@@ -79,7 +79,9 @@ export async function launchRealWorkspace(
       Reflect.set(dialog, 'showOpenDialog', async () => ({ canceled: false, filePaths: [path] }))
     }, projectDirectory)
     await page.getByRole('button', { name: 'Add project', exact: true }).click()
-    await expect(page.getByRole('button', { name, exact: true })).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: `Rename Project ${name}`, exact: true }),
+    ).toBeVisible()
     const projectId = await page.evaluate(async (selectedPath) => {
       const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
       const catalog = await bridge.getProjectCatalog()
