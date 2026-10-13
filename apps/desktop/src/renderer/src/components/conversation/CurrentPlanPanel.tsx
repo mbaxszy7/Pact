@@ -1,0 +1,217 @@
+import { FileText, RotateCcw, X } from 'lucide-react'
+import { useLayoutEffect, useRef, type ReactNode } from 'react'
+
+import type { CollaborationDocument } from '@pact/contracts'
+
+import type { PlanTextSelection } from './CollaborationReview'
+
+import { CollaborationDocumentView } from './CollaborationDocumentView'
+import { MessageMarkdown, type ProjectFileTarget } from './MessageMarkdown'
+
+export interface CurrentPlanDocument {
+  taskId?: string | undefined
+  runId: string
+  messageId: string
+  version: number
+  author: 'codex' | 'claude'
+  content: string
+  document?: CollaborationDocument | undefined
+  sessionId?: string | undefined
+  aroundOffset?: number | undefined
+  navigationId?: string | undefined
+  basis?: 'markdown-visible-v2' | 'plain-visible-v1' | undefined
+  status: string
+}
+
+/** One context document; current plan or immutable Comment source, owned by ConversationView. */
+export function CurrentPlanPanel({
+  plan,
+  loading,
+  error,
+  source = false,
+  onPlanReady,
+  onClose,
+  onRetry,
+  onOpenProjectFile,
+  onCreatePlanComment,
+  todos,
+  todoCount = 0,
+  activeTab = 'plan',
+  onTabChange,
+  taskLabel,
+  todoSource,
+}: {
+  plan?: CurrentPlanDocument | undefined
+  loading: boolean
+  error?: string | undefined
+  source?: boolean | undefined
+  onPlanReady?: ((host: HTMLElement) => (() => void) | undefined) | undefined
+  onClose: () => void
+  onRetry: () => void
+  onOpenProjectFile: (target: ProjectFileTarget) => void
+  onCreatePlanComment?: ((selection: PlanTextSelection) => void) | undefined
+  todos?: ReactNode | undefined
+  todoCount?: number | undefined
+  activeTab?: 'plan' | 'todos' | undefined
+  onTabChange?: ((tab: 'plan' | 'todos') => void) | undefined
+  taskLabel?: string | undefined
+  todoSource?: boolean | undefined
+}): React.JSX.Element {
+  const planDocumentRef = useRef<HTMLDivElement>(null)
+  const planRunId = plan?.runId
+  const planVersion = plan?.version
+  useLayoutEffect(() => {
+    if (!loading && !error && planRunId && planVersion !== undefined && planDocumentRef.current)
+      return onPlanReady?.(planDocumentRef.current)
+    return undefined
+  }, [planRunId, planVersion, loading, error, onPlanReady])
+  return (
+    <section
+      className="flex h-full min-h-0 flex-col"
+      aria-label={source ? 'Plan source' : activeTab === 'todos' ? 'Task Todos' : 'Current plan'}
+    >
+      <header className="flex shrink-0 items-start justify-between gap-group border-b border-border px-section py-panel">
+        <div className="min-w-0">
+          <h2 className="flex items-baseline gap-2 text-body font-medium text-primary">
+            {source
+              ? 'Plan source'
+              : todoSource && activeTab === 'todos'
+                ? 'Todo source'
+                : plan
+                  ? 'Current plan'
+                  : (taskLabel ?? 'Review')}
+            {plan && !(todoSource && activeTab === 'todos') ? (
+              <span className="font-normal text-secondary">· v{plan.version}</span>
+            ) : null}
+          </h2>
+          {plan && !(todoSource && activeTab === 'todos') ? (
+            <p className="mt-2 text-caption text-secondary">
+              {plan.author === 'claude' ? 'Claude Code' : 'Codex'} · {plan.status}
+            </p>
+          ) : null}
+        </div>
+        <button
+          type="button"
+          aria-label="Close context panel"
+          onClick={onClose}
+          className="grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+        >
+          <X aria-hidden="true" className="size-4" strokeWidth={1.75} />
+        </button>
+      </header>
+      {!source && todos !== undefined ? (
+        <nav
+          aria-label="Task context"
+          className="flex shrink-0 gap-1 border-b border-border px-panel py-1.5"
+        >
+          {plan ? (
+            <button
+              type="button"
+              aria-current={activeTab === 'plan' ? 'page' : undefined}
+              onClick={() => onTabChange?.('plan')}
+              className={`min-h-8 rounded-control px-3 text-caption font-medium focus-visible:outline-2 focus-visible:outline-focus ${activeTab === 'plan' ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
+            >
+              Plan
+            </button>
+          ) : null}
+          <button
+            type="button"
+            aria-current={activeTab === 'todos' ? 'page' : undefined}
+            onClick={() => onTabChange?.('todos')}
+            className={`min-h-8 rounded-control px-3 text-caption font-medium focus-visible:outline-2 focus-visible:outline-focus ${activeTab === 'todos' ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
+          >
+            Todos{todoCount > 0 ? ` · ${todoCount}` : ''}
+          </button>
+        </nav>
+      ) : null}
+      <div data-pact-context-scroll className="min-h-0 flex-1 overflow-auto px-panel py-panel">
+        {!source && todos !== undefined ? (
+          <div hidden={activeTab !== 'todos'} inert={activeTab !== 'todos'}>
+            {todos}
+          </div>
+        ) : null}
+        {!source && activeTab === 'todos' ? null : error ? (
+          <div role="alert" className="max-w-[70ch] text-caption text-secondary">
+            <p>Plan could not be loaded.</p>
+            <button
+              type="button"
+              onClick={onRetry}
+              className="mt-group inline-flex min-h-8 items-center gap-2 rounded-control px-3 py-1.5 font-medium text-primary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
+            >
+              <RotateCcw aria-hidden="true" className="size-3.5" strokeWidth={1.75} /> Try again
+            </button>
+          </div>
+        ) : plan ? (
+          <div
+            ref={planDocumentRef}
+            className="pact-plan-document mx-auto min-w-0 max-w-[72ch]"
+            data-pact-plan-run-id={plan.runId}
+            data-pact-plan-version={plan.version}
+            data-pact-plan-message-id={plan.messageId}
+            data-pact-message-id={plan.messageId}
+          >
+            {plan.document && plan.sessionId ? (
+              <CollaborationDocumentView
+                key={`${plan.document.id}:${plan.navigationId ?? ''}:${plan.aroundOffset ?? ''}:${plan.basis ?? ''}`}
+                sessionId={plan.sessionId}
+                runId={plan.runId}
+                source={plan.document}
+                displayContext={{ taskId: plan.taskId }}
+                messageId={plan.messageId}
+                aroundOffset={plan.aroundOffset}
+                basis={plan.basis}
+                onOpenProjectFile={onOpenProjectFile}
+                onReady={() =>
+                  planDocumentRef.current ? onPlanReady?.(planDocumentRef.current) : undefined
+                }
+                onCreateComment={
+                  onCreatePlanComment
+                    ? (selection) =>
+                        onCreatePlanComment({
+                          ...selection,
+                          plan: { runId: plan.runId, version: plan.version },
+                          content: '',
+                        })
+                    : undefined
+                }
+              />
+            ) : (
+              <MessageMarkdown
+                key={`${plan.runId}:${plan.version}`}
+                content={plan.content}
+                messageId={plan.messageId}
+                onOpenProjectFile={onOpenProjectFile}
+                onCreateComment={
+                  onCreatePlanComment
+                    ? (selection) =>
+                        onCreatePlanComment({
+                          ...selection,
+                          plan: { runId: plan.runId, version: plan.version },
+                          content: plan.content,
+                        })
+                    : undefined
+                }
+              />
+            )}
+            {onCreatePlanComment ? (
+              <p className="mt-section text-caption text-secondary">
+                Select text to add a Comment.
+              </p>
+            ) : null}
+          </div>
+        ) : loading ? (
+          <div aria-busy="true" aria-label="Loading current plan" className="space-y-group">
+            <div className="h-4 w-2/3 rounded-control bg-surface-muted" />
+            <div className="h-3 w-full rounded-control bg-surface-muted" />
+            <div className="h-3 w-4/5 rounded-control bg-surface-muted" />
+          </div>
+        ) : (
+          <div className="mt-section text-caption text-secondary">
+            <FileText aria-hidden="true" className="mb-group size-5" strokeWidth={1.75} />
+            Awaiting first plan
+          </div>
+        )}
+      </div>
+    </section>
+  )
+}

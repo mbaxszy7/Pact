@@ -1,0 +1,28 @@
+{
+  "name": "@pact/persistence",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "db:check": "drizzle-kit check --config=drizzle.config.ts",
+    "db:generate": "drizzle-kit generate --config=drizzle.config.ts",
+    "db:migrate:dev": "node scripts/prepare-dev-database.mjs && drizzle-kit migrate --config=drizzle.config.ts",
+    "db:studio": "node scripts/prepare-dev-database.mjs && drizzle-kit studio --config=drizzle.config.ts --host=127.0.0.1 --port=4983",
+    "typecheck": "tsc --noEmit -p tsconfig.json --composite false"
+  },
+  "dependencies": {
+    "@pact/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "9.6.0",
+    "better-sqlite3": "13.0.3",
+    "drizzle-kit": "0.31.10",
+    "drizzle-orm": "0.45.2"
+  },
+  "peerDependencies": {
+    "better-sqlite3": "13.0.3",
+    "drizzle-orm": "0.45.2"
+  }
+}

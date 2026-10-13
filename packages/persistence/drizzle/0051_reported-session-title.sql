@@ -1,0 +1,1 @@
+CREATE INDEX `agent_event_journal_reported_title` ON `agent_event_journal` (`session_id`) WHERE "agent_event_journal"."event_type" = 'session.title.updated' AND json_extract("agent_event_journal"."payload", '$.titleAdopted') = 1;

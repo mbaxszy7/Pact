@@ -1,0 +1,6 @@
+DROP INDEX `conversation_body_inputs_owner_capacity_idx`;--> statement-breakpoint
+DROP INDEX `conversation_body_inputs_bytes_idx`;--> statement-breakpoint
+DROP INDEX `conversation_body_inputs_unreferenced_expiry_idx`;--> statement-breakpoint
+CREATE INDEX `conversation_body_inputs_owner_capacity_idx` ON `conversation_body_inputs` (`owner_key`,`bytes`,`parts`) WHERE "conversation_body_inputs"."committed_message_id" IS NULL AND "conversation_body_inputs"."pending_receipt_id" IS NULL AND "conversation_body_inputs"."source_run_id" IS NULL;--> statement-breakpoint
+CREATE INDEX `conversation_body_inputs_bytes_idx` ON `conversation_body_inputs` (`bytes`,`parts`) WHERE "conversation_body_inputs"."committed_message_id" IS NULL AND "conversation_body_inputs"."pending_receipt_id" IS NULL AND "conversation_body_inputs"."source_run_id" IS NULL;--> statement-breakpoint
+CREATE INDEX `conversation_body_inputs_unreferenced_expiry_idx` ON `conversation_body_inputs` (`updated_at`) WHERE "conversation_body_inputs"."committed_message_id" IS NULL AND "conversation_body_inputs"."pending_receipt_id" IS NULL AND "conversation_body_inputs"."source_run_id" IS NULL;

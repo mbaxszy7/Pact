@@ -1,0 +1,2 @@
+ALTER TABLE `conversation_messages` ADD `route_pending_agent_id` text;--> statement-breakpoint
+CREATE INDEX `conversation_messages_pending_route_idx` ON `conversation_messages` (`route_pending_agent_id`,`session_id`) WHERE "conversation_messages"."route_pending_agent_id" IS NOT NULL;

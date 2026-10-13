@@ -1,0 +1,1 @@
+ALTER TABLE `native_agent_contexts` ADD `recovery_action` text;

@@ -1,0 +1,105 @@
+[data-theme='dark'] {
+  color-scheme: dark;
+
+  --pact-canvas: #0f1720;
+  --pact-surface: #141e28;
+  --pact-surface-muted: #192633;
+  --pact-surface-raised: #1d2a36;
+  --pact-menu-surface: #2b3d4b;
+  --pact-surface-inverse: #edf5fb;
+  --pact-text-primary: #f2f7fb;
+  --pact-text-secondary: #a9b7c4;
+  --pact-text-tertiary: #8393a1;
+  --pact-text-inverse: #0a0d12;
+  --pact-border: #2b3b49;
+  --pact-border-strong: #627587;
+  --pact-focus: #67b1ff;
+  --pact-selection: rgb(103 177 255 / 30%);
+  --pact-navigation-selected: rgb(242 247 251 / 7%);
+
+  --pact-status-ready: #5ee58a;
+  --pact-status-ready-muted: #17392b;
+  --pact-status-ready-foreground: #5ee58a;
+  --pact-status-warning: #e6b84a;
+  --pact-status-warning-muted: #3d3116;
+  --pact-status-warning-foreground: #e6b84a;
+  --pact-status-danger: #ff8a80;
+  --pact-status-danger-muted: #402421;
+  --pact-status-danger-foreground: #ff8a80;
+  --pact-status-info: #67b1ff;
+  --pact-status-info-muted: #1d3855;
+  --pact-status-info-foreground: #67b1ff;
+  --pact-danger: #ff8a80;
+  --pact-danger-muted: #402421;
+
+  --pact-speaker-user: #2b2941;
+  --pact-speaker-claude: #382923;
+  --pact-speaker-codex: #19372f;
+  --pact-diff-added: #17392b;
+  --pact-diff-added-foreground: #9ce7b3;
+  --pact-diff-removed: #402421;
+  --pact-diff-removed-foreground: #ffaea6;
+
+  --pact-shadow-popover: 0 14px 34px rgb(0 0 0 / 36%);
+  --pact-shadow-dialog: 0 24px 60px rgb(0 0 0 / 52%);
+
+  --pact-material-canvas: rgb(15 23 32 / var(--pact-material-navigation-alpha));
+  --pact-material-navigation: rgb(25 38 51 / var(--pact-material-navigation-alpha));
+  --pact-material-chat: rgb(20 30 40 / var(--pact-material-chat-alpha));
+  --pact-material-code: rgb(29 42 54 / var(--pact-material-code-alpha));
+  --pact-material-user: rgb(43 41 65 / var(--pact-material-message-alpha));
+  --pact-material-claude: rgb(56 41 35 / var(--pact-material-message-alpha));
+  --pact-material-codex: rgb(25 55 47 / var(--pact-material-message-alpha));
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    color-scheme: dark;
+
+    --pact-canvas: #0f1720;
+    --pact-surface: #141e28;
+    --pact-surface-muted: #192633;
+    --pact-surface-raised: #1d2a36;
+    --pact-menu-surface: #2b3d4b;
+    --pact-surface-inverse: #edf5fb;
+    --pact-text-primary: #f2f7fb;
+    --pact-text-secondary: #a9b7c4;
+    --pact-text-tertiary: #8393a1;
+    --pact-text-inverse: #0a0d12;
+    --pact-border: #2b3b49;
+    --pact-border-strong: #627587;
+    --pact-focus: #67b1ff;
+    --pact-selection: rgb(103 177 255 / 30%);
+    --pact-navigation-selected: rgb(242 247 251 / 7%);
+    --pact-status-ready: #5ee58a;
+    --pact-status-ready-muted: #17392b;
+    --pact-status-ready-foreground: #5ee58a;
+    --pact-status-warning: #e6b84a;
+    --pact-status-warning-muted: #3d3116;
+    --pact-status-warning-foreground: #e6b84a;
+    --pact-status-danger: #ff8a80;
+    --pact-status-danger-muted: #402421;
+    --pact-status-danger-foreground: #ff8a80;
+    --pact-status-info: #67b1ff;
+    --pact-status-info-muted: #1d3855;
+    --pact-status-info-foreground: #67b1ff;
+    --pact-danger: #ff8a80;
+    --pact-danger-muted: #402421;
+    --pact-speaker-user: #2b2941;
+    --pact-speaker-claude: #382923;
+    --pact-speaker-codex: #19372f;
+    --pact-diff-added: #17392b;
+    --pact-diff-added-foreground: #9ce7b3;
+    --pact-diff-removed: #402421;
+    --pact-diff-removed-foreground: #ffaea6;
+    --pact-shadow-popover: 0 14px 34px rgb(0 0 0 / 36%);
+    --pact-shadow-dialog: 0 24px 60px rgb(0 0 0 / 52%);
+    --pact-material-canvas: rgb(15 23 32 / var(--pact-material-navigation-alpha));
+    --pact-material-navigation: rgb(25 38 51 / var(--pact-material-navigation-alpha));
+    --pact-material-chat: rgb(20 30 40 / var(--pact-material-chat-alpha));
+    --pact-material-code: rgb(29 42 54 / var(--pact-material-code-alpha));
+    --pact-material-user: rgb(43 41 65 / var(--pact-material-message-alpha));
+    --pact-material-claude: rgb(56 41 35 / var(--pact-material-message-alpha));
+    --pact-material-codex: rgb(25 55 47 / var(--pact-material-message-alpha));
+  }
+}

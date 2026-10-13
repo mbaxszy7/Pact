@@ -1,0 +1,1 @@
+ALTER TABLE `conversation_messages` ADD `skill_invocation_json` text;

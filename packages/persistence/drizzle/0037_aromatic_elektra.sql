@@ -1,0 +1,1 @@
+CREATE INDEX `agent_runs_session_agent_generation_idx` ON `agent_runs` (`session_id`,`agent_id`,`binding_generation`);

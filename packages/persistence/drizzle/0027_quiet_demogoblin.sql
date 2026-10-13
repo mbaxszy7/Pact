@@ -1,0 +1,1 @@
+ALTER TABLE `workspace_change_sets` ADD `effects_uncertain` integer DEFAULT false NOT NULL;

@@ -1,0 +1,2 @@
+CREATE INDEX `agent_runs_user_artifacts_idx` ON `agent_runs` (`user_message_id`,`agent_id`,`created_at`,`id`) WHERE "agent_runs"."workspace_changes_json" IS NOT NULL;--> statement-breakpoint
+CREATE INDEX `workspace_change_intents_unreconciled_id_idx` ON `workspace_change_intents` (`id`) WHERE "workspace_change_intents"."reconciled_at" IS NULL;

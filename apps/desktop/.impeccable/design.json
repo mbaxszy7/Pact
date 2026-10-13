@@ -1,0 +1,272 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-04T10:33:04.614663+00:00",
+  "title": "Design System: Pact Desktop",
+  "extensions": {
+    "colorMeta": {
+      "canvas-light": {
+        "role": "neutral",
+        "displayName": "Sky Canvas",
+        "canonical": "#ebf5ff",
+        "tonalRamp": [
+          "#14202c",
+          "#263a4c",
+          "#3c5870",
+          "#587794",
+          "#7f9db8",
+          "#aac4d9",
+          "#d3e7f5",
+          "#ebf5ff"
+        ]
+      },
+      "canvas-dark": {
+        "role": "neutral",
+        "displayName": "Midnight Canvas",
+        "canonical": "#0f1720",
+        "tonalRamp": [
+          "#0f1720",
+          "#172331",
+          "#213247",
+          "#304661",
+          "#4b6179",
+          "#71859a",
+          "#a4b2bf",
+          "#e7edf2"
+        ]
+      },
+      "iris": {
+        "role": "primary",
+        "displayName": "Iris Focus",
+        "canonical": "#0069e0",
+        "tonalRamp": [
+          "#001b3b",
+          "#00326b",
+          "#004a9e",
+          "#0069e0",
+          "#3b8df0",
+          "#73aff8",
+          "#add1fc",
+          "#e6f3ff"
+        ]
+      },
+      "user-light": {
+        "role": "secondary",
+        "displayName": "User Lavender",
+        "canonical": "#f1e6ff",
+        "tonalRamp": [
+          "#2c203b",
+          "#4b3862",
+          "#6c5388",
+          "#8e72aa",
+          "#b19ace",
+          "#d1bdea",
+          "#e8d8fa",
+          "#f7f0ff"
+        ]
+      },
+      "claude-light": {
+        "role": "secondary",
+        "displayName": "Claude Peach",
+        "canonical": "#fff2eb",
+        "tonalRamp": [
+          "#3a231a",
+          "#613c2d",
+          "#885943",
+          "#ae7860",
+          "#d29d84",
+          "#ecc2ad",
+          "#f8dfd1",
+          "#fff2eb"
+        ]
+      },
+      "codex-light": {
+        "role": "secondary",
+        "displayName": "Codex Mint",
+        "canonical": "#d3f6e3",
+        "tonalRamp": [
+          "#163326",
+          "#245641",
+          "#357a5e",
+          "#52a07d",
+          "#76c3a0",
+          "#a0dfc1",
+          "#c5efda",
+          "#eafaf2"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "Onboarding and intentional empty states only."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Top-level settings and Project overview surfaces."
+      },
+      "body": {
+        "displayName": "Interface Body",
+        "purpose": "Transcript, forms, navigation, and Artifact content."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Metadata, toolbar labels, chips, and navigation."
+      },
+      "code": {
+        "displayName": "Code and Data",
+        "purpose": "Source, Diff, terminal, commands, identifiers, and measurements."
+      }
+    },
+    "shadows": [
+      {
+        "name": "popover-light",
+        "value": "0 14px 34px rgb(30 67 92 / 14%)",
+        "purpose": "Light-theme menus and transient controls that leave the pane."
+      },
+      {
+        "name": "dialog-light",
+        "value": "0 24px 60px rgb(30 67 92 / 20%)",
+        "purpose": "Light-theme dialogs that genuinely leave the pane."
+      },
+      {
+        "name": "popover-dark",
+        "value": "0 14px 34px rgb(0 0 0 / 36%)",
+        "purpose": "Dark-theme menus and transient controls that leave the pane."
+      },
+      {
+        "name": "dialog-dark",
+        "value": "0 24px 60px rgb(0 0 0 / 52%)",
+        "purpose": "Dark-theme dialogs that genuinely leave the pane."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-out-pact",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Short state and material transitions that settle without bounce."
+      }
+    ],
+    "breakpoints": [
+      { "name": "sm", "value": "640px" },
+      { "name": "md", "value": "768px" },
+      { "name": "lg", "value": "1024px" },
+      { "name": "xl", "value": "1280px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary-light",
+      "description": "The strongest action in a local decision area.",
+      "html": "<button class=\"ds-btn-primary\">Send</button>",
+      "css": ".ds-btn-primary { min-height: 36px; border: 0; border-radius: 8px; padding: 8px 18px; background: #181d27; color: #fff; font: 500 14px/20px var(--pact-font-sans); transition: filter 160ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-btn-primary:hover { filter: brightness(1.12); } .ds-btn-primary:focus-visible { outline: 2px solid #0069e0; outline-offset: 2px; }"
+    },
+    {
+      "name": "User Message",
+      "kind": "custom",
+      "refersTo": "message-user",
+      "description": "A right-aligned User message on a lavender provenance surface.",
+      "html": "<article class=\"ds-message-user\"><strong>You</strong><p>Keep existing user sessions working.</p></article>",
+      "css": ".ds-message-user { width: min(68%, 44rem); margin-left: auto; border-radius: 12px; padding: 14px 16px; background: #f1e6ff; color: #0a0d12; font: 400 14px/20px var(--pact-font-sans); } .ds-message-user strong { font-weight: 500; } .ds-message-user p { margin: 6px 0 0; } .ds-message-user:focus-within { outline: 2px solid #0069e0; outline-offset: 2px; }"
+    },
+    {
+      "name": "Claude Message",
+      "kind": "custom",
+      "refersTo": "message-claude",
+      "description": "A left-aligned Claude message on a peach provenance surface.",
+      "html": "<article class=\"ds-message-claude\"><strong>Claude</strong><p>I’ll review the change and its edge cases.</p></article>",
+      "css": ".ds-message-claude { width: min(74%, 48rem); margin-right: auto; border-radius: 12px; padding: 14px 16px; background: #fff2eb; color: #0a0d12; font: 400 14px/20px var(--pact-font-sans); } .ds-message-claude strong { font-weight: 500; } .ds-message-claude p { margin: 6px 0 0; } .ds-message-claude:focus-within { outline: 2px solid #0069e0; outline-offset: 2px; }"
+    },
+    {
+      "name": "Codex Message",
+      "kind": "custom",
+      "refersTo": "message-codex",
+      "description": "A left-aligned Codex message on a mint provenance surface.",
+      "html": "<article class=\"ds-message-codex\"><strong>Codex</strong><p>Updating the schema and running tests.</p></article>",
+      "css": ".ds-message-codex { width: min(74%, 48rem); margin-right: auto; border-radius: 12px; padding: 14px 16px; background: #d3f6e3; color: #0a0d12; font: 400 14px/20px var(--pact-font-sans); } .ds-message-codex strong { font-weight: 500; } .ds-message-codex p { margin: 6px 0 0; } .ds-message-codex:focus-within { outline: 2px solid #0069e0; outline-offset: 2px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Daylight Control Room",
+    "overview": "Pact pairs an airy sky-tinted workspace with a midnight companion theme. The interface remains operational and precise, but soft lavender, peach, and mint message surfaces give User, Claude, and Codex an identity that is memorable without becoming noisy. Dense actions stay charcoal or pale inverse; Iris blue is rationed to focus, selection, and live state. This is an Operate interface. Transcript, Diff, documents, permissions, and runtime activity must remain readable for hours. Translucency is optional material depth, not decoration: navigation may reveal more of the desktop environment, Chat reveals less, and code surfaces remain nearly opaque.",
+    "keyCharacteristics": [
+      "Pale sky canvas and bone-white work surfaces in light mode.",
+      "Midnight-blue surfaces rather than generic black in dark mode.",
+      "Lavender User messages on the right; peach Claude and mint Codex messages on the left.",
+      "Compact, familiar desktop controls with deliberate color fields.",
+      "Solid and pure-translucent variants sharing one component system.",
+      "Fully opaque type, icons, code, Diff meaning, and focus states."
+    ],
+    "rules": [
+      {
+        "name": "The Semantic Color Rule",
+        "body": "Speaker color identifies provenance; Iris identifies interaction; green, ochre, and red identify operational state. Every colored signal also carries text, iconography, position, or shape.",
+        "section": "colors"
+      },
+      {
+        "name": "The Density-by-Importance Rule",
+        "body": "In translucent mode, Sidebar is most transparent, Chat is denser, and Diff/terminal/permissions are nearly opaque. Light translucency uses a brighter ice-blue Sidebar overlay fixed seven percentage points below Chat so it never turns gray or becomes fully opaque. Text and code never inherit surface Alpha.",
+        "section": "colors"
+      },
+      {
+        "name": "The Mid-weight Ceiling Rule",
+        "body": "Use weight 500 for normal emphasis and 600 only when compact accessibility testing proves 500 insufficient. Product UI never inherits marketing-scale display type.",
+        "section": "typography"
+      },
+      {
+        "name": "The Legibility-before-Material Rule",
+        "body": "If desktop content competes with UI content, increase the local surface Alpha before adding blur, outline, or shadow.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Shared Icon Vocabulary Rule",
+        "body": "Product controls use lucide-react at a normal 16px size and 1.75px stroke. Common controls do not introduce one-off inline SVG drawings.",
+        "section": "components"
+      },
+      {
+        "name": "The Transparent Backing Rule",
+        "body": "macOS uses transparent true with explicit #00000000 backing and no Vibrancy. Supported Windows build 22621 or newer uses frameless transparent backing, native Window Controls Overlay and background material none rather than Mica. Transparency strength 0/50/100 maps to stored materialOpacity 100/85/70. Text, code and focus remain opaque. Unsupported system/build, reduced transparency, high contrast, forced colors or observable initialization failure uses the complete Solid theme with a concise fallback reason. API success or Renderer Alpha does not establish desktop-compositor correctness.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Project Navigation Rule",
+        "body": "Project folder controls disclosure; name or Pencil opens an inline editor. Hover and keyboard focus expose New Session, Rename and Archive. Expanded headers leave 6px before indented Sessions. Rename trims a nonempty single-line name of at most 120 UTF-16 units; Enter saves, Escape cancels and blur retains the draft. Failed save keeps input and local error. The shell has no dedicated fullscreen feature. Local layout state does not imply persisted per-Session pane preferences.",
+        "section": "layout"
+      },
+      {
+        "name": "The Accessible Desktop Layout Rule",
+        "body": "Fill the Renderer viewport with internally scrolling panes. Wide is at least 1100px; compact is 860 to 1099px; narrower supported windows retain Navigation left of Chat with Context overlaying right. Native minimum is 720 by 520px. Side-pane close restores labeled control focus; overlay Context contains Tab and closes on Escape. Separators are 1px with invisible 6px hit extensions and keyboard resize. Interactive titlebar content is no-drag and respects native control safe areas. Short interruptible transitions honor reduced motion; lazy details have scoped loading and retry. Focus, forced colors, placeholders, status and Diff foregrounds remain readable across themes.",
+        "section": "layout"
+      },
+      {
+        "name": "The Single Current Plan Rule",
+        "body": "Context Plan is the sole full-plan reading area and Todos owns shared Pending/Done rows. Chat keeps compact opaque version/review cards with title, feedback count and one disclosure; required actions and errors remain visible. Todo tick is status rather than a checkbox; Done info explains the reason. Questions and Comments add persistent drafts through Add to comment, with Send only in Composer. Historical sources preserve then/current distinction and exact Comment focus after asynchronous body readiness. Internal IDs, hashes, JSON fields and submission instructions stay out of product prose.",
+        "section": "components"
+      },
+      {
+        "name": "The Composer and Recovery Rule",
+        "body": "Composer starts at least two lines high, with atomic inline Skill/route units, Comment/answer chips above and image controls below full-width body. Observed response replaces Send with Stop without auto-sending the next draft. Image modal uses directional navigation, bounded filmstrip, 180ms reduced-motion-aware transition and close focus return, without zoom controls. Recovery is one concise card showing affected Agents and their currently valid action.",
+        "section": "components"
+      }
+    ],
+    "dos": [
+      "Do use the four main-workspace references as the visual target set.",
+      "Do implement appearance through semantic Tailwind utilities and per-surface CSS variables.",
+      "Do preserve meaningful differences between solid/translucent and light/dark modes.",
+      "Do keep text, icons, code, and focus indicators fully opaque.",
+      "Do use Lucide React for common product controls and state icons.",
+      "Do expose Project actions on Hover and keyboard focus together.",
+      "Do fall back to the complete Solid theme when native material is unavailable or inappropriate."
+    ],
+    "donts": [
+      "Don't use whole-window opacity to implement translucency.",
+      "Don't draw Project-to-Session connector lines or show branch/Changes/path/count metadata by default.",
+      "Don't add a persistent Sessions label under an already expanded Project.",
+      "Don't use gradients, 3D illustration, giant typography, or 32px marketing-card radii in product UI.",
+      "Don't let wallpaper reduce Diff, terminal, permission, or body-text contrast.",
+      "Don't treat Agent color as the only provenance cue.",
+      "Don't draw one-off inline SVG icons when Lucide already provides the control or state symbol."
+    ]
+  }
+}

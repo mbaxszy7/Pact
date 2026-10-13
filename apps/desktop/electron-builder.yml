@@ -1,0 +1,50 @@
+appId: com.pact.desktop
+productName: Pact
+asar: true
+afterPack: build/after-pack.mjs
+directories:
+  buildResources: build
+  output: release
+extraResources:
+  - from: ../../packages/persistence/drizzle
+    to: persistence-migrations
+    filter:
+      - '**/*'
+files:
+  - out/**
+  - package.json
+  - '!**/*.map'
+  - '!**/.vscode/**'
+  - '!src/**'
+  - '!electron.vite.config.*'
+  - '!{.env,.env.*,pnpm-lock.yaml}'
+artifactName: Pact-${version}-${os}-${arch}.${ext}
+npmRebuild: true
+mac:
+  category: public.app-category.developer-tools
+  hardenedRuntime: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  notarize: false
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+    - target: zip
+      arch:
+        - arm64
+        - x64
+win:
+  executableName: Pact
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: Pact
+  uninstallDisplayName: Pact

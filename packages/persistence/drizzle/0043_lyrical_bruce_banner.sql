@@ -1,0 +1,1 @@
+DROP INDEX `session_forks_one_pending_source_idx`;

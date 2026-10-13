@@ -1,0 +1,1 @@
+CREATE INDEX `agent_run_activities_run_status_idx` ON `agent_run_activities` (`run_id`,`status`);

@@ -1,0 +1,16 @@
+[extend]
+useDefault = true
+
+# Keep default provider rules; add the private context exposed by common config formats.
+[[rules]]
+id = "pact-config-credential"
+description = "Credential assigned in a configuration file"
+regex = '''(?i)(?:[a-z0-9_-]*(?:api[_-]?key|auth[_-]?token|access[_-]?token|password|client[_-]?secret|private[_-]?key)[a-z0-9_-]*)["']?\s*[:=]\s*["']([^\s"']{16,})["']'''
+secretGroup = 1
+entropy = 3.0
+keywords = ["key", "token", "password", "secret"]
+
+[[rules.allowlists]]
+description = "Explicit nonfunctional credentials used by isolation and redaction tests"
+regexTarget = "secret"
+regexes = ['''^(?:synthetic-[a-z0-9-]+|fixture-[a-z0-9-]+|OWNED_LOOPBACK_ONLY)$''']

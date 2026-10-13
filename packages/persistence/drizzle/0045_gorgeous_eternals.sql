@@ -1,0 +1,2 @@
+ALTER TABLE `native_rebuild_operations` ADD `returned_input_json` text;--> statement-breakpoint
+CREATE UNIQUE INDEX `native_rebuild_operations_returned_input_idx` ON `native_rebuild_operations` (`session_id`) WHERE json_extract("native_rebuild_operations"."returned_input_json", '$.state') IN ('pending', 'installed');

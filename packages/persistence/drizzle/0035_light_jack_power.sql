@@ -1,0 +1,1 @@
+ALTER TABLE `native_rebuild_operations` ADD `initialization_witness_json` text;

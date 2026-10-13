@@ -1,0 +1,2 @@
+CREATE INDEX `agent_runs_session_created_idx` ON `agent_runs` (`session_id`,`created_at`);--> statement-breakpoint
+CREATE INDEX `conversation_messages_session_role_state_sequence_idx` ON `conversation_messages` (`session_id`,`role`,`state`,`sequence`);

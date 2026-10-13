@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": [
+    "electron.vite.config.*",
+    "src/main/**/*",
+    "src/preload/**/*",
+    "src/utility/**/*",
+    "src/diagnostics/**/*"
+  ],
+  "compilerOptions": {
+    "composite": true,
+    "lib": ["ES2024"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "target": "ES2024",
+    "types": ["electron-vite/node"]
+  }
+}

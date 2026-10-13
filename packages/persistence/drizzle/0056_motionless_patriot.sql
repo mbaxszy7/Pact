@@ -1,0 +1,1 @@
+ALTER TABLE `conversation_body_inputs` ADD `projection_basis` text;

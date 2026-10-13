@@ -1,0 +1,1 @@
+ALTER TABLE `collaboration_turns` ADD `pending_envelope_body_id` text REFERENCES conversation_body_inputs(id);

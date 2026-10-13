@@ -1,0 +1,2 @@
+ALTER TABLE `anchored_comments` ADD `return_operation_id` text;--> statement-breakpoint
+CREATE INDEX `anchored_comments_active_return_owner_idx` ON `anchored_comments` (`session_id`,`return_operation_id`) WHERE "anchored_comments"."sent_with_message_id" IS NULL AND "anchored_comments"."pending_receipt_id" IS NULL;

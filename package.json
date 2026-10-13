@@ -1,0 +1,72 @@
+{
+  "name": "pact",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A governed dual-agent coding workspace.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "bench:catalog": "vitest bench --mode benchmark --run packages/persistence/src/session-repository.test.ts -t CatalogBenchmark --reporter=verbose",
+    "build": "pnpm -r --if-present build",
+    "check": "pnpm docs:check && pnpm format:check && pnpm lint && pnpm db:check && pnpm typecheck && pnpm test",
+    "db:check": "pnpm --filter @pact/persistence db:check",
+    "db:generate": "pnpm --filter @pact/persistence db:generate",
+    "db:migrate:dev": "pnpm --filter @pact/persistence db:migrate:dev",
+    "db:studio": "pnpm --filter @pact/persistence db:studio",
+    "dev": "pnpm --filter @pact/desktop dev",
+    "dist:mac": "pnpm --filter @pact/desktop dist:mac",
+    "dist:win": "pnpm --filter @pact/desktop dist:win",
+    "docs:check": "node scripts/check-publication.mjs",
+    "format": "oxfmt -c ./oxfmt.config.ts .",
+    "format:check": "oxfmt -c ./oxfmt.config.ts --check .",
+    "lint": "oxlint -c ./oxlint.config.ts .",
+    "lint:fix": "oxlint -c ./oxlint.config.ts --fix .",
+    "lint:staged": "lint-staged --max-arg-length 2048 --concurrent 1",
+    "package:dir": "pnpm --filter @pact/desktop package:dir",
+    "package:smoke": "node scripts/package-smoke.mjs",
+    "prepare": "simple-git-hooks",
+    "secrets:check": "node scripts/check-secrets.mjs --staged",
+    "secrets:history": "node scripts/check-secrets.mjs --history",
+    "start": "pnpm --filter @pact/desktop start",
+    "test": "vitest run",
+    "test:e2e": "node scripts/run-e2e.mjs all",
+    "test:e2e:deterministic": "node scripts/run-e2e.mjs deterministic",
+    "test:e2e:real": "node scripts/run-e2e.mjs real",
+    "test:e2e:ui": "node scripts/run-e2e.mjs ui",
+    "test:infra": "node --test scripts/check-publication.test.mjs scripts/e2e-baseline.test.mjs scripts/check-e2e-coverage.test.mjs scripts/run-e2e.test.mjs scripts/run-e2e-windows.test.mjs scripts/package-smoke.test.mjs",
+    "test:native": "vitest run --config vitest.native.config.ts",
+    "test:watch": "vitest",
+    "typecheck": "pnpm typecheck:tests && pnpm -r --if-present typecheck",
+    "typecheck:tests": "tsc --noEmit -p tests/tsconfig.json",
+    "verify:package": "pnpm package:dir && pnpm package:smoke"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@testing-library/react": "16.3.3",
+    "@testing-library/user-event": "14.6.7",
+    "@types/node": "24.13.4",
+    "@vitest/coverage-v8": "5.0.0",
+    "jsdom": "30.0.1",
+    "knip": "6.35.1",
+    "lint-staged": "17.5.0",
+    "oxfmt": "0.67.0",
+    "oxlint": "1.82.0",
+    "oxlint-tsgolint": "7.0.2001",
+    "simple-git-hooks": "2.14.0",
+    "smol-toml": "1.8.0",
+    "typescript": "7.0.2",
+    "vitest": "5.0.0"
+  },
+  "simple-git-hooks": {
+    "pre-commit": "pnpm lint:staged && node scripts/check-publication.mjs --staged && pnpm secrets:check"
+  },
+  "lint-staged": {
+    "*": "oxfmt -c ./oxfmt.config.ts --no-error-on-unmatched-pattern",
+    "*.{js,jsx,ts,tsx,mjs,cjs}": "oxlint -c ./oxlint.config.ts --fix"
+  },
+  "engines": {
+    "node": ">=24.18.0 <25",
+    "pnpm": ">=12 <13"
+  },
+  "packageManager": "pnpm@12.11.2"
+}

@@ -1,0 +1,1 @@
+CREATE INDEX `conversation_messages_run_role_idx` ON `conversation_messages` (`run_id`,`role`);
