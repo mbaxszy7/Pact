@@ -53,17 +53,14 @@ pnpm dist:win               # Build the Windows installer on Windows
 
 Windows E2E also needs PowerShell 7 (`pwsh.exe`) and the Windows .NET Framework C# compiler.
 Real-provider tests require private configuration and can incur model fees. Read the
-[testing guide](docs/testing.md) before running them. Current signing and notarization settings
+[testing guide](CONTRIBUTING.md#testing) before running them. Current signing and notarization settings
 produce development artifacts, not signed public releases.
 
 ## Development documentation
 
-- [Contributing](CONTRIBUTING.md): setup, migrations, checks, and change discipline.
-- [Domain glossary](CONTEXT.md): shared product terminology.
-- [Product specification](docs/product/requirements.md): behavior, scope, and open decisions.
-- [Architecture](docs/technical-foundation.md): interfaces, ownership, trust, and recovery.
-- [Performance](docs/performance.md): budgets, lifecycle rules, and measurement.
-- [Testing](docs/testing.md): public CI, native protocols, private providers, and coverage obligations.
+- [Contributing](CONTRIBUTING.md): setup, migrations, testing, and change discipline.
+- [Product specification](docs/product/requirements.md): vocabulary, behavior, and open decisions.
+- [Architecture](docs/technical-foundation.md): interfaces, ownership, recovery, and resource budgets.
 - [Desktop product context](apps/desktop/PRODUCT.md) and [design system](apps/desktop/DESIGN.md).
 - [Agent instructions](AGENTS.md).
 

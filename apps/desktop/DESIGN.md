@@ -204,7 +204,7 @@ Translucent uses explicit transparent window backing and per-surface color overl
 - Message surfaces: 86–96%.
 - Text, icons, code, and focus rings: always 100%.
 
-macOS uses `transparent: true` with `#00000000` backing and no Vibrancy. Windows build 22621 or newer uses a frameless transparent window, native Window Controls Overlay and the same semantic Alpha layers, with background material set to `none`. Solid restores opaque theme backing. Unsupported platforms/builds, reduced transparency, high contrast/forced colors or observable initialization failure fall back to the complete Solid theme. Retain the requested preference and show a concise effective fallback reason. Renderer Alpha and successful API calls are not desktop-compositor evidence; inspect actual effects on each target platform. Verification is described in [Testing](../../docs/testing.md).
+macOS uses `transparent: true` with `#00000000` backing and no Vibrancy. Windows build 22621 or newer uses a frameless transparent window, native Window Controls Overlay and the same semantic Alpha layers, with background material set to `none`. Solid restores opaque theme backing. Unsupported platforms/builds, reduced transparency, high contrast/forced colors or observable initialization failure fall back to the complete Solid theme. Retain the requested preference and show a concise effective fallback reason. Renderer Alpha and successful API calls are not desktop-compositor evidence; inspect actual effects on each target platform. Verification is described in [Contributing](../../CONTRIBUTING.md#testing).
 
 **The Legibility-before-Material Rule.** If desktop content competes with UI content, increase the local surface Alpha before adding blur, outline, or shadow.
 

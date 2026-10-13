@@ -22,6 +22,9 @@ await test('private inputs and historical documents fail even if forcibly staged
     'nested/private.key',
     'local.sqlite',
     'docs/plans/new.md',
+    'CONTEXT.md',
+    'docs/performance.md',
+    'docs/testing.md',
     'tests/e2e/env/codex/auth.json',
     '.gitleaksignore',
   ]) {
@@ -33,11 +36,11 @@ await test('private inputs and historical documents fail even if forcibly staged
 
 await test('a missing specification, untranslated text or link to deleted plans blocks publication', () => {
   const files = publicFiles()
-  files.delete('CONTEXT.md')
+  files.delete('docs/product/requirements.md')
   files.set('README.md', Buffer.from('[Old plan](docs/plans/old.md)'))
   files.set('CONTRIBUTING.md', Buffer.from('\u4e2d\u6587'))
   const problems = publicationProblems(files)
-  assert.ok(problems.some((problem) => problem.startsWith('CONTEXT.md')))
+  assert.ok(problems.some((problem) => problem.startsWith('docs/product/requirements.md')))
   assert.ok(problems.some((problem) => problem.includes('unavailable local link')))
   assert.ok(problems.some((problem) => problem.includes('must be English')))
 })

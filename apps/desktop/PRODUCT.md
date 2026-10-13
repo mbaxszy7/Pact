@@ -57,7 +57,7 @@ Forward execution preserves native tools and user permissions. Recorded Changes 
 
 - [Product specification](../../docs/product/requirements.md) is the behavior source, including the current/future distinction.
 - [Architecture](../../docs/technical-foundation.md) defines accepted process, state and interface ownership.
-- [Performance](../../docs/performance.md) owns resource bounds; [Testing](../../docs/testing.md) states verification methods and limitations.
+- [Architecture resource requirements](../../docs/technical-foundation.md#performance-and-resource-requirements) owns resource bounds; [Contributing](../../CONTRIBUTING.md#testing) states verification methods and limitations.
 - [Design](DESIGN.md) and its four main-workspace reference images define visual hierarchy. Sample content in those images is illustrative, not a current product fixture or production screenshot.
 - The Renderer contains actual Project/Session conversation, collaboration and recovery UI. Do not call it a foundation-only health screen.
 - Do not invent customer claims, usage benchmarks, testimonials, release maturity or unverified platform effects.

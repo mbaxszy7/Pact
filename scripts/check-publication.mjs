@@ -29,11 +29,8 @@ export const publicDocuments = new Set([
   'README.md',
   'CONTRIBUTING.md',
   'AGENTS.md',
-  'CONTEXT.md',
   'docs/product/requirements.md',
   'docs/technical-foundation.md',
-  'docs/performance.md',
-  'docs/testing.md',
   'apps/desktop/PRODUCT.md',
   'apps/desktop/DESIGN.md',
 ])

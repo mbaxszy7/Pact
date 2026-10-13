@@ -2,7 +2,61 @@
 
 Pact is a local desktop workspace for a user, Claude Code and Codex to work in one shared conversation. Users bring their own installed and authenticated CLIs. Pact routes requests, retains visible conversation and collaboration facts, presents native interactions and recorded file changes, and provides explicit recovery actions.
 
-This document separates current behavior from **Planned scope**. A future requirement is neither an implemented capability nor authorization to build it. Resource limits and measurement belong to [Performance](../performance.md), process boundaries and persistence to [Architecture](../technical-foundation.md), verification to [Testing](../testing.md), appearance to [Design](../../apps/desktop/DESIGN.md), and terminology to [CONTEXT](../../CONTEXT.md).
+This document separates current behavior from **Planned scope**. A future requirement is neither an implemented capability nor authorization to build it. Process boundaries, persistence, resource limits and measurement belong to [Architecture](../technical-foundation.md), verification to [Contributing](../../CONTRIBUTING.md#testing), appearance to [Design](../../apps/desktop/DESIGN.md), and terminology to the [glossary below](#terminology).
+
+## Terminology
+
+Use these terms consistently in code, UI and documentation.
+
+| Term                       | Meaning                                                                                                                                                                                               |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Project                    | A canonical user-added local directory reference, classified as Git or directory. Rename/archive changes Pact metadata, not files.                                                                    |
+| Session                    | One shared visible conversation belonging to a Project, with its own settings, native bindings, history, Comments and collaboration tasks.                                                            |
+| Primary / Secondary        | Default Session responsibilities. Explicit message/task routing can choose either Agent without permanently changing these defaults.                                                                  |
+| CLI Ready                  | The selected native CLI is discoverable, accepts its own effective authentication and can start its control/probe operation. This does not guarantee model quota or future task success.              |
+| Runtime Preparation        | First-use setup before defaults are saved. Both CLIs must be Ready; no model task is used to prove readiness.                                                                                         |
+| Runtime Degraded           | A returning user's readable workspace with Agent-start actions disabled while a required CLI is unavailable. It is not a return to onboarding or an offline mode.                                     |
+| Default Session Settings   | The singleton App template copied when a Session is created. Global edits affect future Sessions only.                                                                                                |
+| Session Settings Revision  | An immutable whole Session configuration. A Run keeps the revision frozen at admission; later tasks use later saved revisions.                                                                        |
+| Agent Run / root Turn      | One explicitly authorized execution owned by a concrete Agent, with native identity, completion and delivery evidence. Root Turn does not mean exactly one provider API request.                      |
+| Native Agent Context       | One provider's own conversation identity/private history. Claude and Codex maintain separate native contexts for the same Pact Session.                                                               |
+| Binding generation         | The identity epoch tying one Agent's native context and executor to the Pact Session. Retired callbacks cannot mutate the current binding.                                                            |
+| Durable Session Context    | Pact-owned original messages, sent Comments, images and collaboration facts preserved independently of native private context.                                                                        |
+| Event Journal              | Ordered durable facts about execution, messages, decisions and recovery. It is not a raw token stream, diagnostic log or complete provider transcript.                                                |
+| Message Projection         | A bounded/readable representation of an immutable or streaming message source. Preview/cache eviction never changes the original source.                                                              |
+| Work Log / Agent Activity  | Sanitized provider-visible progress and Tool lifecycle for a Run, excluding hidden chain-of-thought, unrestricted arguments and raw output.                                                           |
+| Session Activity           | Current Run/interaction/recovery needs, independent of a collaboration task's workflow phase or review verdict. Idle means no active work or required user response.                                  |
+| Session Title              | Pact's display name, with placeholder/local/Agent sources and user rename priority. Derived native `[Pact]` naming is separate.                                                                       |
+| Cross-Agent Handoff        | Ordered, source-attributed user questions and completed answers not yet received by the target Agent, with Comments/images and frozen coverage. It does not merge native contexts.                    |
+| Ordered independent `@all` | Primary then Secondary on one User Message. Secondary excludes this round's Primary answer; later ordinary Handoff can deliver it. It is not shared-file isolation.                                   |
+| Peer Proposal              | A validated lazy suggestion to ask the other Agent. It starts no work until the user clicks and cannot consume current drafts.                                                                        |
+| Collaboration Task         | One `/plan`, `/build` or `/review` objective with frozen roles, version/source basis, Todo ledger, input progress and counted actions.                                                                |
+| Duty                       | The frozen authority of a collaboration Turn: plan submission/adoption/review, code review or stage result. A role label alone does not authorize edits or acceptance.                                |
+| Current Plan               | The task's one authoritative complete plan/reference. Primary maintains later versions; peer review does not publish a competing plan.                                                                |
+| Review basis / fact        | Exact frozen plan or code scope/source plus the responsible Actor's actual completed verdict. It is not an entire workspace snapshot or an inferred agreement.                                        |
+| Todo                       | A versioned opinion, decision or information item with stable identity. Open needs handling; Awaiting review needs confirmation; Done records a reasoned final disposition.                           |
+| Question revision          | The exact version of a Todo's user-input requirement. An answer to an older revision cannot answer a new question.                                                                                    |
+| Answer resolver            | The frozen Actor responsible for processing a question's actual sent answer. Closing that question does not grant peer review acceptance.                                                             |
+| Input Batch                | All accepted body/attachment/Comment/answer sources from one atomic Send, including members outside the resident UI page.                                                                             |
+| Processed-input watermark  | The contiguous settled Batch sequence. A later success cannot skip an earlier unresolved Batch.                                                                                                       |
+| Plan ready                 | A durable exact-plan review acceptance with the complete ledger and required inputs settled. Temporary runtime admission can disable dispatch without deleting this fact.                             |
+| Anchored Comment           | A persistent user draft or sent observation tied to an immutable message/plan/report/Todo revision or versioned Project-file selection, with a quote snapshot. It is not a user-editable Todo status. |
+| Project File Reference     | Click-triggered local text preview metadata. Relative paths stay in the Project; explicit outside absolute paths are preview-only and grant no Comment/Undo authority.                                |
+| Changes Card               | Actual native-recorded file modifications for one settled Run. Missing/mixed evidence limits Undo; it does not block native forward tools or claim full Project coverage.                             |
+| Undo                       | Whole-card guarded inverse file application after all-file conflict-free preflight. It has no Redo and does not restore transcript, native context, Git state or external effects.                    |
+| Native permission mode     | Session/Agent choice of Native, Ask, Auto or confirmed Full access. Tool approvals are separate transient native requests; modes do not save global permission rules.                                 |
+| Unknown delivery           | The request may have reached native execution but its outcome is not established. Do not blindly resend or infer termination from timeout/silence.                                                    |
+| Retry / check              | Inspection or saved-result/candidate readback, without a new model task, old-request replay or new native candidate.                                                                                  |
+| Rebuild                    | User-confirmed verified initialization from durable visible history into a new native binding. It is not native resume, Fork or replay of the prior task.                                             |
+| Returned input             | A durable receipt for a provably unsent/refused latest input excluded from a successful Rebuild seed, offered back for explicit user Send without overwriting newer drafts.                           |
+| Fork                       | A new Pact Session and genuine native branch for both Agents at one completed-answer boundary, sharing current Project files. It is not historical code restoration.                                  |
+| Managed image              | Immutable locally saved PNG/JPEG/WebP content referenced by messages/receipts/branches; a thumbnail is a disposable view.                                                                             |
+| Native compaction          | Provider-managed private-context reduction while retaining the same native identity. Pact does not treat it as missing history or auto-Rebuild.                                                       |
+| Checkpoint                 | Planned automatic Session/workspace restore point. Separate from current Fork and Changes/Undo; no complete Checkpoint feature is shipped.                                                            |
+| Writer Lease               | A former hard forward-write proposal, withdrawn from current execution. Pact only coordinates its own Undo and known native Runs, not external editors/tools.                                         |
+| Diagnostics                | Bounded sanitized local operation logs. They do not replace the SQLite Journal or the planned full audit export.                                                                                      |
+
+Avoid using `completed`, `accepted`, `ready`, `responded` and `resolved` interchangeably: they describe different native, workflow, admission and input facts.
 
 ## Scope and boundaries
 

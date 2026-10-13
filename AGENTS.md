@@ -4,9 +4,9 @@
 
 - Behavior: [docs/product/requirements.md](docs/product/requirements.md).
 - Interfaces/ownership: [docs/technical-foundation.md](docs/technical-foundation.md).
-- Budgets/benchmarks: [docs/performance.md](docs/performance.md).
-- Checks: [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/testing.md](docs/testing.md).
-- Terminology: [CONTEXT.md](CONTEXT.md).
+- Budgets/benchmarks: [Architecture resource requirements](docs/technical-foundation.md#performance-and-resource-requirements).
+- Checks: [CONTRIBUTING.md](CONTRIBUTING.md).
+- Terminology: [Product glossary](docs/product/requirements.md#terminology).
 - UI: [apps/desktop/PRODUCT.md](apps/desktop/PRODUCT.md) and [apps/desktop/DESIGN.md](apps/desktop/DESIGN.md).
 - Active user instructions take precedence. Preserve user and concurrent changes.
 
@@ -51,7 +51,7 @@ Use pnpm only, isolated dependencies, an exact lockfile, Oxlint, and Oxfmt. Nati
 belong in desktop, are rebuilt for Electron, and require E2E/packaged validation. Keep generated
 output, credentials, databases, logs, checkpoints, and reports out of Git.
 
-Read performance before changing streaming, IPC, persistence, previews, native lifecycle, probes,
+Read the architecture resource requirements before changing streaming, IPC, persistence, previews, native lifecycle, probes,
 queues, caches, workers, or retention. Every owner needs item/byte bounds, deadline/TTL, cleanup,
 cancellation, and restart behavior. Streaming uses bounded versioned patches; paginated snapshots
 serve initial load/resync. A page/resident budget is not a total content limit. Do not truncate facts,
