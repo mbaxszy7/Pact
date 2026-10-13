@@ -81,11 +81,11 @@ deferred checks, and unverified platforms. Missing evidence cannot establish a p
 ## Documentation policy
 
 The reviewed Markdown allowlist is `README.md`, `CONTRIBUTING.md`, `AGENTS.md`, `CONTEXT.md`,
-`SECURITY.md`, the product/architecture/performance/testing specifications under `docs/`, and desktop
+the product/architecture/performance/testing specifications under `docs/`, and desktop
 `PRODUCT.md`/`DESIGN.md`. `scripts/check-publication.mjs` enforces exact paths, English text, local
 links, and absence of private/generated material.
 
-Publication inspection owns at most 4096 paths (1 MiB total, 1 KiB per path), reads only the eleven
+Publication inspection owns at most 4096 paths (1 MiB total, 1 KiB per path), reads only the ten
 reviewed documents (128 KiB each, 512 KiB total), and emits at most 128 diagnostics/64 KiB. Overflow
 fails visibly. Binary/source content is inspected by the secret scanner, not retained by this policy
 checker. Local documentation links must stay inside the repository.
@@ -105,5 +105,4 @@ legally required notices.
 
 Do not commit credentials, provider homes, environment files, databases, checkpoints, logs, traces,
 or raw user/agent output. Ignore rules do not protect tracked/forcibly added files. Test credentials
-must be unmistakably nonfunctional; never broadly exempt test directories from scanning. Follow
-the [security policy](SECURITY.md) for private reports and credential incidents.
+must be unmistakably nonfunctional; never broadly exempt test directories from scanning.

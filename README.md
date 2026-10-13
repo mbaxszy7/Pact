@@ -65,7 +65,7 @@ produce development artifacts, not signed public releases.
 - [Performance](docs/performance.md): budgets, lifecycle rules, and measurement.
 - [Testing](docs/testing.md): public CI, native protocols, private providers, and coverage obligations.
 - [Desktop product context](apps/desktop/PRODUCT.md) and [design system](apps/desktop/DESIGN.md).
-- [Agent instructions](AGENTS.md) and [security policy](SECURITY.md).
+- [Agent instructions](AGENTS.md).
 
 ## License
 

@@ -30,7 +30,6 @@ export const publicDocuments = new Set([
   'CONTRIBUTING.md',
   'AGENTS.md',
   'CONTEXT.md',
-  'SECURITY.md',
   'docs/product/requirements.md',
   'docs/technical-foundation.md',
   'docs/performance.md',
