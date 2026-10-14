@@ -42,7 +42,7 @@ function readProcessTable(timeout = 1000) {
   return new Promise((resolveTable, reject) => {
     execFile(
       '/bin/ps',
-      ['-axo', 'pid=,ppid=,pgid=,lstart='],
+      ['-axo', 'pid=,ppid=,pgid=,lstart=,stat='],
       {
         env: { PATH: process.env.PATH, LC_ALL: 'C' },
         encoding: 'utf8',
@@ -67,12 +67,18 @@ function readProcessTable(timeout = 1000) {
         }
         const rows = new Map()
         for (const line of lines) {
-          const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s*$/u.exec(line)
+          const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s+([A-Za-z+<>?]{1,8})\s*$/u.exec(line)
           if (!match) {
-            reject(failure('E2E process ownership query returned an invalid row.'))
+            const fields = line.trim().split(/\s+/u)
+            const flags = fields.at(-1) ?? ''
+            reject(
+              failure(
+                `E2E process ownership query returned an invalid row (pidFields=${/^\s*\d+\s+\d+\s+\d+\s/u.test(line)}; fieldCount=${Math.min(fields.length, 4097)}; stat=${/^[A-Za-z+<>?]{1,8}$/u.test(flags) ? flags : 'unrecognized'}).`,
+              ),
+            )
             return
           }
-          const [, pidText, parentText, groupText, started] = match
+          const [, pidText, parentText, groupText, started, stat] = match
           const pid = Number(pidText)
           const ppid = Number(parentText)
           const pgid = Number(groupText)
@@ -80,7 +86,7 @@ function readProcessTable(timeout = 1000) {
             reject(failure('E2E process ownership query returned an invalid identity.'))
             return
           }
-          rows.set(pid, { pid, ppid, pgid, started })
+          rows.set(pid, { pid, ppid, pgid, started, stat })
         }
         resolveTable(rows)
       },
@@ -104,6 +110,7 @@ export function run(
     redact = (text) => text,
     write,
     onState = () => {},
+    onOwnership,
     inspectProcesses = readProcessTable,
   } = {},
 ) {
@@ -151,8 +158,13 @@ export function run(
     let groupTimer
     let observerFailed = false
     const ownedProcesses = new Map()
-    const ownedGroups = new Set(child.pid ? [child.pid] : [])
-    const groupLeaderStarts = new Map()
+    const ownedGroups = new Map(
+      child.pid ? [[child.pid, { admitted: true, started: undefined }]] : [],
+    )
+    let ownershipEvidenceIncomplete = false
+    let cleanupError
+    let ownershipProbeIncomplete = false
+    let ownershipSequence = 0
     let ownershipSample
     let ownershipTimer
     let cleanupRefreshing = false
@@ -173,7 +185,13 @@ export function run(
           maxBufferedBytes,
           groupGone,
           ownedProcessCount: identityCount(),
-          ownedGroupCount: ownedGroups.size,
+          ownedGroupCount: admittedGroupCount(),
+          cleanupGroupCount: ownedGroups.size,
+          ownershipEvidenceIncomplete,
+          ownershipProbeIncomplete,
+          ...(cleanupError && safeErrors.has(cleanupError)
+            ? { cleanupFailure: cleanupError.message }
+            : {}),
           ...(startupError && safeErrors.has(startupError)
             ? { failure: startupError.message }
             : {}),
@@ -193,13 +211,98 @@ export function run(
         throw failure(`E2E process-group check failed (${safeCode(error)}).`)
       }
     }
-    const groupAlive = () => [...ownedGroups].some(groupExists)
+    const groupAlive = () => {
+      let alive = false
+      for (const pgid of ownedGroups.keys()) {
+        try {
+          alive = groupExists(pgid) || alive
+        } catch (error) {
+          recordFailure(error)
+          alive = true
+        }
+      }
+      return alive
+    }
+    const admittedGroupCount = () =>
+      [...ownedGroups.values()].filter((group) => group.admitted).length
+    const recordFailure = (error) => {
+      if (!startupError) startupError = error
+      else if (error !== startupError) cleanupError ??= error
+    }
     const identityCount = () =>
       ownedProcesses.size +
       [...uncertainGroups.values()].reduce((count, pending) => count + pending.identities.length, 0)
+    const pendingConfirmations = () =>
+      [...uncertainGroups].filter(([pgid]) => !invalidGroups.has(pgid))
+    const retainInvalidGroup = (pgid, previous) => {
+      invalidGroups.add(pgid)
+      const retained = new Map(
+        (uncertainGroups.get(pgid)?.identities ?? []).map((known) => [known.pid, known]),
+      )
+      for (const known of [...previous, ...ownedProcesses.values()]) {
+        if (known.pgid === pgid) retained.set(known.pid, known)
+      }
+      uncertainGroups.set(pgid, {
+        identities: [...retained.values()],
+        deadline: performance.now(),
+      })
+      for (const [pid, known] of ownedProcesses) {
+        if (known.pgid === pgid) ownedProcesses.delete(pid)
+      }
+    }
+    const observeOwnership = (stage, rows, problem) => {
+      if (typeof onOwnership !== 'function' || ownershipProbeIncomplete) return
+      const snapshot = {
+        stage,
+        sequence: ++ownershipSequence,
+        elapsedMs: Math.round(performance.now()),
+        rootPid: child.pid ?? null,
+        requestedSignal: requestedSignal ?? null,
+        problem: problem && safeErrors.has(problem) ? problem.message : null,
+        admittedGroupCount: admittedGroupCount(),
+        evidenceIncomplete: ownershipEvidenceIncomplete,
+        groups: [...ownedGroups].map(([pgid, group]) => ({
+          pgid,
+          admitted: group.admitted,
+          started: group.started ?? null,
+          uncertain: uncertainGroups.has(pgid),
+          invalid: invalidGroups.has(pgid),
+          signal: sentSignals.get(pgid) ?? null,
+        })),
+        identities: [
+          ...ownedProcesses.values(),
+          ...[...uncertainGroups.values()].flatMap((pending) => pending.identities),
+        ].map((known) => ({
+          pid: known.pid,
+          ppid: known.ppid,
+          pgid: known.pgid,
+          started: known.started,
+          observed: sameProcess(known, rows.get(known.pid)) === true,
+          stat: rows.get(known.pid)?.stat ?? null,
+        })),
+      }
+      // A diagnostic callback never becomes a second owner or changes the job's
+      // verdict. Its fixed scalar snapshot has the existing identity bounds.
+      try {
+        if (
+          snapshot.groups.length > maxOwnedProcesses ||
+          snapshot.identities.length > maxOwnedProcesses ||
+          Buffer.byteLength(JSON.stringify(snapshot)) > 64 * 1024
+        )
+          throw new Error('Ownership observation exceeded its bound')
+        const observation = onOwnership(snapshot)
+        if (observation !== undefined) {
+          // The contract is synchronous/void. Observe one invalid return's
+          // rejection without awaiting it or admitting another callback.
+          ownershipProbeIncomplete = true
+          void Promise.resolve(observation).catch(() => {})
+        }
+      } catch {
+        ownershipProbeIncomplete = true
+      }
+    }
     const retireGroup = (pgid) => {
       ownedGroups.delete(pgid)
-      groupLeaderStarts.delete(pgid)
       uncertainGroups.delete(pgid)
       invalidGroups.delete(pgid)
       sentSignals.delete(pgid)
@@ -215,38 +318,58 @@ export function run(
         let problem
         do {
           for (const [pgid, pending] of uncertainGroups) {
+            if (invalidGroups.has(pgid)) continue
             if (pending.deadline > performance.now()) continue
-            uncertainGroups.delete(pgid)
-            if (groupExists(pgid)) {
-              invalidGroups.add(pgid)
-              problem ??= failure(
-                'E2E owned group has no previously verified live process anchor after confirmation deadline.',
-              )
-            } else {
-              retireGroup(pgid)
-              retired.add(pgid)
+            try {
+              if (groupExists(pgid)) {
+                retainInvalidGroup(pgid, [])
+                problem ??= failure(
+                  'E2E owned group has no previously verified live process anchor after confirmation deadline.',
+                )
+              } else {
+                retireGroup(pgid)
+                retired.add(pgid)
+              }
+            } catch (error) {
+              retainInvalidGroup(pgid, [])
+              problem ??= error
             }
           }
           const available = Math.min(
             1000,
-            ...[...uncertainGroups.values()].map((pending) => pending.deadline - performance.now()),
+            ...pendingConfirmations().map(([, pending]) => pending.deadline - performance.now()),
           )
           // oxlint-disable-next-line no-await-in-loop -- One OS query owns the single-flight; unknown groups retain a fixed five-second deadline.
           rows = await inspectProcesses(Math.max(1, Math.floor(available)))
           const previous = [...ownedProcesses.values()]
           const root = rows.get(child.pid)
-          if (!ownedProcesses.size && root?.ppid === process.pid && root.pgid === child.pid) {
+          const rootGroup = ownedGroups.get(child.pid)
+          if (
+            rootGroup &&
+            !rootGroup.started &&
+            !uncertainGroups.has(child.pid) &&
+            !invalidGroups.has(child.pid) &&
+            identityCount() < maxOwnedProcesses &&
+            root?.ppid === process.pid &&
+            root.pgid === child.pid
+          ) {
             ownedProcesses.set(root.pid, root)
-            groupLeaderStarts.set(root.pgid, root.started)
+            rootGroup.started = root.started
           }
           for (const [pid, known] of ownedProcesses) {
             if (!sameProcess(known, rows.get(pid))) ownedProcesses.delete(pid)
           }
           const verifiedGroups = new Set()
-          for (const pgid of ownedGroups) {
-            if (!groupExists(pgid)) {
-              retireGroup(pgid)
-              retired.add(pgid)
+          for (const [pgid, group] of ownedGroups) {
+            try {
+              if (!groupExists(pgid)) {
+                retireGroup(pgid)
+                retired.add(pgid)
+                continue
+              }
+            } catch (error) {
+              retainInvalidGroup(pgid, previous)
+              problem ??= error
               continue
             }
             if (invalidGroups.has(pgid)) {
@@ -254,9 +377,9 @@ export function run(
               continue
             }
             const leader = rows.get(pgid)
-            const started = groupLeaderStarts.get(pgid)
+            const started = group.started
             if (!started || (leader && leader.started !== started)) {
-              invalidGroups.add(pgid)
+              retainInvalidGroup(pgid, previous)
               problem ??= failure('E2E owned group lost its verifiable process identity.')
               continue
             }
@@ -279,8 +402,7 @@ export function run(
               })
             }
             if (performance.now() >= uncertainGroups.get(pgid).deadline) {
-              uncertainGroups.delete(pgid)
-              invalidGroups.add(pgid)
+              retainInvalidGroup(pgid, previous)
               problem ??= failure(
                 'E2E owned group has no previously verified live process anchor after confirmation deadline.',
               )
@@ -298,8 +420,11 @@ export function run(
               )
                 continue
               if (!verifiedGroups.has(row.pgid) && !ownedProcesses.has(row.ppid)) continue
-              if (identityCount() >= maxOwnedProcesses)
-                throw failure('E2E job exceeded 256 owned process identities.')
+              if (identityCount() >= maxOwnedProcesses) {
+                ownershipEvidenceIncomplete = true
+                problem ??= failure('E2E job exceeded 256 owned process identities.')
+                continue
+              }
               ownedProcesses.set(row.pid, row)
               changed = true
             }
@@ -307,18 +432,32 @@ export function run(
           for (const known of ownedProcesses.values()) {
             if (ownedGroups.has(known.pgid)) continue
             const leader = rows.get(known.pgid)
-            if (!leader || !sameProcess(ownedProcesses.get(leader.pid) ?? {}, leader))
-              throw failure('E2E descendant group has no verified owned leader.')
-            if (ownedGroups.size >= maxOwnedGroups)
-              throw failure('E2E job exceeded 16 active owned process groups.')
-            ownedGroups.add(known.pgid)
-            groupLeaderStarts.set(known.pgid, leader.started)
+            const verifiedLeader =
+              leader && sameProcess(ownedProcesses.get(leader.pid) ?? {}, leader)
+            const admitted = Boolean(verifiedLeader) && admittedGroupCount() < maxOwnedGroups
+            // Admission can fail without releasing cleanup responsibility. Every
+            // retained group is backed by one of the bounded verified identities.
+            if (ownedGroups.size >= maxOwnedProcesses) {
+              ownershipEvidenceIncomplete = true
+              problem ??= failure('E2E cleanup responsibility exceeded 256 process groups.')
+              continue
+            }
+            ownedGroups.set(known.pgid, {
+              admitted,
+              started: verifiedLeader ? leader.started : undefined,
+            })
+            if (!verifiedLeader) {
+              retainInvalidGroup(known.pgid, [])
+              problem ??= failure('E2E descendant group has no verified owned leader.')
+            }
+            if (!admitted) problem ??= failure('E2E job exceeded 16 active owned process groups.')
           }
           // Pending confirmation never blocks cancellation of independently
           // verified groups. An unknown group is neither adopted nor signalled.
+          observeOwnership(problem ? 'rejected' : 'sampled', rows, problem)
           if (requestedSignal) signalGroups(requestedSignal, rows)
           if (problem) throw problem
-          if (uncertainGroups.size) {
+          if (pendingConfirmations().length) {
             // oxlint-disable-next-line no-await-in-loop -- Only this single-flight owns the bounded confirmation cadence.
             await new Promise((resume) =>
               setTimeout(
@@ -327,15 +466,15 @@ export function run(
                   0,
                   Math.min(
                     groupCheckInterval,
-                    ...[...uncertainGroups.values()].map(
-                      (pending) => pending.deadline - performance.now(),
+                    ...pendingConfirmations().map(
+                      ([, pending]) => pending.deadline - performance.now(),
                     ),
                   ),
                 ),
               ),
             )
           }
-        } while (uncertainGroups.size)
+        } while (pendingConfirmations().length)
         return rows
       })().finally(() => {
         ownershipSample = undefined
@@ -343,8 +482,14 @@ export function run(
       return ownershipSample
     }
     const signalGroups = (requested, rows) => {
-      for (const pgid of ownedGroups) {
-        if (!groupExists(pgid)) continue
+      for (const pgid of ownedGroups.keys()) {
+        try {
+          if (!groupExists(pgid)) continue
+        } catch (error) {
+          retainInvalidGroup(pgid, [])
+          recordFailure(error)
+          continue
+        }
         const anchor = [...ownedProcesses.values()].find(
           (known) => known.pgid === pgid && sameProcess(known, rows.get(known.pid)),
         )
@@ -362,7 +507,7 @@ export function run(
           sentSignals.set(pgid, requested)
         } catch (error) {
           if (error.code !== 'ESRCH') {
-            startupError = failure(`E2E owned group could not be signalled (${safeCode(error)}).`)
+            recordFailure(failure(`E2E owned group could not be signalled (${safeCode(error)}).`))
           }
         }
       }
@@ -389,7 +534,6 @@ export function run(
       signal?.removeEventListener('abort', onCancel)
       ownedProcesses.clear()
       ownedGroups.clear()
-      groupLeaderStarts.clear()
       uncertainGroups.clear()
       invalidGroups.clear()
       sentSignals.clear()
@@ -399,7 +543,7 @@ export function run(
     }
     const checkGroup = () => {
       try {
-        groupGone = !groupAlive()
+        groupGone = !groupAlive() && !ownershipEvidenceIncomplete
         if (groupGone && !cleanupRefreshing && !ownershipSample) {
           clearTimeout(killTimer)
           clearTimeout(confirmTimer)
@@ -407,7 +551,7 @@ export function run(
           finish()
         }
       } catch (error) {
-        startupError = error
+        recordFailure(error)
         stop('group-check-failed')
       }
     }
@@ -435,7 +579,7 @@ export function run(
           const rows = await refreshOwnership()
           signalGroups(requestedSignal, rows)
         } catch (error) {
-          startupError = error
+          recordFailure(error)
         } finally {
           cleanupRefreshing = false
           monitorGroup()
@@ -463,8 +607,11 @@ export function run(
           child.stderr?.destroy()
           reject(
             failure(
-              'E2E owned process groups could not be confirmed closed after SIGKILL.' +
-                (startupError && safeErrors.has(startupError) ? ` ${startupError.message}` : ''),
+              (startupError && safeErrors.has(startupError) ? `${startupError.message} ` : '') +
+                'E2E owned process groups could not be confirmed closed after SIGKILL.' +
+                (cleanupError && safeErrors.has(cleanupError)
+                  ? ` Cleanup observation: ${cleanupError.message}`
+                  : ''),
             ),
           )
         }, confirmationDeadline)
@@ -487,7 +634,7 @@ export function run(
           return undefined
         },
         (error) => {
-          startupError = error
+          recordFailure(error)
           stop('ownership-query-failed')
           return undefined
         },
@@ -550,7 +697,7 @@ export function run(
       }
     }
     child.once('error', (error) => {
-      startupError = failure(`E2E job could not start (${safeCode(error)}).`)
+      recordFailure(failure(`E2E job could not start (${safeCode(error)}).`))
       stop('spawn-failed')
     })
     child.once('exit', (code) => {

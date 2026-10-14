@@ -258,7 +258,16 @@ failure uses bounded TERM/KILL and five-second confirmation. Identity is PID plu
 rechecked before signalling. Limits are 256 process identities, 16 active groups, 1-second/256 KiB/
 4096-row process queries, and 256 KiB output. Temporary identity uncertainty does not permit claiming
 new members or prevent cleanup of other verified groups. Never enumerate command lines/environment
-for ownership or kill by process name.
+for ownership or kill by process name. Exceeding the 16-group admission limit still retains every
+verified rejected group for cleanup under the same 256-identity bound. Unknown identities retain
+their reservation until physical absence is confirmed; one group's failure cannot prevent cleanup
+of independently verified groups.
+
+The optional ownership diagnostic is synchronous and void. Its fixed PID/PPID/PGID/birth/state
+snapshots are at most 64 KiB and 256 identities/groups, contain no command lines or environment,
+and cannot change the execution result. An invalid return or exception disables that observer;
+accidental asynchronous rejection is observed once without admitting a Promise queue. Scoped
+runner regressions do not establish a complete real-provider suite or Windows acceptance.
 
 Standalone Windows NativeRpc helpers retain their ten-second/16 KiB compilation budget and private
 nonce-directory lifecycle. A native fixture entry has a ten-minute ceiling. NativeRpc completion

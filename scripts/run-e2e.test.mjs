@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import childProcess, { execFile, execFileSync } from 'node:child_process'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -64,10 +65,21 @@ async function treeFixture(context) {
   const report = join(root, 'pids.json')
   const term = join(root, 'term.txt')
   const groups = new Set()
+  const groupIdentities = new Map()
   const states = []
   const lines = []
   context.after(async () => {
+    const rows = actualProcesses()
     for (const pid of groups) {
+      if (groupGone(pid)) continue
+      const known = groupIdentities.get(pid) ?? []
+      if (
+        !known.some((identity) => {
+          const row = rows.get(identity.pid)
+          return row && row.pgid === pid && row.started === identity.started
+        })
+      )
+        throw new Error('Emergency fixture cleanup has no fresh verified group identity')
       try {
         process.kill(-pid, 'SIGKILL')
       } catch (error) {
@@ -96,7 +108,14 @@ async function treeFixture(context) {
         onState(value) {
           if (states.length >= 256) throw new Error('Node observer event capacity exceeded')
           states.push(value)
-          if (value.pid) groups.add(value.pid)
+          if (value.pid) {
+            groups.add(value.pid)
+            if (!groupIdentities.has(value.pid)) {
+              const row = actualProcesses().get(value.pid)
+              if (row?.ppid === process.pid && row.pgid === value.pid)
+                groupIdentities.set(value.pid, [row])
+            }
+          }
         },
         ...extra,
       })
@@ -112,7 +131,17 @@ async function treeFixture(context) {
           throw error
         }
       })
-      if (value.detached) groups.add(value.worker)
+      const rows = actualProcesses()
+      for (const pid of [value.worker, ...(value.workers ?? [])].filter(Number.isSafeInteger)) {
+        const row = rows.get(pid)
+        const pgid = value.detached || value.workers ? pid : value.parent
+        if (row?.ppid !== value.parent || row.pgid !== pgid)
+          throw new Error('Node fixture descendant identity could not be verified')
+        groups.add(pgid)
+        const identities = groupIdentities.get(pgid) ?? []
+        if (!identities.some((identity) => identity.pid === pid)) identities.push(row)
+        groupIdentities.set(pgid, identities)
+      }
       return value
     },
   }
@@ -150,6 +179,125 @@ await test(
     assert.ok(fixture.states.every((value) => value.ownedProcessCount <= 256))
     assert.ok(fixture.states.every((value) => value.ownedGroupCount <= 16))
     assert.equal(fixture.states.at(-1).groupGone, true)
+  },
+)
+
+await test(
+  'an OS-supported unknown stat flag on an unrelated row cannot fail the job',
+  posixOnly,
+  async (context) => {
+    const fixture = await treeFixture(context)
+    const original = childProcess.execFile
+    let injections = 0
+    childProcess.execFile = (file, args, options, callback) => {
+      if (file !== '/bin/ps') return original(file, args, options, callback)
+      return original(file, args, options, (error, stdout, stderr) => {
+        if (error) callback(error, stdout, stderr)
+        else {
+          injections++
+          callback(null, stdout + '1999999999 1 1999999999 Wed Oct 14 20:00:00 2026 ?s\n', stderr)
+        }
+      })
+    }
+    syncBuiltinESMExports()
+    try {
+      assert.equal(await fixture.execute('normal-held', 10_000), 7)
+      assert.ok(injections > 0)
+      assert.equal(fixture.states.at(-1).groupGone, true)
+    } finally {
+      childProcess.execFile = original
+      syncBuiltinESMExports()
+    }
+  },
+)
+
+await test(
+  'an optional ownership observer cannot alter the execution verdict',
+  posixOnly,
+  async (context) => {
+    const fixture = await treeFixture(context)
+    let observations = 0
+    const result = await fixture.execute('normal-held', 10_000, {
+      onOwnership(value) {
+        observations++
+        assert.ok(value.groups.length <= 256)
+        assert.ok(value.identities.length <= 256)
+        throw new Error(syntheticSecret)
+      },
+    })
+    assert.equal(result, 7)
+    assert.equal(observations, 1)
+    assert.equal(fixture.states.at(-1).ownershipProbeIncomplete, true)
+    assert.equal(fixture.states.at(-1).groupGone, true)
+    assert.ok(!JSON.stringify(fixture.states).includes(syntheticSecret))
+  },
+)
+
+await test(
+  'a rejected asynchronous diagnostic cannot escape the isolated runner',
+  posixOnly,
+  async () => {
+    const source = `import { run } from ${JSON.stringify(new URL('./run-e2e.mjs', import.meta.url).href)};
+      const code = await run(['-e', 'setTimeout(() => process.exit(7), 1500)'], 5000, {
+        executable: process.execPath, write() {},
+        onOwnership: async () => { throw new Error(${JSON.stringify(syntheticSecret)}) }
+      });
+      process.exitCode = code;`
+    const result = await new Promise((done) => {
+      execFile(
+        process.execPath,
+        ['--input-type=module', '-e', source],
+        {
+          env: { PATH: process.env.PATH, HOME: process.env.HOME },
+          timeout: 10_000,
+          maxBuffer: 256 * 1024,
+          shell: false,
+        },
+        (error, stdout, stderr) =>
+          done({
+            code: error?.code ?? 0,
+            leaked: (stdout + stderr).includes(syntheticSecret),
+          }),
+      )
+    })
+    // The isolated job's only child exits naturally after 1.5s even on the red
+    // implementation, so an unhandled-rejection reproduction leaves no tree.
+    await delay(1700)
+    assert.equal(result.leaked, false)
+    assert.equal(result.code, 7)
+  },
+)
+
+await test(
+  'the sixteen-group boundary preserves a successful natural exit',
+  posixOnly,
+  async (context) => {
+    const fixture = await treeFixture(context)
+    const execution = fixture.execute('groups-15-natural')
+    const pids = await fixture.pids()
+    assert.equal(await execution, 0)
+    assert.equal(pids.workers.length, 15)
+    assert.ok(fixture.states.some((value) => value.ownedGroupCount === 16))
+    assert.ok([pids.parent, ...pids.workers].every(groupGone))
+    assert.equal(fixture.states.at(-1).groupGone, true)
+  },
+)
+
+await test(
+  'rejected excess groups remain owned until all eighteen actual groups are released',
+  posixOnly,
+  async (context) => {
+    const fixture = await treeFixture(context)
+    const execution = fixture.execute('groups-17-hold')
+    const pids = await fixture.pids()
+    await assert.rejects(execution, /exceeded 16 active owned process groups/)
+    assert.equal(pids.workers.length, 17)
+    // This assertion runs before the fixture's emergency after-hook. A failed
+    // admission must release the real Node tree without that fallback's help.
+    assert.ok([pids.parent, ...pids.workers].every(groupGone))
+    assert.ok(fixture.states.every((value) => value.ownedGroupCount <= 16))
+    assert.equal(fixture.states.at(-1).groupGone, true)
+    assert.equal(fixture.states.at(-1).ownedProcessCount, 0)
   },
 )
 
@@ -309,6 +457,88 @@ await test(
     assert.equal(pidGone(pids.parent), true)
     assert.equal(pidGone(pids.worker), false)
     await assert.rejects(readFile(fixture.term), { code: 'ENOENT' })
+  },
+)
+
+await test(
+  'one group liveness error retains its identities while independent verified groups close',
+  { ...posixOnly, timeout: 25_000 },
+  async (context) => {
+    const fixture = await treeFixture(context)
+    const originalKill = process.kill
+    let uncertainGroup
+    const execution = fixture.execute('detached', 20_000)
+    const pids = await fixture.pids()
+    uncertainGroup = pids.worker
+    process.kill = (pid, signal) => {
+      if (pid === -uncertainGroup && signal === 0)
+        throw Object.assign(new Error('synthetic group observation failure'), { code: 'EIO' })
+      return originalKill.call(process, pid, signal)
+    }
+    try {
+      await assert.rejects(execution, /process-group check failed \(EIO\)/)
+      assert.equal(pidGone(pids.parent), true)
+      assert.equal(pidGone(pids.worker), false)
+      assert.ok(fixture.states.some((value) => value.ownedProcessCount >= 2))
+    } finally {
+      process.kill = originalKill
+    }
+  },
+)
+
+await test(
+  'a temporarily invalid root cannot duplicate its retained 256-identity reservation',
+  { ...posixOnly, timeout: 25_000 },
+  async (context) => {
+    const fixture = await treeFixture(context)
+    const originalKill = process.kill
+    let root
+    let observations = 0
+    let injected = false
+    const counts = []
+    const execution = fixture.execute('hold', 20_000, {
+      inspectProcesses() {
+        const actual = actualProcesses()
+        root ??= [...actual.values()].find(
+          (row) => row.ppid === process.pid && row.pgid === row.pid,
+        )
+        observations++
+        if (!root) return actual
+        const rows = new Map([[root.pid, actual.get(root.pid)]])
+        for (let index = 1; index < 256; index++) {
+          const pid = 1_000_000_000 + index
+          rows.set(pid, {
+            pid,
+            ppid: root.pid,
+            pgid: root.pgid,
+            started: 'synthetic bounded identity ' + index,
+          })
+        }
+        return rows
+      },
+      onOwnership(value) {
+        counts.push(value.identities.length)
+      },
+    })
+    process.kill = (pid, signal) => {
+      if (root && pid === -root.pgid && signal === 0 && observations >= 2 && !injected) {
+        injected = true
+        throw Object.assign(new Error('synthetic once-only group observation failure'), {
+          code: 'EIO',
+        })
+      }
+      return originalKill.call(process, pid, signal)
+    }
+    try {
+      await fixture.pids()
+      await assert.rejects(execution, /process-group check failed \(EIO\)/)
+      assert.equal(injected, true)
+      assert.ok(counts.includes(256))
+      assert.ok(counts.every((count) => count <= 256))
+      assert.ok(fixture.states.every((value) => value.ownedProcessCount <= 256))
+    } finally {
+      process.kill = originalKill
+    }
   },
 )
 
@@ -598,6 +828,20 @@ const [worker, report, term, mode, secret] = process.argv.slice(2)
 if (mode === 'normal' || mode === 'normal-held') {
   process.stdout.write('normal output\\nAuthorization: Bearer ' + secret.slice(0, 14))
   setTimeout(() => { process.stdout.write(secret.slice(14) + '\\nEOF ' + secret); process.exitCode = 7 }, mode === 'normal' ? 20 : 2500)
+} else if (mode.startsWith('groups-')) {
+  const count = Number(mode.split('-')[1])
+  const natural = mode.endsWith('-natural')
+  const children = Array.from({ length: count }, () => spawn(process.execPath, [worker, term, natural ? 'natural-tail' : 'hold'], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'], shell: false }))
+  await Promise.all(children.map(child => new Promise(resolve => child.once('message', resolve))))
+  writeFileSync(report, JSON.stringify({ parent: process.pid, workers: children.map(child => child.pid) }))
+  if (natural) {
+    setTimeout(() => process.stdout.write('verified groups ready\\n'), 1500)
+    setTimeout(() => process.exit(0), 3000)
+  }
+  else {
+    process.on('SIGTERM', () => appendFileSync(term, String(process.pid) + '\\n'))
+    setInterval(() => {}, 1000)
+  }
 } else {
   const detached = mode.startsWith('detached')
   const child = spawn(process.execPath, [worker, term, mode], { detached, stdio: ['ignore', 'ignore', 'ignore', 'ipc'], shell: false })
