@@ -470,6 +470,36 @@ export const runtimeHealthSchema = z.object({
         maxMs: z.number().finite().nonnegative(),
         planOverflow: z.boolean(),
         unsupportedOperations: z.boolean(),
+        firstPlanFailure: z
+          .strictObject({
+            reason: z.enum([
+              'statement-bytes',
+              'plan-capacity',
+              'plan-rows',
+              'plan-detail',
+              'plan-bytes',
+              'explain-failed',
+            ]),
+            sqlSha256: z
+              .string()
+              .regex(/^[a-f\d]{64}$/u)
+              .nullable(),
+            sourceBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+            operationIndex: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+            retainedPlans: z.number().int().nonnegative().max(64),
+            retainedPlanBytes: z
+              .number()
+              .int()
+              .nonnegative()
+              .max(16 * 1024),
+            planRows: z.number().int().nonnegative().max(0xffffffff).nullable(),
+          })
+          .refine((failure) =>
+            failure.sourceBytes > 8192
+              ? failure.reason === 'statement-bytes' && failure.sqlSha256 === null
+              : failure.reason !== 'statement-bytes' && failure.sqlSha256 !== null,
+          )
+          .optional(),
         queryPlans: z
           .array(
             z.strictObject({

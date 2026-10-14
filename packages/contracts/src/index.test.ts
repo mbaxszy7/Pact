@@ -79,6 +79,76 @@ describe('foundation contracts', () => {
       agentModelOptionSchema.safeParse({ ...old, resolvedModel: 'x'.repeat(241) }).success,
     ).toBe(false)
   })
+  it('admits only bounded, content-free first SQLite plan failures while accepting old snapshots', () => {
+    const health = {
+      status: 'ready',
+      database: 'ready',
+      pid: 100,
+      checkedAt: new Date().toISOString(),
+      performance: {
+        eventLoopLagP95Ms: 0,
+        eventLoopSamples: 0,
+        activeResources: {},
+        resourceHighWater: 0,
+        resourceCapacityExceeded: false,
+        sqlite: {
+          operations: 65,
+          transactions: 0,
+          rowsReturned: 65,
+          totalMs: 1,
+          maxMs: 1,
+          planOverflow: true,
+          unsupportedOperations: false,
+          queryPlans: [],
+        },
+      },
+    }
+    const failure = {
+      reason: 'plan-capacity',
+      sqlSha256: 'a'.repeat(64),
+      sourceBytes: 18,
+      operationIndex: 65,
+      retainedPlans: 64,
+      retainedPlanBytes: 16384,
+      planRows: null,
+    }
+    const withFailure = (value: unknown) => ({
+      ...health,
+      performance: {
+        ...health.performance,
+        sqlite: { ...health.performance.sqlite, firstPlanFailure: value },
+      },
+    })
+    expect(runtimeHealthSchema.safeParse(health).success).toBe(true)
+    expect(runtimeHealthSchema.safeParse(withFailure(failure)).success).toBe(true)
+    expect(
+      runtimeHealthSchema.safeParse(
+        withFailure({ ...failure, reason: 'statement-bytes', sourceBytes: 8193, sqlSha256: null }),
+      ).success,
+    ).toBe(true)
+    expect(
+      runtimeHealthSchema.safeParse(withFailure({ ...failure, reason: 'plan-rows', planRows: 131 }))
+        .success,
+    ).toBe(true)
+    for (const invalid of [
+      { ...failure, reason: 'raw-error' },
+      { ...failure, source: 'SELECT private_business_content' },
+      { ...failure, bindings: ['private_business_content'] },
+      { ...failure, error: 'raw provider error' },
+      { ...failure, sqlSha256: 'not-a-digest' },
+      { ...failure, sqlSha256: null },
+      { ...failure, sourceBytes: 8193 },
+      { ...failure, reason: 'statement-bytes', sqlSha256: null },
+      { ...failure, sourceBytes: Number.MAX_SAFE_INTEGER + 1 },
+      { ...failure, operationIndex: 0 },
+      { ...failure, operationIndex: Number.MAX_SAFE_INTEGER + 1 },
+      { ...failure, retainedPlans: 65 },
+      { ...failure, retainedPlanBytes: 16385 },
+      { ...failure, planRows: -1 },
+      { ...failure, planRows: 0x100000000 },
+    ])
+      expect(runtimeHealthSchema.safeParse(withFailure(invalid)).success).toBe(false)
+  })
   it('accepts valid app metadata', () => {
     expect(
       appInfoSchema.parse({

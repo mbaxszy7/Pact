@@ -3,6 +3,12 @@ import type Database from 'better-sqlite3'
 import { createHash } from 'node:crypto'
 import { statSync } from 'node:fs'
 
+import type { RuntimeHealth } from '@pact/contracts'
+
+type FirstPlanFailure = NonNullable<
+  NonNullable<RuntimeHealth['performance']>['sqlite']['firstPlanFailure']
+>
+
 /** Opt-in isolated measurements: no SQL text, bindings or database contents leave this owner. */
 export class DatabasePerformance {
   private operations = 0
@@ -13,6 +19,7 @@ export class DatabasePerformance {
   private planBytes = 0
   private planOverflow = false
   private unsupportedOperations = false
+  private firstPlanFailure: FirstPlanFailure | undefined
   private readonly plans = new Map<string, string[]>()
   private readonly originalPrepare: Database.Database['prepare']
   private readonly originalTransaction: import('./drizzle-database.js').PactDrizzleDatabase['transaction']
@@ -86,21 +93,27 @@ export class DatabasePerformance {
     args: unknown[],
     prepare: Database.Database['prepare'],
   ): void {
-    if (Buffer.byteLength(source) > 8192) {
+    const sourceBytes = Buffer.byteLength(source)
+    if (sourceBytes > 8192) {
       this.planOverflow = true
+      this.recordFirstPlanFailure('statement-bytes', sourceBytes, null, null)
       return
     }
     const key = createHash('sha256').update(source).digest('hex')
     if (this.plans.has(key)) return
     if (this.plans.size >= 64) {
       this.planOverflow = true
+      this.recordFirstPlanFailure('plan-capacity', sourceBytes, key, null)
       return
     }
+    let planRows: number | null = null
     try {
       const statement = prepare(`EXPLAIN QUERY PLAN ${source}`)
       const rows: unknown = Reflect.apply(statement.all.bind(statement), statement, args)
+      if (Array.isArray(rows)) planRows = rows.length
       if (!Array.isArray(rows) || rows.length > 64) {
         this.planOverflow = true
+        this.recordFirstPlanFailure('plan-rows', sourceBytes, key, planRows)
         return
       }
       const details: string[] = []
@@ -110,6 +123,7 @@ export class DatabasePerformance {
           row && typeof row === 'object' ? Reflect.get(row, 'detail') : undefined
         if (typeof detail !== 'string' || Buffer.byteLength(detail) > 512) {
           this.planOverflow = true
+          this.recordFirstPlanFailure('plan-detail', sourceBytes, key, planRows)
           return
         }
         details.push(detail)
@@ -117,12 +131,32 @@ export class DatabasePerformance {
       }
       if (this.planBytes + bytes > 16 * 1024) {
         this.planOverflow = true
+        this.recordFirstPlanFailure('plan-bytes', sourceBytes, key, planRows)
         return
       }
       this.planBytes += bytes
       this.plans.set(key, details)
     } catch {
       this.unsupportedOperations = true
+      this.recordFirstPlanFailure('explain-failed', sourceBytes, key, planRows)
+    }
+  }
+
+  private recordFirstPlanFailure(
+    reason: FirstPlanFailure['reason'],
+    sourceBytes: number,
+    sqlSha256: string | null,
+    planRows: number | null,
+  ): void {
+    if (this.firstPlanFailure) return
+    this.firstPlanFailure = {
+      reason,
+      sqlSha256,
+      sourceBytes,
+      operationIndex: this.operations,
+      retainedPlans: this.plans.size,
+      retainedPlanBytes: this.planBytes,
+      planRows,
     }
   }
 
@@ -152,6 +186,7 @@ export class DatabasePerformance {
         maxMs: this.maxMs,
         planOverflow: this.planOverflow,
         unsupportedOperations: this.unsupportedOperations,
+        firstPlanFailure: this.firstPlanFailure && { ...this.firstPlanFailure },
         queryPlans: [...this.plans].map(([sqlSha256, details]) => ({ sqlSha256, details })),
       },
     }
