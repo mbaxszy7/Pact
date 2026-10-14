@@ -8,6 +8,7 @@ import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { promisify } from 'node:util'
 
+import { classifyProductTransition } from './ci-identity.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
 const SHA = /^[a-f0-9]{40}$/
@@ -201,12 +202,22 @@ export async function resolveReleaseIdentity(api, number, { botId, appSlug, appr
     'Release label is missing',
   )
   const sourceSha = pr.merge_commit_sha
+  const merge = await api.request(api.path(`/commits/${sourceSha}`))
+  requireFact(
+    merge.sha === sourceSha && merge.parents?.length === 1 && SHA.test(merge.parents[0].sha),
+    'Release source must be an authenticated squash commit with one parent',
+  )
   const versions = await Promise.all([
     api.jsonAt('version.json', sourceSha),
     api.jsonAt('package.json', sourceSha),
     api.jsonAt('apps/desktop/package.json', sourceSha),
     api.jsonAt('.release-please-manifest.json', sourceSha),
+    api.jsonAt('version.json', merge.parents[0].sha),
   ])
+  requireFact(
+    classifyProductTransition(versions[4], versions[0]).kind === 'release',
+    'The actual squash parent and merged product metadata do not declare a new release',
+  )
   const version = releaseVersion(versions[0].version, approvedMajor)
   requireFact(
     versions[1].version === version &&
@@ -230,6 +241,11 @@ export async function verifyOwnerReleaseReview(api, pr) {
   const mergedAt = Date.parse(pr.merged_at)
   requireFact(Number.isFinite(mergedAt), 'Release PR merge time is unresolved')
   const reviews = await api.list(api.path(`/pulls/${pr.number}/reviews`))
+  for (const review of reviews.filter((candidate) => candidate.user?.id === OWNER_ID))
+    requireFact(
+      ['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED', 'COMMENTED', 'PENDING'].includes(review.state),
+      'Owner review state is unresolved',
+    )
   const meaningful = reviews.filter(
     (review) =>
       review.user?.id === OWNER_ID &&
@@ -239,15 +255,19 @@ export async function verifyOwnerReleaseReview(api, pr) {
     requireFact(
       Number.isSafeInteger(review.id) &&
         review.id > 0 &&
+        SHA.test(review.commit_id) &&
         Number.isFinite(Date.parse(review.submitted_at)),
       'Owner review identity is unresolved',
     )
-  const latest = meaningful.toSorted((a, b) => a.id - b.id).at(-1)
+  const latest = meaningful
+    .toSorted((a, b) => Date.parse(a.submitted_at) - Date.parse(b.submitted_at) || a.id - b.id)
+    .at(-1)
+  // Native main rules dismiss approval when its diff changes. This current API
+  // state is evaluated after the protected owner-only manual merge, rather than
+  // treating an old review commit ID as a separate approval policy.
   requireFact(
-    latest?.state === 'APPROVED' &&
-      latest.commit_id === pr.head.sha &&
-      Date.parse(latest.submitted_at) <= mergedAt,
-    'The owner did not approve the actual Release PR head before merging',
+    latest?.state === 'APPROVED' && Date.parse(latest.submitted_at) <= mergedAt,
+    'The owner did not approve the Release PR before its protected manual merge',
   )
 }
 

@@ -40,7 +40,7 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
           permission-issues: write
-      - name: Determine first-release override and unfinished publication
+      - name: Preview exact release intent and maintain the validated version PR
         id: version
         run: node scripts/release-please.mjs
         env:

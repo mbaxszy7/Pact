@@ -1,6 +1,8 @@
-import { appendFile, readFile } from 'node:fs/promises'
+import { appendFile } from 'node:fs/promises'
+import { isDeepStrictEqual } from 'node:util'
 import { Manifest, GitHub as ReleasePleaseGitHub } from 'release-please'
 
+import { classifyProductTransition } from './ci-identity.mjs'
 import {
   compareVersions,
   decodeIdentity,
@@ -12,6 +14,122 @@ import {
 } from './release-control.mjs'
 import { verifyStagingRelease } from './release-staging.mjs'
 import { isScriptEntry } from './script-entry.mjs'
+
+const versionPaths = [
+  'version.json',
+  'package.json',
+  'apps/desktop/package.json',
+  '.release-please-manifest.json',
+]
+const releasePaths = new Set([...versionPaths, 'CHANGELOG.md'])
+const shaPattern = /^[a-f\d]{40}$/u
+
+function requireFact(condition, message) {
+  if (!condition) throw new Error(message)
+}
+
+/** Preview once, then give the pinned library the exact validated updates to write. */
+export async function createValidatedPullRequests(
+  plan,
+  github,
+  { sourceSha, productMetadata, approvedMajor = '', verifySource },
+) {
+  requireFact(shaPattern.test(sourceSha), 'Release PR source SHA is unresolved')
+  requireFact(typeof verifySource === 'function', 'Release PR requires a current main source guard')
+  await verifySource()
+  const candidates = await plan.buildPullRequests()
+  requireFact(
+    Array.isArray(candidates) && candidates.length <= 1,
+    'Release Please must produce a single product candidate',
+  )
+  for (const candidate of candidates) {
+    requireFact(
+      candidate.headRefName === 'release-please--branches--main' &&
+        Buffer.byteLength(candidate.body.toString()) <= 64 * 1024,
+      'Release PR branch or notes exceed the admitted product scope',
+    )
+    // oxlint-disable-next-line eslint/no-await-in-loop -- The single candidate is rendered from an immutable main source before any write.
+    const changes = await github.buildChangeSet(candidate.updates, sourceSha)
+    requireFact(
+      changes instanceof Map &&
+        changes.size <= releasePaths.size &&
+        [...changes.keys()].every((path) => releasePaths.has(path)) &&
+        versionPaths.every((path) => changes.has(path)) &&
+        changes.has('CHANGELOG.md'),
+      'Release PR changes unexpected source or omits a version authority/changelog',
+    )
+    const before = {},
+      after = {}
+    for (const path of versionPaths) {
+      const change = changes.get(path)
+      requireFact(
+        typeof change.originalContent === 'string' &&
+          typeof change.content === 'string' &&
+          Buffer.byteLength(change.originalContent) <= 64 * 1024 &&
+          Buffer.byteLength(change.content) <= 64 * 1024,
+        'Release PR version metadata is missing or exceeds its bound',
+      )
+      before[path] = JSON.parse(change.originalContent)
+      after[path] = JSON.parse(change.content)
+    }
+    requireFact(
+      isDeepStrictEqual(before['version.json'], productMetadata),
+      'Release PR preview product metadata differs from its immutable source',
+    )
+    const transition = classifyProductTransition(before['version.json'], after['version.json'])
+    requireFact(transition.kind === 'release', 'Release PR preview has no new release intent')
+    const version = releaseVersion(transition.version, approvedMajor)
+    requireFact(
+      candidate.title.toString() === `chore(main): release ${version}`,
+      'Release PR preview title disagrees with its product version',
+    )
+    for (const path of versionPaths) {
+      const key = path === '.release-please-manifest.json' ? '.' : 'version'
+      requireFact(
+        before[path]?.[key] === productMetadata.version && after[path]?.[key] === version,
+        'Product, desktop, root package and Release Please preview versions disagree',
+      )
+      const expected = { ...before[path], [key]: version }
+      if (path === 'version.json') expected.candidateVersion = version
+      requireFact(
+        isDeepStrictEqual(after[path], expected),
+        'Release PR preview modifies non-version product metadata',
+      )
+    }
+    candidate.updates = [...changes].map(([path, change]) => {
+      requireFact(
+        typeof change.content === 'string' && Buffer.byteLength(change.content) <= 64 * 1024,
+        'Release PR output exceeds its admitted content bound',
+      )
+      const beforeContent = change.originalContent ?? undefined
+      const afterContent = change.content
+      return Object.freeze({
+        path,
+        createIfMissing: beforeContent === undefined,
+        updater: Object.freeze({
+          updateContent(content) {
+            requireFact(
+              content === beforeContent,
+              'Release PR source changed after preview; rerun from current main',
+            )
+            return afterContent
+          },
+        }),
+      })
+    })
+    Object.freeze(candidate.updates)
+    Object.freeze(candidate)
+  }
+  Object.freeze(candidates)
+  await verifySource()
+  const originalBuild = plan.buildPullRequests
+  plan.buildPullRequests = async () => candidates
+  try {
+    return await plan.createPullRequests()
+  } finally {
+    plan.buildPullRequests = originalBuild
+  }
+}
 
 export async function releaseManifest(github, releaseAs = '') {
   return Manifest.fromManifest(
@@ -38,10 +156,16 @@ export function bootstrapDecision({
   tags,
   releases,
   manifestVersion,
+  productMetadata,
   releaseMerge = false,
   approvedMajor = '',
 }) {
   releaseVersion(manifestVersion, approvedMajor)
+  classifyProductTransition(productMetadata, productMetadata)
+  requireFact(
+    productMetadata.version === manifestVersion,
+    'Product and Release Please manifest versions disagree',
+  )
   const productTags = tags.filter((tag) => /^v\d+\.\d+\.\d+$/.test(tag.name))
   const published = releases.filter((release) => !release.draft && !release.prerelease)
   for (const release of releases) {
@@ -66,8 +190,14 @@ export function bootstrapDecision({
   }
   if (published.length === 0) {
     if (manifestVersion !== '0.1.0') throw new Error('The initial product version must be 0.1.0')
+    if (productMetadata.candidateVersion !== '0.1.0-unreleased')
+      return { pendingRelease: true, releaseAs: '' }
     return { pendingRelease: false, releaseAs: '0.1.0' }
   }
+  requireFact(
+    productMetadata.candidateVersion === manifestVersion,
+    'Published product cannot restore an unreleased version marker',
+  )
   const latest = published
     .map((release) => release.tag_name.slice(1))
     .toSorted(compareVersions)
@@ -84,7 +214,13 @@ export async function main(environment = process.env) {
   const botId = Number(environment.PACT_RELEASE_APP_BOT_ID)
   if (!Number.isSafeInteger(botId) || botId <= 0) throw new Error('Verified App bot ID is missing')
   const api = new GitHub(environment.GITHUB_REPOSITORY, environment.GH_TOKEN)
-  const manifest = JSON.parse(await readFile('.release-please-manifest.json', 'utf8'))
+  const mainRef = await api.request(api.path('/git/ref/heads/main'))
+  const sourceSha = mainRef.object?.sha
+  requireFact(shaPattern.test(sourceSha), 'Release Please main source SHA is unresolved')
+  const [manifest, productMetadata] = await Promise.all([
+    api.jsonAt('.release-please-manifest.json', sourceSha),
+    api.jsonAt('version.json', sourceSha),
+  ])
   const [allTags, allReleases] = await Promise.all([
     api.list(api.path('/tags')),
     api.list(api.path('/releases')),
@@ -171,6 +307,7 @@ export async function main(environment = process.env) {
     tags,
     releases,
     manifestVersion: manifest['.'],
+    productMetadata,
     releaseMerge,
     approvedMajor: environment.PACT_APPROVED_MAJOR_VERSION,
   })
@@ -183,7 +320,18 @@ export async function main(environment = process.env) {
     const [owner, repo] = api.repository.split('/')
     const github = await ReleasePleaseGitHub.create({ owner, repo, token: environment.GH_TOKEN })
     const releasePlan = await releaseManifest(github, decision.releaseAs)
-    await releasePlan.createPullRequests()
+    await createValidatedPullRequests(releasePlan, github, {
+      sourceSha,
+      productMetadata,
+      approvedMajor: environment.PACT_APPROVED_MAJOR_VERSION,
+      async verifySource() {
+        const current = await api.request(api.path('/git/ref/heads/main'))
+        requireFact(
+          current.object?.sha === sourceSha,
+          'Release Please main source changed; rerun before writing a version PR',
+        )
+      },
+    })
   }
   return decision
 }

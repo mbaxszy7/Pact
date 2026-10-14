@@ -62,6 +62,7 @@ export async function readDistributionManifest(path) {
     manifest.productName !== expectedName ||
     manifest.appId !== expectedId ||
     typeof manifest.version !== 'string' ||
+    manifest.version.length > 128 ||
     !/^\d+\.\d+\.\d+(?:-dev\.\d+\.sha[a-f0-9]{12})?$/u.test(manifest.version) ||
     !/^[a-f0-9]{40}$/u.test(manifest.sourceSha) ||
     !/^\d{1,16}$/u.test(manifest.buildNumber) ||
@@ -84,6 +85,9 @@ export async function readDistributionManifest(path) {
       !/^[a-f0-9]{64}$/u.test(artifact.sha256) ||
       !Number.isSafeInteger(artifact.bytes) ||
       artifact.bytes < 1 ||
+      typeof artifact.path !== 'string' ||
+      artifact.path.length > 255 ||
+      /[\r\n\0]/u.test(artifact.path) ||
       basename(artifact.path) !== artifact.path
     )
       throw new Error('Distribution artifact metadata is invalid.')
@@ -153,7 +157,9 @@ export async function prepareApplication({
     throw new Error('Installation artifact hash or byte count does not match the manifest.')
   const destination = join(root, 'installed')
   await mkdir(destination, { mode: 0o700 })
-  const installedArtifact = { ...selected }
+  const installedArtifact = Object.fromEntries(
+    ['path', 'kind', 'sha256', 'bytes'].map((name) => [name, selected[name]]),
+  )
   if (process.platform === 'darwin') {
     const application = join(destination, manifest.application.bundleName)
     if (
@@ -289,7 +295,7 @@ export async function prepareApplication({
   }
 }
 
-async function runOwnedPackagedProcess(executable, environment, phase, redact, timeoutMs) {
+async function runOwnedPackagedProcess(executable, environment, phase, redact, timeoutMs, onState) {
   let passed = false
   let identity
   let output = ''
@@ -300,6 +306,7 @@ async function runOwnedPackagedProcess(executable, environment, phase, redact, t
       executable,
       cwd: dirname(executable),
       env: environment,
+      onState,
       redact,
       write: (_channel, text) => {
         output = appendLog(output, text)
@@ -411,33 +418,128 @@ async function runPackagedProcess(executable, environment, phase, spawnProcess, 
           ? 'timed out'
           : `exited with code ${exitCode ?? 'null'}`
       reject(
-        new Error(
-          `Packaged ${phase ? 'smoke' : 'core inspection'} ${termination} (signal: ${signal ?? 'none'}).\n${redact(output)}`,
+        Object.assign(
+          new Error(
+            `Packaged ${phase ? 'smoke' : 'core inspection'} ${termination} (signal: ${signal ?? 'none'}).\n${redact(output)}`,
+          ),
+          { packageSmokeOutcome: cancelled ? 'interrupted' : timedOut ? 'timed-out' : 'failed' },
         ),
       )
     })
   })
 }
 
+const smokePhases = new Set([
+  'configuration',
+  'manifest',
+  'admission',
+  'environment',
+  'installation',
+  'seed',
+  'verify',
+  'content',
+  'production-paths',
+  'real-core',
+  'real-core-restart',
+  'source-integrity',
+  'cleanup',
+  'report',
+])
+
+/** Fixed metadata only; errors, paths and optional package fields never enter reports. */
+export function packageSmokeFailureReport(facts) {
+  const identity = facts.manifest
+  const projection = identity
+    ? Object.fromEntries(
+        ['sourceSha', 'version', 'channel', 'platform', 'arch', 'appId', 'productName'].map(
+          (name) => [name, identity[name]],
+        ),
+      )
+    : {}
+  const processes = facts.processes.map((item) => ({
+    phase: smokePhases.has(item.phase) ? item.phase : 'admission',
+    releaseVerified: item.releaseVerified === true,
+  }))
+  const processReleaseVerified = processes.every((item) => item.releaseVerified)
+  return {
+    schemaVersion: 1,
+    status: 'blocked',
+    ...projection,
+    ...(identity ? { appContentHash: identity.application.contentSha256 } : {}),
+    manifestIdentityVerified: Boolean(identity),
+    applicationContentVerified: facts.applicationContentVerified === true,
+    runtimeIdentityVerified: facts.runtimeIdentityVerified === true,
+    installationVerified: facts.installationVerified === true,
+    verificationMode: ['unpacked', 'mounted-dmg-copy', 'extracted-zip', 'installed-nsis'].includes(
+      facts.verificationMode,
+    )
+      ? facts.verificationMode
+      : 'unconfirmed',
+    failurePhase: smokePhases.has(facts.failurePhase ?? facts.phase)
+      ? (facts.failurePhase ?? facts.phase)
+      : 'admission',
+    failureCode:
+      facts.cleanupFailed === true
+        ? 'CLEANUP_UNCONFIRMED'
+        : facts.interrupted === true
+          ? 'EXECUTION_INTERRUPTED'
+          : facts.timedOut === true
+            ? 'EXECUTION_TIMED_OUT'
+            : 'VERIFICATION_FAILED',
+    processes,
+    processReleaseVerified,
+    installationCleanupVerified: facts.installationCleanupVerified === true,
+    providerCopiesCleanupVerified: facts.providerCopiesCleanupVerified === true,
+    privateRootCreated: facts.privateRootCreated === true,
+    privateRootCleanupVerified: facts.privateRootCleanupVerified === true,
+    recoveryPreserved: facts.recoveryPreserved === true,
+    cleanupVerified:
+      processReleaseVerified &&
+      facts.installationCleanupVerified === true &&
+      facts.providerCopiesCleanupVerified === true &&
+      facts.privateRootCleanupVerified === true,
+  }
+}
+
+async function writeSmokeReport(path, report) {
+  const file = resolvePath(path)
+  if (Buffer.byteLength(file) > 4096 || /[\r\n\0]/u.test(file))
+    throw new Error('Invalid packaged report destination')
+  const bytes = `${JSON.stringify(report, null, 2)}\n`
+  if (Buffer.byteLength(bytes) > 16 * 1024)
+    throw new Error('Packaged report exceeds its fixed byte bound')
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 })
+  const parent = await lstat(dirname(file))
+  if (!parent.isDirectory() || parent.isSymbolicLink())
+    throw new Error('Packaged report destination cannot be redirected')
+  await writeFile(file, bytes, { flag: 'wx', mode: 0o600 })
+}
+
 /** UI smoke never loads model credentials; real core inspection fails before launch without them. */
-export async function main({
-  executable,
-  manifestPath,
-  applicationPath,
-  artifactPath,
-  reportPath,
-  unpacked = false,
-  productionPaths = false,
-  sourceEnvironment = process.env,
-  realCore = false,
-  spawnProcess = spawn,
-} = {}) {
+async function performPackagedSmoke(
+  {
+    executable,
+    manifestPath,
+    applicationPath,
+    artifactPath,
+    reportPath,
+    unpacked = false,
+    productionPaths = false,
+    sourceEnvironment = process.env,
+    realCore = false,
+    spawnProcess = spawn,
+  } = {},
+  facts,
+) {
   const config = realCore
     ? await loadProviderConfiguration(undefined, sourceEnvironment)
     : undefined
+  facts.phase = 'manifest'
   const manifest = manifestPath
     ? await readDistributionManifest(resolvePath(manifestPath))
     : undefined
+  facts.manifest = manifest
+  facts.phase = 'admission'
   if (!manifest && spawnProcess === spawn)
     throw new Error(
       'Packaged launch requires --manifest <exact distribution-manifest.json>; no package paths are guessed.',
@@ -455,31 +557,73 @@ export async function main({
     throw new Error(
       'Production paths require a genuine application with smoke protocol 2; older packages cannot safely serve that probe.',
     )
+  facts.phase = 'environment'
   const requestedRoot = await mkdtemp(join(tmpdir(), 'pact-package-smoke-'))
+  facts.privateRootCreated = true
+  facts.privateRootCleanupVerified = false
   let application
   let pendingReport
   let preserveRoot = false
   let providerHomes = []
   const cleanup = async () => {
-    try {
-      await application?.dispose()
-    } catch (error) {
+    let cleanupError
+    const unresolvedProcess =
+      spawnProcess === spawn && facts.processes.some((item) => !item.releaseVerified)
+    if (unresolvedProcess) {
       preserveRoot = true
-      throw new Error(
-        `Packaged installation cleanup failed; recovery is preserved at ${requestedRoot}.`,
-        { cause: error },
-      )
-    } finally {
-      await Promise.all(providerHomes.map((path) => rm(path, { force: true, recursive: true })))
-      if (!preserveRoot) await rm(requestedRoot, { force: true, recursive: true })
+      if (application) facts.installationCleanupVerified = false
+      cleanupError = new Error('Packaged process release was not confirmed')
+    } else {
+      try {
+        await application?.dispose()
+        if (application) facts.installationCleanupVerified = true
+      } catch (error) {
+        preserveRoot = true
+        facts.installationCleanupVerified = false
+        cleanupError = error
+      }
+    }
+    const providerCleanup = await Promise.allSettled(
+      providerHomes.map((path) => rm(path, { force: true, recursive: true })),
+    )
+    facts.providerCopiesCleanupVerified = providerCleanup.every(
+      (item) => item.status === 'fulfilled',
+    )
+    if (!facts.providerCopiesCleanupVerified) {
+      preserveRoot = true
+      cleanupError ??= new Error('Provider copy cleanup was not confirmed')
+    }
+    if (!preserveRoot) {
+      try {
+        await rm(requestedRoot, { force: true, recursive: true })
+        try {
+          await lstat(requestedRoot)
+          throw new Error('Packaged private root still exists')
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error
+          facts.privateRootCleanupVerified = true
+        }
+      } catch (error) {
+        preserveRoot = true
+        cleanupError ??= error
+      }
+    }
+    facts.recoveryPreserved = preserveRoot
+    if (cleanupError) {
+      facts.cleanupFailed = true
+      facts.failurePhase ??= 'cleanup'
+      throw new Error('Packaged cleanup could not be confirmed', { cause: cleanupError })
     }
   }
   try {
+    facts.phase = 'environment'
     const root = await realpath(requestedRoot)
     const prepared = await prepareProviderEnvironment(root, config, sourceEnvironment)
     providerHomes = [prepared.claudeHome, prepared.codexHome]
     await mkdir(join(root, 'logs', 'production'), { recursive: true, mode: 0o700 })
     const environment = { ...prepared.env, PACT_E2E_ROOT: root }
+    facts.phase = 'installation'
+    if (manifest) facts.installationCleanupVerified = false
     application = manifest
       ? await prepareApplication({
           manifest,
@@ -491,13 +635,31 @@ export async function main({
           environment,
         })
       : undefined
+    facts.installationVerified = application?.installationVerified === true
+    facts.verificationMode = application?.verificationMode
+    facts.applicationContentVerified = Boolean(application)
     const selectedExecutable = application?.executable ?? executable
     if (!selectedExecutable) throw new Error('No explicit packaged executable was supplied.')
-    const launch =
-      spawnProcess === spawn
-        ? (selected, env, phase, _spawn, redact, timeout) =>
-            runOwnedPackagedProcess(selected, env, phase, redact, timeout)
-        : runPackagedProcess
+    const launch = async (selected, env, phase, selectedSpawn, redact, timeout) => {
+      const observation = { phase: facts.phase, releaseVerified: false }
+      facts.processes.push(observation)
+      if (spawnProcess !== spawn)
+        return runPackagedProcess(selected, env, phase, selectedSpawn, redact, timeout)
+      return runOwnedPackagedProcess(selected, env, phase, redact, timeout, (state) => {
+        observation.releaseVerified =
+          state.kind === 'settled' &&
+          state.groupGone === true &&
+          state.ownedProcessCount === 0 &&
+          state.ownershipEvidenceIncomplete !== true &&
+          state.ownershipProbeIncomplete !== true
+        if (
+          state.kind === 'stopping' &&
+          ['interrupted-SIGINT', 'interrupted-SIGTERM', 'cancelled'].includes(state.reason)
+        )
+          facts.interrupted = true
+        if (state.kind === 'stopping' && state.reason === 'deadline') facts.timedOut = true
+      })
+    }
     if (realCore) {
       const projectDirectory = join(root, 'project')
       await mkdir(projectDirectory, { mode: 0o700 })
@@ -507,6 +669,7 @@ export async function main({
       console.log(`Test CLI paths: Claude=${config.claudePath}; Codex=${config.codexPath}`)
       console.log(`Add this owned test Project in Pact: ${projectDirectory}`)
       const deadline = Date.now() + PACKAGE_REAL_CORE_TIMEOUT_MS
+      facts.phase = 'real-core'
       await launch(
         selectedExecutable,
         environment,
@@ -518,6 +681,7 @@ export async function main({
       console.log(
         'Restarting the same isolated packaged profile. Verify the saved messages, Native identities and recovery, then quit Pact again.',
       )
+      facts.phase = 'real-core-restart'
       await launch(
         selectedExecutable,
         environment,
@@ -526,6 +690,7 @@ export async function main({
         (text) => config.redact(text),
         Math.max(1, deadline - Date.now()),
       )
+      facts.phase = 'source-integrity'
       await config.assertSourceIntegrity()
       console.log(
         'Packaged core inspection closed; record the actual business verification separately.',
@@ -551,6 +716,7 @@ export async function main({
             }
           : {}),
       }
+      facts.phase = 'seed'
       const seededIdentity = await launch(
         selectedExecutable,
         {
@@ -561,6 +727,8 @@ export async function main({
         spawnProcess,
         (text) => text,
       )
+      facts.runtimeIdentityVerified = Boolean(seededIdentity)
+      facts.phase = 'verify'
       const verifiedIdentity = await launch(
         selectedExecutable,
         {
@@ -572,6 +740,7 @@ export async function main({
         (text) => text,
       )
       if (manifest) {
+        facts.phase = 'content'
         await verifyApplication(
           application.applicationPath,
           manifest,
@@ -583,6 +752,7 @@ export async function main({
           )
         let productionDataRootVerified = false
         if (productionPaths) {
+          facts.phase = 'production-paths'
           const pureRoot = join(root, 'production-path-probe')
           const pure = await prepareProviderEnvironment(pureRoot, undefined, sourceEnvironment)
           const nativeEnvironment = { ...pure.env }
@@ -602,7 +772,7 @@ export async function main({
             if (sourceEnvironment[key] === undefined) delete nativeEnvironment[key]
             else nativeEnvironment[key] = sourceEnvironment[key]
           }
-          const productionIdentity = await runOwnedPackagedProcess(
+          const productionIdentity = await launch(
             selectedExecutable,
             {
               ...nativeEnvironment,
@@ -611,6 +781,7 @@ export async function main({
               PACT_PACKAGE_EXPECTED_IDENTITY: smokeEnvironment.PACT_PACKAGE_EXPECTED_IDENTITY,
             },
             'production-paths',
+            spawnProcess,
             (text) => text,
           )
           if (
@@ -645,20 +816,59 @@ export async function main({
           productionDataRootVerified,
         }
       }
-      console.log(`Packaged smoke passed: ${selectedExecutable}`)
+      console.log('Packaged smoke passed.')
     }
   } catch (error) {
     preserveRoot = error?.preserveRoot === true
+    facts.failurePhase = facts.phase
+    if (preserveRoot) facts.installationCleanupVerified = false
     throw error
   } finally {
     await cleanup()
   }
   if (pendingReport && reportPath) {
-    await writeFile(
-      resolvePath(reportPath),
-      `${JSON.stringify({ ...pendingReport, cleanupVerified: true }, null, 2)}\n`,
-      { flag: 'wx' },
-    )
+    facts.phase = 'report'
+    await writeSmokeReport(reportPath, { ...pendingReport, cleanupVerified: true })
+  }
+}
+
+/** The existing smoke owner publishes failure facts only after its cleanup attempt. */
+export async function main(options = {}) {
+  if (options.reportPath) {
+    const path = resolvePath(options.reportPath)
+    if (Buffer.byteLength(path) > 4096 || /[\r\n\0]/u.test(path))
+      throw new Error('Invalid packaged report destination')
+    try {
+      await lstat(path)
+      throw Object.assign(new Error('Existing packaged report cannot be overwritten'), {
+        code: 'EEXIST',
+      })
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+  }
+  const facts = {
+    phase: 'configuration',
+    processes: [],
+    installationCleanupVerified: true,
+    providerCopiesCleanupVerified: true,
+    privateRootCleanupVerified: true,
+  }
+  try {
+    return await performPackagedSmoke(options, facts)
+  } catch (error) {
+    if (error.packageSmokeOutcome === 'interrupted') facts.interrupted = true
+    if (error.packageSmokeOutcome === 'timed-out') facts.timedOut = true
+    if (options.reportPath) {
+      try {
+        await writeSmokeReport(options.reportPath, packageSmokeFailureReport(facts))
+      } catch (reportError) {
+        throw new AggregateError([error, reportError], 'Packaged verification or report failed', {
+          cause: reportError,
+        })
+      }
+    }
+    throw error
   }
 }
 
@@ -698,8 +908,10 @@ if (isScriptEntry(import.meta.url)) {
       }
       return main(options)
     })
-    .catch((error) => {
-      console.error(`Packaged smoke failed: ${error.message}`)
+    .catch(() => {
+      console.error(
+        'Packaged smoke failed; inspect the bounded verification report when available.',
+      )
       process.exitCode = 1
     })
 }

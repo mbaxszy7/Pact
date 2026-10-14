@@ -148,12 +148,61 @@ jobs:
           controller: control
           native: 'true'
           display: 'true'
-      - name: Target-architecture Electron and native protocol checks
+      - name: Capture trusted no-credential case inventory before build
+        working-directory: control
+        run: pnpm exec playwright test --list --reporter=json > "$RUNNER_TEMP/pact-e2e-inventory.json"
+      - name: Target-architecture Electron build
+        run: node control/scripts/ci.mjs build
+      - name: Electron UI
+        id: ui
+        run: node control/scripts/ci.mjs ui
+        env:
+          PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/darwin-arm64
+      - name: Deterministic Electron business and lifecycle journeys
+        id: deterministic
+        run: node control/scripts/ci.mjs deterministic
+        env:
+          PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/darwin-arm64
+      - name: Target-architecture native CLI protocol checks
+        run: node control/scripts/ci.mjs native
+      - name: Collect bounded no-credential Electron failure diagnostics
+        if: failure()
+        timeout-minutes: 2
         run: |
-          node control/scripts/ci.mjs build
-          node control/scripts/ci.mjs ui
-          node control/scripts/ci.mjs deterministic
-          node control/scripts/ci.mjs native
+          mkdir -p "$RUNNER_TEMP/pact-release-ui-diagnostics"
+          node control/scripts/ci-ui-diagnostics.mjs --source "$GITHUB_WORKSPACE/source/test-results" --output "$RUNNER_TEMP/pact-release-ui-diagnostics/darwin-arm64"
+        env:
+          PACT_CI_DIAGNOSTIC_LANE: uncredentialed
+      - name: Preserve only collected no-credential UI context and traces
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-ui-diagnostics-darwin-arm64-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pact-release-ui-diagnostics/darwin-arm64
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Summarize Release UI and deterministic cases including failures and unexecuted journeys
+        if: always()
+        run: >-
+          node control/scripts/ci-ui-diagnostics.mjs --reports --release
+          --evidence "$RUNNER_TEMP/pact-release-evidence/darwin-arm64"
+          --workspace "$GITHUB_WORKSPACE/source"
+          --identity "$RUNNER_TEMP/pact-identity/release-identity.json"
+          --inventory "$RUNNER_TEMP/pact-e2e-inventory.json"
+        env:
+          PACT_CI_DIAGNOSTIC_LANE: uncredentialed
+          PACT_UI_EXECUTION_COMPLETED: ${{ steps.ui.outputs.ui_execution_completed }}
+          PACT_DETERMINISTIC_EXECUTION_COMPLETED: ${{ steps.deterministic.outputs.deterministic_execution_completed }}
+      - name: Preserve actual no-credential release E2E results and readable reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-e2e-darwin-arm64-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-release-evidence/darwin-arm64/*.json
+            ${{ runner.temp }}/pact-release-evidence/darwin-arm64/*.md
+          if-no-files-found: error
+          retention-days: 14
       - name: Build final Stable installers on the actual target architecture
         working-directory: source
         run: >-
@@ -202,6 +251,24 @@ jobs:
           --report "$RUNNER_TEMP/pact-release/$PLATFORM_KEY/package-soak-report.json"
         env:
           PLATFORM_KEY: darwin-arm64
+      - name: Preserve failed packaged verification separately from release assets
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: packaged-verification-darwin-arm64-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-release/darwin-arm64/distribution-manifest.json
+            ${{ runner.temp }}/pact-release/darwin-arm64/package-*-report.json
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Link packaged failure evidence in the workflow summary
+        if: always()
+        run: >-
+          node --input-type=module -e '
+          import { appendFile } from "node:fs/promises";
+          const url = "https://github.com/mbaxszy7/Pact/actions/runs/" + process.env.GITHUB_RUN_ID;
+          await appendFile(process.env.GITHUB_STEP_SUMMARY,
+          "\nPackaged verification (darwin-arm64): [workflow reports](" + url + ") · artifact `packaged-verification-darwin-arm64-a" + process.env.GITHUB_RUN_ATTEMPT + "`. Failed diagnostics are retained separately from successful release assets.\n");'
       - name: Preserve exact final bytes for upload recovery
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -303,12 +370,61 @@ jobs:
           workspace: source
           controller: control
           native: 'true'
-      - name: Target-architecture Electron and native protocol checks
+      - name: Capture trusted no-credential case inventory before build
+        working-directory: control
+        run: pnpm exec playwright test --list --reporter=json > "$RUNNER_TEMP/pact-e2e-inventory.json"
+      - name: Target-architecture Electron build
+        run: node control/scripts/ci.mjs build
+      - name: Electron UI
+        id: ui
+        run: node control/scripts/ci.mjs ui
+        env:
+          PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/win32-x64
+      - name: Deterministic Electron business and lifecycle journeys
+        id: deterministic
+        run: node control/scripts/ci.mjs deterministic
+        env:
+          PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/win32-x64
+      - name: Target-architecture native CLI protocol checks
+        run: node control/scripts/ci.mjs native
+      - name: Collect bounded no-credential Electron failure diagnostics
+        if: failure()
+        timeout-minutes: 2
         run: |
-          node control/scripts/ci.mjs build
-          node control/scripts/ci.mjs ui
-          node control/scripts/ci.mjs deterministic
-          node control/scripts/ci.mjs native
+          mkdir -p "$RUNNER_TEMP/pact-release-ui-diagnostics"
+          node control/scripts/ci-ui-diagnostics.mjs --source "$GITHUB_WORKSPACE/source/test-results" --output "$RUNNER_TEMP/pact-release-ui-diagnostics/win32-x64"
+        env:
+          PACT_CI_DIAGNOSTIC_LANE: uncredentialed
+      - name: Preserve only collected no-credential UI context and traces
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-ui-diagnostics-win32-x64-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pact-release-ui-diagnostics/win32-x64
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Summarize Release UI and deterministic cases including failures and unexecuted journeys
+        if: always()
+        run: >-
+          node control/scripts/ci-ui-diagnostics.mjs --reports --release
+          --evidence "$RUNNER_TEMP/pact-release-evidence/win32-x64"
+          --workspace "$GITHUB_WORKSPACE/source"
+          --identity "$RUNNER_TEMP/pact-identity/release-identity.json"
+          --inventory "$RUNNER_TEMP/pact-e2e-inventory.json"
+        env:
+          PACT_CI_DIAGNOSTIC_LANE: uncredentialed
+          PACT_UI_EXECUTION_COMPLETED: ${{ steps.ui.outputs.ui_execution_completed }}
+          PACT_DETERMINISTIC_EXECUTION_COMPLETED: ${{ steps.deterministic.outputs.deterministic_execution_completed }}
+      - name: Preserve actual no-credential release E2E results and readable reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-e2e-win32-x64-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-release-evidence/win32-x64/*.json
+            ${{ runner.temp }}/pact-release-evidence/win32-x64/*.md
+          if-no-files-found: error
+          retention-days: 14
       - name: Build final Stable installers on the actual target architecture
         working-directory: source
         run: >-
@@ -358,6 +474,24 @@ jobs:
           --report "$RUNNER_TEMP/pact-release/$PLATFORM_KEY/package-soak-report.json"
         env:
           PLATFORM_KEY: win32-x64
+      - name: Preserve failed packaged verification separately from release assets
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: packaged-verification-win32-x64-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-release/win32-x64/distribution-manifest.json
+            ${{ runner.temp }}/pact-release/win32-x64/package-*-report.json
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Link packaged failure evidence in the workflow summary
+        if: always()
+        run: >-
+          node --input-type=module -e '
+          import { appendFile } from "node:fs/promises";
+          const url = "https://github.com/mbaxszy7/Pact/actions/runs/" + process.env.GITHUB_RUN_ID;
+          await appendFile(process.env.GITHUB_STEP_SUMMARY,
+          "\nPackaged verification (win32-x64): [workflow reports](" + url + ") · artifact `packaged-verification-win32-x64-a" + process.env.GITHUB_RUN_ATTEMPT + "`. Failed diagnostics are retained separately from successful release assets.\n");'
       - name: Preserve exact final bytes for upload recovery
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -459,12 +593,61 @@ jobs:
           workspace: source
           controller: control
           native: 'true'
-      - name: Target-architecture Electron and native protocol checks
+      - name: Capture trusted no-credential case inventory before build
+        working-directory: control
+        run: pnpm exec playwright test --list --reporter=json > "$RUNNER_TEMP/pact-e2e-inventory.json"
+      - name: Target-architecture Electron build
+        run: node control/scripts/ci.mjs build
+      - name: Electron UI
+        id: ui
+        run: node control/scripts/ci.mjs ui
+        env:
+          PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/win32-arm64
+      - name: Deterministic Electron business and lifecycle journeys
+        id: deterministic
+        run: node control/scripts/ci.mjs deterministic
+        env:
+          PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/win32-arm64
+      - name: Target-architecture native CLI protocol checks
+        run: node control/scripts/ci.mjs native
+      - name: Collect bounded no-credential Electron failure diagnostics
+        if: failure()
+        timeout-minutes: 2
         run: |
-          node control/scripts/ci.mjs build
-          node control/scripts/ci.mjs ui
-          node control/scripts/ci.mjs deterministic
-          node control/scripts/ci.mjs native
+          mkdir -p "$RUNNER_TEMP/pact-release-ui-diagnostics"
+          node control/scripts/ci-ui-diagnostics.mjs --source "$GITHUB_WORKSPACE/source/test-results" --output "$RUNNER_TEMP/pact-release-ui-diagnostics/win32-arm64"
+        env:
+          PACT_CI_DIAGNOSTIC_LANE: uncredentialed
+      - name: Preserve only collected no-credential UI context and traces
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-ui-diagnostics-win32-arm64-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pact-release-ui-diagnostics/win32-arm64
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Summarize Release UI and deterministic cases including failures and unexecuted journeys
+        if: always()
+        run: >-
+          node control/scripts/ci-ui-diagnostics.mjs --reports --release
+          --evidence "$RUNNER_TEMP/pact-release-evidence/win32-arm64"
+          --workspace "$GITHUB_WORKSPACE/source"
+          --identity "$RUNNER_TEMP/pact-identity/release-identity.json"
+          --inventory "$RUNNER_TEMP/pact-e2e-inventory.json"
+        env:
+          PACT_CI_DIAGNOSTIC_LANE: uncredentialed
+          PACT_UI_EXECUTION_COMPLETED: ${{ steps.ui.outputs.ui_execution_completed }}
+          PACT_DETERMINISTIC_EXECUTION_COMPLETED: ${{ steps.deterministic.outputs.deterministic_execution_completed }}
+      - name: Preserve actual no-credential release E2E results and readable reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-e2e-win32-arm64-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-release-evidence/win32-arm64/*.json
+            ${{ runner.temp }}/pact-release-evidence/win32-arm64/*.md
+          if-no-files-found: error
+          retention-days: 14
       - name: Build final Stable installers on the actual target architecture
         working-directory: source
         run: >-
@@ -514,6 +697,24 @@ jobs:
           --report "$RUNNER_TEMP/pact-release/$PLATFORM_KEY/package-soak-report.json"
         env:
           PLATFORM_KEY: win32-arm64
+      - name: Preserve failed packaged verification separately from release assets
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: packaged-verification-win32-arm64-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-release/win32-arm64/distribution-manifest.json
+            ${{ runner.temp }}/pact-release/win32-arm64/package-*-report.json
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Link packaged failure evidence in the workflow summary
+        if: always()
+        run: >-
+          node --input-type=module -e '
+          import { appendFile } from "node:fs/promises";
+          const url = "https://github.com/mbaxszy7/Pact/actions/runs/" + process.env.GITHUB_RUN_ID;
+          await appendFile(process.env.GITHUB_STEP_SUMMARY,
+          "\nPackaged verification (win32-arm64): [workflow reports](" + url + ") · artifact `packaged-verification-win32-arm64-a" + process.env.GITHUB_RUN_ATTEMPT + "`. Failed diagnostics are retained separately from successful release assets.\n");'
       - name: Preserve exact final bytes for upload recovery
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

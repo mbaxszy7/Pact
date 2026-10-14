@@ -144,8 +144,8 @@ acceptance order in [change discipline above](#change-discipline).
 
 CI configuration and a successful build do not establish repository enforcement or release
 acceptance. Required lanes need current code identity, their actual prerequisites and successful
-execution on the appropriate native architecture. External PR jobs must not receive private provider
-configuration or model credentials. Credential-free UI/deterministic/native protocol evidence is
+execution on the appropriate native architecture. Automatic external PR jobs must not receive private
+provider configuration or model credentials. Credential-free UI/deterministic/native protocol evidence is
 separate from explicitly authorized real-provider execution; missing authorization, credentials,
 platforms or required performance observations cannot become passing evidence.
 
@@ -158,27 +158,35 @@ Discovery must match that inventory and its tags; a missing, new, duplicate or r
 case cannot silently change the merge gate. Test titles, assertions and the immutable
 baseline remain unchanged.
 
-Ordinary PRs require all 29 core cases on Windows x64, Windows arm64 and macOS arm64.
+Dev-scope PRs require all 29 core cases on Windows x64, Windows arm64 and macOS arm64.
 They cover first-use readiness/defaults, actual Claude/Codex replies and continuation,
 dual-Agent routing and explicit collaboration, native permission lifetime, Stop before
 effects, cold recovery without replay, frozen drafts/settings, and Changes/Undo safety.
 The cold lost-ACK case remains core even if an earlier run failed during Session setup.
 The 32 extended cases retain appearance, large-history/file/capacity work, image input,
 additional persistence journeys and fault permutations. Their execution is deferred on
-ordinary automatic PR runs; deterministic checks and applicable performance budgets remain
+automatic Dev-scope PR runs; deterministic checks and applicable performance budgets remain
 required. Classification follows business risk, never an observed failure.
 
-Use the **Trusted Provider E2E** manual dispatch with `suite=full` for a complete regression
-of an exact reviewed PR head/base/tree and successful CI run. Execution authorization is
-still separate from Approve PR; forks receive no model secrets without that authorization.
-For an ordinary PR, an extended case failure is reported while the core gate remains
-eligible. A Release PR forces `suite=full` and a full gate regardless of the input, so
+Provider execution belongs to the same **CI** root run and attempt as its prerequisite
+checks. The root calls **Trusted Provider E2E** as a reusable workflow; it has no independent
+dispatch or completion-triggered run. Add `pact:real-full` to a Dev-scope PR to execute the
+full regression; the label requests cases and does not authorize model credentials.
+Owner-authored same-repository code and API-verified release-only App changes use
+`pact-provider-ci`. Other sources wait for owner approval in `pact-provider-reviewed-ci`.
+Review the attested head/base/tree and root run/attempt before approving that environment;
+the trusted preflight revalidates their current identity and prerequisites before model
+configuration is exposed. Execution authorization is separate from Approve PR. A new
+candidate needs its own verified execution; missing or stale authorization blocks the gate.
+For a Dev-scope PR, an extended case failure is reported while the core gate remains
+eligible. Any Stable-scope candidate forces `suite=full` and a full gate regardless of
+author or input, so
 extended failures, missing results and skips block release-candidate acceptance.
 Native cases explicitly assigned to another platform are reported as not applicable; for
 example macOS window Alpha is required on macOS rather than converted into a passing Windows
 test. Any skip of an applicable core/full case remains a failure of the selected gate.
 
-Each native platform publishes `provider-report-PLATFORM`: `real-summary.md` and
+Each native platform publishes `provider-report-PLATFORM-aATTEMPT`: `real-summary.md` and
 `real-summary.json`, retained for 14 days, plus an Actions step summary. Every reviewed
 case is listed with tier/scenario, result, duration, required status and a fixed safe reason;
 unexecuted extended cases say deferred rather than passed. The report records head/base,
@@ -195,20 +203,63 @@ when configuration admission fails. Raw Provider evidence and disposable test ou
 remain private and are removed after safe projection. A local clean-tree receipt is
 distinct from a PR attestation; a dirty or changing working tree has no captured code
 identity. Deliberately filtered local runs list unexecuted obligations and cannot claim
-a complete core/full gate. UI/deterministic Actions summaries link `e2e-PLATFORM` reports
-and, on failure, `ui-diagnostics-PLATFORM` snapshots/traces; both retain 14 days.
+a complete core/full gate. UI/deterministic Actions summaries link `e2e-PLATFORM-aATTEMPT`
+reports and, on failure, `ui-diagnostics-PLATFORM-aATTEMPT` snapshots/traces; both retain
+14 days. Prerequisites, identity and provider evidence must all belong to the same root
+run and attempt. A partial rerun cannot borrow old-attempt prerequisites or artifacts;
+use **Re-run all jobs** for a complete replacement. The native `pact-complete` job fails
+when any required dependency failed, was cancelled, skipped or not executed.
 
-Ordinary branch pushes and business PRs run the fast/static, unit/script, native protocol,
+Stable release jobs preserve `release-e2e-PLATFORM-aATTEMPT` JSON/Markdown reports and
+failure-only `release-ui-diagnostics-PLATFORM-aATTEMPT` snapshots/traces for 14 days.
+Their Actions summaries list every trusted-discovered UI/deterministic case, including
+cases not run after an earlier failure. These no-credential reports record the release
+version, source SHA, tag, Release PR and Release ID; they omit signed-state extensions
+and do not replace the release controller's authenticated staging or publication checks.
+
+Ordinary branch pushes and Dev-scope PRs run the fast/static, unit/script, native protocol,
 UI/deterministic and installed smoke checks without an hour-long soak on every change.
 The **CI** manual dispatch with `run_soak=true` runs the one-hour installed deterministic
 fixture soak on all three native platforms without paid providers. Manual soak runs use
-their own concurrency identity so a branch push cannot cancel them. Release PRs retain
+their own concurrency identity so a branch push cannot cancel them. Stable-scope PRs retain
 the two-hour Stable-candidate soak; final releases require the two-hour final-content soak.
 Soak launch supervision allows measurement duration plus ten minutes, and its enclosing
 driver allows plus twenty minutes for setup, shutdown, cold restart and report completion.
 Release build jobs allow five hours in total for packaging, the two-hour measurement and
 validation overhead. These operational deadlines do not change any performance budget,
 required duration, resource-release observation or publication gate.
+
+### Product version and release intent
+
+`version.json` contains the product `version` and `candidateVersion` release-intent
+marker. Initially they are `0.1.0` and `0.1.0-unreleased`; the root package, desktop package
+and Release Please manifest remain `0.1.0`. The unreleased marker is not an application
+version and never enters a Stable installer. The first Release Please PR changes the
+marker to `0.1.0`; its pinned JSON updaters subsequently advance both fields together
+with all package/manifest versions. No permanent `release-as: 0.1.0` override remains.
+
+Candidate scope follows the actual product metadata transition. Unchanged metadata uses
+Dev/core scope. The initial marker transition, or a later strictly increasing synchronized
+version and marker, uses Stable/full scope regardless of PR author, branch name or labels.
+Malformed metadata, rollback, a version change without its marker or restoration of the
+initial sentinel blocks candidate admission. Release Please previews and validates the
+exact updates once before creating/updating its PR; same-version `Release-As` overrides
+and unapproved major versions cannot generate a new release PR.
+
+The marker selects required tests and packaging; it grants no credential or publication
+permission. Formal publication additionally requires the fixed App's merged Release PR,
+the owner's approval and manual squash merge, and a legal transition from the actual
+squash parent to the merged metadata. Copying release metadata into an owner business PR
+cannot create a formal Release or reset the first-release override. An unfinished version
+waits for recovery of its original authenticated Release PR and Draft rather than creating
+another same-version PR. Repository enforcement and native environment approval behavior
+still require live verification before CI/CD is considered ready.
+
+Native main rules dismiss stale approvals when the PR diff changes. Formal publication
+checks the owner's latest effective API review state before the protected manual merge;
+ordinary comments cannot replace it, and dismissal or requested changes blocks it.
+An approval still marked effective after a diff-equivalent update may refer to an older
+head commit. Model execution approval does not satisfy this PR review requirement.
 
 ### Distribution build, smoke, and soak
 
@@ -259,6 +310,14 @@ process runner, installed-content verification, seed/cold identity and confirmed
 bind the same final application-content hash and the actual installation artifacts. A same-SHA
 rebuild with different application bytes requires new validation. Keep credentials, private paths,
 debugging receipts/nonces and raw application output out of published evidence.
+
+Smoke admission and execution failures also write a bounded `status: blocked` report after
+cleanup is attempted. It records a fixed failure phase/code, validated identity when available,
+and separate application-process, installation, provider-copy and private-root cleanup facts.
+Unknown process release or failed installation cleanup retains the owned recovery directory;
+neither deleting a directory nor calling terminate proves physical process cleanup.
+Release Actions retain these reports in `packaged-verification-PLATFORM-aATTEMPT` even after
+failure, separately from the successful artifacts eligible for signed release staging.
 
 The resource report retains each complete SQLite query plan once in `sqliteQueryPlanDictionary`;
 sample `queryPlanIndices` resolve into that dictionary. Scalar counters remain in every sample.
@@ -407,9 +466,10 @@ private key remain configured until explicitly revoked or rotated.
 
 Keep `PACT_GOVERNANCE_READY=false` until the repository can enforce the exact author/reviewer/merger
 policy, shared-commit association, current mandatory evidence, and failure/cancellation boundaries.
-An asynchronous App result does not prove synchronous revocation. A trusted Provider start job
-invalidates the old context before admitting execution, but cancellation before that job and partial
-reruns remain unverified. The executor's report trust boundary still requires completion; a mutable local
+An asynchronous App result does not prove synchronous revocation. The required native root graph
+and the final App writer validate the current execution attempt; queued cancellation, copied heads
+and partial reruns still require repository-level acceptance evidence. The executor's report trust
+boundary still requires completion; a mutable local
 controller is not OS isolation. Missing authority, configuration, observations or platforms block
 acceptance.
 

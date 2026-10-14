@@ -5,6 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { Errors, GitHub as ReleasePleaseGitHub } from 'release-please'
 
 import {
   compareVersions,
@@ -24,7 +25,11 @@ import {
   verifyTag,
 } from './release-control.mjs'
 import { bootstrapDecision } from './release-please.mjs'
-import { releaseManifest, authenticatePublishedReleases } from './release-please.mjs'
+import {
+  releaseManifest,
+  authenticatePublishedReleases,
+  createValidatedPullRequests,
+} from './release-please.mjs'
 import {
   findStagedPlatforms,
   stagePlatform,
@@ -65,6 +70,9 @@ function fixtureReleaseState(releaseId = 100) {
 
 function apiFixture({ published = false, version = '0.1.0' } = {}) {
   const state = {
+    parentMetadata: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
+    productMetadata: { version, candidateVersion: version },
+    mergeCommit: { sha: identity.sourceSha, parents: [{ sha: 'd'.repeat(40) }] },
     tag: { object: { type: 'commit', sha: identity.sourceSha } },
     release: {
       id: 100,
@@ -133,6 +141,7 @@ function apiFixture({ published = false, version = '0.1.0' } = {}) {
       if (path.startsWith('/users/')) return { id: 12345, type: 'Bot' }
       if (path.endsWith('/actions/runs/10')) return structuredClone(state.run)
       if (path.endsWith('/pulls/42')) return structuredClone(state.pr)
+      if (path.endsWith(`/commits/${identity.sourceSha}`)) return structuredClone(state.mergeCommit)
       if (path.endsWith('/git/ref/tags/v0.1.0')) return state.tag
       if (path.endsWith('/git/refs')) {
         state.tag = { object: { type: 'commit', sha: options.body.sha } }
@@ -192,7 +201,10 @@ function apiFixture({ published = false, version = '0.1.0' } = {}) {
       throw new Error(`Unexpected fixture list ${path}`)
     },
     async jsonAt(path, sha) {
+      if (path === 'version.json' && sha === 'd'.repeat(40))
+        return structuredClone(state.parentMetadata)
       assert.equal(sha, identity.sourceSha)
+      if (path === 'version.json') return structuredClone(state.productMetadata)
       return path === '.release-please-manifest.json' ? { '.': version } : { version }
     },
     async assetDigest(asset) {
@@ -308,20 +320,35 @@ async function archiveFixture(context, state, key, root) {
 }
 
 void test('first-release override is transient; later maintenance never pins 0.1.0', () => {
-  assert.deepEqual(bootstrapDecision({ tags: [], releases: [], manifestVersion: '0.1.0' }), {
-    pendingRelease: false,
-    releaseAs: '0.1.0',
-  })
+  assert.deepEqual(
+    bootstrapDecision({
+      tags: [],
+      releases: [],
+      manifestVersion: '0.1.0',
+      productMetadata: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
+    }),
+    {
+      pendingRelease: false,
+      releaseAs: '0.1.0',
+    },
+  )
   assert.deepEqual(
     bootstrapDecision({
       tags: [{ name: 'v0.1.0' }],
       releases: [{ tag_name: 'v0.1.0', draft: false, prerelease: false }],
       manifestVersion: '0.1.0',
+      productMetadata: { version: '0.1.0', candidateVersion: '0.1.0' },
     }),
     { pendingRelease: false, releaseAs: '' },
   )
   assert.deepEqual(
-    bootstrapDecision({ tags: [], releases: [], manifestVersion: '0.1.0', releaseMerge: true }),
+    bootstrapDecision({
+      tags: [],
+      releases: [],
+      manifestVersion: '0.1.0',
+      productMetadata: { version: '0.1.0', candidateVersion: '0.1.0' },
+      releaseMerge: true,
+    }),
     { pendingRelease: true, releaseAs: '' },
   )
 })
@@ -329,7 +356,12 @@ void test('first-release override is transient; later maintenance never pins 0.1
 void test('unpublished tags, unfinished drafts and merged version changes wait for recovery', () => {
   const pending = { pendingRelease: true, releaseAs: '' }
   assert.deepEqual(
-    bootstrapDecision({ tags: [{ name: 'v0.1.0' }], releases: [], manifestVersion: '0.1.0' }),
+    bootstrapDecision({
+      tags: [{ name: 'v0.1.0' }],
+      releases: [],
+      manifestVersion: '0.1.0',
+      productMetadata: { version: '0.1.0', candidateVersion: '0.1.0' },
+    }),
     pending,
   )
   assert.deepEqual(
@@ -337,6 +369,7 @@ void test('unpublished tags, unfinished drafts and merged version changes wait f
       tags: [{ name: 'v0.1.0' }],
       releases: [{ tag_name: 'v0.1.0', draft: true }],
       manifestVersion: '0.1.0',
+      productMetadata: { version: '0.1.0', candidateVersion: '0.1.0' },
     }),
     pending,
   )
@@ -345,12 +378,18 @@ void test('unpublished tags, unfinished drafts and merged version changes wait f
       tags: [{ name: 'v0.1.0' }],
       releases: [{ tag_name: 'v0.1.0', draft: false, prerelease: false }],
       manifestVersion: '0.2.0',
+      productMetadata: { version: '0.2.0', candidateVersion: '0.2.0' },
     }),
     pending,
   )
   assert.throws(
     () =>
-      bootstrapDecision({ tags: [{ name: 'unknown' }], releases: [], manifestVersion: '0.1.0' }),
+      bootstrapDecision({
+        tags: [{ name: 'unknown' }],
+        releases: [],
+        manifestVersion: '0.1.0',
+        productMetadata: { version: '0.1.0', candidateVersion: '0.1.0' },
+      }),
     /unknown tag/,
   )
   assert.throws(
@@ -359,6 +398,7 @@ void test('unpublished tags, unfinished drafts and merged version changes wait f
         tags: [],
         releases: [{ tag_name: 'v0.1.0', draft: false }],
         manifestVersion: '0.1.0',
+        productMetadata: { version: '0.1.0', candidateVersion: '0.1.0' },
       }),
     /missing/,
   )
@@ -406,6 +446,84 @@ void test('ordinary business PR cannot create a stable release; unmerged bot PR 
   await assert.rejects(
     resolveReleaseIdentity(api, 42, { botId: 12345, appSlug: 'pact-ci' }),
     /not merged/,
+  )
+})
+
+void test('actual squash-parent metadata must introduce release intent before any Draft can exist', async () => {
+  const { api, state } = apiFixture()
+  const options = { botId: 12345, appSlug: 'pact-ci' }
+  const goodParent = structuredClone(state.parentMetadata)
+  for (const parent of [
+    { version: '0.1.0', candidateVersion: '0.1.0' },
+    { version: '0.2.0', candidateVersion: '0.2.0' },
+    { version: '0.1.0' },
+    null,
+  ]) {
+    state.parentMetadata = parent
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Each immutable parent contradiction is a separate release admission.
+    await assert.rejects(
+      resolveReleaseIdentity(api, 42, options),
+      /do not declare a new release|strictly increase|Product version|initialization/,
+    )
+    assert.equal(state.mutations.length, 0)
+  }
+  state.parentMetadata = goodParent
+  state.productMetadata.candidateVersion = '0.1.0-unreleased'
+  await assert.rejects(resolveReleaseIdentity(api, 42, options), /release/)
+  state.productMetadata.candidateVersion = '0.1.0'
+  for (const merge of [
+    { sha: 'f'.repeat(40), parents: [{ sha: 'd'.repeat(40) }] },
+    { sha: identity.sourceSha, parents: [] },
+    { sha: identity.sourceSha, parents: [{ sha: 'd'.repeat(40) }, { sha: 'b'.repeat(40) }] },
+  ]) {
+    state.mergeCommit = merge
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Squash provenance must hold for each independently malformed commit response.
+    await assert.rejects(resolveReleaseIdentity(api, 42, options), /squash/)
+  }
+  assert.equal(state.mutations.length, 0)
+})
+
+void test('a later formal release advances from its actual parent rather than the PR base metadata', async () => {
+  const { api, state } = apiFixture({ version: '0.2.0' })
+  state.parentMetadata = { version: '0.1.0', candidateVersion: '0.1.0' }
+  state.pr.base.sha = 'e'.repeat(40)
+  const result = await resolveReleaseIdentity(api, 42, { botId: 12345, appSlug: 'pact-ci' })
+  assert.equal(result.version, '0.2.0')
+  assert.equal(result.sourceSha, identity.sourceSha)
+  state.productMetadata.candidateVersion = '0.1.0'
+  await assert.rejects(
+    resolveReleaseIdentity(api, 42, { botId: 12345, appSlug: 'pact-ci' }),
+    /Product version/,
+  )
+  assert.equal(state.mutations.length, 0)
+})
+
+void test('copied release metadata on main cannot bootstrap a second same-version PR or release', async () => {
+  assert.deepEqual(
+    bootstrapDecision({
+      tags: [],
+      releases: [],
+      manifestVersion: '0.1.0',
+      productMetadata: { version: '0.1.0', candidateVersion: '0.1.0' },
+    }),
+    { pendingRelease: true, releaseAs: '' },
+  )
+  const { api, state } = apiFixture()
+  state.pr.user.id = 31481964
+  await assert.rejects(
+    resolveReleaseIdentity(api, 42, { botId: 12345, appSlug: 'pact-ci' }),
+    /fixed App/,
+  )
+  assert.equal(state.mutations.length, 0)
+  assert.throws(
+    () =>
+      bootstrapDecision({
+        tags: [{ name: 'v0.1.0' }],
+        releases: [{ tag_name: 'v0.1.0', draft: false, prerelease: false }],
+        manifestVersion: '0.1.0',
+        productMetadata: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
+      }),
+    /restore/,
   )
 })
 
@@ -697,14 +815,14 @@ void test('workflow keeps App credentials out of builds and forbids automatic/pa
   assert.deepEqual(Object.keys(config.packages), ['.'])
 })
 
-void test('merged Release PR needs the latest meaningful owner approval of the actual head before merge', async () => {
+void test('merged Release PR needs the currently effective owner review before its protected manual merge', async () => {
   const { api, state } = apiFixture()
   const options = { botId: 12345, appSlug: 'fixture-app' }
   const valid = structuredClone(state.reviews)
   for (const reviews of [
     [],
-    [{ ...valid[0], commit_id: 'd'.repeat(40) }],
     [{ ...valid[0], state: 'DISMISSED' }],
+    [...valid, { ...valid[0], id: 2, state: 'DISMISSED' }],
     [...valid, { ...valid[0], id: 2, state: 'CHANGES_REQUESTED' }],
     [{ ...valid[0], submitted_at: '2026-10-12T13:00:00Z' }],
   ]) {
@@ -714,6 +832,22 @@ void test('merged Release PR needs the latest meaningful owner approval of the a
   }
   state.reviews = [...valid, { ...valid[0], id: 2, state: 'COMMENTED', commit_id: 'd'.repeat(40) }]
   assert.equal((await resolveReleaseIdentity(api, 42, options)).sourceSha, identity.sourceSha)
+  state.reviews = [{ ...valid[0], commit_id: 'd'.repeat(40) }]
+  assert.equal((await resolveReleaseIdentity(api, 42, options)).sourceSha, identity.sourceSha)
+  state.reviews.push({
+    ...valid[0],
+    id: 2,
+    state: 'COMMENTED',
+    submitted_at: '2026-10-12T11:30:00Z',
+  })
+  assert.equal((await resolveReleaseIdentity(api, 42, options)).sourceSha, identity.sourceSha)
+  state.reviews = [
+    { ...valid[0], id: 2 },
+    { ...valid[0], id: 1, state: 'CHANGES_REQUESTED', submitted_at: '2026-10-12T11:30:00Z' },
+  ]
+  await assert.rejects(resolveReleaseIdentity(api, 42, options), /did not approve/)
+  state.reviews = [...valid, { ...valid[0], id: 2, state: 'UNKNOWN' }]
+  await assert.rejects(resolveReleaseIdentity(api, 42, options), /state is unresolved/)
 })
 
 void test('the pinned Release Please library produces first and later semantic versions without a permanent override', async () => {
@@ -770,6 +904,235 @@ void test('the pinned Release Please library produces first and later semantic v
       assert.notEqual(changelog.updater.updateContent(prior), prior)
     }
   }
+})
+
+async function releasePreviewFixture({
+  previous = '',
+  message = 'fix: correction',
+  override = '',
+} = {}) {
+  const config = JSON.parse(
+    await readFile(new URL('../release-please-config.json', import.meta.url), 'utf8'),
+  )
+  const version = previous || '0.1.0'
+  const productMetadata = {
+    version,
+    candidateVersion: previous || '0.1.0-unreleased',
+  }
+  const sourceSha = 'a'.repeat(40)
+  const files = new Map([
+    ['release-please-config.json', JSON.stringify(config)],
+    ['.release-please-manifest.json', JSON.stringify({ '.': version })],
+    ['version.json', JSON.stringify(productMetadata)],
+    ['package.json', JSON.stringify({ name: 'pact', version, private: true })],
+    [
+      'apps/desktop/package.json',
+      JSON.stringify({ name: '@pact/desktop', version, private: true }),
+    ],
+    ['CHANGELOG.md', '# Changelog\n'],
+  ])
+  const state = { builds: 0, sourceGuards: 0, writes: [], beforeWrite: undefined }
+  const github = {
+    repository: { owner: 'example', repo: 'Pact', defaultBranch: 'main' },
+    logger: { warn() {}, info() {}, debug() {}, error() {} },
+    async getFileJson(path) {
+      return JSON.parse(files.get(path))
+    },
+    async getFileContentsOnBranch(path, branch) {
+      assert.ok(branch === 'main' || branch === sourceSha)
+      const content = files.get(path)
+      if (content === undefined) throw new Errors.FileNotFoundError(path)
+      return {
+        parsedContent: content,
+        content: Buffer.from(content).toString('base64'),
+        sha: sourceSha,
+      }
+    },
+    buildChangeSet(...args) {
+      return ReleasePleaseGitHub.prototype.buildChangeSet.call(this, ...args)
+    },
+    async *releaseIterator() {
+      if (previous) yield { tagName: `v${previous}`, sha: 'f'.repeat(40), notes: 'prior' }
+    },
+    async *tagIterator() {},
+    async *mergeCommitIterator() {
+      yield { sha: sourceSha, message, files: ['src/fixture.ts'] }
+      if (previous)
+        yield {
+          sha: 'f'.repeat(40),
+          message: `chore(main): release ${previous}`,
+          files: ['package.json'],
+        }
+    },
+    async *pullRequestIterator() {},
+    async createPullRequest(pullRequest, branch, _message, updates) {
+      state.beforeWrite?.()
+      const changes = await this.buildChangeSet(updates, branch)
+      state.writes.push({ pullRequest, changes })
+      return { ...pullRequest, number: 43 }
+    },
+  }
+  const plan = await releaseManifest(github, override)
+  const build = plan.buildPullRequests.bind(plan)
+  plan.buildPullRequests = async () => {
+    state.builds++
+    return build()
+  }
+  const options = {
+    sourceSha,
+    productMetadata,
+    async verifySource() {
+      state.sourceGuards++
+    },
+  }
+  return { plan, github, state, options, files }
+}
+
+void test('pinned GenericJson composes both product fields and replaces the entire initial marker', async () => {
+  const fixture = await releasePreviewFixture({ override: '0.1.0' })
+  const candidates = await fixture.plan.buildPullRequests()
+  const update = candidates[0].updates.find((entry) => entry.path === 'version.json')
+  assert.equal(update.updater.constructor.name, 'CompositeUpdater')
+  assert.deepEqual(
+    update.updater.updaters.map((updater) => updater.jsonpath),
+    ['$.version', '$.candidateVersion'],
+  )
+  assert.deepEqual(JSON.parse(update.updater.updateContent(fixture.files.get('version.json'))), {
+    version: '0.1.0',
+    candidateVersion: '0.1.0',
+  })
+})
+
+void test('the validated pinned-library candidate is built once and is the exact subsequent PR write', async () => {
+  for (const [previous, message, override, expected] of [
+    ['', 'fix: first correction', '0.1.0', '0.1.0'],
+    ['0.1.0', 'fix: correction', '', '0.1.1'],
+    ['0.1.0', 'feat: capability', '', '0.2.0'],
+    ['0.1.0', 'feat!: new contract\n\nBREAKING CHANGE: protocol changes', '', '0.2.0'],
+    ['0.1.0', 'chore: maintain tooling', '', ''],
+  ]) {
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Each version decision uses a fresh real Manifest and complete immutable source.
+    const fixture = await releasePreviewFixture({ previous, message, override })
+    // oxlint-disable-next-line eslint/no-await-in-loop -- The actual pinned createPullRequests consumes the validated cached build.
+    await createValidatedPullRequests(fixture.plan, fixture.github, fixture.options)
+    assert.equal(fixture.state.builds, 1)
+    assert.equal(fixture.state.sourceGuards, 2)
+    assert.equal(fixture.state.writes.length, expected ? 1 : 0)
+    if (!expected) continue
+    const { pullRequest, changes } = fixture.state.writes[0]
+    assert.equal(pullRequest.title, `chore(main): release ${expected}`)
+    for (const path of [
+      'version.json',
+      'package.json',
+      'apps/desktop/package.json',
+      '.release-please-manifest.json',
+    ]) {
+      const metadata = JSON.parse(changes.get(path).content)
+      assert.equal(metadata[path === '.release-please-manifest.json' ? '.' : 'version'], expected)
+      if (path === 'version.json') assert.equal(metadata.candidateVersion, expected)
+    }
+  }
+})
+
+void test('RELEASE AS same-version or rollback cannot write an App PR', async () => {
+  for (const [previous, target] of [
+    ['0.1.0', '0.1.0'],
+    ['0.2.0', '0.1.0'],
+  ]) {
+    // oxlint-disable-next-line eslint/no-await-in-loop -- The actual parser must reject each semantic release contradiction before mutation.
+    const fixture = await releasePreviewFixture({
+      previous,
+      message: `fix: override\n\nRelease-As: ${target}`,
+    })
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Each real candidate is independently admitted and blocked without a write.
+    await assert.rejects(
+      createValidatedPullRequests(fixture.plan, fixture.github, fixture.options),
+      previous === target ? /no new release intent/ : /strictly increase/,
+    )
+    assert.equal(fixture.state.writes.length, 0)
+  }
+})
+
+void test('a missing/unchanged marker, unauthorized major or source drift blocks the prospective PR write', async () => {
+  const unchanged = await releasePreviewFixture({ previous: '0.1.0', message: 'fix: correction' })
+  const originalBuild = unchanged.plan.buildPullRequests.bind(unchanged.plan)
+  unchanged.plan.buildPullRequests = async () => {
+    const candidates = await originalBuild()
+    const update = candidates[0].updates.find((entry) => entry.path === 'version.json')
+    update.updater.updaters = update.updater.updaters.filter(
+      (updater) => updater.jsonpath !== '$.candidateVersion',
+    )
+    return candidates
+  }
+  await assert.rejects(
+    createValidatedPullRequests(unchanged.plan, unchanged.github, unchanged.options),
+    /Product version/,
+  )
+  assert.equal(unchanged.state.writes.length, 0)
+
+  const missing = await releasePreviewFixture({ override: '0.1.0' })
+  missing.options.productMetadata = { version: '0.1.0' }
+  missing.files.set('version.json', JSON.stringify(missing.options.productMetadata))
+  await assert.rejects(
+    createValidatedPullRequests(missing.plan, missing.github, missing.options),
+    /Product version/,
+  )
+  assert.equal(missing.state.writes.length, 0)
+
+  const major = await releasePreviewFixture({
+    previous: '0.1.0',
+    message: 'feat: explicit major\n\nRelease-As: 1.0.0',
+  })
+  await assert.rejects(
+    createValidatedPullRequests(major.plan, major.github, major.options),
+    /owner approval/,
+  )
+  assert.equal(major.state.writes.length, 0)
+  await createValidatedPullRequests(major.plan, major.github, {
+    ...major.options,
+    approvedMajor: '1',
+  })
+  assert.equal(major.state.writes.length, 1)
+
+  const drift = await releasePreviewFixture({ previous: '0.1.0' })
+  drift.state.beforeWrite = () => drift.files.set('CHANGELOG.md', '# Concurrent main change\n')
+  await assert.rejects(
+    createValidatedPullRequests(drift.plan, drift.github, drift.options),
+    /changed after preview/,
+  )
+  assert.equal(drift.state.writes.length, 0)
+})
+
+void test('a changed main identity or non-version candidate update cannot write a PR', async () => {
+  const changed = await releasePreviewFixture({ previous: '0.1.0' })
+  changed.options.verifySource = async () => {
+    changed.state.sourceGuards++
+    if (changed.state.sourceGuards === 2) throw new Error('Current main changed')
+  }
+  await assert.rejects(
+    createValidatedPullRequests(changed.plan, changed.github, changed.options),
+    /main changed/,
+  )
+  assert.equal(changed.state.writes.length, 0)
+
+  const nonVersion = await releasePreviewFixture({ previous: '0.1.0' })
+  const build = nonVersion.plan.buildPullRequests.bind(nonVersion.plan)
+  nonVersion.plan.buildPullRequests = async () => {
+    const candidates = await build()
+    const update = candidates[0].updates.find((entry) => entry.path === 'package.json')
+    const originalUpdate = update.updater.updateContent.bind(update.updater)
+    update.updater = {
+      updateContent(content) {
+        return JSON.stringify({ ...JSON.parse(originalUpdate(content)), private: false })
+      },
+    }
+    return candidates
+  }
+  await assert.rejects(
+    createValidatedPullRequests(nonVersion.plan, nonVersion.github, nonVersion.options),
+    /non-version/,
+  )
+  assert.equal(nonVersion.state.writes.length, 0)
 })
 
 void test('a same-App uploader cannot supply self-consistent substituted contents under a valid identity signature', async (context) => {

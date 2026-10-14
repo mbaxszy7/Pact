@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative } from 'node:path'
 import { test } from 'node:test'
 
-import { main } from './package-smoke.mjs'
+import { main, packageSmokeFailureReport } from './package-smoke.mjs'
 
 const sourceEnvironment = {
   HOME: '/synthetic-daily-home',
@@ -233,4 +233,166 @@ await test('real core copies synthetic native files, launches normal UI twice an
   } finally {
     await rm(sourceRoot, { recursive: true, force: true })
   }
+})
+
+await test('configuration and invalid-manifest failures write bounded safe admission reports before any process starts', async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), 'pact-smoke-report-'))
+  context.after(() => rm(directory, { recursive: true, force: true }))
+  const missing = join(directory, 'private-provider-configuration'),
+    configurationReport = join(directory, 'configuration.json'),
+    manifestReport = join(directory, 'manifest-failure.json'),
+    manifest = join(directory, 'invalid-manifest.json'),
+    secret = 'synthetic-private-manifest-extension',
+    calls = []
+  await assert.rejects(
+    main({
+      realCore: true,
+      sourceEnvironment: { ...sourceEnvironment, PACT_E2E_ENV_DIR: missing },
+      spawnProcess: simulatedSpawn(calls),
+      reportPath: configurationReport,
+    }),
+  )
+  await writeFile(manifest, JSON.stringify({ secret }))
+  await assert.rejects(
+    main({
+      manifestPath: manifest,
+      sourceEnvironment,
+      spawnProcess: simulatedSpawn(calls),
+      reportPath: manifestReport,
+    }),
+  )
+  assert.equal(calls.length, 0)
+  for (const [path, phase] of [
+    [configurationReport, 'configuration'],
+    [manifestReport, 'manifest'],
+  ]) {
+    // oxlint-disable-next-line no-await-in-loop -- Compare the two independent immutable admission-failure records.
+    const bytes = await readFile(path, 'utf8'),
+      report = JSON.parse(bytes)
+    assert.equal(report.status, 'blocked')
+    assert.equal(report.failurePhase, phase)
+    assert.equal(report.manifestIdentityVerified, false)
+    assert.equal(report.privateRootCreated, false)
+    assert.equal(report.cleanupVerified, true)
+    assert.equal(bytes.includes(missing) || bytes.includes(secret), false)
+  }
+})
+
+await test('seed, verify and cancellation failures retain their stage without inventing process release', async (context) => {
+  context.mock.method(console, 'log', () => {})
+  const directory = await mkdtemp(join(tmpdir(), 'pact-smoke-process-report-'))
+  context.after(() => rm(directory, { recursive: true, force: true }))
+  for (const phase of ['seed', 'verify', 'cancel']) {
+    const calls = [],
+      reportPath = join(directory, `${phase}.json`)
+    const spawnProcess = (executable, args, options) =>
+      simulatedSpawn(calls, {
+        pass: phase === 'verify' && calls.length === 0,
+        interrupt: phase === 'cancel',
+      })(executable, args, options)
+    // oxlint-disable-next-line no-await-in-loop -- Each process-boundary double owns a distinct fixture/report and completes cleanup before the next case.
+    await assert.rejects(
+      main({ executable: '/synthetic/Pact', sourceEnvironment, spawnProcess, reportPath }),
+    )
+    // oxlint-disable-next-line no-await-in-loop -- Read the immutable safe projection after the failed owner has completed its cleanup attempt.
+    const text = await readFile(reportPath, 'utf8'),
+      report = JSON.parse(text)
+    assert.equal(report.status, 'blocked')
+    assert.equal(report.failurePhase, phase === 'cancel' ? 'seed' : phase)
+    assert.equal(report.processReleaseVerified, false)
+    assert.equal(report.cleanupVerified, false)
+    assert.equal(report.privateRootCleanupVerified, true)
+    assert.equal(
+      report.failureCode,
+      phase === 'cancel' ? 'EXECUTION_INTERRUPTED' : 'VERIFICATION_FAILED',
+    )
+    assert.equal(text.includes(calls[0].options.env.PACT_E2E_ROOT), false)
+    // oxlint-disable-next-line no-await-in-loop -- Confirm the owned double's private root was removed without interpreting that as physical child proof.
+    await assert.rejects(stat(calls[0].options.env.PACT_E2E_ROOT), { code: 'ENOENT' })
+  }
+})
+
+await test('existing reports stop admission and cleanup failures remain explicitly blocked with recovery retained', async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), 'pact-smoke-report-guard-'))
+  context.after(() => rm(directory, { recursive: true, force: true }))
+  const reportPath = join(directory, 'report.json'),
+    calls = []
+  await writeFile(reportPath, 'existing recovery evidence')
+  await assert.rejects(
+    main({
+      executable: '/synthetic/Pact',
+      sourceEnvironment,
+      spawnProcess: simulatedSpawn(calls),
+      reportPath,
+    }),
+    { code: 'EEXIST' },
+  )
+  assert.equal(calls.length, 0)
+  assert.equal(await readFile(reportPath, 'utf8'), 'existing recovery evidence')
+  const secret = 'synthetic-private-output',
+    report = packageSmokeFailureReport({
+      phase: 'verify',
+      failurePhase: 'verify',
+      cleanupFailed: true,
+      processes: [{ phase: 'verify', releaseVerified: false, error: secret, pid: 42 }],
+      privateRootCreated: true,
+      privateRootCleanupVerified: false,
+      installationCleanupVerified: false,
+      providerCopiesCleanupVerified: true,
+      recoveryPreserved: true,
+      error: { message: secret },
+      privateRoot: secret,
+    })
+  assert.equal(report.failureCode, 'CLEANUP_UNCONFIRMED')
+  assert.equal(report.cleanupVerified, false)
+  assert.equal(report.recoveryPreserved, true)
+  assert.equal(JSON.stringify(report).includes(secret), false)
+  assert.equal(Object.hasOwn(report.processes[0], 'pid'), false)
+})
+
+await test('a parsed manifest contributes only validated distribution identity to a pre-launch failure report', async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), 'pact-smoke-identity-report-'))
+  context.after(() => rm(directory, { recursive: true, force: true }))
+  const manifestPath = join(directory, 'distribution-manifest.json'),
+    reportPath = join(directory, 'failure.json'),
+    secret = 'synthetic-private-package-extension',
+    calls = []
+  await writeFile(
+    manifestPath,
+    JSON.stringify({
+      schemaVersion: 1,
+      channel: 'dev',
+      platform: process.platform,
+      arch: process.arch,
+      productName: 'Pact Dev',
+      appId: 'com.pact.desktop.dev',
+      version: '0.1.0',
+      sourceSha: 'a'.repeat(40),
+      buildNumber: '1',
+      application: {
+        path: 'unpacked',
+        executable: 'Pact',
+        contentSha256: 'b'.repeat(64),
+        entries: [],
+        secret,
+      },
+      artifacts: [],
+      extensions: secret,
+    }),
+  )
+  await assert.rejects(
+    main({ manifestPath, reportPath, sourceEnvironment, spawnProcess: simulatedSpawn(calls) }),
+    /genuine owned process/,
+  )
+  const text = await readFile(reportPath, 'utf8'),
+    report = JSON.parse(text)
+  assert.equal(report.failurePhase, 'admission')
+  assert.equal(report.manifestIdentityVerified, true)
+  assert.equal(report.applicationContentVerified, false)
+  assert.equal(report.runtimeIdentityVerified, false)
+  assert.equal(report.sourceSha, 'a'.repeat(40))
+  assert.equal(report.appContentHash, 'b'.repeat(64))
+  assert.equal(report.cleanupVerified, true)
+  assert.equal(text.includes(secret) || text.includes(directory), false)
+  assert.equal(calls.length, 0)
 })
