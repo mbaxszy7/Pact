@@ -211,7 +211,9 @@ jobs:
 
   platform:
     name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'platform' || 'branch-platform' }}-${{ matrix.key }}
-    needs: [identity, quality]
+    # No-credential native validation can diagnose platform/package failures while
+    # shared quality runs independently. Provider admission and final gates require both.
+    needs: [identity, publication]
     strategy:
       fail-fast: false
       matrix:

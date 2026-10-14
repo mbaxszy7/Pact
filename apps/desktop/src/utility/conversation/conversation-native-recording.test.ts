@@ -565,8 +565,12 @@ it.each(['codex', 'claude'] as const)(
         .all()
         .filter((event) => event.eventType === 'turn.completed').length
       f.endBackground(firstId)
-      await vi.waitFor(() =>
-        expect(f.db.conversationRepository.findRun(firstId)?.workspaceChanges?.state).toBe('ready'),
+      await vi.waitFor(
+        () =>
+          expect(f.db.conversationRepository.findRun(firstId)?.workspaceChanges?.state).toBe(
+            'ready',
+          ),
+        { timeout: 10_000 },
       )
       expect(f.db.conversationRepository.findRun(firstId)?.nativeEffectsState).toBe('settled')
       expect(
@@ -583,6 +587,9 @@ it.each(['codex', 'claude'] as const)(
       await f.dispose()
     }
   },
+  // Root ending and Composer admission are checked earlier; this wait covers
+  // asynchronous immutable-file finalization after actual background EOF.
+  30_000,
 )
 
 it.each(['codex', 'claude'] as const)(

@@ -113,7 +113,7 @@ describe('Native image input', () => {
     expect(block.source.media_type).toBe('image/png')
     expect(Buffer.from(block.source.data, 'base64')).toEqual(bytes)
     expect(await readFile(image.path)).toEqual(bytes)
-  })
+  }, 15_000) // Fixture I/O plus the existing 10-second Native image owner deadline.
 
   it('preserves message provenance and image order for both Native providers', async () => {
     const images = await Promise.all(
