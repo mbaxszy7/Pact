@@ -496,6 +496,20 @@ export type StreamDeltaEvent = Extract<
   { type: 'text.delta' | 'reasoning.summary.delta' }
 >
 
+/** A fixed template belongs to one connection; rows and parameters are never cached. */
+function lazyStatement<T>(build: () => { toSQL(): { sql: string }; prepare(): T }): () => T {
+  let statement: T | undefined
+  return () => {
+    if (statement === undefined) {
+      const query = build()
+      if (Buffer.byteLength(query.toSQL().sql) > 8192)
+        throw new Error('A fixed source query exceeds its SQL byte bound.')
+      statement = query.prepare()
+    }
+    return statement
+  }
+}
+
 export class ConversationRepository {
   private readonly observations = new Map<string, ConversationObservation>()
   private completeReadCount = 0
@@ -505,6 +519,176 @@ export class ConversationRepository {
   private readonly streamLookups = {
     text: { queries: 0, returnedRows: 0 },
     activity: { queries: 0, returnedRows: 0 },
+  }
+
+  // At most fourteen immutable templates. Each prepares on first use and SQLite
+  // finalizes it when this Repository's connection closes. All facts are reread.
+  private readonly sourceQueries = {
+    run: lazyStatement(() =>
+      this.database
+        .select(publicRunColumns)
+        .from(agentRuns)
+        .where(eq(agentRuns.id, sql.placeholder('runId'))),
+    ),
+    latestRun: lazyStatement(() =>
+      this.database
+        .select(publicRunColumns)
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.sessionId, sql.placeholder('sessionId')),
+            eq(agentRuns.agentId, sql.placeholder('agentId')),
+            isNull(agentRuns.forkSourceRunId),
+          ),
+        )
+        .orderBy(desc(agentRuns.createdAt), desc(sql`${agentRuns}.rowid`))
+        .limit(1),
+    ),
+    latestGenerationRun: lazyStatement(() =>
+      this.database
+        .select(publicRunColumns)
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.sessionId, sql.placeholder('sessionId')),
+            eq(agentRuns.agentId, sql.placeholder('agentId')),
+            isNull(agentRuns.forkSourceRunId),
+            eq(agentRuns.bindingGeneration, sql.placeholder('generation')),
+            ne(agentRuns.controlDisposition, 'abandoned'),
+            isNull(agentRuns.forkSourceRunId),
+          ),
+        )
+        .orderBy(desc(agentRuns.createdAt), desc(sql`${agentRuns}.rowid`))
+        .limit(1),
+    ),
+    nativeContext: lazyStatement(() =>
+      this.database
+        .select()
+        .from(nativeAgentContexts)
+        .where(
+          and(
+            eq(nativeAgentContexts.sessionId, sql.placeholder('sessionId')),
+            eq(nativeAgentContexts.agentId, sql.placeholder('agentId')),
+          ),
+        ),
+    ),
+    lastRebuild: lazyStatement(() =>
+      this.database
+        .select({ id: nativeRebuildOperations.id })
+        .from(nativeRebuildOperations)
+        .where(
+          and(
+            eq(nativeRebuildOperations.sessionId, sql.placeholder('sessionId')),
+            eq(nativeRebuildOperations.agentId, sql.placeholder('agentId')),
+          ),
+        )
+        .orderBy(desc(nativeRebuildOperations.createdAt), desc(nativeRebuildOperations.id))
+        .limit(1),
+    ),
+    rebuild: lazyStatement(() =>
+      this.database
+        .select({
+          id: nativeRebuildOperations.id,
+          oldGeneration: nativeRebuildOperations.oldGeneration,
+          stage: nativeRebuildOperations.stage,
+          provisionalNativeSessionId: nativeRebuildOperations.provisionalNativeSessionId,
+          sourceHash: nativeRebuildOperations.sourceHash,
+          failureReason: nativeRebuildOperations.failureReason,
+          checkAction: nativeRebuildOperations.checkAction,
+        })
+        .from(nativeRebuildOperations)
+        .where(eq(nativeRebuildOperations.id, sql.placeholder('operationId'))),
+    ),
+    document: lazyStatement(() =>
+      this.database
+        .select()
+        .from(conversationBodyInputs)
+        .where(
+          and(
+            eq(conversationBodyInputs.id, sql.placeholder('documentId')),
+            eq(conversationBodyInputs.sessionId, sql.placeholder('sessionId')),
+            eq(conversationBodyInputs.purpose, 'collaboration'),
+          ),
+        ),
+    ),
+    authorization: lazyStatement(() =>
+      this.database
+        .select()
+        .from(collaborationTurnAuthorizations)
+        .where(eq(collaborationTurnAuthorizations.runId, sql.placeholder('runId'))),
+    ),
+    todoDocument: lazyStatement(() =>
+      this.database
+        .select({ id: collaborationTodoRevisions.todoId })
+        .from(collaborationTodoRevisions)
+        .where(
+          and(
+            eq(collaborationTodoRevisions.taskId, sql.placeholder('taskId')),
+            lte(collaborationTodoRevisions.ledgerRevision, sql.placeholder('baseTodoRevision')),
+            or(
+              eq(collaborationTodoRevisions.documentId, sql.placeholder('documentId')),
+              eq(collaborationTodoRevisions.contentDocumentId, sql.placeholder('documentId')),
+              eq(collaborationTodoRevisions.reasonDocumentId, sql.placeholder('documentId')),
+            ),
+          ),
+        )
+        .limit(1),
+    ),
+    requiredInputDocument: lazyStatement(() =>
+      this.database
+        .select({ found: sql<number>`1`.as('found') })
+        .from(sql`collaboration_required_input_members r
+          JOIN conversation_input_batches b ON b.id=r.batch_id
+          LEFT JOIN conversation_input_batch_members m ON m.batch_id=r.batch_id AND m.member_id=r.member_id`)
+        .where(sql`r.run_id=${sql.placeholder('runId')} AND
+          (json_extract(b.body_document_json,'$.id')=${sql.placeholder('documentId')}
+          OR json_extract(m.body_document_json,'$.id')=${sql.placeholder('documentId')}
+          OR json_extract(m.anchor_document_json,'$.id')=${sql.placeholder('documentId')})`)
+        .limit(1),
+    ),
+    earlierInputDocument: lazyStatement(() =>
+      this.database
+        .select({ found: sql<number>`1`.as('found') })
+        .from(sql`conversation_input_batches b
+          LEFT JOIN conversation_input_batch_members m ON m.batch_id=b.id`)
+        .where(sql`b.task_id=${sql.placeholder('taskId')} AND b.sequence<=${sql.placeholder('inputSequence')}
+          AND (json_extract(b.body_document_json,'$.id')=${sql.placeholder('documentId')}
+          OR json_extract(m.body_document_json,'$.id')=${sql.placeholder('documentId')}
+          OR json_extract(m.anchor_document_json,'$.id')=${sql.placeholder('documentId')})`)
+        .limit(1),
+    ),
+    frozenTurn: lazyStatement(() =>
+      this.database
+        .select({ state: collaborationTurns.stateJson })
+        .from(collaborationTurns)
+        .where(eq(collaborationTurns.runId, sql.placeholder('runId'))),
+    ),
+    quotedDocument: lazyStatement(() =>
+      this.database
+        .select({ found: sql<number>`1`.as('found') })
+        .from(sql`conversation_run_source_refs s
+          LEFT JOIN conversation_input_batches b ON b.id=s.batch_id
+          LEFT JOIN conversation_input_batch_members m ON m.batch_id=s.batch_id`)
+        .where(sql`s.run_id=${sql.placeholder('runId')} AND
+          (EXISTS (SELECT 1 FROM json_each(s.documents_json) j WHERE json_extract(j.value,'$.source.id')=${sql.placeholder('documentId')})
+          OR json_extract(b.body_document_json,'$.id')=${sql.placeholder('documentId')}
+          OR json_extract(m.body_document_json,'$.id')=${sql.placeholder('documentId')}
+          OR json_extract(m.anchor_document_json,'$.id')=${sql.placeholder('documentId')})`)
+        .limit(1),
+    ),
+    documentPart: lazyStatement(() =>
+      this.database
+        .select()
+        .from(conversationBodyParts)
+        .where(
+          and(
+            eq(conversationBodyParts.inputId, sql.placeholder('documentId')),
+            lte(conversationBodyParts.offset, sql.placeholder('offset')),
+          ),
+        )
+        .orderBy(desc(conversationBodyParts.offset))
+        .limit(1),
+    ),
   }
 
   constructor(private readonly database: PactDrizzleDatabase) {}
@@ -2293,11 +2477,7 @@ export class ConversationRepository {
   }
 
   collaborationTurnAuthorization(runId: string): FrozenCollaborationAuthorization | undefined {
-    const row = this.database
-      .select()
-      .from(collaborationTurnAuthorizations)
-      .where(eq(collaborationTurnAuthorizations.runId, runId))
-      .get()
+    const row = this.sourceQueries.authorization().get({ runId })
     return row
       ? collaborationTurnAuthorizationSchema.parse(JSON.parse(row.authorizationJson))
       : undefined
@@ -2458,41 +2638,24 @@ export class ConversationRepository {
         ].some((ref) => ref?.id === document.id && ref.sha256 === document.sha256)
       )
         return true
-      const source = this.database
-        .select({ id: collaborationTodoRevisions.todoId })
-        .from(collaborationTodoRevisions)
-        .where(
-          and(
-            eq(collaborationTodoRevisions.taskId, auth.taskId),
-            lte(collaborationTodoRevisions.ledgerRevision, auth.baseTodoRevision),
-            or(
-              eq(collaborationTodoRevisions.documentId, document.id),
-              eq(collaborationTodoRevisions.contentDocumentId, document.id),
-              eq(collaborationTodoRevisions.reasonDocumentId, document.id),
-            ),
-          ),
-        )
-        .limit(1)
-        .get()
+      const source = this.sourceQueries.todoDocument().get({
+        taskId: auth.taskId,
+        baseTodoRevision: auth.baseTodoRevision,
+        documentId: document.id,
+      })
       if (source) return true
-      const inputSource = this.database.get<{
-        found: number
-      }>(sql`SELECT 1 AS found FROM collaboration_required_input_members r
-        JOIN conversation_input_batches b ON b.id=r.batch_id
-        LEFT JOIN conversation_input_batch_members m ON m.batch_id=r.batch_id AND m.member_id=r.member_id
-        WHERE r.run_id=${runId} AND (json_extract(b.body_document_json,'$.id')=${document.id} OR json_extract(m.body_document_json,'$.id')=${document.id} OR json_extract(m.anchor_document_json,'$.id')=${document.id}) LIMIT 1`)
+      const inputSource = this.sourceQueries.requiredInputDocument().get({
+        runId,
+        documentId: document.id,
+      })
       if (inputSource) return true
-      const earlierInput = this.database.get<{
-        found: number
-      }>(sql`SELECT 1 AS found FROM conversation_input_batches b
-        LEFT JOIN conversation_input_batch_members m ON m.batch_id=b.id WHERE b.task_id=${auth.taskId} AND b.sequence<=${auth.inputSequence}
-        AND (json_extract(b.body_document_json,'$.id')=${document.id} OR json_extract(m.body_document_json,'$.id')=${document.id} OR json_extract(m.anchor_document_json,'$.id')=${document.id}) LIMIT 1`)
+      const earlierInput = this.sourceQueries.earlierInputDocument().get({
+        taskId: auth.taskId,
+        inputSequence: auth.inputSequence,
+        documentId: document.id,
+      })
       if (earlierInput) return true
-      const frozen = this.database
-        .select({ state: collaborationTurns.stateJson })
-        .from(collaborationTurns)
-        .where(eq(collaborationTurns.runId, runId))
-        .get()
+      const frozen = this.sourceQueries.frozenTurn().get({ runId })
       const task = frozen ? this.decodedCollaboration(frozen.state, false) : undefined
       if (
         task &&
@@ -2506,13 +2669,7 @@ export class ConversationRepository {
       )
         return true
     }
-    return Boolean(
-      this.database.get<{ found: number }>(sql`SELECT 1 AS found FROM conversation_run_source_refs s
-      LEFT JOIN conversation_input_batches b ON b.id=s.batch_id
-      LEFT JOIN conversation_input_batch_members m ON m.batch_id=s.batch_id
-      WHERE s.run_id=${runId} AND (EXISTS (SELECT 1 FROM json_each(s.documents_json) j WHERE json_extract(j.value,'$.source.id')=${document.id})
-      OR json_extract(b.body_document_json,'$.id')=${document.id} OR json_extract(m.body_document_json,'$.id')=${document.id} OR json_extract(m.anchor_document_json,'$.id')=${document.id}) LIMIT 1`),
-    )
+    return Boolean(this.sourceQueries.quotedDocument().get({ runId, documentId: document.id }))
   }
 
   collaborationAnswerResolver(task: CollaborationTask): RuntimeAgentId {
@@ -3757,17 +3914,7 @@ export class ConversationRepository {
   }
 
   collaborationDocumentRow(sessionId: string, ref: CollaborationDocument) {
-    const row = this.database
-      .select()
-      .from(conversationBodyInputs)
-      .where(
-        and(
-          eq(conversationBodyInputs.id, ref.id),
-          eq(conversationBodyInputs.sessionId, sessionId),
-          eq(conversationBodyInputs.purpose, 'collaboration'),
-        ),
-      )
-      .get()
+    const row = this.sourceQueries.document().get({ sessionId, documentId: ref.id })
     if (
       !row?.sealed ||
       !row.sourceRunId ||
@@ -5839,18 +5986,10 @@ export class ConversationRepository {
           'The document does not belong to the requested source Run.',
         )
       if (input.offset > row.chars) throw new RunOperationConflictError('Invalid document offset.')
-      const parts = this.database
-        .select()
-        .from(conversationBodyParts)
-        .where(
-          and(
-            eq(conversationBodyParts.inputId, row.id),
-            lte(conversationBodyParts.offset, input.offset),
-          ),
-        )
-        .orderBy(desc(conversationBodyParts.offset))
-        .limit(1)
-        .all()
+      const parts = this.sourceQueries.documentPart().all({
+        documentId: row.id,
+        offset: input.offset,
+      })
       const part = parts[0]
       let text = part ? part.text.slice(input.offset - part.offset) : ''
       while (Buffer.byteLength(JSON.stringify({ text })) > 40 * 1024)
@@ -8313,26 +8452,10 @@ export class ConversationRepository {
     agentId: RuntimeAgentId,
     generation?: number,
   ): AgentRun | undefined {
-    const row = this.database
-      .select(publicRunColumns)
-      .from(agentRuns)
-      .where(
-        and(
-          eq(agentRuns.sessionId, sessionId),
-          eq(agentRuns.agentId, agentId),
-          isNull(agentRuns.forkSourceRunId),
-          ...(generation === undefined
-            ? []
-            : [
-                eq(agentRuns.bindingGeneration, generation),
-                ne(agentRuns.controlDisposition, 'abandoned'),
-                isNull(agentRuns.forkSourceRunId),
-              ]),
-        ),
-      )
-      .orderBy(desc(agentRuns.createdAt), desc(sql`${agentRuns}.rowid`))
-      .limit(1)
-      .get()
+    const row =
+      generation === undefined
+        ? this.sourceQueries.latestRun().get({ sessionId, agentId })
+        : this.sourceQueries.latestGenerationRun().get({ sessionId, agentId, generation })
     return row ? ConversationRepository.toRun(row) : undefined
   }
 
@@ -8568,19 +8691,7 @@ export class ConversationRepository {
   }
 
   nativeRebuildOperation(id: string): NativeRebuildOperation | undefined {
-    const row = this.database
-      .select({
-        id: nativeRebuildOperations.id,
-        oldGeneration: nativeRebuildOperations.oldGeneration,
-        stage: nativeRebuildOperations.stage,
-        provisionalNativeSessionId: nativeRebuildOperations.provisionalNativeSessionId,
-        sourceHash: nativeRebuildOperations.sourceHash,
-        failureReason: nativeRebuildOperations.failureReason,
-        checkAction: nativeRebuildOperations.checkAction,
-      })
-      .from(nativeRebuildOperations)
-      .where(eq(nativeRebuildOperations.id, id))
-      .get()
+    const row = this.sourceQueries.rebuild().get({ operationId: id })
     return row
       ? {
           id: row.id,
@@ -8624,18 +8735,7 @@ export class ConversationRepository {
     sessionId: string,
     agentId: RuntimeAgentId,
   ): NativeRebuildOperation | undefined {
-    const row = this.database
-      .select({ id: nativeRebuildOperations.id })
-      .from(nativeRebuildOperations)
-      .where(
-        and(
-          eq(nativeRebuildOperations.sessionId, sessionId),
-          eq(nativeRebuildOperations.agentId, agentId),
-        ),
-      )
-      .orderBy(desc(nativeRebuildOperations.createdAt), desc(nativeRebuildOperations.id))
-      .limit(1)
-      .get()
+    const row = this.sourceQueries.lastRebuild().get({ sessionId, agentId })
     return row ? this.nativeRebuildOperation(row.id) : undefined
   }
 
@@ -9903,11 +10003,7 @@ export class ConversationRepository {
   }
 
   findRun(runId: string): AgentRun | undefined {
-    const run = this.database
-      .select(publicRunColumns)
-      .from(agentRuns)
-      .where(eq(agentRuns.id, runId))
-      .get()
+    const run = this.sourceQueries.run().get({ runId })
     return run ? ConversationRepository.toRun(run) : undefined
   }
 
@@ -11682,13 +11778,7 @@ export class ConversationRepository {
   }
 
   nativeContext(sessionId: string, agentId: RuntimeAgentId): NativeAgentContext | undefined {
-    const context = this.database
-      .select()
-      .from(nativeAgentContexts)
-      .where(
-        and(eq(nativeAgentContexts.sessionId, sessionId), eq(nativeAgentContexts.agentId, agentId)),
-      )
-      .get()
+    const context = this.sourceQueries.nativeContext().get({ sessionId, agentId })
     return context ? this.projectNativeContext(context) : undefined
   }
 
