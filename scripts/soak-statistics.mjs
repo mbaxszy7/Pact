@@ -169,8 +169,144 @@ export function percentile(histogramValue, percent) {
   return null
 }
 
+// Report JSON is a distinct trust seam from the application's typed health contract. Validate
+// fixed owner/category metadata again, including the warm-start baseline; a missing[] assertion
+// cannot supply evidence. Current producers deliberately remain incomplete for unobserved hops.
+function completeLogicalIpcTraffic(evidence, requestedDurationMs) {
+  const ipc = evidence.ipcTraffic
+  const unit = 'json-utf8-null-binary-skeleton-plus-visible-binary-bytes'
+  if (
+    !ipc ||
+    ipc.unit !== unit ||
+    ipc.observed !== true ||
+    ipc.complete !== true ||
+    !Array.isArray(ipc.issues) ||
+    ipc.issues.length !== 0 ||
+    !Number.isSafeInteger(ipc.observedDurationMs) ||
+    ipc.observedDurationMs < requestedDurationMs
+  )
+    return false
+  const categories = {
+    'renderer-bridge': [
+      'renderer-main.invoke',
+      'main-renderer.reply',
+      'renderer-main.send',
+      'main-renderer.event',
+    ],
+    'main-utility': [
+      'main-utility.request',
+      'utility-main.reply',
+      'utility-main.event',
+      'main-utility.control',
+      'utility-main.control',
+    ],
+  }
+  const totals = (snapshot) => {
+    if (
+      !snapshot ||
+      snapshot.schemaVersion !== 1 ||
+      snapshot.unit !== unit ||
+      snapshot.complete !== true ||
+      !Array.isArray(snapshot.uncovered) ||
+      snapshot.uncovered.length !== 0 ||
+      !Array.isArray(snapshot.owners) ||
+      snapshot.owners.length !== 2
+    )
+      return undefined
+    const owners = new Set(),
+      sum = { business: 0, control: 0 }
+    for (const owner of snapshot.owners) {
+      if (
+        !owner ||
+        typeof owner !== 'object' ||
+        Array.isArray(owner) ||
+        typeof owner.owner !== 'string' ||
+        !Object.hasOwn(categories, owner.owner)
+      )
+        return undefined
+      const allowed = categories[owner.owner]
+      if (
+        !allowed ||
+        owners.has(owner.owner) ||
+        owner.complete !== true ||
+        typeof owner.epoch !== 'string' ||
+        !/^[a-f\d]{8}-[a-f\d]{4}-[1-8][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/iu.test(
+          owner.epoch,
+        ) ||
+        !Number.isSafeInteger(owner.transportEpoch) ||
+        owner.transportEpoch < 1 ||
+        owner.transportEpoch > 64 ||
+        !Array.isArray(owner.issues) ||
+        owner.issues.length !== 0 ||
+        !Array.isArray(owner.counters) ||
+        owner.counters.length !== allowed.length
+      )
+        return undefined
+      owners.add(owner.owner)
+      const seen = new Set()
+      let messages = 0
+      for (const row of owner.counters) {
+        if (
+          !row ||
+          typeof row !== 'object' ||
+          Array.isArray(row) ||
+          !allowed.includes(row.category) ||
+          seen.has(row.category)
+        )
+          return undefined
+        seen.add(row.category)
+        for (const lane of ['business', 'control']) {
+          const counts = row[lane]
+          if (
+            !counts ||
+            !['messages', 'incompleteMessages', 'jsonBytes', 'binaryBytes', 'totalBytes'].every(
+              (key) => Number.isSafeInteger(counts[key]) && counts[key] >= 0,
+            ) ||
+            counts.incompleteMessages !== 0 ||
+            counts.totalBytes !== counts.jsonBytes + counts.binaryBytes
+          )
+            return undefined
+          messages += counts.messages
+          sum[lane] += counts.totalBytes
+          if (messages > 1_000_000 || !Number.isSafeInteger(sum[lane])) return undefined
+        }
+      }
+    }
+    return Number.isSafeInteger(sum.business + sum.control) ? sum : undefined
+  }
+  const before = totals(ipc.baseline),
+    after = totals(ipc.snapshot)
+  if (!before || !after) return false
+  for (const owner of ipc.snapshot.owners) {
+    const initial = ipc.baseline.owners.find((value) => value.owner === owner.owner)
+    // A generation change needs per-generation coverage proof that this report does not yet
+    // carry. Refuse the window instead of inferring continuity from a later cumulative number.
+    if (
+      !initial ||
+      initial.epoch !== owner.epoch ||
+      initial.transportEpoch !== owner.transportEpoch
+    )
+      return false
+    for (const row of owner.counters) {
+      const previous = initial.counters.find((value) => value.category === row.category)
+      if (!previous) return false
+      for (const lane of ['business', 'control'])
+        for (const key of ['messages', 'jsonBytes', 'binaryBytes', 'totalBytes'])
+          if (row[lane][key] < previous[lane][key]) return false
+    }
+  }
+  return (
+    Number.isSafeInteger(ipc.businessBytes) &&
+    Number.isSafeInteger(ipc.controlBytes) &&
+    ipc.businessBytes === after.business - before.business &&
+    ipc.controlBytes === after.control - before.control
+  )
+}
+
 export function evaluateSoak(evidence, requestedDurationMs) {
   const unmet = []
+  if (!completeLogicalIpcTraffic(evidence, requestedDurationMs))
+    unmet.push('complete-logical-ipc-traffic')
   const threshold = (name, value, maximum) => {
     if (!Number.isFinite(value) || value > maximum) unmet.push(name)
   }

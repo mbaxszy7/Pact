@@ -10,6 +10,7 @@ import { createServer } from 'node:net'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
+import { projectLogicalIpcTraffic } from '../apps/desktop/src/shared/logical-ipc-traffic.ts'
 import { PactDatabase } from '../packages/persistence/src/index.ts'
 import { conversationMessages } from '../packages/persistence/src/schema/index.ts'
 import { prepareDeterministicSoakEnvironment } from '../tests/e2e/runtime-fixture.ts'
@@ -346,7 +347,6 @@ async function instrument(page) {
       rendererEventLoop: make(),
       frames: make(),
       terminalEnabledAt: [],
-      ipcBytes: 0,
       sustainedLongTasks: 0,
       unexplainedLongTasksOver200Ms: 0,
       lastLongTask: -Infinity,
@@ -400,7 +400,6 @@ async function instrument(page) {
     })
     observer.observe({ type: 'longtask', buffered: false })
     const remove = globalThis.pact.onConversationChanged((patch) => {
-      state.ipcBytes += new TextEncoder().encode(JSON.stringify(patch)).byteLength
       for (const execution of patch.runs) {
         if (
           !['completed', 'failed', 'interrupted'].includes(execution.status) ||
@@ -544,7 +543,7 @@ async function main() {
     sqliteQueryPlanDictionary: resourceProjection.queryPlans,
     resourceHighWater: {},
     resourceFinal: {},
-    conversationPatchIpcBytes: 0,
+    ipcTraffic: { observed: false, complete: false },
   }
   let iteration = 0,
     lastState,
@@ -633,6 +632,41 @@ async function main() {
     await page.getByRole('combobox', { name: 'Message', exact: true }).waitFor({ state: 'visible' })
     evidence.reactCommits = await reactInspection.begin()
     await instrument(page)
+    const initialHealth = await page.evaluate(() => globalThis.pact.getRuntimeHealth())
+    const initialIpc = projectLogicalIpcTraffic(
+      initialHealth.ok ? initialHealth.value.ipcTraffic : undefined,
+    )
+    let lastIpcSnapshot = initialIpc.snapshot
+    const ipcIssues = new Set(initialIpc.issues)
+    const ipcStarted = performance.now()
+    const observeIpc = (raw, elapsedMs) => {
+      const measured = projectLogicalIpcTraffic(raw, lastIpcSnapshot)
+      if (measured.snapshot) lastIpcSnapshot = measured.snapshot
+      for (const issue of measured.issues) ipcIssues.add(issue)
+      if (ipcIssues.size > 64) throw new Error('IPC observation issue capacity exceeded')
+      const businessBytes = Math.max(0, measured.businessBytes - initialIpc.businessBytes)
+      const controlBytes = Math.max(0, measured.controlBytes - initialIpc.controlBytes)
+      evidence.ipcTraffic = {
+        unit: measured.snapshot?.unit,
+        observed: measured.observed && initialIpc.observed,
+        complete: measured.complete && initialIpc.complete && ipcIssues.size === 0,
+        observedDurationMs: Math.floor(elapsedMs),
+        businessBytes,
+        controlBytes,
+        businessBytesPerSecond: elapsedMs > 0 ? businessBytes / (elapsedMs / 1000) : 0,
+        controlBytesPerSecond: elapsedMs > 0 ? controlBytes / (elapsedMs / 1000) : 0,
+        issues: [...ipcIssues],
+        baseline: initialIpc.snapshot,
+        snapshot: measured.snapshot,
+      }
+      if (
+        !evidence.ipcTraffic.complete &&
+        !evidence.missingObservations.includes('ipc-traffic-observation-incomplete')
+      )
+        evidence.missingObservations.push('ipc-traffic-observation-incomplete')
+      // complete-ipc-traffic stays missing: uninstrumented Worker/diagnostic hops are real gaps.
+    }
+    observeIpc(initialHealth.ok ? initialHealth.value.ipcTraffic : undefined, 0)
     const started = performance.now()
     measurementStarted = started
     let nextTurn = started
@@ -685,6 +719,7 @@ async function main() {
         const health = await page.evaluate(() => globalThis.pact.getRuntimeHealth())
         if (!health.ok || !health.value.conversation)
           throw new Error('Real Utility health observation is missing')
+        observeIpc(health.value.ipcTraffic, performance.now() - ipcStarted)
         for (const [key, value] of Object.entries(health.value.conversation))
           if (Number.isFinite(value))
             evidence.resourceHighWater[key] = Math.max(evidence.resourceHighWater[key] ?? 0, value)
@@ -735,8 +770,6 @@ async function main() {
       frameIntervals: renderer.frames,
       sustainedLongTasks: renderer.sustainedLongTasks,
       unexplainedLongTasksOver200Ms: renderer.unexplainedLongTasksOver200Ms,
-      conversationPatchIpcBytes: renderer.ipcBytes,
-      conversationPatchIpcBytesPerSecond: renderer.ipcBytes / (evidence.durationMs / 1000),
     })
     evidence.reactCommits = await reactInspection.stop()
     if (reactCommitObservationComplete(evidence.reactCommits))
@@ -761,6 +794,7 @@ async function main() {
     }
     const final = await page.evaluate(() => globalThis.pact.getRuntimeHealth())
     if (!final.ok) throw new Error('Final Utility health is missing')
+    observeIpc(final.value.ipcTraffic, performance.now() - ipcStarted)
     evidence.resourceFinal = final.value.conversation ?? {}
     if (!final.value.performance || final.value.performance.eventLoopSamples < 100)
       evidence.missingObservations.push('complete-utility-event-loop-sampling')

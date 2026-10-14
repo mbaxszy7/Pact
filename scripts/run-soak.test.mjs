@@ -14,6 +14,169 @@ import {
 } from './soak-statistics.mjs'
 
 const reactProbeKey = '__pactSoakReact_' + 'a'.repeat(64)
+const zeroIpcCounts = () => ({
+  messages: 0,
+  incompleteMessages: 0,
+  jsonBytes: 0,
+  binaryBytes: 0,
+  totalBytes: 0,
+})
+const evaluateIpcGate = (input) =>
+  evaluateSoak({ durationMs: 7_200_000, missingObservations: [], ipcTraffic: input }, 7_200_000)
+function completeIpcEvidence(durationMs = 7_200_000) {
+  const unit = 'json-utf8-null-binary-skeleton-plus-visible-binary-bytes'
+  const categories = {
+    'renderer-bridge': [
+      'renderer-main.invoke',
+      'main-renderer.reply',
+      'renderer-main.send',
+      'main-renderer.event',
+    ],
+    'main-utility': [
+      'main-utility.request',
+      'utility-main.reply',
+      'utility-main.event',
+      'main-utility.control',
+      'utility-main.control',
+    ],
+  }
+  const snapshot = {
+    schemaVersion: 1,
+    unit,
+    complete: true,
+    uncovered: [],
+    owners: Object.entries(categories).map(([owner, entries], index) => ({
+      owner,
+      epoch: `00000000-0000-4000-8000-00000000000${index + 1}`,
+      transportEpoch: 1,
+      complete: true,
+      issues: [],
+      counters: entries.map((category) => ({
+        category,
+        business: zeroIpcCounts(),
+        control: zeroIpcCounts(),
+      })),
+    })),
+  }
+  return {
+    observed: true,
+    complete: true,
+    unit,
+    observedDurationMs: durationMs,
+    issues: [],
+    businessBytes: 0,
+    controlBytes: 0,
+    baseline: structuredClone(snapshot),
+    snapshot,
+  }
+}
+
+void test('IPC acceptance independently rejects missing, partial, overflowed and discontinuous report facts', () => {
+  const ipcTraffic = completeIpcEvidence()
+  assert.equal(
+    evaluateIpcGate(ipcTraffic).unmetBudgets.includes('complete-logical-ipc-traffic'),
+    false,
+  )
+  const invalid = [
+    undefined,
+    { ...ipcTraffic, complete: false },
+    { ...ipcTraffic, issues: ['counter_overflow'] },
+    { ...ipcTraffic, unit: 'wire-bytes' },
+    { ...ipcTraffic, observedDurationMs: 7_199_999 },
+    { ...ipcTraffic, baseline: undefined },
+    { ...ipcTraffic, businessBytes: 1 },
+  ]
+  for (const mutate of [
+    (value) => {
+      value.snapshot.uncovered.push('main-directory-worker')
+    },
+    (value) => {
+      value.snapshot.owners[0].complete = false
+    },
+    (value) => {
+      value.snapshot.owners[0] = null
+    },
+    (value) => {
+      value.snapshot.owners[0].owner = 'constructor'
+    },
+    (value) => {
+      value.snapshot.owners[0].counters[0] = null
+    },
+    (value) => {
+      value.snapshot.owners[0].issues.push('counter_overflow')
+    },
+    (value) => {
+      value.snapshot.owners[0].epoch = '00000000-0000-4000-8000-000000000099'
+    },
+    (value) => {
+      value.snapshot.owners[0].transportEpoch = 3
+    },
+    (value) => {
+      value.snapshot.owners[0].counters.pop()
+    },
+    (value) => {
+      value.snapshot.owners[0].counters[0].business.messages = 1_000_001
+    },
+    (value) => {
+      value.snapshot.owners[0].counters[0].business.jsonBytes = Number.MAX_SAFE_INTEGER + 1
+    },
+    (value) => {
+      value.snapshot.owners[0].counters[0].business.incompleteMessages = 1
+    },
+    (value) => {
+      value.baseline.owners[0].counters[0].business.messages = 1
+    },
+  ]) {
+    const value = structuredClone(ipcTraffic)
+    mutate(value)
+    invalid.push(value)
+  }
+  for (const value of invalid)
+    assert(evaluateIpcGate(value).unmetBudgets.includes('complete-logical-ipc-traffic'))
+})
+
+void test('actual logical IPC projections keep partial hops, failed owners and resets blocking', async () => {
+  await import('./soak-module-loader.mjs')
+  const { LogicalIpcTrafficCollector, logicalIpcTrafficSnapshot, projectLogicalIpcTraffic } =
+    await import('../apps/desktop/src/shared/logical-ipc-traffic.ts')
+  const main = new LogicalIpcTrafficCollector(
+    'main-utility',
+    '00000000-0000-4000-8000-000000000001',
+  )
+  const preload = new LogicalIpcTrafficCollector(
+    'renderer-bridge',
+    '00000000-0000-4000-8000-000000000002',
+  )
+  main.record('main-utility.request', 'business', { input: 'fixture' })
+  preload.record('renderer-main.invoke', 'control', [])
+  const observation = logicalIpcTrafficSnapshot(main.snapshot())
+  observation.owners.push(preload.snapshot())
+  observation.uncovered = observation.uncovered.filter((hop) => hop !== 'renderer-main-bridge')
+  const projected = projectLogicalIpcTraffic(observation)
+  assert.equal(projected.observed, true)
+  assert.equal(projected.businessBytes, Buffer.byteLength('{"input":"fixture"}'))
+  assert.equal(projected.controlBytes, 2)
+  assert.equal(projected.complete, false)
+  assert(projected.issues.includes('uncovered:main-directory-worker'))
+  const budget = evaluateSoak(
+    { durationMs: 3_600_000, missingObservations: ['complete-ipc-traffic'] },
+    3_600_000,
+  )
+  assert(budget.unmetBudgets.includes('unobserved:complete-ipc-traffic'))
+  assert.equal(budget.budgetPass, false)
+  main.invalidate('transport_error')
+  observation.owners[0] = main.snapshot()
+  assert(projectLogicalIpcTraffic(observation).issues.includes('main-utility:transport_error'))
+  const previous = structuredClone(observation)
+  observation.owners[0] = new LogicalIpcTrafficCollector(
+    'main-utility',
+    '00000000-0000-4000-8000-000000000003',
+  ).snapshot()
+  assert(
+    projectLogicalIpcTraffic(observation, previous).issues.includes('main-utility:epoch-reset'),
+  )
+  assert.equal(projectLogicalIpcTraffic(undefined).observed, false)
+})
 function reactRealm(before) {
   const realm = createContext({ location: { href: 'app://bundle/index.html' } })
   runInContext('globalThis.top = globalThis', realm)
@@ -253,6 +416,7 @@ void test('continuous two-hour duration is actual elapsed evidence, not an E2E t
       cleanupVerified: true,
     },
     missingObservations: [],
+    ipcTraffic: completeIpcEvidence(),
   }
   assert.equal(evaluateSoak(evidence, 7_200_000).budgetPass, true)
   assert.equal(evaluateSoak({ ...evidence, durationMs: 7_199_999 }, 7_200_000).budgetPass, false)

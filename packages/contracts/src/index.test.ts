@@ -8,12 +8,39 @@ import {
   conversationSendInputSchema,
   runtimePreparationSchema,
   runtimeHealthSchema,
+  IPC_TRAFFIC_UNIT,
+  ipcTrafficSchema,
 } from './index.js'
 
 const uuid = (index: number): string =>
   `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`
 
 describe('foundation contracts', () => {
+  it('keeps optional IPC health backward compatible and rejects fabricated full coverage', () => {
+    const health = {
+      status: 'ready',
+      database: 'ready',
+      pid: 100,
+      checkedAt: new Date().toISOString(),
+    }
+    expect(runtimeHealthSchema.safeParse(health).success).toBe(true)
+    const observation = {
+      schemaVersion: 1,
+      unit: IPC_TRAFFIC_UNIT,
+      complete: false,
+      owners: [],
+      uncovered: ['main-directory-worker'],
+    }
+    expect(runtimeHealthSchema.safeParse({ ...health, ipcTraffic: observation }).success).toBe(true)
+    expect(ipcTrafficSchema.safeParse({ ...observation, complete: true }).success).toBe(false)
+    expect(
+      ipcTrafficSchema.safeParse({ ...observation, unit: 'electron-wire-bytes' }).success,
+    ).toBe(false)
+    expect(
+      ipcTrafficSchema.safeParse({ ...observation, payload: 'never-export-business-facts' })
+        .success,
+    ).toBe(false)
+  })
   it('preserves native aliases with optional exact wire identity and accepts old catalogs', () => {
     const old = { id: 'haiku', displayName: 'Haiku', supportedEfforts: ['low', 'high'] }
     expect(agentModelOptionSchema.parse(old)).toEqual(old)

@@ -220,7 +220,149 @@ export const appInfoSchema = z.object({
 
 export type AppInfo = z.infer<typeof appInfoSchema>
 
+export const IPC_TRAFFIC_UNIT = 'json-utf8-null-binary-skeleton-plus-visible-binary-bytes' as const
+export const ipcTrafficCategorySchema = z.enum([
+  'renderer-main.invoke',
+  'main-renderer.reply',
+  'renderer-main.send',
+  'main-renderer.event',
+  'main-utility.request',
+  'utility-main.reply',
+  'utility-main.event',
+  'main-utility.control',
+  'utility-main.control',
+])
+export type IpcTrafficCategory = z.infer<typeof ipcTrafficCategorySchema>
+export const ipcTrafficIssueSchema = z.enum([
+  'invalid_limits',
+  'byte_limit',
+  'node_limit',
+  'depth_limit',
+  'unsupported_value',
+  'unsupported_prototype',
+  'unsupported_binary',
+  'accessor',
+  'to_json',
+  'cycle',
+  'uninspectable',
+  'counter_overflow',
+  'epoch_limit',
+  'invalid_epoch',
+  'unvalidated_message',
+  'transport_error',
+  'unknown_category',
+  'disposed',
+  'cleanup_unavailable',
+])
+export type IpcTrafficIssue = z.infer<typeof ipcTrafficIssueSchema>
+export const ipcTrafficUncoveredSchema = z.enum([
+  'renderer-main-bridge',
+  'main-utility-diagnostic-control',
+  'main-directory-worker',
+  'utility-markdown-worker',
+  'utility-image-codec-worker',
+  'utility-native-json-worker',
+  'utility-native-fork-worker',
+  'main-diagnostic-log-worker',
+  'renderer-monaco-workers',
+])
+const ipcTrafficCountsSchema = z
+  .strictObject({
+    messages: z.number().int().min(0).max(1_000_000),
+    incompleteMessages: z.number().int().min(0).max(1_000_000),
+    jsonBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    binaryBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    totalBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  })
+  .refine(
+    (value) =>
+      value.totalBytes === value.jsonBytes + value.binaryBytes &&
+      value.incompleteMessages <= value.messages,
+  )
+export const ipcTrafficOwnerSnapshotSchema = z
+  .strictObject({
+    owner: z.enum(['renderer-bridge', 'main-utility']),
+    epoch: z.uuid().nullable(),
+    transportEpoch: z.number().int().min(1).max(64),
+    complete: z.boolean(),
+    issues: z.array(ipcTrafficIssueSchema).max(19),
+    counters: z
+      .array(
+        z.strictObject({
+          category: ipcTrafficCategorySchema,
+          business: ipcTrafficCountsSchema,
+          control: ipcTrafficCountsSchema,
+        }),
+      )
+      .max(9),
+  })
+  .refine(
+    (value) =>
+      new Set(value.counters.map((row) => row.category)).size === value.counters.length &&
+      value.counters.length === (value.owner === 'renderer-bridge' ? 4 : 5) &&
+      value.counters.every((row) =>
+        value.owner === 'renderer-bridge'
+          ? [
+              'renderer-main.invoke',
+              'main-renderer.reply',
+              'renderer-main.send',
+              'main-renderer.event',
+            ].includes(row.category)
+          : [
+              'main-utility.request',
+              'utility-main.reply',
+              'utility-main.event',
+              'main-utility.control',
+              'utility-main.control',
+            ].includes(row.category),
+      ) &&
+      new Set(value.issues).size === value.issues.length &&
+      Number.isSafeInteger(
+        value.counters.reduce(
+          (total, row) => total + row.business.totalBytes + row.control.totalBytes,
+          0,
+        ),
+      ) &&
+      (!value.complete ||
+        (value.epoch !== null &&
+          value.issues.length === 0 &&
+          value.counters.every(
+            (row) => row.business.incompleteMessages === 0 && row.control.incompleteMessages === 0,
+          ))),
+  )
+export type IpcTrafficOwnerSnapshot = z.infer<typeof ipcTrafficOwnerSnapshotSchema>
+export const ipcTrafficSchema = z
+  .strictObject({
+    schemaVersion: z.literal(1),
+    unit: z.literal(IPC_TRAFFIC_UNIT),
+    complete: z.boolean(),
+    owners: z.array(ipcTrafficOwnerSnapshotSchema).max(2),
+    uncovered: z.array(ipcTrafficUncoveredSchema).max(9),
+  })
+  .refine(
+    (value) =>
+      new Set(value.owners.map((owner) => owner.owner)).size === value.owners.length &&
+      new Set(value.uncovered).size === value.uncovered.length &&
+      Number.isSafeInteger(
+        value.owners.reduce(
+          (total, owner) =>
+            total +
+            owner.counters.reduce(
+              (bytes, row) => bytes + row.business.totalBytes + row.control.totalBytes,
+              0,
+            ),
+          0,
+        ),
+      ) &&
+      (!value.complete ||
+        (value.owners.length === 2 &&
+          value.uncovered.length === 0 &&
+          value.owners.every((owner) => owner.complete))),
+  )
+export type IpcTraffic = z.infer<typeof ipcTrafficSchema>
+
 export const runtimeHealthSchema = z.object({
+  ipcTraffic: ipcTrafficSchema.optional(),
   performance: z
     .strictObject({
       eventLoopLagP95Ms: z.number().finite().nonnegative(),
