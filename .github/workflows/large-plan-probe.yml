@@ -1,0 +1,29 @@
+name: Large plan diagnosis
+
+on:
+  push:
+    branches: [codex/pact-ci-governance]
+    paths:
+      - .github/workflows/large-plan-probe.yml
+      - apps/desktop/src/utility/conversation/conversation-collaboration.test.ts
+
+permissions:
+  contents: read
+
+jobs:
+  large-plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Original large-source case with bounded numeric phase observations
+        env:
+          PACT_TEST_SOURCE_METRICS: '1'
+        run: >-
+          pnpm exec vitest run
+          apps/desktop/src/utility/conversation/conversation-collaboration.test.ts
+          -t 'continues an approved complete 9 MiB plan'
+          --maxWorkers=1 --reporter=verbose

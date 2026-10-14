@@ -35,6 +35,19 @@ import { collaborationReadOnly } from './collaboration-prompt.js'
 import { Conversation } from './conversation.js'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
 
+let largePlanMetrics: { started: number; events: number } | undefined
+const metric = (phase: string, since: number, numbers: Record<string, number> = {}): void => {
+  if (!largePlanMetrics) return
+  if (++largePlanMetrics.events > 32) throw new Error('Large-source metric inventory exceeded')
+  console.log(
+    JSON.stringify({
+      largePlanMetric: phase,
+      ms: Math.round((performance.now() - since) * 100) / 100,
+      ...numbers,
+    }),
+  )
+}
+
 const markdownWorker = vi.hoisted(() => ({ path: '' }))
 vi.mock('node:worker_threads', async (original) => {
   const actual = await original<typeof import('node:worker_threads')>()
@@ -204,6 +217,8 @@ function adapter(agentId: RuntimeAgentId) {
       for (const document of [phase.planDocument, phase.taskDocument].filter(
         (source) => source !== undefined,
       )) {
+        const measuredAt = largePlanMetrics ? performance.now() : 0
+        let pages = 0
         let offset = 0,
           largestReply = 0
         const hash = createHash('sha256')
@@ -213,6 +228,7 @@ function adapter(agentId: RuntimeAgentId) {
             document,
             offset,
           })
+          pages++
           hash.update(page.text)
           largestReply = Math.max(largestReply, Buffer.byteLength(JSON.stringify(page)))
           offset += page.text.length
@@ -220,6 +236,11 @@ function adapter(agentId: RuntimeAgentId) {
           if (page.nextOffset !== offset)
             throw Error('Source continuation skipped or repeated text')
         }
+        metric(document === phase.planDocument ? 'plan-pages' : 'task-pages', measuredAt, {
+          turn: native.inputs.length,
+          pages,
+          chars: offset,
+        })
         native.sources.push({
           runId: input.runId,
           id: document.id,
@@ -230,6 +251,8 @@ function adapter(agentId: RuntimeAgentId) {
       }
       const priorSource = phase.priorResultDocument ?? phase.resultDocument
       if (priorSource) {
+        const measuredAt = largePlanMetrics ? performance.now() : 0
+        let pages = 0
         let text = '',
           offset = 0
         for (;;) {
@@ -238,11 +261,17 @@ function adapter(agentId: RuntimeAgentId) {
             document: priorSource,
             offset,
           })
+          pages++
           text += page.text
           if (page.nextOffset === null) break
           offset = page.nextOffset
         }
         collaborationResultSchema.parse(JSON.parse(text))
+        metric('prior-result-pages', measuredAt, {
+          turn: native.inputs.length,
+          pages,
+          chars: text.length,
+        })
       }
       const submission = collaborationSubmission(phase),
         comments = frozenComments(input),
@@ -320,8 +349,12 @@ function adapter(agentId: RuntimeAgentId) {
         answer: `${phase.stage} complete.`,
         result,
       }
+      const carrierStarted = largePlanMetrics ? performance.now() : 0
       input.recordCollaborationCarrierText?.(JSON.stringify(carrier))
+      metric('carrier-text', carrierStarted, { turn: native.inputs.length })
+      const carrierParsed = largePlanMetrics ? performance.now() : 0
       input.recordCollaborationCarrier?.(JSON.parse(JSON.stringify(carrier)))
+      metric('carrier-parse', carrierParsed, { turn: native.inputs.length })
       yield {
         agentId,
         type: 'collaboration.result',
@@ -379,6 +412,7 @@ afterEach(async () => {
   native.output = true
   native.sources = []
   native.comments = []
+  largePlanMetrics = undefined
   vi.restoreAllMocks()
 })
 
@@ -459,7 +493,10 @@ async function fixture(primaryAgentId: RuntimeAgentId = 'codex', databaseInProje
       expect(db.conversationRepository.nativeRecoveryBlocksInput(sessionId)).toBe(false),
     )
     await vi.waitFor(() => expect(flow.diagnostics().activeExecutions).toBe(0))
-    return db.conversationRepository.collaboration(sessionId, undefined, true)!
+    const measuredAt = largePlanMetrics ? performance.now() : 0
+    const result = db.conversationRepository.collaboration(sessionId, undefined, true)!
+    metric('settled-hydrate', measuredAt, { turn: native.inputs.length })
+    return result
   }
   const act = async (action: CollaborationAction) => {
     const task = db.conversationRepository.collaboration(sessionId)!
@@ -539,9 +576,13 @@ describe('Pact workflow admission and durable dispatch', () => {
   it(
     'continues an approved complete 9 MiB plan through the source reader without hydrating preflight or starting extra Turns',
     async () => {
+      if (process.env.PACT_TEST_SOURCE_METRICS === '1')
+        largePlanMetrics = { started: performance.now(), events: 0 }
+      const measuredFixture = largePlanMetrics ? performance.now() : 0
       const f = await fixture(),
         plan =
           '## Scope\n\n```text\n' + 'x'.repeat(9 * 1024 * 1024) + '\n```\n\nVerify the true tail.'
+      metric('fixture', measuredFixture)
       native.next = {
         plan,
         summary: 'Complete large plan.',
@@ -579,6 +620,7 @@ describe('Pact workflow admission and durable dispatch', () => {
       expect(reviewed.result?.todoDeltas).toHaveLength(40)
       expect(reviewed.result?.todoDeltas.every((delta) => delta.operation === 'confirm')).toBe(true)
       expect(native.inputs).toHaveLength(4)
+      if (largePlanMetrics) metric('whole-case', largePlanMetrics.started)
       // Windows runs four complete Turns and three full 9 MiB source reads in this scenario.
       // Its aggregate test deadline is separate from the unchanged per-operation runtime limits.
     },
