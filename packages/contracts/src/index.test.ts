@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  agentModelOptionSchema,
   appearanceSettingsUpdateSchema,
   appearanceSnapshotSchema,
   appInfoSchema,
@@ -13,6 +14,18 @@ const uuid = (index: number): string =>
   `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`
 
 describe('foundation contracts', () => {
+  it('preserves native aliases with optional exact wire identity and accepts old catalogs', () => {
+    const old = { id: 'haiku', displayName: 'Haiku', supportedEfforts: ['low', 'high'] }
+    expect(agentModelOptionSchema.parse(old)).toEqual(old)
+    expect(agentModelOptionSchema.parse({ ...old, resolvedModel: 'configured-wire[1m]' })).toEqual({
+      ...old,
+      resolvedModel: 'configured-wire[1m]',
+    })
+    expect(agentModelOptionSchema.safeParse({ ...old, resolvedModel: '' }).success).toBe(false)
+    expect(
+      agentModelOptionSchema.safeParse({ ...old, resolvedModel: 'x'.repeat(241) }).success,
+    ).toBe(false)
+  })
   it('accepts valid app metadata', () => {
     expect(
       appInfoSchema.parse({

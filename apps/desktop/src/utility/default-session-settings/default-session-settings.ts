@@ -437,6 +437,7 @@ export class DefaultSessionSettings {
   private static toClaudeModelOption(model: ModelInfo): AgentModelOption {
     return {
       id: model.value,
+      ...(model.resolvedModel ? { resolvedModel: model.resolvedModel } : {}),
       displayName: model.displayName,
       supportedEfforts: model.supportedEffortLevels ?? [],
     }

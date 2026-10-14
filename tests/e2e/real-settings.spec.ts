@@ -26,6 +26,7 @@ import {
   waitForRealCompletion,
   type RealWorkspace,
 } from './real-harness.js'
+import { resolveRealConfiguredModel } from './real-model-selection.js'
 import { findNativeRecord, type NativeEvidence } from './real-native-evidence.js'
 import { test } from './runtime-fixture.js'
 import { windowsTextCommand } from './windows-test-command.js'
@@ -351,8 +352,8 @@ function supportedSelections(
 ): Selections {
   if (catalog.status !== 'available')
     throw new Error(`${catalog.agentId} actual CLI catalog is unavailable`)
-  const configured = configuredModel && catalog.models.find((model) => model.id === configuredModel)
-  if (!configured || configured.supportedEfforts.length < 2)
+  const configured = resolveRealConfiguredModel(catalog, configuredModel)
+  if (configured.supportedEfforts.length < 2)
     throw new Error(
       `${catalog.agentId} configured model has fewer than two native-supported effort options`,
     )

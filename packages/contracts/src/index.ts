@@ -350,6 +350,8 @@ export type DefaultSessionSettingsState = z.infer<typeof defaultSessionSettingsS
 
 export const agentModelOptionSchema = z.strictObject({
   id: z.string().min(1),
+  // A CLI alias may resolve to a different wire ID for this configuration/CWD.
+  resolvedModel: z.string().min(1).max(240).optional(),
   displayName: z.string().min(1),
   supportedEfforts: z.array(z.string().min(1)),
   defaultEffort: z.string().min(1).optional(),

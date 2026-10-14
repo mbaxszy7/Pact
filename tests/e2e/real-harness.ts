@@ -5,6 +5,7 @@ import { writeFile } from 'node:fs/promises'
 import type { ConversationSnapshot, DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
+import { resolveRealConfiguredModel } from './real-model-selection.js'
 import {
   createRuntimeFixture,
   test,
@@ -266,40 +267,45 @@ export async function selectRealConfiguredEffort(
 ): Promise<void> {
   if (agentIds.length < 1 || agentIds.length > 2 || new Set(agentIds).size !== agentIds.length)
     throw new Error('Real effort selection requires one or two unique Agents')
-  // Select only an effort advertised by the selected real CLI for the user's configured
-  // model. This bounds review latency without changing any source config file.
+  // Keep the configured wire model while choosing an actual native alias/effort.
+  const state = await ctx.page.evaluate(async (sessionId) => {
+    const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+    return bridge.getSessionSettings(sessionId)
+  }, ctx.sessionId)
+  if (!state.ok) throw new Error('Actual Session settings are unavailable')
+  const previous = state.value.session.settings,
+    agents = { ...previous.agents },
+    models = ctx.fixture.readConfigurationModels()
+  for (const agent of agentIds) {
+    const model = resolveRealConfiguredModel(
+      state.value.modelCatalogs[agent],
+      models[agent],
+      agents[agent].model,
+    )
+    agents[agent] = {
+      model: model.id,
+      effort: model.supportedEfforts.includes('low') ? 'low' : (model.supportedEfforts[0] ?? null),
+    }
+  }
   const saved = await ctx.page.evaluate(
-    async ({ sessionId, models, agentIds: selectedAgents }) => {
+    async ({ sessionId, settings }) => {
       const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
-      const state = await bridge.getSessionSettings(sessionId)
-      if (!state.ok) throw new Error('Actual Session settings are unavailable')
-      const agents = { ...state.value.session.settings.agents }
-      for (const agent of selectedAgents) {
-        const catalog = state.value.modelCatalogs[agent]
-        const model = catalog.models.find((item) => item.id === models[agent])
-        if (catalog.status !== 'available' || !model)
-          throw new Error('Configured real model is absent from the actual CLI catalog')
-        agents[agent] = {
-          model: model.id,
-          effort: model.supportedEfforts.includes('low')
-            ? 'low'
-            : (model.supportedEfforts[0] ?? null),
-        }
-      }
-      const previous = state.value.session.settings
       return bridge.saveSessionSettings({
         sessionId,
-        settings: {
-          primaryAgentId: previous.primaryAgentId,
-          agents,
-          maxDiscussionRounds: previous.maxDiscussionRounds,
-          runningMessagePolicy: previous.runningMessagePolicy,
-          maxReviewCycles: previous.maxReviewCycles,
-          maxRepairAttempts: previous.maxRepairAttempts,
-        },
+        settings,
       })
     },
-    { sessionId: ctx.sessionId, models: ctx.fixture.readConfigurationModels(), agentIds },
+    {
+      sessionId: ctx.sessionId,
+      settings: {
+        primaryAgentId: previous.primaryAgentId,
+        agents,
+        maxDiscussionRounds: previous.maxDiscussionRounds,
+        runningMessagePolicy: previous.runningMessagePolicy,
+        maxReviewCycles: previous.maxReviewCycles,
+        maxRepairAttempts: previous.maxRepairAttempts,
+      },
+    },
   )
   expect(saved.ok).toBe(true)
 }
