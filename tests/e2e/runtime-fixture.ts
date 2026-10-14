@@ -42,12 +42,6 @@ const repositoryRoot = resolve(import.meta.dirname, '../..')
 const desktopRoot = resolve(repositoryRoot, 'apps/desktop')
 const migrationsFolder = resolve(repositoryRoot, 'packages/persistence/drizzle')
 const requireFromDesktop = createRequire(resolve(desktopRoot, 'package.json'))
-const electronModule: unknown = requireFromDesktop('electron')
-
-if (typeof electronModule !== 'string') {
-  throw new TypeError('The Electron package did not return an executable path')
-}
-const electronExecutable = electronModule
 
 const ownedFixtures = new Set<() => Promise<void>>()
 const creatingFixtures = new Map<
@@ -871,6 +865,11 @@ export async function createRuntimeFixture(
                 if (aliases[0] !== aliases[1])
                   throw new Error('Test environment cannot change native storage roots')
               }
+              // Test discovery imports this fixture without needing an Electron installation.
+              const electronModule: unknown = requireFromDesktop('electron')
+              if (typeof electronModule !== 'string')
+                throw new TypeError('The Electron package did not return an executable path')
+              const electronExecutable = electronModule
               if (process.platform === 'win32') {
                 if (launchCount >= 64) throw new Error('Windows fixture launch capacity exceeded')
                 launchCount++
