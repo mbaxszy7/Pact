@@ -10,7 +10,7 @@ for (const command of ['ordinary', '/plan', '/build', '/review'] as const)
   test(
     `same authorized ${command} Turn publishes metadata without a Native name`,
     { tag: '@deterministic' },
-    async () => {
+    async ({ browserName: _browserName }, testInfo) => {
       const fixture = await createRuntimeFixture({
         codexAppServer: command === 'ordinary' ? 'complete' : 'collaboration',
         claudeConversation: 'collaboration',
@@ -43,8 +43,8 @@ for (const command of ['ordinary', '/plan', '/build', '/review'] as const)
       )
       db.close()
       const app = await fixture.launch()
+      const page = await app.firstWindow()
       try {
-        const page = await app.firstWindow()
         await page.getByRole('button', { name: 'New session', exact: true }).click()
         const editor = page.getByRole('combobox', { name: 'Message', exact: true })
         await editor.fill(
@@ -67,6 +67,50 @@ for (const command of ['ordinary', '/plan', '/build', '/review'] as const)
         await expect(
           page.getByRole('heading', { name: 'My deliberate title', exact: true }),
         ).toBeVisible()
+      } catch (error) {
+        try {
+          const observations = await page.evaluate(() => {
+            const input = document.querySelector<HTMLInputElement>('[aria-label="Session title"]')
+            const save = document.querySelector<HTMLButtonElement>(
+              '[aria-label="Save Session title"]',
+            )
+            return {
+              schemaVersion: 1,
+              phase: 'authorized-title-and-manual-rename',
+              width: window.innerWidth,
+              height: window.innerHeight,
+              visibility: document.visibilityState,
+              focusedTitleInput: input !== null && document.activeElement === input,
+              titleInputPresent: input !== null,
+              deliberateDraftPresent: input?.value === 'My deliberate title',
+              savePresent: save !== null,
+              saveDisabled: save?.disabled ?? null,
+              deliberateTitlePresent: [...document.querySelectorAll('h1')].some(
+                (heading) => heading.textContent === 'My deliberate title',
+              ),
+              openContextOverlays: document.querySelectorAll(
+                '.workspace-context-overlay[data-open="true"]',
+              ).length,
+              workingIndicators: document.querySelectorAll('[aria-label$="is responding"]').length,
+            }
+          })
+          const body = Buffer.from(JSON.stringify(observations))
+          if (body.byteLength > 4096)
+            throw new Error('Native title scalar diagnostics exceed their byte bound', {
+              cause: error,
+            })
+          await testInfo.attach('native-title-scalar-diagnostics', {
+            body,
+            contentType: 'application/json',
+          })
+        } catch (diagnosticError) {
+          throw new AggregateError(
+            [error],
+            'Native title failed and scalar diagnostics were unavailable',
+            { cause: diagnosticError },
+          )
+        }
+        throw error
       } finally {
         await app.close()
         await fixture.dispose()

@@ -446,7 +446,7 @@ test(
             set(value: string) {
               increment('sourcePropertyWrites')
               if (value === thumbnail) increment('matchingThumbnailProperties')
-              sourceProperty.set!.call(this, value)
+              sourceProperty.set!.call(this, value === thumbnail ? pending : value)
             },
           })
         URL.createObjectURL = function (blob) {

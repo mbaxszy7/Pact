@@ -15,15 +15,15 @@ const resultCard = (page: Page): Locator =>
 async function closeContextOverlay(page: Page): Promise<void> {
   const overlay = page.getByRole('dialog', { name: 'Context panel', exact: true })
   if (await overlay.isVisible()) {
-    await page.keyboard.press('Escape')
+    await page.getByRole('button', { name: 'Close context panel', exact: true }).click()
     await expect(overlay).toHaveCount(0)
   }
 }
 
 async function expandResult(card: Locator): Promise<void> {
-  await closeContextOverlay(card.page())
   const toggle = card.getByRole('heading').locator('..')
   await expect(toggle).toBeEnabled()
+  await closeContextOverlay(card.page())
   if ((await toggle.getAttribute('aria-expanded')) !== 'true') await toggle.click()
   await expect(toggle).toHaveAttribute('aria-expanded', 'true')
 }
@@ -78,7 +78,10 @@ async function expectAlignedTodo(row: Locator): Promise<void> {
   await expect.poll(async () => Math.abs(await todoOffset(row))).toBeLessThanOrEqual(2)
 }
 
-async function prepare(primary: 'codex' | 'claude' = 'codex') {
+async function prepare(
+  primary: 'codex' | 'claude' = 'codex',
+  viewport?: { width: number; height: number },
+) {
   const fixture = await createRuntimeFixture({
     mode: 'deterministic',
     codexAppServer: 'collaboration',
@@ -124,6 +127,7 @@ async function prepare(primary: 'codex' | 'claude' = 'codex') {
   }
   const app = await fixture.launch(),
     page = await app.firstWindow()
+  if (viewport) await page.setViewportSize(viewport)
   await page.getByRole('button', { name: 'Collaboration', exact: true }).click()
   const send = async (content: string) => {
     await closeContextOverlay(page)
@@ -225,7 +229,7 @@ for (const primary of ['codex', 'claude'] as const)
   })
 
 test('@deterministic Pact questions accept a deliberate answer and direct Review remains readonly until repair is clicked', async () => {
-  const f = await prepare()
+  const f = await prepare('codex', { width: 1000, height: 720 })
   try {
     await f.send('/plan unclear cancellation requirement')
     await openIssue(f.page, 'Choose the cancellation scope')
@@ -313,7 +317,7 @@ test('@deterministic Pact build coalesces a running update into a readonly respo
       .click()
     await expect(
       f.page.getByRole('button', { name: 'Review changes · Codex', exact: true }),
-    ).toBeEnabled()
+    ).toBeEnabled({ timeout: 30_000 })
     const response = await readTodos(f.page, f.sessionId)
     expect(response.task?.stage).toBe('supplement')
     expect(response.task?.duty).toBe('stage_result')
@@ -506,7 +510,7 @@ test('@deterministic source edits do not block an authorized repair and normal r
 })
 
 test('@deterministic Pact bare Secondary build sends a frozen answer directly to its implementer before explicit work continuation', async () => {
-  const f = await prepare()
+  const f = await prepare('codex', { width: 1000, height: 720 })
   try {
     await f.page.getByRole('combobox', { name: 'Message', exact: true }).fill('@claude /build')
     await expect

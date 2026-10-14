@@ -1,9 +1,11 @@
 import { expect, type ElectronApplication, type Page } from '@playwright/test'
 import { randomUUID } from 'node:crypto'
-import { writeFile } from 'node:fs/promises'
+import { lstat, open, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 
 import type { ConversationSnapshot, DesktopBridge } from '../../packages/contracts/src/index.js'
 
+import { diagnosticRecordSchema } from '../../packages/contracts/src/diagnostics.js'
 import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import { resolveRealConfiguredModel } from './real-model-selection.js'
 import {
@@ -15,6 +17,39 @@ import {
 
 const maxRuns = 128
 const maxBodyBytes = 8 * 1024 * 1024
+
+/** Keep only fixed startup enums before this fixture's cleanup removes its private logs. */
+async function readCatalogFailures(fixture: RuntimeFixture): Promise<unknown> {
+  try {
+    const path = join(dirname(fixture.databaseFile), 'logs/development/pact-0.jsonl')
+    const info = await lstat(path)
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 64 * 1024)
+      return { status: 'unavailable' }
+    const file = await open(path, 'r')
+    try {
+      const bytes = Buffer.alloc(info.size)
+      const { bytesRead } = await file.read(bytes, 0, bytes.length, 0)
+      const lines = bytes.subarray(0, bytesRead).toString('utf8').split('\n')
+      if (lines.length > 256) return { status: 'unavailable' }
+      const events = lines.flatMap((line) => {
+        if (!line) return []
+        const parsed = diagnosticRecordSchema.safeParse(JSON.parse(line))
+        if (!parsed.success || !parsed.data.settingsCatalogPhase) return []
+        return [
+          {
+            phase: parsed.data.settingsCatalogPhase,
+            failure: parsed.data.settingsCatalogFailure ?? 'other',
+          },
+        ]
+      })
+      return events.length <= 32 ? { status: 'observed', events } : { status: 'overflow' }
+    } finally {
+      await file.close()
+    }
+  } catch {
+    return { status: 'unavailable' }
+  }
+}
 
 export interface RealWorkspace {
   fixture: RuntimeFixture
@@ -104,6 +139,7 @@ export async function launchRealWorkspace(
             JSON.stringify({
               failure: error instanceof Error ? error.message : 'Session creation failed',
               startup: dialog.slice(0, 6_000),
+              catalogFailureDiagnostics: await readCatalogFailures(fixture),
             }),
           ),
         )
