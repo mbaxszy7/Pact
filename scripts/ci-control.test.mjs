@@ -20,17 +20,24 @@ import {
 
 const head = 'a'.repeat(40),
   base = 'b'.repeat(40),
-  candidate = 'c'.repeat(40)
+  candidate = 'c'.repeat(40),
+  tree = 'd'.repeat(40)
 const identity = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   repository: 'mbaxszy7/Pact',
+  repositoryId: 1416403312,
+  headRepositoryId: 1416403312,
   pullRequest: 7,
   headSha: head,
   baseSha: base,
   candidateSha: candidate,
+  treeSha: tree,
+  policySha: base,
   authorId: 31481964,
   channel: 'dev',
 }
+const commit = { sha: candidate, tree: { sha: tree }, parents: [{ sha: base }, { sha: head }] }
+const currentFacts = { commit, mainSha: base }
 const pr = {
   number: 7,
   state: 'open',
@@ -63,6 +70,10 @@ void test('only the fixed base CI workflow can supply candidate evidence', () =>
     { pull_requests: [{ number: 8, head: { sha: head }, base: { sha: base } }] },
   ])
     assert.throws(() => validateSourceRun({ ...sourceRun, ...change }, identity, 50))
+  assert.throws(
+    () => validateSourceRun({ ...sourceRun, workflow_id: undefined }, identity, undefined),
+    /unresolved/,
+  )
 })
 
 void test('an older run/attempt cannot publish after a newer same-PR failure or an ambiguous newer run', () => {
@@ -169,6 +180,131 @@ void test('logical run numbers order generations independently of unique run IDs
   )
 })
 
+void test('missing scope metadata on a newer failed generation is ambiguous rather than unrelated', () => {
+  for (const field of ['event', 'head_sha', 'workflow_id']) {
+    for (const value of [undefined, null, 0, -1, 1.5, {}, '']) {
+      const newer = { ...sourceRun, id: 101, run_number: 11, conclusion: 'failure', [field]: value }
+      assert.throws(
+        () => requireLatestGeneration([sourceRun, newer], sourceRun, identity),
+        /metadata|unresolved/,
+      )
+    }
+  }
+  const provider = { ...sourceRun, head_branch: 'main' }
+  for (const field of ['head_branch', 'head_sha', 'workflow_id']) {
+    for (const value of [undefined, null, 0, -1, 1.5, {}, '']) {
+      const newer = { ...provider, id: 101, run_number: 11, conclusion: 'failure', [field]: value }
+      assert.throws(
+        () => requireLatestProviderGeneration([provider, newer], provider),
+        /metadata|unresolved/,
+      )
+    }
+  }
+  for (const pull_requests of [[{}], [{ number: 0 }], [{ number: '7' }]])
+    assert.throws(
+      () =>
+        requireLatestGeneration(
+          [
+            sourceRun,
+            { ...sourceRun, id: 101, run_number: 11, conclusion: 'failure', pull_requests },
+          ],
+          sourceRun,
+          identity,
+        ),
+      /ambiguous/,
+    )
+})
+
+void test('a truncated Release file inventory cannot authorize paid execution through the trusted admit entry', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-release-admission-'))
+  const originalFetch = globalThis.fetch
+  const releaseIdentity = { ...identity, authorId: 342242262, channel: 'stable' }
+  const releasePr = {
+    ...pr,
+    title: 'chore(main): release 0.2.0',
+    changed_files: 6,
+    user: { id: 342242262, type: 'Bot' },
+    head: { ...pr.head, ref: 'release-please--branches--main' },
+  }
+  const proof = {
+    id: 500,
+    name: 'pact-candidate-identity',
+    external_id: 'pact-ci:100:1:candidate',
+    app: { id: 1234 },
+    status: 'completed',
+    conclusion: 'neutral',
+    head_sha: candidate,
+    output: {
+      summary: JSON.stringify({
+        schemaVersion: 1,
+        workflowRunId: 100,
+        workflowAttempt: 1,
+        identity: releaseIdentity,
+      }),
+    },
+  }
+  try {
+    const path = join(root, 'identity.json')
+    await writeFile(path, JSON.stringify(releaseIdentity), { flag: 'wx', mode: 0o600 })
+    globalThis.fetch = async (url, options) => {
+      assert.equal(options.method, 'GET', 'admission must have no publication side effects')
+      const parsed = new URL(url),
+        endpoint = parsed.pathname.replace('/repos/mbaxszy7/Pact', '')
+      let response
+      if (endpoint === '/actions/runs/100') response = { ...sourceRun, conclusion: 'success' }
+      else if (endpoint === '/actions/workflows/ci.yml') response = { id: 50 }
+      else if (endpoint === '/actions/workflows/50/runs')
+        response = { total_count: 1, workflow_runs: [sourceRun] }
+      else if (endpoint === '/pulls/7') response = releasePr
+      else if (endpoint === `/git/commits/${candidate}`) response = commit
+      else if (endpoint === '/git/ref/heads/main')
+        response = { ref: 'refs/heads/main', object: { type: 'commit', sha: base } }
+      else if (endpoint === `/commits/${candidate}/check-runs`)
+        response = { total_count: 1, check_runs: [proof] }
+      else if (endpoint === '/actions/runs/100/attempts/1/jobs')
+        response = {
+          total_count: ciJobs.length,
+          jobs: ciJobs.map((name, index) => ({
+            id: index + 1,
+            name,
+            status: 'completed',
+            conclusion: 'success',
+          })),
+        }
+      else if (endpoint === '/users/pact-ci-mbaxszy7%5Bbot%5D')
+        response = { id: 342242262, type: 'Bot' }
+      else if (endpoint === '/pulls/7/files')
+        response = [{ filename: 'version.json', status: 'modified' }]
+      else if (endpoint.startsWith('/contents/')) {
+        const file = endpoint.slice('/contents/'.length),
+          version = parsed.searchParams.get('ref') === base ? '0.1.0' : '0.2.0'
+        const value = file === '.release-please-manifest.json' ? { '.': version } : { version }
+        const bytes = Buffer.from(JSON.stringify(value))
+        response = {
+          type: 'file',
+          encoding: 'base64',
+          size: bytes.length,
+          content: bytes.toString('base64'),
+        }
+      } else throw new Error(`Unexpected fixture endpoint: ${endpoint}`)
+      return new Response(JSON.stringify(response))
+    }
+    await assert.rejects(
+      main(['admit', '--identity', path, '--run', '100'], {
+        GH_TOKEN: 'nonfunctional-fixture',
+        PACT_CI_APP_ID: '1234',
+        PACT_RELEASE_APP_BOT_ID: '342242262',
+        PACT_RELEASE_APP_SLUG: 'pact-ci-mbaxszy7',
+        GITHUB_OUTPUT: join(root, 'outputs'),
+      }),
+      /complete|unexpected|inventory/,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 void test('failure, cancellation, skip, missing, duplicate and unfinished required jobs never pass', () => {
   const jobs = ciJobs.map((name) => ({ name, status: 'completed', conclusion: 'success' }))
   assert.equal(requiredJobsPassed(jobs, ciJobs), true)
@@ -182,29 +318,29 @@ void test('failure, cancellation, skip, missing, duplicate and unfinished requir
   )
 })
 
-void test('a fork or different API author needs owner authorization for the exact head/base/candidate', () => {
-  assert.equal(executionAdmission(identity, pr).allowed, true)
+void test('a fork or different API author needs owner authorization for the exact head/base/code tree', () => {
+  assert.equal(executionAdmission(identity, pr, currentFacts).allowed, true)
   assert.equal(
-    executionAdmission(identity, { ...pr, head: { ...pr.head, repo: { id: 1 } } }).allowed,
+    executionAdmission(
+      { ...identity, headRepositoryId: 1 },
+      { ...pr, head: { ...pr.head, repo: { id: 1 } } },
+      currentFacts,
+    ).allowed,
     false,
   )
   const outsider = { ...pr, user: { id: 999 } },
     outsiderIdentity = { ...identity, authorId: 999 }
-  assert.equal(executionAdmission(outsiderIdentity, outsider).allowed, false)
+  assert.equal(executionAdmission(outsiderIdentity, outsider, currentFacts).allowed, false)
   const grant = {
+    ...currentFacts,
     manual: true,
     actorId: 31481964,
     headSha: head,
     baseSha: base,
-    candidateSha: candidate,
+    treeSha: tree,
   }
   assert.equal(executionAdmission(outsiderIdentity, outsider, grant).allowed, true)
-  for (const change of [
-    { actorId: 999 },
-    { headSha: base },
-    { baseSha: head },
-    { candidateSha: head },
-  ])
+  for (const change of [{ actorId: 999 }, { headSha: base }, { baseSha: head }, { treeSha: head }])
     assert.throws(() => executionAdmission(outsiderIdentity, outsider, { ...grant, ...change }))
   assert.throws(
     () =>
@@ -213,7 +349,7 @@ void test('a fork or different API author needs owner authorization for the exac
         { ...outsider, head: { ...outsider.head, sha: base } },
         grant,
       ),
-    /obsolete/,
+    /exact current/,
   )
 })
 
@@ -250,13 +386,98 @@ void test('API pagination establishes a complete job inventory rather than stopp
     calls.push(url)
     return new Response(
       JSON.stringify({
+        total_count: 101,
         jobs: calls.length === 1 ? Array.from({ length: 100 }, (_, id) => ({ id })) : [{ id: 100 }],
       }),
+      {
+        headers:
+          calls.length === 1 ? { link: `<${url.replace('&page=1', '&page=2')}>; rel="next"` } : {},
+      },
     )
   })
   assert.equal((await api.list(api.path('/actions/runs/100/jobs'), 'jobs')).length, 101)
   assert.equal(calls.length, 2)
   assert(calls[1].includes('page=2'))
+})
+
+void test('short pages, changing totals and the filtered Actions search ceiling cannot masquerade as complete evidence', async () => {
+  for (const payload of [
+    { total_count: 2, workflow_runs: [{ id: 1 }] },
+    { total_count: 1000, workflow_runs: [{ id: 1 }] },
+    { workflow_runs: [{ id: 1 }] },
+  ]) {
+    const api = new CIAPI(
+      'nonfunctional-fixture',
+      async () => new Response(JSON.stringify(payload)),
+    )
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Each fixed malformed evidence case must fail before the next fixture.
+    await assert.rejects(
+      api.list(api.path('/actions/workflows/50/runs?event=pull_request_target'), 'workflow_runs'),
+      /complete|ceiling|total/,
+    )
+  }
+  let page = 0
+  const changed = new CIAPI('nonfunctional-fixture', async (url) => {
+    page++
+    return new Response(
+      JSON.stringify({
+        total_count: page === 1 ? 101 : 102,
+        jobs:
+          page === 1
+            ? Array.from({ length: 100 }, (_, id) => ({ id }))
+            : [{ id: 100 }, { id: 101 }],
+      }),
+      { headers: page === 1 ? { link: `<${url.replace('&page=1', '&page=2')}>; rel="next"` } : {} },
+    )
+  })
+  await assert.rejects(
+    changed.list(changed.path('/actions/runs/100/jobs'), 'jobs'),
+    /total changed/,
+  )
+})
+
+void test('Link pagination is followed even for a short page, with no foreign origin or repeated entries admitted', async () => {
+  let page = 0
+  const complete = new CIAPI('nonfunctional-fixture', async (url) => {
+    page++
+    return new Response(JSON.stringify({ total_count: 2, check_runs: [{ id: page }] }), {
+      headers: page === 1 ? { link: `<${url.replace('&page=1', '&page=2')}>; rel="next"` } : {},
+    })
+  })
+  assert.equal(
+    (
+      await complete.list(
+        complete.path(`/commits/${candidate}/check-runs?filter=all`),
+        'check_runs',
+      )
+    ).length,
+    2,
+  )
+  for (const next of [
+    'https://foreign.example/list?page=2',
+    `https://api.github.com/repos/mbaxszy7/Pact/actions/runs/100/jobs?per_page=100&page=1`,
+  ]) {
+    const invalid = new CIAPI(
+      'nonfunctional-fixture',
+      async () =>
+        new Response(JSON.stringify({ total_count: 2, jobs: [{ id: 1 }] }), {
+          headers: { link: `<${next}>; rel="next"` },
+        }),
+    )
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Each forbidden link is a separate fixed trust-boundary fixture.
+    await assert.rejects(invalid.list(invalid.path('/actions/runs/100/jobs'), 'jobs'), /pagination/)
+  }
+  page = 0
+  const duplicate = new CIAPI('nonfunctional-fixture', async (url) => {
+    page++
+    return new Response(JSON.stringify({ total_count: 2, jobs: [{ id: 1 }] }), {
+      headers: page === 1 ? { link: `<${url.replace('&page=1', '&page=2')}>; rel="next"` } : {},
+    })
+  })
+  await assert.rejects(
+    duplicate.list(duplicate.path('/actions/runs/100/jobs'), 'jobs'),
+    /duplicate/,
+  )
 })
 
 void test('a runtime artifact cannot replace the fixed-App receipt or another run/PR identity', () => {
@@ -341,12 +562,21 @@ void test('Provider dispatch startup revokes prior success through the fixed App
       else if (endpoint === '/actions/runs/200') response = actualRun
       else if (endpoint === '/actions/workflows/ci.yml') response = { id: 50 }
       else if (endpoint === '/actions/workflows/provider-e2e.yml') response = { id: 75 }
-      else if (endpoint === '/actions/workflows/50/runs') response = { workflow_runs: [sourceRun] }
+      else if (endpoint === '/actions/workflows/50/runs')
+        response = { total_count: 1, workflow_runs: [sourceRun] }
       else if (endpoint === '/actions/workflows/75/runs')
-        response = { workflow_runs: newerRun ? [actualRun, newerRun] : [actualRun] }
+        response = {
+          total_count: newerRun ? 2 : 1,
+          workflow_runs: newerRun ? [actualRun, newerRun] : [actualRun],
+        }
       else if (endpoint === '/pulls/7') response = pr
-      else if (endpoint === `/commits/${candidate}/check-runs`) response = { check_runs: [proof] }
-      else if (endpoint === '/actions/runs/100/attempts/1/jobs') response = { jobs: [] }
+      else if (endpoint === `/git/commits/${candidate}`) response = commit
+      else if (endpoint === '/git/ref/heads/main')
+        response = { ref: 'refs/heads/main', object: { type: 'commit', sha: base } }
+      else if (endpoint === `/commits/${candidate}/check-runs`)
+        response = { total_count: 1, check_runs: [{ id: 500, ...proof }] }
+      else if (endpoint === '/actions/runs/100/attempts/1/jobs')
+        response = { total_count: 0, jobs: [] }
       else throw new Error(`Unexpected fixture endpoint: ${endpoint}`)
       return new Response(JSON.stringify(response))
     }

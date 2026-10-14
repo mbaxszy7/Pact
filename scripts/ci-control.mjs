@@ -5,6 +5,7 @@ import {
   repository,
   repositoryId,
   requireCurrent,
+  readCurrent,
   requireIdentity,
   requireSha,
 } from './ci-identity.mjs'
@@ -41,7 +42,7 @@ export class CIAPI {
     return `/repos/${repository}${suffix}`
   }
 
-  async request(path, { method = 'GET', body } = {}) {
+  async response(path, { method = 'GET', body } = {}) {
     requireFact(path.startsWith('/'), 'GitHub API path must be absolute')
     const response = await this.fetch(`https://api.github.com${path}`, {
       method,
@@ -63,26 +64,72 @@ export class CIAPI {
       requireFact(bytes <= 2 * 1024 * 1024, 'CI API response exceeds 2 MiB')
       chunks.push(chunk)
     }
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    return {
+      data: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+      link: response.headers.get('link'),
+    }
+  }
+
+  async request(path, options) {
+    return (await this.response(path, options)).data
   }
 
   async list(path, key) {
     const result = []
+    const seen = new Set()
+    let total
     let bytes = 0
     for (let page = 1; page <= 100; page++) {
-      // oxlint-disable-next-line eslint/no-await-in-loop -- One bounded page establishes completeness before the next request.
-      const response = await this.request(
-        `${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${page}`,
-      )
-      const batch = key ? response[key] : response
+      const pagePath = `${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${page}`,
+        expectedNext = `${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${page + 1}`
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Each bounded page and its metadata establish completeness before the next request.
+      const { data, link } = await this.response(pagePath)
+      const next = nextPage(link, expectedNext)
+      const batch = key ? data[key] : data
       requireFact(Array.isArray(batch) && batch.length <= 100, 'Invalid GitHub page')
+      if (key) {
+        requireFact(
+          Number.isSafeInteger(data.total_count) &&
+            data.total_count >= 0 &&
+            data.total_count <= 10_000,
+          'CI list total is incomplete or exceeds admission',
+        )
+        if (
+          key === 'workflow_runs' &&
+          data.total_count >= 1000 &&
+          new URL(`https://api.github.com${path}`).search.length > 0
+        )
+          throw new Error(
+            'Filtered Actions search reached its 1,000-result ceiling; completeness is unresolved',
+          )
+        if (total !== undefined)
+          requireFact(total === data.total_count, 'CI list total changed during pagination')
+        total = data.total_count
+        for (const item of batch) {
+          requireFact(
+            Number.isSafeInteger(item?.id) && item.id >= 0 && !seen.has(item.id),
+            'Invalid or duplicate CI list item identity',
+          )
+          seen.add(item.id)
+        }
+      }
       bytes += Buffer.byteLength(JSON.stringify(batch))
       requireFact(
         bytes <= 8 * 1024 * 1024,
         'CI list exceeds 8 MiB; incomplete evidence blocks admission',
       )
       result.push(...batch)
-      if (batch.length < 100) return result
+      if (key) {
+        requireFact(result.length <= total, 'CI list exceeds its complete total')
+        if (!next) {
+          requireFact(result.length === total, 'CI list is incomplete; missing pagination link')
+          return result
+        }
+        requireFact(
+          result.length < total && batch.length > 0,
+          'CI pagination disagrees with its total',
+        )
+      } else if (!next && batch.length < 100) return result
     }
     throw new Error('CI pagination exceeds 10,000 entries; incomplete evidence blocks admission')
   }
@@ -99,6 +146,39 @@ export class CIAPI {
   }
 }
 
+function nextPage(link, expectedPath) {
+  if (link === null) return false
+  requireFact(
+    typeof link === 'string' && Buffer.byteLength(link) <= 4096,
+    'Invalid CI pagination metadata',
+  )
+  const parts = link.split(',')
+  requireFact(parts.length <= 4, 'Invalid CI pagination metadata')
+  let next
+  const relations = new Set()
+  for (const part of parts) {
+    const match = /^\s*<([^<>]+)>;\s*rel="(next|prev|first|last)"\s*$/u.exec(part)
+    requireFact(match && !relations.has(match[2]), 'Invalid CI pagination link')
+    relations.add(match[2])
+    if (match[2] === 'next') next = match[1]
+  }
+  if (!next) return false
+  const actual = new URL(next),
+    expected = new URL(`https://api.github.com${expectedPath}`)
+  actual.searchParams.sort()
+  expected.searchParams.sort()
+  requireFact(
+    actual.origin === expected.origin &&
+      !actual.username &&
+      !actual.password &&
+      !actual.hash &&
+      actual.pathname === expected.pathname &&
+      actual.searchParams.toString() === expected.searchParams.toString(),
+    'CI pagination changed origin, query or sequence',
+  )
+  return true
+}
+
 export function requiredJobsPassed(jobs, expected) {
   requireFact(Array.isArray(jobs) && jobs.length <= 1024, 'Invalid CI job inventory')
   return expected.every((name) => {
@@ -113,6 +193,11 @@ export function requiredJobsPassed(jobs, expected) {
 
 export function validateSourceRun(run, identity, workflowId, { allowRunning = false } = {}) {
   requireIdentity(identity)
+  requireRunScope(run)
+  requireFact(
+    Number.isSafeInteger(workflowId) && workflowId > 0,
+    'Trusted CI workflow identity is unresolved',
+  )
   requireFact(identity.pullRequest !== null, 'Provider control requires a PR identity')
   requireFact(
     run.repository?.id === repositoryId &&
@@ -147,10 +232,29 @@ function validGenerationIdentity(run) {
   )
 }
 
+function requireRunScope(run, provider = false) {
+  requireFact(
+    run &&
+      Number.isSafeInteger(run.workflow_id) &&
+      run.workflow_id > 0 &&
+      typeof run.head_sha === 'string' &&
+      /^[a-f\d]{40}$/u.test(run.head_sha) &&
+      (provider
+        ? typeof run.head_branch === 'string' &&
+          run.head_branch.length > 0 &&
+          run.head_branch.length <= 255 &&
+          !/[\0\r\n]/u.test(run.head_branch)
+        : typeof run.event === 'string' && /^[a-z_]{1,100}$/u.test(run.event)),
+    'CI generation scope metadata is unresolved',
+  )
+}
+
 export function requireLatestGeneration(runs, sourceRun, identity) {
   requireFact(Array.isArray(runs) && runs.length <= 10_000, 'CI generation inventory is incomplete')
   requireFact(validGenerationIdentity(sourceRun), 'Source CI generation identity is unresolved')
+  requireRunScope(sourceRun)
   for (const run of runs) {
+    requireRunScope(run)
     if (
       run.event !== 'pull_request_target' ||
       run.head_sha !== identity.baseSha ||
@@ -166,7 +270,10 @@ export function requireLatestGeneration(runs, sourceRun, identity) {
     requireFact(run.run_number !== sourceRun.run_number, 'CI generation identity is ambiguous')
     if (run.run_number < sourceRun.run_number) continue
     requireFact(
-      Array.isArray(run.pull_requests) && run.pull_requests.length > 0,
+      Array.isArray(run.pull_requests) &&
+        run.pull_requests.length > 0 &&
+        run.pull_requests.length <= 1024 &&
+        run.pull_requests.every((pr) => Number.isSafeInteger(pr?.number) && pr.number > 0),
       'A newer CI run has ambiguous PR association; success is blocked',
     )
     requireFact(
@@ -214,7 +321,9 @@ export function requireLatestProviderGeneration(runs, evidenceRun) {
     validGenerationIdentity(evidenceRun),
     'Provider evidence generation identity is unresolved',
   )
+  requireRunScope(evidenceRun, true)
   for (const run of runs) {
+    requireRunScope(run, true)
     if (
       run.workflow_id !== evidenceRun.workflow_id ||
       run.head_branch !== 'main' ||
@@ -277,20 +386,20 @@ export function executionAdmission(
     actorId,
     headSha,
     baseSha,
-    candidateSha,
+    treeSha,
+    commit,
+    mainSha,
     authorizedRelease: releaseSourceAuthorized = false,
   } = {},
 ) {
-  requireCurrent(identity, pr)
+  requireCurrent(identity, pr, commit, mainSha)
   if (manual) {
     requireFact(actorId === ownerId, 'Only the verified owner can authorize paid execution')
     requireFact(
-      headSha === identity.headSha &&
-        baseSha === identity.baseSha &&
-        candidateSha === identity.candidateSha,
+      headSha === identity.headSha && baseSha === identity.baseSha && treeSha === identity.treeSha,
       'Paid execution authorization is obsolete or incomplete',
     )
-    return { allowed: true, kind: 'owner-exact-candidate' }
+    return { allowed: true, kind: 'owner-reviewed-code-identity' }
   }
   if (pr.user.id === ownerId && pr.head.repo?.id === repositoryId)
     return { allowed: true, kind: 'trusted-owner-source' }
@@ -346,6 +455,14 @@ async function authorizedRelease(api, identity, pr, env) {
     'Release author is not the fixed App',
   )
   const files = await api.list(api.path(`/pulls/${pr.number}/files`))
+  requireFact(
+    Number.isSafeInteger(pr.changed_files) &&
+      pr.changed_files > 0 &&
+      pr.changed_files <= releaseFiles.length + 1 &&
+      files.length === pr.changed_files &&
+      new Set(files.map((file) => file.filename)).size === files.length,
+    'Release file inventory is incomplete, duplicate or unexpected',
+  )
   requireFact(
     files.length > 0 &&
       files.length <= releaseFiles.length + 1 &&
@@ -424,20 +541,19 @@ export function verifyCandidateAttestation(checks, identity, run, expectedAppId)
 }
 
 async function context(api, identity, runId, expectedAppId) {
-  const [run, workflow, pr] = await Promise.all([
+  const [run, workflow] = await Promise.all([
     api.request(api.path(`/actions/runs/${runId}`)),
     api.request(api.path('/actions/workflows/ci.yml')),
-    api.request(api.path(`/pulls/${identity.pullRequest}`)),
   ])
   validateSourceRun(run, identity, workflow.id)
   await latestGeneration(api, identity, run)
-  requireCurrent(identity, pr)
+  const facts = await readCurrent(identity, (path) => api.request(path))
   const proofs = await api.list(
     api.path(`/commits/${identity.candidateSha}/check-runs?filter=all`),
     'check_runs',
   )
   verifyCandidateAttestation(proofs, identity, run, expectedAppId)
-  return { run, pr }
+  return { run, ...facts }
 }
 
 async function readIdentity(path) {
@@ -461,7 +577,7 @@ async function publishCheck(
     Number.isSafeInteger(expectedAppId) && expectedAppId > 0,
     'Fixed CI App ID is missing',
   )
-  requireCurrent(identity, await api.request(api.path(`/pulls/${identity.pullRequest}`)))
+  await readCurrent(identity, (path) => api.request(path))
   await latestGeneration(api, identity, evidenceRun)
   if (providerEvidence) await latestProviderGeneration(api, providerEvidence)
   const check = await api.request(api.path('/check-runs'), {
@@ -473,8 +589,8 @@ async function publishCheck(
       external_id: `pact:${identity.pullRequest}:${identity.headSha}:${identity.baseSha}:${runId}:${name}`,
       details_url: `https://github.com/${repository}/actions/runs/${runId}`,
       output: {
-        title: passed ? 'Exact candidate evidence passed' : 'Required evidence is blocked',
-        summary: `${explanation}\n\nPR #${identity.pullRequest}; head ${identity.headSha}; base ${identity.baseSha}; candidate ${identity.candidateSha}.`,
+        title: passed ? 'Current code identity evidence passed' : 'Required evidence is blocked',
+        summary: `${explanation}\n\nPR #${identity.pullRequest}; head ${identity.headSha}; base ${identity.baseSha}; tree ${identity.treeSha}; policy ${identity.policySha}; tested candidate ${identity.candidateSha}.`,
       },
     },
   })
@@ -492,7 +608,7 @@ async function publishCheck(
     })
     throw new Error('The check was not issued by the required fixed App')
   }
-  requireCurrent(identity, await api.request(api.path(`/pulls/${identity.pullRequest}`)))
+  await readCurrent(identity, (path) => api.request(path))
   await latestGeneration(api, identity, evidenceRun)
   if (providerEvidence) await latestProviderGeneration(api, providerEvidence)
   await api.request(api.path(`/check-runs/${check.id}`), {
@@ -500,7 +616,7 @@ async function publishCheck(
     body: { status: 'completed', conclusion: passed ? 'success' : 'failure' },
   })
   try {
-    requireCurrent(identity, await api.request(api.path(`/pulls/${identity.pullRequest}`)))
+    await readCurrent(identity, (path) => api.request(path))
     await latestGeneration(api, identity, evidenceRun)
     if (providerEvidence) await latestProviderGeneration(api, providerEvidence)
   } catch {
@@ -510,7 +626,8 @@ async function publishCheck(
         conclusion: 'failure',
         output: {
           title: 'Obsolete candidate',
-          summary: 'Head, base or the current merge candidate changed during publication.',
+          summary:
+            'PR association, head, base, merge tree or trusted policy changed during publication.',
         },
       },
     })
@@ -543,13 +660,12 @@ export async function main(args = process.argv.slice(2), env = process.env) {
   }
   const api = new CIAPI(env.GH_TOKEN)
   if (mode === 'attest') {
-    const [sourceRun, workflow, pr] = await Promise.all([
+    const [sourceRun, workflow] = await Promise.all([
       api.request(api.path(`/actions/runs/${options['--run']}`)),
       api.request(api.path('/actions/workflows/ci.yml')),
-      api.request(api.path(`/pulls/${identity.pullRequest}`)),
     ])
     validateSourceRun(sourceRun, identity, workflow.id, { allowRunning: true })
-    requireCurrent(identity, pr)
+    await readCurrent(identity, (path) => api.request(path))
     await latestGeneration(api, identity, sourceRun)
     requireFact(
       String(sourceRun.id) === env.GITHUB_RUN_ID &&
@@ -558,6 +674,8 @@ export async function main(args = process.argv.slice(2), env = process.env) {
         env.PACT_CI_HEAD_SHA === identity.headSha &&
         env.PACT_CI_BASE_SHA === identity.baseSha &&
         env.PACT_CI_CANDIDATE_SHA === identity.candidateSha &&
+        env.PACT_CI_TREE_SHA === identity.treeSha &&
+        env.PACT_CI_POLICY_SHA === identity.policySha &&
         env.PACT_CI_CHANNEL === identity.channel,
       'Artifact identity disagrees with the trusted GitHub job outputs',
     )
@@ -596,14 +714,19 @@ export async function main(args = process.argv.slice(2), env = process.env) {
       check.app?.id === Number(env.PACT_CI_APP_ID),
       'Candidate attestation was not issued by the fixed App',
     )
-    requireCurrent(identity, await api.request(api.path(`/pulls/${identity.pullRequest}`)))
+    await readCurrent(identity, (path) => api.request(path))
     await api.request(api.path(`/check-runs/${check.id}`), {
       method: 'PATCH',
       body: { status: 'completed', conclusion: 'neutral' },
     })
     return
   }
-  const { run, pr } = await context(api, identity, options['--run'], Number(env.PACT_CI_APP_ID))
+  const { run, pr, commit, mainSha } = await context(
+    api,
+    identity,
+    options['--run'],
+    Number(env.PACT_CI_APP_ID),
+  )
   const jobs = await api.list(
     api.path(`/actions/runs/${run.id}/attempts/${run.run_attempt}/jobs`),
     'jobs',
@@ -662,19 +785,21 @@ export async function main(args = process.argv.slice(2), env = process.env) {
           actorId,
           headSha: env.PACT_PROVIDER_HEAD_SHA,
           baseSha: env.PACT_PROVIDER_BASE_SHA,
-          candidateSha: env.PACT_PROVIDER_CANDIDATE_SHA,
+          treeSha: env.PACT_PROVIDER_TREE_SHA,
+          commit,
+          mainSha,
           authorizedRelease: await authorizedRelease(api, identity, pr, env),
         })
       : { allowed: false, kind: 'required-uncredentialed-ci-failed' }
     if (env.GITHUB_OUTPUT)
       await appendFile(
         env.GITHUB_OUTPUT,
-        `applicable=true\nallowed=${admission.allowed}\ncandidate=${identity.candidateSha}\nbase=${identity.baseSha}\npull_request=${identity.pullRequest}\nci_run=${run.id}\nci_attempt=${run.run_attempt}\n`,
+        `applicable=true\nallowed=${admission.allowed}\ncandidate=${identity.candidateSha}\nbase=${identity.baseSha}\ntree=${identity.treeSha}\npolicy=${identity.policySha}\npull_request=${identity.pullRequest}\nci_run=${run.id}\nci_attempt=${run.run_attempt}\n`,
       )
     if (env.GITHUB_STEP_SUMMARY)
       await appendFile(
         env.GITHUB_STEP_SUMMARY,
-        `Paid provider admission: ${admission.kind}; head=${identity.headSha}; base=${identity.baseSha}; candidate=${identity.candidateSha}.\n`,
+        `Paid provider admission: ${admission.kind}; head=${identity.headSha}; base=${identity.baseSha}; tree=${identity.treeSha}; policy=${identity.policySha}; tested candidate=${identity.candidateSha}.\n`,
       )
   } else if (mode === 'publish') {
     requireFact(

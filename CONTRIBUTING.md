@@ -354,10 +354,14 @@ acceptance.
 The approval policy requires renewed approval when the reviewable diff changes and permits reuse
 when that diff is unchanged. Native CODEOWNERS and stale-review dismissal must enforce this per PR;
 an App check attached to a shared SHA cannot supply atomic author exemption or review revocation.
-Keep approval blocked until the native boundaries, candidate-only check selection, latest-attempt
-isolation and trusted main-only workflow bootstrap are verified. GitHub may regenerate a merge candidate with the
-same parents and tree but a new commit timestamp. Its new SHA invalidates the exact candidate receipt;
-never silently reinterpret old evidence as a test of that new commit.
+Keep approval blocked until native check consumption, latest-attempt isolation and trusted main-only
+workflow bootstrap are verified. Test identity records the exact PR, author and head repository,
+head and current main base, merged code tree, and trusted policy commit. GitHub may regenerate a
+merge commit with a new timestamp and SHA. Evidence can remain eligible only when its ordered
+base/head parents and complete code tree match, and neither head, current main base nor policy
+changed. Always retain the actual tested merge SHA in execution receipts; equivalence does not
+claim execution of the replacement commit. Shared-SHA test evidence never supplies another PR's
+author exemption or review approval.
 
 Release Please owns the single product version and `CHANGELOG.md`. Its initial `0.1.0` override is
 transient. Automatic Release PR execution admits synchronized version fields and bounded changelog

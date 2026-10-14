@@ -22,12 +22,12 @@ on:
         description: Exact reviewed main base SHA (40 hex characters)
         required: true
         type: string
-      candidate_sha:
-        description: Exact reviewed two-parent merge candidate SHA (40 hex characters)
+      tree_sha:
+        description: Reviewed merged code tree SHA for this exact head and base (40 hex characters)
         required: true
         type: string
       authorize_provider:
-        description: Authorize Claude/Codex execution of this exact candidate; this is separate from Approve PR
+        description: Authorize Claude/Codex execution of this head/base/code tree; this is separate from Approve PR
         required: true
         type: boolean
         default: false
@@ -121,7 +121,7 @@ jobs:
           PACT_PROVIDER_AUTHORIZE: ${{ inputs.authorize_provider && 'true' || 'false' }}
           PACT_PROVIDER_HEAD_SHA: ${{ inputs.head_sha }}
           PACT_PROVIDER_BASE_SHA: ${{ inputs.base_sha }}
-          PACT_PROVIDER_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          PACT_PROVIDER_TREE_SHA: ${{ inputs.tree_sha }}
           PACT_RELEASE_APP_BOT_ID: ${{ vars.PACT_RELEASE_APP_BOT_ID }}
           PACT_RELEASE_APP_SLUG: ${{ vars.PACT_RELEASE_APP_SLUG }}
           PACT_CI_APP_ID: ${{ vars.PACT_CI_APP_ID }}

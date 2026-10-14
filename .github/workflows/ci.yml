@@ -29,6 +29,8 @@ jobs:
       candidate: ${{ steps.identity.outputs.candidate }}
       head: ${{ steps.identity.outputs.head }}
       base: ${{ steps.identity.outputs.base }}
+      tree: ${{ steps.identity.outputs.tree }}
+      policy: ${{ steps.identity.outputs.policy }}
       channel: ${{ steps.identity.outputs.channel }}
       controller: ${{ github.event.pull_request.base.sha || github.sha }}
     steps:
@@ -40,7 +42,7 @@ jobs:
         with:
           node-version-file: .node-version
       - id: identity
-        name: Capture current head, base and actual two-parent merge candidate
+        name: Capture current head, base, merged code tree and actual execution commit
         run: node scripts/ci-identity.mjs capture-api "$RUNNER_TEMP/ci-identity.json"
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -133,6 +135,8 @@ jobs:
           PACT_CI_HEAD_SHA: ${{ needs.identity.outputs.head }}
           PACT_CI_BASE_SHA: ${{ needs.identity.outputs.base }}
           PACT_CI_CANDIDATE_SHA: ${{ needs.identity.outputs.candidate }}
+          PACT_CI_TREE_SHA: ${{ needs.identity.outputs.tree }}
+          PACT_CI_POLICY_SHA: ${{ needs.identity.outputs.policy }}
           PACT_CI_CHANNEL: ${{ needs.identity.outputs.channel }}
 
   quality:
