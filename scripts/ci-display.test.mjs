@@ -31,6 +31,10 @@ function bridged(
   workArea = { width: 1024, height: 684 },
 ) {
   const calls = []
+  const stages = []
+  let currentMode = mode
+  const excludedWidth = mode.width - workArea.width
+  const excludedHeight = mode.height - workArea.height
   const screen = {
     deviceDescription: { objectForKey: () => 1 },
     frame: { size: { width: mode.width, height: mode.height } },
@@ -38,7 +42,7 @@ function bridged(
   }
   const native = {
     CGMainDisplayID: () => 1,
-    CGDisplayCopyDisplayMode: () => mode,
+    CGDisplayCopyDisplayMode: () => currentMode,
     CGDisplayCopyAllDisplayModes: () => modes,
     CGDisplayModeGetWidth: (value) => value.width,
     CGDisplayModeGetHeight: (value) => value.height,
@@ -48,8 +52,36 @@ function bridged(
     CFArrayGetCount: (value) => value.length,
     CFArrayGetValueAtIndex: (value, index) => value[index],
     NSScreen: { screens: { js: [screen] } },
-    CGDisplaySetDisplayMode: (_display, selected) => {
+    kCGConfigureForSession: 1,
+    CGBeginDisplayConfiguration: (reference) => {
+      stages.push('begin')
+      reference[0] = { valid: true, selected: null }
+      return 0
+    },
+    CGConfigureDisplayWithDisplayMode: (token, _display, selected) => {
+      assert.equal(token.valid, true)
+      stages.push('configure')
       calls.push(selected)
+      token.selected = selected
+      return 0
+    },
+    CGCompleteDisplayConfiguration: (token, scope) => {
+      assert.equal(token.valid, true)
+      assert.equal(scope, 1)
+      stages.push('complete-session')
+      token.valid = false
+      currentMode = token.selected
+      screen.frame.size = { width: currentMode.width, height: currentMode.height }
+      screen.visibleFrame.size = {
+        width: currentMode.width - excludedWidth,
+        height: currentMode.height - excludedHeight,
+      }
+      return 0
+    },
+    CGCancelDisplayConfiguration: (token) => {
+      assert.equal(token.valid, true)
+      stages.push('cancel')
+      token.valid = false
       return 0
     },
   }
@@ -58,10 +90,11 @@ function bridged(
       runInNewContext(`${macDisplaySource}\nrun(operation)`, {
         $: native,
         ObjC: { import() {}, bindFunction() {}, unwrap: (value) => value },
+        Ref: () => [],
         operation: [operation],
       }),
     )
-  return { calls, invoke, native }
+  return { calls, stages, invoke, native }
 }
 
 await test('does not admit display changes on a developer or self-hosted machine', async () => {
@@ -193,11 +226,14 @@ await test('predicted exclusions cannot falsely prove a mode unavailable before 
 await test('native API failure and mode overflow are explicit failures with no second setter attempt', () => {
   const failed = bridged()
   let setters = 0
-  failed.native.CGDisplaySetDisplayMode = () => {
+  failed.native.CGConfigureDisplayWithDisplayMode = () => {
     setters++
     return 1001
   }
-  assert.equal(failed.invoke('configure').failure, 'native-mode-change-failed')
+  const evidence = failed.invoke('configure')
+  assert.equal(evidence.failure, 'native-mode-configuration-failed')
+  assert.equal(evidence.configuration.tokenReleased, true)
+  assert.deepEqual(failed.stages, ['begin', 'cancel'])
   assert.equal(setters, 1)
   const oversized = bridged(
     small,
@@ -205,6 +241,169 @@ await test('native API failure and mode overflow are explicit failures with no s
   )
   assert.throws(() => oversized.invoke('configure'), /mode count/)
   assert.equal(oversized.calls.length, 0)
+})
+
+await test('commits once for the login session and observes the genuine in-process mode before exit', () => {
+  const native = bridged()
+  const observed = native.invoke('configure')
+  assert.deepEqual(native.stages, ['begin', 'configure', 'complete-session'])
+  assert.equal(native.calls.length, 1)
+  assert.equal(observed.configuration.scope, 'login-session')
+  assert.equal(observed.configuration.tokenReleased, true)
+  assert.deepEqual(observed.modeAfterSetter, sufficient)
+})
+
+await test('begin and complete failures do not cancel a nonexistent or consumed configuration token', () => {
+  const denied = bridged()
+  denied.native.CGBeginDisplayConfiguration = () => 1001
+  assert.equal(denied.invoke('configure').failure, 'native-configuration-begin-failed')
+  assert.deepEqual(denied.stages, [])
+  const rejected = bridged()
+  rejected.native.CGCompleteDisplayConfiguration = (token, scope) => {
+    assert.equal(scope, 1)
+    token.valid = false
+    rejected.stages.push('complete-failed')
+    return 1002
+  }
+  const result = rejected.invoke('configure')
+  assert.equal(result.failure, 'native-session-commit-failed')
+  assert.equal(result.configuration.tokenReleased, true)
+  assert.deepEqual(rejected.stages, ['begin', 'configure', 'complete-failed'])
+})
+
+await test('an exceptional configure call still releases its one open transaction', () => {
+  const native = bridged()
+  native.native.CGConfigureDisplayWithDisplayMode = () => {
+    throw new Error('synthetic-native-call-exception')
+  }
+  const result = native.invoke('configure')
+  assert.equal(result.failure, 'native-configuration-call-failed')
+  assert.equal(result.configuration.tokenReleased, true)
+  assert.deepEqual(native.stages, ['begin', 'cancel'])
+})
+
+await test('a bridge exception at Complete preserves unconfirmed token state and never double-cancels', () => {
+  const native = bridged()
+  native.native.CGCompleteDisplayConfiguration = () => {
+    throw new Error('synthetic-complete-bridge-exception')
+  }
+  const result = native.invoke('configure')
+  assert.equal(result.failure, 'native-configuration-call-failed')
+  assert.equal(result.configuration.tokenReleased, false)
+  assert.deepEqual(native.stages, ['begin', 'configure'])
+})
+
+await test('failed cancellation preserves its unresolved token as a blocking fact', () => {
+  const native = bridged()
+  native.native.CGConfigureDisplayWithDisplayMode = () => 1001
+  native.native.CGCancelDisplayConfiguration = () => {
+    throw new Error('synthetic-cancel-bridge-exception')
+  }
+  const result = native.invoke('configure')
+  assert.equal(result.failure, 'native-configuration-cancel-failed')
+  assert.equal(result.configuration.tokenReleased, false)
+})
+
+function selectedFacts() {
+  return {
+    ...facts(small, 684),
+    selected: sufficient,
+    modeAfterSetter: sufficient,
+    configuration: {
+      scope: 'login-session',
+      beginCode: 0,
+      configureCode: 0,
+      completeCode: 0,
+      cancelCode: null,
+      tokenReleased: true,
+    },
+  }
+}
+
+await test('post-exit observations retain restored and settled states without repeating the mutation', async () => {
+  let clock = 0
+  const calls = []
+  const result = await main(['configure'], hosted, {
+    platform: 'darwin',
+    now: () => clock,
+    pause: (ms) => {
+      clock += ms
+    },
+    observe: (operation, options) => {
+      calls.push({ operation, clock, timeout: options.timeout })
+      if (operation === 'configure') return selectedFacts()
+      return clock === 0 ? facts(small, 684) : facts()
+    },
+  })
+  assert.deepEqual(
+    calls.map((call) => call.operation),
+    ['configure', 'inspect', 'inspect', 'inspect'],
+  )
+  assert.deepEqual(
+    calls.map((call) => call.clock),
+    [0, 0, 250, 2000],
+  )
+  assert.equal(result.samples[0].before.screen.workAreaHeight, 684)
+  assert.equal(result.samples[2].before.screen.workAreaHeight, 1120)
+  assert.equal(result.after.availableModes, undefined)
+  assert(calls.every((call) => call.timeout <= 15_000))
+})
+
+await test('a mode that reverts after the helper exits remains a failure with all bounded samples', async () => {
+  let clock = 0
+  let mutations = 0
+  await assert.rejects(
+    main(['configure'], hosted, {
+      platform: 'darwin',
+      now: () => clock,
+      pause: (ms) => {
+        clock += ms
+      },
+      observe: (operation) => {
+        if (operation === 'configure') {
+          mutations++
+          return selectedFacts()
+        }
+        return facts(small, 684)
+      },
+    }),
+    (error) => {
+      assert.equal(error.displayEvidence.before.modeAfterSetter.id, sufficient.id)
+      assert.deepEqual(
+        error.displayEvidence.samples.map((sample) => sample.requestedOffsetMs),
+        [0, 250, 2000],
+      )
+      assert(error.displayEvidence.samples.every((sample) => sample.before.mode.id === small.id))
+      return /unchanged UI/.test(error.message)
+    },
+  )
+  assert.equal(mutations, 1)
+})
+
+await test('the original combined deadline bounds all read-only observations and creates no late timer', async () => {
+  let clock = 0,
+    reads = 0,
+    timers = 0
+  await assert.rejects(
+    main(['configure'], hosted, {
+      platform: 'darwin',
+      now: () => clock,
+      pause: () => {
+        timers++
+      },
+      observe: (operation) => {
+        if (operation === 'configure') {
+          clock = 30_001
+          return selectedFacts()
+        }
+        reads++
+        return facts()
+      },
+    }),
+    /deadline expired/,
+  )
+  assert.equal(reads, 0)
+  assert.equal(timers, 0)
 })
 
 await test('failed preparation retains only validated bounded screen metadata', async () => {
