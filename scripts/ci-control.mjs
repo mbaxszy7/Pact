@@ -138,14 +138,18 @@ export function validateSourceRun(run, identity, workflowId, { allowRunning = fa
       ),
       'CI PR association disagrees with the captured candidate',
     )
-  requireFact(
-    Number.isSafeInteger(run.id) && Number.isSafeInteger(run.run_attempt),
-    'CI run identity is incomplete',
+  requireFact(validGenerationIdentity(run), 'CI run identity is incomplete')
+}
+
+function validGenerationIdentity(run) {
+  return ['id', 'run_number', 'run_attempt'].every(
+    (field) => Number.isSafeInteger(run[field]) && run[field] > 0,
   )
 }
 
 export function requireLatestGeneration(runs, sourceRun, identity) {
   requireFact(Array.isArray(runs) && runs.length <= 10_000, 'CI generation inventory is incomplete')
+  requireFact(validGenerationIdentity(sourceRun), 'Source CI generation identity is unresolved')
   for (const run of runs) {
     if (
       run.event !== 'pull_request_target' ||
@@ -153,15 +157,14 @@ export function requireLatestGeneration(runs, sourceRun, identity) {
       run.workflow_id !== sourceRun.workflow_id
     )
       continue
-    requireFact(
-      Number.isSafeInteger(run.id) && Number.isSafeInteger(run.run_attempt),
-      'CI generation identity is unresolved',
-    )
-    if (run.id < sourceRun.id) continue
+    requireFact(validGenerationIdentity(run), 'CI generation identity is unresolved')
     if (run.id === sourceRun.id) {
+      requireFact(run.run_number === sourceRun.run_number, 'CI generation identity disagrees')
       requireFact(run.run_attempt === sourceRun.run_attempt, 'CI attempt is obsolete')
       continue
     }
+    requireFact(run.run_number !== sourceRun.run_number, 'CI generation identity is ambiguous')
+    if (run.run_number < sourceRun.run_number) continue
     requireFact(
       Array.isArray(run.pull_requests) && run.pull_requests.length > 0,
       'A newer CI run has ambiguous PR association; success is blocked',
@@ -172,7 +175,12 @@ export function requireLatestGeneration(runs, sourceRun, identity) {
     )
   }
   requireFact(
-    runs.some((run) => run.id === sourceRun.id && run.run_attempt === sourceRun.run_attempt),
+    runs.some(
+      (run) =>
+        run.id === sourceRun.id &&
+        run.run_number === sourceRun.run_number &&
+        run.run_attempt === sourceRun.run_attempt,
+    ),
     'Current CI generation is missing',
   )
 }
@@ -181,6 +189,7 @@ export async function latestGeneration(api, identity, evidenceRun) {
   const run = await api.request(api.path(`/actions/runs/${evidenceRun.id}`))
   requireFact(
     run.id === evidenceRun.id &&
+      run.run_number === evidenceRun.run_number &&
       run.run_attempt === evidenceRun.run_attempt &&
       run.workflow_id === evidenceRun.workflow_id,
     'CI attempt changed after evidence capture',
@@ -201,6 +210,10 @@ export function requireLatestProviderGeneration(runs, evidenceRun) {
     Array.isArray(runs) && runs.length <= 10_000,
     'Provider generation inventory is incomplete',
   )
+  requireFact(
+    validGenerationIdentity(evidenceRun),
+    'Provider evidence generation identity is unresolved',
+  )
   for (const run of runs) {
     if (
       run.workflow_id !== evidenceRun.workflow_id ||
@@ -208,22 +221,34 @@ export function requireLatestProviderGeneration(runs, evidenceRun) {
       run.head_sha !== evidenceRun.head_sha
     )
       continue
-    requireFact(
-      Number.isSafeInteger(run.id) && Number.isSafeInteger(run.run_attempt),
-      'Provider generation identity is unresolved',
-    )
-    if (run.id === evidenceRun.id)
+    requireFact(validGenerationIdentity(run), 'Provider generation identity is unresolved')
+    if (run.id === evidenceRun.id) {
+      requireFact(
+        run.run_number === evidenceRun.run_number,
+        'Provider generation identity disagrees',
+      )
       requireFact(
         run.run_attempt === evidenceRun.run_attempt,
         'Provider evidence attempt is obsolete',
       )
-    if (run.id > evidenceRun.id)
+      continue
+    }
+    requireFact(
+      run.run_number !== evidenceRun.run_number,
+      'Provider generation identity is ambiguous',
+    )
+    if (run.run_number > evidenceRun.run_number)
       throw new Error(
         'A newer Provider run has unresolved candidate association; old evidence cannot publish',
       )
   }
   requireFact(
-    runs.some((run) => run.id === evidenceRun.id && run.run_attempt === evidenceRun.run_attempt),
+    runs.some(
+      (run) =>
+        run.id === evidenceRun.id &&
+        run.run_number === evidenceRun.run_number &&
+        run.run_attempt === evidenceRun.run_attempt,
+    ),
     'Provider evidence generation is missing',
   )
 }
@@ -232,6 +257,7 @@ async function latestProviderGeneration(api, evidenceRun) {
   const run = await api.request(api.path(`/actions/runs/${evidenceRun.id}`))
   requireFact(
     run.id === evidenceRun.id &&
+      run.run_number === evidenceRun.run_number &&
       run.run_attempt === evidenceRun.run_attempt &&
       run.workflow_id === evidenceRun.workflow_id,
     'Provider attempt changed after evidence capture',

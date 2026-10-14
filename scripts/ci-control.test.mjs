@@ -41,6 +41,7 @@ const pr = {
 }
 const sourceRun = {
   id: 100,
+  run_number: 10,
   run_attempt: 1,
   repository: { id: 1416403312, full_name: 'mbaxszy7/Pact' },
   workflow_id: 50,
@@ -66,7 +67,7 @@ void test('only the fixed base CI workflow can supply candidate evidence', () =>
 
 void test('an older run/attempt cannot publish after a newer same-PR failure or an ambiguous newer run', () => {
   requireLatestGeneration([sourceRun], sourceRun, identity)
-  const newer = { ...sourceRun, id: 101, conclusion: 'failure' }
+  const newer = { ...sourceRun, id: 101, run_number: 11, conclusion: 'failure' }
   assert.throws(
     () => requireLatestGeneration([sourceRun, newer], sourceRun, identity),
     /newer CI run/,
@@ -102,7 +103,7 @@ void test('a late successful Provider writer cannot replace a newer failed dispa
   assert.throws(
     () =>
       requireLatestProviderGeneration(
-        [original, { ...original, id: 201, conclusion: 'failure' }],
+        [original, { ...original, id: 201, run_number: 11, conclusion: 'failure' }],
         original,
       ),
     /newer Provider run/,
@@ -110,6 +111,61 @@ void test('a late successful Provider writer cannot replace a newer failed dispa
   assert.throws(
     () => requireLatestProviderGeneration([{ ...original, run_attempt: 2 }], original),
     /attempt is obsolete/,
+  )
+})
+
+void test('logical run numbers order generations independently of unique run IDs', () => {
+  const newer = { ...sourceRun, id: 99, run_number: 11, conclusion: 'cancelled' }
+  assert.throws(
+    () => requireLatestGeneration([sourceRun, newer], sourceRun, identity),
+    /newer CI run/,
+  )
+  assert.throws(
+    () =>
+      requireLatestProviderGeneration(
+        [
+          Object.assign({}, sourceRun, { head_branch: 'main' }),
+          Object.assign({}, newer, { head_branch: 'main' }),
+        ],
+        { ...sourceRun, head_branch: 'main' },
+      ),
+    /newer Provider run/,
+  )
+  const older = { ...sourceRun, id: 999, run_number: 9, run_attempt: 2 }
+  requireLatestGeneration([sourceRun, older], sourceRun, identity)
+  requireLatestProviderGeneration(
+    [
+      { ...sourceRun, head_branch: 'main' },
+      { ...older, head_branch: 'main' },
+    ],
+    { ...sourceRun, head_branch: 'main' },
+  )
+  for (const run_number of [undefined, 0, -1, 1.5]) {
+    assert.throws(() =>
+      requireLatestGeneration([{ ...sourceRun, run_number }], sourceRun, identity),
+    )
+    assert.throws(() =>
+      requireLatestProviderGeneration([{ ...sourceRun, run_number, head_branch: 'main' }], {
+        ...sourceRun,
+        head_branch: 'main',
+      }),
+    )
+  }
+  const conflicting = { ...sourceRun, id: 101 }
+  assert.throws(
+    () => requireLatestGeneration([sourceRun, conflicting], sourceRun, identity),
+    /generation identity/,
+  )
+  assert.throws(
+    () =>
+      requireLatestProviderGeneration(
+        [
+          { ...sourceRun, head_branch: 'main' },
+          { ...conflicting, head_branch: 'main' },
+        ],
+        { ...sourceRun, head_branch: 'main' },
+      ),
+    /generation identity/,
   )
 })
 
@@ -314,7 +370,7 @@ void test('Provider dispatch startup revokes prior success through the fixed App
     await assert.rejects(main(args, env), /exact current/)
     assert.equal(writes.length, 0)
     actualRun = providerRun
-    newerRun = { ...providerRun, id: 201 }
+    newerRun = { ...providerRun, id: 201, run_number: 11 }
     await assert.rejects(main(args, env), /newer Provider run/)
     assert.equal(writes.length, 0)
   } finally {
