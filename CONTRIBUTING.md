@@ -328,11 +328,11 @@ reruns remain unverified. The executor's report trust boundary still requires co
 controller is not OS isolation. Missing authority, configuration, observations or platforms block
 acceptance.
 
-Native stale-review dismissal can preserve approval after a tree-identical new commit. GitHub can
-also advance an existing review's `commit_id` without a new approval, so comparing the current
-review API field with the head does not prove approval of that exact commit. The current native
-configuration cannot satisfy an any-new-commit approval requirement; keep the approval check blocked
-until an enforceable policy is agreed and verified. GitHub may regenerate a merge candidate with the
+The approval policy requires renewed approval when the reviewable diff changes and permits reuse
+when that diff is unchanged. Native CODEOWNERS and stale-review dismissal must enforce this per PR;
+an App check attached to a shared SHA cannot supply atomic author exemption or review revocation.
+Keep approval blocked until the native boundaries, candidate-only check selection, latest-attempt
+isolation and trusted main-only workflow bootstrap are verified. GitHub may regenerate a merge candidate with the
 same parents and tree but a new commit timestamp. Its new SHA invalidates the exact candidate receipt;
 never silently reinterpret old evidence as a test of that new commit.
 

@@ -695,10 +695,9 @@ export async function main(args = process.argv.slice(2), env = process.env) {
       run,
       providerRun,
     )
-    // SHA-associated checks cannot provide an atomic per-PR author exemption.
-    // Native stale-review dismissal can retain approval across tree-identical new commits,
-    // and GitHub can advance an existing review's commit_id without a new approval.
-    // No setting or historical review is allowed to manufacture a passing gate.
+    // Native PR rules must own atomic diff-based approval and its revocation.
+    // SHA-associated checks do not provide per-PR authorization or latest-attempt isolation.
+    // Keep this gate blocked until the revised policy and trusted bootstrap are verified.
     await publishCheck(
       api,
       identity,
@@ -706,7 +705,7 @@ export async function main(args = process.argv.slice(2), env = process.env) {
       'owner-approval',
       false,
       providerRun.id,
-      'BLOCKED: native approval can survive a tree-identical new head and its review commit identity can advance without a new approval. Exact owner-author exemption and current-head approval remain unenforced; shared-SHA and asynchronous checks cannot substitute for an atomic PR gate.',
+      'BLOCKED: revised diff-based owner approval is not yet enforced on main. Candidate-only check freshness, shared-SHA association, latest-attempt isolation and trusted-workflow bootstrap remain unverified.',
       run,
       providerRun,
     )
