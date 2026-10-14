@@ -5,6 +5,7 @@ import { dirname, resolve } from 'node:path'
 import {
   rpcResultSchema,
   sessionCatalogPageSchema,
+  sessionSettingsSaveResultSchema,
   type SessionCatalogCursor,
   type SessionCatalogPage,
 } from '../../packages/contracts/src/index.js'
@@ -119,7 +120,7 @@ test(
 
       const unreadSettings = firstPage.sessions[0]?.settings
       if (!unreadSettings) throw new Error('Expected Session settings in the first page.')
-      const saved = await window.evaluate(
+      const savedRaw = await window.evaluate(
         async ({ sessionId, settings }) => {
           const pact: unknown = Reflect.get(globalThis, 'pact')
           if (
@@ -144,6 +145,8 @@ test(
         },
         { sessionId: unreadSessionId, settings: unreadSettings },
       )
+      const saved = rpcResultSchema(sessionSettingsSaveResultSchema).parse(savedRaw)
+      if (!saved.ok) throw new Error(fixture.redactDiagnostic(JSON.stringify(saved.error)))
       expect(saved).toMatchObject({
         ok: true,
         value: {
