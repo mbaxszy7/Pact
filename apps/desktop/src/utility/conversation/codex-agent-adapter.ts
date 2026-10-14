@@ -56,6 +56,7 @@ import {
   type CodexConnectionDiagnostics,
 } from './codex-app-server-connection'
 import { readCodexInitializationRollout } from './codex-native-rollout'
+import { codexProcessEnvironment } from './codex-process-environment'
 import {
   projectCollaborationAnswer,
   readCollaborationAnswer,
@@ -2418,7 +2419,7 @@ export class CodexAgentAdapter implements AgentAdapter {
           JSON.stringify({
             executable: this.executablePath,
             cwd,
-            env: CodexAgentAdapter.processEnvironment(storageRoot),
+            env: codexProcessEnvironment(storageRoot),
           }),
         )
         .digest('hex') === environmentKey
@@ -4912,7 +4913,7 @@ export class CodexAgentAdapter implements AgentAdapter {
         process.env['CODEX_HOME'] ??
         resolvePath(homedir(), '.codex'),
     )
-    const env = CodexAgentAdapter.processEnvironment(storageRoot)
+    const env = codexProcessEnvironment(storageRoot)
     // A bounded digest is retained, never the environment or its credential values.
     const key = createHash('sha256')
       .update(JSON.stringify({ executable: this.executablePath, cwd, env }))
@@ -5196,7 +5197,7 @@ export class CodexAgentAdapter implements AgentAdapter {
   private async startProcess(
     cwd: string,
     storageRoot?: string,
-    env = CodexAgentAdapter.processEnvironment(storageRoot),
+    env = codexProcessEnvironment(storageRoot),
   ): Promise<{ child: ChildProcessWithoutNullStreams; close: () => Promise<void> }> {
     const isWindowsCommand = process.platform === 'win32' && /\.cmd$/iu.test(this.executablePath)
     if (isWindowsCommand && /[&|<>^%!"\r\n]/u.test(this.executablePath)) {
@@ -5232,15 +5233,6 @@ export class CodexAgentAdapter implements AgentAdapter {
       { cwd, env, windowsHide: true, windowsVerbatimArguments: isWindowsCommand },
     )
     return { child, close: () => processGroup.close() }
-  }
-
-  private static processEnvironment(storageRoot?: string): NodeJS.ProcessEnv {
-    return {
-      ...process.env,
-      ...(storageRoot ? { CODEX_HOME: storageRoot } : {}),
-      // This process is Pact; its identity is not a writer takeover capability.
-      CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'pact',
-    }
   }
 
   private discoverInterruptArgs(

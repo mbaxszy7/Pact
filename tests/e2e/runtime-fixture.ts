@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import { codexProcessEnvironment } from '../../apps/desktop/src/utility/conversation/codex-process-environment.js'
 import { OwnedProcessGroup } from '../../apps/desktop/src/utility/owned-process-group.js'
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { readCiProviderConfiguration } from '../../scripts/ci.mjs'
@@ -767,7 +768,7 @@ export async function createRuntimeFixture(
             configuration!.codexPath,
             directory,
             {
-              ...environment.env,
+              ...codexProcessEnvironment(undefined, environment.env),
               CODEX_INTERNAL_ORIGINATOR_OVERRIDE: originator,
             },
             new OwnedProcessGroup({ startupObservationMs: 2_000 }),

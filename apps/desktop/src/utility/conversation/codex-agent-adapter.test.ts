@@ -81,12 +81,109 @@ import {
   resolveLoadedCodexConfiguration,
 } from './codex-agent-adapter.js'
 import { CODEX_MAX_FRAME_BYTES } from './codex-app-server-connection.js'
+import { codexProcessEnvironment } from './codex-process-environment.js'
 import {
   planAuthorization,
   planEnvelope,
   planRunInput,
 } from './collaboration-fixture.test-support.js'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
+
+describe('owned Codex loopback environment', () => {
+  it('adds only local hosts while preserving external proxy configuration and its source', () => {
+    const source = Object.freeze({
+      HTTP_PROXY: 'http://proxy.invalid:8080',
+      HTTPS_PROXY: 'http://secure-proxy.invalid:8080',
+      SOURCE_MARKER: 'retained',
+    })
+    const environment = codexProcessEnvironment('/owned/native', source, 'darwin')
+    expect(environment).toEqual({
+      ...source,
+      CODEX_HOME: '/owned/native',
+      CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'pact',
+      NO_PROXY: '127.0.0.1,localhost',
+      no_proxy: '127.0.0.1,localhost',
+    })
+    expect(source).not.toHaveProperty('NO_PROXY')
+  })
+  it.each(['NO_PROXY', 'no_proxy'] as const)(
+    'preserves a single %s value for both Unix spellings',
+    (key) => {
+      const source = Object.freeze({ [key]: ' internal.invalid ,127.0.0.1' })
+      const environment = codexProcessEnvironment(undefined, source, 'linux')
+      expect(environment.NO_PROXY).toBe(' internal.invalid ,127.0.0.1,localhost')
+      expect(environment.no_proxy).toBe(environment.NO_PROXY)
+      expect(source[key]).toBe(' internal.invalid ,127.0.0.1')
+    },
+  )
+  it('preserves distinct Unix values without union and does not duplicate existing hosts', () => {
+    const source = Object.freeze({
+      NO_PROXY: 'upper.invalid, LOCALHOST ',
+      no_proxy: 'lower.invalid,127.0.0.1',
+    })
+    const environment = codexProcessEnvironment(undefined, source, 'darwin')
+    expect(environment.NO_PROXY).toBe('upper.invalid, LOCALHOST ,127.0.0.1')
+    expect(environment.no_proxy).toBe('lower.invalid,127.0.0.1,localhost')
+    expect(codexProcessEnvironment(undefined, environment, 'darwin')).toEqual(environment)
+  })
+  it('retains the effective mixed-case Windows value and emits one native variable', () => {
+    expect(
+      codexProcessEnvironment(undefined, { No_Proxy: 'mixed.invalid' }, 'win32').NO_PROXY,
+    ).toBe('mixed.invalid,127.0.0.1,localhost')
+    const environment = codexProcessEnvironment(
+      undefined,
+      {
+        NO_PROXY: 'first.invalid',
+        No_Proxy: 'shadowed.invalid',
+        no_proxy: 'also-shadowed.invalid',
+      },
+      'win32',
+    )
+    expect(environment.NO_PROXY).toBe('first.invalid,127.0.0.1,localhost')
+    expect(Object.keys(environment).filter((key) => key.toUpperCase() === 'NO_PROXY')).toEqual([
+      'NO_PROXY',
+    ])
+    // Node deduplicates Windows key spellings before dropping undefined values.
+    expect(
+      codexProcessEnvironment(
+        undefined,
+        { NO_PROXY: undefined, no_proxy: 'shadowed.invalid' },
+        'win32',
+      ).NO_PROXY,
+    ).toBe('127.0.0.1,localhost')
+  })
+  it('fails before launch instead of truncating exclusions at byte or item capacity', () => {
+    const allowed = 'a'.repeat(8192 - ',127.0.0.1,localhost'.length)
+    expect(
+      Buffer.byteLength(
+        codexProcessEnvironment(undefined, { NO_PROXY: allowed }, 'linux').NO_PROXY!,
+      ),
+    ).toBe(8192)
+    expect(() => codexProcessEnvironment(undefined, { NO_PROXY: allowed + 'a' }, 'linux')).toThrow(
+      /capacity/u,
+    )
+    expect(
+      codexProcessEnvironment(
+        undefined,
+        { NO_PROXY: Array.from({ length: 254 }, () => 'a').join(',') },
+        'linux',
+      ).NO_PROXY?.split(','),
+    ).toHaveLength(256)
+    expect(() =>
+      codexProcessEnvironment(
+        undefined,
+        { NO_PROXY: Array.from({ length: 255 }, () => 'a').join(',') },
+        'linux',
+      ),
+    ).toThrow(/capacity/u)
+    expect(() =>
+      codexProcessEnvironment(undefined, { NO_PROXY: 'a'.repeat(8193) }, 'linux'),
+    ).toThrow(/8 KiB/u)
+    expect(() => codexProcessEnvironment(undefined, { NO_PROXY: 'bad\0entry' }, 'linux')).toThrow(
+      /Invalid/u,
+    )
+  })
+})
 
 let workerFixture: Awaited<ReturnType<typeof nativeWorkerFixture>>
 beforeAll(async () => {
