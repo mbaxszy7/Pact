@@ -465,7 +465,8 @@ await test(
   { ...posixOnly, timeout: 25_000 },
   async (context) => {
     const fixture = await treeFixture(context)
-    const originalKill = process.kill
+    const originalKill = Object.getOwnPropertyDescriptor(process, 'kill')
+    assert.ok(originalKill && typeof originalKill.value === 'function')
     let uncertainGroup
     const execution = fixture.execute('detached', 20_000)
     const pids = await fixture.pids()
@@ -473,7 +474,7 @@ await test(
     process.kill = (pid, signal) => {
       if (pid === -uncertainGroup && signal === 0)
         throw Object.assign(new Error('synthetic group observation failure'), { code: 'EIO' })
-      return originalKill.call(process, pid, signal)
+      return Reflect.apply(originalKill.value, process, [pid, signal])
     }
     try {
       await assert.rejects(execution, /process-group check failed \(EIO\)/)
@@ -481,7 +482,7 @@ await test(
       assert.equal(pidGone(pids.worker), false)
       assert.ok(fixture.states.some((value) => value.ownedProcessCount >= 2))
     } finally {
-      process.kill = originalKill
+      Object.defineProperty(process, 'kill', originalKill)
     }
   },
 )
@@ -491,7 +492,8 @@ await test(
   { ...posixOnly, timeout: 25_000 },
   async (context) => {
     const fixture = await treeFixture(context)
-    const originalKill = process.kill
+    const originalKill = Object.getOwnPropertyDescriptor(process, 'kill')
+    assert.ok(originalKill && typeof originalKill.value === 'function')
     let root
     let observations = 0
     let injected = false
@@ -527,7 +529,7 @@ await test(
           code: 'EIO',
         })
       }
-      return originalKill.call(process, pid, signal)
+      return Reflect.apply(originalKill.value, process, [pid, signal])
     }
     try {
       await fixture.pids()
@@ -537,7 +539,7 @@ await test(
       assert.ok(counts.every((count) => count <= 256))
       assert.ok(fixture.states.every((value) => value.ownedProcessCount <= 256))
     } finally {
-      process.kill = originalKill
+      Object.defineProperty(process, 'kill', originalKill)
     }
   },
 )
