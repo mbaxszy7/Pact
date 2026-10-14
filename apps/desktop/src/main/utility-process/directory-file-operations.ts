@@ -9,6 +9,8 @@ import {
   type DirectoryFileOperationResult,
 } from '@pact/contracts'
 
+import type { LogicalIpcTrafficCollector } from '../../shared/logical-ipc-traffic'
+
 const MAX_DIRECTORY_WORKERS = 5
 const MAX_DIRECTORY_REQUEST_BYTES = 64 * 1024
 const KILL_GRACE_MS = 2_000
@@ -32,8 +34,12 @@ interface DirectoryWorker {
 export class DirectoryFileOperations {
   private readonly workers = new Map<UtilityProcess, DirectoryWorker>()
   private disposed = false
+  private traffic: LogicalIpcTrafficCollector | undefined
 
   constructor(private readonly workerScriptPath: string) {}
+  configureTraffic(traffic: LogicalIpcTrafficCollector | undefined): void {
+    this.traffic = traffic
+  }
 
   execute(
     input: DirectoryFileOperationInput,
@@ -115,6 +121,8 @@ export class DirectoryFileOperations {
       settled: false,
     }
     this.workers.set(child, worker)
+    const traffic = this.traffic
+    const settleTraffic = traffic?.beginTransport()
     if (signal) {
       worker.abort = () =>
         this.stop(worker, {
@@ -125,6 +133,8 @@ export class DirectoryFileOperations {
       signal.addEventListener('abort', worker.abort, { once: true })
     }
     child.on('message', (message: unknown) => {
+      // Count the actual receive even after cancellation; late delivery remains real traffic.
+      traffic?.record('directory-main.reply', 'business', message)
       if (worker.stopping) return
       const response = directoryFileOperationResultSchema.safeParse(message)
       if (!response.success || worker.result) {
@@ -150,7 +160,9 @@ export class DirectoryFileOperations {
       }
       try {
         child.postMessage(parsed.data)
+        traffic?.record('main-directory.request', 'business', parsed.data)
       } catch {
+        traffic?.invalidate('transport_error')
         this.stop(worker, {
           ok: false,
           code: 'IO',
@@ -159,6 +171,7 @@ export class DirectoryFileOperations {
       }
     })
     child.once('exit', (code: number) => {
+      settleTraffic?.()
       this.workers.delete(child)
       clearTimeout(worker.deadline)
       if (worker.forceTimer) clearTimeout(worker.forceTimer)

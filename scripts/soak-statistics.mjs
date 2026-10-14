@@ -174,7 +174,7 @@ export function percentile(histogramValue, percent) {
 // cannot supply evidence. Current producers deliberately remain incomplete for unobserved hops.
 function completeLogicalIpcTraffic(evidence, requestedDurationMs) {
   const ipc = evidence.ipcTraffic
-  const unit = 'json-utf8-null-binary-skeleton-plus-visible-binary-bytes'
+  const unit = 'json-utf8-regexp-source-flags-null-binary-skeleton-plus-visible-binary-bytes-v1'
   if (
     !ipc ||
     ipc.unit !== unit ||
@@ -200,6 +200,21 @@ function completeLogicalIpcTraffic(evidence, requestedDurationMs) {
       'main-utility.control',
       'utility-main.control',
     ],
+    'main-directory': ['main-directory.request', 'directory-main.reply'],
+    'utility-markdown': ['utility-markdown.request', 'markdown-utility.reply'],
+    'utility-image': ['utility-image.init', 'image-utility.reply'],
+    'utility-native-json': ['utility-native-json.init', 'native-json-utility.reply'],
+    'utility-native-fork': [
+      'utility-native-fork.init',
+      'utility-native-fork.control',
+      'native-fork-utility.reply',
+    ],
+    'main-diagnostic-log': [
+      'main-diagnostic-log.init',
+      'main-diagnostic-log.request',
+      'diagnostic-log-main.reply',
+    ],
+    'renderer-monaco': ['renderer-monaco.request', 'monaco-renderer.reply'],
   }
   const totals = (snapshot) => {
     if (
@@ -210,7 +225,7 @@ function completeLogicalIpcTraffic(evidence, requestedDurationMs) {
       !Array.isArray(snapshot.uncovered) ||
       snapshot.uncovered.length !== 0 ||
       !Array.isArray(snapshot.owners) ||
-      snapshot.owners.length !== 2
+      snapshot.owners.length !== 9
     )
       return undefined
     const owners = new Set(),
@@ -236,6 +251,18 @@ function completeLogicalIpcTraffic(evidence, requestedDurationMs) {
         !Number.isSafeInteger(owner.transportEpoch) ||
         owner.transportEpoch < 1 ||
         owner.transportEpoch > 64 ||
+        ![
+          'startedTransports',
+          'settledTransports',
+          'activeTransports',
+          'highWaterTransports',
+        ].every((key) => Number.isSafeInteger(owner[key]) && owner[key] >= 0) ||
+        owner.startedTransports > 1_000_000 ||
+        owner.settledTransports > 1_000_000 ||
+        owner.activeTransports > 64 ||
+        owner.highWaterTransports > 64 ||
+        owner.startedTransports - owner.settledTransports !== owner.activeTransports ||
+        owner.highWaterTransports < owner.activeTransports ||
         !Array.isArray(owner.issues) ||
         owner.issues.length !== 0 ||
         !Array.isArray(owner.counters) ||
@@ -284,7 +311,10 @@ function completeLogicalIpcTraffic(evidence, requestedDurationMs) {
     if (
       !initial ||
       initial.epoch !== owner.epoch ||
-      initial.transportEpoch !== owner.transportEpoch
+      initial.transportEpoch !== owner.transportEpoch ||
+      owner.startedTransports < initial.startedTransports ||
+      owner.settledTransports < initial.settledTransports ||
+      owner.highWaterTransports < initial.highWaterTransports
     )
       return false
     for (const row of owner.counters) {

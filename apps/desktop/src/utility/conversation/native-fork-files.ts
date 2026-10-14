@@ -3,6 +3,7 @@ import { Worker } from 'node:worker_threads'
 
 import type { AgentNativeForkBoundary, AgentNativeForkWitness } from '@pact/agent-runtime'
 
+import { ipcTrafficMeasurementSchema } from '@pact/contracts'
 import {
   collaborationResultSchema,
   collaborationAnswerFormatSchema,
@@ -10,6 +11,7 @@ import {
   type CollaborationAnswerFormat,
 } from '@pact/contracts'
 
+import { LogicalIpcWorkerTraffic, observeWorkerTraffic } from '../../shared/logical-ipc-traffic'
 import { AgentExecutionError } from './agent-execution-error'
 import { NativeWorkingMemory, NATIVE_OWNER_WORKING_BYTES } from './native-working-memory'
 
@@ -152,6 +154,8 @@ function answerResult(value: unknown): NativeForkAnswerResult {
 export class NativeForkFiles {
   private worker: Worker | undefined
 
+  constructor(private readonly ipcTraffic?: LogicalIpcWorkerTraffic) {}
+
   async execute(
     input: NativeForkFileInput,
     signal: AbortSignal,
@@ -211,10 +215,12 @@ export class NativeForkFiles {
         false,
       )
     const reservation = new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES)
+    const traffic = this.ipcTraffic?.collector('utility-native-fork')
+    const initialization = traffic ? { input, measure: true } : input
     let worker: Worker
     try {
       worker = new Worker(join(__dirname, 'native-fork-worker.js'), {
-        workerData: input,
+        workerData: initialization,
         resourceLimits: {
           maxOldGenerationSizeMb: 128,
           maxYoungGenerationSizeMb: 8,
@@ -225,6 +231,15 @@ export class NativeForkFiles {
       reservation.release()
       throw error
     }
+    traffic?.record('utility-native-fork.init', 'business', initialization)
+    observeWorkerTraffic(
+      worker,
+      traffic,
+      'utility-native-fork.control',
+      'native-fork-utility.reply',
+      'business',
+      false,
+    )
     this.worker = worker
     let active = true
     let referencePending = false
@@ -266,6 +281,14 @@ export class NativeForkFiles {
             code?: string
             nativeSessionId?: string
           }) => {
+            if (traffic) {
+              const measured = ipcTrafficMeasurementSchema.safeParse(
+                Reflect.get(message, 'ipcMeasurement'),
+              )
+              if (measured.success)
+                traffic.recordMeasurement('native-fork-utility.reply', 'business', measured.data)
+              else traffic.invalidate('unvalidated_message')
+            }
             if (message.type === 'history_reference') {
               const id = message.nativeSessionId
               if (

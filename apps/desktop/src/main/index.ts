@@ -1,9 +1,12 @@
 import { electronApp, optimizer } from '@electron-toolkit/utils'
 import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
+import { randomUUID } from 'node:crypto'
+import { realpathSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 import type { RuntimeStartupFailure } from '@pact/contracts'
 
+import { hasLogicalIpcFixtureNonce, LogicalIpcWorkerTraffic } from '../shared/logical-ipc-traffic'
 import { registerAppProtocol } from './app-protocol'
 import { registerDesktopModules } from './modules'
 import {
@@ -110,6 +113,23 @@ async function bootstrap(): Promise<void> {
   if (completePackagedProductionPathProbe()) return
   registerAppProtocol(join(__dirname, '../renderer'))
   const paths = resolveRuntimePaths()
+  let traffic: LogicalIpcWorkerTraffic | undefined
+  if (
+    (Boolean(process.env.PACT_SOAK_NONCE) || !app.isPackaged) &&
+    hasLogicalIpcFixtureNonce(process.env) &&
+    process.env.PACT_E2E_ROOT &&
+    paths.databaseFile !== ':memory:'
+  ) {
+    try {
+      if (realpathSync(dirname(paths.databaseFile)) === realpathSync(process.env.PACT_E2E_ROOT))
+        traffic = new LogicalIpcWorkerTraffic(
+          ['main-utility', 'main-directory', 'main-diagnostic-log'],
+          randomUUID(),
+        )
+    } catch {
+      /* An unproved fixture stays disabled and cannot satisfy the measurement gate. */
+    }
+  }
   diagnostics = new DiagnosticLogs(
     join(
       paths.databaseFile === ':memory:'
@@ -119,10 +139,13 @@ async function bootstrap(): Promise<void> {
       app.isPackaged ? 'production' : 'development',
     ),
     rendererTrust,
+    traffic?.collector('main-utility'),
+    traffic?.collector('main-diagnostic-log'),
   )
   utilityClient.start({
     ...paths,
     diagnostics,
+    ...(traffic ? { traffic } : {}),
     onStartupFailed: (failure: RuntimeStartupFailure) => {
       if (startupFailureShown) return
       startupFailureShown = true

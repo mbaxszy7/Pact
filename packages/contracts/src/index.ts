@@ -220,7 +220,49 @@ export const appInfoSchema = z.object({
 
 export type AppInfo = z.infer<typeof appInfoSchema>
 
-export const IPC_TRAFFIC_UNIT = 'json-utf8-null-binary-skeleton-plus-visible-binary-bytes' as const
+export const IPC_TRAFFIC_UNIT =
+  'json-utf8-regexp-source-flags-null-binary-skeleton-plus-visible-binary-bytes-v1' as const
+export const IPC_TRAFFIC_OWNER_CATEGORIES = {
+  'renderer-bridge': [
+    'renderer-main.invoke',
+    'main-renderer.reply',
+    'renderer-main.send',
+    'main-renderer.event',
+  ],
+  'main-utility': [
+    'main-utility.request',
+    'utility-main.reply',
+    'utility-main.event',
+    'main-utility.control',
+    'utility-main.control',
+  ],
+  'main-directory': ['main-directory.request', 'directory-main.reply'],
+  'utility-markdown': ['utility-markdown.request', 'markdown-utility.reply'],
+  'utility-image': ['utility-image.init', 'image-utility.reply'],
+  'utility-native-json': ['utility-native-json.init', 'native-json-utility.reply'],
+  'utility-native-fork': [
+    'utility-native-fork.init',
+    'utility-native-fork.control',
+    'native-fork-utility.reply',
+  ],
+  'main-diagnostic-log': [
+    'main-diagnostic-log.init',
+    'main-diagnostic-log.request',
+    'diagnostic-log-main.reply',
+  ],
+  'renderer-monaco': ['renderer-monaco.request', 'monaco-renderer.reply'],
+} as const
+export const ipcTrafficOwnerSchema = z.enum([
+  'renderer-bridge',
+  'main-utility',
+  'main-directory',
+  'utility-markdown',
+  'utility-image',
+  'utility-native-json',
+  'utility-native-fork',
+  'main-diagnostic-log',
+  'renderer-monaco',
+])
 export const ipcTrafficCategorySchema = z.enum([
   'renderer-main.invoke',
   'main-renderer.reply',
@@ -231,6 +273,22 @@ export const ipcTrafficCategorySchema = z.enum([
   'utility-main.event',
   'main-utility.control',
   'utility-main.control',
+  'main-directory.request',
+  'directory-main.reply',
+  'utility-markdown.request',
+  'markdown-utility.reply',
+  'utility-image.init',
+  'image-utility.reply',
+  'utility-native-json.init',
+  'native-json-utility.reply',
+  'utility-native-fork.init',
+  'utility-native-fork.control',
+  'native-fork-utility.reply',
+  'main-diagnostic-log.init',
+  'main-diagnostic-log.request',
+  'diagnostic-log-main.reply',
+  'renderer-monaco.request',
+  'monaco-renderer.reply',
 ])
 export type IpcTrafficCategory = z.infer<typeof ipcTrafficCategorySchema>
 export const ipcTrafficIssueSchema = z.enum([
@@ -255,6 +313,45 @@ export const ipcTrafficIssueSchema = z.enum([
   'cleanup_unavailable',
 ])
 export type IpcTrafficIssue = z.infer<typeof ipcTrafficIssueSchema>
+export const ipcTrafficMeasurementSchema = z
+  .strictObject({
+    complete: z.boolean(),
+    jsonBytes: z
+      .number()
+      .int()
+      .min(0)
+      .max(128 * 1024 * 1024),
+    binaryBytes: z
+      .number()
+      .int()
+      .min(0)
+      .max(128 * 1024 * 1024),
+    totalBytes: z
+      .number()
+      .int()
+      .min(0)
+      .max(128 * 1024 * 1024),
+    reason: ipcTrafficIssueSchema.optional(),
+  })
+  .refine(
+    (value) =>
+      value.totalBytes === value.jsonBytes + value.binaryBytes &&
+      (value.complete ? value.reason === undefined : value.reason !== undefined),
+  )
+export type IpcTrafficMeasurement = z.infer<typeof ipcTrafficMeasurementSchema>
+export const monacoIpcObservationSchema = z.discriminatedUnion('type', [
+  z.strictObject({
+    type: z.literal('message'),
+    unit: z.literal(IPC_TRAFFIC_UNIT),
+    category: z.enum(['renderer-monaco.request', 'monaco-renderer.reply']),
+    measurement: ipcTrafficMeasurementSchema,
+  }),
+  z.strictObject({
+    type: z.enum(['created', 'termination-requested', 'transport-error']),
+    unit: z.literal(IPC_TRAFFIC_UNIT),
+  }),
+])
+export type MonacoIpcObservation = z.infer<typeof monacoIpcObservationSchema>
 export const ipcTrafficUncoveredSchema = z.enum([
   'renderer-main-bridge',
   'main-utility-diagnostic-control',
@@ -281,9 +378,13 @@ const ipcTrafficCountsSchema = z
   )
 export const ipcTrafficOwnerSnapshotSchema = z
   .strictObject({
-    owner: z.enum(['renderer-bridge', 'main-utility']),
+    owner: ipcTrafficOwnerSchema,
     epoch: z.uuid().nullable(),
     transportEpoch: z.number().int().min(1).max(64),
+    startedTransports: z.number().int().min(0).max(1_000_000),
+    settledTransports: z.number().int().min(0).max(1_000_000),
+    activeTransports: z.number().int().min(0).max(64),
+    highWaterTransports: z.number().int().min(0).max(64),
     complete: z.boolean(),
     issues: z.array(ipcTrafficIssueSchema).max(19),
     counters: z
@@ -294,29 +395,18 @@ export const ipcTrafficOwnerSnapshotSchema = z
           control: ipcTrafficCountsSchema,
         }),
       )
-      .max(9),
+      .max(5),
   })
   .refine(
     (value) =>
       new Set(value.counters.map((row) => row.category)).size === value.counters.length &&
-      value.counters.length === (value.owner === 'renderer-bridge' ? 4 : 5) &&
+      value.counters.length === IPC_TRAFFIC_OWNER_CATEGORIES[value.owner].length &&
       value.counters.every((row) =>
-        value.owner === 'renderer-bridge'
-          ? [
-              'renderer-main.invoke',
-              'main-renderer.reply',
-              'renderer-main.send',
-              'main-renderer.event',
-            ].includes(row.category)
-          : [
-              'main-utility.request',
-              'utility-main.reply',
-              'utility-main.event',
-              'main-utility.control',
-              'utility-main.control',
-            ].includes(row.category),
+        (IPC_TRAFFIC_OWNER_CATEGORIES[value.owner] as readonly string[]).includes(row.category),
       ) &&
       new Set(value.issues).size === value.issues.length &&
+      value.startedTransports - value.settledTransports === value.activeTransports &&
+      value.highWaterTransports >= value.activeTransports &&
       Number.isSafeInteger(
         value.counters.reduce(
           (total, row) => total + row.business.totalBytes + row.control.totalBytes,
@@ -336,7 +426,7 @@ export const ipcTrafficSchema = z
     schemaVersion: z.literal(1),
     unit: z.literal(IPC_TRAFFIC_UNIT),
     complete: z.boolean(),
-    owners: z.array(ipcTrafficOwnerSnapshotSchema).max(2),
+    owners: z.array(ipcTrafficOwnerSnapshotSchema).max(9),
     uncovered: z.array(ipcTrafficUncoveredSchema).max(9),
   })
   .refine(
@@ -355,7 +445,7 @@ export const ipcTrafficSchema = z
         ),
       ) &&
       (!value.complete ||
-        (value.owners.length === 2 &&
+        (value.owners.length === 9 &&
           value.uncovered.length === 0 &&
           value.owners.every((owner) => owner.complete))),
   )
@@ -2369,6 +2459,8 @@ export const utilityEventSchema = z.discriminatedUnion('type', [
 export type UtilityEvent = z.infer<typeof utilityEventSchema>
 
 export interface DesktopBridge {
+  /** Fixture-only scalar observation; local Preload counters, never generic IPC or business DTOs. */
+  observeMonacoWorkerTraffic?(this: void, observation: MonacoIpcObservation): void
   getDiagnosticStatus?(): Promise<DiagnosticStatus>
   onDiagnosticStatusChanged?(listener: (status: DiagnosticStatus) => void): () => void
   reportRendererFault?(fault: RendererFault): void

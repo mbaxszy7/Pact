@@ -4,6 +4,7 @@ export interface LogicalPayloadByteLimits {
   maxNodes: number
   maxDepth: number
 }
+export type LogicalPayloadProfile = 'plain-dto' | 'monaco-clone-data'
 
 export type LogicalPayloadIncompleteReason =
   | 'invalid_limits'
@@ -55,6 +56,21 @@ const typedArrayByteLength = intrinsicGetter(typedArrayPrototype, 'byteLength')
 const typedArrayBuffer = intrinsicGetter(typedArrayPrototype, 'buffer')
 const dataViewByteLength = intrinsicGetter(DataView.prototype, 'byteLength')
 const dataViewBuffer = intrinsicGetter(DataView.prototype, 'buffer')
+const regexpSource = intrinsicGetter(RegExp.prototype, 'source')
+const regexpFlags = [
+  ['hasIndices', 'd'],
+  ['global', 'g'],
+  ['ignoreCase', 'i'],
+  ['multiline', 'm'],
+  ['dotAll', 's'],
+  ['unicode', 'u'],
+  ['unicodeSets', 'v'],
+  ['sticky', 'y'],
+] as const
+const regexpFlagGetters = regexpFlags.map(([name, flag]) => ({
+  flag,
+  get: intrinsicGetter(RegExp.prototype, name),
+}))
 
 function hasArrayBufferBrand(value: object): value is ArrayBuffer {
   try {
@@ -113,6 +129,8 @@ function binaryLength(value: object): number | 'unsupported' | undefined {
  * omitted object undefined and null array holes/undefined. Unsupported values never count as a
  * successful zero. Binary leaves (ArrayBuffer, DataView and typed views, including Node Buffer)
  * become null in the JSON skeleton; binaryBytes counts each leaf's visible byteLength separately.
+ * The opt-in Monaco clone-data profile also projects the confirmed native RegExp leaf to the
+ * canonical {$regexp:{source,flags}} JSON token, without adding virtual input nodes/containers.
  * totalBytes is jsonBytes + binaryBytes, NOT Electron/structured-clone wire or resident-memory bytes.
  * Repeated references count per occurrence; only the current ancestor chain identifies cycles.
  *
@@ -129,6 +147,7 @@ function binaryLength(value: object): number | 'unsupported' | undefined {
 export function measureLogicalPayloadBytes(
   payload: unknown,
   limits: LogicalPayloadByteLimits,
+  profile: LogicalPayloadProfile = 'plain-dto',
 ): LogicalPayloadByteMeasurement {
   let jsonBytes = 0
   let binaryBytes = 0
@@ -143,7 +162,11 @@ export function measureLogicalPayloadBytes(
     return reason ? { ...counts, complete: false, reason } : { ...counts, complete: true }
   }
   try {
-    if (limits === null || typeof limits !== 'object') {
+    if (
+      limits === null ||
+      typeof limits !== 'object' ||
+      !['plain-dto', 'monaco-clone-data'].includes(profile)
+    ) {
       incomplete('invalid_limits')
       return result()
     }
@@ -230,6 +253,34 @@ export function measureLogicalPayloadBytes(
       const bytes = binaryLength(value)
       if (bytes === 'unsupported') return incomplete('unsupported_binary')
       if (bytes !== undefined) return add(4) && add(bytes, true)
+      if (profile === 'monaco-clone-data' && Object.getPrototypeOf(value) === RegExp.prototype) {
+        // Actual installed Monaco sends native RegExp in its clone-data initialization. Clone
+        // preserves source/flags, drops custom own properties and resets lastIndex. Read internal
+        // slots only: the native flags getter itself would consult user-overridable properties.
+        let source: unknown
+        let flags = ''
+        try {
+          source = regexpSource?.(value)
+          for (const entry of regexpFlagGetters) {
+            if (!entry.get) return incomplete('unsupported_prototype')
+            const enabled = entry.get(value)
+            if (typeof enabled !== 'boolean') return incomplete('unsupported_prototype')
+            if (enabled) flags += entry.flag
+          }
+        } catch {
+          return incomplete('unsupported_prototype')
+        }
+        if (typeof source !== 'string') return incomplete('unsupported_prototype')
+        // A constant-sized canonical skeleton makes hidden clone state visible in the declared
+        // metric. No pattern/body copy, serialization hook or payload reference is retained.
+        return (
+          add('{"$regexp":{"source":'.length) &&
+          string(source) &&
+          add(',"flags":'.length) &&
+          string(flags) &&
+          add(2)
+        )
+      }
       if (depth >= maxDepth) return incomplete('depth_limit')
       if (ancestors.has(value)) return incomplete('cycle')
       const isArray = Array.isArray(value)

@@ -10,12 +10,32 @@ import {
   runtimeHealthSchema,
   IPC_TRAFFIC_UNIT,
   ipcTrafficSchema,
+  monacoIpcObservationSchema,
 } from './index.js'
 
 const uuid = (index: number): string =>
   `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`
 
 describe('foundation contracts', () => {
+  it('rejects missing and older Monaco measurement units before counting traffic', () => {
+    const observation = {
+      type: 'message',
+      unit: IPC_TRAFFIC_UNIT,
+      category: 'renderer-monaco.request',
+      measurement: { complete: true, jsonBytes: 38, binaryBytes: 0, totalBytes: 38 },
+    }
+    expect(monacoIpcObservationSchema.safeParse(observation).success).toBe(true)
+    expect(monacoIpcObservationSchema.safeParse({ ...observation, unit: undefined }).success).toBe(
+      false,
+    )
+    expect(
+      monacoIpcObservationSchema.safeParse({
+        ...observation,
+        unit: 'json-utf8-null-binary-skeleton-plus-visible-binary-bytes',
+      }).success,
+    ).toBe(false)
+    expect(monacoIpcObservationSchema.safeParse({ type: 'created' }).success).toBe(false)
+  })
   it('keeps optional IPC health backward compatible and rejects fabricated full coverage', () => {
     const health = {
       status: 'ready',
@@ -33,6 +53,12 @@ describe('foundation contracts', () => {
     }
     expect(runtimeHealthSchema.safeParse({ ...health, ipcTraffic: observation }).success).toBe(true)
     expect(ipcTrafficSchema.safeParse({ ...observation, complete: true }).success).toBe(false)
+    expect(
+      ipcTrafficSchema.safeParse({
+        ...observation,
+        unit: 'json-utf8-null-binary-skeleton-plus-visible-binary-bytes',
+      }).success,
+    ).toBe(false)
     expect(
       ipcTrafficSchema.safeParse({ ...observation, unit: 'electron-wire-bytes' }).success,
     ).toBe(false)

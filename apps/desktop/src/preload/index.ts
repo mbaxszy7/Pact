@@ -12,9 +12,14 @@ import {
   rpcResultSchema,
   runtimeHealthSchema,
   rendererFaultSchema,
+  monacoIpcObservationSchema,
 } from '@pact/contracts'
 
-import { LogicalIpcTrafficCollector } from '../shared/logical-ipc-traffic'
+import {
+  hasLogicalIpcFixtureNonce,
+  LogicalIpcTrafficCollector,
+  logicalIpcTrafficSnapshot,
+} from '../shared/logical-ipc-traffic'
 
 if (!process.contextIsolated) {
   throw new Error('Pact requires context isolation')
@@ -28,9 +33,12 @@ function observationEpoch(): string | null {
   }
 }
 const traffic =
-  /^[a-f\d]{64}$/u.test(process.env.PACT_SOAK_NONCE ?? '') && process.env.PACT_E2E_ROOT
+  hasLogicalIpcFixtureNonce(process.env) && process.env.PACT_E2E_ROOT
     ? new LogicalIpcTrafficCollector('renderer-bridge', observationEpoch())
     : undefined
+const monacoTraffic = traffic
+  ? new LogicalIpcTrafficCollector('renderer-monaco', observationEpoch())
+  : undefined
 const controlChannels = new Set<string>([
   IPC_CHANNELS.runtimeHealth,
   IPC_CHANNELS.appInfo,
@@ -126,6 +134,7 @@ if (traffic) {
         for (const cleanup of eventCleanup) cleanup()
         eventCleanup.length = 0
         traffic.dispose()
+        monacoTraffic?.dispose()
       },
       { once: true },
     ])
@@ -133,6 +142,31 @@ if (traffic) {
 }
 
 const bridge: DesktopBridge = {
+  ...(monacoTraffic
+    ? {
+        observeMonacoWorkerTraffic: (
+          input: import('@pact/contracts').MonacoIpcObservation,
+        ): void => {
+          const parsed = monacoIpcObservationSchema.safeParse(input)
+          if (!parsed.success) {
+            monacoTraffic.invalidate('unvalidated_message')
+            return
+          }
+          if (parsed.data.type === 'message')
+            monacoTraffic.recordMeasurement(
+              parsed.data.category,
+              'business',
+              parsed.data.measurement,
+            )
+          else if (parsed.data.type === 'created') {
+            monacoTraffic.beginTransport()
+            monacoTraffic.invalidate('cleanup_unavailable') // No Browser API acknowledges physical Worker settlement.
+          } else if (parsed.data.type === 'transport-error')
+            monacoTraffic.invalidate('transport_error')
+          else monacoTraffic.invalidate('cleanup_unavailable') // Browser terminate() has no physical settlement receipt.
+        },
+      }
+    : {}),
   setComposerEditingState: (input) => invoke(IPC_CHANNELS.composerEditingState, input),
   settleComposerEdit: (input) => invoke(IPC_CHANNELS.composerEditReceipt, input),
   onComposerEditCommand,
@@ -171,15 +205,12 @@ const bridge: DesktopBridge = {
       ...parsed.data,
       value: {
         ...parsed.data.value,
-        ipcTraffic: {
-          ...observation,
-          complete: false,
-          owners: [
-            ...observation.owners.filter((owner) => owner.owner !== 'renderer-bridge'),
-            traffic.snapshot(),
-          ],
-          uncovered: observation.uncovered.filter((hop) => hop !== 'renderer-main-bridge'),
-        },
+        ipcTraffic: logicalIpcTrafficSnapshot(traffic.snapshot(), [
+          ...observation.owners.filter(
+            (owner) => owner.owner !== 'renderer-bridge' && owner.owner !== 'renderer-monaco',
+          ),
+          ...(monacoTraffic ? [monacoTraffic.snapshot()] : []),
+        ]),
       },
     }
   },

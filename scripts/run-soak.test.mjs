@@ -24,7 +24,7 @@ const zeroIpcCounts = () => ({
 const evaluateIpcGate = (input) =>
   evaluateSoak({ durationMs: 7_200_000, missingObservations: [], ipcTraffic: input }, 7_200_000)
 function completeIpcEvidence(durationMs = 7_200_000) {
-  const unit = 'json-utf8-null-binary-skeleton-plus-visible-binary-bytes'
+  const unit = 'json-utf8-regexp-source-flags-null-binary-skeleton-plus-visible-binary-bytes-v1'
   const categories = {
     'renderer-bridge': [
       'renderer-main.invoke',
@@ -39,6 +39,21 @@ function completeIpcEvidence(durationMs = 7_200_000) {
       'main-utility.control',
       'utility-main.control',
     ],
+    'main-directory': ['main-directory.request', 'directory-main.reply'],
+    'utility-markdown': ['utility-markdown.request', 'markdown-utility.reply'],
+    'utility-image': ['utility-image.init', 'image-utility.reply'],
+    'utility-native-json': ['utility-native-json.init', 'native-json-utility.reply'],
+    'utility-native-fork': [
+      'utility-native-fork.init',
+      'utility-native-fork.control',
+      'native-fork-utility.reply',
+    ],
+    'main-diagnostic-log': [
+      'main-diagnostic-log.init',
+      'main-diagnostic-log.request',
+      'diagnostic-log-main.reply',
+    ],
+    'renderer-monaco': ['renderer-monaco.request', 'monaco-renderer.reply'],
   }
   const snapshot = {
     schemaVersion: 1,
@@ -49,6 +64,10 @@ function completeIpcEvidence(durationMs = 7_200_000) {
       owner,
       epoch: `00000000-0000-4000-8000-00000000000${index + 1}`,
       transportEpoch: 1,
+      startedTransports: 0,
+      settledTransports: 0,
+      activeTransports: 0,
+      highWaterTransports: 0,
       complete: true,
       issues: [],
       counters: entries.map((category) => ({
@@ -82,6 +101,7 @@ void test('IPC acceptance independently rejects missing, partial, overflowed and
     { ...ipcTraffic, complete: false },
     { ...ipcTraffic, issues: ['counter_overflow'] },
     { ...ipcTraffic, unit: 'wire-bytes' },
+    { ...ipcTraffic, unit: 'json-utf8-null-binary-skeleton-plus-visible-binary-bytes' },
     { ...ipcTraffic, observedDurationMs: 7_199_999 },
     { ...ipcTraffic, baseline: undefined },
     { ...ipcTraffic, businessBytes: 1 },
@@ -113,6 +133,16 @@ void test('IPC acceptance independently rejects missing, partial, overflowed and
     },
     (value) => {
       value.snapshot.owners[0].counters.pop()
+    },
+    (value) => {
+      delete value.snapshot.owners[0].startedTransports
+    },
+    (value) => {
+      value.snapshot.owners[0].activeTransports = 1
+    },
+    (value) => {
+      value.baseline.owners[0].startedTransports = 1
+      value.baseline.owners[0].settledTransports = 1
     },
     (value) => {
       value.snapshot.owners[0].counters[0].business.messages = 1_000_001

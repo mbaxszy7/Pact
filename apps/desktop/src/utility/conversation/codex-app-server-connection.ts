@@ -8,6 +8,8 @@ import {
   type DiagnosticFailureSource,
 } from '@pact/contracts/diagnostics'
 
+import type { LogicalIpcWorkerTraffic } from '../../shared/logical-ipc-traffic'
+
 import { recordDiagnostic } from '../../diagnostics/utility-log'
 import { AgentExecutionError } from './agent-execution-error'
 import {
@@ -168,6 +170,7 @@ export class CodexAppServerConnection {
     private readonly child: ChildProcessWithoutNullStreams,
     private readonly onClosed?: () => void,
     private readonly closeOwnedProcess?: () => Promise<void>,
+    private readonly ipcTraffic?: LogicalIpcWorkerTraffic,
   ) {
     recordDiagnostic({
       operation: 'process',
@@ -502,7 +505,11 @@ export class CodexAppServerConnection {
         message = JSON.parse(this.decoder.decode(frame))
         heldBytes = freezeNativeJsonFrame(message)
       } else {
-        const parsed = await parseNativeJsonFrame(frame, this.inboundController.signal)
+        const parsed = await parseNativeJsonFrame(
+          frame,
+          this.inboundController.signal,
+          this.ipcTraffic,
+        )
         message = parsed.message
         heldBytes = parsed.heldBytes
       }

@@ -30,6 +30,123 @@ function jsonCounts(value: unknown) {
 }
 
 describe('logical payload byte measurement', () => {
+  it('counts a genuine RegExp clone leaf without adding virtual nodes or containers', () => {
+    const value = /a/g
+    const expected = Buffer.byteLength(
+      JSON.stringify({
+        $regexp: { source: structuredClone(value).source, flags: structuredClone(value).flags },
+      }),
+    )
+    expect(expected).toBe(38)
+    const limits = { maxBytes: expected, maxNodes: 1, maxDepth: 0 }
+    expect(measureLogicalPayloadBytes(value, limits, 'monaco-clone-data')).toEqual({
+      complete: true,
+      jsonBytes: expected,
+      binaryBytes: 0,
+      totalBytes: expected,
+      visitedNodes: 1,
+    })
+    expect(
+      measureLogicalPayloadBytes(value, { ...limits, maxBytes: expected - 1 }, 'monaco-clone-data'),
+    ).toMatchObject({ complete: false, reason: 'byte_limit' })
+    expect(measureLogicalPayloadBytes(value, limits)).toMatchObject({ complete: false })
+    let nested: unknown = value
+    for (let index = 0; index < 64; index += 1) nested = [nested]
+    expect(
+      measureLogicalPayloadBytes(nested, { ...LIMITS, maxNodes: 65 }, 'monaco-clone-data'),
+    ).toMatchObject({ complete: true, visitedNodes: 65, totalBytes: expected + 128 })
+    expect(measureLogicalPayloadBytes([nested], LIMITS, 'monaco-clone-data')).toMatchObject({
+      complete: false,
+      reason: 'depth_limit',
+    })
+    expect(
+      measureLogicalPayloadBytes([value, value], { ...LIMITS, maxNodes: 2 }, 'monaco-clone-data'),
+    ).toMatchObject({ complete: false, reason: 'node_limit' })
+  })
+
+  it('matches independent structuredClone source/flags oracles for Unicode, escapes and legal flags', () => {
+    for (const source of ['', 'é😀', '\ud800', 'a\\\\b', '\n', '[A-Z]']) {
+      for (let bits = 0; bits < 256; bits += 1) {
+        const flags = Array.from('dgimsuvy')
+          .filter((_flag, index) => (bits & (1 << index)) !== 0)
+          .join('')
+        if (flags.includes('u') && flags.includes('v')) continue // ECMAScript rejects this combination.
+        const value = new RegExp(source, flags),
+          clone = structuredClone(value)
+        const expected = Buffer.byteLength(
+          JSON.stringify({ $regexp: { source: clone.source, flags: clone.flags } }),
+        )
+        expect(
+          measureLogicalPayloadBytes(value, { ...LIMITS, maxNodes: 1 }, 'monaco-clone-data'),
+        ).toMatchObject({
+          complete: true,
+          jsonBytes: expected,
+          totalBytes: expected,
+          binaryBytes: 0,
+          visitedNodes: 1,
+        })
+      }
+    }
+  })
+
+  it('does not run custom RegExp properties or hooks that actual structured clone discards', () => {
+    const value = /é😀/gims
+    const clone = structuredClone(value)
+    const getter = vi.fn<() => string>(() => 'private data')
+    for (const name of [
+      'source',
+      'flags',
+      'hasIndices',
+      'global',
+      'ignoreCase',
+      'multiline',
+      'dotAll',
+      'unicode',
+      'unicodeSets',
+      'sticky',
+      'toJSON',
+      'custom',
+    ])
+      Object.defineProperty(value, name, { enumerable: true, get: getter })
+    value.lastIndex = 55
+    const expected = Buffer.byteLength(
+      JSON.stringify({ $regexp: { source: clone.source, flags: clone.flags } }),
+    )
+    expect(measureLogicalPayloadBytes(value, LIMITS, 'monaco-clone-data')).toMatchObject({
+      complete: true,
+      totalBytes: expected,
+    })
+    expect(getter).not.toHaveBeenCalled()
+    expect(structuredClone(value).lastIndex).toBe(0)
+    expect(getter).not.toHaveBeenCalled()
+  })
+
+  it('rejects fake brands, unknown classes and unavailable native flag intrinsics', async () => {
+    class Unknown {
+      marker = true
+    }
+    for (const value of [Object.create(RegExp.prototype), new Date(0), new Map(), new Unknown()])
+      expect(measureLogicalPayloadBytes(value, LIMITS, 'monaco-clone-data')).toMatchObject({
+        complete: false,
+        reason: 'unsupported_prototype',
+      })
+    const original = Object.getOwnPropertyDescriptor.bind(Object)
+    const missing = vi
+      .spyOn(Object, 'getOwnPropertyDescriptor')
+      .mockImplementation((value, key) =>
+        value === RegExp.prototype && key === 'unicodeSets' ? undefined : original(value, key),
+      )
+    try {
+      vi.resetModules()
+      const { measureLogicalPayloadBytes: unavailable } = await import('./logical-payload-bytes.js')
+      expect(unavailable(/a/g, LIMITS, 'monaco-clone-data')).toMatchObject({
+        complete: false,
+        reason: 'unsupported_prototype',
+      })
+    } finally {
+      missing.mockRestore()
+    }
+  })
   it.each([
     null,
     true,

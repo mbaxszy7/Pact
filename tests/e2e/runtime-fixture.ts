@@ -1,5 +1,6 @@
 import { _electron as electron, test as baseTest, type ElectronApplication } from '@playwright/test'
 import { execFile } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import {
   chmod,
   lstat,
@@ -93,6 +94,8 @@ export const test = baseTest.extend<{ runtimeOwnership: void }>({
 type ProbeState = 'ready' | 'authentication_required' | 'cannot_verify' | 'startup_failed'
 
 export interface RuntimeFixtureOptions {
+  /** Credential-free fixture only; the fixture owns the nonce and canonical isolated root. */
+  measureIpcTraffic?: boolean
   mode?: 'ui' | 'real' | 'deterministic'
   configuration?: ProviderConfiguration
   transportFault?: NativeTransportFault
@@ -709,6 +712,11 @@ export async function createRuntimeFixture(
       environment.env.NODE_ENV = 'test'
       environment.env.PACT_TEST_DB_FILE = databaseFile
       environment.env.PACT_E2E_ROOT = directory
+      if (options.measureIpcTraffic) {
+        if (mode === 'real')
+          throw new Error('IPC performance fixtures cannot authorize real provider generation')
+        environment.env.PACT_E2E_IPC_NONCE = randomBytes(32).toString('hex')
+      }
       const codexAppServerPath = options.codexAppServer
         ? await writeCodexAppServer(
             directory,

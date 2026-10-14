@@ -14,6 +14,7 @@ import {
 import { PactDatabase, DatabaseOpenError } from '@pact/persistence'
 
 import { closeDiagnostics, receiveDiagnostic, recordDiagnostic } from '../diagnostics/utility-log'
+import { hasLogicalIpcFixtureNonce, LogicalIpcWorkerTraffic } from '../shared/logical-ipc-traffic'
 import { handleAppearanceRequest } from './appearance/handler'
 import { Conversation } from './conversation/conversation'
 import { ConversationImages } from './conversation/conversation-images'
@@ -35,6 +36,7 @@ let workspaceChanges: WorkspaceChanges | undefined
 let directoryFiles: UtilityDirectoryFileClient | undefined
 let eventLoopProbe: ReturnType<typeof monitorEventLoopDelay> | undefined
 let resourceHighWater = 0
+let workerTraffic: LogicalIpcWorkerTraffic | undefined
 
 if (!parentPort) throw new Error('Pact utility runtime requires an Electron parent port')
 if (
@@ -88,7 +90,7 @@ async function bootstrap(
   const measurementRoot = process.env.PACT_E2E_ROOT
   const measurePerformance = Boolean(
     measurementRoot &&
-    /^[a-f\d]{64}$/u.test(process.env.PACT_SOAK_NONCE ?? '') &&
+    hasLogicalIpcFixtureNonce(process.env) &&
     runtimeDatabaseFile !== ':memory:' &&
     (await realpath(dirname(runtimeDatabaseFile))) === (await realpath(measurementRoot)),
   )
@@ -99,6 +101,10 @@ async function bootstrap(
   })
   database = openedDatabase
   if (measurePerformance) {
+    workerTraffic = new LogicalIpcWorkerTraffic(
+      ['utility-markdown', 'utility-image', 'utility-native-json', 'utility-native-fork'],
+      randomUUID(),
+    )
     eventLoopProbe = monitorEventLoopDelay({ resolution: 10 })
     eventLoopProbe.enable()
   }
@@ -137,6 +143,7 @@ async function bootstrap(
   const images = new ConversationImages(
     openedDatabase.conversationRepository,
     runtimeWorkspaceStorageRoot,
+    workerTraffic,
   )
   await images.initialize()
   conversation = new Conversation(
@@ -147,6 +154,7 @@ async function bootstrap(
     projectFileReader,
     runtimeDatabaseFile === ':memory:' ? undefined : workspaceOwner,
     images,
+    workerTraffic,
   )
   conversation.subscribe((patch, progress) => {
     parentPort.postMessage(
@@ -271,6 +279,23 @@ async function bootstrap(
               pid: process.pid,
               checkedAt: new Date().toISOString(),
               ...(eventLoopProbe ? { performance: performanceSnapshot(openedDatabase) } : {}),
+              ...(workerTraffic
+                ? {
+                    ipcTraffic: {
+                      schemaVersion: 1 as const,
+                      unit: 'json-utf8-regexp-source-flags-null-binary-skeleton-plus-visible-binary-bytes-v1' as const,
+                      complete: false,
+                      owners: workerTraffic.snapshots(),
+                      uncovered: [
+                        'renderer-main-bridge',
+                        'main-utility-diagnostic-control',
+                        'main-directory-worker',
+                        'main-diagnostic-log-worker',
+                        'renderer-monaco-workers',
+                      ] as const,
+                    },
+                  }
+                : {}),
               conversation: {
                 ...conversationOwner.diagnostics(),
                 completeReads: openedDatabase.conversationRepository.diagnostics().completeReads,

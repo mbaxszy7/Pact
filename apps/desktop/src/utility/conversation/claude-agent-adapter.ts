@@ -52,6 +52,8 @@ import {
   type NativePermissionRequest,
 } from '@pact/contracts'
 
+import type { LogicalIpcWorkerTraffic } from '../../shared/logical-ipc-traffic'
+
 import { AgentActivityDetail } from './agent-activity-detail'
 import { AgentAnswerAssembler } from './agent-answer-assembler'
 import {
@@ -217,13 +219,16 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     this.skillCatalogChanged = listener
   }
   private disposed = false
-  private readonly nativeForkFiles = new NativeForkFiles()
+  private readonly nativeForkFiles: NativeForkFiles
   private readonly forkInitializing = new Set<string>()
 
   constructor(
     private readonly executablePath: string,
     private readonly dependencies: ClaudeAgentDependencies = defaultClaudeAgentDependencies,
-  ) {}
+    ipcTraffic?: LogicalIpcWorkerTraffic,
+  ) {
+    this.nativeForkFiles = new NativeForkFiles(ipcTraffic)
+  }
 
   retireSourceGrant(owner: { runId: string; grant: string }): void {
     const source = this.backgroundRuns.get(owner.runId)?.sourceGrant

@@ -9,6 +9,7 @@ import { afterAll, beforeAll, expect, it, vi } from 'vitest'
 
 import type { AgentNativeForkWitness } from '@pact/contracts'
 
+import { LogicalIpcWorkerTraffic } from '../../shared/logical-ipc-traffic'
 import {
   NativeForkFiles,
   type NativeForkFileInput,
@@ -36,7 +37,11 @@ vi.mock('node:worker_threads', async (original) => {
   }
 })
 let directory: string
-const files = new NativeForkFiles()
+const traffic = new LogicalIpcWorkerTraffic(
+  ['utility-native-fork'],
+  '00000000-0000-4000-8000-000000000001',
+)
+const files = new NativeForkFiles(traffic)
 beforeAll(async () => {
   directory = await mkdtemp(join(tmpdir(), 'pact-fork-worker-test-'))
   const desktopRoot = resolve(import.meta.dirname, '../../..')
@@ -1005,4 +1010,19 @@ it('cancels the sole pending parent read and cleans up the worker before another
       )
     ).prefixHash,
   ).toBe(fixture.prefix.prefixHash)
+})
+
+it('keeps all actual Fork candidate/reference/ACK traffic and physical exits in one group', async () => {
+  await files.dispose()
+  expect(traffic.snapshots()[0]).toMatchObject({
+    complete: true,
+    activeTransports: 0,
+    startedTransports: workerLocation.started,
+    settledTransports: workerLocation.started,
+  })
+  expect(traffic.snapshots()[0]!.counters[0]!.business.messages).toBe(workerLocation.started)
+  expect(traffic.snapshots()[0]!.counters[1]!.business.messages).toBeGreaterThan(0)
+  expect(traffic.snapshots()[0]!.counters[2]!.business.messages).toBeGreaterThan(
+    workerLocation.started,
+  )
 })

@@ -70,7 +70,9 @@ import {
 import type { DiagnosticLogs } from '../modules/diagnostics'
 
 import {
+  hasLogicalIpcFixtureNonce,
   LogicalIpcTrafficCollector,
+  LogicalIpcWorkerTraffic,
   logicalIpcTrafficSnapshot,
 } from '../../shared/logical-ipc-traffic'
 import { DirectoryFileOperations } from './directory-file-operations'
@@ -87,6 +89,7 @@ const diagnosticUuid = (value: unknown): value is string =>
 const DIRECTORY_REQUEST_LIMIT = 20
 
 export interface UtilityProcessStartOptions {
+  traffic?: LogicalIpcWorkerTraffic
   databaseFile: string
   migrationsFolder: string
   workspaceStorageRoot?: string
@@ -255,6 +258,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   private startupFailureCallback: UtilityProcessStartOptions['onStartupFailed']
   private diagnostics: UtilityProcessStartOptions['diagnostics']
   private traffic: LogicalIpcTrafficCollector | undefined
+  private workerTraffic: LogicalIpcWorkerTraffic | undefined
   private readonly inFlightRequests = new Map<string, InFlightRequest>()
   private readonly conversationListeners = new Set<
     (patch: ConversationPatch, progress: boolean) => void
@@ -286,9 +290,14 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       ],
       { serviceName: 'Pact Utility Process' },
     )
+    if (options.traffic) {
+      this.workerTraffic = options.traffic
+      this.traffic = options.traffic.collector('main-utility')
+      this.directoryOperations.configureTraffic(options.traffic.collector('main-directory'))
+    }
     if (this.traffic) this.traffic.advanceTransportEpoch()
     else if (
-      /^[a-f\d]{64}$/u.test(process.env.PACT_SOAK_NONCE ?? '') &&
+      hasLogicalIpcFixtureNonce(process.env) &&
       process.env.PACT_E2E_ROOT &&
       options.databaseFile !== ':memory:'
     ) {
@@ -416,7 +425,19 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
           ok: true,
           value: {
             ...result.value,
-            ipcTraffic: logicalIpcTrafficSnapshot(this.traffic.snapshot()),
+            ipcTraffic: logicalIpcTrafficSnapshot(this.traffic.snapshot(), [
+              ...(this.workerTraffic
+                ?.snapshots()
+                .filter((owner) => owner.owner !== 'main-utility') ?? []),
+              ...(result.value.ipcTraffic?.owners.filter((owner) =>
+                [
+                  'utility-markdown',
+                  'utility-image',
+                  'utility-native-json',
+                  'utility-native-fork',
+                ].includes(owner.owner),
+              ) ?? []),
+            ]),
           },
         }
       : result
@@ -1044,8 +1065,8 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   }
 
   dispose(): void {
-    this.traffic?.dispose()
-    this.traffic = undefined
+    // Main's measurement lives through child shutdown and diagnostic-log close. Its fixed
+    // counters survive late deliveries/restarts; disposing this client must not reset them.
     this.conversationListeners.clear()
     const target = this.child
     this.child = undefined

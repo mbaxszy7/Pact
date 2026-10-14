@@ -219,6 +219,25 @@ Performance is a correctness property for long-running local Sessions on macOS a
 | Codex child proxy exclusions        | Each output `NO_PROXY` spelling ≤8 KiB and ≤256 comma-separated entries                                                                                                                                                                                         | Fresh snapshots add only exact `127.0.0.1` and `localhost`; preserve Unix case variants independently and the effective Windows case-insensitive value; over-capacity values fail before native launch, without truncation or global proxy changes               |
 | Repository source query templates   | At most 14 fixed prepared statements per connection; SQL text at most 8 KiB per template (112 KiB aggregate)                                                                                                                                                    | Prepare on first use; every page executes current parameters and rereads root, binding, authorization, document metadata and body parts; SQLite finalizes statements on connection close, and a new connection owns fresh templates                              |
 
+Fixture-only logical IPC observation is owned by the existing transports for their process or
+document lifetime. Nine fixed groups contain 25 direction/initialization slots with separate
+business and control lanes, at most 1,000,000 messages per group, 19 sticky issues and 64 transport
+epochs. Snapshot counters contain no DTO references, paths, bodies or credential values. Generic
+plain DTO measurement retains its 262,144-node/64-depth/128 MiB observation ceilings; these limits
+do not admit or truncate business traffic. The Monaco clone-data profile counts the native RegExp
+leaf as canonical `{"$regexp":{"source":SOURCE_JSON_STRING,"flags":FLAGS_JSON_STRING}}` using
+captured internal-slot getters; its unit is
+`json-utf8-regexp-source-flags-null-binary-skeleton-plus-visible-binary-bytes-v1`. It does not
+invoke payload accessors or `toJSON`, count discarded custom RegExp fields/`lastIndex`, or add
+virtual nodes/depth to the input. Unknown prototypes remain incomplete. Older units cannot
+satisfy the current gate. Native JSON and Fork Workers count large admitted replies
+using their existing bounded encoder and send a scalar receipt in the same reply, including the
+receipt's own bytes. Transfer senders measure before detachment and commit only after successful
+delivery admission. Actual Node Worker exit settles the scalar active count; Browser `terminate()`
+does not establish physical release. Monaco observation therefore retains a blocking cleanup issue
+until independent physical Browser Worker evidence is available. A partial measurement cannot
+satisfy the complete IPC soak gate.
+
 ### Catalog, Transcript, and streaming
 
 | Resource / owner                                 | Numerical bound                                                                                     | Lifecycle and measurement                                                                                                                                    |

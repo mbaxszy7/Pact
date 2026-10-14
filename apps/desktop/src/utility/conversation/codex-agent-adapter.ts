@@ -38,6 +38,8 @@ import {
 } from '@pact/contracts'
 import { diagnosticEventSchema } from '@pact/contracts/diagnostics'
 
+import type { LogicalIpcWorkerTraffic } from '../../shared/logical-ipc-traffic'
+
 import { recordDiagnostic } from '../../diagnostics/utility-log'
 import { OwnedProcessGroup } from '../owned-process-group'
 import { AgentActivityDetail } from './agent-activity-detail'
@@ -588,7 +590,7 @@ export class CodexAgentAdapter implements AgentAdapter {
   private readonly retiredNativeChildren = new Set<string>()
   private idleTimer: ReturnType<typeof setTimeout> | undefined
   private uncertainTitleExecutor: string | undefined
-  private readonly nativeForkFiles = new NativeForkFiles()
+  private readonly nativeForkFiles: NativeForkFiles
   // Pending actual Fork/startup owners count against the same eight-context ceiling.
   private readonly nativeForkOwners = new Map<string, CodexNativeForkOwner>()
 
@@ -596,7 +598,10 @@ export class CodexAgentAdapter implements AgentAdapter {
     private readonly executablePath: string,
     private readonly processFactory?: CodexProcessFactory,
     private readonly nativeReadOptions: { storageRoot?: string } = {},
-  ) {}
+    private readonly ipcTraffic?: LogicalIpcWorkerTraffic,
+  ) {
+    this.nativeForkFiles = new NativeForkFiles(ipcTraffic)
+  }
 
   retireSourceGrant(owner: { runId: string; grant: string }): void {
     this.peerToolServer.retireSourceReader(owner)
@@ -2350,7 +2355,7 @@ export class CodexAgentAdapter implements AgentAdapter {
       controller.abort()
       throw error
     }
-    const connection = new CodexAppServerConnection(child, undefined, closeProcess)
+    const connection = new CodexAppServerConnection(child, undefined, closeProcess, this.ipcTraffic)
     const owner = { controller, connection, task: Promise.resolve<unknown>(undefined) }
     this.nativeInspection = owner
     const release = (): void => {
@@ -4966,6 +4971,7 @@ export class CodexAgentAdapter implements AgentAdapter {
         void this.closeConnection(connection, new Error('Codex connection closed.'))
       },
       owned.close,
+      this.ipcTraffic,
     )
     connection.setSkillChangeListener(() => this.skillCatalogChanged?.())
     this.connection = connection

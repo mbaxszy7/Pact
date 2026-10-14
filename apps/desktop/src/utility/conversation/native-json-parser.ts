@@ -1,6 +1,13 @@
 import { join } from 'node:path'
 import { Worker } from 'node:worker_threads'
 
+import { ipcTrafficMeasurementSchema } from '@pact/contracts'
+
+import {
+  LogicalIpcWorkerTraffic,
+  logicalIpcMeasurement,
+  observeWorkerTraffic,
+} from '../../shared/logical-ipc-traffic'
 import { AgentExecutionError } from './agent-execution-error'
 
 const PARSER_DEADLINE_MS = 10_000
@@ -24,6 +31,7 @@ const unavailable = (): AgentExecutionError =>
 export async function parseNativeJsonFrame(
   bytes: Buffer,
   signal: AbortSignal,
+  ipcTraffic?: LogicalIpcWorkerTraffic,
 ): Promise<{ message: unknown; heldBytes: number }> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), PARSER_DEADLINE_MS)
@@ -73,16 +81,39 @@ export async function parseNativeJsonFrame(
         ? bytes
         : Uint8Array.from(bytes)
     if (!(data.buffer instanceof ArrayBuffer)) throw unavailable()
+    const traffic = ipcTraffic?.collector('utility-native-json')
+    const initial = traffic ? { bytes: data, measure: true } : data
+    const initMeasurement = traffic ? logicalIpcMeasurement(initial) : undefined
     worker = new Worker(join(__dirname, 'native-json-parser-worker.js'), {
-      workerData: data,
+      workerData: initial,
       transferList: [data.buffer],
       resourceLimits: { maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 8, stackSizeMb: 4 },
     })
+    if (initMeasurement)
+      traffic?.recordMeasurement('utility-native-json.init', 'business', initMeasurement)
+    observeWorkerTraffic(
+      worker,
+      traffic,
+      'utility-native-json.init',
+      'native-json-utility.reply',
+      'business',
+      false,
+    )
     const owned = worker
     return await new Promise<{ message: unknown; heldBytes: number }>((resolve, reject) => {
       const cancelled = (): void => reject(unavailable())
       observed.addEventListener('abort', cancelled, { once: true })
       owned.once('message', (result: unknown) => {
+        if (traffic) {
+          const measurement = ipcTrafficMeasurementSchema.safeParse(
+            result && typeof result === 'object'
+              ? Reflect.get(result, 'ipcMeasurement')
+              : undefined,
+          )
+          if (measurement.success)
+            traffic.recordMeasurement('native-json-utility.reply', 'business', measurement.data)
+          else traffic.invalidate('unvalidated_message')
+        }
         observed.removeEventListener('abort', cancelled)
         if (
           !result ||

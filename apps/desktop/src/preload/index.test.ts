@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { IPC_CHANNELS, type DesktopBridge } from '@pact/contracts'
+import { IPC_CHANNELS, IPC_TRAFFIC_UNIT, type DesktopBridge } from '@pact/contracts'
 
 import {
   LogicalIpcTrafficCollector,
@@ -94,6 +94,35 @@ afterEach(() => {
 })
 
 describe('Preload logical IPC observation at named bridge seams', () => {
+  it('accepts current typed local observations and rejects older units without generic IPC', async () => {
+    const { bridge } = await load(true)
+    const observe: unknown = Reflect.get(bridge, 'observeMonacoWorkerTraffic')
+    if (typeof observe !== 'function') throw new Error('Missing fixture-only local observation.')
+    Reflect.apply(observe, undefined, [{ type: 'created', unit: IPC_TRAFFIC_UNIT }])
+    const message = {
+      type: 'message',
+      unit: IPC_TRAFFIC_UNIT,
+      category: 'renderer-monaco.request',
+      measurement: { complete: true, jsonBytes: 38, binaryBytes: 0, totalBytes: 38 },
+    }
+    Reflect.apply(observe, undefined, [message])
+    Reflect.apply(observe, undefined, [
+      { ...message, unit: 'json-utf8-null-binary-skeleton-plus-visible-binary-bytes' },
+    ])
+    Reflect.apply(observe, undefined, [{ ...message, unit: undefined }])
+    expect(harness.invoke).not.toHaveBeenCalled()
+    expect(harness.send).not.toHaveBeenCalled()
+    const result = await bridge.getRuntimeHealth()
+    if (!result.ok) throw new Error('Missing measured health.')
+    const owner = result.value.ipcTraffic?.owners.find((value) => value.owner === 'renderer-monaco')
+    expect(owner?.issues).toEqual(['cleanup_unavailable', 'unvalidated_message'])
+    expect(owner?.counters[0]?.business).toMatchObject({
+      messages: 1,
+      incompleteMessages: 0,
+      totalBytes: 38,
+    })
+    expect(owner?.activeTransports).toBe(1)
+  })
   it.each([false, true])(
     'preserves independent duplicate callback subscriptions (measurement %s)',
     async (measure) => {
