@@ -17,7 +17,12 @@ async function addProject(
     }))
   }, directory)
   await window.getByRole('button', { name: 'Add project', exact: true }).click()
-  await expect(window.getByRole('button', { name, exact: true })).toBeVisible()
+  await expect(
+    window.getByRole('button', { name: `Rename Project ${name}`, exact: true }),
+  ).toBeVisible()
+  await expect(
+    window.getByRole('button', { name: `Rename Project ${name}`, exact: true }),
+  ).toHaveText(name)
 }
 
 test(
@@ -46,10 +51,10 @@ test(
       await window.getByRole('button', { name: 'Create Session' }).click()
 
       const firstProjectGroup = window
-        .getByRole('button', { name: 'project-one', exact: true })
+        .getByRole('button', { name: 'Rename Project project-one', exact: true })
         .locator('../..')
       const secondProjectGroup = window
-        .getByRole('button', { name: 'project-two', exact: true })
+        .getByRole('button', { name: 'Rename Project project-two', exact: true })
         .locator('../..')
       await expect(
         firstProjectGroup.getByRole('button', { name: 'New session', exact: true }),
