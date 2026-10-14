@@ -219,6 +219,11 @@ Performance is a correctness property for long-running local Sessions on macOS a
 | Codex child proxy exclusions        | Each output `NO_PROXY` spelling ≤8 KiB and ≤256 comma-separated entries                                                                                                                                                                                         | Fresh snapshots add only exact `127.0.0.1` and `localhost`; preserve Unix case variants independently and the effective Windows case-insensitive value; over-capacity values fail before native launch, without truncation or global proxy changes               |
 | Repository source query templates   | At most 14 fixed prepared statements per connection; SQL text at most 8 KiB per template (112 KiB aggregate)                                                                                                                                                    | Prepare on first use; every page executes current parameters and rereads root, binding, authorization, document metadata and body parts; SQLite finalizes statements on connection close, and a new connection owns fresh templates                              |
 
+The soak supervisor allows the requested measurement plus ten minutes per application launch,
+and the enclosing driver allows measurement plus twenty minutes. Setup, cold restart, shutdown
+and report work do not count toward the required continuous measurement duration. These bounds
+do not relax runtime performance or physical cleanup requirements.
+
 Fixture-only logical IPC observation is owned by the existing transports for their process or
 document lifetime. Nine fixed groups contain 25 direction/initialization slots with separate
 business and control lanes, at most 1,000,000 messages per group, 19 sticky issues and 64 transport

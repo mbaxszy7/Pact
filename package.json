@@ -32,6 +32,7 @@
     "test:e2e": "node scripts/run-e2e.mjs all",
     "test:e2e:deterministic": "node scripts/run-e2e.mjs deterministic",
     "test:e2e:real": "node scripts/run-e2e.mjs real",
+    "test:e2e:real:core": "node scripts/run-e2e.mjs real-core",
     "test:e2e:ui": "node scripts/run-e2e.mjs ui",
     "test:infra": "node scripts/ci.mjs infra",
     "test:native": "vitest run --config vitest.native.config.ts",

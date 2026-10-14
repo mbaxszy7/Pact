@@ -9,6 +9,7 @@ import {
   requireIdentity,
   requireSha,
 } from './ci-identity.mjs'
+import { requireRealScope } from './real-e2e-policy.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
 export const platformKeys = ['darwin-arm64', 'win32-x64', 'win32-arm64']
@@ -20,6 +21,15 @@ export const ciJobs = [
   ...platformKeys.map((key) => `platform-${key}`),
 ]
 export const providerJobs = platformKeys.map((key) => `provider-${key}`)
+
+export function providerScopes(identity, requested = 'core') {
+  requireIdentity(identity)
+  requireRealScope(requested)
+  // Release candidates retain every real-provider obligation regardless of dispatch input.
+  return identity.channel === 'stable'
+    ? { suite: 'full', gate: 'full' }
+    : { suite: requested, gate: 'core' }
+}
 const releaseFiles = [
   'package.json',
   'apps/desktop/package.json',
@@ -765,6 +775,7 @@ export async function main(args = process.argv.slice(2), env = process.env) {
     return
   } else if (mode === 'admit') {
     const manual = env.PACT_PROVIDER_MANUAL === 'true'
+    const scopes = providerScopes(identity, manual ? (env.PACT_PROVIDER_SUITE ?? 'core') : 'core')
     let actorId
     if (manual) {
       const ownRun = await api.request(api.path(`/actions/runs/${env.GITHUB_RUN_ID}`))
@@ -794,7 +805,7 @@ export async function main(args = process.argv.slice(2), env = process.env) {
     if (env.GITHUB_OUTPUT)
       await appendFile(
         env.GITHUB_OUTPUT,
-        `applicable=true\nallowed=${admission.allowed}\ncandidate=${identity.candidateSha}\nbase=${identity.baseSha}\ntree=${identity.treeSha}\npolicy=${identity.policySha}\npull_request=${identity.pullRequest}\nci_run=${run.id}\nci_attempt=${run.run_attempt}\n`,
+        `applicable=true\nallowed=${admission.allowed}\nsuite=${scopes.suite}\nreal_gate=${scopes.gate}\ncandidate=${identity.candidateSha}\nbase=${identity.baseSha}\ntree=${identity.treeSha}\npolicy=${identity.policySha}\npull_request=${identity.pullRequest}\nci_run=${run.id}\nci_attempt=${run.run_attempt}\n`,
       )
     if (env.GITHUB_STEP_SUMMARY)
       await appendFile(
@@ -842,7 +853,7 @@ export async function main(args = process.argv.slice(2), env = process.env) {
       'provider-e2e',
       passed,
       providerRun.id,
-      'Claude and Codex real-provider execution is separately authorized for this exact identity and required on each target architecture. Missing, cancelled, skipped or failed tasks block this check.',
+      'Claude and Codex core business cases are required on each target architecture for ordinary PRs. Release PRs require the full suite. Extended ordinary-PR failures remain visible in reports. Missing authorization, core failures, cancellation or unavailable evidence block this check.',
       run,
       providerRun,
     )

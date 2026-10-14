@@ -5,7 +5,7 @@ import { createRuntimeFixture } from './runtime-fixture.js'
 
 test(
   'saves first-use defaults and reopens the singleton from Settings',
-  { tag: '@real' },
+  { tag: ['@real', '@real-core'] },
   async () => {
     test.setTimeout(120_000)
     const fixture = await createRuntimeFixture({ mode: 'real', firstUse: true })

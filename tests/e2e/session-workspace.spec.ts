@@ -27,7 +27,7 @@ async function addProject(
 
 test(
   'keeps Project context while creating, reopening, archiving, and restoring a Session',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(120_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })

@@ -6,6 +6,12 @@ on:
     types: [completed]
   workflow_dispatch:
     inputs:
+      suite:
+        description: Core PR gate or full regression (Release PRs always require full)
+        type: choice
+        options: [core, full]
+        default: core
+        required: true
       ci_run:
         description: Exact completed CI run ID
         required: true
@@ -94,6 +100,8 @@ jobs:
       pull_request: ${{ steps.admit.outputs.pull_request }}
       ci_run: ${{ steps.admit.outputs.ci_run }}
       ci_attempt: ${{ steps.admit.outputs.ci_attempt }}
+      suite: ${{ steps.admit.outputs.suite }}
+      real_gate: ${{ steps.admit.outputs.real_gate }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -122,6 +130,7 @@ jobs:
           PACT_PROVIDER_HEAD_SHA: ${{ inputs.head_sha }}
           PACT_PROVIDER_BASE_SHA: ${{ inputs.base_sha }}
           PACT_PROVIDER_TREE_SHA: ${{ inputs.tree_sha }}
+          PACT_PROVIDER_SUITE: ${{ inputs.suite }}
           PACT_RELEASE_APP_BOT_ID: ${{ vars.PACT_RELEASE_APP_BOT_ID }}
           PACT_RELEASE_APP_SLUG: ${{ vars.PACT_RELEASE_APP_SLUG }}
           PACT_CI_APP_ID: ${{ vars.PACT_CI_APP_ID }}
@@ -207,15 +216,32 @@ jobs:
         with:
           workspace: source
           controller: control
-      - name: Claude and Codex actual Provider E2E with isolated temporary configuration
-        run: node control/scripts/ci.mjs real
+      - name: Execute selected Claude and Codex cases with isolated temporary configuration
+        id: execute
+        # Preserve the actual failing step. The following report gate decides which
+        # cases are mandatory; infrastructure/admission failures never emit completion.
+        continue-on-error: true
+        run: node control/scripts/ci.mjs real "$REAL_SUITE"
         env:
+          REAL_SUITE: ${{ needs.admission.outputs.suite }}
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
           PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-evidence/${{ matrix.key }}
           PACT_CLAUDE_SETTINGS_JSON: ${{ secrets.PACT_CLAUDE_SETTINGS_JSON }}
           PACT_CODEX_CONFIG_TOML: ${{ secrets.PACT_CODEX_CONFIG_TOML }}
           PACT_CODEX_AUTH_JSON: ${{ secrets.PACT_CODEX_AUTH_JSON }}
           PACT_CODEX_PROVIDER_ENV_JSON: ${{ secrets.PACT_CODEX_PROVIDER_ENV_JSON }}
+      - name: Report every core and extended case and enforce the selected business gate
+        if: always()
+        run: >-
+          node control/scripts/real-e2e-policy.mjs "$REAL_SUITE" "$REAL_GATE"
+          "$RUNNER_TEMP/pact-evidence/$PLATFORM_KEY"
+          "$RUNNER_TEMP/pact-identity/ci-identity.json"
+        env:
+          REAL_SUITE: ${{ needs.admission.outputs.suite }}
+          REAL_GATE: ${{ needs.admission.outputs.real_gate }}
+          PLATFORM_KEY: ${{ matrix.key }}
+          PACT_CI_WORKSPACE: ${{ github.workspace }}/source
+          PACT_REAL_EXECUTION_COMPLETED: ${{ steps.execute.outputs.real_execution_completed }}
       - name: Fetch this exact CI run's matching platform UI and deterministic execution evidence
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -223,15 +249,27 @@ jobs:
           path: ${{ runner.temp }}/pact-evidence/${{ matrix.key }}
           run-id: ${{ needs.admission.outputs.ci_run || github.event.workflow_run.id || inputs.ci_run }}
           github-token: ${{ github.token }}
-      - name: Require genuine full execution evidence for every immutable assertion obligation
+      - name: Require unchanged assertion obligations and every currently mandatory execution result
         run: >-
           node control/scripts/check-e2e-coverage.mjs --require-results --json
+          --real-scope "$REAL_GATE"
           --results-json "$RUNNER_TEMP/pact-evidence/$PLATFORM_KEY/ui.json"
           --results-json "$RUNNER_TEMP/pact-evidence/$PLATFORM_KEY/deterministic.json"
           --results-json "$RUNNER_TEMP/pact-evidence/$PLATFORM_KEY/real.json"
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
           PLATFORM_KEY: ${{ matrix.key }}
+          REAL_GATE: ${{ needs.admission.outputs.real_gate }}
+      - name: Upload sanitized core and extended case reports (no private model output)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: provider-report-${{ matrix.key }}
+          path: |
+            ${{ runner.temp }}/pact-evidence/${{ matrix.key }}/real-summary.json
+            ${{ runner.temp }}/pact-evidence/${{ matrix.key }}/real-summary.md
+          if-no-files-found: error
+          retention-days: 14
       - name: Remove private Provider execution evidence
         if: always()
         run: |

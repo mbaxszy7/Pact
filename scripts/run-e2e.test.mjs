@@ -924,3 +924,39 @@ if (mode === 'normal' || mode === 'normal-held') {
 }
 `
 }
+
+await test('core real selection retains one build, both-provider admission, integrity and forbids subset overrides', async () => {
+  const calls = []
+  let integrity = 0
+  const code = await main({
+    lane: 'real',
+    realScope: 'core',
+    forwarded: ['--reporter=line,json'],
+    loadConfiguration: async () => ({
+      redact: (text) => text,
+      assertSourceIntegrity: async () => {
+        integrity += 1
+      },
+    }),
+    runJob: async (args) => {
+      calls.push(args)
+      return 0
+    },
+  })
+  assert.equal(code, 0)
+  assert.equal(integrity, 1)
+  assert.equal(calls.length, 2)
+  assert.deepEqual(calls[0], ['build'])
+  assert(calls[1].includes('--project=real'))
+  assert(calls[1].includes('--grep'))
+  for (const forwarded of [
+    ['--grep', 'selected'],
+    ['real-stop.spec.ts'],
+    ['--grep-invert=lost ACK'],
+    ['--project=real'],
+  ]) {
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Each invalid narrowing must fail before the sole build.
+    await assert.rejects(main({ lane: 'real', realScope: 'core', forwarded }), /narrowed|override/)
+  }
+  await assert.rejects(main({ lane: 'all', realScope: 'core' }), /only to the real/)
+})

@@ -99,7 +99,7 @@ export async function main(args = process.argv.slice(2), source = process.env) {
         join(import.meta.dirname, 'soak-driver.mjs'),
         settings,
       ],
-      durationMs + 10 * 60_000,
+      durationMs + 20 * 60_000,
       {
         executable: process.execPath,
         cwd: resolve(import.meta.dirname, '..'),

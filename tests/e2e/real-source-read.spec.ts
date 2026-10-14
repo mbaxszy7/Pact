@@ -20,7 +20,7 @@ import { test } from './runtime-fixture.js'
 // file. No IPC error, Agent response or Native evidence is manufactured.
 test(
   'real source-read refusal remains distinct and accepts no input',
-  { tag: '@real' },
+  { tag: ['@real', '@real-core'] },
   async () => {
     test.setTimeout(360_000)
     const ctx = await launchRealWorkspace('real-unreadable-source')

@@ -564,7 +564,7 @@ async function main() {
       PACT_SOAK_CDP_PORT: String(port),
       PACT_SOAK_RECEIPT_FILE: receiptFile,
     }
-    const completion = run([], settings.durationMs + 5 * 60_000, {
+    const completion = run([], settings.durationMs + 10 * 60_000, {
       executable: settings.executable,
       cwd: settings.dataRoot,
       env: appEnvironment,

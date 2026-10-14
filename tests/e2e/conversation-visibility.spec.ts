@@ -298,7 +298,7 @@ test(
 
 test(
   'read Retry never resends and hidden detail cancellation permits another expansion',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     const fixture = await createRuntimeFixture({ mode: 'real' })
     await seed(fixture, 1, true)

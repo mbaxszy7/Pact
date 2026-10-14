@@ -12,6 +12,13 @@ import {
 } from '../tests/e2e/coverage-manifest.ts'
 import { ciEnvironment } from './ci.mjs'
 import { readE2EBaseline } from './e2e-baseline.mjs'
+import {
+  realCases,
+  realCaseRequired,
+  requireRealScope,
+  realReportCases,
+  validateRealTags,
+} from './real-e2e-policy.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
 const selectedWorkspace = process.env.PACT_CI_WORKSPACE
@@ -32,12 +39,19 @@ const babelRequire = createRequire(reactRequire.resolve('@babel/core'))
 const { parse } = babelRequire('@babel/parser')
 
 function options(argv) {
-  const result = { json: false, sourceOnly: false, requireResults: false, results: [] }
+  const result = {
+    json: false,
+    sourceOnly: false,
+    requireResults: false,
+    results: [],
+    realScope: 'full',
+  }
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]
     if (argument === '--json') result.json = true
     else if (argument === '--source-only') result.sourceOnly = true
     else if (argument === '--require-results') result.requireResults = true
+    else if (argument === '--real-scope') result.realScope = requireRealScope(argv[++index])
     else if (argument === '--list-json' || argument === '--results-json') {
       const path = argv[++index]
       if (!path || path.startsWith('--')) throw new Error(`${argument} requires a file path`)
@@ -420,7 +434,8 @@ function targetStatus(target, listed, results) {
   return 'passed'
 }
 
-function check(configuration) {
+export function check(configuration) {
+  const realScope = requireRealScope(configuration.realScope ?? 'full')
   const problems = []
   const skippedSources = []
   const sources = new Map()
@@ -487,10 +502,21 @@ function check(configuration) {
   for (const key of manifestIdentities)
     if (!originals.has(key))
       problems.push({ type: 'manifest-original-not-in-baseline', identity: JSON.parse(key) })
-  const listed = configuration.sourceOnly
-    ? new Map()
-    : reportCases(configuration.list ? reportFile(configuration.list) : discoverCandidate())
+  const discovery = configuration.sourceOnly
+    ? null
+    : configuration.list
+      ? reportFile(configuration.list)
+      : discoverCandidate()
+  const listed = discovery ? reportCases(discovery) : new Map()
+  if (discovery) validateRealTags(realReportCases(discovery, root))
   const results = new Map()
+  if (!configuration.sourceOnly) {
+    for (const target of listed.values())
+      if (target.project === 'real') realCaseRequired(target, realScope)
+    for (const item of realCases)
+      if (!listed.has(identity(item.path, item.title, 'real')))
+        problems.push({ type: 'classified-real-case-no-longer-registered', ...item })
+  }
   const executionReports = []
   let reportBytes = 0
   let previousStart = 0
@@ -536,12 +562,13 @@ function check(configuration) {
       })
     const targets = item.targets.map((target) => ({
       ...target,
+      required: realCaseRequired(target, realScope),
       status: configuration.sourceOnly ? 'unverified' : targetStatus(target, listed, results),
       executionHistory:
         results.get(identity(target.path, target.title, target.project))?.history ?? [],
     }))
     for (const target of targets)
-      if (['missing', 'failed', 'skipped'].includes(target.status))
+      if (target.required && ['missing', 'failed', 'skipped'].includes(target.status))
         problems.push({ type: `target-${target.status}`, ...target })
     const coveredLines = new Set(
       item.assertionGroups.flatMap((group) => group.originalAssertionLines),
@@ -560,7 +587,10 @@ function check(configuration) {
         title: item.originalTitle,
         checks: pending,
       })
-    if (configuration.requireResults && targets.some((target) => target.status === 'unverified'))
+    if (
+      configuration.requireResults &&
+      targets.some((target) => target.required && target.status === 'unverified')
+    )
       problems.push({
         type: 'results-required',
         path: item.originalPath,
@@ -583,13 +613,16 @@ function check(configuration) {
   })
   const additionalBusinessCases = e2eBusinessExpansionTargets.map((target) => {
     const status = configuration.sourceOnly ? 'unverified' : targetStatus(target, listed, results)
+    const required = realCaseRequired(target, realScope)
     if (
-      ['missing', 'failed', 'skipped'].includes(status) ||
-      (configuration.requireResults && status === 'unverified')
+      required &&
+      (['missing', 'failed', 'skipped'].includes(status) ||
+        (configuration.requireResults && status === 'unverified'))
     )
       problems.push({ type: `additional-business-${status}`, ...target })
     return {
       ...target,
+      required,
       status,
       executionHistory:
         results.get(identity(target.path, target.title, target.project))?.history ?? [],
@@ -629,6 +662,7 @@ function check(configuration) {
   }
   return {
     baseline: { revision: e2eMigrationBaseline.revision, ...actualBaseline },
+    realScope,
     discoveryChecked: !configuration.sourceOnly,
     registeredCaseCount: configuration.sourceOnly ? null : listed.size,
     resultsSupplied: executionReports.length > 0,
@@ -641,8 +675,12 @@ function check(configuration) {
     passedGate:
       !configuration.sourceOnly &&
       problems.length === 0 &&
-      cases.every((item) => item.status === 'verified-by-results') &&
-      additionalBusinessCases.every((item) => item.status === 'passed'),
+      cases.every(
+        (item) =>
+          item.pendingRealChecks.length === 0 &&
+          item.targets.every((target) => !target.required || target.status === 'passed'),
+      ) &&
+      additionalBusinessCases.every((item) => !item.required || item.status === 'passed'),
   }
 }
 

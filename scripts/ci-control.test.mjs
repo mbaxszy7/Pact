@@ -6,6 +6,7 @@ import { test } from 'node:test'
 
 import {
   CIAPI,
+  providerScopes,
   ciJobs,
   executionAdmission,
   requiredJobsPassed,
@@ -607,4 +608,21 @@ void test('Provider dispatch startup revokes prior success through the fixed App
     globalThis.fetch = originalFetch
     await rm(root, { recursive: true, force: true })
   }
+})
+
+await test('ordinary PRs require core and optional full regression cannot weaken Release PRs', () => {
+  assert.deepEqual(providerScopes({ ...identity, channel: 'dev' }), { suite: 'core', gate: 'core' })
+  assert.deepEqual(providerScopes({ ...identity, channel: 'dev' }, 'full'), {
+    suite: 'full',
+    gate: 'core',
+  })
+  assert.deepEqual(providerScopes({ ...identity, channel: 'stable' }, 'core'), {
+    suite: 'full',
+    gate: 'full',
+  })
+  assert.deepEqual(providerScopes({ ...identity, channel: 'stable' }, 'full'), {
+    suite: 'full',
+    gate: 'full',
+  })
+  assert.throws(() => providerScopes(identity, 'skip'), /core or full/)
 })

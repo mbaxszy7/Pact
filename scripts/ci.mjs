@@ -1,10 +1,21 @@
 import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
-import { readdir, mkdtemp, writeFile, rm, mkdir, lstat, open, realpath } from 'node:fs/promises'
+import {
+  readdir,
+  mkdtemp,
+  writeFile,
+  appendFile,
+  rm,
+  mkdir,
+  lstat,
+  open,
+  realpath,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve, join, isAbsolute } from 'node:path'
 
 import { loadProviderConfiguration } from '../tests/e2e/provider-environment.ts'
+import { requireRealScope } from './real-e2e-policy.mjs'
 import { run } from './run-e2e.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
@@ -187,10 +198,29 @@ async function validateEvidence(path) {
     throw new Error('E2E execution evidence is missing or exceeds 8 MiB')
 }
 
-async function real(env, source, workspace, evidence, validateOnly = false) {
+/** Exit 1 is an assertion outcome only after natural, verified supervisor settlement. */
+export async function runCiE2EJob(args, timeout, options) {
+  let stopped = false,
+    settled = false
+  const code = await run(args, timeout, {
+    ...options,
+    onState(state) {
+      stopped ||= state.kind === 'stopping'
+      if (state.kind === 'settled')
+        settled = state.groupGone === true && state.ownedProcessCount === 0
+      options.onState?.(state)
+    },
+  })
+  if (stopped || !settled) throw new Error('CI E2E supervisor did not finish naturally')
+  return code
+}
+
+async function real(env, source, workspace, evidence, validateOnly = false, scope = 'full') {
   const parent = source.RUNNER_TEMP ?? tmpdir()
+  const outputPath = source.GITHUB_OUTPUT
   const directory = await mkdtemp(join(parent, 'pact-ci-provider-'))
   let configuration
+  let completedCode
   try {
     await Promise.all(
       ['claude', 'codex'].map((name) => mkdir(join(directory, name), { mode: 0o700 })),
@@ -232,12 +262,19 @@ async function real(env, source, workspace, evidence, validateOnly = false) {
       Object.assign(process.env, selected)
       const code = await runE2E({
         lane: 'real',
+        realScope: scope,
         forwarded: evidence.forwarded,
         loadConfiguration: async () => configuration,
         runJob: (args, timeout, options) =>
-          run(args, timeout, { ...options, cwd: workspace, env: selected }),
+          runCiE2EJob(args, timeout, { ...options, cwd: workspace, env: selected }),
       })
-      if (code !== 0) throw new Error('Required real-provider E2E failed')
+      await configuration.assertSourceIntegrity()
+      await validateEvidence(evidence.path)
+      // Playwright's ordinary assertion failure is still a completed execution.
+      // A separate report gate decides core/full policy; supervisors or admission
+      // errors never emit this marker and cannot be ignored as an extended failure.
+      if (![0, 1].includes(code)) throw new Error('Real-provider runner did not complete normally')
+      completedCode = code
     } finally {
       for (const key of Object.keys(process.env)) delete process.env[key]
       Object.assign(process.env, previous)
@@ -254,6 +291,10 @@ async function real(env, source, workspace, evidence, validateOnly = false) {
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
+  // Cleanup and both integrity checks must finish before the trusted marker exists.
+  if (outputPath) await appendFile(outputPath, 'real_execution_completed=true\n')
+  if (completedCode !== 0)
+    throw new Error('Real-provider cases failed; inspect the sanitized report')
 }
 
 export async function main(args = process.argv.slice(2), source = process.env) {
@@ -284,9 +325,10 @@ export async function main(args = process.argv.slice(2), source = process.env) {
     if (forwarded.length) throw new Error('Provider validation has no extra arguments')
     await real(env, source, workspace, {}, true)
   } else if (lane === 'real') {
-    if (forwarded.length) throw new Error('Real lane has no extra arguments')
+    if (forwarded.length > 1) throw new Error('Real lane accepts only core or full scope')
+    const scope = requireRealScope(forwarded[0] ?? 'full')
     const evidence = await evidenceEnvironment(lane, env, source)
-    await real(evidence.env, source, workspace, evidence)
+    await real(evidence.env, source, workspace, evidence, false, scope)
   } else if (['ui', 'deterministic'].includes(lane)) {
     const evidence = await evidenceEnvironment(lane, env, source)
     if (forwarded.some((value) => value.startsWith('--reporter')))

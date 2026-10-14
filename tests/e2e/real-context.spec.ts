@@ -42,7 +42,7 @@ const processProbeDeadlineMs = 2_000
 // a metadata-to-hydration revision race. Native file loss uses Native recovery;
 // an ordinary SQLite I/O error maps to INTERNAL. No fabricated IPC refusal is
 // used here to pretend that the unavailable-source obligation is complete.
-test.describe('real evidence', { tag: '@real' }, () => {
+test.describe('real evidence', { tag: ['@real', '@real-extended'] }, () => {
   test('real explicit Claude request after peer failure never reruns Codex', async () => {
     test.setTimeout(caseDeadlineMs)
     const ctx = await launchRealWorkspace('real-failed-peer')

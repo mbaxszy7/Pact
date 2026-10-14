@@ -6,6 +6,13 @@ on:
   pull_request_target:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review, edited]
+  workflow_dispatch:
+    inputs:
+      run_soak:
+        description: Run the one-hour installed deterministic soak with fixture data (no paid models)
+        type: boolean
+        default: false
+        required: true
 
 # The base workflow alone controls PR jobs. Candidate execution has read-only
 # permissions and no environment, App, or provider credentials.
@@ -14,7 +21,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: pact-ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('branch-{0}', github.ref) }}
+  group: pact-ci-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('branch-{0}', github.ref) }}
   cancel-in-progress: true
 
 defaults:
@@ -309,6 +316,7 @@ jobs:
         env:
           PLATFORM_KEY: ${{ matrix.key }}
       - name: Continuous deterministic resource soak on installed content
+        if: needs.identity.outputs.channel == 'stable' || (github.event_name == 'workflow_dispatch' && inputs.run_soak)
         working-directory: source
         run: >-
           node scripts/run-soak.mjs

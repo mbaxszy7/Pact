@@ -3,6 +3,7 @@ import { once } from 'node:events'
 import { resolve } from 'node:path'
 
 import { loadProviderConfiguration } from '../tests/e2e/provider-environment.ts'
+import { coreRealGrep, requireRealScope } from './real-e2e-policy.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
 const outputLimit = 256 * 1024
@@ -748,6 +749,7 @@ export function run(
 /** Configuration admission precedes the sole build; all jobs share one two-hour deadline. */
 export async function main({
   lane = 'all',
+  realScope = 'full',
   forwarded = [],
   loadConfiguration = loadProviderConfiguration,
   runJob = run,
@@ -755,7 +757,12 @@ export async function main({
   if (!['all', 'ui', 'real', 'deterministic'].includes(lane)) {
     throw failure('Choose E2E lane: all, ui, real or deterministic')
   }
+  requireRealScope(realScope)
+  if (realScope === 'core' && lane !== 'real')
+    throw failure('Core selection applies only to the real E2E lane')
   const argumentsForTests = forwarded.filter((value) => value !== '--')
+  if (realScope === 'core' && argumentsForTests.some((value) => value !== '--reporter=line,json'))
+    throw failure('Core E2E selection cannot be narrowed by forwarded arguments')
   if (argumentsForTests.some((value) => value.startsWith('--project'))) {
     throw failure('Select the E2E lane through this command, not a second --project override')
   }
@@ -780,6 +787,7 @@ export async function main({
           'playwright',
           'test',
           ...projects.map((project) => `--project=${project}`),
+          ...(realScope === 'core' ? ['--grep', coreRealGrep()] : []),
           ...argumentsForTests,
         ],
         Math.max(1, deadline - Date.now()),
@@ -805,7 +813,12 @@ export async function main({
 }
 
 if (isScriptEntry(import.meta.url)) {
-  void main({ lane: process.argv[2] ?? 'all', forwarded: process.argv.slice(3) }).then(
+  const core = process.argv[2] === 'real-core'
+  void main({
+    lane: core ? 'real' : (process.argv[2] ?? 'all'),
+    realScope: core ? 'core' : 'full',
+    forwarded: process.argv.slice(3),
+  }).then(
     (code) => {
       process.exitCode = code
       return undefined

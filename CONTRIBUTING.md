@@ -130,6 +130,7 @@ must be unmistakably nonfunctional; never broadly exempt test directories from s
 | UI                          | `pnpm test:e2e:ui`                                                                     | Real Electron UI with fixture data; no provider credentials                                    |
 | Deterministic               | `pnpm test:e2e:deterministic`                                                          | Electron plus controlled protocols/fixed loads; not real model evidence                        |
 | Real provider               | `pnpm test:e2e:real`                                                                   | Installed/authenticated CLIs and private configuration; paid model requests                    |
+| Core real provider          | `pnpm test:e2e:real:core`                                                              | The `@real-core` business cases; the same actual CLIs and isolated configuration               |
 | Complete E2E                | `pnpm test:e2e`                                                                        | All three Electron lanes; private configuration admitted before the sole build                 |
 | Native protocol             | `pnpm test:native`                                                                     | Actual CLI/SDK storage and protocol against isolated loopback providers; no paid models        |
 | Packaged smoke              | Manifest-based commands below                                                          | Actual installation/extraction, private data, seed and cold verification                       |
@@ -147,6 +148,58 @@ execution on the appropriate native architecture. External PR jobs must not rece
 configuration or model credentials. Credential-free UI/deterministic/native protocol evidence is
 separate from explicitly authorized real-provider execution; missing authorization, credentials,
 platforms or required performance observations cannot become passing evidence.
+
+### Core and extended real-provider policy
+
+Keep the full `@real` lane. Each real case also has exactly one Playwright tag:
+`@real-core` or `@real-extended`. The reviewed case inventory in
+`scripts/real-e2e-policy.mjs` gives each existing case its business scenario and tier.
+Discovery must match that inventory and its tags; a missing, new, duplicate or retagged
+case cannot silently change the merge gate. Test titles, assertions and the immutable
+baseline remain unchanged.
+
+Ordinary PRs require all 29 core cases on Windows x64, Windows arm64 and macOS arm64.
+They cover first-use readiness/defaults, actual Claude/Codex replies and continuation,
+dual-Agent routing and explicit collaboration, native permission lifetime, Stop before
+effects, cold recovery without replay, frozen drafts/settings, and Changes/Undo safety.
+The cold lost-ACK case remains core even if an earlier run failed during Session setup.
+The 32 extended cases retain appearance, large-history/file/capacity work, image input,
+additional persistence journeys and fault permutations. Their execution is deferred on
+ordinary automatic PR runs; deterministic checks and applicable performance budgets remain
+required. Classification follows business risk, never an observed failure.
+
+Use the **Trusted Provider E2E** manual dispatch with `suite=full` for a complete regression
+of an exact reviewed PR head/base/tree and successful CI run. Execution authorization is
+still separate from Approve PR; forks receive no model secrets without that authorization.
+For an ordinary PR, an extended case failure is reported while the core gate remains
+eligible. A Release PR forces `suite=full` and a full gate regardless of the input, so
+extended failures, missing results and skips block release-candidate acceptance.
+Native cases explicitly assigned to another platform are reported as not applicable; for
+example macOS window Alpha is required on macOS rather than converted into a passing Windows
+test. Any skip of an applicable core/full case remains a failure of the selected gate.
+
+Each native platform publishes `provider-report-PLATFORM`: `real-summary.md` and
+`real-summary.json`, retained for 14 days, plus an Actions step summary. Every reviewed
+case is listed with tier/scenario, result, duration, required status and a fixed safe reason;
+unexecuted extended cases say deferred rather than passed. The report records head/base,
+tree, tested commit and policy hash. Errors, model output, attachments, traces and private
+configuration stay out of these artifacts. Missing configuration, execution cancellation,
+global runner errors, invalid evidence, failed source-integrity or cleanup checks cannot
+be treated as an optional extended failure. Full execution coverage still uses the existing
+unmodified assertion obligations; `--real-scope core` changes only which real execution
+results are currently required, and never certifies a complete baseline run.
+
+Ordinary branch pushes and business PRs run the fast/static, unit/script, native protocol,
+UI/deterministic and installed smoke checks without an hour-long soak on every change.
+The **CI** manual dispatch with `run_soak=true` runs the one-hour installed deterministic
+fixture soak on all three native platforms without paid providers. Manual soak runs use
+their own concurrency identity so a branch push cannot cancel them. Release PRs retain
+the two-hour Stable-candidate soak; final releases require the two-hour final-content soak.
+Soak launch supervision allows measurement duration plus ten minutes, and its enclosing
+driver allows plus twenty minutes for setup, shutdown, cold restart and report completion.
+Release build jobs allow five hours in total for packaging, the two-hour measurement and
+validation overhead. These operational deadlines do not change any performance budget,
+required duration, resource-release observation or publication gate.
 
 ### Distribution build, smoke, and soak
 

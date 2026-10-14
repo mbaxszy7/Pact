@@ -27,7 +27,7 @@ const createdAt = Date.parse('2026-09-24T00:00:00.000Z')
 
 test(
   'loads five Sessions at a time and preserves activity and unread state after restart',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(180_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })
@@ -198,7 +198,7 @@ test(
 
 test(
   'bounds Project DOM and preserves keyboard focus after scrolling a large Catalog',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(180_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })

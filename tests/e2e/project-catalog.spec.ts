@@ -5,7 +5,7 @@ import { createRuntimeFixture } from './runtime-fixture.js'
 
 test(
   'adds, restores, collapses, archives, and re-adds a local Project',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(120_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })

@@ -11,7 +11,7 @@ import { test } from './runtime-fixture.js'
 
 test(
   'real @all Agents read the same code that exists only in attached image pixels',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(240_000)
     const ctx = await launchRealWorkspace('real-image-input')

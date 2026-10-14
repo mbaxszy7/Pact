@@ -116,7 +116,7 @@ jobs:
     needs: [identity, quality]
     if: needs.identity.outputs.applicable == 'true' && needs.identity.outputs.published == 'false' && needs.identity.outputs.ready_darwin_arm64 != 'true'
     runs-on: macos-15
-    timeout-minutes: 240
+    timeout-minutes: 300
     env:
       PACT_CI_WORKSPACE: ${{ github.workspace }}/source
       PACT_EXPECTED_VERSION: ${{ needs.identity.outputs.version }}
@@ -272,7 +272,7 @@ jobs:
     needs: [identity, quality]
     if: needs.identity.outputs.applicable == 'true' && needs.identity.outputs.published == 'false' && needs.identity.outputs.ready_win32_x64 != 'true'
     runs-on: windows-2025
-    timeout-minutes: 240
+    timeout-minutes: 300
     env:
       PACT_CI_WORKSPACE: ${{ github.workspace }}/source
       PACT_EXPECTED_VERSION: ${{ needs.identity.outputs.version }}
@@ -428,7 +428,7 @@ jobs:
     needs: [identity, quality]
     if: needs.identity.outputs.applicable == 'true' && needs.identity.outputs.published == 'false' && needs.identity.outputs.ready_win32_arm64 != 'true'
     runs-on: windows-11-arm
-    timeout-minutes: 240
+    timeout-minutes: 300
     env:
       PACT_CI_WORKSPACE: ${{ github.workspace }}/source
       PACT_EXPECTED_VERSION: ${{ needs.identity.outputs.version }}
