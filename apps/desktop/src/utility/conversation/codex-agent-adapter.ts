@@ -124,7 +124,13 @@ export interface CodexRunConfiguration {
   effort: string | null
 }
 
-type CodexProcessFactory = (cwd: string) => ChildProcessWithoutNullStreams
+type OwnedCodexProcess = {
+  child: ChildProcessWithoutNullStreams
+  close: () => Promise<void>
+}
+type CodexProcessFactory = (
+  cwd: string,
+) => ChildProcessWithoutNullStreams | OwnedCodexProcess | Promise<OwnedCodexProcess>
 
 interface EarlyNativeFact {
   event: object
@@ -568,7 +574,11 @@ export class CodexAgentAdapter implements AgentAdapter {
   private processEnvironmentKey: string | undefined
   private connectionProcess: ChildProcessWithoutNullStreams | undefined
   private nativeInspection:
-    | { controller: AbortController; connection: CodexAppServerConnection; task: Promise<unknown> }
+    | {
+        controller: AbortController
+        connection: CodexAppServerConnection | undefined
+        task: Promise<unknown>
+      }
     | undefined
   private initialized = false
   private running = false
@@ -2335,34 +2345,48 @@ export class CodexAgentAdapter implements AgentAdapter {
     const controller = new AbortController()
     const readSignal = AbortSignal.any([signal, controller.signal])
     const deadline = setTimeout(() => controller.abort(), 10_000)
-    let child: ChildProcessWithoutNullStreams
-    let closeProcess: (() => Promise<void>) | undefined
-    try {
-      if (this.processFactory) child = this.processFactory(cwd)
-      else {
-        const owned = await this.startProcess(cwd, this.processStorageRoot)
-        child = owned.child
-        closeProcess = owned.close
-      }
-      if (child === this.connectionProcess)
-        throw new AgentExecutionError(
-          'protocol_error',
-          'The read-only process factory reused the live executor.',
-          false,
-        )
-    } catch (error) {
-      clearTimeout(deadline)
-      controller.abort()
-      throw error
+    const owner: NonNullable<CodexAgentAdapter['nativeInspection']> = {
+      controller,
+      connection: undefined,
+      task: Promise.resolve(undefined),
     }
-    const connection = new CodexAppServerConnection(child, undefined, closeProcess, this.ipcTraffic)
-    const owner = { controller, connection, task: Promise.resolve<unknown>(undefined) }
     this.nativeInspection = owner
-    const release = (): void => {
-      if (this.nativeInspection === owner) this.nativeInspection = undefined
-    }
-    try {
-      const task = (async () => {
+    // Install the entire lifecycle task before invoking a possibly asynchronous factory.
+    const task = Promise.resolve().then(async () => {
+      try {
+        if (readSignal.aborted || this.disposed || this.connection !== live)
+          throw new AgentExecutionError(
+            'agent_process_crash',
+            'The native history reader was cancelled before preparation.',
+            false,
+          )
+        const owned = this.processFactory
+          ? await this.injectedProcess(cwd)
+          : await this.startProcess(cwd, this.processStorageRoot)
+        if (owned.child === this.connectionProcess)
+          throw new AgentExecutionError(
+            'protocol_error',
+            'The read-only process factory reused the live executor.',
+            false,
+          )
+        const connection = new CodexAppServerConnection(
+          owned.child,
+          undefined,
+          owned.close,
+          this.ipcTraffic,
+          () =>
+            !this.disposed &&
+            !readSignal.aborted &&
+            this.nativeInspection === owner &&
+            this.connection === live,
+        )
+        owner.connection = connection
+        if (readSignal.aborted || this.disposed || this.connection !== live)
+          throw new AgentExecutionError(
+            'agent_process_crash',
+            'The native history reader was cancelled before initialization.',
+            false,
+          )
         options.beforeInitialize?.(connection)
         const initialized = await connection.request(
           'initialize',
@@ -2384,18 +2408,24 @@ export class CodexAgentAdapter implements AgentAdapter {
             'The native history reader did not initialize.',
             false,
           )
-        await connection.notify('initialized', {})
-        return read(connection, readSignal)
-      })()
-      owner.task = task
-      return await task
-    } finally {
-      clearTimeout(deadline)
-      controller.abort()
-      // Inspection retires only this short-lived observer, never the model executor.
-      await connection.close(new Error('Read-only native history inspection finished.'))
-      release()
-    }
+        if (readSignal.aborted || this.disposed || this.connection !== live)
+          throw new AgentExecutionError(
+            'agent_process_crash',
+            'The native history reader was cancelled before its initialization acknowledgement.',
+            false,
+          )
+        await connection.notify('initialized', {}, { signal: readSignal })
+        return await read(connection, readSignal)
+      } finally {
+        clearTimeout(deadline)
+        controller.abort()
+        // A failed physical close keeps this same inspection owner reserved.
+        await owner.connection?.close(new Error('Read-only native history inspection finished.'))
+        if (this.nativeInspection === owner) this.nativeInspection = undefined
+      }
+    })
+    owner.task = task
+    return await task
   }
 
   /** Resolve only implicit Windows readonly defaults; never inherit an old Thread's grant. */
@@ -4429,17 +4459,27 @@ export class CodexAgentAdapter implements AgentAdapter {
   }
 
   async dispose(): Promise<void> {
+    let failure: { error: unknown } | undefined
+    const attempt = async (work: () => void | Promise<unknown>): Promise<void> => {
+      try {
+        await work()
+      } catch (error) {
+        failure ??= { error }
+      }
+    }
     this.skillCatalogChanged = undefined
     this.disposed = true
+    const reader = this.nativeInspection
+    reader?.controller.abort()
     const probe = this.featureProbe
     probe?.stop()
     await probe?.task.catch(() => undefined)
     await this.connectionStarting?.task.catch(() => undefined)
-    if (this.nativeInspection) {
-      const reader = this.nativeInspection
-      reader.controller.abort()
+    if (reader) {
       await reader.task.catch(() => undefined)
-      await reader.connection.close(new Error('Native history reader is shutting down.'))
+      await attempt(() =>
+        reader.connection?.close(new Error('Native history reader is shutting down.')),
+      )
     }
     this.terminalEvidence.clear()
     this.evidenceCacheWork.release()
@@ -4448,7 +4488,7 @@ export class CodexAgentAdapter implements AgentAdapter {
       receipt.observation?.abort()
     }
     this.nativeRebuildReceipts.clear()
-    await this.nativeForkFiles.dispose()
+    await attempt(() => this.nativeForkFiles.dispose())
     for (const owner of this.nativeForkOwners.values()) owner.release()
     this.nativeForkOwners.clear()
     clearTimeout(this.idleTimer)
@@ -4458,18 +4498,21 @@ export class CodexAgentAdapter implements AgentAdapter {
     const closing = connection
       ? this.closeConnection(connection, new Error('Codex connection closed.'))
       : this.closingConnection
-    if (closing) await closing
+    if (closing) await attempt(() => closing)
     for (const background of this.nativeBackground) {
       background.unknown = true
       this.settleNativeBackground(background)
     }
-    await this.peerToolServer.dispose()
-    if (probe && this.featureProbe === probe)
-      throw new AgentExecutionError(
-        'runtime_incompatible',
-        'The Codex capability probe did not confirm process exit.',
-        false,
-      )
+    await attempt(() => this.peerToolServer.dispose())
+    if (this.featureProbe)
+      failure ??= {
+        error: new AgentExecutionError(
+          'runtime_incompatible',
+          'The Codex capability probe did not confirm process exit.',
+          false,
+        ),
+      }
+    if (failure) throw failure.error
   }
 
   hasActiveBackgroundWork(runId?: string): boolean {
@@ -4912,6 +4955,8 @@ export class CodexAgentAdapter implements AgentAdapter {
   }
 
   private async ensureConnection(cwd: string): Promise<CodexAppServerConnection> {
+    if (this.disposed)
+      throw new AgentExecutionError('agent_process_crash', 'Codex is shutting down.', false)
     const storageRoot = resolvePath(
       cwd,
       this.nativeReadOptions.storageRoot ??
@@ -4960,8 +5005,19 @@ export class CodexAgentAdapter implements AgentAdapter {
       throw new AgentExecutionError('agent_process_crash', 'Codex is shutting down.', false)
     this.processStorageRoot = storageRoot
     const owned = this.processFactory
-      ? { child: this.processFactory(cwd), close: undefined }
+      ? await this.injectedProcess(cwd)
       : await this.startProcess(cwd, this.processStorageRoot, env)
+    if (this.disposed) {
+      const closing = owned.close
+        ? Promise.resolve().then(() => owned.close!())
+        : new CodexAppServerConnection(owned.child, undefined, undefined, this.ipcTraffic).close(
+            new Error('Injected Codex process arrived during disposal.'),
+          )
+      this.closingConnection = closing
+      await closing
+      if (this.closingConnection === closing) this.closingConnection = undefined
+      throw new AgentExecutionError('agent_process_crash', 'Codex is shutting down.', false)
+    }
     const child = owned.child
     this.connectionProcess = child
     const connection = new CodexAppServerConnection(
@@ -4972,6 +5028,7 @@ export class CodexAgentAdapter implements AgentAdapter {
       },
       owned.close,
       this.ipcTraffic,
+      () => !this.disposed,
     )
     connection.setSkillChangeListener(() => this.skillCatalogChanged?.())
     this.connection = connection
@@ -5002,8 +5059,23 @@ export class CodexAgentAdapter implements AgentAdapter {
     if (!Reflect.has(response, 'result')) {
       throw new AgentExecutionError('runtime_incompatible', 'Codex initialization failed.', false)
     }
-    this.initialized = true
-    await connection.notify('initialized', {})
+    try {
+      if (signal.aborted || this.disposed || this.connection !== connection)
+        throw new AgentExecutionError(
+          'agent_process_crash',
+          'Codex initialization was cancelled before acknowledgement.',
+          false,
+        )
+      await connection.notify('initialized', {}, { signal })
+      this.initialized = true
+    } catch (error) {
+      // A cancelled acknowledgement cannot leave a half-initialized actor reusable.
+      await this.closeConnection(
+        connection,
+        error instanceof Error ? error : new Error('Codex initialization acknowledgement failed.'),
+      )
+      throw error
+    }
   }
 
   private detachConnection(connection: CodexAppServerConnection): void {
@@ -5198,6 +5270,14 @@ export class CodexAgentAdapter implements AgentAdapter {
       processes.clear()
       cursors.clear()
     }
+  }
+
+  private async injectedProcess(cwd: string): Promise<{
+    child: ChildProcessWithoutNullStreams
+    close: (() => Promise<void>) | undefined
+  }> {
+    const supplied = await this.processFactory!(cwd)
+    return 'child' in supplied ? supplied : { child: supplied, close: undefined }
   }
 
   private async startProcess(

@@ -81,6 +81,7 @@ interface OutboundFrame {
   reject: (error: Error) => void
   onDispatch?: (() => void) | undefined
   canDispatch?: (() => boolean) | undefined
+  cancelBeforeWriteSignal?: AbortSignal | undefined
 }
 
 export interface CodexConnectionDiagnostics {
@@ -171,6 +172,7 @@ export class CodexAppServerConnection {
     private readonly onClosed?: () => void,
     private readonly closeOwnedProcess?: () => Promise<void>,
     private readonly ipcTraffic?: LogicalIpcWorkerTraffic,
+    private readonly isLifetimeCurrent?: () => boolean,
   ) {
     recordDiagnostic({
       operation: 'process',
@@ -303,8 +305,15 @@ export class CodexAppServerConnection {
     return response
   }
 
-  async notify(method: string, params: object): Promise<void> {
-    await this.enqueue({ method, params }, {})
+  async notify(
+    method: string,
+    params: object,
+    options: { signal?: AbortSignal | undefined; canDispatch?: (() => boolean) | undefined } = {},
+  ): Promise<void> {
+    await this.enqueue(
+      { method, params },
+      { canDispatch: options.canDispatch, cancelBeforeWriteSignal: options.signal },
+    )
   }
 
   /** A native server request is independent of our outbound request ID space. */
@@ -655,6 +664,7 @@ export class CodexAppServerConnection {
       requestId?: number | undefined
       onDispatch?: (() => void) | undefined
       canDispatch?: (() => boolean) | undefined
+      cancelBeforeWriteSignal?: AbortSignal | undefined
     },
   ): Promise<void> {
     if (!this.isOpen) {
@@ -721,7 +731,8 @@ export class CodexAppServerConnection {
     }
     this.writing = true
     this.activeOutboundFrame = frame
-    const signal = this.pendingRequests.get(frame.requestId ?? -1)?.signal
+    const signal =
+      frame.cancelBeforeWriteSignal ?? this.pendingRequests.get(frame.requestId ?? -1)?.signal
     const writeSignal = frame.controller.signal
     const source = (physicalSignal: AbortSignal): AsyncIterable<Uint8Array> =>
       frame.bytes
@@ -742,6 +753,7 @@ export class CodexAppServerConnection {
       onFirstWrite: () => frame.onDispatch?.(),
       canDispatch: () =>
         this.isOpen &&
+        (this.isLifetimeCurrent?.() ?? true) &&
         (frame.requestId === undefined || this.pendingRequests.has(frame.requestId)) &&
         (frame.canDispatch?.() ?? true),
       deadlineMs: Math.max(1, frame.expiresAt - Date.now()),

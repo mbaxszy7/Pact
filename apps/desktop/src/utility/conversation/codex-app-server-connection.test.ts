@@ -19,6 +19,60 @@ afterEach(() => {
 })
 
 describe('Codex App Server connection budgets', () => {
+  it.each(['lifetime', 'notification-abort'] as const)(
+    'keeps a queued %s frame unwritten after its owner stops under real stream backpressure',
+    async (mode) => {
+      const child = fakeChild(),
+        methods: unknown[] = []
+      child.onRequest((request) => {
+        methods.push(Reflect.get(request, 'method'))
+        if (Reflect.has(request, 'id'))
+          child.stdout.write(`${JSON.stringify({ id: Reflect.get(request, 'id'), result: {} })}\n`)
+      })
+      const write = child.stdin.write.bind(child.stdin)
+      let blocked = true,
+        current = true
+      child.stdin.write = ((bytes: Buffer) => {
+        const accepted = write(bytes)
+        return blocked ? false : accepted
+      }) as typeof child.stdin.write
+      const connection = new CodexAppServerConnection(
+        child.process,
+        undefined,
+        undefined,
+        undefined,
+        () => current,
+      )
+      const controller = new AbortController()
+      try {
+        await connection.request('block', {}, { timeoutMs: 1000 })
+        const queued =
+          mode === 'lifetime'
+            ? connection.request('thread/read', {}, { timeoutMs: 1000 })
+            : connection.notify('initialized', {}, { signal: controller.signal })
+        const outcome = queued.catch((error: unknown) => error)
+        if (mode === 'lifetime') current = false
+        else controller.abort()
+        blocked = false
+        child.stdin.emit('drain')
+        expect(await outcome).toBeInstanceOf(Error)
+        expect(methods).toEqual(['block'])
+        current = true
+        await connection.request('ping', {}, { timeoutMs: 1000 })
+        expect(methods).toEqual(['block', 'ping'])
+        await vi.waitFor(() =>
+          expect(connection.diagnostics()).toMatchObject({
+            pendingRequests: 0,
+            queuedOutboundFrames: 0,
+            queuedOutboundBytes: 0,
+          }),
+        )
+      } finally {
+        await connection.close()
+      }
+    },
+  )
+
   it.each(['stale', 'throws'] as const)(
     'rejects %s metadata at actual dispatch after backpressure and keeps normal RPC usable',
     async (fence) => {
