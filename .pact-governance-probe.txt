@@ -1,1 +1,1 @@
-Shared-SHA governance probe; disposable text change.
+Fixed App review lifecycle fixture after owner self-exemption proof.
