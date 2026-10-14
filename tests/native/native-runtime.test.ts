@@ -1,6 +1,7 @@
-import { spawn, type ChildProcess, type SpawnOptionsWithoutStdio } from 'node:child_process'
+import type { spawn, ChildProcess, SpawnOptionsWithoutStdio } from 'node:child_process'
+
 import { randomUUID } from 'node:crypto'
-import { appendFile, mkdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, realpath, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
@@ -10,6 +11,7 @@ import type { NativeContextRebuildChunk } from '../../packages/contracts/src/ind
 import {
   actualSdk,
   boundedNativeText,
+  cleanupNativeFixture,
   buildAdapters,
   executable,
   hash,
@@ -28,19 +30,36 @@ import {
 
 let bundle: Awaited<ReturnType<typeof buildAdapters>>
 let buildRoot: string
+let buildOwned: Awaited<ReturnType<typeof ownedRoot>> | undefined
+let fixtureOwnersReleased = true
+async function finishFixture(
+  owned: Awaited<ReturnType<typeof ownedRoot>>,
+  options: Parameters<typeof cleanupNativeFixture>[1] = {},
+): Promise<void> {
+  try {
+    await cleanupNativeFixture(owned, options)
+  } catch (error) {
+    fixtureOwnersReleased = false
+    throw error
+  }
+}
 let codexExecutable: string
 let claudeExecutable: string
 beforeAll(async () => {
+  const setupDeadlineAt = performance.now() + 60_000
   const owned = await ownedRoot()
   buildRoot = owned.root
+  buildOwned = owned
   // Missing/unrecognized real binaries fail, rather than silently using Fake CLI.
-  codexExecutable = await executable('codex', owned)
-  claudeExecutable = await executable('claude', owned)
+  codexExecutable = await executable('codex', owned, setupDeadlineAt)
+  claudeExecutable = await executable('claude', owned, setupDeadlineAt)
   await recordSdkVersion()
   bundle = await buildAdapters(buildRoot)
-})
+}, 60_000)
 afterAll(async () => {
-  if (buildRoot) await rm(buildRoot, { recursive: true, force: true })
+  if (!fixtureOwnersReleased)
+    throw new Error('Native adapter bundle retained while fixture cleanup is unconfirmed')
+  if (buildOwned) await finishFixture(buildOwned)
 })
 
 describe('real Claude Code / production Adapter zero-prompt Fork settings', () => {
@@ -56,16 +75,17 @@ describe('real Claude Code / production Adapter zero-prompt Fork settings', () =
       const sdk = actualSdk()
       const previousConfig = process.env.CLAUDE_CONFIG_DIR
       const children = new Set<ChildProcess>()
-      const exits: Promise<void>[] = []
       let adapter: NativeAdapter | undefined
       let cold: NativeAdapter | undefined
       let applied: { model?: string; effort?: string } | undefined
       let queryOptions: SdkQueryInput['options'] | undefined
       let stdoutBytes = 0
       const controller = new AbortController()
+      const deadlineAt = performance.now() + 25_000
       const deadline = setTimeout(() => controller.abort(), 25_000)
       try {
         await provider.start()
+        await owned.processes.prepare(claudeExecutable, 4, deadlineAt)
         process.env.CLAUDE_CONFIG_DIR = owned.home
         await writeFile(
           join(owned.home, 'settings.json'),
@@ -136,19 +156,9 @@ describe('real Claude Code / production Adapter zero-prompt Fork settings', () =
           },
           spawn: (command: string, args: string[], options: Parameters<typeof spawn>[2]) => {
             if (children.size >= 4) throw new Error('Owned Claude child capacity exceeded')
-            const child = spawn(command, args, options)
+            const child = owned.processes.spawn(command, args, options ?? {})
             children.add(child)
-            const exit = new Promise<void>((resolveExit) => {
-              child.once('exit', () => {
-                children.delete(child)
-                resolveExit()
-              })
-              child.once('error', () => {
-                children.delete(child)
-                resolveExit()
-              })
-            })
-            exits.push(exit)
+            child.once('close', () => children.delete(child))
             let pending = ''
             child.stdout?.on('data', (chunk: Buffer) => {
               stdoutBytes += chunk.length
@@ -248,18 +258,12 @@ describe('real Claude Code / production Adapter zero-prompt Fork settings', () =
       } finally {
         controller.abort()
         clearTimeout(deadline)
-        await cold?.dispose()
-        await adapter?.dispose()
-        for (const child of children) child.kill('SIGTERM')
-        await within(Promise.all(exits), 1500, 'Owned Claude termination grace').catch(
-          () => undefined,
-        )
-        for (const child of children) child.kill('SIGKILL')
-        await Promise.all(exits)
         if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
         else process.env.CLAUDE_CONFIG_DIR = previousConfig
-        await provider.close()
-        await rm(owned.root, { recursive: true, force: true })
+        await finishFixture(owned, {
+          adapters: [cold, adapter].filter((value): value is NativeAdapter => Boolean(value)),
+          provider,
+        })
       }
     },
   )
@@ -292,13 +296,15 @@ it.each([
     const provider = new LoopbackProvider()
     const previousConfig = process.env.CLAUDE_CONFIG_DIR
     const children = new Set<ChildProcess>()
-    const exits: Promise<void>[] = []
     const adapters: NativeAdapter[] = []
+    const clients: NativeRpc[] = []
     const controller = new AbortController()
+    const deadlineAt = performance.now() + 25_000
     const deadline = setTimeout(() => controller.abort(), 25_000)
     try {
       await provider.start()
       await provider.configureCodex(owned.home)
+      if (agent === 'claude') await owned.processes.prepare(claudeExecutable, 4, deadlineAt)
       if (workspace)
         await appendFile(
           join(owned.home, 'config.toml'),
@@ -306,7 +312,11 @@ it.each([
         )
       process.env.CLAUDE_CONFIG_DIR = owned.home
       const env = { ...isolatedEnv(owned.root, owned.home), ANTHROPIC_BASE_URL: provider.url }
-      const configReader = new NativeRpc(codexExecutable, owned.cwd, env)
+      const configReader = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+        deadlineAt,
+        processes: owned.processes,
+      })
+      clients.push(configReader)
       try {
         await configReader.initialize()
         const config = result(
@@ -323,25 +333,17 @@ it.each([
       } finally {
         await configReader.close()
       }
-      const start = (
+      const startOwned = (
         command: string,
         args: readonly string[],
         options: SpawnOptionsWithoutStdio,
       ) => {
         if (children.size >= 4) throw new Error('Owned empty Rebuild child capacity exceeded')
-        const child = spawn(command, args, options)
+        const handle = owned.processes.spawnOwned(command, args, options)
+        const child = handle.child
         children.add(child)
-        exits.push(
-          new Promise<void>((resolveExit) => {
-            const end = () => {
-              children.delete(child)
-              resolveExit()
-            }
-            child.once('exit', end)
-            child.once('error', end)
-          }),
-        )
-        return child
+        child.once('close', () => children.delete(child))
+        return handle
       }
       const sdk = actualSdk()
       const makeAdapter = (): NativeAdapter => {
@@ -351,17 +353,21 @@ it.each([
                 getSessionInfo: sdk.getSessionInfo,
                 query: (input: SdkQueryInput) =>
                   sdk.query({ ...input, options: { ...input.options, env } }),
-                spawn: start,
+                spawn: (
+                  command: string,
+                  args: readonly string[],
+                  options: SpawnOptionsWithoutStdio,
+                ) => startOwned(command, args, options).child,
               })
             : new bundle.CodexAgentAdapter(
                 codexExecutable,
                 (cwd) =>
-                  start(codexExecutable, ['app-server'], {
-                    cwd,
-                    env,
-                    shell: false,
-                    stdio: ['pipe', 'pipe', 'pipe'],
-                  }),
+                  owned.processes.spawnOwnedAsync(
+                    codexExecutable,
+                    ['app-server'],
+                    { cwd, env, shell: false, stdio: ['pipe', 'pipe', 'pipe'] },
+                    deadlineAt,
+                  ),
                 { storageRoot: owned.home },
               )
         adapters.push(adapter)
@@ -387,8 +393,9 @@ it.each([
       expect(adapter.hasActiveBackgroundWork()).toBe(false)
       await adapter.dispose()
       const cold = makeAdapter()
-      const probe = () =>
-        cold.probeNativeStatus(
+      const probe = async () => {
+        if (agent === 'claude') await owned.processes.prepare(claudeExecutable, 4, deadlineAt)
+        return cold.probeNativeStatus(
           {
             target: 'initialized_binding',
             sessionId: input.sessionId,
@@ -410,6 +417,7 @@ it.each([
           },
           controller.signal,
         )
+      }
       await expect(probe()).resolves.toMatchObject({
         kind: 'binding_ready',
         source: 'completed_initialization_readback',
@@ -424,7 +432,11 @@ it.each([
             )
           : result(
               await (async () => {
-                const reader = new NativeRpc(codexExecutable, owned.cwd, env)
+                const reader = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+                  deadlineAt,
+                  processes: owned.processes,
+                })
+                clients.push(reader)
                 try {
                   await reader.initialize()
                   return await reader.request<{ thread: NativeThread }>('thread/read', {
@@ -462,18 +474,9 @@ it.each([
     } finally {
       controller.abort()
       clearTimeout(deadline)
-      // oxlint-disable-next-line no-await-in-loop -- Release each owned Native writer before disposing the next owner.
-      for (const adapter of adapters) await adapter.dispose()
-      for (const child of children) child.kill('SIGTERM')
-      await within(Promise.all(exits), 1500, 'Owned empty Rebuild termination grace').catch(
-        () => undefined,
-      )
-      for (const child of children) child.kill('SIGKILL')
-      await Promise.all(exits)
       if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
       else process.env.CLAUDE_CONFIG_DIR = previousConfig
-      await provider.close()
-      await rm(owned.root, { recursive: true, force: true })
+      await finishFixture(owned, { adapters, clients, provider })
     }
   },
 )
@@ -484,14 +487,17 @@ it('real default paginated Codex writer → production selected true Fork → co
   const clients: NativeRpc[] = []
   const adapters: NativeAdapter[] = []
   const children = new Set<ChildProcess>()
-  const exits: Promise<void>[] = []
   const controller = new AbortController()
+  const deadlineAt = performance.now() + 45_000
   const deadline = setTimeout(() => controller.abort(), 45_000)
   try {
     await provider.start()
     await provider.configureCodex(owned.home)
     const env = isolatedEnv(owned.root, owned.home)
-    const writer = new NativeRpc(codexExecutable, owned.cwd, env)
+    const writer = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+      deadlineAt,
+      processes: owned.processes,
+    })
     clients.push(writer)
     await writer.initialize()
     const sourceThread = result(
@@ -516,28 +522,18 @@ it('real default paginated Codex writer → production selected true Fork → co
     const sourceText = await boundedNativeText(sourceRead.path, owned.home)
     const sourceHash = hash(sourceText)
     await writer.close()
-    const factory = (cwd: string) => {
+    const factory = async (cwd: string) => {
       if (children.size >= 4) throw new Error('Owned Codex child capacity exceeded')
-      const child = spawn(codexExecutable, ['app-server'], {
-        cwd,
-        env,
-        shell: false,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      })
-      children.add(child)
-      exits.push(
-        new Promise<void>((resolveExit) => {
-          child.once('exit', () => {
-            children.delete(child)
-            resolveExit()
-          })
-          child.once('error', () => {
-            children.delete(child)
-            resolveExit()
-          })
-        }),
+      const handle = await owned.processes.spawnOwnedAsync(
+        codexExecutable,
+        ['app-server'],
+        { cwd, env, shell: false, stdio: ['pipe', 'pipe', 'pipe'] },
+        deadlineAt,
       )
-      return child
+      const child = handle.child
+      children.add(child)
+      child.once('close', () => children.delete(child))
+      return handle
     }
     const adapter = new bundle.CodexAgentAdapter(codexExecutable, factory, {
       storageRoot: owned.home,
@@ -603,7 +599,10 @@ it('real default paginated Codex writer → production selected true Fork → co
     }
     expect(await adapter.setNativeTitle(label, controller.signal)).toBe('synchronized')
     expect(await adapter.setNativeTitle(label, controller.signal)).toBe('synchronized')
-    const metadataReader = new NativeRpc(codexExecutable, owned.cwd, env)
+    const metadataReader = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+      deadlineAt,
+      processes: owned.processes,
+    })
     clients.push(metadataReader)
     await metadataReader.initialize()
     const named = result(
@@ -704,16 +703,7 @@ it('real default paginated Codex writer → production selected true Fork → co
   } finally {
     controller.abort()
     clearTimeout(deadline)
-    // oxlint-disable no-await-in-loop -- Each owner releases its Native writer before the next owner is disposed.
-    for (const adapter of adapters) await adapter.dispose()
-    for (const client of clients) await client.close()
-    // oxlint-enable no-await-in-loop
-    for (const child of children) child.kill('SIGTERM')
-    await within(Promise.all(exits), 1500, 'Owned Codex termination grace').catch(() => undefined)
-    for (const child of children) child.kill('SIGKILL')
-    await Promise.all(exits)
-    await provider.close()
-    await rm(owned.root, { recursive: true, force: true })
+    await finishFixture(owned, { adapters, clients, provider })
   }
 })
 
@@ -725,7 +715,9 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
     await provider.start()
     await provider.configureCodex(owned.home)
     const env = isolatedEnv(owned.root, owned.home)
-    const creator = new NativeRpc(codexExecutable, owned.cwd, env)
+    const creator = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+      processes: owned.processes,
+    })
     clients.push(creator)
     await creator.initialize()
     const thread = result(
@@ -738,10 +730,15 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
     ).thread
     await writeTurn(creator, thread.id, 'NATIVE_WRITER_INPUT')
     await creator.close()
-    const desktop = new NativeRpc(codexExecutable, owned.cwd, {
-      ...env,
-      CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'Codex Desktop',
-    })
+    const desktop = await NativeRpc.create(
+      codexExecutable,
+      owned.cwd,
+      {
+        ...env,
+        CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'Codex Desktop',
+      },
+      { processes: owned.processes },
+    )
     clients.push(desktop)
     await desktop.initialize()
     result(
@@ -750,7 +747,9 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
     result(await desktop.request('thread/read', { threadId: thread.id, includeTurns: false }))
     result(await desktop.request('thread/read', { threadId: thread.id, includeTurns: true }))
     result(await desktop.request('thread/turns/list', { threadId: thread.id, limit: 25 }))
-    const pact = new NativeRpc(codexExecutable, owned.cwd, env)
+    const pact = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+      processes: owned.processes,
+    })
     clients.push(pact)
     await pact.initialize()
     const resumed = result(
@@ -773,7 +772,7 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
     })
     expect(pact.child.exitCode).toBeNull()
     // stdin EOF is natural shutdown, not lock removal or forcibly stealing ownership.
-    pact.child.stdin.end()
+    await pact.endInputNaturally()
     await within(pact.exited, 5000, 'Owned writer did not exit naturally')
     expect(pact.child.exitCode).toBe(0)
     const afterExit = result(
@@ -787,7 +786,9 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
     expect(afterExit.status.type).toBe('idle')
     // Match the reported direction too: Desktop owns the now-resumed writer,
     // and a fresh Pact client must preserve that ownership rather than steal it.
-    const nextPact = new NativeRpc(codexExecutable, owned.cwd, env)
+    const nextPact = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+      processes: owned.processes,
+    })
     clients.push(nextPact)
     await nextPact.initialize()
     const pactRejected = await nextPact.request('thread/resume', {
@@ -800,7 +801,7 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
       message: `thread ${thread.id} already has an active writer`,
     })
     expect(desktop.child.exitCode).toBeNull()
-    desktop.child.stdin.end()
+    await desktop.endInputNaturally()
     await within(desktop.exited, 5000, 'Owned Desktop writer did not exit naturally')
     expect(desktop.child.exitCode).toBe(0)
     const pactAfterExit = result(
@@ -815,9 +816,6 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
     expect(provider.requests).toHaveLength(1)
     expect(provider.errors).toEqual([])
   } finally {
-    // oxlint-disable-next-line no-await-in-loop -- Owned clients must release their writers sequentially.
-    for (const client of clients) await client.close()
-    await provider.close()
-    await rm(owned.root, { recursive: true, force: true })
+    await finishFixture(owned, { clients, provider })
   }
 })

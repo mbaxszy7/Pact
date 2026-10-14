@@ -20,6 +20,8 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 const imageByteLimit = 64 * 1024
 const imageLifetimeMs = 10 * 60_000
+// Hosted cold compilation is setup work. Target startup keeps its separate caller deadline.
+const imageCompilationMs = 30_000
 const privateImages = new Set<string>()
 let seed:
   | {
@@ -152,10 +154,10 @@ function installImage(executable: string): void {
     const parent = realpathSync(tmpdir())
     const directory = mkdtempSync(join(parent, 'pact-test-image-'))
     const image = join(directory, 'image.exe')
-    const deadline = performance.now() + 10_000
+    const deadline = performance.now() + imageCompilationMs
     const remaining = (): number => {
       const value = Math.floor(deadline - performance.now())
-      if (value < 1) throw new Error('Windows fixture image preparation exceeded 10s')
+      if (value < 1) throw new Error('Windows fixture image preparation exceeded 30s')
       return value
     }
     preparingImage = true
@@ -170,7 +172,7 @@ function installImage(executable: string): void {
       })
       const hash = digest(boundedBytes(image))
       if (key !== imageKey() || performance.now() >= deadline)
-        throw new Error('Windows fixture image preparation changed or exceeded 10s')
+        throw new Error('Windows fixture image preparation changed or exceeded 30s')
       seed = {
         directory,
         parent,

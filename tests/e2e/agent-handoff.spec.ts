@@ -217,6 +217,9 @@ test(
       await window.getByRole('button', { name: 'Handoff Session', exact: true }).click()
       const composer = window.getByRole('combobox', { name: 'Message' })
       await composer.fill('Review the full handoff')
+      await expect(window.getByRole('button', { name: 'Send message', exact: true })).toBeEnabled({
+        timeout: 30_000,
+      })
       await composer.press('Enter')
       await expect(
         window.getByText(

@@ -803,15 +803,17 @@ export async function createRuntimeFixture(
               throw new Error('Owned native clients require a live real fixture')
             if (nativeClients.size >= 2)
               throw new Error('A real fixture owns at most two auxiliary Native clients')
-            const client = new NativeRpc(
+            const client = await NativeRpc.create(
               configuration!.codexPath,
               directory,
               {
                 ...codexProcessEnvironment(undefined, environment.env),
                 CODEX_INTERNAL_ORIGINATOR_OVERRIDE: originator,
               },
-              new OwnedProcessGroup({ startupObservationMs: 2_000 }),
-              () => nativeClients.delete(client),
+              {
+                group: new OwnedProcessGroup({ startupObservationMs: 2_000 }),
+                onReleased: () => nativeClients.delete(client),
+              },
             )
             nativeClients.add(client)
             await client.initialize()

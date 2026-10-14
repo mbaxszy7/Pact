@@ -1,10 +1,19 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
 
 import { OwnedProcessGroup } from '../../apps/desktop/src/utility/owned-process-group.js'
-import { NativeRpc, within } from './native-harness.js'
+import {
+  cleanupNativeFixture,
+  isolatedEnv,
+  LoopbackProvider,
+  NativeRpc,
+  NativeProcessSet,
+  NativeProcessOwner,
+  ownedRoot,
+  within,
+} from './native-harness.js'
 
 function gate(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void
@@ -13,6 +22,179 @@ function gate(): { promise: Promise<void>; resolve: () => void } {
   })
   return { promise, resolve }
 }
+
+it('closes a preparation ticket before disposal returns and never starts its late child', async () => {
+  const owned = await ownedRoot()
+  const held = gate()
+  const prepared = gate()
+  const prepare = NativeProcessOwner.prepare.bind(NativeProcessOwner)
+  const observation = vi
+    .spyOn(NativeProcessOwner, 'prepare')
+    .mockImplementation(async (...args) => {
+      const owner = await prepare(...args)
+      prepared.resolve()
+      await held.promise
+      return owner
+    })
+  let invocation: Promise<unknown> | undefined
+  try {
+    invocation = owned.processes.spawnOwnedAsync(
+      process.execPath,
+      ['-e', 'process.stdin.resume();'],
+      { cwd: owned.cwd, env: isolatedEnv(owned.root, owned.home), shell: false },
+      performance.now() + 50_000,
+    )
+    void invocation.catch(() => undefined)
+    await prepared.promise
+    let closed = false
+    const originalClosing = owned.processes.close()
+    const closing = originalClosing.then(() => {
+      closed = true
+      return undefined
+    })
+    expect(owned.processes.close()).toBe(originalClosing)
+    expect(() => owned.processes.spawnOwned(process.execPath, [], { cwd: owned.cwd })).toThrow(
+      'closing',
+    )
+    await expect(
+      owned.processes.spawnOwnedAsync(
+        process.execPath,
+        [],
+        { cwd: owned.cwd },
+        performance.now() + 50_000,
+      ),
+    ).rejects.toThrow('closing')
+    await Promise.resolve()
+    expect(closed).toBe(false)
+    expect((await stat(owned.root)).isDirectory()).toBe(true)
+    held.resolve()
+    await expect(invocation).rejects.toThrow('closing')
+    await closing
+    expect(owned.processes.facts()).toEqual([
+      expect.objectContaining({ admitted: false, released: true, helperReleased: true }),
+    ])
+    await cleanupNativeFixture(owned)
+    await expect(stat(owned.root)).rejects.toMatchObject({ code: 'ENOENT' })
+  } finally {
+    held.resolve()
+    observation.mockRestore()
+    await invocation?.catch(() => undefined)
+    await owned.processes.close().catch(() => undefined)
+    if (owned.processes.facts().every((fact) => fact.released))
+      await rm(owned.root, { recursive: true, force: true })
+  }
+})
+
+it('rechecks an unadmitted owner once after genuine group release and never removes its confirmed helper twice', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-native-prepared-recovery-'))
+  const owner = await NativeProcessOwner.prepare(process.execPath, root, performance.now() + 30_000)
+  const failure = new Error('Controlled unadmitted group failure')
+  const groupClose = vi.spyOn(owner.group, 'close').mockRejectedValueOnce(failure)
+  try {
+    const original = owner.close()
+    await expect(original).rejects.toBe(failure)
+    expect(owner.facts().released).toBe(false)
+    expect(() => owner.start([], { cwd: root })).toThrow('admission is obsolete')
+    groupClose.mockRestore()
+    await owner.group.close()
+    const repaired = owner.close({ recheck: true })
+    await repaired
+    expect(owner.facts()).toMatchObject({
+      admitted: false,
+      groupReleased: true,
+      controlClosed: true,
+      helperReleased: true,
+      released: true,
+    })
+    expect(owner.close({ recheck: true })).toBe(repaired)
+    expect(() => owner.start([], { cwd: root })).toThrow('admission is obsolete')
+  } finally {
+    groupClose.mockRestore()
+    await owner.group.close()
+    await owner.close({ recheck: true }).catch(() => undefined)
+    if (owner.facts().released) await rm(root, { recursive: true, force: true })
+  }
+})
+
+it('retains recovery data when a genuine client rejects cleanup despite confirmed physical release', async () => {
+  const owned = await ownedRoot(),
+    protocol = await protocolChild()
+  const observe = vi
+    .spyOn(protocol.group, 'observe')
+    .mockRejectedValueOnce(new Error('Controlled preliminary observation failure'))
+  try {
+    await expect(protocol.client.close()).rejects.toThrow(
+      'Controlled preliminary observation failure',
+    )
+    expect(protocol.client.cleanupFacts()).toMatchObject({
+      phase: 'released-with-errors',
+      released: true,
+      helperReleased: true,
+    })
+    await expect(cleanupNativeFixture(owned, { clients: [protocol.client] })).rejects.toThrow(
+      'recovery data retained',
+    )
+    expect((await stat(owned.root)).isDirectory()).toBe(true)
+  } finally {
+    observe.mockRestore()
+    await protocol.client.close().catch(() => undefined)
+    await owned.processes.close()
+    if (protocol.client.cleanupFacts().released) {
+      await rm(protocol.directory, { recursive: true, force: true })
+      await rm(owned.root, { recursive: true, force: true })
+    }
+  }
+})
+
+it('attempts every genuine process/provider cleanup and retains the root after an earlier owner rejects', async () => {
+  const owned = await ownedRoot()
+  const provider = new LoopbackProvider()
+  const first = vi
+    .fn<() => Promise<void>>()
+    .mockRejectedValueOnce(new Error('Controlled disposal failure'))
+    .mockResolvedValue(undefined)
+  const second = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+  try {
+    await provider.start()
+    await owned.processes.prepare(process.execPath, 1, performance.now() + 10_000)
+    const child = owned.processes.spawn(process.execPath, ['-e', 'process.stdin.resume();'], {
+      cwd: owned.cwd,
+      env: isolatedEnv(owned.root, owned.home),
+      shell: false,
+    })
+    await expect(
+      cleanupNativeFixture(owned, {
+        adapters: [{ dispose: first }, { dispose: second }],
+        provider,
+      }),
+    ).rejects.toThrow('recovery data retained')
+    expect(first).toHaveBeenCalledOnce()
+    expect(second).toHaveBeenCalledOnce()
+    expect(child.exitCode !== null || child.signalCode !== null).toBe(true)
+    expect(owned.processes.facts()).toEqual([
+      expect.objectContaining({
+        admitted: true,
+        childClosed: true,
+        groupReleased: true,
+        released: true,
+      }),
+    ])
+    expect(provider.server.listening).toBe(false)
+    expect((await stat(owned.root)).isDirectory()).toBe(true)
+    // The controlled rejection is acknowledged before the second, genuine cleanup
+    // receipt permits directory removal. No original failed receipt is rewritten.
+    await cleanupNativeFixture(owned, {
+      adapters: [{ dispose: first }, { dispose: second }],
+      provider,
+    })
+    await expect(stat(owned.root)).rejects.toMatchObject({ code: 'ENOENT' })
+  } finally {
+    await owned.processes.close().catch(() => undefined)
+    await provider.close().catch(() => undefined)
+    if (owned.processes.facts().every((facts) => facts.released))
+      await rm(owned.root, { recursive: true, force: true })
+  }
+})
 
 it('retains ownership when child close cleanup has not settled before its deadline', async () => {
   const owned = await protocolChild()
@@ -38,7 +220,14 @@ it('retains ownership when child close cleanup has not settled before its deadli
     await originalClosed
     await owned.group.close()
     await within(owned.childClosed, 4000, 'Controlled protocol child did not close')
-    if (owned.group.released) await rm(owned.directory, { recursive: true, force: true })
+    await owned.client.close({ recheck: true })
+    expect(owned.client.cleanupFacts()).toMatchObject({ released: true, helperReleased: true })
+    expect(owned.client.cleanupFacts().previousAttempt).toMatchObject({
+      phase: 'unconfirmed',
+      released: false,
+    })
+    if (owned.group.released && owned.client.cleanupFacts().released)
+      await rm(owned.directory, { recursive: true, force: true })
   }
 })
 
@@ -71,7 +260,7 @@ input.once('close', () => { fs.writeFileSync(${JSON.stringify(eofPath)}, 'natura
       { mode: 0o600 },
     )
     const onReleased = vi.fn<() => void>()
-    client = new NativeRpc(
+    client = await NativeRpc.create(
       process.execPath,
       directory,
       {
@@ -81,8 +270,11 @@ input.once('close', () => { fs.writeFileSync(${JSON.stringify(eofPath)}, 'natura
         TMPDIR: directory,
         TEMP: directory,
       },
-      withGroup ? group : undefined,
-      onReleased,
+      {
+        group: withGroup ? group : undefined,
+        onReleased,
+        processes: new NativeProcessSet(directory),
+      },
     )
     const created = client
     const childClosed = new Promise<void>((done) => created.child.once('close', () => done()))
@@ -128,7 +320,120 @@ it('settles pending requests and shares one close after real child and group rel
     await owned.group.close()
     await within(owned.childClosed, 4000, 'Controlled protocol child did not close')
     expect(owned.group.released).toBe(true)
+    await owned.client.close({ recheck: true }).catch(() => undefined)
+    expect(owned.client.cleanupFacts()).toMatchObject({
+      released: true,
+      helperReleased: true,
+      closeSettled: true,
+    })
     await rm(owned.directory, { recursive: true, force: true })
+  }
+})
+
+it('confirms an observed group after the protocol child has already exited naturally', async () => {
+  const owned = await protocolChild()
+  try {
+    owned.client.child.stdin.end()
+    await within(owned.childClosed, 2000, 'Natural protocol child did not close')
+    await expect(owned.client.close()).resolves.toBeUndefined()
+    expect(owned.group.released).toBe(true)
+    expect(owned.client.cleanupFacts()).toMatchObject({
+      childClosed: true,
+      groupReleased: true,
+      helperReleased: true,
+      released: true,
+    })
+  } finally {
+    await owned.client.close().catch(() => undefined)
+    await owned.group.close().catch(() => undefined)
+    if (owned.group.released && owned.client.cleanupFacts().released)
+      await rm(owned.directory, { recursive: true, force: true })
+  }
+})
+
+it('closes a factory owner with a late-born helper before deleting its root', async () => {
+  const owned = await ownedRoot()
+  let helperPid: number | undefined
+  let child: import('node:child_process').ChildProcessWithoutNullStreams | undefined
+  try {
+    await writeFile(
+      join(owned.cwd, 'late-helper.cjs'),
+      `
+const { spawn } = require('node:child_process');
+const readline = require('node:readline');
+process.stdout.write('ready\\n');
+const input = readline.createInterface({ input: process.stdin });
+input.once('line', () => {
+  const helper = spawn(process.execPath, ['-e', 'process.on("SIGTERM",()=>{}); setInterval(()=>{},1000); setTimeout(()=>process.exit(0),5000); process.stdout.write("ready");'], { stdio: ['ignore', 'pipe', 'ignore'] });
+  helper.stdout.once('data', () => {
+    process.stdout.write(JSON.stringify({ pid: helper.pid }) + '\\n');
+    helper.stdout.destroy(); helper.unref();
+  });
+});
+input.once('close', () => process.exit(0));
+`,
+    )
+    await owned.processes.prepare(process.execPath, 1, performance.now() + 10_000)
+    const handle = owned.processes.spawnOwned(process.execPath, ['late-helper.cjs'], {
+      cwd: owned.cwd,
+      env: isolatedEnv(owned.root, owned.home),
+      shell: false,
+    })
+    child = handle.child
+    let pending = ''
+    const ready = Promise.withResolvers<void>()
+    const helper = Promise.withResolvers<number>()
+    child.stdout.on('data', (bytes: Buffer) => {
+      pending += bytes.toString('utf8')
+      if (pending.length > 1024) throw new Error('Late helper fixture exceeds its bound')
+      for (;;) {
+        const end = pending.indexOf('\n')
+        if (end < 0) break
+        const line = pending.slice(0, end)
+        pending = pending.slice(end + 1)
+        if (line === 'ready') ready.resolve()
+        else {
+          const result: unknown = JSON.parse(line)
+          const pid: unknown =
+            result && typeof result === 'object' ? Reflect.get(result, 'pid') : undefined
+          if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0)
+            throw new Error('Invalid late helper identity')
+          helper.resolve(pid)
+        }
+      }
+    })
+    await within(ready.promise, 2000, 'Late helper root did not start')
+    await handle.observe()
+    child.stdin.write('spawn\n')
+    helperPid = await within(helper.promise, 2000, 'Late helper did not start')
+    await expect(handle.close()).resolves.toBeUndefined()
+    expect(owned.processes.facts()).toEqual([
+      expect.objectContaining({
+        admitted: true,
+        childClosed: true,
+        groupReleased: true,
+        released: true,
+      }),
+    ])
+    expect(() => process.kill(helperPid!, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }))
+    let platformReleased = owned.processes.facts()[0]?.windowsJobEmpty === true
+    if (process.platform !== 'win32') {
+      try {
+        process.kill(-child.pid!, 0)
+        platformReleased = false
+      } catch (error) {
+        platformReleased = Boolean(
+          error && typeof error === 'object' && Reflect.get(error, 'code') === 'ESRCH',
+        )
+      }
+    }
+    expect(platformReleased).toBe(true)
+    await cleanupNativeFixture(owned)
+    await expect(stat(owned.root)).rejects.toMatchObject({ code: 'ENOENT' })
+  } finally {
+    await owned.processes.close().catch(() => undefined)
+    if (owned.processes.facts().every((fact) => fact.released))
+      await rm(owned.root, { recursive: true, force: true })
   }
 })
 
@@ -176,6 +481,12 @@ it('continues EOF and physical release after the single ownership observation re
     await owned.group.close()
     await within(owned.childClosed, 4000, 'Controlled protocol child did not close')
     expect(owned.group.released).toBe(true)
+    await owned.client.close({ recheck: true }).catch(() => undefined)
+    expect(owned.client.cleanupFacts()).toMatchObject({
+      released: true,
+      helperReleased: true,
+      closeSettled: true,
+    })
     await rm(owned.directory, { recursive: true, force: true })
   }
 })
@@ -207,6 +518,12 @@ it('keeps release notification behind the real process-group release gate', asyn
     await originalClose()
     await within(owned.childClosed, 4000, 'Controlled protocol child did not close')
     expect(owned.group.released).toBe(true)
+    await owned.client.close({ recheck: true }).catch(() => undefined)
+    expect(owned.client.cleanupFacts()).toMatchObject({
+      released: true,
+      helperReleased: true,
+      closeSettled: true,
+    })
     await rm(owned.directory, { recursive: true, force: true })
   }
 })
@@ -237,11 +554,17 @@ it('does not notify release when the group remains unconfirmed despite real chil
     await within(owned.childClosed, 4000, 'Controlled protocol child did not close')
     expect(owned.group.released).toBe(true)
     expect(owned.onReleased).not.toHaveBeenCalled()
+    await owned.client.close({ recheck: true }).catch(() => undefined)
+    expect(owned.client.cleanupFacts()).toMatchObject({
+      released: true,
+      helperReleased: true,
+      closeSettled: true,
+    })
     await rm(owned.directory, { recursive: true, force: true })
   }
 })
 
-it('confirms the real child close event before notifying release without a group owner', async () => {
+it('confirms real child and default fixture-owner closure before notifying release', async () => {
   const owned = await protocolChild(false)
   const closeEvent = vi.fn<() => void>()
   owned.client.child.once('close', closeEvent)
@@ -263,6 +586,12 @@ it('confirms the real child close event before notifying release without a group
     await owned.client.close().catch(() => undefined)
     await within(owned.childClosed, 4000, 'Controlled protocol child did not close')
     await owned.group.close()
+    await owned.client.close({ recheck: true }).catch(() => undefined)
+    expect(owned.client.cleanupFacts()).toMatchObject({
+      released: true,
+      helperReleased: true,
+      closeSettled: true,
+    })
     await rm(owned.directory, { recursive: true, force: true })
   }
 })

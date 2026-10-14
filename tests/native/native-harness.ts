@@ -1,6 +1,7 @@
+import type { ChildProcessWithoutNullStreams, SpawnOptions } from 'node:child_process'
 import type { Socket } from 'node:net'
 
-import { spawn, execFile, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { access, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
@@ -8,8 +9,8 @@ import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { promisify } from 'node:util'
 
-import type { OwnedProcessGroup } from '../../apps/desktop/src/utility/owned-process-group.js'
 import type {
   AgentNativeContextRebuildInput,
   AgentNativeContextRebuildResult,
@@ -21,15 +22,518 @@ import type {
   NativeProbeResult,
 } from '../../packages/contracts/src/index.js'
 
+import { OwnedProcessGroup } from '../../apps/desktop/src/utility/owned-process-group.js'
 import {
-  removeWindowsRpcLauncherSync,
-  writeWindowsRpcLauncher,
+  writeWindowsObservedLauncher,
+  type WindowsLaunchOwner,
 } from '../e2e/windows-cli-launcher.js'
 
 export const desktopRoot = resolve(import.meta.dirname, '../../apps/desktop')
 const desktopRequire = createRequire(join(desktopRoot, 'package.json'))
 export const hash = (text: string | Buffer): string =>
   createHash('sha256').update(text).digest('hex')
+
+type HelperDiagnostic = {
+  stage: 'canonicalize' | 'identity' | 'remove'
+  canonicalMatches: boolean | null
+  errno: 'EACCES' | 'EPERM' | 'ENOENT' | 'ENOTDIR' | 'ENOTEMPTY' | 'EBUSY' | 'EIO' | 'EINVAL' | null
+}
+const groupFailureMessages = new Map([
+  ['The owned process did not establish its owned group.', 'initial-identity'],
+  ['The owned group lost its verified process identity.', 'lost-anchor'],
+  ['The owned group identity changed.', 'identity-changed'],
+  ['Process group identities could not be checked.', 'observation-failed'],
+  ['Process group observation exceeded its limit.', 'observation-overflow'],
+  ['Process group observation was invalid.', 'observation-invalid'],
+  ['Process group identity was invalid.', 'row-invalid'],
+  ['Process group ownership exceeded its identity limit.', 'identity-capacity'],
+  ['Process group release could not be confirmed.', 'release-unconfirmed'],
+  ['The owned owned group could not be stopped.', 'signal-failed'],
+  ['The owned process scope did not release before its deadline.', 'release-deadline'],
+  ['Process input cleanup did not settle.', 'input-unsettled'],
+])
+const execFileAsync = promisify(execFile)
+
+/** Fixture process ownership; production Adapter interfaces and policies remain unchanged. */
+export class NativeProcessOwner {
+  readonly group: OwnedProcessGroup
+  private child: ChildProcessWithoutNullStreams | undefined
+  private closed: Promise<void> | undefined
+  private closeTask: Promise<void> | undefined
+  private recheckTask: Promise<void> | undefined
+  private firstCloseSettled = false
+  private firstCloseRejected = false
+  private childClosed = false
+  private controlClosed = false
+  private helperReleased = false
+  private jobEmpty = false
+  private helperDiagnostic: HelperDiagnostic | undefined
+  private groupFailure: string | undefined
+
+  private constructor(
+    readonly command: string,
+    readonly deadlineAt: number,
+    private readonly windows: WindowsLaunchOwner | undefined,
+    group?: OwnedProcessGroup,
+  ) {
+    this.group = group ?? new OwnedProcessGroup()
+  }
+
+  static async prepare(
+    command: string,
+    root: string,
+    deadlineAt: number,
+    group?: OwnedProcessGroup,
+  ): Promise<NativeProcessOwner> {
+    const remaining = Math.floor(deadlineAt - performance.now())
+    if (remaining <= 0 || remaining > 50_000) throw new Error('Native fixture deadline is invalid')
+    const windows =
+      process.platform === 'win32'
+        ? await writeWindowsObservedLauncher(root, command, remaining)
+        : undefined
+    return new NativeProcessOwner(command, deadlineAt, windows, group)
+  }
+
+  start(args: readonly string[], options: SpawnOptions): ChildProcessWithoutNullStreams {
+    if (this.child || this.closeTask || performance.now() >= this.deadlineAt)
+      throw new Error('Owned native process admission is obsolete')
+    this.windows?.armStartup(Math.min(this.deadlineAt, performance.now() + 10_000))
+    if (options.cwd !== undefined && typeof options.cwd !== 'string')
+      throw new Error('Native fixture requires its exact string working directory')
+    if (options.shell !== undefined && options.shell !== false)
+      throw new Error('Native fixture cannot use a shell')
+    if (
+      options.stdio !== undefined &&
+      options.stdio !== 'pipe' &&
+      (!Array.isArray(options.stdio) ||
+        options.stdio.length !== 3 ||
+        options.stdio.some((entry) => entry !== 'pipe'))
+    )
+      throw new Error('Native fixture requires three owned protocol pipes')
+    const child = this.group.spawn(this.windows?.executablePath ?? this.command, [...args], {
+      cwd: options.cwd,
+      env: options.env,
+      signal: options.signal,
+      windowsHide: options.windowsHide,
+    })
+    this.child = child
+    this.closed = new Promise((done) => {
+      child.once('close', () => {
+        this.childClosed = true
+        done()
+        // The native root is genuinely closed. Settle its owner (including any
+        // remaining owned descendants) while retaining uncertain cleanup facts.
+        void this.close().catch(() => undefined)
+      })
+    })
+    if (this.windows) {
+      const cancel = this.windows.cancel.bind(this.windows)
+      // Killing the Job helper would lose its authenticated empty receipt. Request
+      // cancellation through its existing control owner and keep the helper alive.
+      child.kill = () => {
+        cancel()
+        return true
+      }
+      void this.windows.empty.then(
+        () => {
+          this.jobEmpty = true
+          return undefined
+        },
+        () => undefined,
+      )
+    }
+    return child
+  }
+
+  started(): Promise<void> {
+    return this.windows?.started.then(() => undefined) ?? Promise.resolve()
+  }
+
+  facts() {
+    const admitted = Boolean(this.child)
+    const physical =
+      this.group.released && (!admitted || (this.childClosed && (!this.windows || this.jobEmpty)))
+    return {
+      admitted,
+      childClosed: this.childClosed,
+      groupReleased: this.group.released,
+      windowsJobEmpty: this.windows ? (admitted ? this.jobEmpty : null) : null,
+      controlClosed: !this.windows || this.controlClosed,
+      helperReleased: !this.windows || this.helperReleased,
+      released: physical && (!this.windows || (this.controlClosed && this.helperReleased)),
+      ...(this.helperDiagnostic ? { helperDiagnostic: { ...this.helperDiagnostic } } : {}),
+      ...(this.groupFailure ? { groupFailure: this.groupFailure } : {}),
+    }
+  }
+
+  async failedGroupDiagnostic(): Promise<object | null> {
+    if (!this.groupFailure || process.platform === 'win32') return null
+    const input: unknown = Reflect.get(this.group, 'root')
+    let witness: {
+      pid: number
+      ppid: number
+      pgid: number
+      started: string
+      state: string
+    } | null = null
+    let rootFailure: string | null = null
+    if (input instanceof Promise) {
+      try {
+        const value: unknown = await input
+        if (value && typeof value === 'object') {
+          const pid: unknown = Reflect.get(value, 'pid'),
+            ppid: unknown = Reflect.get(value, 'ppid'),
+            pgid: unknown = Reflect.get(value, 'pgid'),
+            started: unknown = Reflect.get(value, 'started'),
+            state: unknown = Reflect.get(value, 'state')
+          if (
+            typeof pid === 'number' &&
+            typeof ppid === 'number' &&
+            typeof pgid === 'number' &&
+            typeof started === 'string' &&
+            started.length <= 64 &&
+            typeof state === 'string' &&
+            state.length <= 16
+          )
+            witness = { pid, ppid, pgid, started, state }
+        }
+      } catch (error) {
+        rootFailure =
+          error instanceof Error
+            ? (groupFailureMessages.get(error.message) ?? 'other')
+            : 'non-error'
+      }
+    }
+    let observed = false
+    const members: Array<{ pid: number; ppid: number; pgid: number; state: string }> = []
+    try {
+      const { stdout } = await execFileAsync('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,stat='], {
+        timeout: 2000,
+        maxBuffer: 32 * 1024,
+        shell: false,
+      })
+      for (const line of stdout.split('\n')) {
+        const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+([A-Za-z+<>-]{1,16})\s*$/u.exec(line)
+        if (!match) continue
+        const pid = Number(match[1]),
+          ppid = Number(match[2]),
+          pgid = Number(match[3]),
+          state = match[4]!
+        if (pid === this.child?.pid || pgid === (witness?.pgid ?? this.child?.pid)) {
+          if (members.length >= 256) throw new Error('Owned process diagnostic capacity exceeded')
+          members.push({ pid, ppid, pgid, state })
+        }
+      }
+      observed = true
+    } catch {
+      /* Missing observation stays missing rather than becoming empty proof. */
+    }
+    return {
+      phase: 'failed-group',
+      error: this.groupFailure,
+      rootFailure,
+      witness,
+      childPid: this.child?.pid ?? null,
+      childExitCode: this.child?.exitCode ?? null,
+      childSignal: this.child?.signalCode ?? null,
+      childClosed: this.childClosed,
+      observed,
+      members,
+    }
+  }
+
+  close(options: { recheck?: boolean } = {}): Promise<void> {
+    this.closeTask ??= Promise.resolve()
+      .then(() => this.release())
+      .then(
+        () => {
+          this.firstCloseSettled = true
+          return undefined
+        },
+        (error: unknown) => {
+          this.firstCloseSettled = true
+          this.firstCloseRejected = true
+          throw error
+        },
+      )
+    if (options.recheck && this.firstCloseSettled && this.firstCloseRejected && !this.recheckTask) {
+      // A genuine receipt from this original group/Job permits one explicit
+      // completion of wrapper cleanup. Its original failure stays cached.
+      this.recheckTask = Promise.resolve().then(() => {
+        if (
+          !this.group.released ||
+          (this.child && (!this.childClosed || (this.windows && !this.jobEmpty)))
+        )
+          throw new Error('Owned native physical release remains unconfirmed')
+        return this.release()
+      })
+    }
+    return this.recheckTask ?? this.closeTask
+  }
+
+  private async release(): Promise<void> {
+    let firstError: Error | undefined
+    const attempt = async (work: () => Promise<void>): Promise<void> => {
+      try {
+        await work()
+      } catch (error) {
+        firstError ??= error instanceof Error ? error : new Error('Owned native cleanup failed')
+      }
+    }
+    if (this.windows && this.child && !this.childClosed) this.child.stdin.end()
+    await attempt(async () => {
+      try {
+        await this.group.close()
+      } catch (error) {
+        this.groupFailure =
+          error instanceof Error
+            ? (groupFailureMessages.get(error.message) ?? 'other')
+            : 'non-error'
+        throw error
+      }
+    })
+    if (this.closed)
+      await attempt(() => within(this.closed!, 1500, 'Owned helper child close deadline'))
+    if (this.windows) {
+      if (this.child && !this.jobEmpty) {
+        this.windows.cancel()
+        await attempt(async () => {
+          await within(this.windows!.empty, 5000, 'Owned Windows Job release deadline')
+          this.jobEmpty = true
+        })
+      }
+      if (!this.controlClosed)
+        await attempt(async () => {
+          await this.windows!.disposeControl()
+          this.controlClosed = true
+        })
+      // An unadmitted prepared helper owns no launched Job. Its control owner
+      // still needs genuine disposal and canonical, guarded helper removal.
+      if (
+        !this.helperReleased &&
+        this.group.released &&
+        (!this.child || (this.childClosed && this.jobEmpty)) &&
+        this.controlClosed
+      ) {
+        let stage: HelperDiagnostic['stage'] = 'canonicalize'
+        let canonicalMatches: boolean | null = null
+        try {
+          canonicalMatches = (await realpath(this.windows.directory)) === this.windows.directory
+          stage = 'identity'
+          if (!canonicalMatches) throw new Error('Unsafe Windows RPC cleanup target')
+          stage = 'remove'
+          await rm(this.windows.directory, { recursive: true, force: true })
+          this.helperReleased = true
+        } catch (error) {
+          const code: unknown =
+            error && typeof error === 'object' ? Reflect.get(error, 'code') : undefined
+          const allowed = [
+            'EACCES',
+            'EPERM',
+            'ENOENT',
+            'ENOTDIR',
+            'ENOTEMPTY',
+            'EBUSY',
+            'EIO',
+            'EINVAL',
+          ] as const
+          const errno = allowed.find((value) => value === code) ?? null
+          this.helperDiagnostic = { stage, canonicalMatches, errno }
+          console.info('[native cleanup helper]', JSON.stringify(this.helperDiagnostic))
+          firstError ??= new Error('Owned Windows RPC launcher cleanup failed')
+        }
+      }
+    }
+    if (!this.facts().released)
+      firstError ??= new Error('Owned native process cleanup is unconfirmed')
+    if (firstError) throw firstError
+  }
+}
+
+/** Each invocation owns one reserved ticket before any asynchronous preparation. */
+export class NativeProcessSet {
+  private readonly tickets: Array<{
+    kind: 'factory' | 'rpc'
+    phase: 'preparing' | 'prepared' | 'admitted' | 'failed'
+    owner?: NativeProcessOwner
+    preparation?: Promise<void>
+  }> = []
+  private readonly available: NativeProcessOwner[] = []
+  private closing = false
+  private closeTask: Promise<void> | undefined
+  constructor(private readonly root: string) {}
+
+  assertOpen(): void {
+    if (this.closing) throw new Error('Native fixture process owner is closing')
+  }
+
+  private reserve(kind: 'factory' | 'rpc') {
+    if (this.closing) throw new Error('Native fixture process owner is closing')
+    const live = this.tickets.filter(
+      (ticket) =>
+        ticket.phase === 'preparing' ||
+        ticket.phase === 'prepared' ||
+        ticket.phase === 'failed' ||
+        !ticket.owner?.facts().released,
+    )
+    if (
+      this.tickets.length >= 64 ||
+      live.length >= 8 ||
+      (kind === 'factory' && live.filter((ticket) => ticket.kind === 'factory').length >= 4)
+    )
+      throw new Error('Native fixture owner capacity exceeded')
+    const ticket: (typeof this.tickets)[number] = { kind, phase: 'preparing' }
+    this.tickets.push(ticket)
+    return ticket
+  }
+
+  private async prepareOwner(
+    command: string,
+    deadlineAt: number,
+    kind: 'factory' | 'rpc',
+    group?: OwnedProcessGroup,
+  ) {
+    const ticket = this.reserve(kind)
+    const finished = Promise.withResolvers<void>()
+    ticket.preparation = finished.promise
+    try {
+      const owner = await NativeProcessOwner.prepare(command, this.root, deadlineAt, group)
+      ticket.owner = owner
+      if (this.closing) {
+        await owner.close()
+        throw new Error('Native preparation ended after its owner began closing')
+      }
+      ticket.phase = 'prepared'
+      return { ticket, owner }
+    } catch (error) {
+      ticket.phase = 'failed'
+      throw error
+    } finally {
+      finished.resolve()
+    }
+  }
+
+  async prepareRpcOwner(
+    command: string,
+    deadlineAt: number,
+    group?: OwnedProcessGroup,
+  ): Promise<NativeProcessOwner> {
+    const { ticket, owner } = await this.prepareOwner(command, deadlineAt, 'rpc', group)
+    if (this.closing) {
+      await owner.close()
+      throw new Error('Native fixture process owner is closing')
+    }
+    ticket.phase = 'admitted'
+    return owner
+  }
+
+  get helperRoot(): string {
+    return this.root
+  }
+
+  async prepare(command: string, count: number, deadlineAt: number): Promise<void> {
+    if (!Number.isSafeInteger(count) || count < 1 || count > 4)
+      throw new Error('Native fixture process capacity exceeded')
+    const needed = count - this.available.filter((owner) => owner.command === command).length
+    if (this.available.length + needed > 4)
+      throw new Error('Native fixture prepared capacity exceeded')
+    for (let index = 0; index < needed; index++) {
+      // oxlint-disable-next-line no-await-in-loop -- The synchronous SDK seam owns at most four prepared slots under the same fixture deadline.
+      const { owner } = await this.prepareOwner(command, deadlineAt, 'factory')
+      if (this.closing) {
+        // oxlint-disable-next-line no-await-in-loop -- A late prepared owner must actually close before this bounded preparation loop exits.
+        await owner.close()
+        throw new Error('Native fixture process owner is closing')
+      }
+      this.available.push(owner)
+    }
+  }
+
+  spawnOwned(command: string, args: readonly string[], options: SpawnOptions) {
+    if (this.closing) throw new Error('Native fixture process owner is closing')
+    const index = this.available.findIndex((owner) => owner.command === command)
+    if (index < 0) throw new Error('Native fixture process was not prepared')
+    const [owner] = this.available.splice(index, 1)
+    const ticket = this.tickets.find((value) => value.owner === owner)
+    if (!owner || !ticket) throw new Error('Native fixture owner ticket is unresolved')
+    ticket.phase = 'admitted'
+    return {
+      child: owner.start(args, options),
+      close: () => owner.close(),
+      observe: () => owner.group.observe(),
+    }
+  }
+
+  async spawnOwnedAsync(
+    command: string,
+    args: readonly string[],
+    options: SpawnOptions,
+    deadlineAt: number,
+  ) {
+    const { ticket, owner } = await this.prepareOwner(command, deadlineAt, 'factory')
+    if (this.closing) {
+      await owner.close()
+      throw new Error('Native fixture process owner is closing')
+    }
+    ticket.phase = 'admitted'
+    return { child: owner.start(args, options), close: () => owner.close() }
+  }
+
+  spawn(
+    command: string,
+    args: readonly string[],
+    options: SpawnOptions,
+  ): ChildProcessWithoutNullStreams {
+    return this.spawnOwned(command, args, options).child
+  }
+
+  facts() {
+    return this.tickets.map(
+      (ticket) =>
+        ticket.owner?.facts() ?? {
+          admitted: false,
+          childClosed: false,
+          groupReleased: false,
+          windowsJobEmpty: null,
+          controlClosed: false,
+          helperReleased: false,
+          released: false,
+          preparing: ticket.phase === 'preparing',
+          preparationFailed: ticket.phase === 'failed',
+        },
+    )
+  }
+
+  async diagnostics(): Promise<Array<object | null>> {
+    return Promise.all(
+      this.tickets.flatMap((ticket) =>
+        ticket.owner && !ticket.owner.facts().released
+          ? [ticket.owner.failedGroupDiagnostic()]
+          : [],
+      ),
+    )
+  }
+
+  close(): Promise<void> {
+    this.closing = true
+    this.closeTask ??= this.release()
+    return this.closeTask
+  }
+
+  private async release(): Promise<void> {
+    await Promise.allSettled(
+      this.tickets.flatMap((ticket) => (ticket.preparation ? [ticket.preparation] : [])),
+    )
+    const results = await Promise.allSettled(
+      this.tickets.flatMap((ticket) => (ticket.owner ? [ticket.owner.close()] : [])),
+    )
+    if (
+      results.some((entry) => entry.status === 'rejected') ||
+      this.facts().some((fact) => !fact.released)
+    )
+      throw new Error('Owned native factory cleanup is unconfirmed')
+  }
+}
 
 export interface Boundary {
   nativeSessionId: string
@@ -128,7 +632,14 @@ interface AdapterBundle {
   ClaudeAgentAdapter: new (executable: string, dependencies: object) => NativeAdapter
   CodexAgentAdapter: new (
     executable: string,
-    processFactory: ((cwd: string) => ChildProcessWithoutNullStreams) | undefined,
+    processFactory:
+      | ((
+          cwd: string,
+        ) =>
+          | ChildProcessWithoutNullStreams
+          | { child: ChildProcessWithoutNullStreams; close: () => Promise<void> }
+          | Promise<{ child: ChildProcessWithoutNullStreams; close: () => Promise<void> }>)
+      | undefined,
     readOptions: { storageRoot: string },
   ) => NativeAdapter
 }
@@ -181,7 +692,8 @@ export async function recordSdkVersion(): Promise<void> {
 
 export async function executable(
   agent: 'codex' | 'claude',
-  owned: { root: string; cwd: string; home: string },
+  owned: { root: string; cwd: string; home: string; processes: NativeProcessSet },
+  setupDeadlineAt = performance.now() + 30_000,
 ): Promise<string> {
   const requested =
     process.env[`PACT_NATIVE_${agent.toUpperCase()}_EXECUTABLE`] ??
@@ -210,31 +722,69 @@ export async function executable(
     // oxlint-enable no-await-in-loop
   }
   if (!path) throw new Error(`Required real ${agent} CLI is unavailable: ${requested}`)
-  const version = await new Promise<string>((resolveVersion, reject) => {
-    execFile(
-      path,
-      ['--version'],
-      { cwd: owned.cwd, env: isolatedEnv(owned.root, owned.home), timeout: 5000, maxBuffer: 8192 },
-      (error, stdout) => {
-        if (error) reject(new Error(`Required real ${agent} CLI is unavailable: ${error.message}`))
-        else resolveVersion(stdout.trim())
-      },
+  await owned.processes.prepare(path, 1, Math.min(setupDeadlineAt, performance.now() + 50_000))
+  const deadlineAt = Math.min(setupDeadlineAt, performance.now() + 5000)
+  let version: string
+  let handle: ReturnType<NativeProcessSet['spawnOwned']> | undefined
+  try {
+    handle = owned.processes.spawnOwned(path, ['--version'], {
+      cwd: owned.cwd,
+      env: isolatedEnv(owned.root, owned.home),
+      shell: false,
+    })
+    const child = handle.child
+    version = await within(
+      new Promise<string>((done, reject) => {
+        const chunks: Buffer[] = []
+        let stdoutBytes = 0,
+          stderrBytes = 0
+        child.stdout.on('data', (data: Buffer) => {
+          stdoutBytes += data.length
+          if (stdoutBytes > 8192) {
+            child.kill()
+            reject(new Error('Native version output exceeds 8 KiB'))
+          } else chunks.push(data)
+        })
+        child.stderr.on('data', (data: Buffer) => {
+          stderrBytes += data.length
+          if (stderrBytes > 8192) {
+            child.kill()
+            reject(new Error('Native version error output exceeds 8 KiB'))
+          }
+        })
+        child.once('error', () =>
+          reject(new Error('Required native version command could not start')),
+        )
+        child.once('close', (code) => {
+          if (code !== 0) reject(new Error('Required native version command failed'))
+          else done(Buffer.concat(chunks).toString('utf8').trim())
+        })
+      }),
+      Math.max(1, deadlineAt - performance.now()),
+      'Native version deadline exceeded',
     )
-  })
+  } finally {
+    await handle?.close()
+  }
   console.info(`[native gate] ${agent}: ${path}; ${version}`)
   if (!version.match(agent === 'codex' ? /^codex-cli \d+\./u : /^\d+\.\d+\.\d+ \(Claude Code\)/u))
     throw new Error(`Unexpected ${agent} CLI identity: ${version}`)
   return path
 }
 
-export async function ownedRoot(): Promise<{ root: string; cwd: string; home: string }> {
+export async function ownedRoot(): Promise<{
+  root: string
+  cwd: string
+  home: string
+  processes: NativeProcessSet
+}> {
   const root = await mkdtemp(join(tmpdir(), 'pact-native-gate-'))
   const cwd = join(root, 'project'),
     home = join(root, 'native')
   try {
     await mkdir(cwd)
     await mkdir(home)
-    return { root, cwd, home }
+    return { root, cwd, home, processes: new NativeProcessSet(root) }
   } catch (error) {
     await rm(root, { recursive: true, force: true })
     throw error
@@ -250,6 +800,12 @@ export function isolatedEnv(root: string, home: string): NodeJS.ProcessEnv {
     CODEX_HOME: home,
     CLAUDE_CONFIG_DIR: home,
     TERM: 'dumb',
+    SystemRoot: process.env.SystemRoot,
+    WINDIR: process.env.WINDIR,
+    SystemDrive: process.env.SystemDrive,
+    ComSpec: process.env.ComSpec,
+    TEMP: root,
+    TMP: root,
     // macOS system proxies can intercept reqwest even with no proxy variables inherited.
     // Only this fixture's loopback Provider bypasses a proxy; production configuration is unchanged.
     NO_PROXY: '127.0.0.1,localhost',
@@ -312,6 +868,9 @@ export interface NativeCleanupFacts {
   pendingRequests: number
   lifetimeReleased: boolean
   released: boolean
+  windowsJobEmpty: boolean | null
+  helperReleased: boolean
+  previousAttempt?: Omit<NativeCleanupFacts, 'previousAttempt'>
 }
 
 // All requests settle in 10s; no retries after unknown delivery. The only child
@@ -328,7 +887,6 @@ export class NativeRpc {
   private next = 0
   private ended = false
   private fatal: Error | undefined
-  private launcherCleanupError: Error | undefined
   private stderrBytes = 0
   private readonly deadline: ReturnType<typeof setTimeout>
   private closing: Promise<void> | undefined
@@ -340,43 +898,51 @@ export class NativeRpc {
   private released = false
   private cleanupPhase: NativeCleanupFacts['phase'] = 'open'
   private readonly cleanupStages: NativeCleanupFacts['stages'] = []
+  private previousAttempt: Omit<NativeCleanupFacts, 'previousAttempt'> | undefined
 
-  constructor(
+  static async create(
     executablePath: string,
     cwd: string,
     env: NodeJS.ProcessEnv,
-    private readonly processGroup?: OwnedProcessGroup,
-    private readonly onReleased?: () => void,
-  ) {
-    const isWindowsCommand = process.platform === 'win32' && /\.cmd$/iu.test(executablePath)
-    if (isWindowsCommand && /[&|<>^%!"\r\n]/u.test(executablePath))
-      throw new Error('Unsafe Windows executable path')
-    const launcher =
-      process.platform === 'win32'
-        ? writeWindowsRpcLauncher(executablePath, env['TEMP'] ?? cwd)
-        : undefined
+    options: {
+      group?: OwnedProcessGroup | undefined
+      onReleased?: () => void
+      deadlineAt?: number
+      processes?: NativeProcessSet
+    } = {},
+  ): Promise<NativeRpc> {
+    const deadlineAt = Math.min(options.deadlineAt ?? Infinity, performance.now() + 50_000)
+    const scope = options.processes
+      ? await options.processes.prepareRpcOwner(executablePath, deadlineAt, options.group)
+      : await NativeProcessOwner.prepare(
+          executablePath,
+          env['TEMP'] ?? cwd,
+          deadlineAt,
+          options.group,
+        )
     try {
-      const options = {
-        cwd,
-        env,
-        ...(launcher ? { windowsHide: true } : {}),
-      }
-      const target = launcher?.executable ?? executablePath
-      this.child = processGroup
-        ? processGroup.spawn(target, ['app-server'], options)
-        : spawn(target, ['app-server'], {
-            ...options,
-            shell: false,
-            stdio: ['pipe', 'pipe', 'pipe'],
-          })
+      options.processes?.assertOpen()
+      return new NativeRpc(cwd, env, scope, options.onReleased)
     } catch (error) {
-      if (launcher) removeWindowsRpcLauncherSync(launcher.directory)
+      await scope.close().catch(() => undefined)
       throw error
     }
-    this.deadline = setTimeout(() => {
-      this.fail(new Error('Owned Native RPC lifetime exceeded 50s'))
-      this.child.kill('SIGTERM')
-    }, 50_000)
+  }
+
+  private constructor(
+    cwd: string,
+    env: NodeJS.ProcessEnv,
+    private readonly scope: NativeProcessOwner,
+    private readonly onReleased?: () => void,
+  ) {
+    this.child = scope.start(['app-server'], { cwd, env, shell: false, windowsHide: true })
+    this.deadline = setTimeout(
+      () => {
+        this.fail(new Error('Owned Native RPC lifetime exceeded 50s'))
+        this.child.kill('SIGTERM')
+      },
+      Math.max(1, scope.deadlineAt - performance.now()),
+    )
     this.exited = new Promise((resolveExit) => {
       this.child.once('exit', () => {
         this.childExit = true
@@ -391,30 +957,16 @@ export class NativeRpc {
       })
     })
     this.closed = new Promise((resolveClose) => {
-      const finish = async (): Promise<void> => {
+      const finish = (): void => {
         clearTimeout(this.deadline)
         this.lifetimeReleased = true
         this.childClosed = true
         this.ended = true
         this.fail(new Error('Owned native RPC exited'))
-        if (launcher) {
-          try {
-            if ((await realpath(launcher.directory)) !== launcher.directory)
-              throw new Error('Unsafe Windows RPC cleanup target')
-            await rm(launcher.directory, {
-              recursive: true,
-              force: true,
-              maxRetries: 3,
-              retryDelay: 250,
-            })
-          } catch {
-            this.launcherCleanupError = new Error('Owned Windows RPC launcher cleanup failed')
-          }
-        }
         resolveClose()
       }
       this.child.once('close', () => {
-        void finish()
+        finish()
       })
     })
     this.child.stderr.on('data', (data: Buffer) => {
@@ -500,12 +1052,19 @@ export class NativeRpc {
     })
   }
   async initialize(): Promise<void> {
-    result(
-      await this.request('initialize', {
-        clientInfo: { name: 'pact', title: 'Pact Native Test', version: '0.0.0' },
-        capabilities: { experimentalApi: true },
-      }),
-    )
+    const request = this.request('initialize', {
+      clientInfo: { name: 'pact', title: 'Pact Native Test', version: '0.0.0' },
+      capabilities: { experimentalApi: true },
+    })
+    const [reply] = await Promise.all([
+      request,
+      within(
+        this.scope.started(),
+        Math.min(10_000, Math.max(1, this.scope.deadlineAt - performance.now())),
+        'Owned native startup deadline',
+      ),
+    ])
+    result(reply)
     this.child.stdin.write(`${JSON.stringify({ method: 'initialized', params: {} })}\n`)
   }
   async completed(threadId: string, turnId: string): Promise<void> {
@@ -536,8 +1095,18 @@ export class NativeRpc {
     // oxlint-enable no-await-in-loop
     throw new Error('unknown_delivery: Native Turn did not complete in 10s')
   }
-  close(): Promise<void> {
+  async endInputNaturally(): Promise<void> {
+    if (this.closingRequested) throw new Error('Owned Native RPC is closing')
+    await within(this.scope.group.observe(), 2000, 'Owned natural EOF observation deadline')
+    this.child.stdin.end()
+  }
+  close(options: { recheck?: boolean } = {}): Promise<void> {
     this.closingRequested = true
+    if (options.recheck && this.cleanupPhase === 'unconfirmed' && !this.previousAttempt) {
+      this.previousAttempt = this.cleanupFacts()
+      this.cleanupStages.length = 0
+      this.closing = undefined
+    }
     this.closing ??= Promise.resolve().then(() => this.release())
     return this.closing
   }
@@ -550,10 +1119,20 @@ export class NativeRpc {
       childClosed: this.childClosed,
       closeSettled: this.closeSettled,
       stdinEnded: this.child.stdin.writableEnded,
-      groupReleased: this.processGroup?.released ?? this.childClosed,
+      groupReleased: this.scope.facts().groupReleased,
       pendingRequests: this.pending.size,
       lifetimeReleased: this.lifetimeReleased,
       released: this.released,
+      windowsJobEmpty: this.scope.facts().windowsJobEmpty,
+      helperReleased: this.scope.facts().helperReleased,
+      ...(this.previousAttempt
+        ? {
+            previousAttempt: {
+              ...this.previousAttempt,
+              stages: this.previousAttempt.stages.map((stage) => ({ ...stage })),
+            },
+          }
+        : {}),
     }
   }
   private async release(): Promise<void> {
@@ -585,8 +1164,7 @@ export class NativeRpc {
     }
     if (!this.ended) {
       await stage('observe', async () => {
-        if (this.processGroup)
-          await within(this.processGroup.observe(), 2000, 'Owned observation deadline')
+        await within(this.scope.group.observe(), 2000, 'Owned observation deadline')
       })
       await stage('eof', async () => {
         this.child.stdin.end()
@@ -595,35 +1173,17 @@ export class NativeRpc {
     }
     // A failed preliminary observation must not prevent the genuine owner from
     // independently proving release. All OS identity checks/signals remain there.
-    if (this.processGroup) await stage('group', () => this.processGroup!.close())
-    else {
-      if (!this.ended)
-        await stage(
-          'terminate',
-          async () => {
-            this.child.kill('SIGTERM')
-            await within(this.exited, 1500, 'Owned termination grace deadline')
-          },
-          false,
-        )
-      if (!this.ended)
-        await stage('kill', async () => {
-          this.child.kill('SIGKILL')
-          await within(this.exited, 1500, 'Owned kill deadline')
-        })
-    }
+    await stage('group', () => this.scope.close({ recheck: Boolean(this.previousAttempt) }))
     await stage('close', async () => {
       await within(this.closed, 1500, 'Owned child close deadline')
       this.closeSettled = true
     })
-    firstError ??= this.launcherCleanupError
     if (this.pending.size) firstError ??= new Error('Native requests leaked on cleanup')
     this.released =
       this.childClosed &&
       this.closeSettled &&
-      !this.launcherCleanupError &&
       this.pending.size === 0 &&
-      (this.processGroup?.released ?? true)
+      this.scope.facts().released
     this.cleanupPhase = this.released
       ? firstError
         ? 'released-with-errors'
@@ -802,6 +1362,90 @@ export class LoopbackProvider {
     await new Promise<void>((resolveClose) => this.server.close(() => resolveClose()))
     if (this.sockets.size) await pause(20)
     if (this.sockets.size) throw new Error('Loopback sockets leaked on cleanup')
+  }
+}
+
+async function attemptNativeCleanup(work: () => Promise<void>): Promise<boolean> {
+  try {
+    await work()
+    return true
+  } catch {
+    return false
+  }
+}
+
+export async function cleanupNativeFixture(
+  owned: Awaited<ReturnType<typeof ownedRoot>>,
+  {
+    adapters = [],
+    clients = [],
+    provider,
+  }: {
+    adapters?: Array<Pick<NativeAdapter, 'dispose'>>
+    clients?: NativeRpc[]
+    provider?: LoopbackProvider
+  } = {},
+): Promise<void> {
+  if (adapters.length > 8 || clients.length > 8)
+    throw new Error('Native cleanup inventory exceeds its bound')
+  const adaptersClosed: boolean[] = []
+  for (const adapter of adapters) {
+    // oxlint-disable-next-line no-await-in-loop -- Attempt each native writer even when a prior owner rejected disposal.
+    adaptersClosed.push(await attemptNativeCleanup(() => adapter.dispose()))
+  }
+  const clientsClosed: boolean[] = []
+  for (const client of clients) {
+    // oxlint-disable-next-line no-await-in-loop -- A failed client must not prevent other admitted clients from attempting genuine closure.
+    clientsClosed.push(await attemptNativeCleanup(() => client.close()))
+  }
+  const factoriesClosed = await attemptNativeCleanup(() => owned.processes.close())
+  const providerClosed = !provider || (await attemptNativeCleanup(() => provider.close()))
+  const clientFacts = clients.map((client) => client.cleanupFacts())
+  const processFacts = owned.processes.facts()
+  if (!factoriesClosed)
+    console.info('[native failed-group]', JSON.stringify(await owned.processes.diagnostics()))
+  const released =
+    adaptersClosed.every(Boolean) &&
+    clientsClosed.every(Boolean) &&
+    factoriesClosed &&
+    providerClosed &&
+    clientFacts.every((facts) => facts.released) &&
+    processFacts.every((facts) => facts.released)
+  console.info(
+    '[native before-delete]',
+    JSON.stringify({
+      adaptersClosed,
+      clientsClosed,
+      providerClosed,
+      factoriesClosed,
+      clients: clientFacts,
+      processes: processFacts,
+      released,
+    }),
+  )
+  if (!released)
+    throw new Error('Owned native fixture cleanup is unconfirmed; recovery data retained')
+  try {
+    await rm(owned.root, { recursive: true, force: true })
+  } catch (error) {
+    const code: unknown =
+      error && typeof error === 'object' ? Reflect.get(error, 'code') : undefined
+    const allowed = [
+      'EACCES',
+      'EPERM',
+      'ENOENT',
+      'ENOTDIR',
+      'ENOTEMPTY',
+      'EBUSY',
+      'EIO',
+      'EINVAL',
+    ] as const
+    console.info(
+      '[native root-remove]',
+      JSON.stringify({ stage: 'remove', errno: allowed.find((value) => value === code) ?? null }),
+    )
+    // oxlint-disable-next-line eslint/preserve-caught-error -- Only bounded allowlisted filesystem facts may escape; the raw cause can expose private paths.
+    throw new Error('Owned native fixture directory removal failed; recovery data retained')
   }
 }
 

@@ -48,6 +48,10 @@ await test('requires actual completion and every native case, including hook fai
     nativeReport({ ...fixture(), numTotalTests: 2 }, { completed: true, exitCode: 0 }).status,
     'blocked',
   )
+  const duplicate = fixture()
+  duplicate.numTotalTests = 2
+  duplicate.testResults[0].assertionResults.push(duplicate.testResults[0].assertionResults[0])
+  assert.equal(nativeReport(duplicate, { completed: true, exitCode: 0 }).status, 'blocked')
 })
 await test('withholds raw failure output and bounds the reported inventory', () => {
   const report = nativeReport(fixture('failed'), { completed: true, exitCode: 1 })

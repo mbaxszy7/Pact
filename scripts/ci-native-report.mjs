@@ -3,6 +3,7 @@ import { publicReportIdentity, readE2EJson, writeE2EReport } from './e2e-report.
 /** Protocol fixtures have no model credentials. Raw errors and attachments never leave this owner. */
 export function nativeReport(raw, { completed, exitCode, identity = null } = {}) {
   const cases = []
+  const names = new Set()
   let valid = Boolean(raw && typeof raw.success === 'boolean' && Array.isArray(raw.testResults))
   if (valid && raw.testResults.length <= 32) {
     for (const file of raw.testResults) {
@@ -17,11 +18,13 @@ export function nativeReport(raw, { completed, exitCode, identity = null } = {})
           item.fullName.length < 1 ||
           Buffer.byteLength(item.fullName) > 512 ||
           /[\r\n\0]/u.test(item.fullName) ||
+          names.has(item.fullName) ||
           !['passed', 'failed', 'pending', 'skipped', 'todo', 'disabled'].includes(item.status)
         ) {
           valid = false
           break
         }
+        names.add(item.fullName)
         const errors = Array.isArray(item.failureMessages) ? item.failureMessages : []
         const cleanup = errors.some(
           (value) =>

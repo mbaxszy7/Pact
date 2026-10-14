@@ -509,7 +509,7 @@ process.stdin.resume();setInterval(()=>{},1000);\n`,
         expect(!pids || (gone(pids.worker) && gone(pids.descendant))).toBe(true)
         expect(readdirSync(root).filter((name) => name.startsWith('pact-native-rpc-'))).toEqual([])
       }
-      rpc = new NativeRpc(
+      rpc = await NativeRpc.create(
         executable,
         root,
         {
@@ -517,8 +517,7 @@ process.stdin.resume();setInterval(()=>{},1000);\n`,
           SystemRoot: process.env.SystemRoot,
           TEMP: root,
         },
-        owner,
-        owned ? onReleased : undefined,
+        owner ? { group: owner, onReleased } : {},
       )
       const began = performance.now()
       const stages: Record<string, number> = {}
@@ -595,7 +594,10 @@ it.skipIf(process.platform !== 'win32')(
         "import{createInterface}from'node:readline';for await(const line of createInterface({input:process.stdin})){const message=JSON.parse(line);if(message.id!==undefined)console.log(JSON.stringify({id:message.id,result:{}}));}\n",
       )
       const executable = await writeWindowsNodeLauncher(root, 'protocol', [entry])
-      rpc = new NativeRpc(executable, root, { TEMP: root, SystemRoot: process.env.SystemRoot })
+      rpc = await NativeRpc.create(executable, root, {
+        TEMP: root,
+        SystemRoot: process.env.SystemRoot,
+      })
       await rpc.initialize()
       rpc.child.stdin.end()
       await rpc.exited
@@ -617,7 +619,9 @@ it.skipIf(process.platform !== 'win32')(
   async () => {
     const root = await mkdtemp(join(tmpdir(), 'pact-windows-cli-test-'))
     try {
-      const rpc = new NativeRpc(process.execPath, join(root, 'missing-cwd'), { TEMP: root })
+      const rpc = await NativeRpc.create(process.execPath, join(root, 'missing-cwd'), {
+        TEMP: root,
+      })
       await rpc.exited
       await rpc.close()
       expect((await readdir(root)).filter((name) => name.startsWith('pact-native-rpc-'))).toEqual(
@@ -636,7 +640,7 @@ it.skipIf(process.platform !== 'win32')(
     const root = await mkdtemp(join(tmpdir(), 'pact-windows-cli-test-'))
     try {
       vi.stubEnv('SystemRoot', join(root, 'missing-framework'))
-      expect(() => new NativeRpc(process.execPath, root, { TEMP: root })).toThrow(
+      await expect(NativeRpc.create(process.execPath, root, { TEMP: root })).rejects.toThrow(
         'could not compile',
       )
       expect(await readdir(root)).toEqual([])

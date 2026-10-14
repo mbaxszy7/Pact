@@ -24,6 +24,14 @@ vi.mock('../native/native-harness.js', async (original) => {
   return {
     ...actual,
     NativeRpc: class {
+      static async create(
+        executable: string,
+        cwd: string,
+        environment: NodeJS.ProcessEnv,
+        options: { group?: unknown; onReleased?: () => void } = {},
+      ) {
+        return new this(executable, cwd, environment, options.group, options.onReleased)
+      }
       private readonly record = { initialized: false, released: false, closeCalls: 0 }
       private closing: Promise<void> | undefined
 
