@@ -1,5 +1,5 @@
 import { PanelLeft } from 'lucide-react'
-import { type ReactNode, useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from 'react'
+import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import {
   Group,
   type Layout,
@@ -57,11 +57,8 @@ function freezePanelContent(
   }
 }
 
-function useWorkspaceViewport(
-  onViewportChange: (viewport: WorkspaceViewport) => void,
-): WorkspaceViewport {
+function useWorkspaceViewport(): WorkspaceViewport {
   const [viewport, setViewport] = useState<WorkspaceViewport>(getWorkspaceViewport)
-  const handleViewportChange = useEffectEvent(onViewportChange)
 
   useEffect(() => {
     const queries = [
@@ -69,9 +66,7 @@ function useWorkspaceViewport(
       window.matchMedia('(min-width: 860px)'),
     ]
     const updateViewport = (): void => {
-      const nextViewport = getWorkspaceViewport()
-      setViewport(nextViewport)
-      handleViewportChange(nextViewport)
+      setViewport(getWorkspaceViewport())
     }
 
     queries.forEach((query) => query.addEventListener('change', updateViewport))
@@ -128,7 +123,11 @@ export function WorkspaceShell({
   const [layoutState, setLayoutState] = useState<WorkspaceLayoutState>(initialState)
   const [isLayoutAnimating, setIsLayoutAnimating] = useState(false)
   const [isContextOverlayRendered, setIsContextOverlayRendered] = useState(
-    () => hasContextPanel && initialState.contextPanel === 'open' && initialViewport !== 'wide',
+    () =>
+      hasContextPanel &&
+      (contextPanelOpen ?? initialState.contextPanel === 'open') &&
+      !isSettingsView &&
+      initialViewport !== 'wide',
   )
   const [navigationHeaderWidth, setNavigationHeaderWidth] = useState(0)
   const [navigationPanelElement, setNavigationPanelElement] = useState<HTMLDivElement | null>(null)
@@ -153,12 +152,29 @@ export function WorkspaceShell({
   const effectiveNavigationHeaderWidth =
     navigationPanelElement && !isContextExpanded ? navigationHeaderWidth : 0
 
-  const handleViewportChange = useEffectEvent((nextViewport: WorkspaceViewport) => {
-    contextFocusScrollPositionRef.current = { x: window.scrollX, y: window.scrollY }
+  const viewport = useWorkspaceViewport()
+  const canRenderContextOverlay = hasContextPanel && !isSettingsView && viewport !== 'wide'
+
+  // Mount controlled opens before committing children; the retained state only
+  // keeps an already mounted overlay alive for its existing exit transition.
+  if (canRenderContextOverlay && isContextVisible && !isContextOverlayRendered) {
+    setIsContextOverlayRendered(true)
+  } else if (!canRenderContextOverlay && isContextOverlayRendered) {
+    setIsContextOverlayRendered(false)
+  }
+
+  useLayoutEffect(() => {
     window.clearTimeout(overlayExitTimerRef.current)
-    setIsContextOverlayRendered(hasContextPanel && nextViewport !== 'wide' && isContextOpen)
-  })
-  const viewport = useWorkspaceViewport(handleViewportChange)
+    overlayExitTimerRef.current = undefined
+    if (canRenderContextOverlay && isContextVisible) {
+      contextFocusScrollPositionRef.current = { x: window.scrollX, y: window.scrollY }
+    } else if (canRenderContextOverlay && isContextOverlayRendered) {
+      overlayExitTimerRef.current = window.setTimeout(() => {
+        setIsContextOverlayRendered(false)
+      }, 180)
+    }
+    return () => window.clearTimeout(overlayExitTimerRef.current)
+  }, [canRenderContextOverlay, isContextOverlayRendered, isContextVisible])
 
   useLayoutEffect(() => {
     let observer: ResizeObserver | undefined
@@ -236,22 +252,11 @@ export function WorkspaceShell({
   const closeContext = (): void => {
     beginLayoutAnimation('context')
     restoreToggleFocus.current = true
-    window.clearTimeout(overlayExitTimerRef.current)
-    if (viewport === 'wide') {
-      setIsContextOverlayRendered(false)
-    } else {
-      overlayExitTimerRef.current = window.setTimeout(() => {
-        setIsContextOverlayRendered(false)
-      }, 180)
-    }
     setLayoutState((state) => ({ ...state, contextPanel: 'closed' }))
     onContextPanelOpenChange?.(false)
   }
   const openContext = (): void => {
     beginLayoutAnimation('context')
-    contextFocusScrollPositionRef.current = { x: window.scrollX, y: window.scrollY }
-    window.clearTimeout(overlayExitTimerRef.current)
-    if (viewport !== 'wide') setIsContextOverlayRendered(true)
     setLayoutState((state) => ({ ...state, contextPanel: 'open' }))
     onContextPanelOpenChange?.(true)
   }

@@ -147,6 +147,7 @@ jobs:
           workspace: source
           controller: control
           native: 'true'
+          display: 'true'
       - name: Target-architecture Electron and native protocol checks
         run: |
           node control/scripts/ci.mjs build

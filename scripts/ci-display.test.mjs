@@ -107,7 +107,9 @@ await test('configuration independently observes the native logical work area af
   })
   assert.deepEqual(calls, ['configure', 'inspect'])
   assert.equal(result.after.before.screen.workAreaHeight, 1120)
-  assert.deepEqual(result.minimumLogicalWorkArea, { width: 1600, height: 1064 })
+  assert.deepEqual(result.maximumContentViewport, { width: 1600, height: 1000 })
+  assert.deepEqual(result.nativeFrameContentDelta, { width: 0, height: 0 })
+  assert.deepEqual(result.minimumLogicalWorkArea, { width: 1600, height: 1000 })
 })
 
 await test('a setter return or large physical pixel count cannot replace measured logical capacity', async () => {
@@ -115,7 +117,8 @@ await test('a setter return or large physical pixel count cannot replace measure
     main(['configure'], hosted, { platform: 'darwin', observe: () => facts(small, 684) }),
     /unchanged UI test viewports/,
   )
-  assert.throws(() => validateDisplayFacts(facts(sufficient, 1000)), /unchanged UI/)
+  assert.throws(() => validateDisplayFacts(facts(sufficient, 999)), /unchanged UI/)
+  assert.doesNotThrow(() => validateDisplayFacts(facts(sufficient, 1000)))
   await assert.rejects(
     main(['configure'], hosted, {
       platform: 'darwin',
@@ -160,6 +163,33 @@ await test('an already sufficient work area is preserved and a missing mode is n
   assert.equal(unavailable.calls.length, 0)
 })
 
+await test('the actual 1920x1080 display with 1050 logical work height needs no oversized mode', () => {
+  const mode = { id: 4, width: 1920, height: 1080, pixelWidth: 3840, pixelHeight: 2160 }
+  const actual = bridged(mode, [small, mode], { width: 1862, height: 1050 })
+  const observed = actual.invoke('configure')
+  assert.equal(observed.failure, null)
+  assert.equal(observed.selected, null)
+  assert.equal(actual.calls.length, 0)
+  assert.doesNotThrow(() => validateDisplayFacts(observed))
+})
+
+await test('selection admits a genuine 1920x1080 mode and accounts for actual menu/Dock exclusions', () => {
+  const mode = { id: 4, width: 1920, height: 1080, pixelWidth: 1920, pixelHeight: 1080 }
+  const native = bridged(small, [small, mode], { width: 1024, height: 738 })
+  assert.equal(native.invoke('configure').selected.id, mode.id)
+  assert.deepEqual(native.calls, [mode])
+  const narrow = { id: 5, width: 1600, height: 1200, pixelWidth: 1600, pixelHeight: 1200 }
+  const excluded = bridged(small, [narrow, sufficient], { width: 994, height: 738 })
+  assert.equal(excluded.invoke('configure').selected.id, sufficient.id)
+})
+
+await test('predicted exclusions cannot falsely prove a mode unavailable before fresh measurement', () => {
+  const mode = { id: 4, width: 1920, height: 1080, pixelWidth: 1920, pixelHeight: 1080 }
+  const native = bridged(small, [small, mode])
+  assert.equal(native.invoke('configure').failure, null)
+  assert.deepEqual(native.calls, [mode])
+})
+
 await test('native API failure and mode overflow are explicit failures with no second setter attempt', () => {
   const failed = bridged()
   let setters = 0
@@ -167,7 +197,7 @@ await test('native API failure and mode overflow are explicit failures with no s
     setters++
     return 1001
   }
-  assert.throws(() => failed.invoke('configure'), /native display mode change failed/)
+  assert.equal(failed.invoke('configure').failure, 'native-mode-change-failed')
   assert.equal(setters, 1)
   const oversized = bridged(
     small,
@@ -175,4 +205,18 @@ await test('native API failure and mode overflow are explicit failures with no s
   )
   assert.throws(() => oversized.invoke('configure'), /mode count/)
   assert.equal(oversized.calls.length, 0)
+})
+
+await test('failed preparation retains only validated bounded screen metadata', async () => {
+  const source = facts(small, 684)
+  source.extra = 'synthetic-secret-not-display-evidence'
+  await assert.rejects(
+    main(['configure'], hosted, { platform: 'darwin', observe: () => source }),
+    (error) => {
+      assert.equal(error.displayEvidence.before.before.screen.workAreaHeight, 684)
+      assert.equal(error.displayEvidence.after.before.screen.workAreaHeight, 684)
+      assert.equal(JSON.stringify(error.displayEvidence).includes(source.extra), false)
+      return /unchanged UI/.test(error.message)
+    },
+  )
 })

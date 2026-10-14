@@ -236,6 +236,23 @@ jobs:
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
           PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-evidence/${{ matrix.key }}
+      - name: Collect bounded no-credential Electron failure diagnostics
+        if: failure()
+        timeout-minutes: 2
+        run: |
+          mkdir -p "$RUNNER_TEMP/pact-ui-diagnostics"
+          node control/scripts/ci-ui-diagnostics.mjs --source "$GITHUB_WORKSPACE/source/test-results" --output "$RUNNER_TEMP/pact-ui-diagnostics/$PLATFORM_KEY"
+        env:
+          PLATFORM_KEY: ${{ matrix.key }}
+          PACT_CI_DIAGNOSTIC_LANE: uncredentialed
+      - name: Preserve only collected no-credential UI context and traces
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ui-diagnostics-${{ matrix.key }}
+          path: ${{ runner.temp }}/pact-ui-diagnostics/${{ matrix.key }}
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Preserve actual uncredentialed test results for the full immutable result gate
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
