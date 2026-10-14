@@ -19,6 +19,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup
+      - name: Admit a private bounded CPU-profile directory
+        run: install -d -m 700 "$RUNNER_TEMP/large-plan-profile"
       - name: Original large-source case with bounded numeric phase observations
         env:
           PACT_TEST_SOURCE_METRICS: '1'
@@ -27,6 +29,54 @@ jobs:
           apps/desktop/src/utility/conversation/conversation-collaboration.test.ts
           -t 'continues an approved complete 9 MiB plan'
           --maxWorkers=1 --reporter=verbose
+          --execArgv=--cpu-prof
+          --execArgv=--cpu-prof-dir=$RUNNER_TEMP/large-plan-profile
+      - name: Project only numeric profile evidence, then remove private profiles
+        if: success() || failure()
+        run: |
+          node --input-type=module <<'NODE'
+          import { readdir, readFile, lstat, rm } from 'node:fs/promises';
+          import { join, basename } from 'node:path';
+          const root = join(process.env.RUNNER_TEMP, 'large-plan-profile');
+          try {
+            const files = await readdir(root);
+            if (files.length > 8) throw Error('CPU profile count exceeds its bound');
+            for (const file of files) {
+              if (!file.endsWith('.cpuprofile')) throw Error('Unexpected profile file');
+              const path = join(root, file), info = await lstat(path);
+              if (!info.isFile() || info.isSymbolicLink() || info.size > 32 * 1024 * 1024) throw Error('CPU profile byte bound');
+              const profile = JSON.parse(await readFile(path, 'utf8'));
+              if (!Array.isArray(profile.nodes) || profile.nodes.length > 100000 || !Array.isArray(profile.samples) || profile.samples.length > 1000000) throw Error('CPU profile schema bound');
+              const nodes = new Map(profile.nodes.map(node => [node.id, node])), parents = new Map();
+              for (const node of profile.nodes) for (const child of node.children ?? []) parents.set(child, node.id);
+              const groups = {}, group = node => {
+                const url = node.callFrame?.url ?? '';
+                if (url.includes('/drizzle-orm')) return 'drizzle';
+                if (url.includes('/better-sqlite3')) return 'sqlite';
+                if (url.endsWith('/database-performance.ts')) return 'sql-observation';
+                if (url.includes('/conversation-repository.ts')) return 'repository';
+                if (url.endsWith('/conversation.ts')) return 'conversation';
+                if (url.includes('/zod')) return 'validation';
+                return null;
+              };
+              for (const sample of profile.samples) {
+                const seen = new Set(); let id = sample;
+                for (let depth = 0; id && depth < 256; depth++) {
+                  const node = nodes.get(id); if (!node) break;
+                  const kind = group(node); if (kind) seen.add(kind);
+                  id = parents.get(id);
+                }
+                for (const kind of seen) groups[kind] = (groups[kind] ?? 0) + 1;
+              }
+              const top = profile.nodes.filter(node => node.hitCount > 0).sort((a,b) => b.hitCount-a.hitCount).slice(0,25).map(node => ({
+                function: String(node.callFrame?.functionName ?? '').replace(/[^a-zA-Z0-9 _.$<>:-]/gu, '').slice(0,120),
+                file: basename(node.callFrame?.url ?? '').slice(0,100),
+                line: node.callFrame?.lineNumber ?? null, hits: node.hitCount,
+              }));
+              console.log(JSON.stringify({largePlanCpuProfile:1,samples:profile.samples.length,durationUs:profile.endTime-profile.startTime,groups,top}));
+            }
+          } finally { await rm(root, {recursive:true,force:true}); }
+          NODE
       - name: Compare the complete collaboration unit file without changing its deadlines
         if: success() || failure()
         env:

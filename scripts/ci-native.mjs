@@ -37,12 +37,18 @@ export async function main(source = process.env) {
   if (installed !== 0) throw new Error('Pinned native CLI installation failed')
   const lines = []
   for (const agent of ['claude', 'codex']) {
-    const path = join(
-      directory,
-      'node_modules',
-      '.bin',
-      `${agent}${process.platform === 'win32' ? '.cmd' : ''}`,
-    )
+    // The pinned Claude installer supplies bin/claude.exe on every target OS.
+    // Selecting that exact native entry preserves executable identity through
+    // SDK spawning and owned-process interruption, unlike the pnpm shim.
+    const path =
+      agent === 'claude'
+        ? join(directory, 'node_modules', '@anthropic-ai/claude-code', 'bin', 'claude.exe')
+        : join(
+            directory,
+            'node_modules',
+            '.bin',
+            `codex${process.platform === 'win32' ? '.cmd' : ''}`,
+          )
     // oxlint-disable-next-line eslint/no-await-in-loop -- Exactly two installed executable entries are checked before publishing either path.
     const info = await lstat(path)
     if (!info.isFile() && !info.isSymbolicLink())
