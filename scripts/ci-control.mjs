@@ -8,6 +8,8 @@ import {
   readCurrent,
   requireIdentity,
   requireSha,
+  requireBootstrapSource,
+  classifyProductTransition,
 } from './ci-identity.mjs'
 import { requireRealScope } from './real-e2e-policy.mjs'
 import { isScriptEntry } from './script-entry.mjs'
@@ -20,7 +22,10 @@ export const ciJobs = [
   'quality',
   ...platformKeys.map((key) => `platform-${key}`),
 ]
-export const providerJobs = platformKeys.map((key) => `provider-${key}`)
+export const providerJobs = [
+  'provider / admission',
+  ...platformKeys.map((key) => `provider / provider-${key}`),
+]
 
 export function providerScopes(identity, requested = 'core') {
   requireIdentity(identity)
@@ -66,7 +71,10 @@ export class CIAPI {
       signal: AbortSignal.timeout(15_000),
       redirect: 'error',
     })
-    requireFact(response.ok, `CI control API failed (${response.status})`)
+    if (!response.ok)
+      throw Object.assign(new Error(`CI control API failed (${response.status})`), {
+        status: response.status,
+      })
     let bytes = 0
     const chunks = []
     for await (const chunk of response.body) {
@@ -189,14 +197,15 @@ function nextPage(link, expectedPath) {
   return true
 }
 
-export function requiredJobsPassed(jobs, expected) {
+export function requiredJobsPassed(jobs, expected, run) {
   requireFact(Array.isArray(jobs) && jobs.length <= 1024, 'Invalid CI job inventory')
   return expected.every((name) => {
     const matching = jobs.filter((job) => job.name === name)
     return (
       matching.length === 1 &&
       matching[0].status === 'completed' &&
-      matching[0].conclusion === 'success'
+      matching[0].conclusion === 'success' &&
+      (!run || (matching[0].run_id === run.id && matching[0].run_attempt === run.run_attempt))
     )
   })
 }
@@ -217,11 +226,14 @@ export function validateSourceRun(run, identity, workflowId, { allowRunning = fa
     'CI evidence has an unknown repository or workflow',
   )
   requireFact(
-    run.event === 'pull_request_target' &&
+    (identity.sourceKind === 'bootstrap'
+      ? run.event === 'push' &&
+        run.head_branch === identity.controllerRef.slice('refs/heads/'.length)
+      : run.event === 'pull_request_target') &&
       (run.status === 'completed' ||
         (allowRunning && ['queued', 'in_progress'].includes(run.status))) &&
-      run.head_sha === identity.baseSha,
-    'CI was not controlled by the exact trusted base',
+      run.head_sha === identity.headSha,
+    'CI is not a PR target run for the captured head',
   )
   if (run.pull_requests?.length)
     requireFact(
@@ -266,11 +278,15 @@ export function requireLatestGeneration(runs, sourceRun, identity) {
   for (const run of runs) {
     requireRunScope(run)
     if (
-      run.event !== 'pull_request_target' ||
-      run.head_sha !== identity.baseSha ||
+      run.event !== sourceRun.event ||
+      run.head_sha !== identity.headSha ||
       run.workflow_id !== sourceRun.workflow_id
     )
       continue
+    if (identity.sourceKind === 'bootstrap') {
+      requireRunScope(run, true)
+      if (run.head_branch !== identity.controllerRef.slice('refs/heads/'.length)) continue
+    }
     requireFact(validGenerationIdentity(run), 'CI generation identity is unresolved')
     if (run.id === sourceRun.id) {
       requireFact(run.run_number === sourceRun.run_number, 'CI generation identity disagrees')
@@ -279,6 +295,8 @@ export function requireLatestGeneration(runs, sourceRun, identity) {
     }
     requireFact(run.run_number !== sourceRun.run_number, 'CI generation identity is ambiguous')
     if (run.run_number < sourceRun.run_number) continue
+    if (identity.sourceKind === 'bootstrap')
+      throw new Error('A newer frozen bootstrap run supersedes this candidate result')
     requireFact(
       Array.isArray(run.pull_requests) &&
         run.pull_requests.length > 0 &&
@@ -314,7 +332,7 @@ export async function latestGeneration(api, identity, evidenceRun) {
   validateSourceRun(run, identity, evidenceRun.workflow_id, { allowRunning: true })
   const runs = await api.list(
     api.path(
-      `/actions/workflows/${run.workflow_id}/runs?event=pull_request_target&head_sha=${identity.baseSha}`,
+      `/actions/workflows/${run.workflow_id}/runs?event=${run.event}&head_sha=${identity.headSha}`,
     ),
     'workflow_runs',
   )
@@ -322,99 +340,46 @@ export async function latestGeneration(api, identity, evidenceRun) {
   return run
 }
 
-export function requireLatestProviderGeneration(runs, evidenceRun) {
+export function requireTrustedWorkflowSource(identity, env) {
+  requireIdentity(identity)
+  if (identity.sourceKind === 'bootstrap') return requireBootstrapSource(env, identity)
   requireFact(
-    Array.isArray(runs) && runs.length <= 10_000,
-    'Provider generation inventory is incomplete',
+    env.GITHUB_EVENT_NAME === 'pull_request_target' &&
+      env.GITHUB_REF === 'refs/heads/main' &&
+      env.GITHUB_SHA === identity.policySha,
+    'Trusted workflow source does not match the captured main policy',
   )
-  requireFact(
-    validGenerationIdentity(evidenceRun),
-    'Provider evidence generation identity is unresolved',
-  )
-  requireRunScope(evidenceRun, true)
-  for (const run of runs) {
-    requireRunScope(run, true)
-    if (
-      run.workflow_id !== evidenceRun.workflow_id ||
-      run.head_branch !== 'main' ||
-      run.head_sha !== evidenceRun.head_sha
-    )
-      continue
-    requireFact(validGenerationIdentity(run), 'Provider generation identity is unresolved')
-    if (run.id === evidenceRun.id) {
-      requireFact(
-        run.run_number === evidenceRun.run_number,
-        'Provider generation identity disagrees',
-      )
-      requireFact(
-        run.run_attempt === evidenceRun.run_attempt,
-        'Provider evidence attempt is obsolete',
-      )
-      continue
-    }
-    requireFact(
-      run.run_number !== evidenceRun.run_number,
-      'Provider generation identity is ambiguous',
-    )
-    if (run.run_number > evidenceRun.run_number)
-      throw new Error(
-        'A newer Provider run has unresolved candidate association; old evidence cannot publish',
-      )
-  }
-  requireFact(
-    runs.some(
-      (run) =>
-        run.id === evidenceRun.id &&
-        run.run_number === evidenceRun.run_number &&
-        run.run_attempt === evidenceRun.run_attempt,
-    ),
-    'Provider evidence generation is missing',
-  )
-}
-
-async function latestProviderGeneration(api, evidenceRun) {
-  const run = await api.request(api.path(`/actions/runs/${evidenceRun.id}`))
-  requireFact(
-    run.id === evidenceRun.id &&
-      run.run_number === evidenceRun.run_number &&
-      run.run_attempt === evidenceRun.run_attempt &&
-      run.workflow_id === evidenceRun.workflow_id,
-    'Provider attempt changed after evidence capture',
-  )
-  const runs = await api.list(
-    api.path(`/actions/workflows/${evidenceRun.workflow_id}/runs?head_sha=${evidenceRun.head_sha}`),
-    'workflow_runs',
-  )
-  requireLatestProviderGeneration(runs, evidenceRun)
 }
 
 export function executionAdmission(
   identity,
   pr,
-  {
-    manual,
-    actorId,
-    headSha,
-    baseSha,
-    treeSha,
-    commit,
-    mainSha,
-    authorizedRelease: releaseSourceAuthorized = false,
-  } = {},
+  { commit, mainSha, authorizedRelease: releaseSourceAuthorized = false } = {},
 ) {
   requireCurrent(identity, pr, commit, mainSha)
-  if (manual) {
-    requireFact(actorId === ownerId, 'Only the verified owner can authorize paid execution')
-    requireFact(
-      headSha === identity.headSha && baseSha === identity.baseSha && treeSha === identity.treeSha,
-      'Paid execution authorization is obsolete or incomplete',
-    )
-    return { allowed: true, kind: 'owner-reviewed-code-identity' }
+  if (identity.sourceKind === 'bootstrap')
+    return {
+      allowed: true,
+      kind: 'frozen-bootstrap-environment-review-required',
+      providerEnvironment: 'pact-bootstrap-provider-ci',
+    }
+  const trusted =
+    (pr.user.id === ownerId && pr.head.repo?.id === repositoryId) || releaseSourceAuthorized
+  return {
+    // This admits a job to its environment queue, not secret execution. GitHub owns
+    // the mandatory owner approval for the exact external run before its job starts.
+    allowed: true,
+    kind: trusted ? 'trusted-source' : 'owner-environment-review-required',
+    providerEnvironment: trusted ? 'pact-provider-ci' : 'pact-provider-reviewed-ci',
   }
-  if (pr.user.id === ownerId && pr.head.repo?.id === repositoryId)
-    return { allowed: true, kind: 'trusted-owner-source' }
-  if (releaseSourceAuthorized) return { allowed: true, kind: 'verified-release-only-source' }
-  return { allowed: false, kind: 'explicit-owner-execution-authorization-required' }
+}
+
+export function currentPrerequisitesPassed(jobs, run, expected = ciJobs) {
+  return (
+    ((run.status === 'in_progress' && run.conclusion === null) ||
+      (run.status === 'completed' && run.conclusion === 'success')) &&
+    requiredJobsPassed(jobs, expected, run)
+  )
 }
 
 function canonical(value) {
@@ -437,19 +402,29 @@ export function verifyReleaseOnlyChanges(before, after) {
   )
   for (const path of releaseFiles) {
     const key = path === '.release-please-manifest.json' ? '.' : 'version'
+    const expected = { ...before[path], [key]: version }
+    if (path === 'version.json') expected.candidateVersion = version
     requireFact(
-      after[path]?.[key] === version &&
-        canonical({ ...before[path], [key]: version }) === canonical(after[path]),
+      after[path]?.[key] === version && canonical(expected) === canonical(after[path]),
       'Bot source contains changes beyond synchronized release versions',
     )
   }
+  requireFact(
+    classifyProductTransition(before['version.json'], after['version.json']).kind === 'release',
+    'Release fields do not advance their content intent',
+  )
   return version
 }
 
 async function authorizedRelease(api, identity, pr, env) {
-  if (identity.channel !== 'stable') return false
+  if (pr.head.ref !== 'release-please--branches--main' || pr.user.type !== 'Bot') return false
   const botId = Number(env.PACT_RELEASE_APP_BOT_ID),
     slug = env.PACT_RELEASE_APP_SLUG
+  requireFact(
+    identity.channel === 'stable' &&
+      classifyProductTransition(identity.product.before, identity.product.after).kind === 'release',
+    'Release App source does not advance its immutable release intent',
+  )
   requireFact(
     Number.isSafeInteger(botId) && botId > 0 && /^[a-z0-9-]+$/u.test(slug ?? ''),
     'Dedicated Release App identity is not configured',
@@ -535,7 +510,7 @@ export function verifyCandidateAttestation(checks, identity, run, expectedAppId)
   requireFact(
     proof.status === 'completed' &&
       proof.conclusion === 'neutral' &&
-      proof.head_sha === identity.candidateSha &&
+      proof.head_sha === identity.headSha &&
       typeof proof.output?.summary === 'string' &&
       Buffer.byteLength(proof.output.summary) <= 4096,
     'Candidate attestation is incomplete or has a different content identity',
@@ -555,15 +530,32 @@ async function context(api, identity, runId, expectedAppId) {
     api.request(api.path(`/actions/runs/${runId}`)),
     api.request(api.path('/actions/workflows/ci.yml')),
   ])
-  validateSourceRun(run, identity, workflow.id)
+  validateSourceRun(run, identity, workflow.id, { allowRunning: true })
   await latestGeneration(api, identity, run)
   const facts = await readCurrent(identity, (path) => api.request(path))
   const proofs = await api.list(
-    api.path(`/commits/${identity.candidateSha}/check-runs?filter=all`),
+    api.path(`/commits/${identity.headSha}/check-runs?filter=all`),
     'check_runs',
   )
   verifyCandidateAttestation(proofs, identity, run, expectedAppId)
   return { run, ...facts }
+}
+
+export function requirePublishedChecks(checks, identity, run, appId) {
+  requireFact(Number.isSafeInteger(appId) && appId > 0, 'Fixed App identity is missing')
+  for (const name of ['pact-ci', 'provider-e2e']) {
+    const externalId = `pact:${identity.pullRequest}:${identity.headSha}:${identity.baseSha}:${run.id}:${run.run_attempt}:${name}`
+    const matching = checks.filter(
+      (check) => check.name === name && check.app?.id === appId && check.external_id === externalId,
+    )
+    requireFact(
+      matching.length === 1 &&
+        matching[0].head_sha === identity.headSha &&
+        matching[0].status === 'completed' &&
+        matching[0].conclusion === 'success',
+      'Current fixed-App passing checks are incomplete or ambiguous',
+    )
+  }
 }
 
 async function readIdentity(path) {
@@ -581,7 +573,6 @@ async function publishCheck(
   runId,
   explanation,
   evidenceRun,
-  providerEvidence,
 ) {
   requireFact(
     Number.isSafeInteger(expectedAppId) && expectedAppId > 0,
@@ -589,14 +580,13 @@ async function publishCheck(
   )
   await readCurrent(identity, (path) => api.request(path))
   await latestGeneration(api, identity, evidenceRun)
-  if (providerEvidence) await latestProviderGeneration(api, providerEvidence)
   const check = await api.request(api.path('/check-runs'), {
     method: 'POST',
     body: {
       name,
-      head_sha: identity.candidateSha,
+      head_sha: identity.headSha,
       status: 'in_progress',
-      external_id: `pact:${identity.pullRequest}:${identity.headSha}:${identity.baseSha}:${runId}:${name}`,
+      external_id: `pact:${identity.pullRequest}:${identity.headSha}:${identity.baseSha}:${runId}:${evidenceRun.run_attempt}:${name}`,
       details_url: `https://github.com/${repository}/actions/runs/${runId}`,
       output: {
         title: passed ? 'Current code identity evidence passed' : 'Required evidence is blocked',
@@ -620,7 +610,6 @@ async function publishCheck(
   }
   await readCurrent(identity, (path) => api.request(path))
   await latestGeneration(api, identity, evidenceRun)
-  if (providerEvidence) await latestProviderGeneration(api, providerEvidence)
   await api.request(api.path(`/check-runs/${check.id}`), {
     method: 'PATCH',
     body: { status: 'completed', conclusion: passed ? 'success' : 'failure' },
@@ -628,7 +617,6 @@ async function publishCheck(
   try {
     await readCurrent(identity, (path) => api.request(path))
     await latestGeneration(api, identity, evidenceRun)
-    if (providerEvidence) await latestProviderGeneration(api, providerEvidence)
   } catch {
     await api.request(api.path(`/check-runs/${check.id}`), {
       method: 'PATCH',
@@ -650,7 +638,7 @@ function flags(args) {
   for (let index = 0; index < args.length; index += 2) {
     const name = args[index]
     requireFact(
-      ['--identity', '--run', '--provider-run'].includes(name) && args[index + 1] && !result[name],
+      ['--identity', '--run'].includes(name) && args[index + 1] && !result[name],
       'Invalid CI control arguments',
     )
     result[name] = args[index + 1]
@@ -668,6 +656,11 @@ export async function main(args = process.argv.slice(2), env = process.env) {
       await appendFile(env.GITHUB_OUTPUT, 'applicable=false\nallowed=false\n')
     return
   }
+  requireTrustedWorkflowSource(identity, env)
+  requireFact(
+    String(options['--run']) === env.GITHUB_RUN_ID,
+    'Control must belong to this one CI graph',
+  )
   const api = new CIAPI(env.GH_TOKEN)
   if (mode === 'attest') {
     const [sourceRun, workflow] = await Promise.all([
@@ -689,24 +682,11 @@ export async function main(args = process.argv.slice(2), env = process.env) {
         env.PACT_CI_CHANNEL === identity.channel,
       'Artifact identity disagrees with the trusted GitHub job outputs',
     )
-    // This is an asynchronous invalidation. Cancellation before this job runs remains a delivery blocker.
-    for (const name of ['pact-ci', 'provider-e2e', 'owner-approval'])
-      // oxlint-disable-next-line eslint/no-await-in-loop -- Invalidate each fixed-App required context before attesting the new generation.
-      await publishCheck(
-        api,
-        identity,
-        Number(env.PACT_CI_APP_ID),
-        name,
-        false,
-        sourceRun.id,
-        'The latest candidate run has not completed all mandatory evidence.',
-        sourceRun,
-      )
     const check = await api.request(api.path('/check-runs'), {
       method: 'POST',
       body: {
         name: 'pact-candidate-identity',
-        head_sha: identity.candidateSha,
+        head_sha: identity.headSha,
         status: 'in_progress',
         external_id: `pact-ci:${sourceRun.id}:${sourceRun.run_attempt}:candidate`,
         output: {
@@ -741,138 +721,87 @@ export async function main(args = process.argv.slice(2), env = process.env) {
     api.path(`/actions/runs/${run.id}/attempts/${run.run_attempt}/jobs`),
     'jobs',
   )
-  const ciPassed = run.conclusion === 'success' && requiredJobsPassed(jobs, ciJobs)
-  if (mode === 'provider-start') {
-    const providerRun = await api.request(api.path(`/actions/runs/${env.GITHUB_RUN_ID}`))
-    const providerWorkflow = await api.request(api.path('/actions/workflows/provider-e2e.yml'))
-    requireFact(
-      providerRun.repository?.id === repositoryId &&
-        providerRun.workflow_id === providerWorkflow.id &&
-        providerRun.path === '.github/workflows/provider-e2e.yml' &&
-        providerRun.head_branch === 'main' &&
-        providerRun.run_attempt === Number(env.GITHUB_RUN_ATTEMPT),
-      'Provider invalidation must belong to the exact current trusted workflow attempt',
-    )
-    await publishCheck(
-      api,
-      identity,
-      Number(env.PACT_CI_APP_ID),
-      'provider-e2e',
-      false,
-      providerRun.id,
-      'The new Provider dispatch or rerun must complete every mandatory platform before this context may pass.',
-      run,
-      providerRun,
-    )
-    return
-  } else if (mode === 'preflight') {
+  requireFact(Number(env.GITHUB_RUN_ATTEMPT) === run.run_attempt, 'Control attempt is obsolete')
+  const ciPassed = currentPrerequisitesPassed(jobs, run)
+  if (mode === 'preflight') {
     requireFact(
       Number(env.PACT_EXPECTED_CI_ATTEMPT) === run.run_attempt,
-      'Paid execution authorization belongs to an obsolete CI attempt',
+      'Paid execution belongs to an obsolete attempt',
     )
-    requireFact(ciPassed, 'Latest mandatory uncredentialed CI did not pass before paid execution')
+    requireFact(
+      ciPassed,
+      'Current mandatory prerequisites did not complete successfully; Re-run all jobs',
+    )
     await latestGeneration(api, identity, run)
     return
   } else if (mode === 'admit') {
-    const manual = env.PACT_PROVIDER_MANUAL === 'true'
-    const scopes = providerScopes(identity, manual ? (env.PACT_PROVIDER_SUITE ?? 'core') : 'core')
-    let actorId
-    if (manual) {
-      const ownRun = await api.request(api.path(`/actions/runs/${env.GITHUB_RUN_ID}`))
-      requireFact(
-        ownRun.event === 'workflow_dispatch' && ownRun.head_branch === 'main',
-        'Paid authorization must originate from the trusted main dispatch',
-      )
-      actorId = ownRun.actor.id
-      requireFact(
-        Number(env.PACT_PROVIDER_PR_NUMBER) === identity.pullRequest &&
-          env.PACT_PROVIDER_AUTHORIZE === 'true',
-        'Owner must explicitly authorize this PR execution',
-      )
-    }
-    const admission = ciPassed
-      ? executionAdmission(identity, pr, {
-          manual,
-          actorId,
-          headSha: env.PACT_PROVIDER_HEAD_SHA,
-          baseSha: env.PACT_PROVIDER_BASE_SHA,
-          treeSha: env.PACT_PROVIDER_TREE_SHA,
-          commit,
-          mainSha,
-          authorizedRelease: await authorizedRelease(api, identity, pr, env),
-        })
-      : { allowed: false, kind: 'required-uncredentialed-ci-failed' }
+    requireFact(
+      Number(env.PACT_EXPECTED_CI_ATTEMPT) === run.run_attempt,
+      'Admission belongs to an obsolete attempt',
+    )
+    requireFact(
+      ciPassed,
+      'Current mandatory prerequisites did not complete successfully; Re-run all jobs',
+    )
+    const scopes = providerScopes(identity, env.PACT_PROVIDER_SUITE ?? 'core')
+    const admission = executionAdmission(identity, pr, {
+      commit,
+      mainSha,
+      authorizedRelease: await authorizedRelease(api, identity, pr, env),
+    })
     if (env.GITHUB_OUTPUT)
       await appendFile(
         env.GITHUB_OUTPUT,
-        `applicable=true\nallowed=${admission.allowed}\nsuite=${scopes.suite}\nreal_gate=${scopes.gate}\ncandidate=${identity.candidateSha}\nbase=${identity.baseSha}\ntree=${identity.treeSha}\npolicy=${identity.policySha}\npull_request=${identity.pullRequest}\nci_run=${run.id}\nci_attempt=${run.run_attempt}\n`,
+        `applicable=true\nallowed=true\nprovider_environment=${admission.providerEnvironment}\nsuite=${scopes.suite}\nreal_gate=${scopes.gate}\ncandidate=${identity.candidateSha}\nbase=${identity.baseSha}\ntree=${identity.treeSha}\npolicy=${identity.policySha}\npull_request=${identity.pullRequest}\nci_run=${run.id}\nci_attempt=${run.run_attempt}\n`,
       )
     if (env.GITHUB_STEP_SUMMARY)
       await appendFile(
         env.GITHUB_STEP_SUMMARY,
-        `Paid provider admission: ${admission.kind}; head=${identity.headSha}; base=${identity.baseSha}; tree=${identity.treeSha}; policy=${identity.policySha}; tested candidate=${identity.candidateSha}.\n`,
+        `Provider environment: ${admission.providerEnvironment}; ${admission.kind}. PR #${identity.pullRequest}; head=${identity.headSha}; base=${identity.baseSha}; tree=${identity.treeSha}; tested candidate=${identity.candidateSha}; suite=${scopes.suite}. Environment approval authorizes this immutable execution identity separately from Approve PR.\n`,
       )
   } else if (mode === 'publish') {
-    requireFact(
-      /^[1-9]\d*$/u.test(options['--provider-run'] ?? ''),
-      'An exact provider workflow run is required',
-    )
-    const providerRun = await api.request(api.path(`/actions/runs/${options['--provider-run']}`))
-    const providerWorkflow = await api.request(api.path('/actions/workflows/provider-e2e.yml'))
-    requireFact(
-      providerRun.repository?.id === repositoryId &&
-        providerRun.workflow_id === providerWorkflow.id &&
-        providerRun.path === '.github/workflows/provider-e2e.yml' &&
-        providerRun.head_branch === 'main',
-      'Provider evidence has an untrusted workflow identity',
-    )
-    const providerTasks = await api.list(
-      api.path(`/actions/runs/${providerRun.id}/attempts/${providerRun.run_attempt}/jobs`),
-      'jobs',
-    )
-    await latestProviderGeneration(api, providerRun)
-    const passed =
+    const providerPassed =
       ciPassed &&
       env.PACT_PROVIDER_ALLOWED === 'true' &&
-      requiredJobsPassed(providerTasks, ['check-start', 'admission', ...providerJobs])
-    await publishCheck(
-      api,
-      identity,
-      Number(env.PACT_CI_APP_ID),
-      'pact-ci',
-      ciPassed,
-      run.id,
-      'Publication, all static/unit/script checks and each target architecture must actually complete successfully.',
-      run,
-      providerRun,
+      currentPrerequisitesPassed(jobs, run, providerJobs)
+    for (const [name, passed, explanation] of [
+      [
+        'pact-ci',
+        ciPassed,
+        'Every mandatory uncredentialed prerequisite must succeed in this exact CI attempt.',
+      ],
+      [
+        'provider-e2e',
+        providerPassed,
+        'All three Provider jobs must succeed in this exact CI attempt; core ordinary-PR cases and full Release cases remain mandatory. Environment waiting, cancellation, skipped or missing jobs block this check.',
+      ],
+    ]) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- The existing owner serially publishes the two fixed contexts after their current-run checks.
+      await publishCheck(
+        api,
+        identity,
+        Number(env.PACT_CI_APP_ID),
+        name,
+        passed,
+        run.id,
+        explanation,
+        run,
+      )
+    }
+    requireFact(providerPassed, 'Required Provider evidence did not pass')
+  } else if (mode === 'complete') {
+    requireFact(
+      currentPrerequisitesPassed(jobs, run, [...ciJobs, ...providerJobs, 'check-writer']),
+      'Every mandatory job, including the isolated writer, must succeed in this exact attempt; Re-run all jobs',
     )
-    await publishCheck(
-      api,
-      identity,
-      Number(env.PACT_CI_APP_ID),
-      'provider-e2e',
-      passed,
-      providerRun.id,
-      'Claude and Codex core business cases are required on each target architecture for ordinary PRs. Release PRs require the full suite. Extended ordinary-PR failures remain visible in reports. Missing authorization, core failures, cancellation or unavailable evidence block this check.',
-      run,
-      providerRun,
+    const checks = await api.list(
+      api.path(`/commits/${identity.headSha}/check-runs?filter=all`),
+      'check_runs',
     )
-    // Native PR rules must own atomic diff-based approval and its revocation.
-    // SHA-associated checks do not provide per-PR authorization or latest-attempt isolation.
-    // Keep this gate blocked until the revised policy and trusted bootstrap are verified.
-    await publishCheck(
-      api,
-      identity,
-      Number(env.PACT_CI_APP_ID),
-      'owner-approval',
-      false,
-      providerRun.id,
-      'BLOCKED: revised diff-based owner approval is not yet enforced on main. Candidate-only check freshness, shared-SHA association, latest-attempt isolation and trusted-workflow bootstrap remain unverified.',
-      run,
-      providerRun,
-    )
-    if (!passed) throw new Error('Required Provider evidence did not pass')
-  } else throw new Error('Expected CI admission or publication')
+    requirePublishedChecks(checks, identity, run, Number(env.PACT_CI_APP_ID))
+    await readCurrent(identity, (path) => api.request(path))
+    await latestGeneration(api, identity, run)
+  } else throw new Error('Expected CI attestation, admission, preflight, publication or completion')
 }
 
 if (isScriptEntry(import.meta.url))

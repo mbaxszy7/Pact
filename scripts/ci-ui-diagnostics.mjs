@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
 import { lstat, mkdir, open, opendir, realpath, rm, writeFile } from 'node:fs/promises'
-import { basename, isAbsolute, join, relative, sep } from 'node:path'
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 import { publicReportIdentity, readE2EJson, writeE2EReport } from './e2e-report.mjs'
 import { isScriptEntry } from './script-entry.mjs'
@@ -217,7 +217,9 @@ export function evaluateUiReport(
     lane,
     inventory,
     workspace,
+    inventoryWorkspace = workspace,
     identity = null,
+    identityKind = 'ci',
     execution = 'unavailable',
     platform = process.platform,
     architecture = process.arch,
@@ -226,16 +228,22 @@ export function evaluateUiReport(
   if (
     !['ui', 'deterministic'].includes(lane) ||
     !isAbsolute(workspace) ||
+    !isAbsolute(inventoryWorkspace) ||
     !['completed', 'unavailable'].includes(execution) ||
+    !['ci', 'release'].includes(identityKind) ||
     !['darwin-arm64', 'win32-x64', 'win32-arm64'].includes(`${platform}-${architecture}`)
   )
     throw new Error('Invalid no-credential report target')
   const issues = []
+  const identityIssue =
+    identityKind === 'release'
+      ? 'missing-or-invalid-release-identity'
+      : 'missing-or-invalid-ci-code-identity'
   let known = new Map(),
     observed = new Map(),
     publicIdentity = null
   try {
-    known = caseInventory(inventory, lane, workspace)
+    known = caseInventory(inventory, lane, inventoryWorkspace)
     if (!known.size) throw new Error('Empty inventory')
   } catch {
     issues.push('missing-or-invalid-discovery-inventory')
@@ -247,10 +255,10 @@ export function evaluateUiReport(
     issues.push('missing-or-invalid-execution-evidence')
   }
   try {
-    publicIdentity = publicReportIdentity(identity)
-    if (!publicIdentity) issues.push('missing-or-invalid-ci-code-identity')
+    publicIdentity = publicReportIdentity(identity, identityKind)
+    if (!publicIdentity) issues.push(identityIssue)
   } catch {
-    issues.push('missing-or-invalid-ci-code-identity')
+    issues.push(identityIssue)
   }
   if (execution !== 'completed') issues.push('runner-or-preparation-failed')
   const cases = [...known].map(([key, item]) => {
@@ -344,6 +352,7 @@ export function evaluateUiReport(
     lane,
     informational: true,
     identity: publicIdentity,
+    identityKind,
     platform,
     architecture,
     execution,
@@ -371,7 +380,12 @@ export function uiReportMarkdown(report) {
     `Platform: ${report.platform}/${report.architecture}; execution: **${report.execution}**.`,
     report.resultGate,
   ]
-  if (report.identity)
+  if (report.identity && report.identityKind === 'release')
+    lines.push(
+      `Release PR: #${report.identity.releasePR}; version: \`${report.identity.version}\`; source: \`${report.identity.sourceSha}\`; tag: \`${report.identity.tag}\`; Release ID: ${report.identity.releaseId}.`,
+      'This informational identity projection does not replace signed release-state or artifact validation.',
+    )
+  else if (report.identity)
     lines.push(
       `PR: ${report.identity.pullRequest}; head: \`${report.identity.headSha}\`; base: \`${report.identity.baseSha}\`; tree: \`${report.identity.treeSha}\`; tested commit: \`${report.identity.candidateSha}\`.`,
     )
@@ -403,17 +417,30 @@ export function uiReportMarkdown(report) {
 export async function writeUiReports({
   evidence,
   workspace,
+  inventoryWorkspace = workspace,
   identityPath,
   inventoryPath,
   summary,
   execution = {},
   platform = process.platform,
   architecture = process.arch,
+  identityKind = 'ci',
+  runAttempt = 1,
 }) {
+  if (
+    !['ci', 'release'].includes(identityKind) ||
+    !Number.isSafeInteger(runAttempt) ||
+    runAttempt < 1
+  )
+    throw new Error('Invalid report execution identity')
+  const artifactName =
+    identityKind === 'release'
+      ? `release-e2e-${platform}-${architecture}-a${runAttempt}`
+      : `e2e-${platform}-${architecture}-a${runAttempt}`
   let identity = null,
     inventory = null
   try {
-    identity = await readE2EJson(identityPath, 4096)
+    identity = await readE2EJson(identityPath, identityKind === 'release' ? 1024 * 1024 : 4096)
   } catch {
     /* Fixed safe issue is projected below. */
   }
@@ -435,11 +462,14 @@ export async function writeUiReports({
       lane,
       inventory,
       workspace,
+      inventoryWorkspace,
       identity,
+      identityKind,
       execution: execution[lane] ?? 'unavailable',
       platform,
       architecture,
     })
+    report.diagnosticArtifact = `${identityKind === 'release' ? 'release-' : ''}ui-diagnostics-${platform}-${architecture}-a${runAttempt}`
     reports.push(
       // oxlint-disable-next-line eslint/no-await-in-loop -- Each lane has immutable distinct files and the shared Actions summary preserves their order.
       await writeE2EReport(report, {
@@ -448,7 +478,7 @@ export async function writeUiReports({
         markdown: uiReportMarkdown,
         summary,
         workspace,
-        artifactName: `e2e-${platform}-${architecture}`,
+        artifactName,
       }),
     )
   }
@@ -457,6 +487,8 @@ export async function writeUiReports({
 
 export async function main(argv = process.argv.slice(2), source = process.env) {
   if (argv[0] === '--reports') {
+    const identityKind = argv[1] === '--release' ? 'release' : 'ci'
+    if (identityKind === 'release') argv = [argv[0], ...argv.slice(2)]
     if (
       argv.length !== 9 ||
       argv[1] !== '--evidence' ||
@@ -470,9 +502,12 @@ export async function main(argv = process.argv.slice(2), source = process.env) {
     const reports = await writeUiReports({
       evidence: argv[2],
       workspace: argv[4],
+      inventoryWorkspace: resolve(import.meta.dirname, '..'),
       identityPath: argv[6],
       inventoryPath: argv[8],
       summary: source.GITHUB_STEP_SUMMARY,
+      identityKind,
+      runAttempt: Number(source.GITHUB_RUN_ATTEMPT ?? '1'),
       execution: {
         ui: source.PACT_UI_EXECUTION_COMPLETED === 'true' ? 'completed' : 'unavailable',
         deterministic:

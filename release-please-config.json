@@ -25,6 +25,7 @@
       "package-name": "pact",
       "extra-files": [
         { "type": "json", "path": "version.json", "jsonpath": "$.version" },
+        { "type": "json", "path": "version.json", "jsonpath": "$.candidateVersion" },
         { "type": "json", "path": "apps/desktop/package.json", "jsonpath": "$.version" }
       ]
     }

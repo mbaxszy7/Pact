@@ -83,7 +83,7 @@ await test('code identity projection never publishes extensions or the unvalidat
   const head = 'a'.repeat(40),
     secret = 'synthetic-private-identity-extension'
   const identity = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     repository: 'mbaxszy7/Pact',
     repositoryId: 1416403312,
     pullRequest: null,
@@ -95,10 +95,75 @@ await test('code identity projection never publishes extensions or the unvalidat
     candidateSha: head,
     treeSha: 'd'.repeat(40),
     policySha: head,
+    sourceKind: 'branch',
+    controllerSha: head,
+    controllerRef: null,
+    product: null,
     extra: { secret },
   }
   const projected = publicReportIdentity(identity)
   assert.equal(JSON.stringify(projected).includes(secret), false)
   assert.equal(projected.candidateSha, head)
+  assert.deepEqual(publicReportIdentity(projected), projected)
+  for (const sourceKind of ['main', 'bootstrap']) {
+    const prIdentity = {
+      ...identity,
+      sourceKind,
+      pullRequest: 7,
+      authorId: 31481964,
+      baseSha: 'b'.repeat(40),
+      controllerSha: sourceKind === 'main' ? 'b'.repeat(40) : head,
+      controllerRef:
+        sourceKind === 'main'
+          ? 'refs/heads/main'
+          : `refs/heads/codex/pact-ci-bootstrap-${head.slice(0, 12)}`,
+      policySha: sourceKind === 'main' ? 'b'.repeat(40) : head,
+      product: {
+        before: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
+        after: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
+      },
+    }
+    const projectedPr = publicReportIdentity(prIdentity)
+    assert.equal(projectedPr.controllerRef, prIdentity.controllerRef)
+    assert.deepEqual(publicReportIdentity(projectedPr), projectedPr)
+    assert.equal(JSON.stringify(projectedPr).includes(secret), false)
+  }
   assert.throws(() => publicReportIdentity({ ...identity, treeSha: secret }), /commit identity/)
+})
+
+await test('release reports whitelist fixed release identity and never export signed state or extensions', () => {
+  const secret = 'synthetic-private-release-signature',
+    identity = {
+      schemaVersion: 1,
+      repository: 'mbaxszy7/Pact',
+      releasePR: 14,
+      version: '0.1.0',
+      sourceSha: 'a'.repeat(40),
+      tag: 'v0.1.0',
+      releaseId: 1234,
+      signature: secret,
+      staging: { key: secret },
+      extensions: secret,
+    }
+  const projected = publicReportIdentity(identity, 'release')
+  assert.deepEqual(Object.keys(projected), [
+    'schemaVersion',
+    'repository',
+    'releasePR',
+    'version',
+    'sourceSha',
+    'tag',
+    'releaseId',
+  ])
+  assert.equal(JSON.stringify(projected).includes(secret), false)
+  for (const changes of [
+    { tag: 'v0.2.0' },
+    { releaseId: null },
+    { releasePR: 0 },
+    { repository: 'another/Pact' },
+    { sourceSha: secret },
+    { version: '0.0.0', tag: 'v0.0.0' },
+  ])
+    assert.throws(() => publicReportIdentity({ ...identity, ...changes }, 'release'), /identity/)
+  assert.throws(() => publicReportIdentity(identity, 'ci'), /identity/)
 })

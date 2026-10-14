@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -7,6 +7,7 @@ import { test } from 'node:test'
 import {
   CIAPI,
   providerScopes,
+  requireTrustedWorkflowSource,
   ciJobs,
   executionAdmission,
   requiredJobsPassed,
@@ -15,7 +16,9 @@ import {
   verifyCandidateAttestation,
   requireLatestGeneration,
   latestGeneration,
-  requireLatestProviderGeneration,
+  currentPrerequisitesPassed,
+  requirePublishedChecks,
+  providerJobs,
   main,
 } from './ci-control.mjs'
 
@@ -24,7 +27,7 @@ const head = 'a'.repeat(40),
   candidate = 'c'.repeat(40),
   tree = 'd'.repeat(40)
 const identity = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   repository: 'mbaxszy7/Pact',
   repositoryId: 1416403312,
   headRepositoryId: 1416403312,
@@ -34,8 +37,39 @@ const identity = {
   candidateSha: candidate,
   treeSha: tree,
   policySha: base,
+  sourceKind: 'main',
+  controllerSha: base,
+  controllerRef: 'refs/heads/main',
+  product: {
+    before: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
+    after: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
+  },
   authorId: 31481964,
   channel: 'dev',
+}
+const releaseProduct = {
+  before: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
+  after: { version: '0.1.0', candidateVersion: '0.1.0' },
+}
+function productFile(path, ref, product) {
+  if (path === '.github/CODEOWNERS') {
+    const bytes = Buffer.from('* @mbaxszy7\n')
+    return {
+      type: 'file',
+      encoding: 'base64',
+      size: bytes.length,
+      content: bytes.toString('base64'),
+    }
+  }
+  const data = ref === base ? product.before : product.after
+  const value =
+    path === 'version.json'
+      ? data
+      : path === '.release-please-manifest.json'
+        ? { '.': data.version }
+        : { version: data.version }
+  const bytes = Buffer.from(JSON.stringify(value))
+  return { type: 'file', encoding: 'base64', size: bytes.length, content: bytes.toString('base64') }
 }
 const commit = { sha: candidate, tree: { sha: tree }, parents: [{ sha: base }, { sha: head }] }
 const currentFacts = { commit, mainSha: base }
@@ -54,9 +88,10 @@ const sourceRun = {
   repository: { id: 1416403312, full_name: 'mbaxszy7/Pact' },
   workflow_id: 50,
   path: '.github/workflows/ci.yml',
-  head_sha: base,
+  head_sha: head,
   event: 'pull_request_target',
   status: 'completed',
+  conclusion: 'success',
   pull_requests: [{ number: 7, head: { sha: head }, base: { sha: base } }],
 }
 
@@ -65,7 +100,7 @@ void test('only the fixed base CI workflow can supply candidate evidence', () =>
   for (const change of [
     { workflow_id: 51 },
     { path: 'anything.yml' },
-    { head_sha: head },
+    { head_sha: base },
     { event: 'workflow_dispatch' },
     { status: 'in_progress' },
     { pull_requests: [{ number: 8, head: { sha: head }, base: { sha: base } }] },
@@ -109,19 +144,37 @@ void test('the API freshness guard must not replace an old successful evidence a
   )
 })
 
-void test('a late successful Provider writer cannot replace a newer failed dispatch or rerun', () => {
-  const original = { ...sourceRun, id: 200, workflow_id: 75, head_branch: 'main' }
-  requireLatestProviderGeneration([original], original)
+void test('frozen bootstrap generations are scoped to their exact push ref without ambiguous PR metadata', () => {
+  const bootstrap = {
+    ...identity,
+    sourceKind: 'bootstrap',
+    controllerSha: head,
+    controllerRef: `refs/heads/codex/pact-ci-bootstrap-${head.slice(0, 12)}`,
+    policySha: head,
+  }
+  const run = {
+    ...sourceRun,
+    event: 'push',
+    head_branch: bootstrap.controllerRef.slice('refs/heads/'.length),
+    pull_requests: [],
+  }
+  requireLatestGeneration([run], run, bootstrap)
+  const newer = { ...run, id: 101, run_number: 11, conclusion: 'failure' }
   assert.throws(
-    () =>
-      requireLatestProviderGeneration(
-        [original, { ...original, id: 201, run_number: 11, conclusion: 'failure' }],
-        original,
-      ),
-    /newer Provider run/,
+    () => requireLatestGeneration([run, newer], run, bootstrap),
+    /newer frozen bootstrap/,
+  )
+  requireLatestGeneration(
+    [run, { ...newer, head_branch: 'codex/another-branch-with-the-same-head' }],
+    run,
+    bootstrap,
   )
   assert.throws(
-    () => requireLatestProviderGeneration([{ ...original, run_attempt: 2 }], original),
+    () => requireLatestGeneration([run, { ...newer, head_branch: undefined }], run, bootstrap),
+    /metadata is unresolved/,
+  )
+  assert.throws(
+    () => requireLatestGeneration([{ ...run, run_attempt: 2 }], run, bootstrap),
     /attempt is obsolete/,
   )
 })
@@ -132,51 +185,17 @@ void test('logical run numbers order generations independently of unique run IDs
     () => requireLatestGeneration([sourceRun, newer], sourceRun, identity),
     /newer CI run/,
   )
-  assert.throws(
-    () =>
-      requireLatestProviderGeneration(
-        [
-          Object.assign({}, sourceRun, { head_branch: 'main' }),
-          Object.assign({}, newer, { head_branch: 'main' }),
-        ],
-        { ...sourceRun, head_branch: 'main' },
-      ),
-    /newer Provider run/,
+  requireLatestGeneration(
+    [sourceRun, { ...sourceRun, id: 999, run_number: 9, run_attempt: 2 }],
+    sourceRun,
+    identity,
   )
-  const older = { ...sourceRun, id: 999, run_number: 9, run_attempt: 2 }
-  requireLatestGeneration([sourceRun, older], sourceRun, identity)
-  requireLatestProviderGeneration(
-    [
-      { ...sourceRun, head_branch: 'main' },
-      { ...older, head_branch: 'main' },
-    ],
-    { ...sourceRun, head_branch: 'main' },
-  )
-  for (const run_number of [undefined, 0, -1, 1.5]) {
+  for (const run_number of [undefined, 0, -1, 1.5])
     assert.throws(() =>
       requireLatestGeneration([{ ...sourceRun, run_number }], sourceRun, identity),
     )
-    assert.throws(() =>
-      requireLatestProviderGeneration([{ ...sourceRun, run_number, head_branch: 'main' }], {
-        ...sourceRun,
-        head_branch: 'main',
-      }),
-    )
-  }
-  const conflicting = { ...sourceRun, id: 101 }
   assert.throws(
-    () => requireLatestGeneration([sourceRun, conflicting], sourceRun, identity),
-    /generation identity/,
-  )
-  assert.throws(
-    () =>
-      requireLatestProviderGeneration(
-        [
-          { ...sourceRun, head_branch: 'main' },
-          { ...conflicting, head_branch: 'main' },
-        ],
-        { ...sourceRun, head_branch: 'main' },
-      ),
+    () => requireLatestGeneration([sourceRun, { ...sourceRun, id: 101 }], sourceRun, identity),
     /generation identity/,
   )
 })
@@ -187,16 +206,6 @@ void test('missing scope metadata on a newer failed generation is ambiguous rath
       const newer = { ...sourceRun, id: 101, run_number: 11, conclusion: 'failure', [field]: value }
       assert.throws(
         () => requireLatestGeneration([sourceRun, newer], sourceRun, identity),
-        /metadata|unresolved/,
-      )
-    }
-  }
-  const provider = { ...sourceRun, head_branch: 'main' }
-  for (const field of ['head_branch', 'head_sha', 'workflow_id']) {
-    for (const value of [undefined, null, 0, -1, 1.5, {}, '']) {
-      const newer = { ...provider, id: 101, run_number: 11, conclusion: 'failure', [field]: value }
-      assert.throws(
-        () => requireLatestProviderGeneration([provider, newer], provider),
         /metadata|unresolved/,
       )
     }
@@ -219,7 +228,15 @@ void test('missing scope metadata on a newer failed generation is ambiguous rath
 void test('a truncated Release file inventory cannot authorize paid execution through the trusted admit entry', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pact-release-admission-'))
   const originalFetch = globalThis.fetch
-  const releaseIdentity = { ...identity, authorId: 342242262, channel: 'stable' }
+  const releaseIdentity = {
+    ...identity,
+    authorId: 342242262,
+    channel: 'stable',
+    product: {
+      before: { version: '0.1.0', candidateVersion: '0.1.0' },
+      after: { version: '0.2.0', candidateVersion: '0.2.0' },
+    },
+  }
   const releasePr = {
     ...pr,
     title: 'chore(main): release 0.2.0',
@@ -234,7 +251,7 @@ void test('a truncated Release file inventory cannot authorize paid execution th
     app: { id: 1234 },
     status: 'completed',
     conclusion: 'neutral',
-    head_sha: candidate,
+    head_sha: head,
     output: {
       summary: JSON.stringify({
         schemaVersion: 1,
@@ -258,9 +275,11 @@ void test('a truncated Release file inventory cannot authorize paid execution th
         response = { total_count: 1, workflow_runs: [sourceRun] }
       else if (endpoint === '/pulls/7') response = releasePr
       else if (endpoint === `/git/commits/${candidate}`) response = commit
+      else if (endpoint === `/git/commits/${base}`)
+        response = { sha: base, tree: { sha: 'f'.repeat(40) } }
       else if (endpoint === '/git/ref/heads/main')
         response = { ref: 'refs/heads/main', object: { type: 'commit', sha: base } }
-      else if (endpoint === `/commits/${candidate}/check-runs`)
+      else if (endpoint === `/commits/${head}/check-runs`)
         response = { total_count: 1, check_runs: [proof] }
       else if (endpoint === '/actions/runs/100/attempts/1/jobs')
         response = {
@@ -270,8 +289,12 @@ void test('a truncated Release file inventory cannot authorize paid execution th
             name,
             status: 'completed',
             conclusion: 'success',
+            run_id: 100,
+            run_attempt: 1,
           })),
         }
+      else if (endpoint === '/users/mbaxszy7')
+        response = { id: 31481964, login: 'mbaxszy7', type: 'User' }
       else if (endpoint === '/users/pact-ci-mbaxszy7%5Bbot%5D')
         response = { id: 342242262, type: 'Bot' }
       else if (endpoint === '/pulls/7/files')
@@ -279,8 +302,15 @@ void test('a truncated Release file inventory cannot authorize paid execution th
       else if (endpoint.startsWith('/contents/')) {
         const file = endpoint.slice('/contents/'.length),
           version = parsed.searchParams.get('ref') === base ? '0.1.0' : '0.2.0'
-        const value = file === '.release-please-manifest.json' ? { '.': version } : { version }
-        const bytes = Buffer.from(JSON.stringify(value))
+        const value =
+          file === '.release-please-manifest.json'
+            ? { '.': version }
+            : file === 'version.json'
+              ? { version, candidateVersion: version }
+              : { version }
+        const bytes = Buffer.from(
+          file === '.github/CODEOWNERS' ? '* @mbaxszy7\n' : JSON.stringify(value),
+        )
         response = {
           type: 'file',
           encoding: 'base64',
@@ -294,6 +324,12 @@ void test('a truncated Release file inventory cannot authorize paid execution th
       main(['admit', '--identity', path, '--run', '100'], {
         GH_TOKEN: 'nonfunctional-fixture',
         PACT_CI_APP_ID: '1234',
+        GITHUB_EVENT_NAME: 'pull_request_target',
+        GITHUB_REF: 'refs/heads/main',
+        GITHUB_SHA: base,
+        GITHUB_RUN_ID: '100',
+        GITHUB_RUN_ATTEMPT: '1',
+        PACT_EXPECTED_CI_ATTEMPT: '1',
         PACT_RELEASE_APP_BOT_ID: '342242262',
         PACT_RELEASE_APP_SLUG: 'pact-ci-mbaxszy7',
         GITHUB_OUTPUT: join(root, 'outputs'),
@@ -319,36 +355,33 @@ void test('failure, cancellation, skip, missing, duplicate and unfinished requir
   )
 })
 
-void test('a fork or different API author needs owner authorization for the exact head/base/code tree', () => {
-  assert.equal(executionAdmission(identity, pr, currentFacts).allowed, true)
+void test('external sources can only queue for the reviewed environment; review-like inputs cannot grant secrets', () => {
   assert.equal(
-    executionAdmission(
-      { ...identity, headRepositoryId: 1 },
-      { ...pr, head: { ...pr.head, repo: { id: 1 } } },
-      currentFacts,
-    ).allowed,
-    false,
+    executionAdmission(identity, pr, currentFacts).providerEnvironment,
+    'pact-provider-ci',
   )
   const outsider = { ...pr, user: { id: 999 } },
     outsiderIdentity = { ...identity, authorId: 999 }
-  assert.equal(executionAdmission(outsiderIdentity, outsider, currentFacts).allowed, false)
-  const grant = {
-    ...currentFacts,
-    manual: true,
-    actorId: 31481964,
-    headSha: head,
-    baseSha: base,
-    treeSha: tree,
-  }
-  assert.equal(executionAdmission(outsiderIdentity, outsider, grant).allowed, true)
-  for (const change of [{ actorId: 999 }, { headSha: base }, { baseSha: head }, { treeSha: head }])
-    assert.throws(() => executionAdmission(outsiderIdentity, outsider, { ...grant, ...change }))
+  assert.equal(
+    executionAdmission(outsiderIdentity, outsider, {
+      ...currentFacts,
+      manual: true,
+      actorId: 31481964,
+    }).providerEnvironment,
+    'pact-provider-reviewed-ci',
+  )
+  const fork = { ...pr, head: { ...pr.head, repo: { id: 1 } } }
+  assert.equal(
+    executionAdmission({ ...identity, headRepositoryId: 1 }, fork, currentFacts)
+      .providerEnvironment,
+    'pact-provider-reviewed-ci',
+  )
   assert.throws(
     () =>
       executionAdmission(
         outsiderIdentity,
         { ...outsider, head: { ...outsider.head, sha: base } },
-        grant,
+        currentFacts,
       ),
     /exact current/,
   )
@@ -358,13 +391,13 @@ void test('automatic Release App execution admits only synchronized version-fiel
   const before = {
     'package.json': { name: 'pact', scripts: { test: 'vitest run' }, version: '0.1.0' },
     'apps/desktop/package.json': { name: 'desktop', version: '0.1.0' },
-    'version.json': { version: '0.1.0' },
+    'version.json': { version: '0.1.0', candidateVersion: '0.1.0' },
     '.release-please-manifest.json': { '.': '0.1.0' },
   }
   const after = {
     'package.json': { ...before['package.json'], version: '0.2.0' },
     'apps/desktop/package.json': { ...before['apps/desktop/package.json'], version: '0.2.0' },
-    'version.json': { version: '0.2.0' },
+    'version.json': { version: '0.2.0', candidateVersion: '0.2.0' },
     '.release-please-manifest.json': { '.': '0.2.0' },
   }
   assert.equal(verifyReleaseOnlyChanges(before, after), '0.2.0')
@@ -488,7 +521,7 @@ void test('a runtime artifact cannot replace the fixed-App receipt or another ru
     app: { id: 1234 },
     status: 'completed',
     conclusion: 'neutral',
-    head_sha: candidate,
+    head_sha: head,
     output: {
       summary: JSON.stringify({
         schemaVersion: 1,
@@ -501,7 +534,7 @@ void test('a runtime artifact cannot replace the fixed-App receipt or another ru
   verifyCandidateAttestation([check], identity, sourceRun, 1234)
   for (const changed of [
     { app: { id: 999 } },
-    { head_sha: head },
+    { head_sha: candidate },
     { status: 'in_progress' },
     { conclusion: 'success' },
     { external_id: 'pact-ci:101:1:candidate' },
@@ -513,31 +546,145 @@ void test('a runtime artifact cannot replace the fixed-App receipt or another ru
     () => verifyCandidateAttestation([check, check], identity, sourceRun, 1234),
     /unique/,
   )
+  for (const changed of [
+    { ...identity, pullRequest: 8 },
+    { ...identity, candidateSha: 'e'.repeat(40) },
+  ])
+    assert.throws(() => verifyCandidateAttestation([check], changed, sourceRun, 1234), /disagrees/)
   assert.throws(
-    () => verifyCandidateAttestation([check], { ...identity, pullRequest: 8 }, sourceRun, 1234),
-    /disagrees/,
+    () => verifyCandidateAttestation([check], identity, { ...sourceRun, run_attempt: 2 }, 1234),
+    /unique/,
   )
 })
 
-void test('Provider dispatch startup revokes prior success through the fixed App; obsolete attempts cannot write', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'pact-provider-start-'))
-  const originalFetch = globalThis.fetch
-  const providerRun = {
-    ...sourceRun,
-    id: 200,
-    workflow_id: 75,
-    event: 'workflow_dispatch',
-    head_branch: 'main',
-    path: '.github/workflows/provider-e2e.yml',
-    status: 'in_progress',
+await test('ordinary PRs require core and optional full regression cannot weaken Release PRs', () => {
+  assert.deepEqual(providerScopes({ ...identity, channel: 'dev' }), { suite: 'core', gate: 'core' })
+  assert.deepEqual(providerScopes({ ...identity, channel: 'dev' }, 'full'), {
+    suite: 'full',
+    gate: 'core',
+  })
+  assert.deepEqual(
+    providerScopes({ ...identity, channel: 'stable', product: releaseProduct }, 'core'),
+    {
+      suite: 'full',
+      gate: 'full',
+    },
+  )
+  assert.deepEqual(
+    providerScopes({ ...identity, channel: 'stable', product: releaseProduct }, 'full'),
+    {
+      suite: 'full',
+      gate: 'full',
+    },
+  )
+  assert.throws(() => providerScopes(identity, 'skip'), /core or full/)
+})
+
+await test('REST pull_request_target head is candidate head, distinct from the trusted base workflow source', () => {
+  validateSourceRun({ ...sourceRun, head_sha: identity.headSha, pull_requests: [] }, identity, 50)
+  assert.throws(() => validateSourceRun({ ...sourceRun, head_sha: identity.baseSha }, identity, 50))
+})
+
+await test('trusted base workflow provenance is a separate signed-job claim, not REST head metadata', () => {
+  const env = {
+    GITHUB_EVENT_NAME: 'pull_request_target',
+    GITHUB_REF: 'refs/heads/main',
+    GITHUB_SHA: base,
   }
-  const proof = {
-    name: 'pact-candidate-identity',
-    external_id: 'pact-ci:100:1:candidate',
+  requireTrustedWorkflowSource(identity, env)
+  for (const change of [
+    { GITHUB_EVENT_NAME: 'push' },
+    { GITHUB_REF: 'refs/heads/feature' },
+    { GITHUB_SHA: head },
+    { GITHUB_SHA: undefined },
+  ])
+    assert.throws(
+      () => requireTrustedWorkflowSource(identity, { ...env, ...change }),
+      /does not match/,
+    )
+})
+
+await test('one running root graph can admit completed prerequisites without a circular overall-success requirement', () => {
+  const run = { ...sourceRun, status: 'in_progress', conclusion: null }
+  const jobs = ciJobs.map((name, id) => ({
+    id: id + 1,
+    name,
+    status: 'completed',
+    conclusion: 'success',
+    run_id: run.id,
+    run_attempt: run.run_attempt,
+  }))
+  assert.equal(currentPrerequisitesPassed(jobs, run), true)
+  for (const state of ['failure', 'cancelled', 'skipped', 'neutral', null])
+    assert.equal(
+      currentPrerequisitesPassed([{ ...jobs[0], conclusion: state }, ...jobs.slice(1)], run),
+      false,
+    )
+  for (const changes of [
+    { run_attempt: 2 },
+    { run_id: 200 },
+    { run_attempt: undefined },
+    { status: 'queued' },
+  ])
+    assert.equal(
+      currentPrerequisitesPassed([{ ...jobs[0], ...changes }, ...jobs.slice(1)], run),
+      false,
+    )
+  assert.equal(currentPrerequisitesPassed(jobs.slice(1), run), false)
+  assert.equal(currentPrerequisitesPassed([...jobs, jobs[0]], run), false)
+  assert.equal(
+    currentPrerequisitesPassed(jobs, { ...run, status: 'completed', conclusion: 'cancelled' }),
+    false,
+  )
+})
+
+await test('completion requires unique current-attempt fixed-App successes for this PR on H', () => {
+  const checks = ['pact-ci', 'provider-e2e'].map((name, index) => ({
+    id: index + 1,
+    name,
     app: { id: 1234 },
+    head_sha: head,
+    status: 'completed',
+    conclusion: 'success',
+    external_id: `pact:7:${head}:${base}:100:1:${name}`,
+  }))
+  requirePublishedChecks(checks, identity, sourceRun, 1234)
+  for (const changes of [
+    { app: { id: 999 } },
+    { head_sha: candidate },
+    { conclusion: 'neutral' },
+    { conclusion: 'skipped' },
+    { conclusion: 'cancelled' },
+    { status: 'in_progress' },
+  ])
+    assert.throws(() =>
+      requirePublishedChecks([{ ...checks[0], ...changes }, checks[1]], identity, sourceRun, 1234),
+    )
+  assert.throws(() => requirePublishedChecks([checks[0]], identity, sourceRun, 1234))
+  assert.throws(() => requirePublishedChecks([...checks, checks[0]], identity, sourceRun, 1234))
+  assert.throws(() =>
+    requirePublishedChecks(checks, { ...identity, pullRequest: 8 }, sourceRun, 1234),
+  )
+  assert.throws(() =>
+    requirePublishedChecks(checks, identity, { ...sourceRun, run_attempt: 2 }, 1234),
+  )
+})
+
+await test('the trusted primary admission, writer and completion interfaces share the same root and attempt', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-single-graph-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const path = join(root, 'identity.json'),
+    outputs = join(root, 'outputs')
+  await writeFile(path, JSON.stringify(identity))
+  const run = { ...sourceRun, status: 'in_progress', conclusion: null }
+  const proof = {
+    id: 500,
+    name: 'pact-candidate-identity',
+    app: { id: 1234 },
+    head_sha: head,
+    external_id: 'pact-ci:100:1:candidate',
     status: 'completed',
     conclusion: 'neutral',
-    head_sha: candidate,
     output: {
       summary: JSON.stringify({
         schemaVersion: 1,
@@ -547,82 +694,95 @@ void test('Provider dispatch startup revokes prior success through the fixed App
       }),
     },
   }
-  const writes = []
-  let actualRun = providerRun,
-    newerRun
-  try {
-    const path = join(root, 'identity.json')
-    await writeFile(path, JSON.stringify(identity), { flag: 'wx', mode: 0o600 })
-    globalThis.fetch = async (url, options) => {
-      const endpoint = new URL(url).pathname.replace('/repos/mbaxszy7/Pact', '')
-      let response
-      if (options.method !== 'GET') {
-        writes.push({ endpoint, ...JSON.parse(options.body) })
-        response = { id: 550, app: { id: 1234 } }
-      } else if (endpoint === '/actions/runs/100') response = sourceRun
-      else if (endpoint === '/actions/runs/200') response = actualRun
-      else if (endpoint === '/actions/workflows/ci.yml') response = { id: 50 }
-      else if (endpoint === '/actions/workflows/provider-e2e.yml') response = { id: 75 }
-      else if (endpoint === '/actions/workflows/50/runs')
-        response = { total_count: 1, workflow_runs: [sourceRun] }
-      else if (endpoint === '/actions/workflows/75/runs')
-        response = {
-          total_count: newerRun ? 2 : 1,
-          workflow_runs: newerRun ? [actualRun, newerRun] : [actualRun],
-        }
-      else if (endpoint === '/pulls/7') response = pr
-      else if (endpoint === `/git/commits/${candidate}`) response = commit
-      else if (endpoint === '/git/ref/heads/main')
-        response = { ref: 'refs/heads/main', object: { type: 'commit', sha: base } }
-      else if (endpoint === `/commits/${candidate}/check-runs`)
-        response = { total_count: 1, check_runs: [{ id: 500, ...proof }] }
-      else if (endpoint === '/actions/runs/100/attempts/1/jobs')
-        response = { total_count: 0, jobs: [] }
-      else throw new Error(`Unexpected fixture endpoint: ${endpoint}`)
-      return new Response(JSON.stringify(response))
-    }
-    const args = ['provider-start', '--identity', path, '--run', '100']
-    const env = {
-      GH_TOKEN: 'nonfunctional-fixture',
-      PACT_CI_APP_ID: '1234',
-      GITHUB_RUN_ID: '200',
-      GITHUB_RUN_ATTEMPT: '1',
-    }
-    await main(args, env)
-    assert.equal(writes.length, 2)
-    assert.equal(writes[0].name, 'provider-e2e')
-    assert.equal(writes[0].head_sha, candidate)
-    assert.equal(writes[1].status, 'completed')
-    assert.equal(writes[1].conclusion, 'failure')
-    writes.length = 0
-    await assert.rejects(main(args, { ...env, GITHUB_RUN_ATTEMPT: '2' }), /exact current/)
-    assert.equal(writes.length, 0)
-    actualRun = { ...providerRun, path: '.github/workflows/other.yml' }
-    await assert.rejects(main(args, env), /exact current/)
-    assert.equal(writes.length, 0)
-    actualRun = providerRun
-    newerRun = { ...providerRun, id: 201, run_number: 11 }
-    await assert.rejects(main(args, env), /newer Provider run/)
-    assert.equal(writes.length, 0)
-  } finally {
-    globalThis.fetch = originalFetch
-    await rm(root, { recursive: true, force: true })
+  let jobs = [...ciJobs, ...providerJobs, 'check-writer'].map((name, index) => ({
+    id: index + 1,
+    name,
+    status: 'completed',
+    conclusion: 'success',
+    run_id: 100,
+    run_attempt: 1,
+  }))
+  const checks = [proof],
+    writes = [],
+    requests = []
+  const original = globalThis.fetch
+  context.after(() => {
+    globalThis.fetch = original
+  })
+  globalThis.fetch = async (url, options) => {
+    const endpoint = new URL(url).pathname.replace('/repos/mbaxszy7/Pact', '')
+    requests.push(endpoint)
+    let response
+    if (options.method === 'POST' && endpoint === '/check-runs') {
+      const body = JSON.parse(options.body)
+      response = { id: 501 + writes.length, app: { id: 1234 }, ...body }
+      checks.push(response)
+      writes.push(body)
+    } else if (options.method === 'PATCH') {
+      const check = checks.find((item) => endpoint === `/check-runs/${item.id}`)
+      assert.ok(check)
+      Object.assign(check, JSON.parse(options.body))
+      response = check
+    } else if (endpoint === '/actions/runs/100') response = run
+    else if (endpoint === '/actions/workflows/ci.yml') response = { id: 50 }
+    else if (endpoint === '/actions/workflows/50/runs')
+      response = { total_count: 1, workflow_runs: [run] }
+    else if (endpoint === '/pulls/7') response = pr
+    else if (endpoint === `/git/commits/${candidate}`) response = commit
+    else if (endpoint === `/git/commits/${base}`)
+      response = { sha: base, tree: { sha: 'f'.repeat(40) } }
+    else if (endpoint === '/git/ref/heads/main')
+      response = { ref: 'refs/heads/main', object: { type: 'commit', sha: base } }
+    else if (endpoint === `/commits/${head}/check-runs`)
+      response = { total_count: checks.length, check_runs: checks }
+    else if (endpoint === '/actions/runs/100/attempts/1/jobs')
+      response = { total_count: jobs.length, jobs }
+    else if (endpoint === '/users/mbaxszy7')
+      response = { id: 31481964, login: 'mbaxszy7', type: 'User' }
+    else if (endpoint.startsWith('/contents/'))
+      response = productFile(
+        endpoint.slice('/contents/'.length),
+        new URL(url).searchParams.get('ref'),
+        identity.product,
+      )
+    else throw new Error(`Unexpected fixed fixture endpoint: ${endpoint}`)
+    return new Response(JSON.stringify(response))
   }
-})
-
-await test('ordinary PRs require core and optional full regression cannot weaken Release PRs', () => {
-  assert.deepEqual(providerScopes({ ...identity, channel: 'dev' }), { suite: 'core', gate: 'core' })
-  assert.deepEqual(providerScopes({ ...identity, channel: 'dev' }, 'full'), {
-    suite: 'full',
-    gate: 'core',
-  })
-  assert.deepEqual(providerScopes({ ...identity, channel: 'stable' }, 'core'), {
-    suite: 'full',
-    gate: 'full',
-  })
-  assert.deepEqual(providerScopes({ ...identity, channel: 'stable' }, 'full'), {
-    suite: 'full',
-    gate: 'full',
-  })
-  assert.throws(() => providerScopes(identity, 'skip'), /core or full/)
+  const env = {
+    GH_TOKEN: 'nonfunctional-fixture',
+    PACT_CI_APP_ID: '1234',
+    GITHUB_EVENT_NAME: 'pull_request_target',
+    GITHUB_REF: 'refs/heads/main',
+    GITHUB_SHA: base,
+    GITHUB_RUN_ID: '100',
+    GITHUB_RUN_ATTEMPT: '1',
+    PACT_EXPECTED_CI_ATTEMPT: '1',
+    PACT_PROVIDER_SUITE: 'core',
+    PACT_PROVIDER_ALLOWED: 'true',
+    GITHUB_OUTPUT: outputs,
+  }
+  const args = (mode) => [mode, '--identity', path, '--run', '100']
+  await main(args('admit'), env)
+  assert.match(await readFile(outputs, 'utf8'), /provider_environment=pact-provider-ci/)
+  await main(args('preflight'), env)
+  await main(args('publish'), env)
+  await main(args('complete'), env)
+  assert.deepEqual(
+    writes.map((item) => item.name),
+    ['pact-ci', 'provider-e2e'],
+  )
+  assert(writes.every((item) => item.head_sha === head))
+  assert(requests.includes('/actions/runs/100/attempts/1/jobs'))
+  assert(!requests.some((item) => item.includes('provider-e2e.yml')))
+  jobs = jobs.map((item) =>
+    item.name === 'provider / provider-win32-arm64'
+      ? Object.assign({}, item, { conclusion: 'skipped' })
+      : item,
+  )
+  await assert.rejects(main(args('complete'), env), /Every mandatory job/)
+  await assert.rejects(main(args('admit'), { ...env, GITHUB_RUN_ID: '200' }), /one CI graph/)
+  await assert.rejects(
+    main(args('preflight'), { ...env, PACT_EXPECTED_CI_ATTEMPT: '2' }),
+    /obsolete attempt/,
+  )
 })

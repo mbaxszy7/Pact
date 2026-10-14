@@ -264,7 +264,7 @@ await test('a macOS-only case is required on macOS and explicitly non-applicable
 await test('validated identity extensions never enter published report JSON or Markdown', () => {
   const secret = 'synthetic-nonfunctional-private-identity-canary'
   const identity = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     repository: 'mbaxszy7/Pact',
     repositoryId: 1416403312,
     pullRequest: 7,
@@ -276,6 +276,13 @@ await test('validated identity extensions never enter published report JSON or M
     candidateSha: 'c'.repeat(40),
     treeSha: 'd'.repeat(40),
     policySha: 'b'.repeat(40),
+    sourceKind: 'main',
+    controllerSha: 'b'.repeat(40),
+    controllerRef: 'refs/heads/main',
+    product: {
+      before: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
+      after: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
+    },
     privateConfig: { token: secret },
     secret,
   }
@@ -291,7 +298,7 @@ await test('a branch identity does not export its unvalidated author field', () 
   const secret = 'synthetic-nonfunctional-private-branch-canary'
   const head = 'a'.repeat(40)
   const identity = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     repository: 'mbaxszy7/Pact',
     repositoryId: 1416403312,
     pullRequest: null,
@@ -303,6 +310,10 @@ await test('a branch identity does not export its unvalidated author field', () 
     candidateSha: head,
     treeSha: 'd'.repeat(40),
     policySha: head,
+    sourceKind: 'branch',
+    controllerSha: head,
+    controllerRef: null,
+    product: null,
   }
   const report = evaluateRealReport(fixture('core'), { identity })
   assert.equal(JSON.stringify(report).includes(secret), false)
@@ -355,6 +366,62 @@ await test('the reporting entry still lists all cases and fails when CI identity
     assert.equal(report.cases.length, 61)
     assert.equal(report.gatePassed, false)
     assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+await test('the actual CI reporting entry preserves a validated controller through both safe projections', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'pact-real-policy-current-identity-'))
+  const head = 'a'.repeat(40),
+    base = 'b'.repeat(40),
+    privateCanary = 'nonfunctional-private-report-extension'
+  const identity = {
+    schemaVersion: 3,
+    repository: 'mbaxszy7/Pact',
+    repositoryId: 1416403312,
+    pullRequest: 7,
+    headRepositoryId: 1416403312,
+    authorId: 31481964,
+    channel: 'dev',
+    headSha: head,
+    baseSha: base,
+    candidateSha: 'c'.repeat(40),
+    treeSha: 'd'.repeat(40),
+    policySha: base,
+    sourceKind: 'main',
+    controllerSha: base,
+    controllerRef: 'refs/heads/main',
+    product: {
+      before: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
+      after: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
+    },
+    privateConfig: { token: privateCanary },
+  }
+  try {
+    await writeFile(join(directory, 'real.json'), JSON.stringify(fixture('core')))
+    const identityPath = join(directory, 'identity.json')
+    await writeFile(identityPath, JSON.stringify(identity))
+    execFileSync(
+      process.execPath,
+      ['scripts/real-e2e-policy.mjs', 'core', 'core', directory, identityPath],
+      {
+        cwd: workspace,
+        env: {
+          ...process.env,
+          PACT_REAL_EXECUTION_COMPLETED: 'true',
+          PACT_CI_WORKSPACE: directory,
+          GITHUB_STEP_SUMMARY: '',
+        },
+        encoding: 'utf8',
+        timeout: 10_000,
+      },
+    )
+    const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
+    assert.equal(report.cases.length, 61)
+    assert.equal(report.gatePassed, true)
+    assert.equal(report.identity.controllerRef, identity.controllerRef)
+    assert.equal(JSON.stringify(report).includes(privateCanary), false)
   } finally {
     await rm(directory, { recursive: true, force: true })
   }

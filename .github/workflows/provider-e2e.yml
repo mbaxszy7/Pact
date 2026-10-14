@@ -1,95 +1,70 @@
 name: Trusted Provider E2E
 
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-  workflow_dispatch:
+  workflow_call:
     inputs:
+      controller:
+        description: Exact trusted root workflow source commit
+        required: true
+        type: string
+      source_kind:
+        description: Trusted main or explicitly frozen bootstrap controller source
+        required: true
+        type: string
       suite:
-        description: Core PR gate or full regression (Release PRs always require full)
-        type: choice
-        options: [core, full]
+        description: Core or full execution; Stable content always requires full
         default: core
+        type: string
+      root_run_id:
+        description: Root CI run containing this reusable workflow
         required: true
+        type: string
+      root_attempt:
+        description: Root CI attempt owning all prerequisite artifacts and jobs
+        required: true
+        type: string
+    outputs:
+      allowed:
+        value: ${{ jobs.admission.outputs.allowed }}
+      applicable:
+        value: ${{ jobs.admission.outputs.applicable }}
+      suite:
+        value: ${{ jobs.admission.outputs.suite }}
+      real_gate:
+        value: ${{ jobs.admission.outputs.real_gate }}
+      candidate:
+        value: ${{ jobs.admission.outputs.candidate }}
+      base:
+        value: ${{ jobs.admission.outputs.base }}
       ci_run:
-        description: Exact completed CI run ID
-        required: true
-        type: string
-      pull_request:
-        description: PR number receiving separate paid-execution authorization
-        required: true
-        type: string
-      head_sha:
-        description: Exact reviewed PR head SHA (40 hex characters)
-        required: true
-        type: string
-      base_sha:
-        description: Exact reviewed main base SHA (40 hex characters)
-        required: true
-        type: string
-      tree_sha:
-        description: Reviewed merged code tree SHA for this exact head and base (40 hex characters)
-        required: true
-        type: string
-      authorize_provider:
-        description: Authorize Claude/Codex execution of this head/base/code tree; this is separate from Approve PR
-        required: true
-        type: boolean
-        default: false
+        value: ${{ jobs.admission.outputs.ci_run }}
+      ci_attempt:
+        value: ${{ jobs.admission.outputs.ci_attempt }}
+      provider_environment:
+        value: ${{ jobs.admission.outputs.provider_environment }}
 
+# Model credentials are supplied only by the selected native environment.
+# No repository/App secrets are inherited by this reusable workflow.
 permissions:
   contents: read
   pull-requests: read
   actions: read
   checks: read
 
+env:
+  PACT_CI_BOOTSTRAP_REF: ${{ vars.PACT_CI_BOOTSTRAP_REF }}
+  PACT_CI_BOOTSTRAP_HEAD: ${{ vars.PACT_CI_BOOTSTRAP_HEAD }}
+  PACT_CI_BOOTSTRAP_BASE: ${{ vars.PACT_CI_BOOTSTRAP_BASE }}
+  PACT_CI_BOOTSTRAP_TREE: ${{ vars.PACT_CI_BOOTSTRAP_TREE }}
+  PACT_CI_BOOTSTRAP_PR: ${{ vars.PACT_CI_BOOTSTRAP_PR }}
+
 defaults:
   run:
     shell: bash
 
 jobs:
-  check-start:
-    if: github.ref == 'refs/heads/main' && github.repository_id == '1416403312'
-    environment: pact-control-plane
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version-file: .node-version
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: ci-identity
-          path: ${{ runner.temp }}/pact-identity
-          run-id: ${{ github.event.workflow_run.id || inputs.ci_run }}
-          github-token: ${{ github.token }}
-      - id: app
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
-        with:
-          app-id: ${{ secrets.PACT_CI_APP_ID }}
-          private-key: ${{ secrets.PACT_CI_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: Pact
-          permission-contents: read
-          permission-actions: read
-          permission-pull-requests: read
-          permission-checks: write
-      - name: Invalidate prior Provider success before admitting another execution
-        run: >-
-          node scripts/ci-control.mjs provider-start
-          --identity "$RUNNER_TEMP/pact-identity/ci-identity.json" --run "$CI_RUN"
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-          PACT_CI_APP_ID: ${{ secrets.PACT_CI_APP_ID }}
-          CI_RUN: ${{ github.event.workflow_run.id || inputs.ci_run }}
-
   admission:
-    if: github.ref == 'refs/heads/main' && github.repository_id == '1416403312'
+    if: github.repository_id == '1416403312' && ((inputs.source_kind == 'main' && github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (inputs.source_kind == 'bootstrap' && (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -97,39 +72,34 @@ jobs:
       allowed: ${{ steps.admit.outputs.allowed }}
       candidate: ${{ steps.admit.outputs.candidate }}
       base: ${{ steps.admit.outputs.base }}
-      pull_request: ${{ steps.admit.outputs.pull_request }}
       ci_run: ${{ steps.admit.outputs.ci_run }}
       ci_attempt: ${{ steps.admit.outputs.ci_attempt }}
       suite: ${{ steps.admit.outputs.suite }}
       real_gate: ${{ steps.admit.outputs.real_gate }}
+      provider_environment: ${{ steps.admit.outputs.provider_environment }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.controller }}
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: .node-version
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ci-identity
+          name: ci-identity-a${{ inputs.root_attempt }}
           path: ${{ runner.temp }}/pact-identity
-          run-id: ${{ github.event.workflow_run.id || inputs.ci_run }}
+          run-id: ${{ inputs.root_run_id }}
           github-token: ${{ github.token }}
       - id: admit
-        name: Admit API-proven trusted source or explicit exact owner execution authorization
+        name: Validate current root prerequisites and select owner-controlled model environment
         run: >-
           node scripts/ci-control.mjs admit
           --identity "$RUNNER_TEMP/pact-identity/ci-identity.json" --run "$CI_RUN"
         env:
           GH_TOKEN: ${{ github.token }}
-          CI_RUN: ${{ github.event.workflow_run.id || inputs.ci_run }}
-          PACT_PROVIDER_MANUAL: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
-          PACT_PROVIDER_PR_NUMBER: ${{ inputs.pull_request }}
-          PACT_PROVIDER_AUTHORIZE: ${{ inputs.authorize_provider && 'true' || 'false' }}
-          PACT_PROVIDER_HEAD_SHA: ${{ inputs.head_sha }}
-          PACT_PROVIDER_BASE_SHA: ${{ inputs.base_sha }}
-          PACT_PROVIDER_TREE_SHA: ${{ inputs.tree_sha }}
+          CI_RUN: ${{ inputs.root_run_id }}
+          PACT_EXPECTED_CI_ATTEMPT: ${{ inputs.root_attempt }}
           PACT_PROVIDER_SUITE: ${{ inputs.suite }}
           PACT_RELEASE_APP_BOT_ID: ${{ vars.PACT_RELEASE_APP_BOT_ID }}
           PACT_RELEASE_APP_SLUG: ${{ vars.PACT_RELEASE_APP_SLUG }}
@@ -137,9 +107,9 @@ jobs:
 
   provider:
     name: provider-${{ matrix.key }}
-    needs: [admission, check-start]
+    needs: admission
     if: needs.admission.outputs.applicable == 'true' && needs.admission.outputs.allowed == 'true'
-    environment: pact-provider-ci
+    environment: ${{ needs.admission.outputs.provider_environment }}
     strategy:
       fail-fast: false
       matrix:
@@ -158,16 +128,13 @@ jobs:
             key: win32-arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
-    concurrency:
-      group: pact-provider-pr-${{ needs.admission.outputs.pull_request }}-${{ matrix.key }}
-      cancel-in-progress: true
     steps:
       # This initial preflight is trusted before candidate execution. After setup,
       # this entire runner is a candidate executor; its local controller is mutable.
-      # App authorization and final checks remain in separate trusted jobs.
+      # App check publication stays in the root workflow's clean trusted job.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.admission.outputs.base }}
+          ref: ${{ inputs.controller }}
           path: control
           persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -183,9 +150,9 @@ jobs:
           display: 'true'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ci-identity
+          name: ci-identity-a${{ inputs.root_attempt }}
           path: ${{ runner.temp }}/pact-identity
-          run-id: ${{ needs.admission.outputs.ci_run || github.event.workflow_run.id || inputs.ci_run }}
+          run-id: ${{ inputs.root_run_id }}
           github-token: ${{ github.token }}
       - name: Trusted preflight before any candidate dependency, hook, or test can execute
         run: |
@@ -202,8 +169,8 @@ jobs:
           --identity "$RUNNER_TEMP/pact-identity/ci-identity.json" --run "$CI_RUN"
         env:
           GH_TOKEN: ${{ github.token }}
-          CI_RUN: ${{ needs.admission.outputs.ci_run }}
-          PACT_EXPECTED_CI_ATTEMPT: ${{ needs.admission.outputs.ci_attempt }}
+          CI_RUN: ${{ inputs.root_run_id }}
+          PACT_EXPECTED_CI_ATTEMPT: ${{ inputs.root_attempt }}
           PACT_CI_APP_ID: ${{ vars.PACT_CI_APP_ID }}
       - name: Validate mandatory isolated model configuration with the still-trusted controller
         run: node control/scripts/ci.mjs validate-provider
@@ -242,13 +209,13 @@ jobs:
           PLATFORM_KEY: ${{ matrix.key }}
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
           PACT_REAL_EXECUTION_COMPLETED: ${{ steps.execute.outputs.real_execution_completed }}
-          PACT_REAL_REPORT_ARTIFACT: provider-report-${{ matrix.key }}
+          PACT_REAL_REPORT_ARTIFACT: provider-report-${{ matrix.key }}-a${{ inputs.root_attempt }}
       - name: Fetch this exact CI run's matching platform UI and deterministic execution evidence
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: e2e-${{ matrix.key }}
+          name: e2e-${{ matrix.key }}-a${{ inputs.root_attempt }}
           path: ${{ runner.temp }}/pact-evidence/${{ matrix.key }}
-          run-id: ${{ needs.admission.outputs.ci_run || github.event.workflow_run.id || inputs.ci_run }}
+          run-id: ${{ inputs.root_run_id }}
           github-token: ${{ github.token }}
       - name: Require unchanged assertion obligations and every currently mandatory execution result
         run: >-
@@ -265,7 +232,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: provider-report-${{ matrix.key }}
+          name: provider-report-${{ matrix.key }}-a${{ inputs.root_attempt }}
           path: |
             ${{ runner.temp }}/pact-evidence/${{ matrix.key }}/real-summary.json
             ${{ runner.temp }}/pact-evidence/${{ matrix.key }}/real-summary.md
@@ -283,50 +250,3 @@ jobs:
           '
         env:
           PLATFORM_KEY: ${{ matrix.key }}
-
-  check-writer:
-    needs: [check-start, admission, provider]
-    if: always() && github.ref == 'refs/heads/main'
-    environment: pact-control-plane
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    concurrency:
-      group: pact-check-writer-pr-${{ needs.admission.outputs.pull_request || github.event.workflow_run.id || inputs.ci_run }}
-      cancel-in-progress: false
-      queue: max
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version-file: .node-version
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: ci-identity
-          path: ${{ runner.temp }}/pact-identity
-          run-id: ${{ needs.admission.outputs.ci_run || github.event.workflow_run.id || inputs.ci_run }}
-          github-token: ${{ github.token }}
-      - id: app
-        name: Mint a fixed repository-scoped read-PR/read-Actions/write-Checks token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
-        with:
-          app-id: ${{ secrets.PACT_CI_APP_ID }}
-          private-key: ${{ secrets.PACT_CI_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: Pact
-          permission-contents: read
-          permission-actions: read
-          permission-pull-requests: read
-          permission-checks: write
-      - name: Publish fixed-App checks only for current, complete candidate evidence
-        run: >-
-          node scripts/ci-control.mjs publish
-          --identity "$RUNNER_TEMP/pact-identity/ci-identity.json"
-          --run "$CI_RUN" --provider-run "$GITHUB_RUN_ID"
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-          PACT_CI_APP_ID: ${{ secrets.PACT_CI_APP_ID }}
-          PACT_PROVIDER_ALLOWED: ${{ needs.admission.outputs.allowed }}
-          CI_RUN: ${{ needs.admission.outputs.ci_run || github.event.workflow_run.id || inputs.ci_run }}

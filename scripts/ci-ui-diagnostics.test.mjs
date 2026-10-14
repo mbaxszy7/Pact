@@ -167,7 +167,7 @@ const reportFixture = (lane = 'ui') => ({
   errors: [],
 })
 const reportIdentity = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   repository: 'mbaxszy7/Pact',
   repositoryId: 1416403312,
   pullRequest: 3,
@@ -179,6 +179,13 @@ const reportIdentity = {
   candidateSha: 'c'.repeat(40),
   treeSha: 'd'.repeat(40),
   policySha: 'b'.repeat(40),
+  sourceKind: 'main',
+  controllerSha: 'b'.repeat(40),
+  controllerRef: 'refs/heads/main',
+  product: {
+    before: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
+    after: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
+  },
 }
 const reportOptions = {
   lane: 'ui',
@@ -296,4 +303,84 @@ await test('both native lane reports persist even when the second lane did not s
       true,
     )
   }
+})
+
+await test('release summaries keep signed identity private and list skipped lanes in distinct release artifacts', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-release-ui-reports-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const evidence = join(root, 'evidence'),
+    identityPath = join(root, 'identity.json'),
+    inventoryPath = join(root, 'inventory.json'),
+    summary = join(root, 'summary.md'),
+    secret = 'synthetic-private-signed-release-state'
+  const identity = {
+    schemaVersion: 1,
+    repository: 'mbaxszy7/Pact',
+    releasePR: 14,
+    version: '0.1.0',
+    sourceSha: 'a'.repeat(40),
+    tag: 'v0.1.0',
+    releaseId: 1234,
+    signature: secret,
+    staging: { key: secret },
+    extensions: secret,
+  }
+  await mkdir(evidence)
+  await writeFile(identityPath, JSON.stringify(identity))
+  await writeFile(
+    inventoryPath,
+    JSON.stringify({
+      suites: [...reportFixture('ui').suites, ...reportFixture('deterministic').suites],
+    }),
+  )
+  await writeFile(join(evidence, 'ui.json'), JSON.stringify(reportFixture()))
+  const reports = await writeUiReports({
+    evidence,
+    workspace: root,
+    identityPath,
+    inventoryPath,
+    summary,
+    execution: { ui: 'completed' },
+    platform: 'darwin',
+    architecture: 'arm64',
+    identityKind: 'release',
+    runAttempt: 2,
+  })
+  assert.equal(reports[0].report.identityKind, 'release')
+  assert.equal(reports[0].report.identity.releaseId, 1234)
+  assert.equal(reports[1].report.cases[0].status, 'not-run')
+  assert.equal(reports[0].report.reportFiles.artifactName, 'release-e2e-darwin-arm64-a2')
+  assert.equal(reports[0].report.diagnosticArtifact, 'release-ui-diagnostics-darwin-arm64-a2')
+  const text = await readFile(summary, 'utf8')
+  assert(text.includes('Release PR: #14'))
+  assert(text.includes('v0.1.0'))
+  assert(text.includes('Release ID: 1234'))
+  assert(text.includes('does not replace signed release-state'))
+  assert.equal(text.includes('PR: undefined'), false)
+  assert.equal(text.includes(secret) || JSON.stringify(reports).includes(secret), false)
+  assert.equal(Object.hasOwn(reports[0].report.identity, 'candidateSha'), false)
+  const invalid = evaluateUiReport(null, {
+    ...reportOptions,
+    identityKind: 'release',
+    identity: { ...identity, releaseId: null },
+  })
+  assert(invalid.issues.includes('missing-or-invalid-release-identity'))
+  assert.equal(invalid.identity, null)
+})
+
+await test('trusted controller discovery and tested source use distinct absolute roots without losing case identities', () => {
+  const inventory = reportFixture(),
+    raw = reportFixture(),
+    local = inventory.suites[0].specs[0].file
+  inventory.suites[0].specs[0].file = `/workspace/control/tests/e2e/${local}`
+  raw.suites[0].specs[0].file = `/workspace/source/tests/e2e/${local}`
+  const report = evaluateUiReport(raw, {
+    ...reportOptions,
+    inventory,
+    workspace: '/workspace/source',
+    inventoryWorkspace: '/workspace/control',
+  })
+  assert.equal(report.cases[0].status, 'passed')
+  assert.equal(report.issues.includes('missing-or-invalid-discovery-inventory'), false)
+  assert.equal(report.issues.includes('case-absent-from-discovery-inventory'), false)
 })

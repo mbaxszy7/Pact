@@ -857,7 +857,7 @@ async function localCodeIdentity() {
     if (await git(['status', '--porcelain'])) return null
     const headSha = await git(['rev-parse', 'HEAD'])
     return {
-      schemaVersion: 2,
+      schemaVersion: 3,
       repository,
       repositoryId,
       pullRequest: null,
@@ -867,6 +867,10 @@ async function localCodeIdentity() {
       baseSha: null,
       treeSha: await git(['rev-parse', `${headSha}^{tree}`]),
       policySha: headSha,
+      sourceKind: 'branch',
+      controllerSha: headSha,
+      controllerRef: null,
+      product: null,
       channel: 'dev',
     }
   } catch {

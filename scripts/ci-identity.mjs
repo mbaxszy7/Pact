@@ -9,6 +9,64 @@ export const repository = 'mbaxszy7/Pact'
 export const repositoryId = 1416403312
 export const ownerId = 31481964
 const shaPattern = /^[a-f\d]{40}$/u
+const initialCandidate = '0.1.0-unreleased'
+const productVersionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
+
+function productMetadata(value) {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    typeof value.version !== 'string' ||
+    value.version.length > 64 ||
+    !productVersionPattern.test(value.version) ||
+    (value.candidateVersion !== value.version &&
+      !(value.version === '0.1.0' && value.candidateVersion === initialCandidate))
+  )
+    throw new Error('Product version and candidate intent are missing, invalid or unsynchronized')
+  return { version: value.version, candidateVersion: value.candidateVersion }
+}
+
+function compareProductVersions(left, right) {
+  const a = left.split('.').map(BigInt),
+    b = right.split('.').map(BigInt)
+  for (let index = 0; index < 3; index++) {
+    if (a[index] > b[index]) return 1
+    if (a[index] < b[index]) return -1
+  }
+  return 0
+}
+
+/** One content policy is shared by CI, the PR generator and formal publication. */
+export function classifyProductTransition(before, after, { allowInitialization = false } = {}) {
+  const next = productMetadata(after)
+  if (before === null) {
+    if (
+      !allowInitialization ||
+      next.version !== '0.1.0' ||
+      next.candidateVersion !== initialCandidate
+    )
+      throw new Error('Product initialization requires the explicitly trusted bootstrap source')
+    return { kind: 'initialization', channel: 'dev', version: next.version }
+  }
+  const prior = productMetadata(before)
+  if (prior.version === next.version && prior.candidateVersion === next.candidateVersion)
+    return { kind: 'development', channel: 'dev', version: next.version }
+  if (
+    next.candidateVersion === initialCandidate ||
+    next.candidateVersion === prior.candidateVersion
+  )
+    throw new Error(
+      'Release intent must advance with its version; restoration and unchanged intent are blocked',
+    )
+  if (prior.candidateVersion === initialCandidate) {
+    if (next.version !== '0.1.0') throw new Error('The initial release must be exactly 0.1.0')
+  } else if (compareProductVersions(next.version, prior.version) <= 0) {
+    throw new Error(
+      'Release version must strictly increase; same-version and rollback candidates are blocked',
+    )
+  }
+  return { kind: 'release', channel: 'stable', version: next.version }
+}
 export function requireSha(value) {
   if (typeof value !== 'string' || !shaPattern.test(value))
     throw new Error('Invalid commit identity')
@@ -41,7 +99,7 @@ export function candidateIdentity(pr, commit, mainSha) {
   )
     throw new Error('Merge candidate does not have the exact current base and head parents')
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     repository,
     repositoryId,
     pullRequest: pr.number,
@@ -51,6 +109,9 @@ export function candidateIdentity(pr, commit, mainSha) {
     candidateSha,
     treeSha: requireSha(commit.tree?.sha),
     policySha: baseSha,
+    sourceKind: 'main',
+    controllerSha: baseSha,
+    controllerRef: 'refs/heads/main',
     authorId: pr.user.id,
   }
 }
@@ -66,7 +127,6 @@ export function requireCurrent(identity, pr, commit, mainSha) {
       'headSha',
       'baseSha',
       'treeSha',
-      'policySha',
       'authorId',
     ].some((key) => current[key] !== identity[key])
   )
@@ -89,6 +149,56 @@ export async function readCurrent(identity, request = api) {
   if (mainRef.ref !== 'refs/heads/main' || mainRef.object?.type !== 'commit')
     throw new Error('Current main identity is unresolved')
   const current = requireCurrent(identity, pr, commit, mainRef.object.sha)
+  const baseCommit = await request(`/repos/${repository}/git/commits/${identity.baseSha}`)
+  if (baseCommit.sha !== identity.baseSha || requireSha(baseCommit.tree?.sha) === commit.tree.sha)
+    throw new Error('Candidate has no actual change to the current protected main tree')
+  const [owner, ownership] = await Promise.all([
+    request('/users/mbaxszy7'),
+    request(`/repos/${repository}/contents/.github/CODEOWNERS?ref=${commit.sha}`),
+  ])
+  if (
+    owner.id !== ownerId ||
+    owner.login !== 'mbaxszy7' ||
+    owner.type !== 'User' ||
+    ownership.type !== 'file' ||
+    ownership.encoding !== 'base64' ||
+    !Number.isSafeInteger(ownership.size) ||
+    ownership.size < 1 ||
+    ownership.size > 4096
+  )
+    throw new Error('The stable owner or candidate CODEOWNERS policy is invalid')
+  const ownerBytes = Buffer.from(ownership.content, 'base64')
+  if (
+    ownerBytes.length !== ownership.size ||
+    !Buffer.from(ownerBytes.toString('utf8')).equals(ownerBytes)
+  )
+    throw new Error('CODEOWNERS policy bytes are invalid')
+  const declarations = ownerBytes
+    .toString('utf8')
+    .split(/\r?\n/u)
+    .map((line) => line.split('#')[0].trim())
+    .filter(Boolean)
+  if (declarations.length !== 1 || !/^\*\s+@mbaxszy7$/u.test(declarations[0]))
+    throw new Error('Candidate must preserve the sole stable owner for every path')
+  const [before, after] = await Promise.all([
+    readProductMetadataAt(identity.baseSha, request, {
+      allowMissing: identity.sourceKind === 'bootstrap',
+    }),
+    readProductMetadataAt(commit.sha, request),
+  ])
+  if (JSON.stringify({ before, after }) !== JSON.stringify(identity.product))
+    throw new Error('Current merged product intent differs from its tested content')
+  if (identity.sourceKind === 'bootstrap') {
+    const ref = await request(
+      `/repos/${repository}/git/ref/${identity.controllerRef.slice('refs/'.length)}`,
+    )
+    if (
+      ref.ref !== identity.controllerRef ||
+      ref.object?.type !== 'commit' ||
+      ref.object.sha !== identity.controllerSha
+    )
+      throw new Error('Frozen bootstrap controller identity changed')
+  }
   return { pr, current, commit, mainSha: mainRef.object.sha }
 }
 
@@ -99,7 +209,7 @@ export async function readPullRequest(number, token = process.env.GITHUB_TOKEN) 
 
 export function requireIdentity(identity) {
   if (
-    identity.schemaVersion !== 2 ||
+    identity.schemaVersion !== 3 ||
     identity.repository !== repository ||
     identity.repositoryId !== repositoryId ||
     !['dev', 'stable'].includes(identity.channel)
@@ -109,6 +219,9 @@ export function requireIdentity(identity) {
   requireSha(identity.candidateSha)
   requireSha(identity.treeSha)
   requireSha(identity.policySha)
+  requireSha(identity.controllerSha)
+  if (identity.policySha !== identity.controllerSha)
+    throw new Error('Controller policy identity is invalid')
   if (identity.pullRequest !== null) {
     requireSha(identity.baseSha)
     if (
@@ -118,25 +231,98 @@ export function requireIdentity(identity) {
       identity.authorId < 1 ||
       !Number.isSafeInteger(identity.headRepositoryId) ||
       identity.headRepositoryId < 1 ||
-      identity.policySha !== identity.baseSha
+      !['main', 'bootstrap'].includes(identity.sourceKind)
     )
       throw new Error('Invalid CI PR identity')
+    if (
+      identity.sourceKind === 'main' &&
+      (identity.controllerSha !== identity.baseSha || identity.controllerRef !== 'refs/heads/main')
+    )
+      throw new Error('Invalid trusted main controller identity')
+    if (
+      identity.sourceKind === 'bootstrap' &&
+      (identity.controllerSha !== identity.headSha ||
+        identity.controllerRef !==
+          `refs/heads/codex/pact-ci-bootstrap-${identity.headSha.slice(0, 12)}`)
+    )
+      throw new Error('Invalid frozen bootstrap controller identity')
+    const classification = classifyProductTransition(
+      identity.product?.before,
+      identity.product?.after,
+      { allowInitialization: identity.sourceKind === 'bootstrap' },
+    )
+    if (classification.channel !== identity.channel)
+      throw new Error('CI channel disagrees with immutable product content')
   } else if (
     identity.baseSha !== null ||
     identity.headRepositoryId !== repositoryId ||
     identity.headSha !== identity.candidateSha ||
     identity.policySha !== identity.headSha ||
-    identity.channel !== 'dev'
+    identity.channel !== 'dev' ||
+    identity.sourceKind !== 'branch' ||
+    identity.controllerRef !== null ||
+    identity.product !== null
   )
     throw new Error('Invalid branch-push identity')
   return identity
+}
+
+/** Read bounded immutable product inputs, independently of PR author, labels or ref names. */
+export async function readProductMetadataAt(sha, request = api, { allowMissing = false } = {}) {
+  requireSha(sha)
+  const read = async (path) => {
+    const file = await request(`/repos/${repository}/contents/${path}?ref=${sha}`)
+    if (
+      file.type !== 'file' ||
+      file.encoding !== 'base64' ||
+      !Number.isSafeInteger(file.size) ||
+      file.size < 1 ||
+      file.size > 64 * 1024
+    )
+      throw new Error('Product metadata must be a bounded immutable JSON file')
+    const bytes = Buffer.from(file.content, 'base64')
+    if (bytes.length !== file.size || !Buffer.from(bytes.toString('utf8')).equals(bytes))
+      throw new Error('Product metadata bytes are incomplete or invalid')
+    return JSON.parse(bytes.toString('utf8'))
+  }
+  let version
+  try {
+    version = await read('version.json')
+  } catch (error) {
+    if (allowMissing && error.status === 404) return null
+    throw error
+  }
+  const product = productMetadata(version)
+  const files = await Promise.all(
+    ['package.json', 'apps/desktop/package.json', '.release-please-manifest.json'].map(read),
+  )
+  if (files.some((file, index) => (index === 2 ? file['.'] : file.version) !== product.version))
+    throw new Error('Product, desktop and Release Please versions are not synchronized')
+  return product
+}
+
+export function requireBootstrapSource(env, identity) {
+  if (identity.sourceKind !== 'bootstrap') throw new Error('Bootstrap identity is required')
+  if (
+    env.GITHUB_REPOSITORY !== repository ||
+    env.GITHUB_REPOSITORY_ID !== String(repositoryId) ||
+    env.GITHUB_EVENT_NAME !== 'push' ||
+    env.GITHUB_REF !== identity.controllerRef ||
+    env.GITHUB_SHA !== identity.controllerSha ||
+    env.PACT_CI_BOOTSTRAP_REF !== identity.controllerRef ||
+    env.PACT_CI_BOOTSTRAP_HEAD !== identity.headSha ||
+    env.PACT_CI_BOOTSTRAP_BASE !== identity.baseSha ||
+    env.PACT_CI_BOOTSTRAP_TREE !== identity.treeSha ||
+    Number(env.PACT_CI_BOOTSTRAP_PR) !== identity.pullRequest
+  )
+    throw new Error('This is not the explicitly reviewed frozen bootstrap source')
 }
 
 async function publishOutputs(identity) {
   if (process.env.GITHUB_OUTPUT)
     await appendFile(
       process.env.GITHUB_OUTPUT,
-      `candidate=${identity.candidateSha}\nhead=${identity.headSha}\nbase=${identity.baseSha ?? ''}\ntree=${identity.treeSha}\npolicy=${identity.policySha}\nchannel=${identity.channel}\npull_request=${identity.pullRequest ?? ''}\n`,
+      `candidate=${identity.candidateSha}\nhead=${identity.headSha}\nbase=${identity.baseSha ?? ''}\ntree=${identity.treeSha}\npolicy=${identity.policySha}\nchannel=${identity.channel}\npull_request=${identity.pullRequest ?? ''}\ncontroller=${identity.controllerSha}\nsource_kind=${identity.sourceKind}\n`,
     )
   if (process.env.GITHUB_STEP_SUMMARY)
     await appendFile(
@@ -155,7 +341,10 @@ async function api(path, token = process.env.GITHUB_TOKEN) {
     signal: AbortSignal.timeout(10_000),
     redirect: 'error',
   })
-  if (!response.ok) throw new Error(`CI identity API failed (${response.status})`)
+  if (!response.ok)
+    throw Object.assign(new Error(`CI identity API failed (${response.status})`), {
+      status: response.status,
+    })
   let size = 0
   const chunks = []
   for await (const chunk of response.body) {
@@ -199,7 +388,10 @@ export async function main() {
       if (mainRef.ref !== 'refs/heads/main' || mainRef.object?.type !== 'commit')
         throw new Error('Current main identity is unresolved')
       if (mode === 'capture-api') {
-        if (pr.base.sha !== process.env.PACT_CI_CONTROL_SHA)
+        if (
+          process.env.GITHUB_EVENT_NAME !== 'push' &&
+          pr.base.sha !== process.env.PACT_CI_CONTROL_SHA
+        )
           throw new Error('Trusted base changed; rerun CI from its current identity')
       } else if (
         revision.length !== 4 ||
@@ -211,22 +403,23 @@ export async function main() {
         throw new Error('Workspace does not contain the actual tested merge content')
       }
       identity = { ...candidateIdentity(pr, merge, mainRef.object.sha), channel: 'dev' }
-      if (pr.head.ref === 'release-please--branches--main') {
-        const botId = Number(process.env.PACT_RELEASE_APP_BOT_ID)
-        const slug = process.env.PACT_RELEASE_APP_SLUG
-        if (!Number.isSafeInteger(botId) || botId < 1 || !/^[a-z0-9-]+$/u.test(slug ?? ''))
-          throw new Error('A Release candidate requires a verified dedicated App identity')
-        const bot = await api(`/users/${encodeURIComponent(`${slug}[bot]`)}`)
-        if (
-          bot.id !== botId ||
-          bot.type !== 'Bot' ||
-          pr.user.id !== botId ||
-          pr.user.type !== 'Bot' ||
-          pr.head.repo?.id !== repositoryId
-        )
-          throw new Error('Release candidate author or repository is not the dedicated App')
-        identity.channel = 'stable'
+      if (process.env.GITHUB_EVENT_NAME === 'push') {
+        identity.sourceKind = 'bootstrap'
+        identity.controllerSha = identity.headSha
+        identity.policySha = identity.headSha
+        identity.controllerRef = process.env.GITHUB_REF
+        requireBootstrapSource(process.env, identity)
       }
+      const [before, after] = await Promise.all([
+        readProductMetadataAt(identity.baseSha, api, {
+          allowMissing: identity.sourceKind === 'bootstrap',
+        }),
+        readProductMetadataAt(identity.candidateSha, api),
+      ])
+      identity.product = { before, after }
+      identity.channel = classifyProductTransition(before, after, {
+        allowInitialization: identity.sourceKind === 'bootstrap',
+      }).channel
     } else {
       const candidateSha =
         mode === 'capture-api' ? requireSha(process.env.PACT_CI_PUSH_SHA) : requireSha(revision[0])
@@ -235,7 +428,7 @@ export async function main() {
           ? requireSha((await api(`/repos/${repository}/git/commits/${candidateSha}`)).tree?.sha)
           : requireSha(revision[1])
       identity = {
-        schemaVersion: 2,
+        schemaVersion: 3,
         repository,
         repositoryId,
         headRepositoryId: repositoryId,
@@ -245,6 +438,10 @@ export async function main() {
         candidateSha,
         treeSha,
         policySha: candidateSha,
+        sourceKind: 'branch',
+        controllerSha: candidateSha,
+        controllerRef: null,
+        product: null,
         channel: 'dev',
       }
     }

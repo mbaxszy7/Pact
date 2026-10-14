@@ -5,7 +5,7 @@ on:
     branches: ['**']
   pull_request_target:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review, edited]
+    types: [opened, synchronize, reopened, ready_for_review, edited, labeled, unlabeled]
   workflow_dispatch:
     inputs:
       run_soak:
@@ -14,14 +14,25 @@ on:
         default: false
         required: true
 
-# The base workflow alone controls PR jobs. Candidate execution has read-only
-# permissions and no environment, App, or provider credentials.
+# The authenticated controller source controls PR jobs. Frozen bootstrap execution
+# stays disabled until its public identity tuple and separate environments are set.
+# Uncredentialed jobs are read-only; model credentials and the App identity remain
+# in separate admitted jobs and named environments.
 permissions:
   contents: read
   pull-requests: read
+  actions: read
+  checks: read
+
+env:
+  PACT_CI_BOOTSTRAP_REF: ${{ vars.PACT_CI_BOOTSTRAP_REF }}
+  PACT_CI_BOOTSTRAP_HEAD: ${{ vars.PACT_CI_BOOTSTRAP_HEAD }}
+  PACT_CI_BOOTSTRAP_BASE: ${{ vars.PACT_CI_BOOTSTRAP_BASE }}
+  PACT_CI_BOOTSTRAP_TREE: ${{ vars.PACT_CI_BOOTSTRAP_TREE }}
+  PACT_CI_BOOTSTRAP_PR: ${{ vars.PACT_CI_BOOTSTRAP_PR }}
 
 concurrency:
-  group: pact-ci-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('branch-{0}', github.ref) }}
+  group: pact-ci-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '') && format('pr-{0}', vars.PACT_CI_BOOTSTRAP_PR) || format('branch-{0}', github.ref) }}
   cancel-in-progress: true
 
 defaults:
@@ -30,6 +41,7 @@ defaults:
 
 jobs:
   identity:
+    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'identity' || 'branch-identity' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -39,7 +51,9 @@ jobs:
       tree: ${{ steps.identity.outputs.tree }}
       policy: ${{ steps.identity.outputs.policy }}
       channel: ${{ steps.identity.outputs.channel }}
-      controller: ${{ github.event.pull_request.base.sha || github.sha }}
+      controller: ${{ steps.identity.outputs.controller }}
+      source_kind: ${{ steps.identity.outputs.source_kind }}
+      pull_request: ${{ steps.identity.outputs.pull_request }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -53,19 +67,20 @@ jobs:
         run: node scripts/ci-identity.mjs capture-api "$RUNNER_TEMP/ci-identity.json"
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          PACT_CI_PR_NUMBER: ${{ github.event.pull_request.number }}
+          PACT_CI_PR_NUMBER: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '') && vars.PACT_CI_BOOTSTRAP_PR || '' }}
           PACT_CI_CONTROL_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
           PACT_CI_PUSH_SHA: ${{ github.sha }}
           PACT_RELEASE_APP_BOT_ID: ${{ vars.PACT_RELEASE_APP_BOT_ID }}
           PACT_RELEASE_APP_SLUG: ${{ vars.PACT_RELEASE_APP_SLUG }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ci-identity
+          name: ci-identity-a${{ github.run_attempt }}
           path: ${{ runner.temp }}/ci-identity.json
           if-no-files-found: error
           retention-days: 14
 
   publication:
+    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'publication' || 'branch-publication' }}
     needs: identity
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -102,13 +117,15 @@ jobs:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
 
   candidate-attestation:
+    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'candidate-attestation' || 'branch-candidate-attestation' }}
     needs: identity
-    if: github.event_name == 'pull_request_target'
-    environment: pact-control-plane
+    if: github.repository_id == '1416403312' && ((github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != ''))
+    environment: ${{ github.event_name == 'pull_request_target' && 'pact-control-plane' || 'pact-bootstrap-control-plane' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      # No candidate files or candidate dependencies enter this privileged job.
+      # Only the authenticated controller source enters this job; no merge
+      # candidate dependencies or model configuration are installed.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.identity.outputs.controller }}
@@ -118,7 +135,7 @@ jobs:
           node-version-file: .node-version
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ci-identity
+          name: ci-identity-a${{ github.run_attempt }}
           path: ${{ runner.temp }}/pact-identity
       - id: app
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
@@ -138,7 +155,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           PACT_CI_APP_ID: ${{ secrets.PACT_CI_APP_ID }}
-          PACT_CI_PR_NUMBER: ${{ github.event.pull_request.number }}
+          PACT_CI_PR_NUMBER: ${{ needs.identity.outputs.pull_request }}
           PACT_CI_HEAD_SHA: ${{ needs.identity.outputs.head }}
           PACT_CI_BASE_SHA: ${{ needs.identity.outputs.base }}
           PACT_CI_CANDIDATE_SHA: ${{ needs.identity.outputs.candidate }}
@@ -147,6 +164,7 @@ jobs:
           PACT_CI_CHANNEL: ${{ needs.identity.outputs.channel }}
 
   quality:
+    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'quality' || 'branch-quality' }}
     needs: [identity, publication]
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -179,7 +197,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: quality-process-evidence
+          name: quality-process-evidence-a${{ github.run_attempt }}
           path: ${{ runner.temp }}/pact-quality-evidence/infra-supervision.json
           if-no-files-found: ignore
           retention-days: 14
@@ -192,7 +210,7 @@ jobs:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
 
   platform:
-    name: platform-${{ matrix.key }}
+    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'platform' || 'branch-platform' }}-${{ matrix.key }}
     needs: [identity, quality]
     strategy:
       fail-fast: false
@@ -231,7 +249,7 @@ jobs:
           display: 'true'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ci-identity
+          name: ci-identity-a${{ github.run_attempt }}
           path: ${{ runner.temp }}/pact-identity
       - name: Verify target architecture and exact tested workspace
         run: |
@@ -257,6 +275,9 @@ jobs:
           PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-evidence/${{ matrix.key }}
       - name: Deterministic Electron business and lifecycle journeys
         id: deterministic
+        # A naturally completed failing UI lane still permits independent diagnostics.
+        # The failed step remains failed and therefore blocks the platform gate.
+        if: ${{ !cancelled() && steps.ui.outputs.ui_execution_completed == 'true' }}
         run: node control/scripts/ci.mjs deterministic
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
@@ -274,7 +295,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ui-diagnostics-${{ matrix.key }}
+          name: ui-diagnostics-${{ matrix.key }}-a${{ github.run_attempt }}
           path: ${{ runner.temp }}/pact-ui-diagnostics/${{ matrix.key }}
           if-no-files-found: ignore
           retention-days: 14
@@ -295,17 +316,21 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: e2e-${{ matrix.key }}
+          name: e2e-${{ matrix.key }}-a${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/pact-evidence/${{ matrix.key }}/*.json
             ${{ runner.temp }}/pact-evidence/${{ matrix.key }}/*.md
           if-no-files-found: error
           retention-days: 14
       - name: Actual native CLI protocol, configuration and cold-history regression
+        id: native
+        if: ${{ !cancelled() && steps.ui.outputs.ui_execution_completed == 'true' && steps.deterministic.outputs.deterministic_execution_completed == 'true' }}
         run: node control/scripts/ci.mjs native
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
       - name: Build Dev or Stable-candidate installers
+        id: distribution
+        if: ${{ !cancelled() && steps.native.outcome == 'success' }}
         working-directory: source
         run: >-
           node scripts/build-distribution.mjs --channel "$CHANNEL"
@@ -319,6 +344,8 @@ jobs:
           PLATFORM_KEY: ${{ matrix.key }}
           CANDIDATE_SHA: ${{ needs.identity.outputs.candidate }}
       - name: Install and cold-start the exact NSIS or DMG application
+        id: package-smoke
+        if: ${{ !cancelled() && steps.distribution.outcome == 'success' }}
         working-directory: source
         run: >-
           node scripts/package-smoke.mjs --production-paths
@@ -327,7 +354,8 @@ jobs:
         env:
           PLATFORM_KEY: ${{ matrix.key }}
       - name: Extract and validate the exact macOS ZIP
-        if: matrix.platform == 'darwin'
+        id: zip-smoke
+        if: ${{ !cancelled() && matrix.platform == 'darwin' && steps.package-smoke.outcome == 'success' }}
         working-directory: source
         run: |
           node --input-type=module -e '
@@ -345,7 +373,7 @@ jobs:
         env:
           PLATFORM_KEY: ${{ matrix.key }}
       - name: Continuous deterministic resource soak on installed content
-        if: needs.identity.outputs.channel == 'stable' || (github.event_name == 'workflow_dispatch' && inputs.run_soak)
+        if: ${{ success() && (needs.identity.outputs.channel == 'stable' || (github.event_name == 'workflow_dispatch' && inputs.run_soak)) }}
         working-directory: source
         run: >-
           node scripts/run-soak.mjs
@@ -364,7 +392,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ needs.identity.outputs.channel }}-${{ matrix.key }}
+          name: ${{ needs.identity.outputs.channel }}-${{ matrix.key }}-a${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/pact-distribution/${{ matrix.key }}/*.exe
             ${{ runner.temp }}/pact-distribution/${{ matrix.key }}/*.dmg
@@ -373,3 +401,103 @@ jobs:
             ${{ runner.temp }}/pact-distribution/${{ matrix.key }}/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
+
+  provider:
+    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'provider' || 'branch-provider' }}
+    needs: [identity, publication, quality, platform, candidate-attestation]
+    if: github.repository_id == '1416403312' && ((github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != ''))
+    # The local reusable workflow is loaded from this root workflow's trusted
+    # source commit. Only its named environment supplies model credentials.
+    uses: ./.github/workflows/provider-e2e.yml
+    with:
+      controller: ${{ needs.identity.outputs.controller }}
+      source_kind: ${{ needs.identity.outputs.source_kind }}
+      suite: ${{ contains(github.event.pull_request.labels.*.name, 'pact:real-full') && 'full' || 'core' }}
+      root_run_id: ${{ github.run_id }}
+      root_attempt: ${{ github.run_attempt }}
+
+  check-writer:
+    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'check-writer' || 'branch-check-writer' }}
+    needs: [identity, publication, quality, platform, candidate-attestation, provider]
+    if: always() && (github.repository_id == '1416403312' && ((github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')))
+    environment: ${{ github.event_name == 'pull_request_target' && 'pact-control-plane' || 'pact-bootstrap-control-plane' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Only controller scripts execute here; candidate hooks/dependencies and
+      # Provider secrets remain in their separate jobs.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.identity.outputs.controller || github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ci-identity-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pact-identity
+      - id: app
+        name: Mint repository-scoped read-source/read-PR/read-Actions/write-Checks identity
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.PACT_CI_APP_ID }}
+          private-key: ${{ secrets.PACT_CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: Pact
+          permission-contents: read
+          permission-actions: read
+          permission-pull-requests: read
+          permission-checks: write
+      - name: Publish fixed-App results for this current root execution attempt
+        run: >-
+          node scripts/ci-control.mjs publish
+          --identity "$RUNNER_TEMP/pact-identity/ci-identity.json" --run "$GITHUB_RUN_ID"
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PACT_CI_APP_ID: ${{ secrets.PACT_CI_APP_ID }}
+          PACT_PROVIDER_ALLOWED: ${{ needs.provider.outputs.allowed }}
+
+  pact-complete:
+    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'pact-complete' || 'branch-pact-complete' }}
+    needs: [identity, publication, quality, platform, candidate-attestation, provider, check-writer]
+    if: always() && (github.repository_id == '1416403312' && ((github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.identity.outputs.controller || github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ci-identity-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pact-identity
+      - name: Require every current dependency and fixed-App result to pass
+        run: >-
+          node scripts/ci-control.mjs complete
+          --identity "$RUNNER_TEMP/pact-identity/ci-identity.json" --run "$GITHUB_RUN_ID"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACT_CI_APP_ID: ${{ vars.PACT_CI_APP_ID }}
+          PACT_PROVIDER_ALLOWED: ${{ needs.provider.outputs.allowed }}
+
+  branch-complete:
+    needs: [identity, publication, quality, platform]
+    if: always() && !(github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != ''))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all no-credential branch checks and target architectures to pass
+        run: >-
+          node --input-type=module -e
+          'for (const name of ["IDENTITY_RESULT","PUBLICATION_RESULT","QUALITY_RESULT","PLATFORM_RESULT"])
+          if (process.env[name] !== "success") throw Error(`${name} did not pass`);'
+        env:
+          IDENTITY_RESULT: ${{ needs.identity.result }}
+          PUBLICATION_RESULT: ${{ needs.publication.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          PLATFORM_RESULT: ${{ needs.platform.result }}

@@ -20,10 +20,36 @@ export const e2eReportLimits = Object.freeze({
 })
 
 /** Never publish optional identity extensions or an unvalidated branch author. */
-export function publicReportIdentity(identity) {
+export function publicReportIdentity(identity, kind = 'ci') {
+  if (!['ci', 'release'].includes(kind)) throw new Error('Invalid report identity kind')
   if (identity === null) return null
+  if (kind === 'release') {
+    if (
+      !identity ||
+      identity.schemaVersion !== 1 ||
+      identity.repository !== 'mbaxszy7/Pact' ||
+      !Number.isSafeInteger(identity.releasePR) ||
+      identity.releasePR < 1 ||
+      !Number.isSafeInteger(identity.releaseId) ||
+      identity.releaseId < 1 ||
+      typeof identity.version !== 'string' ||
+      identity.version.length > 128 ||
+      !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.test(identity.version) ||
+      identity.version === '0.0.0' ||
+      !/^[a-f\d]{40}$/u.test(identity.sourceSha ?? '') ||
+      identity.tag !== `v${identity.version}`
+    )
+      throw new Error('Invalid release report identity')
+    // This is an informational projection. The release controller still authenticates
+    // the original signed identity before staging or publishing any application bytes.
+    return Object.fromEntries(
+      ['schemaVersion', 'repository', 'releasePR', 'version', 'sourceSha', 'tag', 'releaseId'].map(
+        (name) => [name, identity[name]],
+      ),
+    )
+  }
   requireIdentity(identity)
-  return Object.fromEntries(
+  const result = Object.fromEntries(
     [
       'schemaVersion',
       'repository',
@@ -37,6 +63,9 @@ export function publicReportIdentity(identity) {
       'policySha',
       'authorId',
       'channel',
+      'sourceKind',
+      'controllerSha',
+      'controllerRef',
     ]
       .filter(
         (name) =>
@@ -44,6 +73,23 @@ export function publicReportIdentity(identity) {
       )
       .map((name) => [name, identity[name]]),
   )
+  result.product =
+    identity.product === null
+      ? null
+      : {
+          before:
+            identity.product.before === null
+              ? null
+              : {
+                  version: identity.product.before.version,
+                  candidateVersion: identity.product.before.candidateVersion,
+                },
+          after: {
+            version: identity.product.after.version,
+            candidateVersion: identity.product.after.candidateVersion,
+          },
+        }
+  return result
 }
 
 export async function readE2EJson(path, limit = e2eReportLimits.inputBytes) {
