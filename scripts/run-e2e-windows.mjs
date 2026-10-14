@@ -7,8 +7,8 @@ import { basename, delimiter, isAbsolute, join } from 'node:path'
 
 const outputLimit = 256 * 1024
 
-async function executablePath(name, candidates = []) {
-  const directories = (process.env.PATH ?? '').split(delimiter).filter(isAbsolute)
+async function executablePath(name, candidates = [], env = process.env) {
+  const directories = (env.PATH ?? '').split(delimiter).filter(isAbsolute)
   if (directories.length > 128) throw new Error('Executable discovery limit')
   for (const candidate of [
     ...candidates,
@@ -26,30 +26,37 @@ async function executablePath(name, candidates = []) {
   throw new Error('Native executable unavailable')
 }
 
-async function targetPath(executable) {
+async function targetPath(executable, env = process.env) {
   if (executable !== 'pnpm')
     return {
-      executable: await executablePath(executable, isAbsolute(executable) ? [executable] : []),
+      executable: await executablePath(executable, isAbsolute(executable) ? [executable] : [], env),
       prefix: [],
     }
-  const entry = process.env.npm_execpath
+  const entry = env.npm_execpath
   if (entry && isAbsolute(entry) && /^pnpm\.(?:cjs|mjs|js)$/iu.test(basename(entry))) {
     const actual = await realpath(entry)
     if (!(await stat(actual)).isFile()) throw new Error('Package manager entry is not a file')
     return { executable: process.execPath, prefix: [actual] }
   }
-  const directories = (process.env.PATH ?? '').split(delimiter).filter(isAbsolute)
+  const directories = (env.PATH ?? '').split(delimiter).filter(isAbsolute)
   return {
-    executable: await executablePath('pnpm.exe', [
-      ...(process.env.npm_execpath ? [process.env.npm_execpath] : []),
-      ...directories.map((directory) => join(directory, 'node_modules/pnpm/pnpm.exe')),
-    ]),
+    executable: await executablePath(
+      'pnpm.exe',
+      [
+        ...(env.npm_execpath ? [env.npm_execpath] : []),
+        ...directories.map((directory) => join(directory, 'node_modules/pnpm/pnpm.exe')),
+      ],
+      env,
+    ),
     prefix: [],
   }
 }
 
 /** One native Job owns all Windows descendants; POSIX ownership remains in run-e2e.mjs. */
 export async function runWindows(args, timeout, options, { failure, scrubHeaders }) {
+  const env = options.env ?? process.env
+  const signal = options.signal
+  if (signal?.aborted) throw failure('Windows E2E job cancelled before admission.')
   if (!Number.isFinite(timeout) || timeout <= 0)
     throw failure('E2E job deadline must be positive and finite.')
   const startedAt = performance.now()
@@ -58,12 +65,11 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
   try {
     ;[target, powershell] = await Promise.race([
       Promise.all([
-        targetPath(options.executable),
+        targetPath(options.executable, env),
         executablePath(
-          process.env.PACT_E2E_POWERSHELL_EXECUTABLE ?? 'pwsh.exe',
-          process.env.PACT_E2E_POWERSHELL_EXECUTABLE
-            ? [process.env.PACT_E2E_POWERSHELL_EXECUTABLE]
-            : [],
+          env.PACT_E2E_POWERSHELL_EXECUTABLE ?? 'pwsh.exe',
+          env.PACT_E2E_POWERSHELL_EXECUTABLE ? [env.PACT_E2E_POWERSHELL_EXECUTABLE] : [],
+          env,
         ),
       ]),
       new Promise((_, reject) => {
@@ -81,6 +87,7 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
     clearTimeout(lookupTimer)
   }
   const pipeName = `pact-e2e-${process.pid}-${randomUUID()}`
+  if (signal?.aborted) throw failure('Windows E2E job cancelled before admission.')
   const token = randomUUID()
   const request = JSON.stringify({
     pipe: pipeName,
@@ -145,6 +152,7 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
       clearTimeout(startupTimer)
       process.removeListener('SIGINT', onInterrupt)
       process.removeListener('SIGTERM', onTerminate)
+      signal?.removeEventListener('abort', onCancel)
       socket?.destroy()
       server.close()
       control = Buffer.alloc(0)
@@ -175,12 +183,14 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
     }
     const onInterrupt = () => stop('interrupted-SIGINT')
     const onTerminate = () => stop('interrupted-SIGTERM')
+    const onCancel = () => stop('cancelled')
     const deadline = setTimeout(
       () => stop('deadline'),
       Math.max(1, timeout - (performance.now() - startedAt)),
     )
     process.once('SIGINT', onInterrupt)
     process.once('SIGTERM', onTerminate)
+    signal?.addEventListener('abort', onCancel, { once: true })
     const emitLine = async (channel, bytes) => {
       if (stopping) return
       const text = scrubHeaders(options.redact(bytes.toString('utf8'))) + '\n'
@@ -309,7 +319,7 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
           '-File',
           join(import.meta.dirname, 'windows-e2e-job.ps1'),
         ],
-        { cwd: options.cwd, shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] },
+        { cwd: options.cwd, env, shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] },
       )
       state('bootstrapping')
       startupTimer = setTimeout(

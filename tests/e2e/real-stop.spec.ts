@@ -1,11 +1,11 @@
 import { expect, type Page } from '@playwright/test'
 import { createHash } from 'node:crypto'
 import { opendir, readFile, stat, writeFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
 
 import type { ConversationSnapshot, DesktopBridge } from '../../packages/contracts/src/index.js'
 
-import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import {
   authMarker,
   closeRealWorkspace,
@@ -26,7 +26,6 @@ import {
 import { test } from './runtime-fixture.js'
 import { windowsTextCommand } from './windows-test-command.js'
 
-const migrationsFolder = resolve(import.meta.dirname, '../../packages/persistence/drizzle')
 const commandDelayMs = 15_000
 
 for (const agentId of ['codex', 'claude'] as const) {
@@ -36,9 +35,9 @@ for (const agentId of ['codex', 'claude'] as const) {
     async () => {
       test.setTimeout(600_000)
       const ctx = await launchRealWorkspace(`real-stop-${agentId}`)
-      let observer: PactDatabase | undefined
+      let observer: ReadonlyFixtureDatabase | undefined
       try {
-        observer = await PactDatabase.open({ filePath: ctx.fixture.databaseFile, migrationsFolder })
+        observer = ReadonlyFixtureDatabase.open(ctx.fixture)
         const database = observer
         if (agentId === 'claude') await selectRealConfiguredEffort(ctx, [agentId])
         const sourceMarker = authMarker('STOP_SOURCE')
@@ -727,7 +726,7 @@ async function clickStop(ctx: RealWorkspace, agentId: 'claude' | 'codex'): Promi
 }
 
 async function requireNativeStop(ctx: RealWorkspace, runId: string): Promise<void> {
-  const database = await PactDatabase.open({ filePath: ctx.fixture.databaseFile, migrationsFolder })
+  const database = ReadonlyFixtureDatabase.open(ctx.fixture)
   try {
     await expect
       .poll(

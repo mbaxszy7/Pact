@@ -1,0 +1,38 @@
+name: Pact isolated toolchain
+description: Initialize exact pnpm before Node cache, then install frozen isolated dependencies and optional native CLIs.
+inputs:
+  workspace:
+    description: Relative source checkout directory
+    default: .
+  controller:
+    description: Relative trusted controller checkout directory (empty uses workspace)
+    default: ''
+  native:
+    description: Install actual pinned Claude and Codex CLIs without provider credentials
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      with:
+        version: 12.11.2
+        run_install: false
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version-file: ${{ inputs.workspace }}/.node-version
+        cache: pnpm
+        cache-dependency-path: ${{ inputs.workspace }}/pnpm-lock.yaml
+    - name: Install frozen source dependencies
+      shell: bash
+      working-directory: ${{ inputs.workspace }}
+      run: pnpm install --frozen-lockfile
+    - name: Install frozen trusted controller dependencies
+      if: inputs.controller != '' && inputs.controller != inputs.workspace
+      shell: bash
+      working-directory: ${{ inputs.controller || inputs.workspace }}
+      run: pnpm install --frozen-lockfile
+    - name: Install exact native CLIs in a private temporary directory
+      if: inputs.native == 'true'
+      shell: bash
+      working-directory: ${{ inputs.controller || inputs.workspace }}
+      run: node scripts/ci-native.mjs

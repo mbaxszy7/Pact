@@ -6,6 +6,8 @@ import { compareAssertions, sourceEvidence } from './check-e2e-coverage.mjs'
 
 const evidence = (expression) =>
   sourceEvidence('fixture', `test('same', async () => {\n${expression}\n})`)
+const helperEvidence = (name, assertions) =>
+  sourceEvidence('fixture', `async function ${name}() {\n${assertions}\n}`)
 const original = evidence("expect(composer).toHaveValue('Keep my draft')")
 
 await test('contenteditable migration retains exact locator, expected string and equality', () => {
@@ -121,6 +123,31 @@ await test('replacement registrations cannot refer to unknown sites or waive all
     () => compareAssertions('fixture', quota, quota, [update, update]),
     /Invalid assertion/,
   )
+})
+
+await test('a named helper contract keeps its exact owner and every replacement obligation', () => {
+  const originalHelper = helperEvidence('addProject', "expect(project).toHaveText('Project')")
+  const contract = {
+    originalLine: 2,
+    reason: 'Preserve Project identity while checking its explicit accessible action.',
+    replacementAssertions: [
+      'expect(project).toBeVisible()',
+      "expect(project).toHaveText('Project')",
+    ],
+  }
+  const replacements = contract.replacementAssertions.join('\n')
+  assert.deepEqual(
+    compareAssertions('fixture', originalHelper, helperEvidence('addProject', replacements), [
+      contract,
+    ]),
+    [],
+  )
+  for (const current of [
+    helperEvidence('otherHelper', replacements),
+    helperEvidence('addProject', contract.replacementAssertions[0]),
+    helperEvidence('addProject', replacements.replace("'Project'", "'Other'")),
+  ])
+    assert.equal(compareAssertions('fixture', originalHelper, current, [contract]).length, 1)
 })
 
 await test('revised case identity preserves the immutable original owner only for its exact mapping', () => {

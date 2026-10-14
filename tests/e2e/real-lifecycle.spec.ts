@@ -1,11 +1,10 @@
 import { expect } from '@playwright/test'
 import { createHash } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
 
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
-import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import {
   authMarker,
   closeRealWorkspace,
@@ -77,10 +76,7 @@ for (const cold of [false, true]) {
         )
         expect(inspected).toMatchObject({ ok: true })
         const checkedSnapshot = await readRealConversation(ctx)
-        const database = await PactDatabase.open({
-          filePath: ctx.fixture.databaseFile,
-          migrationsFolder: resolve(import.meta.dirname, '../../packages/persistence/drizzle'),
-        })
+        const database = ReadonlyFixtureDatabase.open(ctx.fixture)
         let allMessages
         try {
           const rows = database.drizzle.query.conversationMessages

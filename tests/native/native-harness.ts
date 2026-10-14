@@ -250,6 +250,10 @@ export function isolatedEnv(root: string, home: string): NodeJS.ProcessEnv {
     CODEX_HOME: home,
     CLAUDE_CONFIG_DIR: home,
     TERM: 'dumb',
+    // macOS system proxies can intercept reqwest even with no proxy variables inherited.
+    // Only this fixture's loopback Provider bypasses a proxy; production configuration is unchanged.
+    NO_PROXY: '127.0.0.1,localhost',
+    no_proxy: '127.0.0.1,localhost',
     CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'pact',
     PACT_NATIVE_TOKEN: 'OWNED_LOOPBACK_ONLY',
     ANTHROPIC_API_KEY: 'OWNED_LOOPBACK_ONLY',

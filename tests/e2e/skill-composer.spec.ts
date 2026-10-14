@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import { createRuntimeFixture, test, type RuntimeFixture } from './runtime-fixture.js'
 
 const migrationsFolder = resolve(import.meta.dirname, '../../packages/persistence/drizzle')
@@ -157,7 +158,7 @@ test(
       await editor.press('Enter')
       await expect(window.getByRole('button', { name: 'Copy Codex message' })).toBeVisible()
       await expect(editor).toBeEmpty()
-      const db = await PactDatabase.open({ filePath: owned.fixture.databaseFile, migrationsFolder })
+      const db = ReadonlyFixtureDatabase.open(owned.fixture)
       try {
         const messages = db.conversationRepository
           .read(owned.sessionId)

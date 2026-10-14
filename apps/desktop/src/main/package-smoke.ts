@@ -1,6 +1,7 @@
 import { app, type BrowserWindow } from 'electron'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { isAbsolute, join } from 'node:path'
+import { constants, lstatSync, realpathSync } from 'node:fs'
+import { lstat, mkdtemp, open, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { Worker } from 'node:worker_threads'
 
 import { collaborationMarkdownPageSchema } from '@pact/contracts'
@@ -9,17 +10,222 @@ import { imageCodecResultSchema } from '@pact/contracts/images'
 import type { AppearanceController } from './modules/appearance/controller'
 import type { UtilityProcessClient } from './utility-process/client'
 
+import {
+  defaultProductPaths,
+  readConfiguredDefaultPaths,
+  readProductIdentity,
+} from './product-identity'
+
 const PACKAGE_SMOKE_ENV = 'PACT_PACKAGE_SMOKE'
 const PACKAGE_SMOKE_PHASE_ENV = 'PACT_PACKAGE_SMOKE_PHASE'
 const PACKAGE_SMOKE_USER_DATA_ENV = 'PACT_PACKAGE_SMOKE_USER_DATA'
 const PACKAGE_SMOKE_TIMEOUT_MS = 10_000
+let soakInspection: { receipt: string; nonce: string; port: number } | undefined
+let soakStopTimer: NodeJS.Timeout | undefined
+let soakStopTask: Promise<void> | undefined
+let soakDisposed = false
+
+export async function disposePackagedSoakInspection(): Promise<void> {
+  soakDisposed = true
+  if (soakStopTimer) clearInterval(soakStopTimer)
+  soakStopTimer = undefined
+  await soakStopTask
+}
+
+async function readPackagedSoakStop(): Promise<void> {
+  if (!soakInspection || soakDisposed) return
+  const file = `${soakInspection.receipt}.stop`
+  try {
+    const stat = await lstat(file)
+    if (
+      !stat.isFile() ||
+      stat.isSymbolicLink() ||
+      stat.size > 256 ||
+      (await realpath(file)) !== resolvePath(file)
+    )
+      throw new Error('Invalid packaged soak stop control.')
+    const handle = await open(
+      file,
+      constants.O_RDONLY | (process.platform === 'win32' ? 0 : constants.O_NOFOLLOW),
+    )
+    let bytes: Buffer
+    try {
+      const contents = Buffer.alloc(257)
+      const { bytesRead } = await handle.read(contents, 0, 257, 0)
+      if (bytesRead > 256) throw new Error('Packaged soak stop control exceeds its byte bound.')
+      bytes = contents.subarray(0, bytesRead)
+    } finally {
+      await handle.close()
+    }
+    const stop: unknown = JSON.parse(bytes.toString('utf8'))
+    if (
+      !stop ||
+      typeof stop !== 'object' ||
+      Array.isArray(stop) ||
+      Object.keys(stop).length !== 3 ||
+      Reflect.get(stop, 'schemaVersion') !== 1 ||
+      Reflect.get(stop, 'nonce') !== soakInspection.nonce ||
+      Reflect.get(stop, 'mainPid') !== process.pid
+    )
+      throw new Error('Packaged soak stop identity does not match this process.')
+    if (soakDisposed) return
+    soakDisposed = true
+    if (soakStopTimer) clearInterval(soakStopTimer)
+    soakStopTimer = undefined
+    app.quit()
+  } catch (error) {
+    if (error && typeof error === 'object' && Reflect.get(error, 'code') === 'ENOENT') return
+    soakDisposed = true
+    if (soakStopTimer) clearInterval(soakStopTimer)
+    soakStopTimer = undefined
+    app.exit(1)
+  }
+}
+
+/** The packaged harness can expose only an owned Renderer inspection surface on loopback. */
+export function configurePackagedSoakInspection(): void {
+  const receipt = process.env.PACT_SOAK_RECEIPT_FILE
+  const nonce = process.env.PACT_SOAK_NONCE
+  const rawPort = process.env.PACT_SOAK_CDP_PORT
+  if (receipt === undefined && nonce === undefined && rawPort === undefined) return
+  const root = process.env.PACT_E2E_ROOT
+  if (
+    !app.isPackaged ||
+    !root ||
+    Buffer.byteLength(root) > 4096 ||
+    !isAbsolute(root) ||
+    !receipt ||
+    Buffer.byteLength(receipt) > 4096 ||
+    !isAbsolute(receipt) ||
+    !nonce ||
+    !/^[a-f0-9]{64}$/u.test(nonce) ||
+    !rawPort ||
+    !/^\d{1,5}$/u.test(rawPort)
+  )
+    throw new Error(
+      'Packaged soak requires an owned root and complete, bounded inspection identity.',
+    )
+  const canonicalRoot = realpathSync(root)
+  const rootStat = lstatSync(canonicalRoot)
+  if (
+    !rootStat.isDirectory() ||
+    (process.platform !== 'win32' &&
+      ((rootStat.mode & 0o077) !== 0 || (process.getuid && rootStat.uid !== process.getuid())))
+  )
+    throw new Error('Packaged soak root must be a private directory owned by this process user.')
+  const parent = dirname(receipt)
+  const remainder = relative(canonicalRoot, resolvePath(receipt))
+  if (
+    resolvePath(root) !== canonicalRoot ||
+    resolvePath(receipt) !== receipt ||
+    realpathSync(parent) !== resolvePath(parent) ||
+    remainder === '..' ||
+    !remainder ||
+    remainder.startsWith('../') ||
+    remainder.startsWith('..\\') ||
+    isAbsolute(remainder) ||
+    !lstatSync(parent).isDirectory()
+  )
+    throw new Error(
+      'Packaged soak receipt must stay inside its canonical owned root without symbolic links.',
+    )
+  const port = Number(rawPort)
+  if (port < 1 || port > 65_535)
+    throw new Error('Packaged soak requires a valid loopback inspection port.')
+  if (app.isReady())
+    throw new Error('Packaged soak inspection must be configured before Electron readiness.')
+  soakInspection = { receipt, nonce, port }
+  app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1')
+  app.commandLine.appendSwitch('remote-debugging-port', String(port))
+}
+
+export async function writePackagedSoakReceipt(
+  window: BrowserWindow,
+  pageLoad: Promise<void>,
+): Promise<void> {
+  if (!soakInspection) return
+  await pageLoad
+  const url = window.webContents.getURL()
+  if (url !== 'app://bundle/index.html')
+    throw new Error('Packaged soak Renderer is not the exact trusted application URL.')
+  let timeout: NodeJS.Timeout | undefined
+  let info: unknown
+  try {
+    window.webContents.debugger.attach('1.3')
+    info = await Promise.race([
+      window.webContents.debugger.sendCommand('Target.getTargetInfo'),
+      new Promise((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error('Packaged soak target identity deadline exceeded.')),
+          5000,
+        )
+      }),
+    ])
+  } finally {
+    if (timeout) clearTimeout(timeout)
+    if (window.webContents.debugger.isAttached()) window.webContents.debugger.detach()
+  }
+  const targetInfo: unknown =
+    info && typeof info === 'object' ? Reflect.get(info, 'targetInfo') : undefined
+  if (!targetInfo || typeof targetInfo !== 'object')
+    throw new Error('Packaged soak target information is missing.')
+  const targetId: unknown =
+    targetInfo && typeof targetInfo === 'object' ? Reflect.get(targetInfo, 'targetId') : undefined
+  if (
+    typeof targetId !== 'string' ||
+    !/^[A-Za-z0-9_-]{1,128}$/u.test(targetId) ||
+    Reflect.get(targetInfo, 'url') !== url ||
+    Reflect.get(targetInfo, 'type') !== 'page'
+  )
+    throw new Error('Packaged soak target identity is invalid.')
+  const identity = readProductIdentity()
+  const receipt = {
+    schemaVersion: 1,
+    nonce: soakInspection.nonce,
+    mainPid: process.pid,
+    windowId: window.id,
+    webContentsId: window.webContents.id,
+    targetId,
+    port: soakInspection.port,
+    sourceSha: identity.sourceSha,
+    version: identity.version,
+    channel: identity.channel,
+    platform: process.platform,
+    arch: process.arch,
+    url,
+  }
+  const bytes = JSON.stringify(receipt)
+  if (Buffer.byteLength(bytes) > 4096)
+    throw new Error('Packaged soak receipt exceeds its byte bound.')
+  const controller = new AbortController()
+  const deadline = setTimeout(() => controller.abort(), 5000)
+  try {
+    await writeFile(soakInspection.receipt, `${bytes}\n`, {
+      flag: 'wx',
+      mode: 0o600,
+      signal: controller.signal,
+    })
+  } finally {
+    clearTimeout(deadline)
+  }
+  soakStopTimer = setInterval(() => {
+    if (soakStopTask || soakDisposed) return
+    soakStopTask = readPackagedSoakStop().finally(() => {
+      soakStopTask = undefined
+    })
+  }, 250)
+}
+
+export function isPackagedSoakInspection(): boolean {
+  return soakInspection !== undefined
+}
 
 export function isPackageSmoke(): boolean {
   return process.env[PACKAGE_SMOKE_ENV] === '1'
 }
 
 export function configurePackageSmokeUserData(): void {
-  if (!isPackageSmoke()) return
+  if (!isPackageSmoke() || process.env[PACKAGE_SMOKE_PHASE_ENV] === 'production-paths') return
 
   const userDataPath = process.env[PACKAGE_SMOKE_USER_DATA_ENV]
   if (!userDataPath || !isAbsolute(userDataPath)) {
@@ -211,13 +417,96 @@ async function verifyPackagedMarkdownProjection(): Promise<void> {
   }
 }
 
+function readPackagedSmokeIdentity() {
+  if (!app.isPackaged) throw new Error('Package smoke must run from an Electron package.')
+  const identity = readProductIdentity()
+  const expectedBytes = process.env.PACT_PACKAGE_EXPECTED_IDENTITY
+  if (!expectedBytes || expectedBytes.length > 4096)
+    throw new Error('Package smoke requires bounded expected distribution identity.')
+  const expected: unknown = JSON.parse(expectedBytes)
+  if (!expected || typeof expected !== 'object')
+    throw new Error('Package smoke distribution identity is invalid.')
+  for (const [field, value] of Object.entries(identity)) {
+    if (Reflect.get(expected, field) !== value)
+      throw new Error(`Package smoke identity mismatch: ${field}.`)
+  }
+  if (
+    Reflect.get(expected, 'platform') !== process.platform ||
+    Reflect.get(expected, 'arch') !== process.arch ||
+    app.getName() !== identity.productName
+  ) {
+    throw new Error('Package smoke runtime platform or application name is invalid.')
+  }
+  const configuredPaths = readConfiguredDefaultPaths()
+  const defaultPaths = defaultProductPaths(identity)
+  if (
+    Object.entries(defaultPaths).some(
+      ([field, value]) => Reflect.get(configuredPaths, field) !== value,
+    )
+  ) {
+    throw new Error(
+      'Packaged default profile/session/log paths do not match their channel identity.',
+    )
+  }
+  const otherIdentity =
+    identity.channel === 'dev'
+      ? {
+          ...identity,
+          channel: 'stable' as const,
+          productName: 'Pact' as const,
+          appId: 'com.pact.desktop' as const,
+        }
+      : {
+          ...identity,
+          channel: 'dev' as const,
+          productName: 'Pact Dev' as const,
+          appId: 'com.pact.desktop.dev' as const,
+        }
+  const otherPaths = defaultProductPaths(otherIdentity)
+  if (Object.values(defaultPaths).some((path) => Object.values(otherPaths).includes(path))) {
+    throw new Error('Packaged Dev and Stable profile/session/log paths overlap.')
+  }
+  return {
+    ...identity,
+    platform: process.platform,
+    arch: process.arch,
+    defaultPaths,
+    userData: app.getPath('userData'),
+    sessionData: app.getPath('sessionData'),
+    logs: app.getPath('logs'),
+  }
+}
+
+/** No Utility, database, provider, Renderer, or diagnostic Worker starts in this phase. */
+export function completePackagedProductionPathProbe(): boolean {
+  if (!isPackageSmoke() || process.env[PACKAGE_SMOKE_PHASE_ENV] !== 'production-paths') return false
+  if (
+    process.env.PACT_E2E_ROOT !== undefined ||
+    process.env[PACKAGE_SMOKE_USER_DATA_ENV] !== undefined
+  )
+    throw new Error('Production path inspection cannot use an isolated profile override.')
+  const identity = readPackagedSmokeIdentity()
+  if (
+    identity.userData !== identity.defaultPaths.userData ||
+    identity.sessionData !== identity.defaultPaths.sessionData ||
+    identity.logs !== identity.defaultPaths.logs
+  )
+    throw new Error('The actual production paths differ from their native channel defaults.')
+  process.stdout.write(
+    `PACT_PACKAGE_IDENTITY:${JSON.stringify({ ...identity, productionDataRootVerified: true })}\n`,
+  )
+  process.stdout.write('PACT_PACKAGE_SMOKE:PASS\n')
+  app.exit(0)
+  return true
+}
+
 export async function completePackagedSmoke(
   window: BrowserWindow,
   pageLoad: Promise<void>,
   utilityClient: UtilityProcessClient,
   appearanceSettings: AppearanceController,
 ): Promise<void> {
-  if (!app.isPackaged) throw new Error('Package smoke must run from an Electron package.')
+  process.stdout.write(`PACT_PACKAGE_IDENTITY:${JSON.stringify(readPackagedSmokeIdentity())}\n`)
 
   await pageLoad
 

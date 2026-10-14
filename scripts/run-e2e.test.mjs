@@ -154,6 +154,23 @@ await test(
 )
 
 await test(
+  'AbortSignal closes the owned detached process tree and cannot report success',
+  posixOnly,
+  async (context) => {
+    const fixture = await treeFixture(context)
+    const controller = new AbortController()
+    const execution = fixture.execute('detached', 30_000, { signal: controller.signal })
+    const pids = await fixture.pids()
+    controller.abort()
+    assert.equal(await execution, 1)
+    assert.equal(groupGone(pids.parent), true)
+    assert.equal(groupGone(pids.worker), true)
+    assert.equal(pidGone(pids.worker), true)
+    assert.equal(fixture.states.find((value) => value.kind === 'stopping').reason, 'cancelled')
+  },
+)
+
+await test(
   'a detached ignored-TERM group remains owned when its original parent exits successfully',
   posixOnly,
   async (context) => {

@@ -11,15 +11,20 @@ import {
   e2eMigrationOriginalAssertions,
 } from '../tests/e2e/coverage-manifest.ts'
 import { readE2EBaseline } from './e2e-baseline.mjs'
+import { isScriptEntry } from './script-entry.mjs'
 
-const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const rootRequire = createRequire(join(root, 'package.json'))
+const selectedWorkspace = process.env.PACT_CI_WORKSPACE
+if (selectedWorkspace !== undefined && !isAbsolute(selectedWorkspace))
+  throw new Error('Coverage workspace must be an explicit absolute path.')
+const root = selectedWorkspace ?? resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const controllerRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const rootRequire = createRequire(join(controllerRoot, 'package.json'))
 const maxSourceBytes = 512 * 1024
 const maxReportBytes = 8 * 1024 * 1024
 const maxResultReports = 8
 const maxTotalReportBytes = 16 * 1024 * 1024
 // Reuse the parser already required by the desktop's React build; add no dependency.
-const desktopRequire = createRequire(join(root, 'apps/desktop/package.json'))
+const desktopRequire = createRequire(join(controllerRoot, 'apps/desktop/package.json'))
 const reactRequire = createRequire(desktopRequire.resolve('@vitejs/plugin-react'))
 const babelRequire = createRequire(reactRequire.resolve('@babel/core'))
 const { parse } = babelRequire('@babel/parser')
@@ -221,6 +226,7 @@ export function sourceEvidence(path, text, { baseline = false } = {}) {
           ownerSource: ownerNode
             ? text.slice(owner.arguments[0].start, owner.arguments[0].end)
             : undefined,
+          ownerHelper: !owner && helper?.id?.name ? helper.id.name : undefined,
           signature: JSON.stringify([
             owner ? canonical(ownerNode) : (helper?.id?.name ?? 'module'),
             assertionCanonical(chain),
@@ -281,13 +287,16 @@ export function compareAssertions(path, baseline, current, updates = []) {
     const update = updateByLine.get(assertion.line)
     let required = [assertion.signature]
     if (update) {
-      if (!assertion.ownerSource) throw new Error('Contract update requires an exact test owner')
+      if (!assertion.ownerSource && !/^[A-Za-z_$][A-Za-z\d_$]*$/u.test(assertion.ownerHelper ?? ''))
+        throw new Error('Contract update requires an exact test or named helper owner')
       required = update.replacementAssertions.map((expression) => {
         if (Buffer.byteLength(expression) > 8192)
           throw new Error('Assertion replacement exceeds its byte bound')
         const parsed = sourceEvidence(
           path,
-          `test(${assertion.ownerSource}, async () => { ${expression} })`,
+          assertion.ownerSource
+            ? `test(${assertion.ownerSource}, async () => { ${expression} })`
+            : `async function ${assertion.ownerHelper}() { ${expression} }`,
         )
         if (parsed.assertions.length !== 1)
           throw new Error('Each replacement must contain exactly one assertion')
@@ -359,7 +368,7 @@ function targetStatus(target, listed, results) {
 function check(configuration) {
   const problems = []
   const skippedSources = []
-  const original = readE2EBaseline()
+  const original = readE2EBaseline(join(root, 'tests/e2e/baseline.json'))
   if (original.revision !== e2eMigrationBaseline.revision)
     throw new Error('E2E manifest and immutable source revision disagree')
   const baselinePaths = Object.keys(original.files).toSorted()
@@ -433,7 +442,7 @@ function check(configuration) {
                 ? [rootRequire.resolve('@playwright/test/cli'), 'test', '--list', '--reporter=json']
                 : ['exec', 'playwright', 'test', '--list', '--reporter=json'],
               {
-                cwd: root,
+                cwd: controllerRoot,
                 encoding: 'utf8',
                 timeout: 30_000,
                 maxBuffer: maxReportBytes,
@@ -570,7 +579,7 @@ function check(configuration) {
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))
+if (isScriptEntry(import.meta.url))
   try {
     const configuration = options(process.argv.slice(2))
     const report = check(configuration)

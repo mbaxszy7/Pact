@@ -2,7 +2,7 @@ import { expect } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { lstat, mkdir, open, realpath, rename } from 'node:fs/promises'
-import { basename, isAbsolute, join, relative, resolve } from 'node:path'
+import { basename, isAbsolute, join, relative } from 'node:path'
 import { promisify } from 'node:util'
 
 import type { ConversationSnapshot, DesktopBridge } from '../../packages/contracts/src/index.js'
@@ -11,7 +11,7 @@ import {
   MAX_COMMENTS_PER_MESSAGE,
   MESSAGE_ANCHOR_TEXT_BASIS,
 } from '../../packages/contracts/src/index.js'
-import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import {
   addRealSession,
   authMarker,
@@ -30,7 +30,6 @@ import {
   stopWindowsOwnedAgentProcess,
 } from './windows-process-observation.js'
 
-const migrationsFolder = resolve(import.meta.dirname, '../../packages/persistence/drizzle')
 const executeFile = promisify(execFile)
 const caseDeadlineMs = 600_000
 const runItems = 8
@@ -390,7 +389,7 @@ async function waitForNativeText(
   ctx: RealWorkspace,
   agentId: 'claude' | 'codex',
 ): Promise<{ id: string; nativeSessionId: string }> {
-  const database = await PactDatabase.open({ filePath: ctx.fixture.databaseFile, migrationsFolder })
+  const database = ReadonlyFixtureDatabase.open(ctx.fixture)
   let observed: { id: string; nativeSessionId: string } | undefined
   try {
     await expect
@@ -435,7 +434,7 @@ async function waitForFailure(
   agentId: 'claude' | 'codex',
   count: number,
 ): Promise<ConversationSnapshot> {
-  const database = await PactDatabase.open({ filePath: ctx.fixture.databaseFile, migrationsFolder })
+  const database = ReadonlyFixtureDatabase.open(ctx.fixture)
   try {
     await expect
       .poll(
@@ -485,7 +484,7 @@ async function findOwnedAgentProcess(
   })
   // Read the already selected real executable; avoid new readiness/auth probes
   // during the short live-response window being deliberately interrupted.
-  const database = await PactDatabase.open({ filePath: ctx.fixture.databaseFile, migrationsFolder })
+  const database = ReadonlyFixtureDatabase.open(ctx.fixture)
   let executable: string | undefined
   try {
     executable = database.runtimePreparationRepository.readSelectedExecutablePath(agentId)

@@ -221,6 +221,12 @@ export const diagnosticEventSchema = z.strictObject({
       'RENDERER_VIEW',
       'UNHANDLED_ERROR',
       'UNHANDLED_REJECTION',
+      'DATABASE_IN_USE',
+      'DATABASE_INCOMPATIBLE',
+      'DATABASE_BACKUP_FAILED',
+      'DATABASE_MIGRATION_FAILED',
+      'DATABASE_STORAGE_FAILED',
+      'STARTUP_FAILURE_DISPLAY_FAILED',
     ])
     .optional(),
 })

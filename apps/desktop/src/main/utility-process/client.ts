@@ -58,6 +58,7 @@ import type {
 import {
   utilityEventSchema,
   utilityResponseSchema,
+  runtimeStartupFailureAckSchema,
   directoryFileOperationMessageSchema,
   workspaceStorageRootSchema,
   WORKSPACE_OPERATION_TIMEOUT_MS as WORKSPACE_UNDO_TIMEOUT_MS,
@@ -84,6 +85,7 @@ export interface UtilityProcessStartOptions {
   workspaceStorageRoot?: string
   simulateAppearanceWriteFailure?: boolean
   diagnostics?: Pick<DiagnosticLogs, 'identity' | 'record' | 'attachUtility' | 'acceptUtility'>
+  onStartupFailed?: (failure: import('@pact/contracts').RuntimeStartupFailure) => void
 }
 
 type WithoutRequestId<Request> = Request extends unknown ? Omit<Request, 'requestId'> : never
@@ -242,6 +244,8 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   >()
   private shutdownTask: Promise<RpcResult<{ flushed: true }>> | undefined
   private child: UtilityProcess | undefined
+  private startupFailure: import('@pact/contracts').RuntimeStartupFailure | undefined
+  private startupFailureCallback: UtilityProcessStartOptions['onStartupFailed']
   private diagnostics: UtilityProcessStartOptions['diagnostics']
   private readonly inFlightRequests = new Map<string, InFlightRequest>()
   private readonly conversationListeners = new Set<
@@ -261,6 +265,8 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     if (options.workspaceStorageRoot) workspaceStorageRootSchema.parse(options.workspaceStorageRoot)
 
     this.diagnostics = options.diagnostics
+    this.startupFailure = undefined
+    this.startupFailureCallback = options.onStartupFailed
     const startedChild = utilityProcess.fork(
       this.utilityScriptPath,
       [
@@ -292,7 +298,8 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       this.child = undefined
       this.failChildRequests(
         startedChild,
-        ElectronUtilityProcessClient.unavailable(`Utility runtime exited with code ${code}.`),
+        this.startupFailureError() ??
+          ElectronUtilityProcessClient.unavailable(`Utility runtime exited with code ${code}.`),
       )
     })
   }
@@ -302,6 +309,8 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     expectedResponseType: UtilityResponse['type'],
     timeoutMs = REQUEST_TIMEOUT_MS,
   ): Promise<UtilityTransportResult> {
+    const startupError = this.startupFailureError()
+    if (startupError) return Promise.resolve({ kind: 'not-sent', error: startupError })
     if (this.shutdownTask && payload.type !== 'runtime.shutdown.request') {
       return Promise.resolve({
         kind: 'not-sent',
@@ -1242,6 +1251,41 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     if (this.child !== source) return
     const event = utilityEventSchema.safeParse(message)
     if (event.success) {
+      if (event.data.type === 'runtime.startup-failed.event') {
+        if (this.startupFailure) return
+        this.startupFailure = event.data
+        const error = this.startupFailureError()!
+        for (const [requestId, request] of this.inFlightRequests) {
+          if (request.child !== source) continue
+          this.finishRequest(
+            requestId,
+            event.data.stage === 'persistence'
+              ? { kind: 'not-sent', error }
+              : ElectronUtilityProcessClient.requestFailure(request, error),
+          )
+        }
+        try {
+          source.postMessage(
+            runtimeStartupFailureAckSchema.parse({
+              type: 'runtime.startup-failed.ack',
+              failureId: event.data.failureId,
+            }),
+          )
+        } catch {
+          /* The retained failure remains available even when the failed child has exited. */
+        }
+        try {
+          this.startupFailureCallback?.(event.data)
+        } catch {
+          this.diagnostics?.record({
+            operation: 'utility',
+            phase: 'failed',
+            level: 'error',
+            code: 'STARTUP_FAILURE_DISPLAY_FAILED',
+          })
+        }
+        return
+      }
       if (event.data.type === 'conversation.patch.event') {
         for (const listener of this.conversationListeners)
           listener(event.data.patch, event.data.progress)
@@ -1255,6 +1299,14 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     if (!request || request.child !== source || request.expectedResponseType !== parsed.data.type)
       return
     this.finishRequest(parsed.data.requestId, { kind: 'response', response: parsed.data })
+  }
+
+  private startupFailureError(): AppError | undefined {
+    if (!this.startupFailure) return undefined
+    return {
+      code: this.startupFailure.code,
+      message: `Pact stopped opening its data: ${this.startupFailure.reason}. Existing data and recovery files are preserved.`,
+    }
   }
 
   private requestDiagnostic(

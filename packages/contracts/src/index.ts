@@ -176,6 +176,11 @@ export const appErrorSchema = z.object({
     'VALIDATION',
     'PERMISSION_DENIED',
     'RUNTIME_UNAVAILABLE',
+    'DATABASE_IN_USE',
+    'DATABASE_INCOMPATIBLE',
+    'DATABASE_BACKUP_FAILED',
+    'DATABASE_MIGRATION_FAILED',
+    'DATABASE_STORAGE_FAILED',
     'TIMEOUT',
     'CONFLICT',
     'AGENT_CAPACITY',
@@ -216,6 +221,34 @@ export const appInfoSchema = z.object({
 export type AppInfo = z.infer<typeof appInfoSchema>
 
 export const runtimeHealthSchema = z.object({
+  performance: z
+    .strictObject({
+      eventLoopLagP95Ms: z.number().finite().nonnegative(),
+      eventLoopSamples: z.number().int().nonnegative(),
+      databaseBytes: z.number().int().nonnegative().optional(),
+      walBytes: z.number().int().nonnegative().optional(),
+      activeResources: z.record(z.string().max(64), z.number().int().nonnegative()),
+      resourceHighWater: z.number().int().nonnegative(),
+      resourceCapacityExceeded: z.boolean(),
+      sqlite: z.strictObject({
+        operations: z.number().int().nonnegative(),
+        transactions: z.number().int().nonnegative(),
+        rowsReturned: z.number().int().nonnegative(),
+        totalMs: z.number().finite().nonnegative(),
+        maxMs: z.number().finite().nonnegative(),
+        planOverflow: z.boolean(),
+        unsupportedOperations: z.boolean(),
+        queryPlans: z
+          .array(
+            z.strictObject({
+              sqlSha256: z.string().regex(/^[a-f\d]{64}$/u),
+              details: z.array(z.string().max(512)).max(64),
+            }),
+          )
+          .max(64),
+      }),
+    })
+    .optional(),
   conversation: z
     .strictObject({
       interestedSessions: z.number().int().nonnegative().max(CONVERSATION_INTEREST_ITEMS),
@@ -2154,7 +2187,35 @@ export const utilityResponseSchema = z.discriminatedUnion('type', [
 
 export type UtilityResponse = z.infer<typeof utilityResponseSchema>
 
+export const runtimeStartupFailureSchema = z.strictObject({
+  type: z.literal('runtime.startup-failed.event'),
+  failureId: z.string().uuid(),
+  stage: z.enum(['persistence', 'runtime']),
+  code: z.enum([
+    'DATABASE_IN_USE',
+    'DATABASE_INCOMPATIBLE',
+    'DATABASE_BACKUP_FAILED',
+    'DATABASE_MIGRATION_FAILED',
+    'DATABASE_STORAGE_FAILED',
+  ]),
+  reason: z
+    .string()
+    .min(1)
+    .max(128)
+    .regex(/^[a-z-]+$/u),
+  dataFilePath: z.string().min(1).max(4096),
+  backupFilePath: z.string().min(1).max(4096).optional(),
+  partialBackupFilePath: z.string().min(1).max(4096).optional(),
+  stagingFilePath: z.string().min(1).max(4096).optional(),
+})
+export type RuntimeStartupFailure = z.infer<typeof runtimeStartupFailureSchema>
+export const runtimeStartupFailureAckSchema = z.strictObject({
+  type: z.literal('runtime.startup-failed.ack'),
+  failureId: z.string().uuid(),
+})
+
 export const utilityEventSchema = z.discriminatedUnion('type', [
+  runtimeStartupFailureSchema,
   z.strictObject({
     type: z.literal('conversation.patch.event'),
     patch: conversationPatchSchema,

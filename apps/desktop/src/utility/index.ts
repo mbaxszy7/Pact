@@ -1,13 +1,17 @@
+import { randomUUID } from 'node:crypto'
 import { realpath, rm } from 'node:fs/promises'
-import { basename, isAbsolute } from 'node:path'
+import { basename, dirname, isAbsolute } from 'node:path'
+import { monitorEventLoopDelay } from 'node:perf_hooks'
 
 import {
   utilityEventSchema,
   utilityRequestSchema,
   utilityResponseSchema,
   workspaceStorageRootSchema,
+  runtimeStartupFailureSchema,
+  runtimeStartupFailureAckSchema,
 } from '@pact/contracts'
-import { PactDatabase } from '@pact/persistence'
+import { PactDatabase, DatabaseOpenError } from '@pact/persistence'
 
 import { closeDiagnostics, receiveDiagnostic, recordDiagnostic } from '../diagnostics/utility-log'
 import { handleAppearanceRequest } from './appearance/handler'
@@ -29,6 +33,8 @@ let database: PactDatabase | undefined
 let conversation: Conversation | undefined
 let workspaceChanges: WorkspaceChanges | undefined
 let directoryFiles: UtilityDirectoryFileClient | undefined
+let eventLoopProbe: ReturnType<typeof monitorEventLoopDelay> | undefined
+let resourceHighWater = 0
 
 if (!parentPort) throw new Error('Pact utility runtime requires an Electron parent port')
 if (
@@ -45,17 +51,57 @@ if (
 )
   throw new Error('Memory-only workspace storage requires an owned temporary directory.')
 
+function performanceSnapshot(
+  openedDatabase: PactDatabase,
+): import('@pact/contracts').RuntimeHealth['performance'] {
+  const probe = eventLoopProbe
+  const sqlite = openedDatabase.performanceDiagnostics()
+  if (!probe || !sqlite) return undefined
+  const resources = process.getActiveResourcesInfo()
+  resourceHighWater = Math.max(resourceHighWater, resources.length)
+  const activeResources: Record<string, number> = {}
+  const resourceCapacityExceeded =
+    resources.length > 256 || resources.some((name) => name.length > 64)
+  if (!resourceCapacityExceeded)
+    for (const name of resources) activeResources[name] = (activeResources[name] ?? 0) + 1
+  const eventLoopSamples = probe.count
+  const eventLoopLagP95Ms = eventLoopSamples
+    ? Math.max(0, probe.percentile(95) / 1_000_000 - 10)
+    : 0
+  probe.reset()
+  return {
+    ...sqlite,
+    eventLoopLagP95Ms,
+    eventLoopSamples,
+    activeResources,
+    resourceHighWater,
+    resourceCapacityExceeded,
+  }
+}
+
 async function bootstrap(
   runtimeDatabaseFile: string,
   runtimeMigrationsFolder: string,
   runtimeWorkspaceStorageRoot: string,
 ): Promise<void> {
   recordDiagnostic({ operation: 'utility', phase: 'started' })
+  const measurementRoot = process.env.PACT_E2E_ROOT
+  const measurePerformance = Boolean(
+    measurementRoot &&
+    /^[a-f\d]{64}$/u.test(process.env.PACT_SOAK_NONCE ?? '') &&
+    runtimeDatabaseFile !== ':memory:' &&
+    (await realpath(dirname(runtimeDatabaseFile))) === (await realpath(measurementRoot)),
+  )
   const openedDatabase = await PactDatabase.open({
     filePath: runtimeDatabaseFile,
     migrationsFolder: runtimeMigrationsFolder,
+    measurePerformance,
   })
   database = openedDatabase
+  if (measurePerformance) {
+    eventLoopProbe = monitorEventLoopDelay({ resolution: 10 })
+    eventLoopProbe.enable()
+  }
   const directoryOwner = new UtilityDirectoryFileClient(parentPort)
   directoryFiles = directoryOwner
 
@@ -224,6 +270,7 @@ async function bootstrap(
               database: 'ready',
               pid: process.pid,
               checkedAt: new Date().toISOString(),
+              ...(eventLoopProbe ? { performance: performanceSnapshot(openedDatabase) } : {}),
               conversation: {
                 ...conversationOwner.diagnostics(),
                 completeReads: openedDatabase.conversationRepository.diagnostics().completeReads,
@@ -971,17 +1018,56 @@ process.on('uncaughtExceptionMonitor', (_error, origin) => {
 })
 
 process.once('exit', () => {
+  eventLoopProbe?.disable()
   void conversation?.dispose()
   database?.close()
   directoryFiles?.dispose()
 })
 
-void bootstrap(databaseFile, migrationsFolder, workspaceStorageRoot).catch(() => {
-  directoryFiles?.dispose()
-  recordDiagnostic({ operation: 'utility', phase: 'failed', level: 'error', code: 'INTERNAL' })
-  console.error('Failed to initialize Pact persistence.')
-  // ParentPort listeners keep a failed bootstrap alive even with exitCode set.
-  // Exit so Main settles outstanding requests and the exit handler closes storage.
-  closeDiagnostics()
-  process.exit(1)
-})
+void bootstrap(databaseFile, migrationsFolder, workspaceStorageRoot).catch(
+  async (cause: unknown) => {
+    eventLoopProbe?.disable()
+    directoryFiles?.dispose()
+    const failure = runtimeStartupFailureSchema.parse({
+      type: 'runtime.startup-failed.event',
+      failureId: randomUUID(),
+      stage: cause instanceof DatabaseOpenError ? 'persistence' : 'runtime',
+      code: cause instanceof DatabaseOpenError ? cause.code : 'DATABASE_STORAGE_FAILED',
+      reason: cause instanceof DatabaseOpenError ? cause.reason : 'runtime-initialization-failed',
+      dataFilePath: cause instanceof DatabaseOpenError ? cause.dataFilePath : databaseFile,
+      ...(cause instanceof DatabaseOpenError && cause.backupFilePath
+        ? { backupFilePath: cause.backupFilePath }
+        : {}),
+      ...(cause instanceof DatabaseOpenError && cause.partialBackupFilePath
+        ? { partialBackupFilePath: cause.partialBackupFilePath }
+        : {}),
+      ...(cause instanceof DatabaseOpenError && cause.stagingFilePath
+        ? { stagingFilePath: cause.stagingFilePath }
+        : {}),
+    })
+    recordDiagnostic({ operation: 'utility', phase: 'failed', level: 'error', code: failure.code })
+    await conversation?.dispose()
+    database?.close()
+    // An explicit bounded ACK prevents an immediate exit from dropping the failure message.
+    await new Promise<void>((resolveAck) => {
+      const receive = (message: Electron.MessageEvent): void => {
+        const ack = runtimeStartupFailureAckSchema.safeParse(message.data)
+        if (ack.success && ack.data.failureId === failure.failureId) finish()
+      }
+      const finish = (): void => {
+        clearTimeout(timer)
+        parentPort.removeListener('message', receive)
+        resolveAck()
+      }
+      const timer = setTimeout(finish, 3000)
+      parentPort.on('message', receive)
+      try {
+        parentPort.postMessage(failure)
+      } catch {
+        finish()
+      }
+    })
+    closeDiagnostics()
+    process.exit(1)
+  },
+)

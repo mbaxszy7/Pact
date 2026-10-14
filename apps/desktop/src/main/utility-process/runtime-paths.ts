@@ -1,5 +1,5 @@
 import { app } from 'electron'
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 
@@ -75,21 +75,11 @@ export function resolveRuntimePaths(): RuntimePaths {
     }
   }
 
-  if (app.isPackaged) {
-    return {
-      databaseFile: join(app.getPath('userData'), 'pact.sqlite'),
-      workspaceStorageRoot: join(app.getPath('userData'), 'workspace-versions'),
-      migrationsFolder: join(process.resourcesPath, 'persistence-migrations'),
-    }
-  }
-
   return {
-    databaseFile: join(repositoryRoot, '.pact-data/dev/pact.sqlite'),
-    workspaceStorageRoot: join(
-      app.getPath('userData'),
-      'workspace-versions-development',
-      createHash('sha256').update(repositoryRoot).digest('hex'),
-    ),
-    migrationsFolder: join(repositoryRoot, 'packages/persistence/drizzle'),
+    databaseFile: join(app.getPath('userData'), 'pact.sqlite'),
+    workspaceStorageRoot: join(app.getPath('userData'), 'workspace-versions'),
+    migrationsFolder: app.isPackaged
+      ? join(process.resourcesPath, 'persistence-migrations')
+      : join(repositoryRoot, 'packages/persistence/drizzle'),
   }
 }

@@ -8,5 +8,5 @@
     "noEmit": true,
     "target": "ES2024"
   },
-  "include": ["drizzle.config.ts", "src/**/*.ts"]
+  "include": ["drizzle.config.ts", "src/**/*.ts", "scripts/**/*.ts"]
 }

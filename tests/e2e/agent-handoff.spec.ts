@@ -600,6 +600,7 @@ test(
       database.close()
     }
     const app = await fixture.launch()
+    let appClosed = false
     try {
       const window = await app.firstWindow()
       await window.getByRole('button', { name: 'Unconfirmed candidate', exact: true }).click()
@@ -652,6 +653,8 @@ test(
       }, sessionId)
       expect(returned?.route).toEqual({ type: 'primary', agentId: 'codex' })
       expect(returned?.state).toBe('installed')
+      await app.close()
+      appClosed = true
       const persisted = await PactDatabase.open({
         filePath: fixture.databaseFile,
         migrationsFolder,
@@ -680,7 +683,7 @@ test(
         persisted.close()
       }
     } finally {
-      await app.close()
+      if (!appClosed) await app.close()
       await fixture.dispose()
     }
   },

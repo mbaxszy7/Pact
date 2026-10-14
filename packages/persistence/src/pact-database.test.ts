@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3'
 import { eq, sql } from 'drizzle-orm'
+import { readMigrationFiles } from 'drizzle-orm/migrator'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -53,16 +54,17 @@ describe('Pact database migrations', () => {
     const databaseFile = join(directory, 'pact.sqlite')
     const backupFile = join(directory, 'pact.before-migrate.sqlite')
     const legacy = new Database(databaseFile)
-    legacy.exec(`
-      CREATE TABLE pact_schema_meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
-      CREATE TABLE __drizzle_migrations (id INTEGER PRIMARY KEY NOT NULL, hash TEXT NOT NULL, created_at NUMERIC);
-    `)
+    const initial = readMigrationFiles({ migrationsFolder })[0]!
+    legacy.exec(
+      'CREATE TABLE __drizzle_migrations (id INTEGER PRIMARY KEY NOT NULL, hash TEXT NOT NULL, created_at NUMERIC)',
+    )
+    for (const statement of initial.sql) legacy.exec(statement)
     legacy
       .prepare('INSERT INTO pact_schema_meta (key, value) VALUES (?, ?)')
       .run('status', 'preserve-me')
     legacy
       .prepare('INSERT INTO __drizzle_migrations (id, hash, created_at) VALUES (?, ?, ?)')
-      .run(1, 'version-zero', 1789032777704)
+      .run(1, initial.hash, initial.folderMillis)
     legacy.close()
 
     const database = await PactDatabase.open({

@@ -507,7 +507,9 @@ export class ConversationRepository {
     activity: { queries: 0, returnedRows: 0 },
   }
 
-  constructor(private readonly database: PactDrizzleDatabase) {
+  constructor(private readonly database: PactDrizzleDatabase) {}
+
+  recoverAbandonedBodyInputs(): void {
     // Utility owns one Repository instance. A new owner cannot reuse earlier window handles.
     this.database
       .delete(conversationBodyInputs)

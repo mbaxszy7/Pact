@@ -1,11 +1,10 @@
 import { expect, type ElectronApplication, type Page } from '@playwright/test'
 import { randomUUID } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
 
 import type { ConversationSnapshot, DesktopBridge } from '../../packages/contracts/src/index.js'
 
-import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import {
   createRuntimeFixture,
   test,
@@ -13,7 +12,6 @@ import {
   type RuntimeFixtureOptions,
 } from './runtime-fixture.js'
 
-const migrationsFolder = resolve(import.meta.dirname, '../../packages/persistence/drizzle')
 const maxRuns = 128
 const maxBodyBytes = 8 * 1024 * 1024
 
@@ -310,10 +308,7 @@ export async function readRealConversation(
   context: RealWorkspace,
   sessionId = context.sessionId,
 ): Promise<ConversationSnapshot> {
-  const database = await PactDatabase.open({
-    filePath: context.fixture.databaseFile,
-    migrationsFolder,
-  })
+  const database = ReadonlyFixtureDatabase.open(context.fixture)
   try {
     const snapshot = database.conversationRepository.read(sessionId)
     if (
@@ -337,10 +332,7 @@ export async function waitForRealCompletion(
 ): Promise<ConversationSnapshot> {
   if (count > maxRuns) throw new Error('Real case exceeds its model-Run bound')
   let failedNative: { sessionId: string; turnId: string | null } | undefined
-  const database = await PactDatabase.open({
-    filePath: context.fixture.databaseFile,
-    migrationsFolder,
-  })
+  const database = ReadonlyFixtureDatabase.open(context.fixture)
   try {
     await expect
       .poll(

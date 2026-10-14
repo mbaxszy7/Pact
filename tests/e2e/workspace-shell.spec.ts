@@ -37,7 +37,12 @@ async function addProject(
     }))
   }, projectDirectory)
   await window.getByRole('button', { name: 'Add project', exact: true }).click()
-  await expect(window.getByRole('button', { name: 'layout-project', exact: true })).toBeVisible()
+  await expect(
+    window.getByRole('button', { name: 'Rename Project layout-project', exact: true }),
+  ).toBeVisible()
+  await expect(
+    window.getByRole('button', { name: 'Rename Project layout-project', exact: true }),
+  ).toHaveText('layout-project')
 }
 
 test(

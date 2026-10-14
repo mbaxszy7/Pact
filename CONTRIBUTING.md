@@ -55,23 +55,36 @@ pnpm db:migrate:dev
 pnpm db:studio
 ```
 
-The ignored development database is `.pact-data/dev/pact.sqlite`. Studio listens on
-`127.0.0.1:4983` and is not packaged. Never target a user's production database with development
-commands. Packaged startup applies migrations in Utility after a consistent backup, before reporting
-ready. Failure stops startup and preserves recovery information. Do not use `drizzle-kit push`
-or introduce a production migration shell command.
+The tool default `.pact-data/dev/pact.sqlite` is an isolated repository database, separate from the
+application's normal Dev database under the OS appData directory in `Pact Dev`. Source and packaged
+Dev launches share that application root across branches; Stable uses `Pact`. Existing repository
+tool data is preserved and is not automatically copied into the application root.
+
+`db:migrate:dev` and `db:studio` run `packages/persistence/scripts/development-database.ts` through
+tsx and `PactDatabase.open`. They hold the sibling `.pact-writer.sqlite` reservation for their actual
+process lifetime; Studio imports its server in that same process, listens on `127.0.0.1:4983` and is
+not packaged. `PACT_DB_FILE` selects an explicit tool database. Keep it in a controlled development
+environment and close any Pact instance using that data directory. The reservation coordinates Pact
+and these wrappers; raw Drizzle/SQLite commands, legacy clients and manual edits can bypass it.
+
+Application startup owns read-only, complete ordered migration-history verification before writable
+opening, WAL adjustment or migration. Only a proven complete prefix can upgrade after a consistent
+non-overwriting backup; new databases use checked atomic staging. Incompatible history and failed
+backup/migration stop startup and preserve recovery files. See [database ownership and limits](docs/technical-foundation.md#persistence-and-projections).
+Never target user application data with routine development commands, invoke raw migration/Studio
+against a live Pact root, use `drizzle-kit push`, or add a production migration shell command.
 
 ## Required verification
 
-| Change                                              | Checks                                                         |
-| --------------------------------------------------- | -------------------------------------------------------------- |
-| Documentation/configuration                         | `pnpm docs:check`, `pnpm format:check`, relevant narrow checks |
-| TypeScript                                          | `pnpm check`                                                   |
-| Renderer/Main/Preload/Utility or IPC lifecycle      | The above and applicable Electron E2E                          |
-| Native dependency, fuse, protocol, or packaging     | The above and `pnpm verify:package`                            |
-| Native history, settings, Fork, or writer lifecycle | Relevant `pnpm test:native` cases                              |
-| Streaming/resources/performance                     | Same-fixture measurements and applicable performance budgets   |
-| Test infrastructure                                 | Relevant `pnpm test:infra` cases                               |
+| Change                                              | Checks                                                           |
+| --------------------------------------------------- | ---------------------------------------------------------------- |
+| Documentation/configuration                         | `pnpm docs:check`, `pnpm format:check`, relevant narrow checks   |
+| TypeScript                                          | `pnpm check`                                                     |
+| Renderer/Main/Preload/Utility or IPC lifecycle      | The above and applicable Electron E2E                            |
+| Native dependency, fuse, protocol, or packaging     | The above and explicit native distribution/installed smoke below |
+| Native history, settings, Fork, or writer lifecycle | Relevant `pnpm test:native` cases                                |
+| Streaming/resources/performance                     | Same-fixture measurements and applicable performance budgets     |
+| Test infrastructure                                 | Relevant `pnpm test:infra` cases                                 |
 
 The [testing section below](#testing) identifies commands needing credentials or paid models. Run the
 affected real-provider lane in a trusted local environment when its unique behavior changes; public
@@ -80,11 +93,11 @@ deferred checks, and unverified platforms. Missing evidence cannot establish a p
 
 ## Documentation policy
 
-The reviewed Markdown allowlist is `README.md`, `CONTRIBUTING.md`, `AGENTS.md`, the product and
+The reviewed Markdown allowlist is `README.md`, `CONTRIBUTING.md`, `AGENTS.md`, `CHANGELOG.md`, the product and
 architecture specifications under `docs/`, and desktop `PRODUCT.md`/`DESIGN.md`. `scripts/check-publication.mjs` enforces exact paths, English text, local
 links, and absence of private/generated material.
 
-Publication inspection owns at most 4096 paths (1 MiB total, 1 KiB per path), reads only the seven
+Publication inspection owns at most 4096 paths (1 MiB total, 1 KiB per path), reads only the eight
 reviewed documents (128 KiB each, 512 KiB total), and emits at most 128 diagnostics/64 KiB. Overflow
 fails visibly. Binary/source content is inspected by the secret scanner, not retained by this policy
 checker. Local documentation links must stay inside the repository.
@@ -110,28 +123,93 @@ must be unmistakably nonfunctional; never broadly exempt test directories from s
 
 ### Evidence and commands
 
-| Lane                  | Command                                      | Prerequisites and evidence                                                              |
-| --------------------- | -------------------------------------------- | --------------------------------------------------------------------------------------- |
-| Unit                  | `pnpm test`                                  | Vitest; public, isolated fixtures, no paid models                                       |
-| Infrastructure        | `pnpm test:infra`                            | Node tests for publication, baseline integrity, coverage, runners, and packaged harness |
-| UI                    | `pnpm test:e2e:ui`                           | Real Electron UI with fixture data; no provider credentials                             |
-| Deterministic         | `pnpm test:e2e:deterministic`                | Electron plus controlled protocols/fixed loads; not real model evidence                 |
-| Real provider         | `pnpm test:e2e:real`                         | Installed/authenticated CLIs and private configuration; paid model requests             |
-| Complete E2E          | `pnpm test:e2e`                              | All three Electron lanes; private configuration admitted before the sole build          |
-| Native protocol       | `pnpm test:native`                           | Actual CLI/SDK storage and protocol against isolated loopback providers; no paid models |
-| Packaged smoke        | `pnpm verify:package`                        | Actual unpacked application, isolated data, seed and cold verification                  |
-| Packaged visible core | `node scripts/package-smoke.mjs --real-core` | Trusted local real-provider configuration; manual actual business observations required |
+| Lane                        | Command                                                                                | Prerequisites and evidence                                                                     |
+| --------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Unit                        | `pnpm test`                                                                            | Vitest; public, isolated fixtures, no paid models                                              |
+| Infrastructure              | `pnpm test:infra`                                                                      | Node tests for publication, baseline integrity, coverage, runners, and packaged harness        |
+| UI                          | `pnpm test:e2e:ui`                                                                     | Real Electron UI with fixture data; no provider credentials                                    |
+| Deterministic               | `pnpm test:e2e:deterministic`                                                          | Electron plus controlled protocols/fixed loads; not real model evidence                        |
+| Real provider               | `pnpm test:e2e:real`                                                                   | Installed/authenticated CLIs and private configuration; paid model requests                    |
+| Complete E2E                | `pnpm test:e2e`                                                                        | All three Electron lanes; private configuration admitted before the sole build                 |
+| Native protocol             | `pnpm test:native`                                                                     | Actual CLI/SDK storage and protocol against isolated loopback providers; no paid models        |
+| Packaged smoke              | Manifest-based commands below                                                          | Actual installation/extraction, private data, seed and cold verification                       |
+| Packaged visible core       | `node scripts/package-smoke.mjs --manifest MANIFEST --real-core`                       | Trusted local real-provider configuration; manual actual business observations required        |
+| Continuous packaged fixture | `node scripts/run-soak.mjs --manifest MANIFEST --duration-ms DURATION --report REPORT` | Isolated protocol fixture; complete duration, budgets, identity and resource evidence required |
 
 Electron runners build the selected lane, use one Playwright worker, zero retries, and a two-hour
 total deadline with a five-minute build budget. Forward file names and `--grep` after `--`; do not
 override the project's lane with a second `--project`. UI/native changes follow the visual-first
 acceptance order in [change discipline above](#change-discipline).
 
-Public CI scans history and publication policy, runs quality/build and infrastructure checks, and
-executes UI/deterministic Electron tests plus packaged smoke on macOS and Windows. Native protocol CI
-installs pinned CLIs on macOS and uses dummy authentication/loopback endpoints. External PR jobs do
-not receive private provider configuration or model credentials. Real tests remain enabled for
-trusted local validation; public CI is not evidence that those model cases passed.
+CI configuration and a successful build do not establish repository enforcement or release
+acceptance. Required lanes need current code identity, their actual prerequisites and successful
+execution on the appropriate native architecture. External PR jobs must not receive private provider
+configuration or model credentials. Credential-free UI/deterministic/native protocol evidence is
+separate from explicitly authorized real-provider execution; missing authorization, credentials,
+platforms or required performance observations cannot become passing evidence.
+
+### Distribution build, smoke, and soak
+
+Use the distribution entry point with a fresh, empty output directory and the native runner for the
+target below. Replace `COMMIT_SHA` with the full checked-out commit SHA and `BUILD_NUMBER` with a
+decimal build identifier. `version.json` supplies the product version. Dev metadata includes a
+compatible prerelease, build number and source identity only during packaging; the command verifies
+and restores the desktop package metadata without a version commit.
+
+| Target        | Arguments                        | Installation artifacts  |
+| ------------- | -------------------------------- | ----------------------- |
+| macOS arm64   | `--platform darwin --arch arm64` | DMG and ZIP             |
+| Windows x64   | `--platform win32 --arch x64`    | Separate NSIS installer |
+| Windows arm64 | `--platform win32 --arch arm64`  | Separate NSIS installer |
+
+For example, on macOS arm64:
+
+```sh
+node scripts/build-distribution.mjs --channel dev --platform darwin --arch arm64 --sha COMMIT_SHA --build-number BUILD_NUMBER --output .pact-data/distributions/dev
+node scripts/package-smoke.mjs --manifest .pact-data/distributions/dev/distribution-manifest.json --production-paths --report .pact-data/distributions/dev/smoke.json
+node scripts/run-soak.mjs --manifest .pact-data/distributions/dev/distribution-manifest.json --duration-ms 3600000 --report .pact-data/distributions/dev/soak-1h.json
+```
+
+The release candidate uses Stable metadata and its own artifacts:
+
+```sh
+node scripts/build-distribution.mjs --channel stable --platform darwin --arch arm64 --sha COMMIT_SHA --build-number BUILD_NUMBER --output .pact-data/distributions/stable
+node scripts/package-smoke.mjs --manifest .pact-data/distributions/stable/distribution-manifest.json --production-paths --report .pact-data/distributions/stable/smoke.json
+node scripts/run-soak.mjs --manifest .pact-data/distributions/stable/distribution-manifest.json --duration-ms 7200000 --report .pact-data/distributions/stable/soak-2h.json
+```
+
+The manifest identifies the exact executable/bundle, channel/version, source SHA, architecture,
+application identity, application-content hash and installation-artifact hashes. Smoke does not guess
+fixed `Pact.app` or `Pact.exe` paths. Add `--artifact ARTIFACT_PATH` to validate the other artifact
+listed in that manifest, such as the macOS ZIP, with a separate report. A directory-only build adds
+`--dir` and smoke adds `--unpacked`; that report cannot satisfy an installation gate. NSIS installation
+smoke requires a native ephemeral GitHub-hosted Windows runner and verified uninstall cleanup.
+
+`--production-paths` explicitly checks normal OS channel paths before Utility, a database, providers
+or diagnostic Workers start, retaining the real single-instance rule. It does not open user business
+data. The isolated `PACT_E2E_ROOT` phases alone do not establish those normal paths. Do not invoke the
+explicit production-path probe against an occupied daily instance. Native dependencies are rebuilt
+for Electron; Windows distribution signing and macOS certificate signing/notarization are disabled,
+with necessary macOS ad-hoc signing retained.
+
+Reports are written without overwriting previous evidence. Smoke success requires the genuine owned
+process runner, installed-content verification, seed/cold identity and confirmed cleanup. Soak must
+bind the same final application-content hash and the actual installation artifacts. A same-SHA
+rebuild with different application bytes requires new validation. Keep credentials, private paths,
+debugging receipts/nonces and raw application output out of published evidence.
+
+The resource report retains each complete SQLite query plan once in `sqliteQueryPlanDictionary`;
+sample `queryPlanIndices` resolve into that dictionary. Scalar counters remain in every sample.
+The dictionary is bounded to 64 plans/32 KiB serialized bytes, without changing the production
+plan budget or the report's 768 KiB limit. Missing observations still block acceptance.
+
+The soak command is a runnable verification path, not a completed acceptance claim. Short runs only
+exercise the harness; a two-hour E2E timeout is not continuous soak. The one-hour deterministic and
+two-hour packaged acceptance evidence remains incomplete, including the missing observations listed
+in [architecture](docs/technical-foundation.md#evidence-known-gaps-and-future-scope). Its report stays
+blocked when duration, budgets, observations, recovery or physical cleanup are insufficient.
+Windows x64/arm64 installed-launch validation and full Windows/macOS Dev/Stable coexistence, upgrade
+and uninstall debugging remain TODO. Code integration does not establish those platform gates.
 
 ### Private real-provider configuration
 
@@ -234,6 +312,50 @@ eight sockets. Claude's non-model HEAD probe is allowed; model POSTs fail. Codex
 no provider requests beyond the two fixture source Turns. These test-harness limits are not production
 large-content policy. Cleanup owns every root, bundle, process, and socket, including failures.
 
+### CI control and release recovery
+
+Use separate `pact-control-plane` and `pact-provider-ci` environments. Both permit only the
+`main` branch and disable administrator bypass. App credentials belong only to the control-plane
+environment; model configuration belongs only to the Provider environment. Do not use repository
+secrets for either identity. GitHub App installation tokens are short-lived; the installation and
+private key remain configured until explicitly revoked or rotated.
+
+Keep `PACT_GOVERNANCE_READY=false` until the repository can enforce the exact author/reviewer/merger
+policy, shared-commit association, current mandatory evidence, and failure/cancellation boundaries.
+An asynchronous App result does not prove synchronous revocation. A trusted Provider start job
+invalidates the old context before admitting execution, but cancellation before that job and partial
+reruns remain unverified. The executor's report trust boundary still requires completion; a mutable local
+controller is not OS isolation. Missing authority, configuration, observations or platforms block
+acceptance.
+
+Native stale-review dismissal can preserve approval after a tree-identical new commit. GitHub can
+also advance an existing review's `commit_id` without a new approval, so comparing the current
+review API field with the head does not prove approval of that exact commit. The current native
+configuration cannot satisfy an any-new-commit approval requirement; keep the approval check blocked
+until an enforceable policy is agreed and verified. GitHub may regenerate a merge candidate with the
+same parents and tree but a new commit timestamp. Its new SHA invalidates the exact candidate receipt;
+never silently reinterpret old evidence as a test of that new commit.
+
+Release Please owns the single product version and `CHANGELOG.md`. Its initial `0.1.0` override is
+transient. Automatic Release PR execution admits synchronized version fields and bounded changelog
+text; it does not admit executable changes. The publication controller verifies the owner's actual
+head review, fixed source/tag/Release identity, signed content commitment and completed publication
+proof before treating a release as complete.
+
+Recover a merged Release PR by starting a **new** Stable Release `workflow_dispatch` with its PR
+number. Each successful platform is durably staged in an authenticated, unpublished draft. Recovery
+uses the exact staged installer and content-bound smoke/soak reports even after Actions artifacts
+expire. A complete signed upload intent can finish its interrupted completion marker. Unknown,
+partial-starter or mismatched bytes stop recovery; they are not overwritten or adopted. A frozen
+selection cannot be rebuilt into different bytes, and an already published release remains read-only.
+The failed-jobs rerun path across producer attempts and recovery after signing-key rotation are not
+verified alternatives to this entry point.
+
+The controller bounds each API/evidence document, paginates to establish completion, retains at most
+128 authenticated run records and 128 stage attempts per version, and admits at most 32 formal assets.
+Exhausted bounds stop admission while preserving records. Do not remove records or raise a limit to
+force a release through the gate.
+
 ### Immutable coverage obligations
 
 `tests/e2e/baseline.json` packages the exact 21 source files from original revision
@@ -273,8 +395,9 @@ Quarantine needs concrete evidence, preserved alternative coverage, a re-enable 
 authorization. Required invariants without replacement evidence remain blockers. Do not fix tests by
 raising budgets, changing provider/permissions, weakening assertions, or replacing the user task.
 
-Packaged smoke validates `app.isPackaged`, `app://`, Utility, SQLite, fuses, ASAR, seed durability, and
-independent cold restart with private data. `--real-core` preserves production fuses and does not
+Packaged smoke validates manifest identity/content, `app.isPackaged`, `app://`, Utility, SQLite,
+fuses, ASAR, seed durability and independent cold restart with private data. `--real-core` uses the
+same explicit manifest, preserves production fuses and does not
 inject a testing Bridge; observe actual provider replies/file effects and cold identity/content
 preservation. A visible window or exit zero alone is not business acceptance. Select an instance by
 its exact executable and fixture project; stop if native automation targets another instance.

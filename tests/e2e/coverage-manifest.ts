@@ -445,6 +445,21 @@ function journey(
   return {
     originalPath,
     originalTitle: title,
+    ...(file === 'workspace-shell.spec.ts' && title.startsWith('resizes and collapses')
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 39,
+              reason:
+                'The existing ProjectNavigation exposes Rename Project plus the Project name as its accessible action label. Retain the original visible Project obligation and additionally require its exact displayed name; no layout or focus assertion is waived.',
+              replacementAssertions: [
+                "expect(window.getByRole('button', { name: 'Rename Project layout-project', exact: true })).toBeVisible()",
+                "expect(window.getByRole('button', { name: 'Rename Project layout-project', exact: true })).toHaveText('layout-project')",
+              ],
+            },
+          ],
+        }
+      : {}),
     ...(revisedCommentLimit
       ? {
           currentTitle,

@@ -1,9 +1,9 @@
 import { execFile, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
 
 import { loadProviderConfiguration } from '../tests/e2e/provider-environment.ts'
+import { isScriptEntry } from './script-entry.mjs'
 
 const outputLimit = 256 * 1024
 const terminationGrace = 5000
@@ -99,18 +99,21 @@ export function run(
   {
     executable = 'pnpm',
     cwd = repositoryRoot,
+    env = process.env,
+    signal,
     redact = (text) => text,
     write,
     onState = () => {},
     inspectProcesses = readProcessTable,
   } = {},
 ) {
+  if (signal?.aborted) return Promise.reject(failure('E2E job cancelled before admission.'))
   if (process.platform === 'win32') {
     return import('./run-e2e-windows.mjs').then(({ runWindows }) =>
       runWindows(
         args,
         timeout,
-        { executable, cwd, redact, write, onState },
+        { executable, cwd, env, signal, redact, write, onState },
         { failure, scrubHeaders },
       ),
     )
@@ -123,6 +126,7 @@ export function run(
     try {
       child = spawn(executable, args, {
         cwd,
+        env,
         detached: true,
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -338,7 +342,7 @@ export function run(
       })
       return ownershipSample
     }
-    const signalGroups = (signal, rows) => {
+    const signalGroups = (requested, rows) => {
       for (const pgid of ownedGroups) {
         if (!groupExists(pgid)) continue
         const anchor = [...ownedProcesses.values()].find(
@@ -348,14 +352,14 @@ export function run(
           !anchor ||
           uncertainGroups.has(pgid) ||
           invalidGroups.has(pgid) ||
-          sentSignals.get(pgid) === signal ||
+          sentSignals.get(pgid) === requested ||
           sentSignals.get(pgid) === 'SIGKILL' ||
-          (requestedSignal === 'SIGKILL' && signal !== 'SIGKILL')
+          (requestedSignal === 'SIGKILL' && requested !== 'SIGKILL')
         )
           continue
         try {
-          process.kill(-pgid, signal)
-          sentSignals.set(pgid, signal)
+          process.kill(-pgid, requested)
+          sentSignals.set(pgid, requested)
         } catch (error) {
           if (error.code !== 'ESRCH') {
             startupError = failure(`E2E owned group could not be signalled (${safeCode(error)}).`)
@@ -382,6 +386,7 @@ export function run(
       clearInterval(ownershipTimer)
       process.removeListener('SIGINT', onInterrupt)
       process.removeListener('SIGTERM', onTerminate)
+      signal?.removeEventListener('abort', onCancel)
       ownedProcesses.clear()
       ownedGroups.clear()
       groupLeaderStarts.clear()
@@ -424,8 +429,8 @@ export function run(
       state('stopping', reason)
       clearTimeout(drainTimer)
       cleanupRefreshing = true
-      const refreshAndSignal = async (signal) => {
-        requestedSignal = signal
+      const refreshAndSignal = async (requested) => {
+        requestedSignal = requested
         try {
           const rows = await refreshOwnership()
           signalGroups(requestedSignal, rows)
@@ -453,6 +458,7 @@ export function run(
           clearInterval(ownershipTimer)
           process.removeListener('SIGINT', onInterrupt)
           process.removeListener('SIGTERM', onTerminate)
+          signal?.removeEventListener('abort', onCancel)
           child.stdout?.destroy()
           child.stderr?.destroy()
           reject(
@@ -467,8 +473,10 @@ export function run(
     }
     const onInterrupt = () => stop('interrupted-SIGINT')
     const onTerminate = () => stop('interrupted-SIGTERM')
+    const onCancel = () => stop('cancelled')
     process.once('SIGINT', onInterrupt)
     process.once('SIGTERM', onTerminate)
+    signal?.addEventListener('abort', onCancel, { once: true })
     const deadline = setTimeout(() => stop('deadline'), timeout)
     const sample = () => {
       if (settled || stopping) return
@@ -637,7 +645,7 @@ export async function main({
   return result
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isScriptEntry(import.meta.url)) {
   void main({ lane: process.argv[2] ?? 'all', forwarded: process.argv.slice(3) }).then(
     (code) => {
       process.exitCode = code
