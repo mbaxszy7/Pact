@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { AsyncLocalStorage, createHook } from 'node:async_hooks'
 import { execFileSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { getEventListeners, once } from 'node:events'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -267,14 +268,38 @@ describe('Owned physical process groups', () => {
   })
 
   it('releases the bounded startup observation timer when its owner closes', async () => {
-    const before = timeoutCount()
-    const fixture = await createFixture('normal', { startupObservationMs: 2_000 })
-    await fixture.owner.close()
-    await expectReleased(fixture)
-    // Windows starts no observation timer; an ambient test timer can expire during close.
-    expect(timeoutCount()).toSatisfy((count: number) =>
-      process.platform === 'win32' ? count <= before : count === before,
-    )
+    const scope = new AsyncLocalStorage<symbol>(),
+      token = Symbol('owned timer fixture')
+    const timers = new Set<number>()
+    let created = 0,
+      overflow = false
+    const observer = createHook({
+      init(id, type) {
+        if (type !== 'Timeout' || scope.getStore() !== token) return
+        created++
+        if (timers.size >= 128) overflow = true
+        else timers.add(id)
+      },
+      destroy(id) {
+        timers.delete(id)
+      },
+    }).enable()
+    try {
+      await scope.run(token, async () => {
+        const fixture = await createFixture('normal', { startupObservationMs: 2_000 })
+        await fixture.owner.close()
+        await expectReleased(fixture)
+      })
+      // Node delivers timer destruction after clearTimeout. The observation
+      // belongs only to this call chain, so ambient expiry cannot hide a leak.
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(created).toBeGreaterThan(0)
+      expect(overflow).toBe(false)
+      expect(timers.size).toBe(0)
+    } finally {
+      observer.disable()
+      scope.disable()
+    }
   })
 
   it('keeps concurrently spawned catalog scopes in separate owned groups', async () => {
