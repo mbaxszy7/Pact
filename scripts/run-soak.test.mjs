@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { createContext, runInContext } from 'node:vm'
 
 import {
   histogram,
@@ -8,7 +9,150 @@ import {
   evaluateSoak,
   validateReceipt,
   resourceReportProjection,
+  installReactCommitProbe,
+  reactCommitObservationComplete,
 } from './soak-statistics.mjs'
+
+const reactProbeKey = '__pactSoakReact_' + 'a'.repeat(64)
+function reactRealm(before) {
+  const realm = createContext({ location: { href: 'app://bundle/index.html' } })
+  runInContext('globalThis.top = globalThis', realm)
+  before?.(realm)
+  runInContext(`(${installReactCommitProbe.toString()})(${JSON.stringify(reactProbeKey)})`, realm)
+  return realm
+}
+
+void test('React probe counts mount and workload commits without reading or retaining React facts', () => {
+  const realm = reactRealm(),
+    hook = Reflect.get(realm, '__REACT_DEVTOOLS_GLOBAL_HOOK__'),
+    probe = realm[reactProbeKey]
+  const renderer = hook.inject({ privateMetadata: 'never-recorded' })
+  const root = Object.defineProperty({}, 'privateBody', {
+    get() {
+      throw new Error('React objects must not be inspected')
+    },
+  })
+  hook.onCommitFiberRoot(renderer, root)
+  assert.equal(probe.beginWorkload().status, 'observed')
+  hook.onCommitFiberRoot(renderer, root)
+  hook.onCommitFiberRoot(renderer, root)
+  const measured = probe.stop()
+  assert.deepEqual(JSON.parse(JSON.stringify(measured)), {
+    schemaVersion: 1,
+    status: 'observed',
+    injectedRenderers: 1,
+    initialMountCommits: 1,
+    workloadCommits: 2,
+    cleanupVerified: true,
+  })
+  assert.equal(reactCommitObservationComplete(measured), true)
+  assert.equal(Object.hasOwn(realm, '__REACT_DEVTOOLS_GLOBAL_HOOK__'), false)
+  assert.equal(Object.hasOwn(realm, reactProbeKey), false)
+  hook.onCommitFiberRoot(renderer, root)
+  assert.equal(measured.workloadCommits, 2)
+  assert.equal(JSON.stringify(measured).includes('private'), false)
+})
+
+void test('React probe preserves an unknown hook, including accessors, and blocks missing injection', () => {
+  const realm = reactRealm((context) => {
+    Object.defineProperty(context, '__REACT_DEVTOOLS_GLOBAL_HOOK__', {
+      configurable: true,
+      get() {
+        throw new Error('An unknown hook must not be invoked or inspected')
+      },
+    })
+  })
+  const original = Object.getOwnPropertyDescriptor(realm, '__REACT_DEVTOOLS_GLOBAL_HOOK__')
+  const unknown = realm[reactProbeKey].stop()
+  assert.equal(unknown.reason, 'unknown-existing-hook')
+  assert.equal(reactCommitObservationComplete(unknown), false)
+  assert.deepEqual(
+    Object.getOwnPropertyDescriptor(realm, '__REACT_DEVTOOLS_GLOBAL_HOOK__'),
+    original,
+  )
+  const absent = reactRealm()[reactProbeKey]
+  assert.equal(absent.beginWorkload().reason, 'not-injected')
+  assert.equal(reactCommitObservationComplete(absent.stop()), false)
+})
+
+void test('React probe fences unknown renderers, duplicate phases, hook replacement and count overflow', () => {
+  const unknown = reactRealm()
+  Reflect.get(unknown, '__REACT_DEVTOOLS_GLOBAL_HOOK__').onCommitFiberRoot(1)
+  assert.equal(unknown[reactProbeKey].stop().reason, 'unknown-renderer')
+
+  const phase = reactRealm(),
+    phaseHook = Reflect.get(phase, '__REACT_DEVTOOLS_GLOBAL_HOOK__'),
+    phaseProbe = phase[reactProbeKey]
+  phaseHook.onCommitFiberRoot(phaseHook.inject())
+  phaseProbe.beginWorkload()
+  assert.equal(phaseProbe.beginWorkload().reason, 'invalid-phase')
+  assert.equal(reactCommitObservationComplete(phaseProbe.stop()), false)
+
+  const replaced = reactRealm(),
+    replacement = { ownedElsewhere: true }
+  Object.defineProperty(replaced, '__REACT_DEVTOOLS_GLOBAL_HOOK__', {
+    configurable: true,
+    value: replacement,
+  })
+  assert.equal(replaced[reactProbeKey].stop().reason, 'hook-replaced')
+  assert.equal(Reflect.get(replaced, '__REACT_DEVTOOLS_GLOBAL_HOOK__'), replacement)
+
+  const overflow = reactRealm()
+  runInContext(
+    `const renderer = __REACT_DEVTOOLS_GLOBAL_HOOK__.inject();
+     for (let index = 0; index < 1000001; index++)
+       __REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot(renderer);`,
+    overflow,
+  )
+  const measured = overflow[reactProbeKey].stop()
+  assert.equal(measured.reason, 'commit-capacity')
+  assert.equal(measured.initialMountCommits, 1_000_000)
+  assert.equal(reactCommitObservationComplete(measured), false)
+})
+
+void test('React evidence requires real injection and verified cleanup without imposing a workload threshold', () => {
+  const observed = {
+    schemaVersion: 1,
+    status: 'observed',
+    injectedRenderers: 1,
+    initialMountCommits: 1,
+    workloadCommits: 0,
+    cleanupVerified: true,
+  }
+  assert.equal(reactCommitObservationComplete(observed), true)
+  for (const changed of [
+    { status: 'pending' },
+    { injectedRenderers: 0 },
+    { initialMountCommits: 0 },
+    { workloadCommits: -1 },
+    { workloadCommits: 1_000_000 },
+    { cleanupVerified: false },
+    { privateBody: 'must-not-export' },
+  ])
+    assert.equal(reactCommitObservationComplete({ ...observed, ...changed }), false)
+})
+
+void test('React probe installs only in the exact top trusted document and bounds Renderer registrations', () => {
+  for (const change of [
+    (realm) => {
+      realm.location.href = 'https://example.invalid/'
+    },
+    (realm) => {
+      realm.top = {}
+    },
+  ]) {
+    const rejected = reactRealm(change)
+    assert.equal(Object.hasOwn(rejected, reactProbeKey), false)
+    assert.equal(Object.hasOwn(rejected, '__REACT_DEVTOOLS_GLOBAL_HOOK__'), false)
+  }
+  const realm = reactRealm(),
+    hook = Reflect.get(realm, '__REACT_DEVTOOLS_GLOBAL_HOOK__')
+  for (let index = 0; index < 17; index++) hook.inject()
+  const measured = realm[reactProbeKey].stop()
+  assert.equal(measured.injectedRenderers, 16)
+  assert.equal(measured.reason, 'renderer-capacity')
+  assert.equal(reactCommitObservationComplete(measured), false)
+})
 
 void test('two-hour resource samples preserve exact plans and counters inside the report byte bound', () => {
   const projection = resourceReportProjection()
@@ -100,11 +244,20 @@ void test('continuous two-hour duration is actual elapsed evidence, not an E2E t
     cleanupVerified: true,
     recoveryVerified: true,
     resourceLifecycleVerified: true,
+    reactCommits: {
+      schemaVersion: 1,
+      status: 'observed',
+      injectedRenderers: 1,
+      initialMountCommits: 1,
+      workloadCommits: 100,
+      cleanupVerified: true,
+    },
     missingObservations: [],
   }
   assert.equal(evaluateSoak(evidence, 7_200_000).budgetPass, true)
   assert.equal(evaluateSoak({ ...evidence, durationMs: 7_199_999 }, 7_200_000).budgetPass, false)
   assert.equal(evaluateSoak(evidence, 1000).budgetPass, false)
+  assert.equal(evaluateSoak({ ...evidence, reactCommits: undefined }, 7_200_000).budgetPass, false)
 })
 
 void test('CDP receipts bind a private nonce to exact Main PID, renderer target and packaged content identity', () => {

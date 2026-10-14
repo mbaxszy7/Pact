@@ -20,6 +20,8 @@ import {
   observe,
   validateReceipt,
   resourceReportProjection,
+  installReactCommitProbe,
+  reactCommitObservationComplete,
 } from './soak-statistics.mjs'
 
 const exec = promisify(execFile)
@@ -190,6 +192,143 @@ async function connectTarget(port, receipt, deadline, observeDiscovery) {
     }
   }
   throw new Error('The exact owned CDP target could not be admitted before startup deadline')
+}
+
+function validateBridgeIdentity(info, manifest) {
+  if (
+    !info?.ok ||
+    !['dev', 'stable'].includes(manifest.channel) ||
+    info.value?.packaged !== true ||
+    info.value.name !== (manifest.channel === 'dev' ? 'Pact Dev' : 'Pact') ||
+    info.value.version !== manifest.version ||
+    info.value.platform !== manifest.platform ||
+    info.value.arch !== manifest.arch
+  )
+    throw new Error('Actual registered Bridge package identity mismatch')
+}
+
+async function inspectReactCommits(page, receipt, expected, receiptFile, mainPid) {
+  const key = `__pactSoakReact_${randomBytes(32).toString('hex')}`
+  let session,
+    identifier,
+    admitted = false,
+    closed = false,
+    observation = { schemaVersion: 1, status: 'blocked', reason: 'probe-not-admitted' }
+  const verifyIdentity = async () => {
+    if (mainPid() !== receipt.mainPid || page.url() !== receipt.url)
+      throw new Error('React observation no longer owns the original application target')
+    const currentReceipt = await boundedJson(receiptFile)
+    validateReceipt(currentReceipt, expected)
+    if (JSON.stringify(currentReceipt) !== JSON.stringify(receipt))
+      throw new Error('React observation distribution receipt changed')
+    const { targetInfo } = await session.send('Target.getTargetInfo')
+    if (targetInfo.targetId !== receipt.targetId || targetInfo.url !== receipt.url)
+      throw new Error('React observation target identity changed')
+    validateBridgeIdentity(
+      await page.evaluate(() => globalThis.pact.getAppInfo()),
+      expected.manifest,
+    )
+  }
+  const stop = async () => {
+    if (closed) return observation
+    closed = true
+    let identityVerified = false
+    try {
+      if (session) {
+        await verifyIdentity()
+        identityVerified = true
+        const measured = await page.evaluate((probeKey) => {
+          const probe = Object.getOwnPropertyDescriptor(globalThis, probeKey)?.value
+          return probe?.stop()
+        }, key)
+        if (measured) observation = measured
+      }
+    } catch {
+      observation = { schemaVersion: 1, status: 'blocked', reason: 'probe-read-or-identity-failed' }
+    }
+    let registrationReleased = identifier === undefined
+    if (identifier !== undefined) {
+      try {
+        await session.send('Page.removeScriptToEvaluateOnNewDocument', { identifier })
+        registrationReleased = true
+      } catch {
+        /* Physical application exit still owns final cleanup; this observation cannot pass. */
+      }
+    }
+    let sessionReleased = !session
+    try {
+      await session?.detach()
+      sessionReleased = true
+    } catch {
+      /* A failed temporary inspection detach is disclosed rather than called released. */
+    }
+    if (
+      !admitted ||
+      !identityVerified ||
+      !registrationReleased ||
+      !sessionReleased ||
+      !reactCommitObservationComplete(observation)
+    )
+      observation = {
+        ...observation,
+        status: 'blocked',
+        cleanupVerified: false,
+        reason: observation.reason ?? 'incomplete-identity-counts-or-cleanup',
+      }
+    return observation
+  }
+  try {
+    session = await page.context().newCDPSession(page)
+    await verifyIdentity()
+    // The registering session must receive document instrumentation even when
+    // Playwright performs reload through its separate Page session.
+    await session.send('Page.enable')
+    if (await page.evaluate(() => Reflect.has(globalThis, '__REACT_DEVTOOLS_GLOBAL_HOOK__'))) {
+      observation = { schemaVersion: 1, status: 'blocked', reason: 'unknown-existing-hook' }
+      return { begin: async () => observation, stop }
+    }
+    const source = `(${installReactCommitProbe.toString()})(${JSON.stringify(key)})`
+    if (Buffer.byteLength(source) > 16 * 1024)
+      throw new Error('React observation script exceeds its byte bound')
+    ;({ identifier } = await session.send('Page.addScriptToEvaluateOnNewDocument', { source }))
+    if (typeof identifier !== 'string' || !identifier.length || identifier.length > 256)
+      throw new Error('React observation script registration is invalid')
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 10_000 })
+    await page.waitForFunction(() => Boolean(globalThis.pact?.getAppInfo), null, { timeout: 5000 })
+    await verifyIdentity()
+    admitted = true
+  } catch {
+    observation = {
+      schemaVersion: 1,
+      status: 'blocked',
+      reason: 'probe-install-or-identity-failed',
+    }
+  }
+  return {
+    begin: async () => {
+      if (!admitted || closed) return observation
+      try {
+        await verifyIdentity()
+        const measured = await page.evaluate((probeKey) => {
+          const probe = Object.getOwnPropertyDescriptor(globalThis, probeKey)?.value
+          return probe?.beginWorkload()
+        }, key)
+        observation = measured ?? {
+          schemaVersion: 1,
+          status: 'blocked',
+          reason: 'probe-not-injected',
+        }
+      } catch {
+        observation = {
+          schemaVersion: 1,
+          status: 'blocked',
+          reason: 'probe-start-or-identity-failed',
+        }
+      }
+      return observation
+    },
+    stop,
+  }
 }
 
 async function instrument(page) {
@@ -458,15 +597,10 @@ async function main() {
         evidence.cdpDiscovery = discovery
       })
       stage = 'registered-bridge-identity'
-      const info = await connection.page.evaluate(() => globalThis.pact.getAppInfo())
-      if (
-        !info.ok ||
-        !info.value.packaged ||
-        info.value.version !== settings.manifest.version ||
-        info.value.platform !== settings.manifest.platform ||
-        info.value.arch !== settings.manifest.arch
+      validateBridgeIdentity(
+        await connection.page.evaluate(() => globalThis.pact.getAppInfo()),
+        settings.manifest,
       )
-        throw new Error('Actual registered Bridge package identity mismatch')
       return { ...connection, receipt, nonce, completion, abort }
     } catch {
       abort.abort()
@@ -475,15 +609,29 @@ async function main() {
       throw new Error('Packaged application launch/receipt/target admission failed')
     }
   }
-  let active
+  let active, reactInspection
   try {
     active = await launch()
     const { page, browser } = active
+    stage = 'react-commit-inspection'
+    reactInspection = await inspectReactCommits(
+      page,
+      active.receipt,
+      {
+        nonce: active.nonce,
+        mainPid: active.receipt.mainPid,
+        port: active.receipt.port,
+        manifest: settings.manifest,
+      },
+      receiptFile,
+      () => lastState?.pid,
+    )
     stage = 'select-session'
     await page
       .getByRole('button', { name: 'Soak Session 1', exact: true })
       .click({ timeout: 15_000 })
     await page.getByRole('combobox', { name: 'Message', exact: true }).waitFor({ state: 'visible' })
+    evidence.reactCommits = await reactInspection.begin()
     await instrument(page)
     const started = performance.now()
     measurementStarted = started
@@ -590,6 +738,11 @@ async function main() {
       conversationPatchIpcBytes: renderer.ipcBytes,
       conversationPatchIpcBytesPerSecond: renderer.ipcBytes / (evidence.durationMs / 1000),
     })
+    evidence.reactCommits = await reactInspection.stop()
+    if (reactCommitObservationComplete(evidence.reactCommits))
+      evidence.missingObservations = evidence.missingObservations.filter(
+        (missing) => missing !== 'react-commit-counts',
+      )
     const terminalPath = join(settings.dataRoot, 'soak-native-terminals.jsonl'),
       info = await lstat(terminalPath)
     if (!info.isFile() || info.isSymbolicLink() || info.size > 64 * 1024)
@@ -699,6 +852,7 @@ async function main() {
       }
     }
   } finally {
+    if (reactInspection) evidence.reactCommits = await reactInspection.stop()
     if (active && !lastState?.groupGone) {
       try {
         await stopReceipt(receiptFile, active.nonce, active.receipt.mainPid)
