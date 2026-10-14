@@ -437,10 +437,8 @@ function check(configuration) {
       : JSON.parse(
           boundedText(
             execFileSync(
-              process.platform === 'win32' ? process.execPath : 'pnpm',
-              process.platform === 'win32'
-                ? [rootRequire.resolve('@playwright/test/cli'), 'test', '--list', '--reporter=json']
-                : ['exec', 'playwright', 'test', '--list', '--reporter=json'],
+              process.execPath,
+              [rootRequire.resolve('@playwright/test/cli'), 'test', '--list', '--reporter=json'],
               {
                 cwd: controllerRoot,
                 encoding: 'utf8',
