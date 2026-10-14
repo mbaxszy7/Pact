@@ -11,6 +11,14 @@ import { main, run } from './run-e2e.mjs'
 
 const posixOnly = { skip: process.platform === 'win32', timeout: 20_000 }
 const syntheticSecret = 'synthetic-only-runner-secret-0123456789'
+const selectedGroupLimit = process.env.PACT_INFRA_POSIX_OWNED_GROUP_LIMIT === undefined ? 16 : 3
+const selectedGroupOptions =
+  process.env.PACT_INFRA_POSIX_OWNED_GROUP_LIMIT === undefined ? {} : { posixOwnedGroupLimit: 3 }
+if (
+  process.env.PACT_INFRA_POSIX_OWNED_GROUP_LIMIT !== undefined &&
+  process.env.PACT_INFRA_POSIX_OWNED_GROUP_LIMIT !== '3'
+)
+  throw new Error('The nested infrastructure test group limit must be exactly 3')
 
 function pidGone(pid) {
   try {
@@ -269,33 +277,87 @@ await test(
 )
 
 await test(
-  'the sixteen-group boundary preserves a successful natural exit',
+  'the optional POSIX group limit can only tighten the default and rejects before spawn',
+  posixOnly,
+  async (context) => {
+    for (const limit of [undefined, 1, 3, 16]) {
+      // oxlint-disable-next-line no-await-in-loop -- Each fixture owns and closes one real subject before the next capacity check.
+      const fixture = await treeFixture(context)
+      // oxlint-disable-next-line no-await-in-loop -- Each actual subject settles before the next bounded admission check.
+      assert.equal(await fixture.execute('normal', 10_000, { posixOwnedGroupLimit: limit }), 7)
+    }
+    let admitted = 0
+    for (const limit of [0, 17, -1, 1.5, '3', null, NaN, Infinity]) {
+      // oxlint-disable-next-line no-await-in-loop -- Invalid limits must reject without admitting any process.
+      await assert.rejects(
+        run([], 1000, {
+          executable: process.execPath,
+          posixOwnedGroupLimit: limit,
+          onState() {
+            admitted++
+          },
+        }),
+        /integer from 1 to 16/,
+      )
+    }
+    assert.equal(admitted, 0)
+  },
+)
+
+await test(
+  'Windows cannot silently accept a POSIX group limit',
+  { skip: process.platform !== 'win32' },
+  async () => {
+    let admitted = 0
+    await assert.rejects(
+      run([], 1000, {
+        executable: process.execPath,
+        posixOwnedGroupLimit: 3,
+        onState() {
+          admitted++
+        },
+      }),
+      /cannot apply to a Windows Job/,
+    )
+    assert.equal(admitted, 0)
+  },
+)
+
+await test(
+  'the selected owned-group boundary preserves a successful natural exit',
   posixOnly,
   async (context) => {
     const fixture = await treeFixture(context)
-    const execution = fixture.execute('groups-15-natural')
+    const execution = fixture.execute(`groups-${selectedGroupLimit - 1}-natural`, 10_000, {
+      ...selectedGroupOptions,
+    })
     const pids = await fixture.pids()
     assert.equal(await execution, 0)
-    assert.equal(pids.workers.length, 15)
-    assert.ok(fixture.states.some((value) => value.ownedGroupCount === 16))
+    assert.equal(pids.workers.length, selectedGroupLimit - 1)
+    assert.ok(fixture.states.some((value) => value.ownedGroupCount === selectedGroupLimit))
     assert.ok([pids.parent, ...pids.workers].every(groupGone))
     assert.equal(fixture.states.at(-1).groupGone, true)
   },
 )
 
 await test(
-  'rejected excess groups remain owned until all eighteen actual groups are released',
+  'rejected excess groups remain owned until the complete actual tree is released',
   posixOnly,
   async (context) => {
     const fixture = await treeFixture(context)
-    const execution = fixture.execute('groups-17-hold')
+    const execution = fixture.execute(`groups-${selectedGroupLimit + 1}-hold`, 10_000, {
+      ...selectedGroupOptions,
+    })
     const pids = await fixture.pids()
-    await assert.rejects(execution, /exceeded 16 active owned process groups/)
-    assert.equal(pids.workers.length, 17)
+    await assert.rejects(
+      execution,
+      new RegExp(`exceeded ${selectedGroupLimit} active owned process groups`),
+    )
+    assert.equal(pids.workers.length, selectedGroupLimit + 1)
     // This assertion runs before the fixture's emergency after-hook. A failed
     // admission must release the real Node tree without that fallback's help.
     assert.ok([pids.parent, ...pids.workers].every(groupGone))
-    assert.ok(fixture.states.every((value) => value.ownedGroupCount <= 16))
+    assert.ok(fixture.states.every((value) => value.ownedGroupCount <= selectedGroupLimit))
     assert.equal(fixture.states.at(-1).groupGone, true)
     assert.equal(fixture.states.at(-1).ownedProcessCount, 0)
   },

@@ -111,10 +111,21 @@ export function run(
     write,
     onState = () => {},
     onOwnership,
+    posixOwnedGroupLimit,
     inspectProcesses = readProcessTable,
   } = {},
 ) {
   if (signal?.aborted) return Promise.reject(failure('E2E job cancelled before admission.'))
+  if (
+    posixOwnedGroupLimit !== undefined &&
+    (!Number.isSafeInteger(posixOwnedGroupLimit) ||
+      posixOwnedGroupLimit < 1 ||
+      posixOwnedGroupLimit > maxOwnedGroups)
+  )
+    return Promise.reject(failure('POSIX owned-group limit must be an integer from 1 to 16.'))
+  if (process.platform === 'win32' && posixOwnedGroupLimit !== undefined)
+    return Promise.reject(failure('A POSIX owned-group limit cannot apply to a Windows Job.'))
+  const groupLimit = posixOwnedGroupLimit ?? maxOwnedGroups
   if (process.platform === 'win32') {
     return import('./run-e2e-windows.mjs').then(({ runWindows }) =>
       runWindows(
@@ -434,7 +445,7 @@ export function run(
             const leader = rows.get(known.pgid)
             const verifiedLeader =
               leader && sameProcess(ownedProcesses.get(leader.pid) ?? {}, leader)
-            const admitted = Boolean(verifiedLeader) && admittedGroupCount() < maxOwnedGroups
+            const admitted = Boolean(verifiedLeader) && admittedGroupCount() < groupLimit
             // Admission can fail without releasing cleanup responsibility. Every
             // retained group is backed by one of the bounded verified identities.
             if (ownedGroups.size >= maxOwnedProcesses) {
@@ -450,7 +461,8 @@ export function run(
               retainInvalidGroup(known.pgid, [])
               problem ??= failure('E2E descendant group has no verified owned leader.')
             }
-            if (!admitted) problem ??= failure('E2E job exceeded 16 active owned process groups.')
+            if (!admitted)
+              problem ??= failure(`E2E job exceeded ${groupLimit} active owned process groups.`)
           }
           // Pending confirmation never blocks cancellation of independently
           // verified groups. An unknown group is neither adopted nor signalled.

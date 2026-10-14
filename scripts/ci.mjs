@@ -270,11 +270,15 @@ export async function main(args = process.argv.slice(2), source = process.env) {
     // One worker avoids competing large-source fixtures; no deadline or assertion is relaxed.
     await pnpm(['exec', 'vitest', 'run', '--maxWorkers=1'], env, undefined, undefined, workspace)
   } else if (lane === 'infra') {
-    const code = await run(['--test', ...(await scriptTests(workspace))], 20 * 60_000, {
-      executable: process.execPath,
-      cwd: workspace,
-      env,
-    })
+    const code = await run(
+      ['--test', '--test-concurrency=1', ...(await scriptTests(workspace))],
+      20 * 60_000,
+      {
+        executable: process.execPath,
+        cwd: workspace,
+        env: { ...env, PACT_INFRA_POSIX_OWNED_GROUP_LIMIT: '3' },
+      },
+    )
     if (code !== 0) throw new Error('Required script tests failed')
   } else if (lane === 'validate-provider') {
     if (forwarded.length) throw new Error('Provider validation has no extra arguments')

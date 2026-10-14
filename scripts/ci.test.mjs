@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 
 import { prepareProviderEnvironment } from '../tests/e2e/provider-environment.ts'
 import {
@@ -75,6 +76,75 @@ void test('script inventory contains independent secret and platform runner test
   assert(files.includes('scripts/run-e2e-windows.test.mjs'))
   assert(files.includes('scripts/package-smoke.test.mjs'))
 })
+
+void test(
+  'the real infrastructure caller supervises tightened nested groups and rejects failures and cancellation',
+  { skip: process.platform === 'win32', timeout: 60_000 },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-ci-infra-primary-'))
+    const scripts = join(root, 'scripts'),
+      report = join(root, 'cancel-ready.json')
+    const file = join(scripts, 'bounded.test.mjs')
+    const source = {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      PACT_CI_WORKSPACE: root,
+      PACT_INFRA_POSIX_OWNED_GROUP_LIMIT: '17',
+    }
+    const runnerUrl = new URL('./run-e2e.mjs', import.meta.url).href
+    try {
+      await mkdir(scripts)
+      await writeFile(
+        file,
+        `import assert from 'node:assert/strict';
+      import { test } from 'node:test';
+      import { run } from ${JSON.stringify(runnerUrl)};
+      await test('bounded actual nested subject', async () => {
+        assert.equal(process.env.PACT_INFRA_POSIX_OWNED_GROUP_LIMIT, '3');
+        const child = 'setTimeout(() => process.exit(0), 2300)';
+        const parent = "import {spawn} from 'node:child_process';for(let i=0;i<2;i++)spawn(process.execPath,['-e',"+JSON.stringify(child)+"],{detached:true,stdio:'ignore',shell:false});setTimeout(()=>process.stdout.write('ready\\\\n'),1500);setTimeout(()=>process.exit(0),2800);";
+        assert.equal(await run(['--input-type=module','-e',parent],10000,{executable:process.execPath,posixOwnedGroupLimit:3,write(){}}),0);
+      });`,
+      )
+      await main(['infra'], source)
+      await writeFile(
+        file,
+        "import {test} from 'node:test';import assert from 'node:assert/strict';test('controlled failure',()=>assert.fail('controlled assertion'));",
+      )
+      await assert.rejects(main(['infra'], source), /Required script tests failed/)
+      await assert.rejects(
+        main(['infra'], { ...source, PACT_CI_WORKSPACE: join(root, 'missing') }),
+        /ENOENT/,
+      )
+      await writeFile(
+        file,
+        `import {test} from 'node:test';import {writeFileSync} from 'node:fs';
+      await test('controlled cancellation',async()=>{writeFileSync(${JSON.stringify(report)},'{}');await new Promise(()=>setInterval(()=>{},1000));});`,
+      )
+      const pending = main(['infra'], source)
+      const rejected = assert.rejects(pending, /Required script tests failed/)
+      const until = performance.now() + 10_000
+      let ready = false
+      while (performance.now() < until) {
+        try {
+          // oxlint-disable-next-line no-await-in-loop -- This owned marker is read under one fixed deadline before signalling the caller.
+          await readFile(report)
+          ready = true
+          break
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error
+        }
+        // oxlint-disable-next-line no-await-in-loop -- The readiness poll settles before its next bounded iteration.
+        await delay(25)
+      }
+      assert.equal(ready, true)
+      process.kill(process.pid, 'SIGINT')
+      await rejected
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  },
+)
 
 void test('execution reports use a private explicit path and cannot overwrite old results', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'pact-ci-evidence-test-'))

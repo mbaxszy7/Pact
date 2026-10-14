@@ -269,6 +269,20 @@ and cannot change the execution result. An invalid return or exception disables 
 accidental asynchronous rejection is observed once without admitting a Promise queue. Scoped
 runner regressions do not establish a complete real-provider suite or Windows acceptance.
 
+`run()` accepts an optional `posixOwnedGroupLimit` integer from 1 through 16 to tighten admission;
+its default remains 16 and it rejects this POSIX option on Windows. Production execution does not
+read the infrastructure test environment. CI script tests run one file at a time and use a fixed
+test-only limit of three, so their real boundary fixtures fit inside the unchanged outer supervisor.
+Direct default-budget acceptance still exercises the actual 16-group success and 18-group refusal:
+
+```sh
+pnpm exec node --test --test-name-pattern='selected owned-group boundary|rejected excess groups' scripts/run-e2e.test.mjs
+```
+
+Run that command without `PACT_INFRA_POSIX_OWNED_GROUP_LIMIT`. The CI-sized fixtures do not replace
+the default-budget evidence. All rejected groups must be confirmed closed before the test fixture's
+independent emergency cleanup; invalid limits fail before process admission.
+
 Standalone Windows NativeRpc helpers retain their ten-second/16 KiB compilation budget and private
 nonce-directory lifecycle. A native fixture entry has a ten-minute ceiling. NativeRpc completion
 waits for inherited stdio and helper cleanup; ordinary native EOF remains exit zero, while intentional
