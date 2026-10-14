@@ -16,11 +16,11 @@ const catalog = (models) => ({
   checkedAt: new Date().toISOString(),
 })
 
-test('exact native ID wins without changing existing payloads', () => {
+await test('exact native ID wins without changing existing payloads', () => {
   const exact = { id: 'actual-wire', displayName: 'Configured', supportedEfforts: ['low'] }
   assert.equal(resolveRealConfiguredModel(catalog([option('alias'), exact]), 'actual-wire'), exact)
 })
-test('equivalent aliases use stable native identity independent of list order', () => {
+await test('equivalent aliases use stable native identity independent of list order', () => {
   const haiku = option('haiku'),
     opus = option('opus'),
     sonnet = option('sonnet')
@@ -31,7 +31,7 @@ test('equivalent aliases use stable native identity independent of list order', 
     sonnet,
   )
 })
-test('effort ordering does not create a false alias conflict', () => {
+await test('effort ordering does not create a false alias conflict', () => {
   assert.equal(
     resolveRealConfiguredModel(
       catalog([option('b'), option('a', 'actual-wire', ['high', 'low'])]),
@@ -40,14 +40,14 @@ test('effort ordering does not create a false alias conflict', () => {
     'a',
   )
 })
-test('missing and decorated wire identities cannot stand in for the configuration', () => {
+await test('missing and decorated wire identities cannot stand in for the configuration', () => {
   for (const model of [
     option('haiku', 'actual-wire[1m]'),
     { id: 'haiku', displayName: 'Haiku', supportedEfforts: ['low'] },
   ])
     assert.throws(() => resolveRealConfiguredModel(catalog([model]), 'actual-wire'), /absent/u)
 })
-test('conflicting aliases fail instead of choosing another effort policy', () => {
+await test('conflicting aliases fail instead of choosing another effort policy', () => {
   assert.throws(
     () =>
       resolveRealConfiguredModel(
@@ -65,7 +65,7 @@ test('conflicting aliases fail instead of choosing another effort policy', () =>
     /conflicting/u,
   )
 })
-test('duplicate native IDs and unavailable catalogs cannot authorize a selection', () => {
+await test('duplicate native IDs and unavailable catalogs cannot authorize a selection', () => {
   assert.throws(
     () => resolveRealConfiguredModel(catalog([option('a'), option('a')]), 'actual-wire'),
     /duplicate/u,

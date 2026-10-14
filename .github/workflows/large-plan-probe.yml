@@ -27,3 +27,11 @@ jobs:
           apps/desktop/src/utility/conversation/conversation-collaboration.test.ts
           -t 'continues an approved complete 9 MiB plan'
           --maxWorkers=1 --reporter=verbose
+      - name: Compare the complete collaboration unit file without changing its deadlines
+        if: success() || failure()
+        env:
+          PACT_TEST_SOURCE_METRICS: '1'
+        run: >-
+          pnpm exec vitest run
+          apps/desktop/src/utility/conversation/conversation-collaboration.test.ts
+          --maxWorkers=1 --reporter=verbose
