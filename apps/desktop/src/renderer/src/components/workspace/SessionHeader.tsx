@@ -9,6 +9,7 @@ interface SessionHeaderProps {
   saving: boolean
   onSave: (title: string) => Promise<boolean>
   onOpenSettings: () => void
+  settingsButtonRef?: React.RefObject<HTMLButtonElement | null> | undefined
 }
 
 export function SessionHeader({
@@ -17,6 +18,7 @@ export function SessionHeader({
   saving,
   onSave,
   onOpenSettings,
+  settingsButtonRef,
 }: SessionHeaderProps): React.JSX.Element {
   return (
     <div className="flex h-full min-w-0 items-center justify-between gap-group">
@@ -30,6 +32,7 @@ export function SessionHeader({
         <EditableSessionTitle session={session} saving={saving} onSave={onSave} />
       </div>
       <button
+        ref={settingsButtonRef}
         className="inline-flex h-8 shrink-0 items-center gap-2 rounded-control px-2.5 text-caption font-medium text-secondary hover:bg-surface-muted hover:text-primary"
         type="button"
         onClick={onOpenSettings}
