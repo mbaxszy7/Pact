@@ -163,6 +163,9 @@ it('does not let an old Markdown response or an already-applied source navigatio
   await waitFor(() => expect(f.read).toHaveBeenCalledOnce())
   fireEvent.click(toggle(target))
   await screen.findByText('Latest requested details.')
+  // The current document's onReady effect owns its final scroll alignment.
+  // Finish that legitimate alignment before measuring a late obsolete response.
+  await waitFor(() => expect(layout.offset(target)).toBe(0))
   const calls = layout.scroll.mock.calls.length
   await act(async () =>
     oldDocument.resolve(documentResponse(old, 'Obsolete details.', f.props.sessionId)),
