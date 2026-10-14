@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { readFileSync, statSync } from 'node:fs'
+import { readFileSync, realpathSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -10,15 +10,17 @@ import {
   e2eMigrationCases,
   e2eMigrationOriginalAssertions,
 } from '../tests/e2e/coverage-manifest.ts'
+import { ciEnvironment } from './ci.mjs'
 import { readE2EBaseline } from './e2e-baseline.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
 const selectedWorkspace = process.env.PACT_CI_WORKSPACE
 if (selectedWorkspace !== undefined && !isAbsolute(selectedWorkspace))
   throw new Error('Coverage workspace must be an explicit absolute path.')
-const root = selectedWorkspace ?? resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const root = realpathSync(
+  selectedWorkspace ?? resolve(dirname(fileURLToPath(import.meta.url)), '..'),
+)
 const controllerRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const rootRequire = createRequire(join(controllerRoot, 'package.json'))
 const maxSourceBytes = 512 * 1024
 const maxReportBytes = 8 * 1024 * 1024
 const maxResultReports = 8
@@ -30,10 +32,11 @@ const babelRequire = createRequire(reactRequire.resolve('@babel/core'))
 const { parse } = babelRequire('@babel/parser')
 
 function options(argv) {
-  const result = { json: false, requireResults: false, results: [] }
+  const result = { json: false, sourceOnly: false, requireResults: false, results: [] }
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]
     if (argument === '--json') result.json = true
+    else if (argument === '--source-only') result.sourceOnly = true
     else if (argument === '--require-results') result.requireResults = true
     else if (argument === '--list-json' || argument === '--results-json') {
       const path = argv[++index]
@@ -46,7 +49,45 @@ function options(argv) {
       }
     } else throw new Error(`Unknown option: ${argument}`)
   }
+  if (result.sourceOnly && (result.list || result.results.length || result.requireResults))
+    throw new Error('Source-only coverage cannot accept discovery or execution reports')
   return result
+}
+
+/** Candidate registration has no authority to read the controller's credential environment. */
+export function discoveryEnvironment(source) {
+  return Object.fromEntries(
+    Object.entries(ciEnvironment(source)).filter(([key]) => !key.startsWith('PACT_')),
+  )
+}
+
+function discoverCandidate() {
+  const candidateRequire = createRequire(join(root, 'package.json'))
+  const cli = realpathSync(candidateRequire.resolve('@playwright/test/cli'))
+  const modules = join(realpathSync(root), 'node_modules')
+  const selected = relative(modules, cli)
+  if (
+    isAbsolute(selected) ||
+    selected === '..' ||
+    selected.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)
+  )
+    throw new Error('Candidate Playwright must be installed in its own workspace')
+  return JSON.parse(
+    boundedText(
+      execFileSync(
+        process.execPath,
+        [cli, 'test', '--config', join(root, 'playwright.config.ts'), '--list', '--reporter=json'],
+        {
+          cwd: root,
+          env: discoveryEnvironment(process.env),
+          encoding: 'utf8',
+          timeout: 30_000,
+          maxBuffer: maxReportBytes,
+        },
+      ),
+      maxReportBytes,
+    ),
+  )
 }
 
 function boundedText(text, maximum) {
@@ -175,6 +216,7 @@ export function sourceEvidence(path, text, { baseline = false } = {}) {
   const assertions = []
   const titles = []
   const skipSites = []
+  const skips = []
   function visit(node, ancestors = []) {
     if (!node || typeof node !== 'object') return
     if (node.type === 'CallExpression') {
@@ -237,8 +279,21 @@ export function sourceEvidence(path, text, { baseline = false } = {}) {
         callee.type === 'MemberExpression' &&
         callee.object.name === 'test' &&
         ['skip', 'fixme'].includes(callee.property.name)
-      )
+      ) {
         skipSites.push(node.loc.start.line)
+        const owner = ancestors
+          .toReversed()
+          .find(
+            (parent) =>
+              parent.type === 'CallExpression' &&
+              parent.callee.type === 'Identifier' &&
+              parent.callee.name === 'test',
+          )
+        skips.push({
+          line: node.loc.start.line,
+          signature: JSON.stringify([canonical(owner?.arguments[0] ?? null), canonical(node)]),
+        })
+      }
       if (callee.type === 'Identifier' && callee.name === 'test') {
         let environments = [{}]
         for (const loop of ancestors.filter((parent) => parent.type === 'ForOfStatement')) {
@@ -262,7 +317,7 @@ export function sourceEvidence(path, text, { baseline = false } = {}) {
     }
   }
   visit(ast)
-  return { path, assertions, titles, skipSites }
+  return { path, assertions, titles, skipSites, skips }
 }
 
 export function compareAssertions(path, baseline, current, updates = []) {
@@ -368,6 +423,7 @@ function targetStatus(target, listed, results) {
 function check(configuration) {
   const problems = []
   const skippedSources = []
+  const sources = new Map()
   const original = readE2EBaseline(join(root, 'tests/e2e/baseline.json'))
   if (original.revision !== e2eMigrationBaseline.revision)
     throw new Error('E2E manifest and immutable source revision disagree')
@@ -396,6 +452,7 @@ function check(configuration) {
     let current
     try {
       current = sourceEvidence(path, readFileSync(join(root, path), 'utf8'))
+      sources.set(path, current)
     } catch {
       problems.push({ type: 'original-source-unavailable', path })
       continue
@@ -410,7 +467,6 @@ function check(configuration) {
           .flatMap((item) => item.contractUpdates ?? []),
       ),
     )
-    if (current.skipSites.length) skippedSources.push({ path, lines: current.skipSites })
   }
   const actualBaseline = {
     specCount: baselinePaths.length,
@@ -431,25 +487,9 @@ function check(configuration) {
   for (const key of manifestIdentities)
     if (!originals.has(key))
       problems.push({ type: 'manifest-original-not-in-baseline', identity: JSON.parse(key) })
-  const listed = reportCases(
-    configuration.list
-      ? reportFile(configuration.list)
-      : JSON.parse(
-          boundedText(
-            execFileSync(
-              process.execPath,
-              [rootRequire.resolve('@playwright/test/cli'), 'test', '--list', '--reporter=json'],
-              {
-                cwd: controllerRoot,
-                encoding: 'utf8',
-                timeout: 30_000,
-                maxBuffer: maxReportBytes,
-              },
-            ),
-            maxReportBytes,
-          ),
-        ),
-  )
+  const listed = configuration.sourceOnly
+    ? new Map()
+    : reportCases(configuration.list ? reportFile(configuration.list) : discoverCandidate())
   const results = new Map()
   const executionReports = []
   let reportBytes = 0
@@ -488,7 +528,7 @@ function check(configuration) {
         identity(test.path, test.title) ===
         identity(item.originalPath, item.currentTitle ?? item.originalTitle),
     )
-    if (!originalListed)
+    if (!configuration.sourceOnly && !originalListed)
       problems.push({
         type: 'original-case-no-longer-registered',
         path: item.originalPath,
@@ -496,7 +536,7 @@ function check(configuration) {
       })
     const targets = item.targets.map((target) => ({
       ...target,
-      status: targetStatus(target, listed, results),
+      status: configuration.sourceOnly ? 'unverified' : targetStatus(target, listed, results),
       executionHistory:
         results.get(identity(target.path, target.title, target.project))?.history ?? [],
     }))
@@ -542,7 +582,7 @@ function check(configuration) {
     }
   })
   const additionalBusinessCases = e2eBusinessExpansionTargets.map((target) => {
-    const status = targetStatus(target, listed, results)
+    const status = configuration.sourceOnly ? 'unverified' : targetStatus(target, listed, results)
     if (
       ['missing', 'failed', 'skipped'].includes(status) ||
       (configuration.requireResults && status === 'unverified')
@@ -555,14 +595,42 @@ function check(configuration) {
         results.get(identity(target.path, target.title, target.project))?.history ?? [],
     }
   })
-  for (const path of new Set(e2eBusinessExpansionTargets.map((target) => target.path))) {
-    const source = sourceEvidence(path, readFileSync(join(root, path), 'utf8'))
-    if (source.skipSites.length)
-      problems.push({ type: 'additional-business-source-skip', path, lines: source.skipSites })
+  const targetPaths = new Set([
+    ...baselinePaths,
+    ...e2eMigrationCases.flatMap((item) => item.targets.map((target) => target.path)),
+    ...e2eBusinessExpansionTargets.map((target) => target.path),
+  ])
+  for (const path of targetPaths) {
+    let source = sources.get(path)
+    if (!source) {
+      try {
+        source = sourceEvidence(path, readFileSync(join(root, path), 'utf8'))
+      } catch {
+        problems.push({ type: 'target-source-unavailable', path })
+        continue
+      }
+    }
+    if (!source.skipSites.length) continue
+    skippedSources.push({ path, lines: source.skipSites })
+    // Retain only exact platform/accessibility conditions already present in
+    // trusted controller source. A new skip cannot bypass static publication.
+    const trusted = sourceEvidence(path, readFileSync(join(controllerRoot, path), 'utf8'))
+    const remaining = new Map()
+    for (const skip of trusted.skips)
+      remaining.set(skip.signature, (remaining.get(skip.signature) ?? 0) + 1)
+    const unexpected = source.skips.filter((skip) => {
+      const count = remaining.get(skip.signature) ?? 0
+      if (count === 0) return true
+      remaining.set(skip.signature, count - 1)
+      return false
+    })
+    if (unexpected.length)
+      problems.push({ type: 'source-skip', path, lines: unexpected.map((skip) => skip.line) })
   }
   return {
     baseline: { revision: e2eMigrationBaseline.revision, ...actualBaseline },
-    registeredCaseCount: listed.size,
+    discoveryChecked: !configuration.sourceOnly,
+    registeredCaseCount: configuration.sourceOnly ? null : listed.size,
     resultsSupplied: executionReports.length > 0,
     executionReports,
     sourceSkipSites: skippedSources,
@@ -571,6 +639,7 @@ function check(configuration) {
     cases,
     additionalBusinessCases,
     passedGate:
+      !configuration.sourceOnly &&
       problems.length === 0 &&
       cases.every((item) => item.status === 'verified-by-results') &&
       additionalBusinessCases.every((item) => item.status === 'passed'),
