@@ -62,7 +62,7 @@ it.each(['sidebar-title', 'source-navigation'] as const)(
       markdown.resolve(documentResponse(target, 'The third issue details.', f.props.sessionId)),
     )
     await screen.findByText('The third issue details.')
-    expect(layout.offset(target)).toBe(0)
+    await waitFor(() => expect(layout.offset(target)).toBe(0))
     expect(document.activeElement).toBe(button)
     expect(f.props.onReadDetail).toHaveBeenCalledWith(target)
     expect(f.read).toHaveBeenCalledWith(
@@ -77,7 +77,7 @@ it('positions the same row after closing and reopening it, and leaves a user scr
   const layout = mount(f.props)
   fireEvent.click(toggle(target))
   await screen.findByText(`Details for ${target.title}.`)
-  expect(layout.offset(target)).toBe(0)
+  await waitFor(() => expect(layout.offset(target)).toBe(0))
   layout.host.scrollTop = 90
   const calls = layout.scroll.mock.calls.length
   layout.view.rerender(
@@ -94,7 +94,7 @@ it('positions the same row after closing and reopening it, and leaves a user scr
   expect(toggle(target).getAttribute('aria-expanded')).toBe('false')
   fireEvent.click(toggle(target))
   await screen.findByText(`Details for ${target.title}.`)
-  expect(layout.offset(target)).toBe(0)
+  await waitFor(() => expect(layout.offset(target)).toBe(0))
 })
 
 it('applies each source navigation once even when the same Todo version is clicked again', async () => {
@@ -103,7 +103,7 @@ it('applies each source navigation once even when the same Todo version is click
   f.props.reveal = { todoId: target.id, revision: target.revision, navigationId: 'first' }
   const layout = mount(f.props)
   await screen.findByText(`Details for ${target.title}.`)
-  expect(layout.offset(target)).toBe(0)
+  await waitFor(() => expect(layout.offset(target)).toBe(0))
   layout.host.scrollTop = 90
   layout.view.rerender(
     <CollaborationTodos {...f.props} reveal={{ ...f.props.reveal, navigationId: 'second' }} />,
@@ -144,7 +144,7 @@ it('ignores an old metadata read after a quick title switch and reveals only the
   await act(async () => nextRead.resolve(detailFor(target)))
   await screen.findByText(`Details for ${target.title}.`)
   expect(screen.queryByText(`Details for ${old.title}.`)).toBeNull()
-  expect(layout.offset(target)).toBe(0)
+  await waitFor(() => expect(layout.offset(target)).toBe(0))
 })
 
 it('does not let an old Markdown response or an already-applied source navigation steal a local selection', async () => {
