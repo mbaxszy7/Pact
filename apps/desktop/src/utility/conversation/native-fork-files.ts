@@ -153,6 +153,7 @@ function answerResult(value: unknown): NativeForkAnswerResult {
 /** One bounded off-event-loop reader per Adapter. No native process or transcript cache. */
 export class NativeForkFiles {
   private worker: Worker | undefined
+  private terminateWorker: (() => Promise<void>) | undefined
 
   constructor(private readonly ipcTraffic?: LogicalIpcWorkerTraffic) {}
 
@@ -246,6 +247,34 @@ export class NativeForkFiles {
     const references = new AbortController()
     let timer: ReturnType<typeof setTimeout> | undefined
     let abort: (() => void) | undefined
+    let physicallySettled = false
+    let termination: Promise<void> | undefined
+    const settlePhysical = (): void => {
+      if (physicallySettled) return
+      physicallySettled = true
+      reservation.release()
+      if (this.worker === worker) {
+        this.worker = undefined
+        this.terminateWorker = undefined
+      }
+    }
+    const terminate = (): Promise<void> => {
+      if (physicallySettled) return Promise.resolve()
+      if (!termination) {
+        try {
+          termination = worker.terminate().then(settlePhysical)
+        } catch (error) {
+          return Promise.reject(error)
+        }
+        termination = termination.catch((error: unknown) => {
+          termination = undefined
+          throw error
+        })
+      }
+      return termination
+    }
+    this.terminateWorker = terminate
+    worker.once('exit', settlePhysical)
     try {
       return await new Promise<T>((resolve, reject) => {
         abort = () =>
@@ -289,6 +318,7 @@ export class NativeForkFiles {
                 traffic.recordMeasurement('native-fork-utility.reply', 'business', measured.data)
               else traffic.invalidate('unvalidated_message')
             }
+            if (!active) return
             if (message.type === 'history_reference') {
               const id = message.nativeSessionId
               if (
@@ -367,18 +397,11 @@ export class NativeForkFiles {
       references.abort()
       clearTimeout(timer)
       if (abort) signal.removeEventListener('abort', abort)
-      try {
-        await worker.terminate()
-      } finally {
-        reservation.release()
-        if (this.worker === worker) this.worker = undefined
-      }
+      await terminate()
     }
   }
 
   async dispose(): Promise<void> {
-    const worker = this.worker
-    if (worker) await worker.terminate()
-    if (this.worker === worker) this.worker = undefined
+    await this.terminateWorker?.()
   }
 }

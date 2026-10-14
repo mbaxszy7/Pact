@@ -18,6 +18,7 @@ import { hasLogicalIpcFixtureNonce, LogicalIpcWorkerTraffic } from '../shared/lo
 import { handleAppearanceRequest } from './appearance/handler'
 import { Conversation } from './conversation/conversation'
 import { ConversationImages } from './conversation/conversation-images'
+import { nativeWorkingMemoryDiagnostics } from './conversation/native-working-memory'
 import { DefaultSessionSettings } from './default-session-settings/default-session-settings'
 import { ProjectCatalog } from './project-catalog/project-catalog'
 import { ProjectFileReader } from './project-file/project-file-reader'
@@ -78,6 +79,7 @@ function performanceSnapshot(
     activeResources,
     resourceHighWater,
     resourceCapacityExceeded,
+    nativeMemory: nativeWorkingMemoryDiagnostics(),
   }
 }
 

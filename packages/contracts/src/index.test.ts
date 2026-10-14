@@ -11,12 +11,55 @@ import {
   IPC_TRAFFIC_UNIT,
   ipcTrafficSchema,
   monacoIpcObservationSchema,
+  nativeMemoryDiagnosticsSchema,
 } from './index.js'
 
 const uuid = (index: number): string =>
   `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`
 
 describe('foundation contracts', () => {
+  it('requires truthful, bounded Native reservation scalars and accepts explicit unknown counts', () => {
+    const observed = {
+      unit: 'native-working-reservations-v1',
+      observationsComplete: true,
+      chargedBytes: 50,
+      reservationItems: 1,
+      highWaterBytes: 100,
+      highWaterItems: 2,
+      acquiredBytes: 150,
+      releasedBytes: 100,
+      acquiredItems: 3,
+      releasedItems: 2,
+    }
+    expect(nativeMemoryDiagnosticsSchema.safeParse(observed).success).toBe(true)
+    expect(
+      nativeMemoryDiagnosticsSchema.safeParse({
+        ...observed,
+        observationsComplete: false,
+        acquiredBytes: null,
+      }).success,
+    ).toBe(true)
+    for (const invalid of [
+      { ...observed, unit: 'node-active-resources' },
+      { ...observed, paths: ['/private/source'] },
+      { ...observed, model: 'private-model' },
+      { ...observed, body: 'private-body' },
+      { ...observed, chargedBytes: -1 },
+      { ...observed, chargedBytes: 512 * 1024 * 1024 + 1 },
+      { ...observed, acquiredBytes: 149 },
+      { ...observed, releasedItems: 3 },
+      { ...observed, highWaterBytes: 49 },
+      { ...observed, highWaterItems: 0 },
+      { ...observed, highWaterBytes: 151 },
+      { ...observed, highWaterItems: 4 },
+      { ...observed, acquiredItems: Number.MAX_SAFE_INTEGER + 1 },
+      { ...observed, reservationItems: 0.5 },
+      { ...observed, acquiredBytes: null },
+      { ...observed, observationsComplete: false },
+      { ...observed, observationsComplete: false, acquiredItems: null, acquiredBytes: 149 },
+    ])
+      expect(nativeMemoryDiagnosticsSchema.safeParse(invalid).success).toBe(false)
+  })
   it('rejects missing and older Monaco measurement units before counting traffic', () => {
     const observation = {
       type: 'message',
@@ -120,6 +163,33 @@ describe('foundation contracts', () => {
       },
     })
     expect(runtimeHealthSchema.safeParse(health).success).toBe(true)
+    const nativeMemory = {
+      unit: 'native-working-reservations-v1',
+      observationsComplete: true,
+      chargedBytes: 0,
+      reservationItems: 0,
+      highWaterBytes: 4096,
+      highWaterItems: 1,
+      acquiredBytes: 4096,
+      releasedBytes: 4096,
+      acquiredItems: 1,
+      releasedItems: 1,
+    }
+    expect(
+      runtimeHealthSchema.safeParse({
+        ...health,
+        performance: { ...health.performance, nativeMemory },
+      }).success,
+    ).toBe(true)
+    expect(
+      runtimeHealthSchema.safeParse({
+        ...health,
+        performance: {
+          ...health.performance,
+          nativeMemory: { ...nativeMemory, observationsComplete: false },
+        },
+      }).success,
+    ).toBe(false)
     expect(runtimeHealthSchema.safeParse(withFailure(failure)).success).toBe(true)
     expect(
       runtimeHealthSchema.safeParse(

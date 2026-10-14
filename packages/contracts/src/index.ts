@@ -451,6 +451,61 @@ export const ipcTrafficSchema = z
   )
 export type IpcTraffic = z.infer<typeof ipcTrafficSchema>
 
+export const nativeMemoryDiagnosticsSchema = z
+  .strictObject({
+    unit: z.literal('native-working-reservations-v1'),
+    observationsComplete: z.boolean(),
+    chargedBytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(512 * 1024 * 1024)
+      .nullable(),
+    reservationItems: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    highWaterBytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(512 * 1024 * 1024)
+      .nullable(),
+    highWaterItems: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    acquiredBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    releasedBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    acquiredItems: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    releasedItems: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  })
+  .refine((value) => {
+    const complete = Object.values(value).every((count) => count !== null)
+    if (value.observationsComplete !== complete) return false
+    const {
+      acquiredBytes,
+      releasedBytes,
+      chargedBytes,
+      acquiredItems,
+      releasedItems,
+      reservationItems,
+      highWaterBytes,
+      highWaterItems,
+    } = value
+    return (
+      (acquiredBytes === null ||
+        releasedBytes === null ||
+        chargedBytes === null ||
+        acquiredBytes - releasedBytes === chargedBytes) &&
+      (acquiredItems === null ||
+        releasedItems === null ||
+        reservationItems === null ||
+        acquiredItems - releasedItems === reservationItems) &&
+      (highWaterBytes === null || chargedBytes === null || highWaterBytes >= chargedBytes) &&
+      (highWaterItems === null ||
+        reservationItems === null ||
+        highWaterItems >= reservationItems) &&
+      (highWaterBytes === null || acquiredBytes === null || highWaterBytes <= acquiredBytes) &&
+      (highWaterItems === null || acquiredItems === null || highWaterItems <= acquiredItems)
+    )
+  })
+export type NativeMemoryDiagnostics = z.infer<typeof nativeMemoryDiagnosticsSchema>
+
 export const runtimeHealthSchema = z.object({
   ipcTraffic: ipcTrafficSchema.optional(),
   performance: z
@@ -462,6 +517,7 @@ export const runtimeHealthSchema = z.object({
       activeResources: z.record(z.string().max(64), z.number().int().nonnegative()),
       resourceHighWater: z.number().int().nonnegative(),
       resourceCapacityExceeded: z.boolean(),
+      nativeMemory: nativeMemoryDiagnosticsSchema.optional(),
       sqlite: z.strictObject({
         operations: z.number().int().nonnegative(),
         transactions: z.number().int().nonnegative(),

@@ -14,9 +14,17 @@ import {
   NativeForkFiles,
   type NativeForkFileInput,
   type NativeForkHistoryReference,
+  type NativeForkFileResult,
 } from './native-fork-files'
+import { NativeWorkingMemory, NATIVE_OWNER_WORKING_BYTES } from './native-working-memory'
 
-const workerLocation = vi.hoisted(() => ({ path: '', live: 0, started: 0 }))
+const workerLocation = vi.hoisted(() => ({
+  path: '',
+  live: 0,
+  started: 0,
+  throwNext: false,
+  last: undefined as import('node:worker_threads').Worker | undefined,
+}))
 vi.mock('node:worker_threads', async (original) => {
   const actual = await original<typeof import('node:worker_threads')>()
   return {
@@ -26,9 +34,14 @@ vi.mock('node:worker_threads', async (original) => {
         _filename: ConstructorParameters<typeof actual.Worker>[0],
         options?: ConstructorParameters<typeof actual.Worker>[1],
       ) {
+        if (workerLocation.throwNext) {
+          workerLocation.throwNext = false
+          throw new Error('Controlled Worker construction failure')
+        }
         super(workerLocation.path, options)
         workerLocation.live += 1
         workerLocation.started += 1
+        workerLocation.last = this
         this.once('exit', () => {
           workerLocation.live -= 1
         })
@@ -1026,3 +1039,176 @@ it('keeps all actual Fork candidate/reference/ACK traffic and physical exits in 
     workerLocation.started,
   )
 })
+
+it('retains a rejected termination owner and shared reservation until the exact real Worker exits', async () => {
+  const fixture = await pagedFixture()
+  const owner = new NativeForkFiles()
+  const entered = Promise.withResolvers<void>()
+  const controller = new AbortController()
+  const persistCandidate = vi.fn<(value: NativeForkFileResult) => Promise<void>>(
+    async () => undefined,
+  )
+  const execution = owner.execute(
+    fixture.child,
+    controller.signal,
+    persistCandidate,
+    (_id, signal) =>
+      new Promise<NativeForkHistoryReference>((_resolve, reject) => {
+        signal.addEventListener(
+          'abort',
+          () => reject(new Error('Controlled parent cancellation')),
+          { once: true },
+        )
+        entered.resolve()
+      }),
+  )
+  const outcome = execution.catch((error: unknown) => error)
+  await entered.promise
+  const worker = workerLocation.last!
+  const termination = vi
+    .spyOn(worker, 'terminate')
+    .mockRejectedValue(new Error('Controlled termination rejection'))
+  const retained = Array.from({ length: 3 }, () =>
+    new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES),
+  )
+  let additional: ReturnType<NativeWorkingMemory['reserve']> | undefined
+  try {
+    controller.abort()
+    expect(await outcome).toBeInstanceOf(Error)
+    expect(workerLocation.live).toBe(1)
+    expect(() => {
+      additional = new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES)
+    }).toThrow(/capacity is full/u)
+    const started = workerLocation.started
+    await expect(
+      owner.execute(
+        fixture.child,
+        new AbortController().signal,
+        undefined,
+        fixture.resolveReference,
+      ),
+    ).rejects.toThrow(/already active/u)
+    expect(workerLocation.started).toBe(started)
+    worker.emit('message', {
+      type: 'candidate',
+      result: { ...fixture.prefix, nativeSessionId: fixture.child.nativeSessionId },
+    })
+    await Promise.resolve()
+    expect(persistCandidate).not.toHaveBeenCalled()
+    termination.mockRestore()
+    await worker.terminate()
+    expect(workerLocation.live).toBe(0)
+    additional = new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES)
+    expect(retained.every((reservation) => reservation.bytes === NATIVE_OWNER_WORKING_BYTES)).toBe(
+      true,
+    )
+  } finally {
+    termination.mockRestore()
+    await worker.terminate()
+    additional?.release()
+    for (const reservation of retained) reservation.release()
+    await owner.dispose()
+  }
+}, 15_000)
+
+it('shares pending termination between abort and disposal while replacement remains refused', async () => {
+  const fixture = await pagedFixture()
+  const owner = new NativeForkFiles()
+  const controller = new AbortController()
+  const entered = Promise.withResolvers<void>()
+  const heldTermination = Promise.withResolvers<number>()
+  const execution = owner.execute(
+    fixture.child,
+    controller.signal,
+    undefined,
+    (_id, signal) =>
+      new Promise<NativeForkHistoryReference>((_resolve, reject) => {
+        signal.addEventListener(
+          'abort',
+          () => reject(new Error('Controlled parent cancellation')),
+          { once: true },
+        )
+        entered.resolve()
+      }),
+  )
+  const outcome = execution.catch((error: unknown) => error)
+  await entered.promise
+  const worker = workerLocation.last!
+  const actualTerminate = worker.terminate.bind(worker)
+  const termination = vi
+    .spyOn(worker, 'terminate')
+    .mockImplementation(() => heldTermination.promise)
+  let closed = false
+  const closing = owner.dispose().then(() => {
+    closed = true
+    return undefined
+  })
+  try {
+    controller.abort()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(closed).toBe(false)
+    expect(workerLocation.live).toBe(1)
+    const started = workerLocation.started
+    await expect(
+      owner.execute(
+        fixture.child,
+        new AbortController().signal,
+        undefined,
+        fixture.resolveReference,
+      ),
+    ).rejects.toThrow(/already active/u)
+    expect(workerLocation.started).toBe(started)
+    expect(termination).toHaveBeenCalledTimes(1)
+    heldTermination.resolve(await actualTerminate())
+    expect(await outcome).toBeInstanceOf(Error)
+    await closing
+    expect(closed).toBe(true)
+    expect(workerLocation.live).toBe(0)
+  } finally {
+    termination.mockRestore()
+    heldTermination.resolve(await actualTerminate())
+    await closing
+    await outcome
+    await owner.dispose()
+  }
+}, 15_000)
+
+it('constructor failure retains no Worker or shared reservation and permits the next real operation', async () => {
+  const fixture = await pagedFixture()
+  const owner = new NativeForkFiles()
+  const retained = Array.from({ length: 3 }, () =>
+    new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES),
+  )
+  let additional: ReturnType<NativeWorkingMemory['reserve']> | undefined
+  try {
+    workerLocation.throwNext = true
+    await expect(
+      owner.execute(
+        fixture.child,
+        new AbortController().signal,
+        undefined,
+        fixture.resolveReference,
+      ),
+    ).rejects.toThrow('Controlled Worker construction failure')
+    expect(workerLocation.live).toBe(0)
+    additional = new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES)
+    additional.release()
+    expect(
+      (
+        await owner.execute(
+          fixture.child,
+          new AbortController().signal,
+          undefined,
+          fixture.resolveReference,
+        )
+      ).prefixHash,
+    ).toBe(fixture.prefix.prefixHash)
+    expect(workerLocation.live).toBe(0)
+  } finally {
+    workerLocation.throwNext = false
+    additional?.release()
+    for (const reservation of retained) reservation.release()
+    await owner.dispose()
+  }
+}, 15_000)
