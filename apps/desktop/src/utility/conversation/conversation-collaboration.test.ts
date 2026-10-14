@@ -218,16 +218,20 @@ function adapter(agentId: RuntimeAgentId) {
         (source) => source !== undefined,
       )) {
         const measuredAt = largePlanMetrics ? performance.now() : 0
-        let pages = 0
+        const cpuStarted = largePlanMetrics ? process.cpuUsage() : undefined
+        let pages = 0,
+          readerMs = 0
         let offset = 0,
           largestReply = 0
         const hash = createHash('sha256')
         for (;;) {
+          const readerStarted = largePlanMetrics ? performance.now() : 0
           const page = input.readCollaborationSourcePart!({
             ...input.promptEnvelope.sourceGrant,
             document,
             offset,
           })
+          if (largePlanMetrics) readerMs += performance.now() - readerStarted
           pages++
           hash.update(page.text)
           largestReply = Math.max(largestReply, Buffer.byteLength(JSON.stringify(page)))
@@ -236,10 +240,14 @@ function adapter(agentId: RuntimeAgentId) {
           if (page.nextOffset !== offset)
             throw Error('Source continuation skipped or repeated text')
         }
+        const cpu = cpuStarted ? process.cpuUsage(cpuStarted) : undefined
         metric(document === phase.planDocument ? 'plan-pages' : 'task-pages', measuredAt, {
           turn: native.inputs.length,
           pages,
           chars: offset,
+          readerMs: Math.round(readerMs * 100) / 100,
+          cpuUserMs: (cpu?.user ?? 0) / 1000,
+          cpuSystemMs: (cpu?.system ?? 0) / 1000,
         })
         native.sources.push({
           runId: input.runId,
@@ -252,25 +260,33 @@ function adapter(agentId: RuntimeAgentId) {
       const priorSource = phase.priorResultDocument ?? phase.resultDocument
       if (priorSource) {
         const measuredAt = largePlanMetrics ? performance.now() : 0
-        let pages = 0
+        const cpuStarted = largePlanMetrics ? process.cpuUsage() : undefined
+        let pages = 0,
+          readerMs = 0
         let text = '',
           offset = 0
         for (;;) {
+          const readerStarted = largePlanMetrics ? performance.now() : 0
           const page = input.readCollaborationSourcePart!({
             ...input.promptEnvelope.sourceGrant,
             document: priorSource,
             offset,
           })
+          if (largePlanMetrics) readerMs += performance.now() - readerStarted
           pages++
           text += page.text
           if (page.nextOffset === null) break
           offset = page.nextOffset
         }
         collaborationResultSchema.parse(JSON.parse(text))
+        const cpu = cpuStarted ? process.cpuUsage(cpuStarted) : undefined
         metric('prior-result-pages', measuredAt, {
           turn: native.inputs.length,
           pages,
           chars: text.length,
+          readerMs: Math.round(readerMs * 100) / 100,
+          cpuUserMs: (cpu?.user ?? 0) / 1000,
+          cpuSystemMs: (cpu?.system ?? 0) / 1000,
         })
       }
       const submission = collaborationSubmission(phase),
