@@ -330,6 +330,19 @@ jobs:
         run: node control/scripts/ci.mjs native
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-evidence/${{ matrix.key }}
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/pact-identity/ci-identity.json
+          PACT_CI_NATIVE_ARTIFACT: native-e2e-${{ matrix.key }}-a${{ github.run_attempt }}
+      - name: Preserve safe native protocol case reports including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-e2e-${{ matrix.key }}-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-native-evidence/${{ matrix.key }}/native-summary.json
+            ${{ runner.temp }}/pact-native-evidence/${{ matrix.key }}/native-summary.md
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Build Dev or Stable-candidate installers
         id: distribution
         if: ${{ !cancelled() && steps.native.outcome == 'success' }}

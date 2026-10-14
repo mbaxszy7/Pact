@@ -165,6 +165,21 @@ jobs:
           PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/darwin-arm64
       - name: Target-architecture native CLI protocol checks
         run: node control/scripts/ci.mjs native
+        env:
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-evidence/darwin-arm64
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/pact-identity/release-identity.json
+          PACT_CI_NATIVE_IDENTITY_KIND: release
+          PACT_CI_NATIVE_ARTIFACT: release-native-e2e-darwin-arm64-a${{ github.run_attempt }}
+      - name: Preserve safe native protocol case reports including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-native-e2e-darwin-arm64-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-native-evidence/darwin-arm64/native-summary.json
+            ${{ runner.temp }}/pact-native-evidence/darwin-arm64/native-summary.md
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Collect bounded no-credential Electron failure diagnostics
         if: failure()
         timeout-minutes: 2
@@ -387,6 +402,21 @@ jobs:
           PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/win32-x64
       - name: Target-architecture native CLI protocol checks
         run: node control/scripts/ci.mjs native
+        env:
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-evidence/win32-x64
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/pact-identity/release-identity.json
+          PACT_CI_NATIVE_IDENTITY_KIND: release
+          PACT_CI_NATIVE_ARTIFACT: release-native-e2e-win32-x64-a${{ github.run_attempt }}
+      - name: Preserve safe native protocol case reports including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-native-e2e-win32-x64-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-native-evidence/win32-x64/native-summary.json
+            ${{ runner.temp }}/pact-native-evidence/win32-x64/native-summary.md
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Collect bounded no-credential Electron failure diagnostics
         if: failure()
         timeout-minutes: 2
@@ -610,6 +640,21 @@ jobs:
           PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/win32-arm64
       - name: Target-architecture native CLI protocol checks
         run: node control/scripts/ci.mjs native
+        env:
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-evidence/win32-arm64
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/pact-identity/release-identity.json
+          PACT_CI_NATIVE_IDENTITY_KIND: release
+          PACT_CI_NATIVE_ARTIFACT: release-native-e2e-win32-arm64-a${{ github.run_attempt }}
+      - name: Preserve safe native protocol case reports including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-native-e2e-win32-arm64-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-native-evidence/win32-arm64/native-summary.json
+            ${{ runner.temp }}/pact-native-evidence/win32-arm64/native-summary.md
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Collect bounded no-credential Electron failure diagnostics
         if: failure()
         timeout-minutes: 2

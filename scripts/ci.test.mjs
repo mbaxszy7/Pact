@@ -18,6 +18,63 @@ import {
   main,
 } from './ci.mjs'
 
+void test('native CI preserves failed case reports and refuses missing execution evidence even after exit zero', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'pact-native-ci-report-'))
+  try {
+    await writeFile(
+      join(workspace, 'package.json'),
+      JSON.stringify({
+        private: true,
+        type: 'module',
+        scripts: { 'test:native': 'node fixture.mjs' },
+      }),
+    )
+    /* oxlint-disable no-await-in-loop -- Each real pnpm invocation must finish before this owned fixture program is replaced for its next outcome. */
+    for (const mode of ['failed', 'passed', 'missing']) {
+      const directory = join(workspace, mode)
+      const raw = {
+        success: mode === 'passed',
+        numTotalTests: 1,
+        testResults: [
+          {
+            assertionResults: [
+              {
+                fullName: 'Owned native fixture',
+                status: mode === 'passed' ? 'passed' : 'failed',
+                duration: 1,
+                failureMessages: ['synthetic-private-native-error'],
+              },
+            ],
+          },
+        ],
+      }
+      await writeFile(
+        join(workspace, 'fixture.mjs'),
+        `import{writeFileSync}from'node:fs';const i=process.argv.indexOf('--outputFile');if(i<0)throw Error('missing reporter');${mode === 'missing' ? '' : `writeFileSync(process.argv[i+1],${JSON.stringify(JSON.stringify(raw))});`}process.exitCode=${mode === 'failed' ? 1 : 0};`,
+      )
+      const source = {
+        PATH: process.env.PATH,
+        HOME: workspace,
+        USERPROFILE: workspace,
+        SystemRoot: process.env.SystemRoot,
+        TEMP: workspace,
+        PACT_CI_WORKSPACE: workspace,
+        PACT_CI_NATIVE_REPORT_DIR: directory,
+        PACT_CI_NATIVE_ARTIFACT: `native-e2e-fixture-${mode}-a1`,
+      }
+      if (mode === 'passed') await main(['native'], source)
+      else await assert.rejects(main(['native'], source), /native.*(failed|incomplete)/iu)
+      const report = JSON.parse(await readFile(join(directory, 'native-summary.json'), 'utf8'))
+      assert.equal(report.status, mode === 'missing' ? 'blocked' : mode)
+      assert(!JSON.stringify(report).includes('synthetic-private-native-error'))
+      assert(!(await readdir(directory)).some((name) => name.startsWith('private-')))
+    }
+    /* oxlint-enable no-await-in-loop */
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+  }
+})
+
 void test('trusted preflight rejects missing credentials and invalid indirect Codex auth before candidate hooks can run', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pact-provider-preflight-'))
   const source = {

@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os'
 import { resolve, join, isAbsolute } from 'node:path'
 
 import { loadProviderConfiguration } from '../tests/e2e/provider-environment.ts'
+import { writeNativeReport } from './ci-native-report.mjs'
 import { requireRealScope } from './real-e2e-policy.mjs'
 import { run, runNaturally as runCiE2EJob } from './run-e2e.mjs'
 import { isScriptEntry } from './script-entry.mjs'
@@ -396,6 +397,64 @@ export async function main(args = process.argv.slice(2), source = process.env) {
     if (source.GITHUB_OUTPUT)
       await appendFile(source.GITHUB_OUTPUT, `${lane}_execution_completed=true\n`)
     if (code !== 0) throw new Error('Required Electron E2E lane failed')
+  } else if (lane === 'native' && source.PACT_CI_NATIVE_REPORT_DIR) {
+    if (forwarded.length) throw new Error('Reported native execution owns its reporter arguments')
+    const directory = source.PACT_CI_NATIVE_REPORT_DIR
+    if (
+      !isAbsolute(directory) ||
+      Buffer.byteLength(directory) > 4096 ||
+      /[\r\n\0]/u.test(directory)
+    )
+      throw new Error('Native reports require a bounded private directory')
+    await mkdir(directory, { recursive: true, mode: 0o700 })
+    const info = await lstat(directory)
+    if (!info.isDirectory() || info.isSymbolicLink())
+      throw new Error('Native reports cannot be redirected')
+    const rawDirectory = await mkdtemp(join(directory, 'private-'))
+    const rawPath = join(rawDirectory, 'execution.json')
+    let code, problem, nativeState
+    try {
+      code = await runCiE2EJob(
+        ['test:native', '--reporter=verbose', '--reporter=json', '--outputFile', rawPath],
+        20 * 60_000,
+        {
+          cwd: workspace,
+          env,
+          onState: (state) => {
+            nativeState = state
+          },
+        },
+      )
+      if (code !== 0) problem = new Error('Required native protocol cases failed')
+    } catch (error) {
+      problem = error
+    }
+    try {
+      const written = await writeNativeReport({
+        rawPath,
+        directory,
+        workspace,
+        completed: code === 0 || code === 1,
+        exitCode: code,
+        identityPath: source.PACT_CI_NATIVE_IDENTITY_FILE,
+        identityKind: source.PACT_CI_NATIVE_IDENTITY_KIND ?? 'ci',
+        artifactName: source.PACT_CI_NATIVE_ARTIFACT,
+        summary: source.GITHUB_STEP_SUMMARY,
+      })
+      if (written.report.status !== 'passed')
+        problem ??= new Error('Required native execution evidence is incomplete or failed')
+    } finally {
+      // Unconfirmed process ownership retains its private recovery evidence.
+      // Raw fixture output is never part of an upload pattern.
+      if (
+        !nativeState ||
+        (nativeState.kind === 'settled' &&
+          nativeState.groupGone === true &&
+          nativeState.ownedProcessCount === 0)
+      )
+        await rm(rawDirectory, { recursive: true, force: true })
+    }
+    if (problem) throw problem
   } else if (['native', 'build'].includes(lane)) {
     const command = {
       native: 'test:native',

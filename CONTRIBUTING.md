@@ -210,6 +210,19 @@ run and attempt. A partial rerun cannot borrow old-attempt prerequisites or arti
 use **Re-run all jobs** for a complete replacement. The native `pact-complete` job fails
 when any required dependency failed, was cancelled, skipped or not executed.
 
+UI and deterministic failure output uses separate `ui/` and `deterministic/` directories.
+Both diagnostic lanes share the original 32 MiB budget; a later lane cannot overwrite
+an earlier snapshot or silently increase the upload capacity. JSON/Markdown case reports
+remain separate from these disposable traces.
+
+Credential-free CLI protocol checks publish `native-e2e-PLATFORM-aATTEMPT` containing
+`native-summary.json` and `native-summary.md`, with an Actions summary and 14-day retention.
+Release jobs use `release-native-e2e-PLATFORM-aATTEMPT`. These reports list every actual
+Vitest case, including failed and unexecuted cases, with duration and a fixed failure
+category. Missing, invalid or incomplete execution evidence blocks the native check.
+Raw errors, native output and configuration are excluded; uncertain physical process
+cleanup retains its private recovery evidence and cannot be reported as complete.
+
 Stable release jobs preserve `release-e2e-PLATFORM-aATTEMPT` JSON/Markdown reports and
 failure-only `release-ui-diagnostics-PLATFORM-aATTEMPT` snapshots/traces for 14 days.
 Their Actions summaries list every trusted-discovered UI/deterministic case, including

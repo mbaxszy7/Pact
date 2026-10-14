@@ -180,7 +180,7 @@ export async function writeE2EReport(
 ) {
   if (
     !isAbsolute(directory) ||
-    !/^(?:real|ui|deterministic)-summary$/u.test(basename) ||
+    !/^(?:real|ui|deterministic|native)-summary$/u.test(basename) ||
     (artifactName !== undefined && !/^[a-z\d-]{1,100}$/u.test(artifactName))
   )
     throw new Error('Invalid E2E report destination')
