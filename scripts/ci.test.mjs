@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm, writeFile, readFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { mkdir, mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 
 import { prepareProviderEnvironment } from '../tests/e2e/provider-environment.ts'
+import { collectNoCredentialDiagnostics } from './ci-ui-diagnostics.mjs'
 import {
   ciEnvironment,
   scriptTests,
@@ -156,6 +160,7 @@ void test('execution reports use a private explicit path and cannot overwrite ol
     )
     assert.deepEqual(prepared.forwarded, ['--reporter=line,json'])
     assert.equal(prepared.env.PLAYWRIGHT_JSON_OUTPUT_FILE, join(directory, 'real.json'))
+    assert.equal(Object.hasOwn(prepared.env, 'PACT_E2E_OUTPUT_DIR'), false)
     await writeFile(prepared.path, '{}', { flag: 'wx' })
     await assert.rejects(
       evidenceEnvironment('real', {}, { PACT_CI_EVIDENCE_DIR: directory }),
@@ -167,6 +172,112 @@ void test('execution reports use a private explicit path and cannot overwrite ol
     )
   } finally {
     await rm(directory, { recursive: true, force: true })
+  }
+})
+
+void test('lane output is private and independent while local execution without evidence remains unchanged', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'pact-ci-lane-output-'))
+  try {
+    const env = { CI: 'true' }
+    assert.deepEqual(await evidenceEnvironment('ui', env, {}), { env, forwarded: [] })
+    const ui = await evidenceEnvironment('ui', env, { PACT_CI_EVIDENCE_DIR: directory })
+    const deterministic = await evidenceEnvironment('deterministic', env, {
+      PACT_CI_EVIDENCE_DIR: directory,
+    })
+    assert.equal(ui.env.PACT_E2E_OUTPUT_DIR, join(directory, 'ui/test-results'))
+    assert.equal(
+      deterministic.env.PACT_E2E_OUTPUT_DIR,
+      join(directory, 'deterministic/test-results'),
+    )
+    assert.notEqual(ui.env.PACT_E2E_OUTPUT_DIR, deterministic.env.PACT_E2E_OUTPUT_DIR)
+    await writeFile(join(directory, 'ui/recovery.txt'), 'retain incomplete lane')
+    await assert.rejects(evidenceEnvironment('ui', env, { PACT_CI_EVIDENCE_DIR: directory }), {
+      code: 'EEXIST',
+    })
+    assert.equal(
+      await readFile(join(directory, 'ui/recovery.txt'), 'utf8'),
+      'retain incomplete lane',
+    )
+    await assert.rejects(
+      evidenceEnvironment('unknown', env, { PACT_CI_EVIDENCE_DIR: directory }),
+      /explicit/,
+    )
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+void test('two genuinely failed Playwright invocations preserve the first lane context and trace after the second starts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-ci-playwright-lanes-'))
+  try {
+    const evidence = join(root, 'evidence'),
+      output = join(root, 'diagnostics')
+    const config = join(root, 'playwright.config.mjs')
+    await writeFile(
+      config,
+      `export default {testDir:'.',testMatch:'lanes.spec.mjs',outputDir:process.env.PACT_E2E_OUTPUT_DIR,retries:0,workers:1,projects:[{name:'ui',grep:/@ui\\b/},{name:'deterministic',grep:/@deterministic\\b/}]};\n`,
+    )
+    await writeFile(
+      join(root, 'lanes.spec.mjs'),
+      `import {test,expect} from ${JSON.stringify(import.meta.resolve('@playwright/test'))};
+import {writeFile} from 'node:fs/promises';
+for(const lane of ['ui','deterministic']) test('synthetic '+lane+' failure',{tag:'@'+lane},async({},info)=>{
+await writeFile(info.outputPath('trace.zip'),Buffer.from([0x50,0x4b,lane==='ui'?1:2]));
+expect(1).toBe(2);
+});\n`,
+    )
+    const execute = promisify(execFile),
+      cli = fileURLToPath(import.meta.resolve('@playwright/test/cli'))
+    const env = ciEnvironment({ ...process.env, CI: 'true' })
+    const ui = await evidenceEnvironment('ui', env, { PACT_CI_EVIDENCE_DIR: evidence })
+    await assert.rejects(
+      execute(
+        process.execPath,
+        [cli, 'test', '--config', config, '--project=ui', ...ui.forwarded],
+        { cwd: root, env: ui.env, timeout: 20000, maxBuffer: 128 * 1024 },
+      ),
+      { code: 1 },
+    )
+    const cases = (await readdir(ui.env.PACT_E2E_OUTPUT_DIR, { withFileTypes: true })).filter(
+      (entry) => entry.isDirectory(),
+    )
+    assert.equal(cases.length, 1)
+    const firstContext = join(ui.env.PACT_E2E_OUTPUT_DIR, cases[0].name, 'error-context.md')
+    const firstText = await readFile(firstContext, 'utf8')
+    assert.match(firstText, /synthetic ui failure/u)
+    const deterministic = await evidenceEnvironment('deterministic', env, {
+      PACT_CI_EVIDENCE_DIR: evidence,
+    })
+    await assert.rejects(
+      execute(
+        process.execPath,
+        [cli, 'test', '--config', config, '--project=deterministic', ...deterministic.forwarded],
+        { cwd: root, env: deterministic.env, timeout: 20000, maxBuffer: 128 * 1024 },
+      ),
+      { code: 1 },
+    )
+    assert.equal(await readFile(firstContext, 'utf8'), firstText)
+    const collected = await collectNoCredentialDiagnostics(evidence, output)
+    assert.equal(collected.complete, true)
+    assert.equal(collected.totalFiles, 4)
+    assert.deepEqual(
+      collected.lanes.map((lane) => lane.lane),
+      ['ui', 'deterministic'],
+    )
+    for (const lane of collected.lanes) {
+      const context = lane.files.find((file) => file.path.endsWith('/error-context.md'))
+      const trace = lane.files.find((file) => file.path.endsWith('/trace.zip'))
+      assert(context && trace)
+      // oxlint-disable-next-line no-await-in-loop -- Verify both independently collected lane files after both genuine Playwright processes ended.
+      const text = await readFile(join(output, lane.lane, context.path), 'utf8')
+      assert(text.includes(`synthetic ${lane.lane} failure`))
+      if (lane.lane === 'ui') assert.equal(text, firstText)
+      // oxlint-disable-next-line no-await-in-loop -- The first trace remains complete when the next lane's disposable output is initialized.
+      const traceBytes = await readFile(join(output, lane.lane, trace.path))
+      assert.deepEqual(traceBytes, Buffer.from([0x50, 0x4b, lane.lane === 'ui' ? 1 : 2]))
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
   }
 })
 

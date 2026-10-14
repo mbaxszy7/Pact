@@ -95,16 +95,39 @@ export async function evidenceEnvironment(lane, env, source) {
     /[\r\n\0]/u.test(directory)
   )
     throw new Error('CI evidence needs an explicit bounded private directory')
-  await mkdir(directory, { recursive: true, mode: 0o700 })
   const path = join(directory, `${lane}.json`)
+  const outputDir = ['ui', 'deterministic'].includes(lane)
+    ? join(directory, lane, 'test-results')
+    : undefined
+  if ([path, outputDir].some((value) => value && Buffer.byteLength(value) > 4096))
+    throw new Error('CI evidence paths exceed their byte bound')
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  const rootInfo = await lstat(directory)
+  if (
+    !rootInfo.isDirectory() ||
+    rootInfo.isSymbolicLink() ||
+    (process.platform !== 'win32' &&
+      ((rootInfo.mode & 0o077) !== 0 || (process.getuid && rootInfo.uid !== process.getuid())))
+  )
+    throw new Error('CI evidence must use a regular private directory')
   try {
     await lstat(path)
     throw new Error('Existing E2E execution evidence cannot be overwritten')
   } catch (error) {
     if (error.code !== 'ENOENT') throw error
   }
+  if (outputDir) {
+    const laneDirectory = join(directory, lane)
+    // Playwright clears only this lane's disposable output, never another lane's evidence.
+    // An occupied lane directory retains its recovery value and is never replaced.
+    await mkdir(laneDirectory, { mode: 0o700 })
+  }
   return {
-    env: { ...env, PLAYWRIGHT_JSON_OUTPUT_FILE: path },
+    env: {
+      ...env,
+      PLAYWRIGHT_JSON_OUTPUT_FILE: path,
+      ...(outputDir ? { PACT_E2E_OUTPUT_DIR: outputDir } : {}),
+    },
     forwarded: ['--reporter=line,json'],
     path,
   }

@@ -170,7 +170,7 @@ jobs:
         timeout-minutes: 2
         run: |
           mkdir -p "$RUNNER_TEMP/pact-release-ui-diagnostics"
-          node control/scripts/ci-ui-diagnostics.mjs --source "$GITHUB_WORKSPACE/source/test-results" --output "$RUNNER_TEMP/pact-release-ui-diagnostics/darwin-arm64"
+          node control/scripts/ci-ui-diagnostics.mjs --evidence "$RUNNER_TEMP/pact-release-evidence/darwin-arm64" --output "$RUNNER_TEMP/pact-release-ui-diagnostics/darwin-arm64"
         env:
           PACT_CI_DIAGNOSTIC_LANE: uncredentialed
       - name: Preserve only collected no-credential UI context and traces
@@ -392,7 +392,7 @@ jobs:
         timeout-minutes: 2
         run: |
           mkdir -p "$RUNNER_TEMP/pact-release-ui-diagnostics"
-          node control/scripts/ci-ui-diagnostics.mjs --source "$GITHUB_WORKSPACE/source/test-results" --output "$RUNNER_TEMP/pact-release-ui-diagnostics/win32-x64"
+          node control/scripts/ci-ui-diagnostics.mjs --evidence "$RUNNER_TEMP/pact-release-evidence/win32-x64" --output "$RUNNER_TEMP/pact-release-ui-diagnostics/win32-x64"
         env:
           PACT_CI_DIAGNOSTIC_LANE: uncredentialed
       - name: Preserve only collected no-credential UI context and traces
@@ -615,7 +615,7 @@ jobs:
         timeout-minutes: 2
         run: |
           mkdir -p "$RUNNER_TEMP/pact-release-ui-diagnostics"
-          node control/scripts/ci-ui-diagnostics.mjs --source "$GITHUB_WORKSPACE/source/test-results" --output "$RUNNER_TEMP/pact-release-ui-diagnostics/win32-arm64"
+          node control/scripts/ci-ui-diagnostics.mjs --evidence "$RUNNER_TEMP/pact-release-evidence/win32-arm64" --output "$RUNNER_TEMP/pact-release-ui-diagnostics/win32-arm64"
         env:
           PACT_CI_DIAGNOSTIC_LANE: uncredentialed
       - name: Preserve only collected no-credential UI context and traces

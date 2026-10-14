@@ -86,7 +86,29 @@ async function copyDiagnostic(source, target, limit) {
 }
 
 /** Collect only two named Playwright files from a no-credential executor. */
-export async function collectUiDiagnostics(source, output) {
+export async function collectUiDiagnostics(
+  source,
+  output,
+  {
+    remainingBytes = diagnosticLimits.totalBytes,
+    remainingCases = diagnosticLimits.cases,
+    remainingFiles = diagnosticLimits.files,
+    lane,
+  } = {},
+) {
+  if (
+    (lane !== undefined && !['ui', 'deterministic'].includes(lane)) ||
+    !Number.isSafeInteger(remainingBytes) ||
+    remainingBytes < 0 ||
+    remainingBytes > diagnosticLimits.totalBytes ||
+    !Number.isSafeInteger(remainingCases) ||
+    remainingCases < 0 ||
+    remainingCases > diagnosticLimits.cases ||
+    !Number.isSafeInteger(remainingFiles) ||
+    remainingFiles < 0 ||
+    remainingFiles > diagnosticLimits.files
+  )
+    throw new Error('UI diagnostics need bounded no-credential lane capacity')
   if (
     !isAbsolute(source) ||
     !isAbsolute(output) ||
@@ -108,11 +130,12 @@ export async function collectUiDiagnostics(source, output) {
       root = await lstat(source)
     } catch (error) {
       if (error.code !== 'ENOENT') throw error
-      await writeFile(join(output, 'inventory.json'), '{"files":[],"sourcePresent":false}\n', {
+      const inventory = { files: [], sourcePresent: false, ...(lane ? { lane } : {}) }
+      await writeFile(join(output, 'inventory.json'), `${JSON.stringify(inventory)}\n`, {
         flag: 'wx',
         mode: 0o600,
       })
-      return { files: [], sourcePresent: false }
+      return inventory
     }
     if (!root.isDirectory() || root.isSymbolicLink())
       throw new Error('UI diagnostic root must be a regular directory')
@@ -121,14 +144,14 @@ export async function collectUiDiagnostics(source, output) {
     let rootEntries = 0
     for await (const entry of input) {
       rootEntries++
-      if (rootEntries > diagnosticLimits.cases + 8)
+      if (rootEntries > remainingCases + 8)
         throw new Error('UI diagnostic root exceeds its entry bound')
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue
       if (entry.isSymbolicLink()) throw new Error('UI diagnostic directories cannot be symlinks')
       if (!/^[a-z\d._-]{1,160}$/iu.test(entry.name))
         throw new Error('UI diagnostic case name exceeds its path bound')
       cases++
-      if (cases > diagnosticLimits.cases) throw new Error('UI diagnostics exceed their case bound')
+      if (cases > remainingCases) throw new Error('UI diagnostics exceed their case bound')
       const directory = join(source, entry.name)
       const identity = await lstat(directory)
       if (
@@ -146,7 +169,7 @@ export async function collectUiDiagnostics(source, output) {
         if (!['error-context.md', 'trace.zip'].includes(file.name)) continue
         if (!file.isFile() || file.isSymbolicLink())
           throw new Error('UI diagnostics cannot contain non-file sources')
-        if (records.length >= diagnosticLimits.files)
+        if (records.length >= remainingFiles)
           throw new Error('UI diagnostics exceed their file bound')
         const targetDirectory = join(output, entry.name)
         await mkdir(targetDirectory, { recursive: true, mode: 0o700 })
@@ -155,7 +178,7 @@ export async function collectUiDiagnostics(source, output) {
           join(targetDirectory, file.name),
           Math.min(
             file.name === 'trace.zip' ? diagnosticLimits.traceBytes : diagnosticLimits.contextBytes,
-            diagnosticLimits.totalBytes - totalBytes,
+            remainingBytes - totalBytes,
           ),
         )
         totalBytes += copied.bytes
@@ -164,7 +187,13 @@ export async function collectUiDiagnostics(source, output) {
       await unchangedDirectory(directory, identity)
     }
     await unchangedDirectory(source, root)
-    const inventory = { files: records, sourcePresent: true, totalBytes }
+    const inventory = {
+      files: records,
+      sourcePresent: true,
+      totalBytes,
+      caseCount: cases,
+      ...(lane ? { lane } : {}),
+    }
     await writeFile(join(output, 'inventory.json'), `${JSON.stringify(inventory)}\n`, {
       flag: 'wx',
       mode: 0o600,
@@ -172,6 +201,105 @@ export async function collectUiDiagnostics(source, output) {
     return inventory
   } catch (error) {
     await rm(output, { recursive: true, force: true })
+    throw error
+  }
+}
+
+/** Both no-credential lanes share the original byte, file and case budgets. */
+export async function collectNoCredentialDiagnostics(evidence, output) {
+  if (
+    !isAbsolute(evidence) ||
+    !isAbsolute(output) ||
+    [evidence, output].some((path) => Buffer.byteLength(path) > 4096 || /[\r\n\0]/u.test(path)) ||
+    contains(evidence, output) ||
+    contains(output, evidence)
+  )
+    throw new Error('UI diagnostics need separate explicit evidence and output directories')
+  let root, canonical
+  const laneDirectories = new Map()
+  try {
+    root = await lstat(evidence)
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+  }
+  if (root) {
+    if (!root.isDirectory() || root.isSymbolicLink())
+      throw new Error('UI diagnostic evidence must be a regular directory')
+    canonical = await realpath(evidence)
+    const entries = await opendir(evidence)
+    let count = 0
+    for await (const entry of entries) {
+      if (++count > 8) throw new Error('UI diagnostic evidence exceeds its entry bound')
+      if (['ui', 'deterministic'].includes(entry.name)) {
+        const path = join(evidence, entry.name)
+        const identity = await lstat(path)
+        if (
+          !identity.isDirectory() ||
+          identity.isSymbolicLink() ||
+          (await realpath(path)) !== join(canonical, entry.name)
+        )
+          throw new Error('UI diagnostic lane must be a regular contained directory')
+        laneDirectories.set(entry.name, identity)
+      } else if (
+        !/^(ui|deterministic)(-summary)?\.(json|md)$/u.test(entry.name) ||
+        !entry.isFile() ||
+        entry.isSymbolicLink()
+      )
+        throw new Error('Only explicit no-credential lane evidence may be collected')
+    }
+    await unchangedDirectory(evidence, root)
+  }
+  await mkdir(output, { mode: 0o700 })
+  const lanes = []
+  let totalBytes = 0,
+    totalCases = 0,
+    totalFiles = 0,
+    currentLane
+  const inventory = (complete) => ({
+    schemaVersion: 1,
+    complete,
+    totalBytes,
+    totalCases,
+    totalFiles,
+    lanes,
+  })
+  try {
+    for (const lane of ['ui', 'deterministic']) {
+      currentLane = lane
+      // oxlint-disable-next-line no-await-in-loop -- The second lane receives only the remaining shared capacity after the first immutable collection.
+      const collected = await collectUiDiagnostics(
+        join(evidence, lane, 'test-results'),
+        join(output, lane),
+        {
+          lane,
+          remainingBytes: diagnosticLimits.totalBytes - totalBytes,
+          remainingCases: diagnosticLimits.cases - totalCases,
+          remainingFiles: diagnosticLimits.files - totalFiles,
+        },
+      )
+      totalBytes += collected.totalBytes ?? 0
+      totalCases += collected.caseCount ?? 0
+      totalFiles += collected.files.length
+      lanes.push(collected)
+      if (laneDirectories.has(lane)) {
+        // oxlint-disable-next-line no-await-in-loop -- Confirm the same explicit lane parent remains after descriptor-bound copying.
+        await unchangedDirectory(join(evidence, lane), laneDirectories.get(lane))
+      }
+    }
+    if (root) await unchangedDirectory(evidence, root)
+    const report = inventory(true)
+    await writeFile(join(output, 'inventory.json'), `${JSON.stringify(report)}\n`, {
+      flag: 'wx',
+      mode: 0o600,
+    })
+    return report
+  } catch (error) {
+    // Completed first-lane evidence survives a later capacity/identity failure.
+    await writeFile(
+      join(output, 'inventory.json'),
+      `${JSON.stringify({ ...inventory(false), failedLane: currentLane })}\n`,
+      { flag: 'wx', mode: 0o600 },
+    )
     throw error
   }
 }
@@ -402,7 +530,7 @@ export function uiReportMarkdown(report) {
       lines.push(`Persistent local report: \`${report.reportFiles.localDirectory}\`.`)
   }
   lines.push(
-    `Failure snapshots/traces, when collection succeeded: **${report.diagnosticArtifact}**, retained for 14 days. Only the no-credential lane may publish these diagnostics.`,
+    `Failure snapshots/traces, when collection succeeded: **${report.diagnosticArtifact}**, directory \`${report.lane}/\`, retained for 14 days. Each lane inventory identifies its source; the root inventory reports shared capacity and collection failures. Only the no-credential lane may publish these diagnostics.`,
     '',
     '| Case | Required | Result | Duration (s) | Failure category |',
     '| --- | --- | --- | ---: | --- |',
@@ -522,14 +650,22 @@ export async function main(argv = process.argv.slice(2), source = process.env) {
   }
   if (
     argv.length !== 4 ||
-    argv[0] !== '--source' ||
+    !['--source', '--evidence'].includes(argv[0]) ||
     argv[2] !== '--output' ||
     source.GITHUB_ACTIONS !== 'true' ||
     source.PACT_CI_DIAGNOSTIC_LANE !== 'uncredentialed'
   )
     throw new Error('UI diagnostics require the explicit no-credential CI lane')
-  const report = await collectUiDiagnostics(argv[1], argv[3])
-  console.log(JSON.stringify({ files: report.files.length, bytes: report.totalBytes ?? 0 }))
+  const report =
+    argv[0] === '--evidence'
+      ? await collectNoCredentialDiagnostics(argv[1], argv[3])
+      : await collectUiDiagnostics(argv[1], argv[3])
+  console.log(
+    JSON.stringify({
+      files: report.totalFiles ?? report.files.length,
+      bytes: report.totalBytes ?? 0,
+    }),
+  )
 }
 
 if (isScriptEntry(import.meta.url)) {

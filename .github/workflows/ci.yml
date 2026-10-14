@@ -289,7 +289,7 @@ jobs:
         timeout-minutes: 2
         run: |
           mkdir -p "$RUNNER_TEMP/pact-ui-diagnostics"
-          node control/scripts/ci-ui-diagnostics.mjs --source "$GITHUB_WORKSPACE/source/test-results" --output "$RUNNER_TEMP/pact-ui-diagnostics/$PLATFORM_KEY"
+          node control/scripts/ci-ui-diagnostics.mjs --evidence "$RUNNER_TEMP/pact-evidence/$PLATFORM_KEY" --output "$RUNNER_TEMP/pact-ui-diagnostics/$PLATFORM_KEY"
         env:
           PLATFORM_KEY: ${{ matrix.key }}
           PACT_CI_DIAGNOSTIC_LANE: uncredentialed

@@ -7,6 +7,7 @@ import { test } from 'node:test'
 
 import {
   collectUiDiagnostics,
+  collectNoCredentialDiagnostics,
   diagnosticLimits,
   evaluateUiReport,
   main,
@@ -143,6 +144,120 @@ await test('CLI admission requires an explicitly uncredentialed GitHub lane', as
     }),
     /no-credential/,
   )
+})
+
+await test('two lanes share the original total byte cap and preserve a completed first collection when the second exceeds it', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-two-lane-cap-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const evidence = join(root, 'evidence'),
+    output = join(root, 'output')
+  await mkdir(join(evidence, 'ui/test-results/first'), { recursive: true })
+  await mkdir(join(evidence, 'deterministic/test-results/second'), { recursive: true })
+  const first = join(evidence, 'ui/test-results/first/trace.zip')
+  const second = join(evidence, 'deterministic/test-results/second/trace.zip')
+  await writeFile(first, '')
+  await truncate(first, diagnosticLimits.traceBytes)
+  await writeFile(second, '')
+  await truncate(second, diagnosticLimits.traceBytes)
+  await writeFile(
+    join(evidence, 'deterministic/test-results/second/error-context.md'),
+    'over total cap',
+  )
+  await assert.rejects(collectNoCredentialDiagnostics(evidence, output), /bounded regular file/)
+  assert.equal(
+    (await readFile(join(output, 'ui/first/trace.zip'))).length,
+    diagnosticLimits.traceBytes,
+  )
+  const inventory = JSON.parse(await readFile(join(output, 'inventory.json'), 'utf8'))
+  assert.equal(inventory.complete, false)
+  assert.equal(inventory.failedLane, 'deterministic')
+  assert.equal(inventory.totalBytes, diagnosticLimits.traceBytes)
+  assert.equal(inventory.lanes[0].lane, 'ui')
+  assert.equal((await readFile(first)).length, diagnosticLimits.traceBytes)
+  assert.equal((await readFile(second)).length, diagnosticLimits.traceBytes)
+})
+
+await test('accepts exactly 32 MiB across two complete traces without truncation or per-lane budget doubling', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-two-lane-exact-cap-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const evidence = join(root, 'evidence'),
+    output = join(root, 'output')
+  for (const lane of ['ui', 'deterministic']) {
+    const directory = join(evidence, lane, 'test-results/only-case')
+    // oxlint-disable-next-line no-await-in-loop -- Create both independently scoped explicit no-credential lane roots.
+    await mkdir(directory, { recursive: true })
+    // oxlint-disable-next-line no-await-in-loop -- Keep a complete fixed-size source for descriptor-bound copying.
+    await writeFile(join(directory, 'trace.zip'), '')
+    // oxlint-disable-next-line no-await-in-loop -- Each complete trace is within the unchanged individual 16 MiB limit.
+    await truncate(join(directory, 'trace.zip'), diagnosticLimits.traceBytes)
+  }
+  const inventory = await collectNoCredentialDiagnostics(evidence, output)
+  assert.equal(inventory.complete, true)
+  assert.equal(inventory.totalBytes, diagnosticLimits.totalBytes)
+  assert.equal(inventory.totalFiles, 2)
+  for (const lane of ['ui', 'deterministic']) {
+    // oxlint-disable-next-line no-await-in-loop -- Verify no trace was truncated to satisfy the cross-lane total.
+    const trace = await readFile(join(output, lane, 'only-case/trace.zip'))
+    assert.equal(trace.length, diagnosticLimits.traceBytes)
+  }
+})
+
+await test('aggregation refuses real/unknown directories, symlinked lanes and capacity inflation before copying', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-diagnostic-lane-guard-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const evidence = join(root, 'evidence'),
+    output = join(root, 'output')
+  await mkdir(join(evidence, 'real'), { recursive: true })
+  await assert.rejects(collectNoCredentialDiagnostics(evidence, output), /explicit no-credential/)
+  await rm(join(evidence, 'real'), { recursive: true })
+  await writeFile(join(evidence, 'real.json'), '{}')
+  await assert.rejects(collectNoCredentialDiagnostics(evidence, output), /explicit no-credential/)
+  await rm(join(evidence, 'real.json'))
+  await mkdir(join(evidence, 'unknown'))
+  await assert.rejects(collectNoCredentialDiagnostics(evidence, output), /explicit no-credential/)
+  await rm(join(evidence, 'unknown'), { recursive: true })
+  const outside = join(root, 'outside')
+  await mkdir(outside)
+  await symlink(outside, join(evidence, 'ui'), 'dir')
+  await assert.rejects(collectNoCredentialDiagnostics(evidence, output), /regular contained/)
+  await assert.rejects(
+    collectUiDiagnostics(join(root, 'test-results'), output, { lane: 'real' }),
+    /no-credential/,
+  )
+  await assert.rejects(
+    collectUiDiagnostics(join(root, 'test-results'), output, {
+      remainingBytes: diagnosticLimits.totalBytes + 1,
+    }),
+    /bounded/,
+  )
+  await assert.rejects(
+    main(['--evidence', evidence, '--output', output], {
+      GITHUB_ACTIONS: 'true',
+      PACT_CI_DIAGNOSTIC_LANE: 'real',
+    }),
+    /no-credential/,
+  )
+})
+
+await test('two lanes also share the existing case/path capacity and cannot overwrite an old collection', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-two-lane-case-cap-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const evidence = join(root, 'evidence'),
+    output = join(root, 'output')
+  await mkdir(join(evidence, 'ui/test-results'), { recursive: true })
+  await mkdir(join(evidence, 'deterministic/test-results/overflow-case'), { recursive: true })
+  await Promise.all(
+    Array.from({ length: diagnosticLimits.cases }, (_, index) =>
+      mkdir(join(evidence, 'ui/test-results', `case-${index}`)),
+    ),
+  )
+  await assert.rejects(collectNoCredentialDiagnostics(evidence, output), /case bound/)
+  const inventory = JSON.parse(await readFile(join(output, 'inventory.json'), 'utf8'))
+  assert.equal(inventory.totalCases, diagnosticLimits.cases)
+  assert.equal(inventory.complete, false)
+  await writeFile(join(output, 'recovery.txt'), 'retain first collection')
+  await assert.rejects(collectNoCredentialDiagnostics(evidence, output), { code: 'EEXIST' })
+  assert.equal(await readFile(join(output, 'recovery.txt'), 'utf8'), 'retain first collection')
 })
 
 const reportFixture = (lane = 'ui') => ({
@@ -293,6 +408,8 @@ await test('both native lane reports persist even when the second lane did not s
   assert(text.includes('ui-summary.md'))
   assert(text.includes('deterministic-summary.md'))
   assert(text.includes('ui-diagnostics-'))
+  assert(text.includes('directory `ui/`'))
+  assert(text.includes('directory `deterministic/`'))
   assert(text.includes('retained for 14 days'))
   for (const report of reports) {
     assert.equal(
