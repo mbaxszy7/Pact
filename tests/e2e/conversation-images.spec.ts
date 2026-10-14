@@ -321,12 +321,13 @@ test(
 test(
   'keeps ten-image gallery navigation bounded, focused and reversible without covering input',
   { tag: '@deterministic' },
-  async () => {
+  async ({ browserName: _browserName }, testInfo) => {
     const fixture = await createRuntimeFixture({
       claudeConversation: 'complete',
       codexAppServer: 'complete',
     })
     let app: ElectronApplication | undefined
+    let faultFacts: unknown
     try {
       const { sessionId } = await createImageSession(fixture)
       app = await fixture.launch()
@@ -417,16 +418,54 @@ test(
           'setAttribute',
         )
         const create: typeof URL.createObjectURL = Reflect.get(URL, 'createObjectURL')
+        const sourceProperty = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src')
+        const facts = {
+          attributeWrites: 0,
+          blockedThumbnailAttributes: 0,
+          sourcePropertyWrites: 0,
+          matchingThumbnailProperties: 0,
+          createdImageURLs: 0,
+          blockedOriginalURLs: 0,
+          pendingLoads: 0,
+          otherSlideLoads: 0,
+          incomplete: false,
+        }
+        const increment = (key: Exclude<keyof typeof facts, 'incomplete'>): void => {
+          if (facts[key] >= 32_767) facts.incomplete = true
+          else facts[key] += 1
+        }
         const pending = create.call(URL, new Blob([], { type: 'image/jpeg' }))
         HTMLImageElement.prototype.setAttribute = function (attribute, value) {
+          increment('attributeWrites')
+          if (attribute === 'src' && value === thumbnail) increment('blockedThumbnailAttributes')
           set.call(this, attribute, attribute === 'src' && value === thumbnail ? pending : value)
         }
+        if (sourceProperty?.set)
+          Object.defineProperty(HTMLImageElement.prototype, 'src', {
+            ...sourceProperty,
+            set(value: string) {
+              increment('sourcePropertyWrites')
+              if (value === thumbnail) increment('matchingThumbnailProperties')
+              sourceProperty.set!.call(this, value)
+            },
+          })
         URL.createObjectURL = function (blob) {
+          increment('createdImageURLs')
+          if (Reflect.get(blob, 'type') === 'image/jpeg') increment('blockedOriginalURLs')
           return Reflect.get(blob, 'type') === 'image/jpeg' ? pending : create.call(URL, blob)
         }
+        const observeLoad = (event: Event): void => {
+          if (event.target instanceof HTMLImageElement && event.target.closest('.pact-image-slide'))
+            increment(event.target.src === pending ? 'pendingLoads' : 'otherSlideLoads')
+        }
+        document.addEventListener('load', observeLoad, true)
+        Reflect.set(globalThis, 'galleryImageLoadFacts', facts)
         Reflect.set(globalThis, 'restoreGalleryImageLoad', () => {
           HTMLImageElement.prototype.setAttribute = set
+          if (sourceProperty)
+            Object.defineProperty(HTMLImageElement.prototype, 'src', sourceProperty)
           URL.createObjectURL = create
+          document.removeEventListener('load', observeLoad, true)
           URL.revokeObjectURL(pending)
         })
       }, files[1]!.name)
@@ -444,10 +483,40 @@ test(
         await expect(gallery.locator('.pact-image-slide')).toHaveCount(1)
         await expect(gallery.getByRole('img', { name: files[0]!.name, exact: true })).toBeVisible()
       } finally {
-        await page.evaluate(() => {
+        faultFacts = await page.evaluate(() => {
+          const facts: unknown = Reflect.get(globalThis, 'galleryImageLoadFacts')
+          const count = (key: string): number | null => {
+            const value: unknown =
+              facts && typeof facts === 'object' ? Reflect.get(facts, key) : undefined
+            return typeof value === 'number' &&
+              Number.isSafeInteger(value) &&
+              value >= 0 &&
+              value <= 32_767
+              ? value
+              : null
+          }
+          const snapshot = {
+            attributeWrites: count('attributeWrites'),
+            blockedThumbnailAttributes: count('blockedThumbnailAttributes'),
+            sourcePropertyWrites: count('sourcePropertyWrites'),
+            matchingThumbnailProperties: count('matchingThumbnailProperties'),
+            createdImageURLs: count('createdImageURLs'),
+            blockedOriginalURLs: count('blockedOriginalURLs'),
+            pendingLoads: count('pendingLoads'),
+            otherSlideLoads: count('otherSlideLoads'),
+            incomplete:
+              !facts || typeof facts !== 'object' || Reflect.get(facts, 'incomplete') !== false,
+            slides: document.querySelectorAll('.pact-image-gallery .pact-image-slide').length,
+            activeVisible:
+              document
+                .querySelector('.pact-image-gallery .pact-image-slide[aria-hidden="false"]')
+                ?.getAttribute('data-visible') === 'true',
+          }
           const restore: unknown = Reflect.get(globalThis, 'restoreGalleryImageLoad')
           if (typeof restore === 'function') Reflect.apply(restore, globalThis, [])
           Reflect.deleteProperty(globalThis, 'restoreGalleryImageLoad')
+          Reflect.deleteProperty(globalThis, 'galleryImageLoadFacts')
+          return snapshot
         })
       }
       await page.keyboard.press('Escape')
@@ -462,6 +531,25 @@ test(
       await expect(trigger).toBeFocused()
       // No Model request launches the synthetic Claude protocol child in this UI-only journey.
       await expect(fixture.readClaudeFacts()).rejects.toMatchObject({ code: 'ENOENT' })
+    } catch (error) {
+      try {
+        const body = Buffer.from(JSON.stringify({ faultFacts: faultFacts ?? null }))
+        if (body.byteLength > 64 * 1024)
+          throw new Error('Image scalar diagnostics exceeded their bound', { cause: error })
+        await testInfo.attach('gallery-scalar-diagnostics', {
+          body,
+          contentType: 'application/json',
+        })
+      } catch (diagnosticError) {
+        throw new AggregateError(
+          [error],
+          'Gallery failed and scalar diagnostics were unavailable',
+          {
+            cause: diagnosticError,
+          },
+        )
+      }
+      throw error
     } finally {
       await app?.close()
       await fixture.dispose()

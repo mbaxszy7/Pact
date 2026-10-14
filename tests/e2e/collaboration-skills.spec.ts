@@ -12,7 +12,16 @@ import { createRuntimeFixture, test } from './runtime-fixture.js'
 const resultCard = (page: Page): Locator =>
   page.getByRole('region', { name: 'Pact collaboration result', exact: true }).last()
 
+async function closeContextOverlay(page: Page): Promise<void> {
+  const overlay = page.getByRole('dialog', { name: 'Context panel', exact: true })
+  if (await overlay.isVisible()) {
+    await page.keyboard.press('Escape')
+    await expect(overlay).toHaveCount(0)
+  }
+}
+
 async function expandResult(card: Locator): Promise<void> {
+  await closeContextOverlay(card.page())
   const toggle = card.getByRole('heading').locator('..')
   await expect(toggle).toBeEnabled()
   if ((await toggle.getAttribute('aria-expanded')) !== 'true') await toggle.click()
@@ -117,6 +126,7 @@ async function prepare(primary: 'codex' | 'claude' = 'codex') {
     page = await app.firstWindow()
   await page.getByRole('button', { name: 'Collaboration', exact: true }).click()
   const send = async (content: string) => {
+    await closeContextOverlay(page)
     const editor = page.getByRole('combobox', { name: 'Message', exact: true })
     await editor.fill(content)
     if (/\/(?:plan|build|review)\s*$/u.test(content))
@@ -159,6 +169,7 @@ for (const primary of ['codex', 'claude'] as const)
         join(f.directory, 'cancellation.ts'),
         '// A real source change during planning is allowed.\n',
       )
+      await closeContextOverlay(f.page)
       await discussion.click()
       await expect(
         f.page.getByRole('button', { name: `Implement plan · ${peer}`, exact: true }),
@@ -169,6 +180,8 @@ for (const primary of ['codex', 'claude'] as const)
       const reviewed = cards.last()
       await expect(reviewed.getByRole('heading', { name: 'Review · v1' })).toBeVisible()
       await expect(reviewed.locator('[data-pact-plan-run-id]')).toHaveCount(0)
+      if (!(await f.page.getByRole('navigation', { name: 'Task context' }).isVisible()))
+        await f.page.getByRole('button', { name: 'Plan', exact: true }).click()
       await f.page
         .getByRole('navigation', { name: 'Task context' })
         .getByRole('button', { name: 'Plan', exact: true })
@@ -178,8 +191,10 @@ for (const primary of ['codex', 'claude'] as const)
       )
       await expect(f.page.getByText('View original reply', { exact: true })).toHaveCount(0)
       await expect(f.page.getByText(/View Pact .* details/u)).toHaveCount(0)
+      await closeContextOverlay(f.page)
       await f.page.getByRole('button', { name: `Implement plan · ${peer}`, exact: true }).click()
       const reviewer = primary === 'codex' ? 'Codex' : 'Claude Code'
+      await closeContextOverlay(f.page)
       await f.page
         .getByRole('button', { name: `Review changes · ${reviewer}`, exact: true })
         .click()
@@ -190,9 +205,11 @@ for (const primary of ['codex', 'claude'] as const)
       expect((await readTodos(f.page, f.sessionId)).todos?.items).toEqual([
         expect.objectContaining({ id: 'cleanup', revision: 1, status: 'open' }),
       ])
+      await closeContextOverlay(f.page)
       await f.page
         .getByRole('button', { name: `Repair · ${peer} · edits code`, exact: true })
         .click()
+      await closeContextOverlay(f.page)
       await f.page
         .getByRole('button', { name: `Review changes · ${reviewer}`, exact: true })
         .click()
@@ -232,6 +249,7 @@ test('@deterministic Pact questions accept a deliberate answer and direct Review
       status: 'open',
       revision: 1,
     })
+    await closeContextOverlay(f.page)
     await f.page.getByRole('button', { name: 'Send message', exact: true }).click()
     await expect(
       f.page.getByRole('button', { name: 'Review plan · Claude Code', exact: true }),
@@ -247,6 +265,7 @@ test('@deterministic Pact questions accept a deliberate answer and direct Review
     ).toBeEnabled()
     await openIssue(f.page, 'Keep cancellation with its owner')
     expect(await f.counts()).toEqual({ codex: 3, claude: 0 })
+    await closeContextOverlay(f.page)
     await f.page
       .getByRole('button', { name: 'Respond · Claude Code · read-only', exact: true })
       .click()
@@ -262,6 +281,7 @@ test('@deterministic Pact questions accept a deliberate answer and direct Review
       resolutionKind: 'not_adopted',
     })
     expect(await f.counts()).toEqual({ codex: 3, claude: 1 })
+    await closeContextOverlay(f.page)
     await f.page.getByRole('button', { name: 'Review changes · Codex', exact: true }).click()
     await expectCompleteReview(f.page)
     expect((await readTodos(f.page, f.sessionId)).todos?.items[0]).toMatchObject({
@@ -277,7 +297,9 @@ test('@deterministic Pact questions accept a deliberate answer and direct Review
   }
 })
 
-test('@deterministic Pact build coalesces a running update into a readonly response and preserves explicit review', async () => {
+test('@deterministic Pact build coalesces a running update into a readonly response and preserves explicit review', async ({
+  browserName: _browserName,
+}, testInfo) => {
   const f = await prepare()
   try {
     await f.send('@claude /build Build cancellation')
@@ -310,6 +332,41 @@ test('@deterministic Pact build coalesces a running update into a readonly respo
     ).toBeEnabled()
     await expect(f.page.getByRole('button', { name: 'Not now', exact: true })).toHaveCount(0)
     expect(await f.counts()).toEqual({ codex: 1, claude: 2 })
+  } catch (error) {
+    try {
+      const state = await readTodos(f.page, f.sessionId)
+      const facts = {
+        phase: 'coalescing-failure',
+        counts: await f.counts(),
+        task: state.task
+          ? { stage: state.task.stage, status: state.task.status, duty: state.task.duty }
+          : null,
+        view: await f.page.evaluate(() => ({
+          width: window.innerWidth,
+          height: window.innerHeight,
+          visibility: document.visibilityState,
+          openContextOverlays: document.querySelectorAll(
+            '.workspace-context-overlay[data-open="true"]',
+          ).length,
+          resultCards: document.querySelectorAll('[aria-label="Pact collaboration result"]').length,
+          workingIndicators: document.querySelectorAll('[aria-label$="is responding"]').length,
+        })),
+      }
+      const body = Buffer.from(JSON.stringify(facts))
+      if (body.byteLength > 64 * 1024)
+        throw new Error('Scalar diagnostics exceeded their bound', { cause: error })
+      await testInfo.attach('collaboration-scalar-diagnostics', {
+        body,
+        contentType: 'application/json',
+      })
+    } catch (diagnosticError) {
+      throw new AggregateError(
+        [error],
+        'Collaboration failed and scalar diagnostics were unavailable',
+        { cause: diagnosticError },
+      )
+    }
+    throw error
   } finally {
     await f.app.close()
     await f.fixture.dispose()
@@ -407,6 +464,7 @@ test('@deterministic plan Comments survive restart and return to the frozen sour
     await expect(page.getByLabel('Attached Comment drafts')).toContainText(
       'Keep this exact plan decision.',
     )
+    await closeContextOverlay(page)
     await page
       .getByRole('combobox', { name: 'Message', exact: true })
       .fill('Keep this exact historical plan decision.')
@@ -435,6 +493,7 @@ test('@deterministic source edits do not block an authorized repair and normal r
       f.page.getByRole('button', { name: 'Repair · Codex · edits code', exact: true }),
     ).toBeEnabled()
     await writeFile(join(f.directory, 'later-change.txt'), 'A real source change')
+    await closeContextOverlay(f.page)
     await f.page.getByRole('button', { name: 'Repair · Codex · edits code', exact: true }).click()
     await expect(f.page.getByText(/Code version changed|The code version changed/)).toHaveCount(0)
     await f.page.getByRole('button', { name: 'Review changes · Claude Code', exact: true }).click()
@@ -475,6 +534,7 @@ test('@deterministic Pact bare Secondary build sends a frozen answer directly to
     await row.getByRole('button', { name: 'Add to comment', exact: true }).click()
     await expect(f.page.getByLabel('Attached Comment drafts')).toContainText('Current request')
     expect(await f.counts()).toEqual({ codex: 0, claude: 1 })
+    await closeContextOverlay(f.page)
     await f.page.getByRole('button', { name: 'Send message', exact: true }).click()
     const continueWork = f.page.getByRole('button', {
       name: 'Continue implementation · Claude Code · edits code',
@@ -487,6 +547,7 @@ test('@deterministic Pact bare Secondary build sends a frozen answer directly to
     expect(answered.task?.resumePhase).toMatchObject({ stage: 'implement', actor: 'claude' })
     expect(answered.todos?.items[0]).toMatchObject({ id: 'scope', revision: 2, status: 'done' })
     expect(await f.counts()).toEqual({ codex: 0, claude: 2 })
+    await closeContextOverlay(f.page)
     await continueWork.click()
     await expect(
       f.page.getByRole('button', { name: 'Review changes · Codex', exact: true }),
