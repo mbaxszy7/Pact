@@ -1,7 +1,8 @@
 import type { spawn, ChildProcess, SpawnOptionsWithoutStdio } from 'node:child_process'
 
 import { randomUUID } from 'node:crypto'
-import { appendFile, mkdir, realpath, writeFile } from 'node:fs/promises'
+import { realpathSync } from 'node:fs'
+import { appendFile, lstat, mkdir, realpath, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
@@ -45,6 +46,56 @@ async function finishFixture(
 }
 let codexExecutable: string
 let claudeExecutable: string
+async function observeSdkProjectKey(
+  sdk: ReturnType<typeof actualSdk>,
+  sessionId: string,
+  cwd: string,
+): Promise<string> {
+  let calls = 0
+  let projectKey: string | undefined
+  const messages = await sdk.getSessionMessages(sessionId, {
+    dir: cwd,
+    includeSystemMessages: true,
+    sessionStore: {
+      load: async (key) => {
+        calls += 1
+        if (
+          calls !== 1 ||
+          key.sessionId !== sessionId ||
+          key.subpath !== undefined ||
+          !/^[a-z0-9-]{1,256}$/iu.test(key.projectKey)
+        )
+          throw new Error('Read-only SDK namespace observer contract invalid')
+        projectKey = key.projectKey
+        return []
+      },
+      append: async () => {
+        throw new Error('Read-only SDK namespace observer cannot append')
+      },
+    },
+  })
+  if (calls !== 1 || projectKey === undefined || messages.length !== 0)
+    throw new Error('Read-only SDK namespace observer did not complete one empty lookup')
+  return projectKey
+}
+
+async function sourceIdentity(path: string): Promise<object> {
+  try {
+    const info = await lstat(path)
+    return {
+      exists: true,
+      regularFile: info.isFile(),
+      symlink: info.isSymbolicLink(),
+      dev: info.dev,
+      ino: info.ino,
+      size: info.size,
+    }
+  } catch (error) {
+    if (error instanceof Error && Reflect.get(error, 'code') === 'ENOENT') return { exists: false }
+    throw error
+  }
+}
+
 beforeAll(async () => {
   const setupDeadlineAt = performance.now() + 60_000
   const owned = await ownedRoot()
@@ -142,6 +193,33 @@ describe('real Claude Code / production Adapter zero-prompt Fork settings', () =
             .join('\n') + '\n',
         )
         const sourceHash = hash(await boundedNativeText(sourcePath, owned.home))
+        const canonicalCwd = await realpath(owned.cwd)
+        const fixtureKey = canonicalCwd.replace(/[^a-zA-Z0-9]/gu, '-')
+        const sdkKey = await observeSdkProjectKey(sdk, id, owned.cwd)
+        const canonicalSdkKey = await observeSdkProjectKey(sdk, id, canonicalCwd)
+        console.info(
+          '[native namespace]',
+          JSON.stringify({
+            phase: 'source-written-before-prepare',
+            platform: process.platform,
+            arch: process.arch,
+            node: process.version,
+            cwdHash: hash(owned.cwd),
+            syncCanonicalHash: hash(realpathSync(owned.cwd)),
+            promiseCanonicalHash: hash(canonicalCwd),
+            fixtureKeyHash: hash(fixtureKey),
+            sdkKeyHash: hash(sdkKey),
+            canonicalSdkKeyHash: hash(canonicalSdkKey),
+            sdkMatchesFixture: sdkKey === fixtureKey,
+            canonicalSdkMatchesFixture: canonicalSdkKey === fixtureKey,
+            sourceHash,
+            fixtureSource: await sourceIdentity(sourcePath),
+            sdkSource: await sourceIdentity(join(owned.home, 'projects', sdkKey, `${id}.jsonl`)),
+            canonicalSdkSource: await sourceIdentity(
+              join(owned.home, 'projects', canonicalSdkKey, `${id}.jsonl`),
+            ),
+          }),
+        )
         const dependencies = {
           getSessionInfo: sdk.getSessionInfo,
           query: (input: SdkQueryInput) => {

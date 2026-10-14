@@ -669,6 +669,21 @@ export async function buildAdapters(root: string): Promise<AdapterBundle> {
 export function actualSdk(): {
   query: (input: SdkQueryInput) => unknown
   getSessionInfo: unknown
+  getSessionMessages: (
+    sessionId: string,
+    options: {
+      dir: string
+      includeSystemMessages: true
+      sessionStore: {
+        load: (key: {
+          projectKey: string
+          sessionId: string
+          subpath?: string
+        }) => Promise<unknown[]>
+        append: () => Promise<never>
+      }
+    },
+  ) => Promise<unknown[]>
 } {
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- The desktop package owns and pins this actual SDK dependency.
   return desktopRequire('@anthropic-ai/claude-agent-sdk') as ReturnType<typeof actualSdk>
