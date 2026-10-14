@@ -3,14 +3,70 @@ import { EventEmitter } from 'node:events'
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { expect, it, vi } from 'vitest'
+import { beforeEach, expect, it, vi } from 'vitest'
 
 import type { ProviderConfiguration } from './provider-environment.js'
 
-import { launchRealWorkspace } from './real-harness.js'
-import { createRuntimeFixture } from './runtime-fixture.js'
+const failureProbe = vi.hoisted(() => ({
+  missingReceipt: false,
+  creation: false,
+  clientCloseFails: false,
+  clientReleasedError: false,
+  root: '',
+  clients: [] as Array<{ released: boolean; closeCalls: number }>,
+}))
 
-const failureProbe = vi.hoisted(() => ({ missingReceipt: false, creation: false, root: '' }))
+beforeEach(() => {
+  // Native clients and Electron apps below are controlled lifecycle objects with
+  // no OS processes. Reset only this test file's module-scoped reservations.
+  vi.resetModules()
+  failureProbe.missingReceipt = false
+  failureProbe.creation = false
+  failureProbe.clientCloseFails = false
+  failureProbe.clientReleasedError = false
+  failureProbe.root = ''
+  failureProbe.clients = []
+})
+
+vi.mock('../native/native-harness.js', async (original) => {
+  const actual = await original<typeof import('../native/native-harness.js')>()
+  return {
+    ...actual,
+    NativeRpc: class {
+      private readonly record = { released: false, closeCalls: 0 }
+      private closing: Promise<void> | undefined
+
+      constructor(
+        _executable: string,
+        _cwd: string,
+        _environment: NodeJS.ProcessEnv,
+        _group: unknown,
+        private readonly onReleased?: () => void,
+      ) {
+        failureProbe.clients.push(this.record)
+      }
+
+      async initialize(): Promise<void> {}
+
+      cleanupFacts(): { released: boolean } {
+        return { released: this.record.released }
+      }
+
+      close(): Promise<void> {
+        this.closing ??= Promise.resolve().then(() => {
+          this.record.closeCalls++
+          if (failureProbe.clientCloseFails) throw new Error('Controlled Native close failure')
+          this.record.released = true
+          this.onReleased?.()
+          if (failureProbe.clientReleasedError)
+            throw new Error('Controlled observation failure after physical release')
+          return undefined
+        })
+        return this.closing
+      }
+    },
+  }
+})
 
 vi.mock('./provider-environment.js', async (original) => {
   const actual = await original<typeof import('./provider-environment.js')>()
@@ -75,6 +131,7 @@ const configuration: ProviderConfiguration = {
 it.skipIf(process.platform !== 'win32')(
   'keeps an original window error ahead of cleanup failure without a raw cause',
   async () => {
+    const { launchRealWorkspace } = await import('./real-harness.js')
     const app = Object.assign(new EventEmitter(), {
       close: vi
         .fn<() => Promise<void>>()
@@ -107,6 +164,7 @@ it.skipIf(process.platform !== 'win32')(
 )
 
 it('keeps an original creation error ahead of source-integrity cleanup failure', async () => {
+  const { createRuntimeFixture } = await import('./runtime-fixture.js')
   failureProbe.creation = true
   try {
     await expect(
@@ -132,6 +190,7 @@ it('keeps an original creation error ahead of source-integrity cleanup failure',
 it.skipIf(process.platform !== 'win32').each(['app-close', 'job-receipt'] as const)(
   'keeps private files and the same failed disposal when %s is unconfirmed',
   async (failureKind) => {
+    const { createRuntimeFixture } = await import('./runtime-fixture.js')
     failureProbe.missingReceipt = failureKind === 'job-receipt'
     const fixture = await createRuntimeFixture({ mode: 'ui' })
     const marker = join(fixture.directory, 'private-marker')
@@ -182,6 +241,7 @@ it.skipIf(process.platform !== 'win32').each(['app-close', 'job-receipt'] as con
 it.skipIf(process.platform !== 'win32')(
   'retains an unpublished initial candidate after independent Job release without fabricating closure',
   async () => {
+    const { createRuntimeFixture } = await import('./runtime-fixture.js')
     const output = await mkdtemp(join(tmpdir(), 'pact-cleanup-evidence-'))
     const attach = vi.fn<ReturnType<typeof playwrightTest.info>['attach']>()
     const info = vi.spyOn(playwrightTest, 'info').mockReturnValue(
@@ -226,6 +286,7 @@ it
   .each(['unclosed', 'invalid', 'unpublished-invalid', 'oversized'] as const)(
   'preserves private evidence when transport facts are %s',
   async (state) => {
+    const { createRuntimeFixture } = await import('./runtime-fixture.js')
     const fixture = await createRuntimeFixture({
       mode: 'real',
       configuration,
@@ -259,9 +320,154 @@ it
 )
 
 it('removes the private directory after confirmed closure and remains idempotent', async () => {
+  const { createRuntimeFixture } = await import('./runtime-fixture.js')
   const fixture = await createRuntimeFixture({ mode: 'ui' })
   const disposal = fixture.dispose()
   await disposal
   expect(fixture.dispose()).toBe(disposal)
   await expect(readdir(fixture.directory)).rejects.toMatchObject({ code: 'ENOENT' })
 })
+
+it.each(['app', 'native-client'] as const)(
+  'retains private evidence and the same failed disposal for an unconfirmed %s on every platform',
+  async (kind) => {
+    const { createRuntimeFixture } = await import('./runtime-fixture.js')
+    const fixture = await createRuntimeFixture({ mode: 'real', configuration })
+    const marker = join(fixture.directory, 'private-marker')
+    const close = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValue(new Error('Controlled close failure'))
+    const evaluate = vi.fn<() => Promise<unknown>>()
+    if (process.platform === 'win32') evaluate.mockResolvedValueOnce(process.pid)
+    evaluate
+      .mockResolvedValueOnce({
+        userData: join(fixture.directory, 'electron-profile'),
+        sessionData: join(fixture.directory, 'electron-session'),
+        temp: join(fixture.directory, 'tmp'),
+      })
+      .mockResolvedValue(undefined)
+    const app = Object.assign(new EventEmitter(), {
+      close,
+      firstWindow: async () => ({}),
+      evaluate,
+    })
+    const launch = vi
+      .spyOn(electron, 'launch')
+      // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- No Electron process exists; the real fixture owns a controlled close failure.
+      .mockResolvedValue(app as unknown as Awaited<ReturnType<typeof electron.launch>>)
+    try {
+      await writeFile(marker, 'private evidence retained until physical release')
+      if (kind === 'app') await fixture.launch()
+      else {
+        failureProbe.clientCloseFails = true
+        await fixture.openCodexClient()
+      }
+      const disposal = fixture.dispose()
+      const expected =
+        kind === 'app'
+          ? 'Electron did not acknowledge shutdown'
+          : 'Owned Native client did not close'
+      await expect(disposal).rejects.toThrow(expected)
+      expect(fixture.dispose()).toBe(disposal)
+      await expect(fixture.dispose()).rejects.toThrow(expected)
+      expect(await readFile(marker, 'utf8')).toBe(
+        'private evidence retained until physical release',
+      )
+      expect((await stat(fixture.codexHome)).isDirectory()).toBe(true)
+      await expect(fixture.launch()).rejects.toThrow('disposed')
+      await expect(fixture.openCodexClient()).rejects.toThrow('disposed')
+      await expect(fixture.runNativeCommand('codex', ['--version'])).rejects.toThrow('disposed')
+      expect(close).toHaveBeenCalledTimes(kind === 'app' ? 1 : 0)
+      expect(failureProbe.clients).toEqual(
+        kind === 'native-client' ? [{ released: false, closeCalls: 1 }] : [],
+      )
+    } finally {
+      launch.mockRestore()
+      // Controlled close objects own no OS processes. Failed production cleanup
+      // remains observable above; only this test's private fake files are removed.
+      await rm(fixture.directory, { recursive: true, force: true })
+    }
+  },
+)
+
+it('removes confirmed Native storage while preserving its cached observation error', async () => {
+  const { createRuntimeFixture } = await import('./runtime-fixture.js')
+  failureProbe.clientReleasedError = true
+  const fixture = await createRuntimeFixture({ mode: 'real', configuration })
+  try {
+    await fixture.openCodexClient()
+    const disposal = fixture.dispose()
+    await expect(disposal).rejects.toThrow('Owned Native client did not close')
+    expect(fixture.dispose()).toBe(disposal)
+    expect(failureProbe.clients).toEqual([{ released: true, closeCalls: 1 }])
+    await expect(stat(fixture.directory)).rejects.toMatchObject({ code: 'ENOENT' })
+  } finally {
+    // This Native object never starts an OS process; a failed assertion must not
+    // leave the controlled private fixture on disk.
+    await rm(fixture.directory, { recursive: true, force: true })
+  }
+})
+
+it('keeps all eight fixture reservations occupied after unconfirmed Native client release', async () => {
+  const { createRuntimeFixture } = await import('./runtime-fixture.js')
+  failureProbe.clientCloseFails = true
+  const fixtures = []
+  try {
+    // oxlint-disable no-await-in-loop -- Fill the actual admission slots with separately failed controlled cleanup owners.
+    for (let index = 0; index < 8; index++) {
+      const fixture = await createRuntimeFixture({ mode: 'real', configuration })
+      fixtures.push(fixture)
+      await fixture.openCodexClient()
+      await expect(fixture.dispose()).rejects.toThrow('Owned Native client did not close')
+      expect((await stat(fixture.directory)).isDirectory()).toBe(true)
+    }
+    // oxlint-enable no-await-in-loop
+    await expect(createRuntimeFixture({ mode: 'real', configuration })).rejects.toThrow(
+      'at most eight fixtures',
+    )
+    expect(failureProbe.clients).toHaveLength(8)
+    expect(
+      failureProbe.clients.every((client) => !client.released && client.closeCalls === 1),
+    ).toBe(true)
+  } finally {
+    // These mocked clients have never spawned a process. No real unconfirmed path is removed.
+    await Promise.all(
+      fixtures.map((fixture) => rm(fixture.directory, { recursive: true, force: true })),
+    )
+  }
+})
+
+it
+  .skipIf(process.platform === 'win32')
+  .each(['tmp-only', 'invalid', 'unpublished-invalid'] as const)(
+  'does not infer POSIX transport closure from an empty published set with %s evidence',
+  async (kind) => {
+    const { createRuntimeFixture } = await import('./runtime-fixture.js')
+    const fixture = await createRuntimeFixture({
+      mode: 'real',
+      configuration,
+      transportFault: 'hold-initialization',
+    })
+    const path = join(
+      fixture.directory,
+      'controlled-facts',
+      kind === 'invalid' ? '1.json' : '1.json.tmp',
+    )
+    const body =
+      kind === 'tmp-only'
+        ? JSON.stringify({ relayPid: 1, closed: false, entries: [], forwardedTurns: 0 })
+        : '{'
+    try {
+      await writeFile(path, body)
+      const disposal = fixture.dispose()
+      await expect(disposal).rejects.toThrow(/transport.*(?:clos|fact)/iu)
+      expect(fixture.dispose()).toBe(disposal)
+      expect(await readFile(path, 'utf8')).toBe(body)
+      expect((await stat(fixture.codexHome)).isDirectory()).toBe(true)
+    } finally {
+      // writeNativeTransportFault is a file-only mock here; no relay/CLI was started.
+      await rm(fixture.directory, { recursive: true, force: true })
+    }
+  },
+  10_000,
+)

@@ -10,6 +10,9 @@ inputs:
   native:
     description: Install actual pinned Claude and Codex CLIs without provider credentials
     default: 'false'
+  display:
+    description: Prepare the native macOS logical work area for the unchanged desktop UI viewports
+    default: 'false'
 runs:
   using: composite
   steps:
@@ -36,3 +39,8 @@ runs:
       shell: bash
       working-directory: ${{ inputs.controller || inputs.workspace }}
       run: node scripts/ci-native.mjs
+    - name: Prepare and verify the native macOS logical desktop work area
+      if: runner.os == 'macOS' && inputs.display == 'true'
+      shell: bash
+      working-directory: ${{ inputs.controller || inputs.workspace }}
+      run: node scripts/ci-display.mjs configure

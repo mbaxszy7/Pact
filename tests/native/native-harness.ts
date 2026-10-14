@@ -296,6 +296,24 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>
 }
 
+type CleanupStage = 'observe' | 'eof' | 'eof-grace' | 'group' | 'terminate' | 'kill' | 'close'
+export interface NativeCleanupFacts {
+  phase: 'open' | 'closing' | 'released' | 'released-with-errors' | 'unconfirmed'
+  stages: Array<{
+    stage: CleanupStage
+    milliseconds: number
+    errorClass: 'Error' | 'non-error' | null
+  }>
+  childExit: boolean
+  childClosed: boolean
+  closeSettled: boolean
+  stdinEnded: boolean
+  groupReleased: boolean
+  pendingRequests: number
+  lifetimeReleased: boolean
+  released: boolean
+}
+
 // All requests settle in 10s; no retries after unknown delivery. The only child
 // killed on cleanup is this fixture's own child, never a Desktop/Pact process.
 export class NativeRpc {
@@ -303,6 +321,7 @@ export class NativeRpc {
   readonly events: Event[] = []
   readonly methods: string[] = []
   readonly exited: Promise<void>
+  private readonly closed: Promise<void>
   private readonly pending = new Map<number | string, Pending>()
   private buffer: Buffer = Buffer.alloc(0)
   private bytes = 0
@@ -313,6 +332,14 @@ export class NativeRpc {
   private stderrBytes = 0
   private readonly deadline: ReturnType<typeof setTimeout>
   private closing: Promise<void> | undefined
+  private closingRequested = false
+  private childClosed = false
+  private closeSettled = false
+  private childExit = false
+  private lifetimeReleased = false
+  private released = false
+  private cleanupPhase: NativeCleanupFacts['phase'] = 'open'
+  private readonly cleanupStages: NativeCleanupFacts['stages'] = []
 
   constructor(
     executablePath: string,
@@ -351,8 +378,23 @@ export class NativeRpc {
       this.child.kill('SIGTERM')
     }, 50_000)
     this.exited = new Promise((resolveExit) => {
+      this.child.once('exit', () => {
+        this.childExit = true
+        this.ended = true
+        this.fail(new Error('Owned native RPC exited'))
+        resolveExit()
+      })
+      this.child.once('error', (error) => {
+        this.ended = true
+        this.fail(error)
+        resolveExit()
+      })
+    })
+    this.closed = new Promise((resolveClose) => {
       const finish = async (): Promise<void> => {
         clearTimeout(this.deadline)
+        this.lifetimeReleased = true
+        this.childClosed = true
         this.ended = true
         this.fail(new Error('Owned native RPC exited'))
         if (launcher) {
@@ -369,16 +411,10 @@ export class NativeRpc {
             this.launcherCleanupError = new Error('Owned Windows RPC launcher cleanup failed')
           }
         }
-        resolveExit()
+        resolveClose()
       }
-      this.child.once(launcher ? 'close' : 'exit', () => {
+      this.child.once('close', () => {
         void finish()
-      })
-      this.child.once('error', (error) => {
-        clearTimeout(this.deadline)
-        this.ended = true
-        this.fail(error)
-        if (!launcher) resolveExit()
       })
     })
     this.child.stderr.on('data', (data: Buffer) => {
@@ -441,6 +477,7 @@ export class NativeRpc {
     this.pending.clear()
   }
   request<T>(method: string, params: object): Promise<Reply<T>> {
+    if (this.closingRequested) return Promise.reject(new Error('Owned Native RPC is closing'))
     if (this.fatal) return Promise.reject(this.fatal)
     if (this.pending.size >= 4 || this.methods.length >= 128)
       return Promise.reject(new Error('Native RPC admission bound exceeded'))
@@ -500,29 +537,101 @@ export class NativeRpc {
     throw new Error('unknown_delivery: Native Turn did not complete in 10s')
   }
   close(): Promise<void> {
+    this.closingRequested = true
     this.closing ??= Promise.resolve().then(() => this.release())
     return this.closing
   }
+  /** Bounded lifecycle facts only: never retain protocol text, credentials or raw causes. */
+  cleanupFacts(): NativeCleanupFacts {
+    return {
+      phase: this.cleanupPhase,
+      stages: this.cleanupStages.map((stage) => ({ ...stage })),
+      childExit: this.childExit,
+      childClosed: this.childClosed,
+      closeSettled: this.closeSettled,
+      stdinEnded: this.child.stdin.writableEnded,
+      groupReleased: this.processGroup?.released ?? this.childClosed,
+      pendingRequests: this.pending.size,
+      lifetimeReleased: this.lifetimeReleased,
+      released: this.released,
+    }
+  }
   private async release(): Promise<void> {
+    this.cleanupPhase = 'closing'
     clearTimeout(this.deadline)
-    if (!this.ended) {
-      await this.processGroup?.observe()
-      this.child.stdin.end()
-      await within(this.exited, 1500, 'Owned EOF grace deadline').catch(() => undefined)
-      if (!this.ended) {
-        this.child.kill('SIGTERM')
-        await within(this.exited, 1500, 'Owned termination grace deadline').catch(() => undefined)
-      }
-      if (!this.ended) {
-        this.child.kill('SIGKILL')
-        await this.exited
+    this.lifetimeReleased = true
+    this.fail(new Error('Owned Native RPC is closing'))
+    let firstError: Error | undefined
+    const stage = async (
+      name: CleanupStage,
+      work: () => Promise<void>,
+      required = true,
+    ): Promise<void> => {
+      const started = performance.now()
+      let errorClass: 'Error' | 'non-error' | null = null
+      try {
+        await work()
+      } catch (error) {
+        errorClass = error instanceof Error ? 'Error' : 'non-error'
+        if (required)
+          firstError ??= error instanceof Error ? error : new Error('Owned Native cleanup failed')
+      } finally {
+        this.cleanupStages.push({
+          stage: name,
+          milliseconds: Math.ceil(performance.now() - started),
+          errorClass,
+        })
       }
     }
-    await this.processGroup?.close()
-    if (process.platform === 'win32') await this.exited
-    if (this.launcherCleanupError) throw this.launcherCleanupError
-    if (this.pending.size) throw new Error('Native requests leaked on cleanup')
-    this.onReleased?.()
+    if (!this.ended) {
+      await stage('observe', async () => {
+        if (this.processGroup)
+          await within(this.processGroup.observe(), 2000, 'Owned observation deadline')
+      })
+      await stage('eof', async () => {
+        this.child.stdin.end()
+      })
+      await stage('eof-grace', () => within(this.exited, 1500, 'Owned EOF grace deadline'), false)
+    }
+    // A failed preliminary observation must not prevent the genuine owner from
+    // independently proving release. All OS identity checks/signals remain there.
+    if (this.processGroup) await stage('group', () => this.processGroup!.close())
+    else {
+      if (!this.ended)
+        await stage(
+          'terminate',
+          async () => {
+            this.child.kill('SIGTERM')
+            await within(this.exited, 1500, 'Owned termination grace deadline')
+          },
+          false,
+        )
+      if (!this.ended)
+        await stage('kill', async () => {
+          this.child.kill('SIGKILL')
+          await within(this.exited, 1500, 'Owned kill deadline')
+        })
+    }
+    await stage('close', async () => {
+      await within(this.closed, 1500, 'Owned child close deadline')
+      this.closeSettled = true
+    })
+    firstError ??= this.launcherCleanupError
+    if (this.pending.size) firstError ??= new Error('Native requests leaked on cleanup')
+    this.released =
+      this.childClosed &&
+      this.closeSettled &&
+      !this.launcherCleanupError &&
+      this.pending.size === 0 &&
+      (this.processGroup?.released ?? true)
+    this.cleanupPhase = this.released
+      ? firstError
+        ? 'released-with-errors'
+        : 'released'
+      : 'unconfirmed'
+    if (this.released) this.onReleased?.()
+    if (!this.released) firstError ??= new Error('Owned Native physical release is unconfirmed')
+    if (firstError) throw firstError
   }
 }
 export function result<T>(reply: Reply<T>): T {

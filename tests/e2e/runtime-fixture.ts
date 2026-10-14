@@ -439,6 +439,7 @@ export async function createRuntimeFixture(
     const directory = await mkdtemp(join(tmpdir(), 'pact-runtime-e2e-'))
     const databaseFile = join(directory, 'pact.sqlite')
     const apps = new Set<ElectronApplication>()
+    const failedAppClosures = new Set<ElectronApplication>()
     const nativeClients = new Set<NativeRpc>()
     const launchOwners = new Set<WindowsLaunchOwner>()
     const unlaunchedOwners = new Set<WindowsLaunchOwner>()
@@ -526,30 +527,25 @@ export async function createRuntimeFixture(
       }
     }
     const trackOperation = <T>(start: () => Promise<T>): Promise<T> => {
-      if (process.platform === 'win32' && pendingOperations.size >= 3)
-        return Promise.reject(new Error('Windows launch operation capacity exceeded'))
+      if (disposed) return Promise.reject(new Error('E2E fixture is disposed'))
+      if (pendingOperations.size >= 3)
+        return Promise.reject(new Error('Fixture operation capacity exceeded'))
       const operation = start()
-      if (process.platform === 'win32') {
-        pendingOperations.add(operation)
-        const settled = (): void => {
-          pendingOperations.delete(operation)
-        }
-        void operation.then(settled, settled)
+      pendingOperations.add(operation)
+      const settled = (): void => {
+        pendingOperations.delete(operation)
       }
+      void operation.then(settled, settled)
       return operation
     }
     let disposal: Promise<void> | undefined
     const dispose = (): Promise<void> => {
       disposal ??= (async () => {
         disposed = true
-        const retainUnconfirmed = process.platform === 'win32'
-        if (!retainUnconfirmed) {
-          ownedFixtures.delete(dispose)
-          releaseFixtureSlot()
-        }
+        const windowsJobProof = process.platform === 'win32'
         clearTimeout(timeout)
         const failures: string[] = []
-        if (retainUnconfirmed) {
+        if (windowsJobProof) {
           try {
             await within(
               Promise.allSettled(preparingOwners),
@@ -566,33 +562,52 @@ export async function createRuntimeFixture(
             await client.close()
             nativeClients.delete(client)
           } catch {
-            failures.push('Owned Native client did not close')
+            failures.push(
+              `Owned Native client did not close; lifecycle=${JSON.stringify(client.cleanupFacts())}`,
+            )
           }
         }
-        if (!retainUnconfirmed) nativeClients.clear()
+        const attemptedApps = new Set<ElectronApplication>()
         for (const app of apps) {
+          attemptedApps.add(app)
+          if (failedAppClosures.has(app)) {
+            failures.push('Electron did not acknowledge shutdown')
+            appOwner?.cancel()
+            continue
+          }
           try {
             // oxlint-disable-next-line eslint/no-await-in-loop -- Each app shutdown must settle its Utility and native children first.
-            await app.close()
+            await within(app.close(), 30_000, 'Electron shutdown did not settle')
             apps.delete(app)
           } catch {
+            failedAppClosures.add(app)
             failures.push('Electron did not acknowledge shutdown')
             appOwner?.cancel()
           }
         }
-        if (!retainUnconfirmed) apps.clear()
-        if (retainUnconfirmed) {
+        if (windowsJobProof) {
           for (const owner of launchOwners) owner.cancel()
+        }
+        try {
+          await within(
+            Promise.allSettled(pendingOperations),
+            30_000,
+            'Fixture operations did not settle',
+          )
+        } catch {
+          failures.push('Fixture operations did not settle')
+        }
+        if (lateAppCloseFailed) failures.push('Late Electron launch did not acknowledge shutdown')
+        for (const app of apps) {
+          if (attemptedApps.has(app) || failedAppClosures.has(app)) continue
           try {
-            await within(
-              Promise.allSettled(pendingOperations),
-              30_000,
-              'Windows launch operations did not settle',
-            )
+            // oxlint-disable-next-line no-await-in-loop -- A late launch is a new owner, never a retry of failed shutdown.
+            await within(app.close(), 30_000, 'Late Electron shutdown did not settle')
+            apps.delete(app)
           } catch {
-            failures.push('Windows launch operations did not settle')
+            failedAppClosures.add(app)
+            failures.push('Late Electron launch did not acknowledge shutdown')
           }
-          if (lateAppCloseFailed) failures.push('Late Electron launch did not acknowledge shutdown')
         }
         for (const owner of launchOwners) {
           try {
@@ -604,16 +619,18 @@ export async function createRuntimeFixture(
             )
           }
         }
+        let transportUnconfirmed = false
         if (transport) {
-          if (retainUnconfirmed) {
+          if (windowsJobProof) {
             try {
               const facts = await readTransportFacts(transport)
               const incomplete = facts.filter((fact) => !fact.closed)
               const unpublished = await readUnpublishedTransportFacts(transport)
-              if (incomplete.length || unpublished.length) {
-                if (!releasedLaunches || launchOwners.size)
+              if (!facts.length || incomplete.length || unpublished.length) {
+                if (!releasedLaunches || launchOwners.size) {
+                  transportUnconfirmed = true
                   failures.push('Actual Native transport child did not close before cleanup')
-                else {
+                } else {
                   const info = baseTest.info()
                   const path = info.outputPath(`incomplete-transport-${basename(directory)}.json`)
                   const evidence = redact(
@@ -633,6 +650,7 @@ export async function createRuntimeFixture(
                 }
               }
             } catch {
+              transportUnconfirmed = true
               failures.push('Actual Native transport closure facts could not be read or retained')
             }
           } else {
@@ -641,26 +659,38 @@ export async function createRuntimeFixture(
             try {
               do {
                 // oxlint-disable-next-line no-await-in-loop -- Verify actual child closure before deleting its credential/storage directory.
-                closed = (await readTransportFacts(transport)).every((fact) => fact.closed)
+                const facts = await readTransportFacts(transport)
+                // oxlint-disable-next-line no-await-in-loop -- A partial publication is never a terminal receipt.
+                const unpublished = await readUnpublishedTransportFacts(transport)
+                closed =
+                  facts.length > 0 && facts.every((fact) => fact.closed) && unpublished.length === 0
                 if (!closed) {
                   // oxlint-disable-next-line no-await-in-loop -- The bounded relay owns TERM/KILL settlement; allow its next close event.
                   await new Promise<void>((done) => setTimeout(done, 100))
                 }
               } while (!closed && Date.now() < deadline)
-            } catch (error) {
-              if (!retainUnconfirmed) throw error
+            } catch {
               failures.push('Actual Native transport closure facts could not be read')
             }
-            if (!closed) failures.push('Actual Native transport child did not close before cleanup')
+            if (!closed) {
+              transportUnconfirmed = true
+              failures.push('Actual Native transport child did not close before cleanup')
+            }
           }
         }
-        const releaseUnconfirmed = failures.length > 0
+        const releaseUnconfirmed =
+          nativeClients.size > 0 ||
+          apps.size > 0 ||
+          launchOwners.size > 0 ||
+          preparingOwners.size > 0 ||
+          pendingOperations.size > 0 ||
+          transportUnconfirmed
         try {
           await configuration?.assertSourceIntegrity()
         } catch {
           failures.push('An original provider configuration changed during the test')
         }
-        if (retainUnconfirmed && releaseUnconfirmed)
+        if (releaseUnconfirmed)
           throw new Error(`${failures.join('; ')}; owned fixture retained at ${directory}`)
         await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 })
         ownedFixtures.delete(dispose)
@@ -759,25 +789,27 @@ export async function createRuntimeFixture(
           )
           await rename(path, transport.controlPath)
         },
-        openCodexClient: async (originator = 'pact') => {
-          if (mode !== 'real' || disposed)
-            throw new Error('Owned native clients require a live real fixture')
-          if (nativeClients.size >= 2)
-            throw new Error('A real fixture owns at most two auxiliary Native clients')
-          const client = new NativeRpc(
-            configuration!.codexPath,
-            directory,
-            {
-              ...codexProcessEnvironment(undefined, environment.env),
-              CODEX_INTERNAL_ORIGINATOR_OVERRIDE: originator,
-            },
-            new OwnedProcessGroup({ startupObservationMs: 2_000 }),
-            () => nativeClients.delete(client),
-          )
-          nativeClients.add(client)
-          await client.initialize()
-          return client
-        },
+        openCodexClient: (originator = 'pact') =>
+          trackOperation(async () => {
+            if (mode !== 'real' || disposed)
+              throw new Error('Owned native clients require a live real fixture')
+            if (nativeClients.size >= 2)
+              throw new Error('A real fixture owns at most two auxiliary Native clients')
+            const client = new NativeRpc(
+              configuration!.codexPath,
+              directory,
+              {
+                ...codexProcessEnvironment(undefined, environment.env),
+                CODEX_INTERNAL_ORIGINATOR_OVERRIDE: originator,
+              },
+              new OwnedProcessGroup({ startupObservationMs: 2_000 }),
+              () => nativeClients.delete(client),
+            )
+            nativeClients.add(client)
+            await client.initialize()
+            if (disposed) throw new Error('E2E fixture is disposed')
+            return client
+          }),
         readConfigurationModels: () => configuration?.models ?? { claude: null, codex: null },
         runNativeCommand: (agentId, args) =>
           trackOperation(async () => {
@@ -816,26 +848,27 @@ export async function createRuntimeFixture(
             }
             return boundedCommand(executable, args, directory, environment.env, redact)
           }),
-        createProjectDirectory: async (name, git = true) => {
-          if (disposed) throw new Error('E2E fixture is disposed')
-          const projectDirectory = resolve(directory, name)
-          const local = relative(directory, projectDirectory)
-          if (!local || local.startsWith('..') || isAbsolute(local))
-            throw new Error('Project must belong to the fixture')
-          await mkdir(projectDirectory, { recursive: true, mode: 0o700 })
-          if (git) {
-            const result = await boundedCommand(
-              'git',
-              ['init', '--quiet', projectDirectory],
-              directory,
-              environment.env,
-              redact,
-            )
-            if (result.exitCode !== 0)
-              throw new Error(`Owned Git initialization failed: ${result.stderr}`)
-          }
-          return await realpath(projectDirectory)
-        },
+        createProjectDirectory: (name, git = true) =>
+          trackOperation(async () => {
+            if (disposed) throw new Error('E2E fixture is disposed')
+            const projectDirectory = resolve(directory, name)
+            const local = relative(directory, projectDirectory)
+            if (!local || local.startsWith('..') || isAbsolute(local))
+              throw new Error('Project must belong to the fixture')
+            await mkdir(projectDirectory, { recursive: true, mode: 0o700 })
+            if (git) {
+              const result = await boundedCommand(
+                'git',
+                ['init', '--quiet', projectDirectory],
+                directory,
+                environment.env,
+                redact,
+              )
+              if (result.exitCode !== 0)
+                throw new Error(`Owned Git initialization failed: ${result.stderr}`)
+            }
+            return await realpath(projectDirectory)
+          }),
         launch: (extraEnvironment = {}) =>
           trackOperation(async () => {
             if (disposed) throw new Error('E2E fixture is disposed')
@@ -901,7 +934,10 @@ export async function createRuntimeFixture(
                   )
                 })
               apps.add(app)
-              app.once('close', () => apps.delete(app))
+              app.once('close', () => {
+                apps.delete(app)
+                failedAppClosures.delete(app)
+              })
               try {
                 if (disposed) throw new Error('E2E fixture is disposed')
                 if (currentOwner) {
@@ -957,6 +993,7 @@ export async function createRuntimeFixture(
                 return app
               } catch (error) {
                 await app.close().catch(() => {
+                  failedAppClosures.add(app)
                   if (disposed) lateAppCloseFailed = true
                 })
                 // oxlint-disable-next-line eslint/preserve-caught-error -- A raw nested launch error may contain credentials; expose only the sanitized message.

@@ -1,6 +1,7 @@
 import { _electron as electron, test as baseTest, type ElectronApplication } from '@playwright/test'
 import { EventEmitter } from 'node:events'
-import { mkdir, rm, stat } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, expect, it, vi } from 'vitest'
 
@@ -14,7 +15,49 @@ const probe = vi.hoisted(() => ({
   roots: [] as string[],
   owners: [] as Array<{ directory: string; released: number; reads: number; deadline?: number }>,
   rejectEmpty: false,
+  nativeInitializeGate: undefined as Promise<void> | undefined,
+  clients: [] as Array<{ initialized: boolean; released: boolean; closeCalls: number }>,
 }))
+
+vi.mock('../native/native-harness.js', async (original) => {
+  const actual = await original<typeof import('../native/native-harness.js')>()
+  return {
+    ...actual,
+    NativeRpc: class {
+      private readonly record = { initialized: false, released: false, closeCalls: 0 }
+      private closing: Promise<void> | undefined
+
+      constructor(
+        _executable: string,
+        _cwd: string,
+        _environment: NodeJS.ProcessEnv,
+        _group: unknown,
+        private readonly onReleased?: () => void,
+      ) {
+        probe.clients.push(this.record)
+      }
+
+      async initialize(): Promise<void> {
+        await probe.nativeInitializeGate
+        this.record.initialized = true
+      }
+
+      cleanupFacts(): { released: boolean } {
+        return { released: this.record.released }
+      }
+
+      close(): Promise<void> {
+        this.closing ??= Promise.resolve().then(() => {
+          this.record.closeCalls++
+          this.record.released = true
+          this.onReleased?.()
+          return undefined
+        })
+        return this.closing
+      }
+    },
+  }
+})
 
 vi.mock('./provider-environment.js', async (original) => {
   const actual = await original<typeof import('./provider-environment.js')>()
@@ -25,7 +68,9 @@ vi.mock('./provider-environment.js', async (original) => {
     ) => {
       probe.roots.push(args[0])
       await probe.environmentGate
-      return actual.prepareProviderEnvironment(...args)
+      // These admission cases exercise controlled Node/lifecycle targets, never
+      // a real Provider. The loader's provenance checks have their own tests.
+      return actual.prepareProviderEnvironment(args[0])
     },
   }
 })
@@ -86,6 +131,8 @@ beforeEach(() => {
   probe.roots = []
   probe.owners = []
   probe.rejectEmpty = false
+  probe.nativeInitializeGate = undefined
+  probe.clients = []
 })
 
 function gate(): { promise: Promise<void>; resolve: () => void } {
@@ -97,20 +144,21 @@ function gate(): { promise: Promise<void>; resolve: () => void } {
 }
 
 function controlledApp(root: string): ElectronApplication {
+  const evaluate = vi.fn<() => Promise<unknown>>()
+  if (process.platform === 'win32') evaluate.mockResolvedValueOnce(process.pid)
+  evaluate
+    .mockResolvedValueOnce({
+      userData: join(root, 'electron-profile'),
+      sessionData: join(root, 'electron-session'),
+      temp: join(root, 'tmp'),
+    })
+    .mockResolvedValue(undefined)
   const app = Object.assign(new EventEmitter(), {
     firstWindow: async () => ({}),
     close: async () => {
       app.emit('close')
     },
-    evaluate: vi
-      .fn<() => Promise<unknown>>()
-      .mockResolvedValueOnce(process.pid)
-      .mockResolvedValueOnce({
-        userData: join(root, 'electron-profile'),
-        sessionData: join(root, 'electron-session'),
-        temp: join(root, 'tmp'),
-      })
-      .mockResolvedValue(undefined),
+    evaluate,
   })
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Controlled lifecycle object; no Electron process is created.
   return app as unknown as ElectronApplication
@@ -284,7 +332,7 @@ it.skipIf(process.platform !== 'win32')(
   },
 )
 
-it.skipIf(process.platform !== 'win32').each([false, true])(
+it.each([false, true])(
   'drains a late Electron app before disposal settles (close fails: %s)',
   async (closeFails) => {
     const held = gate()
@@ -328,7 +376,7 @@ it.skipIf(process.platform !== 'win32').each([false, true])(
         ),
       ).toBe(closeFails)
       expect(close).toHaveBeenCalledOnce()
-      expect(probe.owners[0]?.released).toBe(1)
+      expect(probe.owners[0]?.released ?? 0).toBe(process.platform === 'win32' ? 1 : 0)
     } finally {
       held.resolve()
       await operation
@@ -452,3 +500,175 @@ it.skipIf(process.platform !== 'win32').each(['app', 'command'] as const)(
     }
   },
 )
+
+it('drains a pending Native initialization before releasing its fixture and rejects the late client', async () => {
+  const { createRuntimeFixture } = await import('./runtime-fixture.js')
+  const held = gate()
+  probe.nativeInitializeGate = held.promise
+  const fixture = await createRuntimeFixture({
+    mode: 'real',
+    configuration: {
+      claudePath: process.execPath,
+      codexPath: process.execPath,
+      models: { claude: null, codex: null },
+      configurationFingerprint: 'controlled-admission',
+      sourceHashes: [],
+      redact: (text) => text,
+      assertSourceIntegrity: async () => undefined,
+    },
+  })
+  const marker = join(fixture.directory, 'initializing-native-marker')
+  await writeFile(marker, 'pending initialization owns private storage')
+  const operation = fixture.openCodexClient().catch((error: unknown) => error)
+  try {
+    await expect.poll(() => probe.clients.length).toBe(1)
+    let settled = false
+    const disposal = fixture.dispose()
+    void disposal.then(
+      () => {
+        settled = true
+        return undefined
+      },
+      () => {
+        settled = true
+        return undefined
+      },
+    )
+    await new Promise<void>((done) => setImmediate(done))
+    expect(settled).toBe(false)
+    expect(await readFile(marker, 'utf8')).toBe('pending initialization owns private storage')
+    held.resolve()
+    await expect(operation).resolves.toBeInstanceOf(Error)
+    await disposal
+    expect(fixture.dispose()).toBe(disposal)
+    expect(probe.clients).toEqual([{ initialized: true, released: true, closeCalls: 1 }])
+    await expect(stat(fixture.directory)).rejects.toMatchObject({ code: 'ENOENT' })
+  } finally {
+    held.resolve()
+    await operation
+    await fixture.dispose().catch(() => undefined)
+    // The Native client is a lifecycle-only fake with no child process.
+    await rm(fixture.directory, { recursive: true, force: true })
+  }
+})
+
+it('drains an admitted real Node command before deleting its fixture on every platform', async () => {
+  const { createRuntimeFixture } = await import('./runtime-fixture.js')
+  const fixture = await createRuntimeFixture({
+    mode: 'real',
+    configuration: {
+      claudePath: process.execPath,
+      codexPath: process.execPath,
+      models: { claude: null, codex: null },
+      configurationFingerprint: 'controlled-node-command',
+      sourceHashes: [],
+      redact: (text) => text,
+      assertSourceIntegrity: async () => undefined,
+    },
+  })
+  const control = await mkdtemp(join(tmpdir(), 'pact-command-lifecycle-'))
+  const readyPath = join(control, 'ready')
+  const releasePath = join(control, 'release')
+  const marker = join(fixture.directory, 'pending-command-marker')
+  await writeFile(marker, 'real command still owns private storage')
+  const command = fixture.runNativeCommand('codex', [
+    '-e',
+    `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(readyPath)}, 'ready'); const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(releasePath)})) { clearInterval(timer); process.stdout.write('command-drained'); } }, 10);`,
+  ])
+  try {
+    await expect
+      .poll(() =>
+        stat(readyPath).then(
+          () => true,
+          () => false,
+        ),
+      )
+      .toBe(true)
+    let settled = false
+    const disposal = fixture.dispose()
+    void disposal.then(
+      () => {
+        settled = true
+        return undefined
+      },
+      () => {
+        settled = true
+        return undefined
+      },
+    )
+    await new Promise<void>((done) => setImmediate(done))
+    expect(settled).toBe(false)
+    expect(await readFile(marker, 'utf8')).toBe('real command still owns private storage')
+    await writeFile(releasePath, 'release')
+    await expect(command).resolves.toMatchObject({ exitCode: 0, stdout: 'command-drained' })
+    await disposal
+    expect(fixture.dispose()).toBe(disposal)
+    await expect(stat(fixture.directory)).rejects.toMatchObject({ code: 'ENOENT' })
+  } finally {
+    await writeFile(releasePath, 'release')
+    await command.catch(() => undefined)
+    await fixture.dispose().catch(() => undefined)
+    // The real Node command has settled and creates no helper processes.
+    await rm(control, { recursive: true, force: true })
+    await rm(fixture.directory, { recursive: true, force: true })
+  }
+})
+
+it('bounds three pending fixture operations and drains both client constructors and the app', async () => {
+  const { createRuntimeFixture } = await import('./runtime-fixture.js')
+  const held = gate()
+  probe.nativeInitializeGate = held.promise
+  const fixture = await createRuntimeFixture({
+    mode: 'real',
+    configuration: {
+      claudePath: process.execPath,
+      codexPath: process.execPath,
+      models: { claude: null, codex: null },
+      configurationFingerprint: 'controlled-pending-capacity',
+      sourceHashes: [],
+      redact: (text) => text,
+      assertSourceIntegrity: async () => undefined,
+    },
+  })
+  const launch = vi.spyOn(electron, 'launch').mockImplementation(async () => {
+    await held.promise
+    return controlledApp(fixture.directory)
+  })
+  const operations = [fixture.launch(), fixture.openCodexClient(), fixture.openCodexClient()].map(
+    (operation) => operation.catch((error: unknown) => error),
+  )
+  try {
+    await expect.poll(() => probe.clients.length + launch.mock.calls.length).toBe(3)
+    await expect(fixture.runNativeCommand('codex', ['--version'])).rejects.toThrow('capacity')
+    expect(probe.clients).toHaveLength(2)
+    expect(launch).toHaveBeenCalledOnce()
+    const disposal = fixture.dispose()
+    let settled = false
+    void disposal.then(
+      () => {
+        settled = true
+        return undefined
+      },
+      () => {
+        settled = true
+        return undefined
+      },
+    )
+    await new Promise<void>((done) => setImmediate(done))
+    expect(settled).toBe(false)
+    expect((await stat(fixture.directory)).isDirectory()).toBe(true)
+    held.resolve()
+    const outcomes = await Promise.all(operations)
+    expect(outcomes.every((outcome) => outcome instanceof Error)).toBe(true)
+    await disposal
+    expect(probe.clients.every((client) => client.released && client.closeCalls === 1)).toBe(true)
+    await expect(stat(fixture.directory)).rejects.toMatchObject({ code: 'ENOENT' })
+  } finally {
+    held.resolve()
+    await Promise.all(operations)
+    await fixture.dispose().catch(() => undefined)
+    launch.mockRestore()
+    // Controlled clients and Electron targets own no OS processes.
+    await rm(fixture.directory, { recursive: true, force: true })
+  }
+})

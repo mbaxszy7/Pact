@@ -31,6 +31,8 @@ test.describe('real business input return', { tag: '@real' }, () => {
       let writer: NativeRpc | undefined
       let reader: NativeRpc | undefined
       let resumeHeld = false
+      let stage = 'source'
+      let primaryFailure: { error: unknown; stage: string } | undefined
       try {
         if (keepNewDraft) await ctx.fixture.controlTransportFault('release')
         const sourceMarker = `SOURCE_${randomUUID()}`
@@ -116,7 +118,9 @@ test.describe('real business input return', { tag: '@real' }, () => {
 
         // Close Pact before another actual app-server owns this same Native writer.
         await ctx.app.close()
+        stage = 'writer-initialize'
         writer = await ctx.fixture.openCodexClient('Codex Desktop')
+        stage = 'writer-resume'
         const resumed = await writer.request<{ thread: NativeThread }>('thread/resume', {
           threadId: sourceRun.nativeSessionId,
           cwd: ctx.projectDirectory,
@@ -138,6 +142,7 @@ test.describe('real business input return', { tag: '@real' }, () => {
           resumeHeld = true
         }
         await sendRealMessage(ctx, rejectedBody, 'codex')
+        stage = 'occupied-writer-return'
         const composer = ctx.page.getByRole('combobox', { name: 'Message', exact: true })
         if (keepNewDraft) {
           // Hold the unchanged resume request before real dispatch, so the newer
@@ -191,11 +196,13 @@ test.describe('real business input return', { tag: '@real' }, () => {
         expect(writer.child.exitCode).toBeNull()
         // EOF is natural release of our own writer; no lock deletion or external termination.
         writer.child.stdin.end()
+        stage = 'writer-natural-eof'
         await writer.exited
         expect(writer.child.exitCode).toBe(0)
         await writer.close()
         writer = undefined
 
+        stage = 'rebuild'
         await ctx.page.getByRole('button', { name: 'Rebuild…', exact: true }).click()
         await ctx.page.getByRole('button', { name: 'Confirm rebuild', exact: true }).click()
         await expect(
@@ -243,10 +250,12 @@ test.describe('real business input return', { tag: '@real' }, () => {
 
         // A real read-only Native client proves Rebuild has launched no model Turn.
         reader = await ctx.fixture.openCodexClient('Codex Desktop')
+        stage = 'native-readback'
         expect(await nativeTurnIds(reader, sourceRun.nativeSessionId)).toEqual(originalTurns)
         expect(await nativeTurnIds(reader, rebuiltNativeId)).toEqual([])
         await reader.close()
         reader = undefined
+        stage = 'cold-restart'
         await restartRealWorkspace(ctx)
         const coldComposer = ctx.page.getByRole('combobox', { name: 'Message', exact: true })
         await expect.poll(() => coldComposer.textContent()).toBe(rejectedInput)
@@ -264,6 +273,7 @@ test.describe('real business input return', { tag: '@real' }, () => {
 
         // Only this new explicit user Enter may deliver the returned task.
         await coldComposer.press('Enter')
+        stage = 'explicit-returned-input-send'
         const completed = await waitForRealCompletion(ctx, 3, ctx.sessionId, [failed.id])
         expect(
           completed.runs.filter((run) => run.status === 'completed' && run.agentId === 'codex'),
@@ -282,6 +292,7 @@ test.describe('real business input return', { tag: '@real' }, () => {
         ).toContain(rejectedMarker)
         await expect.poll(() => coldComposer.textContent()).toBe('')
         await ctx.app.close()
+        stage = 'durable-readback'
         const database = await PactDatabase.open({
           filePath: ctx.fixture.databaseFile,
           migrationsFolder,
@@ -321,13 +332,64 @@ test.describe('real business input return', { tag: '@real' }, () => {
         } finally {
           database.close()
         }
+      } catch (error) {
+        primaryFailure = { error, stage }
       } finally {
-        try {
-          if (resumeHeld) await ctx.fixture.controlTransportFault('cancel')
-          await writer?.close()
-          await reader?.close()
-        } finally {
-          await closeRealWorkspace(ctx)
+        const cleanupFailures: Array<{ owner: string; message: string }> = []
+        const cleanup = async (owner: string, work: () => Promise<unknown>): Promise<void> => {
+          try {
+            await work()
+          } catch (error) {
+            cleanupFailures.push({
+              owner,
+              message: ctx.fixture
+                .redactDiagnostic(error instanceof Error ? error.message : 'Cleanup failed')
+                .slice(0, 2000),
+            })
+          }
+        }
+        if (resumeHeld)
+          await cleanup('transport-hold', () => ctx.fixture.controlTransportFault('cancel'))
+        if (writer) await cleanup('writer', () => writer!.close())
+        if (reader) await cleanup('reader', () => reader!.close())
+        await cleanup('workspace', () => closeRealWorkspace(ctx))
+        if (primaryFailure || cleanupFailures.length) {
+          const primaryMessage = primaryFailure
+            ? ctx.fixture
+                .redactDiagnostic(
+                  primaryFailure.error instanceof Error
+                    ? primaryFailure.error.message
+                    : 'Business assertion failed',
+                )
+                .slice(0, 6000)
+            : null
+          await cleanup('diagnostic-attachment', () =>
+            test.info().attach('input-return-failure-lifecycle', {
+              body: Buffer.from(
+                ctx.fixture.redactDiagnostic(
+                  JSON.stringify({
+                    primary: primaryFailure
+                      ? { stage: primaryFailure.stage, message: primaryMessage }
+                      : null,
+                    cleanup: cleanupFailures,
+                    writer: writer?.cleanupFacts() ?? null,
+                    reader: reader?.cleanupFacts() ?? null,
+                  }),
+                ),
+              ),
+              contentType: 'application/json',
+            }),
+          )
+          // Preserve the first business failure ahead of cleanup, with no raw cause.
+          // oxlint-disable-next-line no-unsafe-finally -- The caught primary failure is explicitly retained before every independent cleanup error.
+          throw new Error(
+            [
+              primaryMessage,
+              ...cleanupFailures.map((failure) => `cleanup ${failure.owner}: ${failure.message}`),
+            ]
+              .filter(Boolean)
+              .join('; '),
+          )
         }
       }
     })
