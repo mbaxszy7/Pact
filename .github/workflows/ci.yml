@@ -174,6 +174,15 @@ jobs:
         run: node control/scripts/ci.mjs infra
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
+          PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-quality-evidence
+      - name: Preserve bounded script supervision evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quality-process-evidence
+          path: ${{ runner.temp }}/pact-quality-evidence/infra-supervision.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Build and immutable source assertion obligations
         working-directory: source
         run: |
@@ -237,12 +246,17 @@ jobs:
         run: node control/scripts/ci.mjs build
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
+      - name: Capture trusted no-credential case inventory for complete failure reports
+        working-directory: control
+        run: pnpm exec playwright test --list --reporter=json > "$RUNNER_TEMP/pact-e2e-inventory.json"
       - name: Electron UI
+        id: ui
         run: node control/scripts/ci.mjs ui
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
           PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-evidence/${{ matrix.key }}
       - name: Deterministic Electron business and lifecycle journeys
+        id: deterministic
         run: node control/scripts/ci.mjs deterministic
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
@@ -264,12 +278,27 @@ jobs:
           path: ${{ runner.temp }}/pact-ui-diagnostics/${{ matrix.key }}
           if-no-files-found: ignore
           retention-days: 14
-      - name: Preserve actual uncredentialed test results for the full immutable result gate
+      - name: Summarize every no-credential case including failures and unexecuted journeys
+        if: always()
+        run: >-
+          node control/scripts/ci-ui-diagnostics.mjs --reports
+          --evidence "$RUNNER_TEMP/pact-evidence/$PLATFORM_KEY"
+          --workspace "$GITHUB_WORKSPACE/source"
+          --identity "$RUNNER_TEMP/pact-identity/ci-identity.json"
+          --inventory "$RUNNER_TEMP/pact-e2e-inventory.json"
+        env:
+          PLATFORM_KEY: ${{ matrix.key }}
+          PACT_CI_DIAGNOSTIC_LANE: uncredentialed
+          PACT_UI_EXECUTION_COMPLETED: ${{ steps.ui.outputs.ui_execution_completed }}
+          PACT_DETERMINISTIC_EXECUTION_COMPLETED: ${{ steps.deterministic.outputs.deterministic_execution_completed }}
+      - name: Preserve actual uncredentialed test results and readable failure reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: e2e-${{ matrix.key }}
-          path: ${{ runner.temp }}/pact-evidence/${{ matrix.key }}/*.json
+          path: |
+            ${{ runner.temp }}/pact-evidence/${{ matrix.key }}/*.json
+            ${{ runner.temp }}/pact-evidence/${{ matrix.key }}/*.md
           if-no-files-found: error
           retention-days: 14
       - name: Actual native CLI protocol, configuration and cold-history regression

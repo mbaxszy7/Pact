@@ -308,6 +308,20 @@ await test('a branch identity does not export its unvalidated author field', () 
   assert.equal(JSON.stringify(report).includes(secret), false)
 })
 
+await test('real failed and deferred cases use fixed safe failure categories and explicit required flags in Markdown', () => {
+  const raw = fixture('core')
+  fail(first(raw, 'core'), 'timedOut')
+  const report = evaluateRealReport(raw)
+  assert.equal(
+    report.cases.find((item) => item.status === 'timedOut').failureCategory,
+    'case-timeout',
+  )
+  assert.equal(report.cases.find((item) => item.status === 'not-run').failureCategory, 'deferred')
+  const text = realReportMarkdown(report)
+  assert(text.includes('| Required |'))
+  assert(text.includes('case-timeout'))
+})
+
 await test('the reporting entry still lists all cases and fails when CI identity evidence is missing', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'pact-real-policy-missing-identity-'))
   try {
@@ -325,7 +339,12 @@ await test('the reporting entry still lists all cases and fails when CI identity
           ],
           {
             cwd: workspace,
-            env: { ...process.env, PACT_REAL_EXECUTION_COMPLETED: 'true', GITHUB_STEP_SUMMARY: '' },
+            env: {
+              ...process.env,
+              PACT_REAL_EXECUTION_COMPLETED: 'true',
+              PACT_CI_WORKSPACE: directory,
+              GITHUB_STEP_SUMMARY: '',
+            },
             encoding: 'utf8',
             timeout: 10_000,
           },

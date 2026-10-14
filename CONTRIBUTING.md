@@ -189,6 +189,15 @@ be treated as an optional extended failure. Full execution coverage still uses t
 unmodified assertion obligations; `--real-scope core` changes only which real execution
 results are currently required, and never certifies a complete baseline run.
 
+Local `test:e2e` commands also preserve safe, immutable JSON/Markdown under
+`.pact-data/e2e-reports/<unique-run>/`; the command prints the report location even
+when configuration admission fails. Raw Provider evidence and disposable test output
+remain private and are removed after safe projection. A local clean-tree receipt is
+distinct from a PR attestation; a dirty or changing working tree has no captured code
+identity. Deliberately filtered local runs list unexecuted obligations and cannot claim
+a complete core/full gate. UI/deterministic Actions summaries link `e2e-PLATFORM` reports
+and, on failure, `ui-diagnostics-PLATFORM` snapshots/traces; both retain 14 days.
+
 Ordinary branch pushes and business PRs run the fast/static, unit/script, native protocol,
 UI/deterministic and installed smoke checks without an hour-long soak on every change.
 The **CI** manual dispatch with `run_soak=true` runs the one-hour installed deterministic

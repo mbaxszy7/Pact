@@ -1,8 +1,7 @@
 import { createHash } from 'node:crypto'
-import { open, writeFile, appendFile, mkdir } from 'node:fs/promises'
 import { isAbsolute, relative, resolve, join } from 'node:path'
 
-import { requireIdentity } from './ci-identity.mjs'
+import { publicReportIdentity, readE2EJson, writeE2EReport } from './e2e-report.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
 // Exact business cases, independent of a candidate's mutable tags or test outcome.
@@ -400,28 +399,6 @@ export const realCases = [
 export const realPolicyHash = createHash('sha256').update(JSON.stringify(realCases)).digest('hex')
 const caseKey = (path, title) => JSON.stringify([path, title])
 const registered = new Map(realCases.map((item) => [caseKey(item.path, item.title), item]))
-const maxReportBytes = 8 * 1024 * 1024
-
-async function readJson(path, limit) {
-  const file = await open(path, 'r')
-  try {
-    const info = await file.stat()
-    if (!info.isFile() || info.size < 1 || info.size > limit)
-      throw new Error('Invalid bounded evidence file')
-    const buffer = Buffer.alloc(info.size + 1)
-    let size = 0
-    while (size < buffer.length) {
-      // oxlint-disable-next-line eslint/no-await-in-loop -- Read one bounded evidence file to EOF; no unbounded readFile allocation.
-      const { bytesRead } = await file.read(buffer, size, buffer.length - size, size)
-      if (!bytesRead) break
-      size += bytesRead
-    }
-    if (size !== info.size) throw new Error('Evidence file changed or is incomplete')
-    return JSON.parse(buffer.subarray(0, size).toString('utf8'))
-  } finally {
-    await file.close()
-  }
-}
 
 export function requireRealScope(scope) {
   if (!['core', 'full'].includes(scope)) throw new Error('Real E2E scope must be core or full')
@@ -505,31 +482,7 @@ export function evaluateRealReport(
   } catch {
     issues.push('missing-or-invalid-execution-evidence')
   }
-  let publicIdentity = null
-  if (identity !== null) {
-    requireIdentity(identity)
-    publicIdentity = Object.fromEntries(
-      [
-        'schemaVersion',
-        'repository',
-        'repositoryId',
-        'pullRequest',
-        'headRepositoryId',
-        'headSha',
-        'baseSha',
-        'candidateSha',
-        'treeSha',
-        'policySha',
-        'authorId',
-        'channel',
-      ]
-        .filter(
-          (name) =>
-            Object.hasOwn(identity, name) && (name !== 'authorId' || identity.pullRequest !== null),
-        )
-        .map((name) => [name, identity[name]]),
-    )
-  }
+  const publicIdentity = publicReportIdentity(identity)
   if (execution !== 'completed') issues.push('runner-or-preparation-failed')
   if ([...observed.keys()].some((key) => !registered.has(key)))
     issues.push('unclassified-real-case')
@@ -539,7 +492,8 @@ export function evaluateRealReport(
     const test = observed.get(caseKey(item.path, item.title))
     const applicable = !item.platforms || item.platforms.includes(platform)
     let status = 'not-run',
-      durationMs = 0
+      durationMs = 0,
+      failureCategory = item.tier === 'extended' && suite === 'core' ? 'deferred' : 'missing-result'
     let reason =
       item.tier === 'extended' && suite === 'core'
         ? 'Deferred to explicitly authorized full regression and release verification.'
@@ -557,6 +511,13 @@ export function evaluateRealReport(
         else issues.push('invalid-case-duration')
         if (status === 'passed' && (test.expectedStatus !== 'passed' || test.status !== 'expected'))
           status = 'failed'
+        failureCategory = {
+          passed: 'none',
+          failed: 'case-failed',
+          timedOut: 'case-timeout',
+          interrupted: 'execution-interrupted',
+          skipped: 'case-skipped',
+        }[status]
         reason =
           status === 'passed'
             ? 'All original case assertions passed.'
@@ -565,10 +526,12 @@ export function evaluateRealReport(
               : 'Execution failed or was interrupted; private diagnostics are withheld.'
       } else {
         issues.push('missing-result-or-retries')
+        failureCategory = 'invalid-evidence'
       }
     }
     if (!applicable && ['not-run', 'skipped'].includes(status)) {
       status = 'not-applicable'
+      failureCategory = 'other-platform'
       reason = 'This native case is required on its declared target platform, not this runner.'
     }
     return Object.assign({}, item, {
@@ -576,6 +539,7 @@ export function evaluateRealReport(
       required: applicable && (gate === 'full' || item.tier === 'core'),
       status,
       durationMs,
+      failureCategory,
       reason,
     })
   })
@@ -641,28 +605,36 @@ export function realReportMarkdown(report) {
       `| ${tier} | ${counts.passed} | ${counts.failed} | ${counts.skipped} | ${counts.notRun} | ${counts.notApplicable} | ${counts.total} |`,
     )
   if (report.issues.length) lines.push('', `Evidence problems: ${report.issues.join(', ')}.`)
+  if (report.reportFiles) {
+    lines.push(
+      '',
+      `Report files: \`${report.reportFiles.json}\`, \`${report.reportFiles.markdown}\`.`,
+    )
+    if (report.reportFiles.artifactName)
+      lines.push(`Actions artifact: **${report.reportFiles.artifactName}**, retained for 14 days.`)
+    if (report.reportFiles.localDirectory)
+      lines.push(`Persistent local report: \`${report.reportFiles.localDirectory}\`.`)
+  }
   lines.push(
     '',
-    '| Tier / scenario | Case | Result | Duration (s) | Reason |',
-    '| --- | --- | --- | ---: | --- |',
+    '| Tier / scenario | Case | Required | Result | Duration (s) | Failure category | Reason |',
+    '| --- | --- | --- | --- | ---: | --- | --- |',
   )
   for (const item of report.cases)
     lines.push(
-      `| ${item.tier} / ${item.scenario} | ${item.title.replaceAll('|', '\\|')} | ${item.status} | ${(item.durationMs / 1000).toFixed(2)} | ${item.reason} |`,
+      `| ${item.tier} / ${item.scenario} | ${item.title.replaceAll('|', '\\|')} | ${item.required ? 'yes' : 'no'} | ${item.status} | ${(item.durationMs / 1000).toFixed(2)} | ${item.failureCategory} | ${item.reason} |`,
     )
   return `${lines.join('\n')}\n`
 }
 
-export async function writeRealReport(report, directory, summary) {
-  if (!isAbsolute(directory)) throw new Error('Real report directory must be absolute')
-  await mkdir(directory, { recursive: true, mode: 0o700 })
-  const markdown = realReportMarkdown(report)
-  await writeFile(join(directory, 'real-summary.json'), `${JSON.stringify(report, null, 2)}\n`, {
-    flag: 'wx',
-    mode: 0o600,
+export async function writeRealReport(report, directory, summary, options = {}) {
+  return writeE2EReport(report, {
+    ...options,
+    directory,
+    summary,
+    basename: 'real-summary',
+    markdown: realReportMarkdown,
   })
-  await writeFile(join(directory, 'real-summary.md'), markdown, { flag: 'wx', mode: 0o600 })
-  if (summary) await appendFile(summary, markdown)
 }
 
 if (isScriptEntry(import.meta.url)) {
@@ -674,7 +646,7 @@ if (isScriptEntry(import.meta.url)) {
       throw new Error('Explicit real evidence directory is required')
     let raw = null
     try {
-      raw = await readJson(join(directory, 'real.json'), maxReportBytes)
+      raw = await readE2EJson(join(directory, 'real.json'))
     } catch {
       // Admission/run failure is represented below without copying any unsafe exception.
     }
@@ -682,7 +654,7 @@ if (isScriptEntry(import.meta.url)) {
       identityUnavailable = false
     if (identityPath) {
       try {
-        identity = requireIdentity(await readJson(identityPath, 4096))
+        identity = publicReportIdentity(await readE2EJson(identityPath, 4096))
       } catch {
         identityUnavailable = true
       }
@@ -699,7 +671,13 @@ if (isScriptEntry(import.meta.url)) {
       report.gatePassed = false
       report.fullSuitePassed = false
     }
-    await writeRealReport(report, directory, process.env.GITHUB_STEP_SUMMARY)
+    const written = await writeRealReport(report, directory, process.env.GITHUB_STEP_SUMMARY, {
+      workspace: process.env.PACT_CI_WORKSPACE ?? resolve(import.meta.dirname, '..'),
+      artifactName: process.env.PACT_REAL_REPORT_ARTIFACT,
+    })
+    console.log(
+      `Safe real E2E report: ${written.report.reportFiles.localDirectory}/real-summary.md`,
+    )
     if (!report.gatePassed) process.exitCode = 1
   })().catch(() => {
     console.error('Real E2E report could not be completed; gate remains failed.')

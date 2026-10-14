@@ -242,6 +242,7 @@ jobs:
           PLATFORM_KEY: ${{ matrix.key }}
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
           PACT_REAL_EXECUTION_COMPLETED: ${{ steps.execute.outputs.real_execution_completed }}
+          PACT_REAL_REPORT_ARTIFACT: provider-report-${{ matrix.key }}
       - name: Fetch this exact CI run's matching platform UI and deterministic execution evidence
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:

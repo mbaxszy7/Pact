@@ -5,7 +5,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { collectUiDiagnostics, diagnosticLimits, main } from './ci-ui-diagnostics.mjs'
+import {
+  collectUiDiagnostics,
+  diagnosticLimits,
+  evaluateUiReport,
+  main,
+  uiReportMarkdown,
+  writeUiReports,
+} from './ci-ui-diagnostics.mjs'
 
 async function fixture(context) {
   const root = await mkdtemp(join(tmpdir(), 'pact-ui-diagnostics-'))
@@ -136,4 +143,157 @@ await test('CLI admission requires an explicitly uncredentialed GitHub lane', as
     }),
     /no-credential/,
   )
+})
+
+const reportFixture = (lane = 'ui') => ({
+  suites: [
+    {
+      specs: [
+        {
+          file: 'native-ui.spec.ts',
+          title: 'opens the controlled native window',
+          tests: [
+            {
+              projectName: lane,
+              expectedStatus: 'passed',
+              status: 'expected',
+              results: [{ status: 'passed', duration: 12 }],
+            },
+          ],
+        },
+      ],
+    },
+  ],
+  errors: [],
+})
+const reportIdentity = {
+  schemaVersion: 2,
+  repository: 'mbaxszy7/Pact',
+  repositoryId: 1416403312,
+  pullRequest: 3,
+  headRepositoryId: 1416403312,
+  authorId: 31481964,
+  channel: 'dev',
+  headSha: 'a'.repeat(40),
+  baseSha: 'b'.repeat(40),
+  candidateSha: 'c'.repeat(40),
+  treeSha: 'd'.repeat(40),
+  policySha: 'b'.repeat(40),
+}
+const reportOptions = {
+  lane: 'ui',
+  inventory: reportFixture(),
+  workspace: '/workspace/Pact',
+  identity: reportIdentity,
+  execution: 'completed',
+  platform: 'darwin',
+  architecture: 'arm64',
+}
+
+await test('no-credential reports show actual failure status and fixed categories without raw output or attachments', () => {
+  const raw = reportFixture(),
+    secret = 'synthetic-private-report-output'
+  const result = raw.suites[0].specs[0].tests[0]
+  Object.assign(result.results[0], {
+    status: 'timedOut',
+    error: { message: secret, stack: secret },
+    stdout: [{ text: secret }],
+    attachments: [{ path: secret }],
+  })
+  raw.config = { secret }
+  const report = evaluateUiReport(raw, reportOptions)
+  assert.equal(report.informational, true)
+  assert.equal(Object.hasOwn(report, 'gatePassed'), false)
+  assert.equal(report.cases[0].status, 'timedOut')
+  assert.equal(report.cases[0].durationMs, 12)
+  assert.equal(report.cases[0].failureCategory, 'case-timeout')
+  assert.equal((JSON.stringify(report) + uiReportMarkdown(report)).includes(secret), false)
+  assert.equal(report.identity.treeSha, reportIdentity.treeSha)
+})
+
+await test('missing and cancelled executions retain every discovered case and never invent a passing outcome', () => {
+  const report = evaluateUiReport(null, { ...reportOptions, execution: 'unavailable' })
+  assert.equal(report.cases.length, 1)
+  assert.equal(report.cases[0].status, 'not-run')
+  assert(report.issues.includes('runner-or-preparation-failed'))
+  assert(report.issues.includes('missing-or-invalid-execution-evidence'))
+  assert.equal(report.counts.passed, 0)
+  const repeated = reportFixture()
+  repeated.suites[0].specs[0].tests[0].results.push({ status: 'passed', duration: 1 })
+  assert(evaluateUiReport(repeated, reportOptions).issues.includes('missing-result-or-retries'))
+})
+
+await test('candidate-controlled unknown titles and identity extensions cannot enter public report text', () => {
+  const secret = 'synthetic-untrusted-case-title',
+    raw = reportFixture()
+  raw.suites[0].specs[0].title = secret
+  const report = evaluateUiReport(raw, {
+    ...reportOptions,
+    identity: { ...reportIdentity, extra: secret },
+  })
+  assert(report.issues.includes('case-absent-from-discovery-inventory'))
+  assert.equal(report.cases[0].status, 'not-run')
+  assert.equal(report.cases[1].title, 'Unclassified case 1')
+  assert.equal((JSON.stringify(report) + uiReportMarkdown(report)).includes(secret), false)
+})
+
+await test('native Windows-only appearance is declared non-applicable on macOS without treating another skip as success', () => {
+  const raw = reportFixture()
+  raw.suites[0].specs[0].file = 'appearance.spec.ts'
+  raw.suites[0].specs[0].title =
+    'Windows keeps page Alpha and native controls while Solid remains opaque'
+  raw.suites[0].specs[0].tests[0].results[0].status = 'skipped'
+  const report = evaluateUiReport(raw, { ...reportOptions, inventory: structuredClone(raw) })
+  assert.equal(report.cases[0].status, 'not-applicable')
+  assert.equal(report.cases[0].required, false)
+  const windows = evaluateUiReport(raw, {
+    ...reportOptions,
+    inventory: structuredClone(raw),
+    platform: 'win32',
+    architecture: 'x64',
+  })
+  assert.equal(windows.cases[0].status, 'skipped')
+  assert.equal(windows.cases[0].required, true)
+})
+
+await test('both native lane reports persist even when the second lane did not start, and Actions summary points to reports and diagnostics', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-ui-reports-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const evidence = join(root, 'evidence'),
+    identityPath = join(root, 'identity.json'),
+    inventoryPath = join(root, 'inventory.json'),
+    summary = join(root, 'summary.md')
+  await mkdir(evidence)
+  const inventory = {
+    suites: [...reportFixture('ui').suites, ...reportFixture('deterministic').suites],
+  }
+  await writeFile(identityPath, JSON.stringify(reportIdentity))
+  await writeFile(inventoryPath, JSON.stringify(inventory))
+  await writeFile(join(evidence, 'ui.json'), JSON.stringify(reportFixture()))
+  const reports = await writeUiReports({
+    evidence,
+    workspace: root,
+    identityPath,
+    inventoryPath,
+    summary,
+    execution: { ui: 'completed' },
+    platform: 'darwin',
+    architecture: 'arm64',
+  })
+  assert.equal(reports.length, 2)
+  assert.equal(reports[1].report.cases[0].status, 'not-run')
+  const text = await readFile(summary, 'utf8')
+  assert(text.includes('ui-summary.md'))
+  assert(text.includes('deterministic-summary.md'))
+  assert(text.includes('ui-diagnostics-'))
+  assert(text.includes('retained for 14 days'))
+  for (const report of reports) {
+    assert.equal(
+      // oxlint-disable-next-line no-await-in-loop -- Confirm both independent persisted results after their single writer completed.
+      (await readFile(join(report.directory, report.report.reportFiles.markdown), 'utf8')).includes(
+        report.report.reportFiles.localDirectory,
+      ),
+      true,
+    )
+  }
 })

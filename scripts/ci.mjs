@@ -16,7 +16,7 @@ import { resolve, join, isAbsolute } from 'node:path'
 
 import { loadProviderConfiguration } from '../tests/e2e/provider-environment.ts'
 import { requireRealScope } from './real-e2e-policy.mjs'
-import { run } from './run-e2e.mjs'
+import { run, runNaturally as runCiE2EJob } from './run-e2e.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
 const root = resolve(import.meta.dirname, '..')
@@ -199,21 +199,7 @@ async function validateEvidence(path) {
 }
 
 /** Exit 1 is an assertion outcome only after natural, verified supervisor settlement. */
-export async function runCiE2EJob(args, timeout, options) {
-  let stopped = false,
-    settled = false
-  const code = await run(args, timeout, {
-    ...options,
-    onState(state) {
-      stopped ||= state.kind === 'stopping'
-      if (state.kind === 'settled')
-        settled = state.groupGone === true && state.ownedProcessCount === 0
-      options.onState?.(state)
-    },
-  })
-  if (stopped || !settled) throw new Error('CI E2E supervisor did not finish naturally')
-  return code
-}
+export { runCiE2EJob }
 
 async function real(env, source, workspace, evidence, validateOnly = false, scope = 'full') {
   const parent = source.RUNNER_TEMP ?? tmpdir()
@@ -311,16 +297,58 @@ export async function main(args = process.argv.slice(2), source = process.env) {
     // One worker avoids competing large-source fixtures; no deadline or assertion is relaxed.
     await pnpm(['exec', 'vitest', 'run', '--maxWorkers=1'], env, undefined, undefined, workspace)
   } else if (lane === 'infra') {
-    const code = await run(
-      ['--test', '--test-concurrency=1', ...(await scriptTests(workspace))],
-      20 * 60_000,
-      {
-        executable: process.execPath,
-        cwd: workspace,
-        env: { ...env, PACT_INFRA_POSIX_OWNED_GROUP_LIMIT: '3' },
-      },
-    )
-    if (code !== 0) throw new Error('Required script tests failed')
+    const states = [],
+      ownership = []
+    let code,
+      problem,
+      failed = true
+    try {
+      code = await run(
+        ['--test', '--test-concurrency=1', ...(await scriptTests(workspace))],
+        20 * 60_000,
+        {
+          executable: process.execPath,
+          cwd: workspace,
+          env: { ...env, PACT_INFRA_POSIX_OWNED_GROUP_LIMIT: '3' },
+          onState(state) {
+            if (!['started', 'stopping', 'settled'].includes(state.kind)) return
+            states.push(state)
+            if (states.length > 8) states.shift()
+          },
+          onOwnership(observation) {
+            ownership.push(observation)
+            if (ownership.length > 8) ownership.shift()
+          },
+        },
+      )
+      if (code !== 0) throw new Error('Required script tests failed')
+      failed = false
+    } catch (error) {
+      problem = error
+    }
+    try {
+      if (source.PACT_CI_EVIDENCE_DIR) {
+        const directory = source.PACT_CI_EVIDENCE_DIR
+        if (!isAbsolute(directory)) throw new Error('CI diagnostic directory must be absolute')
+        await mkdir(directory, { recursive: true, mode: 0o700 })
+        const bytes = JSON.stringify({
+          lane,
+          status: failed ? 'failed' : 'passed',
+          exitCode: code ?? null,
+          states,
+          ownership,
+        })
+        if (Buffer.byteLength(bytes) > 768 * 1024)
+          throw new Error('CI process evidence exceeds its bound')
+        await writeFile(join(directory, 'infra-supervision.json'), bytes, {
+          flag: 'wx',
+          mode: 0o600,
+        })
+      }
+    } catch (error) {
+      problem ??= error
+    }
+    if (problem) throw problem
   } else if (lane === 'validate-provider') {
     if (forwarded.length) throw new Error('Provider validation has no extra arguments')
     await real(env, source, workspace, {}, true)
@@ -338,10 +366,13 @@ export async function main(args = process.argv.slice(2), source = process.env) {
       lane,
       forwarded: [...forwarded, ...evidence.forwarded],
       runJob: (argumentsForJob, timeout, options) =>
-        run(argumentsForJob, timeout, { ...options, cwd: workspace, env: evidence.env }),
+        runCiE2EJob(argumentsForJob, timeout, { ...options, cwd: workspace, env: evidence.env }),
     })
-    if (code !== 0) throw new Error('Required Electron E2E lane failed')
     await validateEvidence(evidence.path)
+    if (![0, 1].includes(code)) throw new Error('Electron runner did not complete normally')
+    if (source.GITHUB_OUTPUT)
+      await appendFile(source.GITHUB_OUTPUT, `${lane}_execution_completed=true\n`)
+    if (code !== 0) throw new Error('Required Electron E2E lane failed')
   } else if (['native', 'build'].includes(lane)) {
     const command = {
       native: 'test:native',

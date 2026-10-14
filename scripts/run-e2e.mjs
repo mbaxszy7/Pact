@@ -1,9 +1,15 @@
 import { execFile, spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { resolve } from 'node:path'
+import { mkdtemp, writeFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 
 import { loadProviderConfiguration } from '../tests/e2e/provider-environment.ts'
+import { repository, repositoryId } from './ci-identity.mjs'
+import { writeUiReports } from './ci-ui-diagnostics.mjs'
+import { readE2EJson } from './e2e-report.mjs'
 import { coreRealGrep, requireRealScope } from './real-e2e-policy.mjs'
+import { evaluateRealReport, writeRealReport } from './real-e2e-policy.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
 const outputLimit = 256 * 1024
@@ -746,6 +752,23 @@ export function run(
   })
 }
 
+/** Natural exit and verified cleanup distinguish test failure from forced supervision. */
+export async function runNaturally(args, timeout, options = {}) {
+  let stopped = false,
+    settled = false
+  const code = await run(args, timeout, {
+    ...options,
+    onState(state) {
+      stopped ||= state.kind === 'stopping'
+      if (state.kind === 'settled')
+        settled = state.groupGone === true && state.ownedProcessCount === 0
+      options.onState?.(state)
+    },
+  })
+  if (stopped || !settled) throw failure('E2E supervisor did not finish naturally')
+  return code
+}
+
 /** Configuration admission precedes the sole build; all jobs share one two-hour deadline. */
 export async function main({
   lane = 'all',
@@ -753,6 +776,7 @@ export async function main({
   forwarded = [],
   loadConfiguration = loadProviderConfiguration,
   runJob = run,
+  beforeBuild,
 } = {}) {
   if (!['all', 'ui', 'real', 'deterministic'].includes(lane)) {
     throw failure('Choose E2E lane: all, ui, real or deterministic')
@@ -773,6 +797,7 @@ export async function main({
   try {
     configuration = ['all', 'real'].includes(lane) ? await loadConfiguration() : null
     const redact = (text) => configuration?.redact(text) ?? text
+    await beforeBuild?.({ redact })
     const built = await runJob(
       ['build'],
       Math.min(buildDeadline, Math.max(1, deadline - Date.now())),
@@ -812,9 +837,161 @@ export async function main({
   return result
 }
 
+async function localCodeIdentity() {
+  const git = (args) =>
+    new Promise((done, reject) =>
+      execFile(
+        'git',
+        ['-c', 'core.fsmonitor=false', ...args],
+        {
+          cwd: repositoryRoot,
+          encoding: 'utf8',
+          timeout: 5000,
+          maxBuffer: 4096,
+          shell: false,
+        },
+        (error, value) => (error ? reject(error) : done(value.trim())),
+      ),
+    )
+  try {
+    if (await git(['status', '--porcelain'])) return null
+    const headSha = await git(['rev-parse', 'HEAD'])
+    return {
+      schemaVersion: 2,
+      repository,
+      repositoryId,
+      pullRequest: null,
+      headRepositoryId: repositoryId,
+      headSha,
+      candidateSha: headSha,
+      baseSha: null,
+      treeSha: await git(['rev-parse', `${headSha}^{tree}`]),
+      policySha: headSha,
+      channel: 'dev',
+    }
+  } catch {
+    return null
+  }
+}
+
+/** Local commands keep safe reports outside disposable Playwright output, including admission failures. */
+export async function mainWithReports({
+  lane = 'all',
+  realScope = 'full',
+  forwarded = [],
+  runJob = runNaturally,
+  reportWorkspace = repositoryRoot,
+  ...options
+} = {}) {
+  const directory = await mkdtemp(join(tmpdir(), 'pact-e2e-report-'))
+  const inventoryPath = join(directory, 'inventory.json'),
+    rawPath = join(directory, 'execution.json')
+  const originalOutput = process.env.PLAYWRIGHT_JSON_OUTPUT_FILE
+  const originalArtifacts = process.env.PACT_E2E_OUTPUT_DIR
+  const identityBefore = await localCodeIdentity()
+  let code = 1,
+    completed = false,
+    problem
+  try {
+    if (forwarded.some((value) => value.startsWith('--reporter')))
+      throw failure('The E2E report owner selects the reporter')
+    process.env.PLAYWRIGHT_JSON_OUTPUT_FILE = rawPath
+    process.env.PACT_E2E_OUTPUT_DIR = join(directory, 'test-artifacts')
+    code = await main({
+      lane,
+      realScope,
+      ...options,
+      runJob,
+      forwarded: [...forwarded, '--reporter=line,json'],
+      beforeBuild: async ({ redact }) => {
+        process.env.PLAYWRIGHT_JSON_OUTPUT_FILE = inventoryPath
+        try {
+          const listed = await runJob(
+            ['exec', 'playwright', 'test', '--list', '--reporter=json'],
+            30_000,
+            { redact },
+          )
+          if (listed !== 0) throw failure('E2E discovery failed')
+        } finally {
+          process.env.PLAYWRIGHT_JSON_OUTPUT_FILE = rawPath
+        }
+      },
+    })
+    completed = [0, 1].includes(code)
+  } catch (error) {
+    problem = error
+    code = 1
+  } finally {
+    const identityAfter = await localCodeIdentity()
+    const identity =
+      identityBefore && JSON.stringify(identityBefore) === JSON.stringify(identityAfter)
+        ? identityBefore
+        : null
+    const identityPath = join(directory, 'identity.json')
+    try {
+      await writeFile(identityPath, JSON.stringify(identity), { mode: 0o600, flag: 'wx' })
+      const projects = lane === 'all' ? ['ui', 'real', 'deterministic'] : [lane]
+      let raw = null
+      try {
+        raw = await readE2EJson(rawPath)
+      } catch {
+        /* Admission failure still gets a safe complete inventory. */
+      }
+      if (projects.includes('real')) {
+        const report = evaluateRealReport(raw, {
+          suite: realScope,
+          gate: realScope,
+          identity,
+          execution: completed ? 'completed' : 'unavailable',
+        })
+        const receipt = await writeRealReport(report, directory, undefined, {
+          workspace: reportWorkspace,
+        })
+        console.log(
+          `Safe real E2E report: ${receipt.report.reportFiles.localDirectory}/real-summary.md`,
+        )
+        if (!forwarded.length && !report.gatePassed) code = 1
+      }
+      if (projects.some((project) => project !== 'real')) {
+        if (raw)
+          for (const project of projects.filter((selected) => selected !== 'real')) {
+            // oxlint-disable-next-line eslint/no-await-in-loop -- Private raw evidence is only used by the report owner and removed with this run.
+            await writeFile(join(directory, `${project}.json`), JSON.stringify(raw), {
+              mode: 0o600,
+              flag: 'wx',
+            })
+          }
+        const receipts = await writeUiReports({
+          evidence: directory,
+          workspace: reportWorkspace,
+          identityPath,
+          inventoryPath,
+          execution: Object.fromEntries(
+            projects
+              .filter((project) => project !== 'real')
+              .map((project) => [project, completed ? 'completed' : 'unavailable']),
+          ),
+        })
+        for (const receipt of receipts)
+          console.log(
+            `Safe ${receipt.report.lane} E2E report: ${receipt.report.reportFiles.localDirectory}/${receipt.report.reportFiles.markdown}`,
+          )
+      }
+    } finally {
+      if (originalOutput === undefined) delete process.env.PLAYWRIGHT_JSON_OUTPUT_FILE
+      else process.env.PLAYWRIGHT_JSON_OUTPUT_FILE = originalOutput
+      if (originalArtifacts === undefined) delete process.env.PACT_E2E_OUTPUT_DIR
+      else process.env.PACT_E2E_OUTPUT_DIR = originalArtifacts
+      await rm(directory, { recursive: true, force: true })
+    }
+  }
+  if (problem) throw problem
+  return code
+}
+
 if (isScriptEntry(import.meta.url)) {
   const core = process.argv[2] === 'real-core'
-  void main({
+  void mainWithReports({
     lane: core ? 'real' : (process.argv[2] ?? 'all'),
     realScope: core ? 'core' : 'full',
     forwarded: process.argv.slice(3),

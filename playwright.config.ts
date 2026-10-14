@@ -2,6 +2,7 @@ import { defineConfig } from '@playwright/test'
 
 export default defineConfig({
   testDir: './tests/e2e',
+  outputDir: process.env.PACT_E2E_OUTPUT_DIR ?? './test-results',
   testMatch: '**/*.spec.ts',
   fullyParallel: false,
   forbidOnly: Boolean(process.env.CI),
