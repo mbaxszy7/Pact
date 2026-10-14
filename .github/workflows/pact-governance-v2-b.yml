@@ -1,0 +1,15 @@
+name: pact-governance-v2-actions-b
+on:
+  pull_request:
+    types: [edited]
+    branches: [codex/governance-probe-v2-check-base]
+permissions: {}
+jobs:
+  probe-b:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Isolated no-credential attempt
+        run: node -e 'const ms=process.env.HOLD==="true"?45000:0;setTimeout(()=>process.exit(0),ms)'
+        env:
+          HOLD: ${{ contains(github.event.pull_request.title, 'hold') }}
