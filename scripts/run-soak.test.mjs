@@ -2,11 +2,15 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { createContext, runInContext } from 'node:vm'
 
+import { main as runPackagedSoak } from './run-soak.mjs'
 import {
   histogram,
   observe,
@@ -1122,6 +1126,60 @@ void test('continuous two-hour duration is actual elapsed evidence, not an E2E t
   assert.equal(evaluateSoak({ ...evidence, durationMs: 7_199_999 }, 7_200_000).budgetPass, false)
   assert.equal(evaluateSoak(evidence, 1000).budgetPass, false)
   assert.equal(evaluateSoak({ ...evidence, reactCommits: undefined }, 7_200_000).budgetPass, false)
+  const directory = await mkdtemp(join(tmpdir(), 'pact-soak-injected-'))
+  const reportPath = join(directory, 'report.json')
+  const content = { sha256: 'c'.repeat(64), entries: [] }
+  const manifest = {
+    sourceSha: 'a'.repeat(40),
+    version: '0.1.0',
+    channel: 'stable',
+    platform: process.platform,
+    arch: process.arch,
+    productName: 'Pact',
+    application: { contentSha256: content.sha256, entries: [] },
+    artifacts: [],
+  }
+  try {
+    await assert.rejects(
+      runPackagedSoak(
+        [
+          '--manifest',
+          join(directory, 'manifest.json'),
+          '--duration-ms',
+          '7200000',
+          '--report',
+          reportPath,
+        ],
+        { RUNNER_TEMP: directory },
+        {
+          readManifest: async () => manifest,
+          prepare: async ({ root }) => ({
+            executable: process.execPath,
+            applicationPath: root,
+            installationVerified: true,
+            verificationMode: 'installed-nsis',
+            dispose: async () => {},
+          }),
+          runDriver: async (args, _timeout, options) => {
+            const settings = JSON.parse(await readFile(args.at(-1), 'utf8'))
+            await writeFile(settings.observation, JSON.stringify(evidence), {
+              flag: 'wx',
+              mode: 0o600,
+            })
+            options.onState({ groupGone: true, ownedProcessCount: 0 })
+            return 0
+          },
+          inspectContent: async () => content,
+        },
+      ),
+    )
+    const report = JSON.parse(await readFile(reportPath, 'utf8'))
+    assert.equal(report.budgetPass, true)
+    assert.equal(report.status, 'blocked')
+    assert.match(report.failure, /dependencies/u)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
 })
 
 void test('CDP receipts bind a private nonce to exact Main PID, renderer target and packaged content identity', () => {

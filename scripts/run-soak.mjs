@@ -506,6 +506,11 @@ export async function main(args = process.argv.slice(2), source = process.env, d
     prepare = dependencies.prepare ?? prepareApplication,
     runDriver = dependencies.runDriver ?? run,
     inspectContent = dependencies.inspectContent ?? applicationContent
+  const genuineDependencies =
+    readManifest === readDistributionManifest &&
+    prepare === prepareApplication &&
+    runDriver === run &&
+    inspectContent === applicationContent
   const { manifestPath, reportPath, durationMs } = soakArguments(args)
   try {
     await lstat(reportPath)
@@ -681,6 +686,8 @@ export async function main(args = process.argv.slice(2), source = process.env, d
         error.code === 'ENOENT' && Object.is(evidence.cleanupVerified, true) && processesReleased
     }
   }
+  if (!genuineDependencies)
+    problem = 'Injected dependencies cannot provide genuine installed soak acceptance'
   const budgets = evaluateSoak(evidence, durationMs)
   const report = {
     ...evidence,
