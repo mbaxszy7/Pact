@@ -248,6 +248,9 @@ export interface WindowsLaunchOwner {
     startupDeadlineMs?: number
     firstFailure?: string
     nativeErrorCode?: number
+    lastActive?: number
+    exitCode?: number
+    stoppingReason?: 'control-closed' | 'deadline' | 'descendants-still-running'
   }
 }
 
@@ -281,6 +284,8 @@ export async function writeWindowsObservedLauncher(
     >
   > = {}
   let firstFailure: string | undefined, nativeErrorCode: number | undefined
+  let lastActive: number | undefined, exitCode: number | undefined
+  let stoppingReason: ReturnType<WindowsLaunchOwner['diagnostic']>['stoppingReason']
   const mark = (stage: keyof typeof stages): void => {
     stages[stage] = Math.round(performance.now() - began)
   }
@@ -292,6 +297,9 @@ export async function writeWindowsObservedLauncher(
       : { startupDeadlineMs: Math.round(startupDeadline - began) }),
     ...(firstFailure ? { firstFailure } : {}),
     ...(nativeErrorCode !== undefined ? { nativeErrorCode } : {}),
+    ...(lastActive !== undefined ? { lastActive } : {}),
+    ...(exitCode !== undefined ? { exitCode } : {}),
+    ...(stoppingReason ? { stoppingReason } : {}),
   })
   const pipeName = `pact-fixture-${process.pid}-${generation}`
   const server = createServer()
@@ -398,6 +406,7 @@ export async function writeWindowsObservedLauncher(
       )
         throw new Error('Invalid Job start receipt')
       didStart = true
+      lastActive = 1
       mark('started')
       clearTimeout(startupTimer)
       resolveStarted({ generation, pid: message.pid })
@@ -410,6 +419,8 @@ export async function writeWindowsObservedLauncher(
       )
         throw new Error('Invalid Job empty receipt')
       didEmpty = true
+      lastActive = 0
+      exitCode = message.exitCode
       mark('empty')
       clearTimeout(startupTimer)
       clearTimeout(lifetimeTimer)
@@ -425,6 +436,7 @@ export async function writeWindowsObservedLauncher(
         message.active > 256
       )
         throw new Error('Invalid Job process count')
+      lastActive = message.active
     } else if (message.kind === 'stopping') {
       if (
         !exact(['kind', 'generation', 'reason']) ||
@@ -433,6 +445,10 @@ export async function writeWindowsObservedLauncher(
         )
       )
         throw new Error('Invalid Job stop receipt')
+      stoppingReason =
+        message.reason === 'control-closed' || message.reason === 'deadline'
+          ? message.reason
+          : 'descendants-still-running'
     } else if (message.kind === 'error') {
       if (
         !exact(['kind', 'generation', 'code']) ||

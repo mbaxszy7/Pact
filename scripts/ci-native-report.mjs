@@ -1,4 +1,7 @@
+import { join } from 'node:path'
+
 import { publicReportIdentity, readE2EJson, writeE2EReport } from './e2e-report.mjs'
+import { isScriptEntry } from './script-entry.mjs'
 
 /** Protocol fixtures have no model credentials. Raw errors and attachments never leave this owner. */
 export function nativeReport(raw, { completed, exitCode, identity = null } = {}) {
@@ -130,3 +133,58 @@ export async function writeNativeReport({
     artifactName,
   })
 }
+
+/** Setup/cancellation still leaves evidence; an existing execution report is never replaced. */
+export async function ensureUnexecutedNativeReport(options) {
+  try {
+    const existing = await readE2EJson(join(options.directory, 'native-summary.json'))
+    if (
+      existing?.schemaVersion !== 1 ||
+      existing.lane !== 'native' ||
+      existing.platform !== process.platform ||
+      existing.arch !== process.arch ||
+      !['passed', 'failed', 'blocked'].includes(existing.status) ||
+      existing.reportFiles?.artifactName !== options.artifactName
+    )
+      throw new Error('Existing native evidence has an unexpected identity')
+    return existing
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error
+  }
+  let identity = null
+  if (options.identityPath) {
+    try {
+      identity = publicReportIdentity(
+        await readE2EJson(options.identityPath, 16 * 1024),
+        options.identityKind,
+      )
+    } catch {
+      /* No identity or execution can satisfy a gate; still report the missing lane. */
+    }
+  }
+  const report = nativeReport(undefined, { completed: false, identity })
+  report.limitations.push(
+    'Native execution was unavailable; no case is reported as passing. Inspect setup and cancellation diagnostics.',
+  )
+  return writeE2EReport(report, {
+    directory: options.directory,
+    workspace: options.workspace,
+    basename: 'native-summary',
+    markdown: nativeMarkdown,
+    summary: options.summary,
+    artifactName: options.artifactName,
+  })
+}
+
+if (isScriptEntry(import.meta.url))
+  ensureUnexecutedNativeReport({
+    directory: process.env.PACT_CI_NATIVE_REPORT_DIR,
+    workspace: process.env.PACT_CI_WORKSPACE,
+    identityPath: process.env.PACT_CI_NATIVE_IDENTITY_FILE,
+    identityKind: process.env.PACT_CI_NATIVE_IDENTITY_KIND ?? 'ci',
+    artifactName: process.env.PACT_CI_NATIVE_ARTIFACT,
+    summary: process.env.GITHUB_STEP_SUMMARY,
+  }).catch(() => {
+    console.error('Native evidence could not be safely preserved.')
+    process.exitCode = 1
+  })

@@ -157,11 +157,19 @@ it('attempts every genuine process/provider cleanup and retains the root after a
   try {
     await provider.start()
     await owned.processes.prepare(process.execPath, 1, performance.now() + 10_000)
-    const child = owned.processes.spawn(process.execPath, ['-e', 'process.stdin.resume();'], {
-      cwd: owned.cwd,
-      env: isolatedEnv(owned.root, owned.home),
-      shell: false,
-    })
+    const processOwner = owned.processes.spawnOwned(
+      process.execPath,
+      ['-e', 'process.stdin.resume();'],
+      {
+        cwd: owned.cwd,
+        env: isolatedEnv(owned.root, owned.home),
+        shell: false,
+      },
+    )
+    // This case requires an admitted real child. On Windows the returned Child
+    // initially represents its Job helper, before authenticated target startup.
+    await processOwner.started()
+    const child = processOwner.child
     await expect(
       cleanupNativeFixture(owned, {
         adapters: [{ dispose: first }, { dispose: second }],

@@ -397,9 +397,11 @@ export async function main(args = process.argv.slice(2), source = process.env) {
     if (source.GITHUB_OUTPUT)
       await appendFile(source.GITHUB_OUTPUT, `${lane}_execution_completed=true\n`)
     if (code !== 0) throw new Error('Required Electron E2E lane failed')
-  } else if (lane === 'native' && source.PACT_CI_NATIVE_REPORT_DIR) {
+  } else if (lane === 'native') {
     if (forwarded.length) throw new Error('Reported native execution owns its reporter arguments')
-    const directory = source.PACT_CI_NATIVE_REPORT_DIR
+    const temporaryReport = !source.PACT_CI_NATIVE_REPORT_DIR
+    const directory =
+      source.PACT_CI_NATIVE_REPORT_DIR ?? (await mkdtemp(join(tmpdir(), 'pact-native-report-')))
     if (
       !isAbsolute(directory) ||
       Buffer.byteLength(directory) > 4096 ||
@@ -412,7 +414,10 @@ export async function main(args = process.argv.slice(2), source = process.env) {
       throw new Error('Native reports cannot be redirected')
     const rawDirectory = await mkdtemp(join(directory, 'private-'))
     const rawPath = join(rawDirectory, 'execution.json')
-    let code, problem, nativeState
+    let code,
+      problem,
+      nativeState,
+      reportPreserved = false
     try {
       code = await runCiE2EJob(
         ['test:native', '--reporter=verbose', '--reporter=json', '--outputFile', rawPath],
@@ -441,18 +446,21 @@ export async function main(args = process.argv.slice(2), source = process.env) {
         artifactName: source.PACT_CI_NATIVE_ARTIFACT,
         summary: source.GITHUB_STEP_SUMMARY,
       })
+      reportPreserved = true
+      console.info('Safe native E2E report:', join(written.directory, 'native-summary.md'))
       if (written.report.status !== 'passed')
         problem ??= new Error('Required native execution evidence is incomplete or failed')
     } finally {
       // Unconfirmed process ownership retains its private recovery evidence.
       // Raw fixture output is never part of an upload pattern.
-      if (
+      const physicallyReleased =
         !nativeState ||
         (nativeState.kind === 'settled' &&
           nativeState.groupGone === true &&
           nativeState.ownedProcessCount === 0)
-      )
-        await rm(rawDirectory, { recursive: true, force: true })
+      if (physicallyReleased) await rm(rawDirectory, { recursive: true, force: true })
+      if (temporaryReport && reportPreserved && physicallyReleased)
+        await rm(directory, { recursive: true, force: true })
     }
     if (problem) throw problem
   } else if (['native', 'build'].includes(lane)) {

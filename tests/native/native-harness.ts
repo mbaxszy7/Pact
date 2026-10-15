@@ -150,6 +150,7 @@ export class NativeProcessOwner {
   }
 
   facts() {
+    const windows = this.windows?.diagnostic()
     const admitted = Boolean(this.child)
     const physical =
       this.group.released && (!admitted || (this.childClosed && (!this.windows || this.jobEmpty)))
@@ -163,6 +164,17 @@ export class NativeProcessOwner {
       released: physical && (!this.windows || (this.controlClosed && this.helperReleased)),
       ...(this.helperDiagnostic ? { helperDiagnostic: { ...this.helperDiagnostic } } : {}),
       ...(this.groupFailure ? { groupFailure: this.groupFailure } : {}),
+      ...(windows
+        ? {
+            windowsControl: {
+              stages: windows.stages,
+              controlFailed: Boolean(windows.firstFailure),
+              lastActive: windows.lastActive ?? null,
+              exitCode: windows.exitCode ?? null,
+              stoppingReason: windows.stoppingReason ?? null,
+            },
+          }
+        : {}),
     }
   }
 
@@ -461,6 +473,7 @@ export class NativeProcessSet {
       child: owner.start(args, options),
       close: () => owner.close(),
       observe: () => owner.group.observe(),
+      started: () => owner.started(),
     }
   }
 
@@ -667,7 +680,7 @@ export async function buildAdapters(root: string): Promise<AdapterBundle> {
 }
 
 export function actualSdk(): {
-  query: (input: SdkQueryInput) => unknown
+  query: (input: SdkQueryInput) => AsyncIterable<unknown> & { close: () => void }
   getSessionInfo: unknown
   getSessionMessages: (
     sessionId: string,
@@ -793,15 +806,18 @@ export async function ownedRoot(): Promise<{
   home: string
   processes: NativeProcessSet
 }> {
-  const root = await mkdtemp(join(tmpdir(), 'pact-native-gate-'))
-  const cwd = join(root, 'project'),
-    home = join(root, 'native')
+  // Match ProjectCatalog's canonical directory contract; Windows short aliases
+  // otherwise select different namespaces in native CLI and SDK custom stores.
+  const createdRoot = await mkdtemp(join(tmpdir(), 'pact-native-gate-'))
   try {
+    const root = await realpath(createdRoot)
+    const cwd = join(root, 'project'),
+      home = join(root, 'native')
     await mkdir(cwd)
     await mkdir(home)
     return { root, cwd, home, processes: new NativeProcessSet(root) }
   } catch (error) {
-    await rm(root, { recursive: true, force: true })
+    await rm(createdRoot, { recursive: true, force: true })
     throw error
   }
 }
@@ -885,6 +901,7 @@ export interface NativeCleanupFacts {
   released: boolean
   windowsJobEmpty: boolean | null
   helperReleased: boolean
+  windowsControl?: ReturnType<NativeProcessOwner['facts']>['windowsControl']
   previousAttempt?: Omit<NativeCleanupFacts, 'previousAttempt'>
 }
 
@@ -1140,6 +1157,7 @@ export class NativeRpc {
       released: this.released,
       windowsJobEmpty: this.scope.facts().windowsJobEmpty,
       helperReleased: this.scope.facts().helperReleased,
+      windowsControl: this.scope.facts().windowsControl,
       ...(this.previousAttempt
         ? {
             previousAttempt: {
@@ -1235,14 +1253,41 @@ export async function within<T>(
   }
 }
 
+type LoopbackMode =
+  | { mode: 'codex' }
+  | {
+      mode: 'claude'
+      historicalUser: string
+      historicalAssistant: string
+      prompt: string
+      cutoffCanary: string
+      sourceContentHashes: readonly string[]
+      candidateContentHashes: readonly string[]
+    }
+
 export class LoopbackProvider {
   readonly server: Server
-  readonly requests: Array<{ path: string; method: string; inputHash: string }> = []
+  readonly requests: Array<{
+    path: string
+    method: string
+    inputHash: string
+    claude?: {
+      messages: number
+      historicalUserPresent: boolean
+      historicalAssistantPresent: boolean
+      historyRolesInOrder: boolean
+      promptAfterHistory: boolean
+      cutoffCanaryAbsent: boolean
+    }
+  }> = []
   readonly errors: Error[] = []
   private readonly sockets = new Set<Socket>()
   private bytes = 0
   url = ''
-  constructor(private readonly replies: string[] = []) {
+  constructor(
+    private readonly replies: string[] = [],
+    private readonly mode: LoopbackMode = { mode: 'codex' },
+  ) {
     this.server = createServer((request, response) => {
       void (async () => {
         try {
@@ -1253,12 +1298,13 @@ export class LoopbackProvider {
             chunks.push(chunk)
           }
           if (this.requests.length >= 16) throw new Error('Loopback request capacity exceeded')
-          this.requests.push({
+          const receipt: (typeof this.requests)[number] = {
             path: request.url ?? '',
             method: request.method ?? '',
             inputHash: hash(Buffer.concat(chunks)),
-          })
-          // Claude startup's HEAD is permitted, but no Claude model POST is ever permitted.
+          }
+          this.requests.push(receipt)
+          // Startup HEAD is harmless; the default zero-prompt fixture still rejects Claude POSTs.
           if (request.method === 'HEAD' && request.url === '/api/hello') {
             response.writeHead(503)
             response.end()
@@ -1266,6 +1312,207 @@ export class LoopbackProvider {
           }
           const index = this.requests.filter((value) => value.method === 'POST').length
           const text = this.replies[index - 1]
+          if (this.mode.mode === 'claude') {
+            const endpoint = new URL(request.url ?? '', 'http://127.0.0.1')
+            if (
+              request.method !== 'POST' ||
+              endpoint.pathname !== '/v1/messages' ||
+              !['', '?beta=true'].includes(endpoint.search) ||
+              index !== 1 ||
+              text === undefined
+            )
+              throw new Error('Unexpected or excess Claude loopback model request')
+            if (
+              request.headers['content-encoding'] !== undefined &&
+              request.headers['content-encoding'] !== 'identity'
+            )
+              throw new Error('Compressed Claude loopback request is unsupported')
+            let body: unknown
+            try {
+              body = JSON.parse(
+                new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)),
+              )
+            } catch {
+              throw new Error('Malformed Claude loopback request')
+            }
+            if (!body || typeof body !== 'object' || Array.isArray(body))
+              throw new Error('Malformed Claude loopback envelope')
+            const model: unknown = Reflect.get(body, 'model')
+            const messages: unknown = Reflect.get(body, 'messages')
+            if (
+              typeof model !== 'string' ||
+              model.length < 1 ||
+              model.length > 256 ||
+              Reflect.get(body, 'stream') !== true ||
+              !Array.isArray(messages) ||
+              messages.length < 3 ||
+              messages.length > 64
+            )
+              throw new Error('Malformed Claude loopback messages')
+            const claudeMode = this.mode
+            console.info(
+              '[native Claude request schema]',
+              JSON.stringify({
+                betaQuery: endpoint.search === '?beta=true',
+                messages: messages.length,
+                userRoles: messages.filter(
+                  (message: unknown) =>
+                    message &&
+                    typeof message === 'object' &&
+                    Reflect.get(message, 'role') === 'user',
+                ).length,
+                assistantRoles: messages.filter(
+                  (message: unknown) =>
+                    message &&
+                    typeof message === 'object' &&
+                    Reflect.get(message, 'role') === 'assistant',
+                ).length,
+                systems: messages.flatMap((message: unknown) => {
+                  if (
+                    !message ||
+                    typeof message !== 'object' ||
+                    Reflect.get(message, 'role') !== 'system'
+                  )
+                    return []
+                  const content: unknown = Reflect.get(message, 'content')
+                  const serialized = JSON.stringify(content) ?? ''
+                  const contentHash = hash(serialized)
+                  const outputConfig: unknown = Reflect.get(message, 'output_config')
+                  return [
+                    {
+                      contentHash,
+                      contentBlocks: Array.isArray(content) ? content.length : null,
+                      emptyContent:
+                        content === '' || (Array.isArray(content) && content.length === 0),
+                      outputConfigPresent: Boolean(
+                        outputConfig && typeof outputConfig === 'object',
+                      ),
+                      outputEffortLow: Boolean(
+                        outputConfig &&
+                        typeof outputConfig === 'object' &&
+                        Reflect.get(outputConfig, 'effort') === 'low',
+                      ),
+                      sourceContentMatches: claudeMode.sourceContentHashes.includes(contentHash),
+                      candidateContentMatches:
+                        claudeMode.candidateContentHashes.includes(contentHash),
+                      pactMarkerPresent: /pactContext|pact-native-fork|pact-fork-settings-/u.test(
+                        serialized,
+                      ),
+                      forkMarkerPresent: /forkedFrom|fork_summary|fork-summary/u.test(serialized),
+                    },
+                  ]
+                }),
+              }),
+            )
+            const content = messages.map((message: unknown) => {
+              if (!message || typeof message !== 'object' || Array.isArray(message))
+                throw new Error('Malformed Claude loopback message')
+              const role: unknown = Reflect.get(message, 'role')
+              const blocks: unknown = Reflect.get(message, 'content')
+              // The pinned SDK's BetaMessageParam permits in-band system messages.
+              // The stable Messages contract still permits only user/assistant.
+              if (
+                role !== 'user' &&
+                role !== 'assistant' &&
+                !(role === 'system' && endpoint.search === '?beta=true')
+              )
+                throw new Error('Unexpected Claude loopback message role')
+              const keys = Object.keys(message)
+              const clearAt: unknown = Reflect.get(message, 'clear_at')
+              const outputConfig: unknown = Reflect.get(message, 'output_config')
+              if (
+                keys.some(
+                  (key) => !['role', 'content', 'clear_at', 'output_config'].includes(key),
+                ) ||
+                (role !== 'system' && (clearAt !== undefined || outputConfig !== undefined)) ||
+                (clearAt !== undefined &&
+                  clearAt !== null &&
+                  clearAt !== 'never' &&
+                  clearAt !== 'next_user_message') ||
+                (outputConfig !== undefined &&
+                  outputConfig !== null &&
+                  (typeof outputConfig !== 'object' ||
+                    Array.isArray(outputConfig) ||
+                    Object.keys(outputConfig).some((key) => key !== 'effort') ||
+                    (Reflect.get(outputConfig, 'effort') !== undefined &&
+                      Reflect.get(outputConfig, 'effort') !== null &&
+                      !['low', 'medium', 'high', 'xhigh', 'max'].includes(
+                        String(Reflect.get(outputConfig, 'effort')),
+                      ))))
+              )
+                throw new Error('Malformed Claude loopback message configuration')
+              if (typeof blocks === 'string') return { role, text: blocks }
+              if (!Array.isArray(blocks) || blocks.length > 256)
+                throw new Error('Malformed Claude loopback content')
+              return {
+                role,
+                text: blocks
+                  .map((block: unknown) => {
+                    if (
+                      !block ||
+                      typeof block !== 'object' ||
+                      Array.isArray(block) ||
+                      Reflect.get(block, 'type') !== 'text' ||
+                      typeof Reflect.get(block, 'text') !== 'string'
+                    )
+                      throw new Error('Unexpected Claude loopback content block')
+                    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Validated above; only fixed fixture membership facts leave this handler.
+                    return Reflect.get(block, 'text') as string
+                  })
+                  .join('\n'),
+              }
+            })
+            const user = content.findIndex(
+              (message) =>
+                message.role === 'user' && message.text.includes(claudeMode.historicalUser),
+            )
+            const assistant = content.findIndex(
+              (message) =>
+                message.role === 'assistant' &&
+                message.text.includes(claudeMode.historicalAssistant),
+            )
+            const prompt = content.findIndex(
+              (message) => message.role === 'user' && message.text.includes(claudeMode.prompt),
+            )
+            receipt.claude = {
+              messages: content.length,
+              historicalUserPresent: user >= 0,
+              historicalAssistantPresent: assistant >= 0,
+              historyRolesInOrder: user >= 0 && assistant > user,
+              promptAfterHistory: assistant >= 0 && prompt > assistant,
+              cutoffCanaryAbsent: !content.some((message) =>
+                message.text.includes(claudeMode.cutoffCanary),
+              ),
+            }
+            if (Object.entries(receipt.claude).some(([key, value]) => key !== 'messages' && !value))
+              throw new Error('Claude resume did not supply the exact selected history')
+            response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+            const event = (type: string, payload: object): void => {
+              response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`)
+            }
+            event('message_start', {
+              message: {
+                id: 'msg_pact_native_resume_1',
+                type: 'message',
+                role: 'assistant',
+                model,
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: { input_tokens: 1, output_tokens: 0 },
+              },
+            })
+            event('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
+            event('content_block_delta', { index: 0, delta: { type: 'text_delta', text } })
+            event('content_block_stop', { index: 0 })
+            event('message_delta', {
+              delta: { stop_reason: 'end_turn', stop_sequence: null },
+              usage: { output_tokens: 1 },
+            })
+            event('message_stop', {})
+            response.end()
+            return
+          }
           if (request.method !== 'POST' || request.url !== '/v1/responses' || text === undefined)
             throw new Error('Unexpected or excess loopback model request')
           const reasoning = {
@@ -1341,7 +1588,7 @@ export class LoopbackProvider {
           response.end()
         } catch (error) {
           this.errors.push(error instanceof Error ? error : new Error(String(error)))
-          if (!response.headersSent) response.writeHead(500)
+          if (!response.headersSent) response.writeHead(this.mode.mode === 'claude' ? 400 : 500)
           response.end()
         }
       })()
@@ -1395,10 +1642,12 @@ export async function cleanupNativeFixture(
     adapters = [],
     clients = [],
     provider,
+    retainRoot = false,
   }: {
     adapters?: Array<Pick<NativeAdapter, 'dispose'>>
     clients?: NativeRpc[]
     provider?: LoopbackProvider
+    retainRoot?: boolean
   } = {},
 ): Promise<void> {
   if (adapters.length > 8 || clients.length > 8)
@@ -1440,6 +1689,7 @@ export async function cleanupNativeFixture(
   )
   if (!released)
     throw new Error('Owned native fixture cleanup is unconfirmed; recovery data retained')
+  if (retainRoot) return
   try {
     await rm(owned.root, { recursive: true, force: true })
   } catch (error) {

@@ -81,6 +81,54 @@ export async function windowsPnpmExecutable(source) {
 
 export async function main(source = process.env) {
   let stage = 'source-validation'
+  let commandFacts
+  const onState = (state) => {
+    // Only runner-owned scalar observations cross this boundary. Never retain
+    // child output, invocation text, paths, control credentials or raw errors.
+    commandFacts = {
+      kind: [
+        'bootstrapping',
+        'initializing',
+        'started',
+        'buffered',
+        'ownership',
+        'stopping',
+        'settled',
+      ].includes(state.kind)
+        ? state.kind
+        : 'other',
+      reason: [
+        'startup-deadline',
+        'deadline',
+        'cancelled',
+        'supervisor-error',
+        'descendants-still-running',
+        'control-closed',
+        'control-error',
+        'control-budget',
+        'control-invalid',
+        'control-authentication',
+        'control-start-failed',
+        'spawn-failed',
+        'bootstrap-transfer-failed',
+        'output-transfer-failed',
+        'output-budget',
+        'redacted-output-budget',
+        'observer-failed',
+        'interrupted-SIGINT',
+        'interrupted-SIGTERM',
+      ].includes(state.reason)
+        ? state.reason
+        : (commandFacts?.reason ?? null),
+      groupGone: state.groupGone === true,
+      ownedProcesses:
+        Number.isSafeInteger(state.ownedProcessCount) &&
+        state.ownedProcessCount >= 0 &&
+        state.ownedProcessCount <= 256
+          ? state.ownedProcessCount
+          : null,
+    }
+  }
   try {
     if (!source.RUNNER_TEMP || !isAbsolute(source.RUNNER_TEMP))
       throw new Error('Native CI requires the runner-owned temporary directory')
@@ -114,13 +162,16 @@ export async function main(source = process.env) {
       executable: pnpmExecutable,
       cwd: directory,
       env: ciEnvironment(source),
+      onState,
     })
     if (resolved !== 0) throw new Error('Pinned native CLI lockfile admission failed')
     stage = 'installation'
+    commandFacts = undefined
     const installed = await run(['install', '--frozen-lockfile'], 5 * 60_000, {
       executable: pnpmExecutable,
       cwd: directory,
       env: ciEnvironment(source),
+      onState,
     })
     if (installed !== 0) throw new Error('Pinned native CLI installation failed')
     stage = 'native-entry-validation'
@@ -161,6 +212,7 @@ export async function main(source = process.env) {
         stage,
         errorClass: safeErrorClasses.has(error?.name) ? error.name : 'unknown',
         code: safeErrorCodes.has(error?.code) ? error.code : 'unknown',
+        ...(commandFacts ? { command: commandFacts } : {}),
       }),
     )
     throw failure

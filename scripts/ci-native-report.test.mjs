@@ -4,7 +4,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { nativeReport, nativeMarkdown, writeNativeReport } from './ci-native-report.mjs'
+import {
+  nativeReport,
+  nativeMarkdown,
+  writeNativeReport,
+  ensureUnexecutedNativeReport,
+} from './ci-native-report.mjs'
 
 const fixture = (status = 'passed', success = status === 'passed') => ({
   success,
@@ -98,6 +103,49 @@ await test('missing execution leaves immutable local JSON and Markdown instead o
     })
     assert.equal(failed.report.status, 'failed')
     assert(!JSON.stringify(failed.report).includes('secret-provider-output'))
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+  }
+})
+
+await test('setup failure leaves a blocked report and never overwrites completed execution evidence', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'pact-native-unexecuted-'))
+  try {
+    const options = {
+      directory: join(workspace, 'evidence'),
+      workspace,
+      identityPath: join(workspace, 'missing-identity.json'),
+      artifactName: 'native-e2e-darwin-arm64-a1',
+    }
+    const written = await ensureUnexecutedNativeReport(options)
+    assert.equal(written.report.status, 'blocked')
+    assert.equal(written.report.executionCompleted, false)
+    assert.equal(written.report.counts, null)
+    assert.equal(written.report.identity, null)
+    const before = await readFile(join(options.directory, 'native-summary.json'), 'utf8')
+    assert.equal((await ensureUnexecutedNativeReport(options)).status, 'blocked')
+    assert.equal(await readFile(join(options.directory, 'native-summary.json'), 'utf8'), before)
+    await assert.rejects(
+      ensureUnexecutedNativeReport({ ...options, artifactName: 'wrong-artifact' }),
+      /unexpected identity/,
+    )
+    const rawPath = join(workspace, 'actual.json')
+    await writeFile(rawPath, JSON.stringify(fixture()))
+    const completeOptions = {
+      ...options,
+      directory: join(workspace, 'complete'),
+      identityPath: undefined,
+    }
+    await writeNativeReport({ ...completeOptions, rawPath, completed: true, exitCode: 0 })
+    const actualBefore = await readFile(
+      join(completeOptions.directory, 'native-summary.json'),
+      'utf8',
+    )
+    assert.equal((await ensureUnexecutedNativeReport(completeOptions)).status, 'passed')
+    assert.equal(
+      await readFile(join(completeOptions.directory, 'native-summary.json'), 'utf8'),
+      actualBefore,
+    )
   } finally {
     await rm(workspace, { recursive: true, force: true })
   }
