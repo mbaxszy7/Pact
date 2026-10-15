@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -7,9 +8,135 @@ import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 
+import { runWindows, validateWindowsArgumentMode } from './run-e2e-windows.mjs'
 import { run } from './run-e2e.mjs'
 
 const windowsOnly = { skip: process.platform !== 'win32', timeout: 20_000 }
+
+await test('NSIS mode admits only silent owned operations and an absolute final raw directory tail', () => {
+  assert.equal(validateWindowsArgumentMode(['/S'], 'nsis'), 'nsis')
+  for (const directory of [
+    'C:\\Pact Dev\\安装 包',
+    '\\\\server\\share\\Pact Dev',
+    'D:\\a&b%literal\\',
+  ])
+    assert.equal(validateWindowsArgumentMode(['/S', `/D=${directory}`], 'nsis'), 'nsis')
+  assert.equal(validateWindowsArgumentMode(['', 'a"b', '&|%$()']), 'crt')
+  for (const args of [
+    [],
+    ['/s'],
+    ['/S', '/D=relative'],
+    ['/S', '/D=\\rooted'],
+    ['/S', '/D=C:relative'],
+    ['/S', '/D=C:\\bad"quote'],
+    ['/S', '/D=C:\\bad\0name'],
+    ['/S', '/D=C:\\bad\rname'],
+    ['/S', '/D=C:\\bad\nname'],
+    ['/S', '/D=C:\\first', '/D=C:\\second'],
+    ['/D=C:\\last', '/S'],
+    ['/S', '/D=C:\\one /D=C:\\two'],
+    ['/S', '_?=C:\\Pact'],
+  ])
+    assert.throws(() => validateWindowsArgumentMode(args, 'nsis'), /Invalid/u)
+  assert.throws(() => validateWindowsArgumentMode(['/S'], 'raw'), /Invalid/u)
+})
+
+await test('invalid NSIS descriptors fail before executable discovery or Job admission', async () => {
+  await assert.rejects(
+    runWindows(
+      ['/S', '/D=relative'],
+      1000,
+      { windowsArgumentMode: 'nsis' },
+      { failure: (message) => new Error(message), scrubHeaders: (text) => text },
+    ),
+    /failed admission; no job was started/u,
+  )
+  if (process.platform !== 'win32')
+    await assert.rejects(
+      run(['/S'], 1000, { windowsArgumentMode: 'nsis' }),
+      /requires a Windows Job/u,
+    )
+})
+
+await test(
+  'Windows Job preserves NSIS silent switches and a final space/Unicode directory without CRT quotes',
+  windowsOnly,
+  async (context) => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-nsis-raw-arguments-'))
+    let allReleased = true
+    context.after(async () => {
+      if (!allReleased)
+        throw new Error('Windows argument probe release is unconfirmed; fixture retained')
+      await rm(root, { recursive: true, force: true })
+    })
+    const runChecked = async (args, timeout, options) => {
+      let released = false
+      try {
+        return await run(args, timeout, {
+          ...options,
+          onState: (state) => {
+            if (state.kind === 'settled')
+              released = state.groupGone === true && state.ownedProcessCount === 0
+            options.onState?.(state)
+          },
+        })
+      } finally {
+        if (!released) allReleased = false
+      }
+    }
+    const source = join(root, 'RawArguments.cs'),
+      probe = join(root, 'RawArguments.exe')
+    await writeFile(
+      source,
+      `using System;using System.Security.Cryptography;using System.Text;class RawArguments {static int Main(){var raw=Environment.CommandLine;var at=raw.IndexOf(" /D=",StringComparison.Ordinal);var tail=at<0?"":raw.Substring(at+4);string hash;using(var digest=SHA256.Create()){hash=BitConverter.ToString(digest.ComputeHash(Encoding.UTF8.GetBytes(tail))).Replace("-","").ToLowerInvariant();}Console.WriteLine("{\\"silent\\":"+(raw.Contains(" /S ")||raw.EndsWith(" /S",StringComparison.Ordinal)?"true":"false")+",\\"tailHash\\":\\""+hash+"\\",\\"tailQuoted\\":"+(tail.IndexOf('"')>=0?"true":"false")+"}");return 0;}}`,
+    )
+    const compiler = join(
+      process.env.SystemRoot ?? process.env.WINDIR,
+      'Microsoft.NET',
+      'Framework64',
+      'v4.0.30319',
+      'csc.exe',
+    )
+    assert.equal(
+      await runChecked(['/nologo', '/target:exe', `/out:${probe}`, source], 15_000, {
+        executable: compiler,
+        cwd: root,
+        write: () => {},
+      }),
+      0,
+    )
+    const directory = join(root, '安装 package with spaces'),
+      args = ['/S', `/D=${directory}`]
+    const execute = async (windowsArgumentMode) => {
+      let output = '',
+        settled
+      const code = await runChecked(args, 10_000, {
+        executable: probe,
+        cwd: root,
+        windowsArgumentMode,
+        write: (_channel, text) => {
+          output += text
+        },
+        onState: (state) => {
+          if (state.kind === 'settled') settled = state
+        },
+      })
+      assert.equal(code, 0)
+      assert.equal(settled?.groupGone, true)
+      assert.equal(settled?.ownedProcessCount, 0)
+      return JSON.parse(output)
+    }
+    const crt = await execute(undefined)
+    assert.equal(crt.silent, false)
+    assert.notEqual(crt.tailHash, createHash('sha256').update(directory).digest('hex'))
+    const nsis = await execute('nsis')
+    assert.deepEqual(nsis, {
+      silent: true,
+      tailHash: createHash('sha256').update(directory).digest('hex'),
+      tailQuoted: false,
+    })
+  },
+)
 
 void test(
   'Windows forwards the root exit while its libuv Job closes ordinary helpers',

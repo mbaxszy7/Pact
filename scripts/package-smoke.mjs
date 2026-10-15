@@ -1,6 +1,16 @@
 import { execFile, spawn } from 'node:child_process'
 import { constants } from 'node:fs'
-import { access, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import {
+  access,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { promisify } from 'node:util'
@@ -122,6 +132,8 @@ export async function prepareApplication({
   unpacked,
   root,
   environment,
+  facts = { processes: [] },
+  runProcess = run,
 }) {
   if (unpacked) {
     if (artifactPath) throw new Error('Unpacked validation cannot select an installation artifact.')
@@ -248,41 +260,116 @@ export async function prepareApplication({
       'TODO: NSIS installation smoke requires an ephemeral native Windows GitHub runner; production installation debugging remains unverified.',
     )
   const uninstaller = join(destination, `Uninstall ${manifest.productName}.exe`)
-  const dispose = async () => {
-    if (await pathExists(uninstaller)) {
-      const exit = await run(['/S'], 120_000, {
-        executable: uninstaller,
-        cwd: destination,
+  let stage = 'installer-run'
+  const invokeNsis = async (args, executable, cwd, operation) => {
+    const observation = { phase: 'installation', operation, releaseVerified: false }
+    facts.processes.push(observation)
+    const began = performance.now()
+    try {
+      const exit = await runProcess(args, 120_000, {
+        executable,
+        cwd,
         env: environment,
+        windowsArgumentMode: 'nsis',
         write: () => {},
+        onState: (state) => {
+          if (state.kind === 'settled')
+            observation.releaseVerified = state.groupGone === true && state.ownedProcessCount === 0
+          if (state.kind === 'stopping')
+            observation.failureReason = [
+              'deadline',
+              'cancelled',
+              'interrupted-SIGINT',
+              'interrupted-SIGTERM',
+              'supervisor-error',
+              'descendants-still-running',
+            ].includes(state.reason)
+              ? state.reason
+              : 'other'
+          if (state.kind === 'stopping' && state.reason === 'deadline') facts.timedOut = true
+          if (
+            state.kind === 'stopping' &&
+            ['cancelled', 'interrupted-SIGINT', 'interrupted-SIGTERM'].includes(state.reason)
+          )
+            facts.interrupted = true
+        },
       })
-      if (exit !== 0) throw new Error(`Owned NSIS uninstall failed with exit code ${exit}.`)
-      if (await pathExists(uninstaller))
-        throw new Error('Owned NSIS uninstaller did not remove the installation.')
+      if (!observation.releaseVerified) throw new Error('Owned NSIS process release is unconfirmed')
+      return exit
+    } catch (error) {
+      if (!observation.releaseVerified)
+        throw Object.assign(
+          new Error('Owned NSIS process release is unconfirmed', { cause: error }),
+          { preserveRoot: true },
+        )
+      throw error
+    } finally {
+      observation.milliseconds = Math.ceil(performance.now() - began)
+    }
+  }
+  const dispose = async () => {
+    facts.installationCleanupVerified = false
+    try {
+      stage = 'uninstaller-check'
+      if (await pathExists(uninstaller)) {
+        stage = 'uninstall-run'
+        const exit = await invokeNsis(['/S'], uninstaller, root, 'uninstall')
+        if (exit !== 0) throw new Error(`Owned NSIS uninstall failed with exit code ${exit}.`)
+        stage = 'uninstaller-removal'
+        if (await pathExists(uninstaller))
+          throw new Error('Owned NSIS uninstaller did not remove the installation.')
+      } else {
+        const remaining = await readdir(destination).catch((error) => {
+          if (error.code === 'ENOENT') return []
+          throw error
+        })
+        if (remaining.length) throw new Error('Partial NSIS installation has no owned uninstaller')
+      }
+      stage = 'installation-removal'
+      const remaining = await readdir(destination).catch((error) => {
+        if (error.code === 'ENOENT') return []
+        throw error
+      })
+      if (remaining.length) throw new Error('Owned NSIS uninstall left installed payload behind')
+      facts.installationCleanupVerified = true
+    } catch (error) {
+      facts.installationCleanupFailureStage = stage
+      throw Object.assign(
+        new Error('Owned NSIS installation cleanup is unconfirmed', { cause: error }),
+        {
+          preserveRoot: true,
+        },
+      )
     }
   }
   try {
-    const exit = await run(['/S', `/D=${destination}`], 120_000, {
-      executable: artifact,
-      cwd: dirname(artifact),
-      env: environment,
-      write: () => {},
-    })
+    const exit = await invokeNsis(
+      ['/S', `/D=${destination}`],
+      artifact,
+      dirname(artifact),
+      'install',
+    )
     if (exit !== 0) throw new Error(`Owned NSIS installation failed with exit code ${exit}.`)
+    stage = 'uninstaller-check'
     if (!(await pathExists(uninstaller)))
       throw new Error('NSIS did not install its owned uninstaller.')
+    stage = 'application-content'
+    const executable = await verifyApplication(destination, manifest, true)
     return {
       applicationPath: destination,
-      executable: await verifyApplication(destination, manifest, true),
+      executable,
       artifact: installedArtifact,
       verificationMode: 'installed-nsis',
       installationVerified: true,
       dispose,
     }
   } catch (error) {
+    facts.installationFailureStage = stage
+    if (error?.preserveRoot === true) throw error
     try {
       await dispose()
     } catch (cleanupError) {
+      facts.installationCleanupFailureStage = stage
       throw Object.assign(
         new AggregateError(
           [error, cleanupError],
@@ -460,6 +547,23 @@ export function packageSmokeFailureReport(facts) {
   const processes = facts.processes.map((item) => ({
     phase: smokePhases.has(item.phase) ? item.phase : 'admission',
     releaseVerified: item.releaseVerified === true,
+    ...(['install', 'uninstall'].includes(item.operation) ? { operation: item.operation } : {}),
+    ...(Number.isSafeInteger(item.milliseconds) &&
+    item.milliseconds >= 0 &&
+    item.milliseconds <= 1_000_000_000
+      ? { milliseconds: item.milliseconds }
+      : {}),
+    ...([
+      'deadline',
+      'cancelled',
+      'interrupted-SIGINT',
+      'interrupted-SIGTERM',
+      'supervisor-error',
+      'descendants-still-running',
+      'other',
+    ].includes(item.failureReason)
+      ? { failureReason: item.failureReason }
+      : {}),
   }))
   const processReleaseVerified = processes.every((item) => item.releaseVerified)
   return {
@@ -487,6 +591,27 @@ export function packageSmokeFailureReport(facts) {
           : facts.timedOut === true
             ? 'EXECUTION_TIMED_OUT'
             : 'VERIFICATION_FAILED',
+    ...Object.fromEntries(
+      [
+        'installationFailureStage',
+        'installationCleanupFailureStage',
+        'cleanupFailureStage',
+      ].flatMap((key) =>
+        [
+          'installer-run',
+          'uninstaller-check',
+          'application-content',
+          'uninstall-run',
+          'uninstaller-removal',
+          'installation-removal',
+          'private-root-removal',
+          'provider-copies',
+          'process-release',
+        ].includes(facts[key])
+          ? [[key, facts[key]]]
+          : [],
+      ),
+    ),
     ...([
       'HOST_ENVIRONMENT_BOUNDS',
       'OWNED_DIRECTORY_IDENTITY',
@@ -579,6 +704,7 @@ async function performPackagedSmoke(
     const unresolvedProcess =
       spawnProcess === spawn && facts.processes.some((item) => !item.releaseVerified)
     if (unresolvedProcess) {
+      facts.cleanupFailureStage = 'process-release'
       preserveRoot = true
       if (application) facts.installationCleanupVerified = false
       cleanupError = new Error('Packaged process release was not confirmed')
@@ -587,18 +713,25 @@ async function performPackagedSmoke(
         await application?.dispose()
         if (application) facts.installationCleanupVerified = true
       } catch (error) {
+        facts.cleanupFailureStage = 'uninstall-run'
         preserveRoot = true
         facts.installationCleanupVerified = false
         cleanupError = error
       }
     }
-    const providerCleanup = await Promise.allSettled(
-      providerHomes.map((path) => rm(path, { force: true, recursive: true })),
-    )
-    facts.providerCopiesCleanupVerified = providerCleanup.every(
-      (item) => item.status === 'fulfilled',
-    )
+    const unresolvedAfterCleanup =
+      spawnProcess === spawn && facts.processes.some((item) => !item.releaseVerified)
+    if (unresolvedAfterCleanup) facts.providerCopiesCleanupVerified = providerHomes.length === 0
+    else {
+      const providerCleanup = await Promise.allSettled(
+        providerHomes.map((path) => rm(path, { force: true, recursive: true })),
+      )
+      facts.providerCopiesCleanupVerified = providerCleanup.every(
+        (item) => item.status === 'fulfilled',
+      )
+    }
     if (!facts.providerCopiesCleanupVerified) {
+      facts.cleanupFailureStage ??= 'provider-copies'
       preserveRoot = true
       cleanupError ??= new Error('Provider copy cleanup was not confirmed')
     }
@@ -613,6 +746,7 @@ async function performPackagedSmoke(
           facts.privateRootCleanupVerified = true
         }
       } catch (error) {
+        facts.cleanupFailureStage ??= 'private-root-removal'
         preserveRoot = true
         cleanupError ??= error
       }
@@ -642,6 +776,7 @@ async function performPackagedSmoke(
           unpacked,
           root,
           environment,
+          facts,
         })
       : undefined
     facts.installationVerified = application?.installationVerified === true

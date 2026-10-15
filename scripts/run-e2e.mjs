@@ -119,10 +119,16 @@ export function run(
     onState = () => {},
     onOwnership,
     posixOwnedGroupLimit,
+    windowsArgumentMode,
     inspectProcesses = readProcessTable,
   } = {},
 ) {
   if (signal?.aborted) return Promise.reject(failure('E2E job cancelled before admission.'))
+  if (
+    windowsArgumentMode !== undefined &&
+    (process.platform !== 'win32' || windowsArgumentMode !== 'nsis')
+  )
+    return Promise.reject(failure('The named NSIS argument mode requires a Windows Job.'))
   if (
     posixOwnedGroupLimit !== undefined &&
     (!Number.isSafeInteger(posixOwnedGroupLimit) ||
@@ -138,7 +144,7 @@ export function run(
       runWindows(
         args,
         timeout,
-        { executable, cwd, env, signal, redact, write, onState },
+        { executable, cwd, env, signal, redact, write, onState, windowsArgumentMode },
         { failure, scrubHeaders },
       ),
     )

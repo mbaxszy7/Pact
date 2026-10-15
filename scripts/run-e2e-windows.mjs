@@ -7,6 +7,24 @@ import { basename, delimiter, isAbsolute, join } from 'node:path'
 
 const outputLimit = 256 * 1024
 
+/** NSIS parses its raw command line, not CRT argv; only these owned operations opt in. */
+export function validateWindowsArgumentMode(args, mode = 'crt') {
+  if (mode === 'crt') return mode
+  if (mode !== 'nsis' || !Array.isArray(args) || args[0] !== '/S' || ![1, 2].includes(args.length))
+    throw new Error('Invalid named NSIS invocation')
+  if (args.length === 2) {
+    const directory =
+      typeof args[1] === 'string' && args[1].startsWith('/D=') ? args[1].slice(3) : ''
+    if (
+      !/^(?:[a-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$))/iu.test(directory) ||
+      /["\0\r\n]/u.test(directory) ||
+      /\/D=/iu.test(directory)
+    )
+      throw new Error('Invalid owned NSIS installation directory')
+  }
+  return mode
+}
+
 async function executablePath(name, candidates = [], env = process.env) {
   const directories = (env.PATH ?? '').split(delimiter).filter(isAbsolute)
   if (directories.length > 128) throw new Error('Executable discovery limit')
@@ -54,6 +72,12 @@ async function targetPath(executable, env = process.env) {
 
 /** One native Job owns all Windows descendants; POSIX ownership remains in run-e2e.mjs. */
 export async function runWindows(args, timeout, options, { failure, scrubHeaders }) {
+  let argumentMode
+  try {
+    argumentMode = validateWindowsArgumentMode(args, options.windowsArgumentMode)
+  } catch {
+    throw failure('Windows NSIS arguments failed admission; no job was started.')
+  }
   const env = options.env ?? process.env
   const signal = options.signal
   if (signal?.aborted) throw failure('Windows E2E job cancelled before admission.')
@@ -94,6 +118,7 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
     token,
     executable: target.executable,
     args: [...target.prefix, ...args],
+    argumentMode,
     cwd: options.cwd,
     timeout: Math.max(1, timeout - (performance.now() - startedAt)),
   })

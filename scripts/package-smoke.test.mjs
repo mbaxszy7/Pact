@@ -5,7 +5,179 @@ import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative } from 'node:path'
 import { test } from 'node:test'
 
-import { main, packageSmokeFailureReport } from './package-smoke.mjs'
+import { applicationContent, hashFile } from './build-distribution.mjs'
+import { main, packageSmokeFailureReport, prepareApplication } from './package-smoke.mjs'
+
+/** Native process-boundary doubles only; these cases install no software and start no application. */
+async function nsisFixture(context, behavior = {}) {
+  const root = await mkdtemp(join(tmpdir(), 'pact-nsis-preparation-test-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const payload = join(root, 'payload'),
+    owned = join(root, 'owned'),
+    artifact = join(root, 'Pact Dev.exe')
+  await mkdir(payload)
+  await mkdir(owned)
+  await writeFile(join(payload, 'Pact Dev.exe'), 'synthetic application bytes', { mode: 0o700 })
+  await writeFile(artifact, 'synthetic installer bytes', { mode: 0o700 })
+  const content = await applicationContent(payload, 'win32')
+  const manifest = {
+    productName: 'Pact Dev',
+    platform: 'win32',
+    application: {
+      executable: 'Pact Dev.exe',
+      contentSha256: content.sha256,
+      entries: content.entries,
+    },
+    artifacts: [
+      {
+        path: 'Pact Dev.exe',
+        kind: 'nsis',
+        bytes: (await stat(artifact)).size,
+        sha256: await hashFile(artifact),
+      },
+    ],
+  }
+  const facts = { processes: [], installationCleanupVerified: false },
+    calls = []
+  const uninstaller = join(owned, 'installed', 'Uninstall Pact Dev.exe')
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
+  context.after(() => Object.defineProperty(process, 'platform', platform))
+  for (const [key, value] of Object.entries({
+    GITHUB_ACTIONS: 'true',
+    RUNNER_ENVIRONMENT: 'github-hosted',
+    RUNNER_TEMP: root,
+  })) {
+    const original = process.env[key]
+    process.env[key] = value
+    context.after(() => {
+      if (original === undefined) delete process.env[key]
+      else process.env[key] = original
+    })
+  }
+  const runProcess = async (args, timeout, options) => {
+    calls.push({ args, timeout, options })
+    assert.equal(options.windowsArgumentMode, 'nsis')
+    assert.equal(timeout, 120_000)
+    if (calls.length === 1) {
+      await writeFile(
+        join(owned, 'installed', 'Pact Dev.exe'),
+        behavior.corrupt ? 'changed payload' : 'synthetic application bytes',
+        { mode: 0o700 },
+      )
+      if (!behavior.missingUninstaller)
+        await writeFile(uninstaller, 'synthetic uninstaller', { mode: 0o700 })
+      if (!behavior.installUnconfirmed)
+        options.onState({ kind: 'settled', groupGone: true, ownedProcessCount: 0 })
+    } else {
+      assert.equal(options.cwd, owned)
+      assert.deepEqual(args, ['/S'])
+      if (!behavior.uninstallUnconfirmed) {
+        if (behavior.uninstallerOnly) await rm(uninstaller)
+        else await rm(join(owned, 'installed'), { recursive: true })
+        options.onState({ kind: 'settled', groupGone: true, ownedProcessCount: 0 })
+      }
+    }
+    return 0
+  }
+  return {
+    owned,
+    uninstaller,
+    facts,
+    calls,
+    prepare: () =>
+      prepareApplication({
+        manifest,
+        manifestPath: join(root, 'distribution-manifest.json'),
+        root: owned,
+        environment: {},
+        facts,
+        runProcess,
+      }),
+  }
+}
+
+await test('owned NSIS preparation validates actual installed content then uninstalls from outside its payload', async (context) => {
+  const fixture = await nsisFixture(context)
+  const application = await fixture.prepare()
+  assert.equal(application.installationVerified, true)
+  assert.equal(application.verificationMode, 'installed-nsis')
+  assert.deepEqual(fixture.calls[0].args, ['/S', `/D=${join(fixture.owned, 'installed')}`])
+  await application.dispose()
+  await application.dispose()
+  assert.equal(fixture.facts.installationCleanupVerified, true)
+  assert.equal(fixture.calls.length, 2)
+  assert.ok(fixture.facts.processes.every((item) => item.releaseVerified))
+})
+
+await test('installer code zero without a physical receipt retains the installation and never starts uninstall', async (context) => {
+  const fixture = await nsisFixture(context, { installUnconfirmed: true })
+  await assert.rejects(fixture.prepare(), { preserveRoot: true })
+  assert.equal(fixture.calls.length, 1)
+  assert.equal(fixture.facts.installationFailureStage, 'installer-run')
+  assert.equal(fixture.facts.processes[0].releaseVerified, false)
+  assert.equal((await stat(fixture.uninstaller)).isFile(), true)
+})
+
+await test('a partial installation without its own uninstaller retains recovery after confirmed installer exit', async (context) => {
+  const fixture = await nsisFixture(context, { missingUninstaller: true })
+  await assert.rejects(fixture.prepare(), { preserveRoot: true })
+  assert.equal(fixture.calls.length, 1)
+  assert.equal(fixture.facts.installationFailureStage, 'uninstaller-check')
+  assert.equal(fixture.facts.installationCleanupFailureStage, 'uninstaller-check')
+  assert.equal(fixture.facts.processes[0].releaseVerified, true)
+  assert.equal((await stat(join(fixture.owned, 'installed', 'Pact Dev.exe'))).isFile(), true)
+})
+
+await test('content verification failure still proves genuine uninstall before releasing the fixture', async (context) => {
+  const fixture = await nsisFixture(context, { corrupt: true })
+  await assert.rejects(fixture.prepare(), /content differs from the exact manifest payload/u)
+  assert.equal(fixture.facts.installationFailureStage, 'application-content')
+  assert.equal(fixture.facts.installationCleanupVerified, true)
+  assert.equal(fixture.calls.length, 2)
+})
+
+await test('uninstaller code zero without physical release remains blocked and retains recovery files', async (context) => {
+  const fixture = await nsisFixture(context, { uninstallUnconfirmed: true })
+  const application = await fixture.prepare()
+  await assert.rejects(application.dispose(), { preserveRoot: true })
+  assert.equal(fixture.facts.installationCleanupVerified, false)
+  assert.equal(fixture.facts.installationCleanupFailureStage, 'uninstall-run')
+  assert.equal(fixture.facts.processes[1].releaseVerified, false)
+  assert.equal((await stat(fixture.uninstaller)).isFile(), true)
+})
+
+await test('a released uninstaller that removes only itself cannot certify payload cleanup', async (context) => {
+  const fixture = await nsisFixture(context, { uninstallerOnly: true })
+  const application = await fixture.prepare()
+  await assert.rejects(application.dispose(), { preserveRoot: true })
+  assert.equal(fixture.facts.installationCleanupVerified, false)
+  assert.equal((await stat(join(fixture.owned, 'installed', 'Pact Dev.exe'))).isFile(), true)
+  assert.equal(fixture.facts.processes[1].releaseVerified, true)
+})
+
+await test('verification failure and a later unconfirmed uninstall retain both fixed stages and release failures', async (context) => {
+  const fixture = await nsisFixture(context, { corrupt: true, uninstallUnconfirmed: true })
+  await assert.rejects(fixture.prepare(), { preserveRoot: true })
+  const report = packageSmokeFailureReport({
+    ...fixture.facts,
+    phase: 'installation',
+    recoveryPreserved: true,
+  })
+  assert.equal(report.installationFailureStage, 'application-content')
+  assert.equal(report.installationCleanupFailureStage, 'uninstall-run')
+  assert.equal(report.processReleaseVerified, false)
+  assert.equal(report.cleanupVerified, false)
+  assert.equal(report.recoveryPreserved, true)
+  assert.deepEqual(
+    report.processes.map((process) => [process.operation, process.releaseVerified]),
+    [
+      ['install', true],
+      ['uninstall', false],
+    ],
+  )
+  assert.equal(JSON.stringify(report).includes(fixture.owned), false)
+})
 
 const sourceEnvironment = {
   HOME: '/synthetic-daily-home',

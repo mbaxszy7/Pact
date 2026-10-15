@@ -76,8 +76,8 @@ public static class PactE2EJob
         return result.Append('\\', slashes * 2).Append('"').ToString();
     }
 
-    public static int Run(string executable, string[] args, string cwd, long timeout, StreamWriter writer, Task<string> cancel) {
-        return RunOwned(executable, args, cwd, timeout, writer, cancel, false, null);
+    public static int Run(string executable, string[] args, string cwd, long timeout, StreamWriter writer, Task<string> cancel, string argumentMode = "crt") {
+        return RunOwned(executable, args, cwd, timeout, writer, cancel, false, null, argumentMode);
     }
     public static int Forward(string executable, string[] args) {
         return RunOwned(executable, args, Environment.CurrentDirectory, 10 * 60 * 1000, null, new TaskCompletionSource<string>().Task, true, null);
@@ -85,7 +85,27 @@ public static class PactE2EJob
     public static int ForwardObserved(string executable, string[] args, long timeout, StreamWriter writer, Task<string> cancel, string generation) {
         return RunOwned(executable, args, Environment.CurrentDirectory, timeout, writer, cancel, true, generation);
     }
-    static int RunOwned(string executable, string[] args, string cwd, long timeout, StreamWriter writer, Task<string> cancel, bool forwardInput, string generation) {
+    static StringBuilder CommandLine(string executable, string[] args, string argumentMode) {
+        var command = new StringBuilder(Quote(executable));
+        if (argumentMode == "crt") {
+            foreach (var argument in args) command.Append(' ').Append(Quote(argument));
+        } else if (argumentMode == "nsis") {
+            if (args == null || (args.Length != 1 && args.Length != 2) || args[0] != "/S") throw new ArgumentException("Invalid named NSIS invocation");
+            if (args.Length == 2) {
+                if (args[1] == null || !args[1].StartsWith("/D=")) throw new ArgumentException("Invalid NSIS directory argument");
+                var directory = args[1].Substring(3);
+                if (!System.Text.RegularExpressions.Regex.IsMatch(directory, @"^(?:[a-zA-Z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$))") ||
+                    directory.IndexOfAny(new[] { '"', '\0', '\r', '\n' }) >= 0 || directory.IndexOf("/D=", StringComparison.OrdinalIgnoreCase) >= 0)
+                    throw new ArgumentException("Invalid owned NSIS directory");
+            }
+            // /D must be the last raw tail, even for spaces/Unicode. No command shell is used.
+            command.Append(" /S");
+            if (args.Length == 2) command.Append(' ').Append(args[1]);
+        } else throw new ArgumentException("Unknown Windows argument mode");
+        if (command.Length >= 32767) throw new ArgumentException("Command line limit");
+        return command;
+    }
+    static int RunOwned(string executable, string[] args, string cwd, long timeout, StreamWriter writer, Task<string> cancel, bool forwardInput, string generation, string argumentMode = "crt") {
         IntPtr job = IntPtr.Zero, attributes = IntPtr.Zero, jobs = IntPtr.Zero, handles = IntPtr.Zero;
         IntPtr input = IntPtr.Zero, output = IntPtr.Zero, error = IntPtr.Zero;
         ProcessInfo process = new ProcessInfo(); bool attributesReady = false, empty = false;
@@ -97,9 +117,7 @@ public static class PactE2EJob
             limits.Basic.Flags = 0x2000 | 0x8; // KILL_ON_JOB_CLOSE | ACTIVE_PROCESS
             limits.Basic.ActiveLimit = 256;
             Check(SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf<Limits>()));
-            var command = new StringBuilder(Quote(executable));
-            foreach (var argument in args) command.Append(' ').Append(Quote(argument));
-            if (command.Length >= 32767) throw new ArgumentException("Command line limit");
+            var command = CommandLine(executable, args, argumentMode);
             var security = new Security { Size = (uint)Marshal.SizeOf<Security>(), Inherit = 1 };
             input = forwardInput ? InheritedStandard(-10) : CreateFileW("NUL", 0x80000000, 3, ref security, 3, 0, IntPtr.Zero);
             Check(input != new IntPtr(-1));
