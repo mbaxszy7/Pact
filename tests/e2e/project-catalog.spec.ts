@@ -25,7 +25,9 @@ test(
       }, projectDirectory)
       await window.getByRole('button', { name: 'Add project', exact: true }).click()
 
-      const projectRow = window.getByRole('button', { name: 'sample-project', exact: true })
+      const projectRow = window.getByRole('button', {
+        name: /^(Expand|Collapse) Project sample-project$/u,
+      })
       await expect(projectRow).toBeVisible()
       await expect(projectRow).toHaveAttribute('aria-expanded', 'true')
       await projectRow.click()
@@ -36,7 +38,9 @@ test(
       await app.close()
       app = await fixture.launch()
       window = await app.firstWindow()
-      const restoredProject = window.getByRole('button', { name: 'sample-project', exact: true })
+      const restoredProject = window.getByRole('button', {
+        name: /^(Expand|Collapse) Project sample-project$/u,
+      })
       await expect(restoredProject).toBeVisible()
 
       const archive = window.getByRole('button', { name: 'Archive Project sample-project' })
@@ -53,18 +57,21 @@ test(
       await expect(window.getByRole('heading', { name: 'Start with a project' })).toBeVisible()
       await expect(window.getByRole('button', { name: 'Hide navigation panel' })).toHaveCount(0)
       await expect(window.getByRole('button', { name: 'Open settings' })).toBeVisible()
-      const archiveNotice = window.getByText('Project archived', { exact: true }).locator('..')
+      const archiveNotice = window.getByRole('region', { name: 'Archive results', exact: true })
       await expect(archiveNotice).toBeVisible()
-      await expect(archiveNotice.getByRole('button', { name: 'View' })).toHaveCount(0)
+      await expect(archiveNotice.getByRole('button', { name: 'View' })).toHaveCount(1)
       await expect
         .poll(async () => (await archiveNotice.boundingBox())?.y)
         .toBeGreaterThanOrEqual(64)
-      await archiveNotice.getByRole('button', { name: 'Undo' }).click()
+      await archiveNotice.getByRole('button', { name: 'View', exact: true }).click()
+      await archiveNotice
+        .getByRole('button', { name: 'Undo archive of sample-project', exact: true })
+        .click()
       await expect(restoredProject).toBeVisible()
 
       await restoredProject.hover()
       await archive.click()
-      await window.getByRole('button', { name: 'Dismiss archive notice' }).click()
+      await window.getByRole('button', { name: 'Dismiss completed archive results' }).click()
       await app.evaluate(({ dialog }, directoryPath) => {
         Reflect.set(dialog, 'showOpenDialog', async () => ({
           canceled: false,

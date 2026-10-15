@@ -1,4 +1,18 @@
-import { and, desc, eq, lt, lte, ne, or, sql } from 'drizzle-orm'
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gt,
+  inArray,
+  isNull,
+  lt,
+  lte,
+  ne,
+  or,
+  sql,
+  type SQL,
+} from 'drizzle-orm'
 
 import type {
   CollaborationSession,
@@ -8,12 +22,16 @@ import type {
   SessionCatalogChange,
   SessionCatalogCursor,
   SessionCatalogPage,
+  NativeSessionRow,
+  NativeSessionOpenInput,
+  NativeJumpListSuppressionInput,
 } from '@pact/contracts'
 
 import { SESSION_CATALOG_PAGE_BYTES, SESSION_CATALOG_PAGE_ITEMS } from '@pact/contracts'
 
 import type { PactDrizzleDatabase } from './drizzle-database.js'
 
+import { updateSessionNativeMetadata } from './native-presence-metadata.js'
 import {
   agentRuns,
   conversationMessages,
@@ -22,6 +40,9 @@ import {
   sessions,
   sessionForkOperations,
   nativeAgentContexts,
+  projects,
+  nativePresenceMetadata,
+  sessionOpenOperations,
 } from './schema/index.js'
 import {
   deriveSessionActivity,
@@ -29,10 +50,25 @@ import {
   projectSessionTitle,
   type LatestRunActivity,
 } from './session-projection.js'
+import {
+  assertArchiveCommit,
+  assertProjectAvailable,
+  workspaceArchiveBlocked,
+} from './workspace-archive-repository.js'
 
 type SessionRow = typeof sessions.$inferSelect
 type SettingsRevisionRow = typeof sessionSettingsRevisions.$inferSelect
 type SettingsRevisionValues = typeof sessionSettingsRevisions.$inferInsert
+
+function nativeMenuText(value: string): string {
+  // Native menu labels must not retain control characters from user-owned titles.
+  return (
+    value
+      .replace(/\p{Cc}/gu, ' ')
+      .trim()
+      .slice(0, 120) || 'Untitled'
+  )
+}
 
 export interface NewSessionRecord {
   id: string
@@ -58,6 +94,245 @@ export class OversizedCatalogSessionError extends Error {
 
 export class SessionRepository {
   constructor(private readonly database: PactDrizzleDatabase) {}
+
+  nativeInitialized(): boolean {
+    return (
+      this.database
+        .select({ initialized: nativePresenceMetadata.initialized })
+        .from(nativePresenceMetadata)
+        .where(eq(nativePresenceMetadata.id, 1))
+        .get()?.initialized === true
+    )
+  }
+
+  nativeInitializationPage(after?: string): string[] {
+    return this.database
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(after ? gt(sessions.id, after) : undefined)
+      .orderBy(asc(sessions.id))
+      .limit(25)
+      .all()
+      .map((row) => row.id)
+  }
+
+  finishNativeInitialization(): void {
+    this.database
+      .update(nativePresenceMetadata)
+      .set({ initialized: true })
+      .where(eq(nativePresenceMetadata.id, 1))
+      .run()
+  }
+
+  nativeAttentionTotal(): number {
+    return (
+      this.database
+        .select({ total: nativePresenceMetadata.attentionTotal })
+        .from(nativePresenceMetadata)
+        .where(eq(nativePresenceMetadata.id, 1))
+        .get()?.total ?? 0
+    )
+  }
+
+  nativeNeedsAttention(sessionId: string): boolean {
+    return (
+      this.database
+        .select({ attention: sessions.needsAttention })
+        .from(sessions)
+        .where(eq(sessions.id, sessionId))
+        .get()?.attention === true
+    )
+  }
+
+  nativeRecent(): NativeSessionRow[] {
+    const ids = this.database
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(
+        sql`${sessions.workspaceVisible} = 1 AND ${sessions.needsAttention} = 0 AND ${sessions.lastOpenedOrdinal} IS NOT NULL`,
+      )
+      .orderBy(desc(sessions.lastOpenedOrdinal), desc(sessions.id))
+      .limit(18)
+      .all()
+    return ids.flatMap((row) => {
+      const item = this.findNativeRow(row.id)
+      return item ? [item] : []
+    })
+  }
+
+  nativeQuitRecent(): NativeSessionRow[] {
+    // The two indexed partitions cover every visible opened Session. Their top
+    // five can contribute at most ten candidates to the final five.
+    const select = (attention: boolean) =>
+      this.database
+        .select({ id: sessions.id, ordinal: sessions.lastOpenedOrdinal })
+        .from(sessions)
+        .where(
+          attention
+            ? sql`${sessions.workspaceVisible} = 1 AND ${sessions.needsAttention} = 1 AND ${sessions.lastOpenedOrdinal} IS NOT NULL`
+            : sql`${sessions.workspaceVisible} = 1 AND ${sessions.needsAttention} = 0 AND ${sessions.lastOpenedOrdinal} IS NOT NULL`,
+        )
+        .orderBy(desc(sessions.lastOpenedOrdinal), desc(sessions.id))
+        .limit(5)
+        .all()
+    return [...select(false), ...select(true)]
+      .toSorted(
+        (a, b) => (b.ordinal ?? 0) - (a.ordinal ?? 0) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
+      )
+      .slice(0, 5)
+      .flatMap((item) => {
+        const row = this.findNativeRow(item.id)
+        return row ? [row] : []
+      })
+  }
+
+  nativeAttention(after?: {
+    ordinal: number
+    id: string
+  }): Array<{ row: NativeSessionRow; ordinal: number }> {
+    const read = (tail: SQL | undefined, limit: number) =>
+      this.database
+        .select({ id: sessions.id, ordinal: sessions.lastOpenedOrdinal })
+        .from(sessions)
+        .where(and(sql`${sessions.workspaceVisible} = 1 AND ${sessions.needsAttention} = 1`, tail))
+        .orderBy(desc(sessions.lastOpenedOrdinal), desc(sessions.id))
+        .limit(limit)
+        .all()
+    const ids =
+      after?.ordinal === 0
+        ? read(and(isNull(sessions.lastOpenedOrdinal), lt(sessions.id, after.id)), 14)
+        : read(
+            after
+              ? and(
+                  lte(sessions.lastOpenedOrdinal, after.ordinal),
+                  or(
+                    lt(sessions.lastOpenedOrdinal, after.ordinal),
+                    and(eq(sessions.lastOpenedOrdinal, after.ordinal), lt(sessions.id, after.id)),
+                  ),
+                )
+              : undefined,
+            14,
+          )
+    // Seek opened and never-opened partitions independently. A nullable OR tail
+    // otherwise scans every earlier attention entry before reaching this page.
+    if (after && after.ordinal > 0 && ids.length < 14)
+      ids.push(...read(isNull(sessions.lastOpenedOrdinal), 14 - ids.length))
+    return ids.flatMap((item) => {
+      const row = this.findNativeRow(item.id)
+      return row ? [{ row, ordinal: item.ordinal ?? 0 }] : []
+    })
+  }
+
+  /** Metadata only: no directory probe, native connection, body read, or task admission. */
+  findNativeRow(sessionId: string): NativeSessionRow | undefined {
+    const row = this.database
+      .select({
+        session: {
+          id: sessions.id,
+          projectId: sessions.projectId,
+          title: sessions.title,
+          titleSource: sessions.titleSource,
+          lastSeen: sessions.lastSeenMessageSequence,
+          attention: sessions.needsAttention,
+          suppressed: sessions.jumpListSuppressed,
+          removalObserved: sessions.jumpListRemovalObserved,
+        },
+        projectName: projects.name,
+        completedSequence: sql<
+          number | null
+        >`(SELECT sequence FROM conversation_messages WHERE session_id=${sessions.id} AND role='assistant' AND state='complete' AND is_visible=1 ORDER BY sequence DESC LIMIT 1)`,
+      })
+      .from(sessions)
+      .innerJoin(projects, eq(projects.id, sessions.projectId))
+      .where(
+        and(
+          eq(sessions.id, sessionId),
+          isNull(sessions.archivedAt),
+          sql`${sessions.status} <> 'archived'`,
+          isNull(projects.archivedAt),
+        ),
+      )
+      .get()
+    if (!row) return undefined
+    const title = projectSessionTitle(row.session.title, row.session.titleSource).title
+    return {
+      sessionId: row.session.id,
+      projectId: row.session.projectId,
+      title: nativeMenuText(title),
+      projectName: nativeMenuText(row.projectName),
+      state: row.session.attention ? 'attention' : 'idle',
+      unread: hasUnreadSessionMessage(row.session.lastSeen, row.completedSequence ?? undefined),
+      jumpListSuppressed: row.session.suppressed,
+      jumpListRemovalObserved: row.session.removalObserved,
+    }
+  }
+
+  resolveNativeSession(sessionId: string): SessionCatalogChange {
+    if (!this.findNativeRow(sessionId))
+      throw new Error('This Session or its Project is archived or no longer available.')
+    return this.change(sessionId)
+  }
+
+  recordNativeOpened(input: NativeSessionOpenInput): boolean {
+    return this.database.transaction((transaction) => {
+      if (!this.findNativeRow(input.sessionId)) throw new Error('This Session is unavailable.')
+      const prior = transaction
+        .select()
+        .from(sessionOpenOperations)
+        .where(eq(sessionOpenOperations.openingId, input.openingId))
+        .get()
+      if (prior) {
+        if (prior.sessionId !== input.sessionId)
+          throw new Error('This opening already belongs to another Session.')
+        return false
+      }
+      const ordinal = transaction
+        .update(nativePresenceMetadata)
+        .set({ openingOrdinal: sql`${nativePresenceMetadata.openingOrdinal} + 1` })
+        .where(eq(nativePresenceMetadata.id, 1))
+        .returning({ value: nativePresenceMetadata.openingOrdinal })
+        .get().value
+      transaction
+        .insert(sessionOpenOperations)
+        .values({ ...input, ordinal })
+        .run()
+      transaction
+        .update(sessions)
+        .set({ lastOpenedOrdinal: ordinal, jumpListSuppressed: false })
+        .where(eq(sessions.id, input.sessionId))
+        .run()
+      return true
+    })
+  }
+
+  updateNativeJumpListSuppression(input: NativeJumpListSuppressionInput): boolean {
+    return this.database.transaction((transaction) => {
+      let changed = 0
+      if (input.clearedSessionIds.length)
+        changed += transaction
+          .update(sessions)
+          .set({ jumpListRemovalObserved: false })
+          .where(
+            and(
+              inArray(sessions.id, input.clearedSessionIds),
+              eq(sessions.jumpListRemovalObserved, true),
+            ),
+          )
+          .run().changes
+      if (input.removedSessionIds.length)
+        changed += transaction
+          .update(sessions)
+          .set({ jumpListSuppressed: true, jumpListRemovalObserved: true })
+          .where(
+            and(
+              inArray(sessions.id, input.removedSessionIds),
+              eq(sessions.jumpListRemovalObserved, false),
+            ),
+          )
+          .run().changes
+      return changed > 0
+    })
+  }
 
   readPage(projectId: string, cursor?: SessionCatalogCursor): SessionCatalogPage {
     return this.database.transaction((transaction) => {
@@ -111,7 +386,14 @@ export class SessionRepository {
           ),
         )
         .leftJoin(agentRuns, eq(agentRuns.id, latestRunId))
-        .where(and(eq(sessions.projectId, projectId), sql`${sessions.status} <> 'archived'`, after))
+        .where(
+          and(
+            eq(sessions.projectId, projectId),
+            isNull(sessions.archivedAt),
+            sql`${sessions.status} <> 'archived'`,
+            after,
+          ),
+        )
         .orderBy(desc(sessions.createdAt), desc(sessions.id))
         .limit(SESSION_CATALOG_PAGE_ITEMS + 1)
         .all()
@@ -173,7 +455,11 @@ export class SessionRepository {
       .get()
 
     const latestRun = this.database
-      .select()
+      .select({
+        agentId: agentRuns.agentId,
+        status: agentRuns.status,
+        attemptCount: agentRuns.attemptCount,
+      })
       .from(agentRuns)
       .where(
         and(
@@ -227,6 +513,7 @@ export class SessionRepository {
 
   create(record: NewSessionRecord, settings: DefaultSessionSettings): SessionCatalogChange {
     this.database.transaction((transaction) => {
+      assertProjectAvailable(transaction, record.projectId)
       transaction
         .insert(sessions)
         .values({
@@ -357,9 +644,11 @@ export class SessionRepository {
     return this.change(sessionId)
   }
 
-  archive(sessionId: string): SessionCatalogChange {
+  archive(sessionId: string, operationId?: string): SessionCatalogChange {
     const archivedAt = new Date().toISOString()
     this.database.transaction((transaction) => {
+      if (!this.find(sessionId)?.archivedAt)
+        assertArchiveCommit(transaction, { kind: 'session', sessionId }, operationId)
       const result = transaction
         .update(sessions)
         .set({ status: 'archived', archivedAt, updatedAt: archivedAt })
@@ -369,6 +658,7 @@ export class SessionRepository {
         if (this.find(sessionId)?.status !== 'archived') throw new Error('Session does not exist.')
         return
       }
+      updateSessionNativeMetadata(transaction, sessionId)
       transaction
         .update(sessionCatalogRevisions)
         .set({ revision: sql`${sessionCatalogRevisions.revision} + 1` })
@@ -381,15 +671,24 @@ export class SessionRepository {
   restore(sessionId: string): SessionCatalogChange {
     const restoredAt = new Date().toISOString()
     this.database.transaction((transaction) => {
+      const session = this.find(sessionId)
+      if (session && workspaceArchiveBlocked(transaction, session.projectId, sessionId))
+        throw new Error('This archive is still settling. Check its result before restoring.')
       const result = transaction
         .update(sessions)
         .set({ status: 'draft', archivedAt: null, updatedAt: restoredAt })
-        .where(and(eq(sessions.id, sessionId), eq(sessions.status, 'archived')))
+        .where(
+          and(
+            eq(sessions.id, sessionId),
+            sql`(${sessions.archivedAt} IS NOT NULL OR ${sessions.status} = 'archived')`,
+          ),
+        )
         .run()
       if (result.changes === 0) {
         if (!this.find(sessionId)) throw new Error('Session does not exist.')
         return
       }
+      updateSessionNativeMetadata(transaction, sessionId)
       transaction
         .update(sessionCatalogRevisions)
         .set({ revision: sql`${sessionCatalogRevisions.revision} + 1` })
@@ -462,8 +761,8 @@ export class SessionRepository {
       projectId: session.projectId,
       title: title.title,
       titleSource: title.titleSource,
-      status: session.status,
-      activity: deriveSessionActivity(session.status, latestRun),
+      status: session.archivedAt ? 'archived' : session.status,
+      activity: deriveSessionActivity(session.archivedAt ? 'archived' : session.status, latestRun),
       hasUnread: hasUnreadSessionMessage(
         session.lastSeenMessageSequence,
         latestCompletedMessageSequence,

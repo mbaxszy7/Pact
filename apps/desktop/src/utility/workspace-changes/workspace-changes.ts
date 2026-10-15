@@ -110,11 +110,28 @@ interface ApplyFile {
   backup: string
 }
 
-interface UndoOperation {
+interface WorkspaceCleanupOwner {
+  handle?: FileHandle
+  reservation?: WorkspaceReservation
+  cleanup?: Promise<void>
+  cleanupFailed?: boolean
+}
+
+interface RecordingPreparation extends WorkspaceCleanupOwner {
+  sessionId: string
+  projectId: string
+  attempt: Promise<string | undefined>
+}
+
+interface UndoOperation extends WorkspaceCleanupOwner {
+  sessionId: string
+  projectId: string
   controller: AbortController
   applicationStarted: boolean
   completed: Promise<void>
   complete: () => void
+  fail: (error: unknown) => void
+  releaseScratch?: () => void
 }
 
 /** Owns passive native evidence and cold whole-round Undo, never forward Agent writes. */
@@ -122,7 +139,7 @@ export class WorkspaceChanges {
   private readonly owners = new Map<string, WorkspaceReservation>()
   private readonly runs = new Map<string, WorkspaceRun>()
   // At most five preparations and five Undo operations; no native execution is queued.
-  private readonly preparingRuns = new Map<string, string>()
+  private readonly preparingRuns = new Map<string, RecordingPreparation>()
   private readonly undoOperations = new Map<string, UndoOperation>()
   private pendingBlobBytes = 0
   // Reservations include every private capture, merge/patch output and candidate until cleanup
@@ -198,6 +215,7 @@ export class WorkspaceChanges {
     ownerId: string,
     exclusive = true,
     signal?: AbortSignal,
+    owner?: WorkspaceCleanupOwner,
   ): Promise<WorkspaceReservation> {
     const controller = new AbortController()
     const abort = (): void => controller.abort(signal?.reason)
@@ -209,6 +227,7 @@ export class WorkspaceChanges {
     else signal?.addEventListener('abort', abort, { once: true })
     let handle: Awaited<ReturnType<typeof open>> | undefined
     let transferred = false
+    let reservation: WorkspaceReservation | undefined
     try {
       controller.signal.throwIfAborted()
       if (this.disposed) throw new WorkspaceChangeError('PERMISSION_DENIED', 'Pact is closing.')
@@ -243,6 +262,7 @@ export class WorkspaceChanges {
         root,
         constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
       )
+      if (owner) owner.handle = handle
       const identity = await handle.stat({ bigint: true })
       controller.signal.throwIfAborted()
       if (!identity.isDirectory() || (await realpath(project.directoryPath)) !== root) {
@@ -252,7 +272,7 @@ export class WorkspaceChanges {
         )
       }
       controller.signal.throwIfAborted()
-      const reservation = {
+      reservation = {
         ownerId,
         sessionId,
         projectId: project.id,
@@ -263,18 +283,40 @@ export class WorkspaceChanges {
         rootInode: identity.ino.toString(),
       }
       if (exclusive) await this.acquire(reservation, controller.signal)
+      if (owner) owner.reservation = reservation
       transferred = true
       return reservation
     } finally {
       clearTimeout(deadline)
       signal?.removeEventListener('abort', abort)
-      if (!transferred && handle) await handle.close().catch(() => undefined)
+      if (!transferred && handle) {
+        await this.closeHandle(handle, owner)
+        if (reservation && this.owners.get(reservation.key) === reservation)
+          this.owners.delete(reservation.key)
+      }
     }
   }
 
-  async release(reservation: WorkspaceReservation): Promise<void> {
+  async release(reservation: WorkspaceReservation, owner?: WorkspaceCleanupOwner): Promise<void> {
+    await this.closeHandle(reservation.handle, owner)
     if (this.owners.get(reservation.key) === reservation) this.owners.delete(reservation.key)
-    await reservation.handle.close().catch(() => undefined)
+  }
+
+  private closeHandle(handle: FileHandle, owner?: WorkspaceCleanupOwner): Promise<void> {
+    const close = async (): Promise<void> => {
+      try {
+        await handle.close()
+      } catch {
+        if (owner) owner.cleanupFailed = true
+        throw new WorkspaceChangeError(
+          'WORKSPACE_RECOVERY_REQUIRED',
+          'File recording cleanup could not be confirmed. Restart Pact before checking this archive again.',
+        )
+      }
+    }
+    if (!owner) return close()
+    owner.cleanup ??= close()
+    return owner.cleanup
   }
 
   begin(reservation: WorkspaceReservation, run: AgentRun, signal: AbortSignal): void {
@@ -300,29 +342,50 @@ export class WorkspaceChanges {
     })
   }
 
-  async start(run: AgentRun, signal: AbortSignal): Promise<string | undefined> {
+  start(run: AgentRun, signal: AbortSignal): Promise<string | undefined> {
+    const previous = this.preparingRuns.get(run.id)
+    if (previous) return previous.attempt
     const projectId = this.sessions.find(run.sessionId)?.projectId
     if (projectId) this.cancelUndoForNativeRun(projectId)
     if (this.runs.has(run.id)) {
       this.setSignal(run.id, signal)
-      return undefined
+      return Promise.resolve(undefined)
     }
     if (this.runs.size + this.preparingRuns.size >= RECORDING_RUNS || !projectId)
-      return 'File change recording is unavailable because its bounded recording slots are occupied or the Project is unavailable. The native Agent can continue; these edits cannot be undone in Pact.'
-    this.preparingRuns.set(run.id, projectId)
+      return Promise.resolve(
+        'File change recording is unavailable because its bounded recording slots are occupied or the Project is unavailable. The native Agent can continue; these edits cannot be undone in Pact.',
+      )
+    const attempt = Promise.withResolvers<string | undefined>()
+    const owner: RecordingPreparation = {
+      sessionId: run.sessionId,
+      projectId,
+      attempt: attempt.promise,
+    }
+    this.preparingRuns.set(run.id, owner)
+    void this.prepareRecording(run, signal, owner).then(attempt.resolve, attempt.reject)
+    void owner.attempt.catch(() => undefined)
+    return owner.attempt
+  }
+
+  private async prepareRecording(
+    run: AgentRun,
+    signal: AbortSignal,
+    owner: RecordingPreparation,
+  ): Promise<string | undefined> {
     let reservation: WorkspaceReservation | undefined
     let started = false
     // Recording preparation is not execution admission and never acquires a writer lease.
     try {
-      reservation = await this.reserve(run.sessionId, run.id, false, signal)
+      reservation = await this.reserve(run.sessionId, run.id, false, signal, owner)
       this.begin(reservation, run, signal)
       started = true
-    } catch {
+    } catch (error) {
+      if (owner.cleanupFailed) throw error
       // The native Agent remains usable. Without directory evidence no Undo is advertised.
       return 'File change recording could not verify this Project. The native Agent can continue; these edits cannot be undone in Pact.'
     } finally {
-      this.preparingRuns.delete(run.id)
-      if (reservation && !started) await this.release(reservation)
+      if (reservation && !started) await this.release(reservation, owner)
+      if (!owner.cleanupFailed) this.preparingRuns.delete(run.id)
     }
     return undefined
   }
@@ -663,13 +726,85 @@ export class WorkspaceChanges {
     }
   }
 
-  async finish(runId: string): Promise<WorkspaceChangeSet | undefined> {
+  private readonly finishing = new Map<
+    string,
+    { sessionId: string; projectId: string; promise: Promise<WorkspaceChangeSet | undefined> }
+  >()
+
+  finish(runId: string): Promise<WorkspaceChangeSet | undefined> {
+    const existing = this.finishing.get(runId)
+    if (existing) return existing.promise
+    const context = this.runs.get(runId)
+    if (!context) return Promise.resolve(undefined)
+    const task = this.finishRun(runId).then((summary) => {
+      if (this.finishing.get(runId)?.promise === task) this.finishing.delete(runId)
+      return summary
+    })
+    this.finishing.set(runId, {
+      sessionId: context.reservation.sessionId,
+      projectId: context.reservation.projectId,
+      promise: task,
+    })
+    // Keep the original rejected promise as the owner's outcome; observing it is not a retry.
+    void task.catch(() => undefined)
+    return task
+  }
+
+  hasPendingFinalization(scope: import('@pact/contracts').WorkspaceArchiveScope): boolean {
+    return this.scopeFinalizations(scope).length > 0
+  }
+
+  /** Bounded ownership metadata for quitting; never reads files or releases an owner. */
+  pendingSessionIds(): string[] {
+    return [
+      ...new Set([
+        ...[...this.runs.values()].map((owner) => owner.run.sessionId),
+        ...[...this.preparingRuns.values()].map((owner) => owner.sessionId),
+        ...[...this.finishing.values()].map((owner) => owner.sessionId),
+        ...[...this.undoOperations.values()].map((owner) => owner.sessionId),
+      ]),
+    ]
+  }
+
+  async awaitFinalization(scope: import('@pact/contracts').WorkspaceArchiveScope): Promise<void> {
+    await Promise.all(this.scopeFinalizations(scope))
+  }
+
+  private scopeFinalizations(
+    scope: import('@pact/contracts').WorkspaceArchiveScope,
+  ): Promise<unknown>[] {
+    return [
+      ...this.finishing.values(),
+      ...[...this.preparingRuns.values()].map((owner) => ({
+        sessionId: owner.sessionId,
+        projectId: owner.projectId,
+        promise: owner.attempt,
+      })),
+      ...[...this.undoOperations.values()].map((owner) => ({
+        sessionId: owner.sessionId,
+        projectId: owner.projectId,
+        promise: owner.completed,
+      })),
+    ]
+      .filter((entry) =>
+        scope.kind === 'session'
+          ? entry.sessionId === scope.sessionId
+          : entry.projectId === scope.projectId,
+      )
+      .map((entry) => entry.promise)
+  }
+
+  private async finishRun(runId: string): Promise<WorkspaceChangeSet | undefined> {
     const context = this.runs.get(runId)
     if (!context || context.closing) return undefined
     context.closing = true
+    let finalized = false
     try {
       await context.tail
-      if (!this.repository.find(runId)) return undefined
+      if (!this.repository.find(runId)) {
+        finalized = true
+        return undefined
+      }
       const controller = new AbortController()
       const deadline = setTimeout(() => controller.abort(), WORKSPACE_OPERATION_TIMEOUT_MS)
       try {
@@ -719,15 +854,17 @@ export class WorkspaceChanges {
             }),
           ),
         )
-      return this.repository.finalize(runId)
+      const summary = this.repository.finalize(runId)
+      finalized = true
+      return summary
     } finally {
       context.retainedHashes.clear()
       context.operations.clear()
-      this.runs.delete(runId)
       await this.release(context.reservation)
       // A created staging directory holds valuable object backups whenever intents exist.
       if (context.stagingReady && !this.hasEffects(runId))
         await rm(context.stagingRoot, { recursive: true, force: true })
+      if (finalized) this.runs.delete(runId)
     }
   }
 
@@ -839,7 +976,7 @@ export class WorkspaceChanges {
     requireIdle()
     if (
       [...this.runs.values()].some((run) => run.reservation.projectId === changeSet.projectId) ||
-      [...this.preparingRuns.values()].includes(changeSet.projectId)
+      [...this.preparingRuns.values()].some((owner) => owner.projectId === changeSet.projectId)
     )
       throw new WorkspaceChangeError(
         'WORKSPACE_BUSY',
@@ -858,26 +995,44 @@ export class WorkspaceChanges {
     const controller = new AbortController()
     const completion = Promise.withResolvers<void>()
     const operation: UndoOperation = {
+      sessionId: changeSet.sessionId,
+      projectId: changeSet.projectId,
       controller,
       applicationStarted: false,
       completed: completion.promise,
       complete: completion.resolve,
+      fail: completion.reject,
     }
     this.undoOperations.set(changeSet.projectId, operation)
+    void operation.completed.catch(() => undefined)
     const timer = setTimeout(
       () => controller.abort(new Error('Undo timed out.')),
       WORKSPACE_OPERATION_TIMEOUT_MS,
     )
     const work = join(changeSet.stagingRoot, `undo-${randomUUID()}`)
     let reservation: WorkspaceReservation | undefined
-    let releaseScratch: (() => void) | undefined
     let intentId: string | undefined
+    const settleUndo = async (): Promise<void> => {
+      try {
+        if (operation.cleanupFailed) await operation.cleanup
+        if (reservation) await this.release(reservation, operation)
+        await this.pruneIntentWork(work, intentId)
+        operation.releaseScratch?.()
+        if (this.undoOperations.get(changeSet.projectId) === operation)
+          this.undoOperations.delete(changeSet.projectId)
+        operation.complete()
+      } catch (error) {
+        operation.fail(error)
+        throw error
+      }
+    }
     try {
       reservation = await this.reserve(
         changeSet.sessionId,
         `undo:${id}:${randomUUID()}`,
         true,
         controller.signal,
+        operation,
       )
       const latest = this.validateSet(id)
       if (latest.state !== 'ready' || latest.undoUnavailableReason)
@@ -898,7 +1053,7 @@ export class WorkspaceChanges {
           'WORKSPACE_CONFLICT',
           'The Project directory object was replaced. No files were changed.',
         )
-      releaseScratch = this.reserveScratch(
+      operation.releaseScratch = this.reserveScratch(
         WORKSPACE_ROUND_BYTES + WORKSPACE_FILE_BYTES,
         controller.signal,
       )
@@ -1063,15 +1218,7 @@ export class WorkspaceChanges {
       throw error
     } finally {
       clearTimeout(timer)
-      try {
-        if (reservation) await this.release(reservation)
-        await this.pruneIntentWork(work, intentId)
-      } finally {
-        releaseScratch?.()
-        if (this.undoOperations.get(changeSet.projectId) === operation)
-          this.undoOperations.delete(changeSet.projectId)
-        operation.complete()
-      }
+      await settleUndo()
     }
   }
 
@@ -1079,11 +1226,26 @@ export class WorkspaceChanges {
     this.disposed = true
     const undos = [...this.undoOperations.values()]
     for (const undo of undos) undo.controller.abort(new Error('Pact is closing.'))
-    await Promise.all(undos.map((undo) => undo.completed))
+    const undoResults = await Promise.allSettled(undos.map((undo) => undo.completed))
+    const preparations = await Promise.allSettled(
+      [...this.preparingRuns.values()].map((owner) => owner.attempt),
+    )
     const active = [...this.runs.values()]
-    await Promise.all(active.map((context) => context.tail))
-    for (const context of active) await this.finish(context.run.id)
-    this.owners.clear()
+    await Promise.allSettled(active.map((context) => context.tail))
+    const finished = await Promise.allSettled([
+      ...active.map((context) => this.finish(context.run.id)),
+      ...[...this.finishing.values()].map((entry) => entry.promise),
+    ])
+    if (
+      [...undoResults, ...preparations, ...finished].some(
+        (result) => result.status === 'rejected',
+      ) ||
+      this.owners.size
+    )
+      throw new WorkspaceChangeError(
+        'WORKSPACE_RECOVERY_REQUIRED',
+        'Some file recording resources did not finish cleanup. Their ownership is retained until Pact exits.',
+      )
   }
 
   private async apply(
@@ -1759,15 +1921,10 @@ export class WorkspaceChanges {
       )
     signal.throwIfAborted()
     this.owners.set(reservation.key, reservation)
-    try {
-      if (this.repository.hasRecoveryForRoot(reservation.root))
-        await this.reconcile(reservation, signal)
-      signal.throwIfAborted()
-    } catch (error) {
-      if (!current && this.owners.get(reservation.key) === reservation)
-        this.owners.delete(reservation.key)
-      throw error
-    }
+    // reserve releases this directory object before retiring the acquired owner on failure.
+    if (this.repository.hasRecoveryForRoot(reservation.root))
+      await this.reconcile(reservation, signal)
+    signal.throwIfAborted()
   }
 
   /** Observe known intent endpoints only. Equality does not establish who performed an

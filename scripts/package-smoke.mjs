@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import identities from '../apps/desktop/app-identities.json' with { type: 'json' }
 import {
   loadProviderConfiguration,
   prepareProviderEnvironment,
@@ -30,21 +31,23 @@ async function pathExists(path) {
   }
 }
 
-async function findPackagedExecutable() {
+async function findPackagedExecutable(local) {
+  const identity = identities[local ? 'production-local' : 'production-ci']
+  const selectedReleaseRoot = join(releaseRoot, identity.outputDirectory)
   if (process.platform === 'darwin') {
     const executable = join(
-      releaseRoot,
+      selectedReleaseRoot,
       `mac-${process.arch}`,
-      'Pact.app',
+      `${identity.name}.app`,
       'Contents',
       'MacOS',
-      'Pact',
+      identity.name,
     )
     if (await pathExists(executable)) return executable
   }
 
   if (process.platform === 'win32') {
-    const executable = join(releaseRoot, 'win-unpacked', 'Pact.exe')
+    const executable = join(selectedReleaseRoot, 'win-unpacked', `${identity.name}.exe`)
     if (await pathExists(executable)) return executable
   }
 
@@ -151,9 +154,10 @@ export async function main({
   executable,
   sourceEnvironment = process.env,
   realCore = false,
+  local = false,
   spawnProcess = spawn,
 } = {}) {
-  const selectedExecutable = executable ?? (await findPackagedExecutable())
+  const selectedExecutable = executable ?? (await findPackagedExecutable(local))
   const config = realCore
     ? await loadProviderConfiguration(undefined, sourceEnvironment)
     : undefined
@@ -231,10 +235,15 @@ export async function main({
 if (process.argv[1] && resolvePath(process.argv[1]) === fileURLToPath(import.meta.url)) {
   void Promise.resolve()
     .then(() => {
-      if (process.argv.slice(2).some((argument) => argument !== '--real-core')) {
-        throw new Error('Supported packaged invocation: package-smoke.mjs [--real-core]')
+      if (
+        process.argv.slice(2).some((argument) => !['--real-core', '--local'].includes(argument))
+      ) {
+        throw new Error('Supported packaged invocation: package-smoke.mjs [--real-core] [--local]')
       }
-      return main({ realCore: process.argv.includes('--real-core') })
+      return main({
+        realCore: process.argv.includes('--real-core'),
+        local: process.argv.includes('--local'),
+      })
     })
     .catch((error) => {
       console.error('Packaged smoke failed.', error)

@@ -7,9 +7,9 @@ async function addProject(
   fixture: RuntimeFixture,
   app: ElectronApplication,
   window: Page,
-  name: string,
+  projectName: string,
 ): Promise<void> {
-  const directory = await fixture.createProjectDirectory(name)
+  const directory = await fixture.createProjectDirectory(projectName)
   await app.evaluate(({ dialog }, directoryPath) => {
     Reflect.set(dialog, 'showOpenDialog', async () => ({
       canceled: false,
@@ -17,6 +17,7 @@ async function addProject(
     }))
   }, directory)
   await window.getByRole('button', { name: 'Add project', exact: true }).click()
+  const name = `Rename Project ${projectName}`
   await expect(window.getByRole('button', { name, exact: true })).toBeVisible()
 }
 
@@ -46,10 +47,10 @@ test(
       await window.getByRole('button', { name: 'Create Session' }).click()
 
       const firstProjectGroup = window
-        .getByRole('button', { name: 'project-one', exact: true })
+        .getByRole('button', { name: 'Rename Project project-one', exact: true })
         .locator('../..')
       const secondProjectGroup = window
-        .getByRole('button', { name: 'project-two', exact: true })
+        .getByRole('button', { name: 'Rename Project project-two', exact: true })
         .locator('../..')
       await expect(
         firstProjectGroup.getByRole('button', { name: 'New session', exact: true }),
@@ -75,13 +76,16 @@ test(
       await expect(archiveSession).toBeFocused()
       await window.keyboard.press('Enter')
       await expect(restoredSession).toHaveCount(0)
-      const archiveNotice = window.getByText('Session archived', { exact: true }).locator('..')
+      const archiveNotice = window.getByRole('region', { name: 'Archive results', exact: true })
       await expect(archiveNotice).toBeVisible()
-      await expect(archiveNotice.getByRole('button', { name: 'View' })).toHaveCount(0)
+      await expect(archiveNotice.getByRole('button', { name: 'View' })).toHaveCount(1)
       await expect
         .poll(async () => (await archiveNotice.boundingBox())?.y)
         .toBeGreaterThanOrEqual(64)
-      await archiveNotice.getByRole('button', { name: 'Undo' }).click()
+      await archiveNotice.getByRole('button', { name: 'View', exact: true }).click()
+      await archiveNotice
+        .getByRole('button', { name: 'Undo archive of New session', exact: true })
+        .click()
       await expect(window.getByRole('heading', { name: 'New session' })).toBeVisible()
       await expect(window.getByRole('button', { name: 'New session', exact: true })).toBeVisible()
     } finally {

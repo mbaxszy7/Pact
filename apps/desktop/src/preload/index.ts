@@ -9,10 +9,106 @@ import {
   composerEditCommandSchema,
   IPC_CHANNELS,
   projectNameChangeSchema,
+  projectContextSchema,
+  projectDirectoryOpenResultSchema,
   rpcResultSchema,
+  workspaceArchivePreviewSchema,
+  workspaceArchiveReceiptSchema,
+  nativeSessionResolveInputSchema,
+  nativeSessionOpenInputSchema,
+  nativeAttentionReadInputSchema,
+  nativeAttentionPageSchema,
+  nativePresenceVersionSchema,
+  nativeNavigationIntentSchema,
+  nativeNavigationAckInputSchema,
+  nativeNavigationAckResultSchema,
+  nativeQuitStateSchema,
+  nativeQuitDecisionInputSchema,
+  nativeQuitDecisionResultSchema,
+  nativeSessionOpenedResultSchema,
+  sessionCatalogChangeSchema,
 } from '@pact/contracts'
 
 const bridge: DesktopBridge = {
+  resolveNativeSession: async (input) =>
+    rpcResultSchema(sessionCatalogChangeSchema).parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.nativeSessionResolve,
+        nativeSessionResolveInputSchema.parse(input),
+      ),
+    ),
+  recordNativeSessionOpened: async (input) =>
+    rpcResultSchema(nativeSessionOpenedResultSchema).parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.nativeSessionOpened,
+        nativeSessionOpenInputSchema.parse(input),
+      ),
+    ),
+  readNativeAttention: async (input) =>
+    rpcResultSchema(nativeAttentionPageSchema).parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.nativeAttentionRead,
+        nativeAttentionReadInputSchema.parse(input),
+      ),
+    ),
+  onNativePresenceChanged: (listener) => {
+    const changed = (_event: Electron.IpcRendererEvent, raw: unknown): void => {
+      const parsed = nativePresenceVersionSchema.safeParse(raw)
+      if (parsed.success) listener(parsed.data)
+    }
+    ipcRenderer.on(IPC_CHANNELS.nativePresenceChanged, changed)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.nativePresenceChanged, changed)
+  },
+  getNativeNavigation: async () =>
+    rpcResultSchema(nativeNavigationIntentSchema.nullable()).parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.nativeNavigationGet),
+    ),
+  acknowledgeNativeNavigation: async (input) =>
+    rpcResultSchema(nativeNavigationAckResultSchema).parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.nativeNavigationAck,
+        nativeNavigationAckInputSchema.parse(input),
+      ),
+    ),
+  onNativeNavigationChanged: (listener) => {
+    const changed = (_event: Electron.IpcRendererEvent, raw: unknown): void => {
+      const parsed = nativeNavigationIntentSchema.safeParse(raw)
+      if (parsed.success) listener(parsed.data)
+    }
+    ipcRenderer.on(IPC_CHANNELS.nativeNavigationChanged, changed)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.nativeNavigationChanged, changed)
+  },
+  getNativeQuitState: async () =>
+    rpcResultSchema(nativeQuitStateSchema.nullable()).parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.nativeQuitGet),
+    ),
+  respondNativeQuit: async (input) =>
+    rpcResultSchema(nativeQuitDecisionResultSchema).parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.nativeQuitRespond,
+        nativeQuitDecisionInputSchema.parse(input),
+      ),
+    ),
+  onNativeQuitStateChanged: (listener) => {
+    const changed = (_event: Electron.IpcRendererEvent, raw: unknown): void => {
+      const parsed = nativeQuitStateSchema.nullable().safeParse(raw)
+      if (parsed.success) listener(parsed.data)
+    }
+    ipcRenderer.on(IPC_CHANNELS.nativeQuitChanged, changed)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.nativeQuitChanged, changed)
+  },
+  prepareWorkspaceArchive: async (input) =>
+    rpcResultSchema(workspaceArchivePreviewSchema).parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.workspaceArchivePrepare, input),
+    ),
+  readWorkspaceArchive: async (input) =>
+    rpcResultSchema(workspaceArchiveReceiptSchema).parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.workspaceArchiveRead, input),
+    ),
+  cancelWorkspaceArchive: async (input) =>
+    rpcResultSchema(workspaceArchiveReceiptSchema).parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.workspaceArchiveCancel, input),
+    ),
   setComposerEditingState: (input) => ipcRenderer.invoke(IPC_CHANNELS.composerEditingState, input),
   settleComposerEdit: (input) => ipcRenderer.invoke(IPC_CHANNELS.composerEditReceipt, input),
   onComposerEditCommand: (listener) => {
@@ -55,8 +151,25 @@ const bridge: DesktopBridge = {
   saveDefaultSessionSettings: (input) =>
     ipcRenderer.invoke(IPC_CHANNELS.defaultSessionSettingsSave, input),
   getProjectCatalog: () => ipcRenderer.invoke(IPC_CHANNELS.projectCatalogGet),
+  readProjectContext: async (input) => {
+    const result = rpcResultSchema(projectContextSchema).safeParse(
+      await ipcRenderer.invoke(IPC_CHANNELS.projectContextRead, input),
+    )
+    return result.success
+      ? result.data
+      : { ok: false, error: { code: 'INTERNAL', message: 'Invalid project context response.' } }
+  },
+  openProjectDirectory: async (input) => {
+    const result = rpcResultSchema(projectDirectoryOpenResultSchema).safeParse(
+      await ipcRenderer.invoke(IPC_CHANNELS.projectDirectoryOpen, input),
+    )
+    return result.success
+      ? result.data
+      : { ok: false, error: { code: 'INTERNAL', message: 'Invalid folder open response.' } }
+  },
   chooseAndAddProject: () => ipcRenderer.invoke(IPC_CHANNELS.projectCatalogChooseAndAdd),
-  archiveProject: (projectId) => ipcRenderer.invoke(IPC_CHANNELS.projectCatalogArchive, projectId),
+  archiveProject: (projectId, operationId) =>
+    ipcRenderer.invoke(IPC_CHANNELS.projectCatalogArchive, projectId, operationId),
   restoreProject: (projectId) => ipcRenderer.invoke(IPC_CHANNELS.projectCatalogRestore, projectId),
   renameProject: async (input) => {
     const result = rpcResultSchema(projectNameChangeSchema).safeParse(
@@ -73,7 +186,8 @@ const bridge: DesktopBridge = {
   createSession: (input) => ipcRenderer.invoke(IPC_CHANNELS.sessionCreate, input),
   renameSession: (input) => ipcRenderer.invoke(IPC_CHANNELS.sessionRename, input),
   markSessionRead: (input) => ipcRenderer.invoke(IPC_CHANNELS.sessionMarkRead, input),
-  archiveSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.sessionArchive, sessionId),
+  archiveSession: (sessionId, operationId) =>
+    ipcRenderer.invoke(IPC_CHANNELS.sessionArchive, sessionId, operationId),
   restoreSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.sessionRestore, sessionId),
   getSessionSettings: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.sessionSettingsGet, sessionId),
   saveSessionSettings: (input) => ipcRenderer.invoke(IPC_CHANNELS.sessionSettingsSave, input),

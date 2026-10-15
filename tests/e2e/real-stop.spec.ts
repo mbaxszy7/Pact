@@ -393,199 +393,282 @@ for (const agentId of ['codex', 'claude'] as const) {
     },
   )
 
-  test(
-    `real ${agentId} UI Stop interrupts its foreground command before the delayed filesystem effect`,
-    { tag: '@real' },
-    async () => {
-      test.setTimeout(600_000)
-      const ctx = await launchRealWorkspace(`real-stop-command-${agentId}`)
-      const marker = authMarker('FOREGROUND_STOP')
-      const filename = `stop-command-${marker}.mjs`
-      const readyPath = join(ctx.projectDirectory, `${marker}-ready.json`)
-      const finishedPath = join(ctx.projectDirectory, `${marker}-finished.txt`)
-      let ready: CommandReady | undefined
-      let runId: string | undefined
-      let stopStartedAt: number | undefined,
-        stopReturnedAt: number | undefined,
-        nativeEndedAt: number | undefined,
-        firstPidExitAt: number | undefined
-      let pidObserver: ReturnType<typeof setInterval> | undefined
-      let atStopNative: NativeEvidence | undefined
-      try {
-        if (agentId === 'claude') await selectRealConfiguredEffort(ctx, [agentId])
-        await askMode(ctx, agentId)
-        await writeFile(join(ctx.projectDirectory, filename), commandScript(marker), {
-          mode: 0o600,
-          flag: 'wx',
-        })
-        const command =
-          process.platform === 'win32' && agentId === 'codex'
-            ? `& '${process.execPath.replaceAll("'", "''")}' './${filename.replaceAll("'", "''")}'`
-            : `${shellQuote(process.execPath)} ${shellQuote(`./${filename}`)}`
-        await sendRealMessage(
-          ctx,
-          `Run exactly this shell command once in the Project directory: ${command}. It runs a local bounded test script for 15 seconds. Run it in the foreground and wait for it; use timeout 60000 ms and yield/wait 30000 ms where those tool options exist. Do not background, detach, spawn another agent, modify the script, run any other command, or inspect other files. Request approval if the native tool requires it.`,
-          agentId === 'codex' ? 'all' : 'claude',
-        )
-        const card = permissionCard(ctx, agentId)
-        // Workspace-write may permit this exact owned command directly. When
-        // Native asks, approve only its current offered one-call action.
-        await expect
-          .poll(
-            async () =>
-              (await readCommandReady(readyPath, marker))
-                ? 'started'
-                : (await card.isVisible())
-                  ? 'approval'
-                  : 'waiting',
-            { timeout: 120_000 },
-          )
-          .not.toBe('waiting')
-        if (!(await readCommandReady(readyPath, marker))) {
-          await currentPermission(ctx, agentId, filename)
-          await card.getByRole('button', { name: allowLabel(agentId), exact: true }).click()
-        }
-        await expect
-          .poll(async () => Boolean(await readCommandReady(readyPath, marker)), {
-            timeout: 120_000,
-          })
-          .toBe(true)
-        ready = await readCommandReady(readyPath, marker)
-        if (!ready)
-          throw new Error('The real foreground command did not publish its owned PID witness')
-        expect(isProcessAlive(ready.pid)).toBe(true)
-        expect(
-          ready.finishDueAt - Date.now(),
-          'The actual command must still be executing when UI Stop is clicked',
-        ).toBeGreaterThan(3_000)
-        expect(await fileExists(finishedPath)).toBe(false)
-        const running = await readRealConversation(ctx)
-        const run = running.runs[0]
-        if (running.runs.length !== 1 || !run?.nativeSessionId)
-          throw new Error('Actual foreground Native task is unavailable')
-        runId = run.id
-        expect(run).toMatchObject({ agentId, status: 'running', dispatchPhase: 'accepted' })
-        expect(
-          running.activities.some(
-            (activity) =>
-              activity.kind === 'tool' &&
-              (agentId === 'claude'
-                ? activity.toolName === 'Bash'
-                : (activity.title + (activity.detail ?? '')).includes(filename)),
-          ),
-        ).toBe(true)
-        atStopNative = await findNativeRecord(ctx, agentId, run.nativeSessionId)
-        const physical = ready
-        const observationDeadline = Date.now() + 45_000
-        // This case owns one PID observer, at most 1800 samples/45 seconds.
-        // It observes signal zero and releases its timer before fixture teardown.
-        pidObserver = setInterval(() => {
-          if (!isProcessAlive(physical.pid) && firstPidExitAt === undefined)
-            firstPidExitAt = Date.now()
-          if (Date.now() >= observationDeadline) clearInterval(pidObserver)
-        }, 25)
-        stopStartedAt = Date.now()
-        await clickStop(ctx, agentId)
-        stopReturnedAt = Date.now()
-        // Native terminal evidence is independent of Pact's immediate Stopped
-        // projection. This case also observes the exact script PID naturally
-        // exit; it never kills a process to make cancellation appear to work.
-        const settlements = await Promise.allSettled([
-          requireNativeStop(ctx, run.id).then(() => {
-            nativeEndedAt = Date.now()
-            return undefined
-          }),
-          expect.poll(() => isProcessAlive(physical.pid), { timeout: 10_000 }).toBe(false),
-        ])
-        for (const settlement of settlements)
-          if (settlement.status === 'rejected') throw settlement.reason
-        const stopped = await visibleResponseFacts(ctx)
-        await ctx.page.waitForTimeout(Math.max(0, ready.finishDueAt + 500 - Date.now()))
-        expect(await fileExists(finishedPath)).toBe(false)
-        expect(isProcessAlive(ready.pid)).toBe(false)
-        expect(await visibleResponseFacts(ctx)).toEqual(stopped)
-        const after = await readRealConversation(ctx)
-        expect(after.runs).toHaveLength(1)
-        expect(after.messages.some((message) => message.pendingAgentId)).toBe(false)
-        const native = await findNativeRecord(ctx, agentId, run.nativeSessionId)
-        expect(native.containsText(filename)).toBe(true)
-        expect(agentId === 'codex' ? native.codexModelStarts : native.claudeUserInputs).toBe(1)
-        if (agentId === 'codex') expect(await secondaryModelInputs(ctx)).toBe(0)
-      } finally {
+  for (const action of ['stop', 'archive'] as const)
+    test(
+      `real ${agentId} UI ${action === 'stop' ? 'Stop' : 'archive'} interrupts its foreground command before the delayed filesystem effect`,
+      { tag: '@real' },
+      async () => {
+        test.setTimeout(600_000)
+        const ctx = await launchRealWorkspace(`real-${action}-command-${agentId}`)
+        const marker = authMarker('FOREGROUND_STOP')
+        const filename = `stop-command-${marker}.mjs`
+        const readyPath = join(ctx.projectDirectory, `${marker}-ready.json`)
+        const finishedPath = join(ctx.projectDirectory, `${marker}-finished.txt`)
+        let ready: CommandReady | undefined
+        let runId: string | undefined
+        let stopStartedAt: number | undefined,
+          stopReturnedAt: number | undefined,
+          nativeEndedAt: number | undefined,
+          firstPidExitAt: number | undefined
+        let pidObserver: ReturnType<typeof setInterval> | undefined
+        let atStopNative: NativeEvidence | undefined
+        let archivedTitle: string | undefined
+        let archivedResponseFacts: ReturnType<typeof responseFacts>[] | undefined
         try {
-          if (ready) {
-            // Even a failed cancellation check must observe the owned command
-            // beyond its original deadline before ordinary teardown can end it.
-            await ctx.page.waitForTimeout(Math.max(0, ready.finishDueAt + 500 - Date.now()))
-            clearInterval(pidObserver)
-            // Capture observed physical facts before ordinary fixture teardown,
-            // including failures where Native retained uncancellable background work.
-            const facts = await readRealConversation(ctx)
-            const run = facts.runs.find((candidate) => candidate.id === runId)
-            const latestNative = run?.nativeSessionId
-              ? await findNativeRecord(ctx, agentId, run.nativeSessionId).catch(() => undefined)
-              : undefined
-            const commandFacts = (evidence: NativeEvidence | undefined) => {
-              if (!evidence) return undefined
-              const calls = evidence.commandCalls.filter((call) => call.command.includes(filename))
-              const scripts = evidence.execScripts.filter((script) =>
-                script.input.includes(filename),
-              )
-              const ids = new Set([...calls, ...scripts].map((call) => call.callId))
-              return {
-                calls,
-                scripts: scripts.map((script) => ({
-                  callId: script.callId,
-                  at: script.at,
-                  input: ctx.fixture.redactDiagnostic(script.input),
-                })),
-                results: evidence.commandResults
-                  .filter((result) => ids.has(result.callId))
-                  .map((result) => ({
-                    callId: result.callId,
-                    at: result.at,
-                    outputSha256: createHash('sha256').update(result.output).digest('hex'),
-                    status:
-                      result.output.match(
-                        /Process exited with code -?\d+|Process running with session ID [A-Za-z0-9_-]+|Script running with cell ID [A-Za-z0-9_-]+/gu,
-                      ) ?? [],
-                  })),
-              }
-            }
-            await test.info().attach('actual-foreground-command-stop', {
-              body: JSON.stringify({
-                agentId,
-                runId,
-                ready,
-                pidStillAliveBeforeTeardown: isProcessAlive(ready.pid),
-                finishedFileExistsBeforeTeardown: await fileExists(finishedPath),
-                observedAt: Date.now(),
-                stopStartedAt,
-                stopReturnedAt,
-                nativeEndedAt,
-                firstPidExitAt,
-                nativeAtStop: commandFacts(atStopNative),
-                nativeAfterStop: commandFacts(latestNative),
-                run: run
-                  ? {
-                      status: run.status,
-                      failureKind: run.failureKind,
-                      dispatchPhase: run.dispatchPhase,
-                      nativeOutcome: run.nativeOutcome,
-                      nativeEffectsState: run.nativeEffectsState,
-                    }
-                  : undefined,
-              }),
-              contentType: 'application/json',
+          if (agentId === 'claude') await selectRealConfiguredEffort(ctx, [agentId])
+          await askMode(ctx, agentId)
+          await writeFile(join(ctx.projectDirectory, filename), commandScript(marker), {
+            mode: 0o600,
+            flag: 'wx',
+          })
+          const command =
+            process.platform === 'win32' && agentId === 'codex'
+              ? `& '${process.execPath.replaceAll("'", "''")}' './${filename.replaceAll("'", "''")}'`
+              : `${shellQuote(process.execPath)} ${shellQuote(`./${filename}`)}`
+          await sendRealMessage(
+            ctx,
+            `Run exactly this shell command once in the Project directory: ${command}. It runs a local bounded test script for 15 seconds. Run it in the foreground and wait for it; use timeout 60000 ms and yield/wait 30000 ms where those tool options exist. Do not background, detach, spawn another agent, modify the script, run any other command, or inspect other files. Request approval if the native tool requires it.`,
+            agentId === 'codex' ? 'all' : 'claude',
+          )
+          const card = permissionCard(ctx, agentId)
+          // Workspace-write may permit this exact owned command directly. When
+          // Native asks, approve only its current offered one-call action.
+          await expect
+            .poll(
+              async () =>
+                (await readCommandReady(readyPath, marker))
+                  ? 'started'
+                  : (await card.isVisible())
+                    ? 'approval'
+                    : 'waiting',
+              { timeout: 120_000 },
+            )
+            .not.toBe('waiting')
+          if (!(await readCommandReady(readyPath, marker))) {
+            await currentPermission(ctx, agentId, filename)
+            await card.getByRole('button', { name: allowLabel(agentId), exact: true }).click()
+          }
+          await expect
+            .poll(async () => Boolean(await readCommandReady(readyPath, marker)), {
+              timeout: 120_000,
             })
+            .toBe(true)
+          ready = await readCommandReady(readyPath, marker)
+          if (!ready)
+            throw new Error('The real foreground command did not publish its owned PID witness')
+          expect(isProcessAlive(ready.pid)).toBe(true)
+          expect(
+            ready.finishDueAt - Date.now(),
+            'The actual command must still be executing when UI Stop is clicked',
+          ).toBeGreaterThan(3_000)
+          expect(await fileExists(finishedPath)).toBe(false)
+          const running = await readRealConversation(ctx)
+          const run = running.runs[0]
+          if (running.runs.length !== 1 || !run?.nativeSessionId)
+            throw new Error('Actual foreground Native task is unavailable')
+          runId = run.id
+          expect(run).toMatchObject({ agentId, status: 'running', dispatchPhase: 'accepted' })
+          expect(
+            running.activities.some(
+              (activity) =>
+                activity.kind === 'tool' &&
+                (agentId === 'claude'
+                  ? activity.toolName === 'Bash'
+                  : (activity.title + (activity.detail ?? '')).includes(filename)),
+            ),
+          ).toBe(true)
+          atStopNative = await findNativeRecord(ctx, agentId, run.nativeSessionId)
+          const physical = ready
+          const observationDeadline = Date.now() + 45_000
+          // This case owns one PID observer, at most 1800 samples/45 seconds.
+          // It observes signal zero and releases its timer before fixture teardown.
+          pidObserver = setInterval(() => {
+            if (!isProcessAlive(physical.pid) && firstPidExitAt === undefined)
+              firstPidExitAt = Date.now()
+            if (Date.now() >= observationDeadline) clearInterval(pidObserver)
+          }, 25)
+          stopStartedAt = Date.now()
+          if (action === 'archive') {
+            const archive = ctx.page
+              .locator(`[data-session-menu="${ctx.sessionId}"]`)
+              .getByRole('button', { name: /^Archive Session /u })
+            await archive.focus()
+            await archive.click()
+            const confirmation = ctx.page.getByRole('dialog', {
+              name: 'Stop and archive?',
+              exact: true,
+            })
+            await expect(confirmation).toBeVisible()
+            archivedTitle = await confirmation.locator('.pact-archive-target').innerText()
+            await confirmation
+              .getByRole('button', { name: 'Stop and archive', exact: true })
+              .click()
+            await expect(
+              ctx.page
+                .getByRole('region', { name: 'Archive results', exact: true })
+                .getByRole('status'),
+            ).toHaveText('1 archived', { timeout: 25_000 })
+            // A native acknowledgement alone is insufficient: the actual command is already gone
+            // when Pact reports confirmed archive, before any fixture teardown can stop it.
+            expect(isProcessAlive(physical.pid)).toBe(false)
+            const database = await PactDatabase.open({
+              filePath: ctx.fixture.databaseFile,
+              migrationsFolder,
+            })
+            try {
+              expect(database.sessionRepository.find(ctx.sessionId)?.status).toBe('archived')
+              expect(database.conversationRepository.findRun(run.id)).toMatchObject({
+                nativeOutcome: 'interrupted',
+                nativeEffectsState: 'settled',
+              })
+              expect(
+                database.drizzle.query.workspaceArchiveOperations
+                  .findFirst({
+                    where: (fields, { and, eq }) =>
+                      and(eq(fields.sessionId, ctx.sessionId), eq(fields.state, 'archived')),
+                  })
+                  .sync()?.state,
+              ).toBe('archived')
+              archivedResponseFacts = database.conversationRepository
+                .read(ctx.sessionId)
+                .messages.filter((message) => message.role === 'assistant')
+                .map(responseFacts)
+            } finally {
+              database.close()
+            }
+          } else await clickStop(ctx, agentId)
+          stopReturnedAt = Date.now()
+          // Native terminal evidence is independent of Pact's immediate Stopped
+          // projection. This case also observes the exact script PID naturally
+          // exit; it never kills a process to make cancellation appear to work.
+          const settlements = await Promise.allSettled([
+            requireNativeStop(ctx, run.id).then(() => {
+              nativeEndedAt = Date.now()
+              return undefined
+            }),
+            expect.poll(() => isProcessAlive(physical.pid), { timeout: 10_000 }).toBe(false),
+          ])
+          for (const settlement of settlements)
+            if (settlement.status === 'rejected') throw settlement.reason
+          if (action === 'archive') {
+            const results = ctx.page.getByRole('region', { name: 'Archive results', exact: true })
+            await results.getByRole('button', { name: 'View', exact: true }).click()
+            await results
+              .getByRole('button', { name: `Undo archive of ${archivedTitle}`, exact: true })
+              .click()
+            await expect(
+              ctx.page.locator(`[data-session-menu="${ctx.sessionId}"] button[data-nav-primary]`),
+            ).toBeVisible()
+            expect(await visibleResponseFacts(ctx)).toEqual(archivedResponseFacts)
+          }
+          const stopped = await visibleResponseFacts(ctx)
+          await ctx.page.waitForTimeout(Math.max(0, ready.finishDueAt + 500 - Date.now()))
+          expect(await fileExists(finishedPath)).toBe(false)
+          expect(isProcessAlive(ready.pid)).toBe(false)
+          expect(await visibleResponseFacts(ctx)).toEqual(stopped)
+          const after = await readRealConversation(ctx)
+          expect(after.runs).toHaveLength(1)
+          expect(after.messages.some((message) => message.pendingAgentId)).toBe(false)
+          const native = await findNativeRecord(ctx, agentId, run.nativeSessionId)
+          expect(native.containsText(filename)).toBe(true)
+          expect(agentId === 'codex' ? native.codexModelStarts : native.claudeUserInputs).toBe(1)
+          if (agentId === 'codex') expect(await secondaryModelInputs(ctx)).toBe(0)
+          if (action === 'archive') {
+            expect((await readRealConversation(ctx)).runs.map((item) => item.id)).toEqual([run.id])
+            expect(await visibleResponseFacts(ctx)).toEqual(stopped)
+            const afterUndoNative = await findNativeRecord(ctx, agentId, run.nativeSessionId)
+            expect(
+              agentId === 'codex'
+                ? afterUndoNative.codexModelStarts
+                : afterUndoNative.claudeUserInputs,
+            ).toBe(1)
           }
         } finally {
-          clearInterval(pidObserver)
-          await closeRealWorkspace(ctx)
+          try {
+            if (ready) {
+              // Even a failed cancellation check must observe the owned command
+              // beyond its original deadline before ordinary teardown can end it.
+              await ctx.page.waitForTimeout(Math.max(0, ready.finishDueAt + 500 - Date.now()))
+              clearInterval(pidObserver)
+              // Capture observed physical facts before ordinary fixture teardown,
+              // including failures where Native retained uncancellable background work.
+              const database = await PactDatabase.open({
+                filePath: ctx.fixture.databaseFile,
+                migrationsFolder,
+              })
+              let facts: ConversationSnapshot
+              try {
+                facts = database.conversationRepository.read(ctx.sessionId)
+              } finally {
+                database.close()
+              }
+              const run = facts.runs.find((candidate) => candidate.id === runId)
+              const latestNative = run?.nativeSessionId
+                ? await findNativeRecord(ctx, agentId, run.nativeSessionId).catch(() => undefined)
+                : undefined
+              const commandFacts = (evidence: NativeEvidence | undefined) => {
+                if (!evidence) return undefined
+                const calls = evidence.commandCalls.filter((call) =>
+                  call.command.includes(filename),
+                )
+                const scripts = evidence.execScripts.filter((script) =>
+                  script.input.includes(filename),
+                )
+                const ids = new Set([...calls, ...scripts].map((call) => call.callId))
+                return {
+                  calls,
+                  scripts: scripts.map((script) => ({
+                    callId: script.callId,
+                    at: script.at,
+                    input: ctx.fixture.redactDiagnostic(script.input),
+                  })),
+                  results: evidence.commandResults
+                    .filter((result) => ids.has(result.callId))
+                    .map((result) => ({
+                      callId: result.callId,
+                      at: result.at,
+                      outputSha256: createHash('sha256').update(result.output).digest('hex'),
+                      status:
+                        result.output.match(
+                          /Process exited with code -?\d+|Process running with session ID [A-Za-z0-9_-]+|Script running with cell ID [A-Za-z0-9_-]+/gu,
+                        ) ?? [],
+                    })),
+                }
+              }
+              await test.info().attach('actual-foreground-command-stop', {
+                body: JSON.stringify({
+                  agentId,
+                  runId,
+                  ready,
+                  pidStillAliveBeforeTeardown: isProcessAlive(ready.pid),
+                  finishedFileExistsBeforeTeardown: await fileExists(finishedPath),
+                  observedAt: Date.now(),
+                  stopStartedAt,
+                  stopReturnedAt,
+                  nativeEndedAt,
+                  firstPidExitAt,
+                  nativeAtStop: commandFacts(atStopNative),
+                  nativeAfterStop: commandFacts(latestNative),
+                  run: run
+                    ? {
+                        status: run.status,
+                        failureKind: run.failureKind,
+                        dispatchPhase: run.dispatchPhase,
+                        nativeOutcome: run.nativeOutcome,
+                        nativeEffectsState: run.nativeEffectsState,
+                      }
+                    : undefined,
+                }),
+                contentType: 'application/json',
+              })
+            }
+          } finally {
+            clearInterval(pidObserver)
+            await closeRealWorkspace(ctx)
+          }
         }
-      }
-    },
-  )
+      },
+    )
 }
 
 interface CommandReady {

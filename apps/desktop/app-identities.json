@@ -1,0 +1,37 @@
+{
+  "development-local": {
+    "name": "Pact - Development - Local",
+    "appId": "com.pact.desktop.development.local",
+    "packageName": "pact-development-local",
+    "profileDirectory": "Pact - Development - Local",
+    "outputDirectory": "development-local"
+  },
+  "production-local": {
+    "name": "Pact - Production - Local",
+    "appId": "com.pact.desktop.production.local",
+    "packageName": "pact-production-local",
+    "profileDirectory": "Pact - Production - Local",
+    "outputDirectory": "production-local"
+  },
+  "development-ci": {
+    "name": "Pact - Development - CI",
+    "appId": "com.pact.desktop.development.ci",
+    "packageName": "pact-development-ci",
+    "profileDirectory": "Pact - Development - CI",
+    "outputDirectory": "development-ci"
+  },
+  "production-ci": {
+    "name": "Pact",
+    "appId": "com.pact.desktop",
+    "packageName": "@pact/desktop",
+    "profileDirectory": "Pact",
+    "outputDirectory": "."
+  },
+  "installer-preview": {
+    "name": "Pact Installer Preview",
+    "appId": "com.pact.desktop.installer-preview",
+    "packageName": "pact-desktop-installer-preview",
+    "profileDirectory": "Pact Installer Preview",
+    "outputDirectory": "installer-preview"
+  }
+}

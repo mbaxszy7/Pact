@@ -96,14 +96,18 @@ export function ImageGallery({
   images,
   initialId,
   onClose,
+  suspended = false,
 }: {
   sessionId: string
   images: readonly ConversationImage[]
   initialId: string
   onClose: () => void
+  suspended?: boolean | undefined
 }): React.JSX.Element {
   const dialog = useRef<HTMLDialogElement>(null)
   const closeButton = useRef<HTMLButtonElement>(null)
+  const triggerRef = useRef<HTMLElement | undefined>(undefined)
+  const pausedFocusRef = useRef<HTMLElement | undefined>(undefined)
   const [index, setIndex] = useState(
     Math.max(
       0,
@@ -121,13 +125,31 @@ export function ImageGallery({
     [image.id],
   )
   useEffect(() => {
-    const trigger =
-      document.activeElement instanceof HTMLElement ? document.activeElement : undefined
     const element = dialog.current
-    element?.showModal()
-    return () => {
+    if (suspended) {
       element?.close()
-      trigger?.focus({ preventScroll: true })
+      return undefined
+    }
+    if (!triggerRef.current && document.activeElement instanceof HTMLElement)
+      triggerRef.current = document.activeElement
+    element?.showModal()
+    const focus = pausedFocusRef.current
+    if (focus?.isConnected && element?.contains(focus)) focus.focus({ preventScroll: true })
+    return () => {
+      if (
+        document.activeElement instanceof HTMLElement &&
+        element?.contains(document.activeElement)
+      )
+        pausedFocusRef.current = document.activeElement
+      element?.close()
+    }
+  }, [suspended])
+  useEffect(() => {
+    const focus = triggerRef
+    return () => {
+      const trigger = focus.current
+      if (trigger?.isConnected && !trigger.closest('[inert]'))
+        trigger.focus({ preventScroll: true })
     }
   }, [])
   useEffect(() => {

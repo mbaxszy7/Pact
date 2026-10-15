@@ -27,6 +27,54 @@ pnpm secrets:check    # Staged content
 pnpm secrets:history  # All reachable commits
 ```
 
+## Windows installer preview
+
+`pnpm dist:win:preview` builds the Windows x64 NSIS installer for visual review. It regenerates the
+Windows brand assets, typechecks/builds the desktop app, and writes to the ignored
+`apps/desktop/release/installer-preview/` directory. It does not run test suites or publish artifacts.
+
+The preview uses a separate application ID, product name, shortcuts and package name so it does not
+replace a production Pact installation. It installs for the current Windows account, allows a custom
+directory, offers a desktop shortcut, and leaves Open Pact unchecked. The Start menu shortcut is
+always created. Projects, provider configuration and application data are outside the installer-owned
+files and are retained on uninstall.
+
+Inspect the actual native welcome, directory, shortcut, progress and completion pages before visual
+acceptance. Only then run the applicable checks in [Required verification](#required-verification),
+including real installation/upgrade/uninstall checks beyond unpacked package smoke. A preview is not
+a signed production release or evidence that runtime, migration, accessibility or platform gates passed.
+
+## Local application builds
+
+`pnpm dev` uses the shared Pact artwork and the `Pact - Development - Local` native application
+identity. Its browser profile is partitioned by repository. The existing development SQLite and
+historical image/Changes object root are retained; no development data is moved or deleted.
+
+`pnpm dist:win` and `pnpm dist:mac` explicitly build `Pact - Production - Local`. Its application ID,
+executable/bundle name, installation directory, shortcuts, package identity and persistent profile
+are distinct from the preserved official `Pact` identity. Outputs are ignored under
+`apps/desktop/release/production-local/`. These commands do not publish or certify a signed release.
+
+For local unpacked builds, use `pnpm package:dir:local`. After visual acceptance,
+`pnpm package:smoke:local` selects that exact local executable and reuses the existing private
+seed/restart harness. `pnpm verify:package:local` combines those commands. Existing `package:dir`,
+`package:smoke` and `verify:package` retain the official fixture filenames used by CI; they are not
+the normal local application distribution commands.
+
+The finite identity registry also reserves CI development independently from CI production. This
+does not implement CI development/release workflows. Packaged identity comes from embedded metadata,
+not the launch environment. Project files and native provider configuration remain user-owned and
+shared; application identity does not establish a cross-process Project writer lease.
+
+The canonical logo is [resources/icon.svg](apps/desktop/resources/icon.svg).
+`pnpm --filter @pact/desktop brand` regenerates PNG, Windows ICO, macOS ICNS and installer artwork from
+that source. The same generator builds monochrome Windows tray artwork and macOS Template images
+from their canonical SVGs. Inspect tray, packaged taskbar navigation and Pact exit confirmation on
+the actual platform before running their formal tests. Windows development supports tray navigation
+and Session JumpLists for the running repository-specific instance; after a full exit,
+start it with `pnpm dev`. Packaged Session JumpLists also support cold launch. macOS
+packaging/native appearance still requires verification on macOS.
+
 ## Change discipline
 
 Keep a change focused on one reviewable feature or infrastructure concern. Before extending a module,

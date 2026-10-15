@@ -103,8 +103,9 @@ import { MessageMarkdown, type ProjectFileTarget } from './MessageMarkdown'
 import { NativeInputCard } from './NativeInputCard'
 import { NativePermissionCard } from './NativePermissionCard'
 import { PermissionMenu } from './PermissionMenu'
+import { ProjectContextMenu } from './ProjectContextMenu'
 import { SentComments } from './SentComments'
-import { NativeForkRecovery, SessionForkDialog } from './SessionFork'
+import { NativeForkRecovery, SessionForkDialog, type SessionForkOpening } from './SessionFork'
 import { SessionWarningCard } from './SessionWarningCard'
 import { commentDraftSaveSucceeded, type CommentDraftSaveOutcome } from './useConversation'
 import { useSkillComposer, type ComposerEdit } from './useSkillComposer'
@@ -143,7 +144,11 @@ interface ConversationViewProps {
   onPlanAvailable?: ((sessionId: string, taskId?: string) => void) | undefined
   onOpenPlan?: (() => void) | undefined
   onClosePlan?: (() => void) | undefined
-  onForkSessionCreated?: ((change: SessionCatalogChange, enter: boolean) => void) | undefined
+  onForkSessionCreated?:
+    | ((change: SessionCatalogChange, enter: boolean, opening?: SessionForkOpening) => void)
+    | undefined
+  onForkSessionStarted?: (() => SessionForkOpening) | undefined
+  nativePresentationSuspended?: boolean | undefined
   sessionSettingsSaving?: boolean | undefined
   onSaveSessionPermission?: ((input: SessionPermissionSaveInput) => Promise<boolean>) | undefined
   visible: boolean
@@ -287,6 +292,8 @@ export function ConversationView({
   onOpenPlan,
   onClosePlan,
   onForkSessionCreated,
+  onForkSessionStarted,
+  nativePresentationSuspended = false,
   sessionSettingsSaving,
   onSaveSessionPermission,
   visible,
@@ -333,7 +340,11 @@ export function ConversationView({
   onNotice,
   messageNavigation,
 }: ConversationViewProps): React.JSX.Element {
-  const [forkPoint, setForkPoint] = useState<{ sourceSessionId: string; messageId: string }>()
+  const [forkPoint, setForkPoint] = useState<{
+    sourceSessionId: string
+    messageId: string
+    opening?: SessionForkOpening | undefined
+  }>()
   useEffect(() => {
     setForkPoint((current) => (current?.sourceSessionId === session.id ? current : undefined))
   }, [session.id])
@@ -3120,7 +3131,12 @@ export function ConversationView({
               onCopy={copyMessage}
               onFork={
                 message.role === 'assistant' && message.state === 'complete' && onForkSessionCreated
-                  ? () => setForkPoint({ sourceSessionId: session.id, messageId: message.id })
+                  ? () =>
+                      setForkPoint({
+                        sourceSessionId: session.id,
+                        messageId: message.id,
+                        opening: onForkSessionStarted?.(),
+                      })
                   : undefined
               }
               forkDisabled={
@@ -4289,26 +4305,35 @@ export function ConversationView({
               </div>
             </div>
           </div>
-          {onSaveSessionPermission ? (
-            <div
-              className="flex flex-wrap items-center gap-x-2 gap-y-1"
-              style={{ anchorName: `--composer-permissions-${session.id}` }}
-            >
-              {(['claude', 'codex'] as const).map((agent) => (
-                <PermissionMenu
-                  key={`${session.id}-${agent}`}
-                  session={session}
-                  agent={agent}
-                  composerAnchor={`--composer-permissions-${session.id}`}
-                  run={activeRun ?? latestRun}
-                  busy={responseInProgress}
-                  disabled={sessionSettingsSaving}
-                  onSave={onSaveSessionPermission}
-                  onNotice={onNotice}
-                />
-              ))}
-            </div>
-          ) : null}
+          <div
+            className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1"
+            style={{ anchorName: `--composer-permissions-${session.id}` }}
+          >
+            {onSaveSessionPermission ? (
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                {(['claude', 'codex'] as const).map((agent) => (
+                  <PermissionMenu
+                    key={`${session.id}-${agent}`}
+                    session={session}
+                    agent={agent}
+                    composerAnchor={`--composer-permissions-${session.id}`}
+                    run={activeRun ?? latestRun}
+                    busy={responseInProgress}
+                    disabled={sessionSettingsSaving}
+                    onSave={onSaveSessionPermission}
+                    onNotice={onNotice}
+                  />
+                ))}
+              </div>
+            ) : null}
+            <ProjectContextMenu
+              key={`${session.id}-${session.projectId}`}
+              projectId={session.projectId}
+              visible={visible}
+              refreshKey={`${latestRun?.id ?? ''}:${latestRun?.status ?? ''}`}
+              onNotice={onNotice}
+            />
+          </div>
           {history.draftError && snapshot ? (
             <p className="flex items-center gap-2 px-2 text-caption text-secondary" role="alert">
               Couldn’t load comments.
@@ -4329,7 +4354,12 @@ export function ConversationView({
           sourceSessionId={forkPoint.sourceSessionId}
           messageId={forkPoint.messageId}
           onClose={() => setForkPoint(undefined)}
-          onCreated={onForkSessionCreated}
+          onCreated={(change, enter) =>
+            forkPoint.opening
+              ? onForkSessionCreated(change, enter, forkPoint.opening)
+              : onForkSessionCreated(change, enter)
+          }
+          suspended={nativePresentationSuspended}
         />
       ) : null}
       {gallery ? (
@@ -4339,6 +4369,7 @@ export function ConversationView({
           images={gallery.images}
           initialId={gallery.initialId}
           onClose={() => setGallery(undefined)}
+          suspended={nativePresentationSuspended}
         />
       ) : null}
     </main>

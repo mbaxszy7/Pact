@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="164" height="314" viewBox="0 0 164 314">
+  <rect width="164" height="314" fill="#ebf5ff"/>
+  <image x="42" y="40" width="80" height="80" href="__PACT_ICON__"/>
+  <text x="82" y="155" text-anchor="middle" font-family="Inter, Segoe UI, sans-serif" font-size="27" font-weight="600" letter-spacing="-0.6" fill="#0f1720">Pact</text>
+  <path d="M-28 314V272c0-27 22-49 49-49h48" fill="none" stroke="#d3e7f5" stroke-width="28" stroke-linecap="round"/>
+  <path d="M101 223c40 0 72 31 72 70v29" fill="none" stroke="#c4e9d5" stroke-width="28" stroke-linecap="round"/>
+</svg>

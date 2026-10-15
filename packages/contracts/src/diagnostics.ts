@@ -18,6 +18,13 @@ export const LOG_RETRY_MS = 30_000
 export const LOG_MAINTENANCE_MS = 60_000
 
 export const diagnosticRequestTypeSchema = z.enum([
+  'native-presence.read.request',
+  'native-attention.read.request',
+  'native-session.resolve.request',
+  'native-session.opened.request',
+  'native-jump-list.suppression.request',
+  'native-quit.prepare.request',
+  'native-quit.cancel.request',
   'collaboration.action.request',
   'session.fork.request',
   'conversation.interests.request',
@@ -34,6 +41,10 @@ export const diagnosticRequestTypeSchema = z.enum([
   'default-session-settings.get.request',
   'default-session-settings.save.request',
   'project-catalog.get.request',
+  'project-context.read.request',
+  'workspace-archive.prepare.request',
+  'workspace-archive.read.request',
+  'workspace-archive.cancel.request',
   'project-catalog.add.request',
   'project-catalog.archive.request',
   'project-catalog.restore.request',

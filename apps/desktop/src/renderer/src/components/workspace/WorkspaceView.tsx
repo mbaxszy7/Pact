@@ -19,6 +19,7 @@ import type {
 import type { ComposerDocument } from '../conversation/composer-document'
 import type { ConversationViewProjection } from '../conversation/conversation-window'
 import type { ProjectFileTarget } from '../conversation/MessageMarkdown'
+import type { SessionForkOpening } from '../conversation/SessionFork'
 import type {
   ConversationComposerMention,
   ConversationHistoryControls,
@@ -47,7 +48,13 @@ import { ProjectEmptyState, ProjectReadyState } from './WorkspaceEmptyStates'
 import { WorkspaceShell } from './WorkspaceShell'
 
 interface WorkspaceViewProps {
-  onForkSessionCreated: (change: SessionCatalogChange, enter: boolean) => void
+  onForkSessionCreated: (
+    change: SessionCatalogChange,
+    enter: boolean,
+    opening?: SessionForkOpening,
+  ) => void
+  onForkSessionStarted?: (() => SessionForkOpening) | undefined
+  nativePresentationSuspended?: boolean | undefined
   onSaveSessionPermission: (input: SessionPermissionSaveInput) => Promise<boolean>
   projects: Project[]
   sessions: CollaborationSession[]
@@ -416,6 +423,8 @@ function workspaceContent(
               onOpenPlan={planPane.onOpen}
               onClosePlan={planPane.onClose}
               onForkSessionCreated={props.onForkSessionCreated}
+              onForkSessionStarted={props.onForkSessionStarted}
+              nativePresentationSuspended={props.nativePresentationSuspended}
               onSaveSessionPermission={props.onSaveSessionPermission}
               sessionSettingsSaving={props.savingSessionSettings}
               session={selectedSession}

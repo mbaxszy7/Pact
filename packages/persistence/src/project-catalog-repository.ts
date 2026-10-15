@@ -4,7 +4,9 @@ import type { Project, ProjectCatalogState, ProjectNameChange } from '@pact/cont
 
 import type { PactDrizzleDatabase } from './drizzle-database.js'
 
+import { updateProjectNativeVisibility } from './native-presence-metadata.js'
 import { projects } from './schema/index.js'
+import { assertArchiveCommit, workspaceArchiveBlocked } from './workspace-archive-repository.js'
 
 export class ProjectCatalogRepository {
   constructor(private readonly database: PactDrizzleDatabase) {}
@@ -27,26 +29,40 @@ export class ProjectCatalogRepository {
   }
 
   add(project: Project): ProjectCatalogState {
-    this.database
-      .insert(projects)
-      .values({ ...project, archivedAt: null })
-      .onConflictDoUpdate({
-        target: projects.directoryPath,
-        set: { kind: project.kind, archivedAt: null },
-      })
-      .run()
-    return this.read()
+    return this.database.transaction(() => {
+      const existing = this.database
+        .select({ id: projects.id })
+        .from(projects)
+        .where(eq(projects.directoryPath, project.directoryPath))
+        .get()
+      if (existing && workspaceArchiveBlocked(this.database, existing.id))
+        throw new Error('This Project archive is still settling.')
+      this.database
+        .insert(projects)
+        .values({ ...project, archivedAt: null })
+        .onConflictDoUpdate({
+          target: projects.directoryPath,
+          set: { kind: project.kind, archivedAt: null },
+        })
+        .run()
+      updateProjectNativeVisibility(this.database, existing?.id ?? project.id)
+      return this.read()
+    })
   }
 
-  archive(projectId: string): ProjectCatalogState {
-    const archivedAt = new Date().toISOString()
-    const result = this.database
-      .update(projects)
-      .set({ archivedAt })
-      .where(eq(projects.id, projectId))
-      .run()
-    if (result.changes === 0) throw new Error('Project does not exist.')
-    return this.read()
+  archive(projectId: string, operationId?: string): ProjectCatalogState {
+    return this.database.transaction(() => {
+      assertArchiveCommit(this.database, { kind: 'project', projectId }, operationId)
+      const archivedAt = new Date().toISOString()
+      const result = this.database
+        .update(projects)
+        .set({ archivedAt })
+        .where(eq(projects.id, projectId))
+        .run()
+      if (result.changes === 0) throw new Error('Project does not exist.')
+      updateProjectNativeVisibility(this.database, projectId)
+      return this.read()
+    })
   }
 
   rename(input: ProjectNameChange): ProjectNameChange {
@@ -61,13 +77,20 @@ export class ProjectCatalogRepository {
   }
 
   restore(projectId: string): ProjectCatalogState {
-    const result = this.database
-      .update(projects)
-      .set({ archivedAt: null })
-      .where(eq(projects.id, projectId))
-      .run()
-    if (result.changes === 0) throw new Error('Project does not exist.')
-    return this.read()
+    return this.database.transaction(() => {
+      if (workspaceArchiveBlocked(this.database, projectId))
+        throw new Error(
+          'This Project archive is still settling. Check its result before restoring.',
+        )
+      const result = this.database
+        .update(projects)
+        .set({ archivedAt: null })
+        .where(eq(projects.id, projectId))
+        .run()
+      if (result.changes === 0) throw new Error('Project does not exist.')
+      updateProjectNativeVisibility(this.database, projectId)
+      return this.read()
+    })
   }
 
   private static toProject(row: typeof projects.$inferSelect): Project {

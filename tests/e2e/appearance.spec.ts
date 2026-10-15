@@ -26,12 +26,19 @@ test(
   async () => {
     test.skip(process.platform !== 'win32', 'Windows transparent window backing only')
     const fixture = await createRuntimeFixture({ mode: 'ui' })
-    const app = await launchAppearanceApp(fixture)
+    let app = await launchAppearanceApp(fixture)
     try {
-      const window = await app.firstWindow()
+      let window = await app.firstWindow()
       await openAppearanceSettings(window)
       await window.getByRole('radio', { name: 'Dark' }).click()
       await window.getByRole('radio', { name: 'Translucent' }).click()
+      await expect
+        .poll(() => window.evaluate('window.pact.getAppearanceSettings()'))
+        .toMatchObject({ ok: true, value: { requested: { windowMaterial: 'translucent' } } })
+      await app.close()
+      app = await launchAppearanceApp(fixture)
+      window = await app.firstWindow()
+      await openAppearanceSettings(window)
       const settings = await window.evaluate('window.pact.getAppearanceSettings()')
       expect(settings).toMatchObject({
         ok: true,
@@ -79,6 +86,19 @@ test(
         ),
       ).toBe(true)
       await window.getByRole('radio', { name: 'Solid' }).click()
+      await expect
+        .poll(() => window.evaluate('window.pact.getAppearanceSettings()'))
+        .toMatchObject({
+          ok: true,
+          value: {
+            requested: { windowMaterial: 'solid' },
+            effective: { windowMaterial: 'translucent', restartRequired: true },
+          },
+        })
+      await app.close()
+      app = await launchAppearanceApp(fixture)
+      window = await app.firstWindow()
+      await openAppearanceSettings(window)
       await expect(window.locator('html')).toHaveAttribute('data-material', 'solid')
       await window.evaluate(
         () =>
@@ -136,11 +156,35 @@ test(
       await expect(window.getByText('Saved', { exact: true })).toBeVisible()
 
       await window.getByRole('radio', { name: 'Solid' }).click()
+      if (process.platform === 'win32') {
+        await expect
+          .poll(() => window.evaluate('window.pact.getAppearanceSettings()'))
+          .toMatchObject({ ok: true, value: { requested: { windowMaterial: 'solid' } } })
+        await app.close()
+        app = await launchAppearanceApp(fixture)
+        window = await app.firstWindow()
+        await openAppearanceSettings(window)
+      }
       await expect(window.locator('html')).toHaveAttribute('data-material', 'solid')
       const effectOption = 'Translucent'
       const sliderName = 'Transparency strength'
       await expect(window.getByRole('slider', { name: sliderName })).toBeDisabled()
       await window.getByRole('radio', { name: effectOption }).click()
+      if (process.platform === 'win32') {
+        await expect
+          .poll(() => window.evaluate('window.pact.getAppearanceSettings()'))
+          .toMatchObject({
+            ok: true,
+            value: {
+              requested: { windowMaterial: 'translucent' },
+              effective: { windowMaterial: 'solid', restartRequired: true },
+            },
+          })
+        await app.close()
+        app = await launchAppearanceApp(fixture)
+        window = await app.firstWindow()
+        await openAppearanceSettings(window)
+      }
       await expect(window.getByRole('radio', { name: effectOption })).toBeChecked()
       const stored: unknown = await window.evaluate('window.pact.getAppearanceSettings()')
       expect(stored).toMatchObject({

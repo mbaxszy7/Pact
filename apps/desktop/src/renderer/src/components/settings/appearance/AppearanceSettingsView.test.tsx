@@ -28,6 +28,7 @@ function renderSettings(
     effective?: AppearanceEffectiveSettings
     onPreview?: (opacity: number) => void
     onCommit?: (opacity: number) => void
+    platform?: 'win32' | 'darwin'
   } = {},
 ): void {
   render(
@@ -42,12 +43,33 @@ function renderSettings(
       onMaterialOpacityCommit={options.onCommit ?? (() => undefined)}
       onReset={() => undefined}
       onRetry={() => undefined}
-      platform="darwin"
+      platform={options.platform ?? 'darwin'}
     />,
   )
 }
 
 describe('Appearance transparency control', () => {
+  it('explains a pending Windows restart and disables strength until transparency is active', () => {
+    renderSettings({
+      platform: 'win32',
+      effective: { ...effective, windowMaterial: 'solid', restartRequired: true },
+    })
+    expect(screen.getByRole<HTMLInputElement>('radio', { name: 'Translucent' }).checked).toBe(true)
+    expect(screen.getByText(/Currently using Solid/)).toBeTruthy()
+    expect(screen.getByText(/Closing the window keeps Pact running/)).toBeTruthy()
+    expect(
+      screen.getByRole<HTMLInputElement>('slider', { name: 'Transparency strength' }).disabled,
+    ).toBe(true)
+  })
+
+  it('does not show a pending-restart notice after saved Translucent is loaded on startup', () => {
+    renderSettings({ platform: 'win32' })
+    expect(screen.queryByText(/Currently using Solid/)).toBeNull()
+    expect(
+      screen.getByRole<HTMLInputElement>('slider', { name: 'Transparency strength' }).disabled,
+    ).toBe(false)
+  })
+
   it('shows a 0–100 strength scale while preserving the stored 70–100 range', () => {
     const onPreview = vi.fn<(opacity: number) => void>()
     const onCommit = vi.fn<(opacity: number) => void>()

@@ -26,6 +26,11 @@ const working = (operation: SessionForkOperation | undefined): boolean =>
   !!operation &&
   operation.sides.some((side) => ['prepared', 'forking', 'initializing'].includes(side.state))
 
+export interface SessionForkOpening {
+  selectionEpoch: number
+  openingId: string
+}
+
 function NativeForkStates({
   operation,
   onAction,
@@ -102,11 +107,13 @@ export function SessionForkDialog({
   messageId,
   onClose,
   onCreated,
+  suspended = false,
 }: {
   sourceSessionId: string
   messageId: string
   onClose: () => void
   onCreated: (change: SessionCatalogChange, enter: boolean) => void
+  suspended?: boolean | undefined
 }): React.JSX.Element {
   const dialog = useRef<HTMLDialogElement>(null)
   const alive = useRef(true)
@@ -129,6 +136,15 @@ export function SessionForkDialog({
   const [interactions, setInteractions] = useState<PendingNativeInteraction[]>([])
   const [drafts, setDrafts] = useState<Record<string, NativeInputDraft>>({})
   const blockedClose = creating || working(operation)
+  useEffect(() => {
+    const element = dialog.current
+    if (suspended) {
+      element?.close()
+      return undefined
+    }
+    element?.showModal()
+    return () => element?.close()
+  }, [suspended])
   const finishCreation = useCallback(
     (next: SessionForkOperation): void => {
       if (creationPending.current || working(next) || finished.current) return
@@ -209,8 +225,6 @@ export function SessionForkDialog({
   useEffect(() => {
     alive.current = true
     let current = true
-    const element = dialog.current
-    element?.showModal()
     void Promise.allSettled([
       window.pact.forkSession({ action: 'prepare', sourceSessionId, messageId }),
       window.pact.getSessionSettings(sourceSessionId),
@@ -255,7 +269,6 @@ export function SessionForkDialog({
     return () => {
       current = false
       alive.current = false
-      element?.close()
     }
   }, [sourceSessionId, messageId])
   useEffect(

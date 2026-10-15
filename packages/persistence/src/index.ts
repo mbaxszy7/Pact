@@ -31,6 +31,13 @@ export {
   type HandoffSourceRef,
 } from './conversation-repository.js'
 export { ProjectCatalogRepository } from './project-catalog-repository.js'
+export { projectSessionIssues } from './session-issues.js'
+export {
+  WorkspaceArchiveRepository,
+  WorkspaceArchiveConflictError,
+  workspaceArchiveBlocked,
+  archiveScopeHasNativeWork,
+} from './workspace-archive-repository.js'
 export {
   WorkspaceChangesRepository,
   WORKSPACE_INTENT_BYTES,

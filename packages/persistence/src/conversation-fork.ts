@@ -37,6 +37,7 @@ import {
 import type { PactDrizzleDatabase } from './drizzle-database.js'
 
 import { appendAgentEvent } from './agent-event-journal.js'
+import { refreshNativeSessionMetadata } from './native-presence-metadata.js'
 import {
   collaborationTasks,
   collaborationTurns,
@@ -70,6 +71,7 @@ import {
   workspaceChangeSets,
   workspaceFileChanges,
 } from './schema/index.js'
+import { assertSessionAvailable } from './workspace-archive-repository.js'
 
 const MAX_ENTITIES = 10_000
 const MAX_BYTES = 8 * 1024 * 1024
@@ -262,6 +264,7 @@ export function commitFork(
   }
   return database.transaction(() => {
     const prepared = selection.prepared
+    assertSessionAvailable(database, prepared.sourceSessionId)
     const source = database
       .select()
       .from(sessions)
@@ -1525,6 +1528,7 @@ export function commitFork(
       .set({ revision: sql`${sessionCatalogRevisions.revision} + 1` })
       .where(eq(sessionCatalogRevisions.id, 1))
       .run()
+    refreshNativeSessionMetadata(database, sessionId)
     return readFork(database, sessionId)!
   })
 }
@@ -1631,6 +1635,15 @@ export function updateForkIntent(
   patch: Partial<typeof nativeForkIntents.$inferInsert>,
 ): SessionForkOperation {
   return database.transaction(() => {
+    if (patch.dispatched === true || patch.nativeWorkState === 'pending') {
+      assertSessionAvailable(database, sessionId)
+      const source = database
+        .select({ id: sessionForkOperations.sourceSessionId })
+        .from(sessionForkOperations)
+        .where(eq(sessionForkOperations.id, operationId))
+        .get()
+      if (source) assertSessionAvailable(database, source.id)
+    }
     const current = database
       .select({
         operationId: nativeForkIntents.operationId,
@@ -1782,6 +1795,7 @@ export function updateForkIntent(
       .set({ revision: sql`${sessionCatalogRevisions.revision} + 1` })
       .where(eq(sessionCatalogRevisions.id, 1))
       .run()
+    refreshNativeSessionMetadata(database, sessionId)
     return readFork(database, sessionId)!
   })
 }
@@ -1892,51 +1906,67 @@ export function forkBlocksInput(database: PactDrizzleDatabase, sessionId: string
 }
 
 export function recoverForkIntents(database: PactDrizzleDatabase): void {
-  database.transaction(() => {
-    const changed = database
-      .update(nativeForkIntents)
-      .set({
-        state: 'unconfirmed',
-        nativeWorkState: 'unknown',
-        reason: 'App exited before native fork or initialization was confirmed.',
-        updatedAt: new Date().toISOString(),
-      })
-      .where(eq(nativeForkIntents.nativeWorkState, 'pending'))
-      .run()
-    const prepared = database
-      .update(nativeForkIntents)
-      .set({
-        state: 'unconfirmed',
-        reason: 'App exited during native setup. Check this original candidate before continuing.',
-        updatedAt: new Date().toISOString(),
-      })
-      .where(sql`${nativeForkIntents.state} IN ('forking', 'initializing')`)
-      .run()
-    const notStarted = database
-      .update(nativeForkIntents)
-      .set({
-        state: 'error',
-        reason:
-          'Native fork was not dispatched before the App exited. Continue this same fork when ready.',
-        updatedAt: new Date().toISOString(),
-      })
-      .where(and(eq(nativeForkIntents.state, 'prepared'), eq(nativeForkIntents.dispatched, false)))
-      .run()
-    if (changed.changes || prepared.changes || notStarted.changes) {
+  while (true) {
+    const page = database.all<{
+      sessionId: string
+    }>(sql`SELECT DISTINCT f.session_id AS sessionId FROM native_fork_intents n JOIN session_fork_operations f ON f.id=n.operation_id
+      WHERE n.native_work_state='pending' OR n.state IN ('forking','initializing') OR (n.state='prepared' AND n.dispatched=0) ORDER BY f.session_id LIMIT 25`)
+    if (!page.length) return
+    const ids = page.map((row) => row.sessionId)
+    database.transaction(() => {
+      const scope = sql`${nativeForkIntents.operationId} IN (SELECT id FROM session_fork_operations WHERE session_id IN (${sql.join(
+        ids.map((id) => sql`${id}`),
+        sql`, `,
+      )}))`
+      database
+        .update(nativeForkIntents)
+        .set({
+          state: 'unconfirmed',
+          nativeWorkState: 'unknown',
+          reason: 'App exited before native fork or initialization was confirmed.',
+          updatedAt: new Date().toISOString(),
+        })
+        .where(and(scope, eq(nativeForkIntents.nativeWorkState, 'pending')))
+        .run()
+      database
+        .update(nativeForkIntents)
+        .set({
+          state: 'unconfirmed',
+          reason:
+            'App exited during native setup. Check this original candidate before continuing.',
+          updatedAt: new Date().toISOString(),
+        })
+        .where(and(scope, sql`${nativeForkIntents.state} IN ('forking','initializing')`))
+        .run()
+      database
+        .update(nativeForkIntents)
+        .set({
+          state: 'error',
+          reason:
+            'Native fork was not dispatched before the App exited. Continue this same fork when ready.',
+          updatedAt: new Date().toISOString(),
+        })
+        .where(
+          and(
+            scope,
+            eq(nativeForkIntents.state, 'prepared'),
+            eq(nativeForkIntents.dispatched, false),
+          ),
+        )
+        .run()
       database
         .update(sessionForkOperations)
         .set({ ready: false, revision: sql`${sessionForkOperations.revision} + 1` })
-        .where(
-          sql`EXISTS (SELECT 1 FROM ${nativeForkIntents} n WHERE n.operation_id=${sessionForkOperations.id} AND n.state<>'ready')`,
-        )
+        .where(inArray(sessionForkOperations.sessionId, ids))
         .run()
       database
         .update(sessionCatalogRevisions)
         .set({ revision: sql`${sessionCatalogRevisions.revision} + 1` })
         .where(eq(sessionCatalogRevisions.id, 1))
         .run()
-    }
-  })
+      for (const id of ids) refreshNativeSessionMetadata(database, id)
+    })
+  }
 }
 
 export function forkActorIsCurrent(

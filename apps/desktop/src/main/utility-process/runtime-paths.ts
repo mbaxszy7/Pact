@@ -1,7 +1,11 @@
 import { app } from 'electron'
 import { createHash, randomUUID } from 'node:crypto'
-import { realpathSync } from 'node:fs'
+import { mkdirSync, realpathSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
+
+import type { ApplicationIdentity } from '../application-identity'
+
+import { isPackageSmoke } from '../package-smoke'
 
 export interface RuntimePaths {
   databaseFile: string
@@ -13,6 +17,25 @@ export interface RuntimePaths {
 const TEST_DATABASE_FILE_ENV = 'PACT_TEST_DB_FILE'
 const TEST_APPEARANCE_WRITE_FAILURE_ENV = 'PACT_TEST_APPEARANCE_WRITE_FAILURE'
 const ISOLATED_ROOT_ENV = 'PACT_E2E_ROOT'
+const repositoryRoot = resolvePath(__dirname, '../../../..')
+const repositoryIdentity = createHash('sha256').update(repositoryRoot).digest('hex')
+
+/** Configure the application's browser profile before ready; fixture owners take precedence. */
+export function configureApplicationProfile(identity: ApplicationIdentity): void {
+  if (isolatedRoot()) {
+    configureIsolatedProfile()
+    return
+  }
+  if (isPackageSmoke() || (process.env.NODE_ENV === 'test' && !app.isPackaged)) return
+  const profile = join(
+    app.getPath('appData'),
+    identity.profileDirectory,
+    ...(identity.kind === 'development-local' ? [repositoryIdentity] : []),
+  )
+  mkdirSync(profile, { recursive: true })
+  app.setPath('userData', profile)
+  app.setPath('sessionData', profile)
+}
 
 /** Data location only: isolated launches retain the normal IPC, permissions and runtime. */
 export function configureIsolatedProfile(): void {
@@ -33,8 +56,6 @@ function isolatedRoot(): string | undefined {
 }
 
 export function resolveRuntimePaths(): RuntimePaths {
-  const repositoryRoot = resolvePath(__dirname, '../../../..')
-
   const root = isolatedRoot()
   if (root) {
     const databaseFile = join(root, 'pact.sqlite')
@@ -86,9 +107,11 @@ export function resolveRuntimePaths(): RuntimePaths {
   return {
     databaseFile: join(repositoryRoot, '.pact-data/dev/pact.sqlite'),
     workspaceStorageRoot: join(
-      app.getPath('userData'),
+      // Existing development image/file references use this historical object root.
+      app.getPath('appData'),
+      'Pact',
       'workspace-versions-development',
-      createHash('sha256').update(repositoryRoot).digest('hex'),
+      repositoryIdentity,
     ),
     migrationsFolder: join(repositoryRoot, 'packages/persistence/drizzle'),
   }

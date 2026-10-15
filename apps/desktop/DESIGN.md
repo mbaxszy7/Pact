@@ -196,7 +196,7 @@ Spacing follows a 6px rhythm with 12px grouped gaps, 18px surface padding, and 2
 
 Solid themes use tonal separation and hairline dividers. Persistent panes do not use decorative shadows. Menus and dialogs may use one ambient shadow because they genuinely leave the plane.
 
-Translucent uses explicit transparent window backing and per-surface color overlays on macOS and supported Windows. macOS has no Vibrancy blur; Windows disables native backdrop material rather than using Mica. Do not set whole-window opacity. The UI shows a 0–100 **Transparency strength** scale (default 50, higher is more see-through), not a literal window-opacity percentage. It maps to stored `materialOpacity` 100–70 (default 85) and then to separate surface Alpha ranges:
+Translucent uses explicit transparent window backing and per-surface color overlays on macOS and supported Windows. macOS has no Vibrancy blur; Windows disables native backdrop material rather than using Mica. Do not use whole-window opacity for material transparency; the bounded workspace visibility transition below is the sole temporary exception. The UI shows a 0–100 **Transparency strength** scale (default 50, higher is more see-through), not a literal window-opacity percentage. It maps to stored `materialOpacity` 100–70 (default 85) and then to separate surface Alpha ranges:
 
 - Sidebar: 55–90% in dark mode; light translucency uses a brighter ice-blue overlay fixed seven percentage points below Chat (65–90%) so it remains part of the same environment instead of turning gray or becoming fully opaque.
 - Chat: 72–97%.
@@ -204,20 +204,40 @@ Translucent uses explicit transparent window backing and per-surface color overl
 - Message surfaces: 86–96%.
 - Text, icons, code, and focus rings: always 100%.
 
-macOS uses `transparent: true` with `#00000000` backing and no Vibrancy. Windows build 22621 or newer uses a frameless transparent window, native Window Controls Overlay and the same semantic Alpha layers, with background material set to `none`. Solid restores opaque theme backing. Unsupported platforms/builds, reduced transparency, high contrast/forced colors or observable initialization failure fall back to the complete Solid theme. Retain the requested preference and show a concise effective fallback reason. Renderer Alpha and successful API calls are not desktop-compositor evidence; inspect actual effects on each target platform. Verification is described in [Contributing](../../CONTRIBUTING.md#testing).
+macOS uses `transparent: true` with `#00000000` backing and no Vibrancy. Windows resolves its startup material before window creation: Solid uses `transparent: false` and `thickFrame: true`; supported Translucent uses the existing frameless transparent window and semantic Alpha layers. Both retain native Window Controls Overlay and background material `none`. Windows background-mode changes are saved for the next full start; the settings surface identifies the currently active background and explains Exit from the tray before reopening. Theme and transparency-strength changes remain immediate. Unsupported platforms/builds, reduced transparency, high contrast/forced colors or observable material initialization failure fall back to complete Solid without forcing a running workspace to close. Retain the requested preference and show a concise effective fallback reason. A startup settings-read failure instead offers native Retry/Exit before the workspace exists; it must not silently choose Solid or show a false restart requirement. Renderer Alpha and successful API calls are not desktop-compositor evidence; inspect actual effects on each target platform. Verification is described in [Contributing](../../CONTRIBUTING.md#testing).
 
 **The Legibility-before-Material Rule.** If desktop content competes with UI content, increase the local surface Alpha before adding blur, outline, or shadow.
 
 ## Shapes
 
-Inputs, icon buttons, and code-adjacent controls use 8px. Message surfaces use 12px. The translucent outer window and genuinely detached panels may use 14px. Pills are reserved for short recipient and attachment chips; normal toolbar actions are not pills.
+Windows opaque Solid windows use system corner and shadow treatment, without a manual window region. Transparent-backed Windows windows retain subtle 8px corners with native clipping of drawing and pointer input. Maximized and full-screen windows use square corners; macOS retains its native window rounding. Inputs, icon buttons, and code-adjacent controls use 8px. Message surfaces use 12px; genuinely detached panels may use 14px. Pills are reserved for short recipient and attachment chips; normal toolbar actions are not pills.
 
 ## Components
 
 ### Buttons
 
 - **Primary:** charcoal with white text in light mode; pale inverse with dark text in dark mode.
-- **Project actions:** New Session, Rename and Archive controls are hidden at rest and appear together on Project header Hover or `:focus-within`. Rename uses a 14px Pencil beside Archive. Session Archive also appears on Hover/focus. Archive uses a 14px icon inside a 28px hit area and acts directly; the existing Undo notice restores an archived item.
+- **Project actions:** New Session, Rename and Archive controls are hidden at rest and appear together on Project header Hover or `:focus-within`. Rename uses a 14px Pencil beside Archive. Session Archive also appears on Hover/focus. Archive uses a 14px icon inside a 28px hit area. Idle archive acts directly; active work opens the Pact archive confirmation. The summary notice retains individual Undo actions without restarting tasks.
+
+Archive confirmation uses the current raised surface, Inter body/18px title, 14px corners and dialog
+shadow. A compact header names the action; complete target and affected Session names remain readable.
+Flat task rows separate current activity from the later Stop outcome. Cancel receives initial focus;
+Stop and archive names its consequence. During stopping, the same modal retains focus, displays
+indeterminate progress and disables dismissal. Failure retains the item and reports individual
+outcomes, with Check status reading the same operation rather than repeating Stop. The body scrolls
+inside a viewport-bounded dialog while actions remain visible. Both themes, reduced motion, keyboard
+focus and forced colors share this composition. This is an application modal, not a system dialog.
+
+Archive results use one nonmodal raised panel below the titlebar, with a compact count summary and
+View/Hide disclosure. The expanded list uses flat divided rows, complete wrapping names, Session or
+Project metadata, and text/icon status cues for Archived, Archive failed and Result to check. Each
+successful row has Undo; failures expand their reason and affected Session outcomes before Review
+again; unconfirmed rows offer Check status. Progress and restore/check errors stay on their own row.
+The list scrolls within the viewport while summary and footer remain visible; pagination keeps the
+row count bounded. Escape collapses the list and returns focus to its disclosure. Dismiss removes
+only resolved results, leaving unconfirmed entries accessible. The footer explains that stopped tasks
+stay stopped. Both themes and forced colors retain the same hierarchy without a blocking backdrop.
+
 - **Focus:** two-pixel Iris outline with two-pixel offset; focus never relies on translucency.
 - **Destructive:** danger treatment only when the label states the destructive consequence.
 
@@ -251,6 +271,8 @@ User messages are right-aligned on lavender. Claude and Codex messages are left-
 
 The Composer is a stable dense surface at least two lines high. Native Skills and the selected route are atomic inline units; attached Comments and answers are removable source chips above the input. Images show thumbnails, filename and state, with Add image below full-width text. Send is the local action anchor and becomes Stop during an observed response, while editing the next draft remains available under normal gates. Do not auto-send that draft when the response ends.
 
+Composer permission, Project-folder and branch popovers share one presentation: raised surface, neutral hairline border, one subtle shadow (6px downward offset, 18px blur, 18% black), 14px radius, 8px padding, 12px text, 8px action-row corners and the same Hover/focus treatment. Use a title, actions and a divided footer for supplementary context; complete selectable paths and branch names live in that footer. All use the permission menu's 160ms opening/110ms closing motion with reduced-motion support. Width and alignment follow the content and trigger; do not introduce a separate background or shadow treatment for these menus.
+
 ### Artifact, Diff, and Review
 
 The right panel is contextual, resizable and closable. Diff uses dedicated add/remove tokens in both themes and becomes nearly opaque under translucency. Documents preserve comfortable prose measure; Comments retain a visible anchor without obscuring code.
@@ -262,6 +284,75 @@ Context's Todos tab shows Pending and Done with ordinary unboxed rows. One short
 Historical sources show then-state and known current state without changing counts or exposing an answer entry for an old question. Navigation waits for body readiness before alignment, restores exact source focus, and does not reset reading position on refresh. Internal UUIDs, hashes, JSON fields and transport instructions do not belong in visible product prose.
 
 Image preview is a native modal with previous/next, directional keys, bounded filmstrip, close/Escape and trigger focus return. It fits content without zoom/Fit/100% controls. Its 180ms slide/fade honors reduced motion. Recovery uses one compact card for affected Agents, with currently valid action and specific reason rather than stacked warnings or repeated safety paragraphs.
+
+## Windows installer preview
+
+The first Windows x64 installer is a native NSIS Modern UI extension. Its visual design is pending
+user acceptance. The installer retains native window controls, directory selection, keyboard focus,
+progress and completion controls. It presents welcome, directory, shortcut options, progress and
+completion in that order. Setup does not perform provider installation or collect credentials; the
+existing Runtime Preparation flow owns first use after launch.
+
+The proposed Pact icon uses two rounded strokes to form a shared P on the Midnight Canvas
+(`#0f1720`). One stroke uses Sky Canvas (`#ebf5ff`) and the other uses a muted mint (`#a9dfc3`). The
+canonical [SVG](resources/icon.svg) supplies development PNG, multi-size Windows ICO and macOS ICNS
+through one shared asset generator. Welcome/completion artwork uses Sky Canvas,
+with the same mark; intermediate pages use a small header mark on white. Artwork is decorative.
+Instructions, paths, options, progress and results remain native text and controls.
+
+The installer preview has its own application identity, directory, shortcuts and package name. The
+desktop shortcut is optional, the Start menu entry is retained, and Open Pact starts unchecked. The
+installer owns application files and registration, while the existing application owners retain
+projects, conversation data, migrations and provider configuration. Uninstall preserves user data.
+
+The preview is English-only and does not establish signing, upgrade, DPI, accessibility or runtime
+acceptance. Preserve the main-workspace design system while this native design is under review.
+Shared macOS icon assets are available; their native appearance is not established by Windows evidence.
+
+Native development windows identify themselves as `Pact - Development - Local`; locally distributed
+production packages use `Pact - Production - Local`. Native window/taskbar names, installer names and
+shortcuts retain the selected identity, while Pact remains the product brand. Future CI development
+and official production have separate reserved identities; no CI release workflow is implied.
+Windows development taskbar entries use the Pact icon and explicit development name rather than
+Electron's executable branding. Their Session groups navigate the running repository instance;
+fully exited development instances still start through `pnpm dev`.
+
+## Resident window and native navigation
+
+Complete startup uses 80% of the pointer display's available width and height, centered within that
+work area. Retain a 720 by 520 minimum when it fits; smaller work areas cap the minimum and bounds.
+Revealing the running workspace retains its geometry and native window state. If its title bar is
+unreachable after a display change, recover the window into an available work area.
+
+macOS and transparent-backed Windows workspace visibility uses a quiet 150 ms decelerating entrance and a faster 100 ms accelerating
+departure, with no scale or position choreography. This is a brief whole-window opacity transition,
+not a material setting. Stable visible and hidden windows retain native opacity 1. Repeated requests
+reverse from the current opacity; an already visible workspace only receives focus. Reduced motion
+or disabled system animations uses immediate visibility. Minimized/fullscreen windows and native
+window-state changes use their system behavior without an additional fade; macOS retains native
+fullscreen/Space transitions. Transparent Windows preserves its existing corner region and window
+style, which may not support standard native scaling animation. Opaque Solid Windows windows use
+system visibility, minimize, maximize and restore behavior without custom fades or opacity writes.
+
+The tray mark derives from the shared Pact P. Windows uses
+[monochrome artwork](resources/tray.svg) with pale and gray strokes on a charcoal square. macOS uses
+the transparent [Template silhouette](resources/trayTemplate.svg) at normal and Retina density;
+the operating system supplies contrast. Main owns native menu composition. Tray, Windows JumpList
+and macOS Dock menus retain native typography, focus, selection and keyboard behavior.
+
+Flat groups distinguish Needs attention, Running and Recent Sessions. Each entry identifies its
+Session and Project; text state supplements icons without exposing bodies or paths. Starting uses
+an Hourglass and remains distinct from Running. The full attention view uses the existing workspace
+surfaces and typography, flat divided rows, unread cues, visible errors and five-row pagination.
+Opening it preserves the selected Conversation and ordinary drafts.
+
+Exit confirmation uses the Pact application dialog in both themes: compact title, plain consequence,
+affected Session rows and Cancel/Exit Pact actions. Cancel receives initial focus. Pending cancellation
+and physical shutdown keep progress and errors in place rather than closing the dialog optimistically.
+Closing or unconfirmed shutdown disables dismissal and retains the workspace. Reduced motion,
+forced colors and keyboard focus share the same composition. A system dialog is a fallback when the
+Renderer is unavailable. This native module remains subject to actual platform inspection and user
+visual acceptance before formal verification.
 
 ## Do's and Don'ts
 

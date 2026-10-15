@@ -14,9 +14,19 @@ import type {
   UtilityRequestPayload,
   UtilityTransportResult,
 } from '../../utility-process/client'
-import type { MaterialResult, MaterialWindow, NativeThemeSource } from './material'
+import type {
+  MaterialResult,
+  MaterialWindow,
+  NativeThemeSource,
+  WindowAppearance,
+} from './material'
 
-import { applyMaterial, currentMaterialRuntime } from './material'
+import {
+  applyMaterial,
+  currentMaterialRuntime,
+  resolveMaterial,
+  solidBackgroundColor,
+} from './material'
 
 export type { NativeThemeSource } from './material'
 
@@ -28,6 +38,8 @@ export interface AppearanceWindow extends MaterialWindow {
 }
 
 export interface AppearanceController {
+  /** Pin the loaded Windows background mode before constructing the first workspace. Requires a successful refresh. */
+  getWindowAppearance(): WindowAppearance
   /** Reload persisted settings, reconcile uncertain writes, and apply the result to attached windows. */
   refresh(): Promise<RpcResult<AppearanceSnapshot>>
   update(input: AppearanceSettingsUpdate): Promise<RpcResult<AppearanceSnapshot>>
@@ -63,6 +75,7 @@ function effectiveSettings(
     windowMaterial: material.windowMaterial,
     revision: requested.revision,
     ...(material.fallbackReason ? { fallbackReason: material.fallbackReason } : {}),
+    ...(material.restartRequired ? { restartRequired: true } : {}),
   }
 }
 
@@ -92,6 +105,9 @@ export function createAppearanceController(
   let reconciliationGeneration = 0
   let applyingMaterial = false
   let disposed = false
+  let launchMaterial:
+    | { preference: AppearanceSettings['windowMaterial']; native: MaterialResult['windowMaterial'] }
+    | undefined
 
   const request = async (
     payload: AppearanceRequestPayload,
@@ -139,7 +155,29 @@ export function createAppearanceController(
   const applyCurrent = (settings: AppearanceSettings): MaterialResult => {
     applyingMaterial = true
     try {
-      return applyMaterial(settings, nativeTheme, windows, runtime)
+      if (nativeTheme.themeSource !== settings.theme) nativeTheme.themeSource = settings.theme
+      const active = launchMaterial
+        ? { ...settings, windowMaterial: launchMaterial.preference }
+        : settings
+      const desired = resolveMaterial(active, nativeTheme, runtime)
+      // An opaque native window cannot become transparent. System accessibility
+      // can still paint a transparent-backed workspace Solid immediately.
+      const keepSolid = launchMaterial?.native === 'solid'
+      const result = applyMaterial(
+        keepSolid ? { ...active, windowMaterial: 'solid' } : active,
+        nativeTheme,
+        windows,
+        runtime,
+      )
+      const restartRequired =
+        launchMaterial &&
+        (settings.windowMaterial !== launchMaterial.preference ||
+          (keepSolid && desired.windowMaterial === 'translucent'))
+      return {
+        ...result,
+        ...(keepSolid && desired.fallbackReason ? { fallbackReason: desired.fallbackReason } : {}),
+        ...(restartRequired ? { restartRequired: true } : {}),
+      }
     } finally {
       applyingMaterial = false
     }
@@ -175,7 +213,8 @@ export function createAppearanceController(
     if (
       previous?.theme === result.theme &&
       previous.windowMaterial === result.windowMaterial &&
-      previous.fallbackReason === result.fallbackReason
+      previous.fallbackReason === result.fallbackReason &&
+      previous.restartRequired === result.restartRequired
     ) {
       return
     }
@@ -189,6 +228,22 @@ export function createAppearanceController(
   nativeTheme.on('updated', handleNativeThemeUpdate)
 
   return {
+    getWindowAppearance(): WindowAppearance {
+      if (disposed) throw new Error('Appearance controller is disposed.')
+      if (!currentSettings)
+        throw new Error('Appearance settings must be loaded before creating a window.')
+      const settings = currentSettings
+      const result = applyCurrent(settings)
+      if (runtime.platform === 'win32' && !launchMaterial) {
+        launchMaterial = { preference: settings.windowMaterial, native: result.windowMaterial }
+      }
+      return {
+        windowMaterial: launchMaterial?.native ?? result.windowMaterial,
+        backgroundColor:
+          result.windowMaterial === 'solid' ? solidBackgroundColor(result.theme) : '#00000000',
+      }
+    },
+
     async refresh(): Promise<RpcResult<AppearanceSnapshot>> {
       const reconciliationAttempt = reconciliationRequired ? reconciliationGeneration : undefined
       const result = project(await request({ type: 'appearance.get.request' }))
@@ -254,6 +309,7 @@ export function createAppearanceController(
       windowClosedHandlers.clear()
       windows.clear()
       listeners.clear()
+      launchMaterial = undefined
     },
   }
 }

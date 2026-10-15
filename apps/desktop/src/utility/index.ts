@@ -87,6 +87,7 @@ async function bootstrap(
     openedDatabase.sessionRepository,
     defaultSessionSettings,
     (sessionId) => conversation?.sessionTitleChanged(sessionId),
+    () => conversation?.nativeMetadataChanged(),
   )
   const images = new ConversationImages(
     openedDatabase.conversationRepository,
@@ -106,6 +107,14 @@ async function bootstrap(
     parentPort.postMessage(
       utilityEventSchema.parse({ type: 'conversation.patch.event', patch, progress }),
     )
+  })
+  conversation.subscribeNativePresence((version) => {
+    parentPort.postMessage(
+      utilityEventSchema.parse({ type: 'native-presence.changed.event', version }),
+    )
+  })
+  void conversation.initializeNativePresence().catch(() => {
+    recordDiagnostic({ operation: 'utility', phase: 'failed' })
   })
   const shouldFailAppearanceWrites = process.argv[4] === '1'
   const conversationOwner = conversation
@@ -133,6 +142,104 @@ async function bootstrap(
     if (closing && request.data.type !== 'runtime.shutdown.request') return
 
     switch (request.data.type) {
+      case 'native-presence.read.request': {
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'native-presence.read.response',
+            requestId: request.data.requestId,
+            result: conversationOwner.getNativePresence(),
+          }),
+        )
+        return
+      }
+      case 'native-attention.read.request': {
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'native-attention.read.response',
+            requestId: request.data.requestId,
+            result: conversationOwner.readNativeAttention(request.data.input),
+          }),
+        )
+        return
+      }
+      case 'native-session.resolve.request': {
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'native-session.resolve.response',
+            requestId: request.data.requestId,
+            result: sessionWorkspace.resolveNativeSession(request.data.input.sessionId),
+          }),
+        )
+        return
+      }
+      case 'native-session.opened.request': {
+        const result = sessionWorkspace.recordNativeSessionOpened(request.data.input)
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'native-session.opened.response',
+            requestId: request.data.requestId,
+            result,
+          }),
+        )
+        return
+      }
+      case 'native-jump-list.suppression.request': {
+        const result = sessionWorkspace.updateNativeJumpListSuppression(request.data.input)
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'native-jump-list.suppression.response',
+            requestId: request.data.requestId,
+            result,
+          }),
+        )
+        return
+      }
+      case 'native-quit.prepare.request': {
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'native-quit.prepare.response',
+            requestId: request.data.requestId,
+            result: conversationOwner.prepareNativeQuit(request.data.input, activeRequests > 0),
+          }),
+        )
+        return
+      }
+      case 'native-quit.cancel.request': {
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'native-quit.cancel.response',
+            requestId: request.data.requestId,
+            result: conversationOwner.cancelNativeQuit(request.data.input),
+          }),
+        )
+        return
+      }
+      case 'workspace-archive.prepare.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'workspace-archive.prepare.response',
+            requestId,
+            result: conversationOwner.prepareWorkspaceArchive(input),
+          }),
+        )
+        return
+      }
+      case 'workspace-archive.read.request':
+      case 'workspace-archive.cancel.request': {
+        const { input, requestId, type } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'workspace-archive.receipt.response',
+            requestId,
+            result:
+              type === 'workspace-archive.read.request'
+                ? conversationOwner.readWorkspaceArchive(input.operationId)
+                : conversationOwner.cancelWorkspaceArchive(input.operationId),
+          }),
+        )
+        return
+      }
       case 'session.fork.request': {
         const { input, requestId } = request.data
         runRequest(async () => {
@@ -162,6 +269,7 @@ async function bootstrap(
         const requestId = request.data.requestId
         shutdown ??= (async () => {
           closing = true
+          projectCatalog.dispose()
           const drainRequests =
             activeRequests === 0
               ? Promise.resolve()
@@ -177,6 +285,15 @@ async function bootstrap(
           ])
           try {
             await workspaceOwner.dispose()
+            if (results.some((result) => result.status === 'rejected'))
+              throw new Error('Conversation cleanup did not finish successfully.')
+            parentPort.postMessage(
+              utilityEventSchema.parse({
+                type: 'native-presence.quit-recent.event',
+                version: conversationOwner.nativePresenceVersion(),
+                sessions: sessionWorkspace.readQuitRecent(),
+              }),
+            )
           } finally {
             directoryOwner.dispose()
             openedDatabase.close()
@@ -184,8 +301,6 @@ async function bootstrap(
             if (runtimeDatabaseFile === ':memory:')
               await rm(runtimeWorkspaceStorageRoot, { recursive: true, force: true })
           }
-          if (results.some((result) => result.status === 'rejected'))
-            throw new Error('Conversation cleanup did not finish successfully.')
         })()
         void shutdown.then(
           () => {
@@ -303,10 +418,25 @@ async function bootstrap(
         return
       }
 
+      case 'project-context.read.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'project-context.read.response',
+              requestId,
+              result: await projectCatalog.readContext(input),
+            }),
+          )
+        })
+        return
+      }
+
       case 'project-catalog.add.request': {
         const { input, requestId } = request.data
         runRequest(async () => {
           const result = await projectCatalog.add(input)
+          conversationOwner.nativeMetadataChanged()
           parentPort.postMessage(
             utilityResponseSchema.parse({
               type: 'project-catalog.response',
@@ -320,13 +450,21 @@ async function bootstrap(
 
       case 'project-catalog.archive.request': {
         const { input, requestId } = request.data
-        parentPort.postMessage(
-          utilityResponseSchema.parse({
-            type: 'project-catalog.response',
-            requestId,
-            result: projectCatalog.archive(input),
-          }),
-        )
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'project-catalog.response',
+              requestId,
+              result: await conversationOwner.archiveWorkspace(
+                { kind: 'project', projectId: input.projectId },
+                input.operationId,
+                (operationId) => projectCatalog.archive({ ...input, operationId }),
+                () => projectCatalog.load(),
+              ),
+            }),
+          )
+          conversationOwner.nativeMetadataChanged()
+        })
         return
       }
 
@@ -339,6 +477,7 @@ async function bootstrap(
             result: projectCatalog.rename(input),
           }),
         )
+        conversationOwner.nativeMetadataChanged()
         return
       }
 
@@ -351,6 +490,7 @@ async function bootstrap(
             result: projectCatalog.restore(input),
           }),
         )
+        conversationOwner.nativeMetadataChanged()
         return
       }
 
@@ -420,13 +560,20 @@ async function bootstrap(
 
       case 'session.archive.request': {
         const { input, requestId } = request.data
-        parentPort.postMessage(
-          utilityResponseSchema.parse({
-            type: 'session-catalog.response',
-            requestId,
-            result: sessionWorkspace.archive(input),
-          }),
-        )
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'session-catalog.response',
+              requestId,
+              result: await conversationOwner.archiveWorkspace(
+                { kind: 'session', sessionId: input.sessionId },
+                input.operationId,
+                (operationId) => sessionWorkspace.archive({ ...input, operationId }),
+                () => sessionWorkspace.archiveReceipt(input.sessionId),
+              ),
+            }),
+          )
+        })
         return
       }
 
@@ -959,6 +1106,9 @@ async function bootstrap(
         )
     }
   })
+  // Publish only after initialization and the sole request handler are ready.
+  parentPort.postMessage(utilityEventSchema.parse({ type: 'runtime.ready.event' }))
+  recordDiagnostic({ operation: 'utility', phase: 'ready' })
 }
 
 process.on('uncaughtExceptionMonitor', (_error, origin) => {

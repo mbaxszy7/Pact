@@ -51,6 +51,7 @@ import type {
   NativeInitializationWitness,
   RebuildReturnedInputRecord,
   RebuildInputRecovery,
+  WorkspaceArchiveScope,
 } from '@pact/contracts'
 
 import {
@@ -120,6 +121,10 @@ import type { PactDrizzleDatabase } from './drizzle-database.js'
 import { appendAgentEvent } from './agent-event-journal.js'
 import * as forkFacts from './conversation-fork.js'
 import {
+  nativeSessionIssueMetadata,
+  refreshNativeSessionMetadata,
+} from './native-presence-metadata.js'
+import {
   collaborationInputs,
   collaborationTasks,
   collaborationTurns,
@@ -161,6 +166,10 @@ import {
   hasUnreadSessionMessage,
   projectSessionTitle,
 } from './session-projection.js'
+import {
+  WorkspaceArchiveRepository,
+  assertSessionAvailable,
+} from './workspace-archive-repository.js'
 
 const activeRunStatuses = ['starting', 'running', 'recovering'] as const
 const INLINE_CONTENT_BYTES = CONVERSATION_MARKDOWN_BYTES
@@ -507,7 +516,10 @@ export class ConversationRepository {
     activity: { queries: 0, returnedRows: 0 },
   }
 
+  readonly archives: WorkspaceArchiveRepository
+
   constructor(private readonly database: PactDrizzleDatabase) {
+    this.archives = new WorkspaceArchiveRepository(database)
     // Utility owns one Repository instance. A new owner cannot reuse earlier window handles.
     this.database
       .delete(conversationBodyInputs)
@@ -522,6 +534,65 @@ export class ConversationRepository {
         ),
       )
       .run()
+  }
+
+  nativeIssueMetadata(sessionId: string): import('@pact/contracts').SessionIssues {
+    return nativeSessionIssueMetadata(this.database, sessionId).issues
+  }
+
+  nativeRunStatus(runId: string): AgentRun['status'] | undefined {
+    return this.database
+      .select({ status: agentRuns.status })
+      .from(agentRuns)
+      .where(eq(agentRuns.id, runId))
+      .get()?.status
+  }
+
+  refreshNativeAttention(sessionId: string): void {
+    refreshNativeSessionMetadata(this.database, sessionId)
+  }
+
+  private nativeMetadataTransaction<T>(
+    sessionId: string,
+    work: (transaction: PactDrizzleDatabase) => T,
+  ): T {
+    return this.database.transaction((transaction) => {
+      const value = work(transaction)
+      refreshNativeSessionMetadata(transaction, sessionId)
+      return value
+    })
+  }
+
+  initializeNativeAttention(sessionIds: string[]): void {
+    if (sessionIds.length > 25)
+      throw new Error('Native metadata initialization page exceeds its bound.')
+    this.database.transaction(() => {
+      for (const sessionId of sessionIds) this.refreshNativeAttention(sessionId)
+    })
+  }
+
+  nativeQuitUnsettled(excludedIds: string[]): { count: number; sessionIds: string[] } {
+    if (excludedIds.length > 64) throw new Error('Native quit owner metadata exceeds its bound.')
+    const excluded = excludedIds.length
+      ? sql`WHERE session_id NOT IN (${sql.join(
+          excludedIds.map((id) => sql`${id}`),
+          sql`, `,
+        )})`
+      : sql``
+    const work = sql`WITH work(session_id) AS (
+      SELECT session_id FROM agent_runs WHERE fork_source_run_id IS NULL AND ((status IN ('starting', 'running', 'recovering') AND control_disposition <> 'abandoned') OR native_effects_state IN ('pending', 'unknown') OR (dispatch_phase IN ('possibly_sent', 'accepted', 'ended') AND native_outcome IS NULL))
+      UNION SELECT session_id FROM native_agent_contexts WHERE continuation_state IN ('responding', 'waiting_user')
+      UNION SELECT session_id FROM native_rebuild_operations WHERE native_work_state IN ('pending', 'unknown')
+      UNION SELECT coalesce(f.session_id, f.source_session_id) FROM native_fork_intents i JOIN session_fork_operations f ON f.id=i.operation_id WHERE i.native_work_state IN ('pending', 'unknown')
+    )`
+    const count =
+      this.database.get<{ count: number }>(
+        sql`${work} SELECT count(*) AS count FROM work ${excluded}`,
+      )?.count ?? 0
+    const rows = this.database.all<{ sessionId: string }>(
+      sql`${work} SELECT session_id AS sessionId FROM work ${excluded} ORDER BY session_id LIMIT 5`,
+    )
+    return { count, sessionIds: rows.map((row) => row.sessionId) }
   }
 
   imageRecord(id: string): ImageAssetRecord | undefined {
@@ -1375,36 +1446,20 @@ export class ConversationRepository {
   }
 
   sessionHasNativeWork(sessionId: string): boolean {
+    // Keep completed history outside this gate. Literal predicates make the
+    // existing partial indexes eligible; their access path is a resource invariant.
     return (
-      !!this.database
-        .select({ id: agentRuns.id })
-        .from(agentRuns)
-        .where(
-          and(
-            eq(agentRuns.sessionId, sessionId),
-            isNull(agentRuns.forkSourceRunId),
-            or(
-              inArray(agentRuns.nativeEffectsState, ['pending', 'unknown']),
-              and(
-                inArray(agentRuns.status, [...activeRunStatuses]),
-                ne(agentRuns.controlDisposition, 'abandoned'),
-              ),
-            ),
-          ),
-        )
-        .limit(1)
-        .get() ||
-      !!this.database
-        .select({ id: nativeRebuildOperations.id })
-        .from(nativeRebuildOperations)
-        .where(
-          and(
-            eq(nativeRebuildOperations.sessionId, sessionId),
-            inArray(nativeRebuildOperations.nativeWorkState, ['pending', 'unknown']),
-          ),
-        )
-        .limit(1)
-        .get()
+      !!this.database.get<{ id: string }>(sql`
+        SELECT id FROM ${agentRuns} INDEXED BY agent_runs_session_unsettled_work_idx
+        WHERE ${agentRuns.sessionId} = ${sessionId} AND ${agentRuns.forkSourceRunId} IS NULL
+          AND ((${agentRuns.status} IN ('starting', 'running', 'recovering') AND ${agentRuns.controlDisposition} <> 'abandoned') OR ${agentRuns.nativeEffectsState} IN ('pending', 'unknown'))
+        LIMIT 1
+      `) ||
+      !!this.database.get<{ id: string }>(sql`
+        SELECT id FROM ${nativeRebuildOperations} INDEXED BY native_rebuild_operations_unsettled_work_idx
+        WHERE ${nativeRebuildOperations.sessionId} = ${sessionId} AND ${nativeRebuildOperations.nativeWorkState} IN ('pending', 'unknown')
+        LIMIT 1
+      `)
     )
   }
 
@@ -3384,6 +3439,7 @@ export class ConversationRepository {
     const task = this.collaboration(input.sessionId)
     if (!task) throw new RunOperationConflictError('The active collaboration task is unavailable.')
     return this.database.transaction(() => {
+      assertSessionAvailable(this.database, input.sessionId)
       if (this.receivedCollaborationInput(input.sessionId))
         throw new RunOperationConflictError(
           'One message is already waiting. Your draft was preserved.',
@@ -7099,386 +7155,397 @@ export class ConversationRepository {
         'A preserved draft cannot also be included in this message.',
       )
 
-    const committedCommentsRevision = this.database.transaction((transaction) => {
-      const session = transaction
-        .select()
-        .from(sessions)
-        .where(eq(sessions.id, input.sessionId))
-        .get()
-      if (!session) throw new Error('Session does not exist.')
-      const images = this.resolveMessageImages(
-        input.sessionId,
-        input.imageIds ?? [],
-        input.imageOwnerKey,
-      )
-      if (
-        freezeDrafts &&
-        !input.receivedInputId &&
-        session.commentsRevision !== input.expectedCommentsRevision
-      ) {
-        throw new Error('Comment drafts changed. Refresh and try again.')
-      }
-      const activeRun = transaction
-        .select({ id: agentRuns.id })
-        .from(agentRuns)
-        .where(
-          and(
-            eq(agentRuns.sessionId, input.sessionId),
-            inArray(agentRuns.status, [...activeRunStatuses]),
-            ne(agentRuns.controlDisposition, 'abandoned'),
-            isNull(agentRuns.forkSourceRunId),
-          ),
+    const committedCommentsRevision = this.nativeMetadataTransaction(
+      input.sessionId,
+      (transaction) => {
+        assertSessionAvailable(transaction, input.sessionId)
+        const session = transaction
+          .select()
+          .from(sessions)
+          .where(eq(sessions.id, input.sessionId))
+          .get()
+        if (!session) throw new Error('Session does not exist.')
+        const images = this.resolveMessageImages(
+          input.sessionId,
+          input.imageIds ?? [],
+          input.imageOwnerKey,
         )
-        .get()
-      if (activeRun) throw new RunOperationConflictError('This Session already has an active Run.')
-      const draftsCondition = and(
-        eq(anchoredComments.sessionId, input.sessionId),
-        freezeDrafts ? undefined : sql`0`,
-        input.receivedInputId
-          ? eq(anchoredComments.pendingReceiptId, input.receivedInputId)
-          : and(
-              isNull(anchoredComments.sentWithMessageId),
-              isNull(anchoredComments.pendingReceiptId),
+        if (
+          freezeDrafts &&
+          !input.receivedInputId &&
+          session.commentsRevision !== input.expectedCommentsRevision
+        ) {
+          throw new Error('Comment drafts changed. Refresh and try again.')
+        }
+        const activeRun = transaction
+          .select({ id: agentRuns.id })
+          .from(agentRuns)
+          .where(
+            and(
+              eq(agentRuns.sessionId, input.sessionId),
+              inArray(agentRuns.status, [...activeRunStatuses]),
+              ne(agentRuns.controlDisposition, 'abandoned'),
+              isNull(agentRuns.forkSourceRunId),
             ),
-      )
-      const draftCount = transaction
-        .select({ value: sql<number>`count(*)` })
-        .from(anchoredComments)
-        .where(draftsCondition)
-        .get()!.value
-      if (input.preserveDraftComments && !input.receivedInputId && input.commentIds.length > 0)
-        throw new Error('Peer actions cannot consume Comment drafts.')
-      if (!input.content.trim() && !images.length && (!draftCount || !freezeDrafts))
-        throw new RunOperationConflictError(
-          'Write a message, add a Comment, or attach an image before sending.',
-        )
-      const sourceProposal = input.sourceProposalId
-        ? transaction
-            .select({
-              runId: agentRuns.id,
-              runStatus: agentRuns.status,
-              sourceAgentId: agentRuns.agentId,
-              targetAgentId: agentRuns.peerProposalTargetAgentId,
-              state: agentRuns.peerProposalState,
-              sourceMessageId: conversationMessages.id,
-              sourceMessageAgentId: conversationMessages.agentId,
-              sourceMessageState: conversationMessages.state,
-              sourceHasBody: sql<number>`length(trim(${conversationMessages.content}, char(9) || char(10) || char(13) || ' ')) > 0`,
-            })
-            .from(agentRuns)
-            .innerJoin(
-              conversationMessages,
-              and(
-                eq(conversationMessages.runId, agentRuns.id),
-                eq(conversationMessages.role, 'assistant'),
-                eq(conversationMessages.isVisible, true),
-              ),
-            )
-            .where(
-              and(
-                eq(agentRuns.sessionId, input.sessionId),
-                eq(agentRuns.peerProposalId, input.sourceProposalId),
-              ),
-            )
-            .orderBy(desc(conversationMessages.sequence))
-            .limit(1)
-            .get()
-        : undefined
-      if (
-        input.sourceProposalId &&
-        (!sourceProposal ||
-          sourceProposal.state !== 'pending' ||
-          sourceProposal.targetAgentId !== input.agentId ||
-          sourceProposal.runStatus !== 'completed' ||
-          sourceProposal.sourceMessageId !== input.sourceMessageId ||
-          sourceProposal.sourceMessageState !== 'complete' ||
-          !sourceProposal.sourceHasBody ||
-          sourceProposal.sourceMessageAgentId !== sourceProposal.sourceAgentId)
-      )
-        throw new RunOperationConflictError('This peer request is no longer available.')
-      const returnId =
-        input.returnedInputOperationId ??
-        (!input.preserveDraftComments
-          ? this.rebuildInputRecovery(input.sessionId)?.operationId
-          : undefined)
-      if (returnId) {
-        const returned = this.verifyReturnedInput(returnId, input.sessionId)
-        if (input.returnedInputOperationId && returned.record.state !== 'installed')
-          throw new RunOperationConflictError('Restore this input before sending it.')
-        returned.record.state = 'consumed'
-        transaction
-          .update(nativeRebuildOperations)
-          .set({ returnedInputJson: JSON.stringify(returned.record) })
-          .where(eq(nativeRebuildOperations.id, returnId))
-          .run()
-        this.nativeFact(returned.record.runId, 'native.input_consumed', {
-          operationId: returnId,
-          messageId: returned.record.messageId,
-          replacementMessageId: userMessageId,
-          reason: input.returnedInputOperationId ? 'returned_input_sent' : 'new_input_sent',
-        })
-      }
-      const superseded = transaction
-        .select({ id: agentRuns.id })
-        .from(agentRuns)
-        .where(
-          and(
-            eq(agentRuns.sessionId, input.sessionId),
-            eq(agentRuns.peerProposalState, 'pending'),
-            ...(input.sourceProposalId
-              ? [ne(agentRuns.peerProposalId, input.sourceProposalId)]
-              : []),
-          ),
-        )
-        .all()
-      supersededProposalRunIds.push(...superseded.map((entry) => entry.id))
-      if (supersededProposalRunIds.length > 0)
-        transaction
-          .update(agentRuns)
-          .set({ peerProposalState: 'superseded', updatedAt: createdAt })
-          .where(inArray(agentRuns.id, supersededProposalRunIds))
-          .run()
-      const messageSequence =
-        (transaction
-          .select({ value: max(conversationMessages.sequence) })
-          .from(conversationMessages)
-          .where(eq(conversationMessages.sessionId, input.sessionId))
-          .get()?.value ?? -1) + 1
-
-      if (input.receivedInputId) {
-        const received = this.receivedCollaborationInput(input.sessionId)
-        if (!received || received.id !== input.receivedInputId || received.state !== 'accepted')
-          throw new RunOperationConflictError('This received input is no longer eligible.')
-      }
-      if (input.collaboration) {
-        const task = collaborationTaskSchema.parse({ ...input.collaboration, runId })
-        const current = this.collaboration(input.sessionId)
-        if (task.previousRunId) {
-          if (
-            !current ||
-            current.id !== task.id ||
-            current.revision + 1 !== task.revision ||
-            current.runId !== task.previousRunId
           )
-            throw new RunOperationConflictError('The collaboration task changed before dispatch.')
-          transaction
-            .update(collaborationTasks)
-            .set({ stateJson: JSON.stringify(task), updatedAt: createdAt })
-            .where(eq(collaborationTasks.id, task.id))
-            .run()
-        } else {
-          transaction
-            .update(collaborationTasks)
-            .set({ active: false })
-            .where(
-              and(
-                eq(collaborationTasks.sessionId, input.sessionId),
-                eq(collaborationTasks.active, true),
+          .get()
+        if (activeRun)
+          throw new RunOperationConflictError('This Session already has an active Run.')
+        const draftsCondition = and(
+          eq(anchoredComments.sessionId, input.sessionId),
+          freezeDrafts ? undefined : sql`0`,
+          input.receivedInputId
+            ? eq(anchoredComments.pendingReceiptId, input.receivedInputId)
+            : and(
+                isNull(anchoredComments.sentWithMessageId),
+                isNull(anchoredComments.pendingReceiptId),
               ),
-            )
-            .run()
-          transaction
-            .insert(collaborationTasks)
-            .values({
-              id: task.id,
-              sessionId: task.sessionId,
-              stateJson: JSON.stringify(task),
-              active: true,
-              updatedAt: createdAt,
-            })
-            .run()
-        }
-      } else if (!input.sourceProposalId) {
-        const task = this.collaboration(input.sessionId)
-        if (task && task.status !== 'complete') {
-          if (task.status !== 'paused')
-            task.pausedStatus = task.status === 'running' ? 'failed' : task.status
-          task.status = 'paused'
-          task.revision++
-          task.notice =
-            'A new user message superseded the previous action. Resume explicitly after handling it.'
-          this.saveCollaboration(task)
-        }
-      }
-      transaction
-        .insert(conversationMessages)
-        .values({
-          id: userMessageId,
-          sessionId: input.sessionId,
-          runId,
-          role: 'user',
-          routeKind: route.type,
-          routeAgentsJson: JSON.stringify(routeAgents),
-          skillInvocationJson: input.skillInvocation ? JSON.stringify(input.skillInvocation) : null,
-          routePendingAgentId: route.type === 'all' ? route.secondAgentId : null,
-          sourceMessageId: input.sourceMessageId ?? null,
-          content: input.content,
-          state: 'complete',
-          sequence: messageSequence,
-          createdAt,
-          updatedAt: createdAt,
-        })
-        .run()
-      for (const [ordinal, image] of images.entries()) {
-        transaction
-          .insert(conversationMessageImages)
-          .values({ messageId: userMessageId, ordinal, imageId: image.id })
-          .run()
-        transaction
-          .update(conversationImageAssets)
-          .set({ committed: true, updatedAt: createdAt })
-          .where(eq(conversationImageAssets.id, image.id))
-          .run()
-      }
-      transaction
-        .insert(agentRuns)
-        .values({
-          id: runId,
-          collaborationTaskId: input.collaboration?.id,
-          collaborationKind: input.collaboration?.kind,
-          collaborationStage: input.collaboration?.stage,
-          answerFormat: input.collaboration ? 'collaboration_envelope_v5' : undefined,
-          sessionId: input.sessionId,
-          userMessageId,
-          agentId: input.agentId,
-          status: 'starting',
-          bindingGeneration:
-            this.nativeContext(input.sessionId, input.agentId)?.bindingGeneration ?? 1,
-          nativeEffectsState: 'not_dispatched',
-          attemptCount: 1,
-          settingsRevision: input.settingsRevision,
-          permissionMode: this.permissionModeAt(
-            input.sessionId,
-            input.agentId,
-            input.settingsRevision,
-          ),
-          model: input.model,
-          effort: input.effort,
-          handoffSourceIds,
-          handoffMessageCount: input.handoffSourceRefs?.length ?? 0,
-          createdAt,
-          updatedAt: createdAt,
-        })
-        .run()
-      if (input.collaboration)
-        transaction
-          .insert(collaborationTurns)
-          .values({
-            runId,
-            taskId: input.collaboration.id,
-            stateJson: JSON.stringify({ ...input.collaboration, runId }),
-          })
-          .run()
-      if (input.collaboration) this.saveCollaboration({ ...input.collaboration, runId })
-      const batch = this.freezeInputBatch({
-        sessionId: input.sessionId,
-        clientMessageId: input.clientMessageId,
-        commentsRevision: session.commentsRevision,
-        actor: input.agentId,
-        ...(input.batchId ? { batchId: input.batchId } : {}),
-        ...(input.collaboration ? { taskId: input.collaboration.id } : {}),
-        runId,
-        messageId: userMessageId,
-        ...(input.receivedInputId ? { pendingReceiptId: input.receivedInputId } : {}),
-        preserveDraftComments: !freezeDrafts,
-      })
-      this.sealInputBatchSources(batch.id, runId)
-      this.freezeRunSources(runId, input.handoffSourceRefs ?? [])
-      if (input.collaboration)
-        this.freezeCollaborationAuthorization({ ...input.collaboration, runId }, runId, batch)
-      if (freezeDrafts && draftCount > 0)
-        transaction
-          .update(anchoredComments)
-          .set({ sentWithMessageId: userMessageId, pendingReceiptId: null, updatedAt: createdAt })
+        )
+        const draftCount = transaction
+          .select({ value: sql<number>`count(*)` })
+          .from(anchoredComments)
           .where(draftsCondition)
-          .run()
-      if (input.receivedInputId) {
-        transaction
-          .update(collaborationInputs)
-          .set({ state: 'materialized', materializedRunId: runId })
-          .where(eq(collaborationInputs.id, input.receivedInputId))
-          .run()
-        transaction
-          .update(conversationBodyInputs)
-          .set({ committedMessageId: userMessageId, pendingReceiptId: null })
+          .get()!.value
+        if (input.preserveDraftComments && !input.receivedInputId && input.commentIds.length > 0)
+          throw new Error('Peer actions cannot consume Comment drafts.')
+        if (!input.content.trim() && !images.length && (!draftCount || !freezeDrafts))
+          throw new RunOperationConflictError(
+            'Write a message, add a Comment, or attach an image before sending.',
+          )
+        const sourceProposal = input.sourceProposalId
+          ? transaction
+              .select({
+                runId: agentRuns.id,
+                runStatus: agentRuns.status,
+                sourceAgentId: agentRuns.agentId,
+                targetAgentId: agentRuns.peerProposalTargetAgentId,
+                state: agentRuns.peerProposalState,
+                sourceMessageId: conversationMessages.id,
+                sourceMessageAgentId: conversationMessages.agentId,
+                sourceMessageState: conversationMessages.state,
+                sourceHasBody: sql<number>`length(trim(${conversationMessages.content}, char(9) || char(10) || char(13) || ' ')) > 0`,
+              })
+              .from(agentRuns)
+              .innerJoin(
+                conversationMessages,
+                and(
+                  eq(conversationMessages.runId, agentRuns.id),
+                  eq(conversationMessages.role, 'assistant'),
+                  eq(conversationMessages.isVisible, true),
+                ),
+              )
+              .where(
+                and(
+                  eq(agentRuns.sessionId, input.sessionId),
+                  eq(agentRuns.peerProposalId, input.sourceProposalId),
+                ),
+              )
+              .orderBy(desc(conversationMessages.sequence))
+              .limit(1)
+              .get()
+          : undefined
+        if (
+          input.sourceProposalId &&
+          (!sourceProposal ||
+            sourceProposal.state !== 'pending' ||
+            sourceProposal.targetAgentId !== input.agentId ||
+            sourceProposal.runStatus !== 'completed' ||
+            sourceProposal.sourceMessageId !== input.sourceMessageId ||
+            sourceProposal.sourceMessageState !== 'complete' ||
+            !sourceProposal.sourceHasBody ||
+            sourceProposal.sourceMessageAgentId !== sourceProposal.sourceAgentId)
+        )
+          throw new RunOperationConflictError('This peer request is no longer available.')
+        const returnId =
+          input.returnedInputOperationId ??
+          (!input.preserveDraftComments
+            ? this.rebuildInputRecovery(input.sessionId)?.operationId
+            : undefined)
+        if (returnId) {
+          const returned = this.verifyReturnedInput(returnId, input.sessionId)
+          if (input.returnedInputOperationId && returned.record.state !== 'installed')
+            throw new RunOperationConflictError('Restore this input before sending it.')
+          returned.record.state = 'consumed'
+          transaction
+            .update(nativeRebuildOperations)
+            .set({ returnedInputJson: JSON.stringify(returned.record) })
+            .where(eq(nativeRebuildOperations.id, returnId))
+            .run()
+          this.nativeFact(returned.record.runId, 'native.input_consumed', {
+            operationId: returnId,
+            messageId: returned.record.messageId,
+            replacementMessageId: userMessageId,
+            reason: input.returnedInputOperationId ? 'returned_input_sent' : 'new_input_sent',
+          })
+        }
+        const superseded = transaction
+          .select({ id: agentRuns.id })
+          .from(agentRuns)
           .where(
             and(
-              eq(conversationBodyInputs.pendingReceiptId, input.receivedInputId),
-              eq(
-                conversationBodyInputs.id,
-                transaction
-                  .select({ inputId: collaborationInputs.inputId })
-                  .from(collaborationInputs)
-                  .where(eq(collaborationInputs.id, input.receivedInputId))
-                  .get()!.inputId,
-              ),
+              eq(agentRuns.sessionId, input.sessionId),
+              eq(agentRuns.peerProposalState, 'pending'),
+              ...(input.sourceProposalId
+                ? [ne(agentRuns.peerProposalId, input.sourceProposalId)]
+                : []),
             ),
           )
-          .run()
+          .all()
+        supersededProposalRunIds.push(...superseded.map((entry) => entry.id))
+        if (supersededProposalRunIds.length > 0)
+          transaction
+            .update(agentRuns)
+            .set({ peerProposalState: 'superseded', updatedAt: createdAt })
+            .where(inArray(agentRuns.id, supersededProposalRunIds))
+            .run()
+        const messageSequence =
+          (transaction
+            .select({ value: max(conversationMessages.sequence) })
+            .from(conversationMessages)
+            .where(eq(conversationMessages.sessionId, input.sessionId))
+            .get()?.value ?? -1) + 1
+
+        if (input.receivedInputId) {
+          const received = this.receivedCollaborationInput(input.sessionId)
+          if (!received || received.id !== input.receivedInputId || received.state !== 'accepted')
+            throw new RunOperationConflictError('This received input is no longer eligible.')
+        }
+        if (input.collaboration) {
+          const task = collaborationTaskSchema.parse({ ...input.collaboration, runId })
+          const current = this.collaboration(input.sessionId)
+          if (task.previousRunId) {
+            if (
+              !current ||
+              current.id !== task.id ||
+              current.revision + 1 !== task.revision ||
+              current.runId !== task.previousRunId
+            )
+              throw new RunOperationConflictError('The collaboration task changed before dispatch.')
+            transaction
+              .update(collaborationTasks)
+              .set({ stateJson: JSON.stringify(task), updatedAt: createdAt })
+              .where(eq(collaborationTasks.id, task.id))
+              .run()
+          } else {
+            transaction
+              .update(collaborationTasks)
+              .set({ active: false })
+              .where(
+                and(
+                  eq(collaborationTasks.sessionId, input.sessionId),
+                  eq(collaborationTasks.active, true),
+                ),
+              )
+              .run()
+            transaction
+              .insert(collaborationTasks)
+              .values({
+                id: task.id,
+                sessionId: task.sessionId,
+                stateJson: JSON.stringify(task),
+                active: true,
+                updatedAt: createdAt,
+              })
+              .run()
+          }
+        } else if (!input.sourceProposalId) {
+          const task = this.collaboration(input.sessionId)
+          if (task && task.status !== 'complete') {
+            if (task.status !== 'paused')
+              task.pausedStatus = task.status === 'running' ? 'failed' : task.status
+            task.status = 'paused'
+            task.revision++
+            task.notice =
+              'A new user message superseded the previous action. Resume explicitly after handling it.'
+            this.saveCollaboration(task)
+          }
+        }
         transaction
-          .update(conversationImageAssets)
-          .set({ pendingReceiptId: null })
-          .where(
-            and(
-              eq(conversationImageAssets.pendingReceiptId, input.receivedInputId),
-              input.imageIds?.length ? inArray(conversationImageAssets.id, input.imageIds) : sql`0`,
-            ),
-          )
-          .run()
-      }
-      if (input.sourceProposalId) {
-        transaction
-          .update(agentRuns)
-          .set({
-            peerProposalState: 'accepted',
-            peerProposalAcceptedMessageId: userMessageId,
+          .insert(conversationMessages)
+          .values({
+            id: userMessageId,
+            sessionId: input.sessionId,
+            runId,
+            role: 'user',
+            routeKind: route.type,
+            routeAgentsJson: JSON.stringify(routeAgents),
+            skillInvocationJson: input.skillInvocation
+              ? JSON.stringify(input.skillInvocation)
+              : null,
+            routePendingAgentId: route.type === 'all' ? route.secondAgentId : null,
+            sourceMessageId: input.sourceMessageId ?? null,
+            content: input.content,
+            state: 'complete',
+            sequence: messageSequence,
+            createdAt,
             updatedAt: createdAt,
           })
-          .where(eq(agentRuns.peerProposalId, input.sourceProposalId))
           .run()
-      }
-      transaction
-        .update(sessions)
-        .set({
-          status: 'discussing',
-          commentsRevision: freezeDrafts ? session.commentsRevision + 1 : session.commentsRevision,
-          ...(input.suggestedTitle
-            ? { title: input.suggestedTitle, titleSource: 'local' as const }
-            : {}),
-          updatedAt: createdAt,
+        for (const [ordinal, image] of images.entries()) {
+          transaction
+            .insert(conversationMessageImages)
+            .values({ messageId: userMessageId, ordinal, imageId: image.id })
+            .run()
+          transaction
+            .update(conversationImageAssets)
+            .set({ committed: true, updatedAt: createdAt })
+            .where(eq(conversationImageAssets.id, image.id))
+            .run()
+        }
+        transaction
+          .insert(agentRuns)
+          .values({
+            id: runId,
+            collaborationTaskId: input.collaboration?.id,
+            collaborationKind: input.collaboration?.kind,
+            collaborationStage: input.collaboration?.stage,
+            answerFormat: input.collaboration ? 'collaboration_envelope_v5' : undefined,
+            sessionId: input.sessionId,
+            userMessageId,
+            agentId: input.agentId,
+            status: 'starting',
+            bindingGeneration:
+              this.nativeContext(input.sessionId, input.agentId)?.bindingGeneration ?? 1,
+            nativeEffectsState: 'not_dispatched',
+            attemptCount: 1,
+            settingsRevision: input.settingsRevision,
+            permissionMode: this.permissionModeAt(
+              input.sessionId,
+              input.agentId,
+              input.settingsRevision,
+            ),
+            model: input.model,
+            effort: input.effort,
+            handoffSourceIds,
+            handoffMessageCount: input.handoffSourceRefs?.length ?? 0,
+            createdAt,
+            updatedAt: createdAt,
+          })
+          .run()
+        if (input.collaboration)
+          transaction
+            .insert(collaborationTurns)
+            .values({
+              runId,
+              taskId: input.collaboration.id,
+              stateJson: JSON.stringify({ ...input.collaboration, runId }),
+            })
+            .run()
+        if (input.collaboration) this.saveCollaboration({ ...input.collaboration, runId })
+        const batch = this.freezeInputBatch({
+          sessionId: input.sessionId,
+          clientMessageId: input.clientMessageId,
+          commentsRevision: session.commentsRevision,
+          actor: input.agentId,
+          ...(input.batchId ? { batchId: input.batchId } : {}),
+          ...(input.collaboration ? { taskId: input.collaboration.id } : {}),
+          runId,
+          messageId: userMessageId,
+          ...(input.receivedInputId ? { pendingReceiptId: input.receivedInputId } : {}),
+          preserveDraftComments: !freezeDrafts,
         })
-        .where(eq(sessions.id, input.sessionId))
-        .run()
-      appendAgentEvent(transaction, {
-        sessionId: input.sessionId,
-        runId,
-        eventType: 'user.message',
-        payload: JSON.stringify({
-          message:
-            Buffer.byteLength(input.content) <= CONVERSATION_PATCH_TEXT_BYTES
-              ? { id: userMessageId, content: input.content }
-              : {
-                  id: userMessageId,
-                  source: {
-                    version: 1,
-                    messageId: userMessageId,
-                    revision: 0,
-                    sha256: createHash('sha256').update(input.content).digest('hex'),
-                    bytes: Buffer.byteLength(input.content),
+        this.sealInputBatchSources(batch.id, runId)
+        this.freezeRunSources(runId, input.handoffSourceRefs ?? [])
+        if (input.collaboration)
+          this.freezeCollaborationAuthorization({ ...input.collaboration, runId }, runId, batch)
+        if (freezeDrafts && draftCount > 0)
+          transaction
+            .update(anchoredComments)
+            .set({ sentWithMessageId: userMessageId, pendingReceiptId: null, updatedAt: createdAt })
+            .where(draftsCondition)
+            .run()
+        if (input.receivedInputId) {
+          transaction
+            .update(collaborationInputs)
+            .set({ state: 'materialized', materializedRunId: runId })
+            .where(eq(collaborationInputs.id, input.receivedInputId))
+            .run()
+          transaction
+            .update(conversationBodyInputs)
+            .set({ committedMessageId: userMessageId, pendingReceiptId: null })
+            .where(
+              and(
+                eq(conversationBodyInputs.pendingReceiptId, input.receivedInputId),
+                eq(
+                  conversationBodyInputs.id,
+                  transaction
+                    .select({ inputId: collaborationInputs.inputId })
+                    .from(collaborationInputs)
+                    .where(eq(collaborationInputs.id, input.receivedInputId))
+                    .get()!.inputId,
+                ),
+              ),
+            )
+            .run()
+          transaction
+            .update(conversationImageAssets)
+            .set({ pendingReceiptId: null })
+            .where(
+              and(
+                eq(conversationImageAssets.pendingReceiptId, input.receivedInputId),
+                input.imageIds?.length
+                  ? inArray(conversationImageAssets.id, input.imageIds)
+                  : sql`0`,
+              ),
+            )
+            .run()
+        }
+        if (input.sourceProposalId) {
+          transaction
+            .update(agentRuns)
+            .set({
+              peerProposalState: 'accepted',
+              peerProposalAcceptedMessageId: userMessageId,
+              updatedAt: createdAt,
+            })
+            .where(eq(agentRuns.peerProposalId, input.sourceProposalId))
+            .run()
+        }
+        transaction
+          .update(sessions)
+          .set({
+            status: 'discussing',
+            commentsRevision: freezeDrafts
+              ? session.commentsRevision + 1
+              : session.commentsRevision,
+            ...(input.suggestedTitle
+              ? { title: input.suggestedTitle, titleSource: 'local' as const }
+              : {}),
+            updatedAt: createdAt,
+          })
+          .where(eq(sessions.id, input.sessionId))
+          .run()
+        appendAgentEvent(transaction, {
+          sessionId: input.sessionId,
+          runId,
+          eventType: 'user.message',
+          payload: JSON.stringify({
+            message:
+              Buffer.byteLength(input.content) <= CONVERSATION_PATCH_TEXT_BYTES
+                ? { id: userMessageId, content: input.content }
+                : {
+                    id: userMessageId,
+                    source: {
+                      version: 1,
+                      messageId: userMessageId,
+                      revision: 0,
+                      sha256: createHash('sha256').update(input.content).digest('hex'),
+                      bytes: Buffer.byteLength(input.content),
+                    },
                   },
-                },
-          route,
-          ...(images.length ? { images } : {}),
-          sourceMessageId: input.sourceMessageId ?? null,
-          sourceProposalId: input.sourceProposalId ?? null,
-          comments: [],
-          freezeDrafts,
-          inputBatchRef: batch,
-        }),
-        createdAt,
-      })
-      return freezeDrafts ? session.commentsRevision + 1 : session.commentsRevision
-    })
+            route,
+            ...(images.length ? { images } : {}),
+            sourceMessageId: input.sourceMessageId ?? null,
+            sourceProposalId: input.sourceProposalId ?? null,
+            comments: [],
+            freezeDrafts,
+            inputBatchRef: batch,
+          }),
+          createdAt,
+        })
+        return freezeDrafts ? session.commentsRevision + 1 : session.commentsRevision
+      },
+    )
 
     const run = this.findRun(runId)
     if (!run) throw new Error('Agent Run was not created.')
@@ -7532,7 +7599,8 @@ export class ConversationRepository {
       throw new HandoffTooLargeError('The required Agent context is too large to save safely.')
     const runId = randomUUID()
     const createdAt = new Date().toISOString()
-    this.database.transaction((transaction) => {
+    this.nativeMetadataTransaction(input.sessionId, (transaction) => {
+      assertSessionAvailable(transaction, input.sessionId)
       const message = transaction
         .select()
         .from(conversationMessages)
@@ -7658,12 +7726,12 @@ export class ConversationRepository {
     }
   }
 
-  pendingRoutedContinuations(): Array<{
+  pendingRoutedContinuations(scope?: WorkspaceArchiveScope): Array<{
     sessionId: string
     userMessageId: string
     agentId: RuntimeAgentId
   }> {
-    return this.database
+    const query = this.database
       .select({
         sessionId: conversationMessages.sessionId,
         userMessageId: conversationMessages.id,
@@ -7672,15 +7740,23 @@ export class ConversationRepository {
       .from(conversationMessages)
       .innerJoin(sessions, eq(sessions.id, conversationMessages.sessionId))
       .where(
-        and(isNotNull(conversationMessages.routePendingAgentId), ne(sessions.status, 'archived')),
+        and(
+          isNotNull(conversationMessages.routePendingAgentId),
+          ne(sessions.status, 'archived'),
+          isNull(sessions.archivedAt),
+          scope?.kind === 'session'
+            ? eq(sessions.id, scope.sessionId)
+            : scope?.kind === 'project'
+              ? eq(sessions.projectId, scope.projectId)
+              : undefined,
+        ),
       )
       .orderBy(asc(conversationMessages.sessionId), asc(conversationMessages.sequence))
-      .all()
-      .flatMap((row) =>
-        row.agentId
-          ? [{ sessionId: row.sessionId, userMessageId: row.userMessageId, agentId: row.agentId }]
-          : [],
-      )
+    return (scope ? query.limit(6).all() : query.all()).flatMap((row) =>
+      row.agentId
+        ? [{ sessionId: row.sessionId, userMessageId: row.userMessageId, agentId: row.agentId }]
+        : [],
+    )
   }
 
   hasPendingRoutedContinuation(sessionId: string): boolean {
@@ -7876,7 +7952,7 @@ export class ConversationRepository {
     const run = this.findRun(runId)
     if (!run) throw new RunOperationConflictError('The native observation owner is unavailable.')
     const updatedAt = new Date().toISOString()
-    this.database.transaction((transaction) => {
+    this.nativeMetadataTransaction(run.sessionId, (transaction) => {
       transaction
         .update(agentRuns)
         .set({ nativeEffectsState: state, nativeEffectsReason: reason?.slice(0, 128) ?? null })
@@ -7935,7 +8011,7 @@ export class ConversationRepository {
     failure?: { kind: RunFailureKind; message: string; action?: 'retry' | 'rebuild' | 'none' },
   ): ConversationPatch {
     let retired: string | undefined
-    this.database.transaction(() => {
+    this.nativeMetadataTransaction(sessionId, () => {
       const current = this.nativeContext(sessionId, agentId)
       if (generation !== undefined && current && current.bindingGeneration !== generation) return
       if (state === 'recovery_required')
@@ -8006,7 +8082,7 @@ export class ConversationRepository {
     const run = this.findRun(runId)
     if (!run) throw new RunOperationConflictError('Dispatch owner is unavailable.')
     if (run.dispatchPhase === 'ended') return this.runPatch(runId)
-    this.database.transaction(() => {
+    this.nativeMetadataTransaction(run.sessionId, () => {
       this.database
         .update(agentRuns)
         .set({
@@ -8027,7 +8103,7 @@ export class ConversationRepository {
   ): ConversationPatch {
     const evidence = nativeProbeResultSchema.parse(result)
     if (evidence.kind === 'binding_ready') {
-      this.database.transaction(() => {
+      this.nativeMetadataTransaction(evidence.identity.sessionId, () => {
         const receipt = this.confirmedNativeInitialization(
           evidence.identity.sessionId,
           evidence.identity.agentId,
@@ -8102,7 +8178,7 @@ export class ConversationRepository {
     )
       throw new RunOperationConflictError('Native evidence identity does not match its Run.')
     let retired: string | undefined
-    this.database.transaction(() => {
+    this.nativeMetadataTransaction(id.sessionId, () => {
       const currentContext = this.nativeContext(id.sessionId, id.agentId)
       const controls =
         currentContext?.bindingGeneration === id.bindingGeneration &&
@@ -8217,7 +8293,7 @@ export class ConversationRepository {
     const run = this.findRun(runId)
     if (!run) throw new RunOperationConflictError('The observed Run is unavailable.')
     let retired: string | undefined
-    this.database.transaction(() => {
+    this.nativeMetadataTransaction(run.sessionId, () => {
       if (this.ownsNativeControl(runId))
         retired = this.retirePendingRoute(run.sessionId, 'native_observation_unavailable')
       if (
@@ -8403,7 +8479,7 @@ export class ConversationRepository {
     const run = this.findRun(runId)
     if (!run || run.dispatchPhase !== 'ended')
       throw new RunOperationConflictError('The native ending has no evidence.')
-    this.database.transaction(() => {
+    this.nativeMetadataTransaction(run.sessionId, () => {
       this.database
         .update(agentRuns)
         .set({
@@ -8465,7 +8541,7 @@ export class ConversationRepository {
       .where(
         and(
           eq(sessions.projectId, projectId),
-          sql`EXISTS (SELECT 1 FROM ${agentRuns} WHERE ${agentRuns.sessionId} = ${sessions.id} AND ${agentRuns.forkSourceRunId} IS NULL AND ((${agentRuns.status} IN ('starting', 'running', 'recovering') AND ${agentRuns.controlDisposition} <> 'abandoned') OR ${agentRuns.nativeEffectsState} IN ('pending', 'unknown')))`,
+          sql`EXISTS (SELECT 1 FROM ${agentRuns} INDEXED BY agent_runs_session_unsettled_work_idx WHERE ${agentRuns.sessionId} = ${sessions.id} AND ${agentRuns.forkSourceRunId} IS NULL AND ((${agentRuns.status} IN ('starting', 'running', 'recovering') AND ${agentRuns.controlDisposition} <> 'abandoned') OR ${agentRuns.nativeEffectsState} IN ('pending', 'unknown')))`,
         ),
       )
       .limit(1)
@@ -8478,7 +8554,7 @@ export class ConversationRepository {
         .where(
           and(
             eq(sessions.projectId, projectId),
-            sql`EXISTS (SELECT 1 FROM ${nativeRebuildOperations} WHERE ${nativeRebuildOperations.sessionId} = ${sessions.id} AND ${nativeRebuildOperations.nativeWorkState} IN ('pending', 'unknown'))`,
+            sql`EXISTS (SELECT 1 FROM ${nativeRebuildOperations} INDEXED BY native_rebuild_operations_unsettled_work_idx WHERE ${nativeRebuildOperations.sessionId} = ${sessions.id} AND ${nativeRebuildOperations.nativeWorkState} IN ('pending', 'unknown'))`,
           ),
         )
         .limit(1)
@@ -8682,8 +8758,9 @@ export class ConversationRepository {
       throw new RunOperationConflictError(
         'Confirm abandoning the unverified task before rebuilding.',
       )
-    this.database.transaction(() => {
+    this.nativeMetadataTransaction(input.sessionId, () => {
       const pending = this.pendingNativeRebuild(input.sessionId, input.agentId)
+      assertSessionAvailable(this.database, input.sessionId)
       if (pending && pending.stage !== 'unconfirmed')
         throw new RunOperationConflictError('This Native rebuild is still in progress.')
       if (pending)
@@ -9290,18 +9367,27 @@ export class ConversationRepository {
   }
 
   markNativeRebuildDispatched(id: string, executorId?: string): void {
-    this.database
-      .update(nativeRebuildOperations)
-      .set({
-        stage: 'creating',
-        nativeWorkState: 'pending',
-        creationExecutorId: executorId ?? null,
-        updatedAt: new Date().toISOString(),
-      })
-      .where(
-        and(eq(nativeRebuildOperations.id, id), eq(nativeRebuildOperations.stage, 'preparing')),
-      )
-      .run()
+    this.database.transaction(() => {
+      const operation = this.database
+        .select({ sessionId: nativeRebuildOperations.sessionId })
+        .from(nativeRebuildOperations)
+        .where(eq(nativeRebuildOperations.id, id))
+        .get()
+      if (!operation) throw new RunOperationConflictError('This native rebuild is unavailable.')
+      assertSessionAvailable(this.database, operation.sessionId)
+      this.database
+        .update(nativeRebuildOperations)
+        .set({
+          stage: 'creating',
+          nativeWorkState: 'pending',
+          creationExecutorId: executorId ?? null,
+          updatedAt: new Date().toISOString(),
+        })
+        .where(
+          and(eq(nativeRebuildOperations.id, id), eq(nativeRebuildOperations.stage, 'preparing')),
+        )
+        .run()
+    })
   }
 
   readNativeRebuildSource(id: string): NativeContextRebuildChunk[] {
@@ -9359,7 +9445,7 @@ export class ConversationRepository {
       .get()
     if (!row) throw new RunOperationConflictError('The rebuild operation is unavailable.')
     if (['completed', 'superseded'].includes(row.stage)) return this.createPatch(row.sessionId)
-    this.database.transaction(() => {
+    this.nativeMetadataTransaction(row.sessionId, () => {
       this.database
         .update(nativeRebuildOperations)
         .set({
@@ -9428,7 +9514,8 @@ export class ConversationRepository {
     const dividerId = randomUUID()
     let returnedMessageId: string | undefined
     let retiredMessages: ConversationPatch['messages'] = []
-    this.database.transaction(() => {
+    this.nativeMetadataTransaction(row.sessionId, () => {
+      assertSessionAvailable(this.database, row.sessionId)
       const context = this.nativeContext(row.sessionId, row.agentId)
       if (
         (context?.bindingGeneration ?? 1) !== row.oldGeneration ||
@@ -10076,7 +10163,7 @@ export class ConversationRepository {
     const updatedAt = new Date().toISOString()
     const run = this.findRun(runId)
     if (!run) throw new Error('Agent Run does not exist.')
-    this.database.transaction((transaction) => {
+    this.nativeMetadataTransaction(run.sessionId, (transaction) => {
       appendAgentEvent(transaction, {
         sessionId: run.sessionId,
         runId,
@@ -10482,6 +10569,14 @@ export class ConversationRepository {
           .map((change) =>
             this.activityChange(change.id, change.mode, change.detail, change.previousRevision),
           )
+        if (
+          events.some((event) =>
+            ['session.started', 'turn.started', 'turn.completed', 'text.completed'].includes(
+              event.type,
+            ),
+          )
+        )
+          refreshNativeSessionMetadata(transaction, sessionId)
         const run = this.findRun(runId)
         return this.createPatch(sessionId, {
           messages,
@@ -10752,7 +10847,7 @@ export class ConversationRepository {
       transaction
         .update(sessions)
         .set({ status: 'waiting_for_user', updatedAt: now })
-        .where(eq(sessions.id, sessionId))
+        .where(and(eq(sessions.id, sessionId), isNull(sessions.archivedAt)))
         .run()
     } else if (
       event.type === 'reasoning.summary.delta' ||
@@ -11139,7 +11234,7 @@ export class ConversationRepository {
                 : 'paused',
             updatedAt: now,
           })
-          .where(eq(sessions.id, sessionId))
+          .where(and(eq(sessions.id, sessionId), isNull(sessions.archivedAt)))
           .run()
     }
     if (sealedBody && event.type === 'text.completed' && messageChange) {
@@ -11188,7 +11283,7 @@ export class ConversationRepository {
     if (latest?.id !== runId || run.status === 'completed')
       throw new RunOperationConflictError('This Run no longer owns failure settlement.')
     const updatedAt = new Date().toISOString()
-    this.database.transaction((transaction) => {
+    this.nativeMetadataTransaction(run.sessionId, (transaction) => {
       const partialMessage = transaction
         .select({ content: conversationMessages.content })
         .from(conversationMessages)
@@ -11255,7 +11350,7 @@ export class ConversationRepository {
       transaction
         .update(sessions)
         .set({ status: 'paused', updatedAt })
-        .where(eq(sessions.id, run.sessionId))
+        .where(and(eq(sessions.id, run.sessionId), isNull(sessions.archivedAt)))
         .run()
     })
     const updated = this.findRun(runId)
@@ -11278,11 +11373,119 @@ export class ConversationRepository {
   }
 
   recoverInterruptedRuns(): string[] {
-    this.database
-      .update(nativeRebuildOperations)
-      .set({ nativeWorkState: 'unknown' })
-      .where(eq(nativeRebuildOperations.nativeWorkState, 'pending'))
-      .run()
+    const recovered = new Set<string>()
+    while (true) {
+      const page = this.database.all<{ sessionId: string }>(sql`WITH pending(session_id) AS (
+        SELECT session_id FROM agent_runs WHERE status IN ('starting', 'running', 'recovering') AND control_disposition <> 'abandoned' AND fork_source_run_id IS NULL
+        UNION SELECT session_id FROM agent_runs WHERE native_effects_state IN ('pending', 'unknown') AND native_effects_state='pending' AND fork_source_run_id IS NULL
+        UNION SELECT session_id FROM native_agent_contexts WHERE continuation_state IN ('responding','waiting_user','checking','rebuilding')
+        UNION SELECT session_id FROM native_rebuild_operations WHERE native_work_state IN ('pending','unknown') AND native_work_state='pending'
+        UNION SELECT session_id FROM native_rebuild_operations WHERE stage IN ('preparing','creating','seeding','unconfirmed') AND stage IN ('preparing','creating','seeding')
+      ) SELECT session_id AS sessionId FROM pending ORDER BY session_id LIMIT 25`)
+      if (!page.length) break
+      const sessionIds = page.map((row) => row.sessionId)
+      this.database.transaction(() => {
+        this.database
+          .update(nativeRebuildOperations)
+          .set({ nativeWorkState: 'unknown' })
+          .where(
+            and(
+              inArray(nativeRebuildOperations.sessionId, sessionIds),
+              eq(nativeRebuildOperations.nativeWorkState, 'pending'),
+            ),
+          )
+          .run()
+        this.database
+          .update(agentRuns)
+          .set({ nativeEffectsState: 'unknown', nativeEffectsReason: 'pact_restarted' })
+          .where(
+            and(
+              inArray(agentRuns.sessionId, sessionIds),
+              eq(agentRuns.nativeEffectsState, 'pending'),
+              isNull(agentRuns.forkSourceRunId),
+            ),
+          )
+          .run()
+        this.database
+          .update(nativeRebuildOperations)
+          .set({
+            stage: 'unconfirmed',
+            failureReason: 'Pact restarted before the Native rebuild was confirmed.',
+          })
+          .where(
+            and(
+              inArray(nativeRebuildOperations.sessionId, sessionIds),
+              inArray(nativeRebuildOperations.stage, ['creating', 'seeding']),
+            ),
+          )
+          .run()
+        this.database
+          .update(nativeRebuildOperations)
+          .set({
+            stage: 'failed',
+            failureReason: 'Pact restarted before Native creation was dispatched.',
+          })
+          .where(
+            and(
+              inArray(nativeRebuildOperations.sessionId, sessionIds),
+              eq(nativeRebuildOperations.stage, 'preparing'),
+            ),
+          )
+          .run()
+        this.database
+          .update(nativeAgentContexts)
+          .set({
+            continuationState: 'recovery_required',
+            recoveryReason: 'Pact restarted before the native state was confirmed.',
+          })
+          .where(
+            and(
+              inArray(nativeAgentContexts.sessionId, sessionIds),
+              inArray(nativeAgentContexts.continuationState, [
+                'responding',
+                'waiting_user',
+                'checking',
+                'rebuilding',
+              ]),
+            ),
+          )
+          .run()
+        const active = this.database
+          .select({
+            id: agentRuns.id,
+            nativeOutcome: agentRuns.nativeOutcome,
+            dispatchPhase: agentRuns.dispatchPhase,
+            sessionId: agentRuns.sessionId,
+          })
+          .from(agentRuns)
+          .where(
+            and(
+              inArray(agentRuns.sessionId, sessionIds),
+              inArray(agentRuns.status, [...activeRunStatuses]),
+              ne(agentRuns.controlDisposition, 'abandoned'),
+              isNull(agentRuns.forkSourceRunId),
+            ),
+          )
+          .limit(25)
+          .all()
+        for (const run of active) {
+          recovered.add(run.sessionId)
+          if (run.nativeOutcome || run.dispatchPhase === 'ended') {
+            this.database
+              .update(agentRuns)
+              .set({ dispatchPhase: 'ended' })
+              .where(eq(agentRuns.id, run.id))
+              .run()
+            this.settleKnownNativeEnding(run.id)
+          } else
+            this.observationUnavailable(
+              run.id,
+              'Pact lost observation before the native Turn was confirmed.',
+            )
+        }
+        for (const sessionId of sessionIds) refreshNativeSessionMetadata(this.database, sessionId)
+      })
+    }
     this.database
       .update(conversationMessages)
       .set({ routePendingAgentId: null })
@@ -11290,79 +11493,13 @@ export class ConversationRepository {
         and(
           isNotNull(conversationMessages.routePendingAgentId),
           or(
-            sql`NOT EXISTS (SELECT 1 FROM agent_runs AS first
-              WHERE first.id = ${conversationMessages.runId}
-                AND first.status = 'completed' AND first.control_disposition <> 'abandoned')`,
-            sql`EXISTS (SELECT 1 FROM agent_runs AS second
-              WHERE second.user_message_id = ${conversationMessages.id}
-                AND second.agent_id = ${conversationMessages.routePendingAgentId})`,
+            sql`NOT EXISTS (SELECT 1 FROM agent_runs AS first WHERE first.id=${conversationMessages.runId} AND first.status='completed' AND first.control_disposition<>'abandoned')`,
+            sql`EXISTS (SELECT 1 FROM agent_runs AS second WHERE second.user_message_id=${conversationMessages.id} AND second.agent_id=${conversationMessages.routePendingAgentId})`,
           ),
         ),
       )
       .run()
-    // A process restart cannot prove that native background work stopped.
-    this.database
-      .update(agentRuns)
-      .set({ nativeEffectsState: 'unknown', nativeEffectsReason: 'pact_restarted' })
-      .where(and(eq(agentRuns.nativeEffectsState, 'pending'), isNull(agentRuns.forkSourceRunId)))
-      .run()
-    this.database
-      .update(nativeRebuildOperations)
-      .set({
-        stage: 'unconfirmed',
-        failureReason: 'Pact restarted before the Native rebuild was confirmed.',
-      })
-      .where(inArray(nativeRebuildOperations.stage, ['creating', 'seeding']))
-      .run()
-    this.database
-      .update(nativeRebuildOperations)
-      .set({
-        stage: 'failed',
-        failureReason: 'Pact restarted before Native creation was dispatched.',
-      })
-      .where(eq(nativeRebuildOperations.stage, 'preparing'))
-      .run()
-    this.database
-      .update(nativeAgentContexts)
-      .set({
-        continuationState: 'recovery_required',
-        recoveryReason: 'Pact restarted before the native state was confirmed.',
-      })
-      .where(
-        inArray(nativeAgentContexts.continuationState, [
-          'responding',
-          'waiting_user',
-          'checking',
-          'rebuilding',
-        ]),
-      )
-      .run()
-    const active = this.database
-      .select()
-      .from(agentRuns)
-      .where(
-        and(
-          inArray(agentRuns.status, [...activeRunStatuses]),
-          ne(agentRuns.controlDisposition, 'abandoned'),
-          isNull(agentRuns.forkSourceRunId),
-        ),
-      )
-      .all()
-    for (const run of active) {
-      if (run.nativeOutcome || run.dispatchPhase === 'ended') {
-        this.database
-          .update(agentRuns)
-          .set({ dispatchPhase: 'ended' })
-          .where(eq(agentRuns.id, run.id))
-          .run()
-        this.settleKnownNativeEnding(run.id)
-      } else
-        this.observationUnavailable(
-          run.id,
-          'Pact lost observation before the native Turn was confirmed.',
-        )
-    }
-    return [...new Set(active.map((run) => run.sessionId))]
+    return [...recovered]
   }
 
   interruptRun(runId: string, deliveryPossible?: boolean): void {
@@ -11453,7 +11590,7 @@ export class ConversationRepository {
   ): ConversationPatch {
     const now = new Date().toISOString()
     let retired: string | undefined
-    this.database.transaction((transaction) => {
+    this.nativeMetadataTransaction(sessionId, (transaction) => {
       retired = this.retirePendingRoute(sessionId, 'native_session_missing')
       for (const agentId of agentIds) {
         transaction

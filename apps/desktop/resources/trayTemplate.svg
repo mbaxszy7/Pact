@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="96 56 360 384">
+  <title>Pact menu bar icon</title>
+  <desc>The shared P silhouette on a transparent canvas, for macOS system tinting.</desc>
+  <path d="M164 376V184c0-40 32-72 72-72h24" fill="none" stroke="#000" stroke-width="56" stroke-linecap="round"/>
+  <path d="M290 112c57 0 102 43 102 98s-45 98-102 98h-54" fill="none" stroke="#000" stroke-width="56" stroke-linecap="round"/>
+</svg>

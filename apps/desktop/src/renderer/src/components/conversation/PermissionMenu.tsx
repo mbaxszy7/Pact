@@ -153,10 +153,10 @@ export function PermissionMenu({
           width: 'min(360px, calc(100vw - 32px))',
           maxHeight: 'calc(100dvh - 64px)',
         }}
-        className="pact-permission-popover overflow-y-auto rounded-panel border border-border bg-surface-raised p-2 text-caption text-primary"
+        className="pact-composer-popover"
         aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} permissions`}
       >
-        <p className="mb-1 flex h-7 items-center px-2 font-medium">
+        <p className="pact-composer-menu-heading">
           {agent === 'claude' ? 'Claude Code' : 'Codex'} permissions
         </p>
         {!confirming &&
@@ -171,7 +171,7 @@ export function PermissionMenu({
                 aria-controls={mode === 'full' ? `${id}-confirmation` : undefined}
                 disabled={disabled || saving}
                 onClick={() => void choose(mode)}
-                className={`flex w-full cursor-pointer items-center gap-3 rounded-control px-3 py-2 text-left hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default ${mode === 'full' ? 'text-status-warning-foreground' : ''}`}
+                className={`pact-composer-menu-item ${mode === 'full' ? 'text-status-warning-foreground' : ''}`}
               >
                 <option.Icon aria-hidden="true" className="size-4 shrink-0" strokeWidth={1.75} />
                 <span className="min-w-0 flex-1">
@@ -218,7 +218,7 @@ export function PermissionMenu({
             </div>
           </section>
         ) : (
-          <p className="mt-1 border-t border-border px-3 pt-2 text-secondary">
+          <p className="pact-composer-menu-detail">
             {saving ? (
               <>
                 <LoaderCircle aria-hidden="true" className="mr-1 inline size-3 animate-spin" />

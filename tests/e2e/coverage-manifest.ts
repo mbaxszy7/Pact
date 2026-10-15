@@ -90,6 +90,12 @@ export const e2eBusinessExpansionTargets: ReadonlyArray<E2EMigrationTarget & { a
       title: `real ${agent} UI Stop interrupts its foreground command before the delayed filesystem effect`,
     },
   ]),
+  ...(['codex', 'claude'] as const).map((agent) => ({
+    area: 'archive',
+    project: 'real' as const,
+    path: 'tests/e2e/real-stop.spec.ts',
+    title: `real ${agent} UI archive interrupts its foreground command before the delayed filesystem effect`,
+  })),
   {
     area: 'settings',
     project: 'real',
@@ -476,6 +482,20 @@ function journey(
           ],
         }
       : {}),
+    ...(['project-catalog.spec.ts', 'session-workspace.spec.ts'].includes(file)
+      ? {
+          contractUpdates: [
+            {
+              originalLine: file === 'project-catalog.spec.ts' ? 53 : 76,
+              reason:
+                'The accepted archive feedback now retains multiple results in one summary. View expands individual Undo actions; restoration, item identity and notice placement remain required.',
+              replacementAssertions: [
+                `expect(archiveNotice.getByRole('button', { name: 'View' })).toHaveCount(1)`,
+              ],
+            },
+          ],
+        }
+      : {}),
     classification,
     status: 'planned',
     targets,
@@ -610,7 +630,7 @@ export const e2eMigrationCases: readonly E2EMigrationCase[] = [
         47,
         80,
         'real',
-        'Archive returns Empty State and a top notice without View; Undo restores it and re-add restores the archived identity.',
+        'Archive returns Empty State and a top result summary; View exposes its own Undo, which restores it, and re-add restores the archived identity. The accepted disclosure change is recorded in contractUpdates.',
       ],
     ],
   ),
@@ -631,7 +651,7 @@ export const e2eMigrationCases: readonly E2EMigrationCase[] = [
         73,
         90,
         'real',
-        'Archive removes Session; top Undo notice without View restores its identity.',
+        'Archive removes Session; the top result summary expands to its own Undo, which restores the same identity. The accepted disclosure change is recorded in contractUpdates.',
       ],
     ],
   ),

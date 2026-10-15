@@ -1,4 +1,6 @@
+import Database from 'better-sqlite3'
 import { eq, sql } from 'drizzle-orm'
+import { drizzle } from 'drizzle-orm/better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -7,6 +9,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { DefaultSessionSettings, NativeProbeResult, RuntimeAgentId } from '@pact/contracts'
 
+import { ConversationRepository } from './conversation-repository.js'
 import { seedHistoricalAnswerAttempt } from './legacy-database.test-support.js'
 import { PactDatabase } from './pact-database.js'
 import {
@@ -15,6 +18,7 @@ import {
   conversationMessages,
   nativeAgentContexts,
   nativeRebuildOperations,
+  schema,
 } from './schema/index.js'
 
 const migrationsFolder = resolve(import.meta.dirname, '../drizzle')
@@ -965,29 +969,102 @@ it('uses partial unsettled-work indexes without scanning a thousand ended histor
   try {
     const original = start(f).run
     f.repo.failRun(original.id, 'agent_process_crash', 'Never dispatched', false)
-    f.db.drizzle
-      .insert(agentRuns)
-      .values(
-        Array.from({ length: 1000 }, () => ({
-          id: randomUUID(),
-          sessionId: f.sessionId,
-          userMessageId: original.userMessageId,
-          agentId: 'codex' as const,
-          status: 'completed' as const,
-          nativeEffectsState: 'settled' as const,
-          settingsRevision: 1,
-          attemptCount: 1,
-          createdAt: original.createdAt,
-          updatedAt: original.updatedAt,
-        })),
-      )
-      .run()
+    const seedSettled = (count: number) =>
+      f.db.drizzle
+        .insert(agentRuns)
+        .values(
+          Array.from({ length: count }, () => ({
+            id: randomUUID(),
+            sessionId: f.sessionId,
+            userMessageId: original.userMessageId,
+            agentId: 'codex' as const,
+            status: 'completed' as const,
+            nativeEffectsState: 'settled' as const,
+            settingsRevision: 1,
+            attemptCount: 1,
+            createdAt: original.createdAt,
+            updatedAt: original.updatedAt,
+          })),
+        )
+        .run()
+    seedSettled(100)
     expect(f.repo.projectHasNativeWork(f.projectId)).toBe(false)
-    const runPlan = f.db.drizzle.all(
-      sql`EXPLAIN QUERY PLAN SELECT s.id FROM sessions s WHERE s.project_id=${f.projectId} AND EXISTS (SELECT 1 FROM agent_runs r WHERE r.session_id=s.id AND ((r.status IN ('starting','running','recovering') AND r.control_disposition <> 'abandoned') OR r.native_effects_state IN ('pending','unknown'))) LIMIT 1`,
+    const sqlite: unknown = Reflect.get(f.db.drizzle, '$client')
+    if (!(sqlite instanceof Database)) throw new Error('Missing fixture SQLite client.')
+    const queries: { query: string; params: unknown[] }[] = []
+    const traced = drizzle(sqlite, {
+      schema,
+      logger: {
+        logQuery: (query, params) => {
+          if (queries.length >= 8) throw new Error('Native-work query capture exceeds its bound.')
+          queries.push({ query, params })
+        },
+      },
+    })
+    const production = new ConversationRepository(traced)
+    queries.length = 0
+    expect(production.projectHasNativeWork(f.projectId)).toBe(false)
+    const explain = (table: string) => {
+      const query = queries.find((item) => item.query.includes(`EXISTS (SELECT 1 FROM "${table}"`))
+      if (!query) throw new Error('Production native-work query was not observed.')
+      return sqlite.prepare(`EXPLAIN QUERY PLAN ${query.query}`).all(...query.params)
+    }
+    const runPlan = explain('agent_runs')
+    const creationPlan = explain('native_rebuild_operations')
+    expect(production.sessionHasNativeWork(f.sessionId)).toBe(false)
+    const capturePlans = () =>
+      queries
+        .filter(
+          (item) =>
+            item.query.includes('agent_runs') || item.query.includes('native_rebuild_operations'),
+        )
+        .map((item) => ({
+          query: item.query,
+          plan: sqlite.prepare(`EXPLAIN QUERY PLAN ${item.query}`).all(...item.params),
+          rows: sqlite.prepare(item.query).all(...item.params).length,
+        }))
+    const partialStats = () =>
+      sqlite
+        .prepare<unknown[], { name: string; cells: number; bytes: number }>(
+          `SELECT name, sum(ncell) AS cells, sum(pgsize) AS bytes FROM dbstat WHERE name IN ('agent_runs_session_unsettled_work_idx','native_rebuild_operations_unsettled_work_idx','agent_runs_native_generation_latest_idx') GROUP BY name ORDER BY name`,
+        )
+        .all()
+    const before = capturePlans(),
+      beforeStats = partialStats()
+    seedSettled(900)
+    queries.length = 0
+    expect(production.projectHasNativeWork(f.projectId)).toBe(false)
+    expect(production.sessionHasNativeWork(f.sessionId)).toBe(false)
+    const after = capturePlans(),
+      afterStats = partialStats()
+    expect(after).toEqual(before)
+    expect(
+      after.every(
+        (item) =>
+          !JSON.stringify(item.plan).match(/SCAN (agent_runs|native_rebuild_operations)\b/u),
+      ),
+    ).toBe(true)
+    expect(
+      after
+        .filter((item) => item.query.includes('FROM "agent_runs"'))
+        .every((item) =>
+          JSON.stringify(item.plan).includes('agent_runs_session_unsettled_work_idx'),
+        ),
+    ).toBe(true)
+    expect(
+      after
+        .filter((item) => item.query.includes('FROM "native_rebuild_operations"'))
+        .every((item) =>
+          JSON.stringify(item.plan).includes('native_rebuild_operations_unsettled_work_idx'),
+        ),
+    ).toBe(true)
+    expect(afterStats.filter((item) => item.name.endsWith('_unsettled_work_idx'))).toEqual(
+      beforeStats.filter((item) => item.name.endsWith('_unsettled_work_idx')),
     )
-    const creationPlan = f.db.drizzle.all(
-      sql`EXPLAIN QUERY PLAN SELECT s.id FROM sessions s WHERE s.project_id=${f.projectId} AND EXISTS (SELECT 1 FROM native_rebuild_operations r WHERE r.session_id=s.id AND r.native_work_state IN ('pending','unknown')) LIMIT 1`,
+    expect(
+      afterStats.find((item) => item.name === 'agent_runs_native_generation_latest_idx')!.cells,
+    ).toBeGreaterThan(
+      beforeStats.find((item) => item.name === 'agent_runs_native_generation_latest_idx')!.cells,
     )
     expect(JSON.stringify(runPlan)).toContain('agent_runs_session_unsettled_work_idx')
     expect(JSON.stringify(creationPlan)).toContain('native_rebuild_operations_unsettled_work_idx')
@@ -1000,6 +1077,78 @@ it('uses partial unsettled-work indexes without scanning a thousand ended histor
     f.db.close()
   }
 })
+
+it.each([
+  { status: 'running', control: 'retained', effects: 'settled', expected: true },
+  { status: 'running', control: 'abandoned', effects: 'settled', expected: false },
+  { status: 'failed', control: 'abandoned', effects: 'unknown', expected: true },
+  { status: 'completed', control: 'retained', effects: 'pending', expected: true },
+  { status: 'completed', control: 'retained', effects: 'settled', expected: false },
+] as const)(
+  'keeps native-work gate semantics for $status/$control/$effects',
+  async ({ status, control, effects, expected }) => {
+    const f = await fixture()
+    try {
+      const run = start(f).run
+      f.db.drizzle
+        .update(agentRuns)
+        .set({ status, controlDisposition: control, nativeEffectsState: effects })
+        .where(eq(agentRuns.id, run.id))
+        .run()
+      expect(f.repo.sessionHasNativeWork(f.sessionId)).toBe(expected)
+      expect(f.repo.projectHasNativeWork(f.projectId)).toBe(expected)
+    } finally {
+      f.db.close()
+    }
+  },
+)
+
+it('excludes inherited Fork Runs from both native-work gates even when their historical state is active', async () => {
+  const f = await fixture()
+  try {
+    const source = start(f).run
+    f.repo.failRun(source.id, 'agent_process_crash', 'Never dispatched', false)
+    f.db.drizzle
+      .insert(agentRuns)
+      .values({
+        id: randomUUID(),
+        sessionId: f.sessionId,
+        userMessageId: source.userMessageId,
+        agentId: 'codex',
+        forkSourceRunId: source.id,
+        status: 'running',
+        nativeEffectsState: 'unknown',
+        settingsRevision: 1,
+        attemptCount: 1,
+        createdAt: source.createdAt,
+        updatedAt: source.updatedAt,
+      })
+      .run()
+    expect(f.repo.sessionHasNativeWork(f.sessionId)).toBe(false)
+    expect(f.repo.projectHasNativeWork(f.projectId)).toBe(false)
+  } finally {
+    f.db.close()
+  }
+})
+
+it.each(['pending', 'unknown', 'settled'] as const)(
+  'retains the Rebuild native-work branch for %s work',
+  async (state) => {
+    const f = await fixture()
+    try {
+      const creation = seed(f)
+      f.db.drizzle
+        .update(nativeRebuildOperations)
+        .set({ nativeWorkState: state })
+        .where(eq(nativeRebuildOperations.id, creation.id))
+        .run()
+      expect(f.repo.sessionHasNativeWork(f.sessionId)).toBe(state !== 'settled')
+      expect(f.repo.projectHasNativeWork(f.projectId)).toBe(state !== 'settled')
+    } finally {
+      f.db.close()
+    }
+  },
+)
 
 it('offers a first Retry after observation loss and upgrades only an unsuccessful explicit check', async () => {
   const f = await fixture()

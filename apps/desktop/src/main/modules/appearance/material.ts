@@ -16,6 +16,15 @@ export interface NativeThemeSource {
 
 export type MaterialResult = Omit<AppearanceEffectiveSettings, 'revision'>
 
+export interface WindowAppearance {
+  windowMaterial: AppearanceEffectiveSettings['windowMaterial']
+  backgroundColor: string
+}
+
+export function solidBackgroundColor(theme: AppearanceEffectiveSettings['theme']): string {
+  return theme === 'dark' ? '#0f1720' : '#ebf5ff'
+}
+
 export interface MaterialWindow {
   isDestroyed(): boolean
   setBackgroundColor(color: string): void
@@ -56,9 +65,8 @@ function applySolid(
   theme: MaterialResult['theme'],
   platform: NodeJS.Platform,
 ): void {
-  const color = theme === 'dark' ? '#0f1720' : '#ebf5ff'
   if (platform === 'win32') window.setBackgroundMaterial('none')
-  window.setBackgroundColor(color)
+  window.setBackgroundColor(solidBackgroundColor(theme))
 }
 
 function applyTranslucent(window: MaterialWindow, platform: NodeJS.Platform): void {
@@ -70,6 +78,25 @@ function applyTranslucent(window: MaterialWindow, platform: NodeJS.Platform): vo
   }
 }
 
+/** Resolve the same policy before native window creation and while applying its backing. */
+export function resolveMaterial(
+  settings: AppearanceSettings,
+  nativeTheme: NativeThemeSource,
+  runtime: MaterialRuntime,
+): MaterialResult {
+  const theme =
+    settings.theme === 'system'
+      ? nativeTheme.shouldUseDarkColors
+        ? 'dark'
+        : 'light'
+      : settings.theme
+  const reason = fallbackReason(nativeTheme, runtime, settings.windowMaterial)
+  const windowMaterial: MaterialResult['windowMaterial'] =
+    settings.windowMaterial === 'solid' || reason ? 'solid' : 'translucent'
+
+  return { theme, windowMaterial, ...(reason ? { fallbackReason: reason } : {}) }
+}
+
 export function applyMaterial(
   settings: AppearanceSettings,
   nativeTheme: NativeThemeSource,
@@ -77,15 +104,10 @@ export function applyMaterial(
   runtime: MaterialRuntime,
 ): MaterialResult {
   if (nativeTheme.themeSource !== settings.theme) nativeTheme.themeSource = settings.theme
-  const theme =
-    settings.theme === 'system'
-      ? nativeTheme.shouldUseDarkColors
-        ? 'dark'
-        : 'light'
-      : settings.theme
-  let reason = fallbackReason(nativeTheme, runtime, settings.windowMaterial)
-  let windowMaterial: MaterialResult['windowMaterial'] =
-    settings.windowMaterial === 'solid' || reason ? 'solid' : 'translucent'
+  const resolved = resolveMaterial(settings, nativeTheme, runtime)
+  const theme = resolved.theme
+  let reason = resolved.fallbackReason
+  let windowMaterial = resolved.windowMaterial
 
   if (runtime.platform === 'win32') {
     for (const window of windows) {

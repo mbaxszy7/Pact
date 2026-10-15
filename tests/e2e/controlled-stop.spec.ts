@@ -131,8 +131,7 @@ test(
       await (
         await app.firstWindow()
       )
-        .getByRole('button', { name: 'Controlled Stop', exact: true })
-        .last()
+        .locator(`[data-session-menu="${sessionId}"] button[data-nav-primary]`)
         .click()
       const cold = db.conversationRepository.read(sessionId)
       expect(
