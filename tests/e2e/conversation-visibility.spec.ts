@@ -186,8 +186,14 @@ test(
       const target = window.getByText('History answer 8 keeps the selected excerpt intact.', {
         exact: true,
       })
+      // Reading history begins with a user scroll; locator scrolling alone keeps tail-follow on.
+      await window.locator('[data-pact-transcript]').hover()
+      await window.mouse.wheel(0, -640)
       await target.scrollIntoViewIfNeeded()
-      const originalTop = await target.evaluate((element) => {
+      // A real text-selection gesture first leaves the focused contenteditable Composer.
+      await target.click()
+      await expect(composer).not.toBeFocused()
+      const gesture = await target.evaluate((element) => {
         const host = element.closest('[data-pact-message-content]')
         const span = [
           ...(host?.querySelectorAll<HTMLElement>('[data-pact-projection-start]') ?? []),
@@ -198,11 +204,23 @@ test(
         const range = document.createRange()
         range.setStart(node, offset)
         range.setEnd(node, offset + 'selected excerpt'.length)
-        const selection = globalThis.getSelection()
-        selection?.removeAllRanges()
-        selection?.addRange(range)
-        return element.closest('[data-pact-message-id]')?.getBoundingClientRect().top
+        const rectangles = [...range.getClientRects()]
+        const first = rectangles[0],
+          last = rectangles.at(-1)
+        if (!first || !last) throw new Error('Selection gesture geometry unavailable')
+        return {
+          start: { x: first.left + 1, y: first.top + first.height / 2 },
+          end: { x: last.right - 1, y: last.top + last.height / 2 },
+        }
       })
+      // Drive the native gesture; synthetic Range assignment alone does not settle reading state.
+      await window.mouse.move(gesture.start.x, gesture.start.y)
+      await window.mouse.down()
+      await window.mouse.move(gesture.end.x, gesture.end.y, { steps: 12 })
+      await window.mouse.up()
+      await expect
+        .poll(() => window.evaluate(() => globalThis.getSelection()?.toString()))
+        .toBe('selected excerpt')
       const health = () =>
         window.evaluate(async () => {
           const bridge: DesktopBridge = Reflect.get(globalThis, 'pact'),
@@ -210,6 +228,16 @@ test(
           if (!result.ok || !result.value.conversation) throw new Error('Diagnostics unavailable')
           return result.value.conversation
         })
+      const progressWhileReading = (await health()).publishedProgress
+      await expect
+        .poll(async () => (await health()).publishedProgress)
+        .toBeGreaterThan(progressWhileReading)
+      await expect
+        .poll(() => window.evaluate(() => globalThis.getSelection()?.toString()))
+        .toBe('selected excerpt')
+      const originalTop = await target.evaluate(
+        (element) => element.closest('[data-pact-message-id]')?.getBoundingClientRect().top,
+      )
       await observeSelection('selected-before-settings')
       await window.getByRole('button', { name: 'Settings', exact: true }).click()
       await expect.poll(async () => (await health()).interestedSessions).toBe(0)
