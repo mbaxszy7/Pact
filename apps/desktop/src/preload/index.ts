@@ -191,11 +191,8 @@ const bridge: DesktopBridge = {
   openNativeInputURL: (input) => invoke(IPC_CHANNELS.nativeInputOpen, input),
   respondNativePermission: (input) => invoke(IPC_CHANNELS.nativePermissionRespond, input),
   getAppInfo: () => invoke(IPC_CHANNELS.appInfo),
-  getRuntimeHealth: async (input) => {
-    const raw =
-      input === undefined
-        ? await invoke(IPC_CHANNELS.runtimeHealth)
-        : await invoke(IPC_CHANNELS.runtimeHealth, input)
+  getRuntimeHealth: async () => {
+    const raw = await invoke(IPC_CHANNELS.runtimeHealth)
     if (!traffic) return raw
     const parsed = rpcResultSchema(runtimeHealthSchema).safeParse(raw)
     if (!parsed.success) {

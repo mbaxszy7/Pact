@@ -69,7 +69,8 @@ async function load(measure: boolean, contextIsolated = true) {
   harness.invoke.mockReset()
   harness.send.mockReset()
   harness.bridge = undefined
-  vi.stubEnv('PACT_SOAK_NONCE', measure ? 'a'.repeat(64) : '')
+  vi.stubEnv('NODE_ENV', measure ? 'test' : 'production')
+  vi.stubEnv('PACT_E2E_IPC_NONCE', measure ? 'a'.repeat(64) : '')
   vi.stubEnv('PACT_E2E_ROOT', measure ? '/isolated-fixture' : '')
   vi.stubGlobal('process', { ...process, contextIsolated })
   const unload: (() => void)[] = []
@@ -94,22 +95,6 @@ afterEach(() => {
 })
 
 describe('Preload logical IPC observation at named bridge seams', () => {
-  it.each([false, true])(
-    'transfers an optional typed SQLite ACK without changing ordinary health arguments (measurement %s)',
-    async (measure) => {
-      const { bridge } = await load(measure)
-      await bridge.getRuntimeHealth()
-      expect(harness.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.runtimeHealth)
-      const input = {
-        sqlitePlans: {
-          ack: { observerEpoch: epoch, pageSequence: 1, payloadDigest: 'a'.repeat(64) },
-        },
-      }
-      await bridge.getRuntimeHealth(input)
-      expect(harness.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.runtimeHealth, input)
-    },
-  )
-
   it('accepts current typed local observations and rejects older units without generic IPC', async () => {
     const { bridge } = await load(true)
     const observe: unknown = Reflect.get(bridge, 'observeMonacoWorkerTraffic')
@@ -183,7 +168,7 @@ describe('Preload logical IPC observation at named bridge seams', () => {
     expect(harness.handlers.size).toBe(0)
     expect(harness.bridge).toBeUndefined()
   })
-  it('does not create soak taps/stats in ordinary production and preserves subscription cleanup', async () => {
+  it('does not create fixture taps/stats in ordinary production and preserves subscription cleanup', async () => {
     const { bridge, unload } = await load(false)
     expect(harness.handlers.size).toBe(0)
     const listener = vi.fn<() => void>()

@@ -281,25 +281,16 @@ async function bundleFixture(context, key, parentRoot) {
     verificationMode: platform === 'darwin' ? 'mounted-dmg-copy' : 'installed-nsis',
     artifacts: [artifacts[0]],
   }
-  const soak = {
-    ...common,
-    durationMs: 7_200_000,
-    budgetPass: true,
-    cleanupVerified: true,
-    resourceLifecycleVerified: true,
-    artifacts,
-  }
   const write = (file, value) => writeFile(join(root, file), `${JSON.stringify(value)}\n`)
   await write('distribution-manifest.json', manifest)
   await write('package-smoke-report.json', smoke)
-  await write('package-soak-report.json', soak)
   if (platform === 'darwin')
     await write('package-zip-smoke-report.json', {
       ...smoke,
       verificationMode: 'extracted-zip',
       artifacts: [artifacts[1]],
     })
-  return { root, manifest, smoke, soak, write }
+  return { root, manifest, smoke, write }
 }
 
 async function archiveFixture(context, state, key, root) {
@@ -623,29 +614,14 @@ void test('missing tag fails closed; complete new identity creates only its exac
 
 void test('installed platform evidence must bind actual artifact and exact application bytes', async (context) => {
   const bundle = await bundleFixture(context, 'win32-arm64')
-  assert.equal((await validateBundle(bundle.root, identity, 'win32-arm64')).files.length, 4)
+  assert.equal((await validateBundle(bundle.root, identity, 'win32-arm64')).files.length, 3)
   bundle.smoke.appContentHash = 'f'.repeat(64)
   await bundle.write('package-smoke-report.json', bundle.smoke)
   await assert.rejects(validateBundle(bundle.root, identity, 'win32-arm64'), /content hash/)
 })
 
-void test('one-hour, missing budgets, no lifecycle and unpacked-only proof all block publication', async (context) => {
+void test('unpacked-only proof blocks publication', async (context) => {
   const bundle = await bundleFixture(context, 'win32-x64')
-  for (const [field, value, message] of [
-    ['durationMs', 3_600_000, /shorter than two hours/],
-    ['budgetPass', undefined, /incomplete/],
-    ['cleanupVerified', false, /incomplete/],
-    ['resourceLifecycleVerified', false, /incomplete/],
-  ]) {
-    const original = bundle.soak[field]
-    bundle.soak[field] = value
-    // oxlint-disable-next-line eslint/no-await-in-loop -- Each independent rejection needs an exact settled report revision.
-    await bundle.write('package-soak-report.json', bundle.soak)
-    // oxlint-disable-next-line eslint/no-await-in-loop -- The next mutation cannot replace the evidence under the current rejection check.
-    await assert.rejects(validateBundle(bundle.root, identity, 'win32-x64'), message)
-    bundle.soak[field] = original
-  }
-  await bundle.write('package-soak-report.json', bundle.soak)
   bundle.smoke.installationVerified = false
   await bundle.write('package-smoke-report.json', bundle.smoke)
   await assert.rejects(validateBundle(bundle.root, identity, 'win32-x64'), /unverified/)
@@ -665,7 +641,7 @@ void test('old smoke protocols and isolated-root-only evidence never prove produ
 
 void test('macOS requires independently installed DMG and extracted ZIP evidence', async (context) => {
   const bundle = await bundleFixture(context, 'darwin-arm64')
-  assert.equal((await validateBundle(bundle.root, identity, 'darwin-arm64')).files.length, 6)
+  assert.equal((await validateBundle(bundle.root, identity, 'darwin-arm64')).files.length, 5)
   await rm(join(bundle.root, 'package-zip-smoke-report.json'))
   await assert.rejects(validateBundle(bundle.root, identity, 'darwin-arm64'), /ENOENT/)
 })
@@ -800,7 +776,9 @@ void test('workflow keeps App credentials out of builds and forbids automatic/pa
   }
   assert.match(workflow, /cancel-in-progress: false/)
   assert.match(workflow, /group: pact-stable-publication/)
-  assert.match(workflow, /--duration-ms 7200000/)
+  assert.doesNotMatch(workflow, /run-soak|package-soak-report|--duration-ms/u)
+  const ci = await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
+  assert.doesNotMatch(ci, /run_soak|run-soak|package-soak-report|SOAK_DURATION/u)
   const config = JSON.parse(
     await readFile(new URL('../release-please-config.json', import.meta.url), 'utf8'),
   )
@@ -1265,7 +1243,7 @@ void test('a fully uploaded signed staging intent settles interrupted completion
     stagePlatform(api, established, 'win32-x64', bundle.root, { ...signContext, attempt: 1 }),
     /completion marker/,
   )
-  assert.equal(state.assets.length, 4)
+  assert.equal(state.assets.length, 3)
   const writes = state.mutations.length
   api.request = (path, options) =>
     path.endsWith('/actions/artifacts/1001/zip')

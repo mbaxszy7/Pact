@@ -123,19 +123,18 @@ must be unmistakably nonfunctional; never broadly exempt test directories from s
 
 ### Evidence and commands
 
-| Lane                        | Command                                                                                | Prerequisites and evidence                                                                     |
-| --------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| Unit                        | `pnpm test`                                                                            | Vitest; public, isolated fixtures, no paid models                                              |
-| Infrastructure              | `pnpm test:infra`                                                                      | Node tests for publication, baseline integrity, coverage, runners, and packaged harness        |
-| UI                          | `pnpm test:e2e:ui`                                                                     | Real Electron UI with fixture data; no provider credentials                                    |
-| Deterministic               | `pnpm test:e2e:deterministic`                                                          | Electron plus controlled protocols/fixed loads; not real model evidence                        |
-| Real provider               | `pnpm test:e2e:real`                                                                   | Installed/authenticated CLIs and private configuration; paid model requests                    |
-| Core real provider          | `pnpm test:e2e:real:core`                                                              | The `@real-core` business cases; the same actual CLIs and isolated configuration               |
-| Complete E2E                | `pnpm test:e2e`                                                                        | All three Electron lanes; private configuration admitted before the sole build                 |
-| Native protocol             | `pnpm test:native`                                                                     | Actual CLI/SDK storage and protocol against isolated loopback providers; no paid models        |
-| Packaged smoke              | Manifest-based commands below                                                          | Actual installation/extraction, private data, seed and cold verification                       |
-| Packaged visible core       | `node scripts/package-smoke.mjs --manifest MANIFEST --real-core`                       | Trusted local real-provider configuration; manual actual business observations required        |
-| Continuous packaged fixture | `node scripts/run-soak.mjs --manifest MANIFEST --duration-ms DURATION --report REPORT` | Isolated protocol fixture; complete duration, budgets, identity and resource evidence required |
+| Lane                  | Command                                                          | Prerequisites and evidence                                                              |
+| --------------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| Unit                  | `pnpm test`                                                      | Vitest; public, isolated fixtures, no paid models                                       |
+| Infrastructure        | `pnpm test:infra`                                                | Node tests for publication, baseline integrity, coverage, runners, and packaged harness |
+| UI                    | `pnpm test:e2e:ui`                                               | Real Electron UI with fixture data; no provider credentials                             |
+| Deterministic         | `pnpm test:e2e:deterministic`                                    | Electron plus controlled protocols/fixed loads; not real model evidence                 |
+| Real provider         | `pnpm test:e2e:real`                                             | Installed/authenticated CLIs and private configuration; paid model requests             |
+| Core real provider    | `pnpm test:e2e:real:core`                                        | The `@real-core` business cases; the same actual CLIs and isolated configuration        |
+| Complete E2E          | `pnpm test:e2e`                                                  | All three Electron lanes; private configuration admitted before the sole build          |
+| Native protocol       | `pnpm test:native`                                               | Actual CLI/SDK storage and protocol against isolated loopback providers; no paid models |
+| Packaged smoke        | Manifest-based commands below                                    | Actual installation/extraction, private data, seed and cold verification                |
+| Packaged visible core | `node scripts/package-smoke.mjs --manifest MANIFEST --real-core` | Trusted local real-provider configuration; manual actual business observations required |
 
 Electron runners build the selected lane, use one Playwright worker, zero retries, and a two-hour
 total deadline with a five-minute build budget. Forward file names and `--grep` after `--`; do not
@@ -234,17 +233,11 @@ cases not run after an earlier failure. These no-credential reports record the r
 version, source SHA, tag, Release PR and Release ID; they omit signed-state extensions
 and do not replace the release controller's authenticated staging or publication checks.
 
-Ordinary branch pushes and Dev-scope PRs run the fast/static, unit/script, native protocol,
-UI/deterministic and installed smoke checks without an hour-long soak on every change.
-The **CI** manual dispatch with `run_soak=true` runs the one-hour installed deterministic
-fixture soak on all three native platforms without paid providers. Manual soak runs use
-their own concurrency identity so a branch push cannot cancel them. Stable-scope PRs retain
-the two-hour Stable-candidate soak; final releases require the two-hour final-content soak.
-Soak launch supervision allows measurement duration plus ten minutes, and its enclosing
-driver allows plus twenty minutes for setup, shutdown, cold restart and report completion.
-Release build jobs allow five hours in total for packaging, the two-hour measurement and
-validation overhead. These operational deadlines do not change any performance budget,
-required duration, resource-release observation or publication gate.
+Branch pushes and PRs run static checks, unit/script tests, native protocol checks,
+UI/deterministic E2E and installed smoke checks. Stable candidates additionally require
+full provider verification; publication validates every final installer and its content-bound
+smoke report. CI platform jobs allow 90 minutes and release platform jobs allow two hours
+for their required checks, packaging and cleanup. Deadlines do not establish completed tests.
 
 ### Product version and release intent
 
@@ -278,7 +271,7 @@ ordinary comments cannot replace it, and dismissal or requested changes blocks i
 An approval still marked effective after a diff-equivalent update may refer to an older
 head commit. Model execution approval does not satisfy this PR review requirement.
 
-### Distribution build, smoke, and soak
+### Distribution build and smoke
 
 Use the distribution entry point with a fresh, empty output directory and the native runner for the
 target below. Replace `COMMIT_SHA` with the full checked-out commit SHA and `BUILD_NUMBER` with a
@@ -297,7 +290,6 @@ For example, on macOS arm64:
 ```sh
 node scripts/build-distribution.mjs --channel dev --platform darwin --arch arm64 --sha COMMIT_SHA --build-number BUILD_NUMBER --output .pact-data/distributions/dev
 node scripts/package-smoke.mjs --manifest .pact-data/distributions/dev/distribution-manifest.json --production-paths --report .pact-data/distributions/dev/smoke.json
-node scripts/run-soak.mjs --manifest .pact-data/distributions/dev/distribution-manifest.json --duration-ms 3600000 --report .pact-data/distributions/dev/soak-1h.json
 ```
 
 The release candidate uses Stable metadata and its own artifacts:
@@ -305,7 +297,6 @@ The release candidate uses Stable metadata and its own artifacts:
 ```sh
 node scripts/build-distribution.mjs --channel stable --platform darwin --arch arm64 --sha COMMIT_SHA --build-number BUILD_NUMBER --output .pact-data/distributions/stable
 node scripts/package-smoke.mjs --manifest .pact-data/distributions/stable/distribution-manifest.json --production-paths --report .pact-data/distributions/stable/smoke.json
-node scripts/run-soak.mjs --manifest .pact-data/distributions/stable/distribution-manifest.json --duration-ms 7200000 --report .pact-data/distributions/stable/soak-2h.json
 ```
 
 The manifest identifies the exact executable/bundle, channel/version, source SHA, architecture,
@@ -323,8 +314,8 @@ for Electron; Windows distribution signing and macOS certificate signing/notariz
 with necessary macOS ad-hoc signing retained.
 
 Reports are written without overwriting previous evidence. Smoke success requires the genuine owned
-process runner, installed-content verification, seed/cold identity and confirmed cleanup. Soak must
-bind the same final application-content hash and the actual installation artifacts. A same-SHA
+process runner, installed-content verification, seed/cold identity and confirmed cleanup. Reports
+bind the final application-content hash and the actual installation artifacts. A same-SHA
 rebuild with different application bytes requires new validation. Keep credentials, private paths,
 debugging receipts/nonces and raw application output out of published evidence.
 
@@ -336,16 +327,6 @@ neither deleting a directory nor calling terminate proves physical process clean
 Release Actions retain these reports in `packaged-verification-PLATFORM-aATTEMPT` even after
 failure, separately from the successful artifacts eligible for signed release staging.
 
-The resource report retains each complete SQLite query plan once in `sqliteQueryPlanDictionary`;
-sample `queryPlanIndices` resolve into that dictionary. Scalar counters remain in every sample.
-The dictionary is bounded to 64 plans/32 KiB serialized bytes, without changing the production
-plan budget or the report's 768 KiB limit. Missing observations still block acceptance.
-
-The soak command is a runnable verification path, not a completed acceptance claim. Short runs only
-exercise the harness; a two-hour E2E timeout is not continuous soak. The one-hour deterministic and
-two-hour packaged acceptance evidence remains incomplete, including the missing observations listed
-in [architecture](docs/technical-foundation.md#evidence-known-gaps-and-future-scope). Its report stays
-blocked when duration, budgets, observations, recovery or physical cleanup are insufficient.
 Windows x64/arm64 installed-launch validation and full Windows/macOS Dev/Stable coexistence, upgrade
 and uninstall debugging remain TODO. Code integration does not establish those platform gates.
 
@@ -510,7 +491,7 @@ proof before treating a release as complete.
 
 Recover a merged Release PR by starting a **new** Stable Release `workflow_dispatch` with its PR
 number. Each successful platform is durably staged in an authenticated, unpublished draft. Recovery
-uses the exact staged installer and content-bound smoke/soak reports even after Actions artifacts
+uses the exact staged installer and content-bound smoke reports even after Actions artifacts
 expire. A complete signed upload intent can finish its interrupted completion marker. Unknown,
 partial-starter or mismatched bytes stop recovery; they are not overwritten or adopted. A frozen
 selection cannot be rebuilt into different bytes, and an already published release remains read-only.
@@ -573,7 +554,7 @@ does not establish a common cold-launch root cause or full Windows acceptance. T
 executable-instance tail and settings command output discrepancy remain investigation limits. Do not
 carry historical macOS success counts forward as a current Windows claim. Native protocol GUI-free
 results, UI alpha, actual desktop composition, paid model runs, package smoke, signing, and performance
-p95/soak are independent evidence categories. Signed/notarized releases, automatic updates, complete
+p95 are independent evidence categories. Signed/notarized releases, automatic updates, complete
 checkpoint disaster recovery, and release performance acceptance remain separate work.
 
 For resource acceptance and the representative benchmark matrix, see [architecture resource requirements](docs/technical-foundation.md#performance-and-resource-requirements).

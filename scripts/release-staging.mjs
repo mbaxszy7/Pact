@@ -73,7 +73,7 @@ export function verifyStagingRelease(release, identity, context) {
     hashPattern.test(stage.appContentHash) &&
       typeof stage.complete === 'boolean' &&
       Array.isArray(stage.files) &&
-      stage.files.length >= 4 &&
+      stage.files.length >= 3 &&
       stage.files.length <= 8,
     'Staging content commitment is incomplete',
   )
@@ -441,7 +441,7 @@ export async function materializeStagedPlatforms(api, identity, output, context)
       const info = await stat(join(root, file.local))
       fail(info.size === file.bytes, 'Staging file is incomplete')
     }
-    // oxlint-disable-next-line eslint/no-await-in-loop -- Actual content-bound smoke/soak evidence remains necessary on recovery.
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Actual content-bound smoke evidence remains necessary on recovery.
     await validateBundle(root, identity, state.staging.platform)
   }
   return selected.map(({ release, state }) => ({

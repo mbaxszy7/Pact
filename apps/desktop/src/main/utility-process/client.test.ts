@@ -4,12 +4,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 
-import type { SqliteFinal } from '@pact/contracts'
-
 const harness = vi.hoisted(() => {
   type Listener = (...args: unknown[]) => void
   class FakeUtilityProcess {
-    pid: number | undefined
     readonly handlers = new Map<string, Listener[]>()
     readonly posted: unknown[] = []
     throwOnPost = false
@@ -72,7 +69,8 @@ function postedRequest(child: (typeof harness.children)[number], index = 0): { r
 
 function fixture(measure: boolean) {
   const root = mkdtempSync(join(tmpdir(), 'pact-ipc-test-'))
-  vi.stubEnv('PACT_SOAK_NONCE', measure ? 'a'.repeat(64) : '')
+  vi.stubEnv('NODE_ENV', measure ? 'test' : 'production')
+  vi.stubEnv('PACT_E2E_IPC_NONCE', measure ? 'a'.repeat(64) : '')
   vi.stubEnv('PACT_E2E_ROOT', measure ? root : '')
   const runtime = createUtilityProcessClient()
   const options = { databaseFile: join(root, 'pact.sqlite'), migrationsFolder: root }
@@ -112,7 +110,7 @@ async function observedHealth(
 }
 
 describe('Utility transport logical IPC observation', () => {
-  it('leaves ordinary production health unchanged without isolated soak configuration', async () => {
+  it('leaves ordinary production health unchanged without isolated fixture configuration', async () => {
     const { runtime, cleanup } = fixture(false)
     try {
       const result = await observedHealth(runtime, harness.children.at(-1)!)
@@ -234,129 +232,6 @@ describe('Utility transport logical IPC observation', () => {
 })
 
 describe('UtilityProcessClient', () => {
-  it('transfers a bounded health ACK and returns its validation error without disposing the runtime', async () => {
-    const runtime = createUtilityProcessClient()
-    runtime.start(startOptions)
-    const child = harness.children.at(-1)!
-    const input = {
-      sqlitePlans: {
-        ack: {
-          observerEpoch: '00000000-0000-4000-8000-000000000001',
-          pageSequence: 1,
-          payloadDigest: 'a'.repeat(64),
-        },
-      },
-    }
-    try {
-      const pending = runtime.getHealth(input)
-      expect(child.posted.at(-1)).toMatchObject({ type: 'runtime.health.request', input })
-      const error = {
-        code: 'VALIDATION',
-        message: 'The runtime health observation could not be read.',
-      }
-      child.emit('message', {
-        type: 'runtime.health.response',
-        requestId: postedRequest(child).requestId,
-        error,
-      })
-      await expect(pending).resolves.toEqual({ ok: false, error })
-      expect(child.killed).toBe(false)
-      expect(await observedHealth(runtime, child)).toMatchObject({
-        status: 'ready',
-        database: 'ready',
-      })
-    } finally {
-      runtime.dispose()
-    }
-  })
-
-  it.each([true, false])(
-    'preserves final SQLite metadata on a %s flush result from the bound Utility',
-    async (success) => {
-      const runtime = createUtilityProcessClient()
-      runtime.start(startOptions)
-      const child = harness.children.at(-1)!
-      child.pid = 41001
-      const final: SqliteFinal = {
-        schemaVersion: 1,
-        scope: 'post-open-native-run-get-all-and-drizzle-transaction-attempts-v1',
-        observerEpoch: '00000000-0000-4000-8000-000000000001',
-        observerPid: child.pid,
-        recordWatermark: 0,
-        acknowledgedThrough: 0,
-        pageSequence: 0,
-        tailRecords: [],
-        counters: {
-          operations: 0,
-          transactions: 0,
-          rowsReturned: 0,
-          totalMs: 0,
-          maxMs: 0,
-          planOverflow: false,
-          unsupportedOperations: false,
-        },
-        databaseClosed: success,
-        writerClosed: success,
-        collectionDisposed: true,
-      }
-      const result = success
-        ? { ok: true as const, value: { flushed: true as const } }
-        : {
-            ok: false as const,
-            error: { code: 'INTERNAL' as const, message: 'Flush did not finish.' },
-          }
-      const pending = runtime.shutdown()
-      child.emit('message', {
-        type: 'runtime.shutdown.response',
-        requestId: postedRequest(child).requestId,
-        result,
-        sqliteFinal: final,
-      })
-      await expect(pending).resolves.toEqual({ ...result, sqliteFinal: final })
-      expect(child.killed).toBe(true)
-    },
-  )
-
-  it.each([undefined, 41002])(
-    'drops a final receipt when the request-bound Utility PID is %s',
-    async (pid) => {
-      const runtime = createUtilityProcessClient()
-      runtime.start(startOptions)
-      const child = harness.children.at(-1)!
-      child.pid = pid
-      const result = { ok: true as const, value: { flushed: true as const } }
-      const pending = runtime.shutdown()
-      child.emit('message', {
-        type: 'runtime.shutdown.response',
-        requestId: postedRequest(child).requestId,
-        result,
-        sqliteFinal: {
-          schemaVersion: 1,
-          scope: 'post-open-native-run-get-all-and-drizzle-transaction-attempts-v1',
-          observerEpoch: '00000000-0000-4000-8000-000000000001',
-          observerPid: 41001,
-          recordWatermark: 0,
-          acknowledgedThrough: 0,
-          pageSequence: 0,
-          tailRecords: [],
-          counters: {
-            operations: 0,
-            transactions: 0,
-            rowsReturned: 0,
-            totalMs: 0,
-            maxMs: 0,
-            planOverflow: false,
-            unsupportedOperations: false,
-          },
-          databaseClosed: true,
-          writerClosed: true,
-          collectionDisposed: true,
-        },
-      })
-      await expect(pending).resolves.toEqual(result)
-    },
-  )
-
   it('awaits a successful shutdown ACK once, blocks new work and settles remaining requests', async () => {
     vi.useFakeTimers()
     try {

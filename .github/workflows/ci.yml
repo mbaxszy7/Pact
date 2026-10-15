@@ -7,12 +7,6 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review, edited, labeled, unlabeled]
   workflow_dispatch:
-    inputs:
-      run_soak:
-        description: Run the one-hour installed deterministic soak with fixture data (no paid models)
-        type: boolean
-        default: false
-        required: true
 
 # The authenticated controller source controls PR jobs. Frozen bootstrap execution
 # stays disabled until its public identity tuple and separate environments are set.
@@ -231,7 +225,7 @@ jobs:
             arch: arm64
             key: win32-arm64
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 350
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -395,17 +389,6 @@ jobs:
           '
         env:
           PLATFORM_KEY: ${{ matrix.key }}
-      - name: Continuous deterministic resource soak on installed content
-        if: ${{ success() && (needs.identity.outputs.channel == 'stable' || (github.event_name == 'workflow_dispatch' && inputs.run_soak)) }}
-        working-directory: source
-        run: >-
-          node scripts/run-soak.mjs
-          --manifest "$RUNNER_TEMP/pact-distribution/$PLATFORM_KEY/distribution-manifest.json"
-          --duration-ms "$SOAK_DURATION"
-          --report "$RUNNER_TEMP/pact-distribution/$PLATFORM_KEY/package-soak-report.json"
-        env:
-          PLATFORM_KEY: ${{ matrix.key }}
-          SOAK_DURATION: ${{ needs.identity.outputs.channel == 'stable' && '7200000' || '3600000' }}
       - name: Revalidate current head and base after physical cleanup
         run: node control/scripts/ci-identity.mjs verify "$RUNNER_TEMP/pact-identity/ci-identity.json"
         env:

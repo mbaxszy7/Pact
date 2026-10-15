@@ -1,4 +1,9 @@
-import { _electron as electron, test as baseTest, type ElectronApplication } from '@playwright/test'
+import {
+  _electron as electron,
+  test as baseTest,
+  type ElectronApplication,
+  type TestInfo,
+} from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import {
@@ -155,6 +160,7 @@ export interface RuntimeFixture {
   codexHome: string
   createProjectDirectory(name: string, git?: boolean): Promise<string>
   launch(extraEnvironment?: Record<string, string>): Promise<ElectronApplication>
+  captureUiFailure(info: TestInfo): Promise<void>
   dispose(): Promise<void>
   readCodexFacts(): Promise<{
     fixtureError?: string
@@ -261,26 +267,6 @@ function probeExitCode(state: ProbeState): number {
   if (state === 'ready') return 0
   if (state === 'authentication_required') return 1
   return 2
-}
-
-/** A continuous soak owns these files itself; this does not extend an E2E fixture's deadline. */
-export async function prepareDeterministicSoakEnvironment(
-  directory: string,
-  sourceEnvironment: NodeJS.ProcessEnv,
-): Promise<Awaited<ReturnType<typeof prepareProviderEnvironment>>> {
-  const environment = await prepareProviderEnvironment(directory, undefined, sourceEnvironment)
-  const appServer = await writeCodexAppServer(
-    directory,
-    'complete',
-    [],
-    false,
-    join(directory, 'soak-native-terminals.jsonl'),
-  )
-  const [claudePath, codexPath] = await Promise.all([
-    writeCli(directory, 'claude', 'ready'),
-    writeCli(directory, 'codex', 'ready', appServer),
-  ])
-  return { ...environment, claudePath, codexPath }
 }
 
 async function writeCli(
@@ -1015,6 +1001,52 @@ export async function createRuntimeFixture(
               launchingApp = false
             }
           }),
+        async captureUiFailure(info) {
+          if (mode === 'real')
+            throw new Error('Real Provider fixtures cannot export Renderer state')
+          const current = [...apps]
+          if (current.length !== 1)
+            throw new Error('No unique owned Electron window for diagnostics')
+          const page = await current[0]!.firstWindow({ timeout: 2000 })
+          const facts = await page.evaluate(() => {
+            return {
+              schemaVersion: 1,
+              readyState: document.readyState,
+              visibility: document.visibilityState,
+              width: Math.min(innerWidth, 1600),
+              height: Math.min(innerHeight, 1000),
+              focusedTag: document.activeElement?.tagName ?? null,
+              dialogs: document.querySelectorAll('[role="dialog"]').length,
+              alerts: document.querySelectorAll('[role="alert"]').length,
+              composers: document.querySelectorAll('[role="combobox"][aria-label="Message"]')
+                .length,
+              busy: document.querySelectorAll('[aria-busy="true"]').length,
+              createButtons: [...document.querySelectorAll('button')]
+                .filter((button) => button.textContent?.trim() === 'Create Session')
+                .map((button) => ({ disabled: button.disabled })),
+            }
+          })
+          const bytes = Buffer.from(JSON.stringify(facts))
+          if (bytes.length > 4096 || facts.width < 1 || facts.height < 1)
+            throw new Error('Electron failure state exceeded its bound')
+          const state = info.outputPath('electron-state.json')
+          await writeFile(state, bytes, { flag: 'wx', mode: 0o600 })
+          await info.attach('electron-failure-state', {
+            path: state,
+            contentType: 'application/json',
+          })
+          const screenshot = info.outputPath('electron-failure.png')
+          await page.screenshot({
+            path: screenshot,
+            scale: 'css',
+            clip: { x: 0, y: 0, width: facts.width, height: facts.height },
+            timeout: 2000,
+          })
+          await info.attach('electron-failure-screen', {
+            path: screenshot,
+            contentType: 'image/png',
+          })
+        },
         dispose,
         readCodexFacts: async () => {
           if (mode === 'real')
@@ -1225,7 +1257,6 @@ async function writeCodexAppServer(
   scenario: NonNullable<RuntimeFixtureOptions['codexAppServer']>,
   skills: NonNullable<RuntimeFixtureOptions['codexSkills']>,
   sessionTitles = false,
-  soakTerminalFile?: string,
 ): Promise<string> {
   const path = join(directory, 'codex-app-server-fixture.mjs')
   const statePath = join(directory, 'codex-app-server-state.json')
@@ -1243,7 +1274,6 @@ const scenario = ${JSON.stringify(scenario)}
 const sessionTitles = ${JSON.stringify(sessionTitles)}
 const skills = ${JSON.stringify(skills)}
 const statePath = ${JSON.stringify(statePath)}
-const soakTerminalFile = ${JSON.stringify(soakTerminalFile ?? null)}
 const lines = createInterface({ input: process.stdin })
 const send = (message) => process.stdout.write(JSON.stringify(message) + '\\n')
 let state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : {}
@@ -1378,7 +1408,6 @@ for await (const line of lines) {
       send({ method: 'turn/completed', params: { threadId, turn: { id: 'retired-turn', status: 'failed', error: 'temporary failure' } } })
       send({ method: 'error', params: { threadId, turnId: 'retired-turn', message: 'Retired failure' } })
       let text = scenario === 'lost_ack_absent_then_retry' ? 'New task after recovery.' : 'Bounded lifecycle response.'
-      if (soakTerminalFile) text += '\\n\\n[soak.json](soak.json) · [soak.ts](soak.ts)'
       if (scenario === 'handoff_echo') {
         const prefix=request.params.input.filter(item=>item.type==='text').map(item=>item.text).join('\\n')
         const context=fixturePrompt(prefix)
@@ -1403,10 +1432,6 @@ for await (const line of lines) {
         native(threadId).turns.push({ id: turnId, status: 'completed', startedAt: 1, completedAt: 2, durationMs: 1, error: null })
         native(threadId).items.push({ turnId, item: { type: 'userMessage', id: 'fixture-user', clientId: request.params.clientUserMessageId, content: [] } }, { turnId, item: { type: 'agentMessage', id: 'fixture-message', text } }); persist()
         send({ method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', id: 'fixture-message', text } } })
-        if (soakTerminalFile) {
-          if (state.modelStarts.length > 128) throw Error('Soak native Turn capacity exceeded')
-          appendFileSync(soakTerminalFile, JSON.stringify({threadId,turnId,terminalAt:Date.now()})+'\\n', {mode:0o600})
-        }
         send({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } })
       }
       if (sessionTitles && request.params.input.some(item => item.type === 'text' && item.text.includes('Pact Session metadata:'))) {

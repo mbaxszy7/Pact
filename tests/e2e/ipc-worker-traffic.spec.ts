@@ -288,7 +288,7 @@ test(
               directoryPhysical: actual.traffic,
               directoryContentHash: expectedHash,
               scope:
-                'Current host only; physical CDP proof remains separate from runtime counters; complete IPC soak remains blocked.',
+                'Current host only; physical CDP proof remains separate from runtime counters; aggregate counters do not establish physical release.',
             }),
           ),
         })

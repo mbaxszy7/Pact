@@ -62,6 +62,24 @@ await test('keeps an explicit empty inventory when a prior build failed before P
   })
 })
 
+await test('preserves the actual Electron target state and bounded screenshot within shared capacity', async (context) => {
+  const f = await fixture(context),
+    directory = await f.addCase()
+  const state = '{"schemaVersion":1,"composers":0,"dialogs":1}',
+    png = Buffer.from([0x89, 0x50, 0x4e, 0x47])
+  await writeFile(join(directory, 'electron-state.json'), state)
+  await writeFile(join(directory, 'electron-failure.png'), png)
+  const report = await collectUiDiagnostics(f.source, f.output, { lane: 'deterministic' })
+  assert.equal(report.totalBytes, Buffer.byteLength(state) + png.length)
+  assert.equal(report.files.length, 2)
+  assert.equal(await readFile(join(f.output, 'test-case/electron-state.json'), 'utf8'), state)
+  assert.deepEqual(await readFile(join(f.output, 'test-case/electron-failure.png')), png)
+  const oversized = join(f.root, 'oversized')
+  await truncate(join(directory, 'electron-state.json'), 4097)
+  await assert.rejects(collectUiDiagnostics(f.source, oversized), /bounded regular file/)
+  await assert.rejects(readFile(join(oversized, 'inventory.json')), { code: 'ENOENT' })
+})
+
 await test('preserves existing output and refuses contained output paths including two-dot names', async (context) => {
   const f = await fixture(context)
   await mkdir(f.output)

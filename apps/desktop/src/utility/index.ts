@@ -56,10 +56,9 @@ if (
 
 function performanceSnapshot(
   openedDatabase: PactDatabase,
-  input?: import('@pact/contracts').RuntimeHealthInput,
 ): import('@pact/contracts').RuntimeHealth['performance'] {
   const probe = eventLoopProbe
-  const sqlite = openedDatabase.performanceDiagnostics(input?.sqlitePlans)
+  const sqlite = openedDatabase.performanceDiagnostics()
   if (!probe || !sqlite) return undefined
   const resources = process.getActiveResourcesInfo()
   resourceHighWater = Math.max(resourceHighWater, resources.length)
@@ -72,7 +71,7 @@ function performanceSnapshot(
   const eventLoopLagP95Ms = eventLoopSamples
     ? Math.max(0, probe.percentile(95) / 1_000_000 - 10)
     : 0
-  if (input?.sqlitePlans === undefined) probe.reset()
+  probe.reset()
   return {
     ...sqlite,
     eventLoopLagP95Ms,
@@ -247,19 +246,16 @@ async function bootstrap(
         void shutdown.then(
           () => {
             closeDiagnostics()
-            const sqliteFinal = openedDatabase.performanceFinal()
             parentPort.postMessage(
               utilityResponseSchema.parse({
                 type: 'runtime.shutdown.response',
                 requestId,
                 result: { ok: true, value: { flushed: true } },
-                ...(sqliteFinal ? { sqliteFinal } : {}),
               }),
             )
             return undefined
           },
           () => {
-            const sqliteFinal = openedDatabase.performanceFinal()
             parentPort.postMessage(
               utilityResponseSchema.parse({
                 type: 'runtime.shutdown.response',
@@ -268,46 +264,13 @@ async function bootstrap(
                   ok: false,
                   error: { code: 'INTERNAL', message: 'Pact could not finish its shutdown flush.' },
                 },
-                ...(sqliteFinal ? { sqliteFinal } : {}),
               }),
             )
           },
         )
         return
       }
-      case 'runtime.health.request': {
-        const input = request.data.input
-        if (input?.sqlitePlans !== undefined && !eventLoopProbe) {
-          parentPort.postMessage(
-            utilityResponseSchema.parse({
-              type: 'runtime.health.response',
-              requestId: request.data.requestId,
-              error: {
-                code: 'RUNTIME_UNAVAILABLE',
-                message: 'SQLite plan observation is unavailable for this runtime.',
-              },
-            }),
-          )
-          return
-        }
-        let performanceHealth: import('@pact/contracts').RuntimeHealth['performance']
-        try {
-          performanceHealth = eventLoopProbe
-            ? performanceSnapshot(openedDatabase, input)
-            : undefined
-        } catch {
-          parentPort.postMessage(
-            utilityResponseSchema.parse({
-              type: 'runtime.health.response',
-              requestId: request.data.requestId,
-              error: {
-                code: input?.sqlitePlans === undefined ? 'INTERNAL' : 'VALIDATION',
-                message: 'The runtime health observation could not be read.',
-              },
-            }),
-          )
-          return
-        }
+      case 'runtime.health.request':
         parentPort.postMessage(
           utilityResponseSchema.parse({
             type: 'runtime.health.response',
@@ -317,7 +280,7 @@ async function bootstrap(
               database: 'ready',
               pid: process.pid,
               checkedAt: new Date().toISOString(),
-              ...(performanceHealth ? { performance: performanceHealth } : {}),
+              ...(eventLoopProbe ? { performance: performanceSnapshot(openedDatabase) } : {}),
               ...(workerTraffic
                 ? {
                     ipcTraffic: {
@@ -343,7 +306,6 @@ async function bootstrap(
           }),
         )
         return
-      }
 
       case 'runtime-preparation.get.request':
         runRequest(async () => {

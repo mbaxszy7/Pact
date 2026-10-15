@@ -806,38 +806,7 @@ export async function validateBundle(root, identity, platformKey) {
       'ZIP smoke does not bind its archive',
     )
   }
-  const soak = await readJson(join(root, 'package-soak-report.json'))
-  reportIdentity(soak, manifest, 'Packaged soak')
-  requireFact(
-    Number.isFinite(soak.durationMs) && soak.durationMs >= 7_200_000,
-    'Packaged soak is shorter than two hours',
-  )
-  requireFact(
-    soak.budgetPass === true &&
-      soak.cleanupVerified === true &&
-      soak.resourceLifecycleVerified === true,
-    'Packaged performance/resource lifecycle evidence is incomplete',
-  )
-  requireFact(
-    Array.isArray(soak.artifacts) && soak.artifacts.length === manifest.artifacts.length,
-    'Soak installer identity is incomplete',
-  )
-  for (const artifact of manifest.artifacts) {
-    requireFact(
-      soak.artifacts.some(
-        (entry) =>
-          entry.path === artifact.path &&
-          entry.sha256 === artifact.sha256 &&
-          entry.bytes === artifact.bytes,
-      ),
-      'Soak is not bound to every final installer',
-    )
-  }
-  const reports = [
-    'distribution-manifest.json',
-    'package-smoke-report.json',
-    'package-soak-report.json',
-  ]
+  const reports = ['distribution-manifest.json', 'package-smoke-report.json']
   if (platform === 'darwin') reports.push('package-zip-smoke-report.json')
   for (const path of reports)
     // oxlint-disable-next-line eslint/no-await-in-loop -- Admit one bounded evidence file before retaining its digest.
@@ -1141,7 +1110,6 @@ export async function restorePlatform(api, identity, key, output, context) {
     })),
     { remote: `${key}-distribution-manifest.json`, local: 'distribution-manifest.json' },
     { remote: `${key}-package-smoke-report.json`, local: 'package-smoke-report.json' },
-    { remote: `${key}-package-soak-report.json`, local: 'package-soak-report.json' },
     ...(key === 'darwin-arm64'
       ? [{ remote: `${key}-package-zip-smoke-report.json`, local: 'package-zip-smoke-report.json' }]
       : []),

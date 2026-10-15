@@ -17,13 +17,12 @@ import { measureLogicalPayloadBytes, type LogicalPayloadProfile } from './logica
 const LIMITS = { maxBytes: 128 * 1024 * 1024, maxNodes: 262_144, maxDepth: 64 }
 const MAX_MESSAGES = 1_000_000
 /** The E2E alias is generated internally by a credential-free, owned fixture. It never enables
- * the packaged inspector; Main independently requires a nonpackaged app and canonical data root. */
+ * packaged observation; Main independently requires a nonpackaged app and canonical data root. */
 export function hasLogicalIpcFixtureNonce(
   environment: Readonly<Record<string, string | undefined>>,
 ): boolean {
   return (
-    /^[a-f\d]{64}$/u.test(environment.PACT_SOAK_NONCE ?? '') ||
-    (environment.NODE_ENV === 'test' && /^[a-f\d]{64}$/u.test(environment.PACT_E2E_IPC_NONCE ?? ''))
+    environment.NODE_ENV === 'test' && /^[a-f\d]{64}$/u.test(environment.PACT_E2E_IPC_NONCE ?? '')
   )
 }
 const emptyCounts = () => ({

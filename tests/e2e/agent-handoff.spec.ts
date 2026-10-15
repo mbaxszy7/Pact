@@ -73,7 +73,7 @@ test(
 test(
   'a new explicit Claude request after @all does not rerun the confirmed Codex peer',
   { tag: '@deterministic' },
-  async () => {
+  async ({ browserName: _browserName }, testInfo) => {
     const fixture = await createRuntimeFixture({
       codexAppServer: 'complete',
       claudeConversation: 'failure_once',
@@ -102,6 +102,10 @@ test(
       expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(1)
       expect((await fixture.readClaudeFacts()).count).toBe(2)
       await expect(window.getByRole('combobox', { name: 'Message' })).toBeEnabled()
+    } catch (error) {
+      // Capture the actual Electron target before finally closes it; preserve the original failure.
+      await fixture.captureUiFailure(testInfo).catch(() => undefined)
+      throw error
     } finally {
       await app.close()
       await fixture.dispose()

@@ -506,127 +506,6 @@ export const nativeMemoryDiagnosticsSchema = z
   })
 export type NativeMemoryDiagnostics = z.infer<typeof nativeMemoryDiagnosticsSchema>
 
-const sqliteWatermarkSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
-export const sqlitePlanRecordSchema = z.strictObject({
-  recordSequence: sqliteWatermarkSchema.refine((value) => value > 0),
-  schemaVersion: sqliteWatermarkSchema,
-  sqlSha256: z.string().regex(/^[a-f\d]{64}$/u),
-  details: z.array(z.string().max(512)).max(64),
-})
-export type SqlitePlanRecord = z.infer<typeof sqlitePlanRecordSchema>
-export const sqlitePlanAckSchema = z.strictObject({
-  observerEpoch: z.string().uuid(),
-  pageSequence: sqliteWatermarkSchema.refine((value) => value > 0),
-  payloadDigest: z.string().regex(/^[a-f\d]{64}$/u),
-})
-export const sqlitePlanReadInputSchema = z.strictObject({ ack: sqlitePlanAckSchema.optional() })
-export type SqlitePlanReadInput = z.infer<typeof sqlitePlanReadInputSchema>
-export const runtimeHealthInputSchema = z.strictObject({
-  sqlitePlans: sqlitePlanReadInputSchema.optional(),
-})
-export type RuntimeHealthInput = z.infer<typeof runtimeHealthInputSchema>
-export const sqlitePlanPageSchema = z
-  .strictObject({
-    observerEpoch: z.string().uuid(),
-    pageSequence: sqliteWatermarkSchema.refine((value) => value > 0),
-    firstRecordSequence: sqliteWatermarkSchema.refine((value) => value > 0),
-    lastRecordSequence: sqliteWatermarkSchema.refine((value) => value > 0),
-    operationWatermark: sqliteWatermarkSchema,
-    recordWatermark: sqliteWatermarkSchema,
-    payloadDigest: z.string().regex(/^[a-f\d]{64}$/u),
-    records: z.array(sqlitePlanRecordSchema).min(1).max(64),
-  })
-  .refine(
-    (page) =>
-      page.records[0]?.recordSequence === page.firstRecordSequence &&
-      page.records.at(-1)?.recordSequence === page.lastRecordSequence &&
-      page.lastRecordSequence <= page.recordWatermark &&
-      page.records.every(
-        (record, index) => record.recordSequence === page.firstRecordSequence + index,
-      ),
-  )
-export type SqlitePlanPage = z.infer<typeof sqlitePlanPageSchema>
-export const sqlitePlanTransferSchema = z.strictObject({
-  observerEpoch: z.string().uuid(),
-  recordWatermark: sqliteWatermarkSchema,
-  acknowledgedThrough: sqliteWatermarkSchema,
-  lastAck: sqlitePlanAckSchema.optional(),
-  page: sqlitePlanPageSchema.optional(),
-})
-export type SqlitePlanTransfer = z.infer<typeof sqlitePlanTransferSchema>
-
-export const sqlitePerformanceSchema = z.strictObject({
-  operations: z.number().int().nonnegative(),
-  transactions: z.number().int().nonnegative(),
-  rowsReturned: z.number().int().nonnegative(),
-  totalMs: z.number().finite().nonnegative(),
-  maxMs: z.number().finite().nonnegative(),
-  planOverflow: z.boolean(),
-  unsupportedOperations: z.boolean(),
-  firstPlanFailure: z
-    .strictObject({
-      reason: z.enum([
-        'statement-bytes',
-        'plan-capacity',
-        'plan-rows',
-        'plan-detail',
-        'plan-bytes',
-        'explain-failed',
-      ]),
-      sqlSha256: z
-        .string()
-        .regex(/^[a-f\d]{64}$/u)
-        .nullable(),
-      sourceBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-      operationIndex: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-      retainedPlans: z.number().int().nonnegative().max(64),
-      retainedPlanBytes: z
-        .number()
-        .int()
-        .nonnegative()
-        .max(16 * 1024),
-      planRows: z.number().int().nonnegative().max(0xffffffff).nullable(),
-    })
-    .refine((failure) =>
-      failure.sourceBytes > 8192
-        ? failure.reason === 'statement-bytes' && failure.sqlSha256 === null
-        : failure.reason !== 'statement-bytes' && failure.sqlSha256 !== null,
-    )
-    .optional(),
-  retainedPlanBytes: sqliteWatermarkSchema.max(16 * 1024).optional(),
-  highWaterPlanBytes: sqliteWatermarkSchema.max(16 * 1024).optional(),
-  highWaterPlans: sqliteWatermarkSchema.max(64).optional(),
-  unacknowledgedHighWaterPlans: sqliteWatermarkSchema.max(64).optional(),
-  unacknowledgedPlans: sqliteWatermarkSchema.max(64).optional(),
-  recordWatermark: sqliteWatermarkSchema.optional(),
-  planTransfer: sqlitePlanTransferSchema.optional(),
-  queryPlans: z
-    .array(
-      z.strictObject({
-        sqlSha256: z.string().regex(/^[a-f\d]{64}$/u),
-        details: z.array(z.string().max(512)).max(64),
-      }),
-    )
-    .max(64),
-})
-export const sqliteFinalSchema = z.strictObject({
-  schemaVersion: z.literal(1),
-  scope: z.literal('post-open-native-run-get-all-and-drizzle-transaction-attempts-v1'),
-  observerEpoch: z.string().uuid(),
-  observerPid: z.number().int().positive().max(0xffffffff),
-  recordWatermark: sqliteWatermarkSchema,
-  acknowledgedThrough: sqliteWatermarkSchema,
-  pageSequence: sqliteWatermarkSchema,
-  lastAck: sqlitePlanAckSchema.optional(),
-  tailRecords: z.array(sqlitePlanRecordSchema).max(64),
-  counters: sqlitePerformanceSchema.omit({ queryPlans: true, planTransfer: true }),
-  databaseClosed: z.boolean(),
-  writerClosed: z.boolean(),
-  collectionDisposed: z.boolean(),
-})
-export type SqliteFinal = z.infer<typeof sqliteFinalSchema>
-export type RuntimeShutdownReply = RpcResult<{ flushed: true }> & { sqliteFinal?: SqliteFinal }
-
 export const runtimeHealthSchema = z.object({
   ipcTraffic: ipcTrafficSchema.optional(),
   performance: z
@@ -639,7 +518,53 @@ export const runtimeHealthSchema = z.object({
       resourceHighWater: z.number().int().nonnegative(),
       resourceCapacityExceeded: z.boolean(),
       nativeMemory: nativeMemoryDiagnosticsSchema.optional(),
-      sqlite: sqlitePerformanceSchema,
+      sqlite: z.strictObject({
+        operations: z.number().int().nonnegative(),
+        transactions: z.number().int().nonnegative(),
+        rowsReturned: z.number().int().nonnegative(),
+        totalMs: z.number().finite().nonnegative(),
+        maxMs: z.number().finite().nonnegative(),
+        planOverflow: z.boolean(),
+        unsupportedOperations: z.boolean(),
+        firstPlanFailure: z
+          .strictObject({
+            reason: z.enum([
+              'statement-bytes',
+              'plan-capacity',
+              'plan-rows',
+              'plan-detail',
+              'plan-bytes',
+              'explain-failed',
+            ]),
+            sqlSha256: z
+              .string()
+              .regex(/^[a-f\d]{64}$/u)
+              .nullable(),
+            sourceBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+            operationIndex: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+            retainedPlans: z.number().int().nonnegative().max(64),
+            retainedPlanBytes: z
+              .number()
+              .int()
+              .nonnegative()
+              .max(16 * 1024),
+            planRows: z.number().int().nonnegative().max(0xffffffff).nullable(),
+          })
+          .refine((failure) =>
+            failure.sourceBytes > 8192
+              ? failure.reason === 'statement-bytes' && failure.sqlSha256 === null
+              : failure.reason !== 'statement-bytes' && failure.sqlSha256 !== null,
+          )
+          .optional(),
+        queryPlans: z
+          .array(
+            z.strictObject({
+              sqlSha256: z.string().regex(/^[a-f\d]{64}$/u),
+              details: z.array(z.string().max(512)).max(64),
+            }),
+          )
+          .max(64),
+      }),
     })
     .optional(),
   conversation: z
@@ -2184,7 +2109,6 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('runtime.health.request'),
     requestId: z.string().uuid(),
-    input: runtimeHealthInputSchema.optional(),
   }),
   z.object({
     type: z.literal('comment-draft.save.request'),
@@ -2463,16 +2387,12 @@ export const utilityResponseSchema = z.discriminatedUnion('type', [
     type: z.literal('runtime.shutdown.response'),
     requestId: z.string().uuid(),
     result: rpcResultSchema(z.object({ flushed: z.literal(true) })),
-    sqliteFinal: sqliteFinalSchema.optional(),
   }),
-  z
-    .object({
-      type: z.literal('runtime.health.response'),
-      requestId: z.string().uuid(),
-      health: runtimeHealthSchema.optional(),
-      error: appErrorSchema.optional(),
-    })
-    .refine((reply) => (reply.health !== undefined) !== (reply.error !== undefined)),
+  z.object({
+    type: z.literal('runtime.health.response'),
+    requestId: z.string().uuid(),
+    health: runtimeHealthSchema,
+  }),
   z.object({
     type: z.literal('comment-source.response'),
     requestId: z.string().uuid(),
@@ -2639,7 +2559,7 @@ export interface DesktopBridge {
     input: NativePermissionRespondInput,
   ): Promise<RpcResult<ConversationPatch>>
   getAppInfo(): Promise<RpcResult<AppInfo>>
-  getRuntimeHealth(input?: RuntimeHealthInput): Promise<RpcResult<RuntimeHealth>>
+  getRuntimeHealth(): Promise<RpcResult<RuntimeHealth>>
   getRuntimePreparation(): Promise<RpcResult<RuntimePreparation>>
   chooseRuntimeExecutable(agentId: RuntimeAgentId): Promise<RpcResult<RuntimePreparation>>
   getDefaultSessionSettingsEditorState(): Promise<RpcResult<DefaultSessionSettingsEditorState>>

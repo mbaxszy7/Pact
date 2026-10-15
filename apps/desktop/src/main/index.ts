@@ -18,14 +18,9 @@ import { DiagnosticLogs } from './modules/diagnostics'
 import {
   completePackagedSmoke,
   completePackagedProductionPathProbe,
-  configurePackagedSoakInspection,
-  disposePackagedSoakInspection,
   configurePackageSmokeUserData,
   isPackageSmoke,
-  isPackagedSoakInspection,
   observePackagedPageLoad,
-  writePackagedSoakReceipt,
-  writePackagedSoakSqliteFinal,
 } from './package-smoke'
 import { configureProductIdentity, readProductIdentity } from './product-identity'
 import { createRendererTrust } from './renderer-trust'
@@ -64,8 +59,7 @@ function createPactWindow(): BrowserWindow {
           exitCode: details.exitCode,
         })
       })
-      if (isPackageSmoke() || isPackagedSoakInspection())
-        pageLoad = observePackagedPageLoad(createdWindow)
+      if (isPackageSmoke()) pageLoad = observePackagedPageLoad(createdWindow)
     },
   })
 
@@ -81,23 +75,12 @@ function createPactWindow(): BrowserWindow {
     )
   }
 
-  if (isPackagedSoakInspection()) {
-    if (!pageLoad)
-      throw new Error('Packaged soak page observer was not installed before navigation.')
-    void writePackagedSoakReceipt(window, pageLoad).catch(() => {
-      diagnostics?.record({ operation: 'app', phase: 'failed', level: 'error', code: 'INTERNAL' })
-      utilityClient.dispose()
-      app.exit(1)
-    })
-  }
-
   return window
 }
 
 async function bootstrap(): Promise<void> {
   configurePackageSmokeUserData()
   configureIsolatedProfile()
-  configurePackagedSoakInspection()
   if (!app.requestSingleInstanceLock()) {
     app.exit(0)
     return
@@ -116,7 +99,7 @@ async function bootstrap(): Promise<void> {
   const paths = resolveRuntimePaths()
   let traffic: LogicalIpcWorkerTraffic | undefined
   if (
-    (Boolean(process.env.PACT_SOAK_NONCE) || !app.isPackaged) &&
+    !app.isPackaged &&
     hasLogicalIpcFixtureNonce(process.env) &&
     process.env.PACT_E2E_ROOT &&
     paths.databaseFile !== ':memory:'
@@ -224,52 +207,27 @@ app.on('before-quit', (event) => {
   event.preventDefault()
   if (quitting) return
   quitting = true
-  const inspectionClosed = disposePackagedSoakInspection()
   applicationMenu?.dispose()
   removeDesktopModules?.()
   appearanceSettings?.dispose()
-  let fixtureShutdownFailed = false
   void utilityClient
     .shutdown()
-    .then(async (result) => {
+    .then((result) => {
       if (!result.ok) console.error('Pact shutdown was not acknowledged:', result.error.code)
-      try {
-        await writePackagedSoakSqliteFinal(result.sqliteFinal)
-      } catch {
-        fixtureShutdownFailed = true
-        console.error('Pact could not seal its packaged SQLite observation.')
-      }
-      if (!result.ok && isPackagedSoakInspection()) fixtureShutdownFailed = true
-      if (
-        isPackagedSoakInspection() &&
-        (!result.sqliteFinal?.databaseClosed ||
-          !result.sqliteFinal.writerClosed ||
-          !result.sqliteFinal.collectionDisposed)
-      )
-        fixtureShutdownFailed = true
       return undefined
     })
     .catch(() => {
-      fixtureShutdownFailed = isPackagedSoakInspection()
       console.error('Pact shutdown acknowledgement could not be read.')
     })
     // oxlint-disable-next-line typescript/no-misused-promises -- Promise.finally awaits the bounded diagnostic flush before quitting.
     .finally(async () => {
       try {
-        await inspectionClosed
-      } catch {
-        fixtureShutdownFailed = isPackagedSoakInspection()
-        console.error('Pact could not close its packaged inspection.')
-      }
-      try {
         await diagnostics?.close()
       } catch {
-        fixtureShutdownFailed = isPackagedSoakInspection()
         console.error('Pact could not close its diagnostics.')
       }
       quitReady = true
-      if (fixtureShutdownFailed) app.exit(1)
-      else app.quit()
+      app.quit()
     })
 })
 

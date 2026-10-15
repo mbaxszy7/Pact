@@ -12,6 +12,7 @@ export const diagnosticLimits = Object.freeze({
   files: 128,
   contextBytes: 256 * 1024,
   traceBytes: 16 * 1024 * 1024,
+  screenshotBytes: 8 * 1024 * 1024,
   totalBytes: 32 * 1024 * 1024,
 })
 
@@ -166,7 +167,15 @@ export async function collectUiDiagnostics(
         entries++
         if (entries > diagnosticLimits.entriesPerCase)
           throw new Error('UI diagnostic case exceeds its entry bound')
-        if (!['error-context.md', 'trace.zip'].includes(file.name)) continue
+        if (
+          ![
+            'error-context.md',
+            'trace.zip',
+            'electron-state.json',
+            'electron-failure.png',
+          ].includes(file.name)
+        )
+          continue
         if (!file.isFile() || file.isSymbolicLink())
           throw new Error('UI diagnostics cannot contain non-file sources')
         if (records.length >= remainingFiles)
@@ -177,7 +186,13 @@ export async function collectUiDiagnostics(
           join(directory, file.name),
           join(targetDirectory, file.name),
           Math.min(
-            file.name === 'trace.zip' ? diagnosticLimits.traceBytes : diagnosticLimits.contextBytes,
+            file.name === 'trace.zip'
+              ? diagnosticLimits.traceBytes
+              : file.name === 'electron-failure.png'
+                ? diagnosticLimits.screenshotBytes
+                : file.name === 'electron-state.json'
+                  ? 4096
+                  : diagnosticLimits.contextBytes,
             remainingBytes - totalBytes,
           ),
         )

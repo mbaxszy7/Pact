@@ -380,7 +380,6 @@ export async function main(args = process.argv.slice(2)) {
       signing: { mac: 'ad-hoc', windows: 'none', notarized: false },
       verification: {
         packagedSmoke: 'pending',
-        packagedSoak: 'pending',
         productionInstallation:
           'TODO: native installation, coexistence, upgrade and uninstall debugging remain required',
       },
