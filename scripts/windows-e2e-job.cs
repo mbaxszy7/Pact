@@ -155,7 +155,10 @@ public static class PactE2EJob
                     }
                     empty = true; break;
                 }
-                string reason = cancel.IsCompleted ? "control-closed" : clock.ElapsedMilliseconds >= timeout ? "deadline" : exitedAt >= 0 && clock.ElapsedMilliseconds - exitedAt >= 5000 ? "descendants-still-running" : null;
+                // NSIS delegates uninstall to an owned temporary child before its root exits.
+                // That operation keeps the original phase deadline; ordinary commands retain
+                // the five-second post-root drain. Job ownership and cancellation never change.
+                string reason = cancel.IsCompleted ? "control-closed" : clock.ElapsedMilliseconds >= timeout ? "deadline" : argumentMode != "nsis" && exitedAt >= 0 && clock.ElapsedMilliseconds - exitedAt >= 5000 ? "descendants-still-running" : null;
                 if (stoppedAt < 0 && reason != null) {
                     Check(TerminateJobObject(job, 1)); exit = 1; stoppedAt = clock.ElapsedMilliseconds;
                     Emit(writer, "{\"kind\":\"stopping\",\"reason\":\"" + reason + "\"}", generation);

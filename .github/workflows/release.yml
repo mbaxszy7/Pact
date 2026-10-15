@@ -153,6 +153,10 @@ jobs:
         run: pnpm exec playwright test --list --reporter=json > "$RUNNER_TEMP/pact-e2e-inventory.json"
       - name: Target-architecture Electron build
         run: node control/scripts/ci.mjs build
+      - name: Native Windows process and installed-content regressions
+        if: runner.os == 'Windows'
+        working-directory: source
+        run: node --test --test-concurrency=1 scripts/run-e2e-windows.test.mjs scripts/run-e2e.test.mjs scripts/package-smoke.test.mjs
       - name: Electron UI
         id: ui
         run: node control/scripts/ci.mjs ui
@@ -389,6 +393,10 @@ jobs:
         run: pnpm exec playwright test --list --reporter=json > "$RUNNER_TEMP/pact-e2e-inventory.json"
       - name: Target-architecture Electron build
         run: node control/scripts/ci.mjs build
+      - name: Native Windows process and installed-content regressions
+        if: runner.os == 'Windows'
+        working-directory: source
+        run: node --test --test-concurrency=1 scripts/run-e2e-windows.test.mjs scripts/run-e2e.test.mjs scripts/package-smoke.test.mjs
       - name: Electron UI
         id: ui
         run: node control/scripts/ci.mjs ui
@@ -626,6 +634,10 @@ jobs:
         run: pnpm exec playwright test --list --reporter=json > "$RUNNER_TEMP/pact-e2e-inventory.json"
       - name: Target-architecture Electron build
         run: node control/scripts/ci.mjs build
+      - name: Native Windows process and installed-content regressions
+        if: runner.os == 'Windows'
+        working-directory: source
+        run: node --test --test-concurrency=1 scripts/run-e2e-windows.test.mjs scripts/run-e2e.test.mjs scripts/package-smoke.test.mjs
       - name: Electron UI
         id: ui
         run: node control/scripts/ci.mjs ui

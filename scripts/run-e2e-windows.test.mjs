@@ -157,6 +157,104 @@ void test(
   },
 )
 
+await test(
+  'NSIS delegation owns its child until the original deadline while CRT retains its drain limit',
+  { skip: process.platform !== 'win32', timeout: 60_000 },
+  async (context) => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-nsis-delegation-'))
+    let allReleased = true
+    context.after(async () => {
+      if (!allReleased) throw new Error('Delegated Job release is unconfirmed; fixture retained')
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 })
+    })
+    const source = join(root, 'Delegation.cs'),
+      executable = join(root, 'Delegation.exe')
+    await writeFile(
+      source,
+      `using System;using System.Diagnostics;using System.Reflection;using System.Threading;class Delegation{static int Main(string[] args){if(args.Length==1&&args[0]=="child"){Thread.Sleep(int.Parse(Environment.GetEnvironmentVariable("PACT_NSIS_CHILD_DELAY")));return 0;}var info=new ProcessStartInfo(Assembly.GetExecutingAssembly().Location,"child"){UseShellExecute=false,CreateNoWindow=true};using(var child=Process.Start(info)){Console.WriteLine("delegated");return int.Parse(Environment.GetEnvironmentVariable("PACT_NSIS_ROOT_EXIT"));}}}`,
+    )
+    const checked = async (args, timeout, options) => {
+      let released = false
+      try {
+        return await run(args, timeout, {
+          ...options,
+          onState: (state) => {
+            if (state.kind === 'settled')
+              released = state.groupGone === true && state.ownedProcessCount === 0
+            options.onState?.(state)
+          },
+        })
+      } finally {
+        if (!released) allReleased = false
+      }
+    }
+    const compiler = join(
+      process.env.SystemRoot ?? process.env.WINDIR,
+      'Microsoft.NET',
+      'Framework64',
+      'v4.0.30319',
+      'csc.exe',
+    )
+    assert.equal(
+      await checked(['/nologo', '/target:exe', `/out:${executable}`, source], 15_000, {
+        executable: compiler,
+        cwd: root,
+        write: () => {},
+      }),
+      0,
+    )
+    for (const scenario of ['nsis', 'crt', 'nonzero', 'deadline', 'cancel', 'observer-failure']) {
+      const controller = new AbortController(),
+        states = [],
+        mode = scenario === 'crt' ? undefined : 'nsis'
+      let delegated = false
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Every owned Job must physically settle before its next independent failure mode.
+      const code = await checked(['/S'], scenario === 'deadline' ? 6000 : 15_000, {
+        executable,
+        cwd: root,
+        env: {
+          ...process.env,
+          PACT_NSIS_CHILD_DELAY:
+            scenario === 'nonzero' ? '50' : scenario === 'deadline' ? '12000' : '7000',
+          PACT_NSIS_ROOT_EXIT: scenario === 'nonzero' ? '7' : '0',
+        },
+        windowsArgumentMode: mode,
+        signal: controller.signal,
+        write: (_channel, text) => {
+          if (text.trim() === 'delegated') {
+            delegated = true
+            if (scenario === 'cancel') controller.abort()
+          }
+        },
+        onState: (state) => {
+          states.push(state)
+          if (scenario === 'observer-failure' && state.kind === 'started')
+            throw new Error('Controlled owner observation failure')
+        },
+      })
+      assert.equal(code, scenario === 'nsis' ? 0 : scenario === 'nonzero' ? 7 : 1)
+      if (scenario !== 'observer-failure') assert.equal(delegated, true)
+      const stopping = states.filter((state) => state.kind === 'stopping')
+      if (['nsis', 'nonzero'].includes(scenario)) assert.equal(stopping.length, 0)
+      else
+        assert.ok(
+          stopping.some(
+            (state) =>
+              state.reason ===
+              {
+                crt: 'descendants-still-running',
+                deadline: 'deadline',
+                cancel: 'cancelled',
+                'observer-failure': 'observer-failed',
+              }[scenario],
+          ),
+        )
+      assert.equal(states.at(-1).groupGone, true)
+      assert.equal(states.at(-1).ownedProcessCount, 0)
+    }
+  },
+)
+
 async function waitFor(check) {
   const deadline = Date.now() + 10_000
   while (Date.now() < deadline) {

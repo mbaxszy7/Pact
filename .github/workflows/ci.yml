@@ -260,6 +260,10 @@ jobs:
         run: node control/scripts/ci.mjs build
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
+      - name: Native Windows process and installed-content regressions
+        if: runner.os == 'Windows'
+        working-directory: source
+        run: node --test --test-concurrency=1 scripts/run-e2e-windows.test.mjs scripts/run-e2e.test.mjs scripts/package-smoke.test.mjs
       - name: Capture trusted no-credential case inventory for complete failure reports
         working-directory: control
         run: pnpm exec playwright test --list --reporter=json > "$RUNNER_TEMP/pact-e2e-inventory.json"

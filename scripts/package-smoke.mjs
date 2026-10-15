@@ -1,4 +1,5 @@
 import { execFile, spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
 import {
   access,
@@ -23,6 +24,8 @@ import { applicationContent, hashFile } from './build-distribution.mjs'
 import { ciEnvironment } from './ci.mjs'
 import { run } from './run-e2e.mjs'
 import { isScriptEntry } from './script-entry.mjs'
+
+const isSha256 = (value) => typeof value === 'string' && /^[a-f\d]{64}$/u.test(value)
 
 const PACKAGE_SMOKE_ENV = 'PACT_PACKAGE_SMOKE'
 const PACKAGE_SMOKE_PHASE_ENV = 'PACT_PACKAGE_SMOKE_PHASE'
@@ -115,12 +118,67 @@ export async function verifyApplication(application, manifest, installed) {
   if (
     content.sha256 !== manifest.application.contentSha256 ||
     JSON.stringify(content.entries) !== JSON.stringify(manifest.application.entries)
-  )
-    throw new Error('Installed application content differs from the exact manifest payload.')
+  ) {
+    const mismatch = Object.assign(
+      new Error('Installed application content differs from the exact manifest payload.'),
+      { applicationContentMismatch: true },
+    )
+    try {
+      mismatch.applicationContentDifference = applicationContentDifference(
+        manifest.application,
+        content,
+      )
+    } catch {
+      // Optional diagnostics cannot replace the original exact-content rejection.
+    }
+    throw mismatch
+  }
   const executable = resolveWithin(application, manifest.application.executable)
   if (!(await pathExists(executable)))
     throw new Error('The explicit packaged executable is missing or not executable.')
   return executable
+}
+
+/** A bounded diagnostic projection; exact content equality above remains mandatory. */
+export function applicationContentDifference(expected, actual) {
+  const before = new Map(expected.entries.map((entry) => [entry.path, entry])),
+    after = new Map(actual.entries.map((entry) => [entry.path, entry]))
+  let missing = 0,
+    additional = 0,
+    changed = 0
+  const samples = []
+  const record = (kind, path, previous, next) => {
+    if (samples.length >= 8 || typeof path !== 'string') return
+    samples.push({
+      kind,
+      pathSha256: createHash('sha256').update(path).digest('hex'),
+      expectedSha256: isSha256(previous?.sha256) ? previous.sha256 : undefined,
+      actualSha256: isSha256(next?.sha256) ? next.sha256 : undefined,
+    })
+  }
+  for (const [path, entry] of before) {
+    const next = after.get(path)
+    if (!next) {
+      missing++
+      record('missing', path, entry, undefined)
+    } else if (JSON.stringify(entry) !== JSON.stringify(next)) {
+      changed++
+      record('changed', path, entry, next)
+    }
+  }
+  for (const [path, entry] of after)
+    if (!before.has(path)) {
+      additional++
+      record('additional', path, undefined, entry)
+    }
+  return {
+    expectedContentSha256: expected.contentSha256,
+    actualContentSha256: actual.sha256,
+    missing,
+    additional,
+    changed,
+    samples,
+  }
 }
 
 /** The harness owns only an extracted bundle or an installation in an ephemeral Windows runner. */
@@ -364,6 +422,14 @@ export async function prepareApplication({
       dispose,
     }
   } catch (error) {
+    facts.applicationContentDifference ??= error?.applicationContentDifference
+    if (stage === 'application-content')
+      facts.installationContentFailure =
+        error?.applicationContentMismatch === true
+          ? 'CONTENT_MISMATCH'
+          : ['ENOENT', 'EACCES', 'EPERM', 'EBUSY', 'ENOTDIR'].includes(error?.code)
+            ? error.code
+            : 'INSPECTION_FAILED'
     facts.installationFailureStage = stage
     if (error?.preserveRoot === true) throw error
     try {
@@ -408,19 +474,69 @@ async function runOwnedPackagedProcess(executable, environment, phase, redact, t
   )
   if (exit !== 0) {
     const summary = output.match(/^PACT_PACKAGE_SMOKE:FAIL ([^\r\n]{1,512})/mu)?.[1]
-    throw new Error(
-      `Packaged ${phase ?? 'core inspection'} exited with code ${exit}.${summary ? ` ${redact(summary)}` : ''}`,
+    throw Object.assign(
+      new Error(
+        `Packaged ${phase ?? 'core inspection'} exited with code ${exit}.${summary ? ` ${redact(summary)}` : ''}`,
+      ),
+      {
+        runtimeFailureFacts: packagedRuntimeFailureFacts(exit, output, {
+          identity: Boolean(identity),
+          passed,
+        }),
+      },
     )
   }
   if (phase && (!passed || !identity))
-    throw new Error(
-      `Packaged ${phase} omitted required runtime identity or PASS evidence.\n${redact(output)}`,
+    throw Object.assign(
+      new Error(
+        `Packaged ${phase} omitted required runtime identity or PASS evidence.\n${redact(output)}`,
+      ),
+      {
+        runtimeFailureFacts: packagedRuntimeFailureFacts(exit, output, {
+          identity: Boolean(identity),
+          passed,
+        }),
+      },
     )
   return identity
 }
 
 function appendLog(current, chunk) {
   return `${current}${chunk}`.slice(-MAX_LOG_LENGTH)
+}
+
+/** Only fixed categories and scalar marker/result facts may cross into the public report. */
+export function packagedRuntimeFailureFacts(code, output, markers) {
+  const text = typeof output === 'string' ? output.slice(-MAX_LOG_LENGTH) : ''
+  const categories = [
+    [
+      'NATIVE_DEPENDENCY',
+      /ERR_DLOPEN_FAILED|NODE_MODULE_VERSION|Module did not self-register|Cannot find module|Could not load the "sharp" module/u,
+    ],
+    [
+      'PRODUCT_IDENTITY',
+      /Packaged distribution identity|Package smoke identity mismatch|Package smoke runtime platform|Packaged default profile|profile\/session\/log paths/u,
+    ],
+    [
+      'PAGE_LOAD',
+      /Timed out loading app:\/\/bundle|Failed to load app:\/\/bundle|Expected packaged page/u,
+    ],
+    ['RENDERER_MOUNT', /packaged app did not mount its Renderer/u],
+    ['UTILITY_RUNTIME', /packaged utility runtime or database is unavailable/u],
+    ['IMAGE_CODEC', /Packaged image codec/u],
+    ['MARKDOWN_PROJECTION', /Packaged projection/u],
+    ['APPEARANCE', /Packaged appearance/u],
+  ]
+  return {
+    runtimeFailure: categories.find(([, pattern]) => pattern.test(text))?.[0] ?? 'UNCLASSIFIED',
+    ...(Number.isSafeInteger(code) && code >= -0x80000000 && code <= 0xffffffff
+      ? { observedExitCode: code }
+      : {}),
+    runtimeIdentityMarkerReceived:
+      markers === undefined ? /^PACT_PACKAGE_IDENTITY:/mu.test(text) : markers.identity === true,
+    runtimePassMarkerReceived:
+      markers === undefined ? /^PACT_PACKAGE_SMOKE:PASS\s*$/mu.test(text) : markers.passed === true,
+  }
 }
 
 /** The launcher owns one process group, two bounded pipes and its deadline until close. */
@@ -510,7 +626,10 @@ async function runPackagedProcess(executable, environment, phase, spawnProcess, 
           new Error(
             `Packaged ${phase ? 'smoke' : 'core inspection'} ${termination} (signal: ${signal ?? 'none'}).\n${redact(output)}`,
           ),
-          { packageSmokeOutcome: cancelled ? 'interrupted' : timedOut ? 'timed-out' : 'failed' },
+          {
+            packageSmokeOutcome: cancelled ? 'interrupted' : timedOut ? 'timed-out' : 'failed',
+            runtimeFailureFacts: packagedRuntimeFailureFacts(exitCode, output),
+          },
         ),
       )
     })
@@ -537,6 +656,39 @@ const smokePhases = new Set([
 /** Fixed metadata only; errors, paths and optional package fields never enter reports. */
 export function packageSmokeFailureReport(facts) {
   const identity = facts.manifest
+  const difference = facts.applicationContentDifference
+  const contentDifference =
+    difference &&
+    isSha256(difference.expectedContentSha256) &&
+    isSha256(difference.actualContentSha256) &&
+    ['missing', 'additional', 'changed'].every(
+      (key) =>
+        Number.isSafeInteger(difference[key]) && difference[key] >= 0 && difference[key] <= 16_384,
+    ) &&
+    Array.isArray(difference.samples) &&
+    difference.samples.length <= 8 &&
+    difference.samples.every(
+      (sample) =>
+        sample &&
+        ['missing', 'additional', 'changed'].includes(sample.kind) &&
+        isSha256(sample.pathSha256) &&
+        (sample.expectedSha256 === undefined || isSha256(sample.expectedSha256)) &&
+        (sample.actualSha256 === undefined || isSha256(sample.actualSha256)),
+    )
+      ? {
+          expectedContentSha256: difference.expectedContentSha256,
+          actualContentSha256: difference.actualContentSha256,
+          missing: difference.missing,
+          additional: difference.additional,
+          changed: difference.changed,
+          samples: difference.samples.map((sample) => ({
+            kind: sample.kind,
+            pathSha256: sample.pathSha256,
+            expectedSha256: sample.expectedSha256,
+            actualSha256: sample.actualSha256,
+          })),
+        }
+      : undefined
   const projection = identity
     ? Object.fromEntries(
         ['sourceSha', 'version', 'channel', 'platform', 'arch', 'appId', 'productName'].map(
@@ -591,6 +743,41 @@ export function packageSmokeFailureReport(facts) {
           : facts.timedOut === true
             ? 'EXECUTION_TIMED_OUT'
             : 'VERIFICATION_FAILED',
+    ...(contentDifference ? { applicationContentDifference: contentDifference } : {}),
+    ...([
+      'CONTENT_MISMATCH',
+      'ENOENT',
+      'EACCES',
+      'EPERM',
+      'EBUSY',
+      'ENOTDIR',
+      'INSPECTION_FAILED',
+    ].includes(facts.installationContentFailure)
+      ? { installationContentFailure: facts.installationContentFailure }
+      : {}),
+    ...([
+      'NATIVE_DEPENDENCY',
+      'PRODUCT_IDENTITY',
+      'PAGE_LOAD',
+      'RENDERER_MOUNT',
+      'UTILITY_RUNTIME',
+      'IMAGE_CODEC',
+      'MARKDOWN_PROJECTION',
+      'APPEARANCE',
+      'UNCLASSIFIED',
+    ].includes(facts.runtimeFailureFacts?.runtimeFailure)
+      ? {
+          runtimeFailure: facts.runtimeFailureFacts.runtimeFailure,
+          ...(Number.isSafeInteger(facts.runtimeFailureFacts.observedExitCode) &&
+          facts.runtimeFailureFacts.observedExitCode >= -0x80000000 &&
+          facts.runtimeFailureFacts.observedExitCode <= 0xffffffff
+            ? { observedExitCode: facts.runtimeFailureFacts.observedExitCode }
+            : {}),
+          runtimeIdentityMarkerReceived:
+            facts.runtimeFailureFacts.runtimeIdentityMarkerReceived === true,
+          runtimePassMarkerReceived: facts.runtimeFailureFacts.runtimePassMarkerReceived === true,
+        }
+      : {}),
     ...Object.fromEntries(
       [
         'installationFailureStage',
@@ -963,6 +1150,7 @@ async function performPackagedSmoke(
       console.log('Packaged smoke passed.')
     }
   } catch (error) {
+    facts.runtimeFailureFacts ??= error?.runtimeFailureFacts
     preserveRoot = error?.preserveRoot === true
     facts.failurePhase = facts.phase
     if (preserveRoot) facts.installationCleanupVerified = false

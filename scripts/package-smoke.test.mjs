@@ -6,7 +6,104 @@ import { isAbsolute, join, relative } from 'node:path'
 import { test } from 'node:test'
 
 import { applicationContent, hashFile } from './build-distribution.mjs'
-import { main, packageSmokeFailureReport, prepareApplication } from './package-smoke.mjs'
+import {
+  main,
+  packageSmokeFailureReport,
+  packagedRuntimeFailureFacts,
+  applicationContentDifference,
+  verifyApplication,
+  prepareApplication,
+} from './package-smoke.mjs'
+
+await test('malformed comparison metadata cannot replace the original exact-content rejection', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-content-diagnostic-admission-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  await writeFile(join(root, 'Pact.exe'), 'owned fixture')
+  await assert.rejects(
+    verifyApplication(
+      root,
+      {
+        platform: 'win32',
+        application: { contentSha256: '0'.repeat(64), entries: [null], executable: 'Pact.exe' },
+      },
+      false,
+    ),
+    (error) => {
+      assert.equal(
+        error.message,
+        'Installed application content differs from the exact manifest payload.',
+      )
+      assert.equal(error.applicationContentMismatch, true)
+      assert.equal(error.applicationContentDifference, undefined)
+      return true
+    },
+  )
+})
+
+await test('content mismatches retain bounded hashes and counts without paths or optional fields', () => {
+  const before = {
+    contentSha256: 'a'.repeat(64),
+    entries: Array.from({ length: 10 }, (_, i) => ({
+      path: `synthetic-private-root-${i}`,
+      type: 'file',
+      sha256: 'b'.repeat(64),
+    })),
+  }
+  const after = {
+    sha256: 'c'.repeat(64),
+    entries: before.entries.slice(1).map((entry) => ({
+      path: entry.path,
+      type: entry.type,
+      sha256: 'd'.repeat(64),
+    })),
+  }
+  after.entries.push({ path: 'synthetic-new-private-file', type: 'file', sha256: 'e'.repeat(64) })
+  const difference = applicationContentDifference(before, after)
+  assert.equal(difference.changed, 9)
+  assert.equal(difference.missing, 1)
+  assert.equal(difference.additional, 1)
+  assert.equal(difference.samples.length, 8)
+  const report = packageSmokeFailureReport({
+    phase: 'installation',
+    processes: [],
+    applicationContentDifference: { ...difference, privatePath: before.entries[0].path },
+  })
+  assert.deepEqual(report.applicationContentDifference, difference)
+  assert.equal(JSON.stringify(report).includes('synthetic-private'), false)
+  assert.equal(JSON.stringify(report).includes('privatePath'), false)
+})
+
+await test('runtime failure reports retain fixed categories and result facts without application output', () => {
+  const privateOutput =
+    'PACT_PACKAGE_IDENTITY:{"privatePath":"synthetic-private-path"}\n' +
+    'PACT_PACKAGE_SMOKE:FAIL Error: Cannot find module synthetic-private-path\n'
+  const facts = packagedRuntimeFailureFacts(-1073741515, privateOutput)
+  assert.deepEqual(facts, {
+    runtimeFailure: 'NATIVE_DEPENDENCY',
+    observedExitCode: -1073741515,
+    runtimeIdentityMarkerReceived: true,
+    runtimePassMarkerReceived: false,
+  })
+  const report = packageSmokeFailureReport({
+    processes: [],
+    phase: 'seed',
+    runtimeFailureFacts: { ...facts, output: privateOutput },
+  })
+  assert.equal(report.runtimeFailure, 'NATIVE_DEPENDENCY')
+  assert.equal(report.observedExitCode, -1073741515)
+  assert.equal(JSON.stringify(report).includes('synthetic-private-path'), false)
+  assert.deepEqual(packagedRuntimeFailureFacts(null, 'unknown private failure'), {
+    runtimeFailure: 'UNCLASSIFIED',
+    runtimeIdentityMarkerReceived: false,
+    runtimePassMarkerReceived: false,
+  })
+  const rolled = packagedRuntimeFailureFacts(1, 'x'.repeat(20_000), {
+    identity: true,
+    passed: true,
+  })
+  assert.equal(rolled.runtimeIdentityMarkerReceived, true)
+  assert.equal(rolled.runtimePassMarkerReceived, true)
+})
 
 /** Native process-boundary doubles only; these cases install no software and start no application. */
 async function nsisFixture(context, behavior = {}) {
