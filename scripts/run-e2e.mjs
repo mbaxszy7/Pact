@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path'
 
 import { loadProviderConfiguration } from '../tests/e2e/provider-environment.ts'
 import { repository, repositoryId } from './ci-identity.mjs'
-import { writeUiReports } from './ci-ui-diagnostics.mjs'
+import { collectUiDiagnostics, writeUiReports } from './ci-ui-diagnostics.mjs'
 import { readE2EJson } from './e2e-report.mjs'
 import { coreRealGrep, requireRealScope } from './real-e2e-policy.mjs'
 import { evaluateRealReport, writeRealReport } from './real-e2e-policy.mjs'
@@ -906,7 +906,7 @@ export async function mainWithReports({
     if (forwarded.some((value) => value.startsWith('--reporter')))
       throw failure('The E2E report owner selects the reporter')
     process.env.PLAYWRIGHT_JSON_OUTPUT_FILE = rawPath
-    process.env.PACT_E2E_OUTPUT_DIR = join(directory, 'test-artifacts')
+    process.env.PACT_E2E_OUTPUT_DIR = join(directory, 'test-results')
     code = await main({
       lane,
       realScope,
@@ -982,10 +982,43 @@ export async function mainWithReports({
               .map((project) => [project, completed ? 'completed' : 'unavailable']),
           ),
         })
-        for (const receipt of receipts)
+        for (const receipt of receipts) {
           console.log(
             `Safe ${receipt.report.lane} E2E report: ${receipt.report.reportFiles.localDirectory}/${receipt.report.reportFiles.markdown}`,
           )
+          // Only an exclusively credential-free invocation owns exportable browser artifacts.
+          // Explicit --output remains caller-owned; mixed/real runs retain safe summaries only.
+          if (
+            ['ui', 'deterministic'].includes(lane) &&
+            receipt.report.lane === lane &&
+            code !== 0 &&
+            !forwarded.some((value) => value === '--output' || value.startsWith('--output='))
+          ) {
+            let collected = false
+            try {
+              // oxlint-disable-next-line eslint/no-await-in-loop -- One failed no-credential lane exports through the existing bounded, no-follow collector.
+              await collectUiDiagnostics(
+                join(directory, 'test-results'),
+                join(receipt.directory, 'diagnostics'),
+                { lane },
+              )
+              collected = true
+            } catch {
+              code = 1
+            }
+            // oxlint-disable-next-line eslint/no-await-in-loop -- Publish a fixed safe index beside this immutable case report, excluding raw execution/configuration.
+            await writeFile(
+              join(receipt.directory, 'diagnostics.md'),
+              collected
+                ? '# Local failure diagnostics\n\nBounded credential-free traces and snapshots: [inventory](diagnostics/inventory.json).\n\nRaw execution JSON and configuration are excluded.\n'
+                : '# Local failure diagnostics\n\nArtifact collection failed; the case summary remains available. No passing result is inferred from missing diagnostics.\n',
+              { flag: 'wx', mode: 0o600 },
+            )
+            console.log(
+              `Local ${lane} failure diagnostics: ${receipt.report.reportFiles.localDirectory}/diagnostics.md`,
+            )
+          }
+        }
       }
     } finally {
       if (originalOutput === undefined) delete process.env.PLAYWRIGHT_JSON_OUTPUT_FILE

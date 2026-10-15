@@ -200,7 +200,11 @@ results are currently required, and never certifies a complete baseline run.
 Local `test:e2e` commands also preserve safe, immutable JSON/Markdown under
 `.pact-data/e2e-reports/<unique-run>/`; the command prints the report location even
 when configuration admission fails. Raw Provider evidence and disposable test output
-remain private and are removed after safe projection. A local clean-tree receipt is
+remain private and are removed after safe projection. Failed local `ui` or
+`deterministic` invocations also preserve bounded traces/snapshots beside the case
+summary, with a `diagnostics.md` index and hashed `diagnostics/inventory.json`, using
+the same no-follow 32 MiB collector as CI. Explicit `--output` remains caller-owned;
+mixed or real-provider invocations preserve safe summaries only. A local clean-tree receipt is
 distinct from a PR attestation; a dirty or changing working tree has no captured code
 identity. Deliberately filtered local runs list unexecuted obligations and cannot claim
 a complete core/full gate. UI/deterministic Actions summaries link `e2e-PLATFORM-aATTEMPT`

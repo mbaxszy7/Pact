@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, readdir, rm, writeFile, lstat } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, lstat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -123,6 +123,59 @@ await test('core narrowed arguments cannot start a build and are reported as una
     )
     const report = await saved(root)
     assert.equal(report.gatePassed, false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+await test('a failed local deterministic lane preserves bounded traces beside its safe report', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-local-e2e-diagnostics-test-'))
+  let privateArtifacts
+  try {
+    const code = await mainWithReports({
+      lane: 'deterministic',
+      reportWorkspace: root,
+      loadConfiguration: async () => ({
+        redact: (text) => text,
+        assertSourceIntegrity: async () => {},
+      }),
+      runJob: async (args) => {
+        privateArtifacts = process.env.PACT_E2E_OUTPUT_DIR
+        if (args[0] === 'build') return 0
+        await writeFile(
+          process.env.PLAYWRIGHT_JSON_OUTPUT_FILE,
+          JSON.stringify({ suites: [], config: { private: 'raw-execution-only-canary' } }),
+        )
+        if (args.includes('--list')) return 0
+        const output = join(privateArtifacts, 'visibility-failed-deterministic')
+        await mkdir(output, { recursive: true, mode: 0o700 })
+        await writeFile(join(output, 'trace.zip'), 'owned-no-credential-trace')
+        await writeFile(join(output, 'error-context.md'), 'owned fixture snapshot')
+        return 1
+      },
+    })
+    assert.equal(code, 1)
+    const reports = join(root, '.pact-data', 'e2e-reports')
+    const candidates = await Promise.all(
+      (await readdir(reports)).map(async (entry) => {
+        const candidate = join(reports, entry)
+        return (await readdir(candidate)).includes('diagnostics.md') ? candidate : undefined
+      }),
+    )
+    const evidence = candidates.find(Boolean)
+    assert.ok(evidence)
+    const artifacts = join(evidence, 'diagnostics')
+    const inventory = JSON.parse(await readFile(join(artifacts, 'inventory.json'), 'utf8'))
+    assert.equal(inventory.lane, 'deterministic')
+    assert.equal(inventory.sourcePresent, true)
+    assert.equal(inventory.files.length, 2)
+    assert.equal(
+      await readFile(join(artifacts, 'visibility-failed-deterministic', 'trace.zip'), 'utf8'),
+      'owned-no-credential-trace',
+    )
+    assert.equal((await readdir(evidence)).includes('execution.json'), false)
+    assert.equal(JSON.stringify(inventory).includes('raw-execution-only-canary'), false)
+    await assert.rejects(lstat(join(privateArtifacts, '..')), /ENOENT/)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
