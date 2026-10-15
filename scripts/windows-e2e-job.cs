@@ -47,6 +47,66 @@ public static class PactE2EJob
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr CreateFileW(string name, uint access, uint sharing, ref Security security, uint creation, uint flags, IntPtr template);
     [DllImport("kernel32.dll", SetLastError = true)] static extern uint WaitForSingleObject(IntPtr handle, uint timeout);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetExitCodeProcess(IntPtr process, out uint code);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool QueryInformationJobObject(IntPtr job, int kind, IntPtr info, uint size, IntPtr length);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool belongs);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetProcessTimes(IntPtr process, out long created, out long exited, out long kernel, out long user);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags, StringBuilder path, ref uint size);
+
+    // Only the current Job is inspected. Export fixed roles, never paths/arguments.
+    // Two snapshots per observed launch; 16 visible rows, 256 real Job members.
+    static string Members(IntPtr job, uint rootPid) {
+        int bytes = 8 + 256 * IntPtr.Size;
+        IntPtr list = Marshal.AllocHGlobal(bytes);
+        bool incomplete = false; int count = 0;
+        var rows = new StringBuilder();
+        try {
+            if (!QueryInformationJobObject(job, 3, list, (uint)bytes, IntPtr.Zero))
+                return "\"members\":[],\"membersIncomplete\":true";
+            uint assigned = unchecked((uint)Marshal.ReadInt32(list, 0));
+            uint available = unchecked((uint)Marshal.ReadInt32(list, 4));
+            incomplete = assigned != available || available > 16;
+            for (int index = 0; index < Math.Min(available, 16); index++) {
+                long identity = Marshal.ReadIntPtr(list, 8 + index * IntPtr.Size).ToInt64();
+                if (identity < 2 || identity > uint.MaxValue) { incomplete = true; continue; }
+                uint pid = (uint)identity;
+                IntPtr process = OpenProcess(0x1000, false, pid);
+                if (process == IntPtr.Zero) { incomplete = true; continue; }
+                try {
+                    bool belongs; long created, exited, kernel, user;
+                    if (!IsProcessInJob(process, job, out belongs) || !belongs ||
+                        !GetProcessTimes(process, out created, out exited, out kernel, out user)) {
+                        incomplete = true; continue;
+                    }
+                    long createdMs = (created - 116444736000000000L) / 10000;
+                    if (createdMs < 0 || createdMs > 9007199254740991L) { incomplete = true; continue; }
+                    var image = new StringBuilder(1024); uint size = 1024;
+                    string kind = "other";
+                    if (QueryFullProcessImageNameW(process, 0, image, ref size)) {
+                        string name = Path.GetFileName(image.ToString()).ToLowerInvariant();
+                        if (name == "codex.exe") kind = "codex";
+                        else if (name == "node.exe") kind = "node";
+                        else if (name == "cmd.exe") kind = "cmd";
+                        else if (name == "conhost.exe") kind = "conhost";
+                        else if (name == "git.exe") kind = "git";
+                        else if (name == "rg.exe") kind = "rg";
+                    } else incomplete = true;
+                    if (!IsProcessInJob(process, job, out belongs) || !belongs) { incomplete = true; continue; }
+                    if (count++ != 0) rows.Append(',');
+                    rows.Append("{\"pid\":").Append(pid).Append(",\"createdMs\":").Append(createdMs)
+                        .Append(",\"role\":\"").Append(pid == rootPid ? "root" : "descendant")
+                        .Append("\",\"image\":\"").Append(kind).Append("\"}");
+                } finally { CloseHandle(process); }
+            }
+        } finally { Marshal.FreeHGlobal(list); }
+        return "\"members\":[" + rows + "],\"membersIncomplete\":" + (incomplete ? "true" : "false");
+    }
+
+    static void RootExited(StreamWriter writer, string generation, IntPtr job, uint pid, uint code, long elapsed, bool natural, uint active) {
+        if (generation == null) return;
+        Emit(writer, "{\"kind\":\"root-exit\",\"pid\":" + pid + ",\"exitCode\":" + unchecked((int)code) +
+            ",\"elapsedMs\":" + elapsed + ",\"natural\":" + (natural ? "true" : "false") + ",\"active\":" + active + "," + Members(job, pid) + "}", generation);
+    }
 
     static void Check(bool success) { if (!success) throw new Win32Exception(Marshal.GetLastWin32Error()); }
     static void Emit(StreamWriter writer, string message, string generation = null) {
@@ -145,13 +205,17 @@ public static class PactE2EJob
                     uint code; Check(GetExitCodeProcess(process.Process, out code));
                     if (stoppedAt < 0) exit = unchecked((int)code);
                     exitedAt = clock.ElapsedMilliseconds;
+                    RootExited(writer, generation, job, process.Pid, code, exitedAt, stoppedAt < 0, active);
                 }
                 if (active == 0) {
                     // Accounting can become empty just before the root handle is signalled.
                     // Never substitute the initial failure code for its actual exit status.
-                    if (exitedAt < 0 && stoppedAt < 0) {
+                    if (exitedAt < 0) {
                         Check(WaitForSingleObject(process.Process, 5000) == 0);
-                        uint code; Check(GetExitCodeProcess(process.Process, out code)); exit = unchecked((int)code);
+                        uint code; Check(GetExitCodeProcess(process.Process, out code));
+                        if (stoppedAt < 0) exit = unchecked((int)code);
+                        exitedAt = clock.ElapsedMilliseconds;
+                        RootExited(writer, generation, job, process.Pid, code, exitedAt, stoppedAt < 0, 0);
                     }
                     empty = true; break;
                 }
@@ -160,6 +224,8 @@ public static class PactE2EJob
                 // the five-second post-root drain. Job ownership and cancellation never change.
                 string reason = cancel.IsCompleted ? "control-closed" : clock.ElapsedMilliseconds >= timeout ? "deadline" : argumentMode != "nsis" && exitedAt >= 0 && clock.ElapsedMilliseconds - exitedAt >= 5000 ? "descendants-still-running" : null;
                 if (stoppedAt < 0 && reason != null) {
+                    if (generation != null)
+                        Emit(writer, "{\"kind\":\"members\",\"phase\":\"before-stop\"," + Members(job, process.Pid) + "}", generation);
                     Check(TerminateJobObject(job, 1)); exit = 1; stoppedAt = clock.ElapsedMilliseconds;
                     Emit(writer, "{\"kind\":\"stopping\",\"reason\":\"" + reason + "\"}", generation);
                 }

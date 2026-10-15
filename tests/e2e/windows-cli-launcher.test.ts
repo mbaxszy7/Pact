@@ -8,7 +8,13 @@ import { pathToFileURL } from 'node:url'
 import { afterAll, expect, it, vi } from 'vitest'
 
 import { OwnedProcessGroup } from '../../apps/desktop/src/utility/owned-process-group.js'
-import { NativeRpc } from '../native/native-harness.js'
+import {
+  cleanupNativeFixture,
+  isolatedEnv,
+  NativeRpc,
+  ownedRoot,
+  within,
+} from '../native/native-harness.js'
 import { writeNativeTransportFault } from './native-transport-fault.js'
 import {
   disposeWindowsLauncherImage,
@@ -23,6 +29,68 @@ afterAll(() => {
   if (windowsLauncherImageDiagnostic().privateLinks !== 0)
     throw new Error('Windows fixture private image cleanup unconfirmed')
 })
+
+it.skipIf(process.platform !== 'win32')(
+  'confirms an empty Job after a genuine post-start helper exception without inventing root exit',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-job-exception-test-'))
+    const owner = await writeWindowsObservedLauncher(root, process.execPath, 10000)
+    try {
+      const source = await readFile(resolve('scripts/windows-e2e-job.cs'), 'utf8')
+      const boundary = 'var clock = Stopwatch.StartNew(); long exitedAt = -1'
+      expect(source.includes(boundary)).toBe(true)
+      const injected = join(root, 'job.cs')
+      await writeFile(
+        injected,
+        source.replace(
+          boundary,
+          'if (process.Pid > 0) throw new IOException("owned post-start fixture failure"); ' +
+            boundary,
+        ),
+      )
+      // Detach this owned image from the immutable shared seed before compiling.
+      await unlink(owner.executablePath)
+      execFileSync(
+        join(
+          process.env.SystemRoot ?? 'C:\\Windows',
+          'Microsoft.NET',
+          process.arch === 'ia32' ? 'Framework' : 'Framework64',
+          'v4.0.30319/csc.exe',
+        ),
+        [
+          '/nologo',
+          '/target:exe',
+          '/reference:System.Web.Extensions.dll',
+          `/out:${owner.executablePath}`,
+          injected,
+          resolve('tests/e2e/windows-cli-launcher.cs'),
+        ],
+        { timeout: 10000, maxBuffer: 16384, shell: false, windowsHide: true },
+      )
+      owner.armStartup(performance.now() + 10000)
+      const child = spawn(owner.executablePath, ['-e', 'setInterval(()=>{},1000)'], {
+        shell: false,
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      const closed = once(child, 'close')
+      child.stdout.resume()
+      child.stderr.resume()
+      await owner.started
+      await expect(owner.rootExit).rejects.toThrow('root exit is unavailable')
+      expect(await owner.empty).toMatchObject({ active: 0, exitCode: 1 })
+      await closed
+      expect(child.exitCode).toBe(1)
+      expect(owner.diagnostic()).toMatchObject({ lastActive: 0, exitCode: 1, nativeErrorCode: 0 })
+      expect(owner.diagnostic().rootExit).toBeUndefined()
+    } finally {
+      owner.cancel()
+      await owner.disposeControl()
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 })
+    }
+  },
+  20000,
+)
 
 it.skipIf(process.platform !== 'win32')(
   'Windows fixture images share a file instance and keep private descriptors independent',
@@ -857,4 +925,68 @@ fs.renameSync=(source,target)=>{
     }
   },
   20_000,
+)
+
+it.skipIf(process.platform !== 'win32')(
+  'observes natural root exit without claiming an empty Job while a descendant lives',
+  async () => {
+    const owned = await ownedRoot()
+    const sentinel = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], {
+      shell: false,
+      stdio: 'ignore',
+    })
+    const sentinelClosed = once(sentinel, 'close')
+    try {
+      const entry = join(owned.root, 'root.mjs'),
+        marker = join(owned.root, 'descendant.json')
+      await writeFile(
+        entry,
+        `import{spawn}from'node:child_process';import{writeFileSync}from'node:fs';const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{shell:false,stdio:'ignore'});child.once('spawn',()=>writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:child.pid})));process.stdin.resume();process.stdin.once('end',()=>process.exit(0));`,
+      )
+      const scope = await owned.processes.prepareRpcOwner(
+        process.execPath,
+        performance.now() + 15000,
+      )
+      const child = scope.start([entry], {
+        cwd: owned.cwd,
+        env: isolatedEnv(owned.root, owned.home),
+        shell: false,
+      })
+      const closed = once(child, 'close')
+      child.stdout.resume()
+      child.stderr.resume()
+      const root = scope.rootExited()
+      expect(root).toBeDefined()
+      await scope.started()
+      await expect
+        .poll(async () =>
+          readFile(marker, 'utf8').then(
+            () => true,
+            () => false,
+          ),
+        )
+        .toBe(true)
+      child.stdin.end()
+      const receipt = await within(root!, 2000, 'Missing OS root-exit receipt')
+      expect(receipt).toMatchObject({ exitCode: 0, natural: true })
+      expect(receipt.active).toBeGreaterThan(0)
+      expect(receipt.members.some((member) => member.role === 'descendant')).toBe(true)
+      expect(scope.facts().windowsJobEmpty).toBe(false)
+      expect(child.exitCode).toBeNull()
+      await within(closed, 7000, 'Descendant drain did not retain its existing deadline')
+      await scope.close()
+      expect(child.exitCode).toBe(1)
+      expect(scope.facts()).toMatchObject({
+        released: true,
+        windowsControl: { stoppingReason: 'descendants-still-running' },
+      })
+      expect(sentinel.exitCode).toBeNull()
+      expect(sentinel.signalCode).toBeNull()
+    } finally {
+      sentinel.kill()
+      await sentinelClosed
+      await cleanupNativeFixture(owned)
+    }
+  },
+  20000,
 )

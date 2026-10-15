@@ -1,5 +1,6 @@
 import { mkdir, writeFile, appendFile, realpath, lstat, open } from 'node:fs/promises'
-import { basename, dirname, isAbsolute, join } from 'node:path'
+import { createRequire } from 'node:module'
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
 
 import { ciEnvironment } from './ci.mjs'
 import { run } from './run-e2e.mjs'
@@ -38,6 +39,87 @@ function environmentFilePath(path) {
     Buffer.byteLength(path) <= 4096 &&
     !/[\r\n\0]/u.test(path)
   )
+}
+
+async function nativeManifest(path) {
+  const descriptor = await open(path, 'r')
+  try {
+    const info = await descriptor.stat()
+    if (!info.isFile() || info.size > 64 * 1024)
+      throw new Error('Native package manifest must be a bounded regular file')
+    const bytes = Buffer.alloc(64 * 1024 + 1)
+    let offset = 0
+    while (offset < bytes.length) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Complete bounded file admission.
+      const { bytesRead } = await descriptor.read(bytes, offset, bytes.length - offset, offset)
+      if (!bytesRead) break
+      offset += bytesRead
+    }
+    if (offset > 64 * 1024) throw new Error('Native package manifest exceeds 64 KiB')
+    return JSON.parse(bytes.subarray(0, offset).toString('utf8'))
+  } finally {
+    await descriptor.close()
+  }
+}
+
+/** Resolve from the pinned wrapper's own dependency context, including pnpm aliases. */
+export async function windowsCodexEntry(directory, arch) {
+  if (!environmentFilePath(directory) || !['x64', 'arm64'].includes(arch))
+    throw new Error('Invalid Windows Codex package selection')
+  const root = await realpath(directory)
+  const packageRoot = await realpath(join(root, 'node_modules', '@openai', 'codex'))
+  const manifest = await nativeManifest(join(packageRoot, 'package.json'))
+  const alias = `@openai/codex-win32-${arch}`
+  if (
+    manifest.name !== '@openai/codex' ||
+    manifest.version !== '0.159.2' ||
+    manifest.optionalDependencies?.[alias] !== `npm:@openai/codex@0.159.2-win32-${arch}`
+  )
+    throw new Error('Windows Codex wrapper identity mismatch')
+  const require = createRequire(join(packageRoot, 'package.json'))
+  const binaryRoot = await realpath(dirname(require.resolve(`${alias}/package.json`)))
+  for (const path of [packageRoot, binaryRoot]) {
+    const child = relative(root, path)
+    if (!child || child === '..' || child.startsWith(`..${sep}`) || isAbsolute(child))
+      throw new Error('Windows Codex package escaped its private installation')
+  }
+  const binaryManifest = await nativeManifest(join(binaryRoot, 'package.json'))
+  if (
+    binaryManifest.name !== '@openai/codex' ||
+    binaryManifest.version !== `0.159.2-win32-${arch}` ||
+    JSON.stringify(binaryManifest.os) !== '["win32"]' ||
+    JSON.stringify(binaryManifest.cpu) !== JSON.stringify([arch])
+  )
+    throw new Error('Windows Codex native package identity mismatch')
+  const triple = arch === 'x64' ? 'x86_64-pc-windows-msvc' : 'aarch64-pc-windows-msvc'
+  const executable = join(binaryRoot, 'vendor', triple, 'bin', 'codex.exe')
+  if ((await realpath(executable)) !== executable || !(await lstat(executable)).isFile())
+    throw new Error('Windows Codex requires its exact regular native entry')
+  const descriptor = await open(executable, 'r')
+  try {
+    const info = await descriptor.stat()
+    const dos = Buffer.alloc(64)
+    if (
+      info.size < 88 ||
+      info.size > 512 * 1024 * 1024 ||
+      (await descriptor.read(dos, 0, 64, 0)).bytesRead !== 64 ||
+      dos.toString('ascii', 0, 2) !== 'MZ'
+    )
+      throw new Error('Invalid Windows Codex image')
+    const offset = dos.readUInt32LE(60),
+      pe = Buffer.alloc(24)
+    if (
+      offset < 64 ||
+      offset > info.size - 24 ||
+      (await descriptor.read(pe, 0, 24, offset)).bytesRead !== 24 ||
+      pe.readUInt32LE(0) !== 0x4550 ||
+      pe.readUInt16LE(4) !== (arch === 'x64' ? 0x8664 : 0xaa64)
+    )
+      throw new Error('Windows Codex PE architecture mismatch')
+  } finally {
+    await descriptor.close()
+  }
+  return { executable, packageRoot }
 }
 
 /** pnpm/action-setup's .bin contains CMD shims; pnpm 12 supplies this sibling native entry. */
@@ -176,6 +258,8 @@ export async function main(source = process.env) {
     if (installed !== 0) throw new Error('Pinned native CLI installation failed')
     stage = 'native-entry-validation'
     const lines = []
+    const nativeCodex =
+      process.platform === 'win32' ? await windowsCodexEntry(directory, process.arch) : undefined
     for (const agent of ['claude', 'codex']) {
       // The pinned Claude installer supplies bin/claude.exe on every target OS.
       // Selecting that exact native entry preserves executable identity through
@@ -196,8 +280,13 @@ export async function main(source = process.env) {
       if (/[\r\n\0]/u.test(path))
         throw new Error('Native CLI path cannot enter an Actions environment file')
       for (const lane of ['NATIVE', 'E2E'])
-        lines.push(`PACT_${lane}_${agent.toUpperCase()}_EXECUTABLE=${path}`)
+        lines.push(
+          `PACT_${lane}_${agent.toUpperCase()}_EXECUTABLE=${
+            lane === 'NATIVE' && agent === 'codex' && nativeCodex ? nativeCodex.executable : path
+          }`,
+        )
     }
+    if (nativeCodex) lines.push(`PACT_NATIVE_CODEX_PACKAGE_ROOT=${nativeCodex.packageRoot}`)
     stage = 'actions-path-publication'
     await appendFile(source.GITHUB_ENV, lines.join('\n') + '\n')
     // runWindows later resolves pnpm.exe from each absolute PATH directory. Publish

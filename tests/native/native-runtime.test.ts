@@ -1228,6 +1228,73 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
   const owned = await ownedRoot()
   const provider = new LoopbackProvider(['NATIVE_WRITER_REPLY'])
   const clients: NativeRpc[] = []
+  const naturalTakeover = async (
+    writer: NativeRpc,
+    reader: NativeRpc,
+    owner: 'pact' | 'desktop',
+    threadId: string,
+  ) => {
+    await writer.endInputNaturally()
+    const began = performance.now(),
+      deadline = began + 5000
+    const remaining = () => {
+      const milliseconds = deadline - performance.now()
+      if (milliseconds <= 0) throw new Error('Owned EOF deadline already expired')
+      return milliseconds
+    }
+    let takeover: 'pending' | 'accepted' | 'rejected' = 'pending'
+    const results = await Promise.allSettled([
+      within(
+        writer.exited,
+        remaining(),
+        `Owned ${owner === 'desktop' ? 'Desktop writer' : 'writer'} did not exit naturally`,
+      ),
+      (async () => {
+        const root = await within(
+          writer.rootExited(),
+          remaining(),
+          'Owned protocol root did not exit naturally',
+        )
+        if (!root.natural || root.exitCode !== 0)
+          throw new Error('Owned protocol root was forced or failed')
+        // One request after OS-confirmed root exit; no retry after unknown delivery.
+        const takeoverDeadline = remaining()
+        const resumed = result(
+          await within(
+            reader.request<{ thread: NativeThread }>('thread/resume', {
+              threadId,
+              excludeTurns: true,
+              cwd: owned.cwd,
+            }),
+            takeoverDeadline,
+            'Owned writer takeover exceeded the original EOF deadline',
+          ),
+        )
+        takeover = 'accepted'
+        return resumed.thread
+      })().catch((error: unknown) => {
+        takeover = 'rejected'
+        throw error
+      }),
+    ])
+    console.info(
+      '[native natural EOF]',
+      JSON.stringify({
+        owner,
+        elapsedMs: Math.round(performance.now() - began),
+        stdinEnded: writer.child.stdin.writableEnded,
+        stdinFinished: writer.child.stdin.writableFinished,
+        helperExitCode: writer.child.exitCode,
+        takeover,
+        shutdownBoundaries: writer.stopShutdownObservation(),
+        facts: writer.cleanupFacts(),
+      }),
+    )
+    for (const outcome of results) if (outcome.status === 'rejected') throw outcome.reason
+    const resumed = results[1]
+    if (resumed.status !== 'fulfilled') throw new Error('Owned writer takeover is unconfirmed')
+    return resumed.value
+  }
   try {
     await provider.start()
     await provider.configureCodex(owned.home)
@@ -1291,32 +1358,8 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
     })
     expect(pact.child.exitCode).toBeNull()
     // stdin EOF is natural shutdown, not lock removal or forcibly stealing ownership.
-    await pact.endInputNaturally()
-    const pactEofAt = performance.now()
-    try {
-      await within(pact.exited, 5000, 'Owned writer did not exit naturally')
-    } finally {
-      console.info(
-        '[native natural EOF]',
-        JSON.stringify({
-          owner: 'pact',
-          elapsedMs: Math.round(performance.now() - pactEofAt),
-          stdinEnded: pact.child.stdin.writableEnded,
-          stdinFinished: pact.child.stdin.writableFinished,
-          helperExitCode: pact.child.exitCode,
-          shutdownBoundaries: pact.stopShutdownObservation(),
-          facts: pact.cleanupFacts(),
-        }),
-      )
-    }
+    const afterExit = await naturalTakeover(pact, desktop, 'pact', thread.id)
     expect(pact.child.exitCode).toBe(0)
-    const afterExit = result(
-      await desktop.request<{ thread: NativeThread }>('thread/resume', {
-        threadId: thread.id,
-        excludeTurns: true,
-        cwd: owned.cwd,
-      }),
-    ).thread
     expect(afterExit.id).toBe(thread.id)
     expect(afterExit.status.type).toBe('idle')
     // Match the reported direction too: Desktop owns the now-resumed writer,
@@ -1336,32 +1379,8 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
       message: `thread ${thread.id} already has an active writer`,
     })
     expect(desktop.child.exitCode).toBeNull()
-    await desktop.endInputNaturally()
-    const desktopEofAt = performance.now()
-    try {
-      await within(desktop.exited, 5000, 'Owned Desktop writer did not exit naturally')
-    } finally {
-      console.info(
-        '[native natural EOF]',
-        JSON.stringify({
-          owner: 'desktop',
-          elapsedMs: Math.round(performance.now() - desktopEofAt),
-          stdinEnded: desktop.child.stdin.writableEnded,
-          stdinFinished: desktop.child.stdin.writableFinished,
-          helperExitCode: desktop.child.exitCode,
-          shutdownBoundaries: desktop.stopShutdownObservation(),
-          facts: desktop.cleanupFacts(),
-        }),
-      )
-    }
+    const pactAfterExit = await naturalTakeover(desktop, nextPact, 'desktop', thread.id)
     expect(desktop.child.exitCode).toBe(0)
-    const pactAfterExit = result(
-      await nextPact.request<{ thread: NativeThread }>('thread/resume', {
-        threadId: thread.id,
-        excludeTurns: true,
-        cwd: owned.cwd,
-      }),
-    ).thread
     expect(pactAfterExit.id).toBe(thread.id)
     expect(pactAfterExit.status.type).toBe('idle')
     expect(provider.requests).toHaveLength(1)

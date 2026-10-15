@@ -149,6 +149,10 @@ export class NativeProcessOwner {
     return this.windows?.started.then(() => undefined) ?? Promise.resolve()
   }
 
+  rootExited(): WindowsLaunchOwner['rootExit'] | undefined {
+    return this.windows?.rootExit
+  }
+
   facts() {
     const windows = this.windows?.diagnostic()
     const admitted = Boolean(this.child)
@@ -172,6 +176,8 @@ export class NativeProcessOwner {
               lastActive: windows.lastActive ?? null,
               exitCode: windows.exitCode ?? null,
               stoppingReason: windows.stoppingReason ?? null,
+              rootExit: windows.rootExit ?? null,
+              membersBeforeStop: windows.membersBeforeStop ?? null,
             },
           }
         : {}),
@@ -823,6 +829,13 @@ export async function ownedRoot(): Promise<{
 }
 
 export function isolatedEnv(root: string, home: string): NodeJS.ProcessEnv {
+  const packageRoot =
+    process.platform === 'win32' ? process.env.PACT_NATIVE_CODEX_PACKAGE_ROOT : undefined
+  if (
+    packageRoot &&
+    (!isAbsolute(packageRoot) || packageRoot.length > 4096 || /[\r\n\0]/u.test(packageRoot))
+  )
+    throw new Error('Invalid owned Codex package root')
   return {
     PATH: process.env.PATH,
     HOME: root,
@@ -842,6 +855,7 @@ export function isolatedEnv(root: string, home: string): NodeJS.ProcessEnv {
     NO_PROXY: '127.0.0.1,localhost',
     no_proxy: '127.0.0.1,localhost',
     CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'pact',
+    ...(packageRoot ? { CODEX_MANAGED_PACKAGE_ROOT: packageRoot, CODEX_MANAGED_BY_PNPM: '1' } : {}),
     PACT_NATIVE_TOKEN: 'OWNED_LOOPBACK_ONLY',
     ANTHROPIC_API_KEY: 'OWNED_LOOPBACK_ONLY',
     ANTHROPIC_AUTH_TOKEN: 'OWNED_LOOPBACK_ONLY',
@@ -1244,6 +1258,15 @@ export class NativeRpc {
     await within(this.scope.group.observe(), 2000, 'Owned natural EOF observation deadline')
     this.shutdownStages?.start()
     this.child.stdin.end()
+  }
+  rootExited(): Promise<{ exitCode: number | null; natural: boolean }> {
+    return (
+      this.scope.rootExited() ??
+      this.exited.then(() => ({
+        exitCode: this.child.exitCode,
+        natural: this.child.signalCode === null,
+      }))
+    )
   }
   stopShutdownObservation(): ReturnType<NativeStderrStages['stop']> | undefined {
     return this.shutdownStages?.stop()

@@ -6,9 +6,98 @@ import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { main, nativeSetupFailureFacts, windowsPnpmExecutable } from './ci-native.mjs'
+import {
+  main,
+  nativeSetupFailureFacts,
+  windowsPnpmExecutable,
+  windowsCodexEntry,
+} from './ci-native.mjs'
 
 const pinnedManifest = { name: 'pnpm', version: '12.11.2', bin: { pnpm: 'pnpm.exe' } }
+
+async function installedCodex(root, arch) {
+  const packageRoot = join(root, 'node_modules', '@openai', 'codex')
+  const alias = `@openai/codex-win32-${arch}`
+  const binaryRoot = join(packageRoot, 'node_modules', alias)
+  const triple = arch === 'x64' ? 'x86_64-pc-windows-msvc' : 'aarch64-pc-windows-msvc'
+  const executable = join(binaryRoot, 'vendor', triple, 'bin', 'codex.exe')
+  await mkdir(dirname(executable), { recursive: true })
+  await writeFile(
+    join(packageRoot, 'package.json'),
+    JSON.stringify({
+      name: '@openai/codex',
+      version: '0.159.2',
+      optionalDependencies: { [alias]: `npm:@openai/codex@0.159.2-win32-${arch}` },
+    }),
+  )
+  await writeFile(
+    join(binaryRoot, 'package.json'),
+    JSON.stringify({
+      name: '@openai/codex',
+      version: `0.159.2-win32-${arch}`,
+      os: ['win32'],
+      cpu: [arch],
+    }),
+  )
+  // Header admission fixture only; this never executes or certifies a Windows App.
+  const bytes = Buffer.alloc(128)
+  bytes.write('MZ')
+  bytes.writeUInt32LE(64, 60)
+  bytes.writeUInt32LE(0x4550, 64)
+  bytes.writeUInt16LE(arch === 'x64' ? 0x8664 : 0xaa64, 68)
+  await writeFile(executable, bytes)
+  return { packageRoot, binaryRoot, executable, bytes }
+}
+
+for (const arch of ['x64', 'arm64']) {
+  void test(`resolves pinned ${arch} Codex from its alias context and rejects the other PE architecture`, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-ci-codex-entry-'))
+    try {
+      const entry = await installedCodex(await realpath(root), arch)
+      assert.deepEqual(await windowsCodexEntry(root, arch), {
+        executable: entry.executable,
+        packageRoot: entry.packageRoot,
+      })
+      entry.bytes.writeUInt16LE(arch === 'x64' ? 0xaa64 : 0x8664, 68)
+      await writeFile(entry.executable, entry.bytes)
+      await assert.rejects(windowsCodexEntry(root, arch), /PE architecture mismatch/)
+      await writeFile(entry.executable, Buffer.alloc(128))
+      await assert.rejects(windowsCodexEntry(root, arch), /Invalid Windows Codex image/)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+}
+
+void test('rejects wrapper/package drift and missing or oversized native metadata without a shim fallback', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-ci-codex-reject-'))
+  try {
+    const entry = await installedCodex(await realpath(root), 'arm64')
+    const manifest = join(entry.binaryRoot, 'package.json')
+    await writeFile(
+      manifest,
+      JSON.stringify({
+        name: '@openai/codex',
+        version: '0.159.2-win32-x64',
+        os: ['win32'],
+        cpu: ['x64'],
+      }),
+    )
+    await assert.rejects(windowsCodexEntry(root, 'arm64'), /native package identity mismatch/)
+    await writeFile(manifest, ' '.repeat(65537))
+    await assert.rejects(windowsCodexEntry(root, 'arm64'), /bounded regular file/)
+    await rm(manifest)
+    await assert.rejects(windowsCodexEntry(root, 'arm64'))
+    await writeFile(
+      join(entry.packageRoot, 'package.json'),
+      JSON.stringify({ name: '@openai/codex', version: '0.159.3' }),
+    )
+    await assert.rejects(windowsCodexEntry(root, 'arm64'), /wrapper identity mismatch/)
+    await assert.rejects(windowsCodexEntry(root, 'ia32'), /Invalid Windows Codex/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
 async function installedPnpm(root, manifest = pinnedManifest) {
   const home = join(root, 'setup-pnpm', 'node_modules', '.bin')

@@ -233,12 +233,29 @@ export function removeWindowsRpcLauncherSync(directory: string): void {
   rmSync(directory, { recursive: true, force: true })
 }
 
+export interface WindowsJobMembers {
+  members: Array<{
+    pid: number
+    createdMs: number
+    role: 'root' | 'descendant'
+    image: 'codex' | 'node' | 'cmd' | 'conhost' | 'git' | 'rg' | 'other'
+  }>
+  membersIncomplete: boolean
+}
+export interface WindowsRootExit extends WindowsJobMembers {
+  pid: number
+  exitCode: number
+  elapsedMs: number
+  natural: boolean
+  active: number
+}
 export interface WindowsLaunchOwner {
   executablePath: string
   directory: string
   generation: string
   started: Promise<{ generation: string; pid: number }>
   empty: Promise<{ generation: string; active: 0; exitCode: number }>
+  rootExit: Promise<WindowsRootExit>
   armStartup(deadline: number): void
   cancel(): void
   disposeControl(): Promise<void>
@@ -251,11 +268,55 @@ export interface WindowsLaunchOwner {
     lastActive?: number
     exitCode?: number
     stoppingReason?: 'control-closed' | 'deadline' | 'descendants-still-running'
+    rootExit?: WindowsRootExit
+    membersBeforeStop?: WindowsJobMembers
   }
 }
 
 function controlRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+const cloneMembers = (value: WindowsJobMembers): WindowsJobMembers => ({
+  members: value.members.map((member) => ({ ...member })),
+  membersIncomplete: value.membersIncomplete,
+})
+
+function jobMembers(value: Record<string, unknown>): WindowsJobMembers {
+  if (
+    !Array.isArray(value.members) ||
+    value.members.length > 16 ||
+    typeof value.membersIncomplete !== 'boolean'
+  )
+    throw new Error('Invalid Job member snapshot')
+  const identities = new Set<number>()
+  const members = value.members.map<WindowsJobMembers['members'][number]>((member: unknown) => {
+    if (
+      !controlRecord(member) ||
+      Object.keys(member).length !== 4 ||
+      typeof member.pid !== 'number' ||
+      !Number.isSafeInteger(member.pid) ||
+      member.pid < 2 ||
+      member.pid > 0xffffffff ||
+      identities.has(member.pid) ||
+      typeof member.createdMs !== 'number' ||
+      !Number.isSafeInteger(member.createdMs) ||
+      member.createdMs < 0 ||
+      (member.role !== 'root' && member.role !== 'descendant') ||
+      (member.image !== 'codex' &&
+        member.image !== 'node' &&
+        member.image !== 'cmd' &&
+        member.image !== 'conhost' &&
+        member.image !== 'git' &&
+        member.image !== 'rg' &&
+        member.image !== 'other')
+    )
+      throw new Error('Invalid Job member identity')
+    identities.add(member.pid)
+    // The closed enum above prevents native paths or raw image names crossing this seam.
+    return { pid: member.pid, createdMs: member.createdMs, role: member.role, image: member.image }
+  })
+  return { members, membersIncomplete: value.membersIncomplete }
 }
 
 /** One authenticated Job receipt, independent of Electron and every provider/relay it launches. */
@@ -285,6 +346,8 @@ export async function writeWindowsObservedLauncher(
   > = {}
   let firstFailure: string | undefined, nativeErrorCode: number | undefined
   let lastActive: number | undefined, exitCode: number | undefined
+  let rootPid: number | undefined, rootExitFact: WindowsRootExit | undefined
+  let membersBeforeStop: WindowsJobMembers | undefined
   let stoppingReason: ReturnType<WindowsLaunchOwner['diagnostic']>['stoppingReason']
   const mark = (stage: keyof typeof stages): void => {
     stages[stage] = Math.round(performance.now() - began)
@@ -300,6 +363,8 @@ export async function writeWindowsObservedLauncher(
     ...(lastActive !== undefined ? { lastActive } : {}),
     ...(exitCode !== undefined ? { exitCode } : {}),
     ...(stoppingReason ? { stoppingReason } : {}),
+    ...(rootExitFact ? { rootExit: { ...rootExitFact, ...cloneMembers(rootExitFact) } } : {}),
+    ...(membersBeforeStop ? { membersBeforeStop: cloneMembers(membersBeforeStop) } : {}),
   })
   const pipeName = `pact-fixture-${process.pid}-${generation}`
   const server = createServer()
@@ -318,6 +383,8 @@ export async function writeWindowsObservedLauncher(
   let rejectStarted!: (error: Error) => void
   let resolveEmpty!: (value: { generation: string; active: 0; exitCode: number }) => void
   let rejectEmpty!: (error: Error) => void
+  let resolveRootExit!: (value: WindowsRootExit) => void
+  let rejectRootExit!: (error: Error) => void
   const started = new Promise<{ generation: string; pid: number }>((done, reject) => {
     resolveStarted = done
     rejectStarted = reject
@@ -326,8 +393,13 @@ export async function writeWindowsObservedLauncher(
     resolveEmpty = done
     rejectEmpty = reject
   })
+  const rootExit = new Promise<WindowsRootExit>((done, reject) => {
+    resolveRootExit = done
+    rejectRootExit = reject
+  })
   void started.catch(() => undefined)
   void empty.catch(() => undefined)
+  void rootExit.catch(() => undefined)
   const fail = (message: string): void => {
     if (firstFailure) return
     firstFailure = message
@@ -337,6 +409,7 @@ export async function writeWindowsObservedLauncher(
     clearTimeout(lifetimeTimer)
     rejectStarted(error)
     rejectEmpty(error)
+    rejectRootExit(error)
     socket?.destroy()
     if (server.listening) server.close()
   }
@@ -406,10 +479,58 @@ export async function writeWindowsObservedLauncher(
       )
         throw new Error('Invalid Job start receipt')
       didStart = true
+      rootPid = message.pid
       lastActive = 1
       mark('started')
       clearTimeout(startupTimer)
       resolveStarted({ generation, pid: message.pid })
+    } else if (message.kind === 'root-exit') {
+      if (
+        !didStart ||
+        rootExitFact ||
+        message.pid !== rootPid ||
+        !exact([
+          'kind',
+          'generation',
+          'pid',
+          'exitCode',
+          'elapsedMs',
+          'natural',
+          'active',
+          'members',
+          'membersIncomplete',
+        ]) ||
+        typeof message.exitCode !== 'number' ||
+        !Number.isSafeInteger(message.exitCode) ||
+        typeof message.elapsedMs !== 'number' ||
+        !Number.isSafeInteger(message.elapsedMs) ||
+        message.elapsedMs < 0 ||
+        message.elapsedMs > lifetimeMs + 5000 ||
+        typeof message.natural !== 'boolean' ||
+        typeof message.active !== 'number' ||
+        !Number.isSafeInteger(message.active) ||
+        message.active < 0 ||
+        message.active > 256
+      )
+        throw new Error('Invalid Job root exit receipt')
+      rootExitFact = {
+        pid: rootPid!,
+        exitCode: message.exitCode,
+        elapsedMs: message.elapsedMs,
+        natural: message.natural,
+        active: message.active,
+        ...jobMembers(message),
+      }
+      resolveRootExit({ ...rootExitFact, ...cloneMembers(rootExitFact) })
+    } else if (message.kind === 'members') {
+      if (
+        !didStart ||
+        membersBeforeStop ||
+        message.phase !== 'before-stop' ||
+        !exact(['kind', 'generation', 'phase', 'members', 'membersIncomplete'])
+      )
+        throw new Error('Invalid Job member receipt')
+      membersBeforeStop = jobMembers(message)
     } else if (message.kind === 'empty') {
       if (
         !exact(['kind', 'generation', 'exitCode', 'active']) ||
@@ -425,6 +546,11 @@ export async function writeWindowsObservedLauncher(
       clearTimeout(startupTimer)
       clearTimeout(lifetimeTimer)
       if (!didStart) rejectStarted(new Error('Windows Job released without starting its target'))
+      if (!didStart) rejectRootExit(new Error('Windows Job released without starting its target'))
+      else if (!rootExitFact)
+        rejectRootExit(new Error('Windows Job root exit is unavailable after release'))
+      // Authenticated empty proves physical release independently of a missing
+      // root observation on an error path. It cannot prove natural exit/takeover.
       resolveEmpty({ generation, active: 0, exitCode: message.exitCode })
     } else if (message.kind === 'counts') {
       if (
@@ -551,6 +677,7 @@ export async function writeWindowsObservedLauncher(
       generation,
       started,
       empty,
+      rootExit,
       armStartup,
       cancel,
       disposeControl,

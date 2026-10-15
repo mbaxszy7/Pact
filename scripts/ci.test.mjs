@@ -131,6 +131,17 @@ void test('does not raise the existing admitted environment byte bound', () => {
   assert.throws(() => ciEnvironment({ PATH: 'bad\0path' }), /Invalid/)
 })
 
+void test('keeps only the selected native Codex package root across CI isolation', () => {
+  assert.deepEqual(
+    ciEnvironment({
+      PACT_NATIVE_CODEX_PACKAGE_ROOT: '/owned/pinned-codex',
+      CODEX_MANAGED_PACKAGE_ROOT: '/unrelated',
+      CODEX_MANAGED_BY_BUN: '1',
+    }),
+    { PACT_NATIVE_CODEX_PACKAGE_ROOT: '/owned/pinned-codex' },
+  )
+})
+
 void test('script inventory contains independent secret and platform runner tests', async () => {
   const files = await scriptTests()
   assert(files.includes('scripts/check-secrets.test.mjs'))

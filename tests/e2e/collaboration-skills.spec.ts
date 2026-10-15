@@ -53,6 +53,12 @@ async function readTodos(page: Page, sessionId: string) {
 }
 
 async function expectCompleteReview(page: Page): Promise<void> {
+  // A Review is an asynchronous Agent Turn. Wait for its next action using the
+  // existing Playwright action deadline before asserting the settled result.
+  await page
+    .getByRole('button', { name: 'Review current changes · read-only', exact: true })
+    .last()
+    .waitFor({ state: 'visible' })
   const card = resultCard(page)
   await expect(card.getByLabel('Pact Proposal')).toContainText('Review complete')
   await expandResult(card)
