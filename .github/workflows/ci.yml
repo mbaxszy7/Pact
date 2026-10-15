@@ -173,6 +173,7 @@ jobs:
           ref: ${{ needs.identity.outputs.candidate }}
           path: source
           persist-credentials: false
+          fetch-depth: 2
       - uses: ./control/.github/actions/setup
         with:
           workspace: source
@@ -240,6 +241,7 @@ jobs:
           ref: ${{ needs.identity.outputs.candidate }}
           path: source
           persist-credentials: false
+          fetch-depth: 2
       - uses: ./control/.github/actions/setup
         with:
           workspace: source

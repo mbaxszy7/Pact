@@ -142,6 +142,7 @@ jobs:
           ref: ${{ needs.admission.outputs.candidate }}
           path: source
           persist-credentials: false
+          fetch-depth: 2
       - name: Initialize controller before any candidate hook executes
         uses: ./control/.github/actions/setup
         with:

@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { devNull, tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
+import { pathToFileURL } from 'node:url'
 
 import {
   candidateIdentity,
@@ -8,6 +13,89 @@ import {
   requireIdentity,
   requireSha,
 } from './ci-identity.mjs'
+
+function candidateCheckouts(name) {
+  return readFileSync(new URL(`../.github/workflows/${name}`, import.meta.url), 'utf8')
+    .split('\n      - ')
+    .filter(
+      (step) => step.startsWith('uses: actions/checkout@') && step.includes('outputs.candidate }}'),
+    )
+}
+
+void test('every merge-candidate checkout retains the parents required by workspace verification', () => {
+  for (const workflow of ['ci.yml', 'provider-e2e.yml']) {
+    const checkouts = candidateCheckouts(workflow)
+    assert.ok(checkouts.length > 0)
+    for (const step of checkouts) {
+      const depth = Number(/fetch-depth: (\d+)/u.exec(step)?.[1] ?? 1)
+      assert.ok(depth === 0 || depth >= 2, `${workflow} candidate checkout hides merge parents`)
+    }
+  }
+})
+
+void test('the configured platform checkout preserves exact SHA, tree and ordered parents in real Git', (context) => {
+  const root = mkdtempSync(join(tmpdir(), 'pact-ci-merge-history-'))
+  context.after(() => rmSync(root, { recursive: true, force: true }))
+  const source = join(root, 'source'),
+    workspace = join(root, 'workspace')
+  const env = {
+    PATH: process.env.PATH,
+    SystemRoot: process.env.SystemRoot,
+    TEMP: root,
+    TMP: root,
+    HOME: root,
+    USERPROFILE: root,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: devNull,
+    GIT_AUTHOR_NAME: 'Pact fixture',
+    GIT_COMMITTER_NAME: 'Pact fixture',
+    GIT_AUTHOR_EMAIL: 'fixture@example.test',
+    GIT_COMMITTER_EMAIL: 'fixture@example.test',
+  }
+  const git = (cwd, args) =>
+    execFileSync('git', args, {
+      cwd,
+      env,
+      encoding: 'utf8',
+      shell: false,
+      timeout: 5000,
+      maxBuffer: 4096,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim()
+  git(root, ['init', '--quiet', '--initial-branch=main', source])
+  git(source, ['commit', '--quiet', '--allow-empty', '-m', 'fixture root'])
+  git(source, ['checkout', '--quiet', '-b', 'candidate'])
+  git(source, ['commit', '--quiet', '--allow-empty', '-m', 'fixture candidate'])
+  git(source, ['checkout', '--quiet', 'main'])
+  git(source, ['commit', '--quiet', '--allow-empty', '-m', 'fixture base'])
+  git(source, ['merge', '--quiet', '--no-ff', '-m', 'fixture merge', 'candidate'])
+  const expected = git(source, ['show', '-s', '--format=%H %T %P', 'HEAD']).split(' ')
+  assert.equal(expected.length, 4)
+  git(root, [
+    'clone',
+    '--quiet',
+    '--depth=1',
+    '--branch=main',
+    pathToFileURL(source).href,
+    workspace,
+  ])
+  const shallow = git(workspace, ['show', '-s', '--format=%H %T %P', 'HEAD']).split(' ')
+  assert.deepEqual(
+    shallow,
+    expected.slice(0, 2),
+    'depth one hides both parents while SHA and tree still match',
+  )
+  const step = candidateCheckouts('ci.yml').at(-1)
+  const depth = Number(/fetch-depth: (\d+)/u.exec(step)?.[1] ?? 1)
+  git(workspace, [
+    'fetch',
+    '--quiet',
+    ...(depth === 0 ? ['--unshallow'] : [`--depth=${depth}`]),
+    'origin',
+    'main',
+  ])
+  assert.deepEqual(git(workspace, ['show', '-s', '--format=%H %T %P', 'HEAD']).split(' '), expected)
+})
 const head = 'a'.repeat(40),
   base = 'b'.repeat(40),
   candidate = 'c'.repeat(40),
