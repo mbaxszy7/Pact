@@ -13,6 +13,7 @@ import {
   encodeIdentity,
   establishDraft,
   GitHub,
+  main as releaseMain,
   publishRelease,
   releaseVersion,
   RELEASE_PLATFORMS,
@@ -613,11 +614,32 @@ void test('missing tag fails closed; complete new identity creates only its exac
 })
 
 void test('installed platform evidence must bind actual artifact and exact application bytes', async (context) => {
-  const bundle = await bundleFixture(context, 'win32-arm64')
-  assert.equal((await validateBundle(bundle.root, identity, 'win32-arm64')).files.length, 3)
+  const bundle = await bundleFixture(context, 'win32-x64')
+  assert.equal((await validateBundle(bundle.root, identity, 'win32-x64')).files.length, 3)
   bundle.smoke.appContentHash = 'f'.repeat(64)
   await bundle.write('package-smoke-report.json', bundle.smoke)
-  await assert.rejects(validateBundle(bundle.root, identity, 'win32-arm64'), /content hash/)
+  await assert.rejects(validateBundle(bundle.root, identity, 'win32-x64'), /content hash/)
+})
+
+void test('deferred Windows ARM64 installers cannot enter a formal release', async (context) => {
+  assert.deepEqual(RELEASE_PLATFORMS, ['darwin-arm64', 'win32-x64'])
+  const bundle = await bundleFixture(context, 'win32-arm64')
+  await assert.rejects(
+    validateBundle(bundle.root, identity, 'win32-arm64'),
+    /Unsupported release platform/,
+  )
+})
+
+void test('deferred packaging blocks every remote release mutation entry before credentials or network', async () => {
+  for (const command of ['prepare', 'stage', 'publish']) {
+    for (const ready of [undefined, 'false', 'TRUE', '1']) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Verify each public command rejects before API construction or any remote side effect.
+      await assert.rejects(
+        releaseMain([command], { PACT_PACKAGING_READY: ready }),
+        /deferred until native-machine acceptance/,
+      )
+    }
+  }
 })
 
 void test('unpacked-only proof blocks publication', async (context) => {
@@ -650,7 +672,6 @@ void test('one failed or missing platform prevents any upload or publication', a
   const root = await mkdtemp(join(tmpdir(), 'pact-release-all-'))
   context.after(() => rm(root, { recursive: true, force: true }))
   await bundleFixture(context, 'darwin-arm64', root)
-  await bundleFixture(context, 'win32-x64', root)
   const { api, state } = apiFixture()
   await assert.rejects(
     publishRelease(api, { ...identity, releaseId: 100 }, root, signContext),
@@ -777,8 +798,15 @@ void test('workflow keeps App credentials out of builds and forbids automatic/pa
   assert.match(workflow, /cancel-in-progress: false/)
   assert.match(workflow, /group: pact-stable-publication/)
   assert.doesNotMatch(workflow, /run-soak|package-soak-report|--duration-ms/u)
+  assert.doesNotMatch(workflow, /build-win32-arm64|stage-win32-arm64|ready_win32_arm64/u)
+  const publication = await readFile(new URL('./release-control.mjs', import.meta.url), 'utf8')
+  assert.doesNotMatch(publication, /two-hour packaged performance|All three installed/u)
   const ci = await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
   assert.doesNotMatch(ci, /run_soak|run-soak|package-soak-report|SOAK_DURATION/u)
+  assert.match(ci, /key: win32-arm64\s+package: false/u)
+  assert.match(ci, /steps\.native\.outcome == 'success' && matrix\.package/u)
+  assert.match(ci, /matrix\.package && vars\.PACT_PACKAGING_READY == 'true'/u)
+  assert.match(workflow, /vars\.PACT_PACKAGING_READY == 'true'/u)
   const config = JSON.parse(
     await readFile(new URL('../release-please-config.json', import.meta.url), 'utf8'),
   )
@@ -1153,7 +1181,10 @@ void test('persistent signed staging recovers exact original platform bytes afte
     // oxlint-disable-next-line eslint/no-await-in-loop -- Persist each independently completed platform immediately.
     await stagePlatform(api, established, key, join(root, key), stagingContext)
   }
-  assert.equal((await findStagedPlatforms(api, established, signContext)).length, 3)
+  assert.equal(
+    (await findStagedPlatforms(api, established, signContext)).length,
+    RELEASE_PLATFORMS.length,
+  )
   // Remove the transient workflow copies: only durable signed draft bytes remain.
   await Promise.all(RELEASE_PLATFORMS.map((key) => rm(join(root, key), { recursive: true })))
   const output = join(root, 'restored')

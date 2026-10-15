@@ -28,6 +28,7 @@ defaults:
 jobs:
   identity:
     if: >-
+      vars.PACT_PACKAGING_READY == 'true' &&
       github.ref == 'refs/heads/main' &&
       ((github.event_name == 'workflow_dispatch' && github.actor_id == '31481964') ||
        (github.event.pull_request.merged == true &&
@@ -44,7 +45,6 @@ jobs:
       published: ${{ steps.identity.outputs.published }}
       ready_darwin_arm64: ${{ steps.identity.outputs.ready_darwin_arm64 }}
       ready_win32_x64: ${{ steps.identity.outputs.ready_win32_x64 }}
-      ready_win32_arm64: ${{ steps.identity.outputs.ready_win32_arm64 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -74,6 +74,7 @@ jobs:
           PACT_RELEASE_APP_SLUG: ${{ steps.app.outputs.app-slug }}
           PACT_RELEASE_SIGNING_KEY: ${{ secrets.PACT_CI_APP_PRIVATE_KEY }}
           PACT_GOVERNANCE_READY: ${{ vars.PACT_GOVERNANCE_READY }}
+          PACT_PACKAGING_READY: ${{ vars.PACT_PACKAGING_READY }}
           PACT_APPROVED_MAJOR_VERSION: ${{ vars.PACT_APPROVED_MAJOR_VERSION }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: steps.identity.outputs.applicable == 'true'
@@ -351,6 +352,7 @@ jobs:
           PACT_RELEASE_APP_SLUG: ${{ steps.app.outputs.app-slug }}
           PACT_RELEASE_SIGNING_KEY: ${{ secrets.PACT_CI_APP_PRIVATE_KEY }}
           PACT_GOVERNANCE_READY: ${{ vars.PACT_GOVERNANCE_READY }}
+          PACT_PACKAGING_READY: ${{ vars.PACT_PACKAGING_READY }}
           PACT_APPROVED_MAJOR_VERSION: ${{ vars.PACT_APPROVED_MAJOR_VERSION }}
 
   build-win32-x64:
@@ -592,268 +594,18 @@ jobs:
           PACT_RELEASE_APP_SLUG: ${{ steps.app.outputs.app-slug }}
           PACT_RELEASE_SIGNING_KEY: ${{ secrets.PACT_CI_APP_PRIVATE_KEY }}
           PACT_GOVERNANCE_READY: ${{ vars.PACT_GOVERNANCE_READY }}
-          PACT_APPROVED_MAJOR_VERSION: ${{ vars.PACT_APPROVED_MAJOR_VERSION }}
-
-  build-win32-arm64:
-    needs: [identity, quality]
-    if: needs.identity.outputs.applicable == 'true' && needs.identity.outputs.published == 'false' && needs.identity.outputs.ready_win32_arm64 != 'true'
-    runs-on: windows-11-arm
-    timeout-minutes: 120
-    env:
-      PACT_CI_WORKSPACE: ${{ github.workspace }}/source
-      PACT_EXPECTED_VERSION: ${{ needs.identity.outputs.version }}
-      PACT_EXPECTED_SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
-      PACT_EXPECTED_RELEASE_ID: ${{ needs.identity.outputs.release_id }}
-    steps:
-      # The release controller stays on trusted main. Build code has no App or provider secrets.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ needs.identity.outputs.control_sha }}
-          path: control
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version-file: control/.node-version
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-identity
-          path: ${{ runner.temp }}/pact-identity
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ needs.identity.outputs.source_sha }}
-          path: source
-          persist-credentials: false
-      - name: Initialize pinned pnpm, frozen dependencies and native CLIs
-        uses: ./control/.github/actions/setup
-        with:
-          workspace: source
-          controller: control
-          native: 'true'
-      - name: Capture trusted no-credential case inventory before build
-        working-directory: control
-        run: pnpm exec playwright test --list --reporter=json > "$RUNNER_TEMP/pact-e2e-inventory.json"
-      - name: Target-architecture Electron build
-        run: node control/scripts/ci.mjs build
-      - name: Native Windows process and installed-content regressions
-        if: runner.os == 'Windows'
-        working-directory: source
-        run: node --test --test-concurrency=1 scripts/run-e2e-windows.test.mjs scripts/run-e2e.test.mjs scripts/package-smoke.test.mjs
-      - name: Electron UI
-        id: ui
-        run: node control/scripts/ci.mjs ui
-        env:
-          PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/win32-arm64
-      - name: Deterministic Electron business and lifecycle journeys
-        id: deterministic
-        run: node control/scripts/ci.mjs deterministic
-        env:
-          PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/win32-arm64
-      - name: Target-architecture native CLI protocol checks
-        run: node control/scripts/ci.mjs native
-        env:
-          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-evidence/win32-arm64
-          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/pact-identity/release-identity.json
-          PACT_CI_NATIVE_IDENTITY_KIND: release
-          PACT_CI_NATIVE_ARTIFACT: release-native-e2e-win32-arm64-a${{ github.run_attempt }}
-      - name: Report native setup failures and unexecuted cases without replacing actual evidence
-        if: always()
-        run: node control/scripts/ci-native-report.mjs
-        env:
-          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-evidence/win32-arm64
-          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/pact-identity/release-identity.json
-          PACT_CI_NATIVE_IDENTITY_KIND: release
-          PACT_CI_NATIVE_ARTIFACT: release-native-e2e-win32-arm64-a${{ github.run_attempt }}
-      - name: Preserve safe native protocol case reports including failures
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-native-e2e-win32-arm64-a${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/pact-native-evidence/win32-arm64/native-summary.json
-            ${{ runner.temp }}/pact-native-evidence/win32-arm64/native-summary.md
-          if-no-files-found: ignore
-          retention-days: 14
-      - name: Collect bounded no-credential Electron failure diagnostics
-        if: failure()
-        timeout-minutes: 2
-        run: |
-          mkdir -p "$RUNNER_TEMP/pact-release-ui-diagnostics"
-          node control/scripts/ci-ui-diagnostics.mjs --evidence "$RUNNER_TEMP/pact-release-evidence/win32-arm64" --output "$RUNNER_TEMP/pact-release-ui-diagnostics/win32-arm64"
-        env:
-          PACT_CI_DIAGNOSTIC_LANE: uncredentialed
-      - name: Preserve only collected no-credential UI context and traces
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-ui-diagnostics-win32-arm64-a${{ github.run_attempt }}
-          path: ${{ runner.temp }}/pact-release-ui-diagnostics/win32-arm64
-          if-no-files-found: ignore
-          retention-days: 14
-      - name: Summarize Release UI and deterministic cases including failures and unexecuted journeys
-        if: always()
-        run: >-
-          node control/scripts/ci-ui-diagnostics.mjs --reports --release
-          --evidence "$RUNNER_TEMP/pact-release-evidence/win32-arm64"
-          --workspace "$GITHUB_WORKSPACE/source"
-          --identity "$RUNNER_TEMP/pact-identity/release-identity.json"
-          --inventory "$RUNNER_TEMP/pact-e2e-inventory.json"
-        env:
-          PACT_CI_DIAGNOSTIC_LANE: uncredentialed
-          PACT_UI_EXECUTION_COMPLETED: ${{ steps.ui.outputs.ui_execution_completed }}
-          PACT_DETERMINISTIC_EXECUTION_COMPLETED: ${{ steps.deterministic.outputs.deterministic_execution_completed }}
-      - name: Preserve actual no-credential release E2E results and readable reports
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-e2e-win32-arm64-a${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/pact-release-evidence/win32-arm64/*.json
-            ${{ runner.temp }}/pact-release-evidence/win32-arm64/*.md
-          if-no-files-found: error
-          retention-days: 14
-      - name: Build final Stable installers on the actual target architecture
-        working-directory: source
-        run: >-
-          node scripts/build-distribution.mjs --channel stable
-          --platform "$TARGET_PLATFORM" --arch "$TARGET_ARCH"
-          --sha "$SOURCE_SHA" --build-number "$GITHUB_RUN_NUMBER"
-          --output "$RUNNER_TEMP/pact-release/$PLATFORM_KEY"
-        env:
-          TARGET_PLATFORM: win32
-          TARGET_ARCH: arm64
-          PLATFORM_KEY: win32-arm64
-          SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
-      - name: Validate the actually installed NSIS or DMG application
-        working-directory: source
-        run: >-
-          node scripts/package-smoke.mjs
-          --manifest "$RUNNER_TEMP/pact-release/$PLATFORM_KEY/distribution-manifest.json"
-          --production-paths
-          --report "$RUNNER_TEMP/pact-release/$PLATFORM_KEY/package-smoke-report.json"
-        env:
-          PLATFORM_KEY: win32-arm64
-      - name: Validate the actual ZIP extraction
-        if: false
-        working-directory: source
-        run: |
-          node --input-type=module -e '
-            import { readFile } from "node:fs/promises";
-            import { join } from "node:path";
-            import { spawnSync } from "node:child_process";
-            const root = join(process.env.RUNNER_TEMP, "pact-release", process.env.PLATFORM_KEY);
-            const file = join(root, "distribution-manifest.json");
-            const manifest = JSON.parse(await readFile(file, "utf8"));
-            const zip = manifest.artifacts.find(a => a.kind === "zip");
-            if (!zip) throw Error("Required ZIP is missing");
-            const result = spawnSync(process.execPath, ["scripts/package-smoke.mjs", "--manifest", file, "--artifact", join(root, zip.path), "--production-paths", "--report", join(root, "package-zip-smoke-report.json")], {stdio: "inherit", shell: false});
-            if (result.error) throw result.error;
-            process.exit(result.status ?? 1);
-          '
-        env:
-          PLATFORM_KEY: win32-arm64
-      - name: Preserve failed packaged verification separately from release assets
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: packaged-verification-win32-arm64-a${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/pact-release/win32-arm64/distribution-manifest.json
-            ${{ runner.temp }}/pact-release/win32-arm64/package-*-report.json
-          if-no-files-found: ignore
-          retention-days: 14
-      - name: Link packaged failure evidence in the workflow summary
-        if: always()
-        run: >-
-          node --input-type=module -e '
-          import { appendFile } from "node:fs/promises";
-          const url = "https://github.com/mbaxszy7/Pact/actions/runs/" + process.env.GITHUB_RUN_ID;
-          await appendFile(process.env.GITHUB_STEP_SUMMARY,
-          "\nPackaged verification (win32-arm64): [workflow reports](" + url + ") · artifact `packaged-verification-win32-arm64-a" + process.env.GITHUB_RUN_ATTEMPT + "`. Failed diagnostics are retained separately from successful release assets.\n");'
-      - name: Preserve exact final bytes for upload recovery
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: stable-win32-arm64-a${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/pact-release/win32-arm64/*.exe
-            ${{ runner.temp }}/pact-release/win32-arm64/*.dmg
-            ${{ runner.temp }}/pact-release/win32-arm64/*.zip
-            ${{ runner.temp }}/pact-release/win32-arm64/*.json
-            ${{ runner.temp }}/pact-release/win32-arm64/SHA256SUMS
-          if-no-files-found: error
-          retention-days: 14
-
-  stage-win32-arm64:
-    needs: [identity, quality, build-win32-arm64]
-    if: needs.build-win32-arm64.result == 'success'
-    environment: pact-control-plane
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    concurrency:
-      group: pact-release-staging-writer-${{ needs.identity.outputs.release_id }}
-      cancel-in-progress: false
-      queue: max
-    env:
-      PACT_EXPECTED_VERSION: ${{ needs.identity.outputs.version }}
-      PACT_EXPECTED_SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
-      PACT_EXPECTED_RELEASE_ID: ${{ needs.identity.outputs.release_id }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ needs.identity.outputs.control_sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version-file: .node-version
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-identity
-          path: ${{ runner.temp }}/pact-identity
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: stable-win32-arm64-a${{ github.run_attempt }}
-          path: ${{ runner.temp }}/pact-stage
-      - id: app
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
-        with:
-          app-id: ${{ secrets.PACT_CI_APP_ID }}
-          private-key: ${{ secrets.PACT_CI_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: Pact
-          permission-contents: write
-          permission-pull-requests: read
-      - name: Authenticate and persist exact successfully verified platform contents
-        run: >-
-          node scripts/release-control.mjs stage
-          --identity "$RUNNER_TEMP/pact-identity/release-identity.json"
-          --platform win32-arm64 --artifacts "$RUNNER_TEMP/pact-stage"
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-          GITHUB_TOKEN: ${{ github.token }}
-          PACT_RELEASE_APP_BOT_ID: ${{ vars.PACT_RELEASE_APP_BOT_ID }}
-          PACT_RELEASE_APP_SLUG: ${{ steps.app.outputs.app-slug }}
-          PACT_RELEASE_SIGNING_KEY: ${{ secrets.PACT_CI_APP_PRIVATE_KEY }}
-          PACT_GOVERNANCE_READY: ${{ vars.PACT_GOVERNANCE_READY }}
+          PACT_PACKAGING_READY: ${{ vars.PACT_PACKAGING_READY }}
           PACT_APPROVED_MAJOR_VERSION: ${{ vars.PACT_APPROVED_MAJOR_VERSION }}
 
   publication:
     needs:
-      [
-        identity,
-        quality,
-        build-darwin-arm64,
-        build-win32-x64,
-        build-win32-arm64,
-        stage-darwin-arm64,
-        stage-win32-x64,
-        stage-win32-arm64,
-      ]
+      [identity, quality, build-darwin-arm64, build-win32-x64, stage-darwin-arm64, stage-win32-x64]
     if: >-
       always() && needs.identity.result == 'success' &&
       needs.identity.outputs.applicable == 'true' && needs.identity.outputs.published == 'false' &&
       needs.quality.result == 'success' &&
       (needs.identity.outputs.ready_darwin_arm64 == 'true' || needs.stage-darwin-arm64.result == 'success') &&
-      (needs.identity.outputs.ready_win32_x64 == 'true' || needs.stage-win32-x64.result == 'success') &&
-      (needs.identity.outputs.ready_win32_arm64 == 'true' || needs.stage-win32-arm64.result == 'success')
+      (needs.identity.outputs.ready_win32_x64 == 'true' || needs.stage-win32-x64.result == 'success')
     environment: pact-control-plane
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -899,4 +651,5 @@ jobs:
           PACT_RELEASE_APP_SLUG: ${{ steps.app.outputs.app-slug }}
           PACT_RELEASE_SIGNING_KEY: ${{ secrets.PACT_CI_APP_PRIVATE_KEY }}
           PACT_GOVERNANCE_READY: ${{ vars.PACT_GOVERNANCE_READY }}
+          PACT_PACKAGING_READY: ${{ vars.PACT_PACKAGING_READY }}
           PACT_APPROVED_MAJOR_VERSION: ${{ vars.PACT_APPROVED_MAJOR_VERSION }}

@@ -25,7 +25,7 @@ const MAX_ASSETS = 32
 const MAX_TRUSTED_RUNS = 128
 const SIGNATURE_DOMAIN = 'PACT_STABLE_RELEASE_CONTROL_IDENTITY_V1\0'
 const execFileAsync = promisify(execFile)
-export const RELEASE_PLATFORMS = ['darwin-arm64', 'win32-x64', 'win32-arm64']
+export const RELEASE_PLATFORMS = ['darwin-arm64', 'win32-x64']
 
 function requireFact(condition, message) {
   if (!condition) throw new Error(message)
@@ -481,8 +481,9 @@ export async function verifyPublishedRelease(api, release, identity, context) {
     proof = state.publicationProof
   requireFact(
     commitment?.schemaVersion === 1 &&
-      commitment.platforms?.length === 3 &&
-      new Set(commitment.platforms.map((item) => item.platform)).size === 3 &&
+      commitment.platforms?.length === RELEASE_PLATFORMS.length &&
+      new Set(commitment.platforms.map((item) => item.platform)).size ===
+        RELEASE_PLATFORMS.length &&
       commitment.platforms.every(
         (item) => RELEASE_PLATFORMS.includes(item.platform) && HASH.test(item.appContentHash),
       ) &&
@@ -992,7 +993,7 @@ export async function publishRelease(api, identity, artifactsRoot, context) {
     body: {
       draft: false,
       make_latest: newer ? 'false' : 'true',
-      body: `${encodeIdentity(completed)}\n\nSource: ${identity.sourceSha}\nRelease PR: #${identity.releasePR}\nAll three installed platform builds passed smoke and two-hour packaged performance/resource checks. See release-provenance.json, platform evidence and SHA256SUMS.\n\n${NOTES_START}\n${storedReleaseNotes(current.body)}\n${NOTES_END}`,
+      body: `${encodeIdentity(completed)}\n\nSource: ${identity.sourceSha}\nRelease PR: #${identity.releasePR}\nAll required platform installers passed installed smoke and content verification. See release-provenance.json, platform evidence and SHA256SUMS.\n\n${NOTES_START}\n${storedReleaseNotes(current.body)}\n${NOTES_END}`,
     },
   })
   return { ...identity, status: 'published', assets: files.length, latest: !newer }
@@ -1179,6 +1180,11 @@ function argumentsMap(args) {
 
 export async function main(args = process.argv.slice(2), environment = process.env) {
   const [command, ...rest] = args
+  if (['prepare', 'stage', 'publish'].includes(command))
+    requireFact(
+      environment.PACT_PACKAGING_READY === 'true',
+      'Automated installer publication is deferred until native-machine acceptance',
+    )
   const options = argumentsMap(rest)
   const api = new GitHub(environment.GITHUB_REPOSITORY, environment.GH_TOKEN, {
     actionsToken: environment.GITHUB_TOKEN,

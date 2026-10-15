@@ -216,14 +216,17 @@ jobs:
             platform: darwin
             arch: arm64
             key: darwin-arm64
+            package: true
           - runner: windows-2025
             platform: win32
             arch: x64
             key: win32-x64
+            package: true
           - runner: windows-11-arm
             platform: win32
             arch: arm64
             key: win32-arm64
+            package: false
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -351,7 +354,7 @@ jobs:
           retention-days: 14
       - name: Build Dev or Stable-candidate installers
         id: distribution
-        if: ${{ !cancelled() && steps.native.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.native.outcome == 'success' && matrix.package && vars.PACT_PACKAGING_READY == 'true' }}
         working-directory: source
         run: >-
           node scripts/build-distribution.mjs --channel "$CHANNEL"
@@ -364,6 +367,13 @@ jobs:
           TARGET_ARCH: ${{ matrix.arch }}
           PLATFORM_KEY: ${{ matrix.key }}
           CANDIDATE_SHA: ${{ needs.identity.outputs.candidate }}
+      - name: Record deferred installers without waiving native checks
+        if: ${{ !cancelled() && (!matrix.package || vars.PACT_PACKAGING_READY != 'true') }}
+        run: >-
+          node --input-type=module -e
+          'import { appendFile } from "node:fs/promises";
+          await appendFile(process.env.GITHUB_STEP_SUMMARY,
+          "Automated installers and release acceptance are deferred (TODO) until native-machine validation. UI, deterministic and native protocol checks remain required.\n");'
       - name: Install and cold-start the exact NSIS or DMG application
         id: package-smoke
         if: ${{ !cancelled() && steps.distribution.outcome == 'success' }}
@@ -399,7 +409,7 @@ jobs:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
           GITHUB_TOKEN: ${{ github.token }}
       - name: Preserve installers and bounded fixture-only verification records
-        if: always()
+        if: ${{ always() && matrix.package && vars.PACT_PACKAGING_READY == 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ needs.identity.outputs.channel }}-${{ matrix.key }}-a${{ github.run_attempt }}

@@ -234,7 +234,10 @@ version, source SHA, tag, Release PR and Release ID; they omit signed-state exte
 and do not replace the release controller's authenticated staging or publication checks.
 
 Branch pushes and PRs run static checks, unit/script tests, native protocol checks,
-UI/deterministic E2E and installed smoke checks. Stable candidates additionally require
+UI/deterministic E2E on all three test architectures. Installer build/smoke and publication currently
+are deferred until native-machine acceptance. `PACT_PACKAGING_READY` must remain unset or false
+until that acceptance is complete. Windows arm64 installers remain excluded from the future automated
+release set; all three architectures retain their mandatory native protocol checks. Stable candidates additionally require
 full provider verification; publication validates every final installer and its content-bound
 smoke report. CI platform jobs allow 90 minutes and release platform jobs allow two hours
 for their required checks, packaging and cleanup. Deadlines do not establish completed tests.
@@ -283,7 +286,7 @@ and restores the desktop package metadata without a version commit.
 | ------------- | -------------------------------- | ----------------------- |
 | macOS arm64   | `--platform darwin --arch arm64` | DMG and ZIP             |
 | Windows x64   | `--platform win32 --arch x64`    | Separate NSIS installer |
-| Windows arm64 | `--platform win32 --arch arm64`  | Separate NSIS installer |
+| Windows arm64 | Deferred (TODO)                  | No CI/Release installer |
 
 For example, on macOS arm64:
 
@@ -298,6 +301,11 @@ The release candidate uses Stable metadata and its own artifacts:
 node scripts/build-distribution.mjs --channel stable --platform darwin --arch arm64 --sha COMMIT_SHA --build-number BUILD_NUMBER --output .pact-data/distributions/stable
 node scripts/package-smoke.mjs --manifest .pact-data/distributions/stable/distribution-manifest.json --production-paths --report .pact-data/distributions/stable/smoke.json
 ```
+
+Automatic installer jobs and Stable publication are deferred (TODO) until native-machine acceptance;
+`PACT_PACKAGING_READY` defaults to disabled. The commands above remain available for isolated manual
+validation. Windows x64 and macOS arm64 are the candidate automated installer targets; Windows arm64
+needs a separate later integration decision. Do not treat deferred packaging as passing release evidence.
 
 The manifest identifies the exact executable/bundle, channel/version, source SHA, architecture,
 application identity, application-content hash and installation-artifact hashes. Smoke does not guess
@@ -327,8 +335,9 @@ neither deleting a directory nor calling terminate proves physical process clean
 Release Actions retain these reports in `packaged-verification-PLATFORM-aATTEMPT` even after
 failure, separately from the successful artifacts eligible for signed release staging.
 
-Windows x64/arm64 installed-launch validation and full Windows/macOS Dev/Stable coexistence, upgrade
-and uninstall debugging remain TODO. Code integration does not establish those platform gates.
+Windows arm64 installer build, installation acceptance and publication are deferred (TODO).
+Windows x64 installed-launch validation and full Windows/macOS Dev/Stable coexistence, upgrade
+and uninstall debugging still require their actual evidence. Code integration does not establish those platform gates.
 
 ### Private real-provider configuration
 
