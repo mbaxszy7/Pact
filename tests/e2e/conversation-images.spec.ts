@@ -203,7 +203,7 @@ async function readSavedImage(
 test(
   'keeps image-only inputs durable and a later draft intact across ACK and restart',
   { tag: '@deterministic' },
-  async () => {
+  async ({ browserName: _browserName }, testInfo) => {
     const fixture = await createRuntimeFixture({
       claudeConversation: 'complete',
       codexAppServer: 'complete',
@@ -267,25 +267,53 @@ test(
         files.map(({ mediaType, sha256 }) => ({ mediaType, sha256 })),
       ])
 
-      // Delay only this isolated App's typed Send handler before real processing. This leaves
-      // one frozen input pending while the user continues editing through the actual Hook.
+      // Hold only this isolated App's typed Send handler until the later draft is ready.
+      // A fixed sleep neither establishes pending ACK nor belongs in the reply wait budget.
       await app.evaluate(({ ipcMain }) => {
         const handlers: unknown = Reflect.get(ipcMain, '_invokeHandlers')
         if (!(handlers instanceof Map)) throw new Error('Owned IPC handlers are unavailable.')
         const original: unknown = handlers.get('pact:conversation:send')
         if (typeof original !== 'function') throw new Error('Owned Send handler is unavailable.')
+        const control = { entered: false, release: () => {} }
+        const held = new Promise<void>((done) => {
+          control.release = done
+        })
+        Reflect.set(globalThis, 'pactImageSendGate', control)
         ipcMain.removeHandler('pact:conversation:send')
         ipcMain.handle('pact:conversation:send', async (event, input: unknown) => {
-          await new Promise<void>((done) => setTimeout(done, 1500))
+          control.entered = true
+          await held
           return Reflect.apply(original, ipcMain, [event, input])
         })
       })
       await addFile(editor(), files[0]!, 'paste')
       await loadedThumbnails(draft(), 1)
       await send.click()
+      await expect
+        .poll(() =>
+          app!.evaluate(() => {
+            const control: unknown = Reflect.get(globalThis, 'pactImageSendGate')
+            return Boolean(
+              control && typeof control === 'object' && Reflect.get(control, 'entered') === true,
+            )
+          }),
+        )
+        .toBe(true)
       await addFile(editor(), files[1]!, 'paste')
       await editor().press('ControlOrMeta+ArrowRight')
       await page.keyboard.insertText('Keep this next question.')
+      await loadedThumbnails(draft(), 1)
+      await expect(editor()).toHaveText('Keep this next question.')
+      expect((await fixture.readClaudeFacts()).count).toBe(1)
+      await app.evaluate(() => {
+        const control: unknown = Reflect.get(globalThis, 'pactImageSendGate')
+        if (!control || typeof control !== 'object')
+          throw new Error('Owned Send gate is unavailable.')
+        const release: unknown = Reflect.get(control, 'release')
+        if (typeof release !== 'function') throw new Error('Owned Send gate cannot release.')
+        Reflect.apply(release, undefined, [])
+        Reflect.deleteProperty(globalThis, 'pactImageSendGate')
+      })
       await expect(page.getByText('Claude fixture response.', { exact: true })).toHaveCount(2)
       await loadedThumbnails(draft(), 1)
       await expect(
@@ -311,7 +339,20 @@ test(
       await expect(gallery).toHaveCount(0)
       await expect(preview).toBeFocused()
       expect((await fixture.readClaudeFacts()).count).toBe(2)
+    } catch (error) {
+      await fixture.captureUiFailure(testInfo)
+      throw error
     } finally {
+      await app
+        ?.evaluate(() => {
+          const control: unknown = Reflect.get(globalThis, 'pactImageSendGate')
+          if (control && typeof control === 'object') {
+            const release: unknown = Reflect.get(control, 'release')
+            if (typeof release === 'function') Reflect.apply(release, undefined, [])
+            Reflect.deleteProperty(globalThis, 'pactImageSendGate')
+          }
+        })
+        .catch(() => undefined)
       await app?.close()
       await fixture.dispose()
     }
