@@ -151,6 +151,28 @@ export function distributionArguments(args) {
   return options
 }
 
+/** Explicit target names prevent inherited target arrays from adding another architecture. */
+export function distributionBuilderArguments(options, builderCli, configPath) {
+  if (!supported.has(`${options.platform}-${options.arch}`))
+    throw new Error('Unsupported native distribution target')
+  const targets = options.directoryOnly
+    ? ['dir']
+    : options.platform === 'darwin'
+      ? ['dmg', 'zip']
+      : ['nsis']
+  return [
+    builderCli,
+    '--config',
+    configPath,
+    options.platform === 'darwin' ? '--mac' : '--win',
+    ...targets,
+    `--${options.arch}`,
+    '--publish',
+    'never',
+    ...(options.directoryOnly ? ['--dir'] : []),
+  ]
+}
+
 export async function main(args = process.argv.slice(2)) {
   const options = distributionArguments(args)
   const sourceSha = (
@@ -309,16 +331,7 @@ export async function main(args = process.argv.slice(2)) {
     metadataWritten = true
     const builderCli = createRequire(packagePath).resolve('electron-builder/cli.js')
     const packageExit = await run(
-      [
-        builderCli,
-        '--config',
-        configPath,
-        options.platform === 'darwin' ? '--mac' : '--win',
-        `--${options.arch}`,
-        '--publish',
-        'never',
-        ...(options.directoryOnly ? ['--dir'] : []),
-      ],
+      distributionBuilderArguments(options, builderCli, configPath),
       15 * 60_000,
       { executable: process.execPath, cwd: desktop, env: environment },
     )
