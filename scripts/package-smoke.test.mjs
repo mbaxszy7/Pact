@@ -121,6 +121,62 @@ await test('UI packaged smoke needs no model files, isolates both phases and rem
   await assert.rejects(stat(root), { code: 'ENOENT' })
 })
 
+await test('default smoke admission projects a busy runner host before enforcing the isolated environment bound', async (context) => {
+  context.mock.method(console, 'log', () => {})
+  const original = process.env
+  const calls = []
+  try {
+    process.env = {
+      ...original,
+      ...Object.fromEntries(
+        Array.from({ length: 129 }, (_, index) => [
+          `PACT_UNRELATED_RUNNER_${index}`,
+          'synthetic-host-only',
+        ]),
+      ),
+      ANTHROPIC_AUTH_TOKEN: 'synthetic-host-auth-canary',
+    }
+    await main({ executable: '/synthetic/Pact', spawnProcess: simulatedSpawn(calls) })
+    assert.equal(calls.length, 2)
+    for (const call of calls) {
+      assert.equal(call.options.env.ANTHROPIC_AUTH_TOKEN, undefined)
+      assert(
+        Object.keys(call.options.env).every((key) => !key.startsWith('PACT_UNRELATED_RUNNER_')),
+      )
+    }
+  } finally {
+    process.env = original
+  }
+})
+
+await test('an explicitly oversized environment still fails closed and exports only its fixed category', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'pact-smoke-env-report-'))
+  const reportPath = join(directory, 'failure.json')
+  const secret = 'synthetic-unpublished-runner-secret'
+  try {
+    await assert.rejects(
+      main({
+        executable: '/synthetic/Pact',
+        reportPath,
+        sourceEnvironment: Object.fromEntries(
+          Array.from({ length: 129 }, (_, index) => [`EXPLICIT_${index}`, secret]),
+        ),
+        spawnProcess: simulatedSpawn([]),
+      }),
+      /input environment exceeds/,
+    )
+    const bytes = await readFile(reportPath, 'utf8')
+    const report = JSON.parse(bytes)
+    assert.equal(report.status, 'blocked')
+    assert.equal(report.environmentFailure, 'HOST_ENVIRONMENT_BOUNDS')
+    assert.equal(report.failurePhase, 'environment')
+    assert.equal(report.processes.length, 0)
+    assert(!bytes.includes(secret))
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 await test('a zero exit without the package PASS marker fails and does not start verify', async () => {
   const calls = []
   await assert.rejects(

@@ -10,6 +10,7 @@ import {
   prepareProviderEnvironment,
 } from '../tests/e2e/provider-environment.ts'
 import { applicationContent, hashFile } from './build-distribution.mjs'
+import { ciEnvironment } from './ci.mjs'
 import { run } from './run-e2e.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
@@ -486,6 +487,14 @@ export function packageSmokeFailureReport(facts) {
           : facts.timedOut === true
             ? 'EXECUTION_TIMED_OUT'
             : 'VERIFICATION_FAILED',
+    ...([
+      'HOST_ENVIRONMENT_BOUNDS',
+      'OWNED_DIRECTORY_IDENTITY',
+      'FILESYSTEM_ACCESS',
+      'ENVIRONMENT_PREPARATION',
+    ].includes(facts.environmentFailure)
+      ? { environmentFailure: facts.environmentFailure }
+      : {}),
     processes,
     processReleaseVerified,
     installationCleanupVerified: facts.installationCleanupVerified === true,
@@ -834,6 +843,14 @@ async function performPackagedSmoke(
 
 /** The existing smoke owner publishes failure facts only after its cleanup attempt. */
 export async function main(options = {}) {
+  // The host may have hundreds of unrelated runner variables. Admit only the existing
+  // bounded system/CLI allowlist; explicit library environments keep their strict validation.
+  if (options.sourceEnvironment === undefined) {
+    const environment = ciEnvironment(process.env)
+    if (process.env.PACT_E2E_ENV_DIR !== undefined)
+      environment.PACT_E2E_ENV_DIR = process.env.PACT_E2E_ENV_DIR
+    options = { ...options, sourceEnvironment: environment }
+  }
   if (options.reportPath) {
     const path = resolvePath(options.reportPath)
     if (Buffer.byteLength(path) > 4096 || /[\r\n\0]/u.test(path))
@@ -857,6 +874,18 @@ export async function main(options = {}) {
   try {
     return await performPackagedSmoke(options, facts)
   } catch (error) {
+    if (facts.phase === 'environment') {
+      facts.environmentFailure =
+        error?.message ===
+        'E2E provider configuration: input environment exceeds 128 entries or 64 KiB'
+          ? 'HOST_ENVIRONMENT_BOUNDS'
+          : error?.message ===
+              'E2E provider configuration: owned directory resolves through a symlink or is not a directory'
+            ? 'OWNED_DIRECTORY_IDENTITY'
+            : ['EACCES', 'EPERM'].includes(error?.code)
+              ? 'FILESYSTEM_ACCESS'
+              : 'ENVIRONMENT_PREPARATION'
+    }
     if (error.packageSmokeOutcome === 'interrupted') facts.interrupted = true
     if (error.packageSmokeOutcome === 'timed-out') facts.timedOut = true
     if (options.reportPath) {
