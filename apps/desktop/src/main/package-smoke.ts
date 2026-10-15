@@ -4,7 +4,11 @@ import { lstat, mkdtemp, open, readFile, realpath, rm, writeFile } from 'node:fs
 import { dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { Worker } from 'node:worker_threads'
 
-import { collaborationMarkdownPageSchema } from '@pact/contracts'
+import {
+  collaborationMarkdownPageSchema,
+  sqliteFinalSchema,
+  type SqliteFinal,
+} from '@pact/contracts'
 import { imageCodecResultSchema } from '@pact/contracts/images'
 
 import type { AppearanceController } from './modules/appearance/controller'
@@ -20,16 +24,31 @@ const PACKAGE_SMOKE_ENV = 'PACT_PACKAGE_SMOKE'
 const PACKAGE_SMOKE_PHASE_ENV = 'PACT_PACKAGE_SMOKE_PHASE'
 const PACKAGE_SMOKE_USER_DATA_ENV = 'PACT_PACKAGE_SMOKE_USER_DATA'
 const PACKAGE_SMOKE_TIMEOUT_MS = 10_000
-let soakInspection: { receipt: string; nonce: string; port: number } | undefined
+let soakInspection:
+  | {
+      receipt: string
+      nonce: string
+      port: number
+      root: string
+      rootDevice: bigint
+      rootInode: bigint
+      parentDevice: bigint
+      parentInode: bigint
+      finalWork?: Promise<void>
+      startupReceipt?: string
+    }
+  | undefined
 let soakStopTimer: NodeJS.Timeout | undefined
 let soakStopTask: Promise<void> | undefined
 let soakDisposed = false
 
 export async function disposePackagedSoakInspection(): Promise<void> {
+  const finalAtDisposal = soakInspection?.finalWork
   soakDisposed = true
   if (soakStopTimer) clearInterval(soakStopTimer)
   soakStopTimer = undefined
   await soakStopTask
+  await finalAtDisposal?.catch(() => undefined)
 }
 
 async function readPackagedSoakStop(): Promise<void> {
@@ -106,11 +125,12 @@ export function configurePackagedSoakInspection(): void {
       'Packaged soak requires an owned root and complete, bounded inspection identity.',
     )
   const canonicalRoot = realpathSync(root)
-  const rootStat = lstatSync(canonicalRoot)
+  const rootStat = lstatSync(canonicalRoot, { bigint: true })
   if (
     !rootStat.isDirectory() ||
     (process.platform !== 'win32' &&
-      ((rootStat.mode & 0o077) !== 0 || (process.getuid && rootStat.uid !== process.getuid())))
+      ((rootStat.mode & 0o077n) !== 0n ||
+        (process.getuid && rootStat.uid !== BigInt(process.getuid()))))
   )
     throw new Error('Packaged soak root must be a private directory owned by this process user.')
   const parent = dirname(receipt)
@@ -134,7 +154,19 @@ export function configurePackagedSoakInspection(): void {
     throw new Error('Packaged soak requires a valid loopback inspection port.')
   if (app.isReady())
     throw new Error('Packaged soak inspection must be configured before Electron readiness.')
-  soakInspection = { receipt, nonce, port }
+  const parentStat = lstatSync(parent, { bigint: true })
+  if (!parentStat.isDirectory() || parentStat.isSymbolicLink())
+    throw new Error('Packaged soak parent identity is invalid.')
+  soakInspection = {
+    receipt,
+    nonce,
+    port,
+    root: canonicalRoot,
+    rootDevice: rootStat.dev,
+    rootInode: rootStat.ino,
+    parentDevice: parentStat.dev,
+    parentInode: parentStat.ino,
+  }
   app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1')
   app.commandLine.appendSwitch('remote-debugging-port', String(port))
 }
@@ -195,7 +227,7 @@ export async function writePackagedSoakReceipt(
     url,
   }
   const bytes = JSON.stringify(receipt)
-  if (Buffer.byteLength(bytes) > 4096)
+  if (Buffer.byteLength(`${bytes}\n`) > 4096)
     throw new Error('Packaged soak receipt exceeds its byte bound.')
   const controller = new AbortController()
   const deadline = setTimeout(() => controller.abort(), 5000)
@@ -205,6 +237,7 @@ export async function writePackagedSoakReceipt(
       mode: 0o600,
       signal: controller.signal,
     })
+    soakInspection.startupReceipt = `${bytes}\n`
   } finally {
     clearTimeout(deadline)
   }
@@ -214,6 +247,173 @@ export async function writePackagedSoakReceipt(
       soakStopTask = undefined
     })
   }, 250)
+}
+
+/** The existing fixture owner seals a separate private receipt after the Utility closes storage. */
+export async function writePackagedSoakSqliteFinal(final: SqliteFinal | undefined): Promise<void> {
+  const inspection = soakInspection
+  if (!inspection) return
+  const parsed = sqliteFinalSchema.safeParse(final)
+  if (!parsed.success || !inspection.startupReceipt || inspection.finalWork)
+    throw new Error('Packaged soak final SQLite receipt could not be written.')
+  const controller = new AbortController()
+  let deadline: NodeJS.Timeout | undefined
+  const parent = dirname(inspection.receipt)
+  const checkParent = async (): Promise<void> => {
+    controller.signal.throwIfAborted()
+    const root = await lstat(inspection.root, { bigint: true })
+    controller.signal.throwIfAborted()
+    const parentInfo = await lstat(parent, { bigint: true })
+    controller.signal.throwIfAborted()
+    const canonicalRoot = await realpath(inspection.root)
+    controller.signal.throwIfAborted()
+    const canonicalParent = await realpath(parent)
+    controller.signal.throwIfAborted()
+    if (
+      !root.isDirectory() ||
+      root.isSymbolicLink() ||
+      root.dev !== inspection.rootDevice ||
+      root.ino !== inspection.rootInode ||
+      !parentInfo.isDirectory() ||
+      parentInfo.isSymbolicLink() ||
+      parentInfo.dev !== inspection.parentDevice ||
+      parentInfo.ino !== inspection.parentInode ||
+      canonicalRoot !== inspection.root ||
+      canonicalParent !== resolvePath(parent) ||
+      (process.platform !== 'win32' &&
+        ((root.mode & 0o077n) !== 0n || (process.getuid && root.uid !== BigInt(process.getuid()))))
+    )
+      throw new Error('Private receipt directory identity changed')
+  }
+  const work = (async () => {
+    await checkParent()
+    const startupInfo = await lstat(inspection.receipt, { bigint: true })
+    controller.signal.throwIfAborted()
+    if (
+      !startupInfo.isFile() ||
+      startupInfo.isSymbolicLink() ||
+      startupInfo.nlink !== 1n ||
+      startupInfo.size > 4096n
+    )
+      throw new Error('Startup receipt identity invalid')
+    const startup = await open(
+      inspection.receipt,
+      constants.O_RDONLY | (process.platform === 'win32' ? 0 : constants.O_NOFOLLOW),
+    )
+    try {
+      controller.signal.throwIfAborted()
+      const info = await startup.stat({ bigint: true })
+      controller.signal.throwIfAborted()
+      if (
+        info.dev !== startupInfo.dev ||
+        info.ino !== startupInfo.ino ||
+        info.nlink !== 1n ||
+        !info.isFile()
+      )
+        throw new Error('Startup receipt descriptor identity invalid')
+      const contents = Buffer.alloc(4097)
+      const { bytesRead } = await startup.read(contents, 0, contents.length, 0)
+      controller.signal.throwIfAborted()
+      if (
+        bytesRead > 4096 ||
+        contents.subarray(0, bytesRead).toString('utf8') !== inspection.startupReceipt
+      )
+        throw new Error('Startup receipt contents changed')
+    } finally {
+      await startup.close()
+    }
+    controller.signal.throwIfAborted()
+    const identity = readProductIdentity()
+    const startupIdentity: unknown = JSON.parse(inspection.startupReceipt)
+    if (
+      !startupIdentity ||
+      typeof startupIdentity !== 'object' ||
+      Reflect.get(startupIdentity, 'nonce') !== inspection.nonce ||
+      Reflect.get(startupIdentity, 'mainPid') !== process.pid ||
+      Reflect.get(startupIdentity, 'sourceSha') !== identity.sourceSha ||
+      Reflect.get(startupIdentity, 'version') !== identity.version ||
+      Reflect.get(startupIdentity, 'channel') !== identity.channel ||
+      Reflect.get(startupIdentity, 'platform') !== process.platform ||
+      Reflect.get(startupIdentity, 'arch') !== process.arch
+    )
+      throw new Error('Final application identity changed')
+    const bytes =
+      JSON.stringify({
+        schemaVersion: 1,
+        nonce: inspection.nonce,
+        mainPid: process.pid,
+        utilityPid: parsed.data.observerPid,
+        sourceSha: identity.sourceSha,
+        version: identity.version,
+        channel: identity.channel,
+        platform: process.platform,
+        arch: process.arch,
+        sqliteFinal: parsed.data,
+      }) + '\n'
+    if (Buffer.byteLength(bytes) > 32 * 1024) throw new Error('Final receipt byte limit')
+    await checkParent()
+    const file = inspection.receipt + '.sqlite-final'
+    const handle = await open(
+      file,
+      constants.O_WRONLY |
+        constants.O_CREAT |
+        constants.O_EXCL |
+        (process.platform === 'win32' ? 0 : constants.O_NOFOLLOW),
+      0o600,
+    )
+    try {
+      controller.signal.throwIfAborted()
+      const descriptor = await handle.stat({ bigint: true })
+      await checkParent()
+      const current = await lstat(file, { bigint: true })
+      controller.signal.throwIfAborted()
+      if (
+        !descriptor.isFile() ||
+        descriptor.nlink !== 1n ||
+        !current.isFile() ||
+        current.isSymbolicLink() ||
+        current.dev !== descriptor.dev ||
+        current.ino !== descriptor.ino ||
+        current.nlink !== 1n
+      )
+        throw new Error('Final receipt descriptor identity invalid')
+      // A late path replacement cannot redirect this already verified descriptor.
+      await handle.writeFile(bytes, { signal: controller.signal })
+      controller.signal.throwIfAborted()
+      const written = await handle.stat({ bigint: true })
+      await checkParent()
+      const published = await lstat(file, { bigint: true })
+      controller.signal.throwIfAborted()
+      if (
+        written.size !== BigInt(Buffer.byteLength(bytes)) ||
+        published.dev !== written.dev ||
+        published.ino !== written.ino ||
+        published.nlink !== 1n
+      )
+        throw new Error('Final receipt publication identity changed')
+    } finally {
+      await handle.close()
+    }
+  })()
+  // Timeout is a bounded failure wait, not a claim of physical file-operation
+  // release. The one operation stays owned until its finally closes the handles.
+  inspection.finalWork = work
+  void work.catch(() => undefined)
+  try {
+    await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        deadline = setTimeout(() => {
+          controller.abort()
+          reject(new Error('Final receipt deadline'))
+        }, 5000)
+      }),
+    ])
+  } catch {
+    throw new Error('Packaged soak final SQLite receipt could not be written.')
+  } finally {
+    clearTimeout(deadline)
+  }
 }
 
 export function isPackagedSoakInspection(): boolean {

@@ -25,6 +25,7 @@ import {
   isPackagedSoakInspection,
   observePackagedPageLoad,
   writePackagedSoakReceipt,
+  writePackagedSoakSqliteFinal,
 } from './package-smoke'
 import { configureProductIdentity, readProductIdentity } from './product-identity'
 import { createRendererTrust } from './renderer-trust'
@@ -227,18 +228,48 @@ app.on('before-quit', (event) => {
   applicationMenu?.dispose()
   removeDesktopModules?.()
   appearanceSettings?.dispose()
+  let fixtureShutdownFailed = false
   void utilityClient
     .shutdown()
-    .then((result) => {
+    .then(async (result) => {
       if (!result.ok) console.error('Pact shutdown was not acknowledged:', result.error.code)
+      try {
+        await writePackagedSoakSqliteFinal(result.sqliteFinal)
+      } catch {
+        fixtureShutdownFailed = true
+        console.error('Pact could not seal its packaged SQLite observation.')
+      }
+      if (!result.ok && isPackagedSoakInspection()) fixtureShutdownFailed = true
+      if (
+        isPackagedSoakInspection() &&
+        (!result.sqliteFinal?.databaseClosed ||
+          !result.sqliteFinal.writerClosed ||
+          !result.sqliteFinal.collectionDisposed)
+      )
+        fixtureShutdownFailed = true
       return undefined
+    })
+    .catch(() => {
+      fixtureShutdownFailed = isPackagedSoakInspection()
+      console.error('Pact shutdown acknowledgement could not be read.')
     })
     // oxlint-disable-next-line typescript/no-misused-promises -- Promise.finally awaits the bounded diagnostic flush before quitting.
     .finally(async () => {
-      await inspectionClosed
-      await diagnostics?.close()
+      try {
+        await inspectionClosed
+      } catch {
+        fixtureShutdownFailed = isPackagedSoakInspection()
+        console.error('Pact could not close its packaged inspection.')
+      }
+      try {
+        await diagnostics?.close()
+      } catch {
+        fixtureShutdownFailed = isPackagedSoakInspection()
+        console.error('Pact could not close its diagnostics.')
+      }
       quitReady = true
-      app.quit()
+      if (fixtureShutdownFailed) app.exit(1)
+      else app.quit()
     })
 })
 

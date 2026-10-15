@@ -94,6 +94,22 @@ afterEach(() => {
 })
 
 describe('Preload logical IPC observation at named bridge seams', () => {
+  it.each([false, true])(
+    'transfers an optional typed SQLite ACK without changing ordinary health arguments (measurement %s)',
+    async (measure) => {
+      const { bridge } = await load(measure)
+      await bridge.getRuntimeHealth()
+      expect(harness.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.runtimeHealth)
+      const input = {
+        sqlitePlans: {
+          ack: { observerEpoch: epoch, pageSequence: 1, payloadDigest: 'a'.repeat(64) },
+        },
+      }
+      await bridge.getRuntimeHealth(input)
+      expect(harness.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.runtimeHealth, input)
+    },
+  )
+
   it('accepts current typed local observations and rejects older units without generic IPC', async () => {
     const { bridge } = await load(true)
     const observe: unknown = Reflect.get(bridge, 'observeMonacoWorkerTraffic')

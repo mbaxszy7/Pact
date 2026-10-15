@@ -23,6 +23,9 @@ import {
   resourceReportProjection,
   installReactCommitProbe,
   reactCommitObservationComplete,
+  sqlitePlanPagePayload,
+  validateSqliteFinalReceipt,
+  validateSqliteSpoolFrame,
 } from './soak-statistics.mjs'
 
 const exec = promisify(execFile)
@@ -30,16 +33,35 @@ const pause = (milliseconds) => new Promise((done) => setTimeout(done, milliseco
 const migrationsFolder = resolve(import.meta.dirname, '../packages/persistence/drizzle')
 
 async function boundedJson(path, limit = 4096) {
+  const before = await lstat(path)
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > limit)
+    throw new Error('Unsafe private observation record')
   const descriptor = await open(
     path,
     constants.O_RDONLY | (process.platform === 'win32' ? 0 : constants.O_NOFOLLOW),
   )
   try {
     const info = await descriptor.stat()
-    if (!info.isFile() || info.size > limit) throw new Error('Unsafe private observation record')
+    if (
+      !info.isFile() ||
+      info.nlink !== 1 ||
+      info.dev !== before.dev ||
+      info.ino !== before.ino ||
+      info.size > limit
+    )
+      throw new Error('Unsafe private observation record')
     const buffer = Buffer.alloc(limit + 1),
       { bytesRead } = await descriptor.read(buffer, 0, buffer.length, 0)
     if (bytesRead > limit) throw new Error('Private observation record grew beyond its bound')
+    const after = await lstat(path)
+    if (
+      !after.isFile() ||
+      after.isSymbolicLink() ||
+      after.nlink !== 1 ||
+      after.dev !== info.dev ||
+      after.ino !== info.ino
+    )
+      throw new Error('Private observation record identity changed')
     return JSON.parse(buffer.subarray(0, bytesRead).toString('utf8'))
   } finally {
     await descriptor.close()
@@ -524,8 +546,26 @@ async function main() {
   )
   settings.dataRoot = await realpath(settings.dataRoot)
   const seeded = await seed(settings.dataRoot, environment)
-  const resourceProjection = resourceReportProjection()
-  const evidence = {
+  let evidence
+  const ensureEvidenceFits = (candidate) => {
+    // Reserve the fixed shutdown/failure envelope inside the existing report limits.
+    if (
+      Buffer.byteLength(JSON.stringify(candidate)) + 4096 > 768 * 1024 ||
+      Buffer.byteLength(JSON.stringify(candidate, null, 2)) + 4096 > 1024 * 1024
+    )
+      throw Object.assign(new Error('Continuous observation report capacity exhausted'), {
+        code: 'SQLITE_OBSERVATION_REPORT_CAPACITY',
+      })
+  }
+  const resourceProjection = resourceReportProjection({
+    reserve: ({ queryPlans, sqliteObservation }) =>
+      ensureEvidenceFits({
+        ...evidence,
+        sqliteQueryPlanDictionary: queryPlans,
+        sqliteObservation,
+      }),
+  })
+  evidence = {
     durationMs: 0,
     retainedMessages: 1000,
     terminalEnable: histogram(),
@@ -541,6 +581,7 @@ async function main() {
     ],
     resourceSamples: [],
     sqliteQueryPlanDictionary: resourceProjection.queryPlans,
+    sqliteObservation: resourceProjection.sqliteObservation,
     resourceHighWater: {},
     resourceFinal: {},
     ipcTraffic: { observed: false, complete: false },
@@ -608,10 +649,131 @@ async function main() {
       throw new Error('Packaged application launch/receipt/target admission failed')
     }
   }
+  const persistSqlitePage = async (page, deadline) => {
+    const file = join(
+      settings.dataRoot,
+      `sqlite-page-${page.observerEpoch}-${page.pageSequence}.json`,
+    )
+    const observer = resourceProjection.sqliteObservation.epochs.find(
+      (value) => value.observerEpoch === page.observerEpoch,
+    )
+    if (!observer) throw new Error('SQLite page has no admitted process owner')
+    const canonical = validateSqliteSpoolFrame(
+      {
+        schemaVersion: 1,
+        sourceSha: settings.manifest.sourceSha,
+        version: settings.manifest.version,
+        channel: settings.manifest.channel,
+        platform: settings.manifest.platform,
+        arch: settings.manifest.arch,
+        observerPid: observer.observerPid,
+        page: { ...sqlitePlanPagePayload(page), payloadDigest: page.payloadDigest },
+      },
+      settings.manifest,
+    )
+    const bytes = `${JSON.stringify(canonical)}\n`
+    if (Buffer.byteLength(bytes) > 32 * 1024)
+      throw new Error('SQLite page spool exceeds its byte bound')
+    const root = await lstat(settings.dataRoot)
+    if (
+      !root.isDirectory() ||
+      root.isSymbolicLink() ||
+      (await realpath(settings.dataRoot)) !== settings.dataRoot
+    )
+      throw new Error('SQLite page spool root identity changed')
+    const controller = new AbortController(),
+      remaining = deadline - performance.now()
+    if (remaining <= 0) throw new Error('SQLite page spool deadline exceeded')
+    const timer = setTimeout(() => controller.abort(), remaining)
+    try {
+      try {
+        await writeFile(file, bytes, {
+          flag: 'wx',
+          mode: 0o600,
+          flush: true,
+          signal: controller.signal,
+        })
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error
+        // A prior write may have settled without a receipt. Verify it, then flush the same owned file.
+        if (JSON.stringify(await boundedJson(file, 32 * 1024)) !== JSON.stringify(canonical))
+          // oxlint-disable-next-line eslint/preserve-caught-error -- Do not attach a filesystem exception containing the private spool path.
+          throw new Error('SQLite page spool identity conflict')
+        const handle = await open(
+          file,
+          constants.O_RDWR | (process.platform === 'win32' ? 0 : constants.O_NOFOLLOW),
+        )
+        try {
+          await handle.sync()
+        } finally {
+          await handle.close()
+        }
+      }
+      const written = await lstat(file)
+      if (
+        !written.isFile() ||
+        written.isSymbolicLink() ||
+        written.nlink !== 1 ||
+        written.size !== Buffer.byteLength(bytes) ||
+        (await realpath(file)) !== file ||
+        JSON.stringify(await boundedJson(file, 32 * 1024)) !== JSON.stringify(canonical)
+      )
+        throw new Error('SQLite page persistence was not verified')
+      controller.signal.throwIfAborted()
+      return true
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  const drainSqlite = async (application, phase) => {
+    const deadline = performance.now() + 5000
+    try {
+      application.sqliteEpoch = await resourceProjection.drainSqlite({
+        read: (input) =>
+          application.page.evaluate((value) => globalThis.pact.getRuntimeHealth(value), input),
+        persist: (page) => persistSqlitePage(page, deadline),
+        phase,
+        epochIndex: application.sqliteEpoch,
+        deadline,
+      })
+    } finally {
+      // A persistence/ACK failure still leaves this actual process's observed prefix recoverable at seal.
+      if (
+        application.sqliteEpoch === undefined &&
+        resourceProjection.sqliteObservation.epochs.length
+      )
+        application.sqliteEpoch = resourceProjection.sqliteObservation.epochs.length - 1
+    }
+  }
+  const sealSqlite = async (application) => {
+    if (application.sqliteFinalAttempted) return
+    application.sqliteFinalAttempted = true
+    if (!lastState?.groupGone || lastState.ownedProcessCount !== 0)
+      throw new Error('SQLite final receipt requires confirmed physical process exit')
+    const epoch = resourceProjection.sqliteObservation.epochs[application.sqliteEpoch]
+    if (!epoch) throw new Error('SQLite observer was never admitted')
+    const finalPath = `${receiptFile}.sqlite-final`
+    if ((await realpath(finalPath)) !== finalPath)
+      throw new Error('SQLite final receipt path identity changed')
+    const raw = await boundedJson(finalPath, 32 * 1024)
+    const final = validateSqliteFinalReceipt(raw, {
+      nonce: application.nonce,
+      mainPid: application.receipt.mainPid,
+      utilityPid: epoch.observerPid,
+      observerEpoch: epoch.observerEpoch,
+      manifest: settings.manifest,
+    })
+    resourceProjection.sealSqlite(application.sqliteEpoch, final, {
+      physicalGroupGone: true,
+      identityVerified: true,
+    })
+  }
   let active, reactInspection
   try {
     active = await launch()
     const { page, browser } = active
+    stage = 'sqlite-first-admission'
+    await drainSqlite(active, 'admission')
     stage = 'react-commit-inspection'
     reactInspection = await inspectReactCommits(
       page,
@@ -625,11 +787,15 @@ async function main() {
       receiptFile,
       () => lastState?.pid,
     )
+    stage = 'sqlite-after-renderer-reload'
+    await drainSqlite(active, 'after-reload')
     stage = 'select-session'
     await page
       .getByRole('button', { name: 'Soak Session 1', exact: true })
       .click({ timeout: 15_000 })
     await page.getByRole('combobox', { name: 'Message', exact: true }).waitFor({ state: 'visible' })
+    stage = 'sqlite-after-session-selection'
+    await drainSqlite(active, 'after-select-session')
     evidence.reactCommits = await reactInspection.begin()
     await instrument(page)
     const initialHealth = await page.evaluate(() => globalThis.pact.getRuntimeHealth())
@@ -646,7 +812,7 @@ async function main() {
       if (ipcIssues.size > 64) throw new Error('IPC observation issue capacity exceeded')
       const businessBytes = Math.max(0, measured.businessBytes - initialIpc.businessBytes)
       const controlBytes = Math.max(0, measured.controlBytes - initialIpc.controlBytes)
-      evidence.ipcTraffic = {
+      const ipcTraffic = {
         unit: measured.snapshot?.unit,
         observed: measured.observed && initialIpc.observed,
         complete: measured.complete && initialIpc.complete && ipcIssues.size === 0,
@@ -659,6 +825,8 @@ async function main() {
         baseline: initialIpc.snapshot,
         snapshot: measured.snapshot,
       }
+      ensureEvidenceFits({ ...evidence, ipcTraffic })
+      evidence.ipcTraffic = ipcTraffic
       if (
         !evidence.ipcTraffic.complete &&
         !evidence.missingObservations.includes('ipc-traffic-observation-incomplete')
@@ -688,6 +856,9 @@ async function main() {
             throw new Error('Current conversation could not be read')
           return result.value.header.latestRun?.id ?? null
         }, seeded.sessionIds[index])
+        stage = 'sqlite-before-send'
+        await drainSqlite(active, 'before-send')
+        stage = 'deterministic-turn'
         await composer.press('Enter')
         nextTurn = performance.now() + 60_000
         await page.waitForFunction(
@@ -706,6 +877,8 @@ async function main() {
       } else {
         await composer.fill('')
       }
+      stage = 'sqlite-after-workload-cycle'
+      await drainSqlite(active, 'after-workload-cycle')
       const file = iteration % 2 === 0 ? 'soak.json' : 'soak.ts'
       stage = 'file-preview'
       await page.getByRole('button', { name: file, exact: true }).last().click({ timeout: 15_000 })
@@ -747,12 +920,17 @@ async function main() {
           if (!evidence.missingObservations.includes('per-process-rss-cpu'))
             evidence.missingObservations.push('per-process-rss-cpu')
         }
-        evidence.resourceSamples.push({
+        const resourceSnapshot = {
           elapsedMs: Math.floor(performance.now() - started),
           ...(processes ? { processes } : {}),
           conversation: health.value.conversation,
           ...(performanceHealth ? { utility: resourceProjection.project(performanceHealth) } : {}),
+        }
+        ensureEvidenceFits({
+          ...evidence,
+          resourceSamples: [...evidence.resourceSamples, resourceSnapshot],
         })
+        evidence.resourceSamples.push(resourceSnapshot)
       }
       iteration++
       await pause(Math.min(5000, Math.max(1, settings.durationMs - (performance.now() - started))))
@@ -764,13 +942,15 @@ async function main() {
       value.stop()
       return value.state
     })
-    Object.assign(evidence, {
+    const rendererObservation = {
       inputPaint: renderer.inputPaint,
       rendererEventLoop: renderer.rendererEventLoop,
       frameIntervals: renderer.frames,
       sustainedLongTasks: renderer.sustainedLongTasks,
       unexplainedLongTasksOver200Ms: renderer.unexplainedLongTasksOver200Ms,
-    })
+    }
+    ensureEvidenceFits({ ...evidence, ...rendererObservation })
+    Object.assign(evidence, rendererObservation)
     evidence.reactCommits = await reactInspection.stop()
     if (reactCommitObservationComplete(evidence.reactCommits))
       evidence.missingObservations = evidence.missingObservations.filter(
@@ -798,7 +978,8 @@ async function main() {
     evidence.resourceFinal = final.value.conversation ?? {}
     if (!final.value.performance || final.value.performance.eventLoopSamples < 100)
       evidence.missingObservations.push('complete-utility-event-loop-sampling')
-    if (!final.value.performance?.sqlite?.queryPlans?.length)
+    await drainSqlite(active, 'before-shutdown')
+    if (!resourceProjection.queryPlans.length)
       evidence.missingObservations.push('representative-sqlite-query-plans')
     const recoveryPage = async (currentPage) =>
       currentPage.evaluate(async (sessionId) => {
@@ -827,10 +1008,17 @@ async function main() {
     await stopReceipt(receiptFile, active.nonce, active.receipt.mainPid)
     const firstCode = await active.completion
     await browser.close().catch(() => undefined)
+    await sealSqlite(active)
     if (firstCode !== 0 || !lastState?.groupGone || lastState.ownedProcessCount !== 0)
       throw new Error('First packaged process tree did not release naturally')
-    await Promise.all([rm(receiptFile), rm(`${receiptFile}.stop`)])
+    await Promise.all([
+      rm(receiptFile),
+      rm(`${receiptFile}.stop`),
+      rm(`${receiptFile}.sqlite-final`),
+    ])
     active = await launch()
+    stage = 'sqlite-cold-admission'
+    await drainSqlite(active, 'cold-admission')
     stage = 'cold-restart'
     await active.page
       .getByRole('button', { name: `Soak Session ${lastTurnSession + 1}`, exact: true })
@@ -852,10 +1040,13 @@ async function main() {
         (key) => JSON.stringify(beforeRecovery[key]) !== JSON.stringify(afterRecovery[key]),
       ),
     }
+    stage = 'sqlite-cold-before-shutdown'
+    await drainSqlite(active, 'cold-before-shutdown')
     stage = 'final-shutdown'
     await stopReceipt(receiptFile, active.nonce, active.receipt.mainPid)
     const finalCode = await active.completion
     await active.browser.close().catch(() => undefined)
+    await sealSqlite(active)
     evidence.cleanupVerified =
       finalCode === 0 && lastState?.groupGone === true && lastState.ownedProcessCount === 0
     evidence.ownedProcessHighWater = ownedHighWater
@@ -896,6 +1087,14 @@ async function main() {
       await active.completion.catch(() => undefined)
     }
     await active?.browser.close().catch(() => undefined)
+    if (active && !active.sqliteFinalAttempted) {
+      try {
+        await sealSqlite(active)
+      } catch {
+        failure ??= 'SQLite final observation could not be verified'
+        evidence.sqliteFinalFailure = true
+      }
+    }
     evidence.cleanupVerified = lastState?.groupGone === true && lastState.ownedProcessCount === 0
     evidence.ownedProcessHighWater = ownedHighWater
     evidence.ownedProcessFinal = lastState?.ownedProcessCount ?? null
@@ -904,7 +1103,7 @@ async function main() {
     if (Buffer.byteLength(JSON.stringify(evidence)) > 768 * 1024) {
       failure = 'Continuous observation report exceeded its byte bound'
       evidence.failure = failure
-      evidence.resourceSamples = []
+      // Preserve the previously charged evidence prefix; never erase samples for a passing size.
       evidence.missingObservations.push('resource-snapshot-byte-overflow')
     }
     await writeFile(settings.observation, JSON.stringify(evidence), { flag: 'wx', mode: 0o600 })

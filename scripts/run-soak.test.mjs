@@ -1,5 +1,10 @@
+/* oxlint-disable eslint/no-await-in-loop -- Protocol cases deliberately preserve ordered page, ACK, epoch and final transitions through the primary owner. */
 import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { test } from 'node:test'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import { createContext, runInContext } from 'node:vm'
 
 import {
@@ -11,6 +16,10 @@ import {
   resourceReportProjection,
   installReactCommitProbe,
   reactCommitObservationComplete,
+  completeSqliteObservation,
+  validateSqliteFinalReceipt,
+  validateSqliteSpoolFrame,
+  recoverSqlitePages,
 } from './soak-statistics.mjs'
 
 const reactProbeKey = '__pactSoakReact_' + 'a'.repeat(64)
@@ -347,47 +356,707 @@ void test('React probe installs only in the exact top trusted document and bound
   assert.equal(reactCommitObservationComplete(measured), false)
 })
 
-void test('two-hour resource samples preserve exact plans and counters inside the report byte bound', () => {
-  const projection = resourceReportProjection()
-  const plans = Array.from({ length: 64 }, (_, index) => ({
-    sqlSha256: index.toString(16).padStart(64, '0'),
-    details: ['SEARCH owned_fixture USING INDEX owned_fixture_id ' + 'x'.repeat(150)],
-  }))
-  const samples = Array.from({ length: 240 }, (_, index) =>
-    projection.project({
+const sqliteEpoch = (index) => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`
+function sqliteRecord(
+  sequence,
+  schemaVersion = 1,
+  details = ['SEARCH owned_fixture USING INDEX owned_fixture_id'],
+) {
+  return {
+    recordSequence: sequence,
+    schemaVersion,
+    sqlSha256: sequence.toString(16).padStart(64, '0'),
+    details,
+  }
+}
+function sqlLedger(epoch = sqliteEpoch(1), initial = [sqliteRecord(1)]) {
+  const records = [...initial]
+  let acknowledgedThrough = 0,
+    pageSequence = 0,
+    page,
+    lastAck,
+    loseBefore = false,
+    loseAfter = false
+  const persisted = new Set(),
+    calls = []
+  const counters = (closed = false) => ({
+    operations: records.length + 100,
+    transactions: 0,
+    rowsReturned: records.length,
+    totalMs: records.length,
+    maxMs: records.length ? 1 : 0,
+    planOverflow: false,
+    unsupportedOperations: false,
+    retainedPlanBytes: closed ? 0 : Math.min(records.length, 64) * 100,
+    highWaterPlanBytes: 15360,
+    highWaterPlans: 64,
+    unacknowledgedPlans: closed ? 0 : records.length - acknowledgedThrough,
+    unacknowledgedHighWaterPlans: 64,
+    recordWatermark: records.length,
+  })
+  const read = async (input) => {
+    const ack = input.sqlitePlans.ack
+    calls.push(ack ? 'ack' : 'read')
+    if (ack) {
+      assert(persisted.has(ack.payloadDigest), 'ACK must follow confirmed persistence')
+      if (loseBefore) {
+        loseBefore = false
+        throw new Error('unconfirmed transport before delivery')
+      }
+      if (JSON.stringify(ack) !== JSON.stringify(lastAck)) {
+        assert.equal(ack.observerEpoch, epoch)
+        assert.equal(ack.pageSequence, page.pageSequence)
+        assert.equal(ack.payloadDigest, page.payloadDigest)
+        acknowledgedThrough = page.lastRecordSequence
+        lastAck = structuredClone(ack)
+        page = undefined
+      }
+      if (loseAfter) {
+        loseAfter = false
+        throw new Error('unconfirmed transport after delivery')
+      }
+    }
+    if (!page && records.length > acknowledgedThrough) {
+      const payload = {
+        observerEpoch: epoch,
+        pageSequence: ++pageSequence,
+        firstRecordSequence: acknowledgedThrough + 1,
+        lastRecordSequence: records.length,
+        operationWatermark: records.length + 100,
+        recordWatermark: records.length,
+        records: records.slice(acknowledgedThrough),
+      }
+      page = {
+        ...payload,
+        payloadDigest: createHash('sha256').update(JSON.stringify(payload)).digest('hex'),
+      }
+    }
+    return {
+      ok: true,
+      value: {
+        status: 'ready',
+        database: 'ready',
+        pid: 41000 + Number(epoch.slice(-2)),
+        performance: {
+          sqlite: {
+            ...counters(),
+            queryPlans: records
+              .slice(-64)
+              .map(({ sqlSha256, details }) => ({ sqlSha256, details })),
+            planTransfer: {
+              observerEpoch: epoch,
+              recordWatermark: records.length,
+              acknowledgedThrough,
+              ...(lastAck ? { lastAck } : {}),
+              ...(page ? { page: structuredClone(page) } : {}),
+            },
+          },
+        },
+      },
+    }
+  }
+  return {
+    records,
+    persisted,
+    calls,
+    read,
+    loseNextAckBeforeDelivery: () => {
+      loseBefore = true
+    },
+    loseNextAckAfterDelivery: () => {
+      loseAfter = true
+    },
+    persist: async (savedPage) => {
+      persisted.add(savedPage.payloadDigest)
+      return true
+    },
+    final: () => ({
+      schemaVersion: 1,
+      scope: 'post-open-native-run-get-all-and-drizzle-transaction-attempts-v1',
+      observerEpoch: epoch,
+      observerPid: 41000 + Number(epoch.slice(-2)),
+      recordWatermark: records.length,
+      acknowledgedThrough,
+      pageSequence,
+      ...(lastAck ? { lastAck } : {}),
+      tailRecords: records.slice(acknowledgedThrough),
+      counters: counters(true),
+      databaseClosed: true,
+      writerClosed: true,
+      collectionDisposed: true,
+    }),
+  }
+}
+async function completeSqliteFixture() {
+  const archive = resourceReportProjection()
+  for (let index = 1; index <= 2; index++) {
+    const ledger = sqlLedger(sqliteEpoch(index), [sqliteRecord(1), sqliteRecord(2)])
+    const epochIndex = await archive.drainSqlite({
+      read: ledger.read,
+      persist: ledger.persist,
+      phase: index === 1 ? 'before-send' : 'cold-admission',
+    })
+    archive.sealSqlite(epochIndex, ledger.final(), {
+      physicalGroupGone: true,
+      identityVerified: true,
+    })
+  }
+  return {
+    sqliteQueryPlanDictionary: archive.queryPlans,
+    sqliteObservation: archive.sqliteObservation,
+  }
+}
+
+void test('SQLite pages survive lost ACKs only after checking the current prefix/frozen page or lastAck', async () => {
+  for (const mode of ['before', 'after']) {
+    const archive = resourceReportProjection(),
+      ledger = sqlLedger()
+    if (mode === 'before') ledger.loseNextAckBeforeDelivery()
+    else ledger.loseNextAckAfterDelivery()
+    let writes = 0
+    const index = await archive.drainSqlite({
+      read: ledger.read,
+      persist: async (page) => {
+        writes++
+        return ledger.persist(page)
+      },
+      phase: 'before-send',
+    })
+    assert.equal(writes, 1)
+    assert.deepEqual(
+      ledger.calls,
+      mode === 'before' ? ['read', 'ack', 'read', 'ack'] : ['read', 'ack', 'read'],
+    )
+    assert.equal(archive.sqliteObservation.epochs[index].acknowledgedThrough, 1)
+    archive.sealSqlite(index, ledger.final(), { physicalGroupGone: true, identityVerified: true })
+  }
+})
+
+void test('SQLite archive preserves schema-aware records beyond 64 total plans within the same dictionary byte bound', async () => {
+  const archive = resourceReportProjection(),
+    ledger = sqlLedger(
+      sqliteEpoch(1),
+      Array.from({ length: 40 }, (_, index) => sqliteRecord(index + 1)),
+    )
+  const index = await archive.drainSqlite({
+    read: ledger.read,
+    persist: ledger.persist,
+    phase: 'before-send',
+  })
+  ledger.records.push(...Array.from({ length: 40 }, (_, offset) => sqliteRecord(offset + 41)))
+  await archive.drainSqlite({
+    read: ledger.read,
+    persist: ledger.persist,
+    phase: 'after-workload-cycle',
+    epochIndex: index,
+  })
+  ledger.records.push({ ...sqliteRecord(81, 2), sqlSha256: sqliteRecord(1).sqlSha256 })
+  await archive.drainSqlite({
+    read: ledger.read,
+    persist: ledger.persist,
+    phase: 'before-shutdown',
+    epochIndex: index,
+  })
+  assert.equal(archive.queryPlans.length, 81)
+  assert.equal(archive.queryPlans.at(-1).schemaVersion, 2)
+  assert.equal(archive.queryPlans[0].sqlSha256, archive.queryPlans.at(-1).sqlSha256)
+  assert.equal(archive.sqliteObservation.epochs[index].savedThrough, 81)
+  const samples = Array.from({ length: 240 }, (_, offset) =>
+    archive.project({
       eventLoopLagP95Ms: 12,
-      sqlite: { operations: index, planOverflow: false, queryPlans: plans },
+      sqlite: {
+        operations: offset,
+        planOverflow: false,
+        queryPlans: ledger.records
+          .slice(-64)
+          .map(({ sqlSha256, details }) => ({ sqlSha256, details })),
+      },
     }),
   )
-  for (const [index, sample] of samples.entries()) {
-    assert.equal(sample.sqlite.operations, index)
-    assert.deepEqual(
-      sample.sqlite.queryPlanIndices.map((id) => projection.queryPlans[id]),
-      plans,
-    )
-  }
-  assert.equal(projection.queryPlans.length, 64)
+  assert(
+    samples.every(
+      (sample, offset) =>
+        sample.sqlite.operations === offset && sample.sqlite.retainedPlanCount === 64,
+    ),
+  )
   assert(
     Buffer.byteLength(
-      JSON.stringify({ samples, sqliteQueryPlanDictionary: projection.queryPlans }),
+      JSON.stringify({
+        samples,
+        sqliteQueryPlanDictionary: archive.queryPlans,
+        sqliteObservation: archive.sqliteObservation,
+      }),
     ) <
       768 * 1024,
   )
   assert.throws(
-    () =>
-      projection.project({
-        sqlite: { queryPlans: [{ sqlSha256: 'f'.repeat(64), details: ['different'] }] },
-      }),
-    /dictionary/,
-  )
-  assert.throws(
-    () =>
-      resourceReportProjection().project({
-        sqlite: { queryPlans: [{ sqlSha256: 'bad', details: [] }] },
-      }),
+    () => archive.project({ sqlite: { queryPlans: [{ sqlSha256: 'bad', details: [] }] } }),
     /Invalid/,
   )
-  assert.equal(resourceReportProjection().project(undefined), undefined)
+  assert.equal(archive.project(undefined), undefined)
+})
+
+void test('page conflicts, wrong epochs and changed payload digests fail before an ACK', async () => {
+  for (const mutate of [
+    (page) => {
+      page.observerEpoch = sqliteEpoch(9)
+    },
+    (page) => {
+      page.records[0].schemaVersion++
+    },
+    (page) => {
+      page.payloadDigest = 'f'.repeat(64)
+    },
+    (page) => {
+      page.records[0].recordSequence++
+    },
+  ]) {
+    const archive = resourceReportProjection(),
+      ledger = sqlLedger()
+    await assert.rejects(
+      archive.drainSqlite({
+        read: async (input) => {
+          const response = await ledger.read(input)
+          mutate(response.value.performance.sqlite.planTransfer.page)
+          return response
+        },
+        persist: ledger.persist,
+        phase: 'before-send',
+      }),
+      /incomplete/,
+    )
+    assert.equal(ledger.calls.includes('ack'), false)
+  }
+  const archive = resourceReportProjection(),
+    ledger = sqlLedger()
+  ledger.loseNextAckBeforeDelivery()
+  let reads = 0
+  await assert.rejects(
+    archive.drainSqlite({
+      read: async (input) => {
+        const response = await ledger.read(input)
+        if (++reads === 2) {
+          const page = response.value.performance.sqlite.planTransfer.page
+          page.operationWatermark++
+          const { payloadDigest: _digest, ...payload } = page
+          page.payloadDigest = createHash('sha256').update(JSON.stringify(payload)).digest('hex')
+        }
+        return response
+      },
+      persist: ledger.persist,
+      phase: 'before-send',
+    }),
+    /incomplete/,
+  )
+  assert.equal(archive.sqliteObservation.epochs[0].pages.length, 1)
+})
+
+void test('failed persistence and report capacity preserve earlier evidence and never acknowledge the rejected page', async () => {
+  const archive = resourceReportProjection(),
+    ledger = sqlLedger()
+  await assert.rejects(
+    archive.drainSqlite({ read: ledger.read, persist: async () => false, phase: 'before-send' }),
+    /incomplete/,
+  )
+  assert.equal(ledger.calls.includes('ack'), false)
+  assert.equal(archive.queryPlans.length, 0)
+  const limited = resourceReportProjection({
+      reserve: (candidate) => {
+        if (candidate.queryPlans.length > 1) throw new Error('fixed receiver capacity')
+      },
+    }),
+    source = sqlLedger()
+  const epochIndex = await limited.drainSqlite({
+    read: source.read,
+    persist: source.persist,
+    phase: 'before-send',
+  })
+  source.records.push(sqliteRecord(2))
+  const before = JSON.stringify(limited.queryPlans)
+  await assert.rejects(
+    limited.drainSqlite({
+      read: source.read,
+      persist: source.persist,
+      phase: 'before-shutdown',
+      epochIndex,
+    }),
+    /incomplete/,
+  )
+  assert.equal(JSON.stringify(limited.queryPlans), before)
+  assert.equal(source.calls.at(-1), 'read')
+  assert.equal(limited.sqliteObservation.epochs[0].pages[0].persistenceVerified, true)
+})
+
+void test('the real 32-KiB dictionary limit rejects additions without erasing acknowledged prefixes', async () => {
+  const archive = resourceReportProjection(),
+    ledger = sqlLedger(sqliteEpoch(1), [])
+  let index
+  for (let batch = 0; batch < 2; batch++) {
+    ledger.records.push(
+      ...Array.from({ length: 20 }, (_, offset) =>
+        sqliteRecord(batch * 20 + offset + 1, 1, ['x'.repeat(512)]),
+      ),
+    )
+    index = await archive.drainSqlite({
+      read: ledger.read,
+      persist: ledger.persist,
+      phase: 'before-send',
+      epochIndex: index,
+    })
+  }
+  const preserved = JSON.stringify(archive.queryPlans),
+    saved = archive.sqliteObservation.epochs[0].savedThrough
+  ledger.records.push(
+    ...Array.from({ length: 20 }, (_, offset) => sqliteRecord(41 + offset, 1, ['x'.repeat(512)])),
+  )
+  await assert.rejects(
+    archive.drainSqlite({
+      read: ledger.read,
+      persist: ledger.persist,
+      phase: 'before-shutdown',
+      epochIndex: index,
+    }),
+    /incomplete/,
+  )
+  assert.equal(archive.sqliteObservation.failure, 'SQLITE_DICTIONARY_CAPACITY')
+  assert.equal(JSON.stringify(archive.queryPlans), preserved)
+  assert.equal(archive.sqliteObservation.epochs[0].savedThrough, saved)
+  assert.equal(ledger.calls.at(-1), 'read')
+})
+
+void test('a persistence deadline never commits or ACKs a late write result', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const archive = resourceReportProjection(),
+    ledger = sqlLedger()
+  let finish, entered
+  const writing = new Promise((resolve) => {
+    entered = resolve
+  })
+  const pending = archive.drainSqlite({
+    read: ledger.read,
+    persist: () =>
+      new Promise((resolve) => {
+        finish = resolve
+        entered()
+      }),
+    phase: 'before-send',
+    deadline: performance.now() + 5000,
+  })
+  const checked = assert.rejects(pending, /incomplete/)
+  await writing
+  t.mock.timers.tick(5000)
+  await checked
+  assert.equal(archive.sqliteObservation.failure, 'SQLITE_TRANSFER_DEADLINE')
+  finish(true)
+  await Promise.resolve()
+  assert.equal(archive.sqliteObservation.epochs[0].pages.length, 0)
+  assert.equal(ledger.calls.includes('ack'), false)
+  t.mock.timers.reset()
+})
+
+void test('unacknowledged saved-page overlap is preserved at final seal and missing/conflicting tail blocks', async () => {
+  for (const mode of ['same', 'missing', 'conflict']) {
+    const archive = resourceReportProjection(),
+      ledger = sqlLedger(sqliteEpoch(1), [sqliteRecord(1), sqliteRecord(2)])
+    let reads = 0
+    await assert.rejects(
+      archive.drainSqlite({
+        read: async (input) => {
+          if (++reads > 1) throw new Error('transport unavailable')
+          return ledger.read(input)
+        },
+        persist: ledger.persist,
+        phase: 'before-send',
+      }),
+      /incomplete/,
+    )
+    const final = ledger.final()
+    if (mode === 'missing') final.tailRecords.pop()
+    if (mode === 'conflict') final.tailRecords[0].schemaVersion++
+    if (mode === 'same') {
+      archive.sealSqlite(0, final, { physicalGroupGone: true, identityVerified: true })
+      assert.equal(archive.sqliteObservation.epochs[0].final.tailRecords.length, 2)
+      assert.equal(archive.queryPlans.length, 2)
+    } else
+      assert.throws(
+        () => archive.sealSqlite(0, final, { physicalGroupGone: true, identityVerified: true }),
+        /incomplete/,
+      )
+  }
+})
+
+void test('SQLite gate independently validates every epoch, final closure, continuity, counters, digests and ACK prefix', async () => {
+  const valid = await completeSqliteFixture()
+  assert.equal(completeSqliteObservation(valid), true)
+  for (const mutate of [
+    (value) => {
+      delete value.sqliteObservation
+    },
+    (value) => {
+      value.sqliteObservation.epochs.pop()
+    },
+    (value) => {
+      value.sqliteObservation.epochs[1].observerEpoch =
+        value.sqliteObservation.epochs[0].observerEpoch
+    },
+    (value) => {
+      delete value.sqliteObservation.epochs[0].final
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].final.databaseClosed = false
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].final.writerClosed = false
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].final.collectionDisposed = false
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].final.physicalGroupGone = false
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].final.identityVerified = false
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].final.counters.planOverflow = true
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].final.counters.firstPlanFailure = {
+        reason: 'plan-capacity',
+        sqlSha256: 'a'.repeat(64),
+        sourceBytes: 171,
+        operationIndex: 1,
+        retainedPlans: 64,
+        retainedPlanBytes: 1024,
+        planRows: null,
+      }
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].final.counters.unsupportedOperations = true
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].final.counters.retainedPlanBytes = 1
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].final.counters.highWaterPlanBytes = 16385
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].final.counters.highWaterPlans = 65
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].pages[0].records.pop()
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].pages[0].payloadDigest = 'a'.repeat(64)
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].pages[0].persistenceVerified = false
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].final.lastAck.payloadDigest = 'a'.repeat(64)
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].observations[0].acknowledgedThrough = -1
+    },
+    (value) => {
+      value.sqliteObservation.epochs[0].drains[0].acknowledgedThrough = 0
+    },
+  ]) {
+    const changed = structuredClone(valid)
+    mutate(changed)
+    assert.equal(completeSqliteObservation(changed), false)
+    assert(
+      evaluateSoak({ ...changed, missingObservations: [] }, 7_200_000).unmetBudgets.includes(
+        'complete-sqlite-observation',
+      ),
+    )
+  }
+  assert.equal(completeSqliteObservation({ sqliteQueryPlanDictionary: [] }), false)
+})
+
+void test('two hours of empty-page polling retain phase/read counts and first/last counters within the unchanged report limits', async () => {
+  const archive = resourceReportProjection(),
+    ledger = sqlLedger()
+  const epochIndex = await archive.drainSqlite({
+    read: ledger.read,
+    persist: ledger.persist,
+    phase: 'before-send',
+  })
+  for (let iteration = 0; iteration < 1440; iteration++) {
+    if (iteration % 12 === 0)
+      await archive.drainSqlite({
+        read: ledger.read,
+        persist: ledger.persist,
+        phase: 'before-send',
+        epochIndex,
+      })
+    await archive.drainSqlite({
+      read: ledger.read,
+      persist: ledger.persist,
+      phase: 'after-workload-cycle',
+      epochIndex,
+    })
+  }
+  const epoch = archive.sqliteObservation.epochs[0]
+  assert.equal(
+    epoch.drains
+      .filter((value) => value.phase === 'after-workload-cycle')
+      .reduce((sum, value) => sum + value.occurrences, 0),
+    1440,
+  )
+  assert.equal(
+    epoch.observations.reduce((sum, value) => sum + value.readCount, 0),
+    ledger.calls.length,
+  )
+  assert.equal(epoch.pages.length, 1)
+  assert(epoch.observations.length < 250)
+  assert(
+    Buffer.byteLength(
+      JSON.stringify(
+        {
+          sqliteQueryPlanDictionary: archive.queryPlans,
+          sqliteObservation: archive.sqliteObservation,
+        },
+        null,
+        2,
+      ),
+    ) <
+      768 * 1024,
+  )
+})
+
+void test('raw final receipts bind the sealed observer to nonce, actual process IDs, epoch and immutable distribution', async () => {
+  const manifest = {
+    sourceSha: 'a'.repeat(40),
+    version: '0.1.0',
+    channel: 'stable',
+    platform: 'darwin',
+    arch: 'arm64',
+  }
+  const ledger = sqlLedger(),
+    archive = resourceReportProjection()
+  await archive.drainSqlite({ read: ledger.read, persist: ledger.persist, phase: 'before-send' })
+  const final = ledger.final(),
+    raw = {
+      schemaVersion: 1,
+      nonce: 'b'.repeat(64),
+      mainPid: 100,
+      utilityPid: final.observerPid,
+      ...manifest,
+      sqliteFinal: final,
+    }
+  const expected = {
+    nonce: raw.nonce,
+    mainPid: raw.mainPid,
+    utilityPid: raw.utilityPid,
+    observerEpoch: final.observerEpoch,
+    manifest,
+  }
+  assert.deepEqual(validateSqliteFinalReceipt(raw, expected), final)
+  for (const change of [
+    { nonce: 'c'.repeat(64) },
+    { utilityPid: 999 },
+    { mainPid: 999 },
+    { sourceSha: 'd'.repeat(40) },
+    { sqliteFinal: { ...final, observerEpoch: sqliteEpoch(9) } },
+  ])
+    assert.throws(() => validateSqliteFinalReceipt({ ...raw, ...change }, expected))
+})
+
+void test('durable spool recovery shares page/dictionary validation without creating ACKs or final seals', async () => {
+  const manifest = {
+    sourceSha: 'a'.repeat(40),
+    version: '0.1.0',
+    channel: 'stable',
+    platform: 'darwin',
+    arch: 'arm64',
+  }
+  const ledger = sqlLedger(),
+    response = await ledger.read({ sqlitePlans: {} })
+  const frame = {
+    schemaVersion: 1,
+    ...manifest,
+    observerPid: response.value.pid,
+    page: response.value.performance.sqlite.planTransfer.page,
+  }
+  assert.deepEqual(validateSqliteSpoolFrame(frame, manifest), frame)
+  const recovered = await recoverSqlitePages([frame, structuredClone(frame)], manifest)
+  assert.equal(recovered.status, 'unsealed-recovered-prefix')
+  assert.equal(recovered.sqliteObservation.epochs[0].savedThrough, 1)
+  assert.equal(recovered.sqliteObservation.epochs[0].acknowledgedThrough, 0)
+  assert.equal(recovered.sqliteObservation.epochs[0].final, undefined)
+  assert.equal(completeSqliteObservation(recovered), false)
+  await assert.rejects(recoverSqlitePages([{ ...frame, sourceSha: 'f'.repeat(40) }], manifest))
+  await assert.rejects(recoverSqlitePages([{ ...frame, nonce: 'must-not-be-in-spool' }], manifest))
+})
+
+void test('actual producer DTOs and schema changes transfer through durable pages and close receipts', async () => {
+  const source = `
+    import assert from 'node:assert/strict';
+    import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+    import { tmpdir } from 'node:os';
+    import { join } from 'node:path';
+    import { fileURLToPath } from 'node:url';
+    import { sql } from ${JSON.stringify(new URL('../packages/persistence/node_modules/drizzle-orm/index.js', import.meta.url).href)};
+    import { PactDatabase } from ${JSON.stringify(new URL('../packages/persistence/src/pact-database.ts', import.meta.url).href)};
+    import { sqlitePlanPageSchema, sqliteFinalSchema } from ${JSON.stringify(new URL('../packages/contracts/src/index.ts', import.meta.url).href)};
+    import { resourceReportProjection, completeSqliteObservation } from ${JSON.stringify(new URL('./soak-statistics.mjs', import.meta.url).href)};
+    import { validateSoakObservation } from ${JSON.stringify(new URL('./run-soak.mjs', import.meta.url).href)};
+    const root = await mkdtemp(join(tmpdir(), 'pact-sqlite-page-dto-'));
+    const archive = resourceReportProjection(); let db;
+    try {
+      for (let generation = 0; generation < 2; generation++) {
+        db = await PactDatabase.open({ filePath: ':memory:', migrationsFolder: ${JSON.stringify(fileURLToPath(new URL('../packages/persistence/drizzle', import.meta.url)))}, measurePerformance: true });
+        let epochIndex;
+        const drain = phase => archive.drainSqlite({
+          read: async input => ({ ok: true, value: { status:'ready', database:'ready', pid:process.pid, performance:db.performanceDiagnostics(input.sqlitePlans) } }),
+          persist: async page => {
+            sqlitePlanPageSchema.parse(page);
+            const file = join(root, page.observerEpoch + '-' + page.pageSequence + '.json');
+            await writeFile(file, JSON.stringify(page), { flag:'wx', mode:0o600, flush:true });
+            assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), page);
+            return true;
+          }, phase, epochIndex,
+        });
+        for (let index=0; index<70; index++) {
+          db.drizzle.get(sql.raw('SELECT ' + index + ' AS value'));
+          if ((index+1)%30===0) epochIndex = await drain(generation===0 ? 'before-send' : 'cold-admission');
+        }
+        epochIndex = await drain('before-shutdown');
+        db.drizzle.get(sql.raw('SELECT 1 AS value'));
+        db.drizzle.run(sql.raw('CREATE TABLE schema_variant_fixture(id INTEGER PRIMARY KEY)'));
+        db.drizzle.get(sql.raw('SELECT 1 AS value'));
+        await drain('before-shutdown');
+        db.close(); const final = db.performanceFinal(); sqliteFinalSchema.parse(final);
+        archive.sealSqlite(epochIndex, final, { physicalGroupGone:true, identityVerified:true }); db=undefined;
+      }
+      const evidence = { sqliteQueryPlanDictionary: archive.queryPlans, sqliteObservation: archive.sqliteObservation };
+      const serializedEvidence = JSON.parse(JSON.stringify(evidence));
+      assert.deepEqual(validateSoakObservation(serializedEvidence), serializedEvidence);
+      assert.equal(completeSqliteObservation(evidence), true);
+      const variants = archive.queryPlans.filter(plan => plan.sqlSha256 === archive.queryPlans[1].sqlSha256);
+      assert(new Set(variants.map(plan => plan.schemaVersion)).size >= 2);
+      console.log(JSON.stringify({ producerDtoValidated:true, dictionaryEntries:archive.queryPlans.length, epochs:archive.sqliteObservation.epochs.length, completeSchemaVariant:true }));
+    } catch { console.error('Bounded real SQLite DTO fixture failed.'); process.exitCode=1; }
+    finally { db?.close(); await rm(root,{ recursive:true,force:true }); }
+  `
+  const { stdout } = await promisify(execFile)(
+    process.execPath,
+    [
+      '--experimental-transform-types',
+      '--import',
+      fileURLToPath(new URL('./soak-module-loader.mjs', import.meta.url)),
+      '--input-type=module',
+      '--eval',
+      source,
+    ],
+    { timeout: 30000, maxBuffer: 4096, shell: false },
+  )
+  const result = JSON.parse(stdout)
+  assert.equal(result.producerDtoValidated, true)
+  assert.equal(result.epochs, 2)
+  assert.equal(result.completeSchemaVariant, true)
+  assert(result.dictionaryEntries > 64)
 })
 
 void test('bounded histograms retain percentile tails instead of replacing missing observations with zero', () => {
@@ -416,7 +1085,7 @@ void test('missing performance/lifecycle evidence cannot satisfy the budget gate
   assert(result.unmetBudgets.includes('complete-owned-resource-lifecycle'))
 })
 
-void test('continuous two-hour duration is actual elapsed evidence, not an E2E timeout', () => {
+void test('continuous two-hour duration is actual elapsed evidence, not an E2E timeout', async () => {
   const input = histogram(),
     eventLoop = histogram(),
     terminal = histogram()
@@ -447,6 +1116,7 @@ void test('continuous two-hour duration is actual elapsed evidence, not an E2E t
     },
     missingObservations: [],
     ipcTraffic: completeIpcEvidence(),
+    ...(await completeSqliteFixture()),
   }
   assert.equal(evaluateSoak(evidence, 7_200_000).budgetPass, true)
   assert.equal(evaluateSoak({ ...evidence, durationMs: 7_199_999 }, 7_200_000).budgetPass, false)

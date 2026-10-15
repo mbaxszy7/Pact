@@ -2,7 +2,7 @@ import { app, ipcMain } from 'electron'
 
 import type { AppInfo, RpcResult } from '@pact/contracts'
 
-import { appInfoSchema, IPC_CHANNELS } from '@pact/contracts'
+import { appInfoSchema, IPC_CHANNELS, runtimeHealthInputSchema } from '@pact/contracts'
 
 import type { RendererTrust } from '../../renderer-trust'
 import type { UtilityProcessClient } from '../../utility-process/client'
@@ -25,9 +25,16 @@ export function registerFoundationIpcHandlers(
     return { ok: true, value: info }
   })
 
-  ipcMain.handle(IPC_CHANNELS.runtimeHealth, (event) => {
+  ipcMain.handle(IPC_CHANNELS.runtimeHealth, (event, input: unknown) => {
     trust.assertTrustedMainFrame(event)
-    return utilityClient.getHealth()
+    if (input === undefined) return utilityClient.getHealth()
+    const parsed = runtimeHealthInputSchema.safeParse(input)
+    if (!parsed.success)
+      return {
+        ok: false,
+        error: { code: 'VALIDATION', message: 'Invalid runtime health observation input.' },
+      }
+    return utilityClient.getHealth(parsed.data)
   })
 
   return () => {

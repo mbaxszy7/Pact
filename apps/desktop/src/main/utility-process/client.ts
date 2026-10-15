@@ -31,6 +31,8 @@ import type {
   RpcResult,
   RuntimeExecutablePathUpdate,
   RuntimeHealth,
+  RuntimeHealthInput,
+  RuntimeShutdownReply,
   RuntimePreparation,
   SessionArchiveInput,
   SessionCatalogChange,
@@ -123,7 +125,7 @@ export interface UtilityProcessClient {
     input: import('@pact/contracts').NativePermissionRespondInput,
   ): Promise<RpcResult<ConversationPatch>>
   start(options: UtilityProcessStartOptions): void
-  getHealth(): Promise<RpcResult<RuntimeHealth>>
+  getHealth(input?: RuntimeHealthInput): Promise<RpcResult<RuntimeHealth>>
   getRuntimePreparation(): Promise<RpcResult<RuntimePreparation>>
   updateRuntimeExecutablePath(
     input: RuntimeExecutablePathUpdate,
@@ -212,7 +214,7 @@ export interface UtilityProcessClient {
     timeoutMs?: number,
   ): Promise<UtilityTransportResult>
   dispose(): void
-  shutdown(): Promise<RpcResult<{ flushed: true }>>
+  shutdown(): Promise<RuntimeShutdownReply>
 }
 
 interface InFlightRequest {
@@ -252,7 +254,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     string,
     { child: UtilityProcess; controller: AbortController }
   >()
-  private shutdownTask: Promise<RpcResult<{ flushed: true }>> | undefined
+  private shutdownTask: Promise<RuntimeShutdownReply> | undefined
   private child: UtilityProcess | undefined
   private startupFailure: import('@pact/contracts').RuntimeStartupFailure | undefined
   private startupFailureCallback: UtilityProcessStartOptions['onStartupFailed']
@@ -416,9 +418,12 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     })
   }
 
-  async getHealth(): Promise<RpcResult<RuntimeHealth>> {
+  async getHealth(input?: RuntimeHealthInput): Promise<RpcResult<RuntimeHealth>> {
     const result = ElectronUtilityProcessClient.toHealthResult(
-      await this.request({ type: 'runtime.health.request' }, 'runtime.health.response'),
+      await this.request(
+        { type: 'runtime.health.request', ...(input === undefined ? {} : { input }) },
+        'runtime.health.response',
+      ),
     )
     return result.ok && this.traffic
       ? {
@@ -1045,7 +1050,9 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     )
   }
 
-  shutdown(): Promise<RpcResult<{ flushed: true }>> {
+  shutdown(): Promise<RuntimeShutdownReply> {
+    const shutdownChild = this.child
+    const observerPid = shutdownChild?.pid
     this.shutdownTask ??= this.request(
       { type: 'runtime.shutdown.request' },
       'runtime.shutdown.response',
@@ -1053,12 +1060,29 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     )
       .then((result) => {
         if (result.kind !== 'response') return { ok: false as const, error: result.error }
-        return result.response.type === 'runtime.shutdown.response'
-          ? result.response.result
-          : {
-              ok: false as const,
-              error: { code: 'INTERNAL' as const, message: 'Unexpected shutdown acknowledgement.' },
-            }
+        if (result.response.type !== 'runtime.shutdown.response')
+          return {
+            ok: false as const,
+            error: { code: 'INTERNAL' as const, message: 'Unexpected shutdown acknowledgement.' },
+          }
+        const final = result.response.sqliteFinal
+        if (!final) return result.response.result
+        if (
+          !shutdownChild ||
+          !Number.isSafeInteger(observerPid) ||
+          observerPid === undefined ||
+          observerPid <= 0 ||
+          final.observerPid !== observerPid
+        ) {
+          this.diagnostics?.record({
+            operation: 'utility',
+            phase: 'failed',
+            level: 'error',
+            code: 'VALIDATION',
+          })
+          return result.response.result
+        }
+        return { ...result.response.result, sqliteFinal: final }
       })
       .finally(() => this.dispose())
     return this.shutdownTask
@@ -1103,7 +1127,14 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         },
       }
     }
-    return { ok: true, value: result.response.health }
+    if (result.response.health) return { ok: true, value: result.response.health }
+    return {
+      ok: false,
+      error: result.response.error ?? {
+        code: 'INTERNAL',
+        message: 'Utility runtime returned an incomplete health response.',
+      },
+    }
   }
 
   private static toRuntimePreparationResult(

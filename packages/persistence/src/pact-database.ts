@@ -314,9 +314,12 @@ export class PactDatabase {
   }
 
   close(): void {
-    if (this.sqlite.open) this.sqlite.close()
-    this.performanceProbe?.dispose(this.drizzle)
-    if (this.writer?.open) this.writer.close()
+    try {
+      if (this.sqlite.open) this.sqlite.close()
+      if (this.writer?.open) this.writer.close()
+    } finally {
+      this.performanceProbe?.seal(this.drizzle, !this.sqlite.open, !this.writer?.open)
+    }
   }
 
   private static requireExactDriverPath(path: string, filePath: string): void {
@@ -332,8 +335,14 @@ export class PactDatabase {
     return this.sqlite.open
   }
 
-  performanceDiagnostics(): ReturnType<DatabasePerformance['snapshot']> | undefined {
-    return this.performanceProbe?.snapshot()
+  performanceDiagnostics(
+    input?: import('@pact/contracts').SqlitePlanReadInput,
+  ): ReturnType<DatabasePerformance['snapshot']> | undefined {
+    return this.performanceProbe?.snapshot(input)
+  }
+
+  performanceFinal(): import('@pact/contracts').SqliteFinal | undefined {
+    return this.performanceProbe?.sealedReceipt()
   }
 
   private static requireRegularFile(path: string): void {

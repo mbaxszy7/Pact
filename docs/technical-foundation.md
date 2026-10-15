@@ -224,6 +224,24 @@ and the enclosing driver allows measurement plus twenty minutes. Setup, cold res
 and report work do not count toward the required continuous measurement duration. These bounds
 do not relax runtime performance or physical cleanup requirements.
 
+The fixture database observer owns one 64-entry, 16-KiB cache shared by confirmed,
+pending and in-flight plans, including a 1-KiB page/ACK metadata reservation. A plan
+records its actual SQL hash, schema version and bounded EXPLAIN details; SQL text,
+bindings and business rows are excluded. A typed health page remains immutable until
+the driver durably saves it and acknowledges its exact connection epoch, page and
+digest. Only confirmed entries may be evicted; ordinary health reads never confirm
+records. Overflow and failed observations remain sticky. Page transfer does not reset
+the independent event-loop histogram.
+
+The existing shutdown chain seals the final database counters and remaining plan
+records after storage closure. Its separate private receipt is limited to 32 KiB and
+five seconds, bound to the startup nonce, Main/Utility identities and distribution,
+and written through one verified exclusive file descriptor. Timeout retains ownership
+until the underlying operation settles or the process exits; it never proves release.
+The report validates every connection epoch through its final seal. Previously saved
+pages survive driver interruption as an explicitly incomplete recovery prefix, within
+the existing observation/report budgets. A missing seal cannot satisfy soak acceptance.
+
 Fixture-only logical IPC observation is owned by the existing transports for their process or
 document lifetime. Nine fixed groups contain 25 direction/initialization slots with separate
 business and control lanes, at most 1,000,000 messages per group, 19 sticky issues and 64 transport
