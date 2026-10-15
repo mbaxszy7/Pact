@@ -128,7 +128,17 @@ await test('core narrowed arguments cannot start a build and are reported as una
   }
 })
 
-await test('a failed local deterministic lane preserves bounded traces beside its safe report', async () => {
+await test('a failed local deterministic lane preserves bounded traces beside its safe report', async (context) => {
+  // Report-only doubles select a supported product target even in the Linux quality job.
+  // No Electron application or native architecture is exercised by this unit test.
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform'),
+    architecture = Object.getOwnPropertyDescriptor(process, 'arch')
+  Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' })
+  Object.defineProperty(process, 'arch', { ...architecture, value: 'arm64' })
+  context.after(() => {
+    Object.defineProperty(process, 'platform', platform)
+    Object.defineProperty(process, 'arch', architecture)
+  })
   const root = await mkdtemp(join(tmpdir(), 'pact-local-e2e-diagnostics-test-'))
   let privateArtifacts
   try {
