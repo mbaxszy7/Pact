@@ -1,9 +1,17 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $pipe = $null
+$phase = 'entry'
+$startupDiagnostic = $env:PACT_WINDOWS_STARTUP_DIAGNOSTIC -ceq '1'
+function Write-StartupPhase([string] $next) {
+    if ($startupDiagnostic) { [Console]::Error.WriteLine('[pact-windows-startup] ' + $next) }
+}
+Write-StartupPhase $phase
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
 try {
     if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'PowerShell 7 is required' }
+    $phase = 'descriptor'
+    Write-StartupPhase $phase
     $request = [Console]::ReadLine() | ConvertFrom-Json
     $expected = @('pipe', 'token', 'executable', 'args', 'cwd', 'timeout', 'argumentMode')
     $actual = @($request.PSObject.Properties.Name)
@@ -22,6 +30,8 @@ try {
         }
     }
     $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', $request.pipe, [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::Asynchronous)
+    $phase = 'pipe-connect'
+    Write-StartupPhase $phase
     $pipe.Connect(5000)
     $writer = [System.IO.StreamWriter]::new($pipe, [System.Text.UTF8Encoding]::new($false), 1024, $true)
     $writer.AutoFlush = $true
@@ -31,16 +41,29 @@ try {
     if (-not $admission.Wait(5000) -or $admission.Result -ne 'go') { exit 1 }
     # This pending read observes runner loss even during in-process compilation.
     $cancel = $reader.ReadLineAsync()
+    $phase = 'compile'
+    Write-StartupPhase $phase
     Add-Type -LiteralPath (Join-Path $PSScriptRoot 'windows-e2e-job.cs')
     if ($cancel.IsCompleted) {
         $writer.WriteLine('{"kind":"empty","exitCode":1,"active":0}')
         exit 1
     }
+    $phase = 'target-start'
+    Write-StartupPhase $phase
     $code = [PactE2EJob]::Run($request.executable, [string[]]$request.args, $request.cwd, [long]$request.timeout, $writer, $cancel, $request.argumentMode)
     exit $code
 } catch {
     if ($null -ne $writer) {
         try { $writer.WriteLine('{"kind":"error","code":0}') } catch { }
+    }
+    if ($startupDiagnostic) {
+        $category = $_.Exception.GetType().Name
+        if ($category -cnotin @('MethodInvocationException', 'RuntimeException', 'ArgumentException', 'IOException', 'TimeoutException', 'InvalidOperationException', 'Win32Exception')) { $category = 'other' }
+        # Only fixed compiler codes leave this boundary; never source, paths or causes.
+        $message = [string] $_.Exception.Message
+        if ($message.Length -gt 8192) { $message = $message.Substring(0, 8192) }
+        $codes = @([regex]::Matches($message, '\bCS[0-9]{4}\b') | Select-Object -First 8 | ForEach-Object { $_.Value })
+        [Console]::Error.WriteLine('[pact-windows-startup] failed phase=' + $phase + ' class=' + $category + ' compiler=' + ($codes -join ','))
     }
     [Console]::Error.WriteLine('Windows E2E supervisor failed; details withheld.')
     exit 1

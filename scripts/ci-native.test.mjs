@@ -241,3 +241,42 @@ void test('CLI entrypoint emits safe setup classifications without secret values
     code: 'unknown',
   })
 })
+
+void test(
+  'records bounded command phases on an actual failed setup without admitting credentials',
+  {
+    skip: process.platform === 'win32',
+  },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-ci-native-stage-'))
+    try {
+      const bin = join(root, 'bin')
+      await mkdir(bin)
+      await writeFile(
+        join(bin, 'pnpm'),
+        '#!/bin/sh\nif [ -n "${PACT_CI_APP_PRIVATE_KEY-}" ]; then : > "$RUNNER_TEMP/credential-present"; fi\nexit 1\n',
+        { mode: 0o700 },
+      )
+      await assert.rejects(
+        main({
+          RUNNER_TEMP: root,
+          GITHUB_ENV: join(root, 'env'),
+          PATH: bin + ':/usr/bin:/bin',
+          PACT_CI_APP_PRIVATE_KEY: 'synthetic-not-admitted',
+        }),
+        (error) => {
+          const facts = nativeSetupFailureFacts(error)
+          assert.equal(facts.stage, 'lockfile')
+          assert(facts.command.phases.started >= 0)
+          assert(facts.command.phases.settled >= facts.command.phases.started)
+          assert(Object.keys(facts.command.phases).length <= 5)
+          assert(!JSON.stringify(facts).includes('synthetic-not-admitted'))
+          return true
+        },
+      )
+      await assert.rejects(readFile(join(root, 'credential-present')), { code: 'ENOENT' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  },
+)

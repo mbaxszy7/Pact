@@ -164,10 +164,18 @@ export async function windowsPnpmExecutable(source) {
 export async function main(source = process.env) {
   let stage = 'source-validation'
   let commandFacts
+  let commandStartedAt = performance.now()
+  let phases = {}
   const onState = (state) => {
     // Only runner-owned scalar observations cross this boundary. Never retain
     // child output, invocation text, paths, control credentials or raw errors.
+    if (
+      ['bootstrapping', 'initializing', 'started', 'stopping', 'settled'].includes(state.kind) &&
+      phases[state.kind] === undefined
+    )
+      phases[state.kind] = Math.ceil(performance.now() - commandStartedAt)
     commandFacts = {
+      phases: { ...phases },
       kind: [
         'bootstrapping',
         'initializing',
@@ -240,19 +248,23 @@ export async function main(source = process.env) {
       { flag: 'wx', mode: 0o600 },
     )
     stage = 'lockfile'
+    commandStartedAt = performance.now()
+    phases = {}
     const resolved = await run(['install', '--lockfile-only', '--no-frozen-lockfile'], 5 * 60_000, {
       executable: pnpmExecutable,
       cwd: directory,
-      env: ciEnvironment(source),
+      env: { ...ciEnvironment(source), PACT_WINDOWS_STARTUP_DIAGNOSTIC: '1' },
       onState,
     })
     if (resolved !== 0) throw new Error('Pinned native CLI lockfile admission failed')
     stage = 'installation'
     commandFacts = undefined
+    commandStartedAt = performance.now()
+    phases = {}
     const installed = await run(['install', '--frozen-lockfile'], 5 * 60_000, {
       executable: pnpmExecutable,
       cwd: directory,
-      env: ciEnvironment(source),
+      env: { ...ciEnvironment(source), PACT_WINDOWS_STARTUP_DIAGNOSTIC: '1' },
       onState,
     })
     if (installed !== 0) throw new Error('Pinned native CLI installation failed')
