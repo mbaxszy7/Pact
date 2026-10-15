@@ -28,6 +28,139 @@ const supported = new Set(['darwin-arm64', 'win32-x64', 'win32-arm64'])
 const MAX_ENTRIES = 16_384
 const MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 
+async function nativeMachineMatches(path, arch) {
+  const handle = await open(path, 'r')
+  try {
+    const header = Buffer.alloc(64)
+    if (
+      (await handle.read(header, 0, 64, 0)).bytesRead !== 64 ||
+      header.toString('ascii', 0, 2) !== 'MZ'
+    )
+      return false
+    const offset = header.readUInt32LE(60)
+    if (offset < 64 || offset > 1024 * 1024) return false
+    const signature = Buffer.alloc(6)
+    return (
+      (await handle.read(signature, 0, 6, offset)).bytesRead === 6 &&
+      signature.readUInt32LE(0) === 0x00004550 &&
+      signature.readUInt16LE(4) === (arch === 'x64' ? 0x8664 : 0xaa64)
+    )
+  } finally {
+    await handle.close()
+  }
+}
+
+/** Check installed bytes without loading a native module or exposing dependency paths. */
+export async function inspectWindowsSharpSource(packagePath, arch) {
+  if (!['x64', 'arm64'].includes(arch)) throw new Error('Unsupported Windows Sharp architecture.')
+  const facts = {
+    sharpVersionMatches: false,
+    targetDeclaredOptional: false,
+    sharpEntryResolvable: false,
+    targetExportResolvableFromSharp: false,
+    targetNativeFilePresent: false,
+    targetNativeMachineMatches: false,
+    targetDllPayloadPresent: false,
+  }
+  const payload = []
+  const target = `@img/sharp-win32-${arch}`
+  const deadline = Date.now() + 5 * 60_000
+  try {
+    if ((await lstat(packagePath)).size > 64 * 1024) return { facts, payload }
+    const metadata = JSON.parse(await readFile(packagePath, 'utf8'))
+    const version = metadata.dependencies?.sharp
+    if (typeof version !== 'string' || !/^\d+\.\d+\.\d+$/u.test(version)) return { facts, payload }
+    facts.targetDeclaredOptional = metadata.optionalDependencies?.[target] === version
+    const desktopRequire = createRequire(packagePath)
+    const sharpEntry = desktopRequire.resolve('sharp')
+    facts.sharpEntryResolvable = true
+    // Sharp exports its dist entry, but intentionally does not export package.json.
+    const sharpPackage = join(dirname(sharpEntry), '..', 'package.json')
+    if ((await lstat(sharpPackage)).size > 64 * 1024) return { facts, payload }
+    const sharpMetadata = JSON.parse(await readFile(sharpPackage, 'utf8'))
+    facts.sharpVersionMatches = sharpMetadata.name === 'sharp' && sharpMetadata.version === version
+    const targetEntry = createRequire(sharpEntry).resolve(`${target}/sharp.node`)
+    facts.targetExportResolvableFromSharp = true
+    const library = join(dirname(targetEntry), 'lib')
+    const nativeName = `sharp-win32-${arch}-${version}.node`
+    const names = await readdir(library)
+    if (names.length > 64) return { facts, payload }
+    const nativePath = join(library, nativeName)
+    facts.targetNativeFilePresent = names.includes(nativeName) && (await lstat(nativePath)).isFile()
+    if (!facts.targetNativeFilePresent) return { facts, payload }
+    facts.targetNativeMachineMatches = await nativeMachineMatches(nativePath, arch)
+    const selected = names.filter((name) => name === nativeName || name.endsWith('.dll')).toSorted()
+    for (const name of selected) {
+      if (Date.now() >= deadline) return { facts, payload: [] }
+      const path = join(library, name)
+      // oxlint-disable-next-line eslint/no-await-in-loop -- One bounded dependency file stream at a time.
+      const info = await lstat(path)
+      if (!info.isFile()) return { facts, payload: [] }
+      payload.push({
+        path: `resources/app.asar.unpacked/node_modules/${target}/lib/${name}`,
+        bytes: info.size,
+        // oxlint-disable-next-line eslint/no-await-in-loop -- Shares the source inspection deadline.
+        sha256: await hashFile(path, { deadline }),
+      })
+    }
+    facts.targetDllPayloadPresent = selected.some((name) => name.endsWith('.dll'))
+  } catch {
+    // Dependency absence and unreadable bytes fail closed using fixed public facts only.
+  }
+  return { facts, payload }
+}
+
+/** Match the final builder snapshot to the exact source native payload. */
+export async function inspectPackagedWindowsSharp(appPath, content, arch, source) {
+  const target = `@img/sharp-win32-${arch}`
+  const prefix = `resources/app.asar.unpacked/node_modules/${target}/lib/`
+  const selected = content.entries.filter(
+    (entry) => entry.path.startsWith(prefix) && /\.(?:node|dll)$/u.test(entry.path),
+  )
+  const native = source.payload.find((entry) => entry.path.endsWith('.node'))
+  const facts = {
+    packagedTargetNativePresent: Boolean(
+      native &&
+      content.entries.some(
+        (entry) => entry.type === 'file' && entry.path.endsWith(native.path.slice(prefix.length)),
+      ),
+    ),
+    packagedTargetNativeUnpacked: Boolean(
+      native && selected.some((entry) => entry.type === 'file' && entry.path === native.path),
+    ),
+    packagedTargetPayloadMatchesSource: false,
+  }
+  try {
+    facts.packagedTargetPayloadMatchesSource = Boolean(
+      Object.values(source.facts).every((value) => value === true) &&
+      native &&
+      source.payload.length >= 2 &&
+      selected.length === source.payload.length &&
+      source.payload.every((expected) =>
+        selected.some(
+          (entry) =>
+            entry.type === 'file' &&
+            entry.path === expected.path &&
+            entry.bytes === expected.bytes &&
+            entry.sha256 === expected.sha256,
+        ),
+      ) &&
+      (await nativeMachineMatches(join(appPath, native.path), arch)),
+    )
+  } catch {
+    // The build cannot succeed with missing or unreadable final native bytes.
+  }
+  return facts
+}
+
+function requireSharpInspection(stage, arch, facts) {
+  console.log(JSON.stringify({ stage, target: `win32-${arch}`, ...facts }))
+  if (!Object.values(facts).every((value) => value === true))
+    throw new Error(
+      `Windows Sharp ${stage} inspection failed; see the fixed dependency facts above.`,
+    )
+}
+
 export async function hashFile(path, { signal, deadline = Date.now() + 5 * 60_000 } = {}) {
   if (Date.now() >= deadline)
     throw new Error('Application or artifact hashing exceeded its five-minute inspection deadline.')
@@ -246,6 +379,11 @@ export async function main(args = process.argv.slice(2)) {
     throw new Error('Distribution requires the exact workspace pnpm version.')
   if (metadata.version !== productVersion)
     throw new Error('Desktop package version differs from the product authority.')
+  const windowsSharp =
+    options.platform === 'win32'
+      ? await inspectWindowsSharpSource(packagePath, options.arch)
+      : undefined
+  if (windowsSharp) requireSharpInspection('source', options.arch, windowsSharp.facts)
   const injected = Buffer.from(
     `${JSON.stringify({ ...metadata, version, packageManager, pactDistribution: identity }, null, 2)}\n`,
   )
@@ -343,6 +481,12 @@ export async function main(args = process.argv.slice(2)) {
     if (application.platform !== options.platform || application.arch !== options.arch)
       throw new Error('Builder produced an unexpected application architecture.')
     const content = await applicationContent(application.appPath, options.platform)
+    if (windowsSharp)
+      requireSharpInspection(
+        'packaged',
+        options.arch,
+        await inspectPackagedWindowsSharp(application.appPath, content, options.arch, windowsSharp),
+      )
     const expectedKinds = options.directoryOnly
       ? []
       : options.platform === 'darwin'
