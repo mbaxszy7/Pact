@@ -63,7 +63,10 @@ for (const command of ['ordinary', '/plan', '/build', '/review'] as const)
           .hover()
         await page.getByRole('button', { name: 'Rename Session', exact: true }).click()
         await page.getByRole('textbox', { name: 'Session title' }).fill('My deliberate title')
-        await page.getByRole('button', { name: 'Save Session title' }).click()
+        // A completed Plan/Todos panel can take focus and commit the title on blur.
+        // Leave through the stable header control instead of targeting a Save button
+        // that may already have been removed by that successful commit.
+        await page.getByRole('button', { name: 'Session settings', exact: true }).focus()
         await expect(
           page.getByRole('heading', { name: 'My deliberate title', exact: true }),
         ).toBeVisible()
