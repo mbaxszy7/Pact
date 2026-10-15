@@ -941,7 +941,11 @@ it.skipIf(process.platform !== 'win32')(
         marker = join(owned.root, 'descendant.json')
       await writeFile(
         entry,
-        `import{spawn}from'node:child_process';import{writeFileSync}from'node:fs';const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{shell:false,stdio:'ignore'});child.once('spawn',()=>writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:child.pid})));process.stdin.resume();process.stdin.once('end',()=>process.exit(0));`,
+        // A spawn receipt does not prove the descendant entered its live loop.
+        // Its own ready packet must arrive before the parent receives EOF.
+        // Windows libuv kills ordinary children when their Node parent exits.
+        // Detached skips that inner Job; our outer kernel-assigned Job still owns it.
+        `import{spawn}from'node:child_process';import{writeFileSync}from'node:fs';const child=spawn(process.execPath,['-e',"setInterval(()=>{},1000);process.send('ready')"],{shell:false,windowsHide:true,detached:true,stdio:['ignore','ignore','ignore','ipc']});child.once('message',message=>{if(message!=='ready')process.exit(7);writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:child.pid}));});process.stdin.resume();process.stdin.once('end',()=>process.exit(0));`,
       )
       const scope = await owned.processes.prepareRpcOwner(
         process.execPath,
@@ -966,8 +970,12 @@ it.skipIf(process.platform !== 'win32')(
           ),
         )
         .toBe(true)
+      const descendant: { pid: number } = JSON.parse(await readFile(marker, 'utf8'))
+      expect(Number.isSafeInteger(descendant.pid)).toBe(true)
+      expect(gone(descendant.pid)).toBe(false)
       child.stdin.end()
       const receipt = await within(root!, 2000, 'Missing OS root-exit receipt')
+      console.info('[native root regression]', JSON.stringify({ receipt, owner: scope.facts() }))
       expect(receipt).toMatchObject({ exitCode: 0, natural: true })
       expect(receipt.active).toBeGreaterThan(0)
       expect(receipt.members.some((member) => member.role === 'descendant')).toBe(true)

@@ -270,7 +270,7 @@ jobs:
         working-directory: source
         run: |
           node --test --test-concurrency=1 scripts/run-e2e-windows.test.mjs scripts/run-e2e.test.mjs scripts/package-smoke.test.mjs
-          pnpm exec vitest run tests/e2e/windows-cli-launcher.test.ts -t 'observes natural root exit|post-start helper exception'
+          pnpm exec vitest run tests/e2e/windows-cli-launcher.test.ts
       - name: Capture trusted no-credential case inventory for complete failure reports
         working-directory: control
         run: pnpm exec playwright test --list --reporter=json > "$RUNNER_TEMP/pact-e2e-inventory.json"
