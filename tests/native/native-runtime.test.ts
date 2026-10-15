@@ -13,6 +13,7 @@ import {
   actualSdk,
   boundedNativeText,
   cleanupNativeFixture,
+  CODEX_SHUTDOWN_LOG_FILTER,
   buildAdapters,
   executable,
   hash,
@@ -1231,6 +1232,7 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
     await provider.start()
     await provider.configureCodex(owned.home)
     const env = isolatedEnv(owned.root, owned.home)
+    const observedEnv = { ...env, LOG_FORMAT: 'json', RUST_LOG: CODEX_SHUTDOWN_LOG_FILTER }
     const creator = await NativeRpc.create(codexExecutable, owned.cwd, env, {
       processes: owned.processes,
     })
@@ -1250,10 +1252,10 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
       codexExecutable,
       owned.cwd,
       {
-        ...env,
+        ...observedEnv,
         CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'Codex Desktop',
       },
-      { processes: owned.processes },
+      { processes: owned.processes, observeShutdownStages: true },
     )
     clients.push(desktop)
     await desktop.initialize()
@@ -1263,8 +1265,9 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
     result(await desktop.request('thread/read', { threadId: thread.id, includeTurns: false }))
     result(await desktop.request('thread/read', { threadId: thread.id, includeTurns: true }))
     result(await desktop.request('thread/turns/list', { threadId: thread.id, limit: 25 }))
-    const pact = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+    const pact = await NativeRpc.create(codexExecutable, owned.cwd, observedEnv, {
       processes: owned.processes,
+      observeShutdownStages: true,
     })
     clients.push(pact)
     await pact.initialize()
@@ -1301,6 +1304,7 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
           stdinEnded: pact.child.stdin.writableEnded,
           stdinFinished: pact.child.stdin.writableFinished,
           helperExitCode: pact.child.exitCode,
+          shutdownBoundaries: pact.stopShutdownObservation(),
           facts: pact.cleanupFacts(),
         }),
       )
@@ -1345,6 +1349,7 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
           stdinEnded: desktop.child.stdin.writableEnded,
           stdinFinished: desktop.child.stdin.writableFinished,
           helperExitCode: desktop.child.exitCode,
+          shutdownBoundaries: desktop.stopShutdownObservation(),
           facts: desktop.cleanupFacts(),
         }),
       )

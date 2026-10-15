@@ -11,6 +11,7 @@ import {
   NativeRpc,
   NativeProcessSet,
   NativeProcessOwner,
+  NativeStderrStages,
   ownedRoot,
   within,
 } from './native-harness.js'
@@ -22,6 +23,93 @@ function gate(): { promise: Promise<void>; resolve: () => void } {
   })
   return { promise, resolve }
 }
+
+const stageLine = (
+  message: string,
+  target = 'codex_app_server_transport::transport::stdio',
+  level = 'INFO',
+) =>
+  JSON.stringify({
+    target,
+    level,
+    fields: { message },
+    span: { privateValue: 'private-秘密-canary' },
+  })
+
+it('projects only fixed stderr stages across chunk and UTF-8 boundaries without retaining log content', () => {
+  const probe = new NativeStderrStages()
+  probe.push(Buffer.from(stageLine('processor task exited', 'codex_app_server') + '\n'))
+  probe.start()
+  const bytes = Buffer.from(stageLine('stdin reader finished (EOF)', undefined, 'DEBUG') + '\n')
+  const split = bytes.indexOf(Buffer.from('秘')) + 1
+  probe.push(bytes.subarray(0, split))
+  probe.push(bytes.subarray(split))
+  probe.push(
+    Buffer.from(
+      [
+        stageLine('stdout writer exited (channel closed)'),
+        stageLine('processor task exited', 'codex_app_server'),
+        stageLine('stdin reader finished (EOF)', undefined, 'DEBUG'),
+        stageLine('processor task exited', 'unrelated_target'),
+        stageLine('private-unknown-event'),
+        '{not-json',
+      ].join('\n') + '\n',
+    ),
+  )
+  probe.end()
+  const observation = probe.stop()
+  expect(observation.stages.map((entry) => entry.stage)).toEqual([
+    'stdin-reader-finished',
+    'stdout-writer-finished',
+    'processor-exited',
+  ])
+  expect(
+    observation.stages.every(
+      (entry) => Number.isSafeInteger(entry.observedMs) && entry.observedMs >= 0,
+    ),
+  ).toBe(true)
+  expect(observation).toMatchObject({
+    lineOverflow: false,
+    partialLineAtSnapshot: false,
+    stderrEnded: true,
+  })
+  expect(JSON.stringify(observation)).not.toContain('private-')
+  observation.stages.length = 0
+  expect(probe.stop().stages).toHaveLength(3)
+})
+
+it('bounds overlong stderr lines, resumes at LF and handles a bounded EOF tail', () => {
+  const probe = new NativeStderrStages()
+  probe.start()
+  probe.push(Buffer.from('sensitive'.repeat(600)))
+  probe.push(Buffer.from('\n' + stageLine('processor task exited', 'codex_app_server')))
+  probe.end()
+  expect(probe.stop()).toMatchObject({
+    stages: [{ stage: 'processor-exited' }],
+    lineOverflow: true,
+    partialLineAtSnapshot: false,
+    stderrEnded: true,
+  })
+})
+
+it('freezes a partial stderr snapshot at stop and ignores later input, EOF and restart', () => {
+  const probe = new NativeStderrStages()
+  probe.start()
+  const bytes = Buffer.from(stageLine('processor task exited', 'codex_app_server'))
+  probe.push(bytes.subarray(0, bytes.length - 1))
+  const snapshot = probe.stop()
+  expect(snapshot).toEqual({
+    stages: [],
+    lineOverflow: false,
+    partialLineAtSnapshot: true,
+    stderrEnded: false,
+  })
+  probe.push(bytes.subarray(bytes.length - 1))
+  probe.push(Buffer.from('\n' + stageLine('processor task exited', 'codex_app_server') + '\n'))
+  probe.end()
+  probe.start()
+  expect(probe.stop()).toEqual(snapshot)
+})
 
 it('closes a preparation ticket before disposal returns and never starts its late child', async () => {
   const owned = await ownedRoot()

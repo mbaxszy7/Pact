@@ -907,6 +907,103 @@ export interface NativeCleanupFacts {
 
 // All requests settle in 10s; no retries after unknown delivery. The only child
 // killed on cleanup is this fixture's own child, never a Desktop/Pact process.
+export const CODEX_SHUTDOWN_LOG_FILTER =
+  'off,codex_app_server=info,codex_app_server::=off,codex_app_server_=off,codex_app_server_transport::transport::stdio=debug'
+type CodexShutdownStage = 'stdin-reader-finished' | 'processor-exited' | 'stdout-writer-finished'
+
+/** Diagnostic boundaries only: no log content or native exit/release inference. */
+export class NativeStderrStages {
+  private buffer: Buffer = Buffer.alloc(0)
+  private dropping = false
+  private active = false
+  private started = false
+  private stopped = false
+  private startedAt = 0
+  private lineOverflow = false
+  private partialLineAtSnapshot = false
+  private stderrEnded = false
+  private readonly stages: Array<{ stage: CodexShutdownStage; observedMs: number }> = []
+
+  start(): void {
+    if (this.started || this.stopped) return
+    this.started = true
+    this.startedAt = performance.now()
+    this.active = true
+  }
+  push(data: Buffer): void {
+    if (!this.active) return
+    let cursor = 0
+    while (cursor < data.length) {
+      const newline = data.indexOf(10, cursor)
+      const end = newline < 0 ? data.length : newline
+      if (!this.dropping) {
+        if (this.buffer.length + end - cursor > 4096) {
+          this.lineOverflow = true
+          this.dropping = true
+          this.buffer = Buffer.alloc(0)
+        } else if (end > cursor) {
+          this.buffer = Buffer.concat([this.buffer, data.subarray(cursor, end)])
+        }
+      }
+      if (newline < 0) return
+      if (!this.dropping) this.consumeLine()
+      this.buffer = Buffer.alloc(0)
+      this.dropping = false
+      cursor = newline + 1
+    }
+  }
+  private consumeLine(): void {
+    try {
+      const value: unknown = JSON.parse(this.buffer.toString('utf8'))
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return
+      const target: unknown = Reflect.get(value, 'target')
+      const level: unknown = Reflect.get(value, 'level')
+      const fields: unknown = Reflect.get(value, 'fields')
+      if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return
+      const message: unknown = Reflect.get(fields, 'message')
+      let stage: CodexShutdownStage | undefined
+      if (target === 'codex_app_server_transport::transport::stdio') {
+        if (level === 'DEBUG' && message === 'stdin reader finished (EOF)')
+          stage = 'stdin-reader-finished'
+        else if (level === 'INFO' && message === 'stdout writer exited (channel closed)')
+          stage = 'stdout-writer-finished'
+      } else if (
+        target === 'codex_app_server' &&
+        level === 'INFO' &&
+        message === 'processor task exited'
+      )
+        stage = 'processor-exited'
+      if (stage && !this.stages.some((entry) => entry.stage === stage))
+        this.stages.push({ stage, observedMs: Math.round(performance.now() - this.startedAt) })
+    } catch {
+      // Unknown or malformed logs cannot change the protocol/cleanup verdict.
+    }
+  }
+  end(): void {
+    if (this.stopped) return
+    this.stderrEnded = true
+    if (this.active && !this.dropping && this.buffer.length) this.consumeLine()
+    this.buffer = Buffer.alloc(0)
+    this.dropping = false
+    this.active = false
+  }
+  stop() {
+    if (!this.stopped) {
+      this.partialLineAtSnapshot = this.buffer.length > 0 || this.dropping
+      this.buffer = Buffer.alloc(0)
+      this.dropping = false
+      this.active = false
+      this.stopped = true
+    }
+    return {
+      stages: this.stages.map((entry) => ({ ...entry })),
+      lineOverflow: this.lineOverflow,
+      partialLineAtSnapshot: this.partialLineAtSnapshot,
+      stderrEnded: this.stderrEnded,
+    }
+  }
+}
+
 export class NativeRpc {
   readonly child: ChildProcessWithoutNullStreams
   readonly events: Event[] = []
@@ -931,6 +1028,7 @@ export class NativeRpc {
   private cleanupPhase: NativeCleanupFacts['phase'] = 'open'
   private readonly cleanupStages: NativeCleanupFacts['stages'] = []
   private previousAttempt: Omit<NativeCleanupFacts, 'previousAttempt'> | undefined
+  private readonly shutdownStages: NativeStderrStages | undefined
 
   static async create(
     executablePath: string,
@@ -941,6 +1039,7 @@ export class NativeRpc {
       onReleased?: () => void
       deadlineAt?: number
       processes?: NativeProcessSet
+      observeShutdownStages?: boolean
     } = {},
   ): Promise<NativeRpc> {
     const deadlineAt = Math.min(options.deadlineAt ?? Infinity, performance.now() + 50_000)
@@ -954,7 +1053,7 @@ export class NativeRpc {
         )
     try {
       options.processes?.assertOpen()
-      return new NativeRpc(cwd, env, scope, options.onReleased)
+      return new NativeRpc(cwd, env, scope, options.onReleased, options.observeShutdownStages)
     } catch (error) {
       await scope.close().catch(() => undefined)
       throw error
@@ -966,7 +1065,9 @@ export class NativeRpc {
     env: NodeJS.ProcessEnv,
     private readonly scope: NativeProcessOwner,
     private readonly onReleased?: () => void,
+    observeShutdownStages = false,
   ) {
+    this.shutdownStages = observeShutdownStages ? new NativeStderrStages() : undefined
     this.child = scope.start(['app-server'], { cwd, env, shell: false, windowsHide: true })
     this.deadline = setTimeout(
       () => {
@@ -983,6 +1084,7 @@ export class NativeRpc {
         resolveExit()
       })
       this.child.once('error', (error) => {
+        this.shutdownStages?.stop()
         this.ended = true
         this.fail(error)
         resolveExit()
@@ -998,14 +1100,24 @@ export class NativeRpc {
         resolveClose()
       }
       this.child.once('close', () => {
+        this.shutdownStages?.stop()
         finish()
       })
     })
     this.child.stderr.on('data', (data: Buffer) => {
       this.stderrBytes += data.length
-      if (this.stderrBytes > 64 * 1024) this.fail(new Error('Native stderr exceeds 64 KiB'))
+      if (this.stderrBytes > 64 * 1024) {
+        this.shutdownStages?.stop()
+        this.fail(new Error('Native stderr exceeds 64 KiB'))
+        return
+      }
+      this.shutdownStages?.push(data)
     })
-    this.child.stdin.on('error', (error) => this.fail(error))
+    this.child.stderr.once('end', () => this.shutdownStages?.end())
+    this.child.stdin.on('error', (error) => {
+      this.shutdownStages?.stop()
+      this.fail(error)
+    })
     this.child.stdout.on('data', (data: Buffer) => {
       this.bytes += data.length
       if (this.bytes > 8 * 1024 * 1024) {
@@ -1130,9 +1242,14 @@ export class NativeRpc {
   async endInputNaturally(): Promise<void> {
     if (this.closingRequested) throw new Error('Owned Native RPC is closing')
     await within(this.scope.group.observe(), 2000, 'Owned natural EOF observation deadline')
+    this.shutdownStages?.start()
     this.child.stdin.end()
   }
+  stopShutdownObservation(): ReturnType<NativeStderrStages['stop']> | undefined {
+    return this.shutdownStages?.stop()
+  }
   close(options: { recheck?: boolean } = {}): Promise<void> {
+    this.shutdownStages?.stop()
     this.closingRequested = true
     if (options.recheck && this.cleanupPhase === 'unconfirmed' && !this.previousAttempt) {
       this.previousAttempt = this.cleanupFacts()
@@ -1691,7 +1808,14 @@ export async function cleanupNativeFixture(
     throw new Error('Owned native fixture cleanup is unconfirmed; recovery data retained')
   if (retainRoot) return
   try {
-    await rm(owned.root, { recursive: true, force: true })
+    // Physical owners are already released above. Windows may still report a transient
+    // busy file; keep deletion bounded and preserve the root if it does not settle.
+    await rm(owned.root, {
+      recursive: true,
+      force: true,
+      maxRetries: process.platform === 'win32' ? 3 : 0,
+      retryDelay: 250,
+    })
   } catch (error) {
     const code: unknown =
       error && typeof error === 'object' ? Reflect.get(error, 'code') : undefined
