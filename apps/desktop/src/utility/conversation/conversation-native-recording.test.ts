@@ -202,7 +202,9 @@ it('refuses Undo while native work continues without a recording reservation', a
   try {
     const firstId = await f.send()
     f.endBackground(firstId)
-    await vi.waitFor(() => expect(f.workspace.summary(firstId)?.state).toBe('ready'))
+    await vi.waitFor(() => expect(f.workspace.summary(firstId)?.state).toBe('ready'), {
+      timeout: 10_000,
+    })
     vi.spyOn(f.workspace, 'start').mockResolvedValue('Recording preparation failed.')
     native.retainNext = true
     const secondId = await f.send()
@@ -217,7 +219,7 @@ it('refuses Undo while native work continues without a recording reservation', a
   } finally {
     await f.dispose()
   }
-})
+}, 30_000)
 
 it('offers a newly confirmed creation after an unconfirmed candidate cannot be verified', async () => {
   const f = await fixture('codex')
@@ -446,7 +448,11 @@ async function fixture(agentId: RuntimeAgentId) {
     if (!sent.ok) throw new Error(sent.error.message)
     const runId = sent.value.runs[0]?.id
     if (!runId) throw new Error('Run fixture missing')
-    await vi.waitFor(() => expect(flow.diagnostics().activeExecutions).toBe(0))
+    // This fixture awaits real directory Worker I/O, whose own deadline is 5 seconds.
+    // Vitest's 1-second polling default is not a product latency requirement.
+    await vi.waitFor(() => expect(flow.diagnostics().activeExecutions).toBe(0), {
+      timeout: 10_000,
+    })
     return runId
   }
   const endBackground = (runId: string) => {
