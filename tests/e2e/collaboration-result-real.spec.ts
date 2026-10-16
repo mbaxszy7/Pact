@@ -16,7 +16,7 @@ import { test } from './runtime-fixture.js'
 for (const actor of ['codex', 'claude'] as const)
   test(
     `real ${actor} submits a required plan in its first authorized root Turn @real`,
-    { tag: '@real-core' },
+    { tag: '@real-extended' },
     async () => {
       test.setTimeout(300_000)
       const ctx = await launchRealWorkspace(`real-required-plan-${actor}`)

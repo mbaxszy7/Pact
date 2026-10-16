@@ -16,7 +16,7 @@ import { createRuntimeFixture, test } from './runtime-fixture.js'
 
 test(
   'real CLIs report independent readiness and first-use gating',
-  { tag: ['@real', '@real-core'] },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     const fixture = await createRuntimeFixture({ mode: 'real', firstUse: true })
     try {
@@ -76,7 +76,7 @@ test(
 
 test(
   'real configuration loss keeps existing work readable',
-  { tag: ['@real', '@real-core'] },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(600_000)
     const ctx = await launchRealWorkspace('real-degraded-environment')

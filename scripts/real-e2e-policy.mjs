@@ -41,13 +41,13 @@ export const realCases = [
   {
     path: 'tests/e2e/collaboration-result-real.spec.ts',
     title: 'real codex submits a required plan in its first authorized root Turn @real',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'collaboration',
   },
   {
     path: 'tests/e2e/collaboration-result-real.spec.ts',
     title: 'real claude submits a required plan in its first authorized root Turn @real',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'collaboration',
   },
   {
@@ -72,7 +72,7 @@ export const realCases = [
   {
     path: 'tests/e2e/default-session-settings.spec.ts',
     title: 'saves first-use defaults and reopens the singleton from Settings',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'first-use',
   },
   {
@@ -127,7 +127,7 @@ export const realCases = [
   {
     path: 'tests/e2e/real-environment.spec.ts',
     title: 'real CLIs report independent readiness and first-use gating',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'first-use',
   },
   {
@@ -139,7 +139,7 @@ export const realCases = [
   {
     path: 'tests/e2e/real-environment.spec.ts',
     title: 'real configuration loss keeps existing work readable',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'recovery',
   },
   {
@@ -171,7 +171,7 @@ export const realCases = [
   {
     path: 'tests/e2e/real-input-return.spec.ts',
     title: 'real occupied writer returns frozen Codex input and Comments; new draft preserved',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'draft-integrity',
   },
   {
@@ -189,13 +189,13 @@ export const realCases = [
   {
     path: 'tests/e2e/real-lifecycle.spec.ts',
     title: 'real lost ACK recovers the actual completed result without resend; cold inspection',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'recovery',
   },
   {
     path: 'tests/e2e/real-lifecycle.spec.ts',
     title: 'real absence and empty interruption never authorize replay or old-task rebuild',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'recovery',
   },
   {
@@ -208,7 +208,7 @@ export const realCases = [
     path: 'tests/e2e/real-lifecycle.spec.ts',
     title:
       'real graceful quit preserves interrupted text through a new explicit request and cold restart',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'recovery',
   },
   {
@@ -220,7 +220,7 @@ export const realCases = [
   {
     path: 'tests/e2e/real-native.spec.ts',
     title: 'real Claude follow-ups do not rerun Codex and both peer answers reach its next task',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'continuation',
   },
   {
@@ -234,21 +234,21 @@ export const realCases = [
     path: 'tests/e2e/real-peer-assistance.spec.ts',
     title:
       'real claude structured peer request stays inert until Ask and executes the other Agent once',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'collaboration',
   },
   {
     path: 'tests/e2e/real-peer-assistance.spec.ts',
     title:
       'real codex structured peer request stays inert until Ask and executes the other Agent once',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'collaboration',
   },
   {
     path: 'tests/e2e/real-peer-assistance.spec.ts',
     title:
       'real Not now dismisses the proposal without a peer task and plain mention text cannot create one',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'collaboration',
   },
   {
@@ -272,20 +272,20 @@ export const realCases = [
   {
     path: 'tests/e2e/real-permissions.spec.ts',
     title: 'real once permission executes its actual command and does not grant a new Session',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'permissions',
   },
   {
     path: 'tests/e2e/real-permissions.spec.ts',
     title: 'real session permission executes its actual command and does not grant a new Session',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'permissions',
   },
   {
     path: 'tests/e2e/real-recovery.spec.ts',
     title:
       'real Fork preserves both Native histories and the source draft through cold initialization without a Model task',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'recovery',
   },
   {
@@ -299,81 +299,81 @@ export const realCases = [
     path: 'tests/e2e/real-routing.spec.ts',
     title:
       'real @all preserves distinct ordered rows while the second Agent waits for actual permission',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'routing',
   },
   {
     path: 'tests/e2e/real-settings.spec.ts',
     title:
       'real defaults and Session overrides preserve frozen native settings, next-task routing and cold copies',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'settings',
   },
   {
     path: 'tests/e2e/real-source-read.spec.ts',
     title: 'real source-read refusal remains distinct and accepts no input',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'source-integrity',
   },
   {
     path: 'tests/e2e/real-startup.spec.ts',
     title: 'real Session startup closes its native catalog processes without a Model Turn',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'first-use',
   },
   {
     path: 'tests/e2e/real-stop.spec.ts',
     title:
       'real codex UI Stop preserves received text and unsent input before one explicit continuation; @all never starts its secondary',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'stop',
   },
   {
     path: 'tests/e2e/real-stop.spec.ts',
     title:
       'real claude UI Stop preserves received text and unsent input before one explicit continuation',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'stop',
   },
   {
     path: 'tests/e2e/real-stop.spec.ts',
     title:
       'real codex UI Stop retires an unanswered native permission without executing its command',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'stop',
   },
   {
     path: 'tests/e2e/real-stop.spec.ts',
     title:
       'real codex UI Stop interrupts its foreground command before the delayed filesystem effect',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'stop',
   },
   {
     path: 'tests/e2e/real-stop.spec.ts',
     title:
       'real claude UI Stop retires an unanswered native permission without executing its command',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'stop',
   },
   {
     path: 'tests/e2e/real-stop.spec.ts',
     title:
       'real claude UI Stop interrupts its foreground command before the delayed filesystem effect',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'stop',
   },
   {
     path: 'tests/e2e/real-workspace-changes.spec.ts',
     title:
       'real Claude edits preserve native versions and whole-card Undo rejects conflicts without partial writes',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'changes',
   },
   {
     path: 'tests/e2e/real-workspace-changes.spec.ts',
     title: 'real Codex applied patch remains reviewable while unavailable history disables Undo',
-    tier: 'core',
+    tier: 'extended',
     scenario: 'changes',
   },
   {

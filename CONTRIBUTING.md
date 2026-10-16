@@ -157,15 +157,19 @@ Discovery must match that inventory and its tags; a missing, new, duplicate or r
 case cannot silently change the merge gate. Test titles, assertions and the immutable
 baseline remain unchanged.
 
-Dev-scope PRs require all 29 core cases on Windows x64, Windows arm64 and macOS arm64.
-They cover first-use readiness/defaults, actual Claude/Codex replies and continuation,
-dual-Agent routing and explicit collaboration, native permission lifetime, Stop before
-effects, cold recovery without replay, frozen drafts/settings, and Changes/Undo safety.
-The cold lost-ACK case remains core even if an earlier run failed during Session setup.
-The 32 extended cases retain appearance, large-history/file/capacity work, image input,
-additional persistence journeys and fault permutations. Their execution is deferred on
-automatic Dev-scope PR runs; deterministic checks and applicable performance budgets remain
-required. Classification follows business risk, never an observed failure.
+Dev-scope PRs require one real smoke case on Windows x64, Windows arm64 and macOS arm64:
+`real @all completes each Agent once and keeps ordered distinct response rows`.
+It launches the actual App, creates a Project and Session through the UI, sends one
+`@all` message, and verifies that Codex and Claude each complete exactly one real Run,
+return the request marker in separate responses, and release the Composer. Startup,
+Session creation, either Agent's reply, or cleanup failure still blocks this gate.
+
+The other 60 real cases are extended regression. They retain their original assertions
+for permissions, Stop, recovery, settings, drafts, collaboration, Changes/Undo, appearance,
+images and performance, with execution deferred on automatic Dev-scope PR runs. This is
+an explicitly narrowed smoke acceptance scope; a passing smoke does not establish those
+extended behaviors. Credential-free deterministic checks, native protocol tests and
+applicable performance budgets remain required.
 
 Provider execution belongs to the same **Pact CI - Code quality and app tests** root run and attempt
 as its prerequisite checks. The root calls **Pact CI - Claude and Codex tests** as a reusable workflow; it has no independent

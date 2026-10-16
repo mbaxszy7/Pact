@@ -30,7 +30,7 @@ const digest = (value: string) => createHash('sha256').update(value).digest('hex
 
 test(
   'real Claude edits preserve native versions and whole-card Undo rejects conflicts without partial writes',
-  { tag: ['@real', '@real-core'] },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(600_000)
     const ctx = await launchRealWorkspace('real-native-undo')
@@ -154,7 +154,7 @@ test(
 
 test(
   'real Codex applied patch remains reviewable while unavailable history disables Undo',
-  { tag: ['@real', '@real-core'] },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(600_000)
     const ctx = await launchRealWorkspace('real-native-patch-review')

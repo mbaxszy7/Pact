@@ -18,7 +18,7 @@ import { windowsTextCommand } from './windows-test-command.js'
 
 test(
   'real @all preserves distinct ordered rows while the second Agent waits for actual permission',
-  { tag: ['@real', '@real-core'] },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(600_000)
     const ctx = await launchRealWorkspace('real-pending-peer')

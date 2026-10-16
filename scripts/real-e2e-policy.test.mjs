@@ -75,13 +75,11 @@ await test('actual Playwright discovery is completely classified and core select
       .map(key)
       .toSorted(compare),
   )
-  assert.equal(core.size, 29)
-  assert.equal(listed.size - core.size, 32)
-  assert.equal(
-    realCases.find(
-      (item) => item.title.includes('lost ACK') && item.title.includes('cold inspection'),
-    ).tier,
-    'core',
+  assert.equal(core.size, 1)
+  assert.equal(listed.size - core.size, 60)
+  assert.deepEqual(
+    realCases.filter((item) => item.tier === 'core').map((item) => item.title),
+    ['real @all completes each Agent once and keeps ordered distinct response rows'],
   )
 })
 
@@ -90,14 +88,14 @@ await test('core success reports every deferred case without claiming a complete
   assert.equal(report.gatePassed, true)
   assert.equal(report.fullSuitePassed, false)
   assert.deepEqual(report.tiers.core, {
-    total: 29,
-    passed: 29,
+    total: 1,
+    passed: 1,
     failed: 0,
     skipped: 0,
     notRun: 0,
     notApplicable: 0,
   })
-  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 32)
+  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 60)
   assert(
     report.cases
       .filter((item) => item.tier === 'extended')

@@ -20,7 +20,7 @@ import { test } from './runtime-fixture.js'
 for (const requester of ['claude', 'codex'] as const) {
   test(
     `real ${requester} structured peer request stays inert until Ask and executes the other Agent once`,
-    { tag: ['@real', '@real-core'] },
+    { tag: ['@real', '@real-extended'] },
     async () => {
       test.setTimeout(600_000)
       const ctx = await launchRealWorkspace(`real-peer-proposal-${requester}`)
@@ -112,7 +112,7 @@ for (const requester of ['claude', 'codex'] as const) {
 
 test(
   'real Not now dismisses the proposal without a peer task and plain mention text cannot create one',
-  { tag: ['@real', '@real-core'] },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(600_000)
     const ctx = await launchRealWorkspace('real-peer-dismiss')

@@ -24,7 +24,7 @@ test.describe('real business input return', { tag: '@real' }, () => {
   for (const keepNewDraft of [false, true]) {
     test(
       `real occupied writer returns frozen Codex input and Comments; new draft ${keepNewDraft ? 'preserved' : 'empty'}`,
-      { tag: keepNewDraft ? '@real-core' : '@real-extended' },
+      { tag: '@real-extended' },
       async () => {
         test.setTimeout(600_000)
         const ctx = await launchRealWorkspace(

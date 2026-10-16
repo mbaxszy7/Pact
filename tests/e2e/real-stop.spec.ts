@@ -31,7 +31,7 @@ const commandDelayMs = 15_000
 for (const agentId of ['codex', 'claude'] as const) {
   test(
     `real ${agentId} UI Stop preserves received text and unsent input before one explicit continuation${agentId === 'codex' ? '; @all never starts its secondary' : ''}`,
-    { tag: ['@real', '@real-core'] },
+    { tag: ['@real', '@real-extended'] },
     async () => {
       test.setTimeout(600_000)
       const ctx = await launchRealWorkspace(`real-stop-${agentId}`)
@@ -311,7 +311,7 @@ for (const agentId of ['codex', 'claude'] as const) {
 for (const agentId of ['codex', 'claude'] as const) {
   test(
     `real ${agentId} UI Stop retires an unanswered native permission without executing its command`,
-    { tag: ['@real', '@real-core'] },
+    { tag: ['@real', '@real-extended'] },
     async () => {
       test.setTimeout(600_000)
       const ctx = await launchRealWorkspace(`real-stop-permission-${agentId}`)
@@ -394,7 +394,7 @@ for (const agentId of ['codex', 'claude'] as const) {
 
   test(
     `real ${agentId} UI Stop interrupts its foreground command before the delayed filesystem effect`,
-    { tag: ['@real', '@real-core'] },
+    { tag: ['@real', '@real-extended'] },
     async () => {
       test.setTimeout(600_000)
       const ctx = await launchRealWorkspace(`real-stop-command-${agentId}`)

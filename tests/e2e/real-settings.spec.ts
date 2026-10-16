@@ -43,7 +43,7 @@ interface Selections {
 
 test(
   'real defaults and Session overrides preserve frozen native settings, next-task routing and cold copies',
-  { tag: ['@real', '@real-core'] },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     // Six explicit user tasks: CLI default, then E1/E2 for each actual Agent.
     test.setTimeout(840_000)
