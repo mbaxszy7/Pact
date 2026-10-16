@@ -37,6 +37,47 @@ const platformJobs = (job, purpose) => {
   })
 }
 
+void test('partial Windows reruns download the retained producer artifact, not the consumer attempt name', async () => {
+  const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url))
+  const builderRequire = createRequire(desktopRequire.resolve('electron-builder/package.json'))
+  const { load } = builderRequire('js-yaml')
+  const root = load(await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8'))
+  const provider = load(
+    await readFile(new URL('../.github/workflows/provider-e2e.yml', import.meta.url), 'utf8'),
+  )
+  const producer = root.jobs.identity.steps.find((step) => step.id === 'identity-artifact')
+  assert(producer?.uses.startsWith('actions/upload-artifact@'))
+  assert.equal(
+    root.jobs.identity.outputs.artifact_id,
+    '${{ steps.identity-artifact.outputs.artifact-id }}',
+  )
+
+  const platform = root.jobs.platform.steps.find(
+    (step) => step.with?.path === '${{ runner.temp }}/pact-identity',
+  )
+  assert.equal(platform.with['artifact-ids'], '${{ needs.identity.outputs.artifact_id }}')
+  assert.equal(platform.with.name, undefined)
+  assert.equal(platform.with['merge-multiple'], true, 'keep ci-identity.json at the verified path')
+  // A current-attempt producer remains mandatory at every trusted control seam.
+  // GitHub relabels reused job metadata with the new attempt; an old producer
+  // must not mint a fresh attestation that would make those old results usable.
+  for (const job of ['candidate-attestation', 'check-writer', 'pact-complete']) {
+    const step = root.jobs[job].steps.find(
+      (candidateStep) => candidateStep.with?.path === '${{ runner.temp }}/pact-identity',
+    )
+    assert.equal(step.with.name, 'ci-identity-a${{ github.run_attempt }}')
+    assert.equal(step.with['artifact-ids'], undefined)
+  }
+  for (const job of ['admission', 'provider']) {
+    const step = provider.jobs[job].steps.find(
+      (candidateStep) => candidateStep.with?.path === '${{ runner.temp }}/pact-identity',
+    )
+    assert.equal(step.with.name, 'ci-identity-a${{ inputs.root_attempt }}')
+    assert.equal(step.with['artifact-ids'], undefined)
+    assert.equal(step.with['run-id'], '${{ inputs.root_run_id }}')
+  }
+})
+
 void test('all shared jobs use macOS and CI selects exactly the two owner-approved native targets', async () => {
   const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url))
   const builderRequire = createRequire(desktopRequire.resolve('electron-builder/package.json'))

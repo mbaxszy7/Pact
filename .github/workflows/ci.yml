@@ -44,6 +44,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 10
     outputs:
+      artifact_id: ${{ steps.identity-artifact.outputs.artifact-id }}
       candidate: ${{ steps.identity.outputs.candidate }}
       head: ${{ steps.identity.outputs.head }}
       base: ${{ steps.identity.outputs.base }}
@@ -71,7 +72,8 @@ jobs:
           PACT_CI_PUSH_SHA: ${{ github.sha }}
           PACT_RELEASE_APP_BOT_ID: ${{ vars.PACT_RELEASE_APP_BOT_ID }}
           PACT_RELEASE_APP_SLUG: ${{ vars.PACT_RELEASE_APP_SLUG }}
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - id: identity-artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ci-identity-a${{ github.run_attempt }}
           path: ${{ runner.temp }}/ci-identity.json
@@ -265,7 +267,8 @@ jobs:
           display: 'true'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ci-identity-a${{ github.run_attempt }}
+          artifact-ids: ${{ needs.identity.outputs.artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/pact-identity
       - name: Verify target architecture and exact tested workspace
         run: |

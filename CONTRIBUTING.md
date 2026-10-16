@@ -224,9 +224,16 @@ distinct from a PR attestation; a dirty or changing working tree has no captured
 identity. Deliberately filtered local runs list unexecuted obligations and cannot claim
 a complete core/full gate. UI/deterministic Actions summaries link `e2e-PLATFORM-aATTEMPT`
 reports and, on failure, `ui-diagnostics-PLATFORM-aATTEMPT` snapshots/traces; both retain
-14 days. Prerequisites, identity and provider evidence must all belong to the same root
-run and attempt. A partial rerun cannot borrow old-attempt prerequisites or artifacts;
-use **Re-run all jobs** for a complete replacement. The native **PR checks complete** job fails
+14 days. The identity producer exports its immutable upload Artifact ID to the
+uncredentialed platform jobs instead of guessing a filename from their own attempt. A single
+uncredentialed platform rerun can therefore use its retained producer identity, still
+verified against the exact checked-out commit/tree and current PR head/base. Missing
+or expired artifacts fail without fallback. This does not reuse test results: execution
+reports keep their actual attempt numbers. Candidate attestation, Provider admission,
+check publication and the final PR gate retain current-attempt identity artifact names;
+a retained producer cannot issue a fresh attestation. These trusted paths still require
+all prerequisite jobs, attestations and Provider results in the same current root
+attempt; use **Re-run all jobs** for a complete trusted replacement. The native **PR checks complete** job fails
 when any required dependency failed, was cancelled, skipped or not executed.
 
 UI and deterministic failure output uses separate `ui/` and `deterministic/` directories.
