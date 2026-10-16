@@ -29,6 +29,9 @@ See the [product specification](docs/product/requirements.md) for current behavi
 - On Windows, Python 3 and Visual Studio Build Tools with **Desktop development with C++** for
   Electron native dependency rebuilds.
 
+Required CI currently covers Windows x64 and macOS arm64. Windows arm64 CI and all
+automatic installer builds/publication are deferred pending native-machine acceptance.
+
 ```sh
 corepack enable
 pnpm install --frozen-lockfile

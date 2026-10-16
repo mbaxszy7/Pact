@@ -37,15 +37,15 @@ const platformJobs = (job, purpose) => {
   })
 }
 
-void test('all shared jobs use macOS and platform jobs retain exactly the three native targets', async () => {
+void test('all shared jobs use macOS and CI selects exactly the two owner-approved native targets', async () => {
   const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url))
   const builderRequire = createRequire(desktopRequire.resolve('electron-builder/package.json'))
   const { load } = builderRequire('js-yaml')
   const nativeRunners = [
     ['darwin-arm64', 'macos-15'],
     ['win32-x64', 'windows-2025'],
-    ['win32-arm64', 'windows-11-arm'],
   ]
+  assert.deepEqual(platformKeys, ['darwin-arm64', 'win32-x64'])
   for (const name of ['ci', 'provider-e2e', 'release-please', 'release']) {
     const workflow = load(
       // oxlint-disable-next-line no-await-in-loop -- Read each bounded workflow contract independently.
@@ -61,7 +61,14 @@ void test('all shared jobs use macOS and platform jobs retain exactly the three 
         assert(['macos-15', 'windows-2025'].includes(job['runs-on']))
       }
     }
+    assert(!JSON.stringify(workflow).includes('windows-11-arm'))
   }
+  const root = load(await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8'))
+  const scope = root.jobs.identity.steps.find(
+    (step) => step.name === 'Record required and deferred CI platforms',
+  )
+  assert(scope.run.includes('All Windows ARM64 CI is explicitly deferred'))
+  assert(scope.run.includes('it is not a pass'))
 })
 
 void test('model environment secrets cross only the explicitly named reusable-workflow interface', async () => {
@@ -930,14 +937,28 @@ await test('the trusted primary admission, writer and completion interfaces shar
     ['pact-ci', 'provider-e2e'],
   )
   assert(writes.every((item) => item.head_sha === head))
+  assert(
+    writes.every((item) => item.output.summary.includes('All Windows ARM64 CI is owner-deferred')),
+  )
   assert(requests.includes('/actions/runs/100/attempts/1/jobs'))
   assert(!requests.some((item) => item.includes('provider-e2e.yml')))
-  jobs = jobs.map((item) =>
-    item.name === 'Real model tests / Windows arm64 - Claude and Codex'
-      ? Object.assign({}, item, { conclusion: 'skipped' })
-      : item,
-  )
-  await assert.rejects(main(args('complete'), env), /Every mandatory job/)
+  const successfulJobs = jobs
+  for (const name of [
+    'Windows x64 - Native checks and E2E reports',
+    'macOS arm64 - Native checks and E2E reports',
+    'Real model tests / Windows x64 - Claude and Codex',
+    'Real model tests / macOS arm64 - Claude and Codex',
+  ]) {
+    for (const conclusion of ['failure', 'cancelled', 'skipped', 'neutral']) {
+      jobs = successfulJobs.map((item) => (item.name === name ? { ...item, conclusion } : item))
+      // oxlint-disable-next-line no-await-in-loop -- Each current mandatory native/Provider failure is checked through the primary trusted completion interface.
+      await assert.rejects(main(args('complete'), env), /Every mandatory job/)
+    }
+    jobs = successfulJobs.filter((item) => item.name !== name)
+    // oxlint-disable-next-line no-await-in-loop -- Missing execution cannot inherit previously published passing checks.
+    await assert.rejects(main(args('complete'), env), /Every mandatory job/)
+  }
+  jobs = successfulJobs
   await assert.rejects(main(args('admit'), { ...env, GITHUB_RUN_ID: '200' }), /one CI graph/)
   await assert.rejects(
     main(args('preflight'), { ...env, PACT_EXPECTED_CI_ATTEMPT: '2' }),

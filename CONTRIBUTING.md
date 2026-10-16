@@ -4,7 +4,11 @@
 
 Use `.node-version` and the pnpm version in `package.json`.
 Supported desktop targets are Windows x64, Windows arm64 and macOS arm64. Shared CI
-jobs run on macOS arm64; platform-specific jobs use their corresponding native runners.
+jobs run on macOS arm64. Required platform jobs currently use Windows x64 and macOS arm64
+native runners; all Windows arm64 CI is explicitly deferred, not counted as passed.
+Its native launcher has exceeded the unchanged 15-second cold-start budget. Restore its
+native and Provider jobs together only after that failure is resolved and native-machine
+acceptance is complete. The arm64 source implementation and tests remain available.
 
 ```sh
 corepack enable
@@ -159,7 +163,7 @@ Discovery must match that inventory and its tags; a missing, new, duplicate or r
 case cannot silently change the merge gate. Test titles, assertions and the immutable
 baseline remain unchanged.
 
-Dev-scope PRs require one real smoke case on Windows x64, Windows arm64 and macOS arm64:
+Dev-scope PRs require one real smoke case on Windows x64 and macOS arm64:
 `real @all completes each Agent once and keeps ordered distinct response rows`.
 It launches the actual App, creates a Project and Session through the UI, sends one
 `@all` message, and verifies that Codex and Claude each complete exactly one real Run,
@@ -245,11 +249,12 @@ cases not run after an earlier failure. These no-credential reports record the r
 version, source SHA, tag, Release PR and Release ID; they omit signed-state extensions
 and do not replace the release controller's authenticated staging or publication checks.
 
-Branch pushes and PRs run static checks, unit/script tests, native protocol checks,
-UI/deterministic E2E on all three test architectures. Installer build/smoke and publication currently
+Branch pushes and PRs require static checks, unit/script tests, builds and native protocol checks
+on Windows x64 and macOS arm64. PRs also require the real smoke case above; UI/deterministic
+E2E is extended regression. All Windows arm64 CI and installer build/smoke and publication currently
 are deferred until native-machine acceptance. `PACT_PACKAGING_READY` must remain unset or false
 until that acceptance is complete. Windows arm64 installers remain excluded from the future automated
-release set; all three architectures retain their mandatory native protocol checks. Stable candidates additionally require
+release set. Both active CI architectures retain mandatory native protocol checks. Stable candidates additionally require
 full provider verification; publication validates every final installer and its content-bound
 smoke report. CI platform jobs allow 90 minutes and release platform jobs allow two hours
 for their required checks, packaging and cleanup. Deadlines do not establish completed tests.

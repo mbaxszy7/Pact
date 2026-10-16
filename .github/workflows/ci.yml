@@ -77,6 +77,17 @@ jobs:
           path: ${{ runner.temp }}/ci-identity.json
           if-no-files-found: error
           retention-days: 14
+      - name: Record required and deferred CI platforms
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          Required CI platforms: Windows x64 and macOS arm64.
+
+          All Windows ARM64 CI is explicitly deferred by the owner. Its cold native
+          launcher exceeded the unchanged 15-second startup budget; it is not a pass.
+          Re-enable its native and Provider jobs together after resolving that failure
+          and obtaining native-machine acceptance. Installer builds and publication
+          remain disabled pending their separate acceptance.
+          EOF
 
   publication:
     # Required by main protection; keep this exact check name.
@@ -232,12 +243,6 @@ jobs:
             label: Windows x64
             key: win32-x64
             package: true
-          - runner: windows-11-arm
-            platform: win32
-            arch: arm64
-            label: Windows arm64
-            key: win32-arm64
-            package: false
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:

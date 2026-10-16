@@ -803,7 +803,7 @@ void test('workflow keeps App credentials out of builds and forbids automatic/pa
   assert.doesNotMatch(publication, /two-hour packaged performance|All three installed/u)
   const ci = await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
   assert.doesNotMatch(ci, /run_soak|run-soak|package-soak-report|SOAK_DURATION/u)
-  assert.match(ci, /key: win32-arm64\s+package: false/u)
+  assert.doesNotMatch(ci, /key: win32-arm64|runner: windows-11-arm/u)
   assert.match(ci, /steps\.native\.outcome == 'success' && matrix\.package/u)
   assert.match(ci, /matrix\.package && vars\.PACT_PACKAGING_READY == 'true'/u)
   assert.match(workflow, /vars\.PACT_PACKAGING_READY == 'true'/u)

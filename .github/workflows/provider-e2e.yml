@@ -138,11 +138,6 @@ jobs:
             arch: x64
             label: Windows x64
             key: win32-x64
-          - runner: windows-11-arm
-            platform: win32
-            arch: arm64
-            label: Windows arm64
-            key: win32-arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     steps:

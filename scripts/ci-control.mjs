@@ -14,8 +14,10 @@ import {
 import { requireRealScope } from './real-e2e-policy.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
-export const platformKeys = ['darwin-arm64', 'win32-x64', 'win32-arm64']
-const platformLabels = ['macOS arm64', 'Windows x64', 'Windows arm64']
+// Windows ARM64 CI is owner-deferred; restore both workflow matrices and these
+// required job lists together after native launcher and machine acceptance.
+export const platformKeys = ['darwin-arm64', 'win32-x64']
+const platformLabels = ['macOS arm64', 'Windows x64']
 export const checkWriterJob = 'Publish PR check results'
 export const ciJobs = [
   'Resolve tested code',
@@ -592,7 +594,7 @@ async function publishCheck(
       details_url: `https://github.com/${repository}/actions/runs/${runId}`,
       output: {
         title: passed ? 'Current code identity evidence passed' : 'Required evidence is blocked',
-        summary: `${explanation}\n\nPR #${identity.pullRequest}; head ${identity.headSha}; base ${identity.baseSha}; tree ${identity.treeSha}; policy ${identity.policySha}; tested candidate ${identity.candidateSha}.`,
+        summary: `${explanation}\n\nRequired platforms: Windows x64 and macOS arm64. All Windows ARM64 CI is owner-deferred, not passed. Installer builds and publication remain deferred.\n\nPR #${identity.pullRequest}; head ${identity.headSha}; base ${identity.baseSha}; tree ${identity.treeSha}; policy ${identity.policySha}; tested candidate ${identity.candidateSha}.`,
       },
     },
   })
@@ -775,7 +777,7 @@ export async function main(args = process.argv.slice(2), env = process.env) {
       [
         'provider-e2e',
         providerPassed,
-        'All three Provider jobs must succeed in this exact CI attempt; core ordinary-PR cases and full Release cases remain mandatory. Environment waiting, cancellation, skipped or missing jobs block this check.',
+        'Both required native-platform Provider jobs and credential admission must succeed in this exact CI attempt; core ordinary-PR cases and full Release cases remain mandatory. Environment waiting, cancellation, skipped or missing jobs block this check.',
       ],
     ]) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- The existing owner serially publishes the two fixed contexts after their current-run checks.
