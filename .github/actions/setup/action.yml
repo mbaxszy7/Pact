@@ -44,3 +44,11 @@ runs:
       shell: bash
       working-directory: ${{ inputs.controller || inputs.workspace }}
       run: node scripts/ci-display.mjs configure
+    - name: Enable and verify full keyboard navigation for macOS UI tests
+      if: runner.os == 'macOS' && inputs.display == 'true'
+      shell: bash
+      run: |
+        test "$GITHUB_ACTIONS" = true
+        test "$RUNNER_ENVIRONMENT" = github-hosted
+        /usr/bin/defaults write -g AppleKeyboardUIMode -int 3
+        test "$(/usr/bin/defaults read -g AppleKeyboardUIMode)" = 3

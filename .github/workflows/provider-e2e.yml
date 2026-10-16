@@ -23,6 +23,15 @@ on:
         description: Root CI attempt owning all prerequisite artifacts and jobs
         required: true
         type: string
+    secrets:
+      PACT_CLAUDE_SETTINGS_JSON:
+        required: true
+      PACT_CODEX_CONFIG_TOML:
+        required: true
+      PACT_CODEX_AUTH_JSON:
+        required: true
+      PACT_CODEX_PROVIDER_ENV_JSON:
+        required: false
     outputs:
       allowed:
         value: ${{ jobs.admission.outputs.allowed }}
@@ -43,8 +52,8 @@ on:
       provider_environment:
         value: ${{ jobs.admission.outputs.provider_environment }}
 
-# Model credentials are supplied only by the selected native environment.
-# No repository/App secrets are inherited by this reusable workflow.
+# The caller names only model configuration in the reusable-workflow contract.
+# The selected native environment supplies its values; App secrets are not inherited.
 permissions:
   contents: read
   pull-requests: read

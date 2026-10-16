@@ -438,6 +438,13 @@ jobs:
     # The local reusable workflow is loaded from this root workflow's trusted
     # source commit. Only its named environment supplies model credentials.
     uses: ./.github/workflows/provider-e2e.yml
+    # Environment-only secrets still need an explicit reusable-workflow contract.
+    # Forward only model configuration; control-plane/App secrets stay outside it.
+    secrets:
+      PACT_CLAUDE_SETTINGS_JSON: ${{ secrets.PACT_CLAUDE_SETTINGS_JSON }}
+      PACT_CODEX_CONFIG_TOML: ${{ secrets.PACT_CODEX_CONFIG_TOML }}
+      PACT_CODEX_AUTH_JSON: ${{ secrets.PACT_CODEX_AUTH_JSON }}
+      PACT_CODEX_PROVIDER_ENV_JSON: ${{ secrets.PACT_CODEX_PROVIDER_ENV_JSON }}
     with:
       controller: ${{ needs.identity.outputs.controller }}
       source_kind: ${{ needs.identity.outputs.source_kind }}

@@ -37,6 +37,30 @@ const platformJobs = (job, purpose) => {
   })
 }
 
+void test('model environment secrets cross only the explicitly named reusable-workflow interface', async () => {
+  const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url))
+  const builderRequire = createRequire(desktopRequire.resolve('electron-builder/package.json'))
+  const { load } = builderRequire('js-yaml')
+  const root = load(await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8'))
+  const provider = load(
+    await readFile(new URL('../.github/workflows/provider-e2e.yml', import.meta.url), 'utf8'),
+  )
+  const required = ['PACT_CLAUDE_SETTINGS_JSON', 'PACT_CODEX_CONFIG_TOML', 'PACT_CODEX_AUTH_JSON']
+  const names = [...required, 'PACT_CODEX_PROVIDER_ENV_JSON']
+  assert.deepEqual(
+    root.jobs.provider.secrets,
+    Object.fromEntries(names.map((name) => [name, '${{ secrets.' + name + ' }}'])),
+  )
+  assert.deepEqual(
+    provider.on.workflow_call.secrets,
+    Object.fromEntries(names.map((name) => [name, { required: required.includes(name) }])),
+  )
+  assert.equal(
+    provider.jobs.provider.environment,
+    '${{ needs.admission.outputs.provider_environment }}',
+  )
+})
+
 void test('readable workflow names match the exact jobs required by the trusted controller', async () => {
   const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url))
   const builderRequire = createRequire(desktopRequire.resolve('electron-builder/package.json'))

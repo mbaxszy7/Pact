@@ -93,6 +93,9 @@ test(
       await window
         .getByRole('combobox', { name: 'Message', exact: true })
         .fill('Inspect the next task while reading earlier work.')
+      // Editing is available while the initial draft read still gates sending.
+      // Wait for the actual user action to become available before pressing Enter.
+      await expect(window.getByRole('button', { name: 'Send message', exact: true })).toBeEnabled()
       await window.getByRole('combobox', { name: 'Message', exact: true }).press('Enter')
       await expect(
         window.getByRole('button', { name: 'Working · 1 step', exact: true }),
