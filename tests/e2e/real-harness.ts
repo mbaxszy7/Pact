@@ -134,13 +134,10 @@ export async function launchRealWorkspace(
       .click()
       .catch(async () => {
         throw new Error(
-          'ZERO_TURN_STARTUP_DIAGNOSTIC:' +
-            Buffer.from(
-              JSON.stringify({
-                boundary: 'create_session_failed',
-                catalogFailureDiagnostics: await readCatalogFailures(fixture),
-              }),
-            ).toString('base64'),
+          JSON.stringify({
+            failure: 'Session creation failed',
+            catalogFailureDiagnostics: await readCatalogFailures(fixture),
+          }),
         )
       })
     await expect(page.getByRole('heading', { name: 'New session', exact: true })).toBeVisible()
@@ -163,27 +160,7 @@ export async function launchRealWorkspace(
       return catalog.value.sessions[0]!.id
     }, projectId)
     await expect(page.getByRole('combobox', { name: 'Message' })).toBeEnabled({ timeout: 15_000 })
-    const state = await readRealConversation({
-      fixture,
-      app,
-      page,
-      projectId,
-      projectDirectory,
-      sessionId,
-    })
-    throw new Error(
-      'ZERO_TURN_STARTUP_DIAGNOSTIC:' +
-        Buffer.from(
-          JSON.stringify({
-            boundary:
-              state.runs.length === 0 && state.nativeContexts.length === 0
-                ? 'startup_completed'
-                : 'unexpected_native_state',
-            runs: state.runs.length,
-            nativeContexts: state.nativeContexts.length,
-          }),
-        ).toString('base64'),
-    )
+    return { fixture, app, page, projectId, projectDirectory, sessionId }
   } catch (error) {
     try {
       await fixture.dispose()
