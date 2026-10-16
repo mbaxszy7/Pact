@@ -790,15 +790,22 @@ it.each([
         end: actor.length + 1,
       }
     }
+    const planRead = Promise.withResolvers<Awaited<ReturnType<DesktopBridge['getConversation']>>>()
+    props.onPlanAvailable = vi.fn<NonNullable<typeof props.onPlanAvailable>>()
     vi.stubGlobal('pact', {
       ...composerBridgeFixture(),
-      getConversation: vi.fn<DesktopBridge['getConversation']>().mockResolvedValue({
-        ok: true,
-        value: reportPage(task, { planSource: { runId: run.id, messageId: run.userMessageId } }),
-      }),
+      getConversation: vi.fn<DesktopBridge['getConversation']>().mockReturnValue(planRead.promise),
     })
     render(<ConversationView {...props} />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Send message' }))
+    expect(props.onSend).not.toHaveBeenCalled()
+    await act(async () => {
+      planRead.resolve({
+        ok: true,
+        value: reportPage(task, { planSource: { runId: run.id, messageId: run.userMessageId } }),
+      })
+    })
+    await waitFor(() => expect(props.onPlanAvailable).toHaveBeenCalledWith(task.sessionId, task.id))
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
     await waitFor(() =>
       expect(props.onSend).toHaveBeenCalledWith(
         props.composer,

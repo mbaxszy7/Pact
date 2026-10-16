@@ -108,7 +108,13 @@ async function readReadyPid(directory: string, name: string): Promise<number> {
         if (typeof pid === 'number' && Number.isSafeInteger(pid) && pid > 0) return pid
       }
     } catch (error) {
-      if (!(error instanceof Error) || Reflect.get(error, 'code') !== 'ENOENT') throw error
+      // Opening the private readiness file can precede its writer's JSON bytes.
+      // An incomplete record is not ready; every other I/O error stays fatal.
+      if (
+        !(error instanceof SyntaxError) &&
+        (!(error instanceof Error) || Reflect.get(error, 'code') !== 'ENOENT')
+      )
+        throw error
     }
     // oxlint-disable-next-line no-await-in-loop -- The bounded readiness poll yields between observations.
     await new Promise<void>((resolve) => setTimeout(resolve, 10))
@@ -212,6 +218,31 @@ function timeoutCount(): number {
 }
 
 describe('Owned physical process groups', () => {
+  it('waits for a complete readiness record without accepting a partially written JSON file', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'pact-catalog-readiness-'))
+    directories.push(directory)
+    const path = join(directory, 'root.json')
+    await writeFile(path, '')
+    const observed = Promise.withResolvers<void>()
+    const parse = JSON.parse
+    const observer = vi.spyOn(JSON, 'parse').mockImplementation((text, reviver) => {
+      if (text === '') observed.resolve()
+      return parse(text, reviver)
+    })
+    try {
+      const ready = readReadyPid(directory, 'root').then(
+        (pid) => ({ pid }),
+        (error: unknown) => ({ error }),
+      )
+      // Release the writer only after the reader actually saw the empty file.
+      await observed.promise
+      await writeFile(path, JSON.stringify({ pid: process.pid }))
+      expect(await ready).toEqual({ pid: process.pid })
+    } finally {
+      observer.mockRestore()
+    }
+  })
+
   it.skipIf(process.platform !== 'win32')(
     'keeps Windows input close exactly once after a synchronous failure',
     async () => {
