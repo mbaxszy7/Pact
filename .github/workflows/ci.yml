@@ -1,4 +1,4 @@
-name: CI
+name: Pact CI - Code quality and app tests
 
 on:
   push:
@@ -35,7 +35,7 @@ defaults:
 
 jobs:
   identity:
-    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'identity' || 'branch-identity' }}
+    name: Resolve tested code
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -74,7 +74,8 @@ jobs:
           retention-days: 14
 
   publication:
-    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'publication' || 'branch-publication' }}
+    # Required by main protection; keep this exact check name.
+    name: publication
     needs: identity
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -111,7 +112,7 @@ jobs:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
 
   candidate-attestation:
-    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'candidate-attestation' || 'branch-candidate-attestation' }}
+    name: Verify PR code identity
     needs: identity
     if: github.repository_id == '1416403312' && ((github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != ''))
     environment: ${{ github.event_name == 'pull_request_target' && 'pact-control-plane' || 'pact-bootstrap-control-plane' }}
@@ -158,7 +159,8 @@ jobs:
           PACT_CI_CHANNEL: ${{ needs.identity.outputs.channel }}
 
   quality:
-    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'quality' || 'branch-quality' }}
+    # Required by main protection; keep this exact check name.
+    name: quality
     needs: [identity, publication]
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -205,7 +207,7 @@ jobs:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
 
   platform:
-    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'platform' || 'branch-platform' }}-${{ matrix.key }}
+    name: ${{ matrix.label }} - UI and native tests
     # No-credential native validation can diagnose platform/package failures while
     # shared quality runs independently. Provider admission and final gates require both.
     needs: [identity, publication]
@@ -216,16 +218,19 @@ jobs:
           - runner: macos-15
             platform: darwin
             arch: arm64
+            label: macOS arm64
             key: darwin-arm64
             package: true
           - runner: windows-2025
             platform: win32
             arch: x64
+            label: Windows x64
             key: win32-x64
             package: true
           - runner: windows-11-arm
             platform: win32
             arch: arm64
+            label: Windows arm64
             key: win32-arm64
             package: false
     runs-on: ${{ matrix.runner }}
@@ -427,7 +432,7 @@ jobs:
           retention-days: 14
 
   provider:
-    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'provider' || 'branch-provider' }}
+    name: Real model tests
     needs: [identity, publication, quality, platform, candidate-attestation]
     if: github.repository_id == '1416403312' && ((github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != ''))
     # The local reusable workflow is loaded from this root workflow's trusted
@@ -441,7 +446,7 @@ jobs:
       root_attempt: ${{ github.run_attempt }}
 
   check-writer:
-    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'check-writer' || 'branch-check-writer' }}
+    name: Publish PR check results
     needs: [identity, publication, quality, platform, candidate-attestation, provider]
     if: always() && (github.repository_id == '1416403312' && ((github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')))
     environment: ${{ github.event_name == 'pull_request_target' && 'pact-control-plane' || 'pact-bootstrap-control-plane' }}
@@ -483,7 +488,7 @@ jobs:
           PACT_PROVIDER_ALLOWED: ${{ needs.provider.outputs.allowed }}
 
   pact-complete:
-    name: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')) && 'pact-complete' || 'branch-pact-complete' }}
+    name: ${{ (github.repository_id == '1416403312' && ((github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != ''))) && 'PR checks complete' || 'PR checks not required for branch' }}
     needs: [identity, publication, quality, platform, candidate-attestation, provider, check-writer]
     if: always() && (github.repository_id == '1416403312' && ((github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')))
     runs-on: ubuntu-latest
@@ -510,6 +515,7 @@ jobs:
           PACT_PROVIDER_ALLOWED: ${{ needs.provider.outputs.allowed }}
 
   branch-complete:
+    name: Branch checks complete
     needs: [identity, publication, quality, platform]
     if: always() && !(github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != ''))
     runs-on: ubuntu-latest

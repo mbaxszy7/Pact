@@ -142,7 +142,7 @@ export function windowsLauncherImageDiagnostic(): {
   }
 }
 
-function installImage(executable: string): void {
+function installImage(executable: string, deadlineAt = Infinity): void {
   if (executable.length > 4096) throw new Error('Windows fixture image path exceeds its bound')
   if (imageFailure) throw imageFailure
   prunePrivateImages()
@@ -154,7 +154,7 @@ function installImage(executable: string): void {
     const parent = realpathSync(tmpdir())
     const directory = mkdtempSync(join(parent, 'pact-test-image-'))
     const image = join(directory, 'image.exe')
-    const deadline = performance.now() + imageCompilationMs
+    const deadline = Math.min(performance.now() + imageCompilationMs, deadlineAt)
     const remaining = (): number => {
       const value = Math.floor(deadline - performance.now())
       if (value < 1) throw new Error('Windows fixture image preparation exceeded 30s')
@@ -216,6 +216,52 @@ function installImage(executable: string): void {
     digest(boundedBytes(executable)) !== seed.hash
   )
     throw (imageFailure = new Error('Private Windows fixture image changed; evidence retained'))
+}
+
+/** The command runner owns this link until both its helper and actual Job have released. */
+export function prepareWindowsRunnerLauncher(
+  configuration: {
+    executable: string
+    args: string[]
+    cwd: string
+    pipe: string
+    token: string
+    argumentMode: 'crt' | 'nsis'
+  },
+  deadlineAt: number,
+): { executablePath: string; dispose(): void } {
+  if (!Number.isFinite(deadlineAt) || performance.now() >= deadlineAt)
+    throw new Error('Windows runner preparation deadline is obsolete')
+  const parent = realpathSync(tmpdir())
+  const directory = mkdtempSync(join(parent, 'pact-test-image-runner-'))
+  try {
+    const executablePath = join(directory, 'runner.exe')
+    installImage(executablePath, deadlineAt)
+    const timeout = Math.floor(deadlineAt - performance.now())
+    if (timeout < 1) throw new Error('Windows runner preparation exceeded its caller deadline')
+    const descriptor = JSON.stringify({
+      ...configuration,
+      runner: true,
+      prefix: [],
+      generation: randomUUID(),
+      timeout,
+    })
+    if (Buffer.byteLength(descriptor) > 64 * 1024)
+      throw new Error('Windows runner descriptor exceeds 64 KiB')
+    writeFileSync(join(directory, 'runner.json'), descriptor, { flag: 'wx', mode: 0o600 })
+    let disposed = false
+    return {
+      executablePath,
+      dispose() {
+        if (disposed) return
+        removeImageDirectory(directory, parent)
+        disposed = true
+      },
+    }
+  } catch (error) {
+    removeImageDirectory(directory, parent)
+    throw error
+  }
 }
 
 if (process.platform === 'win32')

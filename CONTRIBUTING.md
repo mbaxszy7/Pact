@@ -167,8 +167,8 @@ additional persistence journeys and fault permutations. Their execution is defer
 automatic Dev-scope PR runs; deterministic checks and applicable performance budgets remain
 required. Classification follows business risk, never an observed failure.
 
-Provider execution belongs to the same **CI** root run and attempt as its prerequisite
-checks. The root calls **Trusted Provider E2E** as a reusable workflow; it has no independent
+Provider execution belongs to the same **Pact CI - Code quality and app tests** root run and attempt
+as its prerequisite checks. The root calls **Pact CI - Claude and Codex tests** as a reusable workflow; it has no independent
 dispatch or completion-triggered run. Add `pact:real-full` to a Dev-scope PR to execute the
 full regression; the label requests cases and does not authorize model credentials.
 Owner-authored same-repository code and API-verified release-only App changes use
@@ -210,7 +210,7 @@ a complete core/full gate. UI/deterministic Actions summaries link `e2e-PLATFORM
 reports and, on failure, `ui-diagnostics-PLATFORM-aATTEMPT` snapshots/traces; both retain
 14 days. Prerequisites, identity and provider evidence must all belong to the same root
 run and attempt. A partial rerun cannot borrow old-attempt prerequisites or artifacts;
-use **Re-run all jobs** for a complete replacement. The native `pact-complete` job fails
+use **Re-run all jobs** for a complete replacement. The native **PR checks complete** job fails
 when any required dependency failed, was cancelled, skipped or not executed.
 
 UI and deterministic failure output uses separate `ui/` and `deterministic/` directories.
@@ -367,19 +367,27 @@ success substitutes.
 
 ### Platform process ownership
 
-Windows requires PowerShell 7 (`pwsh.exe` on PATH or `PACT_E2E_POWERSHELL_EXECUTABLE`) and the installed
-.NET Framework C# compiler. One native Job Object owns the test supervisor, Electron, CLI descendants,
+Windows command supervision requires the installed .NET Framework C# compiler and reuses the same
+bounded compiled image as native fixture launchers; it does not compile C# inside PowerShell at each
+command start. Provider scenarios that execute PowerShell still use `pwsh.exe` on PATH or
+`PACT_E2E_POWERSHELL_EXECUTABLE`. One native Job Object owns Electron, CLI descendants,
 and detached workers with a 256-process limit, no breakaway, and kill-on-close. Admission occurs before
 target execution. Control messages are separate from stdout/stderr. Native fixture launchers use the
 same Job/argv boundary, independent descriptors and tokens, and a test-process-owned immutable compiled
 image installed as private hardlinks. This is a code cache, not a readiness guarantee: each real
 first launch still obeys its protocol/deadline. Different-volume link failure must remain visible.
 
-The Windows runner has a 10-second discovery bound, 15-second supervisor startup, five-second natural
+The Windows runner has a 10-second discovery bound, cold compiler preparation bounded to 30 seconds
+and the remaining command deadline, 15-second supervisor startup after compilation, five-second natural
 tail, five-second closure confirmation, one-second control writes, 64 KiB admission, 4 KiB control
-frames, and 256 KiB combined unfinished output. Cancellation, timeout, overflow, runner loss, or
+frames, and 256 KiB combined unfinished output. Runner cancellation uses helper stdin EOF, separate
+from its authenticated receipt pipe; target stdin remains NUL. Cancellation, timeout, overflow, runner loss, or
 supervisor death releases the owned Job; unconfirmed cleanup fails the job. Redact complete lines and
 EOF before emission. A root exit is not enough while its owned tree or pipes survive.
+The command's private compiled link and descriptor are removed only after its helper has closed and
+its output pumps have settled. If `go` might have been sent, the actual Job must also report empty;
+otherwise the trusted helper's closed process proves that no Job was admitted. An error event alone
+does not prove process closure. Unconfirmed release retains private files as recovery evidence.
 
 macOS retains verified descendant process groups. Normal exit allows a five-second natural tail;
 failure uses bounded TERM/KILL and five-second confirmation. Identity is PID plus birth and PGID,

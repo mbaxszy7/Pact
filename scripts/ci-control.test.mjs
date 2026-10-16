@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -9,6 +10,8 @@ import {
   providerScopes,
   requireTrustedWorkflowSource,
   ciJobs,
+  checkWriterJob,
+  platformKeys,
   executionAdmission,
   requiredJobsPassed,
   validateSourceRun,
@@ -21,6 +24,59 @@ import {
   providerJobs,
   main,
 } from './ci-control.mjs'
+
+const platformJobs = (job, purpose) => {
+  assert.equal(job.name, '${{ matrix.label }} - ' + purpose)
+  assert.deepEqual(
+    job.strategy.matrix.include.map(({ key }) => key),
+    platformKeys,
+  )
+  return job.strategy.matrix.include.map(({ label, platform, arch }) => {
+    assert.equal(label, `${platform === 'darwin' ? 'macOS' : 'Windows'} ${arch}`)
+    return `${label} - ${purpose}`
+  })
+}
+
+void test('readable workflow names match the exact jobs required by the trusted controller', async () => {
+  const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url))
+  const builderRequire = createRequire(desktopRequire.resolve('electron-builder/package.json'))
+  const { load } = builderRequire('js-yaml')
+  const root = load(await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8'))
+  const provider = load(
+    await readFile(new URL('../.github/workflows/provider-e2e.yml', import.meta.url), 'utf8'),
+  )
+  assert.deepEqual(ciJobs, [
+    root.jobs.identity.name,
+    root.jobs['candidate-attestation'].name,
+    root.jobs.publication.name,
+    root.jobs.quality.name,
+    ...platformJobs(root.jobs.platform, 'UI and native tests'),
+  ])
+  assert.deepEqual(
+    providerJobs,
+    [provider.jobs.admission.name, ...platformJobs(provider.jobs.provider, 'Claude and Codex')].map(
+      (name) => `${root.jobs.provider.name} / ${name}`,
+    ),
+  )
+  assert.equal(root.jobs['check-writer'].name, checkWriterJob)
+  // These contexts are already required by main protection and cannot be renamed alone.
+  assert.equal(root.jobs.quality.name, 'quality')
+  assert.equal(root.jobs.publication.name, 'publication')
+  // A skipped ordinary-branch job must never produce the required PR context.
+  const finalGate = root.jobs['pact-complete']
+  const trustedCondition = finalGate.if.replace(/^always\(\) && /u, '')
+  assert.equal(
+    finalGate.name,
+    '${{ ' +
+      trustedCondition +
+      " && 'PR checks complete' || 'PR checks not required for branch' }}",
+  )
+  for (const workflow of [root, provider])
+    for (const job of Object.values(workflow.jobs).filter(
+      (candidateJob) => candidateJob !== finalGate,
+    ))
+      if (!job.strategy) assert.ok(job.name && !job.name.includes('${{'))
+})
 
 const head = 'a'.repeat(40),
   base = 'b'.repeat(40),
@@ -694,7 +750,7 @@ await test('the trusted primary admission, writer and completion interfaces shar
       }),
     },
   }
-  let jobs = [...ciJobs, ...providerJobs, 'check-writer'].map((name, index) => ({
+  let jobs = [...ciJobs, ...providerJobs, checkWriterJob].map((name, index) => ({
     id: index + 1,
     name,
     status: 'completed',
@@ -775,7 +831,7 @@ await test('the trusted primary admission, writer and completion interfaces shar
   assert(requests.includes('/actions/runs/100/attempts/1/jobs'))
   assert(!requests.some((item) => item.includes('provider-e2e.yml')))
   jobs = jobs.map((item) =>
-    item.name === 'provider / provider-win32-arm64'
+    item.name === 'Real model tests / Windows arm64 - Claude and Codex'
       ? Object.assign({}, item, { conclusion: 'skipped' })
       : item,
   )

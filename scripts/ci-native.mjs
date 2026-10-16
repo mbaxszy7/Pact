@@ -170,13 +170,27 @@ export async function main(source = process.env) {
     // Only runner-owned scalar observations cross this boundary. Never retain
     // child output, invocation text, paths, control credentials or raw errors.
     if (
-      ['bootstrapping', 'initializing', 'started', 'stopping', 'settled'].includes(state.kind) &&
+      [
+        'preparing',
+        'prepared',
+        'bootstrapping',
+        'initializing',
+        'started',
+        'stopping',
+        'settled',
+      ].includes(state.kind) &&
       phases[state.kind] === undefined
     )
       phases[state.kind] = Math.ceil(performance.now() - commandStartedAt)
+    if (process.platform === 'win32' && ['preparing', 'prepared'].includes(state.kind))
+      console.error(
+        '[pact-windows-startup] ' + (state.kind === 'preparing' ? 'prepare-image' : 'image-ready'),
+      )
     commandFacts = {
       phases: { ...phases },
       kind: [
+        'preparing',
+        'prepared',
         'bootstrapping',
         'initializing',
         'started',

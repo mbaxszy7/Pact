@@ -64,6 +64,7 @@ export class NativeProcessOwner {
   private firstCloseSettled = false
   private firstCloseRejected = false
   private childClosed = false
+  private spawnFailedBeforeStart = false
   private controlClosed = false
   private helperReleased = false
   private jobEmpty = false
@@ -117,6 +118,15 @@ export class NativeProcessOwner {
       windowsHide: options.windowsHide,
     })
     this.child = child
+    let spawned = false
+    child.once('spawn', () => {
+      spawned = true
+    })
+    child.once('error', () => {
+      // An OS spawn error with no assigned PID proves this helper never ran.
+      // Errors from an admitted process still require its real Job receipt.
+      if (!spawned && child.pid === undefined) this.spawnFailedBeforeStart = true
+    })
     this.closed = new Promise((done) => {
       child.once('close', () => {
         this.childClosed = true
@@ -155,11 +165,14 @@ export class NativeProcessOwner {
 
   facts() {
     const windows = this.windows?.diagnostic()
-    const admitted = Boolean(this.child)
+    const admitted = Boolean(this.child) && !this.spawnFailedBeforeStart
     const physical =
-      this.group.released && (!admitted || (this.childClosed && (!this.windows || this.jobEmpty)))
+      this.group.released &&
+      (!this.child || this.childClosed) &&
+      (!admitted || !this.windows || this.jobEmpty)
     return {
       admitted,
+      spawnFailedBeforeStart: this.spawnFailedBeforeStart,
       childClosed: this.childClosed,
       groupReleased: this.group.released,
       windowsJobEmpty: this.windows ? (admitted ? this.jobEmpty : null) : null,
@@ -280,7 +293,8 @@ export class NativeProcessOwner {
       this.recheckTask = Promise.resolve().then(() => {
         if (
           !this.group.released ||
-          (this.child && (!this.childClosed || (this.windows && !this.jobEmpty)))
+          (this.child &&
+            (!this.childClosed || (this.windows && !this.spawnFailedBeforeStart && !this.jobEmpty)))
         )
           throw new Error('Owned native physical release remains unconfirmed')
         return this.release()
@@ -313,7 +327,7 @@ export class NativeProcessOwner {
     if (this.closed)
       await attempt(() => within(this.closed!, 1500, 'Owned helper child close deadline'))
     if (this.windows) {
-      if (this.child && !this.jobEmpty) {
+      if (this.child && !this.spawnFailedBeforeStart && !this.jobEmpty) {
         this.windows.cancel()
         await attempt(async () => {
           await within(this.windows!.empty, 5000, 'Owned Windows Job release deadline')
@@ -330,7 +344,7 @@ export class NativeProcessOwner {
       if (
         !this.helperReleased &&
         this.group.released &&
-        (!this.child || (this.childClosed && this.jobEmpty)) &&
+        (!this.child || (this.childClosed && (this.spawnFailedBeforeStart || this.jobEmpty))) &&
         this.controlClosed
       ) {
         let stage: HelperDiagnostic['stage'] = 'canonicalize'

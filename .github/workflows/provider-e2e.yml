@@ -1,4 +1,4 @@
-name: Trusted Provider E2E
+name: Pact CI - Claude and Codex tests
 
 on:
   workflow_call:
@@ -64,6 +64,7 @@ defaults:
 
 jobs:
   admission:
+    name: Authorize model credentials
     if: github.repository_id == '1416403312' && ((inputs.source_kind == 'main' && github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (inputs.source_kind == 'bootstrap' && (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')))
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -106,7 +107,7 @@ jobs:
           PACT_CI_APP_ID: ${{ vars.PACT_CI_APP_ID }}
 
   provider:
-    name: provider-${{ matrix.key }}
+    name: ${{ matrix.label }} - Claude and Codex
     needs: admission
     if: needs.admission.outputs.applicable == 'true' && needs.admission.outputs.allowed == 'true'
     environment: ${{ needs.admission.outputs.provider_environment }}
@@ -117,14 +118,17 @@ jobs:
           - runner: macos-15
             platform: darwin
             arch: arm64
+            label: macOS arm64
             key: darwin-arm64
           - runner: windows-2025
             platform: win32
             arch: x64
+            label: Windows x64
             key: win32-x64
           - runner: windows-11-arm
             platform: win32
             arch: arm64
+            label: Windows arm64
             key: win32-arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150

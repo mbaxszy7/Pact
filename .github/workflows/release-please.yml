@@ -1,4 +1,4 @@
-name: Release Please
+name: Pact Release - Prepare version PR
 
 on:
   push:
@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   release-pr:
+    name: Update version and changelog PR
     if: github.ref == 'refs/heads/main'
     environment: pact-control-plane
     runs-on: ubuntu-latest

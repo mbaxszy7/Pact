@@ -1,7 +1,17 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { existsSync, readdirSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -575,7 +585,9 @@ process.stdin.resume();setInterval(()=>{},1000);\n`,
         expect(owner?.released).toBe(true)
         // A startup failure must remain the primary error; no worker receipt exists then.
         expect(!pids || (gone(pids.worker) && gone(pids.descendant))).toBe(true)
-        expect(readdirSync(root).filter((name) => name.startsWith('pact-native-rpc-'))).toEqual([])
+        expect(readdirSync(root).filter((name) => name.startsWith('pact-owned-launch-'))).toEqual(
+          [],
+        )
       }
       rpc = await NativeRpc.create(
         executable,
@@ -623,14 +635,22 @@ process.stdin.resume();setInterval(()=>{},1000);\n`,
         )
       }
       const pending = rpc.request('unanswered', {}).catch((error: unknown) => error)
+      expect(rpc.cleanupFacts().pendingRequests).toBe(1)
       await rpc.close()
       expect(released).toBe(owned ? 1 : 0)
       const outcome = await pending
       expect(outcome).toBeInstanceOf(Error)
-      expect(outcome instanceof Error && outcome.message).toContain('Owned native RPC exited')
+      expect(rpc.cleanupFacts()).toMatchObject({
+        released: true,
+        childClosed: true,
+        pendingRequests: 0,
+        groupReleased: true,
+        windowsJobEmpty: true,
+        helperReleased: true,
+      })
       expect(gone(pids.worker)).toBe(true)
       expect(gone(pids.descendant)).toBe(true)
-      expect((await readdir(root)).filter((name) => name.startsWith('pact-native-rpc-'))).toEqual(
+      expect((await readdir(root)).filter((name) => name.startsWith('pact-owned-launch-'))).toEqual(
         [],
       )
       expect(sentinel.exitCode).toBeNull()
@@ -671,7 +691,7 @@ it.skipIf(process.platform !== 'win32')(
       await rpc.exited
       expect(rpc.child.exitCode).toBe(0)
       await rpc.close()
-      expect((await readdir(root)).filter((name) => name.startsWith('pact-native-rpc-'))).toEqual(
+      expect((await readdir(root)).filter((name) => name.startsWith('pact-owned-launch-'))).toEqual(
         [],
       )
     } finally {
@@ -692,7 +712,7 @@ it.skipIf(process.platform !== 'win32')(
       })
       await rpc.exited
       await rpc.close()
-      expect((await readdir(root)).filter((name) => name.startsWith('pact-native-rpc-'))).toEqual(
+      expect((await readdir(root)).filter((name) => name.startsWith('pact-owned-launch-'))).toEqual(
         [],
       )
     } finally {
@@ -703,14 +723,14 @@ it.skipIf(process.platform !== 'win32')(
 )
 
 it.skipIf(process.platform !== 'win32')(
-  'Windows RPC compiler failure removes only its new private directory',
+  'Windows RPC missing compiler removes only its new private directory',
   async () => {
     const root = await mkdtemp(join(tmpdir(), 'pact-windows-cli-test-'))
     try {
       vi.stubEnv('SystemRoot', join(root, 'missing-framework'))
-      await expect(NativeRpc.create(process.execPath, root, { TEMP: root })).rejects.toThrow(
-        'could not compile',
-      )
+      await expect(NativeRpc.create(process.execPath, root, { TEMP: root })).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
       expect(await readdir(root)).toEqual([])
     } finally {
       vi.unstubAllEnvs()
@@ -836,15 +856,20 @@ setInterval(()=>{},1000);\n`,
         await writeFile(
           injection,
           `import fs from 'node:fs';import{syncBuiltinESMExports}from'node:module';import{dirname}from'node:path';import{createHash}from'node:crypto';
-const rename=fs.renameSync;let attempts=0,selected;
+const rename=fs.renameSync;let attempts=0,selected;const records=[];
 fs.renameSync=(source,target)=>{
   if(dirname(target)===${JSON.stringify(files.factsPath)}){
     const bytes=fs.readFileSync(source);const facts=JSON.parse(bytes);
     const match=${JSON.stringify(publishFault)}==='closed'?facts.closed:facts.entries.at(-1)?.kind==='candidate-ack-forwarded';
     if(match&&!selected)selected=source;
     if(selected===source&&match&&attempts<3){
-      attempts++;fs.appendFileSync(${JSON.stringify(publishReport)},JSON.stringify({source,target,sha256:createHash('sha256').update(bytes).digest('hex'),attempts})+'\\n');
+      attempts++;records.push({source,target,sha256:createHash('sha256').update(bytes).digest('hex'),attempts});
       if(attempts<3)throw Object.assign(new Error('injected transient publish lock'),{code:'EPERM'});
+      const result=rename(source,target);
+      // Evidence failure after commit must not retry the completed rename.
+      try{fs.writeFileSync(${JSON.stringify(publishReport)},records.map(record=>JSON.stringify(record)).join('\\n')+'\\n',{flag:'wx'});}
+      catch{throw Object.assign(new Error('Rename fault evidence could not be written'),{code:'PACT_TEST_REPORT_FAILED'});}
+      return result;
     }
   }
   return rename(source,target);
@@ -886,7 +911,7 @@ fs.renameSync=(source,target)=>{
       await owner.close()
       expect(owner.released).toBe(true)
       expect(await facts()).toMatchObject({
-        actualExecutable: actual,
+        actualExecutable: await realpath(actual),
         closed: true,
         nativeInterruptionEnabled: true,
         pendingRequests: 0,

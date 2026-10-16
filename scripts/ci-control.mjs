@@ -15,16 +15,18 @@ import { requireRealScope } from './real-e2e-policy.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
 export const platformKeys = ['darwin-arm64', 'win32-x64', 'win32-arm64']
+const platformLabels = ['macOS arm64', 'Windows x64', 'Windows arm64']
+export const checkWriterJob = 'Publish PR check results'
 export const ciJobs = [
-  'identity',
-  'candidate-attestation',
+  'Resolve tested code',
+  'Verify PR code identity',
   'publication',
   'quality',
-  ...platformKeys.map((key) => `platform-${key}`),
+  ...platformLabels.map((label) => `${label} - UI and native tests`),
 ]
 export const providerJobs = [
-  'provider / admission',
-  ...platformKeys.map((key) => `provider / provider-${key}`),
+  'Real model tests / Authorize model credentials',
+  ...platformLabels.map((label) => `Real model tests / ${label} - Claude and Codex`),
 ]
 
 export function providerScopes(identity, requested = 'core') {
@@ -791,7 +793,7 @@ export async function main(args = process.argv.slice(2), env = process.env) {
     requireFact(providerPassed, 'Required Provider evidence did not pass')
   } else if (mode === 'complete') {
     requireFact(
-      currentPrerequisitesPassed(jobs, run, [...ciJobs, ...providerJobs, 'check-writer']),
+      currentPrerequisitesPassed(jobs, run, [...ciJobs, ...providerJobs, checkWriterJob]),
       'Every mandatory job, including the isolated writer, must succeed in this exact attempt; Re-run all jobs',
     )
     const checks = await api.list(

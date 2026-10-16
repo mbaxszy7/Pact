@@ -24,6 +24,42 @@ function gate(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve }
 }
 
+it('releases an OS-rejected spawn without inventing a Job-empty receipt', async () => {
+  const owned = await ownedRoot()
+  try {
+    const rpc = await NativeRpc.create(
+      process.execPath,
+      join(owned.root, 'missing-cwd'),
+      isolatedEnv(owned.root, owned.home),
+      { processes: owned.processes },
+    )
+    let spawnError: Error | undefined
+    rpc.child.once('error', (error) => {
+      spawnError = error
+    })
+    await within(rpc.exited, 2000, 'OS spawn rejection was not observed')
+    expect(spawnError).toMatchObject({ code: 'ENOENT' })
+    await rpc.close()
+    expect(rpc.cleanupFacts()).toMatchObject({
+      released: true,
+      childExit: false,
+      childClosed: true,
+      pendingRequests: 0,
+      helperReleased: true,
+      windowsJobEmpty: null,
+    })
+    const scopes = owned.processes.facts()
+    expect(scopes).toHaveLength(1)
+    expect(scopes[0]).toMatchObject({
+      admitted: false,
+      spawnFailedBeforeStart: true,
+      released: true,
+    })
+  } finally {
+    await cleanupNativeFixture(owned)
+  }
+})
+
 const stageLine = (
   message: string,
   target = 'codex_app_server_transport::transport::stdio',
