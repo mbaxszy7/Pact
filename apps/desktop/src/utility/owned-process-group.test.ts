@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { OwnedProcessGroup } from './owned-process-group'
+import { OwnedProcessGroup, OwnedProcessIdentityError } from './owned-process-group'
 
 interface ProcessIdentity {
   pid: number
@@ -218,6 +218,41 @@ function timeoutCount(): number {
 }
 
 describe('Owned physical process groups', () => {
+  it('preserves immutable capture facts and the first cleanup observation without changing the error', () => {
+    const capture = {
+      reason: 'missing' as const,
+      initialPresent: false,
+      refreshed: true,
+      captureExited: false,
+      captureClosed: false,
+    }
+    const failure = new OwnedProcessIdentityError(capture)
+    expect(failure.message).toBe('The owned process did not establish its owned group.')
+    expect(failure.diagnostic).toBeUndefined()
+    capture.captureClosed = true
+    failure.observeCleanup({
+      cleanupExited: false,
+      cleanupClosed: false,
+      pidZero: 'success',
+      groupZero: 'success',
+    })
+    failure.observeCleanup({
+      cleanupExited: true,
+      cleanupClosed: true,
+      pidZero: 'ESRCH',
+      groupZero: 'ESRCH',
+    })
+    expect(failure.diagnostic).toEqual({
+      ...capture,
+      captureClosed: false,
+      cleanupExited: false,
+      cleanupClosed: false,
+      pidZero: 'success',
+      groupZero: 'success',
+    })
+    expect(Object.isFrozen(failure.diagnostic)).toBe(true)
+  })
+
   it('waits for a complete readiness record without accepting a partially written JSON file', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'pact-catalog-readiness-'))
     directories.push(directory)

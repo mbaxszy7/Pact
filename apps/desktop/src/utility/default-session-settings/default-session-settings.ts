@@ -18,7 +18,7 @@ import type { DiagnosticEvent } from '@pact/contracts/diagnostics'
 import { DefaultSessionSettingsRepository } from '@pact/persistence'
 
 import { recordDiagnostic } from '../../diagnostics/utility-log'
-import { OwnedProcessGroup } from '../owned-process-group'
+import { OwnedProcessGroup, OwnedProcessIdentityError } from '../owned-process-group'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation'
 
 const CATALOG_TIMEOUT_MS = 15_000
@@ -269,7 +269,9 @@ export class DefaultSessionSettings {
         'Settings are shutting down.': 'disposed',
       }
       let current = error
+      let identity: DiagnosticEvent['settingsCatalogIdentity']
       for (let depth = 0; !failure && depth < 8 && current instanceof Error; depth += 1) {
+        if (current instanceof OwnedProcessIdentityError) identity = current.diagnostic
         const message = Object.getOwnPropertyDescriptor(current, 'message')?.value
         failure =
           current.name === 'AbortError'
@@ -286,6 +288,7 @@ export class DefaultSessionSettings {
         code: 'INTERNAL',
         settingsCatalogPhase: phase,
         settingsCatalogFailure: failure ?? 'other',
+        ...(failure === 'root_identity' && identity ? { settingsCatalogIdentity: identity } : {}),
       })
     } catch {
       // Optional diagnostics cannot replace the original catalog/cleanup exception.

@@ -39,6 +39,9 @@ async function readCatalogFailures(fixture: RuntimeFixture): Promise<unknown> {
           {
             phase: parsed.data.settingsCatalogPhase,
             failure: parsed.data.settingsCatalogFailure ?? 'other',
+            ...(parsed.data.settingsCatalogIdentity
+              ? { identity: parsed.data.settingsCatalogIdentity }
+              : {}),
           },
         ]
       })
@@ -129,19 +132,15 @@ export async function launchRealWorkspace(
     await page
       .getByRole('button', { name: 'Create Session' })
       .click()
-      .catch(async (error: unknown) => {
-        const dialog = await page
-          .locator('body')
-          .innerText({ timeout: 1_000 })
-          .catch(() => 'Startup page unavailable')
+      .catch(async () => {
         throw new Error(
-          fixture.redactDiagnostic(
-            JSON.stringify({
-              failure: error instanceof Error ? error.message : 'Session creation failed',
-              startup: dialog.slice(0, 6_000),
-              catalogFailureDiagnostics: await readCatalogFailures(fixture),
-            }),
-          ),
+          'ZERO_TURN_STARTUP_DIAGNOSTIC:' +
+            Buffer.from(
+              JSON.stringify({
+                boundary: 'create_session_failed',
+                catalogFailureDiagnostics: await readCatalogFailures(fixture),
+              }),
+            ).toString('base64'),
         )
       })
     await expect(page.getByRole('heading', { name: 'New session', exact: true })).toBeVisible()
@@ -164,7 +163,27 @@ export async function launchRealWorkspace(
       return catalog.value.sessions[0]!.id
     }, projectId)
     await expect(page.getByRole('combobox', { name: 'Message' })).toBeEnabled({ timeout: 15_000 })
-    return { fixture, app, page, projectId, projectDirectory, sessionId }
+    const state = await readRealConversation({
+      fixture,
+      app,
+      page,
+      projectId,
+      projectDirectory,
+      sessionId,
+    })
+    throw new Error(
+      'ZERO_TURN_STARTUP_DIAGNOSTIC:' +
+        Buffer.from(
+          JSON.stringify({
+            boundary:
+              state.runs.length === 0 && state.nativeContexts.length === 0
+                ? 'startup_completed'
+                : 'unexpected_native_state',
+            runs: state.runs.length,
+            nativeContexts: state.nativeContexts.length,
+          }),
+        ).toString('base64'),
+    )
   } catch (error) {
     try {
       await fixture.dispose()
