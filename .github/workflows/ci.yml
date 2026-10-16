@@ -41,7 +41,7 @@ defaults:
 jobs:
   identity:
     name: Resolve tested code
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 10
     outputs:
       candidate: ${{ steps.identity.outputs.candidate }}
@@ -82,7 +82,7 @@ jobs:
     # Required by main protection; keep this exact check name.
     name: publication
     needs: identity
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -121,7 +121,7 @@ jobs:
     needs: identity
     if: github.repository_id == '1416403312' && ((github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != ''))
     environment: ${{ github.event_name == 'pull_request_target' && 'pact-control-plane' || 'pact-bootstrap-control-plane' }}
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       # Only the authenticated controller source enters this job; no merge
@@ -167,7 +167,7 @@ jobs:
     # Required by main protection; keep this exact check name.
     name: quality
     needs: [identity, publication]
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -465,7 +465,7 @@ jobs:
     needs: [identity, publication, quality, platform, candidate-attestation, provider]
     if: always() && (github.repository_id == '1416403312' && ((github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')))
     environment: ${{ github.event_name == 'pull_request_target' && 'pact-control-plane' || 'pact-bootstrap-control-plane' }}
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       # Only controller scripts execute here; candidate hooks/dependencies and
@@ -506,7 +506,7 @@ jobs:
     name: Trusted PR gate
     needs: [identity, publication, quality, platform, candidate-attestation, provider, check-writer]
     if: always() && (github.repository_id == '1416403312' && ((github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')))
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -533,7 +533,7 @@ jobs:
     name: Branch checks complete
     needs: [identity, publication, quality, platform]
     if: always() && !(github.event_name == 'pull_request_target' || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != ''))
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 5
     steps:
       - name: Require all no-credential branch checks and target architectures to pass

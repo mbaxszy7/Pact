@@ -231,6 +231,14 @@ describe('foundation contracts', () => {
     ).toBeDefined()
   })
 
+  it('restricts app metadata to supported desktop operating systems', () => {
+    const metadata = { name: 'Pact', version: '0.1.0', arch: 'arm64', packaged: false }
+    for (const platform of ['darwin', 'win32'])
+      expect(appInfoSchema.safeParse({ ...metadata, platform }).success).toBe(true)
+    for (const platform of ['freebsd', 'unsupported'])
+      expect(appInfoSchema.safeParse({ ...metadata, platform }).success).toBe(false)
+  })
+
   it('rejects an invalid runtime process id', () => {
     const result = runtimeHealthSchema.safeParse({
       status: 'ready',

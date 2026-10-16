@@ -34,7 +34,7 @@ jobs:
        (github.event.pull_request.merged == true &&
         github.event.pull_request.head.ref == 'release-please--branches--main'))
     environment: pact-control-plane
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 15
     outputs:
       applicable: ${{ steps.identity.outputs.applicable }}
@@ -87,7 +87,7 @@ jobs:
   quality:
     needs: identity
     if: needs.identity.outputs.applicable == 'true' && needs.identity.outputs.published == 'false'
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 30
     env:
       PACT_CI_WORKSPACE: ${{ github.workspace }}/source
@@ -305,7 +305,7 @@ jobs:
     needs: [identity, quality, build-darwin-arm64]
     if: needs.build-darwin-arm64.result == 'success'
     environment: pact-control-plane
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 60
     concurrency:
       group: pact-release-staging-writer-${{ needs.identity.outputs.release_id }}
@@ -547,7 +547,7 @@ jobs:
     needs: [identity, quality, build-win32-x64]
     if: needs.build-win32-x64.result == 'success'
     environment: pact-control-plane
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 60
     concurrency:
       group: pact-release-staging-writer-${{ needs.identity.outputs.release_id }}
@@ -607,7 +607,7 @@ jobs:
       (needs.identity.outputs.ready_darwin_arm64 == 'true' || needs.stage-darwin-arm64.result == 'success') &&
       (needs.identity.outputs.ready_win32_x64 == 'true' || needs.stage-win32-x64.result == 'success')
     environment: pact-control-plane
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 120
     env:
       PACT_EXPECTED_VERSION: ${{ needs.identity.outputs.version }}

@@ -37,6 +37,33 @@ const platformJobs = (job, purpose) => {
   })
 }
 
+void test('all shared jobs use macOS and platform jobs retain exactly the three native targets', async () => {
+  const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url))
+  const builderRequire = createRequire(desktopRequire.resolve('electron-builder/package.json'))
+  const { load } = builderRequire('js-yaml')
+  const nativeRunners = [
+    ['darwin-arm64', 'macos-15'],
+    ['win32-x64', 'windows-2025'],
+    ['win32-arm64', 'windows-11-arm'],
+  ]
+  for (const name of ['ci', 'provider-e2e', 'release-please', 'release']) {
+    const workflow = load(
+      // oxlint-disable-next-line no-await-in-loop -- Read each bounded workflow contract independently.
+      await readFile(new URL(`../.github/workflows/${name}.yml`, import.meta.url), 'utf8'),
+    )
+    for (const job of Object.values(workflow.jobs)) {
+      if (job.strategy) {
+        assert.deepEqual(
+          job.strategy.matrix.include.map(({ key, runner }) => [key, runner]),
+          nativeRunners,
+        )
+      } else if (job['runs-on']) {
+        assert(['macos-15', 'windows-2025'].includes(job['runs-on']))
+      }
+    }
+  }
+})
+
 void test('model environment secrets cross only the explicitly named reusable-workflow interface', async () => {
   const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url))
   const builderRequire = createRequire(desktopRequire.resolve('electron-builder/package.json'))

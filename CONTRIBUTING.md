@@ -3,6 +3,8 @@
 ## Setup
 
 Use `.node-version` and the pnpm version in `package.json`.
+Supported desktop targets are Windows x64, Windows arm64 and macOS arm64. Shared CI
+jobs run on macOS arm64; platform-specific jobs use their corresponding native runners.
 
 ```sh
 corepack enable

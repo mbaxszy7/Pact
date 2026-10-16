@@ -24,7 +24,7 @@ See the [product specification](docs/product/requirements.md) for current behavi
 ## Run from source
 
 - Node.js **24.18.1**, Corepack, and pnpm **12.11.2**.
-- macOS or Windows; Linux is not a supported desktop target.
+- macOS arm64 or Windows x64/arm64.
 - Claude Code and Codex installed and configured for agent sessions.
 - On Windows, Python 3 and Visual Studio Build Tools with **Desktop development with C++** for
   Electron native dependency rebuilds.

@@ -1,21 +1,21 @@
 name: Verified Gitleaks
-description: Install the checksum-pinned Linux x64 scanner for trusted source and script checks
+description: Install the checksum-pinned macOS arm64 scanner for trusted source and script checks
 runs:
   using: composite
   steps:
     - name: Install checksum-pinned Gitleaks 8.30.1
       shell: bash
       run: |
-        if [ "$RUNNER_OS" != Linux ] || [ "$RUNNER_ARCH" != X64 ]; then
-          echo 'The verified scanner installer requires Linux x64.' >&2
+        if [ "$RUNNER_OS" != macOS ] || [ "$RUNNER_ARCH" != ARM64 ]; then
+          echo 'The verified scanner installer requires macOS arm64.' >&2
           exit 1
         fi
         scannerArchive="$RUNNER_TEMP/pact-gitleaks.tar.gz"
         trap 'rm -f -- "$scannerArchive"' EXIT
         curl --fail --silent --show-error --location --max-time 60 \
-          https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+          https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_darwin_arm64.tar.gz \
           --output "$scannerArchive"
-        echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $scannerArchive" | sha256sum --check
+        echo "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5  $scannerArchive" | shasum --algorithm 256 --check
         install -d -m 700 "$RUNNER_TEMP/pact-gitleaks"
         tar -xzf "$scannerArchive" -C "$RUNNER_TEMP/pact-gitleaks" gitleaks
         echo "$RUNNER_TEMP/pact-gitleaks" >> "$GITHUB_PATH"

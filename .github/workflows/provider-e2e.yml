@@ -75,7 +75,7 @@ jobs:
   admission:
     name: Authorize model credentials
     if: github.repository_id == '1416403312' && ((inputs.source_kind == 'main' && github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (inputs.source_kind == 'bootstrap' && (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')))
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 15
     outputs:
       applicable: ${{ steps.admit.outputs.applicable }}

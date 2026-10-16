@@ -213,7 +213,7 @@ export function rpcResultSchema<T extends z.ZodType>(valueSchema: T) {
 export const appInfoSchema = z.object({
   name: z.string(),
   version: z.string(),
-  platform: z.enum(['darwin', 'win32', 'linux']),
+  platform: z.enum(['darwin', 'win32']),
   arch: z.string(),
   packaged: z.boolean(),
 })

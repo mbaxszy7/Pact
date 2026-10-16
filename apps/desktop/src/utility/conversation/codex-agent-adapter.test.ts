@@ -110,7 +110,7 @@ describe('owned Codex loopback environment', () => {
     'preserves a single %s value for both Unix spellings',
     (key) => {
       const source = Object.freeze({ [key]: ' internal.invalid ,127.0.0.1' })
-      const environment = codexProcessEnvironment(undefined, source, 'linux')
+      const environment = codexProcessEnvironment(undefined, source, 'darwin')
       expect(environment.NO_PROXY).toBe(' internal.invalid ,127.0.0.1,localhost')
       expect(environment.no_proxy).toBe(environment.NO_PROXY)
       expect(source[key]).toBe(' internal.invalid ,127.0.0.1')
@@ -156,30 +156,30 @@ describe('owned Codex loopback environment', () => {
     const allowed = 'a'.repeat(8192 - ',127.0.0.1,localhost'.length)
     expect(
       Buffer.byteLength(
-        codexProcessEnvironment(undefined, { NO_PROXY: allowed }, 'linux').NO_PROXY!,
+        codexProcessEnvironment(undefined, { NO_PROXY: allowed }, 'darwin').NO_PROXY!,
       ),
     ).toBe(8192)
-    expect(() => codexProcessEnvironment(undefined, { NO_PROXY: allowed + 'a' }, 'linux')).toThrow(
+    expect(() => codexProcessEnvironment(undefined, { NO_PROXY: allowed + 'a' }, 'darwin')).toThrow(
       /capacity/u,
     )
     expect(
       codexProcessEnvironment(
         undefined,
         { NO_PROXY: Array.from({ length: 254 }, () => 'a').join(',') },
-        'linux',
+        'darwin',
       ).NO_PROXY?.split(','),
     ).toHaveLength(256)
     expect(() =>
       codexProcessEnvironment(
         undefined,
         { NO_PROXY: Array.from({ length: 255 }, () => 'a').join(',') },
-        'linux',
+        'darwin',
       ),
     ).toThrow(/capacity/u)
     expect(() =>
-      codexProcessEnvironment(undefined, { NO_PROXY: 'a'.repeat(8193) }, 'linux'),
+      codexProcessEnvironment(undefined, { NO_PROXY: 'a'.repeat(8193) }, 'darwin'),
     ).toThrow(/8 KiB/u)
-    expect(() => codexProcessEnvironment(undefined, { NO_PROXY: 'bad\0entry' }, 'linux')).toThrow(
+    expect(() => codexProcessEnvironment(undefined, { NO_PROXY: 'bad\0entry' }, 'darwin')).toThrow(
       /Invalid/u,
     )
   })
