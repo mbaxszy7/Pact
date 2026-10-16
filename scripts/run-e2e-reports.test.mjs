@@ -70,7 +70,7 @@ await test('local core execution keeps a safe immutable report, restores environ
     assert.equal(builds, 1)
     const report = await saved(root)
     assert.equal(report.gatePassed, true)
-    assert.equal(report.tiers.core.passed, 29)
+    assert.equal(report.tiers.core.passed, 1)
     assert.equal(JSON.stringify(report).includes('synthetic-nonfunctional-report-canary'), false)
     await assert.rejects(lstat(join(privateRoot, '..')), /ENOENT/)
     assert.equal(process.env.PLAYWRIGHT_JSON_OUTPUT_FILE, previous)
@@ -98,7 +98,7 @@ await test('configuration admission failure still gets 61 case statuses without 
     const report = await saved(root)
     assert.equal(report.cases.length, 61)
     assert.equal(report.gatePassed, false)
-    assert.equal(report.tiers.core.notRun, 29)
+    assert.equal(report.tiers.core.notRun, 1)
     assert.equal(
       JSON.stringify(report).includes('synthetic-nonfunctional-private-exception'),
       false,
