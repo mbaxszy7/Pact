@@ -1,5 +1,6 @@
 export {
   DatabaseMigrationError,
+  DatabaseOpenError,
   PactDatabase,
   type PactDatabaseOpenOptions,
 } from './pact-database.js'

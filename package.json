@@ -1,6 +1,6 @@
 {
   "name": "pact",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "description": "A governed dual-agent coding workspace.",
   "license": "MIT",
@@ -32,13 +32,14 @@
     "test:e2e": "node scripts/run-e2e.mjs all",
     "test:e2e:deterministic": "node scripts/run-e2e.mjs deterministic",
     "test:e2e:real": "node scripts/run-e2e.mjs real",
+    "test:e2e:real:core": "node scripts/run-e2e.mjs real-core",
     "test:e2e:ui": "node scripts/run-e2e.mjs ui",
-    "test:infra": "node --test scripts/check-publication.test.mjs scripts/e2e-baseline.test.mjs scripts/check-e2e-coverage.test.mjs scripts/run-e2e.test.mjs scripts/run-e2e-windows.test.mjs scripts/package-smoke.test.mjs",
+    "test:infra": "node scripts/ci.mjs infra",
     "test:native": "vitest run --config vitest.native.config.ts",
     "test:watch": "vitest",
     "typecheck": "pnpm typecheck:tests && pnpm -r --if-present typecheck",
     "typecheck:tests": "tsc --noEmit -p tests/tsconfig.json",
-    "verify:package": "pnpm package:dir && pnpm package:smoke"
+    "verify:package": "node scripts/package-smoke.mjs"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",
@@ -52,6 +53,7 @@
     "oxfmt": "0.67.0",
     "oxlint": "1.82.0",
     "oxlint-tsgolint": "7.0.2001",
+    "release-please": "17.3.0",
     "simple-git-hooks": "2.14.0",
     "smol-toml": "1.8.0",
     "typescript": "7.0.2",

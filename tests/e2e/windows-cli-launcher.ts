@@ -20,6 +20,8 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 const imageByteLimit = 64 * 1024
 const imageLifetimeMs = 10 * 60_000
+// Hosted cold compilation is setup work. Target startup keeps its separate caller deadline.
+const imageCompilationMs = 30_000
 const privateImages = new Set<string>()
 let seed:
   | {
@@ -140,7 +142,7 @@ export function windowsLauncherImageDiagnostic(): {
   }
 }
 
-function installImage(executable: string): void {
+function installImage(executable: string, deadlineAt = Infinity): void {
   if (executable.length > 4096) throw new Error('Windows fixture image path exceeds its bound')
   if (imageFailure) throw imageFailure
   prunePrivateImages()
@@ -152,10 +154,10 @@ function installImage(executable: string): void {
     const parent = realpathSync(tmpdir())
     const directory = mkdtempSync(join(parent, 'pact-test-image-'))
     const image = join(directory, 'image.exe')
-    const deadline = performance.now() + 10_000
+    const deadline = Math.min(performance.now() + imageCompilationMs, deadlineAt)
     const remaining = (): number => {
       const value = Math.floor(deadline - performance.now())
-      if (value < 1) throw new Error('Windows fixture image preparation exceeded 10s')
+      if (value < 1) throw new Error('Windows fixture image preparation exceeded 30s')
       return value
     }
     preparingImage = true
@@ -170,7 +172,7 @@ function installImage(executable: string): void {
       })
       const hash = digest(boundedBytes(image))
       if (key !== imageKey() || performance.now() >= deadline)
-        throw new Error('Windows fixture image preparation changed or exceeded 10s')
+        throw new Error('Windows fixture image preparation changed or exceeded 30s')
       seed = {
         directory,
         parent,
@@ -216,6 +218,52 @@ function installImage(executable: string): void {
     throw (imageFailure = new Error('Private Windows fixture image changed; evidence retained'))
 }
 
+/** The command runner owns this link until both its helper and actual Job have released. */
+export function prepareWindowsRunnerLauncher(
+  configuration: {
+    executable: string
+    args: string[]
+    cwd: string
+    pipe: string
+    token: string
+    argumentMode: 'crt' | 'nsis'
+  },
+  deadlineAt: number,
+): { executablePath: string; dispose(): void } {
+  if (!Number.isFinite(deadlineAt) || performance.now() >= deadlineAt)
+    throw new Error('Windows runner preparation deadline is obsolete')
+  const parent = realpathSync(tmpdir())
+  const directory = mkdtempSync(join(parent, 'pact-test-image-runner-'))
+  try {
+    const executablePath = join(directory, 'runner.exe')
+    installImage(executablePath, deadlineAt)
+    const timeout = Math.floor(deadlineAt - performance.now())
+    if (timeout < 1) throw new Error('Windows runner preparation exceeded its caller deadline')
+    const descriptor = JSON.stringify({
+      ...configuration,
+      runner: true,
+      prefix: [],
+      generation: randomUUID(),
+      timeout,
+    })
+    if (Buffer.byteLength(descriptor) > 64 * 1024)
+      throw new Error('Windows runner descriptor exceeds 64 KiB')
+    writeFileSync(join(directory, 'runner.json'), descriptor, { flag: 'wx', mode: 0o600 })
+    let disposed = false
+    return {
+      executablePath,
+      dispose() {
+        if (disposed) return
+        removeImageDirectory(directory, parent)
+        disposed = true
+      },
+    }
+  } catch (error) {
+    removeImageDirectory(directory, parent)
+    throw error
+  }
+}
+
 if (process.platform === 'win32')
   process.once('exit', () => {
     try {
@@ -231,12 +279,29 @@ export function removeWindowsRpcLauncherSync(directory: string): void {
   rmSync(directory, { recursive: true, force: true })
 }
 
+export interface WindowsJobMembers {
+  members: Array<{
+    pid: number
+    createdMs: number
+    role: 'root' | 'descendant'
+    image: 'codex' | 'node' | 'cmd' | 'conhost' | 'git' | 'rg' | 'other'
+  }>
+  membersIncomplete: boolean
+}
+export interface WindowsRootExit extends WindowsJobMembers {
+  pid: number
+  exitCode: number
+  elapsedMs: number
+  natural: boolean
+  active: number
+}
 export interface WindowsLaunchOwner {
   executablePath: string
   directory: string
   generation: string
   started: Promise<{ generation: string; pid: number }>
   empty: Promise<{ generation: string; active: 0; exitCode: number }>
+  rootExit: Promise<WindowsRootExit>
   armStartup(deadline: number): void
   cancel(): void
   disposeControl(): Promise<void>
@@ -246,11 +311,58 @@ export interface WindowsLaunchOwner {
     startupDeadlineMs?: number
     firstFailure?: string
     nativeErrorCode?: number
+    lastActive?: number
+    exitCode?: number
+    stoppingReason?: 'control-closed' | 'deadline' | 'descendants-still-running'
+    rootExit?: WindowsRootExit
+    membersBeforeStop?: WindowsJobMembers
   }
 }
 
 function controlRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+const cloneMembers = (value: WindowsJobMembers): WindowsJobMembers => ({
+  members: value.members.map((member) => ({ ...member })),
+  membersIncomplete: value.membersIncomplete,
+})
+
+function jobMembers(value: Record<string, unknown>): WindowsJobMembers {
+  if (
+    !Array.isArray(value.members) ||
+    value.members.length > 16 ||
+    typeof value.membersIncomplete !== 'boolean'
+  )
+    throw new Error('Invalid Job member snapshot')
+  const identities = new Set<number>()
+  const members = value.members.map<WindowsJobMembers['members'][number]>((member: unknown) => {
+    if (
+      !controlRecord(member) ||
+      Object.keys(member).length !== 4 ||
+      typeof member.pid !== 'number' ||
+      !Number.isSafeInteger(member.pid) ||
+      member.pid < 2 ||
+      member.pid > 0xffffffff ||
+      identities.has(member.pid) ||
+      typeof member.createdMs !== 'number' ||
+      !Number.isSafeInteger(member.createdMs) ||
+      member.createdMs < 0 ||
+      (member.role !== 'root' && member.role !== 'descendant') ||
+      (member.image !== 'codex' &&
+        member.image !== 'node' &&
+        member.image !== 'cmd' &&
+        member.image !== 'conhost' &&
+        member.image !== 'git' &&
+        member.image !== 'rg' &&
+        member.image !== 'other')
+    )
+      throw new Error('Invalid Job member identity')
+    identities.add(member.pid)
+    // The closed enum above prevents native paths or raw image names crossing this seam.
+    return { pid: member.pid, createdMs: member.createdMs, role: member.role, image: member.image }
+  })
+  return { members, membersIncomplete: value.membersIncomplete }
 }
 
 /** One authenticated Job receipt, independent of Electron and every provider/relay it launches. */
@@ -279,6 +391,10 @@ export async function writeWindowsObservedLauncher(
     >
   > = {}
   let firstFailure: string | undefined, nativeErrorCode: number | undefined
+  let lastActive: number | undefined, exitCode: number | undefined
+  let rootPid: number | undefined, rootExitFact: WindowsRootExit | undefined
+  let membersBeforeStop: WindowsJobMembers | undefined
+  let stoppingReason: ReturnType<WindowsLaunchOwner['diagnostic']>['stoppingReason']
   const mark = (stage: keyof typeof stages): void => {
     stages[stage] = Math.round(performance.now() - began)
   }
@@ -290,6 +406,11 @@ export async function writeWindowsObservedLauncher(
       : { startupDeadlineMs: Math.round(startupDeadline - began) }),
     ...(firstFailure ? { firstFailure } : {}),
     ...(nativeErrorCode !== undefined ? { nativeErrorCode } : {}),
+    ...(lastActive !== undefined ? { lastActive } : {}),
+    ...(exitCode !== undefined ? { exitCode } : {}),
+    ...(stoppingReason ? { stoppingReason } : {}),
+    ...(rootExitFact ? { rootExit: { ...rootExitFact, ...cloneMembers(rootExitFact) } } : {}),
+    ...(membersBeforeStop ? { membersBeforeStop: cloneMembers(membersBeforeStop) } : {}),
   })
   const pipeName = `pact-fixture-${process.pid}-${generation}`
   const server = createServer()
@@ -308,6 +429,8 @@ export async function writeWindowsObservedLauncher(
   let rejectStarted!: (error: Error) => void
   let resolveEmpty!: (value: { generation: string; active: 0; exitCode: number }) => void
   let rejectEmpty!: (error: Error) => void
+  let resolveRootExit!: (value: WindowsRootExit) => void
+  let rejectRootExit!: (error: Error) => void
   const started = new Promise<{ generation: string; pid: number }>((done, reject) => {
     resolveStarted = done
     rejectStarted = reject
@@ -316,8 +439,13 @@ export async function writeWindowsObservedLauncher(
     resolveEmpty = done
     rejectEmpty = reject
   })
+  const rootExit = new Promise<WindowsRootExit>((done, reject) => {
+    resolveRootExit = done
+    rejectRootExit = reject
+  })
   void started.catch(() => undefined)
   void empty.catch(() => undefined)
+  void rootExit.catch(() => undefined)
   const fail = (message: string): void => {
     if (firstFailure) return
     firstFailure = message
@@ -327,6 +455,7 @@ export async function writeWindowsObservedLauncher(
     clearTimeout(lifetimeTimer)
     rejectStarted(error)
     rejectEmpty(error)
+    rejectRootExit(error)
     socket?.destroy()
     if (server.listening) server.close()
   }
@@ -396,9 +525,58 @@ export async function writeWindowsObservedLauncher(
       )
         throw new Error('Invalid Job start receipt')
       didStart = true
+      rootPid = message.pid
+      lastActive = 1
       mark('started')
       clearTimeout(startupTimer)
       resolveStarted({ generation, pid: message.pid })
+    } else if (message.kind === 'root-exit') {
+      if (
+        !didStart ||
+        rootExitFact ||
+        message.pid !== rootPid ||
+        !exact([
+          'kind',
+          'generation',
+          'pid',
+          'exitCode',
+          'elapsedMs',
+          'natural',
+          'active',
+          'members',
+          'membersIncomplete',
+        ]) ||
+        typeof message.exitCode !== 'number' ||
+        !Number.isSafeInteger(message.exitCode) ||
+        typeof message.elapsedMs !== 'number' ||
+        !Number.isSafeInteger(message.elapsedMs) ||
+        message.elapsedMs < 0 ||
+        message.elapsedMs > lifetimeMs + 5000 ||
+        typeof message.natural !== 'boolean' ||
+        typeof message.active !== 'number' ||
+        !Number.isSafeInteger(message.active) ||
+        message.active < 0 ||
+        message.active > 256
+      )
+        throw new Error('Invalid Job root exit receipt')
+      rootExitFact = {
+        pid: rootPid!,
+        exitCode: message.exitCode,
+        elapsedMs: message.elapsedMs,
+        natural: message.natural,
+        active: message.active,
+        ...jobMembers(message),
+      }
+      resolveRootExit({ ...rootExitFact, ...cloneMembers(rootExitFact) })
+    } else if (message.kind === 'members') {
+      if (
+        !didStart ||
+        membersBeforeStop ||
+        message.phase !== 'before-stop' ||
+        !exact(['kind', 'generation', 'phase', 'members', 'membersIncomplete'])
+      )
+        throw new Error('Invalid Job member receipt')
+      membersBeforeStop = jobMembers(message)
     } else if (message.kind === 'empty') {
       if (
         !exact(['kind', 'generation', 'exitCode', 'active']) ||
@@ -408,10 +586,17 @@ export async function writeWindowsObservedLauncher(
       )
         throw new Error('Invalid Job empty receipt')
       didEmpty = true
+      lastActive = 0
+      exitCode = message.exitCode
       mark('empty')
       clearTimeout(startupTimer)
       clearTimeout(lifetimeTimer)
       if (!didStart) rejectStarted(new Error('Windows Job released without starting its target'))
+      if (!didStart) rejectRootExit(new Error('Windows Job released without starting its target'))
+      else if (!rootExitFact)
+        rejectRootExit(new Error('Windows Job root exit is unavailable after release'))
+      // Authenticated empty proves physical release independently of a missing
+      // root observation on an error path. It cannot prove natural exit/takeover.
       resolveEmpty({ generation, active: 0, exitCode: message.exitCode })
     } else if (message.kind === 'counts') {
       if (
@@ -423,6 +608,7 @@ export async function writeWindowsObservedLauncher(
         message.active > 256
       )
         throw new Error('Invalid Job process count')
+      lastActive = message.active
     } else if (message.kind === 'stopping') {
       if (
         !exact(['kind', 'generation', 'reason']) ||
@@ -431,6 +617,10 @@ export async function writeWindowsObservedLauncher(
         )
       )
         throw new Error('Invalid Job stop receipt')
+      stoppingReason =
+        message.reason === 'control-closed' || message.reason === 'deadline'
+          ? message.reason
+          : 'descendants-still-running'
     } else if (message.kind === 'error') {
       if (
         !exact(['kind', 'generation', 'code']) ||
@@ -533,6 +723,7 @@ export async function writeWindowsObservedLauncher(
       generation,
       started,
       empty,
+      rootExit,
       armStartup,
       cancel,
       disposeControl,

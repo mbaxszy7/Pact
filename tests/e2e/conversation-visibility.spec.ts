@@ -93,6 +93,9 @@ test(
       await window
         .getByRole('combobox', { name: 'Message', exact: true })
         .fill('Inspect the next task while reading earlier work.')
+      // Editing is available while the initial draft read still gates sending.
+      // Wait for the actual user action to become available before pressing Enter.
+      await expect(window.getByRole('button', { name: 'Send message', exact: true })).toBeEnabled()
       await window.getByRole('combobox', { name: 'Message', exact: true }).press('Enter')
       await expect(
         window.getByRole('button', { name: 'Working · 1 step', exact: true }),
@@ -126,12 +129,50 @@ test(
 test(
   'Settings and minimization pause progress without losing reading position or Selection',
   { tag: '@deterministic' },
-  async () => {
+  async ({ browserName: _browserName }, testInfo) => {
     const fixture = await createRuntimeFixture({ codexAppServer: 'background_stream' })
     const sessionId = await seed(fixture, 10)
     const app = await fixture.launch()
+    const transitions: unknown[] = []
     try {
       const window = await app.firstWindow()
+      const observeSelection = async (phase: string): Promise<void> => {
+        if (transitions.length >= 32) return
+        const facts = await window
+          .evaluate(async () => {
+            const selection = globalThis.getSelection(),
+              text = selection?.toString() ?? '',
+              anchor = selection?.anchorNode,
+              parent = anchor instanceof Element ? anchor : anchor?.parentElement
+            const digest =
+              text.length <= 4096
+                ? await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+                : undefined
+            return {
+              selectionLength: text.length,
+              selectionSha256: digest
+                ? [...new Uint8Array(digest)]
+                    .map((byte) => byte.toString(16).padStart(2, '0'))
+                    .join('')
+                : null,
+              oversizedSelection: text.length > 4096,
+              rangeCount: selection?.rangeCount ?? 0,
+              collapsed: selection?.isCollapsed ?? true,
+              anchorConnected: anchor?.isConnected ?? false,
+              anchorNodeType: anchor?.nodeType ?? null,
+              anchorTag: parent?.tagName ?? null,
+              anchorInMessage: Boolean(parent?.closest('[data-pact-message-content]')),
+              anchorOffset: selection?.anchorOffset ?? null,
+              focusOffset: selection?.focusOffset ?? null,
+              focusedTag: document.activeElement?.tagName ?? null,
+              width: globalThis.innerWidth,
+              height: globalThis.innerHeight,
+              visibility: document.visibilityState,
+            }
+          })
+          .catch(() => ({ observerAvailable: false }))
+        transitions.push({ phase, ...facts })
+      }
       await window.getByRole('button', { name: 'Visible Session', exact: true }).click()
       const composer = window.getByRole('combobox', { name: 'Message', exact: true })
       await composer.fill('Keep the same Run while hiding its view.')
@@ -148,8 +189,14 @@ test(
       const target = window.getByText('History answer 8 keeps the selected excerpt intact.', {
         exact: true,
       })
+      // Reading history begins with a user scroll; locator scrolling alone keeps tail-follow on.
+      await window.locator('[data-pact-transcript]').hover()
+      await window.mouse.wheel(0, -640)
       await target.scrollIntoViewIfNeeded()
-      const originalTop = await target.evaluate((element) => {
+      // A real text-selection gesture first leaves the focused contenteditable Composer.
+      await target.click()
+      await expect(composer).not.toBeFocused()
+      const gesture = await target.evaluate((element) => {
         const host = element.closest('[data-pact-message-content]')
         const span = [
           ...(host?.querySelectorAll<HTMLElement>('[data-pact-projection-start]') ?? []),
@@ -160,11 +207,23 @@ test(
         const range = document.createRange()
         range.setStart(node, offset)
         range.setEnd(node, offset + 'selected excerpt'.length)
-        const selection = globalThis.getSelection()
-        selection?.removeAllRanges()
-        selection?.addRange(range)
-        return element.closest('[data-pact-message-id]')?.getBoundingClientRect().top
+        const rectangles = [...range.getClientRects()]
+        const first = rectangles[0],
+          last = rectangles.at(-1)
+        if (!first || !last) throw new Error('Selection gesture geometry unavailable')
+        return {
+          start: { x: first.left + 1, y: first.top + first.height / 2 },
+          end: { x: last.right - 1, y: last.top + last.height / 2 },
+        }
       })
+      // Drive the native gesture; synthetic Range assignment alone does not settle reading state.
+      await window.mouse.move(gesture.start.x, gesture.start.y)
+      await window.mouse.down()
+      await window.mouse.move(gesture.end.x, gesture.end.y, { steps: 12 })
+      await window.mouse.up()
+      await expect
+        .poll(() => window.evaluate(() => globalThis.getSelection()?.toString()))
+        .toBe('selected excerpt')
       const health = () =>
         window.evaluate(async () => {
           const bridge: DesktopBridge = Reflect.get(globalThis, 'pact'),
@@ -172,14 +231,27 @@ test(
           if (!result.ok || !result.value.conversation) throw new Error('Diagnostics unavailable')
           return result.value.conversation
         })
+      const progressWhileReading = (await health()).publishedProgress
+      await expect
+        .poll(async () => (await health()).publishedProgress)
+        .toBeGreaterThan(progressWhileReading)
+      await expect
+        .poll(() => window.evaluate(() => globalThis.getSelection()?.toString()))
+        .toBe('selected excerpt')
+      const originalTop = await target.evaluate(
+        (element) => element.closest('[data-pact-message-id]')?.getBoundingClientRect().top,
+      )
+      await observeSelection('selected-before-settings')
       await window.getByRole('button', { name: 'Settings', exact: true }).click()
       await expect.poll(async () => (await health()).interestedSessions).toBe(0)
+      await observeSelection('settings-hidden')
       const hidden = await health()
       await expect
         .poll(async () => (await health()).suppressedProgress)
         .toBeGreaterThan(hidden.suppressedProgress)
       expect((await health()).publishedProgress).toBe(hidden.publishedProgress)
       await window.getByRole('button', { name: 'Back to app', exact: true }).click()
+      await observeSelection('returned-from-settings')
       await expect
         .poll(() => window.evaluate(() => globalThis.getSelection()?.toString()))
         .toBe('selected excerpt')
@@ -194,6 +266,7 @@ test(
         for (const nativeWindow of BrowserWindow.getAllWindows()) nativeWindow.minimize()
       })
       await expect.poll(async () => (await health()).interestedSessions).toBe(0)
+      await observeSelection('minimized')
       const minimized = await health()
       await expect
         .poll(async () => (await health()).suppressedProgress)
@@ -205,6 +278,7 @@ test(
           nativeWindow.show()
         }
       })
+      await observeSelection('restored')
       await expect
         .poll(() => window.evaluate(() => globalThis.getSelection()?.toString()))
         .toBe('selected excerpt')
@@ -229,6 +303,23 @@ test(
           if (getComputedStyle(node).overflowY === 'auto') node.scrollTop = node.scrollHeight
       })
       expect((await composer.boundingBox())?.y).toBe(composerBefore?.y)
+    } catch (error) {
+      try {
+        const body = Buffer.from(JSON.stringify({ transitions }))
+        if (body.byteLength > 64 * 1024)
+          throw new Error('Selection scalar diagnostics exceeded their bound', { cause: error })
+        await testInfo.attach('selection-scalar-diagnostics', {
+          body,
+          contentType: 'application/json',
+        })
+      } catch (diagnosticError) {
+        throw new AggregateError(
+          [error],
+          'Visibility failed and scalar diagnostics were unavailable',
+          { cause: diagnosticError },
+        )
+      }
+      throw error
     } finally {
       await app.close()
       await fixture.dispose()
@@ -238,7 +329,7 @@ test(
 
 test(
   'read Retry never resends and hidden detail cancellation permits another expansion',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     const fixture = await createRuntimeFixture({ mode: 'real' })
     await seed(fixture, 1, true)

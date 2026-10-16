@@ -26,7 +26,12 @@ import {
   waitForRealCompletion,
   type RealWorkspace,
 } from './real-harness.js'
-import { findNativeRecord, type NativeEvidence } from './real-native-evidence.js'
+import { resolveRealConfiguredModel } from './real-model-selection.js'
+import {
+  findNativeRecord,
+  readCodexNativeDefaults,
+  type NativeEvidence,
+} from './real-native-evidence.js'
 import { test } from './runtime-fixture.js'
 import { windowsTextCommand } from './windows-test-command.js'
 
@@ -38,7 +43,7 @@ interface Selections {
 
 test(
   'real defaults and Session overrides preserve frozen native settings, next-task routing and cold copies',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     // Six explicit user tasks: CLI default, then E1/E2 for each actual Agent.
     test.setTimeout(840_000)
@@ -54,6 +59,22 @@ test(
       const configuredModels = ctx.fixture.readConfigurationModels()
 
       await askBothAgents(ctx)
+      // This independent, zero-Turn client reads the real project defaults.
+      // A nullable config field and an omitted rollout field are distinct facts;
+      // neither proves a backend's otherwise unreported inference effort.
+      const nativeDefaultsClient = await ctx.fixture.openCodexClient()
+      const nativeCodexDefaults = await (async () => {
+        try {
+          return readCodexNativeDefaults(
+            await nativeDefaultsClient.request('config/read', {
+              cwd: ctx.projectDirectory,
+              includeLayers: false,
+            }),
+          )
+        } finally {
+          await nativeDefaultsClient.close()
+        }
+      })()
       const defaultCodexMarker = authMarker('CODEX_CLI_DEFAULT')
       await sendRealMessage(
         ctx,
@@ -71,8 +92,34 @@ test(
         requireNativeId(codexDefaultRun),
       )
       const codexEffectiveDefault = requireCodexTurn(codexDefaultEvidence, codexDefaultRun)
+      await test.info().attach('actual-codex-default-settings', {
+        body: ctx.fixture.redactDiagnostic(
+          JSON.stringify({
+            configRead: nativeCodexDefaults,
+            turnContext: codexEffectiveDefault,
+            frozenRun: { model: codexDefaultRun.model, effort: codexDefaultRun.effort },
+            nativeModelStarts: codexDefaultEvidence.codexModelStarts,
+          }),
+        ),
+        contentType: 'application/json',
+      })
+      expect(codexDefaultEvidence.codexModelStarts).toBe(1)
       expect(codexEffectiveDefault.model).toBeTruthy()
-      expect(codexEffectiveDefault.effort).toBeTruthy()
+      expect(codexDefaultRun.model).toBe(codexEffectiveDefault.model)
+      if (nativeCodexDefaults.model !== null)
+        expect(codexEffectiveDefault.model).toBe(nativeCodexDefaults.model)
+      expect(codexEffectiveDefault.effort).toBe(nativeCodexDefaults.effort.value)
+      if (nativeCodexDefaults.effort.value === null) {
+        // The pinned rollout serializer omits Option::None, rather than
+        // manufacturing a catalog-derived concrete default.
+        expect(codexEffectiveDefault.effortSource).toBe('omitted')
+        expect(codexEffectiveDefault.effortFields).toEqual({
+          effort: { present: false },
+          reasoning_effort: { present: false },
+        })
+      } else {
+        expect(codexEffectiveDefault.effortSource).not.toBe('omitted')
+      }
       expect(codexDefaultRun.effort).toBe(codexEffectiveDefault.effort)
       if (configuredModels.codex) expect(codexEffectiveDefault.model).toBe(configuredModels.codex)
       expect(codexDefaultEvidence.containsText(defaultCodexMarker)).toBe(true)
@@ -316,27 +363,35 @@ test(
         secondClaudeEvidence.sha256,
       )
       await test.info().attach('actual-native-settings', {
-        body: JSON.stringify({
-          cliDefaults: {
-            codex: codexEffectiveDefault,
-            claude: {
-              models: claudeDefaultEvidence.assistantModels,
-              effort: claudeEffectiveDefault,
+        body: ctx.fixture.redactDiagnostic(
+          JSON.stringify({
+            cliDefaults: {
+              codex: {
+                configRead: nativeCodexDefaults,
+                turnContext: codexEffectiveDefault,
+                frozenRun: { model: codexDefaultRun.model, effort: codexDefaultRun.effort },
+                nativeEffortSelection:
+                  nativeCodexDefaults.effort.value === null ? 'unspecified' : 'named',
+              },
+              claude: {
+                models: claudeDefaultEvidence.assistantModels,
+                effort: claudeEffectiveDefault,
+              },
             },
-          },
-          explicitSelections: choices,
-          runs: completed.runs.map((run) => ({
-            id: run.id,
-            agentId: run.agentId,
-            settingsRevision: run.settingsRevision,
-            nativeSessionId: run.nativeSessionId,
-            nativeTurnId: run.nativeTurnId,
-          })),
-          codexTurnSettings: secondCodexEvidence.codexTurnSettings,
-          claudeObservedEfforts: [choices.claude.firstEffort, choices.claude.nextEffort],
-          sourceConfigurationUnchanged: true,
-          savedCollaborationLimitsAreMetadataOnly: true,
-        }),
+            explicitSelections: choices,
+            runs: completed.runs.map((run) => ({
+              id: run.id,
+              agentId: run.agentId,
+              settingsRevision: run.settingsRevision,
+              nativeSessionId: run.nativeSessionId,
+              nativeTurnId: run.nativeTurnId,
+            })),
+            codexTurnSettings: secondCodexEvidence.codexTurnSettings,
+            claudeObservedEfforts: [choices.claude.firstEffort, choices.claude.nextEffort],
+            sourceConfigurationUnchanged: true,
+            savedCollaborationLimitsAreMetadataOnly: true,
+          }),
+        ),
         contentType: 'application/json',
       })
     } finally {
@@ -351,8 +406,8 @@ function supportedSelections(
 ): Selections {
   if (catalog.status !== 'available')
     throw new Error(`${catalog.agentId} actual CLI catalog is unavailable`)
-  const configured = configuredModel && catalog.models.find((model) => model.id === configuredModel)
-  if (!configured || configured.supportedEfforts.length < 2)
+  const configured = resolveRealConfiguredModel(catalog, configuredModel)
+  if (configured.supportedEfforts.length < 2)
     throw new Error(
       `${catalog.agentId} configured model has fewer than two native-supported effort options`,
     )

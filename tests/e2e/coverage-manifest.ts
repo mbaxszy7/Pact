@@ -442,9 +442,74 @@ function journey(
   if (implemented && !directReal)
     for (const [targetFile, targetTitle] of implemented)
       targets.push({ project: 'real', path: `tests/e2e/${targetFile}`, title: targetTitle })
+  const projectNameContracts: readonly [number, string, 'visible' | 'absent'][] =
+    file === 'session-catalog-performance.spec.ts' &&
+    title === 'loads five Sessions at a time and preserves activity and unread state after restart'
+      ? [[35, 'Catalog scale', 'visible']]
+      : file === 'session-catalog-performance.spec.ts' &&
+          title ===
+            'bounds Project DOM and preserves keyboard focus after scrolling a large Catalog'
+        ? [
+            [213, 'Project 000', 'visible'],
+            [224, 'Project 999', 'visible'],
+            [239, 'Project 999', 'visible'],
+            [245, 'Project 999', 'absent'],
+            [247, 'Project 999', 'visible'],
+          ]
+        : []
   return {
     originalPath,
     originalTitle: title,
+    ...(projectNameContracts.length
+      ? {
+          contractUpdates: projectNameContracts.map(([originalLine, name, state]) => ({
+            originalLine,
+            reason:
+              'ProjectNavigation exposes the exact Project name through the Rename Project action. Preserve visibility or archive removal and additionally verify its complete displayed name; pagination, DOM, focus, restart and Undo obligations remain unchanged.',
+            replacementAssertions:
+              state === 'visible'
+                ? [
+                    `expect(window.getByRole('button', { name: 'Rename Project ${name}', exact: true })).toBeVisible()`,
+                    `expect(window.getByRole('button', { name: 'Rename Project ${name}', exact: true })).toHaveText('${name}')`,
+                  ]
+                : [
+                    `expect(window.getByRole('button', { name: 'Rename Project ${name}', exact: true })).toHaveCount(0)`,
+                    `expect(navigation.getByText('${name}', { exact: true })).toHaveCount(0)`,
+                  ],
+          })),
+        }
+      : {}),
+    ...(file === 'session-workspace.spec.ts' &&
+    title === 'keeps Project context while creating, reopening, archiving, and restoring a Session'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 19,
+              reason:
+                'The existing addProject helper retains its exact owner and checks the named Rename Project action plus the complete displayed Project name. Both selected-Project Session ownership assertions remain unchanged.',
+              replacementAssertions: [
+                "expect(window.getByRole('button', { name: `Rename Project ${name}`, exact: true })).toBeVisible()",
+                "expect(window.getByRole('button', { name: `Rename Project ${name}`, exact: true })).toHaveText(name)",
+              ],
+            },
+          ],
+        }
+      : {}),
+    ...(file === 'workspace-shell.spec.ts' && title.startsWith('resizes and collapses')
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 39,
+              reason:
+                'The existing ProjectNavigation exposes Rename Project plus the Project name as its accessible action label. Retain the original visible Project obligation and additionally require its exact displayed name; no layout or focus assertion is waived.',
+              replacementAssertions: [
+                "expect(window.getByRole('button', { name: 'Rename Project layout-project', exact: true })).toBeVisible()",
+                "expect(window.getByRole('button', { name: 'Rename Project layout-project', exact: true })).toHaveText('layout-project')",
+              ],
+            },
+          ],
+        }
+      : {}),
     ...(revisedCommentLimit
       ? {
           currentTitle,

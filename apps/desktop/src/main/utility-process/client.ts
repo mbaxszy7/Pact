@@ -1,5 +1,6 @@
 import { utilityProcess, type UtilityProcess } from 'electron'
 import { randomUUID } from 'node:crypto'
+import { realpathSync } from 'node:fs'
 import { dirname, isAbsolute, join } from 'node:path'
 
 import type {
@@ -58,6 +59,9 @@ import type {
 import {
   utilityEventSchema,
   utilityResponseSchema,
+  utilityRequestSchema,
+  diagnosticPacketSchema,
+  runtimeStartupFailureAckSchema,
   directoryFileOperationMessageSchema,
   workspaceStorageRootSchema,
   WORKSPACE_OPERATION_TIMEOUT_MS as WORKSPACE_UNDO_TIMEOUT_MS,
@@ -65,6 +69,12 @@ import {
 
 import type { DiagnosticLogs } from '../modules/diagnostics'
 
+import {
+  hasLogicalIpcFixtureNonce,
+  LogicalIpcTrafficCollector,
+  LogicalIpcWorkerTraffic,
+  logicalIpcTrafficSnapshot,
+} from '../../shared/logical-ipc-traffic'
 import { DirectoryFileOperations } from './directory-file-operations'
 
 const REQUEST_TIMEOUT_MS = 2_000
@@ -79,11 +89,13 @@ const diagnosticUuid = (value: unknown): value is string =>
 const DIRECTORY_REQUEST_LIMIT = 20
 
 export interface UtilityProcessStartOptions {
+  traffic?: LogicalIpcWorkerTraffic
   databaseFile: string
   migrationsFolder: string
   workspaceStorageRoot?: string
   simulateAppearanceWriteFailure?: boolean
   diagnostics?: Pick<DiagnosticLogs, 'identity' | 'record' | 'attachUtility' | 'acceptUtility'>
+  onStartupFailed?: (failure: import('@pact/contracts').RuntimeStartupFailure) => void
 }
 
 type WithoutRequestId<Request> = Request extends unknown ? Omit<Request, 'requestId'> : never
@@ -242,7 +254,11 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   >()
   private shutdownTask: Promise<RpcResult<{ flushed: true }>> | undefined
   private child: UtilityProcess | undefined
+  private startupFailure: import('@pact/contracts').RuntimeStartupFailure | undefined
+  private startupFailureCallback: UtilityProcessStartOptions['onStartupFailed']
   private diagnostics: UtilityProcessStartOptions['diagnostics']
+  private traffic: LogicalIpcTrafficCollector | undefined
+  private workerTraffic: LogicalIpcWorkerTraffic | undefined
   private readonly inFlightRequests = new Map<string, InFlightRequest>()
   private readonly conversationListeners = new Set<
     (patch: ConversationPatch, progress: boolean) => void
@@ -261,6 +277,8 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     if (options.workspaceStorageRoot) workspaceStorageRootSchema.parse(options.workspaceStorageRoot)
 
     this.diagnostics = options.diagnostics
+    this.startupFailure = undefined
+    this.startupFailureCallback = options.onStartupFailed
     const startedChild = utilityProcess.fork(
       this.utilityScriptPath,
       [
@@ -272,6 +290,25 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       ],
       { serviceName: 'Pact Utility Process' },
     )
+    if (options.traffic) {
+      this.workerTraffic = options.traffic
+      this.traffic = options.traffic.collector('main-utility')
+      this.directoryOperations.configureTraffic(options.traffic.collector('main-directory'))
+    }
+    if (this.traffic) this.traffic.advanceTransportEpoch()
+    else if (
+      hasLogicalIpcFixtureNonce(process.env) &&
+      process.env.PACT_E2E_ROOT &&
+      options.databaseFile !== ':memory:'
+    ) {
+      try {
+        if (realpathSync(dirname(options.databaseFile)) === realpathSync(process.env.PACT_E2E_ROOT))
+          this.traffic = new LogicalIpcTrafficCollector('main-utility', randomUUID())
+      } catch {
+        // An unproved measurement root stays disabled; absence leaves instrumentation disabled.
+      }
+    }
+
     this.child = startedChild
     this.diagnostics?.attachUtility(startedChild)
     this.diagnostics?.record({
@@ -292,7 +329,8 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       this.child = undefined
       this.failChildRequests(
         startedChild,
-        ElectronUtilityProcessClient.unavailable(`Utility runtime exited with code ${code}.`),
+        this.startupFailureError() ??
+          ElectronUtilityProcessClient.unavailable(`Utility runtime exited with code ${code}.`),
       )
     })
   }
@@ -302,6 +340,8 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     expectedResponseType: UtilityResponse['type'],
     timeoutMs = REQUEST_TIMEOUT_MS,
   ): Promise<UtilityTransportResult> {
+    const startupError = this.startupFailureError()
+    if (startupError) return Promise.resolve({ kind: 'not-sent', error: startupError })
     if (this.shutdownTask && payload.type !== 'runtime.shutdown.request') {
       return Promise.resolve({
         kind: 'not-sent',
@@ -343,9 +383,29 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       this.diagnostics?.record(request.diagnostic)
 
       try {
-        target.postMessage({ ...payload, requestId })
+        const packet = { ...payload, requestId }
+        target.postMessage(packet)
         request.sent = true
+        const traffic = this.traffic
+        if (traffic) {
+          try {
+            const observed = utilityRequestSchema.safeParse(packet)
+            if (observed.success)
+              traffic.record(
+                'main-utility.request',
+                payload.type === 'runtime.health.request' ||
+                  payload.type === 'runtime.shutdown.request'
+                  ? 'control'
+                  : 'business',
+                packet,
+              )
+            else traffic.invalidate('unvalidated_message')
+          } catch {
+            traffic.invalidate('unvalidated_message')
+          }
+        }
       } catch {
+        this.traffic?.invalidate('transport_error')
         this.finishRequest(requestId, {
           kind: 'not-sent',
           error: ElectronUtilityProcessClient.unavailable(
@@ -357,9 +417,30 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   }
 
   async getHealth(): Promise<RpcResult<RuntimeHealth>> {
-    return ElectronUtilityProcessClient.toHealthResult(
+    const result = ElectronUtilityProcessClient.toHealthResult(
       await this.request({ type: 'runtime.health.request' }, 'runtime.health.response'),
     )
+    return result.ok && this.traffic
+      ? {
+          ok: true,
+          value: {
+            ...result.value,
+            ipcTraffic: logicalIpcTrafficSnapshot(this.traffic.snapshot(), [
+              ...(this.workerTraffic
+                ?.snapshots()
+                .filter((owner) => owner.owner !== 'main-utility') ?? []),
+              ...(result.value.ipcTraffic?.owners.filter((owner) =>
+                [
+                  'utility-markdown',
+                  'utility-image',
+                  'utility-native-json',
+                  'utility-native-fork',
+                ].includes(owner.owner),
+              ) ?? []),
+            ]),
+          },
+        }
+      : result
   }
 
   async getRuntimePreparation(): Promise<RpcResult<RuntimePreparation>> {
@@ -984,6 +1065,8 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   }
 
   dispose(): void {
+    // Main's measurement lives through child shutdown and diagnostic-log close. Its fixed
+    // counters survive late deliveries/restarts; disposing this client must not reset them.
     this.conversationListeners.clear()
     const target = this.child
     this.child = undefined
@@ -1183,9 +1266,18 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   }
 
   private receiveResponse(source: UtilityProcess, message: unknown): void {
+    let diagnosticAccepted = false
+    if (this.traffic) {
+      const diagnostic = diagnosticPacketSchema.safeParse(message)
+      if (diagnostic.success) {
+        this.traffic.record('utility-main.control', 'control', message)
+        diagnosticAccepted = true
+      }
+    }
     if (this.diagnostics?.acceptUtility(source, message)) return
     const directory = directoryFileOperationMessageSchema.safeParse(message)
     if (directory.success) {
+      this.traffic?.record('utility-main.control', 'business', message)
       if (source !== this.child) return
       if (directory.data.type === 'workspace.directory.cancel') {
         const pending = this.directoryRequests.get(directory.data.requestId)
@@ -1195,18 +1287,19 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         if (this.directoryRequests.has(requestId)) return
         if (this.directoryRequests.size >= DIRECTORY_REQUEST_LIMIT) {
           try {
-            source.postMessage(
-              directoryFileOperationMessageSchema.parse({
-                type: 'workspace.directory.response',
-                requestId,
-                result: {
-                  ok: false,
-                  code: 'TOO_LARGE',
-                  message: 'The directory request capacity is full.',
-                },
-              }),
-            )
+            const packet = directoryFileOperationMessageSchema.parse({
+              type: 'workspace.directory.response',
+              requestId,
+              result: {
+                ok: false,
+                code: 'TOO_LARGE',
+                message: 'The directory request capacity is full.',
+              },
+            })
+            source.postMessage(packet)
+            this.traffic?.record('main-utility.control', 'business', packet)
           } catch {
+            this.traffic?.invalidate('transport_error')
             /* The requesting core has exited. */
           }
           return
@@ -1219,14 +1312,15 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
           .then((result) => {
             if (this.child === source) {
               try {
-                source.postMessage(
-                  directoryFileOperationMessageSchema.parse({
-                    type: 'workspace.directory.response',
-                    requestId,
-                    result,
-                  }),
-                )
+                const packet = directoryFileOperationMessageSchema.parse({
+                  type: 'workspace.directory.response',
+                  requestId,
+                  result,
+                })
+                source.postMessage(packet)
+                this.traffic?.record('main-utility.control', 'business', packet)
               } catch {
+                this.traffic?.invalidate('transport_error')
                 /* A departed core cannot receive a result; its request is never forwarded to a replacement. */
               }
             }
@@ -1239,9 +1333,50 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       }
       return
     }
-    if (this.child !== source) return
     const event = utilityEventSchema.safeParse(message)
     if (event.success) {
+      this.traffic?.record(
+        'utility-main.event',
+        event.data.type === 'runtime.startup-failed.event' ? 'control' : 'business',
+        message,
+      )
+      if (this.child !== source) return
+      if (event.data.type === 'runtime.startup-failed.event') {
+        if (this.startupFailure) return
+        this.startupFailure = event.data
+        const error = this.startupFailureError()!
+        for (const [requestId, request] of this.inFlightRequests) {
+          if (request.child !== source) continue
+          this.finishRequest(
+            requestId,
+            event.data.stage === 'persistence'
+              ? { kind: 'not-sent', error }
+              : ElectronUtilityProcessClient.requestFailure(request, error),
+          )
+        }
+        try {
+          const packet = runtimeStartupFailureAckSchema.parse({
+            type: 'runtime.startup-failed.ack',
+            failureId: event.data.failureId,
+          })
+          source.postMessage(packet)
+          this.traffic?.record('main-utility.control', 'control', packet)
+        } catch {
+          this.traffic?.invalidate('transport_error')
+          /* The retained failure remains available even when the failed child has exited. */
+        }
+        try {
+          this.startupFailureCallback?.(event.data)
+        } catch {
+          this.diagnostics?.record({
+            operation: 'utility',
+            phase: 'failed',
+            level: 'error',
+            code: 'STARTUP_FAILURE_DISPLAY_FAILED',
+          })
+        }
+        return
+      }
       if (event.data.type === 'conversation.patch.event') {
         for (const listener of this.conversationListeners)
           listener(event.data.patch, event.data.progress)
@@ -1249,12 +1384,32 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       return
     }
     const parsed = utilityResponseSchema.safeParse(message)
-    if (!parsed.success) return
+    if (!parsed.success) {
+      if (!diagnosticAccepted) this.traffic?.invalidate('unvalidated_message')
+      return
+    }
+    this.traffic?.record(
+      'utility-main.reply',
+      parsed.data.type === 'runtime.health.response' ||
+        parsed.data.type === 'runtime.shutdown.response'
+        ? 'control'
+        : 'business',
+      message,
+    )
+    if (this.child !== source) return
 
     const request = this.inFlightRequests.get(parsed.data.requestId)
     if (!request || request.child !== source || request.expectedResponseType !== parsed.data.type)
       return
     this.finishRequest(parsed.data.requestId, { kind: 'response', response: parsed.data })
+  }
+
+  private startupFailureError(): AppError | undefined {
+    if (!this.startupFailure) return undefined
+    return {
+      code: this.startupFailure.code,
+      message: `Pact stopped opening its data: ${this.startupFailure.reason}. Existing data and recovery files are preserved.`,
+    }
   }
 
   private requestDiagnostic(

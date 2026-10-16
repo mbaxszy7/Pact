@@ -1,0 +1,269 @@
+name: Pact CI - Claude and Codex tests
+
+on:
+  workflow_call:
+    inputs:
+      controller:
+        description: Exact trusted root workflow source commit
+        required: true
+        type: string
+      source_kind:
+        description: Trusted main or explicitly frozen bootstrap controller source
+        required: true
+        type: string
+      suite:
+        description: Core or full execution; Stable content always requires full
+        default: core
+        type: string
+      extended_e2e:
+        description: Require the UI and deterministic execution results selected by the caller
+        default: false
+        type: boolean
+      root_run_id:
+        description: Root CI run containing this reusable workflow
+        required: true
+        type: string
+      root_attempt:
+        description: Root CI attempt owning all prerequisite artifacts and jobs
+        required: true
+        type: string
+    secrets:
+      PACT_CLAUDE_SETTINGS_JSON:
+        required: true
+      PACT_CODEX_CONFIG_TOML:
+        required: true
+      PACT_CODEX_AUTH_JSON:
+        required: true
+      PACT_CODEX_PROVIDER_ENV_JSON:
+        required: false
+    outputs:
+      allowed:
+        value: ${{ jobs.admission.outputs.allowed }}
+      applicable:
+        value: ${{ jobs.admission.outputs.applicable }}
+      suite:
+        value: ${{ jobs.admission.outputs.suite }}
+      real_gate:
+        value: ${{ jobs.admission.outputs.real_gate }}
+      candidate:
+        value: ${{ jobs.admission.outputs.candidate }}
+      base:
+        value: ${{ jobs.admission.outputs.base }}
+      ci_run:
+        value: ${{ jobs.admission.outputs.ci_run }}
+      ci_attempt:
+        value: ${{ jobs.admission.outputs.ci_attempt }}
+      provider_environment:
+        value: ${{ jobs.admission.outputs.provider_environment }}
+
+# The caller names only model configuration in the reusable-workflow contract.
+# The selected native environment supplies its values; App secrets are not inherited.
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+  checks: read
+
+env:
+  PACT_CI_BOOTSTRAP_REF: ${{ vars.PACT_CI_BOOTSTRAP_REF }}
+  PACT_CI_BOOTSTRAP_HEAD: ${{ vars.PACT_CI_BOOTSTRAP_HEAD }}
+  PACT_CI_BOOTSTRAP_BASE: ${{ vars.PACT_CI_BOOTSTRAP_BASE }}
+  PACT_CI_BOOTSTRAP_TREE: ${{ vars.PACT_CI_BOOTSTRAP_TREE }}
+  PACT_CI_BOOTSTRAP_PR: ${{ vars.PACT_CI_BOOTSTRAP_PR }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  admission:
+    name: Authorize model credentials
+    if: github.repository_id == '1416403312' && ((inputs.source_kind == 'main' && github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (inputs.source_kind == 'bootstrap' && (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')))
+    runs-on: macos-15
+    timeout-minutes: 15
+    outputs:
+      applicable: ${{ steps.admit.outputs.applicable }}
+      allowed: ${{ steps.admit.outputs.allowed }}
+      candidate: ${{ steps.admit.outputs.candidate }}
+      base: ${{ steps.admit.outputs.base }}
+      ci_run: ${{ steps.admit.outputs.ci_run }}
+      ci_attempt: ${{ steps.admit.outputs.ci_attempt }}
+      suite: ${{ steps.admit.outputs.suite }}
+      real_gate: ${{ steps.admit.outputs.real_gate }}
+      provider_environment: ${{ steps.admit.outputs.provider_environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.controller }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ci-identity-a${{ inputs.root_attempt }}
+          path: ${{ runner.temp }}/pact-identity
+          run-id: ${{ inputs.root_run_id }}
+          github-token: ${{ github.token }}
+      - id: admit
+        name: Validate current root prerequisites and select owner-controlled model environment
+        run: >-
+          node scripts/ci-control.mjs admit
+          --identity "$RUNNER_TEMP/pact-identity/ci-identity.json" --run "$CI_RUN"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUN: ${{ inputs.root_run_id }}
+          PACT_EXPECTED_CI_ATTEMPT: ${{ inputs.root_attempt }}
+          PACT_PROVIDER_SUITE: ${{ inputs.suite }}
+          PACT_RELEASE_APP_BOT_ID: ${{ vars.PACT_RELEASE_APP_BOT_ID }}
+          PACT_RELEASE_APP_SLUG: ${{ vars.PACT_RELEASE_APP_SLUG }}
+          PACT_CI_APP_ID: ${{ vars.PACT_CI_APP_ID }}
+
+  provider:
+    name: ${{ matrix.label }} - Claude and Codex
+    needs: admission
+    if: needs.admission.outputs.applicable == 'true' && needs.admission.outputs.allowed == 'true'
+    environment: ${{ needs.admission.outputs.provider_environment }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: darwin
+            arch: arm64
+            label: macOS arm64
+            key: darwin-arm64
+          - runner: windows-2025
+            platform: win32
+            arch: x64
+            label: Windows x64
+            key: win32-x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    steps:
+      # This initial preflight is trusted before candidate execution. After setup,
+      # this entire runner is a candidate executor; its local controller is mutable.
+      # App check publication stays in the root workflow's clean trusted job.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.controller }}
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.admission.outputs.candidate }}
+          path: source
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Initialize controller before any candidate hook executes
+        uses: ./control/.github/actions/setup
+        with:
+          workspace: control
+          native: 'true'
+          display: 'true'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ci-identity-a${{ inputs.root_attempt }}
+          path: ${{ runner.temp }}/pact-identity
+          run-id: ${{ inputs.root_run_id }}
+          github-token: ${{ github.token }}
+      - name: Trusted preflight before any candidate dependency, hook, or test can execute
+        run: |
+          node --input-type=module -e 'if(process.platform!==process.env.TARGET_PLATFORM||process.arch!==process.env.TARGET_ARCH)throw Error("Runner architecture mismatch")'
+          node control/scripts/ci-identity.mjs verify "$RUNNER_TEMP/pact-identity/ci-identity.json"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PACT_CI_WORKSPACE: ${{ github.workspace }}/source
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          TARGET_ARCH: ${{ matrix.arch }}
+      - name: Recheck the admitted successful CI generation before model secrets or candidate code
+        run: >-
+          node control/scripts/ci-control.mjs preflight
+          --identity "$RUNNER_TEMP/pact-identity/ci-identity.json" --run "$CI_RUN"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUN: ${{ inputs.root_run_id }}
+          PACT_EXPECTED_CI_ATTEMPT: ${{ inputs.root_attempt }}
+          PACT_CI_APP_ID: ${{ vars.PACT_CI_APP_ID }}
+      - name: Validate mandatory isolated model configuration with the still-trusted controller
+        run: node control/scripts/ci.mjs validate-provider
+        env:
+          PACT_CLAUDE_SETTINGS_JSON: ${{ secrets.PACT_CLAUDE_SETTINGS_JSON }}
+          PACT_CODEX_CONFIG_TOML: ${{ secrets.PACT_CODEX_CONFIG_TOML }}
+          PACT_CODEX_AUTH_JSON: ${{ secrets.PACT_CODEX_AUTH_JSON }}
+          PACT_CODEX_PROVIDER_ENV_JSON: ${{ secrets.PACT_CODEX_PROVIDER_ENV_JSON }}
+      - uses: ./control/.github/actions/setup
+        with:
+          workspace: source
+          controller: control
+      - name: Execute selected Claude and Codex cases with isolated temporary configuration
+        id: execute
+        # Preserve the actual failing step. The following report gate decides which
+        # cases are mandatory; infrastructure/admission failures never emit completion.
+        continue-on-error: true
+        run: node control/scripts/ci.mjs real "$REAL_SUITE"
+        env:
+          REAL_SUITE: ${{ needs.admission.outputs.suite }}
+          PACT_CI_WORKSPACE: ${{ github.workspace }}/source
+          PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-evidence/${{ matrix.key }}
+          PACT_CLAUDE_SETTINGS_JSON: ${{ secrets.PACT_CLAUDE_SETTINGS_JSON }}
+          PACT_CODEX_CONFIG_TOML: ${{ secrets.PACT_CODEX_CONFIG_TOML }}
+          PACT_CODEX_AUTH_JSON: ${{ secrets.PACT_CODEX_AUTH_JSON }}
+          PACT_CODEX_PROVIDER_ENV_JSON: ${{ secrets.PACT_CODEX_PROVIDER_ENV_JSON }}
+      - name: Report every core and extended case and enforce the selected business gate
+        if: always()
+        run: >-
+          node control/scripts/real-e2e-policy.mjs "$REAL_SUITE" "$REAL_GATE"
+          "$RUNNER_TEMP/pact-evidence/$PLATFORM_KEY"
+          "$RUNNER_TEMP/pact-identity/ci-identity.json"
+        env:
+          REAL_SUITE: ${{ needs.admission.outputs.suite }}
+          REAL_GATE: ${{ needs.admission.outputs.real_gate }}
+          PLATFORM_KEY: ${{ matrix.key }}
+          PACT_CI_WORKSPACE: ${{ github.workspace }}/source
+          PACT_REAL_EXECUTION_COMPLETED: ${{ steps.execute.outputs.real_execution_completed }}
+          PACT_REAL_REPORT_ARTIFACT: provider-report-${{ matrix.key }}-a${{ inputs.root_attempt }}
+      - name: Fetch this exact CI run's matching platform UI and deterministic execution evidence
+        # Core results are enforced by the always-run report gate above. Deferred
+        # lanes have summaries rather than raw execution files; do not request them.
+        if: ${{ inputs.extended_e2e == true || needs.admission.outputs.real_gate == 'full' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: e2e-${{ matrix.key }}-a${{ inputs.root_attempt }}
+          path: ${{ runner.temp }}/pact-evidence/${{ matrix.key }}
+          run-id: ${{ inputs.root_run_id }}
+          github-token: ${{ github.token }}
+      - name: Require unchanged assertion obligations and every currently mandatory execution result
+        if: ${{ inputs.extended_e2e == true || needs.admission.outputs.real_gate == 'full' }}
+        run: >-
+          node control/scripts/check-e2e-coverage.mjs --require-results --json
+          --real-scope "$REAL_GATE"
+          --results-json "$RUNNER_TEMP/pact-evidence/$PLATFORM_KEY/ui.json"
+          --results-json "$RUNNER_TEMP/pact-evidence/$PLATFORM_KEY/deterministic.json"
+          --results-json "$RUNNER_TEMP/pact-evidence/$PLATFORM_KEY/real.json"
+        env:
+          PACT_CI_WORKSPACE: ${{ github.workspace }}/source
+          PLATFORM_KEY: ${{ matrix.key }}
+          REAL_GATE: ${{ needs.admission.outputs.real_gate }}
+      - name: Upload sanitized core and extended case reports (no private model output)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: provider-report-${{ matrix.key }}-a${{ inputs.root_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-evidence/${{ matrix.key }}/real-summary.json
+            ${{ runner.temp }}/pact-evidence/${{ matrix.key }}/real-summary.md
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove private Provider execution evidence
+        if: always()
+        run: |
+          node --input-type=module -e '
+            import { rm } from "node:fs/promises";
+            import { join } from "node:path";
+            const key=process.env.PLATFORM_KEY;
+            if(!["darwin-arm64","win32-x64","win32-arm64"].includes(key))throw Error("Unknown evidence platform");
+            await rm(join(process.env.RUNNER_TEMP,"pact-evidence",key,"real.json"),{force:true});
+          '
+        env:
+          PLATFORM_KEY: ${{ matrix.key }}

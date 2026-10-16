@@ -41,6 +41,8 @@ describe('Diagnostic trust contract', () => {
     { nativeErrorCode: 2 ** 40 },
     { executorId: '/private/native/path' },
     { failureSource: 'arbitrary-output' },
+    { settingsCatalogPhase: '/private/configuration/path' },
+    { settingsCatalogFailure: 'private-native-output' },
   ])(
     'rejects unsafe diagnostic metadata $requestType$nativeMethod$nativeErrorCode$executorId$failureSource',
     (metadata) => {
@@ -60,6 +62,8 @@ describe('Diagnostic trust contract', () => {
       nativeMethod: 'thread/resume',
       nativeErrorCode: -32600,
       failureSource: 'native_rpc_rejection',
+      settingsCatalogPhase: 'claude_close',
+      settingsCatalogFailure: 'root_identity',
       executorId: randomUUID(),
       operationId: randomUUID(),
       sessionId: randomUUID(),

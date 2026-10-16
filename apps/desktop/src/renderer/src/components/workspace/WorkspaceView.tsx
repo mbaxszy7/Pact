@@ -1,4 +1,4 @@
-import { useCallback, useState, type ReactNode } from 'react'
+import { useCallback, useRef, useState, type ReactNode } from 'react'
 
 import type { SkillSelection } from '@pact/contracts'
 import type {
@@ -197,6 +197,8 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
     props.projects.at(0)
   const [planPane, setPlanPane] = useState<{ sessionId: string; taskId: string; open: boolean }>()
   const [planHost, setPlanHost] = useState<HTMLDivElement | null>(null)
+  const planRestoreFocusRef = useRef<HTMLButtonElement>(null)
+  const sessionSettingsFocusRef = useRef<HTMLButtonElement>(null)
   const planAvailable = Boolean(selectedSession && planPane?.sessionId === selectedSession.id)
   const planOpen = Boolean(planAvailable && planPane?.open && !props.sessionSettingsOpen)
   const acceptPlanTask = useCallback((sessionId: string, taskId?: string): void => {
@@ -268,6 +270,7 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
             saving={props.renamingSessionId === selectedSession.id}
             onSave={(title) => props.onRenameSession(selectedSession.id, title)}
             onOpenSettings={() => props.onOpenSessionSettings(selectedSession.id)}
+            settingsButtonRef={sessionSettingsFocusRef}
           />
         ) : undefined
       }
@@ -282,6 +285,16 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
       isSettingsView={Boolean(props.settingsPage)}
       contextPanelOpen={props.sessionSettingsOpen || planOpen}
       contextPanelExpanded={props.projectFilePanelExpanded}
+      contextPanelRestoreFocusRef={
+        planOpen
+          ? planRestoreFocusRef
+          : props.sessionSettingsOpen &&
+              !props.projectFilePanel &&
+              !props.skillDocumentPanel &&
+              !props.workspaceChangesPanel
+            ? sessionSettingsFocusRef
+            : undefined
+      }
       onContextPanelOpenChange={(open) => {
         if (props.sessionSettingsOpen) props.onSessionSettingsOpenChange(open)
         else if (planAvailable)
@@ -297,14 +310,23 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
           <div ref={setPlanHost} className="h-full min-h-0" />
         ) : undefined
       }
-      workspace={workspaceContent(props, selectedSession, creatingProject, activeProject, {
-        host: planHost,
-        available: planAvailable,
-        open: planOpen,
-        onAvailable: acceptPlanTask,
-        onOpen: openPlan,
-        onClose: closePlan,
-      })}
+      workspace={
+        <WorkspaceContent
+          props={props}
+          selectedSession={selectedSession}
+          creatingProject={creatingProject}
+          activeProject={activeProject}
+          planPane={{
+            host: planHost,
+            available: planAvailable,
+            open: planOpen,
+            onAvailable: acceptPlanTask,
+            onOpen: openPlan,
+            onClose: closePlan,
+            restoreFocusRef: planRestoreFocusRef,
+          }}
+        />
+      }
     />
   )
 }
@@ -363,11 +385,17 @@ function contextPanel(
   )
 }
 
-function workspaceContent(
-  props: WorkspaceViewProps,
-  selectedSession: CollaborationSession | undefined,
-  creatingProject: Project | undefined,
-  activeProject: Project | undefined,
+function WorkspaceContent({
+  props,
+  selectedSession,
+  creatingProject,
+  activeProject,
+  planPane,
+}: {
+  props: WorkspaceViewProps
+  selectedSession: CollaborationSession | undefined
+  creatingProject: Project | undefined
+  activeProject: Project | undefined
   planPane: {
     host: HTMLElement | null
     available: boolean
@@ -375,8 +403,9 @@ function workspaceContent(
     onAvailable: (sessionId: string, taskId?: string) => void
     onOpen: () => void
     onClose: () => void
-  },
-): ReactNode {
+    restoreFocusRef: React.RefObject<HTMLButtonElement | null>
+  }
+}): ReactNode {
   if (props.settingsPage && props.settingsView && (!selectedSession || creatingProject))
     return props.settingsView
   if (creatingProject) {
@@ -411,6 +440,7 @@ function workspaceContent(
               planPanelHost={planPane.host}
               planPanelOpen={planPane.open}
               planAvailable={planPane.available}
+              planRestoreFocusRef={planPane.restoreFocusRef}
               todoNavigation={props.todoNavigation}
               onPlanAvailable={planPane.onAvailable}
               onOpenPlan={planPane.onOpen}

@@ -1,4 +1,3 @@
-/* oxlint-disable no-await-in-loop -- Ordered byte writes, bounded cleanup pages and physical codec settlement belong to one finite image I/O owner. */
 import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
 import { open, mkdir, lstat, realpath, rename, rm, opendir } from 'node:fs/promises'
@@ -15,6 +14,9 @@ import type {
 
 import { imageCodecResultSchema } from '@pact/contracts/images'
 import { ConversationRepository } from '@pact/persistence'
+
+/* oxlint-disable no-await-in-loop -- Ordered byte writes, bounded cleanup pages and physical codec settlement belong to one finite image I/O owner. */
+import { LogicalIpcWorkerTraffic, observeWorkerTraffic } from '../../shared/logical-ipc-traffic'
 
 const PART = 32 * 1024,
   FILE = 64 * 1024 * 1024,
@@ -35,6 +37,7 @@ export class ConversationImages {
   constructor(
     private readonly repository: ConversationRepository,
     root: string,
+    private readonly ipcTraffic?: LogicalIpcWorkerTraffic,
   ) {
     this.folder = join(root, 'images')
   }
@@ -259,6 +262,9 @@ export class ConversationImages {
         workerData: { source, thumbnail },
         resourceLimits: { maxOldGenerationSizeMb: 64, maxYoungGenerationSizeMb: 16 },
       })
+      const traffic = this.ipcTraffic?.collector('utility-image')
+      traffic?.record('utility-image.init', 'business', { source, thumbnail })
+      observeWorkerTraffic(worker, traffic, 'utility-image.init', 'image-utility.reply')
       const owned = worker
       return await new Promise((accept, reject) => {
         const cancel = () => reject(new Error('Image preparation was cancelled or timed out.'))

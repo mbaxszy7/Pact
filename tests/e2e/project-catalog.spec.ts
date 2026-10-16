@@ -5,7 +5,7 @@ import { createRuntimeFixture } from './runtime-fixture.js'
 
 test(
   'adds, restores, collapses, archives, and re-adds a local Project',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(120_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })
@@ -25,19 +25,34 @@ test(
       }, projectDirectory)
       await window.getByRole('button', { name: 'Add project', exact: true }).click()
 
-      const projectRow = window.getByRole('button', { name: 'sample-project', exact: true })
+      const projectRow = window.getByRole('button', {
+        name: /^(?:Collapse|Expand) Project sample-project$/,
+      })
+      const projectName = window.getByRole('button', {
+        name: 'Rename Project sample-project',
+        exact: true,
+      })
       await expect(projectRow).toBeVisible()
+      await expect(projectName).toBeVisible()
+      await expect(projectName).toHaveText('sample-project')
       await expect(projectRow).toHaveAttribute('aria-expanded', 'true')
       await projectRow.click()
       await expect(projectRow).toHaveAttribute('aria-expanded', 'false')
+      await expect(projectRow).toHaveAccessibleName('Expand Project sample-project')
+      await expect(projectName).toHaveText('sample-project')
       await projectRow.click()
       await expect(projectRow).toHaveAttribute('aria-expanded', 'true')
+      await expect(projectRow).toHaveAccessibleName('Collapse Project sample-project')
 
       await app.close()
       app = await fixture.launch()
       window = await app.firstWindow()
-      const restoredProject = window.getByRole('button', { name: 'sample-project', exact: true })
+      const restoredProject = window.getByRole('button', {
+        name: 'Rename Project sample-project',
+        exact: true,
+      })
       await expect(restoredProject).toBeVisible()
+      await expect(restoredProject).toHaveText('sample-project')
 
       const archive = window.getByRole('button', { name: 'Archive Project sample-project' })
       const projectActions = archive.locator('..')
@@ -61,6 +76,7 @@ test(
         .toBeGreaterThanOrEqual(64)
       await archiveNotice.getByRole('button', { name: 'Undo' }).click()
       await expect(restoredProject).toBeVisible()
+      await expect(restoredProject).toHaveText('sample-project')
 
       await restoredProject.hover()
       await archive.click()
@@ -73,6 +89,7 @@ test(
       }, projectDirectory)
       await window.getByRole('button', { name: 'Add project', exact: true }).click()
       await expect(restoredProject).toBeVisible()
+      await expect(restoredProject).toHaveText('sample-project')
     } finally {
       await fixture.dispose()
     }

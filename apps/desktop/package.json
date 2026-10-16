@@ -1,6 +1,6 @@
 {
   "name": "@pact/desktop",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "description": "Pact desktop shell",
   "license": "MIT",
@@ -9,9 +9,9 @@
   "scripts": {
     "build": "pnpm typecheck && electron-vite build",
     "dev": "electron-vite dev",
-    "dist:mac": "pnpm build && electron-builder --mac --publish never",
-    "dist:win": "pnpm build && electron-builder --win --publish never",
-    "package:dir": "pnpm build && electron-builder --dir",
+    "dist:mac": "node ../../scripts/build-distribution.mjs --channel stable --platform darwin",
+    "dist:win": "node ../../scripts/build-distribution.mjs --channel stable --platform win32",
+    "package:dir": "node ../../scripts/build-distribution.mjs --channel dev --dir",
     "postinstall": "install-electron && electron-builder install-app-deps",
     "start": "electron-vite preview",
     "typecheck": "pnpm typecheck:node && pnpm typecheck:web",
@@ -57,5 +57,9 @@
     "tailwindcss": "4.3.3",
     "typescript": "7.0.2",
     "vite": "7.3.6"
+  },
+  "optionalDependencies": {
+    "@img/sharp-win32-arm64": "0.35.5",
+    "@img/sharp-win32-x64": "0.35.5"
   }
 }

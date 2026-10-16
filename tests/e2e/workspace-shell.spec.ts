@@ -37,7 +37,12 @@ async function addProject(
     }))
   }, projectDirectory)
   await window.getByRole('button', { name: 'Add project', exact: true }).click()
-  await expect(window.getByRole('button', { name: 'layout-project', exact: true })).toBeVisible()
+  await expect(
+    window.getByRole('button', { name: 'Rename Project layout-project', exact: true }),
+  ).toBeVisible()
+  await expect(
+    window.getByRole('button', { name: 'Rename Project layout-project', exact: true }),
+  ).toHaveText('layout-project')
 }
 
 test(
@@ -123,6 +128,9 @@ test(
           }
         })
 
+      // The navigation surface has an existing 240 ms entrance transition.
+      // Observe its settled position before asserting the unchanged topology.
+      await expect.poll(async () => (await readTopology()).navigation[0]).toBe(0)
       const expanded = await readTopology()
       expect(expanded.navigation[0]).toBe(0)
       expect(expanded.navigation[1]).toBeLessThanOrEqual(expanded.workspace[0] ?? 0)

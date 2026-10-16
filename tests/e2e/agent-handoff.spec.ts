@@ -73,7 +73,7 @@ test(
 test(
   'a new explicit Claude request after @all does not rerun the confirmed Codex peer',
   { tag: '@deterministic' },
-  async () => {
+  async ({ browserName: _browserName }, testInfo) => {
     const fixture = await createRuntimeFixture({
       codexAppServer: 'complete',
       claudeConversation: 'failure_once',
@@ -102,6 +102,10 @@ test(
       expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(1)
       expect((await fixture.readClaudeFacts()).count).toBe(2)
       await expect(window.getByRole('combobox', { name: 'Message' })).toBeEnabled()
+    } catch (error) {
+      // Capture the actual Electron target before finally closes it; preserve the original failure.
+      await fixture.captureUiFailure(testInfo).catch(() => undefined)
+      throw error
     } finally {
       await app.close()
       await fixture.dispose()
@@ -217,6 +221,9 @@ test(
       await window.getByRole('button', { name: 'Handoff Session', exact: true }).click()
       const composer = window.getByRole('combobox', { name: 'Message' })
       await composer.fill('Review the full handoff')
+      await expect(window.getByRole('button', { name: 'Send message', exact: true })).toBeEnabled({
+        timeout: 30_000,
+      })
       await composer.press('Enter')
       await expect(
         window.getByText(
@@ -600,6 +607,7 @@ test(
       database.close()
     }
     const app = await fixture.launch()
+    let appClosed = false
     try {
       const window = await app.firstWindow()
       await window.getByRole('button', { name: 'Unconfirmed candidate', exact: true }).click()
@@ -652,6 +660,8 @@ test(
       }, sessionId)
       expect(returned?.route).toEqual({ type: 'primary', agentId: 'codex' })
       expect(returned?.state).toBe('installed')
+      await app.close()
+      appClosed = true
       const persisted = await PactDatabase.open({
         filePath: fixture.databaseFile,
         migrationsFolder,
@@ -680,7 +690,7 @@ test(
         persisted.close()
       }
     } finally {
-      await app.close()
+      if (!appClosed) await app.close()
       await fixture.dispose()
     }
   },

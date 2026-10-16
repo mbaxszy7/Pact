@@ -25,6 +25,10 @@ await test('the real pinned scanner blocks staged and deleted historical credent
   try {
     await mkdir(join(root, 'scripts'))
     await copyFile(new URL('./check-secrets.mjs', import.meta.url), script)
+    await copyFile(
+      new URL('./script-entry.mjs', import.meta.url),
+      join(root, 'scripts/script-entry.mjs'),
+    )
     await copyFile(new URL('../.gitleaks.toml', import.meta.url), join(root, '.gitleaks.toml'))
     for (const args of [
       ['init'],

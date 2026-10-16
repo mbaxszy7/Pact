@@ -28,6 +28,7 @@ export interface WorkspaceShellProps {
   contextPanelOpen?: boolean | undefined
   onContextPanelOpenChange?: ((open: boolean) => void) | undefined
   contextPanelExpanded?: boolean | undefined
+  contextPanelRestoreFocusRef?: React.RefObject<HTMLElement | null> | undefined
   showContextToggle?: boolean
   initialState?: WorkspaceLayoutState
 }
@@ -37,6 +38,18 @@ type WorkspaceViewport = 'wide' | 'compact' | 'narrow'
 const defaultLayoutState: WorkspaceLayoutState = {
   navigationPanel: 'open',
   contextPanel: 'open',
+}
+
+function availableFocusTarget(element: HTMLElement | null): element is HTMLElement {
+  if (
+    !element?.isConnected ||
+    element.matches(':disabled') ||
+    element.closest('[inert], [hidden], [aria-hidden="true"], [aria-disabled="true"]') ||
+    element.getClientRects().length === 0
+  )
+    return false
+  const visibility = window.getComputedStyle(element).visibility
+  return visibility !== 'hidden' && visibility !== 'collapse'
 }
 
 function getWorkspaceViewport(): WorkspaceViewport {
@@ -57,11 +70,8 @@ function freezePanelContent(
   }
 }
 
-function useWorkspaceViewport(
-  onViewportChange: (viewport: WorkspaceViewport) => void,
-): WorkspaceViewport {
+function useWorkspaceViewport(): WorkspaceViewport {
   const [viewport, setViewport] = useState<WorkspaceViewport>(getWorkspaceViewport)
-  const handleViewportChange = useEffectEvent(onViewportChange)
 
   useEffect(() => {
     const queries = [
@@ -69,9 +79,7 @@ function useWorkspaceViewport(
       window.matchMedia('(min-width: 860px)'),
     ]
     const updateViewport = (): void => {
-      const nextViewport = getWorkspaceViewport()
-      setViewport(nextViewport)
-      handleViewportChange(nextViewport)
+      setViewport(getWorkspaceViewport())
     }
 
     queries.forEach((query) => query.addEventListener('change', updateViewport))
@@ -120,6 +128,7 @@ export function WorkspaceShell({
   contextPanelOpen,
   onContextPanelOpenChange,
   contextPanelExpanded = false,
+  contextPanelRestoreFocusRef,
   showContextToggle = true,
   initialState = defaultLayoutState,
 }: WorkspaceShellProps): React.JSX.Element {
@@ -128,7 +137,11 @@ export function WorkspaceShell({
   const [layoutState, setLayoutState] = useState<WorkspaceLayoutState>(initialState)
   const [isLayoutAnimating, setIsLayoutAnimating] = useState(false)
   const [isContextOverlayRendered, setIsContextOverlayRendered] = useState(
-    () => hasContextPanel && initialState.contextPanel === 'open' && initialViewport !== 'wide',
+    () =>
+      hasContextPanel &&
+      (contextPanelOpen ?? initialState.contextPanel === 'open') &&
+      !isSettingsView &&
+      initialViewport !== 'wide',
   )
   const [navigationHeaderWidth, setNavigationHeaderWidth] = useState(0)
   const [navigationPanelElement, setNavigationPanelElement] = useState<HTMLDivElement | null>(null)
@@ -143,8 +156,9 @@ export function WorkspaceShell({
   const layoutAnimationTimerRef = useRef<number | undefined>(undefined)
   const overlayExitTimerRef = useRef<number | undefined>(undefined)
   const contextFocusScrollPositionRef = useRef({ x: 0, y: 0 })
+  const contextReturnFocusRef = useRef<HTMLElement | null>(null)
+  const wasContextVisibleRef = useRef(false)
   const restoreNavigationToggleFocus = useRef(false)
-  const restoreToggleFocus = useRef(false)
   const isNavigationOpen = layoutState.navigationPanel === 'open'
   const isNavigationVisible = navigationAvailable && isNavigationOpen
   const isContextOpen = contextPanelOpen ?? layoutState.contextPanel === 'open'
@@ -153,12 +167,29 @@ export function WorkspaceShell({
   const effectiveNavigationHeaderWidth =
     navigationPanelElement && !isContextExpanded ? navigationHeaderWidth : 0
 
-  const handleViewportChange = useEffectEvent((nextViewport: WorkspaceViewport) => {
-    contextFocusScrollPositionRef.current = { x: window.scrollX, y: window.scrollY }
+  const viewport = useWorkspaceViewport()
+  const canRenderContextOverlay = hasContextPanel && !isSettingsView && viewport !== 'wide'
+
+  // Mount controlled opens before committing children; the retained state only
+  // keeps an already mounted overlay alive for its existing exit transition.
+  if (canRenderContextOverlay && isContextVisible && !isContextOverlayRendered) {
+    setIsContextOverlayRendered(true)
+  } else if (!canRenderContextOverlay && isContextOverlayRendered) {
+    setIsContextOverlayRendered(false)
+  }
+
+  useLayoutEffect(() => {
     window.clearTimeout(overlayExitTimerRef.current)
-    setIsContextOverlayRendered(hasContextPanel && nextViewport !== 'wide' && isContextOpen)
-  })
-  const viewport = useWorkspaceViewport(handleViewportChange)
+    overlayExitTimerRef.current = undefined
+    if (canRenderContextOverlay && isContextVisible) {
+      contextFocusScrollPositionRef.current = { x: window.scrollX, y: window.scrollY }
+    } else if (canRenderContextOverlay && isContextOverlayRendered) {
+      overlayExitTimerRef.current = window.setTimeout(() => {
+        setIsContextOverlayRendered(false)
+      }, 180)
+    }
+    return () => window.clearTimeout(overlayExitTimerRef.current)
+  }, [canRenderContextOverlay, isContextOverlayRendered, isContextVisible])
 
   useLayoutEffect(() => {
     let observer: ResizeObserver | undefined
@@ -176,6 +207,7 @@ export function WorkspaceShell({
     return () => {
       window.clearTimeout(layoutAnimationTimerRef.current)
       window.clearTimeout(overlayExitTimerRef.current)
+      contextReturnFocusRef.current = null
     }
   }, [])
 
@@ -196,18 +228,40 @@ export function WorkspaceShell({
     restoreNavigationToggleFocus.current = false
   }, [isNavigationVisible])
 
-  useEffect(() => {
-    if (isContextOpen || !restoreToggleFocus.current) return
-    toggleButtonRef.current?.focus({ preventScroll: true })
-    restoreToggleFocus.current = false
-  }, [isContextOpen])
+  useLayoutEffect(() => {
+    if (isContextVisible && !wasContextVisibleRef.current) {
+      const active = document.activeElement
+      const declared = contextPanelRestoreFocusRef?.current ?? toggleButtonRef.current
+      contextReturnFocusRef.current = availableFocusTarget(declared)
+        ? declared
+        : active instanceof HTMLElement &&
+            !contextDialogRef.current?.contains(active) &&
+            availableFocusTarget(active)
+          ? active
+          : null
+    } else if (!isContextVisible && wasContextVisibleRef.current) {
+      const target = contextReturnFocusRef.current
+      contextReturnFocusRef.current = null
+      const active = document.activeElement
+      if (
+        availableFocusTarget(target) &&
+        (active === document.body ||
+          active === document.documentElement ||
+          contextDialogRef.current?.contains(active))
+      )
+        target.focus({ preventScroll: true })
+    }
+    wasContextVisibleRef.current = isContextVisible
+  }, [isContextVisible, contextPanelRestoreFocusRef])
 
   useEffect(() => {
-    if (!isContextVisible || !isContextOverlayRendered || viewport === 'wide') return
+    if (!isContextVisible || !isContextOverlayRendered || isContextExpanded || viewport === 'wide')
+      return undefined
     const { x, y } = contextFocusScrollPositionRef.current
     contextDialogRef.current?.focus({ preventScroll: true })
-    window.requestAnimationFrame(() => window.scrollTo(x, y))
-  }, [isContextVisible, isContextOverlayRendered, viewport])
+    const frame = window.requestAnimationFrame(() => window.scrollTo(x, y))
+    return () => window.cancelAnimationFrame(frame)
+  }, [isContextVisible, isContextOverlayRendered, isContextExpanded, viewport])
 
   const beginLayoutAnimation = (panel: 'navigation' | 'context'): void => {
     if (panel === 'navigation') {
@@ -235,23 +289,11 @@ export function WorkspaceShell({
 
   const closeContext = (): void => {
     beginLayoutAnimation('context')
-    restoreToggleFocus.current = true
-    window.clearTimeout(overlayExitTimerRef.current)
-    if (viewport === 'wide') {
-      setIsContextOverlayRendered(false)
-    } else {
-      overlayExitTimerRef.current = window.setTimeout(() => {
-        setIsContextOverlayRendered(false)
-      }, 180)
-    }
     setLayoutState((state) => ({ ...state, contextPanel: 'closed' }))
     onContextPanelOpenChange?.(false)
   }
   const openContext = (): void => {
     beginLayoutAnimation('context')
-    contextFocusScrollPositionRef.current = { x: window.scrollX, y: window.scrollY }
-    window.clearTimeout(overlayExitTimerRef.current)
-    if (viewport !== 'wide') setIsContextOverlayRendered(true)
     setLayoutState((state) => ({ ...state, contextPanel: 'open' }))
     onContextPanelOpenChange?.(true)
   }
@@ -277,7 +319,6 @@ export function WorkspaceShell({
     setLayoutState((state) => {
       if (state[panel] === nextState) return state
       if (panel === 'navigationPanel') restoreNavigationToggleFocus.current = nextState === 'closed'
-      else restoreToggleFocus.current = nextState === 'closed'
       return { ...state, [panel]: nextState }
     })
     if (panel === 'contextPanel') onContextPanelOpenChange?.(nextState === 'open')
@@ -301,7 +342,8 @@ export function WorkspaceShell({
       syncPanelStateFromLayout('navigationPanel', layout['workspace-navigation'])
     }
   }
-  const handleContextKeyDown = (event: React.KeyboardEvent): void => {
+  const handleContextKeyDown = useEffectEvent((event: KeyboardEvent): void => {
+    if (event.defaultPrevented) return
     if (event.key === 'Escape') {
       event.preventDefault()
       closeContext()
@@ -310,29 +352,55 @@ export function WorkspaceShell({
 
     if (event.key !== 'Tab') return
 
+    const dialog = contextDialogRef.current
+    if (!dialog) return
     const focusableElements = Array.from(
-      event.currentTarget.querySelectorAll<HTMLElement>(
+      dialog.querySelectorAll<HTMLElement>(
         'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
       ),
+    ).filter(
+      (element) =>
+        element instanceof HTMLElement && element.tabIndex >= 0 && availableFocusTarget(element),
     )
     const firstFocusable = focusableElements.at(0)
     const lastFocusable = focusableElements.at(-1)
-    if (!firstFocusable || !lastFocusable) return
+    if (!firstFocusable || !lastFocusable) {
+      event.preventDefault()
+      dialog.focus({ preventScroll: true })
+      return
+    }
 
     if (
       event.shiftKey &&
-      (document.activeElement === firstFocusable || document.activeElement === event.currentTarget)
+      (document.activeElement === firstFocusable || document.activeElement === dialog)
     ) {
       event.preventDefault()
-      lastFocusable.focus()
+      lastFocusable.focus({ preventScroll: true })
     } else if (
       !event.shiftKey &&
-      (document.activeElement === lastFocusable || document.activeElement === event.currentTarget)
+      (document.activeElement === lastFocusable || document.activeElement === dialog)
     ) {
       event.preventDefault()
-      firstFocusable.focus()
+      firstFocusable.focus({ preventScroll: true })
     }
-  }
+  })
+
+  useLayoutEffect(() => {
+    const dialog = contextDialogRef.current
+    if (
+      !dialog ||
+      !isContextVisible ||
+      !isContextOverlayRendered ||
+      isContextExpanded ||
+      viewport === 'wide'
+    )
+      return undefined
+    // Portal descendants share this DOM boundary even when their React ancestors
+    // belong to the Transcript. The modal owner keeps one listener for this lifetime.
+    const keydown = (event: KeyboardEvent): void => handleContextKeyDown(event)
+    dialog.addEventListener('keydown', keydown)
+    return () => dialog.removeEventListener('keydown', keydown)
+  }, [isContextVisible, isContextOverlayRendered, isContextExpanded, viewport])
   const contextPanel = providedContextPanel ?? null
   const contextToggleLabel = isContextOpen ? 'Close context panel' : 'Open context panel'
   const navigationToggleLabel = isNavigationVisible
@@ -519,7 +587,6 @@ export function WorkspaceShell({
                 aria-label="Context panel"
                 aria-modal="true"
                 inert={!isContextOpen}
-                onKeyDown={handleContextKeyDown}
                 open
                 ref={contextDialogRef}
               >

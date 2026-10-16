@@ -1,11 +1,13 @@
 import { expect, type ElectronApplication, type Page } from '@playwright/test'
 import { randomUUID } from 'node:crypto'
-import { writeFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { lstat, open, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 
 import type { ConversationSnapshot, DesktopBridge } from '../../packages/contracts/src/index.js'
 
-import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { diagnosticRecordSchema } from '../../packages/contracts/src/diagnostics.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
+import { resolveRealConfiguredModel } from './real-model-selection.js'
 import {
   createRuntimeFixture,
   test,
@@ -13,9 +15,41 @@ import {
   type RuntimeFixtureOptions,
 } from './runtime-fixture.js'
 
-const migrationsFolder = resolve(import.meta.dirname, '../../packages/persistence/drizzle')
 const maxRuns = 128
 const maxBodyBytes = 8 * 1024 * 1024
+
+/** Keep only fixed startup enums before this fixture's cleanup removes its private logs. */
+async function readCatalogFailures(fixture: RuntimeFixture): Promise<unknown> {
+  try {
+    const path = join(dirname(fixture.databaseFile), 'logs/development/pact-0.jsonl')
+    const info = await lstat(path)
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 64 * 1024)
+      return { status: 'unavailable' }
+    const file = await open(path, 'r')
+    try {
+      const bytes = Buffer.alloc(info.size)
+      const { bytesRead } = await file.read(bytes, 0, bytes.length, 0)
+      const lines = bytes.subarray(0, bytesRead).toString('utf8').split('\n')
+      if (lines.length > 256) return { status: 'unavailable' }
+      const events = lines.flatMap((line) => {
+        if (!line) return []
+        const parsed = diagnosticRecordSchema.safeParse(JSON.parse(line))
+        if (!parsed.success || !parsed.data.settingsCatalogPhase) return []
+        return [
+          {
+            phase: parsed.data.settingsCatalogPhase,
+            failure: parsed.data.settingsCatalogFailure ?? 'other',
+          },
+        ]
+      })
+      return events.length <= 32 ? { status: 'observed', events } : { status: 'overflow' }
+    } finally {
+      await file.close()
+    }
+  } catch {
+    return { status: 'unavailable' }
+  }
+}
 
 export interface RealWorkspace {
   fixture: RuntimeFixture
@@ -105,6 +139,7 @@ export async function launchRealWorkspace(
             JSON.stringify({
               failure: error instanceof Error ? error.message : 'Session creation failed',
               startup: dialog.slice(0, 6_000),
+              catalogFailureDiagnostics: await readCatalogFailures(fixture),
             }),
           ),
         )
@@ -268,40 +303,45 @@ export async function selectRealConfiguredEffort(
 ): Promise<void> {
   if (agentIds.length < 1 || agentIds.length > 2 || new Set(agentIds).size !== agentIds.length)
     throw new Error('Real effort selection requires one or two unique Agents')
-  // Select only an effort advertised by the selected real CLI for the user's configured
-  // model. This bounds review latency without changing any source config file.
+  // Keep the configured wire model while choosing an actual native alias/effort.
+  const state = await ctx.page.evaluate(async (sessionId) => {
+    const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+    return bridge.getSessionSettings(sessionId)
+  }, ctx.sessionId)
+  if (!state.ok) throw new Error('Actual Session settings are unavailable')
+  const previous = state.value.session.settings,
+    agents = { ...previous.agents },
+    models = ctx.fixture.readConfigurationModels()
+  for (const agent of agentIds) {
+    const model = resolveRealConfiguredModel(
+      state.value.modelCatalogs[agent],
+      models[agent],
+      agents[agent].model,
+    )
+    agents[agent] = {
+      model: model.id,
+      effort: model.supportedEfforts.includes('low') ? 'low' : (model.supportedEfforts[0] ?? null),
+    }
+  }
   const saved = await ctx.page.evaluate(
-    async ({ sessionId, models, agentIds: selectedAgents }) => {
+    async ({ sessionId, settings }) => {
       const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
-      const state = await bridge.getSessionSettings(sessionId)
-      if (!state.ok) throw new Error('Actual Session settings are unavailable')
-      const agents = { ...state.value.session.settings.agents }
-      for (const agent of selectedAgents) {
-        const catalog = state.value.modelCatalogs[agent]
-        const model = catalog.models.find((item) => item.id === models[agent])
-        if (catalog.status !== 'available' || !model)
-          throw new Error('Configured real model is absent from the actual CLI catalog')
-        agents[agent] = {
-          model: model.id,
-          effort: model.supportedEfforts.includes('low')
-            ? 'low'
-            : (model.supportedEfforts[0] ?? null),
-        }
-      }
-      const previous = state.value.session.settings
       return bridge.saveSessionSettings({
         sessionId,
-        settings: {
-          primaryAgentId: previous.primaryAgentId,
-          agents,
-          maxDiscussionRounds: previous.maxDiscussionRounds,
-          runningMessagePolicy: previous.runningMessagePolicy,
-          maxReviewCycles: previous.maxReviewCycles,
-          maxRepairAttempts: previous.maxRepairAttempts,
-        },
+        settings,
       })
     },
-    { sessionId: ctx.sessionId, models: ctx.fixture.readConfigurationModels(), agentIds },
+    {
+      sessionId: ctx.sessionId,
+      settings: {
+        primaryAgentId: previous.primaryAgentId,
+        agents,
+        maxDiscussionRounds: previous.maxDiscussionRounds,
+        runningMessagePolicy: previous.runningMessagePolicy,
+        maxReviewCycles: previous.maxReviewCycles,
+        maxRepairAttempts: previous.maxRepairAttempts,
+      },
+    },
   )
   expect(saved.ok).toBe(true)
 }
@@ -310,10 +350,7 @@ export async function readRealConversation(
   context: RealWorkspace,
   sessionId = context.sessionId,
 ): Promise<ConversationSnapshot> {
-  const database = await PactDatabase.open({
-    filePath: context.fixture.databaseFile,
-    migrationsFolder,
-  })
+  const database = ReadonlyFixtureDatabase.open(context.fixture)
   try {
     const snapshot = database.conversationRepository.read(sessionId)
     if (
@@ -337,10 +374,7 @@ export async function waitForRealCompletion(
 ): Promise<ConversationSnapshot> {
   if (count > maxRuns) throw new Error('Real case exceeds its model-Run bound')
   let failedNative: { sessionId: string; turnId: string | null } | undefined
-  const database = await PactDatabase.open({
-    filePath: context.fixture.databaseFile,
-    migrationsFolder,
-  })
+  const database = ReadonlyFixtureDatabase.open(context.fixture)
   try {
     await expect
       .poll(

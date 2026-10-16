@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect } from '@playwright/test'
 import { open } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
@@ -8,7 +8,7 @@ import {
   diagnosticRecordSchema,
   type DiagnosticRecord,
 } from '../../packages/contracts/src/diagnostics.js'
-import { createRuntimeFixture } from './runtime-fixture.js'
+import { createRuntimeFixture, test } from './runtime-fixture.js'
 
 /** UI-only data; Main/Utility, Worker, IPC and log files are the production implementation. */
 test(

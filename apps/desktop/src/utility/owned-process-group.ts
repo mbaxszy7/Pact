@@ -216,11 +216,16 @@ export class OwnedProcessGroup {
     }, 100)
   }
 
-  private remember(rows: Map<number, Identity>, root: Identity): void {
-    const anchor =
+  private hasLiveAnchor(rows: Map<number, Identity>, root: Identity): boolean {
+    return (
       same(root, rows.get(root.pid)) ||
       [...this.identities.values()].some((known) => same(known, rows.get(known.pid)))
-    if (!anchor) throw new Error('The owned group lost its verified process identity.')
+    )
+  }
+
+  private remember(rows: Map<number, Identity>, root: Identity): void {
+    if (!this.hasLiveAnchor(rows, root))
+      throw new Error('The owned group lost its verified process identity.')
     const leader = rows.get(root.pgid)
     if (leader && !sameIdentity(root, leader)) throw new Error('The owned group identity changed.')
     for (const row of rows.values()) {
@@ -258,8 +263,13 @@ export class OwnedProcessGroup {
   private async signalGroup(root: Identity, signal: NodeJS.Signals): Promise<void> {
     if (this.groupGone(root.pgid)) return
     const rows = await readProcesses()
+    const leader = rows.get(root.pgid)
+    if (leader && !sameIdentity(root, leader)) throw new Error('The owned group identity changed.')
     if (![...rows.values()].some((row) => row.pgid === root.pgid && !/^[ZX]/u.test(row.state)))
       return
+    // A closed root can leave an unobserved helper. Without a live anchor, do
+    // not signal or adopt it; the existing deadline still requires real ESRCH.
+    if (this.childClosed && !this.hasLiveAnchor(rows, root)) return
     this.remember(rows, root)
     // Signalling uses only a private group with a currently verified original identity.
     try {

@@ -90,6 +90,10 @@ test(
           value: { writeText: Promise.resolve.bind(Promise) },
         })
       })
+      // Establish the genuine action before arming the fault: hover renders the
+      // timestamp too, so arming first can remove its target before hover settles.
+      await window.locator('article[data-pact-speaker="codex"]').hover()
+      await expect(window.getByRole('button', { name: 'Copy Codex message' })).toBeVisible()
       // The unique assistant timestamp is read while its Message actions render.
       // Throw repeatedly because React may retry a concurrent render before
       // reaching the boundary; no production test hook or durable data is changed.
@@ -111,7 +115,6 @@ test(
           }),
         )
       }, assistantCreatedAt)
-      await window.locator('article[data-pact-speaker="codex"]').hover()
       await window.getByRole('button', { name: 'Copy Codex message' }).click()
 
       await expect(window.locator('[data-pact-conversation-recovery]')).toBeVisible()

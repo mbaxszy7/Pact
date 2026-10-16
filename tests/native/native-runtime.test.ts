@@ -1,7 +1,9 @@
-import { spawn, type ChildProcess, type SpawnOptionsWithoutStdio } from 'node:child_process'
+import type { spawn, ChildProcess, SpawnOptionsWithoutStdio } from 'node:child_process'
+
 import { randomUUID } from 'node:crypto'
-import { appendFile, mkdir, realpath, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { realpathSync } from 'node:fs'
+import { appendFile, lstat, mkdir, realpath, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import type { AgentNativeContextRebuildInput } from '../../packages/agent-runtime/src/index.js'
@@ -10,6 +12,8 @@ import type { NativeContextRebuildChunk } from '../../packages/contracts/src/ind
 import {
   actualSdk,
   boundedNativeText,
+  cleanupNativeFixture,
+  CODEX_SHUTDOWN_LOG_FILTER,
   buildAdapters,
   executable,
   hash,
@@ -28,44 +32,161 @@ import {
 
 let bundle: Awaited<ReturnType<typeof buildAdapters>>
 let buildRoot: string
+let buildOwned: Awaited<ReturnType<typeof ownedRoot>> | undefined
+let fixtureOwnersReleased = true
+async function finishFixture(
+  owned: Awaited<ReturnType<typeof ownedRoot>>,
+  options: Parameters<typeof cleanupNativeFixture>[1] = {},
+): Promise<void> {
+  try {
+    await cleanupNativeFixture(owned, options)
+  } catch (error) {
+    fixtureOwnersReleased = false
+    throw error
+  }
+}
 let codexExecutable: string
 let claudeExecutable: string
+async function observeSdkProjectKey(
+  sdk: ReturnType<typeof actualSdk>,
+  sessionId: string,
+  cwd: string,
+): Promise<string> {
+  let calls = 0
+  let projectKey: string | undefined
+  const messages = await sdk.getSessionMessages(sessionId, {
+    dir: cwd,
+    includeSystemMessages: true,
+    sessionStore: {
+      load: async (key) => {
+        calls += 1
+        if (
+          calls !== 1 ||
+          key.sessionId !== sessionId ||
+          key.subpath !== undefined ||
+          !/^[a-z0-9-]{1,256}$/iu.test(key.projectKey)
+        )
+          throw new Error('Read-only SDK namespace observer contract invalid')
+        projectKey = key.projectKey
+        return []
+      },
+      append: async () => {
+        throw new Error('Read-only SDK namespace observer cannot append')
+      },
+    },
+  })
+  if (calls !== 1 || projectKey === undefined || messages.length !== 0)
+    throw new Error('Read-only SDK namespace observer did not complete one empty lookup')
+  return projectKey
+}
+
+async function sourceIdentity(path: string): Promise<object> {
+  try {
+    const info = await lstat(path, { bigint: true })
+    return {
+      exists: true,
+      regularFile: info.isFile(),
+      symlink: info.isSymbolicLink(),
+      dev: String(info.dev),
+      ino: String(info.ino),
+      size: String(info.size),
+    }
+  } catch (error) {
+    if (error instanceof Error && Reflect.get(error, 'code') === 'ENOENT') return { exists: false }
+    throw error
+  }
+}
+
+function nativeMessageContentHashes(text: string): string[] {
+  return text
+    .trimEnd()
+    .split('\n')
+    .flatMap((line) => {
+      const record: unknown = JSON.parse(line)
+      if (!record || typeof record !== 'object') return []
+      const message: unknown = Reflect.get(record, 'message')
+      if (!message || typeof message !== 'object') return []
+      const content: unknown = Reflect.get(message, 'content')
+      return content === undefined ? [] : [hash(JSON.stringify(content))]
+    })
+}
+
 beforeAll(async () => {
+  const setupDeadlineAt = performance.now() + 60_000
   const owned = await ownedRoot()
   buildRoot = owned.root
+  buildOwned = owned
   // Missing/unrecognized real binaries fail, rather than silently using Fake CLI.
-  codexExecutable = await executable('codex', owned)
-  claudeExecutable = await executable('claude', owned)
+  codexExecutable = await executable('codex', owned, setupDeadlineAt)
+  claudeExecutable = await executable('claude', owned, setupDeadlineAt)
   await recordSdkVersion()
   bundle = await buildAdapters(buildRoot)
-})
+}, 60_000)
 afterAll(async () => {
-  if (buildRoot) await rm(buildRoot, { recursive: true, force: true })
+  if (!fixtureOwnersReleased)
+    throw new Error('Native adapter bundle retained while fixture cleanup is unconfirmed')
+  if (buildOwned) await finishFixture(buildOwned)
 })
 
 describe('real Claude Code / production Adapter zero-prompt Fork settings', () => {
   it.each([
-    { model: 'opus', effort: 'high', alias: 'pact-fixture-alpha[1m]', expectedEffort: 'high' },
-    { model: 'sonnet', effort: 'medium', alias: 'pact-fixture-beta', expectedEffort: 'medium' },
-    { model: null, effort: null, alias: 'pact-fixture-native-default', expectedEffort: 'max' },
+    {
+      model: 'opus',
+      effort: 'high',
+      alias: 'pact-fixture-alpha[1m]',
+      expectedEffort: 'high',
+      longCwd: false,
+    },
+    {
+      model: 'sonnet',
+      effort: 'medium',
+      alias: 'pact-fixture-beta',
+      expectedEffort: 'medium',
+      longCwd: false,
+    },
+    {
+      model: null,
+      effort: null,
+      alias: 'pact-fixture-native-default',
+      expectedEffort: 'max',
+      longCwd: false,
+    },
+    {
+      model: 'opus',
+      effort: 'high',
+      alias: 'pact-fixture-long-path',
+      expectedEffort: 'high',
+      longCwd: true,
+    },
   ] as const)(
     'reads back $model/$effort with owned settings.env=max and alias=$alias',
-    async ({ model, effort, alias, expectedEffort }) => {
+    async ({ model, effort, alias, expectedEffort, longCwd }) => {
       const owned = await ownedRoot()
       const provider = new LoopbackProvider()
       const sdk = actualSdk()
       const previousConfig = process.env.CLAUDE_CONFIG_DIR
       const children = new Set<ChildProcess>()
-      const exits: Promise<void>[] = []
       let adapter: NativeAdapter | undefined
       let cold: NativeAdapter | undefined
       let applied: { model?: string; effort?: string } | undefined
       let queryOptions: SdkQueryInput['options'] | undefined
       let stdoutBytes = 0
       const controller = new AbortController()
+      const deadlineAt = performance.now() + 25_000
       const deadline = setTimeout(() => controller.abort(), 25_000)
       try {
+        if (longCwd) {
+          const directory = join(
+            owned.cwd,
+            'native-long-namespace-' + 'x'.repeat(Math.max(1, 220 - owned.cwd.length - 22)),
+          )
+          await mkdir(directory, { recursive: true })
+          owned.cwd = await realpath(directory)
+          if (owned.cwd.length <= 200)
+            throw new Error('Long native namespace fixture was not admitted')
+        }
         await provider.start()
+        await owned.processes.prepare(claudeExecutable, 4, deadlineAt)
         process.env.CLAUDE_CONFIG_DIR = owned.home
         await writeFile(
           join(owned.home, 'settings.json'),
@@ -82,11 +203,8 @@ describe('real Claude Code / production Adapter zero-prompt Fork settings', () =
           user = randomUUID(),
           assistant = randomUUID(),
           timestamp = new Date().toISOString()
-        const project = join(
-          owned.home,
-          'projects',
-          (await realpath(owned.cwd)).replace(/[^a-zA-Z0-9]/gu, '-'),
-        )
+        const fixtureKey = await observeSdkProjectKey(sdk, id, owned.cwd)
+        const project = join(owned.home, 'projects', fixtureKey)
         await mkdir(project, { recursive: true })
         const sourcePath = join(project, `${id}.jsonl`)
         await writeFile(
@@ -122,6 +240,32 @@ describe('real Claude Code / production Adapter zero-prompt Fork settings', () =
             .join('\n') + '\n',
         )
         const sourceHash = hash(await boundedNativeText(sourcePath, owned.home))
+        const canonicalCwd = await realpath(owned.cwd)
+        const sdkKey = await observeSdkProjectKey(sdk, id, owned.cwd)
+        const canonicalSdkKey = await observeSdkProjectKey(sdk, id, canonicalCwd)
+        console.info(
+          '[native namespace]',
+          JSON.stringify({
+            phase: 'source-written-before-prepare',
+            platform: process.platform,
+            arch: process.arch,
+            node: process.version,
+            cwdHash: hash(owned.cwd),
+            syncCanonicalHash: hash(realpathSync(owned.cwd)),
+            promiseCanonicalHash: hash(canonicalCwd),
+            fixtureKeyHash: hash(fixtureKey),
+            sdkKeyHash: hash(sdkKey),
+            canonicalSdkKeyHash: hash(canonicalSdkKey),
+            sdkMatchesFixture: sdkKey === fixtureKey,
+            canonicalSdkMatchesFixture: canonicalSdkKey === fixtureKey,
+            sourceHash,
+            fixtureSource: await sourceIdentity(sourcePath),
+            sdkSource: await sourceIdentity(join(owned.home, 'projects', sdkKey, `${id}.jsonl`)),
+            canonicalSdkSource: await sourceIdentity(
+              join(owned.home, 'projects', canonicalSdkKey, `${id}.jsonl`),
+            ),
+          }),
+        )
         const dependencies = {
           getSessionInfo: sdk.getSessionInfo,
           query: (input: SdkQueryInput) => {
@@ -136,19 +280,9 @@ describe('real Claude Code / production Adapter zero-prompt Fork settings', () =
           },
           spawn: (command: string, args: string[], options: Parameters<typeof spawn>[2]) => {
             if (children.size >= 4) throw new Error('Owned Claude child capacity exceeded')
-            const child = spawn(command, args, options)
+            const child = owned.processes.spawn(command, args, options ?? {})
             children.add(child)
-            const exit = new Promise<void>((resolveExit) => {
-              child.once('exit', () => {
-                children.delete(child)
-                resolveExit()
-              })
-              child.once('error', () => {
-                children.delete(child)
-                resolveExit()
-              })
-            })
-            exits.push(exit)
+            child.once('close', () => children.delete(child))
             let pending = ''
             child.stdout?.on('data', (chunk: Buffer) => {
               stdoutBytes += chunk.length
@@ -248,22 +382,409 @@ describe('real Claude Code / production Adapter zero-prompt Fork settings', () =
       } finally {
         controller.abort()
         clearTimeout(deadline)
-        await cold?.dispose()
-        await adapter?.dispose()
-        for (const child of children) child.kill('SIGTERM')
-        await within(Promise.all(exits), 1500, 'Owned Claude termination grace').catch(
-          () => undefined,
-        )
-        for (const child of children) child.kill('SIGKILL')
-        await Promise.all(exits)
         if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
         else process.env.CLAUDE_CONFIG_DIR = previousConfig
-        await provider.close()
-        await rm(owned.root, { recursive: true, force: true })
+        await finishFixture(owned, {
+          adapters: [cold, adapter].filter((value): value is NativeAdapter => Boolean(value)),
+          provider,
+        })
       }
     },
   )
 })
+
+it.each([{ longCwd: false }, { longCwd: true }])(
+  'real Claude CLI resumes the selected Fork prefix and appends into its original witness; long cwd=$longCwd',
+  async ({ longCwd }) => {
+    const owned = await ownedRoot()
+    const sdk = actualSdk()
+    const historicalUser = 'NATIVE_RESUME_ORIGINAL_USER_COMPLETE'
+    const historicalAssistant = 'NATIVE_RESUME_ORIGINAL_ASSISTANT_COMPLETE'
+    const cutoffCanary = 'NATIVE_RESUME_EXCLUDED_LATER_CANARY'
+    const promptUuid = randomUUID()
+    const prompt = `NATIVE_RESUME_NEW_PROMPT_${promptUuid}`
+    const reply = 'NATIVE_RESUME_LOOPBACK_ASSISTANT_COMPLETE'
+    const sourceContentHashes: string[] = [],
+      candidateContentHashes: string[] = []
+    const provider = new LoopbackProvider([reply], {
+      mode: 'claude',
+      historicalUser,
+      historicalAssistant,
+      prompt,
+      cutoffCanary,
+      sourceContentHashes,
+      candidateContentHashes,
+    })
+    const previousConfig = process.env.CLAUDE_CONFIG_DIR
+    const children = new Set<ChildProcess>()
+    const closed: Array<Promise<void>> = []
+    const admitted: ChildProcess[] = []
+    const adapters: NativeAdapter[] = []
+    let session: ReturnType<ReturnType<typeof actualSdk>['query']> | undefined
+    let verified = false
+    const controller = new AbortController()
+    const deadlineAt = performance.now() + 25_000
+    const deadline = setTimeout(() => controller.abort(), 25_000)
+    try {
+      if (longCwd) {
+        const directory = join(
+          owned.cwd,
+          'native-resume-namespace-' + 'x'.repeat(Math.max(1, 220 - owned.cwd.length - 24)),
+        )
+        await mkdir(directory, { recursive: true })
+        owned.cwd = await realpath(directory)
+        if (owned.cwd.length <= 200)
+          throw new Error('Long Claude resume namespace fixture was not admitted')
+      }
+      await provider.start()
+      await owned.processes.prepare(claudeExecutable, 4, deadlineAt)
+      process.env.CLAUDE_CONFIG_DIR = owned.home
+      const env = { ...isolatedEnv(owned.root, owned.home), ANTHROPIC_BASE_URL: provider.url }
+      const spawnOwned = (
+        command: string,
+        args: string[],
+        options: Parameters<typeof spawn>[2],
+      ) => {
+        if (children.size >= 4) throw new Error('Owned Claude child capacity exceeded')
+        const child = owned.processes.spawn(command, args, options ?? {})
+        children.add(child)
+        admitted.push(child)
+        closed.push(
+          new Promise<void>((done) => {
+            child.once('close', () => {
+              children.delete(child)
+              done()
+            })
+          }),
+        )
+        return child
+      }
+      const dependencies = {
+        getSessionInfo: sdk.getSessionInfo,
+        query: (input: SdkQueryInput) =>
+          sdk.query({ ...input, options: { ...input.options, env } }),
+        spawn: spawnOwned,
+      }
+      const sourceId = randomUUID()
+      const user = randomUUID(),
+        assistant = randomUUID(),
+        laterUser = randomUUID(),
+        laterAssistant = randomUUID(),
+        timestamp = new Date().toISOString()
+      const projectKey = await observeSdkProjectKey(sdk, sourceId, owned.cwd)
+      const project = join(owned.home, 'projects', projectKey)
+      await mkdir(project, { recursive: true })
+      const sourcePath = join(project, `${sourceId}.jsonl`)
+      await writeFile(
+        sourcePath,
+        [
+          {
+            type: 'user',
+            uuid: user,
+            parentUuid: null,
+            sessionId: sourceId,
+            timestamp,
+            cwd: owned.cwd,
+            message: { role: 'user', content: historicalUser },
+          },
+          {
+            type: 'assistant',
+            uuid: assistant,
+            parentUuid: user,
+            sessionId: sourceId,
+            timestamp,
+            cwd: owned.cwd,
+            message: {
+              role: 'assistant',
+              id: 'msg_pact_native_historical_1',
+              content: [{ type: 'text', text: historicalAssistant }],
+              model: 'claude-sonnet-4-6',
+              stop_reason: 'end_turn',
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
+          },
+          {
+            type: 'user',
+            uuid: laterUser,
+            parentUuid: assistant,
+            sessionId: sourceId,
+            timestamp,
+            cwd: owned.cwd,
+            message: { role: 'user', content: cutoffCanary },
+          },
+          {
+            type: 'assistant',
+            uuid: laterAssistant,
+            parentUuid: laterUser,
+            sessionId: sourceId,
+            timestamp,
+            cwd: owned.cwd,
+            message: {
+              role: 'assistant',
+              id: 'msg_pact_native_excluded_1',
+              content: [{ type: 'text', text: cutoffCanary }],
+              model: 'claude-sonnet-4-6',
+              stop_reason: 'end_turn',
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
+          },
+        ]
+          .map((value) => JSON.stringify(value))
+          .join('\n') + '\n',
+      )
+      const sourceHash = hash(await boundedNativeText(sourcePath, owned.home))
+      sourceContentHashes.push(
+        ...nativeMessageContentHashes(await boundedNativeText(sourcePath, owned.home)),
+      )
+      const adapter = new bundle.ClaudeAgentAdapter(claudeExecutable, dependencies)
+      adapters.push(adapter)
+      const source = await adapter.prepareNativeFork(
+        {
+          cwd: owned.cwd,
+          nativeSessionId: sourceId,
+          nativeTurnId: user,
+          runId: user,
+          bindingGeneration: 1,
+          throughSequence: 1,
+          deliveryCursor: 1,
+          responseHash: hash(historicalAssistant),
+        },
+        controller.signal,
+      )
+      const input: ForkInput = {
+        operationId: randomUUID(),
+        sessionId: randomUUID(),
+        cwd: owned.cwd,
+        source,
+        model: 'sonnet',
+        effort: 'low',
+        permissionMode: 'native',
+        onDispatched: async () => {},
+        onCandidate: async () => {},
+        reportNativeWork: () => {},
+      }
+      const fork = await adapter.forkNativeContext(input, controller.signal)
+      const initialized = await adapter.initializeNativeFork(
+        { ...input, nativeSessionId: fork.nativeSessionId, witness: fork.witness },
+        controller.signal,
+      )
+      const cold = new bundle.ClaudeAgentAdapter(claudeExecutable, dependencies)
+      adapters.push(cold)
+      expect(
+        await cold.inspectNativeFork(
+          {
+            ...input,
+            nativeSessionId: initialized.nativeSessionId,
+            witness: initialized.witness,
+            lastDispatchedPhase: 'initialize',
+          },
+          controller.signal,
+        ),
+      ).toMatchObject({
+        kind: 'verified',
+        ready: true,
+        result: { nativeSessionId: initialized.nativeSessionId },
+      })
+      expect(provider.requests.filter((request) => request.method === 'POST')).toHaveLength(0)
+      const nativePath = initialized.witness.nativePath
+      if (!nativePath) throw new Error('Initialized Claude Fork lacks its original witness path')
+      const prefix = await boundedNativeText(nativePath, owned.home)
+      expect(hash(prefix)).toBe(initialized.witness.initializedPrefixHash)
+      expect(Buffer.byteLength(prefix)).toBe(initialized.witness.initializedPrefixBytes)
+      expect(prefix).toContain(historicalUser)
+      expect(prefix).toContain(historicalAssistant)
+      expect(prefix).not.toContain(cutoffCanary)
+      candidateContentHashes.push(...nativeMessageContentHashes(prefix))
+      console.info(
+        '[native Claude candidate schema]',
+        JSON.stringify({
+          sourceMessages: sourceContentHashes.length,
+          candidateMessages: candidateContentHashes.length,
+          sourceContentHashes,
+          candidateContentHashes,
+          pactMarkerPresent: /pactContext|pact-native-fork|pact-fork-settings-/u.test(prefix),
+          forkMarkerPresent: /forkedFrom|fork_summary|fork-summary/u.test(prefix),
+        }),
+      )
+      const directory = dirname(nativePath)
+      const directoryBefore = await lstat(directory, { bigint: true })
+      const rootBefore = await lstat(owned.root, { bigint: true })
+      expect(directoryBefore.isDirectory() && !directoryBefore.isSymbolicLink()).toBe(true)
+      expect(await realpath(directory)).toBe(directory)
+      expect(await realpath(owned.root)).toBe(owned.root)
+      session = sdk.query({
+        prompt: (async function* () {
+          yield {
+            type: 'user',
+            uuid: promptUuid,
+            session_id: initialized.nativeSessionId,
+            parent_tool_use_id: null,
+            message: { role: 'user', content: prompt },
+          }
+        })(),
+        options: {
+          cwd: owned.cwd,
+          resume: initialized.nativeSessionId,
+          persistSession: true,
+          abortController: controller,
+          pathToClaudeCodeExecutable: claudeExecutable,
+          settingSources: ['user', 'project', 'local'],
+          systemPrompt: { type: 'preset', preset: 'claude_code' },
+          model: 'sonnet',
+          effort: 'low',
+          env,
+          spawnClaudeCodeProcess: (specification: {
+            command: string
+            args: string[]
+            cwd?: string
+            env: NodeJS.ProcessEnv
+            signal: AbortSignal
+          }) =>
+            spawnOwned(specification.command, specification.args, {
+              cwd: specification.cwd,
+              env: specification.env,
+              signal: specification.signal,
+              stdio: ['pipe', 'pipe', 'pipe'],
+              shell: false,
+            }),
+        },
+      })
+      let messages = 0,
+        bytes = 0,
+        assistantReplies = 0,
+        successfulResults = 0
+      const query = session
+      await within(
+        (async () => {
+          for await (const message of query) {
+            messages += 1
+            bytes += Buffer.byteLength(JSON.stringify(message))
+            if (messages > 128 || bytes > 4 * 1024 * 1024)
+              throw new Error('Claude resume SDK result exceeds its fixture bound')
+            if (!message || typeof message !== 'object' || Array.isArray(message))
+              throw new Error('Malformed Claude resume SDK result')
+            if (Reflect.get(message, 'type') === 'assistant') {
+              const body: unknown = Reflect.get(message, 'message')
+              const content: unknown =
+                body && typeof body === 'object' ? Reflect.get(body, 'content') : undefined
+              if (
+                Array.isArray(content) &&
+                content.some(
+                  (block: unknown) =>
+                    block &&
+                    typeof block === 'object' &&
+                    Reflect.get(block, 'type') === 'text' &&
+                    Reflect.get(block, 'text') === reply,
+                )
+              )
+                assistantReplies += 1
+            }
+            if (Reflect.get(message, 'type') === 'result') {
+              console.info(
+                '[native Claude resume terminal]',
+                JSON.stringify({
+                  successSubtype: Reflect.get(message, 'subtype') === 'success',
+                  isError: Reflect.get(message, 'is_error') === true,
+                  candidateMatches:
+                    Reflect.get(message, 'session_id') === initialized.nativeSessionId,
+                  replyMatches: Reflect.get(message, 'result') === reply,
+                  modelPosts: provider.requests.filter((request) => request.method === 'POST')
+                    .length,
+                  requestFacts: provider.requests.map((request) => ({
+                    inputHash: request.inputHash,
+                    ...request.claude,
+                  })),
+                  providerErrors: provider.errors.length,
+                  unexpectedRole: provider.errors.some(
+                    (error) => error.message === 'Unexpected Claude loopback message role',
+                  ),
+                  compressedInput: provider.errors.some(
+                    (error) =>
+                      error.message === 'Compressed Claude loopback request is unsupported',
+                  ),
+                  historyRejected: provider.errors.some(
+                    (error) =>
+                      error.message === 'Claude resume did not supply the exact selected history',
+                  ),
+                }),
+              )
+              if (
+                Reflect.get(message, 'subtype') !== 'success' ||
+                Reflect.get(message, 'is_error') !== false ||
+                Reflect.get(message, 'session_id') !== initialized.nativeSessionId ||
+                Reflect.get(message, 'result') !== reply
+              )
+                throw new Error(
+                  'Claude resume did not produce its expected successful terminal reply',
+                )
+              successfulResults += 1
+            }
+          }
+        })(),
+        Math.max(1, deadlineAt - performance.now()),
+        'Claude resume did not complete within its original fixture deadline',
+      )
+      expect(assistantReplies).toBe(1)
+      expect(successfulResults).toBe(1)
+      await within(
+        Promise.all(closed),
+        Math.max(1, deadlineAt - performance.now()),
+        'Claude resume native process did not close naturally',
+      )
+      expect(admitted.every((child) => child.exitCode === 0 && child.signalCode === null)).toBe(
+        true,
+      )
+      expect(children.size).toBe(0)
+      const posts = provider.requests.filter((request) => request.method === 'POST')
+      expect(posts).toHaveLength(1)
+      expect(posts[0]?.claude).toMatchObject({
+        historicalUserPresent: true,
+        historicalAssistantPresent: true,
+        historyRolesInOrder: true,
+        promptAfterHistory: true,
+        cutoffCanaryAbsent: true,
+      })
+      expect(provider.errors).toEqual([])
+      const appended = await boundedNativeText(nativePath, owned.home)
+      expect(appended.startsWith(prefix)).toBe(true)
+      expect(appended).toContain(promptUuid)
+      expect(appended).toContain(reply)
+      expect(appended).not.toContain(cutoffCanary)
+      expect(hash(await boundedNativeText(sourcePath, owned.home))).toBe(sourceHash)
+      const directoryAfter = await lstat(directory, { bigint: true })
+      const rootAfter = await lstat(owned.root, { bigint: true })
+      expect([directoryAfter.dev, directoryAfter.ino]).toEqual([
+        directoryBefore.dev,
+        directoryBefore.ino,
+      ])
+      expect([rootAfter.dev, rootAfter.ino]).toEqual([rootBefore.dev, rootBefore.ino])
+      expect(await realpath(directory)).toBe(directory)
+      expect(await realpath(owned.root)).toBe(owned.root)
+      console.info(
+        '[native Claude resume]',
+        JSON.stringify({
+          longCwd,
+          originalPrefixRetained: appended.startsWith(prefix),
+          promptPersisted: appended.includes(promptUuid),
+          assistantPersisted: appended.includes(reply),
+          sourceUnchanged: hash(await boundedNativeText(sourcePath, owned.home)) === sourceHash,
+          prefixHash: hash(prefix),
+          finalHash: hash(appended),
+          requests: posts.length,
+          ...posts[0]?.claude,
+        }),
+      )
+      verified = true
+    } finally {
+      session?.close()
+      controller.abort()
+      clearTimeout(deadline)
+      if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfig
+      await finishFixture(owned, { adapters, provider, retainRoot: !verified })
+    }
+  },
+)
 
 async function writeTurn(client: NativeRpc, threadId: string, text: string): Promise<string> {
   const turn = result(
@@ -292,13 +813,15 @@ it.each([
     const provider = new LoopbackProvider()
     const previousConfig = process.env.CLAUDE_CONFIG_DIR
     const children = new Set<ChildProcess>()
-    const exits: Promise<void>[] = []
     const adapters: NativeAdapter[] = []
+    const clients: NativeRpc[] = []
     const controller = new AbortController()
+    const deadlineAt = performance.now() + 25_000
     const deadline = setTimeout(() => controller.abort(), 25_000)
     try {
       await provider.start()
       await provider.configureCodex(owned.home)
+      if (agent === 'claude') await owned.processes.prepare(claudeExecutable, 4, deadlineAt)
       if (workspace)
         await appendFile(
           join(owned.home, 'config.toml'),
@@ -306,7 +829,11 @@ it.each([
         )
       process.env.CLAUDE_CONFIG_DIR = owned.home
       const env = { ...isolatedEnv(owned.root, owned.home), ANTHROPIC_BASE_URL: provider.url }
-      const configReader = new NativeRpc(codexExecutable, owned.cwd, env)
+      const configReader = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+        deadlineAt,
+        processes: owned.processes,
+      })
+      clients.push(configReader)
       try {
         await configReader.initialize()
         const config = result(
@@ -323,25 +850,17 @@ it.each([
       } finally {
         await configReader.close()
       }
-      const start = (
+      const startOwned = (
         command: string,
         args: readonly string[],
         options: SpawnOptionsWithoutStdio,
       ) => {
         if (children.size >= 4) throw new Error('Owned empty Rebuild child capacity exceeded')
-        const child = spawn(command, args, options)
+        const handle = owned.processes.spawnOwned(command, args, options)
+        const child = handle.child
         children.add(child)
-        exits.push(
-          new Promise<void>((resolveExit) => {
-            const end = () => {
-              children.delete(child)
-              resolveExit()
-            }
-            child.once('exit', end)
-            child.once('error', end)
-          }),
-        )
-        return child
+        child.once('close', () => children.delete(child))
+        return handle
       }
       const sdk = actualSdk()
       const makeAdapter = (): NativeAdapter => {
@@ -351,17 +870,21 @@ it.each([
                 getSessionInfo: sdk.getSessionInfo,
                 query: (input: SdkQueryInput) =>
                   sdk.query({ ...input, options: { ...input.options, env } }),
-                spawn: start,
+                spawn: (
+                  command: string,
+                  args: readonly string[],
+                  options: SpawnOptionsWithoutStdio,
+                ) => startOwned(command, args, options).child,
               })
             : new bundle.CodexAgentAdapter(
                 codexExecutable,
                 (cwd) =>
-                  start(codexExecutable, ['app-server'], {
-                    cwd,
-                    env,
-                    shell: false,
-                    stdio: ['pipe', 'pipe', 'pipe'],
-                  }),
+                  owned.processes.spawnOwnedAsync(
+                    codexExecutable,
+                    ['app-server'],
+                    { cwd, env, shell: false, stdio: ['pipe', 'pipe', 'pipe'] },
+                    deadlineAt,
+                  ),
                 { storageRoot: owned.home },
               )
         adapters.push(adapter)
@@ -387,8 +910,9 @@ it.each([
       expect(adapter.hasActiveBackgroundWork()).toBe(false)
       await adapter.dispose()
       const cold = makeAdapter()
-      const probe = () =>
-        cold.probeNativeStatus(
+      const probe = async () => {
+        if (agent === 'claude') await owned.processes.prepare(claudeExecutable, 4, deadlineAt)
+        return cold.probeNativeStatus(
           {
             target: 'initialized_binding',
             sessionId: input.sessionId,
@@ -410,6 +934,7 @@ it.each([
           },
           controller.signal,
         )
+      }
       await expect(probe()).resolves.toMatchObject({
         kind: 'binding_ready',
         source: 'completed_initialization_readback',
@@ -419,12 +944,16 @@ it.each([
           ? join(
               owned.home,
               'projects',
-              (await realpath(owned.cwd)).replace(/[^a-zA-Z0-9]/gu, '-'),
+              await observeSdkProjectKey(sdk, initialized.nativeSessionId, owned.cwd),
               `${initialized.nativeSessionId}.jsonl`,
             )
           : result(
               await (async () => {
-                const reader = new NativeRpc(codexExecutable, owned.cwd, env)
+                const reader = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+                  deadlineAt,
+                  processes: owned.processes,
+                })
+                clients.push(reader)
                 try {
                   await reader.initialize()
                   return await reader.request<{ thread: NativeThread }>('thread/read', {
@@ -462,18 +991,9 @@ it.each([
     } finally {
       controller.abort()
       clearTimeout(deadline)
-      // oxlint-disable-next-line no-await-in-loop -- Release each owned Native writer before disposing the next owner.
-      for (const adapter of adapters) await adapter.dispose()
-      for (const child of children) child.kill('SIGTERM')
-      await within(Promise.all(exits), 1500, 'Owned empty Rebuild termination grace').catch(
-        () => undefined,
-      )
-      for (const child of children) child.kill('SIGKILL')
-      await Promise.all(exits)
       if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
       else process.env.CLAUDE_CONFIG_DIR = previousConfig
-      await provider.close()
-      await rm(owned.root, { recursive: true, force: true })
+      await finishFixture(owned, { adapters, clients, provider })
     }
   },
 )
@@ -484,14 +1004,17 @@ it('real default paginated Codex writer → production selected true Fork → co
   const clients: NativeRpc[] = []
   const adapters: NativeAdapter[] = []
   const children = new Set<ChildProcess>()
-  const exits: Promise<void>[] = []
   const controller = new AbortController()
+  const deadlineAt = performance.now() + 45_000
   const deadline = setTimeout(() => controller.abort(), 45_000)
   try {
     await provider.start()
     await provider.configureCodex(owned.home)
     const env = isolatedEnv(owned.root, owned.home)
-    const writer = new NativeRpc(codexExecutable, owned.cwd, env)
+    const writer = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+      deadlineAt,
+      processes: owned.processes,
+    })
     clients.push(writer)
     await writer.initialize()
     const sourceThread = result(
@@ -516,28 +1039,18 @@ it('real default paginated Codex writer → production selected true Fork → co
     const sourceText = await boundedNativeText(sourceRead.path, owned.home)
     const sourceHash = hash(sourceText)
     await writer.close()
-    const factory = (cwd: string) => {
+    const factory = async (cwd: string) => {
       if (children.size >= 4) throw new Error('Owned Codex child capacity exceeded')
-      const child = spawn(codexExecutable, ['app-server'], {
-        cwd,
-        env,
-        shell: false,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      })
-      children.add(child)
-      exits.push(
-        new Promise<void>((resolveExit) => {
-          child.once('exit', () => {
-            children.delete(child)
-            resolveExit()
-          })
-          child.once('error', () => {
-            children.delete(child)
-            resolveExit()
-          })
-        }),
+      const handle = await owned.processes.spawnOwnedAsync(
+        codexExecutable,
+        ['app-server'],
+        { cwd, env, shell: false, stdio: ['pipe', 'pipe', 'pipe'] },
+        deadlineAt,
       )
-      return child
+      const child = handle.child
+      children.add(child)
+      child.once('close', () => children.delete(child))
+      return handle
     }
     const adapter = new bundle.CodexAgentAdapter(codexExecutable, factory, {
       storageRoot: owned.home,
@@ -603,7 +1116,10 @@ it('real default paginated Codex writer → production selected true Fork → co
     }
     expect(await adapter.setNativeTitle(label, controller.signal)).toBe('synchronized')
     expect(await adapter.setNativeTitle(label, controller.signal)).toBe('synchronized')
-    const metadataReader = new NativeRpc(codexExecutable, owned.cwd, env)
+    const metadataReader = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+      deadlineAt,
+      processes: owned.processes,
+    })
     clients.push(metadataReader)
     await metadataReader.initialize()
     const named = result(
@@ -704,16 +1220,7 @@ it('real default paginated Codex writer → production selected true Fork → co
   } finally {
     controller.abort()
     clearTimeout(deadline)
-    // oxlint-disable no-await-in-loop -- Each owner releases its Native writer before the next owner is disposed.
-    for (const adapter of adapters) await adapter.dispose()
-    for (const client of clients) await client.close()
-    // oxlint-enable no-await-in-loop
-    for (const child of children) child.kill('SIGTERM')
-    await within(Promise.all(exits), 1500, 'Owned Codex termination grace').catch(() => undefined)
-    for (const child of children) child.kill('SIGKILL')
-    await Promise.all(exits)
-    await provider.close()
-    await rm(owned.root, { recursive: true, force: true })
+    await finishFixture(owned, { adapters, clients, provider })
   }
 })
 
@@ -721,11 +1228,81 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
   const owned = await ownedRoot()
   const provider = new LoopbackProvider(['NATIVE_WRITER_REPLY'])
   const clients: NativeRpc[] = []
+  const naturalTakeover = async (
+    writer: NativeRpc,
+    reader: NativeRpc,
+    owner: 'pact' | 'desktop',
+    threadId: string,
+  ) => {
+    await writer.endInputNaturally()
+    const began = performance.now(),
+      deadline = began + 5000
+    const remaining = () => {
+      const milliseconds = deadline - performance.now()
+      if (milliseconds <= 0) throw new Error('Owned EOF deadline already expired')
+      return milliseconds
+    }
+    let takeover: 'pending' | 'accepted' | 'rejected' = 'pending'
+    const results = await Promise.allSettled([
+      within(
+        writer.exited,
+        remaining(),
+        `Owned ${owner === 'desktop' ? 'Desktop writer' : 'writer'} did not exit naturally`,
+      ),
+      (async () => {
+        const root = await within(
+          writer.rootExited(),
+          remaining(),
+          'Owned protocol root did not exit naturally',
+        )
+        if (!root.natural || root.exitCode !== 0)
+          throw new Error('Owned protocol root was forced or failed')
+        // One request after OS-confirmed root exit; no retry after unknown delivery.
+        const takeoverDeadline = remaining()
+        const resumed = result(
+          await within(
+            reader.request<{ thread: NativeThread }>('thread/resume', {
+              threadId,
+              excludeTurns: true,
+              cwd: owned.cwd,
+            }),
+            takeoverDeadline,
+            'Owned writer takeover exceeded the original EOF deadline',
+          ),
+        )
+        takeover = 'accepted'
+        return resumed.thread
+      })().catch((error: unknown) => {
+        takeover = 'rejected'
+        throw error
+      }),
+    ])
+    console.info(
+      '[native natural EOF]',
+      JSON.stringify({
+        owner,
+        elapsedMs: Math.round(performance.now() - began),
+        stdinEnded: writer.child.stdin.writableEnded,
+        stdinFinished: writer.child.stdin.writableFinished,
+        helperExitCode: writer.child.exitCode,
+        takeover,
+        shutdownBoundaries: writer.stopShutdownObservation(),
+        facts: writer.cleanupFacts(),
+      }),
+    )
+    for (const outcome of results) if (outcome.status === 'rejected') throw outcome.reason
+    const resumed = results[1]
+    if (resumed.status !== 'fulfilled') throw new Error('Owned writer takeover is unconfirmed')
+    return resumed.value
+  }
   try {
     await provider.start()
     await provider.configureCodex(owned.home)
     const env = isolatedEnv(owned.root, owned.home)
-    const creator = new NativeRpc(codexExecutable, owned.cwd, env)
+    const observedEnv = { ...env, LOG_FORMAT: 'json', RUST_LOG: CODEX_SHUTDOWN_LOG_FILTER }
+    const creator = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+      processes: owned.processes,
+    })
     clients.push(creator)
     await creator.initialize()
     const thread = result(
@@ -738,10 +1315,15 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
     ).thread
     await writeTurn(creator, thread.id, 'NATIVE_WRITER_INPUT')
     await creator.close()
-    const desktop = new NativeRpc(codexExecutable, owned.cwd, {
-      ...env,
-      CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'Codex Desktop',
-    })
+    const desktop = await NativeRpc.create(
+      codexExecutable,
+      owned.cwd,
+      {
+        ...observedEnv,
+        CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'Codex Desktop',
+      },
+      { processes: owned.processes, observeShutdownStages: true },
+    )
     clients.push(desktop)
     await desktop.initialize()
     result(
@@ -750,7 +1332,10 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
     result(await desktop.request('thread/read', { threadId: thread.id, includeTurns: false }))
     result(await desktop.request('thread/read', { threadId: thread.id, includeTurns: true }))
     result(await desktop.request('thread/turns/list', { threadId: thread.id, limit: 25 }))
-    const pact = new NativeRpc(codexExecutable, owned.cwd, env)
+    const pact = await NativeRpc.create(codexExecutable, owned.cwd, observedEnv, {
+      processes: owned.processes,
+      observeShutdownStages: true,
+    })
     clients.push(pact)
     await pact.initialize()
     const resumed = result(
@@ -773,21 +1358,15 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
     })
     expect(pact.child.exitCode).toBeNull()
     // stdin EOF is natural shutdown, not lock removal or forcibly stealing ownership.
-    pact.child.stdin.end()
-    await within(pact.exited, 5000, 'Owned writer did not exit naturally')
+    const afterExit = await naturalTakeover(pact, desktop, 'pact', thread.id)
     expect(pact.child.exitCode).toBe(0)
-    const afterExit = result(
-      await desktop.request<{ thread: NativeThread }>('thread/resume', {
-        threadId: thread.id,
-        excludeTurns: true,
-        cwd: owned.cwd,
-      }),
-    ).thread
     expect(afterExit.id).toBe(thread.id)
     expect(afterExit.status.type).toBe('idle')
     // Match the reported direction too: Desktop owns the now-resumed writer,
     // and a fresh Pact client must preserve that ownership rather than steal it.
-    const nextPact = new NativeRpc(codexExecutable, owned.cwd, env)
+    const nextPact = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+      processes: owned.processes,
+    })
     clients.push(nextPact)
     await nextPact.initialize()
     const pactRejected = await nextPact.request('thread/resume', {
@@ -800,24 +1379,13 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
       message: `thread ${thread.id} already has an active writer`,
     })
     expect(desktop.child.exitCode).toBeNull()
-    desktop.child.stdin.end()
-    await within(desktop.exited, 5000, 'Owned Desktop writer did not exit naturally')
+    const pactAfterExit = await naturalTakeover(desktop, nextPact, 'desktop', thread.id)
     expect(desktop.child.exitCode).toBe(0)
-    const pactAfterExit = result(
-      await nextPact.request<{ thread: NativeThread }>('thread/resume', {
-        threadId: thread.id,
-        excludeTurns: true,
-        cwd: owned.cwd,
-      }),
-    ).thread
     expect(pactAfterExit.id).toBe(thread.id)
     expect(pactAfterExit.status.type).toBe('idle')
     expect(provider.requests).toHaveLength(1)
     expect(provider.errors).toEqual([])
   } finally {
-    // oxlint-disable-next-line no-await-in-loop -- Owned clients must release their writers sequentially.
-    for (const client of clients) await client.close()
-    await provider.close()
-    await rm(owned.root, { recursive: true, force: true })
+    await finishFixture(owned, { clients, provider })
   }
 })

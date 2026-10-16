@@ -8,6 +8,21 @@ const nativeFileLimit = 1000
 export const nativeByteLimit = 8 * 1024 * 1024
 const nativeRecordLimit = 10_000
 
+export type NativeEffortField = { present: false } | { present: true; value: string | null }
+
+export interface CodexNativeTurnSettings {
+  turnId?: string
+  model: string
+  effort: string | null
+  effortSource: 'omitted' | 'effort' | 'reasoning_effort' | 'both'
+  effortFields: { effort: NativeEffortField; reasoning_effort: NativeEffortField }
+}
+
+export interface CodexNativeDefaults {
+  model: string | null
+  effort: { source: 'model_reasoning_effort'; present: true; value: string | null }
+}
+
 export interface NativeEvidence {
   path: string
   sha256: string
@@ -27,7 +42,7 @@ export interface NativeEvidence {
   }>
   commandResults: Array<{ callId: string; output: string; at?: string }>
   execScripts: Array<{ callId?: string; input: string; at?: string }>
-  codexTurnSettings: Array<{ turnId?: string; model: string; effort: string | null }>
+  codexTurnSettings: CodexNativeTurnSettings[]
   containsText(text: string): boolean
 }
 
@@ -184,18 +199,44 @@ export async function readNativeEvidence(path: string): Promise<NativeEvidence> 
         }
     }
     const payload = record['payload']
+    if (record['type'] === 'turn_context' && !isRecord(payload))
+      throw new Error('Malformed Native turn_context payload')
     if (isRecord(payload)) {
       if (record['type'] === 'session_meta' && typeof payload['id'] === 'string')
         evidence.nativeIds.add(payload['id'])
       if (record['type'] === 'event_msg' && payload['type'] === 'task_started')
         evidence.codexModelStarts += 1
-      if (record['type'] === 'turn_context' && typeof payload['model'] === 'string') {
-        const effort = payload['effort'] ?? payload['reasoning_effort']
+      if (record['type'] === 'turn_context') {
+        const model = nativeSettingText(payload['model'], 'turn_context model')
+        const effortFields = {
+          effort: nativeEffortField(payload, 'effort'),
+          reasoning_effort: nativeEffortField(payload, 'reasoning_effort'),
+        }
+        if (
+          effortFields.effort.present &&
+          effortFields.reasoning_effort.present &&
+          effortFields.effort.value !== effortFields.reasoning_effort.value
+        )
+          throw new Error('Conflicting Native turn_context effort fields')
+        const effortSource = effortFields.effort.present
+          ? effortFields.reasoning_effort.present
+            ? 'both'
+            : 'effort'
+          : effortFields.reasoning_effort.present
+            ? 'reasoning_effort'
+            : 'omitted'
+        const effort = effortFields.effort.present
+          ? effortFields.effort.value
+          : effortFields.reasoning_effort.present
+            ? effortFields.reasoning_effort.value
+            : null
         const turnId = payload['turn_id']
         evidence.codexTurnSettings.push({
           ...(typeof turnId === 'string' ? { turnId } : {}),
-          model: payload['model'],
-          effort: typeof effort === 'string' ? effort : null,
+          model,
+          effort,
+          effortSource,
+          effortFields,
         })
       }
       if (
@@ -327,6 +368,42 @@ export async function readNativeEvidence(path: string): Promise<NativeEvidence> 
   }
   evidence.claudeUserInputs = userRequestIds.size
   return evidence
+}
+
+/** Parse only the independent config/read ACK's settings scalars, never its private config. */
+export function readCodexNativeDefaults(reply: unknown): CodexNativeDefaults {
+  if (
+    !isRecord(reply) ||
+    Object.hasOwn(reply, 'error') ||
+    !isRecord(reply['result']) ||
+    !isRecord(reply['result']['config'])
+  )
+    throw new Error('Native config/read did not supply a successful configuration ACK')
+  const config = reply['result']['config']
+  if (!Object.hasOwn(config, 'model'))
+    throw new Error('Native config/read did not report its model field')
+  const model = config['model'] === null ? null : nativeSettingText(config['model'], 'model')
+  const effort = nativeEffortField(config, 'model_reasoning_effort')
+  if (!effort.present) throw new Error('Native config/read did not report its default effort field')
+  return { model, effort: { source: 'model_reasoning_effort', ...effort } }
+}
+
+function nativeEffortField(record: Record<string, unknown>, key: string): NativeEffortField {
+  if (!Object.hasOwn(record, key)) return { present: false }
+  const value = record[key]
+  return { present: true, value: value === null ? null : nativeSettingText(value, key) }
+}
+
+function nativeSettingText(value: unknown, field: string): string {
+  // The pinned native protocol admits custom effort strings, not a closed enum.
+  if (
+    typeof value !== 'string' ||
+    !value ||
+    Buffer.byteLength(value) > 240 ||
+    /[\0\r\n]/u.test(value)
+  )
+    throw new Error(`Invalid Native ${field} setting scalar`)
+  return value
 }
 
 function isOwnedPath(root: string, candidate: string): boolean {

@@ -10,7 +10,7 @@ const migrationsFolder = resolve(import.meta.dirname, '../../packages/persistenc
 
 test(
   'persists a Message Comment draft and restores its Composer chip after restart',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(120_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })
@@ -51,7 +51,7 @@ test(
 
 test(
   'preserves an eleven-Comment draft bundle across restart without the retired ten-item limit',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(120_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })

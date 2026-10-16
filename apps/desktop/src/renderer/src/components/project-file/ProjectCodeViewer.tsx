@@ -7,8 +7,9 @@ import 'monaco-editor/features/codicon/register.js'
 import EditorWorker from 'monaco-editor/editor/editor.worker.js?worker'
 import { useEffect, useRef, useState } from 'react'
 
-import { MAX_COMMENT_QUOTE_LENGTH } from '@pact/contracts'
+import { IPC_TRAFFIC_UNIT, MAX_COMMENT_QUOTE_LENGTH } from '@pact/contracts'
 
+import { measureMonacoWorkerMessage } from '../../../../shared/logical-ipc-traffic'
 import { resolveFileLocation, type FileLocation } from './file-location'
 import {
   loadProjectFileLanguage,
@@ -440,9 +441,55 @@ function createWorkerEnvironment(support: ProjectFileLanguageSupport | undefined
     getWorker(_moduleId: string, label: string): Worker {
       const worker = label === 'json' && support ? support.createWorker() : new EditorWorker()
       ownedWorkers.add(worker)
+      const observe = window.pact.observeMonacoWorkerTraffic
+      let removeObservation: (() => void) | undefined
+      if (observe) {
+        observe({ type: 'created', unit: IPC_TRAFFIC_UNIT })
+        const receive = (event: MessageEvent<unknown>): void =>
+          observe({
+            type: 'message',
+            unit: IPC_TRAFFIC_UNIT,
+            category: 'monaco-renderer.reply',
+            measurement: measureMonacoWorkerMessage(event.data),
+          })
+        const error = (): void => observe({ type: 'transport-error', unit: IPC_TRAFFIC_UNIT })
+        worker.addEventListener('message', receive)
+        worker.addEventListener('messageerror', error)
+        worker.addEventListener('error', error)
+        const post: unknown = Reflect.get(worker, 'postMessage')
+        if (typeof post !== 'function') throw new Error('The browser Worker has no transport.')
+        worker.postMessage = function (
+          this: Worker,
+          ...args: [message: unknown, options?: Transferable[] | StructuredSerializeOptions]
+        ): void {
+          if (this !== worker) return Reflect.apply(post, this, args)
+          const measurement = measureMonacoWorkerMessage(args[0])
+          try {
+            Reflect.apply(post, worker, args)
+            observe({
+              type: 'message',
+              unit: IPC_TRAFFIC_UNIT,
+              category: 'renderer-monaco.request',
+              measurement,
+            })
+          } catch (failure) {
+            error()
+            throw failure
+          }
+        }
+        removeObservation = () => {
+          worker.removeEventListener('message', receive)
+          worker.removeEventListener('messageerror', error)
+          worker.removeEventListener('error', error)
+          observe({ type: 'termination-requested', unit: IPC_TRAFFIC_UNIT })
+        }
+      }
       const terminate = worker.terminate.bind(worker)
       worker.terminate = () => {
-        if (ownedWorkers.delete(worker)) terminate()
+        if (ownedWorkers.delete(worker)) {
+          terminate()
+          removeObservation?.()
+        }
       }
       return worker
     },

@@ -103,6 +103,34 @@ export type DiagnosticFailureSource = z.infer<typeof diagnosticFailureSourceSche
 
 const boundedCount = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
 export const diagnosticEventSchema = z.strictObject({
+  settingsCatalogPhase: z
+    .enum([
+      'admission',
+      'readiness',
+      'catalogs',
+      'claude_close',
+      'codex_close',
+      'post_catalog',
+      'repository_read',
+    ])
+    .optional(),
+  settingsCatalogFailure: z
+    .enum([
+      'readiness_failed',
+      'disposed',
+      'catalog_deadline',
+      'cancelled',
+      'capacity',
+      'root_identity',
+      'anchor_lost',
+      'identity_changed',
+      'os_observation',
+      'invalid_observation',
+      'physical_cleanup_deadline',
+      'input_cleanup_deadline',
+      'other',
+    ])
+    .optional(),
   scope: z.enum(['request', 'run', 'process']).optional(),
   requestType: diagnosticRequestTypeSchema.optional(),
   nativeMethod: diagnosticNativeMethodSchema.optional(),
@@ -221,6 +249,12 @@ export const diagnosticEventSchema = z.strictObject({
       'RENDERER_VIEW',
       'UNHANDLED_ERROR',
       'UNHANDLED_REJECTION',
+      'DATABASE_IN_USE',
+      'DATABASE_INCOMPATIBLE',
+      'DATABASE_BACKUP_FAILED',
+      'DATABASE_MIGRATION_FAILED',
+      'DATABASE_STORAGE_FAILED',
+      'STARTUP_FAILURE_DISPLAY_FAILED',
     ])
     .optional(),
 })

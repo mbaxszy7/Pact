@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { AsyncLocalStorage, createHook } from 'node:async_hooks'
 import { execFileSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { getEventListeners, once } from 'node:events'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -35,13 +36,16 @@ const { join } = require('node:path')
 const [mode, directory] = process.argv.slice(2)
 const record = (name) => writeFileSync(join(directory, name + '.json'), JSON.stringify({ pid: process.pid }))
 const keepAlive = () => setInterval(() => {}, 1000)
-if (mode === 'helper') {
-  process.on('SIGTERM', () => {})
+if (mode === 'helper' || mode === 'held-helper') {
+  process.on('SIGTERM', () => { if (mode === 'held-helper') record('term') })
   record('helper')
-  keepAlive()
+  if (mode === 'held-helper') {
+    setInterval(() => { if (existsSync(join(directory, 'release'))) process.exit(0) }, 10)
+    setTimeout(() => process.exit(5), 15000)
+  } else keepAlive()
 } else {
-  const startHelper = (ready) => {
-    spawn(process.execPath, [__filename, 'helper', directory], { stdio: 'ignore', shell: false })
+  const startHelper = (ready, helperMode = 'helper') => {
+    spawn(process.execPath, [__filename, helperMode, directory], { stdio: 'ignore', shell: false })
     const check = setInterval(() => {
       if (!existsSync(join(directory, 'helper.json'))) return
       clearInterval(check)
@@ -54,6 +58,9 @@ if (mode === 'helper') {
     process.on('SIGTERM', () => {})
   }
   process.stdin.resume()
+  if (mode === 'late-held-helper') process.stdin.once('end', () => {
+    startHelper(() => process.exit(0), 'held-helper')
+  })
   if (mode === 'eof') process.stdin.once('end', () => {
     writeFileSync(join(directory, 'eof.json'), JSON.stringify({ ended: true }))
     process.exit(0)
@@ -266,15 +273,93 @@ describe('Owned physical process groups', () => {
     await expectReleased(fixture)
   })
 
+  it.skipIf(process.platform === 'win32')(
+    'waits for actual absence when a closed root leaves a previously unobserved helper',
+    async () => {
+      let fixture: Fixture
+      const closeInput = vi.fn<() => Promise<void>>(async () => {
+        await writeFile(join(fixture.directory, 'release'), '')
+      })
+      fixture = await createFixture('late-held-helper', { onCloseInput: closeInput })
+      await fixture.owner.observe()
+      fixture.child.stdin.end()
+      await captureHelper(fixture)
+      await fixture.closed
+      expect(groupGone(fixture.child.pid!)).toBe(false)
+      await fixture.owner.close()
+      await expectReleased(fixture)
+      expect(closeInput).toHaveBeenCalledOnce()
+      await expect(readFile(join(fixture.directory, 'term.json'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+    },
+  )
+
+  it.skipIf(process.platform === 'win32')(
+    'retains a cached failure when an unverified helper outlives the original cleanup deadline',
+    async () => {
+      const closeInput = vi.fn<() => void>()
+      const fixture = await createFixture('late-held-helper', { onCloseInput: closeInput })
+      await fixture.owner.observe()
+      fixture.child.stdin.end()
+      const helper = await captureHelper(fixture)
+      await fixture.closed
+      const began = performance.now()
+      const closing = fixture.owner.close()
+      const failure = await closing.catch((error: unknown) => error)
+      expect(failure).toBeInstanceOf(Error)
+      expect(performance.now() - began).toBeGreaterThanOrEqual(3900)
+      expect(fixture.owner.released).toBe(false)
+      expect(fixture.owner.close()).toBe(closing)
+      expect(readIdentity(helper.pid)).toMatchObject({
+        groupId: helper.groupId,
+        started: helper.started,
+      })
+      await expect(readFile(join(fixture.directory, 'term.json'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+      await writeFile(join(fixture.directory, 'release'), '')
+      await expect.poll(() => groupGone(fixture.child.pid!)).toBe(true)
+      expect(fixture.owner.released).toBe(false)
+      expect(fixture.owner.close()).toBe(closing)
+      await expect(fixture.owner.close()).rejects.toBe(failure)
+      expect(closeInput).toHaveBeenCalledOnce()
+    },
+  )
+
   it('releases the bounded startup observation timer when its owner closes', async () => {
-    const before = timeoutCount()
-    const fixture = await createFixture('normal', { startupObservationMs: 2_000 })
-    await fixture.owner.close()
-    await expectReleased(fixture)
-    // Windows starts no observation timer; an ambient test timer can expire during close.
-    expect(timeoutCount()).toSatisfy((count: number) =>
-      process.platform === 'win32' ? count <= before : count === before,
-    )
+    const scope = new AsyncLocalStorage<symbol>(),
+      token = Symbol('owned timer fixture')
+    const timers = new Set<number>()
+    let created = 0,
+      overflow = false
+    const observer = createHook({
+      init(id, type) {
+        if (type !== 'Timeout' || scope.getStore() !== token) return
+        created++
+        if (timers.size >= 128) overflow = true
+        else timers.add(id)
+      },
+      destroy(id) {
+        timers.delete(id)
+      },
+    }).enable()
+    try {
+      await scope.run(token, async () => {
+        const fixture = await createFixture('normal', { startupObservationMs: 2_000 })
+        await fixture.owner.close()
+        await expectReleased(fixture)
+      })
+      // Node delivers timer destruction after clearTimeout. The observation
+      // belongs only to this call chain, so ambient expiry cannot hide a leak.
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(created).toBeGreaterThan(0)
+      expect(overflow).toBe(false)
+      expect(timers.size).toBe(0)
+    } finally {
+      observer.disable()
+      scope.disable()
+    }
   })
 
   it('keeps concurrently spawned catalog scopes in separate owned groups', async () => {

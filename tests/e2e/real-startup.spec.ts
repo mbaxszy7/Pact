@@ -11,7 +11,7 @@ import { test } from './runtime-fixture.js'
 
 test(
   'real Session startup closes its native catalog processes without a Model Turn',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     const ctx = await launchRealWorkspace('real-zero-turn-startup', {
       transportFault: 'hold-initialization',

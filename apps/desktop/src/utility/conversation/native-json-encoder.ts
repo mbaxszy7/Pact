@@ -1,5 +1,8 @@
 import { setImmediate } from 'node:timers/promises'
 
+import type { IpcTrafficMeasurement } from '@pact/contracts'
+
+import { logicalIpcMeasurement } from '../../shared/logical-ipc-traffic'
 import { AgentExecutionError } from './agent-execution-error'
 import { NATIVE_FRAME_WRITE_CHUNK_BYTES } from './native-frame-writer'
 
@@ -353,4 +356,55 @@ export async function* encodeNativeJsonFrame(
     checkCancelled(signal)
     throw unsupported()
   }
+}
+
+/** Existing Native Worker owns large admitted bodies and this measurement's <=64 KiB chunk.
+ * Count each fixed outer field separately so an already legal depth-64 body is not rejected
+ * solely because its structured-clone reply adds an envelope. Observation failure is a scalar
+ * incomplete receipt; it never changes or replaces a successful business reply. */
+export async function measureNativeWorkerReply(
+  reply: Record<string, unknown>,
+): Promise<IpcTrafficMeasurement> {
+  try {
+    let jsonBytes = 2,
+      fields = 0
+    for (const key in reply) {
+      if (!Object.hasOwn(reply, key)) continue
+      const descriptor = Object.getOwnPropertyDescriptor(reply, key)
+      if (!descriptor || !('value' in descriptor)) throw new Error('Unsupported observation field.')
+      if (descriptor.value === undefined) continue
+      fields += 1
+      if (fields > 32) throw new Error('Observation envelope exceeds its fixed field bound.')
+      const keyBytes = logicalIpcMeasurement(key)
+      if (!keyBytes.complete) throw new Error('Unsupported observation key.')
+      jsonBytes += keyBytes.jsonBytes + 1 + (fields > 1 ? 1 : 0) - 1 // value encoder's LF
+      // oxlint-disable-next-line no-await-in-loop -- The existing Worker encoder yields bounded chunks and preserves field order.
+      for await (const chunk of encodeNativeJsonFrame(descriptor.value))
+        jsonBytes += chunk.byteLength
+      if (!Number.isSafeInteger(jsonBytes) || jsonBytes > 128 * 1024 * 1024)
+        return {
+          complete: false,
+          jsonBytes: 0,
+          binaryBytes: 0,
+          totalBytes: 0,
+          reason: 'byte_limit',
+        }
+    }
+    let receipt: IpcTrafficMeasurement = {
+      complete: true,
+      jsonBytes,
+      binaryBytes: 0,
+      totalBytes: jsonBytes,
+    }
+    for (let index = 0; index < 8; index += 1) {
+      const scalar = logicalIpcMeasurement({ ipcMeasurement: receipt })
+      if (!scalar.complete) throw new Error('Unsupported observation receipt.')
+      const total = jsonBytes + scalar.totalBytes - 1
+      if (total === receipt.totalBytes) return receipt
+      receipt = { complete: true, jsonBytes: total, binaryBytes: 0, totalBytes: total }
+    }
+  } catch {
+    /* Leave the original business reply intact and block measurement completeness. */
+  }
+  return { complete: false, jsonBytes: 0, binaryBytes: 0, totalBytes: 0, reason: 'uninspectable' }
 }

@@ -140,6 +140,7 @@ interface ConversationViewProps {
   planPanelHost?: HTMLElement | null | undefined
   planPanelOpen?: boolean | undefined
   planAvailable?: boolean | undefined
+  planRestoreFocusRef?: React.RefObject<HTMLButtonElement | null> | undefined
   onPlanAvailable?: ((sessionId: string, taskId?: string) => void) | undefined
   onOpenPlan?: (() => void) | undefined
   onClosePlan?: (() => void) | undefined
@@ -282,6 +283,7 @@ export function ConversationView({
   planPanelHost,
   planPanelOpen,
   planAvailable,
+  planRestoreFocusRef,
   todoNavigation,
   onPlanAvailable,
   onOpenPlan,
@@ -3338,6 +3340,7 @@ export function ConversationView({
       {planAvailable ? (
         <div className="flex shrink-0 justify-end px-section pt-2">
           <button
+            ref={planRestoreFocusRef}
             type="button"
             onClick={() => {
               if (planSourceNavigation) {
