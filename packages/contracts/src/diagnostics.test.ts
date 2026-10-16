@@ -8,8 +8,35 @@ import {
 import { utilityRequestSchema } from './index.js'
 
 const randomUUID = (): string => '00000000-0000-4000-8000-000000000001'
+const catalogIdentity = {
+  reason: 'missing',
+  initialPresent: false,
+  refreshed: true,
+  captureExited: false,
+  captureClosed: false,
+  cleanupExited: true,
+  cleanupClosed: false,
+  pidZero: 'ESRCH',
+  groupZero: 'ESRCH',
+} as const
 
 describe('Diagnostic trust contract', () => {
+  it.each([
+    { reason: 'private-output' },
+    { initialPresent: 'private-output' },
+    { pidZero: '/private/credential/path' },
+    { pid: 1234 },
+    { env: 'private-output' },
+  ])('rejects unreviewed identity facts $reason$initialPresent$pidZero$pid$env', (extra) => {
+    expect(
+      diagnosticEventSchema.safeParse({
+        operation: 'ipc',
+        phase: 'failed',
+        settingsCatalogFailure: 'root_identity',
+        settingsCatalogIdentity: { ...catalogIdentity, ...extra },
+      }).success,
+    ).toBe(false)
+  })
   it('has a fixed safe name for every accepted Utility operation', () => {
     const names = utilityRequestSchema.options.map((option) => option.shape.type.value)
     expect(new Set(diagnosticRequestTypeSchema.options)).toEqual(new Set(names))
@@ -64,6 +91,7 @@ describe('Diagnostic trust contract', () => {
       failureSource: 'native_rpc_rejection',
       settingsCatalogPhase: 'claude_close',
       settingsCatalogFailure: 'root_identity',
+      settingsCatalogIdentity: catalogIdentity,
       executorId: randomUUID(),
       operationId: randomUUID(),
       sessionId: randomUUID(),

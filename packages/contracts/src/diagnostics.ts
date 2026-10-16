@@ -131,6 +131,19 @@ export const diagnosticEventSchema = z.strictObject({
       'other',
     ])
     .optional(),
+  settingsCatalogIdentity: z
+    .strictObject({
+      reason: z.enum(['missing', 'ppid_mismatch', 'pgid_mismatch', 'ppid_and_pgid_mismatch']),
+      initialPresent: z.boolean(),
+      refreshed: z.boolean(),
+      captureExited: z.boolean(),
+      captureClosed: z.boolean(),
+      cleanupExited: z.boolean(),
+      cleanupClosed: z.boolean(),
+      pidZero: z.enum(['success', 'ESRCH', 'EPERM', 'other_error', 'not_observed']),
+      groupZero: z.enum(['success', 'ESRCH', 'EPERM', 'other_error', 'not_observed']),
+    })
+    .optional(),
   scope: z.enum(['request', 'run', 'process']).optional(),
   requestType: diagnosticRequestTypeSchema.optional(),
   nativeMethod: diagnosticNativeMethodSchema.optional(),

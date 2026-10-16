@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { OwnedProcessGroup } from './owned-process-group'
+import { OwnedProcessGroup, OwnedProcessIdentityError } from './owned-process-group'
 
 interface ProcessIdentity {
   pid: number
@@ -108,7 +108,13 @@ async function readReadyPid(directory: string, name: string): Promise<number> {
         if (typeof pid === 'number' && Number.isSafeInteger(pid) && pid > 0) return pid
       }
     } catch (error) {
-      if (!(error instanceof Error) || Reflect.get(error, 'code') !== 'ENOENT') throw error
+      // Opening the private readiness file can precede its writer's JSON bytes.
+      // An incomplete record is not ready; every other I/O error stays fatal.
+      if (
+        !(error instanceof SyntaxError) &&
+        (!(error instanceof Error) || Reflect.get(error, 'code') !== 'ENOENT')
+      )
+        throw error
     }
     // oxlint-disable-next-line no-await-in-loop -- The bounded readiness poll yields between observations.
     await new Promise<void>((resolve) => setTimeout(resolve, 10))
@@ -212,6 +218,66 @@ function timeoutCount(): number {
 }
 
 describe('Owned physical process groups', () => {
+  it('preserves immutable capture facts and the first cleanup observation without changing the error', () => {
+    const capture = {
+      reason: 'missing' as const,
+      initialPresent: false,
+      refreshed: true,
+      captureExited: false,
+      captureClosed: false,
+    }
+    const failure = new OwnedProcessIdentityError(capture)
+    expect(failure.message).toBe('The owned process did not establish its owned group.')
+    expect(failure.diagnostic).toBeUndefined()
+    capture.captureClosed = true
+    failure.observeCleanup({
+      cleanupExited: false,
+      cleanupClosed: false,
+      pidZero: 'success',
+      groupZero: 'success',
+    })
+    failure.observeCleanup({
+      cleanupExited: true,
+      cleanupClosed: true,
+      pidZero: 'ESRCH',
+      groupZero: 'ESRCH',
+    })
+    expect(failure.diagnostic).toEqual({
+      ...capture,
+      captureClosed: false,
+      cleanupExited: false,
+      cleanupClosed: false,
+      pidZero: 'success',
+      groupZero: 'success',
+    })
+    expect(Object.isFrozen(failure.diagnostic)).toBe(true)
+  })
+
+  it('waits for a complete readiness record without accepting a partially written JSON file', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'pact-catalog-readiness-'))
+    directories.push(directory)
+    const path = join(directory, 'root.json')
+    await writeFile(path, '')
+    const observed = Promise.withResolvers<void>()
+    const parse = JSON.parse
+    const observer = vi.spyOn(JSON, 'parse').mockImplementation((text, reviver) => {
+      if (text === '') observed.resolve()
+      return parse(text, reviver)
+    })
+    try {
+      const ready = readReadyPid(directory, 'root').then(
+        (pid) => ({ pid }),
+        (error: unknown) => ({ error }),
+      )
+      // Release the writer only after the reader actually saw the empty file.
+      await observed.promise
+      await writeFile(path, JSON.stringify({ pid: process.pid }))
+      expect(await ready).toEqual({ pid: process.pid })
+    } finally {
+      observer.mockRestore()
+    }
+  })
+
   it.skipIf(process.platform !== 'win32')(
     'keeps Windows input close exactly once after a synchronous failure',
     async () => {

@@ -39,6 +39,9 @@ async function readCatalogFailures(fixture: RuntimeFixture): Promise<unknown> {
           {
             phase: parsed.data.settingsCatalogPhase,
             failure: parsed.data.settingsCatalogFailure ?? 'other',
+            ...(parsed.data.settingsCatalogIdentity
+              ? { identity: parsed.data.settingsCatalogIdentity }
+              : {}),
           },
         ]
       })
@@ -129,19 +132,12 @@ export async function launchRealWorkspace(
     await page
       .getByRole('button', { name: 'Create Session' })
       .click()
-      .catch(async (error: unknown) => {
-        const dialog = await page
-          .locator('body')
-          .innerText({ timeout: 1_000 })
-          .catch(() => 'Startup page unavailable')
+      .catch(async () => {
         throw new Error(
-          fixture.redactDiagnostic(
-            JSON.stringify({
-              failure: error instanceof Error ? error.message : 'Session creation failed',
-              startup: dialog.slice(0, 6_000),
-              catalogFailureDiagnostics: await readCatalogFailures(fixture),
-            }),
-          ),
+          JSON.stringify({
+            failure: 'Session creation failed',
+            catalogFailureDiagnostics: await readCatalogFailures(fixture),
+          }),
         )
       })
     await expect(page.getByRole('heading', { name: 'New session', exact: true })).toBeVisible()

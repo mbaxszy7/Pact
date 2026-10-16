@@ -171,6 +171,34 @@ describe('real Claude Code / production Adapter zero-prompt Fork settings', () =
       let applied: { model?: string; effort?: string } | undefined
       let queryOptions: SdkQueryInput['options'] | undefined
       let stdoutBytes = 0
+      type InitializationMoment =
+        | 'queryEntered'
+        | 'queryReturned'
+        | 'childSpawn'
+        | 'firstStdout'
+        | 'stdoutEnd'
+        | 'childExit'
+        | 'childClose'
+        | 'initializationReply'
+        | 'settingsReply'
+        | 'workUnknown'
+        | 'workSettled'
+        | 'initializedCandidate'
+        | 'rejected'
+      let initializationStartedAt: number | undefined
+      const initializationMoments: Partial<Record<InitializationMoment, number>> = {}
+      const initializationCounts = { queries: 0, spawns: 0, success: 0, error: 0, other: 0 }
+      let initializationOverflow = false
+      let settingsReply: 'unobserved' | 'success' | 'error' | 'other' = 'unobserved'
+      const markInitialization = (moment: InitializationMoment): void => {
+        if (initializationStartedAt !== undefined && initializationMoments[moment] === undefined)
+          initializationMoments[moment] = Math.floor(performance.now() - initializationStartedAt)
+      }
+      const countInitialization = (counter: keyof typeof initializationCounts): void => {
+        if (initializationStartedAt === undefined) return
+        if (initializationCounts[counter] === 65_535) initializationOverflow = true
+        else initializationCounts[counter] += 1
+      }
       const controller = new AbortController()
       const deadlineAt = performance.now() + 25_000
       const deadline = setTimeout(() => controller.abort(), 25_000)
@@ -270,21 +298,33 @@ describe('real Claude Code / production Adapter zero-prompt Fork settings', () =
           getSessionInfo: sdk.getSessionInfo,
           query: (input: SdkQueryInput) => {
             queryOptions = input.options
-            return sdk.query({
+            countInitialization('queries')
+            markInitialization('queryEntered')
+            const query = sdk.query({
               ...input,
               options: {
                 ...input.options,
                 env: { ...isolatedEnv(owned.root, owned.home), ANTHROPIC_BASE_URL: provider.url },
               },
             })
+            markInitialization('queryReturned')
+            return query
           },
           spawn: (command: string, args: string[], options: Parameters<typeof spawn>[2]) => {
             if (children.size >= 4) throw new Error('Owned Claude child capacity exceeded')
             const child = owned.processes.spawn(command, args, options ?? {})
+            countInitialization('spawns')
             children.add(child)
-            child.once('close', () => children.delete(child))
+            child.once('spawn', () => markInitialization('childSpawn'))
+            child.once('exit', () => markInitialization('childExit'))
+            child.once('close', () => {
+              markInitialization('childClose')
+              children.delete(child)
+            })
+            child.stdout?.once('end', () => markInitialization('stdoutEnd'))
             let pending = ''
             child.stdout?.on('data', (chunk: Buffer) => {
+              markInitialization('firstStdout')
               stdoutBytes += chunk.length
               if (stdoutBytes > 4 * 1024 * 1024) {
                 child.kill('SIGTERM')
@@ -305,14 +345,44 @@ describe('real Claude Code / production Adapter zero-prompt Fork settings', () =
                   type: string
                   response?: {
                     request_id?: string
-                    response?: { applied?: { model?: string; effort?: string } }
+                    subtype?: string
+                    response?: {
+                      applied?: { model?: string; effort?: string }
+                      models?: unknown
+                      current_permission_mode?: unknown
+                    }
                   }
+                }
+                if (message.type === 'control_response') {
+                  countInitialization(
+                    message.response?.subtype === 'success'
+                      ? 'success'
+                      : message.response?.subtype === 'error'
+                        ? 'error'
+                        : 'other',
+                  )
+                  if (
+                    message.response?.subtype === 'success' &&
+                    Array.isArray(message.response.response?.models) &&
+                    typeof message.response.response.current_permission_mode === 'string'
+                  )
+                    markInitialization('initializationReply')
                 }
                 if (
                   message.type === 'control_response' &&
                   message.response?.request_id?.startsWith('pact-fork-settings-')
-                )
+                ) {
+                  if (settingsReply === 'unobserved') {
+                    markInitialization('settingsReply')
+                    settingsReply =
+                      message.response.subtype === 'success'
+                        ? 'success'
+                        : message.response.subtype === 'error'
+                          ? 'error'
+                          : 'other'
+                  }
                   applied = message.response.response?.applied
+                }
               }
             })
             return child
@@ -342,16 +412,46 @@ describe('real Claude Code / production Adapter zero-prompt Fork settings', () =
           effort,
           permissionMode: 'native',
           onDispatched: async () => {},
-          onCandidate: async (candidateId) => {
+          onCandidate: async (candidateId, witness) => {
             candidateIds.push(candidateId)
+            if (witness?.initializedAt) markInitialization('initializedCandidate')
           },
-          reportNativeWork: () => {},
+          reportNativeWork: (fact) => {
+            if (fact.state === 'unknown') markInitialization('workUnknown')
+            else if (fact.state === 'settled') markInitialization('workSettled')
+          },
         }
         const fork = await adapter.forkNativeContext(input, controller.signal)
-        const initialized = await adapter.initializeNativeFork(
-          { ...input, nativeSessionId: fork.nativeSessionId, witness: fork.witness },
-          controller.signal,
-        )
+        initializationStartedAt = performance.now()
+        let initialized: Awaited<ReturnType<NativeAdapter['initializeNativeFork']>>
+        try {
+          initialized = await adapter.initializeNativeFork(
+            { ...input, nativeSessionId: fork.nativeSessionId, witness: fork.witness },
+            controller.signal,
+          )
+        } catch (error) {
+          markInitialization('rejected')
+          try {
+            const snapshot = JSON.stringify({
+              schemaVersion: 1,
+              momentsMs: initializationMoments,
+              counts: initializationCounts,
+              settingsReply,
+              stdoutBytes,
+              activeChildren: children.size,
+              overflow: initializationOverflow,
+            })
+            console.info(
+              '[native fork initialization]',
+              Buffer.byteLength(snapshot) <= 4 * 1024
+                ? snapshot
+                : JSON.stringify({ schemaVersion: 1, overflow: true }),
+            )
+          } catch {
+            // Optional fixed facts cannot replace the original initialization failure.
+          }
+          throw error
+        }
         expect(applied).toMatchObject({ model: alias, effort: expectedEffort })
         expect(queryOptions?.effort ?? null).toBe(effort)
         expect(queryOptions?.settings?.env?.CLAUDE_CODE_EFFORT_LEVEL ?? null).toBe(effort)
