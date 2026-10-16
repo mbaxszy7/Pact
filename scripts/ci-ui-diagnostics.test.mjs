@@ -363,6 +363,103 @@ await test('missing and cancelled executions retain every discovered case and ne
   assert(evaluateUiReport(repeated, reportOptions).issues.includes('missing-result-or-retries'))
 })
 
+await test('core CI lists deferred extended cases without inventing passes or requiring their execution', () => {
+  const report = evaluateUiReport(null, {
+    ...reportOptions,
+    scope: 'core',
+    execution: 'deferred',
+  })
+  assert.deepEqual(report.issues, [])
+  assert.equal(report.scope, 'core')
+  assert.equal(report.counts.passed, 0)
+  assert.equal(report.counts['not-run'], 1)
+  assert.deepEqual(
+    report.cases.map(({ tier, required, status, failureCategory }) => ({
+      tier,
+      required,
+      status,
+      failureCategory,
+    })),
+    [{ tier: 'extended', required: false, status: 'not-run', failureCategory: 'deferred' }],
+  )
+  assert(uiReportMarkdown(report).includes('Deferred cases are not passes'))
+  assert.equal(Object.hasOwn(report, 'gatePassed'), false)
+})
+
+await test('deferral cannot excuse invalid identity, discovery, unexpected evidence or an unavailable selected run', () => {
+  const options = { ...reportOptions, scope: 'core', execution: 'deferred' }
+  assert(
+    evaluateUiReport(null, { ...options, identity: null }).issues.includes(
+      'missing-or-invalid-ci-code-identity',
+    ),
+  )
+  assert(
+    evaluateUiReport(null, { ...options, inventory: null }).issues.includes(
+      'missing-or-invalid-discovery-inventory',
+    ),
+  )
+  assert(
+    evaluateUiReport(reportFixture(), options).issues.includes(
+      'unexpected-evidence-for-deferred-lane',
+    ),
+  )
+  assert(
+    evaluateUiReport(null, { ...options, execution: 'unavailable' }).issues.includes(
+      'runner-or-preparation-failed',
+    ),
+  )
+  assert.throws(() => evaluateUiReport(null, { ...options, scope: 'full' }), /Invalid/)
+  assert.throws(() => evaluateUiReport(null, { ...options, identityKind: 'release' }), /Invalid/)
+})
+
+await test('CI core report entry preserves both deferred inventories and rejects absent discovery', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-ui-deferred-reports-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const identityPath = join(root, 'identity.json'),
+    inventoryPath = join(root, 'inventory.json')
+  await writeFile(identityPath, JSON.stringify(reportIdentity))
+  await writeFile(
+    inventoryPath,
+    JSON.stringify({
+      suites: [...reportFixture('ui').suites, ...reportFixture('deterministic').suites],
+    }),
+  )
+  const source = {
+    GITHUB_ACTIONS: 'true',
+    PACT_CI_DIAGNOSTIC_LANE: 'uncredentialed',
+    PACT_E2E_REPORT_SCOPE: 'core',
+  }
+  const args = (evidence, inventory) => [
+    '--reports',
+    '--evidence',
+    evidence,
+    '--workspace',
+    root,
+    '--identity',
+    identityPath,
+    '--inventory',
+    inventory,
+  ]
+  const evidence = join(root, 'valid')
+  await main(args(evidence, inventoryPath), source)
+  for (const lane of ['ui', 'deterministic']) {
+    // oxlint-disable-next-line no-await-in-loop -- Check the independently persisted lane reports.
+    const report = JSON.parse(await readFile(join(evidence, `${lane}-summary.json`), 'utf8'))
+    assert.deepEqual(report.issues, [])
+    assert.equal(report.execution, 'deferred')
+    assert.equal(report.cases[0].required, false)
+    assert.equal(report.cases[0].failureCategory, 'deferred')
+  }
+  await assert.rejects(
+    main(args(join(root, 'invalid'), join(root, 'absent.json')), source),
+    /authentic identity and complete discovery/,
+  )
+  const unexpected = join(root, 'unexpected')
+  await mkdir(unexpected)
+  await writeFile(join(unexpected, 'ui.json'), '{invalid')
+  await assert.rejects(main(args(unexpected, inventoryPath), source), /unreadable evidence/)
+})
+
 await test('candidate-controlled unknown titles and identity extensions cannot enter public report text', () => {
   const secret = 'synthetic-untrusted-case-title',
     raw = reportFixture()

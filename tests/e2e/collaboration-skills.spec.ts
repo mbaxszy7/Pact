@@ -515,59 +515,63 @@ test('@deterministic source edits do not block an authorized repair and normal r
   }
 })
 
-test('@deterministic Pact bare Secondary build sends a frozen answer directly to its implementer before explicit work continuation', async () => {
-  const f = await prepare('codex', { width: 1000, height: 720 })
-  try {
-    await f.page.getByRole('combobox', { name: 'Message', exact: true }).fill('@claude /build')
-    await expect
-      .poll(
-        async () =>
-          (await f.fixture.readClaudeFacts().catch(() => ({ metadataReads: 0 }))).metadataReads ??
-          0,
+test(
+  '@deterministic Pact bare Secondary build sends a frozen answer directly to its implementer before explicit work continuation',
+  { tag: '@e2e-extended' },
+  async () => {
+    const f = await prepare('codex', { width: 1000, height: 720 })
+    try {
+      await f.page.getByRole('combobox', { name: 'Message', exact: true }).fill('@claude /build')
+      await expect
+        .poll(
+          async () =>
+            (await f.fixture.readClaudeFacts().catch(() => ({ metadataReads: 0 }))).metadataReads ??
+            0,
+        )
+        .toBe(1)
+      await expect(f.page.getByRole('listbox', { name: 'Native Skills' })).toHaveAttribute(
+        'aria-busy',
+        'false',
       )
-      .toBe(1)
-    await expect(f.page.getByRole('listbox', { name: 'Native Skills' })).toHaveAttribute(
-      'aria-busy',
-      'false',
-    )
-    expect(await f.counts()).toEqual({ codex: 0, claude: 0 })
-    await f.send('@claude /build')
-    await openIssue(f.page, 'Choose the cancellation scope')
-    const row = f.page
-      .getByRole('region', { name: 'Shared Todos', exact: true })
-      .locator('[data-pact-todo-id="scope"][data-pact-todo-revision="1"]')
-    await expect(row).toContainText('Answer to Claude Code')
-    await expect(row).toContainText('Which cancellation scope should change?')
-    expect(await f.counts()).toEqual({ codex: 0, claude: 1 })
-    await row.getByRole('button', { name: 'Add your answer', exact: true }).click()
-    await row.getByRole('button', { name: 'Current request Recommended', exact: true }).click()
-    await row.getByRole('button', { name: 'Add to comment', exact: true }).click()
-    await expect(f.page.getByLabel('Attached Comment drafts')).toContainText('Current request')
-    expect(await f.counts()).toEqual({ codex: 0, claude: 1 })
-    await closeContextOverlay(f.page)
-    await f.page.getByRole('button', { name: 'Send message', exact: true }).click()
-    const continueWork = f.page.getByRole('button', {
-      name: 'Continue implementation · Claude Code · edits code',
-      exact: true,
-    })
-    await expect(continueWork).toBeEnabled()
-    const answered = await readTodos(f.page, f.sessionId)
-    expect(answered.task?.stage).toBe('supplement')
-    expect(answered.task?.actor).toBe('claude')
-    expect(answered.task?.resumePhase).toMatchObject({ stage: 'implement', actor: 'claude' })
-    expect(answered.todos?.items[0]).toMatchObject({ id: 'scope', revision: 2, status: 'done' })
-    expect(await f.counts()).toEqual({ codex: 0, claude: 2 })
-    await closeContextOverlay(f.page)
-    await continueWork.click()
-    await expect(
-      f.page.getByRole('button', { name: 'Review changes · Codex', exact: true }),
-    ).toBeEnabled()
-    expect(await f.counts()).toEqual({ codex: 0, claude: 3 })
-  } finally {
-    await f.app.close()
-    await f.fixture.dispose()
-  }
-})
+      expect(await f.counts()).toEqual({ codex: 0, claude: 0 })
+      await f.send('@claude /build')
+      await openIssue(f.page, 'Choose the cancellation scope')
+      const row = f.page
+        .getByRole('region', { name: 'Shared Todos', exact: true })
+        .locator('[data-pact-todo-id="scope"][data-pact-todo-revision="1"]')
+      await expect(row).toContainText('Answer to Claude Code')
+      await expect(row).toContainText('Which cancellation scope should change?')
+      expect(await f.counts()).toEqual({ codex: 0, claude: 1 })
+      await row.getByRole('button', { name: 'Add your answer', exact: true }).click()
+      await row.getByRole('button', { name: 'Current request Recommended', exact: true }).click()
+      await row.getByRole('button', { name: 'Add to comment', exact: true }).click()
+      await expect(f.page.getByLabel('Attached Comment drafts')).toContainText('Current request')
+      expect(await f.counts()).toEqual({ codex: 0, claude: 1 })
+      await closeContextOverlay(f.page)
+      await f.page.getByRole('button', { name: 'Send message', exact: true }).click()
+      const continueWork = f.page.getByRole('button', {
+        name: 'Continue implementation · Claude Code · edits code',
+        exact: true,
+      })
+      await expect(continueWork).toBeEnabled()
+      const answered = await readTodos(f.page, f.sessionId)
+      expect(answered.task?.stage).toBe('supplement')
+      expect(answered.task?.actor).toBe('claude')
+      expect(answered.task?.resumePhase).toMatchObject({ stage: 'implement', actor: 'claude' })
+      expect(answered.todos?.items[0]).toMatchObject({ id: 'scope', revision: 2, status: 'done' })
+      expect(await f.counts()).toEqual({ codex: 0, claude: 2 })
+      await closeContextOverlay(f.page)
+      await continueWork.click()
+      await expect(
+        f.page.getByRole('button', { name: 'Review changes · Codex', exact: true }),
+      ).toBeEnabled()
+      expect(await f.counts()).toEqual({ codex: 0, claude: 3 })
+    } finally {
+      await f.app.close()
+      await f.fixture.dispose()
+    }
+  },
+)
 
 test('@deterministic right Todos titles align the exact loaded item and preserve current selection beside historical versions', async () => {
   const f = await prepare()

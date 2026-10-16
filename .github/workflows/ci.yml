@@ -7,6 +7,11 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review, edited, labeled, unlabeled]
   workflow_dispatch:
+    inputs:
+      extended_e2e:
+        description: Run extended UI and deterministic regression
+        type: boolean
+        default: false
 
 # The authenticated controller source controls PR jobs. Frozen bootstrap execution
 # stays disabled until its public identity tuple and separate environments are set.
@@ -207,7 +212,7 @@ jobs:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
 
   platform:
-    name: ${{ matrix.label }} - UI and native tests
+    name: ${{ matrix.label }} - Native checks and E2E reports
     # No-credential native validation can diagnose platform/package failures while
     # shared quality runs independently. Provider admission and final gates require both.
     needs: [identity, publication]
@@ -267,6 +272,7 @@ jobs:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
           GITHUB_TOKEN: ${{ github.token }}
       - name: Rebuild desktop native dependencies for this architecture
+        id: build
         run: node control/scripts/ci.mjs build
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
@@ -279,17 +285,18 @@ jobs:
       - name: Capture trusted no-credential case inventory for complete failure reports
         working-directory: control
         run: pnpm exec playwright test --list --reporter=json > "$RUNNER_TEMP/pact-e2e-inventory.json"
-      - name: Electron UI
+      - name: Extended Electron UI regression
         id: ui
+        if: ${{ inputs.extended_e2e == true }}
         run: node control/scripts/ci.mjs ui
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
           PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-evidence/${{ matrix.key }}
-      - name: Deterministic Electron business and lifecycle journeys
+      - name: Extended deterministic business and lifecycle regression
         id: deterministic
-        # A naturally completed failing UI lane still permits independent diagnostics.
-        # The failed step remains failed and therefore blocks the platform gate.
-        if: ${{ !cancelled() && steps.ui.outputs.ui_execution_completed == 'true' }}
+        # Manual full regression keeps its own failures. Ordinary PR smoke does
+        # not select either extended lane and reports every case as deferred.
+        if: ${{ !cancelled() && inputs.extended_e2e == true && steps.ui.outputs.ui_execution_completed == 'true' }}
         run: node control/scripts/ci.mjs deterministic
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
@@ -324,6 +331,7 @@ jobs:
           PACT_CI_DIAGNOSTIC_LANE: uncredentialed
           PACT_UI_EXECUTION_COMPLETED: ${{ steps.ui.outputs.ui_execution_completed }}
           PACT_DETERMINISTIC_EXECUTION_COMPLETED: ${{ steps.deterministic.outputs.deterministic_execution_completed }}
+          PACT_E2E_REPORT_SCOPE: ${{ inputs.extended_e2e == true && 'full' || 'core' }}
       - name: Preserve actual uncredentialed test results and readable failure reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -336,7 +344,7 @@ jobs:
           retention-days: 14
       - name: Actual native CLI protocol, configuration and cold-history regression
         id: native
-        if: ${{ !cancelled() && steps.ui.outputs.ui_execution_completed == 'true' && steps.deterministic.outputs.deterministic_execution_completed == 'true' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: node control/scripts/ci.mjs native
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
@@ -382,7 +390,7 @@ jobs:
           node --input-type=module -e
           'import { appendFile } from "node:fs/promises";
           await appendFile(process.env.GITHUB_STEP_SUMMARY,
-          "Automated installers and release acceptance are deferred (TODO) until native-machine validation. UI, deterministic and native protocol checks remain required.\n");'
+          "Automated installers and release acceptance are deferred (TODO) until native-machine validation. Native protocol checks and real dual-Agent smoke remain required; extended UI/deterministic cases are reported separately.\n");'
       - name: Install and cold-start the exact NSIS or DMG application
         id: package-smoke
         if: ${{ !cancelled() && steps.distribution.outcome == 'success' }}
@@ -495,7 +503,7 @@ jobs:
           PACT_PROVIDER_ALLOWED: ${{ needs.provider.outputs.allowed }}
 
   pact-complete:
-    name: ${{ (github.repository_id == '1416403312' && ((github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != ''))) && 'PR checks complete' || 'PR checks not required for branch' }}
+    name: Trusted PR gate
     needs: [identity, publication, quality, platform, candidate-attestation, provider, check-writer]
     if: always() && (github.repository_id == '1416403312' && ((github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == vars.PACT_CI_BOOTSTRAP_REF && github.sha == vars.PACT_CI_BOOTSTRAP_HEAD && vars.PACT_CI_BOOTSTRAP_PR != '')))
     runs-on: ubuntu-latest

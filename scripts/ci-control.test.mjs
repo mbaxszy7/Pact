@@ -74,7 +74,7 @@ void test('readable workflow names match the exact jobs required by the trusted 
     root.jobs['candidate-attestation'].name,
     root.jobs.publication.name,
     root.jobs.quality.name,
-    ...platformJobs(root.jobs.platform, 'UI and native tests'),
+    ...platformJobs(root.jobs.platform, 'Native checks and E2E reports'),
   ])
   assert.deepEqual(
     providerJobs,
@@ -86,20 +86,42 @@ void test('readable workflow names match the exact jobs required by the trusted 
   // These contexts are already required by main protection and cannot be renamed alone.
   assert.equal(root.jobs.quality.name, 'quality')
   assert.equal(root.jobs.publication.name, 'publication')
-  // A skipped ordinary-branch job must never produce the required PR context.
+  // The display-only summary is distinct from the fixed-App required contexts.
   const finalGate = root.jobs['pact-complete']
-  const trustedCondition = finalGate.if.replace(/^always\(\) && /u, '')
-  assert.equal(
-    finalGate.name,
-    '${{ ' +
-      trustedCondition +
-      " && 'PR checks complete' || 'PR checks not required for branch' }}",
-  )
+  assert.equal(finalGate.name, 'Trusted PR gate')
+  assert.match(finalGate.if, /^always\(\) && /u)
+  assert(finalGate.needs.includes('provider'))
+  assert(finalGate.needs.includes('check-writer'))
   for (const workflow of [root, provider])
     for (const job of Object.values(workflow.jobs).filter(
       (candidateJob) => candidateJob !== finalGate,
     ))
       if (!job.strategy) assert.ok(job.name && !job.name.includes('${{'))
+})
+
+void test('ordinary PR E2E selects only real smoke while extended reports and native checks remain explicit', async () => {
+  const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url))
+  const builderRequire = createRequire(desktopRequire.resolve('electron-builder/package.json'))
+  const { load } = builderRequire('js-yaml')
+  const root = load(await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8'))
+  assert.equal(root.on.workflow_dispatch.inputs.extended_e2e.default, false)
+  const steps = root.jobs.platform.steps
+  assert.equal(steps.find((step) => step.id === 'ui').if, '${{ inputs.extended_e2e == true }}')
+  assert(
+    steps.find((step) => step.id === 'deterministic').if.includes('inputs.extended_e2e == true'),
+  )
+  const native = steps.find((step) => step.id === 'native')
+  assert.equal(native.if, "${{ !cancelled() && steps.build.outcome == 'success' }}")
+  assert(!native.if.includes('ui_execution_completed'))
+  assert(!steps.some((step) => step['continue-on-error']))
+  const report = steps.find((step) => step.run?.includes('ci-ui-diagnostics.mjs --reports'))
+  assert.equal(report.if, 'always()')
+  assert.equal(
+    report.env.PACT_E2E_REPORT_SCOPE,
+    "${{ inputs.extended_e2e == true && 'full' || 'core' }}",
+  )
+  assert(root.jobs.provider.needs.includes('platform'))
+  assert(root.jobs.provider.needs.includes('quality'))
 })
 
 const head = 'a'.repeat(40),

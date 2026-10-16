@@ -22,7 +22,7 @@ export const ciJobs = [
   'Verify PR code identity',
   'publication',
   'quality',
-  ...platformLabels.map((label) => `${label} - UI and native tests`),
+  ...platformLabels.map((label) => `${label} - Native checks and E2E reports`),
 ]
 export const providerJobs = [
   'Real model tests / Authorize model credentials',

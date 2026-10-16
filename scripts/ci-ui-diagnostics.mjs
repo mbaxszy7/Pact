@@ -364,6 +364,7 @@ export function evaluateUiReport(
     identity = null,
     identityKind = 'ci',
     execution = 'unavailable',
+    scope = 'full',
     platform = process.platform,
     architecture = process.arch,
   },
@@ -372,7 +373,10 @@ export function evaluateUiReport(
     !['ui', 'deterministic'].includes(lane) ||
     !isAbsolute(workspace) ||
     !isAbsolute(inventoryWorkspace) ||
-    !['completed', 'unavailable'].includes(execution) ||
+    !['completed', 'unavailable', 'deferred'].includes(execution) ||
+    !['core', 'full'].includes(scope) ||
+    (execution === 'deferred' && (scope !== 'core' || identityKind !== 'ci')) ||
+    (identityKind === 'release' && scope !== 'full') ||
     !['ci', 'release'].includes(identityKind) ||
     !['darwin-arm64', 'win32-x64', 'win32-arm64'].includes(`${platform}-${architecture}`)
   )
@@ -391,11 +395,15 @@ export function evaluateUiReport(
   } catch {
     issues.push('missing-or-invalid-discovery-inventory')
   }
-  try {
-    observed = caseInventory(raw, lane, workspace)
-    if (raw.errors?.length) issues.push('playwright-global-error')
-  } catch {
-    issues.push('missing-or-invalid-execution-evidence')
+  if (execution === 'deferred') {
+    if (raw !== null) issues.push('unexpected-evidence-for-deferred-lane')
+  } else {
+    try {
+      observed = caseInventory(raw, lane, workspace)
+      if (raw.errors?.length) issues.push('playwright-global-error')
+    } catch {
+      issues.push('missing-or-invalid-execution-evidence')
+    }
   }
   try {
     publicIdentity = publicReportIdentity(identity, identityKind)
@@ -403,12 +411,12 @@ export function evaluateUiReport(
   } catch {
     issues.push(identityIssue)
   }
-  if (execution !== 'completed') issues.push('runner-or-preparation-failed')
+  if (execution === 'unavailable') issues.push('runner-or-preparation-failed')
   const cases = [...known].map(([key, item]) => {
     const result = observed.get(key)?.test
     let status = 'not-run',
       durationMs = 0,
-      failureCategory = 'missing-result'
+      failureCategory = execution === 'deferred' ? 'deferred' : 'missing-result'
     const results = result?.results ?? []
     if (
       results.length === 1 &&
@@ -448,8 +456,8 @@ export function evaluateUiReport(
     return {
       path: item.path,
       title: item.title,
-      tier: 'mandatory',
-      required: applicable,
+      tier: scope === 'core' ? 'extended' : 'mandatory',
+      required: scope === 'full' && applicable,
       applicable,
       status,
       durationMs,
@@ -499,12 +507,15 @@ export function evaluateUiReport(
     platform,
     architecture,
     execution,
+    scope,
     issues: [...new Set(issues)],
     counts,
     cases,
     diagnosticArtifact: `ui-diagnostics-${platform}-${architecture}`,
     resultGate:
-      'The existing immutable coverage/result gate remains authoritative. This report never grants a passing check.',
+      scope === 'core'
+        ? 'Extended UI/deterministic regression is outside the required dual-Agent smoke gate. Deferred cases are not passes; source integrity and native checks remain required. This report never grants a passing check.'
+        : 'The existing immutable coverage/result gate remains authoritative. This report never grants a passing check.',
   }
 }
 
@@ -520,7 +531,7 @@ export function uiReportMarkdown(report) {
   const lines = [
     `# ${report.lane === 'ui' ? 'Electron UI' : 'Deterministic Electron'} E2E`,
     '',
-    `Platform: ${report.platform}/${report.architecture}; execution: **${report.execution}**.`,
+    `Platform: ${report.platform}/${report.architecture}; execution: **${report.execution}**; scope: **${report.scope}**.`,
     report.resultGate,
   ]
   if (report.identity && report.identityKind === 'release')
@@ -547,12 +558,12 @@ export function uiReportMarkdown(report) {
   lines.push(
     `Failure snapshots/traces, when collection succeeded: **${report.diagnosticArtifact}**, directory \`${report.lane}/\`, retained for 14 days. Each lane inventory identifies its source; the root inventory reports shared capacity and collection failures. Only the no-credential lane may publish these diagnostics.`,
     '',
-    '| Case | Required | Result | Duration (s) | Failure category |',
-    '| --- | --- | --- | ---: | --- |',
+    '| Tier | Case | Required | Result | Duration (s) | Failure category |',
+    '| --- | --- | --- | --- | ---: | --- |',
   )
   for (const item of report.cases)
     lines.push(
-      `| ${markdownCell(item.title)} | ${item.required ? 'yes' : 'no'} | ${item.status} | ${(item.durationMs / 1000).toFixed(2)} | ${item.failureCategory} |`,
+      `| ${item.tier} | ${markdownCell(item.title)} | ${item.required ? 'yes' : 'no'} | ${item.status} | ${(item.durationMs / 1000).toFixed(2)} | ${item.failureCategory} |`,
     )
   return `${lines.join('\n')}\n`
 }
@@ -565,6 +576,7 @@ export async function writeUiReports({
   inventoryPath,
   summary,
   execution = {},
+  scope = 'full',
   platform = process.platform,
   architecture = process.arch,
   identityKind = 'ci',
@@ -598,7 +610,10 @@ export async function writeUiReports({
     try {
       // oxlint-disable-next-line eslint/no-await-in-loop -- Read and retain each independent native lane even when the other lane failed early.
       raw = await readE2EJson(join(evidence, `${lane}.json`))
-    } catch {
+    } catch (error) {
+      if (scope === 'core' && execution[lane] === 'deferred' && error.code !== 'ENOENT')
+        // oxlint-disable-next-line eslint/preserve-caught-error -- Keep private evidence paths and parser data out of the safe report failure.
+        throw new Error('Unexpected unreadable evidence in a deferred E2E lane')
       /* Safe failure report still includes every discovered case. */
     }
     const report = evaluateUiReport(raw, {
@@ -608,6 +623,7 @@ export async function writeUiReports({
       inventoryWorkspace,
       identity,
       identityKind,
+      scope,
       execution: execution[lane] ?? 'unavailable',
       platform,
       architecture,
@@ -650,16 +666,33 @@ export async function main(argv = process.argv.slice(2), source = process.env) {
       inventoryPath: argv[8],
       summary: source.GITHUB_STEP_SUMMARY,
       identityKind,
+      scope: source.PACT_E2E_REPORT_SCOPE ?? 'full',
       runAttempt: Number(source.GITHUB_RUN_ATTEMPT ?? '1'),
       execution: {
-        ui: source.PACT_UI_EXECUTION_COMPLETED === 'true' ? 'completed' : 'unavailable',
+        ui:
+          source.PACT_UI_EXECUTION_COMPLETED === 'true'
+            ? 'completed'
+            : source.PACT_E2E_REPORT_SCOPE === 'core'
+              ? 'deferred'
+              : 'unavailable',
         deterministic:
-          source.PACT_DETERMINISTIC_EXECUTION_COMPLETED === 'true' ? 'completed' : 'unavailable',
+          source.PACT_DETERMINISTIC_EXECUTION_COMPLETED === 'true'
+            ? 'completed'
+            : source.PACT_E2E_REPORT_SCOPE === 'core'
+              ? 'deferred'
+              : 'unavailable',
       },
     })
     for (const report of reports)
       console.log(
         `Safe ${report.report.lane} E2E report: ${report.report.reportFiles.localDirectory}/${report.report.reportFiles.markdown}`,
+      )
+    if (
+      source.PACT_E2E_REPORT_SCOPE === 'core' &&
+      reports.some(({ report }) => report.issues.length)
+    )
+      throw new Error(
+        'Deferred E2E reports require authentic identity and complete discovery inventory',
       )
     return
   }

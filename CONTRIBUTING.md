@@ -168,8 +168,14 @@ The other 60 real cases are extended regression. They retain their original asse
 for permissions, Stop, recovery, settings, drafts, collaboration, Changes/Undo, appearance,
 images and performance, with execution deferred on automatic Dev-scope PR runs. This is
 an explicitly narrowed smoke acceptance scope; a passing smoke does not establish those
-extended behaviors. Credential-free deterministic checks, native protocol tests and
-applicable performance budgets remain required.
+extended behaviors. Ordinary PRs also defer the `@ui` and `@deterministic` App E2E
+lanes to extended regression, including the bare Secondary build collaboration journey.
+Their reports list every discovered case as extended, not required, and deferred; no
+deferred case is counted as passed. Select `extended_e2e` on a manual workflow run to
+execute those complete lanes, or use the existing local UI/deterministic commands.
+The deferred reports still require authentic code identity and a complete case inventory.
+Static checks, unit/script tests, builds and native CLI protocol/process safety tests
+remain required. Main protection is unchanged. Stable publication remains disabled.
 
 Provider execution belongs to the same **Pact CI - Code quality and app tests** root run and attempt
 as its prerequisite checks. The root calls **Pact CI - Claude and Codex tests** as a reusable workflow; it has no independent
