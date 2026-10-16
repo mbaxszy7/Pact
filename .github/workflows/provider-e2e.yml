@@ -15,6 +15,10 @@ on:
         description: Core or full execution; Stable content always requires full
         default: core
         type: string
+      extended_e2e:
+        description: Require the UI and deterministic execution results selected by the caller
+        default: false
+        type: boolean
       root_run_id:
         description: Root CI run containing this reusable workflow
         required: true
@@ -225,6 +229,9 @@ jobs:
           PACT_REAL_EXECUTION_COMPLETED: ${{ steps.execute.outputs.real_execution_completed }}
           PACT_REAL_REPORT_ARTIFACT: provider-report-${{ matrix.key }}-a${{ inputs.root_attempt }}
       - name: Fetch this exact CI run's matching platform UI and deterministic execution evidence
+        # Core results are enforced by the always-run report gate above. Deferred
+        # lanes have summaries rather than raw execution files; do not request them.
+        if: ${{ inputs.extended_e2e == true || needs.admission.outputs.real_gate == 'full' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: e2e-${{ matrix.key }}-a${{ inputs.root_attempt }}
@@ -232,6 +239,7 @@ jobs:
           run-id: ${{ inputs.root_run_id }}
           github-token: ${{ github.token }}
       - name: Require unchanged assertion obligations and every currently mandatory execution result
+        if: ${{ inputs.extended_e2e == true || needs.admission.outputs.real_gate == 'full' }}
         run: >-
           node control/scripts/check-e2e-coverage.mjs --require-results --json
           --real-scope "$REAL_GATE"

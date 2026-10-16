@@ -457,6 +457,7 @@ jobs:
       controller: ${{ needs.identity.outputs.controller }}
       source_kind: ${{ needs.identity.outputs.source_kind }}
       suite: ${{ contains(github.event.pull_request.labels.*.name, 'pact:real-full') && 'full' || 'core' }}
+      extended_e2e: ${{ inputs.extended_e2e == true }}
       root_run_id: ${{ github.run_id }}
       root_attempt: ${{ github.run_attempt }}
 

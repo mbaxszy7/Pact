@@ -132,6 +132,15 @@ void test('ordinary PR E2E selects only real smoke while extended reports and na
   const { load } = builderRequire('js-yaml')
   const root = load(await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8'))
   assert.equal(root.on.workflow_dispatch.inputs.extended_e2e.default, false)
+  const provider = load(
+    await readFile(new URL('../.github/workflows/provider-e2e.yml', import.meta.url), 'utf8'),
+  )
+  assert.equal(root.jobs.provider.with.extended_e2e, '${{ inputs.extended_e2e == true }}')
+  assert.deepEqual(provider.on.workflow_call.inputs.extended_e2e, {
+    description: 'Require the UI and deterministic execution results selected by the caller',
+    default: false,
+    type: 'boolean',
+  })
   const steps = root.jobs.platform.steps
   assert.equal(steps.find((step) => step.id === 'ui').if, '${{ inputs.extended_e2e == true }}')
   assert(
@@ -149,6 +158,26 @@ void test('ordinary PR E2E selects only real smoke while extended reports and na
   )
   assert(root.jobs.provider.needs.includes('platform'))
   assert(root.jobs.provider.needs.includes('quality'))
+  const providerSteps = provider.jobs.provider.steps
+  const realGate = providerSteps.find((step) => step.run?.includes('real-e2e-policy.mjs'))
+  assert.equal(realGate.if, 'always()')
+  assert(!realGate['continue-on-error'])
+  const extendedCondition =
+    "${{ inputs.extended_e2e == true || needs.admission.outputs.real_gate == 'full' }}"
+  const extendedEvidence = providerSteps.find(
+    (step) => step.with?.name === 'e2e-${{ matrix.key }}-a${{ inputs.root_attempt }}',
+  )
+  const coverage = providerSteps.find((step) => step.run?.includes('check-e2e-coverage.mjs'))
+  assert.equal(extendedEvidence.if, extendedCondition)
+  assert.equal(coverage.if, extendedCondition)
+  assert(coverage.run.includes('--require-results'))
+  for (const lane of ['ui', 'deterministic', 'real'])
+    assert(coverage.run.includes(`/$PLATFORM_KEY/${lane}.json`))
+  assert(!coverage['continue-on-error'])
+  // Core execution retains source/assertion preservation through its required
+  // publication and quality jobs, even without optional raw UI execution files.
+  assert(root.jobs.publication.steps.some((step) => step.run?.includes('check-e2e-coverage.mjs')))
+  assert(root.jobs.quality.steps.some((step) => step.run?.includes('check-e2e-coverage.mjs')))
 })
 
 const head = 'a'.repeat(40),
