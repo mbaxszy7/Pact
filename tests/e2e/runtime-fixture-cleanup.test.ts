@@ -136,6 +136,131 @@ const configuration: ProviderConfiguration = {
   assertSourceIntegrity: async () => undefined,
 }
 
+function controlledQuitApp(code: number, alreadyClosed: boolean) {
+  const child = { pid: 1337, exitCode: alreadyClosed ? code : null, signalCode: null }
+  const app = Object.assign(new EventEmitter(), {
+    process: () => child,
+    firstWindow: async () => ({
+      isClosed: () => child.exitCode !== null,
+      getByRole: () => ({
+        waitFor: async () => {
+          throw new Error('Controlled window closed')
+        },
+      }),
+    }),
+    waitForEvent: () => new Promise<void>((done) => app.once('close', done)),
+    evaluate: async () => {
+      child.exitCode = code
+      app.emit('close')
+    },
+  })
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Controlled lifecycle boundaries verify diagnostics, not Windows kernel behavior.
+  return app as unknown as Awaited<ReturnType<typeof electron.launch>>
+}
+
+it.each([true, false])(
+  'keeps wrapper exit 1 fatal and records both observation phases; already closed=%s',
+  async (alreadyClosed) => {
+    const { createRuntimeFixture } = await import('./runtime-fixture.js')
+    const { closeRealWorkspace } = await import('./real-harness.js')
+    const fixture = await createRuntimeFixture({ mode: 'ui' })
+    const app = controlledQuitApp(1, alreadyClosed)
+    let disposed = false
+    const dispose = fixture.dispose.bind(fixture)
+    vi.spyOn(fixture, 'dispose').mockImplementation(async () => {
+      await dispose()
+      disposed = true
+    })
+    vi.spyOn(fixture, 'appJobDiagnostic').mockImplementation(() => ({
+      generation: 'same-generation',
+      stages: disposed ? { started: 1, empty: 2 } : { started: 1 },
+      firstFailure: 'controlled-secret',
+      ...(disposed
+        ? {
+            lastActive: 0,
+            exitCode: 0,
+            rootExit: {
+              pid: 1338,
+              exitCode: 0,
+              natural: true,
+              elapsedMs: 20,
+              active: 0,
+              members: [],
+              membersIncomplete: false,
+            },
+          }
+        : {}),
+    }))
+    const output = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      await expect(closeRealWorkspace({ app, fixture })).rejects.toThrow('toBe')
+      expect(disposed).toBe(true)
+      await expect(stat(fixture.directory)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(output).toHaveBeenCalledTimes(2)
+      const text = JSON.stringify(output.mock.calls)
+      expect(text).toContain('before-dispose')
+      expect(text).toContain('after-dispose')
+      expect(text).toContain('rootExit')
+      expect(text).not.toContain('controlled-secret')
+      expect(text).not.toContain(fixture.directory)
+      const records = output.mock.calls.map(([, bytes]) => JSON.parse(String(bytes)))
+      expect(records.map((record) => record.wrapper.exitCode)).toEqual([1, 1])
+      expect(records.map((record) => record.job.generation)).toEqual([
+        'same-generation',
+        'same-generation',
+      ])
+      expect(records[0].job.rootExit).toBeUndefined()
+      expect(records[1].job.rootExit.exitCode).toBe(0)
+    } finally {
+      output.mockRestore()
+      await dispose()
+    }
+  },
+)
+
+it.each(['unavailable', 'overflow'] as const)(
+  'a diagnostic %s cannot mask the original exit assertion or prevent cleanup',
+  async (status) => {
+    const { createRuntimeFixture } = await import('./runtime-fixture.js')
+    const { closeRealWorkspace } = await import('./real-harness.js')
+    const fixture = await createRuntimeFixture({ mode: 'ui' })
+    vi.spyOn(fixture, 'appJobDiagnostic').mockImplementation(() => {
+      if (status === 'unavailable') throw new Error('controlled-secret')
+      return { generation: 'x'.repeat(16 * 1024), stages: {} }
+    })
+    const output = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      await expect(
+        closeRealWorkspace({ app: controlledQuitApp(1, true), fixture }),
+      ).rejects.toThrow('toBe')
+      await expect(stat(fixture.directory)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(output).toHaveBeenCalledTimes(2)
+      expect(output.mock.calls.every(([, bytes]) => String(bytes).includes(status))).toBe(true)
+      expect(JSON.stringify(output.mock.calls)).not.toContain('controlled-secret')
+      expect(Buffer.byteLength(JSON.stringify(output.mock.calls))).toBeLessThan(16 * 1024)
+    } finally {
+      output.mockRestore()
+      await fixture.dispose()
+    }
+  },
+)
+
+it('successful quit emits no failure observations', async () => {
+  const { createRuntimeFixture } = await import('./runtime-fixture.js')
+  const { closeRealWorkspace } = await import('./real-harness.js')
+  const fixture = await createRuntimeFixture({ mode: 'ui' })
+  const read = vi.spyOn(fixture, 'appJobDiagnostic')
+  const output = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  try {
+    await closeRealWorkspace({ app: controlledQuitApp(0, true), fixture })
+    expect(output).not.toHaveBeenCalled()
+    expect(read).not.toHaveBeenCalled()
+  } finally {
+    output.mockRestore()
+    await fixture.dispose()
+  }
+})
+
 it.skipIf(process.platform !== 'win32')(
   'keeps an original window error ahead of cleanup failure without a raw cause',
   async () => {
