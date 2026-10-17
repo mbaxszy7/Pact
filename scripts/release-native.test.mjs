@@ -647,6 +647,53 @@ void test('repository API pins destination, rejects redirects and bounds JSON re
   await assert.rejects(oversized.request('/releases'), /byte bound/u)
 })
 
+void test('failed repository writes report only fixed method and HTTP status without exposing response details or retrying', async (t) => {
+  const reported = []
+  t.mock.method(console, 'error', (line) => reported.push(line))
+  let requests = 0
+  for (const status of [403, 422, 500]) {
+    const api = new ReleaseGitHub('unregistered-fixture-token', {
+      fetchImpl: async () => {
+        requests++
+        return new Response(
+          JSON.stringify({
+            message: 'Synthetic private response',
+            detail: 'unregistered-fixture-secret',
+          }),
+          { status },
+        )
+      },
+    })
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Each genuine HTTP failure must remain a single non-retried write.
+    await assert.rejects(
+      api.request('/issues/42/labels', {
+        method: 'POST',
+        body: { labels: ['autorelease: tagged'] },
+      }),
+      new RegExp('HTTP ' + status, 'u'),
+    )
+  }
+  assert.equal(requests, 3)
+  assert.deepEqual(reported, [
+    '[pact-release] api-method=POST http-status=403',
+    '[pact-release] api-method=POST http-status=422',
+    '[pact-release] api-method=POST http-status=500',
+  ])
+})
+
+void test('repository failure diagnostics never echo an unrecognized request method', async (t) => {
+  const reported = []
+  t.mock.method(console, 'error', (line) => reported.push(line))
+  const api = new ReleaseGitHub('unregistered-fixture-token', {
+    fetchImpl: async () => new Response('Synthetic private body', { status: 403 }),
+  })
+  await assert.rejects(
+    api.request('/issues/42/labels', { method: 'unregistered-private-fixture-method' }),
+    /HTTP 403/u,
+  )
+  assert.deepEqual(reported, ['[pact-release] api-method=UNKNOWN http-status=403'])
+})
+
 const downloadAPI = (body) =>
   new ReleaseGitHub('unregistered-fixture-token', { fetchImpl: async () => new Response(body) })
 
