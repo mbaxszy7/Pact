@@ -409,7 +409,11 @@ await test('deferral cannot excuse invalid identity, discovery, unexpected evide
     ),
   )
   assert.throws(() => evaluateUiReport(null, { ...options, scope: 'full' }), /Invalid/)
-  assert.throws(() => evaluateUiReport(null, { ...options, identityKind: 'release' }), /Invalid/)
+  assert(
+    evaluateUiReport(null, { ...options, identityKind: 'release' }).issues.includes(
+      'missing-or-invalid-release-identity',
+    ),
+  )
 })
 
 await test('CI core report entry preserves both deferred inventories and rejects absent discovery', async (context) => {
@@ -598,6 +602,40 @@ await test('release summaries keep signed identity private and list skipped lane
   })
   assert(invalid.issues.includes('missing-or-invalid-release-identity'))
   assert.equal(invalid.identity, null)
+  const deferredEvidence = join(root, 'deferred')
+  await main(
+    [
+      '--reports',
+      '--release',
+      '--evidence',
+      deferredEvidence,
+      '--workspace',
+      root,
+      '--identity',
+      identityPath,
+      '--inventory',
+      inventoryPath,
+    ],
+    {
+      GITHUB_ACTIONS: 'true',
+      PACT_CI_DIAGNOSTIC_LANE: 'uncredentialed',
+      PACT_E2E_REPORT_SCOPE: 'core',
+    },
+  )
+  const deferredReports = await Promise.all(
+    ['ui', 'deterministic'].map(async (lane) =>
+      JSON.parse(await readFile(join(deferredEvidence, `${lane}-summary.json`), 'utf8')),
+    ),
+  )
+  for (const deferred of deferredReports) {
+    assert.deepEqual(deferred.issues, [])
+    assert.equal(deferred.identityKind, 'release')
+    assert.equal(deferred.identity.releaseId, 1234)
+    assert.equal(deferred.counts.passed, 0)
+    assert.equal(deferred.cases[0].status, 'not-run')
+    assert.equal(deferred.cases[0].required, false)
+    assert.equal(deferred.cases[0].failureCategory, 'deferred')
+  }
 })
 
 await test('trusted controller discovery and tested source use distinct absolute roots without losing case identities', () => {

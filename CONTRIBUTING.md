@@ -232,40 +232,42 @@ Discovery must match that inventory and its tags; a missing, new, duplicate or r
 case cannot silently change the merge gate. Test titles, assertions and the immutable
 baseline remain unchanged.
 
-Dev-scope PRs require one real smoke case on Windows x64 and macOS arm64:
+Automatic Dev and Stable CI require one tagged `@real-core` case on Windows x64 and macOS arm64:
 `real @all completes each Agent once and keeps ordered distinct response rows`.
 It launches the actual App, creates a Project and Session through the UI, sends one
 `@all` message, and verifies that Codex and Claude each complete exactly one real Run,
 return the request marker in separate responses, and release the Composer. Startup,
 Session creation, either Agent's reply, or cleanup failure still blocks this gate.
 
-The other 60 real cases are extended regression. They retain their original assertions
+The other real cases are extended regression. They retain their original assertions
 for permissions, Stop, recovery, settings, drafts, collaboration, Changes/Undo, appearance,
-images and performance, with execution deferred on automatic Dev-scope PR runs. This is
+images and performance, with execution deferred on automatic runs in both channels. This is
 an explicitly narrowed smoke acceptance scope; a passing smoke does not establish those
-extended behaviors. Ordinary PRs also defer the `@ui` and `@deterministic` App E2E
+extended behaviors. Automatic CI and Stable publication also defer the `@ui` and `@deterministic` App E2E
 lanes to extended regression, including the bare Secondary build collaboration journey.
 Their reports list every discovered case as extended, not required, and deferred; no
-deferred case is counted as passed. Select `extended_e2e` on a manual workflow run to
+deferred case is counted as passed. Select `extended_e2e` on a manual CI workflow run to
 execute those complete lanes, or use the existing local UI/deterministic commands.
+The publication workflow has the same opt-in for platform builds performed by that manual
+run; it reuses already verified staged artifacts rather than rerunning their E2E.
 The deferred reports still require authentic code identity and a complete case inventory.
 Static checks, unit/script tests, builds and native CLI protocol/process safety tests
 remain required. Main protection is unchanged. Stable publication remains disabled.
 
 Provider execution belongs to the same **Pact CI - Code quality and app tests** root run and attempt
 as its prerequisite checks. The root calls **Pact CI - Claude and Codex tests** as a reusable workflow; it has no independent
-dispatch or completion-triggered run. Add `pact:real-full` to a Dev-scope PR to execute the
-full regression; the label requests cases and does not authorize model credentials.
+dispatch or completion-triggered run. Its automated selection is always `core`; PR labels
+do not widen execution. Run `pnpm test:e2e:real` manually for full real-provider regression
+with authorized local credentials.
 Owner-authored same-repository code and API-verified release-only App changes use
 `pact-provider-ci`. Other sources wait for owner approval in `pact-provider-reviewed-ci`.
 Review the attested head/base/tree and root run/attempt before approving that environment;
 the trusted preflight revalidates their current identity and prerequisites before model
 configuration is exposed. Execution authorization is separate from Approve PR. A new
 candidate needs its own verified execution; missing or stale authorization blocks the gate.
-For a Dev-scope PR, an extended case failure is reported while the core gate remains
-eligible. Any Stable-scope candidate forces `suite=full` and a full gate regardless of
-author or input, so
-extended failures, missing results and skips block release-candidate acceptance.
+The automated real-provider gate requires `suite=core` and `gate=core` for both channels.
+A manual full regression reports every executed case; a selected full gate rejects
+extended failures, missing results and skips. A core pass never claims full regression acceptance.
 Native cases explicitly assigned to another platform are reported as not applicable; for
 example macOS window Alpha is required on macOS rather than converted into a passing Windows
 test. Any skip of an applicable core/full case remains a failure of the selected gate.
@@ -326,12 +328,11 @@ version, source SHA, tag, Release PR and Release ID; they omit signed-state exte
 and do not replace the release controller's authenticated staging or publication checks.
 
 Branch pushes and PRs require static checks, unit/script tests, builds and native protocol checks
-on Windows x64 and macOS arm64. Dev PRs require the real smoke case above; UI/deterministic
-E2E is optional extended regression for Dev and mandatory for Stable candidates. Windows arm64 CI
+on Windows x64 and macOS arm64. Both Dev and Stable PRs require the core real case above;
+UI/deterministic E2E and full real regression require explicit manual selection. Windows arm64 CI
 and installers remain deferred. `PACT_PACKAGING_READY` enables automatic installer build/smoke;
 enable it only after both native targets pass installer validation. Both active CI architectures
-retain mandatory native protocol checks. Stable candidates additionally require
-full provider verification; publication validates every final installer and its content-bound
+retain mandatory native protocol checks. Stable publication validates every final installer and its content-bound
 smoke report. CI platform jobs allow 90 minutes and release platform jobs allow two hours
 for their required checks, packaging and cleanup. Deadlines do not establish completed tests.
 
@@ -346,13 +347,14 @@ with all package/manifest versions. No permanent `release-as: 0.1.0` override re
 
 Candidate scope follows the actual product metadata transition. Unchanged metadata uses
 Dev/core scope. The initial marker transition, or a later strictly increasing synchronized
-version and marker, uses Stable/full scope regardless of PR author, branch name or labels.
+version and marker, uses Stable identity regardless of PR author, branch name or labels.
+Both identities require the same automated core real-provider gate; full regression is manual.
 Malformed metadata, rollback, a version change without its marker or restoration of the
 initial sentinel blocks candidate admission. Release Please previews and validates the
 exact updates once before creating/updating its PR; same-version `Release-As` overrides
 and unapproved major versions cannot generate a new release PR.
 
-The marker selects required tests and packaging; it grants no credential or publication
+The marker selects distribution identity and packaging; it grants no credential or publication
 permission. Formal publication additionally requires the fixed App's merged Release PR,
 the owner's approval and manual squash merge, and a legal transition from the actual
 squash parent to the merged metadata. Copying release metadata into an owner business PR

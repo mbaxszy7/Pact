@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       suite:
-        description: Core or full execution; Stable content always requires full
+        description: Core automated acceptance or explicitly requested full regression
         default: core
         type: string
       extended_e2e:

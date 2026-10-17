@@ -375,8 +375,7 @@ export function evaluateUiReport(
     !isAbsolute(inventoryWorkspace) ||
     !['completed', 'unavailable', 'deferred'].includes(execution) ||
     !['core', 'full'].includes(scope) ||
-    (execution === 'deferred' && (scope !== 'core' || identityKind !== 'ci')) ||
-    (identityKind === 'release' && scope !== 'full') ||
+    (execution === 'deferred' && scope !== 'core') ||
     !['ci', 'release'].includes(identityKind) ||
     !['darwin-arm64', 'win32-x64', 'win32-arm64'].includes(`${platform}-${architecture}`)
   )

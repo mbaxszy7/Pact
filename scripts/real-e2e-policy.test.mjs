@@ -106,7 +106,7 @@ await test('core success reports every deferred case without claiming a complete
   )
 })
 
-await test('extended failure remains reported while ordinary PR core passes; release full gate fails', () => {
+await test('extended failure remains reported while core passes; explicitly selected full gate fails', () => {
   const raw = fixture()
   fail(first(raw, 'extended'))
   const pr = evaluateRealReport(raw, { suite: 'full', gate: 'core' })

@@ -510,7 +510,7 @@ export function evaluateRealReport(
       failureCategory = item.tier === 'extended' && suite === 'core' ? 'deferred' : 'missing-result'
     let reason =
       item.tier === 'extended' && suite === 'core'
-        ? 'Deferred to explicitly authorized full regression and release verification.'
+        ? 'Deferred to explicitly requested manual full regression.'
         : 'No execution result; missing prerequisites, cancellation or early failure cannot pass.'
     if (test) {
       const results = test.results ?? []

@@ -216,7 +216,7 @@ void test('readable workflow names match the exact jobs required by the trusted 
       if (!job.strategy) assert.ok(job.name && !job.name.includes('${{'))
 })
 
-void test('ordinary PR E2E selects only real smoke while extended reports and native checks remain explicit', async () => {
+void test('automatic Dev and Stable E2E select core while full App regression requires manual dispatch', async () => {
   const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url))
   const builderRequire = createRequire(desktopRequire.resolve('electron-builder/package.json'))
   const { load } = builderRequire('js-yaml')
@@ -225,7 +225,8 @@ void test('ordinary PR E2E selects only real smoke while extended reports and na
   const provider = load(
     await readFile(new URL('../.github/workflows/provider-e2e.yml', import.meta.url), 'utf8'),
   )
-  const fullCondition = "needs.identity.outputs.channel == 'stable' || inputs.extended_e2e == true"
+  const fullCondition = "github.event_name == 'workflow_dispatch' && inputs.extended_e2e == true"
+  assert.equal(root.jobs.provider.with.suite, 'core')
   assert.equal(root.jobs.provider.with.extended_e2e, '${{ ' + fullCondition + ' }}')
   assert.deepEqual(provider.on.workflow_call.inputs.extended_e2e, {
     description: 'Require the UI and deterministic execution results selected by the caller',
@@ -267,6 +268,24 @@ void test('ordinary PR E2E selects only real smoke while extended reports and na
   // publication and quality jobs, even without optional raw UI execution files.
   assert(root.jobs.publication.steps.some((step) => step.run?.includes('check-e2e-coverage.mjs')))
   assert(root.jobs.quality.steps.some((step) => step.run?.includes('check-e2e-coverage.mjs')))
+  for (const lane of ['quality', 'infra', 'build'])
+    assert(root.jobs.quality.steps.some((step) => step.run?.includes(`ci.mjs ${lane}`)))
+  const release = load(
+    await readFile(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8'),
+  )
+  assert.equal(release.on.workflow_dispatch.inputs.extended_e2e.default, false)
+  for (const key of ['darwin-arm64', 'win32-x64']) {
+    const releaseSteps = release.jobs[`build-${key}`].steps
+    for (const id of ['ui', 'deterministic'])
+      assert.equal(releaseSteps.find((step) => step.id === id).if, '${{ ' + fullCondition + ' }}')
+    const releaseReport = releaseSteps.find((step) =>
+      step.run?.includes('ci-ui-diagnostics.mjs --reports --release'),
+    )
+    assert.equal(releaseReport.if, 'always()')
+    assert.equal(releaseReport.env.PACT_E2E_REPORT_SCOPE, report.env.PACT_E2E_REPORT_SCOPE)
+    for (const command of ['ci.mjs native', 'scripts/package-smoke.mjs'])
+      assert(releaseSteps.some((step) => step.run?.includes(command) && !step.if))
+  }
 })
 
 const head = 'a'.repeat(40),
@@ -804,7 +823,7 @@ void test('a runtime artifact cannot replace the fixed-App receipt or another ru
   )
 })
 
-await test('ordinary PRs require core and optional full regression cannot weaken Release PRs', () => {
+await test('both channels default to core and explicitly requested full execution retains its gate', () => {
   assert.deepEqual(providerScopes({ ...identity, channel: 'dev' }), { suite: 'core', gate: 'core' })
   assert.deepEqual(providerScopes({ ...identity, channel: 'dev' }, 'full'), {
     suite: 'full',
@@ -813,8 +832,8 @@ await test('ordinary PRs require core and optional full regression cannot weaken
   assert.deepEqual(
     providerScopes({ ...identity, channel: 'stable', product: releaseProduct }, 'core'),
     {
-      suite: 'full',
-      gate: 'full',
+      suite: 'core',
+      gate: 'core',
     },
   )
   assert.deepEqual(

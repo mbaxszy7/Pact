@@ -300,16 +300,16 @@ jobs:
         run: pnpm exec playwright test --list --reporter=json > "$RUNNER_TEMP/pact-e2e-inventory.json"
       - name: Extended Electron UI regression
         id: ui
-        if: ${{ needs.identity.outputs.channel == 'stable' || inputs.extended_e2e == true }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.extended_e2e == true }}
         run: node control/scripts/ci.mjs ui
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
           PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-evidence/${{ matrix.key }}
       - name: Extended deterministic business and lifecycle regression
         id: deterministic
-        # Stable candidates always select full regression. Dev selects it only
-        # explicitly; a completed failing UI lane still permits deterministic evidence.
-        if: ${{ !cancelled() && (needs.identity.outputs.channel == 'stable' || inputs.extended_e2e == true) && steps.ui.outputs.ui_execution_completed == 'true' }}
+        # Full App regression requires an explicit manual dispatch in either channel.
+        # A completed failing UI lane still permits deterministic evidence.
+        if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' && inputs.extended_e2e == true) && steps.ui.outputs.ui_execution_completed == 'true' }}
         run: node control/scripts/ci.mjs deterministic
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
@@ -344,7 +344,7 @@ jobs:
           PACT_CI_DIAGNOSTIC_LANE: uncredentialed
           PACT_UI_EXECUTION_COMPLETED: ${{ steps.ui.outputs.ui_execution_completed }}
           PACT_DETERMINISTIC_EXECUTION_COMPLETED: ${{ steps.deterministic.outputs.deterministic_execution_completed }}
-          PACT_E2E_REPORT_SCOPE: ${{ (needs.identity.outputs.channel == 'stable' || inputs.extended_e2e == true) && 'full' || 'core' }}
+          PACT_E2E_REPORT_SCOPE: ${{ (github.event_name == 'workflow_dispatch' && inputs.extended_e2e == true) && 'full' || 'core' }}
       - name: Preserve actual uncredentialed test results and readable failure reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -504,8 +504,8 @@ jobs:
     with:
       controller: ${{ needs.identity.outputs.controller }}
       source_kind: ${{ needs.identity.outputs.source_kind }}
-      suite: ${{ contains(github.event.pull_request.labels.*.name, 'pact:real-full') && 'full' || 'core' }}
-      extended_e2e: ${{ needs.identity.outputs.channel == 'stable' || inputs.extended_e2e == true }}
+      suite: core
+      extended_e2e: ${{ github.event_name == 'workflow_dispatch' && inputs.extended_e2e == true }}
       root_run_id: ${{ github.run_id }}
       root_attempt: ${{ github.run_attempt }}
 

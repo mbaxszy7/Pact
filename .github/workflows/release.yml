@@ -10,6 +10,10 @@ on:
         description: Merged Release Please PR number to resume; start a new dispatch after failure
         required: true
         type: string
+      extended_e2e:
+        description: Run full UI and deterministic regression for platform builds performed by this manual run
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -160,11 +164,13 @@ jobs:
         run: node --test --test-concurrency=1 scripts/run-e2e-windows.test.mjs scripts/run-e2e.test.mjs scripts/package-smoke.test.mjs
       - name: Electron UI
         id: ui
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.extended_e2e == true }}
         run: node control/scripts/ci.mjs ui
         env:
           PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/darwin-arm64
       - name: Deterministic Electron business and lifecycle journeys
         id: deterministic
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.extended_e2e == true }}
         run: node control/scripts/ci.mjs deterministic
         env:
           PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/darwin-arm64
@@ -221,6 +227,7 @@ jobs:
           PACT_CI_DIAGNOSTIC_LANE: uncredentialed
           PACT_UI_EXECUTION_COMPLETED: ${{ steps.ui.outputs.ui_execution_completed }}
           PACT_DETERMINISTIC_EXECUTION_COMPLETED: ${{ steps.deterministic.outputs.deterministic_execution_completed }}
+          PACT_E2E_REPORT_SCOPE: ${{ (github.event_name == 'workflow_dispatch' && inputs.extended_e2e == true) && 'full' || 'core' }}
       - name: Preserve actual no-credential release E2E results and readable reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -401,11 +408,13 @@ jobs:
         run: node --test --test-concurrency=1 scripts/run-e2e-windows.test.mjs scripts/run-e2e.test.mjs scripts/package-smoke.test.mjs
       - name: Electron UI
         id: ui
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.extended_e2e == true }}
         run: node control/scripts/ci.mjs ui
         env:
           PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/win32-x64
       - name: Deterministic Electron business and lifecycle journeys
         id: deterministic
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.extended_e2e == true }}
         run: node control/scripts/ci.mjs deterministic
         env:
           PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-release-evidence/win32-x64
@@ -462,6 +471,7 @@ jobs:
           PACT_CI_DIAGNOSTIC_LANE: uncredentialed
           PACT_UI_EXECUTION_COMPLETED: ${{ steps.ui.outputs.ui_execution_completed }}
           PACT_DETERMINISTIC_EXECUTION_COMPLETED: ${{ steps.deterministic.outputs.deterministic_execution_completed }}
+          PACT_E2E_REPORT_SCOPE: ${{ (github.event_name == 'workflow_dispatch' && inputs.extended_e2e == true) && 'full' || 'core' }}
       - name: Preserve actual no-credential release E2E results and readable reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

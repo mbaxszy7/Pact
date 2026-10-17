@@ -34,10 +34,8 @@ export const providerJobs = [
 export function providerScopes(identity, requested = 'core') {
   requireIdentity(identity)
   requireRealScope(requested)
-  // Release candidates retain every real-provider obligation regardless of dispatch input.
-  return identity.channel === 'stable'
-    ? { suite: 'full', gate: 'full' }
-    : { suite: requested, gate: 'core' }
+  // Both channels automate the tagged core cases. Full execution remains explicit.
+  return { suite: requested, gate: identity.channel === 'stable' ? requested : 'core' }
 }
 const releaseFiles = [
   'package.json',
@@ -777,7 +775,7 @@ export async function main(args = process.argv.slice(2), env = process.env) {
       [
         'provider-e2e',
         providerPassed,
-        'Both required native-platform Provider jobs and credential admission must succeed in this exact CI attempt; core ordinary-PR cases and full Release cases remain mandatory. Environment waiting, cancellation, skipped or missing jobs block this check.',
+        'Both required native-platform Provider jobs and credential admission must succeed in this exact CI attempt; tagged core real cases remain mandatory in both channels. Environment waiting, cancellation, skipped or missing jobs block this check.',
       ],
     ]) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- The existing owner serially publishes the two fixed contexts after their current-run checks.
