@@ -97,6 +97,14 @@ export class ReleaseGitHub {
       signal: this.signal(),
     })
     if (optional && response.status === 404) return null
+    if (!response.ok) {
+      const operation = ['GET', 'POST', 'PATCH', 'DELETE'].includes(method) ? method : 'UNKNOWN'
+      const status =
+        Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
+          ? response.status
+          : 0
+      console.error(`[pact-release] api-method=${operation} http-status=${status}`)
+    }
     requireFact(response.ok, `GitHub ${method} failed with HTTP ${response.status}`)
     if (response.status === 204) return null
     return JSON.parse((await boundedBytes(response, 2 * 1024 ** 2)).toString('utf8'))

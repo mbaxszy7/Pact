@@ -449,7 +449,7 @@ void test('delivery and publication consume exact accepted IDs in separate non-e
   assert.deepEqual(publish.permissions, {
     contents: 'write',
     issues: 'write',
-    'pull-requests': 'read',
+    'pull-requests': 'write',
     actions: 'read',
   })
   const command = publish.steps.find((step) => step.run?.includes('release-native.mjs publish'))

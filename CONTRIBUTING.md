@@ -527,6 +527,9 @@ attempt; package IDs and consumed digests, not the consumer's current attempt nu
 name, govern reuse. Source changes or artifacts from another run cannot substitute for those bytes.
 After publication and verification, the publisher idempotently marks the exact version PR
 `autorelease: tagged` and removes `autorelease: pending`, including already-published recovery.
+Its native job token needs `pull-requests: write` for these PR-label mutations; `issues: write`
+with PR read access is insufficient. This permission belongs only to the main-only publisher,
+not ordinary validation or the read-only release resolver.
 Only then does the standard version-maintenance job process the latest main changes, so a release
 failure or a missing label transition cannot silently finish the cycle.
 
@@ -534,6 +537,8 @@ The publisher emits fixed `[pact-release] phase=...` progress codes for candidat
 publication, uploaded-byte and native-attestation verification, and version-label finalization. The
 last phase distinguishes a published-but-unconfirmed result without printing credentials, raw API
 responses or child-process output. A visible Release does not establish completion of later checks.
+Failed JSON API requests also emit only an allowlisted method and numeric HTTP status; response
+bodies, headers and arbitrary exception details remain excluded, and uncertain writes are not resent.
 
 API JSON is bounded to 2 MiB per response, release evidence to 4 MiB per manifest, and each native
 asset to 2 GiB. Publication admits at most 32 assets, streams binary hashes, paginates at most 100
