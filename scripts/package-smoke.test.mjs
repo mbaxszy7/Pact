@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative } from 'node:path'
 import { test } from 'node:test'
+import { pathToFileURL } from 'node:url'
 
 import { applicationContent, hashFile } from './build-distribution.mjs'
+import { ciEnvironment } from './ci.mjs'
 import {
   main,
   packageSmokeFailureReport,
@@ -16,6 +18,7 @@ import {
   prepareApplication,
   readDistributionManifest,
 } from './package-smoke.mjs'
+import { run } from './run-e2e.mjs'
 
 await test('manifest admission preserves local Production identity and rejects mixed profile/channel names', async (context) => {
   const root = await mkdtemp(join(tmpdir(), 'pact-local-manifest-'))
@@ -803,6 +806,20 @@ await test('private-root diagnostics retain only fixed filesystem facts and reje
   })
   assert.equal(JSON.stringify(report).includes('secret'), false)
   assert.equal(Object.hasOwn(report.privateRootCleanupFailure, 'milliseconds'), false)
+  const retryReport = packageSmokeFailureReport({
+    phase: 'cleanup',
+    processes: [],
+    privateRootCleanupRetry: {
+      attempts: 2,
+      initialFailure: { ...report.privateRootCleanupFailure, path: 'secret', message: 'secret' },
+      identityCheck: 'secret',
+      outcome: 'secret',
+      privatePath: 'secret',
+    },
+  })
+  assert.equal(JSON.stringify(retryReport).includes('secret'), false)
+  assert.equal(retryReport.privateRootCleanupRetry.identityCheck, 'unconfirmed')
+  assert.equal(retryReport.privateRootCleanupRetry.outcome, 'unconfirmed')
   assert.equal(
     privateRootCleanupFailure({ rootStillExists: true }, root, 'verify-root-absence', 1).rootState,
     'present',
@@ -844,6 +861,7 @@ await test(
       assert.equal(report.privateRootCleanupFailure.category, 'root')
       assert.ok(['EBUSY', 'EPERM'].includes(report.privateRootCleanupFailure.code))
       assert.equal(report.privateRootCleanupFailure.syscall, 'rmdir')
+      assert.equal(report.privateRootCleanupRetry, undefined)
       assert.equal(bytes.includes(ownedRoot), false)
       assert.equal((await stat(ownedRoot)).isDirectory(), true)
     } finally {
@@ -853,6 +871,193 @@ await test(
     }
   },
 )
+
+for (const scenario of [
+  'released',
+  'persistent',
+  'replacement',
+  'sharing',
+  'unresolved',
+  'absent',
+  'profile',
+  'install-unresolved',
+  'provider-unresolved',
+]) {
+  // oxlint-disable-next-line no-await-in-loop -- Each Windows Job physically settles before the next fixture owns a mapping.
+  await test(
+    `Windows private-root cleanup ${scenario} uses real mapped/sharing locks and keeps its receipts`,
+    { skip: process.platform !== 'win32', timeout: 20_000 },
+    async (context) => {
+      const fixture = await mkdtemp(join(tmpdir(), 'pact-cleanup-lock-'))
+      let settled,
+        runStarted = false
+      context.after(() => {
+        if (!runStarted || (settled?.groupGone === true && settled.ownedProcessCount === 0))
+          return rm(fixture, { force: true, recursive: true })
+        // Preserve the fixture when process release is uncertain.
+        return undefined
+      })
+      const root = join(fixture, 'owned'),
+        directory = scenario === 'profile' ? 'electron-profile' : 'tmp',
+        image = join(root, directory, 'owned-image.dll')
+      await mkdir(join(root, directory), { recursive: true })
+      await copyFile(join(process.env.SystemRoot, 'System32', 'version.dll'), image)
+      const controller = join(fixture, 'lock.ps1'),
+        worker = join(fixture, 'cleanup.mjs')
+      await writeFile(
+        controller,
+        String.raw`
+param($NodePath, $WorkerPath, $ModuleUrl, $OwnedRoot, $Scenario)
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class PactMappedCleanupFixture {
+ [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+ public static extern IntPtr LoadLibraryExW(string path, IntPtr file, uint flags);
+ [DllImport("kernel32.dll", SetLastError=true)]
+ public static extern bool FreeLibrary(IntPtr module);
+}
+'@
+$directory = if ($Scenario -eq 'profile') { 'electron-profile' } else { 'tmp' }
+$image = Join-Path (Join-Path $OwnedRoot $directory) 'owned-image.dll'
+$module = [IntPtr]::Zero
+$stream = $null
+if ($Scenario -eq 'sharing') {
+ $stream = [IO.File]::Open($image, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+} else {
+ $module = [PactMappedCleanupFixture]::LoadLibraryExW($image, [IntPtr]::Zero, 0x20)
+ if ($module -eq [IntPtr]::Zero) { throw 'Fixture mapping failed' }
+}
+try {
+ & $NodePath $WorkerPath $ModuleUrl $OwnedRoot $Scenario | ForEach-Object {
+  if ($_ -eq 'FIRST_FAILURE') {
+   if ($Scenario -in @('released', 'replacement', 'absent')) {
+    if (-not [PactMappedCleanupFixture]::FreeLibrary($module)) { throw 'Mapping release failed' }
+    $module = [IntPtr]::Zero
+   }
+   if ($Scenario -eq 'replacement') {
+    $parent = [IO.Path]::GetDirectoryName($OwnedRoot)
+    $moved = Join-Path $parent 'previous-owned'
+    if ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($moved)) -ne $parent) { throw 'Fixture move escaped' }
+    Move-Item -LiteralPath $OwnedRoot -Destination $moved
+    New-Item -ItemType Directory -Path $OwnedRoot | Out-Null
+    Set-Content -LiteralPath (Join-Path $OwnedRoot 'witness') -Value 'replacement must survive'
+   }
+   if ($Scenario -eq 'absent') { [IO.Directory]::Delete($OwnedRoot, $true) }
+  } else { [Console]::Out.WriteLine($_) }
+ }
+ if ($LASTEXITCODE -ne 0) { throw 'Cleanup worker failed' }
+} finally {
+ if ($stream) { $stream.Dispose() }
+ if ($module -ne [IntPtr]::Zero) {
+  if (-not [PactMappedCleanupFixture]::FreeLibrary($module)) { throw 'Final mapping release failed' }
+ }
+}
+`,
+      )
+      await writeFile(
+        worker,
+        String.raw`
+import { lstat, realpath, readFile } from 'node:fs/promises'
+import { join } from 'node:path'
+const { removePackagedPrivateRoot, packageSmokeFailureReport } = await import(process.argv[2])
+const root = process.argv[3], scenario = process.argv[4]
+const identity = { canonicalPath: await realpath(root), stat: await lstat(root, { bigint: true }) }
+const facts = {
+ phase: 'cleanup', processes: scenario === 'unresolved' ? [{ releaseVerified: false }] : [],
+ installationCleanupVerified: scenario !== 'install-unresolved',
+ providerCopiesCleanupVerified: scenario !== 'provider-unresolved',
+ privateRootCreated: true, privateRootCleanupVerified: false,
+}
+let retry
+Object.defineProperty(facts, 'privateRootCleanupRetry', {
+ get() { return retry }, set(value) { retry = value; console.log('FIRST_FAILURE') },
+})
+let failed = false, passedCleanupFacts
+try { passedCleanupFacts = await removePackagedPrivateRoot(root, identity, facts) }
+catch { failed = true; facts.cleanupFailed = true; facts.recoveryPreserved = true }
+const rootExists = await lstat(root).then(() => true, error => {
+ if (error.code !== 'ENOENT') throw error
+ return false
+})
+const witnessPreserved = scenario === 'replacement'
+ ? (await readFile(join(root, 'witness'), 'utf8')).trim() === 'replacement must survive' : undefined
+console.log(JSON.stringify({ failed, rootExists, witnessPreserved, passedCleanupFacts,
+ report: packageSmokeFailureReport(facts) }))
+`,
+      )
+      let output = ''
+      const command = [
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-File',
+        controller,
+        process.execPath,
+        worker,
+        pathToFileURL(join(import.meta.dirname, 'package-smoke.mjs')).href,
+        root,
+        scenario,
+      ]
+      const options = {
+        executable: 'pwsh.exe',
+        cwd: fixture,
+        env: ciEnvironment(process.env),
+        write: (channel, text) => {
+          if (channel === 'stderr') throw new Error('Controlled cleanup fixture failed')
+          if (Buffer.byteLength(output) + Buffer.byteLength(text) > 8192)
+            throw new Error('Controlled cleanup output exceeded its bound')
+          output += text
+        },
+        onState: (state) => {
+          if (state.kind === 'settled') settled = state
+        },
+      }
+      runStarted = true
+      const exit = await run(command, 15_000, options)
+      assert.equal(exit, 0)
+      assert.equal(settled.groupGone, true)
+      assert.equal(settled.ownedProcessCount, 0)
+      const result = JSON.parse(output.trim()),
+        retry = result.report.privateRootCleanupRetry
+      assert.equal(output.includes(root) || output.includes('owned-image.dll'), false)
+      if (['released', 'absent'].includes(scenario)) {
+        assert.equal(result.failed, false)
+        assert.equal(result.rootExists, false)
+        assert.equal(result.report.cleanupVerified, true)
+        assert.equal(retry.attempts, scenario === 'released' ? 2 : 1)
+        assert.equal(retry.outcome, scenario === 'released' ? 'recovered' : 'already-absent')
+        assert.equal(retry.initialFailure.code, 'EPERM')
+        assert.deepEqual(result.passedCleanupFacts.privateRootCleanupRetry, retry)
+      } else {
+        assert.equal(result.failed, true)
+        assert.equal(result.rootExists, true)
+        assert.equal(result.report.cleanupVerified, false)
+        assert.equal(result.report.recoveryPreserved, true)
+        assert.equal(result.report.failureCode, 'CLEANUP_UNCONFIRMED')
+        if (scenario === 'persistent') {
+          assert.equal(retry.attempts, 2)
+          assert.equal(retry.outcome, 'failed')
+          assert.equal(result.report.privateRootCleanupFailure.code, 'EPERM')
+        } else if (scenario === 'replacement') {
+          assert.equal(retry.attempts, 1)
+          assert.equal(retry.identityCheck, 'changed')
+          assert.equal(retry.outcome, 'identity-blocked')
+          assert.equal(result.witnessPreserved, true)
+        } else {
+          assert.equal(retry, undefined)
+          if (scenario === 'profile')
+            assert.equal(result.report.privateRootCleanupFailure.category, 'profile')
+          assert.equal(
+            result.report.privateRootCleanupFailure.code,
+            scenario === 'sharing' ? 'EBUSY' : 'EPERM',
+          )
+        }
+      }
+    },
+  )
+}
 
 await test('a parsed manifest contributes only validated distribution identity to a pre-launch failure report', async (context) => {
   const directory = await mkdtemp(join(tmpdir(), 'pact-smoke-identity-report-'))
