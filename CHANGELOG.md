@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/mbaxszy7/Pact/compare/v0.1.1...v0.1.2) (2026-10-17)
+
+
+### Bug Fixes
+
+* **ci:** allow publisher to finalize release PR labels ([#16](https://github.com/mbaxszy7/Pact/issues/16)) ([1f43982](https://github.com/mbaxszy7/Pact/commit/1f439828945b4c63c6a20852431c50aeb505302b))
+
 ## [0.1.1](https://github.com/mbaxszy7/Pact/compare/v0.1.0...v0.1.1) (2026-10-17)
 
 
