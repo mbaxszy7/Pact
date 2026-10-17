@@ -125,7 +125,7 @@ test(
 
 test(
   'previews and persists global Appearance settings across a real restart',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     const fixture = await createRuntimeFixture({ mode: 'real' })
     let app: ElectronApplication | undefined
@@ -332,33 +332,37 @@ test(
   },
 )
 
-test('restores the last committed appearance when a save fails', { tag: '@real' }, async () => {
-  const fixture = await createRuntimeFixture({ mode: 'real' })
-  const app = await launchAppearanceApp(fixture, {
-    PACT_TEST_APPEARANCE_WRITE_FAILURE: '1',
-  })
+test(
+  'restores the last committed appearance when a save fails',
+  { tag: ['@real', '@real-extended'] },
+  async () => {
+    const fixture = await createRuntimeFixture({ mode: 'real' })
+    const app = await launchAppearanceApp(fixture, {
+      PACT_TEST_APPEARANCE_WRITE_FAILURE: '1',
+    })
 
-  try {
-    const window = await app.firstWindow()
-    await openAppearanceSettings(window)
-    await expect(window.getByRole('radio', { name: 'Follow system' }).first()).toBeChecked()
+    try {
+      const window = await app.firstWindow()
+      await openAppearanceSettings(window)
+      await expect(window.getByRole('radio', { name: 'Follow system' }).first()).toBeChecked()
 
-    await window.getByRole('radio', { name: 'Dark' }).click()
-    await expect(window.getByRole('alert')).toContainText('Couldn’t save')
-    await expect(window.getByRole('radio', { name: 'Follow system' }).first()).toBeChecked()
-    await expect(window.locator('html')).not.toHaveAttribute('data-theme', /.+/)
+      await window.getByRole('radio', { name: 'Dark' }).click()
+      await expect(window.getByRole('alert')).toContainText('Couldn’t save')
+      await expect(window.getByRole('radio', { name: 'Follow system' }).first()).toBeChecked()
+      await expect(window.locator('html')).not.toHaveAttribute('data-theme', /.+/)
 
-    const stored: unknown = await window.evaluate('window.pact.getAppearanceSettings()')
-    expect(stored).toMatchObject({ ok: true, value: { requested: { theme: 'system' } } })
-  } finally {
-    await quitPact(app)
-    await fixture.dispose()
-  }
-})
+      const stored: unknown = await window.evaluate('window.pact.getAppearanceSettings()')
+      expect(stored).toMatchObject({ ok: true, value: { requested: { theme: 'system' } } })
+    } finally {
+      await quitPact(app)
+      await fixture.dispose()
+    }
+  },
+)
 
 test(
   'macOS page Alpha follows transparency strength while Solid stays opaque',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.skip(process.platform !== 'darwin', 'macOS window backing only')
     const fixture = await createRuntimeFixture({ mode: 'real' })

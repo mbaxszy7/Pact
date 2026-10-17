@@ -1,5 +1,33 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 
+import type { DiagnosticEvent } from '@pact/contracts/diagnostics'
+
+type IdentityDiagnostic = NonNullable<DiagnosticEvent['settingsCatalogIdentity']>
+type IdentityCapture = Pick<
+  IdentityDiagnostic,
+  'reason' | 'initialPresent' | 'refreshed' | 'captureExited' | 'captureClosed'
+>
+type IdentityCleanup = Omit<IdentityDiagnostic, keyof IdentityCapture>
+
+/** Fixed failure evidence only; none of these observations authorize release or signals. */
+export class OwnedProcessIdentityError extends Error {
+  private readonly capture: Readonly<IdentityCapture>
+  private cleanup: Readonly<IdentityCleanup> | undefined
+
+  constructor(capture: IdentityCapture) {
+    super('The owned process did not establish its owned group.')
+    this.capture = Object.freeze({ ...capture })
+  }
+
+  observeCleanup(facts: IdentityCleanup): void {
+    this.cleanup ??= Object.freeze({ ...facts })
+  }
+
+  get diagnostic(): IdentityDiagnostic | undefined {
+    return this.cleanup ? Object.freeze({ ...this.capture, ...this.cleanup }) : undefined
+  }
+}
+
 const CLEANUP_MS = 4_000
 const TERM_GRACE_MS = 250
 const MAX_IDENTITIES = 256
@@ -72,6 +100,16 @@ const same = (known: Identity, row: Identity | undefined): boolean =>
 const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 const errorCode = (error: unknown): unknown =>
   typeof error === 'object' && error !== null ? Reflect.get(error, 'code') : undefined
+const observeZero = (pid: number | undefined): IdentityDiagnostic['pidZero'] => {
+  if (pid === undefined || !Number.isSafeInteger(pid) || pid === 0) return 'not_observed'
+  try {
+    process.kill(pid, 0)
+    return 'success'
+  } catch (error) {
+    const code = errorCode(error)
+    return code === 'ESRCH' || code === 'EPERM' ? code : 'other_error'
+  }
+}
 
 /** One child and its private POSIX group. The caller decides when work may be stopped. */
 export class OwnedProcessGroup {
@@ -153,7 +191,19 @@ export class OwnedProcessGroup {
               initialRows.has(child.pid!) || this.childClosed ? initialRows : await readProcesses()
             const root = rows.get(child.pid!)
             if (!root || root.ppid !== process.pid || root.pgid !== child.pid)
-              throw new Error('The owned process did not establish its owned group.')
+              throw new OwnedProcessIdentityError({
+                reason: !root
+                  ? 'missing'
+                  : root.ppid !== process.pid
+                    ? root.pgid !== child.pid
+                      ? 'ppid_and_pgid_mismatch'
+                      : 'ppid_mismatch'
+                    : 'pgid_mismatch',
+                initialPresent: initialRows.has(child.pid!),
+                refreshed: rows !== initialRows,
+                captureExited: child.exitCode !== null || child.signalCode !== null,
+                captureClosed: this.childClosed,
+              })
             this.remember(rows, root)
             return root
           })
@@ -216,11 +266,16 @@ export class OwnedProcessGroup {
     }, 100)
   }
 
-  private remember(rows: Map<number, Identity>, root: Identity): void {
-    const anchor =
+  private hasLiveAnchor(rows: Map<number, Identity>, root: Identity): boolean {
+    return (
       same(root, rows.get(root.pid)) ||
       [...this.identities.values()].some((known) => same(known, rows.get(known.pid)))
-    if (!anchor) throw new Error('The owned group lost its verified process identity.')
+    )
+  }
+
+  private remember(rows: Map<number, Identity>, root: Identity): void {
+    if (!this.hasLiveAnchor(rows, root))
+      throw new Error('The owned group lost its verified process identity.')
     const leader = rows.get(root.pgid)
     if (leader && !sameIdentity(root, leader)) throw new Error('The owned group identity changed.')
     for (const row of rows.values()) {
@@ -258,8 +313,13 @@ export class OwnedProcessGroup {
   private async signalGroup(root: Identity, signal: NodeJS.Signals): Promise<void> {
     if (this.groupGone(root.pgid)) return
     const rows = await readProcesses()
+    const leader = rows.get(root.pgid)
+    if (leader && !sameIdentity(root, leader)) throw new Error('The owned group identity changed.')
     if (![...rows.values()].some((row) => row.pgid === root.pgid && !/^[ZX]/u.test(row.state)))
       return
+    // A closed root can leave an unobserved helper. Without a live anchor, do
+    // not signal or adopt it; the existing deadline still requires real ESRCH.
+    if (this.childClosed && !this.hasLiveAnchor(rows, root)) return
     this.remember(rows, root)
     // Signalling uses only a private group with a currently verified original identity.
     try {
@@ -290,6 +350,18 @@ export class OwnedProcessGroup {
       try {
         root = await this.root!
       } catch (error) {
+        if (error instanceof OwnedProcessIdentityError) {
+          try {
+            error.observeCleanup({
+              cleanupExited: child.exitCode !== null || child.signalCode !== null,
+              cleanupClosed: this.childClosed,
+              pidZero: observeZero(child.pid),
+              groupZero: observeZero(child.pid === undefined ? undefined : -child.pid),
+            })
+          } catch {
+            // Optional evidence cannot replace the original cleanup failure.
+          }
+        }
         // A short-lived child can be reaped before its birth observation.
         // Physical absence permits settlement without any group signal.
         if (

@@ -1,3 +1,4 @@
+import { eq } from 'drizzle-orm'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -27,6 +28,10 @@ import {
 } from '@pact/contracts'
 import { PactDatabase } from '@pact/persistence'
 
+import {
+  conversationBodyInputs,
+  nativeAgentContexts,
+} from '../../../../../packages/persistence/src/schema/index.js'
 import { markdownVisibleProjection } from '../../shared/message-anchor-text.js'
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
@@ -382,12 +387,17 @@ afterEach(async () => {
   vi.restoreAllMocks()
 })
 
-async function fixture(primaryAgentId: RuntimeAgentId = 'codex', databaseInProject = false) {
+async function fixture(
+  primaryAgentId: RuntimeAgentId = 'codex',
+  databaseInProject = false,
+  measurePerformance = false,
+) {
   const directory = await mkdtemp(join(tmpdir(), 'pact-collaboration-flow-'))
   if (databaseInProject) await mkdir(join(directory, '.pact-data/dev'), { recursive: true })
   const db = await PactDatabase.open({
     filePath: databaseInProject ? join(directory, '.pact-data/dev/pact.sqlite') : ':memory:',
     migrationsFolder: resolve(import.meta.dirname, '../../../../../packages/persistence/drizzle'),
+    measurePerformance,
   })
   const projectId = randomUUID(),
     sessionId = randomUUID(),
@@ -917,6 +927,92 @@ describe('Pact workflow admission and durable dispatch', () => {
       'repair',
       'review',
     ])
+  })
+
+  it('rereads current source ownership and document facts through warmed statements, rollback and Stop', async () => {
+    const f = await fixture('codex', false, true)
+    native.next = { plan: 'Authoritative source.\n'.repeat(700), summary: 'Full source.' }
+    expect((await f.flow.send(f.input('/plan Verify current source authorization'))).ok).toBe(true)
+    await f.settled()
+    const task = f.db.conversationRepository.collaboration(f.sessionId)!
+    native.hold = Promise.withResolvers<void>().promise
+    expect(
+      await f.flow.actOnCollaboration({
+        sessionId: f.sessionId,
+        taskId: task.id,
+        revision: task.revision,
+        clientMessageId: randomUUID(),
+        action: 'continue',
+      }),
+    ).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+    const input = native.inputs[1]!,
+      actor = input.promptEnvelope.collaboration!.actor,
+      document = input.promptEnvelope.collaboration!.planDocument!,
+      grant = input.promptEnvelope.sourceGrant!,
+      reader = input.readCollaborationSourcePart!
+    const first = reader({ ...grant, document, offset: 0 })
+    expect(first.nextOffset).toBe(4096)
+    const select = vi.spyOn(f.db.drizzle, 'select'),
+      before = f.db.performanceDiagnostics()!.sqlite.operations
+    const next = reader({ ...grant, document, offset: 4096 })
+    expect(next.text).toBe('Authoritative source.\n'.repeat(700).slice(4096, 8192))
+    expect(reader({ ...grant, document, offset: 8192 }).text).toBeTruthy()
+    expect(select).not.toHaveBeenCalled()
+    expect(f.db.performanceDiagnostics()!.sqlite.operations).toBeGreaterThan(before)
+    expect(() => reader({ ...grant, grant: randomUUID(), document, offset: 0 })).toThrow(
+      /capability/u,
+    )
+    expect(() => reader({ ...grant, runId: native.inputs[0]!.runId, document, offset: 0 })).toThrow(
+      /capability/u,
+    )
+    for (const changed of [
+      { id: randomUUID() },
+      { sha256: '0'.repeat(64) },
+      { chars: document.chars + 1 },
+      { bytes: document.bytes + 1 },
+    ])
+      expect(() => reader({ ...grant, document: { ...document, ...changed }, offset: 0 })).toThrow(
+        /outside this Run authorization/u,
+      )
+    expect(() =>
+      f.db.drizzle.transaction((transaction) => {
+        transaction
+          .update(conversationBodyInputs)
+          .set({ sealed: false })
+          .where(eq(conversationBodyInputs.id, document.id))
+          .run()
+        expect(() => reader({ ...grant, document, offset: 4096 })).toThrow(
+          /outside this Run authorization/u,
+        )
+        throw new Error('rollback-source-fixture')
+      }),
+    ).toThrow('rollback-source-fixture')
+    expect(reader({ ...grant, document, offset: 4096 }).text).toBe(next.text)
+    expect(f.db.conversationRepository.nativeContext(f.sessionId, actor)).toBeUndefined()
+    expect(() =>
+      f.db.drizzle.transaction((transaction) => {
+        transaction
+          .insert(nativeAgentContexts)
+          .values({
+            sessionId: f.sessionId,
+            agentId: actor,
+            nativeSessionId: 'changed-binding-source-fixture',
+            bindingGeneration: 2,
+            state: 'active',
+            updatedAt: new Date().toISOString(),
+          })
+          .run()
+        expect(() => reader({ ...grant, document, offset: 4096 })).toThrow(/retired Turn/u)
+        throw new Error('rollback-binding-fixture')
+      }),
+    ).toThrow('rollback-binding-fixture')
+    expect(reader({ ...grant, document, offset: 4096 }).text).toBe(next.text)
+    expect(f.flow.stop({ sessionId: f.sessionId })).toMatchObject({ ok: true })
+    expect(() => reader({ ...grant, document, offset: 8192 })).toThrow(/retired Turn/u)
+    await f.flow.dispose()
+    f.db.close()
+    expect(() => f.db.conversationRepository.findRun(input.runId)).toThrow(/not open/u)
   })
 
   it('durably receives during an active Turn, fences its old Proposal and dispatches the user-authorized supplement once', async () => {

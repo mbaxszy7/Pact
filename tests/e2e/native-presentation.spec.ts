@@ -5,6 +5,7 @@ import { resolve } from 'node:path'
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { agentRuns, conversationMessages } from '../../packages/persistence/src/schema/index.js'
 import { quitPact } from './native-quit.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import { createRuntimeFixture, test } from './runtime-fixture.js'
 
 test(
@@ -21,6 +22,7 @@ test(
       migrationsFolder: resolve(import.meta.dirname, '../../packages/persistence/drizzle'),
     })
     let app: ElectronApplication | undefined
+    let observer: ReadonlyFixtureDatabase | undefined
     try {
       const projectId = randomUUID(),
         sourceId = randomUUID(),
@@ -118,6 +120,8 @@ test(
           },
         ])
         .run()
+      db.close()
+      observer = ReadonlyFixtureDatabase.open(fixture)
       app = await fixture.launch()
       const page = await app.firstWindow()
       await page.getByRole('button', { name: 'Preserved workspace', exact: true }).click()
@@ -237,13 +241,14 @@ test(
         })
       await page.screenshot({ path: resolve('.pact-data/mac-validation/sixth-context-light.png') })
       await page.keyboard.press('Escape')
-      expect(db.conversationRepository.read(sourceId).messages).toHaveLength(2)
-      expect(db.conversationRepository.read(sourceId).runs).toHaveLength(1)
+      expect(observer.conversationRepository.read(sourceId).messages).toHaveLength(2)
+      expect(observer.conversationRepository.read(sourceId).runs).toHaveLength(1)
       await quitPact(app, page)
       app = undefined
     } finally {
       if (app) await app.evaluate(({ app: nativeApp }) => nativeApp.exit(1))
-      db.close()
+      if (db.isHealthy()) db.close()
+      observer?.close()
       await fixture.dispose()
     }
   },

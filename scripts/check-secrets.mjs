@@ -2,9 +2,14 @@ import { spawnSync } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
 
-const root = resolve(import.meta.dirname, '..')
+import { isScriptEntry } from './script-entry.mjs'
+
+const controllerRoot = resolve(import.meta.dirname, '..')
+const selectedWorkspace = process.env.PACT_CI_WORKSPACE
+if (selectedWorkspace !== undefined && !isAbsolute(selectedWorkspace))
+  throw new Error('Secret scan workspace must be an explicit absolute path.')
+const root = selectedWorkspace ?? controllerRoot
 
 export function checkSecrets(args = process.argv.slice(2)) {
   if (args.length !== 1 || !['--staged', '--history'].includes(args[0]))
@@ -34,7 +39,7 @@ export function checkSecrets(args = process.argv.slice(2)) {
           ? ['--pre-commit', '--staged']
           : ['--log-opts=--all --full-history']),
         '--config',
-        resolve(root, '.gitleaks.toml'),
+        resolve(controllerRoot, '.gitleaks.toml'),
         '--gitleaks-ignore-path',
         ignorePath,
         '--ignore-gitleaks-allow',
@@ -52,7 +57,7 @@ export function checkSecrets(args = process.argv.slice(2)) {
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))
+if (isScriptEntry(import.meta.url))
   try {
     process.exitCode = checkSecrets()
   } catch (error) {

@@ -1,11 +1,10 @@
 import { expect } from '@playwright/test'
 import { createHash } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
 
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
-import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import {
   authMarker,
   closeRealWorkspace,
@@ -23,7 +22,7 @@ import { test } from './runtime-fixture.js'
 for (const cold of [false, true]) {
   test(
     `real lost ACK recovers the actual completed result without resend; ${cold ? 'cold' : 'warm'} inspection`,
-    { tag: '@real' },
+    { tag: ['@real', '@real-extended'] },
     async () => {
       test.setTimeout(360_000)
       const ctx = await launchRealWorkspace(`real-lost-ack-${cold}`, {
@@ -77,10 +76,7 @@ for (const cold of [false, true]) {
         )
         expect(inspected).toMatchObject({ ok: true })
         const checkedSnapshot = await readRealConversation(ctx)
-        const database = await PactDatabase.open({
-          filePath: ctx.fixture.databaseFile,
-          migrationsFolder: resolve(import.meta.dirname, '../../packages/persistence/drizzle'),
-        })
+        const database = ReadonlyFixtureDatabase.open(ctx.fixture)
         let allMessages
         try {
           const rows = database.drizzle.query.conversationMessages
@@ -208,7 +204,7 @@ for (const cold of [false, true]) {
 
 test(
   'real absence and empty interruption never authorize replay or old-task rebuild',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(360_000)
     const ctx = await launchRealWorkspace('real-before-native', { transportFault: 'pause-turn' })
@@ -301,7 +297,7 @@ test(
 
 test(
   'real completion releases the Composer while Native title evidence is delayed',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(360_000)
     const ctx = await launchRealWorkspace('real-title-read-deadline', {
@@ -356,7 +352,7 @@ test(
 
 test(
   'real graceful quit preserves interrupted text through a new explicit request and cold restart',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(360_000)
     const ctx = await launchRealWorkspace('real-graceful-stream')

@@ -9,17 +9,19 @@ import { imageCodecResultSchema } from '@pact/contracts/images'
 import type { AppearanceController } from './modules/appearance/controller'
 import type { UtilityProcessClient } from './utility-process/client'
 
+import { defaultProductPaths, readProductIdentity } from './product-identity'
+import { readConfiguredDefaultPaths } from './utility-process/runtime-paths'
+
 const PACKAGE_SMOKE_ENV = 'PACT_PACKAGE_SMOKE'
 const PACKAGE_SMOKE_PHASE_ENV = 'PACT_PACKAGE_SMOKE_PHASE'
 const PACKAGE_SMOKE_USER_DATA_ENV = 'PACT_PACKAGE_SMOKE_USER_DATA'
 const PACKAGE_SMOKE_TIMEOUT_MS = 10_000
-
 export function isPackageSmoke(): boolean {
   return process.env[PACKAGE_SMOKE_ENV] === '1'
 }
 
 export function configurePackageSmokeUserData(): void {
-  if (!isPackageSmoke()) return
+  if (!isPackageSmoke() || process.env[PACKAGE_SMOKE_PHASE_ENV] === 'production-paths') return
 
   const userDataPath = process.env[PACKAGE_SMOKE_USER_DATA_ENV]
   if (!userDataPath || !isAbsolute(userDataPath)) {
@@ -211,13 +213,96 @@ async function verifyPackagedMarkdownProjection(): Promise<void> {
   }
 }
 
+function readPackagedSmokeIdentity() {
+  if (!app.isPackaged) throw new Error('Package smoke must run from an Electron package.')
+  const identity = readProductIdentity()
+  const expectedBytes = process.env.PACT_PACKAGE_EXPECTED_IDENTITY
+  if (!expectedBytes || expectedBytes.length > 4096)
+    throw new Error('Package smoke requires bounded expected distribution identity.')
+  const expected: unknown = JSON.parse(expectedBytes)
+  if (!expected || typeof expected !== 'object')
+    throw new Error('Package smoke distribution identity is invalid.')
+  for (const [field, value] of Object.entries(identity)) {
+    if (Reflect.get(expected, field) !== value)
+      throw new Error(`Package smoke identity mismatch: ${field}.`)
+  }
+  if (
+    Reflect.get(expected, 'platform') !== process.platform ||
+    Reflect.get(expected, 'arch') !== process.arch ||
+    app.getName() !== identity.productName
+  ) {
+    throw new Error('Package smoke runtime platform or application name is invalid.')
+  }
+  const configuredPaths = readConfiguredDefaultPaths()
+  const defaultPaths = defaultProductPaths(identity)
+  if (
+    Object.entries(defaultPaths).some(
+      ([field, value]) => Reflect.get(configuredPaths, field) !== value,
+    )
+  ) {
+    throw new Error(
+      'Packaged default profile/session/log paths do not match their channel identity.',
+    )
+  }
+  const otherIdentity =
+    identity.channel === 'dev'
+      ? {
+          ...identity,
+          channel: 'stable' as const,
+          productName: 'Pact' as const,
+          appId: 'com.pact.desktop' as const,
+        }
+      : {
+          ...identity,
+          channel: 'dev' as const,
+          productName: 'Pact Dev' as const,
+          appId: 'com.pact.desktop.dev' as const,
+        }
+  const otherPaths = defaultProductPaths(otherIdentity)
+  if (Object.values(defaultPaths).some((path) => Object.values(otherPaths).includes(path))) {
+    throw new Error('Packaged Dev and Stable profile/session/log paths overlap.')
+  }
+  return {
+    ...identity,
+    platform: process.platform,
+    arch: process.arch,
+    defaultPaths,
+    userData: app.getPath('userData'),
+    sessionData: app.getPath('sessionData'),
+    logs: app.getPath('logs'),
+  }
+}
+
+/** No Utility, database, provider, Renderer, or diagnostic Worker starts in this phase. */
+export function completePackagedProductionPathProbe(): boolean {
+  if (!isPackageSmoke() || process.env[PACKAGE_SMOKE_PHASE_ENV] !== 'production-paths') return false
+  if (
+    process.env.PACT_E2E_ROOT !== undefined ||
+    process.env[PACKAGE_SMOKE_USER_DATA_ENV] !== undefined
+  )
+    throw new Error('Production path inspection cannot use an isolated profile override.')
+  const identity = readPackagedSmokeIdentity()
+  if (
+    identity.userData !== identity.defaultPaths.userData ||
+    identity.sessionData !== identity.defaultPaths.sessionData ||
+    identity.logs !== identity.defaultPaths.logs
+  )
+    throw new Error('The actual production paths differ from their native channel defaults.')
+  process.stdout.write(
+    `PACT_PACKAGE_IDENTITY:${JSON.stringify({ ...identity, productionDataRootVerified: true })}\n`,
+  )
+  process.stdout.write('PACT_PACKAGE_SMOKE:PASS\n')
+  app.exit(0)
+  return true
+}
+
 export async function completePackagedSmoke(
   window: BrowserWindow,
   pageLoad: Promise<void>,
   utilityClient: UtilityProcessClient,
   appearanceSettings: AppearanceController,
 ): Promise<void> {
-  if (!app.isPackaged) throw new Error('Package smoke must run from an Electron package.')
+  process.stdout.write(`PACT_PACKAGE_IDENTITY:${JSON.stringify(readPackagedSmokeIdentity())}\n`)
 
   await pageLoad
 

@@ -81,12 +81,109 @@ import {
   resolveLoadedCodexConfiguration,
 } from './codex-agent-adapter.js'
 import { CODEX_MAX_FRAME_BYTES } from './codex-app-server-connection.js'
+import { codexProcessEnvironment } from './codex-process-environment.js'
 import {
   planAuthorization,
   planEnvelope,
   planRunInput,
 } from './collaboration-fixture.test-support.js'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
+
+describe('owned Codex loopback environment', () => {
+  it('adds only local hosts while preserving external proxy configuration and its source', () => {
+    const source = Object.freeze({
+      HTTP_PROXY: 'http://proxy.invalid:8080',
+      HTTPS_PROXY: 'http://secure-proxy.invalid:8080',
+      SOURCE_MARKER: 'retained',
+    })
+    const environment = codexProcessEnvironment('/owned/native', source, 'darwin')
+    expect(environment).toEqual({
+      ...source,
+      CODEX_HOME: '/owned/native',
+      CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'pact',
+      NO_PROXY: '127.0.0.1,localhost',
+      no_proxy: '127.0.0.1,localhost',
+    })
+    expect(source).not.toHaveProperty('NO_PROXY')
+  })
+  it.each(['NO_PROXY', 'no_proxy'] as const)(
+    'preserves a single %s value for both Unix spellings',
+    (key) => {
+      const source = Object.freeze({ [key]: ' internal.invalid ,127.0.0.1' })
+      const environment = codexProcessEnvironment(undefined, source, 'darwin')
+      expect(environment.NO_PROXY).toBe(' internal.invalid ,127.0.0.1,localhost')
+      expect(environment.no_proxy).toBe(environment.NO_PROXY)
+      expect(source[key]).toBe(' internal.invalid ,127.0.0.1')
+    },
+  )
+  it('preserves distinct Unix values without union and does not duplicate existing hosts', () => {
+    const source = Object.freeze({
+      NO_PROXY: 'upper.invalid, LOCALHOST ',
+      no_proxy: 'lower.invalid,127.0.0.1',
+    })
+    const environment = codexProcessEnvironment(undefined, source, 'darwin')
+    expect(environment.NO_PROXY).toBe('upper.invalid, LOCALHOST ,127.0.0.1')
+    expect(environment.no_proxy).toBe('lower.invalid,127.0.0.1,localhost')
+    expect(codexProcessEnvironment(undefined, environment, 'darwin')).toEqual(environment)
+  })
+  it('retains the effective mixed-case Windows value and emits one native variable', () => {
+    expect(
+      codexProcessEnvironment(undefined, { No_Proxy: 'mixed.invalid' }, 'win32').NO_PROXY,
+    ).toBe('mixed.invalid,127.0.0.1,localhost')
+    const environment = codexProcessEnvironment(
+      undefined,
+      {
+        NO_PROXY: 'first.invalid',
+        No_Proxy: 'shadowed.invalid',
+        no_proxy: 'also-shadowed.invalid',
+      },
+      'win32',
+    )
+    expect(environment.NO_PROXY).toBe('first.invalid,127.0.0.1,localhost')
+    expect(Object.keys(environment).filter((key) => key.toUpperCase() === 'NO_PROXY')).toEqual([
+      'NO_PROXY',
+    ])
+    // Node deduplicates Windows key spellings before dropping undefined values.
+    expect(
+      codexProcessEnvironment(
+        undefined,
+        { NO_PROXY: undefined, no_proxy: 'shadowed.invalid' },
+        'win32',
+      ).NO_PROXY,
+    ).toBe('127.0.0.1,localhost')
+  })
+  it('fails before launch instead of truncating exclusions at byte or item capacity', () => {
+    const allowed = 'a'.repeat(8192 - ',127.0.0.1,localhost'.length)
+    expect(
+      Buffer.byteLength(
+        codexProcessEnvironment(undefined, { NO_PROXY: allowed }, 'darwin').NO_PROXY!,
+      ),
+    ).toBe(8192)
+    expect(() => codexProcessEnvironment(undefined, { NO_PROXY: allowed + 'a' }, 'darwin')).toThrow(
+      /capacity/u,
+    )
+    expect(
+      codexProcessEnvironment(
+        undefined,
+        { NO_PROXY: Array.from({ length: 254 }, () => 'a').join(',') },
+        'darwin',
+      ).NO_PROXY?.split(','),
+    ).toHaveLength(256)
+    expect(() =>
+      codexProcessEnvironment(
+        undefined,
+        { NO_PROXY: Array.from({ length: 255 }, () => 'a').join(',') },
+        'darwin',
+      ),
+    ).toThrow(/capacity/u)
+    expect(() =>
+      codexProcessEnvironment(undefined, { NO_PROXY: 'a'.repeat(8193) }, 'darwin'),
+    ).toThrow(/8 KiB/u)
+    expect(() => codexProcessEnvironment(undefined, { NO_PROXY: 'bad\0entry' }, 'darwin')).toThrow(
+      /Invalid/u,
+    )
+  })
+})
 
 let workerFixture: Awaited<ReturnType<typeof nativeWorkerFixture>>
 beforeAll(async () => {
@@ -3150,6 +3247,218 @@ describe('Codex Native display metadata', () => {
     }
   })
 })
+
+it('keeps injected live and history process owners in control before EOF or root signals', async () => {
+  const owners: Array<{ child: ChildProcessWithoutNullStreams; close: ReturnType<typeof vi.fn> }> =
+    []
+  const factory = () => {
+    const child = completedCapabilityActor()
+    const close = vi.fn<() => Promise<void>>(async () => {
+      expect(child.stdin.writableEnded).toBe(false)
+      const exited = new Promise<void>((done) => child.once('exit', () => done()))
+      child.kill()
+      await exited
+    })
+    const owned = { child, close }
+    owners.push(owned)
+    return owned
+  }
+  const adapter = new CodexAgentAdapter('/owned/codex', factory, { storageRoot: '/owned/native' })
+  try {
+    await collectRun(adapter)
+    await expect(
+      adapter.prepareNativeFork(nativeLaunchForkSource(), new AbortController().signal),
+    ).rejects.toThrow(/Native|native|Codex/u)
+    expect(owners).toHaveLength(2)
+    expect(owners[0]!.close).not.toHaveBeenCalled()
+    expect(owners[1]!.close).toHaveBeenCalledOnce()
+    await adapter.dispose()
+    expect(owners[0]!.close).toHaveBeenCalledOnce()
+    expect(owners[1]!.close).toHaveBeenCalledOnce()
+  } finally {
+    await adapter.dispose()
+  }
+})
+
+it.each([false, true])(
+  'waits for a late owned startup and preserves cleanup failure: %s',
+  async (rejectClose) => {
+    type Owned = { child: ChildProcessWithoutNullStreams; close: () => Promise<void> }
+    let provide: ((value: Owned) => void) | undefined
+    let settleClose: (() => void) | undefined
+    const pending = new Promise<Owned>((done) => {
+      provide = done
+    })
+    const closeGate = new Promise<void>((done) => {
+      settleClose = done
+    })
+    const factory = vi.fn<() => Promise<Owned>>(() => pending)
+    const child = completedCapabilityActor()
+    const failure = new Error('Owned fixture physical cleanup is unconfirmed')
+    let rpc = false
+    child.stdin.on('data', () => {
+      rpc = true
+    })
+    const close = vi.fn<() => Promise<void>>(async () => {
+      await closeGate
+      if (rejectClose) throw failure
+      child.kill()
+    })
+    const adapter = new CodexAgentAdapter('/owned/codex', factory, { storageRoot: '/owned/native' })
+    const run = collectRun(adapter).catch((error: unknown) => error)
+    await vi.waitFor(() => expect(factory).toHaveBeenCalledOnce())
+    let disposed = false
+    const disposal = adapter.dispose().then(
+      () => {
+        disposed = true
+        return null
+      },
+      (error: unknown) => error,
+    )
+    try {
+      provide!({ child, close })
+      await vi.waitFor(() => expect(close).toHaveBeenCalledOnce())
+      expect(disposed).toBe(false)
+      expect(rpc).toBe(false)
+      settleClose!()
+      expect(await disposal).toBe(rejectClose ? failure : null)
+      expect(disposed).toBe(!rejectClose)
+      await run
+      expect(rpc).toBe(false)
+    } finally {
+      settleClose!()
+      child.kill()
+      await run
+      await adapter.dispose().catch(() => undefined)
+    }
+  },
+)
+
+it.each([false, true])(
+  'reserves pending inspection and still closes its independent live owner: %s',
+  async (rejectReaderClose) => {
+    type Owned = { child: ChildProcessWithoutNullStreams; close: () => Promise<void> }
+    const live = completedCapabilityActor(),
+      reader = completedCapabilityActor()
+    let provide: ((value: Owned) => void) | undefined
+    let settleClose: (() => void) | undefined
+    const pending = new Promise<Owned>((done) => {
+      provide = done
+    })
+    const closeGate = new Promise<void>((done) => {
+      settleClose = done
+    })
+    let calls = 0,
+      readerRpc = false,
+      liveReads = 0
+    live.stdin.on('data', (chunk: Buffer) => {
+      for (const line of chunk.toString('utf8').trim().split('\n'))
+        if (JSON.parse(line).method === 'thread/read') liveReads++
+    })
+    reader.stdin.on('data', () => {
+      readerRpc = true
+    })
+    const readerClose = vi.fn<() => Promise<void>>(async () => {
+      await closeGate
+      if (rejectReaderClose) throw new Error('Owned reader physical cleanup is unconfirmed')
+      reader.kill()
+    })
+    const liveClose = vi.fn<() => Promise<void>>(async () => {
+      live.kill()
+    })
+    const factory = (): Owned | Promise<Owned> => {
+      calls++
+      return calls === 1
+        ? {
+            child: live,
+            close: liveClose,
+          }
+        : pending
+    }
+    const adapter = new CodexAgentAdapter('/owned/codex', factory, { storageRoot: '/owned/native' })
+    await collectRun(adapter)
+    const inspecting = adapter
+      .prepareNativeFork(nativeLaunchForkSource(), new AbortController().signal)
+      .catch((error: unknown) => error)
+    await vi.waitFor(() => expect(calls).toBe(2))
+    await expect(
+      adapter.prepareNativeFork(nativeLaunchForkSource(), new AbortController().signal),
+    ).rejects.toThrow('native history reader is unavailable')
+    expect(calls).toBe(2)
+    let disposed = false
+    const beforeDisposalReads = liveReads
+    const probing = rejectReaderClose
+      ? Promise.resolve(undefined)
+      : adapter.probeNativeStatus(
+          {
+            sessionId: 'session-1',
+            agentId: 'codex',
+            requestId: 'run-1',
+            runId: 'run-1',
+            nativeSessionId: 'thread-1',
+            nativeTurnId: 'turn-1',
+            bindingGeneration: 1,
+            cwd: '/project',
+            model: null,
+            effort: null,
+          },
+          new AbortController().signal,
+        )
+    // The already-started probe crosses its cached-connection await before disposal.
+    const disposal = Promise.resolve()
+      .then(() => adapter.dispose())
+      .then(
+        () => {
+          disposed = true
+          return null
+        },
+        (error: unknown) => error,
+      )
+    try {
+      provide!({ child: reader, close: readerClose })
+      await vi.waitFor(() => expect(readerClose).toHaveBeenCalledOnce())
+      expect(disposed).toBe(false)
+      expect(readerRpc).toBe(false)
+      await probing
+      expect(liveReads).toBe(beforeDisposalReads)
+      const beforeReads = liveReads
+      if (!rejectReaderClose) {
+        await adapter.probeNativeStatus(
+          {
+            sessionId: 'session-1',
+            agentId: 'codex',
+            requestId: 'run-1',
+            runId: 'run-1',
+            nativeSessionId: 'thread-1',
+            nativeTurnId: 'turn-1',
+            bindingGeneration: 1,
+            cwd: '/project',
+            model: null,
+            effort: null,
+          },
+          new AbortController().signal,
+        )
+      }
+      expect(liveReads).toBe(beforeReads)
+      settleClose!()
+      await inspecting
+      const outcome = await disposal
+      expect(outcome).toEqual(
+        rejectReaderClose ? new Error('Owned reader physical cleanup is unconfirmed') : null,
+      )
+      expect(liveClose).toHaveBeenCalledOnce()
+      expect(disposed).toBe(!rejectReaderClose)
+      expect(readerRpc).toBe(false)
+    } finally {
+      settleClose!()
+      live.kill()
+      reader.kill()
+      await inspecting
+      await disposal
+      await adapter.dispose().catch(() => undefined)
+    }
+  },
+)
 
 async function collectRun(
   adapter: CodexAgentAdapter,

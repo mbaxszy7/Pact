@@ -228,6 +228,11 @@ export const appErrorSchema = z.object({
     'VALIDATION',
     'PERMISSION_DENIED',
     'RUNTIME_UNAVAILABLE',
+    'DATABASE_IN_USE',
+    'DATABASE_INCOMPATIBLE',
+    'DATABASE_BACKUP_FAILED',
+    'DATABASE_MIGRATION_FAILED',
+    'DATABASE_STORAGE_FAILED',
     'TIMEOUT',
     'CONFLICT',
     'AGENT_CAPACITY',
@@ -260,14 +265,360 @@ export function rpcResultSchema<T extends z.ZodType>(valueSchema: T) {
 export const appInfoSchema = z.object({
   name: z.string(),
   version: z.string(),
-  platform: z.enum(['darwin', 'win32', 'linux']),
+  platform: z.enum(['darwin', 'win32']),
   arch: z.string(),
   packaged: z.boolean(),
 })
 
 export type AppInfo = z.infer<typeof appInfoSchema>
 
+export const IPC_TRAFFIC_UNIT =
+  'json-utf8-regexp-source-flags-null-binary-skeleton-plus-visible-binary-bytes-v1' as const
+export const IPC_TRAFFIC_OWNER_CATEGORIES = {
+  'renderer-bridge': [
+    'renderer-main.invoke',
+    'main-renderer.reply',
+    'renderer-main.send',
+    'main-renderer.event',
+  ],
+  'main-utility': [
+    'main-utility.request',
+    'utility-main.reply',
+    'utility-main.event',
+    'main-utility.control',
+    'utility-main.control',
+  ],
+  'main-directory': ['main-directory.request', 'directory-main.reply'],
+  'utility-markdown': ['utility-markdown.request', 'markdown-utility.reply'],
+  'utility-image': ['utility-image.init', 'image-utility.reply'],
+  'utility-native-json': ['utility-native-json.init', 'native-json-utility.reply'],
+  'utility-native-fork': [
+    'utility-native-fork.init',
+    'utility-native-fork.control',
+    'native-fork-utility.reply',
+  ],
+  'main-diagnostic-log': [
+    'main-diagnostic-log.init',
+    'main-diagnostic-log.request',
+    'diagnostic-log-main.reply',
+  ],
+  'renderer-monaco': ['renderer-monaco.request', 'monaco-renderer.reply'],
+} as const
+export const ipcTrafficOwnerSchema = z.enum([
+  'renderer-bridge',
+  'main-utility',
+  'main-directory',
+  'utility-markdown',
+  'utility-image',
+  'utility-native-json',
+  'utility-native-fork',
+  'main-diagnostic-log',
+  'renderer-monaco',
+])
+export const ipcTrafficCategorySchema = z.enum([
+  'renderer-main.invoke',
+  'main-renderer.reply',
+  'renderer-main.send',
+  'main-renderer.event',
+  'main-utility.request',
+  'utility-main.reply',
+  'utility-main.event',
+  'main-utility.control',
+  'utility-main.control',
+  'main-directory.request',
+  'directory-main.reply',
+  'utility-markdown.request',
+  'markdown-utility.reply',
+  'utility-image.init',
+  'image-utility.reply',
+  'utility-native-json.init',
+  'native-json-utility.reply',
+  'utility-native-fork.init',
+  'utility-native-fork.control',
+  'native-fork-utility.reply',
+  'main-diagnostic-log.init',
+  'main-diagnostic-log.request',
+  'diagnostic-log-main.reply',
+  'renderer-monaco.request',
+  'monaco-renderer.reply',
+])
+export type IpcTrafficCategory = z.infer<typeof ipcTrafficCategorySchema>
+export const ipcTrafficIssueSchema = z.enum([
+  'invalid_limits',
+  'byte_limit',
+  'node_limit',
+  'depth_limit',
+  'unsupported_value',
+  'unsupported_prototype',
+  'unsupported_binary',
+  'accessor',
+  'to_json',
+  'cycle',
+  'uninspectable',
+  'counter_overflow',
+  'epoch_limit',
+  'invalid_epoch',
+  'unvalidated_message',
+  'transport_error',
+  'unknown_category',
+  'disposed',
+  'cleanup_unavailable',
+])
+export type IpcTrafficIssue = z.infer<typeof ipcTrafficIssueSchema>
+export const ipcTrafficMeasurementSchema = z
+  .strictObject({
+    complete: z.boolean(),
+    jsonBytes: z
+      .number()
+      .int()
+      .min(0)
+      .max(128 * 1024 * 1024),
+    binaryBytes: z
+      .number()
+      .int()
+      .min(0)
+      .max(128 * 1024 * 1024),
+    totalBytes: z
+      .number()
+      .int()
+      .min(0)
+      .max(128 * 1024 * 1024),
+    reason: ipcTrafficIssueSchema.optional(),
+  })
+  .refine(
+    (value) =>
+      value.totalBytes === value.jsonBytes + value.binaryBytes &&
+      (value.complete ? value.reason === undefined : value.reason !== undefined),
+  )
+export type IpcTrafficMeasurement = z.infer<typeof ipcTrafficMeasurementSchema>
+export const monacoIpcObservationSchema = z.discriminatedUnion('type', [
+  z.strictObject({
+    type: z.literal('message'),
+    unit: z.literal(IPC_TRAFFIC_UNIT),
+    category: z.enum(['renderer-monaco.request', 'monaco-renderer.reply']),
+    measurement: ipcTrafficMeasurementSchema,
+  }),
+  z.strictObject({
+    type: z.enum(['created', 'termination-requested', 'transport-error']),
+    unit: z.literal(IPC_TRAFFIC_UNIT),
+  }),
+])
+export type MonacoIpcObservation = z.infer<typeof monacoIpcObservationSchema>
+export const ipcTrafficUncoveredSchema = z.enum([
+  'renderer-main-bridge',
+  'main-utility-diagnostic-control',
+  'main-directory-worker',
+  'utility-markdown-worker',
+  'utility-image-codec-worker',
+  'utility-native-json-worker',
+  'utility-native-fork-worker',
+  'main-diagnostic-log-worker',
+  'renderer-monaco-workers',
+])
+const ipcTrafficCountsSchema = z
+  .strictObject({
+    messages: z.number().int().min(0).max(1_000_000),
+    incompleteMessages: z.number().int().min(0).max(1_000_000),
+    jsonBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    binaryBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    totalBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  })
+  .refine(
+    (value) =>
+      value.totalBytes === value.jsonBytes + value.binaryBytes &&
+      value.incompleteMessages <= value.messages,
+  )
+export const ipcTrafficOwnerSnapshotSchema = z
+  .strictObject({
+    owner: ipcTrafficOwnerSchema,
+    epoch: z.uuid().nullable(),
+    transportEpoch: z.number().int().min(1).max(64),
+    startedTransports: z.number().int().min(0).max(1_000_000),
+    settledTransports: z.number().int().min(0).max(1_000_000),
+    activeTransports: z.number().int().min(0).max(64),
+    highWaterTransports: z.number().int().min(0).max(64),
+    complete: z.boolean(),
+    issues: z.array(ipcTrafficIssueSchema).max(19),
+    counters: z
+      .array(
+        z.strictObject({
+          category: ipcTrafficCategorySchema,
+          business: ipcTrafficCountsSchema,
+          control: ipcTrafficCountsSchema,
+        }),
+      )
+      .max(5),
+  })
+  .refine(
+    (value) =>
+      new Set(value.counters.map((row) => row.category)).size === value.counters.length &&
+      value.counters.length === IPC_TRAFFIC_OWNER_CATEGORIES[value.owner].length &&
+      value.counters.every((row) =>
+        (IPC_TRAFFIC_OWNER_CATEGORIES[value.owner] as readonly string[]).includes(row.category),
+      ) &&
+      new Set(value.issues).size === value.issues.length &&
+      value.startedTransports - value.settledTransports === value.activeTransports &&
+      value.highWaterTransports >= value.activeTransports &&
+      Number.isSafeInteger(
+        value.counters.reduce(
+          (total, row) => total + row.business.totalBytes + row.control.totalBytes,
+          0,
+        ),
+      ) &&
+      (!value.complete ||
+        (value.epoch !== null &&
+          value.issues.length === 0 &&
+          value.counters.every(
+            (row) => row.business.incompleteMessages === 0 && row.control.incompleteMessages === 0,
+          ))),
+  )
+export type IpcTrafficOwnerSnapshot = z.infer<typeof ipcTrafficOwnerSnapshotSchema>
+export const ipcTrafficSchema = z
+  .strictObject({
+    schemaVersion: z.literal(1),
+    unit: z.literal(IPC_TRAFFIC_UNIT),
+    complete: z.boolean(),
+    owners: z.array(ipcTrafficOwnerSnapshotSchema).max(9),
+    uncovered: z.array(ipcTrafficUncoveredSchema).max(9),
+  })
+  .refine(
+    (value) =>
+      new Set(value.owners.map((owner) => owner.owner)).size === value.owners.length &&
+      new Set(value.uncovered).size === value.uncovered.length &&
+      Number.isSafeInteger(
+        value.owners.reduce(
+          (total, owner) =>
+            total +
+            owner.counters.reduce(
+              (bytes, row) => bytes + row.business.totalBytes + row.control.totalBytes,
+              0,
+            ),
+          0,
+        ),
+      ) &&
+      (!value.complete ||
+        (value.owners.length === 9 &&
+          value.uncovered.length === 0 &&
+          value.owners.every((owner) => owner.complete))),
+  )
+export type IpcTraffic = z.infer<typeof ipcTrafficSchema>
+
+export const nativeMemoryDiagnosticsSchema = z
+  .strictObject({
+    unit: z.literal('native-working-reservations-v1'),
+    observationsComplete: z.boolean(),
+    chargedBytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(512 * 1024 * 1024)
+      .nullable(),
+    reservationItems: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    highWaterBytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(512 * 1024 * 1024)
+      .nullable(),
+    highWaterItems: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    acquiredBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    releasedBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    acquiredItems: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    releasedItems: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  })
+  .refine((value) => {
+    const complete = Object.values(value).every((count) => count !== null)
+    if (value.observationsComplete !== complete) return false
+    const {
+      acquiredBytes,
+      releasedBytes,
+      chargedBytes,
+      acquiredItems,
+      releasedItems,
+      reservationItems,
+      highWaterBytes,
+      highWaterItems,
+    } = value
+    return (
+      (acquiredBytes === null ||
+        releasedBytes === null ||
+        chargedBytes === null ||
+        acquiredBytes - releasedBytes === chargedBytes) &&
+      (acquiredItems === null ||
+        releasedItems === null ||
+        reservationItems === null ||
+        acquiredItems - releasedItems === reservationItems) &&
+      (highWaterBytes === null || chargedBytes === null || highWaterBytes >= chargedBytes) &&
+      (highWaterItems === null ||
+        reservationItems === null ||
+        highWaterItems >= reservationItems) &&
+      (highWaterBytes === null || acquiredBytes === null || highWaterBytes <= acquiredBytes) &&
+      (highWaterItems === null || acquiredItems === null || highWaterItems <= acquiredItems)
+    )
+  })
+export type NativeMemoryDiagnostics = z.infer<typeof nativeMemoryDiagnosticsSchema>
+
 export const runtimeHealthSchema = z.object({
+  ipcTraffic: ipcTrafficSchema.optional(),
+  performance: z
+    .strictObject({
+      eventLoopLagP95Ms: z.number().finite().nonnegative(),
+      eventLoopSamples: z.number().int().nonnegative(),
+      databaseBytes: z.number().int().nonnegative().optional(),
+      walBytes: z.number().int().nonnegative().optional(),
+      activeResources: z.record(z.string().max(64), z.number().int().nonnegative()),
+      resourceHighWater: z.number().int().nonnegative(),
+      resourceCapacityExceeded: z.boolean(),
+      nativeMemory: nativeMemoryDiagnosticsSchema.optional(),
+      sqlite: z.strictObject({
+        operations: z.number().int().nonnegative(),
+        transactions: z.number().int().nonnegative(),
+        rowsReturned: z.number().int().nonnegative(),
+        totalMs: z.number().finite().nonnegative(),
+        maxMs: z.number().finite().nonnegative(),
+        planOverflow: z.boolean(),
+        unsupportedOperations: z.boolean(),
+        firstPlanFailure: z
+          .strictObject({
+            reason: z.enum([
+              'statement-bytes',
+              'plan-capacity',
+              'plan-rows',
+              'plan-detail',
+              'plan-bytes',
+              'explain-failed',
+            ]),
+            sqlSha256: z
+              .string()
+              .regex(/^[a-f\d]{64}$/u)
+              .nullable(),
+            sourceBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+            operationIndex: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+            retainedPlans: z.number().int().nonnegative().max(64),
+            retainedPlanBytes: z
+              .number()
+              .int()
+              .nonnegative()
+              .max(16 * 1024),
+            planRows: z.number().int().nonnegative().max(0xffffffff).nullable(),
+          })
+          .refine((failure) =>
+            failure.sourceBytes > 8192
+              ? failure.reason === 'statement-bytes' && failure.sqlSha256 === null
+              : failure.reason !== 'statement-bytes' && failure.sqlSha256 !== null,
+          )
+          .optional(),
+        queryPlans: z
+          .array(
+            z.strictObject({
+              sqlSha256: z.string().regex(/^[a-f\d]{64}$/u),
+              details: z.array(z.string().max(512)).max(64),
+            }),
+          )
+          .max(64),
+      }),
+    })
+    .optional(),
   conversation: z
     .strictObject({
       interestedSessions: z.number().int().nonnegative().max(CONVERSATION_INTEREST_ITEMS),
@@ -369,6 +720,8 @@ export type DefaultSessionSettingsState = z.infer<typeof defaultSessionSettingsS
 
 export const agentModelOptionSchema = z.strictObject({
   id: z.string().min(1),
+  // A CLI alias may resolve to a different wire ID for this configuration/CWD.
+  resolvedModel: z.string().min(1).max(240).optional(),
   displayName: z.string().min(1),
   supportedEfforts: z.array(z.string().min(1)),
   defaultEffort: z.string().min(1).optional(),
@@ -2333,6 +2686,33 @@ export const utilityResponseSchema = z.discriminatedUnion('type', [
 
 export type UtilityResponse = z.infer<typeof utilityResponseSchema>
 
+export const runtimeStartupFailureSchema = z.strictObject({
+  type: z.literal('runtime.startup-failed.event'),
+  failureId: z.string().uuid(),
+  stage: z.enum(['persistence', 'runtime']),
+  code: z.enum([
+    'DATABASE_IN_USE',
+    'DATABASE_INCOMPATIBLE',
+    'DATABASE_BACKUP_FAILED',
+    'DATABASE_MIGRATION_FAILED',
+    'DATABASE_STORAGE_FAILED',
+  ]),
+  reason: z
+    .string()
+    .min(1)
+    .max(128)
+    .regex(/^[a-z-]+$/u),
+  dataFilePath: z.string().min(1).max(4096),
+  backupFilePath: z.string().min(1).max(4096).optional(),
+  partialBackupFilePath: z.string().min(1).max(4096).optional(),
+  stagingFilePath: z.string().min(1).max(4096).optional(),
+})
+export type RuntimeStartupFailure = z.infer<typeof runtimeStartupFailureSchema>
+export const runtimeStartupFailureAckSchema = z.strictObject({
+  type: z.literal('runtime.startup-failed.ack'),
+  failureId: z.string().uuid(),
+})
+
 export const utilityEventSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('runtime.ready.event') }),
   z.strictObject({
@@ -2344,6 +2724,7 @@ export const utilityEventSchema = z.discriminatedUnion('type', [
     type: z.literal('native-presence.changed.event'),
     version: nativePresenceVersionSchema,
   }),
+  runtimeStartupFailureSchema,
   z.strictObject({
     type: z.literal('conversation.patch.event'),
     patch: conversationPatchSchema,
@@ -2374,6 +2755,8 @@ export interface DesktopBridge {
   cancelWorkspaceArchive(
     input: WorkspaceArchiveOperationInput,
   ): Promise<RpcResult<WorkspaceArchiveReceipt>>
+  /** Fixture-only scalar observation; local Preload counters, never generic IPC or business DTOs. */
+  observeMonacoWorkerTraffic?(this: void, observation: MonacoIpcObservation): void
   getDiagnosticStatus?(): Promise<DiagnosticStatus>
   onDiagnosticStatusChanged?(listener: (status: DiagnosticStatus) => void): () => void
   reportRendererFault?(fault: RendererFault): void

@@ -1,3 +1,7 @@
+import { Buffer } from 'node:buffer'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 const harness = vi.hoisted(() => {
@@ -118,6 +122,41 @@ async function turn(): Promise<void> {
 }
 
 describe('Utility startup readiness and quit delivery', () => {
+  for (const timing of ['before-wait', 'during-wait'] as const) {
+    it(`preserves a fatal startup failure ${timing} without another readiness timeout`, async () => {
+      vi.useFakeTimers()
+      const runtime = createUtilityProcessClient()
+      const onStartupFailed =
+        vi.fn<(failure: import('@pact/contracts').RuntimeStartupFailure) => void>()
+      runtime.start({ ...startOptions, onStartupFailed })
+      const child = harness.children.at(-1)!
+      const waiting = timing === 'during-wait' ? runtime.waitUntilReady() : undefined
+      const failure = {
+        type: 'runtime.startup-failed.event',
+        failureId: crypto.randomUUID(),
+        stage: 'persistence',
+        code: 'DATABASE_INCOMPATIBLE',
+        reason: 'migration-history-diverged',
+        dataFilePath: '/fixture/pact.sqlite',
+      }
+      child.emit('message', failure)
+      await expect(waiting ?? runtime.waitUntilReady()).resolves.toMatchObject({
+        ok: false,
+        error: { code: 'DATABASE_INCOMPATIBLE' },
+      })
+      await expect(runtime.waitUntilReady()).resolves.toMatchObject({
+        ok: false,
+        error: { code: 'DATABASE_INCOMPATIBLE' },
+      })
+      expect(onStartupFailed).toHaveBeenCalledOnce()
+      expect(child.posted).toContainEqual({
+        type: 'runtime.startup-failed.ack',
+        failureId: failure.failureId,
+      })
+      expect(vi.getTimerCount()).toBe(0)
+      runtime.dispose()
+    })
+  }
   it('waits for cold readiness before the first Appearance RPC, retaining the ordinary read deadline', async () => {
     vi.useFakeTimers()
     const runtime = createUtilityProcessClient()
@@ -263,6 +302,170 @@ describe('Utility startup readiness and quit delivery', () => {
     await expect(cancelled).resolves.toEqual({ ok: true, value: { operationId, cancelled: true } })
     runtime.dispose()
     expect(vi.getTimerCount()).toBe(0)
+  })
+})
+
+function fixture(measure: boolean) {
+  const root = mkdtempSync(join(tmpdir(), 'pact-ipc-test-'))
+  vi.stubEnv('NODE_ENV', measure ? 'test' : 'production')
+  vi.stubEnv('PACT_E2E_IPC_NONCE', measure ? 'a'.repeat(64) : '')
+  vi.stubEnv('PACT_E2E_ROOT', measure ? root : '')
+  const runtime = createUtilityProcessClient()
+  const options = { databaseFile: join(root, 'pact.sqlite'), migrationsFolder: root }
+  runtime.start(options)
+  return {
+    runtime,
+    options,
+    cleanup: () => {
+      runtime.dispose()
+      vi.unstubAllEnvs()
+      rmSync(root, { recursive: true, force: true })
+    },
+  }
+}
+async function observedHealth(
+  runtime: ReturnType<typeof createUtilityProcessClient>,
+  child: (typeof harness.children)[number],
+) {
+  const pending = runtime.getHealth()
+  const packet = postedRequest(child, child.posted.length - 1)
+  child.emit(
+    'message',
+    structuredClone({
+      type: 'runtime.health.response',
+      requestId: packet.requestId,
+      health: {
+        status: 'ready',
+        database: 'ready',
+        pid: 100,
+        checkedAt: new Date().toISOString(),
+      },
+    }),
+  )
+  const result = await pending
+  if (!result.ok) throw new Error('Expected health response.')
+  return result.value
+}
+
+describe('Utility transport logical IPC observation', () => {
+  it('leaves ordinary production health unchanged without isolated fixture configuration', async () => {
+    const { runtime, cleanup } = fixture(false)
+    try {
+      const result = await observedHealth(runtime, harness.children.at(-1)!)
+      expect(result.ipcTraffic).toBeUndefined()
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('counts every delivered request/reply once, separates health and keeps missing Worker coverage', async () => {
+    const { runtime, cleanup } = fixture(true)
+    try {
+      const child = harness.children.at(-1)!
+      const pending = runtime.request({ type: 'appearance.get.request' }, 'appearance.response')
+      const response = {
+        type: 'appearance.response',
+        requestId: postedRequest(child).requestId,
+        result: {
+          ok: true,
+          value: { theme: 'system', windowMaterial: 'system', materialOpacity: 85, revision: 0 },
+        },
+      }
+      child.emit('message', structuredClone(response))
+      await expect(pending).resolves.toMatchObject({ kind: 'response' })
+      const current = await observedHealth(runtime, child)
+      const owner = current.ipcTraffic?.owners[0]
+      expect(owner?.complete).toBe(true)
+      expect(
+        owner?.counters.find((row) => row.category === 'main-utility.request')?.business,
+      ).toMatchObject({
+        messages: 1,
+        totalBytes: Buffer.byteLength(JSON.stringify(child.posted[0])),
+      })
+      expect(
+        owner?.counters.find((row) => row.category === 'utility-main.reply')?.business,
+      ).toMatchObject({
+        messages: 1,
+        totalBytes: Buffer.byteLength(JSON.stringify(response)),
+      })
+      expect(
+        owner?.counters.find((row) => row.category === 'main-utility.request')?.control.messages,
+      ).toBe(1)
+      expect(
+        owner?.counters.find((row) => row.category === 'utility-main.reply')?.control.messages,
+      ).toBe(1)
+      expect(current.ipcTraffic?.complete).toBe(false)
+      expect(current.ipcTraffic?.uncovered).toContain('main-utility-diagnostic-control')
+      expect(current.ipcTraffic?.uncovered).toContain('utility-native-json-worker')
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('observes invalid and late cloned replies without changing existing correlation behavior', async () => {
+    const { runtime, cleanup } = fixture(true)
+    try {
+      const child = harness.children.at(-1)!
+      child.emit('message', { unrecognized: true })
+      const pending = runtime.request({ type: 'appearance.get.request' }, 'appearance.response')
+      const response = {
+        type: 'appearance.response',
+        requestId: postedRequest(child).requestId,
+        result: {
+          ok: true,
+          value: { theme: 'system', windowMaterial: 'system', materialOpacity: 85, revision: 0 },
+        },
+        extra: new Date(0),
+      }
+      child.emit('message', structuredClone(response))
+      await expect(pending).resolves.toMatchObject({ kind: 'response' })
+      child.emit('message', structuredClone({ ...response, extra: undefined }))
+      const owner = (await observedHealth(runtime, child)).ipcTraffic?.owners[0]
+      expect(owner?.issues).toContain('unvalidated_message')
+      expect(owner?.issues).toContain('unsupported_prototype')
+      expect(
+        owner?.counters.find((row) => row.category === 'utility-main.reply')?.business,
+      ).toMatchObject({ messages: 2, incompleteMessages: 1 })
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('advances a Utility restart epoch without losing cumulative Main counters', async () => {
+    const { runtime, options, cleanup } = fixture(true)
+    try {
+      const previousChild = harness.children.at(-1)!
+      const before = (await observedHealth(runtime, previousChild)).ipcTraffic?.owners[0]
+      previousChild.emit('exit', 0)
+      runtime.start(options)
+      const after = (await observedHealth(runtime, harness.children.at(-1)!)).ipcTraffic?.owners[0]
+      expect(after?.epoch).toBe(before?.epoch)
+      expect(after?.transportEpoch).toBe(2)
+      expect(
+        after?.counters.find((row) => row.category === 'main-utility.request')?.control.messages,
+      ).toBe(2)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('keeps a failed post not-sent and marks its observation incomplete', async () => {
+    const { runtime, cleanup } = fixture(true)
+    try {
+      const child = harness.children.at(-1)!
+      child.throwOnPost = true
+      await expect(
+        runtime.request({ type: 'appearance.get.request' }, 'appearance.response'),
+      ).resolves.toMatchObject({ kind: 'not-sent' })
+      child.throwOnPost = false
+      const owner = (await observedHealth(runtime, child)).ipcTraffic?.owners[0]
+      expect(owner?.issues).toContain('transport_error')
+      expect(
+        owner?.counters.find((row) => row.category === 'main-utility.request')?.business.messages,
+      ).toBe(0)
+    } finally {
+      cleanup()
+    }
   })
 })
 

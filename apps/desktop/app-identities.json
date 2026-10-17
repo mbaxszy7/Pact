@@ -14,10 +14,10 @@
     "outputDirectory": "production-local"
   },
   "development-ci": {
-    "name": "Pact - Development - CI",
-    "appId": "com.pact.desktop.development.ci",
+    "name": "Pact Dev",
+    "appId": "com.pact.desktop.dev",
     "packageName": "pact-development-ci",
-    "profileDirectory": "Pact - Development - CI",
+    "profileDirectory": "Pact Dev",
     "outputDirectory": "development-ci"
   },
   "production-ci": {

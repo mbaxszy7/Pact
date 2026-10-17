@@ -21,6 +21,7 @@ import {
 import type { RendererTrust } from '../renderer-trust'
 
 import { DiagnosticProducer } from '../../diagnostics/producer'
+import { LogicalIpcTrafficCollector, observeWorkerTraffic } from '../../shared/logical-ipc-traffic'
 
 /** One owner for admission, filesystem isolation, status, Debug and native menu cleanup. */
 export class DiagnosticLogs {
@@ -55,6 +56,8 @@ export class DiagnosticLogs {
   constructor(
     readonly directory: string,
     private readonly trust: RendererTrust,
+    private readonly utilityTraffic?: LogicalIpcTrafficCollector,
+    workerTraffic?: LogicalIpcTrafficCollector,
   ) {
     const version = app.getVersion().match(/^\d+\.\d+\.\d+/u)?.[0] ?? '0.0.0'
     this.identity = {
@@ -68,6 +71,14 @@ export class DiagnosticLogs {
         workerData: { directory, pid: process.pid },
         resourceLimits: { maxOldGenerationSizeMb: 16, maxYoungGenerationSizeMb: 4 },
       })
+      workerTraffic?.record('main-diagnostic-log.init', 'control', { directory, pid: process.pid })
+      observeWorkerTraffic(
+        this.worker,
+        workerTraffic,
+        'main-diagnostic-log.request',
+        'diagnostic-log-main.reply',
+        'control',
+      )
     } catch {
       this.dead = true
       this.state = 'unavailable'
@@ -135,11 +146,14 @@ export class DiagnosticLogs {
     if (this.utilityTargets.size >= 1) return
     this.utilityTargets.add(child)
     child.once('exit', () => this.utilityTargets.delete(child))
-    if (this.debugUntil)
-      child.postMessage({
+    if (this.debugUntil) {
+      const packet = {
         type: 'diagnostic.debug',
         until: this.debugUntil,
-      } satisfies DiagnosticPacket)
+      } satisfies DiagnosticPacket
+      child.postMessage(packet)
+      this.utilityTraffic?.record('main-utility.control', 'control', packet)
+    }
   }
 
   acceptUtility(child: UtilityProcess, input: unknown): boolean {
@@ -156,12 +170,15 @@ export class DiagnosticLogs {
       return true
     this.submit(packet, (written) => {
       try {
-        child.postMessage({
+        const acknowledgement = {
           type: 'diagnostic.ack',
           id: packet.id,
           written,
-        } satisfies DiagnosticPacket)
+        } satisfies DiagnosticPacket
+        child.postMessage(acknowledgement)
+        this.utilityTraffic?.record('main-utility.control', 'control', acknowledgement)
       } catch {
+        this.utilityTraffic?.invalidate('transport_error')
         /* Departed producer. */
       }
     })
@@ -282,11 +299,14 @@ export class DiagnosticLogs {
     this.producer.setDebug(this.debugUntil)
     for (const child of this.utilityTargets) {
       try {
-        child.postMessage({
+        const packet = {
           type: 'diagnostic.debug',
           until: this.debugUntil,
-        } satisfies DiagnosticPacket)
+        } satisfies DiagnosticPacket
+        child.postMessage(packet)
+        this.utilityTraffic?.record('main-utility.control', 'control', packet)
       } catch {
+        this.utilityTraffic?.invalidate('transport_error')
         /* Child exit owns cleanup. */
       }
     }

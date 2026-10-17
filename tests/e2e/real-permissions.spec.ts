@@ -24,7 +24,7 @@ import { matchesWindowsCommandApproval, windowsTextCommand } from './windows-tes
 for (const choice of ['once', 'session'] as const) {
   test(
     `real ${choice} permission executes its actual command and does not grant a new Session`,
-    { tag: '@real' },
+    { tag: ['@real', '@real-extended'] },
     async () => {
       test.setTimeout(600_000)
       const context = await launchRealWorkspace(`real-permission-${choice}`)

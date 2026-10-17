@@ -73,6 +73,10 @@ test.describe('Native Session permission lifetime', () => {
             choice === 'session' ? 'acceptForSession' : 'accept',
           ])
           expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(1)
+        } catch (error) {
+          // Capture the actual Electron target before finally closes it; preserve the original failure.
+          await fixture.captureUiFailure(testInfo).catch(() => undefined)
+          throw error
         } finally {
           await quitPact(app)
           await fixture.dispose()

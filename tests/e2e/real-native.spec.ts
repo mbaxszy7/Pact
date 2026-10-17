@@ -16,7 +16,7 @@ import { test } from './runtime-fixture.js'
 
 test(
   'real @all completes each Agent once and keeps ordered distinct response rows',
-  { tag: '@real' },
+  { tag: ['@real', '@real-core'] },
   async () => {
     test.setTimeout(600_000)
     const ctx = await launchRealWorkspace('real-all')
@@ -54,7 +54,7 @@ test(
 
 test(
   'real Claude follow-ups do not rerun Codex and both peer answers reach its next task',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(600_000)
     const ctx = await launchRealWorkspace('real-peer-history')
@@ -121,7 +121,7 @@ test(
 
 test(
   'real Native first title accepts an IPC rename and cold resume preserves title and identity',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(600_000)
     const ctx = await launchRealWorkspace('real-native-title')

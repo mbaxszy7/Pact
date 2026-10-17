@@ -1,8 +1,13 @@
 import { optimizer } from '@electron-toolkit/utils'
-import { app, BrowserWindow, nativeTheme } from 'electron'
-import { dirname, join } from 'node:path'
+import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
+import { randomUUID } from 'node:crypto'
+import { realpathSync } from 'node:fs'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
+
+import type { RuntimeStartupFailure } from '@pact/contracts'
 
 import macIcon from '../../build/icon-mac.png?asset'
+import { hasLogicalIpcFixtureNonce, LogicalIpcWorkerTraffic } from '../shared/logical-ipc-traffic'
 import { registerAppProtocol } from './app-protocol'
 import {
   resolveApplicationIdentity,
@@ -22,10 +27,12 @@ import {
 } from './modules/native-presence'
 import {
   completePackagedSmoke,
+  completePackagedProductionPathProbe,
   configurePackageSmokeUserData,
   isPackageSmoke,
   observePackagedPageLoad,
 } from './package-smoke'
+import { readProductIdentity } from './product-identity'
 import { createRendererTrust } from './renderer-trust'
 import { createUtilityProcessClient } from './utility-process/client'
 import { configureApplicationProfile, resolveRuntimePaths } from './utility-process/runtime-paths'
@@ -41,6 +48,7 @@ let appearanceSettings: AppearanceController
 let diagnostics: DiagnosticLogs | undefined
 let applicationMenu: ApplicationMenu | undefined
 let nativePresence: NativePresence | undefined
+let startupFailureShown = false
 
 function createPactWindow(): BrowserWindow {
   let pageLoad: Promise<void> | undefined
@@ -82,9 +90,10 @@ function createPactWindow(): BrowserWindow {
 
 async function bootstrap(): Promise<void> {
   const identity = resolveApplicationIdentity()
+  const productIdentity = readProductIdentity(identity)
   app.setName(identity.name)
-  configurePackageSmokeUserData()
   configureApplicationProfile(identity)
+  configurePackageSmokeUserData()
   const nativeIdentity = resolveNativeApplicationIdentity(identity)
   const developmentLaunch = developmentNativeInvocation(nativeIdentity, process.argv)
   if (developmentLaunch === 'rejected') {
@@ -114,8 +123,26 @@ async function bootstrap(): Promise<void> {
   if (quitting) return
   if (process.platform === 'win32') app.setAppUserModelId(nativeIdentity.appId)
   if (process.platform === 'darwin' && !app.isPackaged) app.dock?.setIcon(macIcon)
+  if (completePackagedProductionPathProbe()) return
   registerAppProtocol(join(__dirname, '../renderer'))
   const paths = resolveRuntimePaths()
+  let traffic: LogicalIpcWorkerTraffic | undefined
+  if (
+    !app.isPackaged &&
+    hasLogicalIpcFixtureNonce(process.env) &&
+    process.env.PACT_E2E_ROOT &&
+    paths.databaseFile !== ':memory:'
+  ) {
+    try {
+      if (realpathSync(dirname(paths.databaseFile)) === realpathSync(process.env.PACT_E2E_ROOT))
+        traffic = new LogicalIpcWorkerTraffic(
+          ['main-utility', 'main-directory', 'main-diagnostic-log'],
+          randomUUID(),
+        )
+    } catch {
+      /* An unproved fixture stays disabled and cannot satisfy the measurement gate. */
+    }
+  }
   diagnostics = new DiagnosticLogs(
     join(
       paths.databaseFile === ':memory:'
@@ -125,12 +152,60 @@ async function bootstrap(): Promise<void> {
       app.isPackaged ? 'production' : 'development',
     ),
     rendererTrust,
+    traffic?.collector('main-utility'),
+    traffic?.collector('main-diagnostic-log'),
   )
   utilityClient.start({
     ...paths,
     diagnostics,
     onExit: () => {
       if (quitting) void finishQuit()
+    },
+    ...(traffic ? { traffic } : {}),
+    onStartupFailed: (failure: RuntimeStartupFailure) => {
+      if (startupFailureShown) return
+      startupFailureShown = true
+      const messages = {
+        DATABASE_IN_USE:
+          'Another Pact process is using this data. Close that process before opening this copy.',
+        DATABASE_INCOMPATIBLE:
+          'This Pact version cannot safely open the existing data. Use a build with compatible migration history.',
+        DATABASE_BACKUP_FAILED:
+          'Pact could not create the required upgrade backup. Check storage space and folder permissions.',
+        DATABASE_MIGRATION_FAILED:
+          'Pact could not complete the data upgrade. Existing data and recovery files have been preserved.',
+        DATABASE_STORAGE_FAILED:
+          'Pact could not open its data. Check that the data folder is available and accessible.',
+      }
+      const canReveal =
+        isAbsolute(failure.dataFilePath) &&
+        paths.databaseFile !== ':memory:' &&
+        resolve(failure.dataFilePath) === resolve(paths.databaseFile)
+      void dialog
+        .showMessageBox({
+          type: 'error',
+          title: `${productIdentity.productName} could not start`,
+          message:
+            failure.stage === 'runtime'
+              ? 'Pact could not start its local runtime. Quit and check the data folder before trying again.'
+              : messages[failure.code],
+          detail: failure.partialBackupFilePath
+            ? 'Your data was preserved. An incomplete backup was kept separately and must not replace the original data.'
+            : failure.backupFilePath
+              ? 'Your data and recovery backup were preserved. Open the data folder to locate them.'
+              : 'Your data was preserved. Pact will quit without recreating or clearing it.',
+          buttons: canReveal ? ['Open data folder', 'Quit'] : ['Quit'],
+          defaultId: canReveal ? 1 : 0,
+          cancelId: canReveal ? 1 : 0,
+          noLink: true,
+        })
+        .then((result) => {
+          if (canReveal && result.response === 0)
+            shell.showItemInFolder(dirname(failure.dataFilePath))
+          app.quit()
+          return undefined
+        })
+        .catch(() => app.quit())
     },
   })
   applicationMenu = new ApplicationMenu(rendererTrust, () => diagnostics!.createMenuItem())
@@ -148,6 +223,7 @@ async function bootstrap(): Promise<void> {
     await quitApproval
     if (quitting) return
     const ready = await utilityClient.waitUntilReady()
+    if (startupFailureShown) return
     const appearance = ready.ok ? await appearanceSettings.refresh() : ready
     await quitApproval
     if (quitting) return
@@ -180,7 +256,11 @@ let quitApproval: Promise<void> | undefined
 let quitCompletion: Promise<void> | undefined
 function finishQuit(): Promise<void> {
   quitCompletion ??= (async () => {
-    await diagnostics?.close()
+    try {
+      await diagnostics?.close()
+    } catch {
+      console.error('Pact could not close its diagnostics.')
+    }
     nativePresence?.dispose()
     quitReady = true
     app.quit()
@@ -198,6 +278,12 @@ app.on('before-quit', (event) => {
   if (quitReady) return
   event.preventDefault()
   if (quitting) return
+  if (startupFailureShown) {
+    quitting = true
+    utilityClient.dispose()
+    if (!utilityClient.isRunning()) void finishQuit()
+    return
+  }
   if (quitApproval) {
     nativePresence?.show()
     return

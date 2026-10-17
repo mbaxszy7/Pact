@@ -1,9 +1,13 @@
 import { execFileSync } from 'node:child_process'
 import { closeSync, existsSync, openSync, readSync } from 'node:fs'
 import { dirname, isAbsolute, relative, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
 
-const root = resolve(import.meta.dirname, '..')
+import { isScriptEntry } from './script-entry.mjs'
+
+const selectedWorkspace = process.env.PACT_CI_WORKSPACE
+if (selectedWorkspace !== undefined && !isAbsolute(selectedWorkspace))
+  throw new Error('Publication workspace must be an explicit absolute path.')
+const root = selectedWorkspace ?? resolve(import.meta.dirname, '..')
 export const publicationLimits = {
   paths: 4096,
   pathBytes: 1024 * 1024,
@@ -27,6 +31,7 @@ function validatePaths(paths) {
 }
 export const publicDocuments = new Set([
   'README.md',
+  'CHANGELOG.md',
   'CONTRIBUTING.md',
   'AGENTS.md',
   'docs/product/requirements.md',
@@ -168,7 +173,7 @@ export function checkPublication(args = process.argv.slice(2)) {
   return problems.length ? 1 : 0
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))
+if (isScriptEntry(import.meta.url))
   try {
     process.exitCode = checkPublication()
   } catch {

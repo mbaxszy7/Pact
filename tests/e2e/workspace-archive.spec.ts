@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { quitPact } from './native-quit.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import { createRuntimeFixture, test, type RuntimeFixture } from './runtime-fixture.js'
 
 async function seed(fixture: RuntimeFixture) {
@@ -49,7 +50,15 @@ async function seed(fixture: RuntimeFixture) {
         maxRepairAttempts: 3,
       },
     )
-  return { database, projectId, extraProjectId, first, second, sentinel }
+  database.close()
+  return {
+    database: ReadonlyFixtureDatabase.open(fixture),
+    projectId,
+    extraProjectId,
+    first,
+    second,
+    sentinel,
+  }
 }
 
 async function undo(page: Page, title: string): Promise<void> {

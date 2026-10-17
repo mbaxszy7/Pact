@@ -13,10 +13,12 @@ import type {
   RpcResult,
   RuntimeAgentId,
 } from '@pact/contracts'
+import type { DiagnosticEvent } from '@pact/contracts/diagnostics'
 
 import { DefaultSessionSettingsRepository } from '@pact/persistence'
 
-import { OwnedProcessGroup } from '../owned-process-group'
+import { recordDiagnostic } from '../../diagnostics/utility-log'
+import { OwnedProcessGroup, OwnedProcessIdentityError } from '../owned-process-group'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation'
 
 const CATALOG_TIMEOUT_MS = 15_000
@@ -140,8 +142,15 @@ export class DefaultSessionSettings {
   }
 
   private async collectEditorState(workingDirectory: string): Promise<CollectedEditorState> {
-    if (this.disposed || this.operations.size >= 4)
-      throw new Error('The settings catalog capacity is unavailable.')
+    if (this.disposed || this.operations.size >= 4) {
+      const error = new Error('The settings catalog capacity is unavailable.')
+      DefaultSessionSettings.recordFailure(
+        'admission',
+        error,
+        this.disposed ? 'disposed' : 'capacity',
+      )
+      throw error
+    }
     const controller = new AbortController()
     const deadline = Date.now() + OPERATION_TIMEOUT_MS
     let resolveDone!: () => void
@@ -153,12 +162,16 @@ export class DefaultSessionSettings {
     }
     this.operations.add(operation)
     const timeout = setTimeout(() => controller.abort(), OPERATION_TIMEOUT_MS)
+    let phase: DiagnosticEvent['settingsCatalogPhase'] = 'readiness'
     try {
       // Runtime Preparation remains the single source of truth for executable selection and
       // readiness. This Module consumes that result instead of rediscovering either CLI.
       const preparation = await this.runtimePreparation.inspectReadiness(controller.signal)
       controller.signal.throwIfAborted()
-      if (!preparation.ok) throw new Error(preparation.error.message)
+      if (!preparation.ok) {
+        DefaultSessionSettings.recordFailure('readiness', undefined, 'readiness_failed')
+        throw new Error(preparation.error.message)
+      }
 
       const byId = new Map(preparation.value.agents.map((agent) => [agent.agentId, agent]))
       const claude = byId.get('claude')
@@ -168,6 +181,7 @@ export class DefaultSessionSettings {
         deadline - Date.now() - CLEANUP_RESERVE_MS,
       )
       if (catalogTimeout <= 0) throw new Error('The settings catalog deadline was reached.')
+      phase = 'catalogs'
       const catalogs = await Promise.allSettled(
         [
           claude?.state === 'ready' && claude.executablePath
@@ -198,6 +212,7 @@ export class DefaultSessionSettings {
               ),
         ].map((work) =>
           Promise.resolve(work).catch((error: unknown) => {
+            DefaultSessionSettings.recordFailure('catalogs', error)
             controller.abort()
             throw error
           }),
@@ -209,8 +224,10 @@ export class DefaultSessionSettings {
         throw new Error('The settings catalog cleanup did not settle.')
       const claudeCatalog = claudeResult.value,
         codexCatalog = codexResult.value
+      phase = 'post_catalog'
       controller.signal.throwIfAborted()
       if (this.disposed) throw new Error('Settings are shutting down.')
+      phase = 'repository_read'
       const current = this.repository.read()
       return {
         editorState: {
@@ -219,10 +236,62 @@ export class DefaultSessionSettings {
         },
         allAgentsReady: claude?.state === 'ready' && codex?.state === 'ready',
       }
+    } catch (error) {
+      DefaultSessionSettings.recordFailure(phase, error)
+      throw error
     } finally {
       clearTimeout(timeout)
       this.operations.delete(operation)
       resolveDone()
+    }
+  }
+
+  /** Only fixed enums leave this boundary; native errors and their causes stay private. */
+  private static recordFailure(
+    phase: DiagnosticEvent['settingsCatalogPhase'],
+    error: unknown,
+    failure?: DiagnosticEvent['settingsCatalogFailure'],
+  ): void {
+    try {
+      const names: Record<string, NonNullable<DiagnosticEvent['settingsCatalogFailure']>> = {
+        'Catalog process capacity is unavailable.': 'capacity',
+        'The owned process did not establish its owned group.': 'root_identity',
+        'The owned group lost its verified process identity.': 'anchor_lost',
+        'The owned group identity changed.': 'identity_changed',
+        'Process group identities could not be checked.': 'os_observation',
+        'Process group observation was invalid.': 'invalid_observation',
+        'Process group identity was invalid.': 'invalid_observation',
+        'Process group observation exceeded its limit.': 'capacity',
+        'Process group ownership exceeded its identity limit.': 'capacity',
+        'The owned process scope did not release before its deadline.': 'physical_cleanup_deadline',
+        'Process input cleanup did not settle.': 'input_cleanup_deadline',
+        'The settings catalog deadline was reached.': 'catalog_deadline',
+        'Settings are shutting down.': 'disposed',
+      }
+      let current = error
+      let identity: DiagnosticEvent['settingsCatalogIdentity']
+      for (let depth = 0; !failure && depth < 8 && current instanceof Error; depth += 1) {
+        if (current instanceof OwnedProcessIdentityError) identity = current.diagnostic
+        const message = Object.getOwnPropertyDescriptor(current, 'message')?.value
+        failure =
+          current.name === 'AbortError'
+            ? 'cancelled'
+            : typeof message === 'string' && Object.hasOwn(names, message)
+              ? names[message]
+              : undefined
+        current = Object.getOwnPropertyDescriptor(current, 'cause')?.value
+      }
+      recordDiagnostic({
+        operation: 'ipc',
+        phase: 'failed',
+        level: 'error',
+        code: 'INTERNAL',
+        settingsCatalogPhase: phase,
+        settingsCatalogFailure: failure ?? 'other',
+        ...(failure === 'root_identity' && identity ? { settingsCatalogIdentity: identity } : {}),
+      })
+    } catch {
+      // Optional diagnostics cannot replace the original catalog/cleanup exception.
     }
   }
 
@@ -308,7 +377,10 @@ export class DefaultSessionSettings {
         cliVersion,
       )
     } finally {
-      await probe.close()
+      await probe.close().catch((error: unknown) => {
+        DefaultSessionSettings.recordFailure('claude_close', error)
+        throw error
+      })
       if (probe.released) this.probes.delete(probe)
     }
   }
@@ -399,7 +471,10 @@ export class DefaultSessionSettings {
       )
     } finally {
       lineReader?.close()
-      await probe.close()
+      await probe.close().catch((error: unknown) => {
+        DefaultSessionSettings.recordFailure('codex_close', error)
+        throw error
+      })
       if (probe.released) this.probes.delete(probe)
     }
   }
@@ -437,6 +512,7 @@ export class DefaultSessionSettings {
   private static toClaudeModelOption(model: ModelInfo): AgentModelOption {
     return {
       id: model.value,
+      ...(model.resolvedModel ? { resolvedModel: model.resolvedModel } : {}),
       displayName: model.displayName,
       supportedEfforts: model.supportedEffortLevels ?? [],
     }

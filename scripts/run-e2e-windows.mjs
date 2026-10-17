@@ -3,12 +3,32 @@ import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { realpath, stat } from 'node:fs/promises'
 import { createServer } from 'node:net'
-import { basename, delimiter, isAbsolute, join } from 'node:path'
+import { basename, delimiter, isAbsolute, join, resolve } from 'node:path'
+
+import { prepareWindowsRunnerLauncher } from '../tests/e2e/windows-cli-launcher.ts'
 
 const outputLimit = 256 * 1024
 
-async function executablePath(name, candidates = []) {
-  const directories = (process.env.PATH ?? '').split(delimiter).filter(isAbsolute)
+/** NSIS parses its raw command line, not CRT argv; only these owned operations opt in. */
+export function validateWindowsArgumentMode(args, mode = 'crt') {
+  if (mode === 'crt') return mode
+  if (mode !== 'nsis' || !Array.isArray(args) || args[0] !== '/S' || ![1, 2].includes(args.length))
+    throw new Error('Invalid named NSIS invocation')
+  if (args.length === 2) {
+    const directory =
+      typeof args[1] === 'string' && args[1].startsWith('/D=') ? args[1].slice(3) : ''
+    if (
+      !/^(?:[a-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$))/iu.test(directory) ||
+      /["\0\r\n]/u.test(directory) ||
+      /\/D=/iu.test(directory)
+    )
+      throw new Error('Invalid owned NSIS installation directory')
+  }
+  return mode
+}
+
+async function executablePath(name, candidates = [], env = process.env) {
+  const directories = (env.PATH ?? '').split(delimiter).filter(isAbsolute)
   if (directories.length > 128) throw new Error('Executable discovery limit')
   for (const candidate of [
     ...candidates,
@@ -26,46 +46,52 @@ async function executablePath(name, candidates = []) {
   throw new Error('Native executable unavailable')
 }
 
-async function targetPath(executable) {
+async function targetPath(executable, env = process.env) {
   if (executable !== 'pnpm')
     return {
-      executable: await executablePath(executable, isAbsolute(executable) ? [executable] : []),
+      executable: await executablePath(executable, isAbsolute(executable) ? [executable] : [], env),
       prefix: [],
     }
-  const entry = process.env.npm_execpath
+  const entry = env.npm_execpath
   if (entry && isAbsolute(entry) && /^pnpm\.(?:cjs|mjs|js)$/iu.test(basename(entry))) {
     const actual = await realpath(entry)
     if (!(await stat(actual)).isFile()) throw new Error('Package manager entry is not a file')
     return { executable: process.execPath, prefix: [actual] }
   }
-  const directories = (process.env.PATH ?? '').split(delimiter).filter(isAbsolute)
+  const directories = (env.PATH ?? '').split(delimiter).filter(isAbsolute)
   return {
-    executable: await executablePath('pnpm.exe', [
-      ...(process.env.npm_execpath ? [process.env.npm_execpath] : []),
-      ...directories.map((directory) => join(directory, 'node_modules/pnpm/pnpm.exe')),
-    ]),
+    executable: await executablePath(
+      'pnpm.exe',
+      [
+        ...(env.npm_execpath ? [env.npm_execpath] : []),
+        ...directories.map((directory) => join(directory, 'node_modules/pnpm/pnpm.exe')),
+      ],
+      env,
+    ),
     prefix: [],
   }
 }
 
 /** One native Job owns all Windows descendants; POSIX ownership remains in run-e2e.mjs. */
 export async function runWindows(args, timeout, options, { failure, scrubHeaders }) {
+  let argumentMode
+  try {
+    argumentMode = validateWindowsArgumentMode(args, options.windowsArgumentMode)
+  } catch {
+    throw failure('Windows NSIS arguments failed admission; no job was started.')
+  }
+  const env = options.env ?? process.env
+  const signal = options.signal
+  if (signal?.aborted) throw failure('Windows E2E job cancelled before admission.')
   if (!Number.isFinite(timeout) || timeout <= 0)
     throw failure('E2E job deadline must be positive and finite.')
   const startedAt = performance.now()
+  const deadlineAt = startedAt + timeout
   let lookupTimer
-  let target, powershell
+  let target
   try {
-    ;[target, powershell] = await Promise.race([
-      Promise.all([
-        targetPath(options.executable),
-        executablePath(
-          process.env.PACT_E2E_POWERSHELL_EXECUTABLE ?? 'pwsh.exe',
-          process.env.PACT_E2E_POWERSHELL_EXECUTABLE
-            ? [process.env.PACT_E2E_POWERSHELL_EXECUTABLE]
-            : [],
-        ),
-      ]),
+    target = await Promise.race([
+      targetPath(options.executable, env),
       new Promise((_, reject) => {
         lookupTimer = setTimeout(
           () => reject(new Error('Lookup deadline')),
@@ -74,19 +100,19 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
       }),
     ])
   } catch {
-    throw failure(
-      'Windows E2E needs native executable targets and PowerShell 7 (pwsh.exe); no job was started.',
-    )
+    throw failure('Windows E2E needs a native executable target; no job was started.')
   } finally {
     clearTimeout(lookupTimer)
   }
   const pipeName = `pact-e2e-${process.pid}-${randomUUID()}`
+  if (signal?.aborted) throw failure('Windows E2E job cancelled before admission.')
   const token = randomUUID()
   const request = JSON.stringify({
     pipe: pipeName,
     token,
     executable: target.executable,
     args: [...target.prefix, ...args],
+    argumentMode,
     cwd: options.cwd,
     timeout: Math.max(1, timeout - (performance.now() - startedAt)),
   })
@@ -97,6 +123,38 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
     Buffer.byteLength(request) > 64 * 1024
   )
     throw failure('Windows E2E startup request exceeds its bound.')
+  let launcher
+  const preparationState = (kind) =>
+    options.onState({
+      kind,
+      pid: null,
+      ownerPid: null,
+      bufferedBytes: 0,
+      maxBufferedBytes: 0,
+      groupGone: true,
+      ownedProcessCount: 0,
+      ownedGroupCount: 0,
+    })
+  try {
+    preparationState('preparing')
+    launcher = prepareWindowsRunnerLauncher(
+      {
+        executable: target.executable,
+        args: [...target.prefix, ...args],
+        cwd: resolve(options.cwd ?? process.cwd()),
+        pipe: pipeName,
+        token,
+        argumentMode,
+      },
+      deadlineAt,
+    )
+    preparationState('prepared')
+    if (signal?.aborted || performance.now() >= deadlineAt)
+      throw new Error('Command admission is obsolete')
+  } catch {
+    launcher?.dispose()
+    throw failure('Windows E2E supervisor image preparation failed; no job was started.')
+  }
   return new Promise((done, reject) => {
     const server = createServer()
     server.maxConnections = 1
@@ -105,7 +163,9 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
     let child,
       socket,
       control = Buffer.alloc(0),
-      authenticated = false
+      authenticated = false,
+      goMayHaveBeenSent = false,
+      startupDeadlineAt = null
     let stopping = false,
       settled = false,
       closed = false,
@@ -132,6 +192,7 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
           groupGone,
           ownedProcessCount,
           ownedGroupCount: groupGone ? 0 : 1,
+          jobAdmitted: goMayHaveBeenSent,
         })
       } catch {
         stop('observer-failed')
@@ -139,19 +200,31 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
     }
     const finish = () => {
       if (settled || !closed || !pumpsClosed) return
+      currentBudget()
+      // The trusted helper cannot create a Job before go. This is evidence of
+      // non-admission after actual close, never a substitute for an admitted Job's empty receipt.
+      if (!goMayHaveBeenSent) groupGone = true
       settled = true
       clearTimeout(deadline)
       clearTimeout(killTimer)
       clearTimeout(startupTimer)
       process.removeListener('SIGINT', onInterrupt)
       process.removeListener('SIGTERM', onTerminate)
+      signal?.removeEventListener('abort', onCancel)
       socket?.destroy()
       server.close()
       control = Buffer.alloc(0)
       if (!groupGone) error ??= failure('Windows E2E Job closure could not be confirmed.')
+      if (groupGone) {
+        try {
+          launcher.dispose()
+        } catch {
+          error ??= failure('Windows E2E launcher cleanup could not be confirmed.')
+        }
+      }
       state('settled')
       if (error) reject(error)
-      else done(stopping ? 1 : exitCode)
+      else done(stopping || signal?.aborted || performance.now() >= deadlineAt ? 1 : exitCode)
     }
     const stop = (reason) => {
       if (stopping || settled) return
@@ -160,8 +233,9 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
       buffers.stderr = Buffer.alloc(0)
       bufferedBytes = 0
       abort.abort()
-      state('stopping', reason)
-      if (authenticated) socket?.end('stop\n')
+      // Cancellation cannot write to the receipt pipe: EPIPE from an already
+      // exited helper would destroy its still-unread genuine empty receipt.
+      if (goMayHaveBeenSent) child?.stdin.end()
       else socket?.destroy()
       killTimer = setTimeout(() => {
         child?.kill()
@@ -172,19 +246,40 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
           finish()
         }
       }, 5000)
+      state('stopping', reason)
     }
     const onInterrupt = () => stop('interrupted-SIGINT')
     const onTerminate = () => stop('interrupted-SIGTERM')
+    const onCancel = () => stop('cancelled')
+    const currentBudget = () => {
+      if (stopping || settled) return false
+      if (signal?.aborted) {
+        stop('cancelled')
+        return false
+      }
+      const now = performance.now()
+      if (now >= deadlineAt) {
+        stop('deadline')
+        return false
+      }
+      if (startupDeadlineAt !== null && pid === null && now >= startupDeadlineAt) {
+        stop('startup-deadline')
+        return false
+      }
+      return true
+    }
     const deadline = setTimeout(
       () => stop('deadline'),
       Math.max(1, timeout - (performance.now() - startedAt)),
     )
     process.once('SIGINT', onInterrupt)
     process.once('SIGTERM', onTerminate)
+    signal?.addEventListener('abort', onCancel, { once: true })
     const emitLine = async (channel, bytes) => {
-      if (stopping) return
+      if (!currentBudget()) return
       const text = scrubHeaders(options.redact(bytes.toString('utf8'))) + '\n'
       if (Buffer.byteLength(text) > outputLimit) return stop('redacted-output-budget')
+      if (!currentBudget()) return
       if (options.write) {
         let onAbort
         try {
@@ -201,13 +296,14 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
         }
       } else if (!process[channel].write(text))
         await once(process[channel], 'drain', { signal: abort.signal })
+      currentBudget()
     }
     const pump = async (channel, stream) => {
       try {
         for await (const chunk of stream) {
           let offset = 0
           while (offset < chunk.length) {
-            if (stopping) break
+            if (!currentBudget()) break
             const newline = chunk.indexOf(10, offset),
               end = newline < 0 ? chunk.length : newline
             const piece = chunk.subarray(offset, end)
@@ -234,11 +330,16 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
           buffers[channel] = Buffer.alloc(0)
           await emitLine(channel, tail)
         }
+        currentBudget()
       } catch {
         if (!stopping) stop('output-transfer-failed')
       }
     }
     server.on('connection', (connection) => {
+      if (socket || stopping || settled) {
+        connection.destroy()
+        return
+      }
       socket = connection
       connection.on('error', () => stop('control-error'))
       connection.on('end', () => {
@@ -255,20 +356,29 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
           } catch {
             return stop('control-invalid')
           }
+          if (!message || typeof message !== 'object' || Array.isArray(message))
+            return stop('control-invalid')
           control = control.subarray(newline + 1)
           if (!authenticated) {
-            if (message.kind !== 'hello' || message.token !== token || stopping)
+            if (message.kind !== 'hello' || message.token !== token)
               return stop('control-authentication')
+            if (!currentBudget()) return
             authenticated = true
             state('initializing')
+            if (!currentBudget()) return
+            // Reserve possible admission before writing; a failed write cannot prove unsent go.
+            goMayHaveBeenSent = true
             connection.write('go\n')
             continue
           }
           if (message.kind === 'started' && Number.isSafeInteger(message.pid) && message.pid > 0) {
+            if (pid !== null) return stop('control-invalid')
+            if (!currentBudget()) continue
             pid = message.pid
             ownedProcessCount = 1
             clearTimeout(startupTimer)
             state('started')
+            currentBudget()
           } else if (
             message.kind === 'counts' &&
             Number.isInteger(message.active) &&
@@ -299,30 +409,23 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
       stop('control-start-failed')
     })
     server.listen(`\\\\.\\pipe\\${pipeName}`, () => {
-      if (stopping) return
-      child = spawn(
-        powershell,
-        [
-          '-NoLogo',
-          '-NoProfile',
-          '-NonInteractive',
-          '-File',
-          join(import.meta.dirname, 'windows-e2e-job.ps1'),
-        ],
-        { cwd: options.cwd, shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] },
-      )
-      state('bootstrapping')
+      if (!currentBudget()) return
+      startupDeadlineAt = Math.min(deadlineAt, performance.now() + 15_000)
+      child = spawn(launcher.executablePath, [], {
+        cwd: options.cwd,
+        env,
+        shell: false,
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
       startupTimer = setTimeout(
         () => stop('startup-deadline'),
-        Math.min(15_000, Math.max(1, timeout - (performance.now() - startedAt))),
+        Math.max(1, startupDeadlineAt - performance.now()),
       )
       child.stdin.on('error', () => stop('bootstrap-transfer-failed'))
-      child.stdin.end(request + '\n')
       child.once('error', () => {
         error = failure('Windows E2E supervisor could not start.')
-        closed = true
         stop('spawn-failed')
-        finish()
       })
       child.once('close', () => {
         closed = true
@@ -335,6 +438,8 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
           return undefined
         },
       )
+      state('bootstrapping')
+      currentBudget()
     })
   })
 }

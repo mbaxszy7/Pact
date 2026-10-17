@@ -1,15 +1,325 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
+import { once } from 'node:events'
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createConnection, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { setTimeout as delay } from 'node:timers/promises'
+import { setImmediate as nextTurn, setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 
+import {
+  disposeWindowsLauncherImage,
+  windowsLauncherImageDiagnostic,
+} from '../tests/e2e/windows-cli-launcher.ts'
+import { runWindows, validateWindowsArgumentMode } from './run-e2e-windows.mjs'
 import { run } from './run-e2e.mjs'
 
 const windowsOnly = { skip: process.platform !== 'win32', timeout: 20_000 }
+
+await test(
+  'a cold Windows Job starts and releases without a PowerShell compiler dependency',
+  windowsOnly,
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-compiled-job-regression-'))
+    let settled
+    try {
+      const result = await run(['-e', 'process.exit(0)'], 15_000, {
+        executable: process.execPath,
+        env: { ...process.env, PACT_E2E_POWERSHELL_EXECUTABLE: join(root, 'missing-pwsh.exe') },
+        write() {},
+        onState(state) {
+          if (state.kind === 'settled') settled = state
+        },
+      })
+      assert.equal(result, 0)
+      assert.equal(settled?.groupGone, true)
+      assert.equal(settled?.ownedProcessCount, 0)
+      assert.equal(windowsLauncherImageDiagnostic().privateLinks, 0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  },
+)
+
+await test(
+  'expired preparation cannot launch a helper or target with a fresh timeout',
+  windowsOnly,
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-expired-job-preparation-'))
+    const states = []
+    const began = performance.now()
+    try {
+      await assert.rejects(
+        run(['-e', 'process.exit(0)'], 1000, {
+          executable: process.execPath,
+          write() {},
+          onState(state) {
+            states.push(state.kind)
+            if (state.kind === 'prepared')
+              Atomics.wait(
+                new Int32Array(new SharedArrayBuffer(4)),
+                0,
+                0,
+                Math.max(0, began + 1000 - performance.now()) + 20,
+              )
+          },
+        }),
+        /supervisor image preparation failed; no job was started/,
+      )
+      assert(states.includes('prepared'))
+      assert(!states.includes('bootstrapping'))
+      assert.equal(windowsLauncherImageDiagnostic().privateLinks, 0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  },
+)
+
+// Exercise real pipe/Job boundaries, including callbacks that outrun timer delivery.
+for (const scenario of [
+  { boundary: 'prepared', microtask: true, admitted: false, timeout: 1000 },
+  { boundary: 'prepared', microtask: true, cancel: true, admitted: false, timeout: 1000 },
+  { boundary: 'initializing', admitted: false, timeout: 15_000 },
+  { boundary: 'initializing', cancel: true, admitted: false, timeout: 15_000 },
+  {
+    boundary: 'initializing',
+    microtask: true,
+    admitted: true,
+    timeout: 30_000,
+    startup: true,
+    lateReceipt: true,
+  },
+  { boundary: 'bootstrapping', admitted: false, timeout: 30_000, startup: true },
+  { boundary: 'started', admitted: true, timeout: 15_000 },
+  { boundary: 'output', admitted: true, timeout: 15_000 },
+  { boundary: 'settled', admitted: true, timeout: 15_000 },
+]) {
+  // oxlint-disable-next-line eslint/no-await-in-loop -- One invocation owns the shared Windows compiler/Job cache at a time.
+  await test(
+    `Windows ${scenario.boundary}${scenario.microtask ? ' microtask' : ''} ${scenario.cancel ? 'cancellation' : scenario.startup ? 'startup deadline' : 'absolute deadline'} cannot become a late success`,
+    { ...windowsOnly, timeout: 35_000 },
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'pact-job-deadline-boundary-'))
+      const marker = join(root, 'target-admitted.txt')
+      const states = []
+      const controller = new AbortController()
+      const began = performance.now()
+      let triggered = false
+      const consumeBudget = () => {
+        if (triggered) return
+        triggered = true
+        if (scenario.cancel) controller.abort()
+        else {
+          const boundary = scenario.startup ? performance.now() + 15_000 : began + scenario.timeout
+          Atomics.wait(
+            new Int32Array(new SharedArrayBuffer(4)),
+            0,
+            0,
+            Math.max(0, boundary - performance.now()) + 50,
+          )
+        }
+      }
+      try {
+        const result = await run(
+          [
+            '-e',
+            'require("node:fs").writeFileSync(process.argv[1],"admitted"); console.log("done")',
+            marker,
+          ],
+          scenario.timeout,
+          {
+            executable: process.execPath,
+            signal: controller.signal,
+            write() {
+              if (scenario.boundary === 'output') consumeBudget()
+            },
+            onState(state) {
+              states.push(state)
+              if (state.kind !== scenario.boundary) return
+              if (scenario.microtask) queueMicrotask(consumeBudget)
+              else consumeBudget()
+            },
+          },
+        )
+        assert.equal(triggered, true, 'The actual requested process boundary must be reached')
+        assert.equal(result, 1)
+        if (scenario.boundary === 'prepared')
+          assert(!states.some((state) => state.kind === 'bootstrapping'))
+        assert.equal(states.at(-1)?.groupGone, true)
+        assert.equal(states.at(-1)?.jobAdmitted, scenario.admitted)
+        assert.equal(states.at(-1)?.ownedProcessCount, 0)
+        if (scenario.lateReceipt) assert(!states.some((state) => state.kind === 'started'))
+        assert.equal(
+          await readFile(marker, 'utf8').then(
+            () => true,
+            () => false,
+          ),
+          scenario.admitted,
+        )
+        assert.equal(windowsLauncherImageDiagnostic().privateLinks, 0)
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+}
+
+await test(
+  'the compiled seed can retire while its owned command keeps a private image',
+  windowsOnly,
+  async () => {
+    let retired = false,
+      settled
+    const controller = new AbortController()
+    const result = await run(['-e', 'setInterval(()=>{},1000)'], 10_000, {
+      executable: process.execPath,
+      signal: controller.signal,
+      write() {},
+      onState(state) {
+        if (state.kind === 'started') {
+          disposeWindowsLauncherImage()
+          assert.doesNotThrow(() => process.kill(state.pid, 0))
+          retired = true
+          controller.abort()
+        }
+        if (state.kind === 'settled') settled = state
+      },
+    })
+    assert.equal(result, 1)
+    assert.equal(retired, true)
+    assert.equal(settled?.groupGone, true)
+    assert.equal(windowsLauncherImageDiagnostic().privateLinks, 0)
+  },
+)
+
+await test('NSIS mode admits only silent owned operations and an absolute final raw directory tail', () => {
+  assert.equal(validateWindowsArgumentMode(['/S'], 'nsis'), 'nsis')
+  for (const directory of [
+    'C:\\Pact Dev\\安装 包',
+    '\\\\server\\share\\Pact Dev',
+    'D:\\a&b%literal\\',
+  ])
+    assert.equal(validateWindowsArgumentMode(['/S', `/D=${directory}`], 'nsis'), 'nsis')
+  assert.equal(validateWindowsArgumentMode(['', 'a"b', '&|%$()']), 'crt')
+  for (const args of [
+    [],
+    ['/s'],
+    ['/S', '/D=relative'],
+    ['/S', '/D=\\rooted'],
+    ['/S', '/D=C:relative'],
+    ['/S', '/D=C:\\bad"quote'],
+    ['/S', '/D=C:\\bad\0name'],
+    ['/S', '/D=C:\\bad\rname'],
+    ['/S', '/D=C:\\bad\nname'],
+    ['/S', '/D=C:\\first', '/D=C:\\second'],
+    ['/D=C:\\last', '/S'],
+    ['/S', '/D=C:\\one /D=C:\\two'],
+    ['/S', '_?=C:\\Pact'],
+  ])
+    assert.throws(() => validateWindowsArgumentMode(args, 'nsis'), /Invalid/u)
+  assert.throws(() => validateWindowsArgumentMode(['/S'], 'raw'), /Invalid/u)
+})
+
+await test('invalid NSIS descriptors fail before executable discovery or Job admission', async () => {
+  await assert.rejects(
+    runWindows(
+      ['/S', '/D=relative'],
+      1000,
+      { windowsArgumentMode: 'nsis' },
+      { failure: (message) => new Error(message), scrubHeaders: (text) => text },
+    ),
+    /failed admission; no job was started/u,
+  )
+  if (process.platform !== 'win32')
+    await assert.rejects(
+      run(['/S'], 1000, { windowsArgumentMode: 'nsis' }),
+      /requires a Windows Job/u,
+    )
+})
+
+await test(
+  'Windows Job preserves NSIS silent switches and a final space/Unicode directory without CRT quotes',
+  windowsOnly,
+  async (context) => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-nsis-raw-arguments-'))
+    let allReleased = true
+    context.after(async () => {
+      if (!allReleased)
+        throw new Error('Windows argument probe release is unconfirmed; fixture retained')
+      await rm(root, { recursive: true, force: true })
+    })
+    const runChecked = async (args, timeout, options) => {
+      let released = false
+      try {
+        return await run(args, timeout, {
+          ...options,
+          onState: (state) => {
+            if (state.kind === 'settled')
+              released = state.groupGone === true && state.ownedProcessCount === 0
+            options.onState?.(state)
+          },
+        })
+      } finally {
+        if (!released) allReleased = false
+      }
+    }
+    const source = join(root, 'RawArguments.cs'),
+      probe = join(root, 'RawArguments.exe')
+    await writeFile(
+      source,
+      `using System;using System.Security.Cryptography;using System.Text;class RawArguments {static int Main(){var raw=Environment.CommandLine;var at=raw.IndexOf(" /D=",StringComparison.Ordinal);var tail=at<0?"":raw.Substring(at+4);string hash;using(var digest=SHA256.Create()){hash=BitConverter.ToString(digest.ComputeHash(Encoding.UTF8.GetBytes(tail))).Replace("-","").ToLowerInvariant();}Console.WriteLine("{\\"silent\\":"+(raw.Contains(" /S ")||raw.EndsWith(" /S",StringComparison.Ordinal)?"true":"false")+",\\"tailHash\\":\\""+hash+"\\",\\"tailQuoted\\":"+(tail.IndexOf('"')>=0?"true":"false")+"}");return 0;}}`,
+    )
+    const compiler = join(
+      process.env.SystemRoot ?? process.env.WINDIR,
+      'Microsoft.NET',
+      'Framework64',
+      'v4.0.30319',
+      'csc.exe',
+    )
+    assert.equal(
+      await runChecked(['/nologo', '/target:exe', `/out:${probe}`, source], 15_000, {
+        executable: compiler,
+        cwd: root,
+        write: () => {},
+      }),
+      0,
+    )
+    const directory = join(root, '安装 package with spaces'),
+      args = ['/S', `/D=${directory}`]
+    const execute = async (windowsArgumentMode) => {
+      let output = '',
+        settled
+      const code = await runChecked(args, 10_000, {
+        executable: probe,
+        cwd: root,
+        windowsArgumentMode,
+        write: (_channel, text) => {
+          output += text
+        },
+        onState: (state) => {
+          if (state.kind === 'settled') settled = state
+        },
+      })
+      assert.equal(code, 0)
+      assert.equal(settled?.groupGone, true)
+      assert.equal(settled?.ownedProcessCount, 0)
+      return JSON.parse(output)
+    }
+    const crt = await execute(undefined)
+    assert.equal(crt.silent, false)
+    assert.notEqual(crt.tailHash, createHash('sha256').update(directory).digest('hex'))
+    const nsis = await execute('nsis')
+    assert.deepEqual(nsis, {
+      silent: true,
+      tailHash: createHash('sha256').update(directory).digest('hex'),
+      tailQuoted: false,
+    })
+  },
+)
 
 void test(
   'Windows forwards the root exit while its libuv Job closes ordinary helpers',
@@ -27,6 +337,104 @@ void test(
     const helpers = JSON.parse(output)
     assert.equal(helpers.length, 3)
     for (const pid of helpers) assert.equal(pidGone(pid), true)
+  },
+)
+
+await test(
+  'NSIS delegation owns its child until the original deadline while CRT retains its drain limit',
+  { skip: process.platform !== 'win32', timeout: 60_000 },
+  async (context) => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-nsis-delegation-'))
+    let allReleased = true
+    context.after(async () => {
+      if (!allReleased) throw new Error('Delegated Job release is unconfirmed; fixture retained')
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 })
+    })
+    const source = join(root, 'Delegation.cs'),
+      executable = join(root, 'Delegation.exe')
+    await writeFile(
+      source,
+      `using System;using System.Diagnostics;using System.Reflection;using System.Threading;class Delegation{static int Main(string[] args){if(args.Length==1&&args[0]=="child"){Thread.Sleep(int.Parse(Environment.GetEnvironmentVariable("PACT_NSIS_CHILD_DELAY")));return 0;}var info=new ProcessStartInfo(Assembly.GetExecutingAssembly().Location,"child"){UseShellExecute=false,CreateNoWindow=true};using(var child=Process.Start(info)){Console.WriteLine("delegated");return int.Parse(Environment.GetEnvironmentVariable("PACT_NSIS_ROOT_EXIT"));}}}`,
+    )
+    const checked = async (args, timeout, options) => {
+      let released = false
+      try {
+        return await run(args, timeout, {
+          ...options,
+          onState: (state) => {
+            if (state.kind === 'settled')
+              released = state.groupGone === true && state.ownedProcessCount === 0
+            options.onState?.(state)
+          },
+        })
+      } finally {
+        if (!released) allReleased = false
+      }
+    }
+    const compiler = join(
+      process.env.SystemRoot ?? process.env.WINDIR,
+      'Microsoft.NET',
+      'Framework64',
+      'v4.0.30319',
+      'csc.exe',
+    )
+    assert.equal(
+      await checked(['/nologo', '/target:exe', `/out:${executable}`, source], 15_000, {
+        executable: compiler,
+        cwd: root,
+        write: () => {},
+      }),
+      0,
+    )
+    for (const scenario of ['nsis', 'crt', 'nonzero', 'deadline', 'cancel', 'observer-failure']) {
+      const controller = new AbortController(),
+        states = [],
+        mode = scenario === 'crt' ? undefined : 'nsis'
+      let delegated = false
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Every owned Job must physically settle before its next independent failure mode.
+      const code = await checked(['/S'], scenario === 'deadline' ? 6000 : 15_000, {
+        executable,
+        cwd: root,
+        env: {
+          ...process.env,
+          PACT_NSIS_CHILD_DELAY:
+            scenario === 'nonzero' ? '50' : scenario === 'deadline' ? '12000' : '7000',
+          PACT_NSIS_ROOT_EXIT: scenario === 'nonzero' ? '7' : '0',
+        },
+        windowsArgumentMode: mode,
+        signal: controller.signal,
+        write: (_channel, text) => {
+          if (text.trim() === 'delegated') {
+            delegated = true
+            if (scenario === 'cancel') controller.abort()
+          }
+        },
+        onState: (state) => {
+          states.push(state)
+          if (scenario === 'observer-failure' && state.kind === 'started')
+            throw new Error('Controlled owner observation failure')
+        },
+      })
+      assert.equal(code, scenario === 'nsis' ? 0 : scenario === 'nonzero' ? 7 : 1)
+      if (scenario !== 'observer-failure') assert.equal(delegated, true)
+      const stopping = states.filter((state) => state.kind === 'stopping')
+      if (['nsis', 'nonzero'].includes(scenario)) assert.equal(stopping.length, 0)
+      else
+        assert.ok(
+          stopping.some(
+            (state) =>
+              state.reason ===
+              {
+                crt: 'descendants-still-running',
+                deadline: 'deadline',
+                cancel: 'cancelled',
+                'observer-failure': 'observer-failed',
+              }[scenario],
+          ),
+        )
+      assert.equal(states.at(-1).groupGone, true)
+      assert.equal(states.at(-1).ownedProcessCount, 0)
+    }
   },
 )
 
@@ -289,5 +697,154 @@ run([${JSON.stringify(fixture.entry)}],15000,{executable:process.execPath,cwd:${
       await exited
       await waitFor(() => pidGone(state.ownerPid) && pidGone(pids.parent) && pidGone(pids.worker))
     }
+  })
+}
+
+for (const attack of ['null-frame', 'authenticated-reconnect']) {
+  // oxlint-disable-next-line eslint/no-await-in-loop -- Each isolated real named-pipe fixture restores TEMP/TMP before the next case.
+  await test(`Windows control authentication rejects ${attack}`, windowsOnly, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-control-authentication-'))
+    const marker = join(root, 'target-must-not-start.txt')
+    const heldPipe = `\\\\.\\pipe\\pact-e2e-held-${process.pid}-${randomUUID()}`
+    const sockets = new Set()
+    const held = createServer((socket) => {
+      sockets.add(socket)
+      socket.on('error', () => {})
+      socket.on('close', () => sockets.delete(socket))
+      socket.resume() // Hold the genuine helper before go; no Job can be created here.
+    })
+    held.maxConnections = 1
+    held.listen(heldPipe)
+    await once(held, 'listening')
+    const oldTemp = process.env.TEMP,
+      oldTmp = process.env.TMP,
+      states = []
+    let descriptor,
+      directory,
+      exercise = Promise.resolve(),
+      fixtureError,
+      ownerPid,
+      secondClosed = false
+    let firstAcknowledged = false
+    process.env.TEMP = root
+    process.env.TMP = root
+    try {
+      const outcome = await run(
+        ['-e', 'require("node:fs").writeFileSync(process.argv[1],"unexpected")', marker],
+        15000,
+        {
+          executable: process.execPath,
+          write() {},
+          onState(state) {
+            assert(states.length < 128)
+            states.push(state)
+            if (state.ownerPid) ownerPid = state.ownerPid
+            if (state.kind === 'prepared') {
+              const names = readdirSync(root).filter((name) =>
+                name.startsWith('pact-test-image-runner-'),
+              )
+              assert.equal(names.length, 1)
+              directory = join(root, names[0])
+              const path = join(directory, 'runner.json')
+              descriptor = JSON.parse(readFileSync(path, 'utf8'))
+              writeFileSync(
+                path,
+                JSON.stringify({ ...descriptor, pipe: heldPipe.split('\\').at(-1) }),
+              )
+            }
+            if (state.kind !== 'bootstrapping') return
+            exercise = (async () => {
+              const first = createConnection(`\\\\.\\pipe\\${descriptor.pipe}`)
+              sockets.add(first)
+              first.on('error', () => {})
+              await once(first, 'connect')
+              const firstClose = new Promise((resolveClose) => first.once('close', resolveClose))
+              if (attack === 'null-frame') {
+                first.write('null\n')
+                await firstClose
+                return
+              }
+              const go = new Promise((resolveGo, rejectGo) => {
+                let bytes = Buffer.alloc(0)
+                const finishGo = (error) => {
+                  clearTimeout(timer)
+                  first.removeListener('data', onData)
+                  first.removeListener('error', onFailure)
+                  first.removeListener('close', onFailure)
+                  if (error) rejectGo(error)
+                  else resolveGo(bytes.toString('ascii'))
+                }
+                const onFailure = () => finishGo(new Error('Controlled pipe closed before go'))
+                const onData = (chunk) => {
+                  if (bytes.length + chunk.length > 16)
+                    return finishGo(new Error('Controlled go receipt exceeded its bound'))
+                  bytes = Buffer.concat([bytes, chunk])
+                  if (bytes.includes(10)) finishGo()
+                }
+                const timer = setTimeout(onFailure, 5000)
+                first.on('data', onData)
+                first.on('error', onFailure)
+                first.on('close', onFailure)
+              })
+              first.write(JSON.stringify({ kind: 'hello', token: descriptor.token }) + '\n')
+              assert.equal(await go, 'go\n')
+              firstAcknowledged = true
+              first.destroy()
+              await firstClose
+              await nextTurn()
+              await nextTurn()
+              const second = createConnection(`\\\\.\\pipe\\${descriptor.pipe}`)
+              sockets.add(second)
+              second.on('error', () => {})
+              await once(second, 'connect')
+              const secondClose = new Promise((resolveClose) => second.once('close', resolveClose))
+              second.write('{"kind":"empty","active":0,"exitCode":0}\n')
+              await secondClose
+              secondClosed = true
+            })().catch((error) => {
+              fixtureError = error
+            })
+          },
+        },
+      ).then(
+        (code) => ({ code }),
+        (error) => ({ error }),
+      )
+      await exercise
+      assert.ifError(fixtureError)
+      assert(ownerPid && pidGone(ownerPid), 'The genuine helper must have actually closed')
+      assert(!states.some((state) => state.kind === 'started'))
+      await assert.rejects(readFile(marker), { code: 'ENOENT' })
+      if (attack === 'null-frame') {
+        assert.equal(outcome.code, 1)
+        assert(states.some((state) => state.reason === 'control-invalid'))
+        assert.equal(states.at(-1)?.groupGone, true)
+        assert.equal(states.at(-1)?.jobAdmitted, false)
+      } else {
+        assert(firstAcknowledged && secondClosed)
+        assert.match(
+          outcome.error?.message ?? '',
+          /Job closure could not be confirmed/u,
+          'Reconnected peer must not supply the original release proof',
+        )
+        assert.equal(states.at(-1)?.groupGone, false)
+        assert.equal(states.at(-1)?.jobAdmitted, true)
+        assert((await readFile(join(directory, 'runner.json'))).length > 0)
+      }
+    } finally {
+      for (const socket of sockets) socket.destroy()
+      await new Promise((resolveClose) => held.close(resolveClose))
+      if (oldTemp === undefined) delete process.env.TEMP
+      else process.env.TEMP = oldTemp
+      if (oldTmp === undefined) delete process.env.TMP
+      else process.env.TMP = oldTmp
+      // Fixture-only proof: the genuine helper was routed to held and never got go.
+      // Preserve the runner's rejection/retention assertion above; never invent Job-empty.
+      if (ownerPid && pidGone(ownerPid)) {
+        disposeWindowsLauncherImage()
+        await rm(root, { recursive: true, force: true })
+      }
+    }
+    assert.equal(windowsLauncherImageDiagnostic().privateLinks, 0)
   })
 }

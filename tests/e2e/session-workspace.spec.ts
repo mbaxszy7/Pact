@@ -7,9 +7,9 @@ async function addProject(
   fixture: RuntimeFixture,
   app: ElectronApplication,
   window: Page,
-  projectName: string,
+  name: string,
 ): Promise<void> {
-  const directory = await fixture.createProjectDirectory(projectName)
+  const directory = await fixture.createProjectDirectory(name)
   await app.evaluate(({ dialog }, directoryPath) => {
     Reflect.set(dialog, 'showOpenDialog', async () => ({
       canceled: false,
@@ -17,13 +17,17 @@ async function addProject(
     }))
   }, directory)
   await window.getByRole('button', { name: 'Add project', exact: true }).click()
-  const name = `Rename Project ${projectName}`
-  await expect(window.getByRole('button', { name, exact: true })).toBeVisible()
+  await expect(
+    window.getByRole('button', { name: `Rename Project ${name}`, exact: true }),
+  ).toBeVisible()
+  await expect(
+    window.getByRole('button', { name: `Rename Project ${name}`, exact: true }),
+  ).toHaveText(name)
 }
 
 test(
   'keeps Project context while creating, reopening, archiving, and restoring a Session',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(120_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })

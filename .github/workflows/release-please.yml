@@ -1,0 +1,52 @@
+name: Pact Release - Prepare version PR
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pact-release-please-main
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  release-pr:
+    name: Update version and changelog PR
+    if: github.ref == 'refs/heads/main'
+    environment: pact-control-plane
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - run: pnpm install --frozen-lockfile
+      - name: Create repository-scoped Release PR token
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.PACT_CI_APP_ID }}
+          private-key: ${{ secrets.PACT_CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: Pact
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+      - name: Preview exact release intent and maintain the validated version PR
+        id: version
+        run: node scripts/release-please.mjs
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PACT_GOVERNANCE_READY: ${{ vars.PACT_GOVERNANCE_READY }}
+          PACT_RELEASE_APP_BOT_ID: ${{ vars.PACT_RELEASE_APP_BOT_ID }}
+          PACT_RELEASE_SIGNING_KEY: ${{ secrets.PACT_CI_APP_PRIVATE_KEY }}
+          PACT_APPROVED_MAJOR_VERSION: ${{ vars.PACT_APPROVED_MAJOR_VERSION }}

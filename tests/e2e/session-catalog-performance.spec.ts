@@ -5,6 +5,7 @@ import { dirname, resolve } from 'node:path'
 import {
   rpcResultSchema,
   sessionCatalogPageSchema,
+  sessionSettingsSaveResultSchema,
   type SessionCatalogCursor,
   type SessionCatalogPage,
 } from '../../packages/contracts/src/index.js'
@@ -26,7 +27,7 @@ const createdAt = Date.parse('2026-09-24T00:00:00.000Z')
 
 test(
   'loads five Sessions at a time and preserves activity and unread state after restart',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(180_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })
@@ -36,7 +37,12 @@ test(
       const { projectId, unreadSessionId } = await seedCatalog(fixture)
       app = await fixture.launch()
       let window = await app.firstWindow()
-      await expect(window.getByRole('button', { name: 'Catalog scale', exact: true })).toBeVisible()
+      await expect(
+        window.getByRole('button', { name: 'Rename Project Catalog scale', exact: true }),
+      ).toBeVisible()
+      await expect(
+        window.getByRole('button', { name: 'Rename Project Catalog scale', exact: true }),
+      ).toHaveText('Catalog scale')
       await expect(window.getByRole('button', { name: 'Session 990', exact: true })).toBeVisible()
       await expect(window.getByRole('button', { name: 'Session 980', exact: true })).toBeVisible()
       await expect(window.getByRole('button', { name: 'Session 940', exact: true })).toHaveCount(0)
@@ -114,7 +120,7 @@ test(
 
       const unreadSettings = firstPage.sessions[0]?.settings
       if (!unreadSettings) throw new Error('Expected Session settings in the first page.')
-      const saved = await window.evaluate(
+      const savedRaw = await window.evaluate(
         async ({ sessionId, settings }) => {
           const pact: unknown = Reflect.get(globalThis, 'pact')
           if (
@@ -139,6 +145,8 @@ test(
         },
         { sessionId: unreadSessionId, settings: unreadSettings },
       )
+      const saved = rpcResultSchema(sessionSettingsSaveResultSchema).parse(savedRaw)
+      if (!saved.ok) throw new Error(fixture.redactDiagnostic(JSON.stringify(saved.error)))
       expect(saved).toMatchObject({
         ok: true,
         value: {
@@ -190,7 +198,7 @@ test(
 
 test(
   'bounds Project DOM and preserves keyboard focus after scrolling a large Catalog',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(180_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })
@@ -218,18 +226,28 @@ test(
       app = await fixture.launch()
       const window = await app.firstWindow()
       const navigation = window.getByRole('navigation', { name: 'Projects and Sessions' })
-      await expect(window.getByRole('button', { name: 'Project 000', exact: true })).toBeVisible()
+      await expect(
+        window.getByRole('button', { name: 'Rename Project Project 000', exact: true }),
+      ).toBeVisible()
+      await expect(
+        window.getByRole('button', { name: 'Rename Project Project 000', exact: true }),
+      ).toHaveText('Project 000')
       await expect(window.getByText('Loading Sessions…', { exact: true })).toHaveCount(0)
       const mountedAtTop = await navigation.evaluate((element) => ({
         rows: element.querySelectorAll('li[data-project-menu]').length,
         height: element.clientHeight,
       }))
       expect(mountedAtTop.rows).toBeLessThanOrEqual(Math.ceil(mountedAtTop.height / 36) + 12)
-      await window.getByRole('button', { name: 'Project 000', exact: true }).focus()
+      await window.getByRole('button', { name: 'Rename Project Project 000', exact: true }).focus()
       await navigation.evaluate((element) => {
         element.scrollTop = element.scrollHeight
       })
-      await expect(window.getByRole('button', { name: 'Project 999', exact: true })).toBeVisible()
+      await expect(
+        window.getByRole('button', { name: 'Rename Project Project 999', exact: true }),
+      ).toBeVisible()
+      await expect(
+        window.getByRole('button', { name: 'Rename Project Project 999', exact: true }),
+      ).toHaveText('Project 999')
       const focused = await navigation.evaluate((element) =>
         element.contains(document.activeElement),
       )
@@ -246,15 +264,28 @@ test(
       await navigation.evaluate((element) => {
         element.scrollTop = element.scrollHeight
       })
-      await expect(window.getByRole('button', { name: 'Project 999', exact: true })).toBeVisible()
+      await expect(
+        window.getByRole('button', { name: 'Rename Project Project 999', exact: true }),
+      ).toBeVisible()
+      await expect(
+        window.getByRole('button', { name: 'Rename Project Project 999', exact: true }),
+      ).toHaveText('Project 999')
       const archiveProject = window.getByRole('button', { name: 'Archive Project Project 999' })
       await archiveProject.focus()
       await expect(archiveProject).toBeInViewport()
       await expect(window.getByRole('menu')).toHaveCount(0)
       await window.keyboard.press('Enter')
-      await expect(window.getByRole('button', { name: 'Project 999', exact: true })).toHaveCount(0)
+      await expect(
+        window.getByRole('button', { name: 'Rename Project Project 999', exact: true }),
+      ).toHaveCount(0)
+      await expect(navigation.getByText('Project 999', { exact: true })).toHaveCount(0)
       await window.getByRole('button', { name: 'Undo', exact: true }).click()
-      await expect(window.getByRole('button', { name: 'Project 999', exact: true })).toBeVisible()
+      await expect(
+        window.getByRole('button', { name: 'Rename Project Project 999', exact: true }),
+      ).toBeVisible()
+      await expect(
+        window.getByRole('button', { name: 'Rename Project Project 999', exact: true }),
+      ).toHaveText('Project 999')
     } finally {
       await app?.close()
       await fixture.dispose()

@@ -5,7 +5,7 @@ import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'nod
 
 import type { ApplicationIdentity } from '../application-identity'
 
-import { isPackageSmoke } from '../package-smoke'
+import { defaultProductPaths, readProductIdentity } from '../product-identity'
 
 export interface RuntimePaths {
   databaseFile: string
@@ -20,21 +20,39 @@ const ISOLATED_ROOT_ENV = 'PACT_E2E_ROOT'
 const repositoryRoot = resolvePath(__dirname, '../../../..')
 const repositoryIdentity = createHash('sha256').update(repositoryRoot).digest('hex')
 
-/** Configure the application's browser profile before ready; fixture owners take precedence. */
+let configuredDefaultPaths: ReturnType<typeof defaultProductPaths> | undefined
+
+/** Sole browser-profile owner; local durable paths remain repository compatible. */
 export function configureApplicationProfile(identity: ApplicationIdentity): void {
-  if (isolatedRoot()) {
-    configureIsolatedProfile()
-    return
+  const root = isolatedRoot()
+  if (root) {
+    const appData = join(root, 'channel-app-data')
+    mkdirSync(appData, { recursive: true, mode: 0o700 })
+    app.setPath('appData', appData)
   }
-  if (isPackageSmoke() || (process.env.NODE_ENV === 'test' && !app.isPackaged)) return
-  const profile = join(
-    app.getPath('appData'),
-    identity.profileDirectory,
-    ...(identity.kind === 'development-local' ? [repositoryIdentity] : []),
+  const paths = defaultProductPaths(readProductIdentity(identity), repositoryIdentity)
+  mkdirSync(paths.sessionData, { recursive: true, mode: 0o700 })
+  app.setPath('userData', paths.userData)
+  app.setPath('sessionData', paths.sessionData)
+  app.setAppLogsPath(paths.logs)
+  configuredDefaultPaths = {
+    userData: app.getPath('userData'),
+    sessionData: app.getPath('sessionData'),
+    logs: app.getPath('logs'),
+  }
+  if (
+    root &&
+    !(
+      process.env.PACT_PACKAGE_SMOKE === '1' &&
+      process.env.PACT_PACKAGE_SMOKE_PHASE === 'production-paths'
+    )
   )
-  mkdirSync(profile, { recursive: true })
-  app.setPath('userData', profile)
-  app.setPath('sessionData', profile)
+    configureIsolatedProfile()
+}
+
+export function readConfiguredDefaultPaths(): ReturnType<typeof defaultProductPaths> {
+  if (!configuredDefaultPaths) throw new Error('Product paths have not been configured.')
+  return configuredDefaultPaths
 }
 
 /** Data location only: isolated launches retain the normal IPC, permissions and runtime. */
@@ -96,13 +114,12 @@ export function resolveRuntimePaths(): RuntimePaths {
     }
   }
 
-  if (app.isPackaged) {
+  if (app.isPackaged)
     return {
       databaseFile: join(app.getPath('userData'), 'pact.sqlite'),
       workspaceStorageRoot: join(app.getPath('userData'), 'workspace-versions'),
       migrationsFolder: join(process.resourcesPath, 'persistence-migrations'),
     }
-  }
 
   return {
     databaseFile: join(repositoryRoot, '.pact-data/dev/pact.sqlite'),

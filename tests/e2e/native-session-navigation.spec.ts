@@ -7,6 +7,7 @@ import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { quitPact } from './native-quit.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import { createRuntimeFixture, test, type RuntimeFixture } from './runtime-fixture.js'
 
 async function seed(fixture: RuntimeFixture) {
@@ -44,7 +45,8 @@ async function seed(fixture: RuntimeFixture) {
       rows.push({ id, title, projectId, projectName })
     }
   }
-  return { database, rows }
+  database.close()
+  return { database: ReadonlyFixtureDatabase.open(fixture), rows }
 }
 
 async function recentLabels(app: ElectronApplication): Promise<string[]> {

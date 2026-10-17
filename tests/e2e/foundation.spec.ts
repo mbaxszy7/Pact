@@ -10,6 +10,7 @@ test(
   async () => {
     const fixture = await createRuntimeFixture()
     const electronApp = await fixture.launch()
+    const keyboardObservations: unknown[] = []
 
     try {
       const window = await electronApp.firstWindow()
@@ -55,7 +56,41 @@ test(
 
       await window.getByRole('button', { name: 'Open settings' }).click()
       await expect(window.getByRole('heading', { name: 'Default session settings' })).toBeVisible()
+      keyboardObservations.push(
+        await window.evaluate(() => {
+          const active = document.activeElement
+          const label = active?.getAttribute('aria-label')
+          return {
+            phase: 'before-tab',
+            documentFocused: document.hasFocus(),
+            activeTag: active?.tagName ?? null,
+            activeLabel: ['Hide navigation panel', 'Open settings'].includes(label ?? '')
+              ? label
+              : 'other',
+            activeTabIndex: active instanceof HTMLElement ? active.tabIndex : null,
+            navigationVisible:
+              document
+                .querySelector('[aria-label="Hide navigation panel"]')
+                ?.getBoundingClientRect().width ?? null,
+          }
+        }),
+      )
       await window.keyboard.press('Tab')
+      keyboardObservations.push(
+        await window.evaluate(() => {
+          const active = document.activeElement
+          const label = active?.getAttribute('aria-label')
+          return {
+            phase: 'after-tab',
+            documentFocused: document.hasFocus(),
+            activeTag: active?.tagName ?? null,
+            activeLabel: ['Hide navigation panel', 'Open settings'].includes(label ?? '')
+              ? label
+              : 'other',
+            activeTabIndex: active instanceof HTMLElement ? active.tabIndex : null,
+          }
+        }),
+      )
       await expect(window.getByRole('button', { name: 'Hide navigation panel' })).toBeFocused()
       await expect
         .poll(() =>
@@ -108,6 +143,21 @@ test(
           ),
         )
         .toBe(true)
+    } catch (error) {
+      const nativeFocus = await electronApp
+        .evaluate(({ BrowserWindow, systemPreferences }) => ({
+          focused: BrowserWindow.getAllWindows().some((window) => window.isFocused()),
+          keyboardMode:
+            process.platform === 'darwin'
+              ? systemPreferences.getUserDefault('AppleKeyboardUIMode', 'integer')
+              : null,
+        }))
+        .catch(() => null)
+      await test.info().attach('keyboard-focus-state', {
+        body: Buffer.from(JSON.stringify({ keyboardObservations, nativeFocus })),
+        contentType: 'application/json',
+      })
+      throw error
     } finally {
       await quitPact(electronApp)
       await fixture.dispose()

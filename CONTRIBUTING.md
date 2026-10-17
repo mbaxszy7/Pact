@@ -3,6 +3,12 @@
 ## Setup
 
 Use `.node-version` and the pnpm version in `package.json`.
+Supported desktop targets are Windows x64, Windows arm64 and macOS arm64. Shared CI
+jobs run on macOS arm64. Required platform jobs currently use Windows x64 and macOS arm64
+native runners; all Windows arm64 CI is explicitly deferred, not counted as passed.
+Its native launcher has exceeded the unchanged 15-second cold-start budget. Restore its
+native and Provider jobs together only after that failure is resolved and native-machine
+acceptance is complete. The arm64 source implementation and tests remain available.
 
 ```sh
 corepack enable
@@ -61,14 +67,17 @@ confirming the previous instance has exited. This development bundle is not a di
 
 `pnpm dist:win` and `pnpm dist:mac` explicitly build `Pact - Production - Local`. Its application ID,
 executable/bundle name, installation directory, shortcuts, package identity and persistent profile
-are distinct from the preserved official `Pact` identity. Outputs are ignored under
-`apps/desktop/release/production-local/`. These commands do not publish or certify a signed release.
+are distinct from the preserved official `Pact` identity. Outputs are ignored under a fresh
+`apps/desktop/release/production-local-PLATFORM-ARCH-BUILD-SHA/` directory. These commands do not
+publish or certify a signed release.
 
-For local unpacked builds, use `pnpm package:dir:local`. After visual acceptance,
-`pnpm package:smoke:local` selects that exact local executable and reuses the existing private
-seed/restart harness. `pnpm verify:package:local` combines those commands. Existing `package:dir`,
-`package:smoke` and `verify:package` retain the official fixture filenames used by CI; they are not
-the normal local application distribution commands.
+From the repository root, build a local unpacked application with
+`pnpm package:dir:local --output "$PWD/.pact-data/distributions/local-review"`
+using a fresh output directory. After visual acceptance, run
+`pnpm package:smoke:local --manifest "$PWD/.pact-data/distributions/local-review/distribution-manifest.json" --unpacked`.
+`verify:package:local` is an alias for this manifest-required smoke command; it does not build.
+`package:dir` builds CI Dev, while `package:smoke` and `verify:package` also require the exact
+generated manifest. Smoke never guesses an executable from an old output directory.
 
 The finite identity registry also reserves CI development independently from CI production. This
 does not implement CI development/release workflows. Packaged identity comes from embedded metadata,
@@ -112,23 +121,34 @@ pnpm db:migrate:dev
 pnpm db:studio
 ```
 
-The ignored development database is `.pact-data/dev/pact.sqlite`. Studio listens on
-`127.0.0.1:4983` and is not packaged. Never target a user's production database with development
-commands. Packaged startup applies migrations in Utility after a consistent backup, before reporting
-ready. Failure stops startup and preserves recovery information. Do not use `drizzle-kit push`
-or introduce a production migration shell command.
+The tool default `.pact-data/dev/pact.sqlite` is an isolated repository database, separate from the
+local source database and historical object roots without moving existing data. CI Dev uses the OS appData `Pact Dev` root across branches; Stable uses `Pact`. Local browser profiles and local Production data remain isolated under their existing names.
+
+`db:migrate:dev` and `db:studio` run `packages/persistence/scripts/development-database.ts` through
+tsx and `PactDatabase.open`. They hold the sibling `.pact-writer.sqlite` reservation for their actual
+process lifetime; Studio imports its server in that same process, listens on `127.0.0.1:4983` and is
+not packaged. `PACT_DB_FILE` selects an explicit tool database. Keep it in a controlled development
+environment and close any Pact instance using that data directory. The reservation coordinates Pact
+and these wrappers; raw Drizzle/SQLite commands, legacy clients and manual edits can bypass it.
+
+Application startup owns read-only, complete ordered migration-history verification before writable
+opening, WAL adjustment or migration. Only a proven complete prefix can upgrade after a consistent
+non-overwriting backup; new databases use checked atomic staging. Incompatible history and failed
+backup/migration stop startup and preserve recovery files. See [database ownership and limits](docs/technical-foundation.md#persistence-and-projections).
+Never target user application data with routine development commands, invoke raw migration/Studio
+against a live Pact root, use `drizzle-kit push`, or add a production migration shell command.
 
 ## Required verification
 
-| Change                                              | Checks                                                         |
-| --------------------------------------------------- | -------------------------------------------------------------- |
-| Documentation/configuration                         | `pnpm docs:check`, `pnpm format:check`, relevant narrow checks |
-| TypeScript                                          | `pnpm check`                                                   |
-| Renderer/Main/Preload/Utility or IPC lifecycle      | The above and applicable Electron E2E                          |
-| Native dependency, fuse, protocol, or packaging     | The above and `pnpm verify:package`                            |
-| Native history, settings, Fork, or writer lifecycle | Relevant `pnpm test:native` cases                              |
-| Streaming/resources/performance                     | Same-fixture measurements and applicable performance budgets   |
-| Test infrastructure                                 | Relevant `pnpm test:infra` cases                               |
+| Change                                              | Checks                                                           |
+| --------------------------------------------------- | ---------------------------------------------------------------- |
+| Documentation/configuration                         | `pnpm docs:check`, `pnpm format:check`, relevant narrow checks   |
+| TypeScript                                          | `pnpm check`                                                     |
+| Renderer/Main/Preload/Utility or IPC lifecycle      | The above and applicable Electron E2E                            |
+| Native dependency, fuse, protocol, or packaging     | The above and explicit native distribution/installed smoke below |
+| Native history, settings, Fork, or writer lifecycle | Relevant `pnpm test:native` cases                                |
+| Streaming/resources/performance                     | Same-fixture measurements and applicable performance budgets     |
+| Test infrastructure                                 | Relevant `pnpm test:infra` cases                                 |
 
 The [testing section below](#testing) identifies commands needing credentials or paid models. Run the
 affected real-provider lane in a trusted local environment when its unique behavior changes; public
@@ -137,11 +157,11 @@ deferred checks, and unverified platforms. Missing evidence cannot establish a p
 
 ## Documentation policy
 
-The reviewed Markdown allowlist is `README.md`, `CONTRIBUTING.md`, `AGENTS.md`, the product and
+The reviewed Markdown allowlist is `README.md`, `CONTRIBUTING.md`, `AGENTS.md`, `CHANGELOG.md`, the product and
 architecture specifications under `docs/`, and desktop `PRODUCT.md`/`DESIGN.md`. `scripts/check-publication.mjs` enforces exact paths, English text, local
 links, and absence of private/generated material.
 
-Publication inspection owns at most 4096 paths (1 MiB total, 1 KiB per path), reads only the seven
+Publication inspection owns at most 4096 paths (1 MiB total, 1 KiB per path), reads only the eight
 reviewed documents (128 KiB each, 512 KiB total), and emits at most 128 diagnostics/64 KiB. Overflow
 fails visibly. Binary/source content is inspected by the secret scanner, not retained by this policy
 checker. Local documentation links must stay inside the repository.
@@ -167,17 +187,18 @@ must be unmistakably nonfunctional; never broadly exempt test directories from s
 
 ### Evidence and commands
 
-| Lane                  | Command                                      | Prerequisites and evidence                                                              |
-| --------------------- | -------------------------------------------- | --------------------------------------------------------------------------------------- |
-| Unit                  | `pnpm test`                                  | Vitest; public, isolated fixtures, no paid models                                       |
-| Infrastructure        | `pnpm test:infra`                            | Node tests for publication, baseline integrity, coverage, runners, and packaged harness |
-| UI                    | `pnpm test:e2e:ui`                           | Real Electron UI with fixture data; no provider credentials                             |
-| Deterministic         | `pnpm test:e2e:deterministic`                | Electron plus controlled protocols/fixed loads; not real model evidence                 |
-| Real provider         | `pnpm test:e2e:real`                         | Installed/authenticated CLIs and private configuration; paid model requests             |
-| Complete E2E          | `pnpm test:e2e`                              | All three Electron lanes; private configuration admitted before the sole build          |
-| Native protocol       | `pnpm test:native`                           | Actual CLI/SDK storage and protocol against isolated loopback providers; no paid models |
-| Packaged smoke        | `pnpm verify:package`                        | Actual unpacked application, isolated data, seed and cold verification                  |
-| Packaged visible core | `node scripts/package-smoke.mjs --real-core` | Trusted local real-provider configuration; manual actual business observations required |
+| Lane                  | Command                                                          | Prerequisites and evidence                                                              |
+| --------------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| Unit                  | `pnpm test`                                                      | Vitest; public, isolated fixtures, no paid models                                       |
+| Infrastructure        | `pnpm test:infra`                                                | Node tests for publication, baseline integrity, coverage, runners, and packaged harness |
+| UI                    | `pnpm test:e2e:ui`                                               | Real Electron UI with fixture data; no provider credentials                             |
+| Deterministic         | `pnpm test:e2e:deterministic`                                    | Electron plus controlled protocols/fixed loads; not real model evidence                 |
+| Real provider         | `pnpm test:e2e:real`                                             | Installed/authenticated CLIs and private configuration; paid model requests             |
+| Core real provider    | `pnpm test:e2e:real:core`                                        | The `@real-core` business cases; the same actual CLIs and isolated configuration        |
+| Complete E2E          | `pnpm test:e2e`                                                  | All three Electron lanes; private configuration admitted before the sole build          |
+| Native protocol       | `pnpm test:native`                                               | Actual CLI/SDK storage and protocol against isolated loopback providers; no paid models |
+| Packaged smoke        | Manifest-based commands below                                    | Actual installation/extraction, private data, seed and cold verification                |
+| Packaged visible core | `node scripts/package-smoke.mjs --manifest MANIFEST --real-core` | Trusted local real-provider configuration; manual actual business observations required |
 
 Electron runners build the selected lane, use one Playwright worker, zero retries, and a two-hour
 total deadline with a five-minute build budget. Forward file names and `--grep` after `--`; do not
@@ -192,11 +213,223 @@ stale-response check pauses only the validated fixture Utility PID, resumes it i
 requires the newer selection to survive without creating Messages or Runs. These UI/protocol
 fixtures do not establish real-provider execution. The macOS Project-context journey disables Playwright focus emulation before checking actual window return events, and checks clipboard equality inside Main without emitting clipboard contents. The migration fixture applies the original migration prefix through 0060 before testing 0061/0062, comparing all legacy columns and the consistent pre-upgrade backup. Named shared-helper assertion revisions retain the exact helper owner and all registered replacement assertions; the immutable baseline is never regenerated.
 
-Public CI scans history and publication policy, runs quality/build and infrastructure checks, and
-executes UI/deterministic Electron tests plus packaged smoke on macOS and Windows. Native protocol CI
-installs pinned CLIs on macOS and uses dummy authentication/loopback endpoints. External PR jobs do
-not receive private provider configuration or model credentials. Real tests remain enabled for
-trusted local validation; public CI is not evidence that those model cases passed.
+CI configuration and a successful build do not establish repository enforcement or release
+acceptance. Required lanes need current code identity, their actual prerequisites and successful
+execution on the appropriate native architecture. Automatic external PR jobs must not receive private
+provider configuration or model credentials. Credential-free UI/deterministic/native protocol evidence is
+separate from explicitly authorized real-provider execution; missing authorization, credentials,
+platforms or required performance observations cannot become passing evidence.
+
+### Core and extended real-provider policy
+
+Keep the full `@real` lane. Each real case also has exactly one Playwright tag:
+`@real-core` or `@real-extended`. The reviewed case inventory in
+`scripts/real-e2e-policy.mjs` gives each existing case its business scenario and tier.
+Discovery must match that inventory and its tags; a missing, new, duplicate or retagged
+case cannot silently change the merge gate. Test titles, assertions and the immutable
+baseline remain unchanged.
+
+Dev-scope PRs require one real smoke case on Windows x64 and macOS arm64:
+`real @all completes each Agent once and keeps ordered distinct response rows`.
+It launches the actual App, creates a Project and Session through the UI, sends one
+`@all` message, and verifies that Codex and Claude each complete exactly one real Run,
+return the request marker in separate responses, and release the Composer. Startup,
+Session creation, either Agent's reply, or cleanup failure still blocks this gate.
+
+The other 60 real cases are extended regression. They retain their original assertions
+for permissions, Stop, recovery, settings, drafts, collaboration, Changes/Undo, appearance,
+images and performance, with execution deferred on automatic Dev-scope PR runs. This is
+an explicitly narrowed smoke acceptance scope; a passing smoke does not establish those
+extended behaviors. Ordinary PRs also defer the `@ui` and `@deterministic` App E2E
+lanes to extended regression, including the bare Secondary build collaboration journey.
+Their reports list every discovered case as extended, not required, and deferred; no
+deferred case is counted as passed. Select `extended_e2e` on a manual workflow run to
+execute those complete lanes, or use the existing local UI/deterministic commands.
+The deferred reports still require authentic code identity and a complete case inventory.
+Static checks, unit/script tests, builds and native CLI protocol/process safety tests
+remain required. Main protection is unchanged. Stable publication remains disabled.
+
+Provider execution belongs to the same **Pact CI - Code quality and app tests** root run and attempt
+as its prerequisite checks. The root calls **Pact CI - Claude and Codex tests** as a reusable workflow; it has no independent
+dispatch or completion-triggered run. Add `pact:real-full` to a Dev-scope PR to execute the
+full regression; the label requests cases and does not authorize model credentials.
+Owner-authored same-repository code and API-verified release-only App changes use
+`pact-provider-ci`. Other sources wait for owner approval in `pact-provider-reviewed-ci`.
+Review the attested head/base/tree and root run/attempt before approving that environment;
+the trusted preflight revalidates their current identity and prerequisites before model
+configuration is exposed. Execution authorization is separate from Approve PR. A new
+candidate needs its own verified execution; missing or stale authorization blocks the gate.
+For a Dev-scope PR, an extended case failure is reported while the core gate remains
+eligible. Any Stable-scope candidate forces `suite=full` and a full gate regardless of
+author or input, so
+extended failures, missing results and skips block release-candidate acceptance.
+Native cases explicitly assigned to another platform are reported as not applicable; for
+example macOS window Alpha is required on macOS rather than converted into a passing Windows
+test. Any skip of an applicable core/full case remains a failure of the selected gate.
+
+Each native platform publishes `provider-report-PLATFORM-aATTEMPT`: `real-summary.md` and
+`real-summary.json`, retained for 14 days, plus an Actions step summary. Every reviewed
+case is listed with tier/scenario, result, duration, required status and a fixed safe reason;
+unexecuted extended cases say deferred rather than passed. The report records head/base,
+tree, tested commit and policy hash. Errors, model output, attachments, traces and private
+configuration stay out of these artifacts. Missing configuration, execution cancellation,
+global runner errors, invalid evidence, failed source-integrity or cleanup checks cannot
+be treated as an optional extended failure. Full execution coverage still uses the existing
+unmodified assertion obligations; `--real-scope core` changes only which real execution
+results are currently required, and never certifies a complete baseline run.
+
+Local `test:e2e` commands also preserve safe, immutable JSON/Markdown under
+`.pact-data/e2e-reports/<unique-run>/`; the command prints the report location even
+when configuration admission fails. Raw Provider evidence and disposable test output
+remain private and are removed after safe projection. Failed local `ui` or
+`deterministic` invocations also preserve bounded traces/snapshots beside the case
+summary, with a `diagnostics.md` index and hashed `diagnostics/inventory.json`, using
+the same no-follow 32 MiB collector as CI. Explicit `--output` remains caller-owned;
+mixed or real-provider invocations preserve safe summaries only. A local clean-tree receipt is
+distinct from a PR attestation; a dirty or changing working tree has no captured code
+identity. Deliberately filtered local runs list unexecuted obligations and cannot claim
+a complete core/full gate. UI/deterministic Actions summaries link `e2e-PLATFORM-aATTEMPT`
+reports and, on failure, `ui-diagnostics-PLATFORM-aATTEMPT` snapshots/traces; both retain
+14 days. The identity producer exports its immutable upload Artifact ID to the
+uncredentialed platform jobs instead of guessing a filename from their own attempt. A single
+uncredentialed platform rerun can therefore use its retained producer identity, still
+verified against the exact checked-out commit/tree and current PR head/base. Missing
+or expired artifacts fail without fallback. This does not reuse test results: execution
+reports keep their actual attempt numbers. Candidate attestation, Provider admission,
+check publication and the final PR gate retain current-attempt identity artifact names;
+a retained producer cannot issue a fresh attestation. These trusted paths still require
+all prerequisite jobs, attestations and Provider results in the same current root
+attempt; use **Re-run all jobs** for a complete trusted replacement. The native **PR checks complete** job fails
+when any required dependency failed, was cancelled, skipped or not executed.
+
+UI and deterministic failure output uses separate `ui/` and `deterministic/` directories.
+Both diagnostic lanes share the original 32 MiB budget; a later lane cannot overwrite
+an earlier snapshot or silently increase the upload capacity. JSON/Markdown case reports
+remain separate from these disposable traces.
+
+Credential-free CLI protocol checks publish `native-e2e-PLATFORM-aATTEMPT` containing
+`native-summary.json` and `native-summary.md`, with an Actions summary and 14-day retention.
+Release jobs use `release-native-e2e-PLATFORM-aATTEMPT`. These reports list every actual
+Vitest case, including failed and unexecuted cases, with duration and a fixed failure
+category. Missing, invalid or incomplete execution evidence blocks the native check.
+Raw errors, native output and configuration are excluded; uncertain physical process
+cleanup retains its private recovery evidence and cannot be reported as complete.
+
+Stable release jobs preserve `release-e2e-PLATFORM-aATTEMPT` JSON/Markdown reports and
+failure-only `release-ui-diagnostics-PLATFORM-aATTEMPT` snapshots/traces for 14 days.
+Their Actions summaries list every trusted-discovered UI/deterministic case, including
+cases not run after an earlier failure. These no-credential reports record the release
+version, source SHA, tag, Release PR and Release ID; they omit signed-state extensions
+and do not replace the release controller's authenticated staging or publication checks.
+
+Branch pushes and PRs require static checks, unit/script tests, builds and native protocol checks
+on Windows x64 and macOS arm64. PRs also require the real smoke case above; UI/deterministic
+E2E is extended regression. All Windows arm64 CI and installer build/smoke and publication currently
+are deferred until native-machine acceptance. `PACT_PACKAGING_READY` must remain unset or false
+until that acceptance is complete. Windows arm64 installers remain excluded from the future automated
+release set. Both active CI architectures retain mandatory native protocol checks. Stable candidates additionally require
+full provider verification; publication validates every final installer and its content-bound
+smoke report. CI platform jobs allow 90 minutes and release platform jobs allow two hours
+for their required checks, packaging and cleanup. Deadlines do not establish completed tests.
+
+### Product version and release intent
+
+`version.json` contains the product `version` and `candidateVersion` release-intent
+marker. Initially they are `0.1.0` and `0.1.0-unreleased`; the root package, desktop package
+and Release Please manifest remain `0.1.0`. The unreleased marker is not an application
+version and never enters a Stable installer. The first Release Please PR changes the
+marker to `0.1.0`; its pinned JSON updaters subsequently advance both fields together
+with all package/manifest versions. No permanent `release-as: 0.1.0` override remains.
+
+Candidate scope follows the actual product metadata transition. Unchanged metadata uses
+Dev/core scope. The initial marker transition, or a later strictly increasing synchronized
+version and marker, uses Stable/full scope regardless of PR author, branch name or labels.
+Malformed metadata, rollback, a version change without its marker or restoration of the
+initial sentinel blocks candidate admission. Release Please previews and validates the
+exact updates once before creating/updating its PR; same-version `Release-As` overrides
+and unapproved major versions cannot generate a new release PR.
+
+The marker selects required tests and packaging; it grants no credential or publication
+permission. Formal publication additionally requires the fixed App's merged Release PR,
+the owner's approval and manual squash merge, and a legal transition from the actual
+squash parent to the merged metadata. Copying release metadata into an owner business PR
+cannot create a formal Release or reset the first-release override. An unfinished version
+waits for recovery of its original authenticated Release PR and Draft rather than creating
+another same-version PR. Repository enforcement and native environment approval behavior
+still require live verification before CI/CD is considered ready.
+
+Native main rules dismiss stale approvals when the PR diff changes. Formal publication
+checks the owner's latest effective API review state before the protected manual merge;
+ordinary comments cannot replace it, and dismissal or requested changes blocks it.
+An approval still marked effective after a diff-equivalent update may refer to an older
+head commit. Model execution approval does not satisfy this PR review requirement.
+
+### Distribution build and smoke
+
+Use the distribution entry point with a fresh, empty output directory and the native runner for the
+target below. Replace `COMMIT_SHA` with the full checked-out commit SHA and `BUILD_NUMBER` with a
+decimal build identifier. `version.json` supplies the product version. Dev metadata includes a
+compatible prerelease, build number and source identity only during packaging; the command verifies
+and restores the desktop package metadata without a version commit.
+
+| Target        | Arguments                        | Installation artifacts  |
+| ------------- | -------------------------------- | ----------------------- |
+| macOS arm64   | `--platform darwin --arch arm64` | DMG and ZIP             |
+| Windows x64   | `--platform win32 --arch x64`    | Separate NSIS installer |
+| Windows arm64 | Deferred (TODO)                  | No CI/Release installer |
+
+For example, on macOS arm64:
+
+```sh
+node scripts/build-distribution.mjs --channel dev --platform darwin --arch arm64 --sha COMMIT_SHA --build-number BUILD_NUMBER --output .pact-data/distributions/dev
+node scripts/package-smoke.mjs --manifest .pact-data/distributions/dev/distribution-manifest.json --production-paths --report .pact-data/distributions/dev/smoke.json
+```
+
+The release candidate uses Stable metadata and its own artifacts:
+
+```sh
+node scripts/build-distribution.mjs --channel stable --platform darwin --arch arm64 --sha COMMIT_SHA --build-number BUILD_NUMBER --output .pact-data/distributions/stable
+node scripts/package-smoke.mjs --manifest .pact-data/distributions/stable/distribution-manifest.json --production-paths --report .pact-data/distributions/stable/smoke.json
+```
+
+Automatic installer jobs and Stable publication are deferred (TODO) until native-machine acceptance;
+`PACT_PACKAGING_READY` defaults to disabled. The commands above remain available for isolated manual
+validation. Windows x64 and macOS arm64 are the candidate automated installer targets; Windows arm64
+needs a separate later integration decision. Do not treat deferred packaging as passing release evidence.
+
+Local production uses the same entry point with `--profile production-local --channel stable`; its name and existing data directories remain separate from both CI channels. Local `dist:mac`, `dist:win`, and `package:dir:local` select this profile. Smoke commands require the exact generated manifest.
+
+The manifest identifies the exact executable/bundle, channel/version, source SHA, architecture,
+application identity, application-content hash and installation-artifact hashes. Smoke does not guess
+fixed `Pact.app` or `Pact.exe` paths. Add `--artifact ARTIFACT_PATH` to validate the other artifact
+listed in that manifest, such as the macOS ZIP, with a separate report. A directory-only build adds
+`--dir` and smoke adds `--unpacked`; that report cannot satisfy an installation gate. NSIS installation
+smoke requires a native ephemeral GitHub-hosted Windows runner and verified uninstall cleanup.
+
+`--production-paths` explicitly checks normal OS channel paths before Utility, a database, providers
+or diagnostic Workers start, retaining the real single-instance rule. It does not open user business
+data. The isolated `PACT_E2E_ROOT` phases alone do not establish those normal paths. Do not invoke the
+explicit production-path probe against an occupied daily instance. Native dependencies are rebuilt
+for Electron; Windows distribution signing and macOS certificate signing/notarization are disabled,
+with necessary macOS ad-hoc signing retained.
+
+Reports are written without overwriting previous evidence. Smoke success requires the genuine owned
+process runner, installed-content verification, seed/cold identity and confirmed cleanup. Reports
+bind the final application-content hash and the actual installation artifacts. A same-SHA
+rebuild with different application bytes requires new validation. Keep credentials, private paths,
+debugging receipts/nonces and raw application output out of published evidence.
+
+Smoke admission and execution failures also write a bounded `status: blocked` report after
+cleanup is attempted. It records a fixed failure phase/code, validated identity when available,
+and separate application-process, installation, provider-copy and private-root cleanup facts.
+Unknown process release or failed installation cleanup retains the owned recovery directory;
+neither deleting a directory nor calling terminate proves physical process cleanup.
+Release Actions retain these reports in `packaged-verification-PLATFORM-aATTEMPT` even after
+failure, separately from the successful artifacts eligible for signed release staging.
+
+Windows arm64 installer build, installation acceptance and publication are deferred (TODO).
+Windows x64 installed-launch validation and full Windows/macOS Dev/Stable coexistence, upgrade
+and uninstall debugging still require their actual evidence. Code integration does not establish those platform gates.
 
 ### Private real-provider configuration
 
@@ -226,26 +459,57 @@ success substitutes.
 
 ### Platform process ownership
 
-Windows requires PowerShell 7 (`pwsh.exe` on PATH or `PACT_E2E_POWERSHELL_EXECUTABLE`) and the installed
-.NET Framework C# compiler. One native Job Object owns the test supervisor, Electron, CLI descendants,
+Windows command supervision requires the installed .NET Framework C# compiler and reuses the same
+bounded compiled image as native fixture launchers; it does not compile C# inside PowerShell at each
+command start. Provider scenarios that execute PowerShell still use `pwsh.exe` on PATH or
+`PACT_E2E_POWERSHELL_EXECUTABLE`. One native Job Object owns Electron, CLI descendants,
 and detached workers with a 256-process limit, no breakaway, and kill-on-close. Admission occurs before
 target execution. Control messages are separate from stdout/stderr. Native fixture launchers use the
 same Job/argv boundary, independent descriptors and tokens, and a test-process-owned immutable compiled
 image installed as private hardlinks. This is a code cache, not a readiness guarantee: each real
 first launch still obeys its protocol/deadline. Different-volume link failure must remain visible.
 
-The Windows runner has a 10-second discovery bound, 15-second supervisor startup, five-second natural
+The Windows runner has a 10-second discovery bound, cold compiler preparation bounded to 30 seconds
+and the remaining command deadline, 15-second supervisor startup after compilation, five-second natural
 tail, five-second closure confirmation, one-second control writes, 64 KiB admission, 4 KiB control
-frames, and 256 KiB combined unfinished output. Cancellation, timeout, overflow, runner loss, or
+frames, and 256 KiB combined unfinished output. Runner cancellation uses helper stdin EOF, separate
+from its authenticated receipt pipe; target stdin remains NUL. Cancellation, timeout, overflow, runner loss, or
 supervisor death releases the owned Job; unconfirmed cleanup fails the job. Redact complete lines and
 EOF before emission. A root exit is not enough while its owned tree or pipes survive.
+The command's private compiled link and descriptor are removed only after its helper has closed and
+its output pumps have settled. If `go` might have been sent, the actual Job must also report empty;
+otherwise the trusted helper's closed process proves that no Job was admitted. An error event alone
+does not prove process closure. Unconfirmed release retains private files as recovery evidence.
 
 macOS retains verified descendant process groups. Normal exit allows a five-second natural tail;
 failure uses bounded TERM/KILL and five-second confirmation. Identity is PID plus birth and PGID,
 rechecked before signalling. Limits are 256 process identities, 16 active groups, 1-second/256 KiB/
 4096-row process queries, and 256 KiB output. Temporary identity uncertainty does not permit claiming
 new members or prevent cleanup of other verified groups. Never enumerate command lines/environment
-for ownership or kill by process name.
+for ownership or kill by process name. Exceeding the 16-group admission limit still retains every
+verified rejected group for cleanup under the same 256-identity bound. Unknown identities retain
+their reservation until physical absence is confirmed; one group's failure cannot prevent cleanup
+of independently verified groups.
+
+The optional ownership diagnostic is synchronous and void. Its fixed PID/PPID/PGID/birth/state
+snapshots are at most 64 KiB and 256 identities/groups, contain no command lines or environment,
+and cannot change the execution result. An invalid return or exception disables that observer;
+accidental asynchronous rejection is observed once without admitting a Promise queue. Scoped
+runner regressions do not establish a complete real-provider suite or Windows acceptance.
+
+`run()` accepts an optional `posixOwnedGroupLimit` integer from 1 through 16 to tighten admission;
+its default remains 16 and it rejects this POSIX option on Windows. Production execution does not
+read the infrastructure test environment. CI script tests run one file at a time and use a fixed
+test-only limit of three, so their real boundary fixtures fit inside the unchanged outer supervisor.
+Direct default-budget acceptance still exercises the actual 16-group success and 18-group refusal:
+
+```sh
+pnpm exec node --test --test-name-pattern='selected owned-group boundary|rejected excess groups' scripts/run-e2e.test.mjs
+```
+
+Run that command without `PACT_INFRA_POSIX_OWNED_GROUP_LIMIT`. The CI-sized fixtures do not replace
+the default-budget evidence. All rejected groups must be confirmed closed before the test fixture's
+independent emergency cleanup; invalid limits fail before process admission.
 
 Standalone Windows NativeRpc helpers retain their ten-second/16 KiB compilation budget and private
 nonce-directory lifecycle. A native fixture entry has a ten-minute ceiling. NativeRpc completion
@@ -299,6 +563,55 @@ eight sockets. Claude's non-model HEAD probe is allowed; model POSTs fail. Codex
 no provider requests beyond the two fixture source Turns. These test-harness limits are not production
 large-content policy. Cleanup owns every root, bundle, process, and socket, including failures.
 
+### CI control and release recovery
+
+Use separate `pact-control-plane` and `pact-provider-ci` environments. Both permit only the
+`main` branch and disable administrator bypass. App credentials belong only to the control-plane
+environment; model configuration belongs only to the Provider environment. Do not use repository
+secrets for either identity. GitHub App installation tokens are short-lived; the installation and
+private key remain configured until explicitly revoked or rotated.
+
+Keep `PACT_GOVERNANCE_READY=false` until the repository can enforce the exact author/reviewer/merger
+policy, shared-commit association, current mandatory evidence, and failure/cancellation boundaries.
+An asynchronous App result does not prove synchronous revocation. The required native root graph
+and the final App writer validate the current execution attempt; queued cancellation, copied heads
+and partial reruns still require repository-level acceptance evidence. The executor's report trust
+boundary still requires completion; a mutable local
+controller is not OS isolation. Missing authority, configuration, observations or platforms block
+acceptance.
+
+The approval policy requires renewed approval when the reviewable diff changes and permits reuse
+when that diff is unchanged. Native CODEOWNERS and stale-review dismissal must enforce this per PR;
+an App check attached to a shared SHA cannot supply atomic author exemption or review revocation.
+Keep approval blocked until native check consumption, latest-attempt isolation and trusted main-only
+workflow bootstrap are verified. Test identity records the exact PR, author and head repository,
+head and current main base, merged code tree, and trusted policy commit. GitHub may regenerate a
+merge commit with a new timestamp and SHA. Evidence can remain eligible only when its ordered
+base/head parents and complete code tree match, and neither head, current main base nor policy
+changed. Always retain the actual tested merge SHA in execution receipts; equivalence does not
+claim execution of the replacement commit. Shared-SHA test evidence never supplies another PR's
+author exemption or review approval.
+
+Release Please owns the single product version and `CHANGELOG.md`. Its initial `0.1.0` override is
+transient. Automatic Release PR execution admits synchronized version fields and bounded changelog
+text; it does not admit executable changes. The publication controller verifies the owner's actual
+head review, fixed source/tag/Release identity, signed content commitment and completed publication
+proof before treating a release as complete.
+
+Recover a merged Release PR by starting a **new** Stable Release `workflow_dispatch` with its PR
+number. Each successful platform is durably staged in an authenticated, unpublished draft. Recovery
+uses the exact staged installer and content-bound smoke reports even after Actions artifacts
+expire. A complete signed upload intent can finish its interrupted completion marker. Unknown,
+partial-starter or mismatched bytes stop recovery; they are not overwritten or adopted. A frozen
+selection cannot be rebuilt into different bytes, and an already published release remains read-only.
+The failed-jobs rerun path across producer attempts and recovery after signing-key rotation are not
+verified alternatives to this entry point.
+
+The controller bounds each API/evidence document, paginates to establish completion, retains at most
+128 authenticated run records and 128 stage attempts per version, and admits at most 32 formal assets.
+Exhausted bounds stop admission while preserving records. Do not remove records or raise a limit to
+force a release through the gate.
+
 ### Immutable coverage obligations
 
 `tests/e2e/baseline.json` packages the exact 21 source files from original revision
@@ -338,8 +651,9 @@ Quarantine needs concrete evidence, preserved alternative coverage, a re-enable 
 authorization. Required invariants without replacement evidence remain blockers. Do not fix tests by
 raising budgets, changing provider/permissions, weakening assertions, or replacing the user task.
 
-Packaged smoke validates `app.isPackaged`, `app://`, Utility, SQLite, fuses, ASAR, seed durability, and
-independent cold restart with private data. `--real-core` preserves production fuses and does not
+Packaged smoke validates manifest identity/content, `app.isPackaged`, `app://`, Utility, SQLite,
+fuses, ASAR, seed durability and independent cold restart with private data. `--real-core` uses the
+same explicit manifest, preserves production fuses and does not
 inject a testing Bridge; observe actual provider replies/file effects and cold identity/content
 preservation. A visible window or exit zero alone is not business acceptance. Select an instance by
 its exact executable and fixture project; stop if native automation targets another instance.
@@ -349,7 +663,7 @@ does not establish a common cold-launch root cause or full Windows acceptance. T
 executable-instance tail and settings command output discrepancy remain investigation limits. Do not
 carry historical macOS success counts forward as a current Windows claim. Native protocol GUI-free
 results, UI alpha, actual desktop composition, paid model runs, package smoke, signing, and performance
-p95/soak are independent evidence categories. Signed/notarized releases, automatic updates, complete
+p95 are independent evidence categories. Signed/notarized releases, automatic updates, complete
 checkpoint disaster recovery, and release performance acceptance remain separate work.
 
 For resource acceptance and the representative benchmark matrix, see [architecture resource requirements](docs/technical-foundation.md#performance-and-resource-requirements).

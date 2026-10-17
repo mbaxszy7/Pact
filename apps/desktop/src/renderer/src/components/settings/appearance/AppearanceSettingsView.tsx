@@ -4,6 +4,7 @@ import type {
   AppearanceEffectiveSettings,
   AppearanceSettings,
   AppearanceTheme,
+  AppInfo,
   WindowMaterial,
 } from '@pact/contracts'
 
@@ -22,7 +23,7 @@ interface AppearanceSettingsViewProps {
   onMaterialOpacityCommit: (opacity: number) => void
   onReset: () => void
   onRetry: () => void
-  platform: 'darwin' | 'win32' | 'linux' | undefined
+  platform: AppInfo['platform'] | undefined
 }
 
 const themeOptions: ReadonlyArray<{

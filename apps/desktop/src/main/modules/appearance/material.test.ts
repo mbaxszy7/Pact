@@ -178,7 +178,7 @@ describe('Appearance material rules', () => {
 
   it('never requests a native effect on an unsupported platform', () => {
     const fixture = windowWith()
-    expect(applyMaterial(settings(), theme(), [fixture.window], { platform: 'linux' })).toEqual({
+    expect(applyMaterial(settings(), theme(), [fixture.window], { platform: 'freebsd' })).toEqual({
       theme: 'light',
       windowMaterial: 'solid',
       fallbackReason: 'native_material_not_supported',

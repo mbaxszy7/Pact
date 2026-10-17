@@ -15,7 +15,7 @@ import { test } from './runtime-fixture.js'
 
 test(
   'real silent Retry reads actual evidence without authorizing generation',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(360_000)
     const ctx = await launchRealWorkspace('real-silent-inspection', {

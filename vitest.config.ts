@@ -26,6 +26,7 @@ export default defineConfig({
       'tests/e2e/windows-process-observation.test.ts',
       'tests/e2e/windows-test-command.test.ts',
       'tests/e2e/real-native-evidence.test.ts',
+      'tests/e2e/readonly-fixture-database.test.ts',
     ],
     passWithNoTests: false,
   },

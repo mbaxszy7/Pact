@@ -143,5 +143,8 @@ describe('Indexed streaming history isolation', () => {
         db.close()
       }
     },
+    // Includes creating 110,010 real rows on hosted runners; the unchanged query,
+    // returned-row and write-count assertions enforce changed-entity work.
+    30_000,
   )
 })

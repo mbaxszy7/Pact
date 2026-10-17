@@ -3,6 +3,7 @@ import { Worker } from 'node:worker_threads'
 
 import type { AgentNativeForkBoundary, AgentNativeForkWitness } from '@pact/agent-runtime'
 
+import { ipcTrafficMeasurementSchema } from '@pact/contracts'
 import {
   collaborationResultSchema,
   collaborationAnswerFormatSchema,
@@ -10,6 +11,7 @@ import {
   type CollaborationAnswerFormat,
 } from '@pact/contracts'
 
+import { LogicalIpcWorkerTraffic, observeWorkerTraffic } from '../../shared/logical-ipc-traffic'
 import { AgentExecutionError } from './agent-execution-error'
 import { NativeWorkingMemory, NATIVE_OWNER_WORKING_BYTES } from './native-working-memory'
 
@@ -151,6 +153,9 @@ function answerResult(value: unknown): NativeForkAnswerResult {
 /** One bounded off-event-loop reader per Adapter. No native process or transcript cache. */
 export class NativeForkFiles {
   private worker: Worker | undefined
+  private terminateWorker: (() => Promise<void>) | undefined
+
+  constructor(private readonly ipcTraffic?: LogicalIpcWorkerTraffic) {}
 
   async execute(
     input: NativeForkFileInput,
@@ -211,10 +216,12 @@ export class NativeForkFiles {
         false,
       )
     const reservation = new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES)
+    const traffic = this.ipcTraffic?.collector('utility-native-fork')
+    const initialization = traffic ? { input, measure: true } : input
     let worker: Worker
     try {
       worker = new Worker(join(__dirname, 'native-fork-worker.js'), {
-        workerData: input,
+        workerData: initialization,
         resourceLimits: {
           maxOldGenerationSizeMb: 128,
           maxYoungGenerationSizeMb: 8,
@@ -225,12 +232,49 @@ export class NativeForkFiles {
       reservation.release()
       throw error
     }
+    traffic?.record('utility-native-fork.init', 'business', initialization)
+    observeWorkerTraffic(
+      worker,
+      traffic,
+      'utility-native-fork.control',
+      'native-fork-utility.reply',
+      'business',
+      false,
+    )
     this.worker = worker
     let active = true
     let referencePending = false
     const references = new AbortController()
     let timer: ReturnType<typeof setTimeout> | undefined
     let abort: (() => void) | undefined
+    let physicallySettled = false
+    let termination: Promise<void> | undefined
+    const settlePhysical = (): void => {
+      if (physicallySettled) return
+      physicallySettled = true
+      reservation.release()
+      if (this.worker === worker) {
+        this.worker = undefined
+        this.terminateWorker = undefined
+      }
+    }
+    const terminate = (): Promise<void> => {
+      if (physicallySettled) return Promise.resolve()
+      if (!termination) {
+        try {
+          termination = worker.terminate().then(settlePhysical)
+        } catch (error) {
+          return Promise.reject(error)
+        }
+        termination = termination.catch((error: unknown) => {
+          termination = undefined
+          throw error
+        })
+      }
+      return termination
+    }
+    this.terminateWorker = terminate
+    worker.once('exit', settlePhysical)
     try {
       return await new Promise<T>((resolve, reject) => {
         abort = () =>
@@ -266,6 +310,15 @@ export class NativeForkFiles {
             code?: string
             nativeSessionId?: string
           }) => {
+            if (traffic) {
+              const measured = ipcTrafficMeasurementSchema.safeParse(
+                Reflect.get(message, 'ipcMeasurement'),
+              )
+              if (measured.success)
+                traffic.recordMeasurement('native-fork-utility.reply', 'business', measured.data)
+              else traffic.invalidate('unvalidated_message')
+            }
+            if (!active) return
             if (message.type === 'history_reference') {
               const id = message.nativeSessionId
               if (
@@ -344,18 +397,11 @@ export class NativeForkFiles {
       references.abort()
       clearTimeout(timer)
       if (abort) signal.removeEventListener('abort', abort)
-      try {
-        await worker.terminate()
-      } finally {
-        reservation.release()
-        if (this.worker === worker) this.worker = undefined
-      }
+      await terminate()
     }
   }
 
   async dispose(): Promise<void> {
-    const worker = this.worker
-    if (worker) await worker.terminate()
-    if (this.worker === worker) this.worker = undefined
+    await this.terminateWorker?.()
   }
 }

@@ -57,7 +57,7 @@ interface StreamObservation {
 
 test(
   'real five active Sessions reject a sixth without accepting input',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(caseDeadlineMs)
     const ctx = await launchRealWorkspace('real-capacity', { transportFault: 'pause-turn' })
@@ -159,71 +159,75 @@ test(
   },
 )
 
-test('real sequential Sessions bound Adapter retention', { tag: '@real' }, async () => {
-  test.setTimeout(caseDeadlineMs)
-  const ctx = await launchRealWorkspace('real-sequential-capacity')
-  const observed: Array<{ sessionId: string; nativeSessionId: string; runId: string }> = []
-  try {
-    for (let index = 0; index < 10; index += 1) {
-      const sessionId =
-        // oxlint-disable-next-line no-await-in-loop -- Each new context follows settlement of the preceding one.
-        index === 0 ? ctx.sessionId : await addRealSession(ctx, `Sequential ${index}`)
-      // oxlint-disable-next-line no-await-in-loop -- Select the current newly created row before its one authorized Send.
-      await selectRealSession(ctx, sessionId)
-      const marker = `SEQUENTIAL_${index}_${randomUUID()}`
-      // oxlint-disable-next-line no-await-in-loop -- Exactly one model request is authorized per fresh Session.
-      await sendRealMessage(
-        ctx,
-        `Briefly acknowledge ${marker}. Do not use tools, read files or write files.`,
-        'codex',
-      )
-      // oxlint-disable-next-line no-await-in-loop -- Complete the current model task before acquiring another Adapter.
-      const completed = await waitForRealCompletion(ctx, 1, sessionId)
-      expect(completed.runs).toHaveLength(1)
-      expect(completed.runs[0]?.agentId).toBe('codex')
-      expect(completed.messages.filter((message) => message.role === 'user')).toHaveLength(1)
-      const reply = answer(completed)
-      expect(reply.content.trim().length).toBeGreaterThan(0)
-      const run = completed.runs[0]!
-      expect(run.nativeSessionId).toBeTruthy()
-      expect(run.nativeTurnId).toBeTruthy()
-      if (!run.nativeSessionId) throw new Error('Actual native Session identity is missing')
-      // Resource retention is a Pact invariant, not a model transcription test.
-      // Independently prove the one request and authentic completed answer.
-      // oxlint-disable-next-line no-await-in-loop -- Observe this settled Native context before acquiring the next one.
-      const native = await findNativeRecord(ctx, 'codex', run.nativeSessionId)
-      expect(native.codexModelStarts).toBe(1)
-      expect(native.containsText(marker)).toBe(true)
-      expect(native.containsText(reply.content)).toBe(true)
-      observed.push({ sessionId, nativeSessionId: run.nativeSessionId, runId: run.id })
-      // oxlint-disable-next-line no-await-in-loop -- High-water ownership is checked after every acquisition, not only at the end.
-      await expect
-        .poll(() => health(ctx), { timeout: 20_000 })
-        .toMatchObject({ activeExecutions: 0, preparingExecutions: 0 })
-      // oxlint-disable-next-line no-await-in-loop -- No next Session is created until current resource counts are observed.
-      const idle = await health(ctx)
-      expect(typeof idle.adapterSlots).toBe('number')
-      expect(idle.adapterSlots).toBeLessThanOrEqual(5)
-      // oxlint-disable-next-line no-await-in-loop -- The actual selected Session must show exactly its own completed reply.
-      await expect(ctx.page.locator('article[data-pact-speaker="codex"]')).toHaveCount(1)
+test(
+  'real sequential Sessions bound Adapter retention',
+  { tag: ['@real', '@real-extended'] },
+  async () => {
+    test.setTimeout(caseDeadlineMs)
+    const ctx = await launchRealWorkspace('real-sequential-capacity')
+    const observed: Array<{ sessionId: string; nativeSessionId: string; runId: string }> = []
+    try {
+      for (let index = 0; index < 10; index += 1) {
+        const sessionId =
+          // oxlint-disable-next-line no-await-in-loop -- Each new context follows settlement of the preceding one.
+          index === 0 ? ctx.sessionId : await addRealSession(ctx, `Sequential ${index}`)
+        // oxlint-disable-next-line no-await-in-loop -- Select the current newly created row before its one authorized Send.
+        await selectRealSession(ctx, sessionId)
+        const marker = `SEQUENTIAL_${index}_${randomUUID()}`
+        // oxlint-disable-next-line no-await-in-loop -- Exactly one model request is authorized per fresh Session.
+        await sendRealMessage(
+          ctx,
+          `Briefly acknowledge ${marker}. Do not use tools, read files or write files.`,
+          'codex',
+        )
+        // oxlint-disable-next-line no-await-in-loop -- Complete the current model task before acquiring another Adapter.
+        const completed = await waitForRealCompletion(ctx, 1, sessionId)
+        expect(completed.runs).toHaveLength(1)
+        expect(completed.runs[0]?.agentId).toBe('codex')
+        expect(completed.messages.filter((message) => message.role === 'user')).toHaveLength(1)
+        const reply = answer(completed)
+        expect(reply.content.trim().length).toBeGreaterThan(0)
+        const run = completed.runs[0]!
+        expect(run.nativeSessionId).toBeTruthy()
+        expect(run.nativeTurnId).toBeTruthy()
+        if (!run.nativeSessionId) throw new Error('Actual native Session identity is missing')
+        // Resource retention is a Pact invariant, not a model transcription test.
+        // Independently prove the one request and authentic completed answer.
+        // oxlint-disable-next-line no-await-in-loop -- Observe this settled Native context before acquiring the next one.
+        const native = await findNativeRecord(ctx, 'codex', run.nativeSessionId)
+        expect(native.codexModelStarts).toBe(1)
+        expect(native.containsText(marker)).toBe(true)
+        expect(native.containsText(reply.content)).toBe(true)
+        observed.push({ sessionId, nativeSessionId: run.nativeSessionId, runId: run.id })
+        // oxlint-disable-next-line no-await-in-loop -- High-water ownership is checked after every acquisition, not only at the end.
+        await expect
+          .poll(() => health(ctx), { timeout: 20_000 })
+          .toMatchObject({ activeExecutions: 0, preparingExecutions: 0 })
+        // oxlint-disable-next-line no-await-in-loop -- No next Session is created until current resource counts are observed.
+        const idle = await health(ctx)
+        expect(typeof idle.adapterSlots).toBe('number')
+        expect(idle.adapterSlots).toBeLessThanOrEqual(5)
+        // oxlint-disable-next-line no-await-in-loop -- The actual selected Session must show exactly its own completed reply.
+        await expect(ctx.page.locator('article[data-pact-speaker="codex"]')).toHaveCount(1)
+      }
+      expect(observed).toHaveLength(10)
+      expect(new Set(observed.map((item) => item.sessionId)).size).toBe(10)
+      expect(new Set(observed.map((item) => item.nativeSessionId)).size).toBe(10)
+      expect(new Set(observed.map((item) => item.runId)).size).toBe(10)
+      await test.info().attach('real-sequential-ownership', {
+        body: JSON.stringify({ sessions: observed, health: await health(ctx) }),
+        contentType: 'application/json',
+      })
+    } finally {
+      observed.length = 0
+      await closeRealWorkspace(ctx)
     }
-    expect(observed).toHaveLength(10)
-    expect(new Set(observed.map((item) => item.sessionId)).size).toBe(10)
-    expect(new Set(observed.map((item) => item.nativeSessionId)).size).toBe(10)
-    expect(new Set(observed.map((item) => item.runId)).size).toBe(10)
-    await test.info().attach('real-sequential-ownership', {
-      body: JSON.stringify({ sessions: observed, health: await health(ctx) }),
-      contentType: 'application/json',
-    })
-  } finally {
-    observed.length = 0
-    await closeRealWorkspace(ctx)
-  }
-})
+  },
+)
 
 test(
   'real inactive Session streaming retains completion, unread and Selection',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(caseDeadlineMs)
     const ctx = await launchRealWorkspace('real-stream-interest')

@@ -1,11 +1,11 @@
 import { expect, type Page } from '@playwright/test'
 import { createHash } from 'node:crypto'
 import { opendir, readFile, stat, writeFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
 
 import type { ConversationSnapshot, DesktopBridge } from '../../packages/contracts/src/index.js'
 
-import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import {
   authMarker,
   closeRealWorkspace,
@@ -26,19 +26,18 @@ import {
 import { test } from './runtime-fixture.js'
 import { windowsTextCommand } from './windows-test-command.js'
 
-const migrationsFolder = resolve(import.meta.dirname, '../../packages/persistence/drizzle')
 const commandDelayMs = 15_000
 
 for (const agentId of ['codex', 'claude'] as const) {
   test(
     `real ${agentId} UI Stop preserves received text and unsent input before one explicit continuation${agentId === 'codex' ? '; @all never starts its secondary' : ''}`,
-    { tag: '@real' },
+    { tag: ['@real', '@real-extended'] },
     async () => {
       test.setTimeout(600_000)
       const ctx = await launchRealWorkspace(`real-stop-${agentId}`)
-      let observer: PactDatabase | undefined
+      let observer: ReadonlyFixtureDatabase | undefined
       try {
-        observer = await PactDatabase.open({ filePath: ctx.fixture.databaseFile, migrationsFolder })
+        observer = ReadonlyFixtureDatabase.open(ctx.fixture)
         const database = observer
         if (agentId === 'claude') await selectRealConfiguredEffort(ctx, [agentId])
         const sourceMarker = authMarker('STOP_SOURCE')
@@ -312,7 +311,7 @@ for (const agentId of ['codex', 'claude'] as const) {
 for (const agentId of ['codex', 'claude'] as const) {
   test(
     `real ${agentId} UI Stop retires an unanswered native permission without executing its command`,
-    { tag: '@real' },
+    { tag: ['@real', '@real-extended'] },
     async () => {
       test.setTimeout(600_000)
       const ctx = await launchRealWorkspace(`real-stop-permission-${agentId}`)
@@ -396,7 +395,7 @@ for (const agentId of ['codex', 'claude'] as const) {
   for (const action of ['stop', 'archive'] as const)
     test(
       `real ${agentId} UI ${action === 'stop' ? 'Stop' : 'archive'} interrupts its foreground command before the delayed filesystem effect`,
-      { tag: '@real' },
+      { tag: ['@real', '@real-extended'] },
       async () => {
         test.setTimeout(600_000)
         const ctx = await launchRealWorkspace(`real-${action}-command-${agentId}`)
@@ -511,10 +510,7 @@ for (const agentId of ['codex', 'claude'] as const) {
             // A native acknowledgement alone is insufficient: the actual command is already gone
             // when Pact reports confirmed archive, before any fixture teardown can stop it.
             expect(isProcessAlive(physical.pid)).toBe(false)
-            const database = await PactDatabase.open({
-              filePath: ctx.fixture.databaseFile,
-              migrationsFolder,
-            })
+            const database = ReadonlyFixtureDatabase.open(ctx.fixture)
             try {
               expect(database.sessionRepository.find(ctx.sessionId)?.status).toBe('archived')
               expect(database.conversationRepository.findRun(run.id)).toMatchObject({
@@ -592,10 +588,7 @@ for (const agentId of ['codex', 'claude'] as const) {
               clearInterval(pidObserver)
               // Capture observed physical facts before ordinary fixture teardown,
               // including failures where Native retained uncancellable background work.
-              const database = await PactDatabase.open({
-                filePath: ctx.fixture.databaseFile,
-                migrationsFolder,
-              })
+              const database = ReadonlyFixtureDatabase.open(ctx.fixture)
               let facts: ConversationSnapshot
               try {
                 facts = database.conversationRepository.read(ctx.sessionId)
@@ -810,7 +803,7 @@ async function clickStop(ctx: RealWorkspace, agentId: 'claude' | 'codex'): Promi
 }
 
 async function requireNativeStop(ctx: RealWorkspace, runId: string): Promise<void> {
-  const database = await PactDatabase.open({ filePath: ctx.fixture.databaseFile, migrationsFolder })
+  const database = ReadonlyFixtureDatabase.open(ctx.fixture)
   try {
     await expect
       .poll(

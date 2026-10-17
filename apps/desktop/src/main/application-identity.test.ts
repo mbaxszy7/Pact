@@ -1,98 +1,147 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtempSync, rmSync, writeFileSync, existsSync, realpathSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import identities from '../../app-identities.json'
+import { resolveApplicationIdentity } from './application-identity'
+import { readProductIdentity } from './product-identity'
 import {
-  resolveApplicationIdentity,
-  resolveNativeApplicationIdentity,
-} from './application-identity.js'
+  configureApplicationProfile,
+  resolveRuntimePaths,
+  readConfiguredDefaultPaths,
+} from './utility-process/runtime-paths'
 
-const native = vi.hoisted(() => ({ packaged: false, path: '', profile: 'C:/Pact/profile-a' }))
+const native = vi.hoisted(() => ({ packaged: true, root: '', paths: {} as Record<string, string> }))
 vi.mock('electron', () => ({
   app: {
     get isPackaged() {
       return native.packaged
     },
-    getAppPath: () => native.path,
-    getPath: () => native.profile,
+    getAppPath: () => native.root,
+    getVersion: () => '0.1.0',
+    getPath: (name: string) => native.paths[name]!,
+    setPath: (name: string, path: string) => {
+      native.paths[name] = path
+    },
+    setAppLogsPath: (path: string) => {
+      native.paths.logs = path
+    },
   },
 }))
-const directories: string[] = []
+
 beforeEach(() => {
-  native.packaged = false
-  native.profile = 'C:/Pact/profile-a'
+  native.root = mkdtempSync(join(tmpdir(), 'pact-identity-integration-'))
+  native.packaged = true
+  native.paths = { appData: join(native.root, 'app-data'), temp: join(native.root, 'temp') }
+  vi.stubEnv('PACT_E2E_ROOT', undefined)
+  vi.stubEnv('PACT_PACKAGE_SMOKE', undefined)
+  vi.stubEnv('NODE_ENV', 'development')
 })
-afterEach(async () => {
-  vi.restoreAllMocks()
+afterEach(() => {
   vi.unstubAllEnvs()
-  await Promise.all(
-    directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
+  rmSync(native.root, { recursive: true, force: true })
+})
+
+function metadata(profile: keyof typeof identities) {
+  const identity = identities[profile]
+  const value = {
+    name: identity.packageName,
+    productName: identity.name,
+    version: '0.1.0',
+    pactBuildProfile: profile,
+  }
+  writeFileSync(join(native.root, 'package.json'), JSON.stringify(value))
+  return value
+}
+
+for (const profile of ['development-ci', 'production-ci'] as const) {
+  it(`resolves ${profile} consistently from the CI producer metadata`, () => {
+    const value = metadata(profile)
+    const identity = identities[profile]
+    const pactDistribution = {
+      channel: profile === 'development-ci' ? 'dev' : 'stable',
+      appId: identity.appId,
+      productName: identity.name,
+      smokeProtocolVersion: 2,
+      platform: process.platform,
+      arch: process.arch,
+      sourceSha: 'a'.repeat(40),
+      buildNumber: '12',
+    }
+    // Channel mapping also works without the legacy profile field.
+    const { pactBuildProfile: _profile, ...unprofiled } = value
+    writeFileSync(
+      join(native.root, 'package.json'),
+      JSON.stringify({ ...unprofiled, pactDistribution }),
+    )
+    expect(resolveApplicationIdentity()).toMatchObject({ kind: profile, ...identity })
+    expect(readProductIdentity()).toMatchObject({
+      productName: identity.name,
+      appId: identity.appId,
+      channel: pactDistribution.channel,
+      sourceSha: pactDistribution.sourceSha,
+    })
+    configureApplicationProfile(resolveApplicationIdentity())
+    const expectedRoot = join(
+      native.root,
+      'app-data',
+      profile === 'development-ci' ? 'Pact Dev' : 'Pact',
+    )
+    expect(native.paths.userData).toBe(expectedRoot)
+    expect(native.paths.sessionData).toBe(join(expectedRoot, 'electron-session'))
+    expect(native.paths.logs).toBe(join(expectedRoot, 'logs'))
+    expect(readConfiguredDefaultPaths().userData).toBe(expectedRoot)
+    writeFileSync(
+      join(native.root, 'package.json'),
+      JSON.stringify({
+        ...value,
+        pactBuildProfile: profile === 'development-ci' ? 'production-ci' : 'development-ci',
+        pactDistribution,
+      }),
+    )
+    expect(() => resolveApplicationIdentity()).toThrow(/identity|identities/iu)
+  })
+}
+
+it('retains local Production metadata and its existing default paths', () => {
+  metadata('production-local')
+  const identity = resolveApplicationIdentity()
+  expect(readProductIdentity(identity)).toMatchObject({
+    channel: 'stable',
+    productName: 'Pact - Production - Local',
+    sourceSha: undefined,
+  })
+  configureApplicationProfile(identity)
+  const expected = join(native.root, 'app-data', 'Pact - Production - Local')
+  expect(native.paths.userData).toBe(expected)
+  expect(native.paths.sessionData).toBe(expected)
+  expect(readConfiguredDefaultPaths().userData).toBe(expected)
+  expect(existsSync(join(expected, 'pact.sqlite'))).toBe(false)
+})
+
+it('preserves local development SQLite and historical object roots', () => {
+  native.packaged = false
+  const identity = resolveApplicationIdentity()
+  configureApplicationProfile(identity)
+  expect(native.paths.userData).toMatch(/Pact - Development - Local[/\\][a-f0-9]{64}$/u)
+  const paths = resolveRuntimePaths()
+  expect(paths.databaseFile).toMatch(/[/\\]\.pact-data[/\\]dev[/\\]pact.sqlite$/u)
+  expect(paths.workspaceStorageRoot).toMatch(
+    /[/\\]Pact[/\\]workspace-versions-development[/\\][a-f0-9]{64}$/u,
   )
 })
 
-async function metadata(value: unknown) {
-  native.path = await mkdtemp(join(tmpdir(), 'pact-identity-'))
-  directories.push(native.path)
-  await writeFile(join(native.path, 'package.json'), JSON.stringify(value))
-  native.packaged = true
-}
-
-describe('Application identity isolation', () => {
-  it('keeps local development distinct and selects packaged identities only from validated metadata', async () => {
-    vi.stubEnv('PACT_BUILD_PROFILE', 'production-ci')
-    expect(resolveApplicationIdentity()).toMatchObject({
-      kind: 'development-local',
-      name: 'Pact - Development - Local',
-    })
-    await metadata({
-      name: identities['production-local'].packageName,
-      productName: identities['production-local'].name,
-      pactBuildProfile: 'production-local',
-    })
-    const identity = resolveApplicationIdentity()
-    expect(identity).toMatchObject({ kind: 'production-local', name: 'Pact - Production - Local' })
-    expect(Object.isFrozen(identity)).toBe(true)
-  })
-
-  it('preserves the official CI identity and reserves four unique application/profile identities', async () => {
-    await metadata({ name: '@pact/desktop' })
-    expect(resolveApplicationIdentity()).toMatchObject({
-      kind: 'production-ci',
-      name: 'Pact',
-      appId: 'com.pact.desktop',
-    })
-    const kinds = [
-      'development-local',
-      'production-local',
-      'development-ci',
-      'production-ci',
-    ] as const
-    for (const field of ['appId', 'packageName', 'profileDirectory'] as const)
-      expect(new Set(kinds.map((kind) => identities[kind][field])).size).toBe(4)
-  })
-
-  it.each([
-    { name: '@pact/desktop', pactBuildProfile: '../other' },
-    { name: '@pact/desktop', pactBuildProfile: 'production-local' },
-    { name: 'pact-production-local', pactBuildProfile: 'production-local', productName: 'Pact' },
-  ])('rejects mismatched package metadata: %j', async (input) => {
-    await metadata(input)
-    expect(() => resolveApplicationIdentity()).toThrow(/identity/)
-  })
-
-  it('scopes Windows development shell identity to the repository profile while keeping packaged/macOS IDs stable', () => {
-    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
-    const identity = resolveApplicationIdentity(),
-      first = resolveNativeApplicationIdentity(identity)
-    native.profile = 'C:/Pact/profile-b'
-    expect(resolveNativeApplicationIdentity(identity).appId).not.toBe(first.appId)
-    expect(first.profileDirectory).toBe(identity.profileDirectory)
-    native.packaged = true
-    expect(resolveNativeApplicationIdentity(identity)).toBe(identity)
-    native.packaged = false
-    vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin')
-    expect(resolveNativeApplicationIdentity(identity)).toBe(identity)
-  })
+it('keeps fixture profiles private before creating normal channel paths', () => {
+  native.packaged = false
+  const rootPath = join(native.root, 'fixture')
+  for (const name of ['electron-profile', 'electron-session', 'tmp'])
+    mkdirSync(join(rootPath, name), { recursive: true })
+  const root = realpathSync(rootPath)
+  vi.stubEnv('PACT_E2E_ROOT', root)
+  configureApplicationProfile(resolveApplicationIdentity())
+  expect(native.paths.userData).toBe(join(root, 'electron-profile'))
+  expect(native.paths.sessionData).toBe(join(root, 'electron-session'))
+  expect(existsSync(join(native.root, 'app-data'))).toBe(false)
+  expect(resolveRuntimePaths().databaseFile).toBe(join(root, 'pact.sqlite'))
 })

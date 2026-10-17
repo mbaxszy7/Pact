@@ -30,7 +30,7 @@ import { test } from './runtime-fixture.js'
 
 test(
   'real Fork preserves both Native histories and the source draft through cold initialization without a Model task',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(600_000)
     const ctx = await launchRealWorkspace('real-fork-recovery')
@@ -234,7 +234,7 @@ test(
 
 test(
   'real Retry inspection of a moved Native record keeps the draft read-only and rebuilds once without replay',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(600_000)
     const ctx = await launchRealWorkspace('real-missing-native-record')

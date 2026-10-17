@@ -25,6 +25,7 @@ import {
   readSubmittedCollaborationReport,
 } from './collaboration-answer'
 import { nativeHistoryImageBytes } from './native-image-content'
+import { measureNativeWorkerReply } from './native-json-encoder'
 
 const TEXT_BYTES = 8 * 1024 * 1024
 const MAX_BYTES = 32 * 1024 * 1024
@@ -769,7 +770,7 @@ async function claude(
       if (input.action !== 'fork') return
       if (!projectDirectory || !uuid.test(key.sessionId) || values.length > MAX_RECORDS)
         throw new Error('Invalid native Fork candidate.')
-      parentPort!.postMessage({ type: 'candidate', result })
+      await postReply({ type: 'candidate', result })
       await new Promise<void>((resolve, reject) =>
         parentPort!.once('message', (message) =>
           message?.type === 'candidate_committed'
@@ -867,7 +868,7 @@ async function historyReference(nativeSessionId: string): Promise<NativeForkHist
         historyMode: reference.historyMode,
       })
     })
-    parentPort!.postMessage({ type: 'history_reference', nativeSessionId })
+    void postReply({ type: 'history_reference', nativeSessionId }).catch(reject)
   })
 }
 
@@ -1429,13 +1430,22 @@ async function codex(input: NativeForkFileInput): Promise<NativeForkFileResult> 
   }
 }
 
+const measureTraffic =
+  workerData !== null && typeof workerData === 'object' && workerData.measure === true
+async function postReply(reply: Record<string, unknown>): Promise<void> {
+  if (measureTraffic) {
+    const ipcMeasurement = await measureNativeWorkerReply(reply)
+    parentPort!.postMessage({ ...reply, ipcMeasurement })
+  } else parentPort!.postMessage(reply)
+}
+
 if (parentPort) {
-  const input: unknown = workerData
+  const input: unknown = measureTraffic ? workerData.input : workerData
   if (!isInput(input)) throw new Error('Invalid native Fork worker input.')
   void (input.provider === 'claude' ? claude(input) : codex(input)).then(
-    (result) => parentPort!.postMessage({ type: 'result', result }),
+    (result) => postReply({ type: 'result', result }),
     (error: unknown) =>
-      parentPort!.postMessage({
+      postReply({
         type: 'error',
         error: error instanceof Error ? error.message : 'Native Fork file inspection failed.',
         code: error instanceof Error ? Reflect.get(error, 'code') : undefined,

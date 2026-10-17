@@ -9,6 +9,7 @@ import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { quitPact } from './native-quit.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import { createRuntimeFixture, test } from './runtime-fixture.js'
 
 test(
@@ -69,6 +70,7 @@ test(
       return { id, projectId }
     })
     let app: ElectronApplication | undefined
+    let observer: ReadonlyFixtureDatabase | undefined
     const writtenClipboard = [nested, 'codex/context-before']
     try {
       await writeFile(join(repository, 'fixture.txt'), 'Owned Git context fixture\n')
@@ -84,6 +86,8 @@ test(
         'Owned context fixture',
       )
       await git('checkout', '--quiet', '-b', 'codex/context-before')
+      database.close()
+      observer = ReadonlyFixtureDatabase.open(fixture)
       app = await fixture.launch()
       const page = await app.firstWindow()
       // Playwright otherwise keeps document focus emulated even while the actual
@@ -176,8 +180,8 @@ test(
       ).toBeVisible()
       await expect(page.getByRole('button', { name: /^Git branch:/u })).toHaveCount(0)
       for (const row of rows) {
-        expect(database.conversationRepository.read(row.id).messages).toHaveLength(0)
-        expect(database.conversationRepository.read(row.id).runs).toHaveLength(0)
+        expect(observer.conversationRepository.read(row.id).messages).toHaveLength(0)
+        expect(observer.conversationRepository.read(row.id).runs).toHaveLength(0)
       }
       await app.evaluate(async ({ clipboard }, owned) => {
         if (owned.includes(await clipboard.readText())) clipboard.clear()
@@ -191,7 +195,8 @@ test(
         }, writtenClipboard)
         await app.evaluate(({ app: nativeApp }) => nativeApp.exit(1))
       }
-      database.close()
+      if (database.isHealthy()) database.close()
+      observer?.close()
       await fixture.dispose()
     }
   },

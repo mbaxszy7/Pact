@@ -25,7 +25,7 @@ const pageItems = 25
 
 test(
   'opens a 10,000-Message Session through bounded pages and keeps large bodies bounded',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(180_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })
@@ -254,7 +254,7 @@ async function messageIntersectsViewport(page: Page, messageId: string): Promise
 
 test(
   'Comment navigation mounts the exact offscreen source and preserves its selection while scrolling',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     const fixture = await createRuntimeFixture({ mode: 'real' })
     const seeded = await seedLongConversation(fixture)

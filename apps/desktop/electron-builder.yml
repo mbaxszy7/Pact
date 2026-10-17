@@ -23,6 +23,7 @@ npmRebuild: true
 mac:
   icon: build/icon.icns
   category: public.app-category.developer-tools
+  identity: '-'
   hardenedRuntime: true
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.plist
@@ -31,18 +32,18 @@ mac:
     - target: dmg
       arch:
         - arm64
-        - x64
     - target: zip
       arch:
         - arm64
-        - x64
 win:
   executableName: Pact
   icon: build/icon.ico
+  signExecutable: false
   target:
     - target: nsis
       arch:
         - x64
+        - arm64
 nsis:
   oneClick: false
   perMachine: false
@@ -60,3 +61,4 @@ nsis:
     - en_US
   shortcutName: Pact
   uninstallDisplayName: Pact
+  deleteAppDataOnUninstall: false

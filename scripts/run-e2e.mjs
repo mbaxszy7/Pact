@@ -1,9 +1,16 @@
 import { execFile, spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { mkdtemp, writeFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 
 import { loadProviderConfiguration } from '../tests/e2e/provider-environment.ts'
+import { repository, repositoryId } from './ci-identity.mjs'
+import { collectUiDiagnostics, writeUiReports } from './ci-ui-diagnostics.mjs'
+import { readE2EJson } from './e2e-report.mjs'
+import { coreRealGrep, requireRealScope } from './real-e2e-policy.mjs'
+import { evaluateRealReport, writeRealReport } from './real-e2e-policy.mjs'
+import { isScriptEntry } from './script-entry.mjs'
 
 const outputLimit = 256 * 1024
 const terminationGrace = 5000
@@ -42,7 +49,7 @@ function readProcessTable(timeout = 1000) {
   return new Promise((resolveTable, reject) => {
     execFile(
       '/bin/ps',
-      ['-axo', 'pid=,ppid=,pgid=,lstart='],
+      ['-axo', 'pid=,ppid=,pgid=,lstart=,stat='],
       {
         env: { PATH: process.env.PATH, LC_ALL: 'C' },
         encoding: 'utf8',
@@ -67,12 +74,18 @@ function readProcessTable(timeout = 1000) {
         }
         const rows = new Map()
         for (const line of lines) {
-          const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s*$/u.exec(line)
+          const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s+([A-Za-z+<>?]{1,8})\s*$/u.exec(line)
           if (!match) {
-            reject(failure('E2E process ownership query returned an invalid row.'))
+            const fields = line.trim().split(/\s+/u)
+            const flags = fields.at(-1) ?? ''
+            reject(
+              failure(
+                `E2E process ownership query returned an invalid row (pidFields=${/^\s*\d+\s+\d+\s+\d+\s/u.test(line)}; fieldCount=${Math.min(fields.length, 4097)}; stat=${/^[A-Za-z+<>?]{1,8}$/u.test(flags) ? flags : 'unrecognized'}).`,
+              ),
+            )
             return
           }
-          const [, pidText, parentText, groupText, started] = match
+          const [, pidText, parentText, groupText, started, stat] = match
           const pid = Number(pidText)
           const ppid = Number(parentText)
           const pgid = Number(groupText)
@@ -80,7 +93,7 @@ function readProcessTable(timeout = 1000) {
             reject(failure('E2E process ownership query returned an invalid identity.'))
             return
           }
-          rows.set(pid, { pid, ppid, pgid, started })
+          rows.set(pid, { pid, ppid, pgid, started, stat })
         }
         resolveTable(rows)
       },
@@ -99,18 +112,39 @@ export function run(
   {
     executable = 'pnpm',
     cwd = repositoryRoot,
+    env = process.env,
+    signal,
     redact = (text) => text,
     write,
     onState = () => {},
+    onOwnership,
+    posixOwnedGroupLimit,
+    windowsArgumentMode,
     inspectProcesses = readProcessTable,
   } = {},
 ) {
+  if (signal?.aborted) return Promise.reject(failure('E2E job cancelled before admission.'))
+  if (
+    windowsArgumentMode !== undefined &&
+    (process.platform !== 'win32' || windowsArgumentMode !== 'nsis')
+  )
+    return Promise.reject(failure('The named NSIS argument mode requires a Windows Job.'))
+  if (
+    posixOwnedGroupLimit !== undefined &&
+    (!Number.isSafeInteger(posixOwnedGroupLimit) ||
+      posixOwnedGroupLimit < 1 ||
+      posixOwnedGroupLimit > maxOwnedGroups)
+  )
+    return Promise.reject(failure('POSIX owned-group limit must be an integer from 1 to 16.'))
+  if (process.platform === 'win32' && posixOwnedGroupLimit !== undefined)
+    return Promise.reject(failure('A POSIX owned-group limit cannot apply to a Windows Job.'))
+  const groupLimit = posixOwnedGroupLimit ?? maxOwnedGroups
   if (process.platform === 'win32') {
     return import('./run-e2e-windows.mjs').then(({ runWindows }) =>
       runWindows(
         args,
         timeout,
-        { executable, cwd, redact, write, onState },
+        { executable, cwd, env, signal, redact, write, onState, windowsArgumentMode },
         { failure, scrubHeaders },
       ),
     )
@@ -123,6 +157,7 @@ export function run(
     try {
       child = spawn(executable, args, {
         cwd,
+        env,
         detached: true,
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -147,8 +182,13 @@ export function run(
     let groupTimer
     let observerFailed = false
     const ownedProcesses = new Map()
-    const ownedGroups = new Set(child.pid ? [child.pid] : [])
-    const groupLeaderStarts = new Map()
+    const ownedGroups = new Map(
+      child.pid ? [[child.pid, { admitted: true, started: undefined }]] : [],
+    )
+    let ownershipEvidenceIncomplete = false
+    let cleanupError
+    let ownershipProbeIncomplete = false
+    let ownershipSequence = 0
     let ownershipSample
     let ownershipTimer
     let cleanupRefreshing = false
@@ -169,7 +209,13 @@ export function run(
           maxBufferedBytes,
           groupGone,
           ownedProcessCount: identityCount(),
-          ownedGroupCount: ownedGroups.size,
+          ownedGroupCount: admittedGroupCount(),
+          cleanupGroupCount: ownedGroups.size,
+          ownershipEvidenceIncomplete,
+          ownershipProbeIncomplete,
+          ...(cleanupError && safeErrors.has(cleanupError)
+            ? { cleanupFailure: cleanupError.message }
+            : {}),
           ...(startupError && safeErrors.has(startupError)
             ? { failure: startupError.message }
             : {}),
@@ -189,13 +235,98 @@ export function run(
         throw failure(`E2E process-group check failed (${safeCode(error)}).`)
       }
     }
-    const groupAlive = () => [...ownedGroups].some(groupExists)
+    const groupAlive = () => {
+      let alive = false
+      for (const pgid of ownedGroups.keys()) {
+        try {
+          alive = groupExists(pgid) || alive
+        } catch (error) {
+          recordFailure(error)
+          alive = true
+        }
+      }
+      return alive
+    }
+    const admittedGroupCount = () =>
+      [...ownedGroups.values()].filter((group) => group.admitted).length
+    const recordFailure = (error) => {
+      if (!startupError) startupError = error
+      else if (error !== startupError) cleanupError ??= error
+    }
     const identityCount = () =>
       ownedProcesses.size +
       [...uncertainGroups.values()].reduce((count, pending) => count + pending.identities.length, 0)
+    const pendingConfirmations = () =>
+      [...uncertainGroups].filter(([pgid]) => !invalidGroups.has(pgid))
+    const retainInvalidGroup = (pgid, previous) => {
+      invalidGroups.add(pgid)
+      const retained = new Map(
+        (uncertainGroups.get(pgid)?.identities ?? []).map((known) => [known.pid, known]),
+      )
+      for (const known of [...previous, ...ownedProcesses.values()]) {
+        if (known.pgid === pgid) retained.set(known.pid, known)
+      }
+      uncertainGroups.set(pgid, {
+        identities: [...retained.values()],
+        deadline: performance.now(),
+      })
+      for (const [pid, known] of ownedProcesses) {
+        if (known.pgid === pgid) ownedProcesses.delete(pid)
+      }
+    }
+    const observeOwnership = (stage, rows, problem) => {
+      if (typeof onOwnership !== 'function' || ownershipProbeIncomplete) return
+      const snapshot = {
+        stage,
+        sequence: ++ownershipSequence,
+        elapsedMs: Math.round(performance.now()),
+        rootPid: child.pid ?? null,
+        requestedSignal: requestedSignal ?? null,
+        problem: problem && safeErrors.has(problem) ? problem.message : null,
+        admittedGroupCount: admittedGroupCount(),
+        evidenceIncomplete: ownershipEvidenceIncomplete,
+        groups: [...ownedGroups].map(([pgid, group]) => ({
+          pgid,
+          admitted: group.admitted,
+          started: group.started ?? null,
+          uncertain: uncertainGroups.has(pgid),
+          invalid: invalidGroups.has(pgid),
+          signal: sentSignals.get(pgid) ?? null,
+        })),
+        identities: [
+          ...ownedProcesses.values(),
+          ...[...uncertainGroups.values()].flatMap((pending) => pending.identities),
+        ].map((known) => ({
+          pid: known.pid,
+          ppid: known.ppid,
+          pgid: known.pgid,
+          started: known.started,
+          observed: sameProcess(known, rows.get(known.pid)) === true,
+          stat: rows.get(known.pid)?.stat ?? null,
+        })),
+      }
+      // A diagnostic callback never becomes a second owner or changes the job's
+      // verdict. Its fixed scalar snapshot has the existing identity bounds.
+      try {
+        if (
+          snapshot.groups.length > maxOwnedProcesses ||
+          snapshot.identities.length > maxOwnedProcesses ||
+          Buffer.byteLength(JSON.stringify(snapshot)) > 64 * 1024
+        )
+          throw new Error('Ownership observation exceeded its bound')
+        const observation = onOwnership(snapshot)
+        if (observation !== undefined) {
+          // The contract is synchronous/void. Observe one invalid return's
+          // rejection without awaiting it or admitting another callback.
+          ownershipProbeIncomplete = true
+          void Promise.resolve(observation).catch(() => {})
+        }
+      } catch {
+        ownershipProbeIncomplete = true
+      }
+    }
     const retireGroup = (pgid) => {
       ownedGroups.delete(pgid)
-      groupLeaderStarts.delete(pgid)
       uncertainGroups.delete(pgid)
       invalidGroups.delete(pgid)
       sentSignals.delete(pgid)
@@ -211,38 +342,58 @@ export function run(
         let problem
         do {
           for (const [pgid, pending] of uncertainGroups) {
+            if (invalidGroups.has(pgid)) continue
             if (pending.deadline > performance.now()) continue
-            uncertainGroups.delete(pgid)
-            if (groupExists(pgid)) {
-              invalidGroups.add(pgid)
-              problem ??= failure(
-                'E2E owned group has no previously verified live process anchor after confirmation deadline.',
-              )
-            } else {
-              retireGroup(pgid)
-              retired.add(pgid)
+            try {
+              if (groupExists(pgid)) {
+                retainInvalidGroup(pgid, [])
+                problem ??= failure(
+                  'E2E owned group has no previously verified live process anchor after confirmation deadline.',
+                )
+              } else {
+                retireGroup(pgid)
+                retired.add(pgid)
+              }
+            } catch (error) {
+              retainInvalidGroup(pgid, [])
+              problem ??= error
             }
           }
           const available = Math.min(
             1000,
-            ...[...uncertainGroups.values()].map((pending) => pending.deadline - performance.now()),
+            ...pendingConfirmations().map(([, pending]) => pending.deadline - performance.now()),
           )
           // oxlint-disable-next-line no-await-in-loop -- One OS query owns the single-flight; unknown groups retain a fixed five-second deadline.
           rows = await inspectProcesses(Math.max(1, Math.floor(available)))
           const previous = [...ownedProcesses.values()]
           const root = rows.get(child.pid)
-          if (!ownedProcesses.size && root?.ppid === process.pid && root.pgid === child.pid) {
+          const rootGroup = ownedGroups.get(child.pid)
+          if (
+            rootGroup &&
+            !rootGroup.started &&
+            !uncertainGroups.has(child.pid) &&
+            !invalidGroups.has(child.pid) &&
+            identityCount() < maxOwnedProcesses &&
+            root?.ppid === process.pid &&
+            root.pgid === child.pid
+          ) {
             ownedProcesses.set(root.pid, root)
-            groupLeaderStarts.set(root.pgid, root.started)
+            rootGroup.started = root.started
           }
           for (const [pid, known] of ownedProcesses) {
             if (!sameProcess(known, rows.get(pid))) ownedProcesses.delete(pid)
           }
           const verifiedGroups = new Set()
-          for (const pgid of ownedGroups) {
-            if (!groupExists(pgid)) {
-              retireGroup(pgid)
-              retired.add(pgid)
+          for (const [pgid, group] of ownedGroups) {
+            try {
+              if (!groupExists(pgid)) {
+                retireGroup(pgid)
+                retired.add(pgid)
+                continue
+              }
+            } catch (error) {
+              retainInvalidGroup(pgid, previous)
+              problem ??= error
               continue
             }
             if (invalidGroups.has(pgid)) {
@@ -250,9 +401,9 @@ export function run(
               continue
             }
             const leader = rows.get(pgid)
-            const started = groupLeaderStarts.get(pgid)
+            const started = group.started
             if (!started || (leader && leader.started !== started)) {
-              invalidGroups.add(pgid)
+              retainInvalidGroup(pgid, previous)
               problem ??= failure('E2E owned group lost its verifiable process identity.')
               continue
             }
@@ -275,8 +426,7 @@ export function run(
               })
             }
             if (performance.now() >= uncertainGroups.get(pgid).deadline) {
-              uncertainGroups.delete(pgid)
-              invalidGroups.add(pgid)
+              retainInvalidGroup(pgid, previous)
               problem ??= failure(
                 'E2E owned group has no previously verified live process anchor after confirmation deadline.',
               )
@@ -294,8 +444,11 @@ export function run(
               )
                 continue
               if (!verifiedGroups.has(row.pgid) && !ownedProcesses.has(row.ppid)) continue
-              if (identityCount() >= maxOwnedProcesses)
-                throw failure('E2E job exceeded 256 owned process identities.')
+              if (identityCount() >= maxOwnedProcesses) {
+                ownershipEvidenceIncomplete = true
+                problem ??= failure('E2E job exceeded 256 owned process identities.')
+                continue
+              }
               ownedProcesses.set(row.pid, row)
               changed = true
             }
@@ -303,18 +456,33 @@ export function run(
           for (const known of ownedProcesses.values()) {
             if (ownedGroups.has(known.pgid)) continue
             const leader = rows.get(known.pgid)
-            if (!leader || !sameProcess(ownedProcesses.get(leader.pid) ?? {}, leader))
-              throw failure('E2E descendant group has no verified owned leader.')
-            if (ownedGroups.size >= maxOwnedGroups)
-              throw failure('E2E job exceeded 16 active owned process groups.')
-            ownedGroups.add(known.pgid)
-            groupLeaderStarts.set(known.pgid, leader.started)
+            const verifiedLeader =
+              leader && sameProcess(ownedProcesses.get(leader.pid) ?? {}, leader)
+            const admitted = Boolean(verifiedLeader) && admittedGroupCount() < groupLimit
+            // Admission can fail without releasing cleanup responsibility. Every
+            // retained group is backed by one of the bounded verified identities.
+            if (ownedGroups.size >= maxOwnedProcesses) {
+              ownershipEvidenceIncomplete = true
+              problem ??= failure('E2E cleanup responsibility exceeded 256 process groups.')
+              continue
+            }
+            ownedGroups.set(known.pgid, {
+              admitted,
+              started: verifiedLeader ? leader.started : undefined,
+            })
+            if (!verifiedLeader) {
+              retainInvalidGroup(known.pgid, [])
+              problem ??= failure('E2E descendant group has no verified owned leader.')
+            }
+            if (!admitted)
+              problem ??= failure(`E2E job exceeded ${groupLimit} active owned process groups.`)
           }
           // Pending confirmation never blocks cancellation of independently
           // verified groups. An unknown group is neither adopted nor signalled.
+          observeOwnership(problem ? 'rejected' : 'sampled', rows, problem)
           if (requestedSignal) signalGroups(requestedSignal, rows)
           if (problem) throw problem
-          if (uncertainGroups.size) {
+          if (pendingConfirmations().length) {
             // oxlint-disable-next-line no-await-in-loop -- Only this single-flight owns the bounded confirmation cadence.
             await new Promise((resume) =>
               setTimeout(
@@ -323,24 +491,30 @@ export function run(
                   0,
                   Math.min(
                     groupCheckInterval,
-                    ...[...uncertainGroups.values()].map(
-                      (pending) => pending.deadline - performance.now(),
+                    ...pendingConfirmations().map(
+                      ([, pending]) => pending.deadline - performance.now(),
                     ),
                   ),
                 ),
               ),
             )
           }
-        } while (uncertainGroups.size)
+        } while (pendingConfirmations().length)
         return rows
       })().finally(() => {
         ownershipSample = undefined
       })
       return ownershipSample
     }
-    const signalGroups = (signal, rows) => {
-      for (const pgid of ownedGroups) {
-        if (!groupExists(pgid)) continue
+    const signalGroups = (requested, rows) => {
+      for (const pgid of ownedGroups.keys()) {
+        try {
+          if (!groupExists(pgid)) continue
+        } catch (error) {
+          retainInvalidGroup(pgid, [])
+          recordFailure(error)
+          continue
+        }
         const anchor = [...ownedProcesses.values()].find(
           (known) => known.pgid === pgid && sameProcess(known, rows.get(known.pid)),
         )
@@ -348,17 +522,17 @@ export function run(
           !anchor ||
           uncertainGroups.has(pgid) ||
           invalidGroups.has(pgid) ||
-          sentSignals.get(pgid) === signal ||
+          sentSignals.get(pgid) === requested ||
           sentSignals.get(pgid) === 'SIGKILL' ||
-          (requestedSignal === 'SIGKILL' && signal !== 'SIGKILL')
+          (requestedSignal === 'SIGKILL' && requested !== 'SIGKILL')
         )
           continue
         try {
-          process.kill(-pgid, signal)
-          sentSignals.set(pgid, signal)
+          process.kill(-pgid, requested)
+          sentSignals.set(pgid, requested)
         } catch (error) {
           if (error.code !== 'ESRCH') {
-            startupError = failure(`E2E owned group could not be signalled (${safeCode(error)}).`)
+            recordFailure(failure(`E2E owned group could not be signalled (${safeCode(error)}).`))
           }
         }
       }
@@ -382,9 +556,9 @@ export function run(
       clearInterval(ownershipTimer)
       process.removeListener('SIGINT', onInterrupt)
       process.removeListener('SIGTERM', onTerminate)
+      signal?.removeEventListener('abort', onCancel)
       ownedProcesses.clear()
       ownedGroups.clear()
-      groupLeaderStarts.clear()
       uncertainGroups.clear()
       invalidGroups.clear()
       sentSignals.clear()
@@ -394,7 +568,7 @@ export function run(
     }
     const checkGroup = () => {
       try {
-        groupGone = !groupAlive()
+        groupGone = !groupAlive() && !ownershipEvidenceIncomplete
         if (groupGone && !cleanupRefreshing && !ownershipSample) {
           clearTimeout(killTimer)
           clearTimeout(confirmTimer)
@@ -402,7 +576,7 @@ export function run(
           finish()
         }
       } catch (error) {
-        startupError = error
+        recordFailure(error)
         stop('group-check-failed')
       }
     }
@@ -424,13 +598,13 @@ export function run(
       state('stopping', reason)
       clearTimeout(drainTimer)
       cleanupRefreshing = true
-      const refreshAndSignal = async (signal) => {
-        requestedSignal = signal
+      const refreshAndSignal = async (requested) => {
+        requestedSignal = requested
         try {
           const rows = await refreshOwnership()
           signalGroups(requestedSignal, rows)
         } catch (error) {
-          startupError = error
+          recordFailure(error)
         } finally {
           cleanupRefreshing = false
           monitorGroup()
@@ -453,12 +627,16 @@ export function run(
           clearInterval(ownershipTimer)
           process.removeListener('SIGINT', onInterrupt)
           process.removeListener('SIGTERM', onTerminate)
+          signal?.removeEventListener('abort', onCancel)
           child.stdout?.destroy()
           child.stderr?.destroy()
           reject(
             failure(
-              'E2E owned process groups could not be confirmed closed after SIGKILL.' +
-                (startupError && safeErrors.has(startupError) ? ` ${startupError.message}` : ''),
+              (startupError && safeErrors.has(startupError) ? `${startupError.message} ` : '') +
+                'E2E owned process groups could not be confirmed closed after SIGKILL.' +
+                (cleanupError && safeErrors.has(cleanupError)
+                  ? ` Cleanup observation: ${cleanupError.message}`
+                  : ''),
             ),
           )
         }, confirmationDeadline)
@@ -467,8 +645,10 @@ export function run(
     }
     const onInterrupt = () => stop('interrupted-SIGINT')
     const onTerminate = () => stop('interrupted-SIGTERM')
+    const onCancel = () => stop('cancelled')
     process.once('SIGINT', onInterrupt)
     process.once('SIGTERM', onTerminate)
+    signal?.addEventListener('abort', onCancel, { once: true })
     const deadline = setTimeout(() => stop('deadline'), timeout)
     const sample = () => {
       if (settled || stopping) return
@@ -479,7 +659,7 @@ export function run(
           return undefined
         },
         (error) => {
-          startupError = error
+          recordFailure(error)
           stop('ownership-query-failed')
           return undefined
         },
@@ -542,7 +722,7 @@ export function run(
       }
     }
     child.once('error', (error) => {
-      startupError = failure(`E2E job could not start (${safeCode(error)}).`)
+      recordFailure(failure(`E2E job could not start (${safeCode(error)}).`))
       stop('spawn-failed')
     })
     child.once('exit', (code) => {
@@ -578,17 +758,41 @@ export function run(
   })
 }
 
+/** Natural exit and verified cleanup distinguish test failure from forced supervision. */
+export async function runNaturally(args, timeout, options = {}) {
+  let stopped = false,
+    settled = false
+  const code = await run(args, timeout, {
+    ...options,
+    onState(state) {
+      stopped ||= state.kind === 'stopping'
+      if (state.kind === 'settled')
+        settled = state.groupGone === true && state.ownedProcessCount === 0
+      options.onState?.(state)
+    },
+  })
+  if (stopped || !settled) throw failure('E2E supervisor did not finish naturally')
+  return code
+}
+
 /** Configuration admission precedes the sole build; all jobs share one two-hour deadline. */
 export async function main({
   lane = 'all',
+  realScope = 'full',
   forwarded = [],
   loadConfiguration = loadProviderConfiguration,
   runJob = run,
+  beforeBuild,
 } = {}) {
   if (!['all', 'ui', 'real', 'deterministic'].includes(lane)) {
     throw failure('Choose E2E lane: all, ui, real or deterministic')
   }
+  requireRealScope(realScope)
+  if (realScope === 'core' && lane !== 'real')
+    throw failure('Core selection applies only to the real E2E lane')
   const argumentsForTests = forwarded.filter((value) => value !== '--')
+  if (realScope === 'core' && argumentsForTests.some((value) => value !== '--reporter=line,json'))
+    throw failure('Core E2E selection cannot be narrowed by forwarded arguments')
   if (argumentsForTests.some((value) => value.startsWith('--project'))) {
     throw failure('Select the E2E lane through this command, not a second --project override')
   }
@@ -599,6 +803,7 @@ export async function main({
   try {
     configuration = ['all', 'real'].includes(lane) ? await loadConfiguration() : null
     const redact = (text) => configuration?.redact(text) ?? text
+    await beforeBuild?.({ redact })
     const built = await runJob(
       ['build'],
       Math.min(buildDeadline, Math.max(1, deadline - Date.now())),
@@ -613,6 +818,7 @@ export async function main({
           'playwright',
           'test',
           ...projects.map((project) => `--project=${project}`),
+          ...(realScope === 'core' ? ['--grep', coreRealGrep()] : []),
           ...argumentsForTests,
         ],
         Math.max(1, deadline - Date.now()),
@@ -637,8 +843,202 @@ export async function main({
   return result
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  void main({ lane: process.argv[2] ?? 'all', forwarded: process.argv.slice(3) }).then(
+async function localCodeIdentity() {
+  const git = (args) =>
+    new Promise((done, reject) =>
+      execFile(
+        'git',
+        ['-c', 'core.fsmonitor=false', ...args],
+        {
+          cwd: repositoryRoot,
+          encoding: 'utf8',
+          timeout: 5000,
+          maxBuffer: 4096,
+          shell: false,
+        },
+        (error, value) => (error ? reject(error) : done(value.trim())),
+      ),
+    )
+  try {
+    if (await git(['status', '--porcelain'])) return null
+    const headSha = await git(['rev-parse', 'HEAD'])
+    return {
+      schemaVersion: 3,
+      repository,
+      repositoryId,
+      pullRequest: null,
+      headRepositoryId: repositoryId,
+      headSha,
+      candidateSha: headSha,
+      baseSha: null,
+      treeSha: await git(['rev-parse', `${headSha}^{tree}`]),
+      policySha: headSha,
+      sourceKind: 'branch',
+      controllerSha: headSha,
+      controllerRef: null,
+      product: null,
+      channel: 'dev',
+    }
+  } catch {
+    return null
+  }
+}
+
+/** Local commands keep safe reports outside disposable Playwright output, including admission failures. */
+export async function mainWithReports({
+  lane = 'all',
+  realScope = 'full',
+  forwarded = [],
+  runJob = runNaturally,
+  reportWorkspace = repositoryRoot,
+  ...options
+} = {}) {
+  const directory = await mkdtemp(join(tmpdir(), 'pact-e2e-report-'))
+  const inventoryPath = join(directory, 'inventory.json'),
+    rawPath = join(directory, 'execution.json')
+  const originalOutput = process.env.PLAYWRIGHT_JSON_OUTPUT_FILE
+  const originalArtifacts = process.env.PACT_E2E_OUTPUT_DIR
+  const identityBefore = await localCodeIdentity()
+  let code = 1,
+    completed = false,
+    problem
+  try {
+    if (forwarded.some((value) => value.startsWith('--reporter')))
+      throw failure('The E2E report owner selects the reporter')
+    process.env.PLAYWRIGHT_JSON_OUTPUT_FILE = rawPath
+    process.env.PACT_E2E_OUTPUT_DIR = join(directory, 'test-results')
+    code = await main({
+      lane,
+      realScope,
+      ...options,
+      runJob,
+      forwarded: [...forwarded, '--reporter=line,json'],
+      beforeBuild: async ({ redact }) => {
+        process.env.PLAYWRIGHT_JSON_OUTPUT_FILE = inventoryPath
+        try {
+          const listed = await runJob(
+            ['exec', 'playwright', 'test', '--list', '--reporter=json'],
+            30_000,
+            { redact },
+          )
+          if (listed !== 0) throw failure('E2E discovery failed')
+        } finally {
+          process.env.PLAYWRIGHT_JSON_OUTPUT_FILE = rawPath
+        }
+      },
+    })
+    completed = [0, 1].includes(code)
+  } catch (error) {
+    problem = error
+    code = 1
+  } finally {
+    const identityAfter = await localCodeIdentity()
+    const identity =
+      identityBefore && JSON.stringify(identityBefore) === JSON.stringify(identityAfter)
+        ? identityBefore
+        : null
+    const identityPath = join(directory, 'identity.json')
+    try {
+      await writeFile(identityPath, JSON.stringify(identity), { mode: 0o600, flag: 'wx' })
+      const projects = lane === 'all' ? ['ui', 'real', 'deterministic'] : [lane]
+      let raw = null
+      try {
+        raw = await readE2EJson(rawPath)
+      } catch {
+        /* Admission failure still gets a safe complete inventory. */
+      }
+      if (projects.includes('real')) {
+        const report = evaluateRealReport(raw, {
+          suite: realScope,
+          gate: realScope,
+          identity,
+          execution: completed ? 'completed' : 'unavailable',
+        })
+        const receipt = await writeRealReport(report, directory, undefined, {
+          workspace: reportWorkspace,
+        })
+        console.log(
+          `Safe real E2E report: ${receipt.report.reportFiles.localDirectory}/real-summary.md`,
+        )
+        if (!forwarded.length && !report.gatePassed) code = 1
+      }
+      if (projects.some((project) => project !== 'real')) {
+        if (raw)
+          for (const project of projects.filter((selected) => selected !== 'real')) {
+            // oxlint-disable-next-line eslint/no-await-in-loop -- Private raw evidence is only used by the report owner and removed with this run.
+            await writeFile(join(directory, `${project}.json`), JSON.stringify(raw), {
+              mode: 0o600,
+              flag: 'wx',
+            })
+          }
+        const receipts = await writeUiReports({
+          evidence: directory,
+          workspace: reportWorkspace,
+          identityPath,
+          inventoryPath,
+          execution: Object.fromEntries(
+            projects
+              .filter((project) => project !== 'real')
+              .map((project) => [project, completed ? 'completed' : 'unavailable']),
+          ),
+        })
+        for (const receipt of receipts) {
+          console.log(
+            `Safe ${receipt.report.lane} E2E report: ${receipt.report.reportFiles.localDirectory}/${receipt.report.reportFiles.markdown}`,
+          )
+          // Only an exclusively credential-free invocation owns exportable browser artifacts.
+          // Explicit --output remains caller-owned; mixed/real runs retain safe summaries only.
+          if (
+            ['ui', 'deterministic'].includes(lane) &&
+            receipt.report.lane === lane &&
+            code !== 0 &&
+            !forwarded.some((value) => value === '--output' || value.startsWith('--output='))
+          ) {
+            let collected = false
+            try {
+              // oxlint-disable-next-line eslint/no-await-in-loop -- One failed no-credential lane exports through the existing bounded, no-follow collector.
+              await collectUiDiagnostics(
+                join(directory, 'test-results'),
+                join(receipt.directory, 'diagnostics'),
+                { lane },
+              )
+              collected = true
+            } catch {
+              code = 1
+            }
+            // oxlint-disable-next-line eslint/no-await-in-loop -- Publish a fixed safe index beside this immutable case report, excluding raw execution/configuration.
+            await writeFile(
+              join(receipt.directory, 'diagnostics.md'),
+              collected
+                ? '# Local failure diagnostics\n\nBounded credential-free traces and snapshots: [inventory](diagnostics/inventory.json).\n\nRaw execution JSON and configuration are excluded.\n'
+                : '# Local failure diagnostics\n\nArtifact collection failed; the case summary remains available. No passing result is inferred from missing diagnostics.\n',
+              { flag: 'wx', mode: 0o600 },
+            )
+            console.log(
+              `Local ${lane} failure diagnostics: ${receipt.report.reportFiles.localDirectory}/diagnostics.md`,
+            )
+          }
+        }
+      }
+    } finally {
+      if (originalOutput === undefined) delete process.env.PLAYWRIGHT_JSON_OUTPUT_FILE
+      else process.env.PLAYWRIGHT_JSON_OUTPUT_FILE = originalOutput
+      if (originalArtifacts === undefined) delete process.env.PACT_E2E_OUTPUT_DIR
+      else process.env.PACT_E2E_OUTPUT_DIR = originalArtifacts
+      await rm(directory, { recursive: true, force: true })
+    }
+  }
+  if (problem) throw problem
+  return code
+}
+
+if (isScriptEntry(import.meta.url)) {
+  const core = process.argv[2] === 'real-core'
+  void mainWithReports({
+    lane: core ? 'real' : (process.argv[2] ?? 'all'),
+    realScope: core ? 'core' : 'full',
+    forwarded: process.argv.slice(3),
+  }).then(
     (code) => {
       process.exitCode = code
       return undefined

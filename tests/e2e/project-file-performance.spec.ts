@@ -12,7 +12,7 @@ const migrationsFolder = resolve(import.meta.dirname, '../../packages/persistenc
 
 test(
   'keeps maximum-size plain files complete while mounting only viewport code rows',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(120_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })
@@ -65,7 +65,7 @@ test(
 
 test(
   'recreates JSON language service across TypeScript and releases Workers after repeated views',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(180_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })
@@ -157,7 +157,7 @@ test(
 
 test(
   'applies the same Comment quote limit to LF-normalized CRLF files',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(120_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })

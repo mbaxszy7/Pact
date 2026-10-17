@@ -141,6 +141,7 @@ import {
 } from '@pact/persistence'
 
 import { recordDiagnostic } from '../../diagnostics/utility-log'
+import { LogicalIpcWorkerTraffic, observeWorkerTraffic } from '../../shared/logical-ipc-traffic'
 import { ProjectFileReader } from '../project-file/project-file-reader'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation'
 import { WorkspaceChanges, WorkspaceChangeError } from '../workspace-changes/workspace-changes'
@@ -387,6 +388,7 @@ export class Conversation {
     private readonly projectFiles: ProjectFileReader,
     private readonly workspaceChanges?: WorkspaceChanges,
     private readonly images?: ConversationImages,
+    private readonly ipcTraffic?: LogicalIpcWorkerTraffic,
   ) {
     this.conversations.archives.recover(this.archiveOwnerId)
     this.conversations.expireNativePermissions()
@@ -1854,6 +1856,12 @@ export class Conversation {
         memory.release()
         throw error
       }
+      observeWorkerTraffic(
+        worker,
+        this.ipcTraffic?.collector('utility-markdown'),
+        'utility-markdown.request',
+        'markdown-utility.reply',
+      )
       // Per-request listeners propagate failures; retain a terminal handler between credited requests.
       worker.on('error', () => undefined)
       this.markdownWorker = worker
@@ -6736,8 +6744,8 @@ export class Conversation {
         throw new Error('Pact is shutting down or recovery was cancelled.')
       const adapter =
         agentId === 'claude'
-          ? new ClaudeAgentAdapter(executablePath)
-          : new CodexAgentAdapter(executablePath)
+          ? new ClaudeAgentAdapter(executablePath, undefined, this.ipcTraffic)
+          : new CodexAgentAdapter(executablePath, undefined, {}, this.ipcTraffic)
       this.adapters.set(key, { sessionId, agentId, executablePath, cwd, adapter })
       adapter.setSkillCatalogListener?.(() => {
         if (this.adapters.get(key)?.adapter !== adapter) return

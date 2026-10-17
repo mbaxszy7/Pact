@@ -19,7 +19,7 @@ import { test } from './runtime-fixture.js'
 
 test(
   'real unconfirmed Fork keeps the committed child locked and resumes the same candidate once after restart',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(600_000)
     const ctx = await launchRealWorkspace('real-fork-initialization', {
@@ -145,7 +145,7 @@ test(
 
 test(
   'real unconfirmed rebuild checks its actual candidate before one confirmed replacement and never replays',
-  { tag: '@real' },
+  { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(600_000)
     const ctx = await launchRealWorkspace('real-rebuild-initialization', {
