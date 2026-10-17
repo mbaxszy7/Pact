@@ -26,6 +26,15 @@ runs:
       shell: bash
       working-directory: ${{ inputs.workspace }}
       run: pnpm install --frozen-lockfile
+    - name: Admit the exact native pnpm entry for every Windows job
+      if: runner.os == 'Windows'
+      shell: bash
+      working-directory: ${{ inputs.workspace }}
+      run: |
+        node --input-type=module <<'NODE'
+        import { publishWindowsPnpmPath } from './scripts/ci-native.mjs'
+        await publishWindowsPnpmPath()
+        NODE
     - name: Install exact native CLIs in a private temporary directory
       if: inputs.native == 'true'
       shell: bash

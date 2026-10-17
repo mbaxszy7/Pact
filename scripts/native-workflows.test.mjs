@@ -13,11 +13,24 @@ const [ci, distribution, release] = await Promise.all(
   ['ci-native', 'distributions', 'release-native'].map(loadWorkflow),
 )
 const allWorkflows = [ci, distribution, release]
+const setup = load(
+  await readFile(new URL('../.github/actions/setup/action.yml', import.meta.url), 'utf8'),
+)
 const commands = (job) => job.steps?.map((step) => step.run ?? '').join('\n') ?? ''
 const upload = (job) =>
   job.steps.filter((step) => step.uses?.startsWith('actions/upload-artifact@'))
 const downloads = (job) =>
   job.steps.filter((step) => step.uses?.startsWith('actions/download-artifact@'))
+
+void test('shared Windows toolchain publishes native pnpm independently of optional CLI installation', () => {
+  const steps = setup.runs.steps
+  const dependencies = steps.findIndex((step) => step.name === 'Install frozen source dependencies')
+  const admission = steps.findIndex((step) => step.run?.includes('publishWindowsPnpmPath'))
+  const native = steps.findIndex((step) => step.run?.includes('node scripts/ci-native.mjs'))
+  assert.ok(dependencies < admission && admission < native)
+  assert.equal(steps[admission].if, "runner.os == 'Windows'")
+  assert.doesNotMatch(steps[admission].run, /inputs\.native|shell: true|\.cmd/u)
+})
 
 void test('main version-merge events queue without replacing an earlier pending release', () => {
   assert.equal(release.concurrency['cancel-in-progress'], false)
