@@ -23,6 +23,45 @@ const helperEvidence = (name, assertions) =>
   sourceEvidence('fixture', `async function ${name}() {\n${assertions}\n}`)
 const original = evidence("expect(composer).toHaveValue('Keep my draft')")
 
+await test('native same-checkout coverage rejects an added body skip without changing baseline evidence', () => {
+  const result = execFileSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `
+    import fs from 'node:fs'
+    import { syncBuiltinESMExports } from 'node:module'
+    import { resolve } from 'node:path'
+    const target = resolve('tests/e2e/real-context.spec.ts')
+    const read = fs.readFileSync.bind(fs)
+    fs.readFileSync = (path, ...args) => {
+      const value = read(path, ...args)
+      return String(path) === target && typeof value === 'string'
+        ? value.replace('    test.setTimeout(caseDeadlineMs)', "    test.skip(true, 'new unapproved body skip')\\n    test.setTimeout(caseDeadlineMs)")
+        : value
+    }
+    syncBuiltinESMExports()
+    const { check } = await import('./scripts/check-e2e-coverage.mjs')
+    const report = check({ sourceOnly: true, results: [], realScope: 'full' })
+    console.log(JSON.stringify(report.problems))
+  `,
+    ],
+    {
+      cwd: resolve(import.meta.dirname, '..'),
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: { ...process.env, PACT_CI_WORKSPACE: resolve(import.meta.dirname, '..') },
+    },
+  )
+  assert.ok(
+    JSON.parse(result).some(
+      (problem) =>
+        problem.type === 'source-skip' && problem.path === 'tests/e2e/real-context.spec.ts',
+    ),
+  )
+})
+
 await test('contenteditable migration retains exact locator, expected string and equality', () => {
   assert.deepEqual(
     compareAssertions(

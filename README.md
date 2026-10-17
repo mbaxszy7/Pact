@@ -29,9 +29,9 @@ See the [product specification](docs/product/requirements.md) for current behavi
 - On Windows, Python 3 and Visual Studio Build Tools with **Desktop development with C++** for
   Electron native dependency rebuilds.
 
-Required CI covers Windows x64 and macOS arm64, including their guarded installer validation.
-CI builds use `Pact Dev`; Stable downloads use `Pact`. Publication requires the approved version
-PR and both platforms' final installer evidence. Windows arm64 CI remains deferred.
+Required CI covers Windows x64 and macOS arm64, with separate packaging, real-core E2E and installed-package jobs.
+CI builds deliver verified `Pact Dev` Actions artifacts; Stable downloads use `Pact`. A version PR
+requires owner approval and manual merge; complete-platform validation and publication then run automatically. Windows arm64 CI remains deferred.
 
 ```sh
 corepack enable

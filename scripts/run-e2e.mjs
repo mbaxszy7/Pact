@@ -5,9 +5,8 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import { loadProviderConfiguration } from '../tests/e2e/provider-environment.ts'
-import { repository, repositoryId } from './ci-identity.mjs'
 import { collectUiDiagnostics, writeUiReports } from './ci-ui-diagnostics.mjs'
-import { readE2EJson } from './e2e-report.mjs'
+import { publicReportIdentity, readE2EJson, reportRepository } from './e2e-report.mjs'
 import { coreRealGrep, requireRealScope } from './real-e2e-policy.mjs'
 import { evaluateRealReport, writeRealReport } from './real-e2e-policy.mjs'
 import { isScriptEntry } from './script-entry.mjs'
@@ -861,24 +860,12 @@ async function localCodeIdentity() {
     )
   try {
     if (await git(['status', '--porcelain'])) return null
-    const headSha = await git(['rev-parse', 'HEAD'])
-    return {
-      schemaVersion: 3,
-      repository,
-      repositoryId,
-      pullRequest: null,
-      headRepositoryId: repositoryId,
-      headSha,
-      candidateSha: headSha,
-      baseSha: null,
-      treeSha: await git(['rev-parse', `${headSha}^{tree}`]),
-      policySha: headSha,
-      sourceKind: 'branch',
-      controllerSha: headSha,
-      controllerRef: null,
-      product: null,
-      channel: 'dev',
-    }
+    return publicReportIdentity({
+      schemaVersion: 1,
+      kind: 'local',
+      repository: reportRepository,
+      sourceSha: await git(['rev-parse', 'HEAD']),
+    })
   } catch {
     return null
   }

@@ -293,8 +293,7 @@ normal production-path correctness.
 
 `version.json` owns the product version. Distribution verifies desktop version and checked-out SHA,
 injects a compatible Dev prerelease/build/source identity or Stable version, then hash-checks metadata
-restoration. Native Windows x64 produces NSIS; macOS arm64 produces DMG/ZIP. Automatic installation
-and publication require `PACT_PACKAGING_READY` after native acceptance. Windows ARM64 CI/installers
+restoration. Native Windows x64 produces NSIS; macOS arm64 produces DMG/ZIP. Separate native package, installed-smoke and core E2E jobs gate delivery and publication. Windows ARM64 CI/installers
 remain deferred. Certificate signing/notarization stay disabled; macOS retains ad-hoc signing.
 Native dependency rebuilding, sandboxing, Context Isolation, ASAR integrity and fuses remain required.
 
@@ -305,9 +304,7 @@ exits before Utility, database, providers, Renderer or diagnostic Workers and re
 rules. Explicit local profiles use the same manifest-based verification without becoming CI Releases.
 
 These interfaces require actual platform evidence for coexistence, upgrades and uninstall cleanup.
-Publication requires enforceable repository gates, authorized environments, all required platform
-results and validation bound to final application/installer hashes. Unknown provenance and failed or
-missing required evidence block publication.
+Publication uses the exact merged version-PR source and same-run package IDs/digests with matching installed evidence. A separate main-only publisher reconciles one Draft, verifies uploaded bytes and native immutable Release integrity, then finalizes standard version labels before maintaining the next PR. Native review rules exempt only the owner-author; CI is never bypassed and Merge stays manual. Model and version-bot environments use ref restrictions without runtime approvals. Missing evidence, expired artifacts or uncertain writes stop; no signed controller, staging Release or alternate recovery path is retained.
 
 ## Verification and remaining scope
 

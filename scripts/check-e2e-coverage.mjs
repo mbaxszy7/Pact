@@ -38,6 +38,47 @@ const reactRequire = createRequire(desktopRequire.resolve('@vitejs/plugin-react'
 const babelRequire = createRequire(reactRequire.resolve('@babel/core'))
 const { parse } = babelRequire('@babel/parser')
 
+// Exact platform conditions accepted after the immutable baseline. Never derive
+// permissions to skip from the candidate checkout, including in native CI.
+const acceptedPlatformSkips = [
+  [
+    'tests/e2e/appearance.spec.ts',
+    'Windows keeps page Alpha and native controls while Solid remains opaque',
+    'win32',
+    'Windows transparent window backing only',
+  ],
+  [
+    'tests/e2e/appearance.spec.ts',
+    'macOS changes material in the same window without a restart notice and restores it on cold launch',
+    'darwin',
+    'macOS live material policy only',
+  ],
+  [
+    'tests/e2e/native-presentation.spec.ts',
+    'macOS native attention and cancel-exit preserve preview, Fork and composer state',
+    'darwin',
+    'Uses the actual macOS Dock menu',
+  ],
+  [
+    'tests/e2e/native-session-navigation.spec.ts',
+    'macOS Dock keeps five cross-Project recent Sessions across cold restart and clicks only navigate',
+    'darwin',
+    'Uses the actual macOS Dock menu',
+  ],
+  [
+    'tests/e2e/native-session-navigation.spec.ts',
+    'macOS native navigation cannot overwrite a newer sidebar choice after a delayed Utility response',
+    'darwin',
+    'Pauses only the owned macOS Utility process',
+  ],
+  [
+    'tests/e2e/project-context.spec.ts',
+    'macOS Project menus use the registered folder, refresh Git facts, and copy exact values',
+    'darwin',
+    'Verifies the macOS menu wording and clipboard',
+  ],
+]
+
 function options(argv) {
   const result = {
     json: false,
@@ -645,11 +686,20 @@ export function check(configuration) {
     }
     if (!source.skipSites.length) continue
     skippedSources.push({ path, lines: source.skipSites })
-    // Retain only exact platform/accessibility conditions already present in
-    // trusted controller source. A new skip cannot bypass static publication.
-    const trusted = sourceEvidence(path, readFileSync(join(controllerRoot, path), 'utf8'))
+    // The hash-verified baseline and these explicit accepted additions remain
+    // authoritative even when the checker and candidate use the same checkout.
+    const trusted = sourceEvidence(path, original.files[path] ?? '')
     const remaining = new Map()
-    for (const skip of trusted.skips)
+    const additions = acceptedPlatformSkips
+      .filter(([acceptedPath]) => acceptedPath === path)
+      .flatMap(
+        ([, title, platform, reason]) =>
+          sourceEvidence(
+            path,
+            `test(${JSON.stringify(title)}, () => { test.skip(process.platform !== ${JSON.stringify(platform)}, ${JSON.stringify(reason)}) })`,
+          ).skips,
+      )
+    for (const skip of [...trusted.skips, ...additions])
       remaining.set(skip.signature, (remaining.get(skip.signature) ?? 0) + 1)
     const unexpected = source.skips.filter((skip) => {
       const count = remaining.get(skip.signature) ?? 0

@@ -1,10 +1,18 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { publicReportIdentity, readE2EJson, writeE2EReport } from './e2e-report.mjs'
+import {
+  ciReportIdentity,
+  publicReportIdentity,
+  readE2EJson,
+  reportIdentityMarkdown,
+  writeCiReportMetadata,
+  writeE2EReport,
+} from './e2e-report.mjs'
 
 await test('bounded report reads reject links, excessive bytes and incomplete JSON without changing recovery evidence', async (context) => {
   const root = await mkdtemp(join(tmpdir(), 'pact-e2e-read-'))
@@ -79,91 +87,98 @@ await test('linked local report parents and linked artifact directories cannot r
   assert.equal(await readFile(join(outside, 'keep.txt'), 'utf8'), 'preserve')
 })
 
-await test('code identity projection never publishes extensions or the unvalidated author of a branch push', () => {
-  const head = 'a'.repeat(40),
-    secret = 'synthetic-private-identity-extension'
-  const identity = {
-    schemaVersion: 3,
+const ciEnvironment = {
+  GITHUB_ACTIONS: 'true',
+  GITHUB_REPOSITORY: 'mbaxszy7/Pact',
+  GITHUB_SHA: 'a'.repeat(40),
+  GITHUB_RUN_ID: '12345',
+  GITHUB_RUN_ATTEMPT: '2',
+  GITHUB_EVENT_NAME: 'pull_request',
+  GITHUB_REF: 'refs/pull/12/merge',
+}
+
+await test('native source/run metadata has one public schema and excludes arbitrary extensions', () => {
+  const identity = ciReportIdentity(ciEnvironment)
+  assert.deepEqual(identity, {
+    schemaVersion: 1,
+    kind: 'ci',
     repository: 'mbaxszy7/Pact',
-    repositoryId: 1416403312,
-    pullRequest: null,
-    headRepositoryId: 1416403312,
-    authorId: secret,
-    channel: 'dev',
-    headSha: head,
-    baseSha: null,
-    candidateSha: head,
-    treeSha: 'd'.repeat(40),
-    policySha: head,
-    sourceKind: 'branch',
-    controllerSha: head,
-    controllerRef: null,
-    product: null,
-    extra: { secret },
-  }
-  const projected = publicReportIdentity(identity)
-  assert.equal(JSON.stringify(projected).includes(secret), false)
-  assert.equal(projected.candidateSha, head)
+    sourceSha: 'a'.repeat(40),
+    runId: 12345,
+    runAttempt: 2,
+    eventName: 'pull_request',
+    ref: 'refs/pull/12/merge',
+  })
+  const secret = 'synthetic-private-report-extension'
+  const projected = publicReportIdentity({ ...identity, secret, config: { secret } })
+  assert.deepEqual(projected, identity)
   assert.deepEqual(publicReportIdentity(projected), projected)
-  for (const sourceKind of ['main', 'bootstrap']) {
-    const prIdentity = {
-      ...identity,
-      sourceKind,
-      pullRequest: 7,
-      authorId: 31481964,
-      baseSha: 'b'.repeat(40),
-      controllerSha: sourceKind === 'main' ? 'b'.repeat(40) : head,
-      controllerRef:
-        sourceKind === 'main'
-          ? 'refs/heads/main'
-          : `refs/heads/codex/pact-ci-bootstrap-${head.slice(0, 12)}`,
-      policySha: sourceKind === 'main' ? 'b'.repeat(40) : head,
-      product: {
-        before: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
-        after: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
-      },
-    }
-    const projectedPr = publicReportIdentity(prIdentity)
-    assert.equal(projectedPr.controllerRef, prIdentity.controllerRef)
-    assert.deepEqual(publicReportIdentity(projectedPr), projectedPr)
-    assert.equal(JSON.stringify(projectedPr).includes(secret), false)
-  }
-  assert.throws(() => publicReportIdentity({ ...identity, treeSha: secret }), /commit identity/)
+  assert(!reportIdentityMarkdown(projected).includes(secret))
+  assert(reportIdentityMarkdown(projected).includes('Actions run: 12345, attempt 2'))
+  for (const changes of [
+    { schemaVersion: 3 },
+    { kind: 'release' },
+    { repository: 'another/Pact' },
+    { sourceSha: 'bad' },
+    { runId: '12345' },
+    { runId: 0 },
+    { runAttempt: 0 },
+    { runAttempt: 1.5 },
+    { eventName: 'pull_request_target' },
+    { ref: 'refs/heads/main\nsecret' },
+    { ref: 'x'.repeat(1025) },
+  ])
+    assert.throws(() => publicReportIdentity({ ...identity, ...changes }), /identity/)
+  for (const changes of [
+    { GITHUB_ACTIONS: 'false' },
+    { GITHUB_RUN_ID: '01' },
+    { GITHUB_RUN_ID: '9007199254740992' },
+    { GITHUB_RUN_ATTEMPT: '' },
+    { GITHUB_SHA: '' },
+    { GITHUB_REPOSITORY: '' },
+  ])
+    assert.throws(() => ciReportIdentity({ ...ciEnvironment, ...changes }), /identity|metadata/)
 })
 
-await test('release reports whitelist fixed release identity and never export signed state or extensions', () => {
-  const secret = 'synthetic-private-release-signature',
-    identity = {
-      schemaVersion: 1,
-      repository: 'mbaxszy7/Pact',
-      releasePR: 14,
-      version: '0.1.0',
-      sourceSha: 'a'.repeat(40),
-      tag: 'v0.1.0',
-      releaseId: 1234,
-      signature: secret,
-      staging: { key: secret },
-      extensions: secret,
-    }
-  const projected = publicReportIdentity(identity, 'release')
-  assert.deepEqual(Object.keys(projected), [
-    'schemaVersion',
-    'repository',
-    'releasePR',
-    'version',
-    'sourceSha',
-    'tag',
-    'releaseId',
-  ])
-  assert.equal(JSON.stringify(projected).includes(secret), false)
-  for (const changes of [
-    { tag: 'v0.2.0' },
-    { releaseId: null },
-    { releasePR: 0 },
-    { repository: 'another/Pact' },
-    { sourceSha: secret },
-    { version: '0.0.0', tag: 'v0.0.0' },
-  ])
-    assert.throws(() => publicReportIdentity({ ...identity, ...changes }, 'release'), /identity/)
-  assert.throws(() => publicReportIdentity(identity, 'ci'), /identity/)
+await test('local source metadata is explicit and never invents an Actions run', () => {
+  const identity = publicReportIdentity({
+    schemaVersion: 1,
+    kind: 'local',
+    repository: 'mbaxszy7/Pact',
+    sourceSha: 'b'.repeat(40),
+    secret: 'private-extension',
+  })
+  assert.equal(identity.kind, 'local')
+  assert.equal(Object.hasOwn(identity, 'runId'), false)
+  assert(reportIdentityMarkdown(identity).includes('this is not a CI run'))
+  assert.equal(publicReportIdentity(null), null)
+  assert(reportIdentityMarkdown(null).includes('unavailable'))
+  assert.throws(() => publicReportIdentity({ ...identity, sourceSha: null }), /identity/)
+})
+
+await test('metadata CLI writes exact native run projection once and rejects missing or malformed evidence', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-ci-metadata-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const file = join(root, 'metadata.json')
+  execFileSync(process.execPath, ['scripts/e2e-report.mjs', '--ci-metadata', file], {
+    env: { ...process.env, ...ciEnvironment },
+    timeout: 5000,
+  })
+  assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), ciReportIdentity(ciEnvironment))
+  await assert.rejects(writeCiReportMetadata(file, ciEnvironment), { code: 'EEXIST' })
+  await assert.rejects(writeCiReportMetadata('relative.json', ciEnvironment), /bounded/)
+  assert.throws(
+    () =>
+      execFileSync(
+        process.execPath,
+        ['scripts/e2e-report.mjs', '--ci-metadata', join(root, 'invalid.json')],
+        {
+          env: { ...process.env, ...ciEnvironment, GITHUB_RUN_ATTEMPT: '0' },
+          timeout: 5000,
+          stdio: 'pipe',
+        },
+      ),
+    (error) => error.status === 1,
+  )
+  assert.deepEqual(await readdir(root), ['metadata.json'])
 })

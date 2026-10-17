@@ -11,7 +11,7 @@ import {
 } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
 
-import { requireIdentity } from './ci-identity.mjs'
+import { isScriptEntry } from './script-entry.mjs'
 
 export const e2eReportLimits = Object.freeze({
   inputBytes: 8 * 1024 * 1024,
@@ -19,77 +19,94 @@ export const e2eReportLimits = Object.freeze({
   retainedRuns: 4096,
 })
 
-/** Never publish optional identity extensions or an unvalidated branch author. */
-export function publicReportIdentity(identity, kind = 'ci') {
-  if (!['ci', 'release'].includes(kind)) throw new Error('Invalid report identity kind')
+export const reportRepository = 'mbaxszy7/Pact'
+const ciEvents = new Set([
+  'push',
+  'pull_request',
+  'workflow_dispatch',
+  'workflow_call',
+  'merge_group',
+])
+
+/** Informational source/run projection; native GitHub jobs own their actual result gates. */
+export function publicReportIdentity(identity) {
   if (identity === null) return null
-  if (kind === 'release') {
-    if (
-      !identity ||
-      identity.schemaVersion !== 1 ||
-      identity.repository !== 'mbaxszy7/Pact' ||
-      !Number.isSafeInteger(identity.releasePR) ||
-      identity.releasePR < 1 ||
-      !Number.isSafeInteger(identity.releaseId) ||
-      identity.releaseId < 1 ||
-      typeof identity.version !== 'string' ||
-      identity.version.length > 128 ||
-      !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.test(identity.version) ||
-      identity.version === '0.0.0' ||
-      !/^[a-f\d]{40}$/u.test(identity.sourceSha ?? '') ||
-      identity.tag !== `v${identity.version}`
-    )
-      throw new Error('Invalid release report identity')
-    // This is an informational projection. The release controller still authenticates
-    // the original signed identity before staging or publishing any application bytes.
-    return Object.fromEntries(
-      ['schemaVersion', 'repository', 'releasePR', 'version', 'sourceSha', 'tag', 'releaseId'].map(
-        (name) => [name, identity[name]],
-      ),
-    )
-  }
-  requireIdentity(identity)
-  const result = Object.fromEntries(
-    [
-      'schemaVersion',
-      'repository',
-      'repositoryId',
-      'pullRequest',
-      'headRepositoryId',
-      'headSha',
-      'baseSha',
-      'candidateSha',
-      'treeSha',
-      'policySha',
-      'authorId',
-      'channel',
-      'sourceKind',
-      'controllerSha',
-      'controllerRef',
-    ]
-      .filter(
-        (name) =>
-          Object.hasOwn(identity, name) && (name !== 'authorId' || identity.pullRequest !== null),
-      )
-      .map((name) => [name, identity[name]]),
+  if (
+    !identity ||
+    typeof identity !== 'object' ||
+    Array.isArray(identity) ||
+    identity.schemaVersion !== 1 ||
+    identity.repository !== reportRepository ||
+    !['ci', 'local'].includes(identity.kind) ||
+    !(typeof identity.sourceSha === 'string' && /^[a-f\d]{40}$/u.test(identity.sourceSha))
   )
-  result.product =
-    identity.product === null
-      ? null
-      : {
-          before:
-            identity.product.before === null
-              ? null
-              : {
-                  version: identity.product.before.version,
-                  candidateVersion: identity.product.before.candidateVersion,
-                },
-          after: {
-            version: identity.product.after.version,
-            candidateVersion: identity.product.after.candidateVersion,
-          },
-        }
-  return result
+    throw new Error('Invalid report source identity')
+  const result = {
+    schemaVersion: 1,
+    kind: identity.kind,
+    repository: reportRepository,
+    sourceSha: identity.sourceSha,
+  }
+  if (identity.kind === 'local') return result
+  if (
+    !Number.isSafeInteger(identity.runId) ||
+    identity.runId < 1 ||
+    !Number.isSafeInteger(identity.runAttempt) ||
+    identity.runAttempt < 1 ||
+    !ciEvents.has(identity.eventName) ||
+    typeof identity.ref !== 'string' ||
+    Buffer.byteLength(identity.ref) > 1024 ||
+    !/^refs\/(?:heads|tags|pull|merge-queue)\/[^\s\p{Cc}]+$/u.test(identity.ref)
+  )
+    throw new Error('Invalid report CI run identity')
+  return Object.assign(result, {
+    runId: identity.runId,
+    runAttempt: identity.runAttempt,
+    eventName: identity.eventName,
+    ref: identity.ref,
+  })
+}
+
+export function ciReportIdentity(source = process.env) {
+  if (
+    source.GITHUB_ACTIONS !== 'true' ||
+    !/^[1-9]\d{0,15}$/u.test(source.GITHUB_RUN_ID ?? '') ||
+    !/^[1-9]\d{0,15}$/u.test(source.GITHUB_RUN_ATTEMPT ?? '')
+  )
+    throw new Error('Native CI run metadata is required')
+  return publicReportIdentity({
+    schemaVersion: 1,
+    kind: 'ci',
+    repository: source.GITHUB_REPOSITORY,
+    sourceSha: source.GITHUB_SHA,
+    runId: Number(source.GITHUB_RUN_ID),
+    runAttempt: Number(source.GITHUB_RUN_ATTEMPT),
+    eventName: source.GITHUB_EVENT_NAME,
+    ref: source.GITHUB_REF,
+  })
+}
+
+export async function readCiReportIdentity(path) {
+  const identity = publicReportIdentity(await readE2EJson(path, 4096))
+  if (identity?.kind !== 'ci') throw new Error('CI run metadata is required')
+  return identity
+}
+
+export function reportIdentityMarkdown(identity) {
+  if (!identity) return 'Source identity is unavailable; no CI execution is attested.'
+  const validated = publicReportIdentity(identity)
+  return validated.kind === 'ci'
+    ? `Source: \`${validated.sourceSha}\`; Actions run: ${validated.runId}, attempt ${validated.runAttempt}; event: ${validated.eventName}.`
+    : `Local source: \`${validated.sourceSha}\`; this is not a CI run.`
+}
+
+/** One bounded no-overwrite native metadata file, never a trust controller or credential reader. */
+export async function writeCiReportMetadata(path, source = process.env) {
+  if (!isAbsolute(path) || /[\r\n\0]/u.test(path) || Buffer.byteLength(path) > 4096)
+    throw new Error('Explicit bounded CI metadata path is required')
+  const identity = ciReportIdentity(source)
+  await writeFile(path, `${JSON.stringify(identity, null, 2)}\n`, { flag: 'wx', mode: 0o600 })
+  return identity
 }
 
 export async function readE2EJson(path, limit = e2eReportLimits.inputBytes) {
@@ -224,4 +241,17 @@ export async function writeE2EReport(
   }
   if (summary) await appendFile(summary, text)
   return { report: output, directory: local ?? directory }
+}
+
+if (isScriptEntry(import.meta.url)) {
+  const argv = process.argv.slice(2)
+  if (argv.length !== 2 || argv[0] !== '--ci-metadata') {
+    console.error('Expected --ci-metadata and an absolute output file.')
+    process.exitCode = 1
+  } else {
+    writeCiReportMetadata(argv[1]).catch(() => {
+      console.error('Native CI metadata could not be safely written.')
+      process.exitCode = 1
+    })
+  }
 }

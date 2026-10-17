@@ -1,0 +1,456 @@
+name: Pact distributions and acceptance
+
+on:
+  workflow_call:
+    secrets:
+      PACT_CLAUDE_SETTINGS_JSON:
+        required: true
+      PACT_CODEX_CONFIG_TOML:
+        required: true
+      PACT_CODEX_AUTH_JSON:
+        required: true
+      PACT_CODEX_PROVIDER_ENV_JSON:
+        required: false
+    inputs:
+      source_sha:
+        description: Exact event commit tested and packaged by every job
+        required: true
+        type: string
+      channel:
+        description: dev or stable application identity
+        required: true
+        type: string
+      real_allowed:
+        description: Only this repository's maintained source may use model credentials
+        required: true
+        type: boolean
+    outputs:
+      package_mac_id:
+        value: ${{ jobs.package_mac.outputs.id }}
+      package_mac_digest:
+        value: ${{ jobs.package_mac.outputs.digest }}
+      package_win_id:
+        value: ${{ jobs.package_win.outputs.id }}
+      package_win_digest:
+        value: ${{ jobs.package_win.outputs.digest }}
+      smoke_mac_id:
+        value: ${{ jobs.smoke_mac.outputs.id }}
+      smoke_mac_digest:
+        value: ${{ jobs.smoke_mac.outputs.digest }}
+      smoke_win_id:
+        value: ${{ jobs.smoke_win.outputs.id }}
+      smoke_win_digest:
+        value: ${{ jobs.smoke_win.outputs.digest }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PACT_CI_CHANNEL: ${{ inputs.channel }}
+
+jobs:
+  quality:
+    name: Quality, types and unit tests
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/setup
+      - uses: ./.github/actions/gitleaks
+      - name: Review source history and immutable assertion obligations
+        run: |
+          node scripts/check-secrets.mjs --history
+          node scripts/check-e2e-coverage.mjs --source-only --json
+      - name: Static checks, all product and test types, and unit tests
+        run: node scripts/ci.mjs quality
+      - name: Independent script tests
+        run: node scripts/ci.mjs infra
+        env:
+          PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-quality-evidence
+      - name: Build and discover every immutable E2E assertion obligation
+        run: |
+          node scripts/ci.mjs build
+          node scripts/check-e2e-coverage.mjs --json
+      - name: Preserve bounded script supervision evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quality-process-evidence-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pact-quality-evidence/infra-supervision.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  native_mac:
+    name: Native protocol - macOS arm64
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          native: 'true'
+      - name: Verify native runner and record the exact source/run
+        run: |
+          node --input-type=module -e 'if(process.platform!=="darwin"||process.arch!=="arm64")throw Error("Runner architecture mismatch")'
+          node scripts/e2e-report.mjs --ci-metadata "$RUNNER_TEMP/e2e-metadata.json"
+      - name: Build native runtime dependencies
+        run: node scripts/ci.mjs build
+      - name: Actual native CLI protocol, configuration and lifecycle cases
+        run: node scripts/ci.mjs native
+        env:
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-evidence/darwin-arm64
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
+          PACT_CI_NATIVE_ARTIFACT: native-e2e-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+      - name: Preserve sanitized native case results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-e2e-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-native-evidence/darwin-arm64/native-summary.json
+            ${{ runner.temp }}/pact-native-evidence/darwin-arm64/native-summary.md
+          if-no-files-found: ignore
+          retention-days: 14
+
+  package_mac:
+    name: Package - macOS arm64
+    needs: quality
+    runs-on: macos-15
+    timeout-minutes: 60
+    outputs:
+      id: ${{ steps.upload.outputs.artifact-id }}
+      digest: ${{ steps.upload.outputs.artifact-digest }}
+    env:
+      PACT_CI_PLATFORM: darwin-arm64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Build the exact native installer candidate
+        run: >-
+          node scripts/build-distribution.mjs --channel "$PACT_CI_CHANNEL"
+          --platform darwin --arch arm64 --sha "$SOURCE_SHA"
+          --build-number "$GITHUB_RUN_NUMBER" --output "$RUNNER_TEMP/package"
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+      - name: Bind the clean installer manifest to its producing execution
+        run: node scripts/ci-artifacts.mjs package-context "$RUNNER_TEMP/package"
+      - id: upload
+        name: Preserve the immutable native package candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/package/*.exe
+            ${{ runner.temp }}/package/*.dmg
+            ${{ runner.temp }}/package/*.zip
+            ${{ runner.temp }}/package/distribution-manifest.json
+            ${{ runner.temp }}/package/execution-context.json
+            ${{ runner.temp }}/package/SHA256SUMS
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke_mac:
+    name: Installed smoke - macOS arm64
+    needs: package_mac
+    runs-on: macos-15
+    timeout-minutes: 45
+    outputs:
+      id: ${{ steps.upload.outputs.artifact-id }}
+      digest: ${{ steps.upload.outputs.artifact-digest }}
+    env:
+      PACT_CI_PLATFORM: darwin-arm64
+      PACKAGE_ID: ${{ needs.package_mac.outputs.id }}
+      PACKAGE_DIGEST: ${{ needs.package_mac.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          display: 'true'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.package_mac.outputs.id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/package
+      - name: Install, cold-start, restart and clean the exact downloaded installers
+        run: >-
+          node scripts/ci-artifacts.mjs smoke "$RUNNER_TEMP/package"
+          "$RUNNER_TEMP/smoke" "$PACKAGE_ID" "$PACKAGE_DIGEST"
+      - id: upload
+        name: Preserve actual installed-byte and cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: smoke-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/smoke/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  real_mac:
+    name: Real core E2E - macOS arm64
+    needs: [quality, native_mac]
+    if: inputs.real_allowed
+    environment: pact-provider-ci
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          native: 'true'
+          display: 'true'
+      - name: Verify native runner and record the exact source/run
+        run: |
+          node --input-type=module -e 'if(process.platform!=="darwin"||process.arch!=="arm64")throw Error("Runner architecture mismatch")'
+          node scripts/e2e-report.mjs --ci-metadata "$RUNNER_TEMP/e2e-metadata.json"
+      - name: Execute existing real core cases with isolated model configuration
+        id: execute
+        continue-on-error: true
+        run: node scripts/ci.mjs real core
+        env:
+          PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-evidence/darwin-arm64
+          PACT_CLAUDE_SETTINGS_JSON: ${{ secrets.PACT_CLAUDE_SETTINGS_JSON }}
+          PACT_CODEX_CONFIG_TOML: ${{ secrets.PACT_CODEX_CONFIG_TOML }}
+          PACT_CODEX_AUTH_JSON: ${{ secrets.PACT_CODEX_AUTH_JSON }}
+          PACT_CODEX_PROVIDER_ENV_JSON: ${{ secrets.PACT_CODEX_PROVIDER_ENV_JSON }}
+      - name: Require real execution and every applicable core case
+        if: always()
+        run: >-
+          node scripts/real-e2e-policy.mjs core core
+          "$RUNNER_TEMP/pact-evidence/darwin-arm64" "$RUNNER_TEMP/e2e-metadata.json"
+        env:
+          PACT_REAL_EXECUTION_COMPLETED: ${{ steps.execute.outputs.real_execution_completed }}
+          PACT_REAL_REPORT_ARTIFACT: real-e2e-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+      - name: Preserve only sanitized core and deferred-case reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: real-e2e-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-evidence/darwin-arm64/real-summary.json
+            ${{ runner.temp }}/pact-evidence/darwin-arm64/real-summary.md
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove private provider output
+        if: always()
+        run: >-
+          node --input-type=module -e
+          'import {rm} from "node:fs/promises";import {join} from "node:path";
+          await rm(join(process.env.RUNNER_TEMP,"pact-evidence","darwin-arm64","real.json"),{force:true});'
+
+  native_win:
+    name: Native protocol - Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          native: 'true'
+      - name: Verify native runner and record the exact source/run
+        run: |
+          node --input-type=module -e 'if(process.platform!=="win32"||process.arch!=="x64")throw Error("Runner architecture mismatch")'
+          node scripts/e2e-report.mjs --ci-metadata "$RUNNER_TEMP/e2e-metadata.json"
+      - name: Build native runtime dependencies
+        run: node scripts/ci.mjs build
+      - name: Actual native CLI protocol, configuration and lifecycle cases
+        run: node scripts/ci.mjs native
+        env:
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-evidence/win32-x64
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
+          PACT_CI_NATIVE_ARTIFACT: native-e2e-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
+      - name: Preserve sanitized native case results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-e2e-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-native-evidence/win32-x64/native-summary.json
+            ${{ runner.temp }}/pact-native-evidence/win32-x64/native-summary.md
+          if-no-files-found: ignore
+          retention-days: 14
+
+  package_win:
+    name: Package - Windows x64
+    needs: quality
+    runs-on: windows-2025
+    timeout-minutes: 60
+    outputs:
+      id: ${{ steps.upload.outputs.artifact-id }}
+      digest: ${{ steps.upload.outputs.artifact-digest }}
+    env:
+      PACT_CI_PLATFORM: win32-x64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Build the exact native installer candidate
+        run: >-
+          node scripts/build-distribution.mjs --channel "$PACT_CI_CHANNEL"
+          --platform win32 --arch x64 --sha "$SOURCE_SHA"
+          --build-number "$GITHUB_RUN_NUMBER" --output "$RUNNER_TEMP/package"
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+      - name: Bind the clean installer manifest to its producing execution
+        run: node scripts/ci-artifacts.mjs package-context "$RUNNER_TEMP/package"
+      - id: upload
+        name: Preserve the immutable native package candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/package/*.exe
+            ${{ runner.temp }}/package/*.dmg
+            ${{ runner.temp }}/package/*.zip
+            ${{ runner.temp }}/package/distribution-manifest.json
+            ${{ runner.temp }}/package/execution-context.json
+            ${{ runner.temp }}/package/SHA256SUMS
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke_win:
+    name: Installed smoke - Windows x64
+    needs: package_win
+    runs-on: windows-2025
+    timeout-minutes: 45
+    outputs:
+      id: ${{ steps.upload.outputs.artifact-id }}
+      digest: ${{ steps.upload.outputs.artifact-digest }}
+    env:
+      PACT_CI_PLATFORM: win32-x64
+      PACKAGE_ID: ${{ needs.package_win.outputs.id }}
+      PACKAGE_DIGEST: ${{ needs.package_win.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          display: 'true'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.package_win.outputs.id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/package
+      - name: Install, cold-start, restart and clean the exact downloaded installers
+        run: >-
+          node scripts/ci-artifacts.mjs smoke "$RUNNER_TEMP/package"
+          "$RUNNER_TEMP/smoke" "$PACKAGE_ID" "$PACKAGE_DIGEST"
+      - id: upload
+        name: Preserve actual installed-byte and cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: smoke-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/smoke/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  real_win:
+    name: Real core E2E - Windows x64
+    needs: [quality, native_win]
+    if: inputs.real_allowed
+    environment: pact-provider-ci
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          native: 'true'
+          display: 'true'
+      - name: Verify native runner and record the exact source/run
+        run: |
+          node --input-type=module -e 'if(process.platform!=="win32"||process.arch!=="x64")throw Error("Runner architecture mismatch")'
+          node scripts/e2e-report.mjs --ci-metadata "$RUNNER_TEMP/e2e-metadata.json"
+      - name: Execute existing real core cases with isolated model configuration
+        id: execute
+        continue-on-error: true
+        run: node scripts/ci.mjs real core
+        env:
+          PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-evidence/win32-x64
+          PACT_CLAUDE_SETTINGS_JSON: ${{ secrets.PACT_CLAUDE_SETTINGS_JSON }}
+          PACT_CODEX_CONFIG_TOML: ${{ secrets.PACT_CODEX_CONFIG_TOML }}
+          PACT_CODEX_AUTH_JSON: ${{ secrets.PACT_CODEX_AUTH_JSON }}
+          PACT_CODEX_PROVIDER_ENV_JSON: ${{ secrets.PACT_CODEX_PROVIDER_ENV_JSON }}
+      - name: Require real execution and every applicable core case
+        if: always()
+        run: >-
+          node scripts/real-e2e-policy.mjs core core
+          "$RUNNER_TEMP/pact-evidence/win32-x64" "$RUNNER_TEMP/e2e-metadata.json"
+        env:
+          PACT_REAL_EXECUTION_COMPLETED: ${{ steps.execute.outputs.real_execution_completed }}
+          PACT_REAL_REPORT_ARTIFACT: real-e2e-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
+      - name: Preserve only sanitized core and deferred-case reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: real-e2e-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-evidence/win32-x64/real-summary.json
+            ${{ runner.temp }}/pact-evidence/win32-x64/real-summary.md
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove private provider output
+        if: always()
+        run: >-
+          node --input-type=module -e
+          'import {rm} from "node:fs/promises";import {join} from "node:path";
+          await rm(join(process.env.RUNNER_TEMP,"pact-evidence","win32-x64","real.json"),{force:true});'
+
+  complete:
+    name: Distribution acceptance complete
+    needs:
+      [
+        quality,
+        native_mac,
+        native_win,
+        package_mac,
+        package_win,
+        smoke_mac,
+        smoke_win,
+        real_mac,
+        real_win,
+      ]
+    if: always()
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - name: Require every independent platform and shared obligation
+        run: >-
+          node --input-type=module -e
+          'const needs=JSON.parse(process.env.RESULTS);
+          if(Object.keys(needs).length!==9||Object.values(needs).some(job=>job.result!=="success"))
+          throw Error("Every quality, native protocol, package, installed smoke and real core job must pass; skipped paid execution is incomplete");'
+        env:
+          RESULTS: ${{ toJSON(needs) }}

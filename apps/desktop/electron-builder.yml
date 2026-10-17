@@ -38,6 +38,9 @@ mac:
 win:
   executableName: Pact
   icon: build/icon.ico
+  extraFiles:
+    - from: build/icon.ico
+      to: uninstallerIcon.ico
   signExecutable: false
   target:
     - target: nsis

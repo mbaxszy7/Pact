@@ -150,3 +150,50 @@ await test('setup failure leaves a blocked report and never overwrites completed
     await rm(workspace, { recursive: true, force: true })
   }
 })
+
+await test('native report recovery binds the same source and run instead of accepting another execution', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-native-run-metadata-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const rawPath = join(root, 'native.json'),
+    identityPath = join(root, 'metadata.json')
+  const identity = {
+    schemaVersion: 1,
+    kind: 'ci',
+    repository: 'mbaxszy7/Pact',
+    sourceSha: 'a'.repeat(40),
+    runId: 1234,
+    runAttempt: 2,
+    eventName: 'push',
+    ref: 'refs/heads/dev',
+  }
+  await writeFile(rawPath, JSON.stringify(fixture()))
+  await writeFile(identityPath, JSON.stringify({ ...identity, secret: 'private-extension' }))
+  const options = {
+    rawPath,
+    directory: join(root, 'reports'),
+    workspace: root,
+    identityPath,
+    artifactName: 'native-e2e-darwin-arm64-a2',
+    completed: true,
+    exitCode: 0,
+  }
+  const written = await writeNativeReport(options)
+  assert.deepEqual(written.report.identity, identity)
+  assert(nativeMarkdown(written.report).includes('Actions run: 1234, attempt 2'))
+  assert.equal((await ensureUnexecutedNativeReport(options)).status, 'passed')
+  for (const changes of [{ sourceSha: 'b'.repeat(40) }, { runId: 1235 }, { runAttempt: 3 }]) {
+    // oxlint-disable-next-line no-await-in-loop -- Each change probes the same immutable evidence against a different native run.
+    await writeFile(identityPath, JSON.stringify({ ...identity, ...changes }))
+    // oxlint-disable-next-line no-await-in-loop -- No probe may replace or accept the retained report.
+    await assert.rejects(ensureUnexecutedNativeReport(options), /unexpected identity/)
+  }
+  assert.deepEqual(
+    JSON.parse(await readFile(join(options.directory, 'native-summary.json'))).identity,
+    identity,
+  )
+  await writeFile(identityPath, JSON.stringify({ ...identity, runAttempt: 0 }))
+  await assert.rejects(
+    writeNativeReport({ ...options, directory: join(root, 'invalid') }),
+    /identity/,
+  )
+})

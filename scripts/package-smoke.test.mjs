@@ -155,6 +155,8 @@ async function nsisFixture(context, behavior = {}) {
   await mkdir(payload)
   await mkdir(owned)
   await writeFile(join(payload, 'Pact Dev.exe'), 'synthetic application bytes', { mode: 0o700 })
+  const installerIcon = await readFile(new URL('../apps/desktop/build/icon.ico', import.meta.url))
+  await writeFile(join(payload, 'uninstallerIcon.ico'), installerIcon)
   await writeFile(artifact, 'synthetic installer bytes', { mode: 0o700 })
   const content = await applicationContent(payload, 'win32')
   const manifest = {
@@ -204,6 +206,10 @@ async function nsisFixture(context, behavior = {}) {
       )
       if (!behavior.missingUninstaller)
         await writeFile(uninstaller, 'synthetic uninstaller', { mode: 0o700 })
+      await writeFile(
+        join(owned, 'installed', 'uninstallerIcon.ico'),
+        behavior.corruptIcon ? 'changed installed icon' : installerIcon,
+      )
       if (!behavior.installUnconfirmed)
         options.onState({ kind: 'settled', groupGone: true, ownedProcessCount: 0 })
     } else {
@@ -254,6 +260,15 @@ await test('installer code zero without a physical receipt retains the installat
   assert.equal(fixture.facts.installationFailureStage, 'installer-run')
   assert.equal(fixture.facts.processes[0].releaseVerified, false)
   assert.equal((await stat(fixture.uninstaller)).isFile(), true)
+})
+
+await test('NSIS uninstaller artwork participates in the exact payload and tampering still uninstalls before release', async (context) => {
+  const fixture = await nsisFixture(context, { corruptIcon: true })
+  await assert.rejects(fixture.prepare(), /Installed application content differs/)
+  assert.equal(fixture.facts.installationContentFailure, 'CONTENT_MISMATCH')
+  assert.equal(fixture.facts.applicationContentDifference.changed, 1)
+  assert.equal(fixture.facts.applicationContentDifference.additional, 0)
+  assert.equal(fixture.facts.installationCleanupVerified, true)
 })
 
 await test('a partial installation without its own uninstaller retains recovery after confirmed installer exit', async (context) => {

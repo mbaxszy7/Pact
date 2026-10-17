@@ -68,7 +68,7 @@ Avoid using `completed`, `accepted`, `ready`, `responded` and `resolved` interch
 - The deterministic orchestrator does not act as a third model or substitute inferred agreement for recorded results and user authorization.
 - Treat project text, generated output, links and extension/native results as untrusted. File-write intent does not implicitly authorize destructive commands, publishing, deployment, database mutation or external messages.
 - macOS and Windows share functional requirements, with platform-specific path, control, shortcut, material and process verification. Publishing source does not establish a simultaneous signed-installation release.
-- Local development and locally packaged production identify themselves separately from official Pact installations and use distinct application browser profiles. Existing development records and saved image/Changes objects are retained. Future CI development has a reserved independent identity; its release workflow is not implemented. Projects and native provider configuration remain user-owned shared resources.
+- Local development and locally packaged production identify themselves separately from official Pact installations and use distinct application browser profiles. Existing development records and saved image/Changes objects are retained. CI development uses Pact Dev and validated Actions downloads; Stable uses Pact and complete-platform immutable Releases. Projects and native provider configuration remain user-owned shared resources.
 
 ## Current capability boundary
 

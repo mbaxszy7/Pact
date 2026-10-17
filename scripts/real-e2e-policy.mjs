@@ -1,7 +1,13 @@
 import { createHash } from 'node:crypto'
 import { isAbsolute, relative, resolve, join } from 'node:path'
 
-import { publicReportIdentity, readE2EJson, writeE2EReport } from './e2e-report.mjs'
+import {
+  publicReportIdentity,
+  readCiReportIdentity,
+  readE2EJson,
+  reportIdentityMarkdown,
+  writeE2EReport,
+} from './e2e-report.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
 // Exact business cases, independent of a candidate's mutable tags or test outcome.
@@ -601,14 +607,7 @@ export function realReportMarkdown(report) {
     `Selected suite: **${report.suite}**; required gate: **${report.gate}**; gate: **${report.gatePassed ? 'PASS' : 'FAIL'}**; full suite: **${report.fullSuitePassed ? 'PASS' : 'NOT PASSED'}**.`,
     `Platform: ${report.platform}/${report.architecture}; policy: \`${report.policyHash}\`.`,
   ]
-  if (report.identity)
-    lines.push(
-      `PR: ${report.identity.pullRequest}; head: \`${report.identity.headSha}\`; base: \`${report.identity.baseSha}\`; tree: \`${report.identity.treeSha}\`; tested commit: \`${report.identity.candidateSha}\`.`,
-    )
-  else
-    lines.push(
-      'Code identity is unavailable; this report is informational and cannot attest current CI execution.',
-    )
+  lines.push(reportIdentityMarkdown(report.identity))
   lines.push(
     '',
     '| Tier | Passed | Failed/interrupted | Skipped | Not run | Other platform | Total |',
@@ -665,10 +664,10 @@ if (isScriptEntry(import.meta.url)) {
       // Admission/run failure is represented below without copying any unsafe exception.
     }
     let identity = null,
-      identityUnavailable = false
+      identityUnavailable = !identityPath
     if (identityPath) {
       try {
-        identity = publicReportIdentity(await readE2EJson(identityPath, 4096))
+        identity = await readCiReportIdentity(identityPath)
       } catch {
         identityUnavailable = true
       }

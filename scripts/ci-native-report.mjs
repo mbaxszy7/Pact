@@ -1,6 +1,12 @@
 import { join } from 'node:path'
 
-import { publicReportIdentity, readE2EJson, writeE2EReport } from './e2e-report.mjs'
+import {
+  publicReportIdentity,
+  readCiReportIdentity,
+  readE2EJson,
+  reportIdentityMarkdown,
+  writeE2EReport,
+} from './e2e-report.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
 /** Protocol fixtures have no model credentials. Raw errors and attachments never leave this owner. */
@@ -60,7 +66,7 @@ export function nativeReport(raw, { completed, exitCode, identity = null } = {})
     executionCompleted: completed === true,
     exitCode: Number.isSafeInteger(exitCode) ? exitCode : null,
     evidenceValid: valid,
-    identity,
+    identity: publicReportIdentity(identity),
     platform: process.platform,
     arch: process.arch,
     cases: valid ? cases : [],
@@ -88,8 +94,7 @@ export function nativeMarkdown(report) {
     `Result: **${report.status}** · ${report.platform}/${report.arch}.`,
     '',
   ]
-  if (report.identity)
-    lines.push(`Source: \`${report.identity.candidateSha ?? report.identity.sourceSha}\`.`, '')
+  lines.push(reportIdentityMarkdown(report.identity), '')
   lines.push(
     `Report artifact: **${report.reportFiles?.artifactName ?? 'local report'}**; CI retention 14 days.`,
     '',
@@ -111,7 +116,6 @@ export async function writeNativeReport({
   completed,
   exitCode,
   identityPath,
-  identityKind = 'ci',
   summary,
   artifactName,
 }) {
@@ -121,9 +125,7 @@ export async function writeNativeReport({
   } catch {
     /* Missing or invalid execution must still leave a safe blocked report. */
   }
-  const identity = identityPath
-    ? publicReportIdentity(await readE2EJson(identityPath, 16 * 1024), identityKind)
-    : null
+  const identity = identityPath ? await readCiReportIdentity(identityPath) : null
   return writeE2EReport(nativeReport(raw, { completed, exitCode, identity }), {
     directory,
     workspace,
@@ -136,6 +138,14 @@ export async function writeNativeReport({
 
 /** Setup/cancellation still leaves evidence; an existing execution report is never replaced. */
 export async function ensureUnexecutedNativeReport(options) {
+  let identity = null
+  if (options.identityPath) {
+    try {
+      identity = await readCiReportIdentity(options.identityPath)
+    } catch {
+      /* No identity or execution can satisfy a gate; still report the missing lane. */
+    }
+  }
   try {
     const existing = await readE2EJson(join(options.directory, 'native-summary.json'))
     if (
@@ -144,23 +154,15 @@ export async function ensureUnexecutedNativeReport(options) {
       existing.platform !== process.platform ||
       existing.arch !== process.arch ||
       !['passed', 'failed', 'blocked'].includes(existing.status) ||
-      existing.reportFiles?.artifactName !== options.artifactName
+      existing.reportFiles?.artifactName !== options.artifactName ||
+      (options.identityPath &&
+        (JSON.stringify(publicReportIdentity(existing.identity)) !== JSON.stringify(identity) ||
+          (existing.status === 'passed' && !identity)))
     )
       throw new Error('Existing native evidence has an unexpected identity')
     return existing
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error
-  }
-  let identity = null
-  if (options.identityPath) {
-    try {
-      identity = publicReportIdentity(
-        await readE2EJson(options.identityPath, 16 * 1024),
-        options.identityKind,
-      )
-    } catch {
-      /* No identity or execution can satisfy a gate; still report the missing lane. */
-    }
   }
   const report = nativeReport(undefined, { completed: false, identity })
   report.limitations.push(
@@ -181,7 +183,6 @@ if (isScriptEntry(import.meta.url))
     directory: process.env.PACT_CI_NATIVE_REPORT_DIR,
     workspace: process.env.PACT_CI_WORKSPACE,
     identityPath: process.env.PACT_CI_NATIVE_IDENTITY_FILE,
-    identityKind: process.env.PACT_CI_NATIVE_IDENTITY_KIND ?? 'ci',
     artifactName: process.env.PACT_CI_NATIVE_ARTIFACT,
     summary: process.env.GITHUB_STEP_SUMMARY,
   }).catch(() => {

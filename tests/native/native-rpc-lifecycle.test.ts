@@ -363,7 +363,10 @@ it('retains ownership when child close cleanup has not settled before its deadli
   }
 })
 
-async function protocolChild(withGroup = true): Promise<{
+async function protocolChild(
+  withGroup = true,
+  initialize = true,
+): Promise<{
   directory: string
   group: OwnedProcessGroup
   client: NativeRpc
@@ -385,6 +388,11 @@ const readline = require('node:readline');
 const input = readline.createInterface({ input: process.stdin });
 input.on('line', (line) => {
   const request = JSON.parse(line);
+  if (request.method === 'initialize' && ${!initialize}) {
+    process.stdout.write(JSON.stringify({ id: 999, result: { private: 'private-native-observation-payload' } }) + '\\n' + 'private-native-partial-frame');
+    process.stderr.write('private-native-stderr');
+    return;
+  }
   if (request.id && request.method !== 'hold') process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + '\\n');
 });
 input.once('close', () => { fs.writeFileSync(${JSON.stringify(eofPath)}, 'natural-eof'); });
@@ -410,7 +418,7 @@ input.once('close', () => { fs.writeFileSync(${JSON.stringify(eofPath)}, 'natura
     )
     const created = client
     const childClosed = new Promise<void>((done) => created.child.once('close', () => done()))
-    await client.initialize()
+    if (initialize) await client.initialize()
     if (withGroup) await group.observe()
     return { directory, group, client, onReleased, childClosed, eofPath }
   } catch (error) {
@@ -421,6 +429,103 @@ input.once('close', () => { fs.writeFileSync(${JSON.stringify(eofPath)}, 'natura
     throw error
   }
 }
+
+it('freezes bounded scalar observations at the first initialize timeout before failure or cleanup', async () => {
+  const owned = await protocolChild(true, false)
+  const partial = 'private-native-partial-frame',
+    stderr = 'private-native-stderr'
+  const unmatched = `${JSON.stringify({ id: 999, result: { private: 'private-native-observation-payload' } })}\n${partial}`
+  const stdoutReceived = gate(),
+    stderrReceived = gate()
+  let stdoutBytes = 0,
+    stderrBytes = 0
+  const stdout = (data: Buffer): void => {
+    stdoutBytes += data.length
+    if (stdoutBytes >= Buffer.byteLength(unmatched)) stdoutReceived.resolve()
+  }
+  const errors = (data: Buffer): void => {
+    stderrBytes += data.length
+    if (stderrBytes >= Buffer.byteLength(stderr)) stderrReceived.resolve()
+  }
+  const timers = vi.spyOn(globalThis, 'setTimeout')
+  try {
+    // A genuine earlier reply distinguishes matched replies from the unrelated ID below.
+    await owned.client.request('probe', {})
+    timers.mockClear()
+    expect(owned.client.cleanupFacts()).not.toHaveProperty('initializeTimeout')
+    owned.client.child.stdout.on('data', stdout)
+    owned.client.child.stderr.on('data', errors)
+    const initialized = owned.client.initialize().catch((error: unknown) => error)
+    await within(
+      Promise.all([stdoutReceived.promise, stderrReceived.promise]),
+      2000,
+      'Controlled initialize output was not observed',
+    )
+    const index = timers.mock.calls.findIndex((args) => args[1] === 10_000)
+    const call = timers.mock.calls[index],
+      scheduled = timers.mock.results[index]
+    if (!call || scheduled?.type !== 'return')
+      throw new Error('Missing existing initialize deadline')
+    // Invoke that existing deadline callback after real pipe observations; do not wait 10s
+    // or change the fixture's actual request/startup/lifetime deadlines and ordering.
+    clearTimeout(scheduled.value)
+    call[0]()
+    timers.mockRestore()
+    expect(await initialized).toMatchObject({
+      message: 'unknown_delivery: initialize exceeded 10s',
+    })
+    const snapshot = owned.client.cleanupFacts().initializeTimeout
+    if (!snapshot) throw new Error('Missing first initialize timeout observation')
+    expect(snapshot).toMatchObject({
+      writeCallbackDone: true,
+      writeCallbackError: false,
+      stdoutBytes: Buffer.byteLength(`${JSON.stringify({ id: 1, result: {} })}\n`) + stdoutBytes,
+      stderrBytes,
+      partialFrameBytes: Buffer.byteLength(partial),
+      matchingReplies: 1,
+      unmatchedReplies: 1,
+      childExit: false,
+      childClosed: false,
+      stdinWritable: true,
+    })
+    expect(snapshot.elapsedMs).toEqual(expect.any(Number))
+    expect(snapshot.writeCallbackElapsedMs).toEqual(expect.any(Number))
+    expect(
+      Object.values(snapshot).every(
+        (value) =>
+          typeof value !== 'number' ||
+          (Number.isSafeInteger(value) && value >= 0 && value <= 8 * 1024 * 1024),
+      ),
+    ).toBe(true)
+    expect(Buffer.byteLength(JSON.stringify(snapshot))).toBeLessThanOrEqual(1024)
+    expect(JSON.stringify(snapshot)).not.toContain('private-native')
+    expect(Object.isFrozen(snapshot)).toBe(true)
+    expect(Reflect.set(snapshot, 'stdoutBytes', 0)).toBe(false)
+    expect(owned.client.cleanupFacts().pendingRequests).toBe(0)
+    await expect(owned.client.request('initialize', {})).rejects.toThrow('initialize exceeded 10s')
+    const late = gate()
+    owned.client.child.stdout.once('data', () => late.resolve())
+    owned.client.child.stdin.write(`${JSON.stringify({ id: 500, method: 'probe', params: {} })}\n`)
+    await within(late.promise, 2000, 'Later owned protocol output was not observed')
+    expect(owned.client.cleanupFacts().initializeTimeout).toBe(snapshot)
+    await owned.client.close()
+    await owned.childClosed
+    expect(owned.client.cleanupFacts()).toMatchObject({ released: true, childClosed: true })
+    expect(owned.client.cleanupFacts().initializeTimeout).toBe(snapshot)
+    expect(snapshot.childClosed).toBe(false)
+    expect(snapshot.stdinWritable).toBe(true)
+  } finally {
+    timers.mockRestore()
+    owned.client.child.stdout.off('data', stdout)
+    owned.client.child.stderr.off('data', errors)
+    await owned.client.close().catch(() => undefined)
+    await owned.group.close()
+    await within(owned.childClosed, 4000, 'Controlled protocol child did not close')
+    await owned.client.close({ recheck: true }).catch(() => undefined)
+    if (owned.group.released && owned.client.cleanupFacts().released)
+      await rm(owned.directory, { recursive: true, force: true })
+  }
+})
 
 it('settles pending requests and shares one close after real child and group release', async () => {
   const owned = await protocolChild()
@@ -698,6 +803,7 @@ it('does not notify release when the group remains unconfirmed despite real chil
 
 it('confirms real child and default fixture-owner closure before notifying release', async () => {
   const owned = await protocolChild(false)
+  expect(owned.client.cleanupFacts()).not.toHaveProperty('initializeTimeout')
   const closeEvent = vi.fn<() => void>()
   owned.client.child.once('close', closeEvent)
   try {

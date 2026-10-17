@@ -1,9 +1,15 @@
 import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
 import { lstat, mkdir, open, opendir, realpath, rm, writeFile } from 'node:fs/promises'
-import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, isAbsolute, join, relative, sep } from 'node:path'
 
-import { publicReportIdentity, readE2EJson, writeE2EReport } from './e2e-report.mjs'
+import {
+  publicReportIdentity,
+  readCiReportIdentity,
+  readE2EJson,
+  reportIdentityMarkdown,
+  writeE2EReport,
+} from './e2e-report.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
 export const diagnosticLimits = Object.freeze({
@@ -360,9 +366,7 @@ export function evaluateUiReport(
     lane,
     inventory,
     workspace,
-    inventoryWorkspace = workspace,
     identity = null,
-    identityKind = 'ci',
     execution = 'unavailable',
     scope = 'full',
     platform = process.platform,
@@ -372,24 +376,19 @@ export function evaluateUiReport(
   if (
     !['ui', 'deterministic'].includes(lane) ||
     !isAbsolute(workspace) ||
-    !isAbsolute(inventoryWorkspace) ||
     !['completed', 'unavailable', 'deferred'].includes(execution) ||
     !['core', 'full'].includes(scope) ||
     (execution === 'deferred' && scope !== 'core') ||
-    !['ci', 'release'].includes(identityKind) ||
     !['darwin-arm64', 'win32-x64', 'win32-arm64'].includes(`${platform}-${architecture}`)
   )
     throw new Error('Invalid no-credential report target')
   const issues = []
-  const identityIssue =
-    identityKind === 'release'
-      ? 'missing-or-invalid-release-identity'
-      : 'missing-or-invalid-ci-code-identity'
+  const identityIssue = 'missing-or-invalid-ci-code-identity'
   let known = new Map(),
     observed = new Map(),
     publicIdentity = null
   try {
-    known = caseInventory(inventory, lane, inventoryWorkspace)
+    known = caseInventory(inventory, lane, workspace)
     if (!known.size) throw new Error('Empty inventory')
   } catch {
     issues.push('missing-or-invalid-discovery-inventory')
@@ -405,7 +404,7 @@ export function evaluateUiReport(
     }
   }
   try {
-    publicIdentity = publicReportIdentity(identity, identityKind)
+    publicIdentity = publicReportIdentity(identity)
     if (!publicIdentity) issues.push(identityIssue)
   } catch {
     issues.push(identityIssue)
@@ -502,7 +501,6 @@ export function evaluateUiReport(
     lane,
     informational: true,
     identity: publicIdentity,
-    identityKind,
     platform,
     architecture,
     execution,
@@ -533,16 +531,7 @@ export function uiReportMarkdown(report) {
     `Platform: ${report.platform}/${report.architecture}; execution: **${report.execution}**; scope: **${report.scope}**.`,
     report.resultGate,
   ]
-  if (report.identity && report.identityKind === 'release')
-    lines.push(
-      `Release PR: #${report.identity.releasePR}; version: \`${report.identity.version}\`; source: \`${report.identity.sourceSha}\`; tag: \`${report.identity.tag}\`; Release ID: ${report.identity.releaseId}.`,
-      'This informational identity projection does not replace signed release-state or artifact validation.',
-    )
-  else if (report.identity)
-    lines.push(
-      `PR: ${report.identity.pullRequest}; head: \`${report.identity.headSha}\`; base: \`${report.identity.baseSha}\`; tree: \`${report.identity.treeSha}\`; tested commit: \`${report.identity.candidateSha}\`.`,
-    )
-  else lines.push('Code identity is unavailable; this report cannot attest current CI execution.')
+  lines.push(reportIdentityMarkdown(report.identity))
   if (report.issues.length) lines.push(`Evidence problems: ${report.issues.join(', ')}.`)
   if (report.reportFiles) {
     lines.push(
@@ -570,7 +559,6 @@ export function uiReportMarkdown(report) {
 export async function writeUiReports({
   evidence,
   workspace,
-  inventoryWorkspace = workspace,
   identityPath,
   inventoryPath,
   summary,
@@ -578,26 +566,27 @@ export async function writeUiReports({
   scope = 'full',
   platform = process.platform,
   architecture = process.arch,
-  identityKind = 'ci',
-  runAttempt = 1,
+  runAttempt,
+  ci = false,
 }) {
   if (
-    !['ci', 'release'].includes(identityKind) ||
-    !Number.isSafeInteger(runAttempt) ||
-    runAttempt < 1
+    typeof ci !== 'boolean' ||
+    (runAttempt !== undefined && (!Number.isSafeInteger(runAttempt) || runAttempt < 1))
   )
     throw new Error('Invalid report execution identity')
-  const artifactName =
-    identityKind === 'release'
-      ? `release-e2e-${platform}-${architecture}-a${runAttempt}`
-      : `e2e-${platform}-${architecture}-a${runAttempt}`
   let identity = null,
     inventory = null
   try {
-    identity = await readE2EJson(identityPath, identityKind === 'release' ? 1024 * 1024 : 4096)
+    identity = ci
+      ? await readCiReportIdentity(identityPath)
+      : publicReportIdentity(await readE2EJson(identityPath, 4096))
   } catch {
     /* Fixed safe issue is projected below. */
   }
+  const attempt = identity?.kind === 'ci' ? identity.runAttempt : (runAttempt ?? 1)
+  if (runAttempt !== undefined && runAttempt !== attempt)
+    throw new Error('Report attempt differs from native run metadata')
+  const artifactName = `e2e-${platform}-${architecture}-a${attempt}`
   try {
     inventory = await readE2EJson(inventoryPath)
   } catch {
@@ -619,15 +608,13 @@ export async function writeUiReports({
       lane,
       inventory,
       workspace,
-      inventoryWorkspace,
       identity,
-      identityKind,
       scope,
       execution: execution[lane] ?? 'unavailable',
       platform,
       architecture,
     })
-    report.diagnosticArtifact = `${identityKind === 'release' ? 'release-' : ''}ui-diagnostics-${platform}-${architecture}-a${runAttempt}`
+    report.diagnosticArtifact = `ui-diagnostics-${platform}-${architecture}-a${attempt}`
     reports.push(
       // oxlint-disable-next-line eslint/no-await-in-loop -- Each lane has immutable distinct files and the shared Actions summary preserves their order.
       await writeE2EReport(report, {
@@ -645,8 +632,6 @@ export async function writeUiReports({
 
 export async function main(argv = process.argv.slice(2), source = process.env) {
   if (argv[0] === '--reports') {
-    const identityKind = argv[1] === '--release' ? 'release' : 'ci'
-    if (identityKind === 'release') argv = [argv[0], ...argv.slice(2)]
     if (
       argv.length !== 9 ||
       argv[1] !== '--evidence' ||
@@ -660,13 +645,13 @@ export async function main(argv = process.argv.slice(2), source = process.env) {
     const reports = await writeUiReports({
       evidence: argv[2],
       workspace: argv[4],
-      inventoryWorkspace: resolve(import.meta.dirname, '..'),
       identityPath: argv[6],
+      ci: true,
       inventoryPath: argv[8],
       summary: source.GITHUB_STEP_SUMMARY,
-      identityKind,
       scope: source.PACT_E2E_REPORT_SCOPE ?? 'full',
-      runAttempt: Number(source.GITHUB_RUN_ATTEMPT ?? '1'),
+      runAttempt:
+        source.GITHUB_RUN_ATTEMPT === undefined ? undefined : Number(source.GITHUB_RUN_ATTEMPT),
       execution: {
         ui:
           source.PACT_UI_EXECUTION_COMPLETED === 'true'

@@ -1,0 +1,141 @@
+name: Pact release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pact-release-main
+  cancel-in-progress: false
+  queue: max
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  resolve:
+    name: Resolve merged version PR
+    runs-on: macos-15
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      applicable: ${{ steps.resolve.outputs.applicable }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      release_pr: ${{ steps.resolve.outputs.release_pr }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+      - id: resolve
+        name: Bind release intent to this exact main push
+        run: node scripts/release-native.mjs resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  validate:
+    name: Validate Stable distributions
+    needs: resolve
+    if: needs.resolve.outputs.applicable == 'true'
+    uses: ./.github/workflows/distributions.yml
+    secrets:
+      PACT_CLAUDE_SETTINGS_JSON: ${{ secrets.PACT_CLAUDE_SETTINGS_JSON }}
+      PACT_CODEX_CONFIG_TOML: ${{ secrets.PACT_CODEX_CONFIG_TOML }}
+      PACT_CODEX_AUTH_JSON: ${{ secrets.PACT_CODEX_AUTH_JSON }}
+      PACT_CODEX_PROVIDER_ENV_JSON: ${{ secrets.PACT_CODEX_PROVIDER_ENV_JSON }}
+    with:
+      source_sha: ${{ needs.resolve.outputs.source_sha }}
+      channel: stable
+      real_allowed: ${{ github.repository_id == '1416403312' }}
+
+  publish:
+    name: Publish Stable
+    needs: [resolve, validate]
+    if: needs.resolve.outputs.applicable == 'true'
+    environment: pact-control-plane
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.validate.outputs.package_mac_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release/darwin-arm64/package
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.validate.outputs.smoke_mac_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release/darwin-arm64/smoke
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.validate.outputs.package_win_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release/win32-x64/package
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.validate.outputs.smoke_win_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release/win32-x64/smoke
+      - name: Verify, publish immutable assets, and finalize the standard version PR
+        run: node scripts/release-native.mjs publish --root "$RUNNER_TEMP/release"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACT_RELEASE_SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          PACT_RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+          PACT_RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          PACT_RELEASE_PR: ${{ needs.resolve.outputs.release_pr }}
+          PACT_RELEASE_ARTIFACTS_JSON: >-
+            {"darwin-arm64":{"packageId":"${{ needs.validate.outputs.package_mac_id }}","packageDigest":"${{ needs.validate.outputs.package_mac_digest }}","smokeId":"${{ needs.validate.outputs.smoke_mac_id }}","smokeDigest":"${{ needs.validate.outputs.smoke_mac_digest }}"},"win32-x64":{"packageId":"${{ needs.validate.outputs.package_win_id }}","packageDigest":"${{ needs.validate.outputs.package_win_digest }}","smokeId":"${{ needs.validate.outputs.smoke_win_id }}","smokeDigest":"${{ needs.validate.outputs.smoke_win_digest }}"}}
+
+  version_pr:
+    name: Maintain version PR
+    needs: [resolve, publish]
+    if: always() && needs.resolve.result == 'success' && (needs.resolve.outputs.applicable != 'true' || needs.publish.result == 'success')
+    environment: pact-control-plane
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Create a short-lived token limited to version PR maintenance
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.PACT_CI_APP_ID }}
+          private-key: ${{ secrets.PACT_CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: Pact
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+      - name: Maintain the standard version PR without publishing or merging it
+        uses: googleapis/release-please-action@8b8fd2cc23b2e18957157a9d923d75aa0c6f6ad5 # v4
+        with:
+          token: ${{ steps.app.outputs.token }}
+          target-branch: main
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
