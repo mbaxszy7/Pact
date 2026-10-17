@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture } from './runtime-fixture.js'
 
@@ -115,7 +116,7 @@ for (const command of ['ordinary', '/plan', '/build', '/review'] as const)
         }
         throw error
       } finally {
-        await app.close()
+        await quitPact(app)
         await fixture.dispose()
       }
     },
@@ -173,7 +174,7 @@ test(
         page.getByRole('heading', { name: 'Untrusted child title', exact: true }),
       ).toHaveCount(0)
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -243,7 +244,7 @@ test(
       expect(facts.methods.indexOf('thread/name/set')).toBeGreaterThan(
         facts.methods.indexOf('turn/start'),
       )
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       window = await app.firstWindow()
       await window.getByRole('button', { name: 'My saved title', exact: true }).click()
@@ -259,7 +260,7 @@ test(
       expect(facts.threadStarts).toBe(1)
       expect(facts.threads?.['fixture-thread']?.name).toBe('[Pact] Title project · My saved title')
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },

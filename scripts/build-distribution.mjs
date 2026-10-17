@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
+import identities from '../apps/desktop/app-identities.json' with { type: 'json' }
 import { run } from './run-e2e.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
@@ -249,6 +250,7 @@ export function distributionArguments(args) {
   }
   const names = {
     '--channel': 'channel',
+    '--profile': 'profile',
     '--platform': 'platform',
     '--arch': 'arch',
     '--sha': 'sourceSha',
@@ -268,6 +270,22 @@ export function distributionArguments(args) {
     if (!name || !args[index + 1] || args[index + 1].startsWith('--'))
       throw new Error(`Invalid distribution argument: ${flag}`)
     options[name] = args[++index]
+  }
+  if (options.profile !== undefined) {
+    if (
+      !Object.hasOwn(identities, options.profile) ||
+      options.profile === 'development-local' ||
+      options.profile === 'installer-preview'
+    )
+      throw new Error('Unsupported distribution profile.')
+    const channel = options.profile.startsWith('production-') ? 'stable' : 'dev'
+    if (options.channel !== channel) throw new Error('Distribution profile and channel differ.')
+    if (
+      options.profile === 'production-local' &&
+      !process.env.GITHUB_RUN_NUMBER &&
+      !seen.has('--build-number')
+    )
+      options.buildNumber = String(Date.now())
   }
   if (!['dev', 'stable'].includes(options.channel))
     throw new Error('Distribution channel must be dev or stable.')
@@ -339,10 +357,14 @@ export async function main(args = process.argv.slice(2)) {
     options.channel === 'stable'
       ? productVersion
       : `${productVersion}-dev.${options.buildNumber.replace(/^0+(?=\d)/u, '')}.sha${sourceSha.slice(0, 12)}`
-  const productName = options.channel === 'dev' ? 'Pact Dev' : 'Pact'
-  const appId = options.channel === 'dev' ? 'com.pact.desktop.dev' : 'com.pact.desktop'
+  const profile =
+    options.profile ?? (options.channel === 'dev' ? 'development-ci' : 'production-ci')
+  const profileIdentity = identities[profile]
+  const productName = profileIdentity.name
+  const appId = profileIdentity.appId
   const identity = {
     smokeProtocolVersion: 2,
+    profile,
     channel: options.channel,
     platform: options.platform,
     arch: options.arch,
@@ -359,7 +381,7 @@ export async function main(args = process.argv.slice(2)) {
       join(
         desktop,
         'release',
-        `${options.channel}-${options.platform}-${options.arch}-${options.buildNumber}-${sourceSha.slice(0, 12)}`,
+        `${profile}-${options.platform}-${options.arch}-${options.buildNumber}-${sourceSha.slice(0, 12)}`,
       ),
   )
   await mkdir(output, { recursive: true })
@@ -385,7 +407,7 @@ export async function main(args = process.argv.slice(2)) {
       : undefined
   if (windowsSharp) requireSharpInspection('source', options.arch, windowsSharp.facts)
   const injected = Buffer.from(
-    `${JSON.stringify({ ...metadata, version, packageManager, pactDistribution: identity }, null, 2)}\n`,
+    `${JSON.stringify({ ...metadata, name: profileIdentity.packageName, productName, pactBuildProfile: profile, version, packageManager, pactDistribution: identity }, null, 2)}\n`,
   )
   if (injected.length > 64 * 1024)
     throw new Error('Injected product metadata exceeds the runtime byte bound.')
@@ -427,7 +449,7 @@ export async function main(args = process.argv.slice(2)) {
       extends: join(desktop, 'electron-builder.yml'),
       appId,
       productName,
-      artifactName: `${productName.replaceAll(' ', '-')}-\${version}-\${os}-\${arch}.\${ext}`,
+      artifactName: `${productName.replaceAll(/[\s-]+/gu, '-')}-\${version}-\${os}-\${arch}.\${ext}`,
       directories: { output },
       mac: {
         target: options.directoryOnly

@@ -47,6 +47,13 @@ export const sessionCatalogRevisions = sqliteTable('session_catalog_revisions', 
   revision: integer('revision').notNull(),
 })
 
+export const nativePresenceMetadata = sqliteTable('native_presence_metadata', {
+  id: integer('id').primaryKey(),
+  openingOrdinal: integer('opening_ordinal').notNull().default(0),
+  attentionTotal: integer('attention_total').notNull().default(0),
+  initialized: integer('initialized', { mode: 'boolean' }).notNull().default(false),
+})
+
 export const projects = sqliteTable('projects', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
@@ -54,6 +61,7 @@ export const projects = sqliteTable('projects', {
   kind: text('kind', { enum: ['git', 'directory'] }).notNull(),
   createdAt: text('created_at').notNull(),
   archivedAt: text('archived_at'),
+  needsAttentionCount: integer('needs_attention_count').notNull().default(0),
 })
 
 export const sessions = sqliteTable(
@@ -85,16 +93,69 @@ export const sessions = sqliteTable(
     }).notNull(),
     settingsRevision: integer('settings_revision').notNull(),
     lastSeenMessageSequence: integer('last_seen_message_sequence'),
+    lastOpenedOrdinal: integer('last_opened_ordinal'),
+    workspaceVisible: integer('workspace_visible', { mode: 'boolean' }).notNull().default(true),
+    needsAttention: integer('needs_attention', { mode: 'boolean' }).notNull().default(false),
+    jumpListSuppressed: integer('jump_list_suppressed', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    jumpListRemovalObserved: integer('jump_list_removal_observed', { mode: 'boolean' })
+      .notNull()
+      .default(false),
     commentsRevision: integer('comments_revision').notNull().default(0),
     createdAt: text('created_at').notNull(),
     updatedAt: text('updated_at').notNull(),
     archivedAt: text('archived_at'),
   },
   (table) => [
+    index('sessions_native_recent_idx')
+      .on(table.lastOpenedOrdinal, table.id)
+      .where(
+        sql`${table.workspaceVisible} = 1 AND ${table.needsAttention} = 0 AND ${table.lastOpenedOrdinal} IS NOT NULL`,
+      ),
+    index('sessions_native_attention_idx')
+      .on(table.lastOpenedOrdinal, table.id)
+      .where(sql`${table.workspaceVisible} = 1 AND ${table.needsAttention} = 1`),
     index('sessions_project_native_work_idx').on(table.projectId, table.id),
     index('sessions_project_created_id_active_idx')
       .on(table.projectId, table.createdAt, table.id)
       .where(sql`${table.status} <> 'archived'`),
+  ],
+)
+
+export const sessionOpenOperations = sqliteTable('session_open_operations', {
+  openingId: text('opening_id').primaryKey(),
+  sessionId: text('session_id')
+    .notNull()
+    .references(() => sessions.id, { onDelete: 'cascade' }),
+  ordinal: integer('ordinal').notNull(),
+})
+
+export const workspaceArchiveOperations = sqliteTable(
+  'workspace_archive_operations',
+  {
+    id: text('id').primaryKey(),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'restrict' }),
+    sessionId: text('session_id').references(() => sessions.id, { onDelete: 'restrict' }),
+    ownerId: text('owner_id').notNull(),
+    state: text('state', {
+      enum: ['prepared', 'stopping', 'archived', 'cancelled', 'not_archived', 'unresolved'],
+    }).notNull(),
+    previewJson: text('preview_json').notNull(),
+    resultsJson: text('results_json').notNull().default('[]'),
+    message: text('message'),
+    createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (table) => [
+    index('workspace_archive_scope_active_idx')
+      .on(table.projectId, table.sessionId)
+      .where(sql`${table.state} IN ('stopping', 'unresolved')`),
+    index('workspace_archive_owner_prepared_idx')
+      .on(table.ownerId)
+      .where(sql`${table.state} = 'prepared'`),
   ],
 )
 
@@ -165,6 +226,11 @@ export const conversationMessages = sqliteTable(
       table.sequence,
     ),
     index('conversation_messages_run_role_idx').on(table.runId, table.role),
+    index('conversation_messages_native_complete_idx')
+      .on(table.runId, table.id)
+      .where(
+        sql`${table.role} = 'assistant' AND ${table.isVisible} = 1 AND ${table.state} = 'complete' AND length(${table.content}) > 0`,
+      ),
     index('conversation_messages_session_visible_sequence_idx').on(
       table.sessionId,
       table.isVisible,
@@ -455,11 +521,28 @@ export const agentRuns = sqliteTable(
       .where(
         sql`(${table.status} IN ('starting', 'running', 'recovering') AND ${table.controlDisposition} <> 'abandoned') OR ${table.nativeEffectsState} IN ('pending', 'unknown')`,
       ),
+    index('agent_runs_native_quit_unsettled_idx')
+      .on(table.sessionId)
+      .where(
+        sql`${table.forkSourceRunId} IS NULL AND ((${table.status} IN ('starting', 'running', 'recovering') AND ${table.controlDisposition} <> 'abandoned') OR ${table.nativeEffectsState} IN ('pending', 'unknown') OR (${table.dispatchPhase} IN ('possibly_sent', 'accepted', 'ended') AND ${table.nativeOutcome} IS NULL))`,
+      ),
     index('agent_runs_session_agent_generation_idx').on(
       table.sessionId,
       table.agentId,
       table.bindingGeneration,
     ),
+    index('agent_runs_native_latest_idx').on(table.sessionId, table.agentId, table.createdAt),
+    index('agent_runs_native_generation_latest_idx').on(
+      table.sessionId,
+      table.agentId,
+      table.bindingGeneration,
+      table.createdAt,
+    ),
+    index('agent_runs_native_unacknowledged_idx')
+      .on(table.sessionId, table.agentId, table.createdAt)
+      .where(
+        sql`${table.forkSourceRunId} IS NULL AND ${table.controlDisposition} <> 'abandoned' AND ${table.dispatchPhase} IN ('possibly_sent', 'accepted') AND ${table.status} IN ('failed', 'interrupted', 'recovering') AND ${table.nativeOutcome} IS NULL`,
+      ),
     index('agent_runs_user_created_idx').on(table.userMessageId, table.createdAt, table.id),
     index('agent_runs_user_artifacts_idx')
       .on(table.userMessageId, table.agentId, table.createdAt, table.id)
@@ -689,6 +772,14 @@ export const nativeAgentContexts = sqliteTable(
     index('native_contexts_pending_permission_idx')
       .on(table.sessionId, table.agentId)
       .where(sql`${table.permissionRequestsJson} IS NOT NULL`),
+    index('native_contexts_quit_unsettled_idx')
+      .on(table.sessionId)
+      .where(sql`${table.continuationState} IN ('responding', 'waiting_user')`),
+    index('native_contexts_recovery_idx')
+      .on(table.sessionId)
+      .where(
+        sql`${table.continuationState} IN ('responding','waiting_user','checking','rebuilding')`,
+      ),
   ],
 )
 
@@ -829,6 +920,11 @@ export const nativeForkIntents = sqliteTable(
   (table) => [
     primaryKey({ columns: [table.operationId, table.agentId] }),
     index('native_fork_intents_work_idx').on(table.nativeWorkState, table.operationId),
+    index('native_fork_intents_recovery_idx')
+      .on(table.operationId)
+      .where(
+        sql`${table.nativeWorkState} = 'pending' OR ${table.state} IN ('forking','initializing') OR (${table.state} = 'prepared' AND ${table.dispatched} = 0)`,
+      ),
   ],
 )
 
@@ -1306,6 +1402,9 @@ export const collaborationInputs = sqliteTable(
 )
 
 export const schema = {
+  nativePresenceMetadata,
+  sessionOpenOperations,
+  workspaceArchiveOperations,
   commentDraftReceipts,
   collaborationTodos,
   collaborationTodoRevisions,

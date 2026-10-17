@@ -10,6 +10,7 @@ import {
   anchoredComments,
   conversationMessages,
 } from '../../packages/persistence/src/schema/index.js'
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture, type RuntimeFixture } from './runtime-fixture.js'
 
@@ -161,7 +162,7 @@ for (const keepNewDraft of [false, true]) {
             if (!settings.ok) throw new Error('Session unavailable')
             return settings.value.session.title
           }, sessionId)
-          await app.close()
+          await quitPact(app)
           app = await fixture.launch()
           page = await app.firstWindow()
           await page.getByRole('button', { name: title, exact: true }).click()
@@ -176,7 +177,7 @@ for (const keepNewDraft of [false, true]) {
         await expect(page.getByText('Bounded lifecycle response.', { exact: true })).toHaveCount(2)
         expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(2)
         await expect.poll(() => composer.textContent()).toBe('')
-        await app.close()
+        await quitPact(app)
         app = undefined
         const database = await PactDatabase.open({
           filePath: fixture.databaseFile,
@@ -206,7 +207,7 @@ for (const keepNewDraft of [false, true]) {
           database.close()
         }
       } finally {
-        await app?.close()
+        if (app) await quitPact(app)
         await fixture.dispose()
       }
     },

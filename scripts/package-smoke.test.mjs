@@ -13,7 +13,47 @@ import {
   applicationContentDifference,
   verifyApplication,
   prepareApplication,
+  readDistributionManifest,
 } from './package-smoke.mjs'
+
+await test('manifest admission preserves local Production identity and rejects mixed profile/channel names', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-local-manifest-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const path = join(root, 'distribution-manifest.json')
+  const manifest = {
+    schemaVersion: 1,
+    profile: 'production-local',
+    channel: 'stable',
+    platform: process.platform,
+    arch: process.arch,
+    productName: 'Pact - Production - Local',
+    appId: 'com.pact.desktop.production.local',
+    version: '0.1.0',
+    sourceSha: 'a'.repeat(40),
+    buildNumber: '1',
+    application: {
+      path: 'application',
+      executable: 'Pact',
+      contentSha256: 'b'.repeat(64),
+      entries: [],
+    },
+    artifacts: [],
+  }
+  await writeFile(path, JSON.stringify(manifest))
+  assert.equal((await readDistributionManifest(path)).productName, manifest.productName)
+  for (const invalid of [
+    { channel: 'dev' },
+    { profile: 'production-ci' },
+    { productName: 'Pact' },
+    { appId: 'com.pact.desktop' },
+  ]) {
+    // Each metadata mutation is independently rejected before installation or launch.
+    // oxlint-disable-next-line no-await-in-loop -- One bounded manifest candidate at a time.
+    await writeFile(path, JSON.stringify({ ...manifest, ...invalid }))
+    // oxlint-disable-next-line no-await-in-loop -- Confirm each candidate without swallowing another rejection.
+    await assert.rejects(readDistributionManifest(path), /invalid identity/u)
+  }
+})
 
 await test('malformed comparison metadata cannot replace the original exact-content rejection', async (context) => {
   const root = await mkdtemp(join(tmpdir(), 'pact-content-diagnostic-admission-'))
@@ -115,6 +155,8 @@ async function nsisFixture(context, behavior = {}) {
   await mkdir(payload)
   await mkdir(owned)
   await writeFile(join(payload, 'Pact Dev.exe'), 'synthetic application bytes', { mode: 0o700 })
+  const installerIcon = await readFile(new URL('../apps/desktop/build/icon.ico', import.meta.url))
+  await writeFile(join(payload, 'uninstallerIcon.ico'), installerIcon)
   await writeFile(artifact, 'synthetic installer bytes', { mode: 0o700 })
   const content = await applicationContent(payload, 'win32')
   const manifest = {
@@ -164,6 +206,10 @@ async function nsisFixture(context, behavior = {}) {
       )
       if (!behavior.missingUninstaller)
         await writeFile(uninstaller, 'synthetic uninstaller', { mode: 0o700 })
+      await writeFile(
+        join(owned, 'installed', 'uninstallerIcon.ico'),
+        behavior.corruptIcon ? 'changed installed icon' : installerIcon,
+      )
       if (!behavior.installUnconfirmed)
         options.onState({ kind: 'settled', groupGone: true, ownedProcessCount: 0 })
     } else {
@@ -214,6 +260,15 @@ await test('installer code zero without a physical receipt retains the installat
   assert.equal(fixture.facts.installationFailureStage, 'installer-run')
   assert.equal(fixture.facts.processes[0].releaseVerified, false)
   assert.equal((await stat(fixture.uninstaller)).isFile(), true)
+})
+
+await test('NSIS uninstaller artwork participates in the exact payload and tampering still uninstalls before release', async (context) => {
+  const fixture = await nsisFixture(context, { corruptIcon: true })
+  await assert.rejects(fixture.prepare(), /Installed application content differs/)
+  assert.equal(fixture.facts.installationContentFailure, 'CONTENT_MISMATCH')
+  assert.equal(fixture.facts.applicationContentDifference.changed, 1)
+  assert.equal(fixture.facts.applicationContentDifference.additional, 0)
+  assert.equal(fixture.facts.installationCleanupVerified, true)
 })
 
 await test('a partial installation without its own uninstaller retains recovery after confirmed installer exit', async (context) => {

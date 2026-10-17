@@ -161,6 +161,14 @@ export async function windowsPnpmExecutable(source) {
   return executable
 }
 
+/** Shared toolchain setup owns PATH admission for every isolated Windows job. */
+export async function publishWindowsPnpmPath(source = process.env) {
+  if (!environmentFilePath(source.GITHUB_PATH))
+    throw new Error('Windows CI needs an explicit Actions path file')
+  const executable = await windowsPnpmExecutable(source)
+  await appendFile(source.GITHUB_PATH, dirname(executable) + '\n')
+}
+
 export async function main(source = process.env) {
   let stage = 'source-validation'
   let commandFacts
@@ -238,8 +246,6 @@ export async function main(source = process.env) {
       throw new Error('Native CI requires the runner-owned temporary directory')
     if (!environmentFilePath(source.GITHUB_ENV))
       throw new Error('Native CI needs an explicit Actions environment file')
-    if (process.platform === 'win32' && !environmentFilePath(source.GITHUB_PATH))
-      throw new Error('Windows native CI needs an explicit Actions path file')
     stage = 'pnpm-discovery'
     const pnpmExecutable =
       process.platform === 'win32' ? await windowsPnpmExecutable(source) : 'pnpm'
@@ -313,12 +319,8 @@ export async function main(source = process.env) {
         )
     }
     if (nativeCodex) lines.push(`PACT_NATIVE_CODEX_PACKAGE_ROOT=${nativeCodex.packageRoot}`)
-    stage = 'actions-path-publication'
+    stage = 'actions-environment-publication'
     await appendFile(source.GITHUB_ENV, lines.join('\n') + '\n')
-    // runWindows later resolves pnpm.exe from each absolute PATH directory. Publish
-    // the verified package directory, where that exact native filename lives.
-    if (process.platform === 'win32')
-      await appendFile(source.GITHUB_PATH, dirname(pnpmExecutable) + '\n')
   } catch (error) {
     const failure = new Error('Pinned native CLI setup failed.')
     setupFailures.set(

@@ -8,8 +8,10 @@ import type { PactDrizzleDatabase } from '../../packages/persistence/src/drizzle
 import type { RuntimeFixture } from './runtime-fixture.js'
 
 import { ConversationRepository } from '../../packages/persistence/src/conversation-repository.js'
+import { ProjectCatalogRepository } from '../../packages/persistence/src/project-catalog-repository.js'
 import { DrizzleRuntimePreparationRepository } from '../../packages/persistence/src/runtime-preparation-repository.js'
 import { schema } from '../../packages/persistence/src/schema/index.js'
+import { SessionRepository } from '../../packages/persistence/src/session-repository.js'
 
 // Resolve the Node-native dependency from its owner, independent of Electron's rebuilt copy.
 const requireFromPersistence = createRequire(
@@ -72,7 +74,9 @@ export class ReadonlyFixtureDatabase {
   private closed = false
   private readonly deadline = performance.now() + observationLeaseMs
   private readonly database: PactDrizzleDatabase
-  readonly conversationRepository: Pick<ConversationRepository, 'read'>
+  readonly projectCatalogRepository: Pick<ProjectCatalogRepository, 'find'>
+  readonly sessionRepository: Pick<SessionRepository, 'find'>
+  readonly conversationRepository: Pick<ConversationRepository, 'read' | 'findRun'>
   readonly runtimePreparationRepository: Pick<
     DrizzleRuntimePreparationRepository,
     'readSelectedExecutablePath'
@@ -82,8 +86,35 @@ export class ReadonlyFixtureDatabase {
     this.database = createDrizzle({ prepare: (sql) => this.prepare(sql) }, { schema })
     // Persistence recovery belongs to PactDatabase's writer lifecycle; this projection only reads.
     const conversation = new ConversationRepository(this.database)
+    const projects = new ProjectCatalogRepository(this.database)
+    const sessions = new SessionRepository(this.database)
+    this.projectCatalogRepository = {
+      find: (id) => {
+        this.requireOpen()
+        const result = projects.find(id)
+        requireResultBound(result)
+        this.requireOpen()
+        return result
+      },
+    }
+    this.sessionRepository = {
+      find: (id) => {
+        this.requireOpen()
+        const result = sessions.find(id)
+        requireResultBound(result)
+        this.requireOpen()
+        return result
+      },
+    }
     const runtime = new DrizzleRuntimePreparationRepository(this.database)
     this.conversationRepository = {
+      findRun: (id) => {
+        this.requireOpen()
+        const result = conversation.findRun(id)
+        requireResultBound(result)
+        this.requireOpen()
+        return result
+      },
       read: (sessionId) => {
         this.requireOpen()
         const result = conversation.read(sessionId)

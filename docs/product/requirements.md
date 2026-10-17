@@ -68,6 +68,7 @@ Avoid using `completed`, `accepted`, `ready`, `responded` and `resolved` interch
 - The deterministic orchestrator does not act as a third model or substitute inferred agreement for recorded results and user authorization.
 - Treat project text, generated output, links and extension/native results as untrusted. File-write intent does not implicitly authorize destructive commands, publishing, deployment, database mutation or external messages.
 - macOS and Windows share functional requirements, with platform-specific path, control, shortcut, material and process verification. Publishing source does not establish a simultaneous signed-installation release.
+- Local development and locally packaged production identify themselves separately from official Pact installations and use distinct application browser profiles. Existing development records and saved image/Changes objects are retained. CI development uses Pact Dev and validated Actions downloads; Stable uses Pact and complete-platform immutable Releases. Projects and native provider configuration remain user-owned shared resources.
 
 ## Current capability boundary
 
@@ -111,7 +112,11 @@ A Project is an explicitly added canonical local-directory reference, not a copy
 
 Rename changes only the saved display name: trimmed, nonempty, single-line and at most 120 UTF-16 units. Re-add preserves identity/name/Sessions. Name/Pencil opens the inline editor and selects the current name; Enter saves, Escape cancels, blur preserves the draft. Failures keep the draft with local error. Read back uncertain writes before another mutation. Folder disclosure remains separate.
 
-Project/Session Archive hides App entries without deleting files, settings, messages or Native histories. Immediate Undo restores the archived item; re-adding an archived canonical Project restores its identity and Sessions. Project archive does not cascade Session archive state. Permanent delete and a persistent Archive browser are not exposed.
+Project/Session Archive hides App entries without deleting files, settings, messages or Native histories. Idle items archive directly. Active tasks require a Pact confirmation showing the affected Sessions: Cancel changes no task; Stop and archive requests interruption and waits for actual native settlement and saved output before hiding the item. Project archive confirms its affected tasks once and archives the Project only after all settle; it does not cascade Session archive state. Partial failure, timeout or unconfirmed native work leaves the item unarchived and identifies finished, stopped and unresolved tasks. Unsupported recovery, Rebuild, Fork or detached work must finish or be checked before archive; archive never invents a successful Stop. Confirmation expires or requires review if the task identities change. Immediate Undo restores visibility without restarting tasks; re-adding an archived canonical Project restores its identity and Sessions. Permanent delete and a persistent Archive browser are not exposed.
+
+Archive feedback combines successful, failed and unconfirmed results in one summary with an expandable, paged list. Each entry identifies the Session or Project and its own result; a Project counts as one entry even when its affected Sessions have different Stop outcomes. Undo restores only the selected successful entry and removes that entry after confirmed restoration. Failure details preserve individual Stop outcomes; Review again prepares current task identities and requires confirmation for active work. An unconfirmed entry only checks the original operation; it cannot authorize another Stop or be dismissed until resolved. Retrying a failed item updates its existing entry. Results remain available until explicitly dismissed or the Renderer restarts; new archives do not overwrite earlier Undo actions. At the display capacity, further archives require reviewing or dismissing resolved entries first. Restoring an independently archived Session requires its Project to be visible first. Feedback is a disposable projection; durable archive receipts remain authoritative.
+
+The Composer footer shows the canonical folder basename and current Git branch beside the permission menus. Folder actions open the registered Project directory in the native file manager or copy its complete path; the branch action copies the complete branch name. A renamed Project display name does not rename this filesystem label. Refresh on entering the visible Session, returning window focus, opening a context menu and Run-state changes. A selected subdirectory inside a repository shows that containing repository's branch without changing the Project directory or classification. Directories outside a repository omit Git metadata; detached HEAD shows its commit without inventing a branch name. Read/open/clipboard failures remain visible and retry is explicit.
 
 ### Session ownership, title and activity
 
@@ -124,6 +129,64 @@ After adopting a native title into Pact, Codex's display name may become `[Pact]
 Activity projects actual Run/interaction/recovery facts, independent of collaboration phase/verdict. Normal completion returns Idle; Waiting means an actual required question/approval. Completed, failed, interrupted, unknown-delivery and abandoned remain distinct. Unread follows durable completed-message sequence and recorded reading position, not transient deltas/title changes.
 
 Navigation is Project → Session, with neutral Project rows, folder disclosure, hover/keyboard-focus actions, 6 px before indented child Sessions and no persistent connectors/`Sessions`/branch/path/count/Changes metadata. There is no dedicated application fullscreen feature. The center header retains title. Settings temporarily replace navigation content and hide Context; Back restores workspace topology.
+
+### Resident application and native Session navigation
+
+Each complete application start centers the workspace on the display containing the pointer, at
+80% of that display's available work-area width and height. Sizing uses logical display coordinates
+and excludes taskbars, menu bars and the Dock. Prefer a 720 by 520 minimum, capped by the available
+work area on smaller displays. Revealing a running instance preserves its current geometry and
+window state; an unreachable title bar is moved back into an available display's work area.
+
+On macOS and transparent-backed Windows windows, the first workspace display and a normal or maximized workspace revealed from
+the tray fade in over 150 ms; closing to the tray fades out over 100 ms. Already visible windows
+are focused without replaying the entrance. Repeated visibility changes replace the current target
+from its current opacity. Reduced-motion or disabled system animation settings use immediate
+visibility changes. Native minimization/restoration, fullscreen and macOS Space transitions retain
+their native behavior without an additional workspace fade. Opaque Solid Windows windows use system
+window operations without custom opacity or shape updates. Transparent Windows windows retain their
+current effects and do not promise native scaling animations unavailable to that window style.
+
+On macOS and Windows, closing the workspace hides its window and keeps Pact and its existing work
+available from the system tray. The tray uses a monochrome version of the shared Pact mark; macOS
+uses a transparent Template image. Clicking the tray icon shows and focuses the existing workspace.
+Right-click opens a native menu with Show Pact, Needs attention, Running, Recent Sessions and Exit.
+Window closure does not authorize Stop, archive or another Agent Turn.
+
+Needs attention includes actual pending approvals/questions and unresolved native recovery, using
+the same facts as the workspace. An ordinary unread answer alone is not attention. The menu shows
+up to five entries and the total, with a paginated App view for additional entries. Running shows
+up to five Sessions with an actual native Adapter, including recovery and native checks. Waiting
+for an Adapter is Starting, rather than Running. Recent Sessions are the five most recently opened
+visible Sessions across Projects, excluding the other groups and filling any resulting gaps.
+Repeated selection of the already visible Session is not a new opening. Native entries identify
+Session and Project names and state without conversation bodies, Project paths or private requests.
+The full attention view also retains unread indication.
+
+Selecting a native entry reveals the workspace and opens that Session without sending input,
+restarting work, restoring an archived entry or initializing a native context. A newer deliberate
+Session choice supersedes an older pending navigation. Archived or unavailable entries report their
+current state and leave the existing selection available. Recent ordering persists across restarts.
+
+Packaged Windows applications publish the same Session groups in their taskbar JumpList. Entries
+launch that exact application identity with only the Session identifier; a second launch reveals its
+existing instance. A normal confirmed exit retains recent entries for cold launch and removes live
+groups. Windows privacy or policy can disable custom categories, and removing a Session from the
+JumpList suppresses it until a later deliberate App opening. Windows development publishes the same
+groups for its running repository-specific instance, with the Pact development name and icon.
+Development taskbar entries only reveal or navigate that existing instance; after a full exit,
+start it with `pnpm dev`. They never launch bare Electron or an older Renderer build. Normal
+development exit clears custom categories unless pending Windows removal records must be preserved.
+macOS publishes the groups in its Dock menu while Pact is running.
+
+Exit, the application Quit command and macOS Cmd+Q use the existing safe shutdown owner. Known idle
+work exits directly. Active or unsettled work opens a Pact confirmation listing affected Sessions;
+Cancel keeps working, and Exit Pact confirms that work may be interrupted. Unavailable or uncertain
+runtime state requires confirmation rather than assuming idle. Cancellation is confirmed before
+the dialog closes. During shutdown the workspace and tray remain available until the actual runtime
+exit is established. Saved conversations and files remain on the device; unsent ordinary drafts
+retain their existing restart behavior. System shutdown or logout does not wait for this user
+confirmation. A system dialog is a fallback only when the Pact interface is unavailable.
 
 ## Messages, routing and execution
 
@@ -383,7 +446,18 @@ Bound DOM/caches while preserving selection, keyboard/screen-reader access, Comm
 
 App-global persisted appearance includes independent System/Light/Dark theme, System/Solid/Translucent material and stored `materialOpacity` 70–100/default 85. Visible Transparency strength 0/50/100 maps to 100/85/70, not whole-window opacity. Semantic surfaces have distinct alpha; text/icons/code/focus remain opaque.
 
-Live preview/reset respects revisions. Save failure restores durable value; uncertain delivery blocks writes until readback. System events cannot reconcile unknown write or overwrite newer revision. macOS uses transparent backing without Vibrancy. Supported Windows uses frameless transparent backing/native overlay, system backdrop disabled rather than Mica. Unsupported build/system, reduced transparency, high contrast/forced colors or observable init error falls back to complete Solid, retaining request/reason. API success/CSS alpha is not compositor evidence.
+Live preview/reset respects revisions. Save failure restores durable value; uncertain delivery blocks writes until readback. System events cannot reconcile unknown write or overwrite newer revision. macOS uses transparent backing without Vibrancy. Windows resolves the saved material before creating its first workspace: Solid uses a genuinely opaque window with native frame styles, while Translucent retains frameless transparent backing; both retain native caption buttons and disable system backdrop material rather than using Mica. Automatic resolves through the existing capability/accessibility policy. Unsupported build/system, reduced transparency, high contrast/forced colors or observable init error falls back to complete Solid, retaining request/reason. API success/CSS alpha is not compositor evidence.
+
+Windows background-mode changes save immediately but take effect on the next complete application
+start. The current background remains active and Appearance identifies a pending restart; returning
+to the startup choice clears that notice. Closing to the tray is not a restart. Pact does not restart
+itself or recreate the workspace when this preference changes, preserving current work and drafts.
+Theme and transparency-strength adjustments remain live, and accessibility can immediately paint a
+transparent-backed workspace Solid. An opaque window stays Solid until restart if system policy
+later permits translucency. Startup waits for the local runtime and a successful saved-settings read
+before constructing the workspace. A failed read offers Retry or Exit instead of fixing the process
+to a default background; neither action overwrites saved preferences.
+The pending-restart projection is transient; persisted settings and their revision remain authoritative.
 
 Use calm dense controls, progressive disclosure and non-color identity/state cues. Target WCAG 2.2 AA, keyboard/focus/scalable text/screen-reader/reduced-motion/light-dark semantics. Code/Diff/permissions stay nearly opaque. Titlebar interaction is no-drag with native safe areas and dragging/resizing elsewhere. Exact visual rules live in Design.
 

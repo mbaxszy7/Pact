@@ -4,6 +4,7 @@ import { resolve } from 'node:path'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { conversationMessages } from '../../packages/persistence/src/schema/index.js'
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture } from './runtime-fixture.js'
 
@@ -130,7 +131,7 @@ test(
       await expect(window.locator('[data-pact-conversation-recovery]')).toHaveCount(0)
       await expect(window.locator('article[data-pact-speaker="user"]')).toHaveCount(1)
     } finally {
-      await app?.close()
+      if (app) await quitPact(app)
       await fixture.dispose()
     }
   },

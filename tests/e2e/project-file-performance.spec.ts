@@ -4,6 +4,7 @@ import { symlink, writeFile } from 'node:fs/promises'
 import { relative, resolve } from 'node:path'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture, type RuntimeFixture } from './runtime-fixture.js'
 
@@ -56,7 +57,7 @@ test(
       await window.getByRole('button', { name: 'Close file preview' }).click()
       await expect(window.locator('.monaco-editor')).toHaveCount(0)
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -148,7 +149,7 @@ test(
       await expect.poll(async () => (await counts()).active).toBe(0)
       await expect(window.locator('.monaco-editor')).toHaveCount(0)
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -183,7 +184,7 @@ test(
       await expect(window.getByText('Select at most 20,000 characters')).toBeVisible()
       await expect(window.getByRole('button', { name: 'Comment on selected code' })).toHaveCount(0)
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },

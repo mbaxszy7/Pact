@@ -240,7 +240,7 @@ export interface SessionWorkspaceFlow {
     settings: DefaultSessionSettings,
   ): Promise<CollaborationSession | undefined>
   rename(sessionId: string, title: string): Promise<boolean>
-  archive(sessionId: string): Promise<boolean>
+  archive(sessionId: string, operationId?: string): Promise<boolean>
   restore(sessionId: string): Promise<boolean>
   loadSettings(sessionId: string): Promise<SessionSettingsEditorState | undefined>
   saveSettings(
@@ -412,17 +412,24 @@ export function useSessionWorkspace(
     }
   }
 
-  const archive = async (sessionId: string): Promise<boolean> => {
+  const archive = async (sessionId: string, operationId?: string): Promise<boolean> => {
     if (archivingSessionId) return false
     setArchivingSessionId(sessionId)
     setActionError(undefined)
     try {
-      const change = unwrapRpcResult(await window.pact.archiveSession(sessionId))
+      let result = await window.pact.archiveSession(sessionId, operationId)
+      if (!result.ok && result.error.code === 'UNCERTAIN' && operationId) {
+        const receipt = await window.pact.readWorkspaceArchive({ operationId })
+        // Only a durable success permits the same-nonce catalog read, never another Stop.
+        if (receipt.ok && receipt.value.state === 'archived')
+          result = await window.pact.archiveSession(sessionId, operationId)
+      }
+      const change = unwrapRpcResult(result)
       acceptSessionCatalogChange(queryClient, change)
       queryClient.removeQueries({ queryKey: sessionWorkspaceQueryKeys.settings(sessionId) })
       return true
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : 'Session could not be deleted.')
+      setActionError(error instanceof Error ? error.message : 'Session could not be archived.')
       return false
     } finally {
       setArchivingSessionId(undefined)

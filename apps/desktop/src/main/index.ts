@@ -1,4 +1,4 @@
-import { electronApp, optimizer } from '@electron-toolkit/utils'
+import { optimizer } from '@electron-toolkit/utils'
 import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
@@ -6,8 +6,13 @@ import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 import type { RuntimeStartupFailure } from '@pact/contracts'
 
+import macIcon from '../../build/icon-mac.png?asset'
 import { hasLogicalIpcFixtureNonce, LogicalIpcWorkerTraffic } from '../shared/logical-ipc-traffic'
 import { registerAppProtocol } from './app-protocol'
+import {
+  resolveApplicationIdentity,
+  resolveNativeApplicationIdentity,
+} from './application-identity'
 import { registerDesktopModules } from './modules'
 import {
   createAppearanceController,
@@ -16,20 +21,22 @@ import {
 import { ApplicationMenu } from './modules/application-menu'
 import { DiagnosticLogs } from './modules/diagnostics'
 import {
+  developmentNativeInvocation,
+  NativePresence,
+  nativeLaunchData,
+} from './modules/native-presence'
+import {
   completePackagedSmoke,
   completePackagedProductionPathProbe,
   configurePackageSmokeUserData,
   isPackageSmoke,
   observePackagedPageLoad,
 } from './package-smoke'
-import { configureProductIdentity, readProductIdentity } from './product-identity'
+import { readProductIdentity } from './product-identity'
 import { createRendererTrust } from './renderer-trust'
 import { createUtilityProcessClient } from './utility-process/client'
-import { configureIsolatedProfile, resolveRuntimePaths } from './utility-process/runtime-paths'
+import { configureApplicationProfile, resolveRuntimePaths } from './utility-process/runtime-paths'
 import { createMainWindow } from './window'
-
-const productIdentity = readProductIdentity()
-configureProductIdentity(productIdentity)
 
 const utilityClient = createUtilityProcessClient()
 const rendererTrust = createRendererTrust({
@@ -40,14 +47,17 @@ let removeDesktopModules: (() => void) | undefined
 let appearanceSettings: AppearanceController
 let diagnostics: DiagnosticLogs | undefined
 let applicationMenu: ApplicationMenu | undefined
+let nativePresence: NativePresence | undefined
 let startupFailureShown = false
 
 function createPactWindow(): BrowserWindow {
   let pageLoad: Promise<void> | undefined
   const window = createMainWindow({
     show: !isPackageSmoke(),
+    appearance: appearanceSettings.getWindowAppearance(),
     trust: rendererTrust,
-    onBeforeLoad: (createdWindow) => {
+    onBeforeLoad: (createdWindow, presentation) => {
+      nativePresence?.attachWindow(createdWindow, presentation)
       applicationMenu?.attachWindow(createdWindow)
       appearanceSettings.attachWindow(createdWindow)
       createdWindow.webContents.on('render-process-gone', (_event, details) => {
@@ -79,21 +89,40 @@ function createPactWindow(): BrowserWindow {
 }
 
 async function bootstrap(): Promise<void> {
+  const identity = resolveApplicationIdentity()
+  const productIdentity = readProductIdentity(identity)
+  app.setName(identity.name)
+  configureApplicationProfile(identity)
   configurePackageSmokeUserData()
-  configureIsolatedProfile()
-  if (!app.requestSingleInstanceLock()) {
+  const nativeIdentity = resolveNativeApplicationIdentity(identity)
+  const developmentLaunch = developmentNativeInvocation(nativeIdentity, process.argv)
+  if (developmentLaunch === 'rejected') {
     app.exit(0)
     return
   }
-  app.on('second-instance', () => {
-    const window = BrowserWindow.getAllWindows()[0]
-    if (!window) return
-    if (window.isMinimized()) window.restore()
-    window.show()
-    window.focus()
-  })
+  const launch = nativeLaunchData(nativeIdentity, process.argv)
+  if (!app.requestSingleInstanceLock(launch ?? {})) {
+    app.exit(0)
+    return
+  }
+  // A taskbar entry can activate a live development server, never cold-start an old build.
+  if (developmentLaunch === 'matching') {
+    app.releaseSingleInstanceLock()
+    app.exit(0)
+    return
+  }
+  nativePresence = new NativePresence(
+    nativeIdentity,
+    utilityClient,
+    rendererTrust,
+    createPactWindow,
+    launch,
+    !isPackageSmoke(),
+  )
   await app.whenReady()
-  electronApp.setAppUserModelId(productIdentity.appId)
+  if (quitting) return
+  if (process.platform === 'win32') app.setAppUserModelId(nativeIdentity.appId)
+  if (process.platform === 'darwin' && !app.isPackaged) app.dock?.setIcon(macIcon)
   if (completePackagedProductionPathProbe()) return
   registerAppProtocol(join(__dirname, '../renderer'))
   const paths = resolveRuntimePaths()
@@ -129,6 +158,9 @@ async function bootstrap(): Promise<void> {
   utilityClient.start({
     ...paths,
     diagnostics,
+    onExit: () => {
+      if (quitting) void finishQuit()
+    },
     ...(traffic ? { traffic } : {}),
     onStartupFailed: (failure: RuntimeStartupFailure) => {
       if (startupFailureShown) return
@@ -184,14 +216,32 @@ async function bootstrap(): Promise<void> {
     optimizer.watchWindowShortcuts(window)
   })
 
-  // Restore saved Appearance before the first window; Renderer handles any load failure and retry.
-  await appearanceSettings.refresh()
-  if (startupFailureShown) return
-  createPactWindow()
-
-  app.on('activate', () => {
-    if (!quitting && BrowserWindow.getAllWindows().length === 0) createPactWindow()
-  })
+  // Cold module loading precedes the ordinary RPC deadline. Never commit a
+  // native window type until the authoritative Appearance read succeeds.
+  /* oxlint-disable no-await-in-loop -- Startup attempts are serial and require an explicit user Retry. */
+  for (;;) {
+    await quitApproval
+    if (quitting) return
+    const ready = await utilityClient.waitUntilReady()
+    if (startupFailureShown) return
+    const appearance = ready.ok ? await appearanceSettings.refresh() : ready
+    await quitApproval
+    if (quitting) return
+    if (appearance.ok) {
+      createPactWindow()
+      nativePresence.start()
+      return
+    }
+    diagnostics.record({
+      operation: 'app',
+      phase: 'failed',
+      level: 'error',
+      code: appearance.error.code,
+    })
+    if (isPackageSmoke()) throw new Error('Package smoke could not load startup Appearance.')
+    if (!(await nativePresence.recoverStartup())) return
+  }
+  /* oxlint-enable no-await-in-loop */
 }
 
 void bootstrap().catch(() => {
@@ -202,35 +252,51 @@ void bootstrap().catch(() => {
 
 let quitting = false
 let quitReady = false
+let quitApproval: Promise<void> | undefined
+let quitCompletion: Promise<void> | undefined
+function finishQuit(): Promise<void> {
+  quitCompletion ??= (async () => {
+    try {
+      await diagnostics?.close()
+    } catch {
+      console.error('Pact could not close its diagnostics.')
+    }
+    nativePresence?.dispose()
+    quitReady = true
+    app.quit()
+  })()
+  return quitCompletion
+}
+// will-quit follows Electron's document shutdown. Keep named handlers available
+// for late Renderer cleanup instead of treating native window closure as an IPC drain.
+app.once('will-quit', () => {
+  applicationMenu?.dispose()
+  removeDesktopModules?.()
+  appearanceSettings?.dispose()
+})
 app.on('before-quit', (event) => {
   if (quitReady) return
   event.preventDefault()
   if (quitting) return
-  quitting = true
-  applicationMenu?.dispose()
-  removeDesktopModules?.()
-  appearanceSettings?.dispose()
-  void utilityClient
-    .shutdown()
-    .then((result) => {
-      if (!result.ok) console.error('Pact shutdown was not acknowledged:', result.error.code)
-      return undefined
-    })
-    .catch(() => {
-      console.error('Pact shutdown acknowledgement could not be read.')
-    })
-    // oxlint-disable-next-line typescript/no-misused-promises -- Promise.finally awaits the bounded diagnostic flush before quitting.
-    .finally(async () => {
-      try {
-        await diagnostics?.close()
-      } catch {
-        console.error('Pact could not close its diagnostics.')
-      }
-      quitReady = true
-      app.quit()
-    })
-})
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  if (startupFailureShown) {
+    quitting = true
+    utilityClient.dispose()
+    if (!utilityClient.isRunning()) void finishQuit()
+    return
+  }
+  if (quitApproval) {
+    nativePresence?.show()
+    return
+  }
+  quitApproval = (async () => {
+    const accepted = await (nativePresence?.requestQuit() ?? Promise.resolve(true))
+    if (!accepted) return
+    quitting = true
+    const result = await utilityClient.shutdown()
+    if (!result.ok) console.error('Pact shutdown was not acknowledged:', result.error.code)
+    if (!utilityClient.isRunning()) await finishQuit()
+    else nativePresence?.shutdownUnconfirmed()
+  })().finally(() => {
+    quitApproval = undefined
+  })
 })

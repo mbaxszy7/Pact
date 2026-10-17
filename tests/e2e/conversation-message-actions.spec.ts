@@ -8,6 +8,7 @@ import {
   agentRuns,
   conversationMessages,
 } from '../../packages/persistence/src/schema/index.js'
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture } from './runtime-fixture.js'
 
@@ -214,7 +215,7 @@ test(
       await expect(collapse).toHaveCount(0)
       await expect(window.locator('.agent-activity-reveal li')).toHaveCount(0)
     } finally {
-      await app?.close()
+      if (app) await quitPact(app)
       await fixture.dispose()
     }
   },

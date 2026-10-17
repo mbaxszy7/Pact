@@ -5,6 +5,7 @@ import { parse, stringify } from 'smol-toml'
 
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
+import { quitPact } from './native-quit.js'
 import {
   closeRealWorkspace,
   launchRealWorkspace,
@@ -84,7 +85,7 @@ test(
       const marker = 'READABLE_NATIVE_HISTORY'
       await sendRealMessage(ctx, `Reply briefly with ${marker}. Do not use tools.`, 'codex')
       const prior = await waitForRealCompletion(ctx, 1)
-      await ctx.app.close()
+      await quitPact(ctx.app)
       await rm(join(ctx.fixture.codexHome, 'auth.json'))
       const nativeConfigPath = join(ctx.fixture.codexHome, 'config.toml')
       const nativeConfig = parse(await readFile(nativeConfigPath, 'utf8'))

@@ -1,5 +1,6 @@
 import { expect } from '@playwright/test'
 
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture } from './runtime-fixture.js'
 
@@ -28,7 +29,7 @@ test(
 
       await expect(window.getByRole('heading', { name: 'Start with a project' })).toBeVisible()
 
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       window = await app.firstWindow()
       await expect(window.getByRole('heading', { name: 'Start with a project' })).toBeVisible()

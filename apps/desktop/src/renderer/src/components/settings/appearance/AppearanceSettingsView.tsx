@@ -130,6 +130,7 @@ export function AppearanceSettingsView({
   onMaterialOpacityCommit,
   onReset,
   onRetry,
+  platform,
 }: AppearanceSettingsViewProps): React.JSX.Element {
   const lastCommittedOpacity = useRef<number | undefined>(undefined)
   const defaultValues =
@@ -137,6 +138,11 @@ export function AppearanceSettingsView({
     settings.windowMaterial === 'system' &&
     settings.materialOpacity === 85
   const backgroundEffectActive = effective?.windowMaterial === 'translucent'
+  const backgroundOptions = materialOptions.map((option) =>
+    platform === 'win32' && option.value === 'translucent'
+      ? { value: option.value, label: option.label, description: 'Requires restarting Pact.' }
+      : option,
+  )
   const effectStrength = settings ? toEffectStrength(settings.materialOpacity) : 50
   const fallbackMessage =
     settings?.windowMaterial === 'translucent'
@@ -153,7 +159,9 @@ export function AppearanceSettingsView({
       <header className="border-b border-border pb-section">
         <h2 className="text-title font-medium tracking-[-0.025em] text-primary">Appearance</h2>
         <p className="mt-2 max-w-prose text-body text-secondary">
-          Changes apply to every Pact window.
+          {platform === 'win32'
+            ? 'Theme changes apply immediately. Changing the window background requires restarting Pact.'
+            : 'Changes apply to every Pact window.'}
         </p>
       </header>
 
@@ -199,10 +207,18 @@ export function AppearanceSettingsView({
             <PreferenceOptions
               name="appearance-material"
               value={settings.windowMaterial}
-              options={materialOptions}
+              options={backgroundOptions}
               disabled={saving}
               onChange={onMaterialChange}
             />
+            {effective.restartRequired ? (
+              <output className="mt-group block rounded-control bg-surface-muted px-group py-2 text-caption text-secondary">
+                <span className="font-medium text-primary">Restart required.</span> Currently using{' '}
+                {effective.windowMaterial === 'solid' ? 'Solid' : 'Translucent'}. To apply your
+                selected background, choose Exit in Pact’s tray menu, then open Pact again. Closing
+                the window keeps Pact running and does not apply the change.
+              </output>
+            ) : null}
             {fallbackMessage ? (
               <output className="mt-group block rounded-control bg-surface-muted px-group py-2 text-caption text-secondary">
                 <span className="font-medium text-primary">Using Solid.</span> {fallbackMessage}
@@ -258,7 +274,11 @@ export function AppearanceSettingsView({
             </div>
             {!backgroundEffectActive ? (
               <p id="appearance-opacity-help" className="mt-2 text-caption text-secondary">
-                Choose Translucent to adjust this.
+                {effective.restartRequired
+                  ? settings.windowMaterial === 'translucent'
+                    ? 'Restart Pact to enable transparency and adjust its strength.'
+                    : 'Restart Pact to use your selected background.'
+                  : 'Choose Translucent to adjust this.'}
               </p>
             ) : null}
           </section>

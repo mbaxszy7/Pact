@@ -4,6 +4,7 @@ import { writeFile } from 'node:fs/promises'
 
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
+import { quitPact } from './native-quit.js'
 import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import {
   authMarker,
@@ -375,7 +376,7 @@ test(
         before.runs[0]?.status,
       )
       const runId = before.runs[0]!.id
-      await ctx.app.close()
+      await quitPact(ctx.app)
       const durable = await readRealConversation(ctx)
       const persisted = durable.messages.find((row) => row.id === response.id)
       expect(persisted?.content.startsWith(response.content)).toBe(true)

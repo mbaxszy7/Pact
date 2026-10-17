@@ -1,0 +1,225 @@
+@layer components {
+  .pact-native-session-name {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .pact-native-session-state {
+    display: inline-flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 6px;
+  }
+  .pact-native-quit {
+    width: min(32rem, calc(100vw - 2rem));
+    max-height: calc(100vh - 3rem);
+    margin: auto;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-panel, 14px);
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+  .pact-native-quit::backdrop {
+    background: color-mix(in srgb, var(--pact-text-primary) 22%, transparent);
+  }
+  .pact-native-quit[open] {
+    display: flex;
+    flex-direction: column;
+  }
+  .pact-native-quit-heading {
+    display: flex;
+    align-items: center;
+    gap: var(--pact-space-group);
+    padding: var(--pact-space-section) var(--pact-space-section) 0;
+  }
+  .pact-native-quit-heading h2 {
+    flex: 1;
+    margin: 0;
+  }
+  .pact-native-close {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    border: 0;
+    border-radius: var(--radius-control, 8px);
+    background: transparent;
+  }
+  .pact-native-quit-content {
+    display: flex;
+    flex-direction: column;
+    gap: var(--pact-space-group);
+    min-height: 0;
+    padding: var(--pact-space-panel) var(--pact-space-section) var(--pact-space-section);
+    overflow: auto;
+  }
+  .pact-native-quit-content p {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+  .pact-native-quit-sessions {
+    margin: 6px 0;
+    padding: 6px 0;
+    list-style: none;
+    border-block: 1px solid var(--pact-border);
+  }
+  .pact-native-quit-sessions li {
+    display: flex;
+    align-items: center;
+    gap: var(--pact-space-group);
+    min-height: 54px;
+    padding: 9px 0;
+  }
+  .pact-native-quit-actions {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--pact-space-group);
+    padding: var(--pact-space-group) var(--pact-space-section) var(--pact-space-panel);
+    border-top: 1px solid var(--pact-border);
+  }
+  .pact-native-quit-exit {
+    color: var(--pact-canvas);
+  }
+  .pact-native-quit-progress {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--pact-space-compact);
+    margin: 0;
+  }
+  .pact-native-attention {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    overscroll-behavior: contain;
+  }
+  .pact-native-attention-content {
+    width: min(52rem, 100%);
+    flex: 1;
+    min-height: 0;
+    margin-inline: auto;
+    padding: var(--pact-space-section) var(--pact-space-spacious);
+    overflow: auto;
+  }
+  .pact-native-attention-back {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--pact-space-compact);
+    min-height: 32px;
+    margin-left: calc(-1 * var(--pact-space-group));
+    padding: 0 var(--pact-space-group);
+    border-radius: var(--radius-control, 8px);
+  }
+  .pact-native-attention-heading {
+    margin-top: var(--pact-space-section);
+    padding-bottom: var(--pact-space-section);
+    border-bottom: 1px solid var(--pact-border);
+  }
+  .pact-native-attention-heading h1 {
+    margin: 0;
+  }
+  .pact-native-attention-heading p {
+    margin: var(--pact-space-group) 0 0;
+  }
+  .pact-native-attention-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--pact-space-group);
+    margin-top: var(--pact-space-section);
+  }
+  .pact-native-attention-sessions {
+    margin: var(--pact-space-group) 0 0;
+    padding: 0;
+    list-style: none;
+  }
+  .pact-native-attention-sessions li + li {
+    border-top: 1px solid var(--pact-border);
+  }
+  .pact-native-attention-session {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: var(--pact-space-group);
+    padding: var(--pact-space-panel) var(--pact-space-group);
+    border: 0;
+    border-radius: var(--radius-control, 8px);
+    background: transparent;
+    text-align: left;
+  }
+  .pact-native-attention-session-status {
+    display: flex;
+    flex-shrink: 0;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 3px;
+  }
+  .pact-native-attention-empty {
+    margin: var(--pact-space-spacious) 0;
+  }
+  .pact-native-attention-error {
+    display: flex;
+    align-items: center;
+    gap: var(--pact-space-group);
+    margin-top: var(--pact-space-panel);
+  }
+  .pact-native-attention-error p {
+    flex: 1;
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+  .pact-native-attention-pages {
+    display: flex;
+    align-items: center;
+    gap: var(--pact-space-group);
+    margin-top: var(--pact-space-panel);
+    padding-top: var(--pact-space-panel);
+    border-top: 1px solid var(--pact-border);
+  }
+  .pact-native-attention-pages p {
+    flex: 1;
+    margin: 0;
+    font-variant-numeric: tabular-nums;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .pact-native-quit:open {
+      animation: pact-native-quit-enter 160ms cubic-bezier(0.16, 1, 0.3, 1);
+    }
+  }
+  @keyframes pact-native-quit-enter {
+    from {
+      opacity: 0.85;
+      transform: translateY(6px);
+    }
+  }
+  @media (max-width: 760px) {
+    .pact-native-attention-content {
+      padding-inline: var(--pact-space-section);
+    }
+    .pact-native-attention-session {
+      gap: var(--pact-space-group);
+    }
+  }
+  @media (forced-colors: active) {
+    .pact-native-quit {
+      outline: 1px solid CanvasText;
+    }
+    .pact-native-quit::backdrop {
+      background: Canvas;
+      opacity: 0.7;
+    }
+    .pact-native-quit-exit {
+      color: ButtonText;
+      background: ButtonFace;
+      outline: 1px solid ButtonText;
+    }
+  }
+}

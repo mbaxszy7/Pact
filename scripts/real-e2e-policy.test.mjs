@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -76,7 +76,7 @@ await test('actual Playwright discovery is completely classified and core select
       .toSorted(compare),
   )
   assert.equal(core.size, 1)
-  assert.equal(listed.size - core.size, 60)
+  assert.equal(listed.size - core.size, 62)
   assert.deepEqual(
     realCases.filter((item) => item.tier === 'core').map((item) => item.title),
     ['real @all completes each Agent once and keeps ordered distinct response rows'],
@@ -95,7 +95,7 @@ await test('core success reports every deferred case without claiming a complete
     notRun: 0,
     notApplicable: 0,
   })
-  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 60)
+  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 62)
   assert(
     report.cases
       .filter((item) => item.tier === 'extended')
@@ -106,7 +106,7 @@ await test('core success reports every deferred case without claiming a complete
   )
 })
 
-await test('extended failure remains reported while ordinary PR core passes; release full gate fails', () => {
+await test('extended failure remains reported while core passes; explicitly selected full gate fails', () => {
   const raw = fixture()
   fail(first(raw, 'extended'))
   const pr = evaluateRealReport(raw, { suite: 'full', gate: 'core' })
@@ -259,62 +259,35 @@ await test('a macOS-only case is required on macOS and explicitly non-applicable
   assert.equal(evaluateRealReport(raw, { suite: 'full', platform: 'darwin' }).gatePassed, false)
 })
 
-await test('validated identity extensions never enter published report JSON or Markdown', () => {
+const reportIdentity = {
+  schemaVersion: 1,
+  kind: 'ci',
+  repository: 'mbaxszy7/Pact',
+  sourceSha: 'a'.repeat(40),
+  runId: 1234,
+  runAttempt: 2,
+  eventName: 'pull_request',
+  ref: 'refs/pull/12/merge',
+}
+
+await test('canonical run metadata excludes arbitrary private extensions from both report formats', () => {
   const secret = 'synthetic-nonfunctional-private-identity-canary'
-  const identity = {
-    schemaVersion: 3,
-    repository: 'mbaxszy7/Pact',
-    repositoryId: 1416403312,
-    pullRequest: 7,
-    headRepositoryId: 1416403312,
-    authorId: 31481964,
-    channel: 'dev',
-    headSha: 'a'.repeat(40),
-    baseSha: 'b'.repeat(40),
-    candidateSha: 'c'.repeat(40),
-    treeSha: 'd'.repeat(40),
-    policySha: 'b'.repeat(40),
-    sourceKind: 'main',
-    controllerSha: 'b'.repeat(40),
-    controllerRef: 'refs/heads/main',
-    product: {
-      before: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
-      after: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
-    },
-    privateConfig: { token: secret },
-    secret,
-  }
-  const report = evaluateRealReport(fixture('core'), { identity })
+  const report = evaluateRealReport(fixture('core'), {
+    identity: { ...reportIdentity, privateConfig: { token: secret }, secret },
+  })
   assert.equal(report.gatePassed, true)
   assert.equal(JSON.stringify(report).includes(secret), false)
   assert.equal(Object.hasOwn(report.identity, 'privateConfig'), false)
   assert.equal(realReportMarkdown(report).includes(secret), false)
-  assert.equal(report.identity.headSha, identity.headSha)
-})
-
-await test('a branch identity does not export its unvalidated author field', () => {
-  const secret = 'synthetic-nonfunctional-private-branch-canary'
-  const head = 'a'.repeat(40)
-  const identity = {
-    schemaVersion: 3,
-    repository: 'mbaxszy7/Pact',
-    repositoryId: 1416403312,
-    pullRequest: null,
-    headRepositoryId: 1416403312,
-    authorId: secret,
-    channel: 'dev',
-    headSha: head,
-    baseSha: null,
-    candidateSha: head,
-    treeSha: 'd'.repeat(40),
-    policySha: head,
-    sourceKind: 'branch',
-    controllerSha: head,
-    controllerRef: null,
-    product: null,
-  }
-  const report = evaluateRealReport(fixture('core'), { identity })
-  assert.equal(JSON.stringify(report).includes(secret), false)
+  assert.deepEqual(report.identity, reportIdentity)
+  assert(realReportMarkdown(report).includes('Actions run: 1234, attempt 2'))
+  assert.throws(
+    () =>
+      evaluateRealReport(fixture('core'), {
+        identity: { ...reportIdentity, runAttempt: 0 },
+      }),
+    /identity/,
+  )
 })
 
 await test('real failed and deferred cases use fixed safe failure categories and explicit required flags in Markdown', () => {
@@ -361,7 +334,7 @@ await test('the reporting entry still lists all cases and fails when CI identity
       (error) => error.status === 1,
     )
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
-    assert.equal(report.cases.length, 61)
+    assert.equal(report.cases.length, 63)
     assert.equal(report.gatePassed, false)
     assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
   } finally {
@@ -369,33 +342,10 @@ await test('the reporting entry still lists all cases and fails when CI identity
   }
 })
 
-await test('the actual CI reporting entry preserves a validated controller through both safe projections', async () => {
+await test('the actual CI reporting entry preserves exact source and run metadata through both safe projections', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'pact-real-policy-current-identity-'))
-  const head = 'a'.repeat(40),
-    base = 'b'.repeat(40),
-    privateCanary = 'nonfunctional-private-report-extension'
-  const identity = {
-    schemaVersion: 3,
-    repository: 'mbaxszy7/Pact',
-    repositoryId: 1416403312,
-    pullRequest: 7,
-    headRepositoryId: 1416403312,
-    authorId: 31481964,
-    channel: 'dev',
-    headSha: head,
-    baseSha: base,
-    candidateSha: 'c'.repeat(40),
-    treeSha: 'd'.repeat(40),
-    policySha: base,
-    sourceKind: 'main',
-    controllerSha: base,
-    controllerRef: 'refs/heads/main',
-    product: {
-      before: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
-      after: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
-    },
-    privateConfig: { token: privateCanary },
-  }
+  const privateCanary = 'nonfunctional-private-report-extension'
+  const identity = { ...reportIdentity, privateConfig: { token: privateCanary } }
   try {
     await writeFile(join(directory, 'real.json'), JSON.stringify(fixture('core')))
     const identityPath = join(directory, 'identity.json')
@@ -416,11 +366,54 @@ await test('the actual CI reporting entry preserves a validated controller throu
       },
     )
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
-    assert.equal(report.cases.length, 61)
+    assert.equal(report.cases.length, 63)
     assert.equal(report.gatePassed, true)
-    assert.equal(report.identity.controllerRef, identity.controllerRef)
+    assert.deepEqual(report.identity, reportIdentity)
     assert.equal(JSON.stringify(report).includes(privateCanary), false)
   } finally {
     await rm(directory, { recursive: true, force: true })
+  }
+})
+
+await test('CI report entry rejects local or null metadata while preserving every case and the failure report', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-real-run-kind-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  for (const [index, identity] of [
+    null,
+    { schemaVersion: 1, kind: 'local', repository: 'mbaxszy7/Pact', sourceSha: 'a'.repeat(40) },
+  ].entries()) {
+    const directory = join(root, String(index))
+    // oxlint-disable-next-line no-await-in-loop -- Each malformed metadata kind owns a separate retained report directory.
+    await mkdir(directory)
+    // oxlint-disable-next-line no-await-in-loop -- Complete fixture evidence precedes its rejected metadata.
+    await writeFile(join(directory, 'real.json'), JSON.stringify(fixture('core')))
+    const path = join(directory, 'identity.json')
+    // oxlint-disable-next-line no-await-in-loop -- Write only this malformed metadata fixture.
+    await writeFile(path, JSON.stringify(identity))
+    assert.throws(
+      () =>
+        execFileSync(
+          process.execPath,
+          ['scripts/real-e2e-policy.mjs', 'core', 'core', directory, path],
+          {
+            cwd: workspace,
+            env: {
+              ...process.env,
+              PACT_REAL_EXECUTION_COMPLETED: 'true',
+              PACT_CI_WORKSPACE: directory,
+              GITHUB_STEP_SUMMARY: '',
+            },
+            timeout: 10000,
+            stdio: 'pipe',
+          },
+        ),
+      (error) => error.status === 1,
+    )
+    // oxlint-disable-next-line no-await-in-loop -- Verify no case inventory was discarded to hide the failed CI metadata.
+    const report = JSON.parse(await readFile(join(directory, 'real-summary.json')))
+    assert.equal(report.gatePassed, false)
+    assert.equal(report.identity, null)
+    assert.equal(report.cases.length, 63)
+    assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
   }
 })

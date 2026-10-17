@@ -10,6 +10,7 @@ import {
   main,
   nativeSetupFailureFacts,
   windowsPnpmExecutable,
+  publishWindowsPnpmPath,
   windowsCodexEntry,
 } from './ci-native.mjs'
 
@@ -120,6 +121,10 @@ void test('admits the exact native sibling of setup-pnpm shims for owned Windows
     // Subsequent runWindows discovery appends pnpm.exe to the published absolute directory.
     assert.equal(join(dirname(executable), 'pnpm.exe'), executable)
     assert.equal(await readFile(executable, 'utf8'), 'synthetic-native-entry')
+    const pathFile = join(root, 'actions-path')
+    await publishWindowsPnpmPath({ PNPM_HOME: home, GITHUB_PATH: pathFile })
+    assert.equal(await readFile(pathFile, 'utf8'), dirname(executable) + '\n')
+    await assert.rejects(publishWindowsPnpmPath({ PNPM_HOME: home }), /explicit Actions path/)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

@@ -8,6 +8,7 @@ import { test } from 'node:test'
 import {
   applicationContent,
   distributionBuilderArguments,
+  distributionArguments,
   inspectPackagedWindowsSharp,
   inspectWindowsSharpSource,
 } from './build-distribution.mjs'
@@ -24,6 +25,23 @@ const { computeArchToTargetNamesMap } = builderRequire(
 )
 const base = builderRequire('js-yaml').load(
   await readFile(new URL('../apps/desktop/electron-builder.yml', import.meta.url), 'utf8'),
+)
+
+await test(
+  'local Production profile stays distinct and cannot claim the CI Dev channel',
+  { skip: !['darwin', 'win32'].includes(process.platform) },
+  () => {
+    const args = ['--profile', 'production-local', '--channel', 'stable', '--build-number', '1']
+    assert.equal(distributionArguments(args).profile, 'production-local')
+    assert.throws(
+      () => distributionArguments(['--profile', 'production-local', '--channel', 'dev']),
+      /profile and channel differ/u,
+    )
+    assert.throws(
+      () => distributionArguments(['--profile', 'unregistered', '--channel', 'stable']),
+      /Unsupported distribution profile/u,
+    )
+  },
 )
 
 function graph(args, options) {

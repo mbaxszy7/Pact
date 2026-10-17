@@ -8,6 +8,8 @@ import {
 } from './collaboration.js'
 export * from './collaboration.js'
 export * from './collaboration-todos.js'
+export * from './workspace-archive.js'
+export * from './native-presence.js'
 import {
   conversationImageSchema,
   conversationImagesSchema,
@@ -16,6 +18,41 @@ import {
   imageReadInputSchema,
   imageReadPartSchema,
 } from './images.js'
+import {
+  nativePresenceSnapshotSchema,
+  nativePresenceVersionSchema,
+  nativeSessionRowSchema,
+  NATIVE_MENU_ITEMS,
+  nativeAttentionReadInputSchema,
+  nativeAttentionPageSchema,
+  nativeSessionResolveInputSchema,
+  nativeSessionOpenInputSchema,
+  nativeJumpListSuppressionInputSchema,
+  nativeSessionOpenedResultSchema,
+  nativeJumpListSuppressionResultSchema,
+  nativeQuitOperationInputSchema,
+  nativeQuitPreparationSchema,
+  nativeQuitCancelledResultSchema,
+  type NativePresenceVersion,
+  type NativeAttentionReadInput,
+  type NativeAttentionPage,
+  type NativeSessionResolveInput,
+  type NativeSessionOpenInput,
+  type NativeQuitState,
+  type NativeQuitDecisionInput,
+  type NativeNavigationIntent,
+  type NativeNavigationAckInput,
+} from './native-presence.js'
+import {
+  workspaceArchivePrepareInputSchema,
+  workspaceArchiveOperationInputSchema,
+  workspaceArchivePreviewSchema,
+  workspaceArchiveReceiptSchema,
+  type WorkspaceArchivePrepareInput,
+  type WorkspaceArchiveOperationInput,
+  type WorkspaceArchivePreview,
+  type WorkspaceArchiveReceipt,
+} from './workspace-archive.js'
 export * from './images.js'
 import {
   skillCatalogReadSchema,
@@ -108,6 +145,19 @@ export {
 
 export const CONVERSATION_INTEREST_ITEMS = 8
 export const IPC_CHANNELS = {
+  nativeSessionResolve: 'pact:native-session:resolve',
+  nativeSessionOpened: 'pact:native-session:opened',
+  nativeAttentionRead: 'pact:native-attention:read',
+  nativePresenceChanged: 'pact:native-presence:changed',
+  nativeNavigationGet: 'pact:native-navigation:get',
+  nativeNavigationAck: 'pact:native-navigation:ack',
+  nativeNavigationChanged: 'pact:native-navigation:changed',
+  nativeQuitGet: 'pact:native-quit:get',
+  nativeQuitRespond: 'pact:native-quit:respond',
+  nativeQuitChanged: 'pact:native-quit:changed',
+  workspaceArchivePrepare: 'pact:workspace-archive:prepare',
+  workspaceArchiveRead: 'pact:workspace-archive:read',
+  workspaceArchiveCancel: 'pact:workspace-archive:cancel',
   diagnosticStatus: 'pact:diagnostics:status',
   diagnosticChanged: 'pact:diagnostics:changed',
   rendererFault: 'pact:diagnostics:renderer-fault',
@@ -126,6 +176,8 @@ export const IPC_CHANNELS = {
   projectCatalogArchive: 'pact:project-catalog:archive',
   projectCatalogRestore: 'pact:project-catalog:restore',
   projectCatalogRename: 'pact:project-catalog:rename',
+  projectContextRead: 'pact:project-context:read',
+  projectDirectoryOpen: 'pact:project-directory:open',
   sessionCatalogGet: 'pact:session-catalog:get',
   sessionCreationPrepare: 'pact:session-creation:prepare',
   sessionCreate: 'pact:session:create',
@@ -727,8 +779,32 @@ export type ProjectDirectoryAddInput = z.infer<typeof projectDirectoryAddInputSc
 
 export const projectArchiveInputSchema = z.strictObject({
   projectId: z.string().uuid(),
+  operationId: z.string().uuid().optional(),
 })
 export type ProjectArchiveInput = z.infer<typeof projectArchiveInputSchema>
+
+export const projectContextInputSchema = z.strictObject({ projectId: z.string().uuid() })
+export type ProjectContextInput = z.infer<typeof projectContextInputSchema>
+export const projectContextSchema = z.strictObject({
+  projectId: z.string().uuid(),
+  directoryPath: z.string().min(1).max(32_768),
+  folderName: z.string().min(1).max(4096),
+  git: z.discriminatedUnion('state', [
+    z.strictObject({
+      state: z.literal('branch'),
+      name: z
+        .string()
+        .min(1)
+        .max(4096)
+        .regex(/^[^\p{Cc}]+$/u),
+    }),
+    z.strictObject({ state: z.literal('detached'), commit: z.string().regex(/^[a-f0-9]{4,64}$/u) }),
+    z.strictObject({ state: z.literal('none') }),
+    z.strictObject({ state: z.literal('unavailable') }),
+  ]),
+})
+export type ProjectContext = z.infer<typeof projectContextSchema>
+export const projectDirectoryOpenResultSchema = z.strictObject({ opened: z.literal(true) })
 
 export const PROJECT_NAME_LIMIT = 120
 // Shared by the rename command and its one-item receipt; both remain below 1 KiB.
@@ -851,6 +927,7 @@ export type SessionSettingsInput = z.infer<typeof sessionSettingsInputSchema>
 
 export const sessionArchiveInputSchema = z.strictObject({
   sessionId: z.string().uuid(),
+  operationId: z.string().uuid().optional(),
 })
 export type SessionArchiveInput = z.infer<typeof sessionArchiveInputSchema>
 
@@ -2073,6 +2150,7 @@ export const appearanceEffectiveSettingsSchema = z.object({
   theme: z.enum(['light', 'dark']),
   windowMaterial: z.enum(['solid', 'translucent']),
   fallbackReason: appearanceFallbackReasonSchema.optional(),
+  restartRequired: z.boolean().optional(),
   revision: z.number().int().nonnegative(),
 })
 export type AppearanceEffectiveSettings = z.infer<typeof appearanceEffectiveSettingsSchema>
@@ -2085,6 +2163,21 @@ export const appearanceSnapshotSchema = z.object({
 export type AppearanceSnapshot = z.infer<typeof appearanceSnapshotSchema>
 
 export const utilityRequestSchema = z.discriminatedUnion('type', [
+  z.strictObject({
+    type: z.literal('workspace-archive.prepare.request'),
+    requestId: z.string().uuid(),
+    input: workspaceArchivePrepareInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('workspace-archive.read.request'),
+    requestId: z.string().uuid(),
+    input: workspaceArchiveOperationInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('workspace-archive.cancel.request'),
+    requestId: z.string().uuid(),
+    input: workspaceArchiveOperationInputSchema,
+  }),
   z.object({
     type: z.literal('skill-document.read.request'),
     requestId: z.string().uuid(),
@@ -2106,6 +2199,37 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
     input: conversationInterestsSchema,
   }),
   z.object({ type: z.literal('runtime.shutdown.request'), requestId: z.string().uuid() }),
+  z.object({ type: z.literal('native-presence.read.request'), requestId: z.string().uuid() }),
+  z.object({
+    type: z.literal('native-attention.read.request'),
+    requestId: z.string().uuid(),
+    input: nativeAttentionReadInputSchema,
+  }),
+  z.object({
+    type: z.literal('native-session.resolve.request'),
+    requestId: z.string().uuid(),
+    input: nativeSessionResolveInputSchema,
+  }),
+  z.object({
+    type: z.literal('native-session.opened.request'),
+    requestId: z.string().uuid(),
+    input: nativeSessionOpenInputSchema,
+  }),
+  z.object({
+    type: z.literal('native-jump-list.suppression.request'),
+    requestId: z.string().uuid(),
+    input: nativeJumpListSuppressionInputSchema,
+  }),
+  z.object({
+    type: z.literal('native-quit.prepare.request'),
+    requestId: z.string().uuid(),
+    input: nativeQuitOperationInputSchema,
+  }),
+  z.object({
+    type: z.literal('native-quit.cancel.request'),
+    requestId: z.string().uuid(),
+    input: nativeQuitOperationInputSchema,
+  }),
   z.object({
     type: z.literal('runtime.health.request'),
     requestId: z.string().uuid(),
@@ -2161,6 +2285,11 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('project-catalog.get.request'),
     requestId: z.string().uuid(),
+  }),
+  z.object({
+    type: z.literal('project-context.read.request'),
+    requestId: z.string().uuid(),
+    input: projectContextInputSchema,
   }),
   z.object({
     type: z.literal('project-catalog.add.request'),
@@ -2358,6 +2487,16 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
 export type UtilityRequest = z.infer<typeof utilityRequestSchema>
 
 export const utilityResponseSchema = z.discriminatedUnion('type', [
+  z.strictObject({
+    type: z.literal('workspace-archive.prepare.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(workspaceArchivePreviewSchema),
+  }),
+  z.strictObject({
+    type: z.literal('workspace-archive.receipt.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(workspaceArchiveReceiptSchema),
+  }),
   z.object({
     type: z.literal('skill-document.read.response'),
     requestId: z.string().uuid(),
@@ -2387,6 +2526,41 @@ export const utilityResponseSchema = z.discriminatedUnion('type', [
     type: z.literal('runtime.shutdown.response'),
     requestId: z.string().uuid(),
     result: rpcResultSchema(z.object({ flushed: z.literal(true) })),
+  }),
+  z.object({
+    type: z.literal('native-presence.read.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(nativePresenceSnapshotSchema),
+  }),
+  z.object({
+    type: z.literal('native-attention.read.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(nativeAttentionPageSchema),
+  }),
+  z.object({
+    type: z.literal('native-session.resolve.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(sessionCatalogChangeSchema),
+  }),
+  z.object({
+    type: z.literal('native-session.opened.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(nativeSessionOpenedResultSchema),
+  }),
+  z.object({
+    type: z.literal('native-jump-list.suppression.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(nativeJumpListSuppressionResultSchema),
+  }),
+  z.object({
+    type: z.literal('native-quit.prepare.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(nativeQuitPreparationSchema),
+  }),
+  z.object({
+    type: z.literal('native-quit.cancel.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(nativeQuitCancelledResultSchema),
   }),
   z.object({
     type: z.literal('runtime.health.response'),
@@ -2422,6 +2596,11 @@ export const utilityResponseSchema = z.discriminatedUnion('type', [
     type: z.literal('project-catalog.response'),
     requestId: z.string().uuid(),
     result: rpcResultSchema(projectCatalogStateSchema),
+  }),
+  z.object({
+    type: z.literal('project-context.read.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(projectContextSchema),
   }),
   z.object({
     type: z.literal('project-catalog.rename.response'),
@@ -2535,6 +2714,16 @@ export const runtimeStartupFailureAckSchema = z.strictObject({
 })
 
 export const utilityEventSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('runtime.ready.event') }),
+  z.strictObject({
+    type: z.literal('native-presence.quit-recent.event'),
+    version: nativePresenceVersionSchema,
+    sessions: z.array(nativeSessionRowSchema).max(NATIVE_MENU_ITEMS),
+  }),
+  z.strictObject({
+    type: z.literal('native-presence.changed.event'),
+    version: nativePresenceVersionSchema,
+  }),
   runtimeStartupFailureSchema,
   z.strictObject({
     type: z.literal('conversation.patch.event'),
@@ -2545,6 +2734,27 @@ export const utilityEventSchema = z.discriminatedUnion('type', [
 export type UtilityEvent = z.infer<typeof utilityEventSchema>
 
 export interface DesktopBridge {
+  resolveNativeSession(input: NativeSessionResolveInput): Promise<RpcResult<SessionCatalogChange>>
+  recordNativeSessionOpened(input: NativeSessionOpenInput): Promise<RpcResult<{ recorded: true }>>
+  readNativeAttention(input: NativeAttentionReadInput): Promise<RpcResult<NativeAttentionPage>>
+  onNativePresenceChanged(listener: (version: NativePresenceVersion) => void): () => void
+  getNativeNavigation(): Promise<RpcResult<NativeNavigationIntent | null>>
+  acknowledgeNativeNavigation(
+    input: NativeNavigationAckInput,
+  ): Promise<RpcResult<{ acknowledged: true }>>
+  onNativeNavigationChanged(listener: (intent: NativeNavigationIntent) => void): () => void
+  getNativeQuitState(): Promise<RpcResult<NativeQuitState | null>>
+  onNativeQuitStateChanged(listener: (state: NativeQuitState | null) => void): () => void
+  respondNativeQuit(input: NativeQuitDecisionInput): Promise<RpcResult<{ accepted: true }>>
+  prepareWorkspaceArchive(
+    input: WorkspaceArchivePrepareInput,
+  ): Promise<RpcResult<WorkspaceArchivePreview>>
+  readWorkspaceArchive(
+    input: WorkspaceArchiveOperationInput,
+  ): Promise<RpcResult<WorkspaceArchiveReceipt>>
+  cancelWorkspaceArchive(
+    input: WorkspaceArchiveOperationInput,
+  ): Promise<RpcResult<WorkspaceArchiveReceipt>>
   /** Fixture-only scalar observation; local Preload counters, never generic IPC or business DTOs. */
   observeMonacoWorkerTraffic?(this: void, observation: MonacoIpcObservation): void
   getDiagnosticStatus?(): Promise<DiagnosticStatus>
@@ -2567,8 +2777,10 @@ export interface DesktopBridge {
     input: DefaultSessionSettingsSaveInput,
   ): Promise<RpcResult<DefaultSessionSettingsState>>
   getProjectCatalog(): Promise<RpcResult<ProjectCatalogState>>
+  readProjectContext(input: ProjectContextInput): Promise<RpcResult<ProjectContext>>
+  openProjectDirectory(input: ProjectContextInput): Promise<RpcResult<{ opened: true }>>
   chooseAndAddProject(): Promise<RpcResult<ProjectCatalogState>>
-  archiveProject(projectId: string): Promise<RpcResult<ProjectCatalogState>>
+  archiveProject(projectId: string, operationId?: string): Promise<RpcResult<ProjectCatalogState>>
   restoreProject(projectId: string): Promise<RpcResult<ProjectCatalogState>>
   renameProject(input: ProjectNameChange): Promise<RpcResult<ProjectNameChange>>
   getSessionCatalog(
@@ -2579,7 +2791,7 @@ export interface DesktopBridge {
   createSession(input: SessionCreateInput): Promise<RpcResult<SessionCatalogChange>>
   renameSession(input: SessionRenameInput): Promise<RpcResult<SessionCatalogChange>>
   markSessionRead(input: SessionMarkReadInput): Promise<RpcResult<SessionCatalogChange>>
-  archiveSession(sessionId: string): Promise<RpcResult<SessionCatalogChange>>
+  archiveSession(sessionId: string, operationId?: string): Promise<RpcResult<SessionCatalogChange>>
   restoreSession(sessionId: string): Promise<RpcResult<SessionCatalogChange>>
   getSessionSettings(sessionId: string): Promise<RpcResult<SessionSettingsEditorState>>
   saveSessionSettings(

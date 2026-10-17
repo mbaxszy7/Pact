@@ -1,0 +1,113 @@
+name: Pact CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Native identity to validate without publishing
+        type: choice
+        options: [dev, stable]
+        default: dev
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pact-ci-${{ github.event.pull_request.number || github.ref }}-${{ inputs.channel || 'dev' }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  checks:
+    name: Validate distributions
+    uses: ./.github/workflows/distributions.yml
+    secrets:
+      PACT_CLAUDE_SETTINGS_JSON: ${{ secrets.PACT_CLAUDE_SETTINGS_JSON }}
+      PACT_CODEX_CONFIG_TOML: ${{ secrets.PACT_CODEX_CONFIG_TOML }}
+      PACT_CODEX_AUTH_JSON: ${{ secrets.PACT_CODEX_AUTH_JSON }}
+      PACT_CODEX_PROVIDER_ENV_JSON: ${{ secrets.PACT_CODEX_PROVIDER_ENV_JSON }}
+    with:
+      source_sha: ${{ github.sha }}
+      channel: ${{ inputs.channel || 'dev' }}
+      real_allowed: ${{ github.repository_id == '1416403312' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+
+  ci_complete:
+    name: CI complete
+    needs: checks
+    if: always()
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - name: Require complete quality and two-platform acceptance
+        run: test "$RESULT" = success
+        env:
+          RESULT: ${{ needs.checks.result }}
+
+  deliver_dev:
+    name: Deliver Dev
+    needs: [checks, ci_complete]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      PACT_CI_CHANNEL: dev
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.checks.outputs.package_mac_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/delivery/darwin-arm64/package
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.checks.outputs.smoke_mac_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/delivery/darwin-arm64/smoke
+      - name: Verify the exact accepted darwin-arm64 candidate before delivery
+        run: >-
+          node scripts/ci-artifacts.mjs verify "$RUNNER_TEMP/delivery/darwin-arm64/package"
+          "$RUNNER_TEMP/delivery/darwin-arm64/smoke" "$PACKAGE_ID" "$PACKAGE_DIGEST"
+        env:
+          PACT_CI_PLATFORM: darwin-arm64
+          PACKAGE_ID: ${{ needs.checks.outputs.package_mac_id }}
+          PACKAGE_DIGEST: ${{ needs.checks.outputs.package_mac_digest }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.checks.outputs.package_win_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/delivery/win32-x64/package
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.checks.outputs.smoke_win_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/delivery/win32-x64/smoke
+      - name: Verify the exact accepted win32-x64 candidate before delivery
+        run: >-
+          node scripts/ci-artifacts.mjs verify "$RUNNER_TEMP/delivery/win32-x64/package"
+          "$RUNNER_TEMP/delivery/win32-x64/smoke" "$PACKAGE_ID" "$PACKAGE_DIGEST"
+        env:
+          PACT_CI_PLATFORM: win32-x64
+          PACKAGE_ID: ${{ needs.checks.outputs.package_win_id }}
+          PACKAGE_DIGEST: ${{ needs.checks.outputs.package_win_digest }}
+      - name: Deliver both accepted native development packages and evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Pact-Dev-${{ github.sha }}-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/delivery
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14

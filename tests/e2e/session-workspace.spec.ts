@@ -1,5 +1,6 @@
 import { expect, type ElectronApplication, type Page } from '@playwright/test'
 
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture, type RuntimeFixture } from './runtime-fixture.js'
 
@@ -64,7 +65,7 @@ test(
       ).toBeVisible()
       await expect(window.getByRole('heading', { name: 'New session' })).toBeVisible()
 
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       window = await app.firstWindow()
       const restoredSession = window.getByRole('button', { name: 'New session', exact: true })
@@ -80,13 +81,16 @@ test(
       await expect(archiveSession).toBeFocused()
       await window.keyboard.press('Enter')
       await expect(restoredSession).toHaveCount(0)
-      const archiveNotice = window.getByText('Session archived', { exact: true }).locator('..')
+      const archiveNotice = window.getByRole('region', { name: 'Archive results', exact: true })
       await expect(archiveNotice).toBeVisible()
-      await expect(archiveNotice.getByRole('button', { name: 'View' })).toHaveCount(0)
+      await expect(archiveNotice.getByRole('button', { name: 'View' })).toHaveCount(1)
       await expect
         .poll(async () => (await archiveNotice.boundingBox())?.y)
         .toBeGreaterThanOrEqual(64)
-      await archiveNotice.getByRole('button', { name: 'Undo' }).click()
+      await archiveNotice.getByRole('button', { name: 'View', exact: true }).click()
+      await archiveNotice
+        .getByRole('button', { name: 'Undo archive of New session', exact: true })
+        .click()
       await expect(window.getByRole('heading', { name: 'New session' })).toBeVisible()
       await expect(window.getByRole('button', { name: 'New session', exact: true })).toBeVisible()
     } finally {

@@ -300,25 +300,14 @@ const reportFixture = (lane = 'ui') => ({
   errors: [],
 })
 const reportIdentity = {
-  schemaVersion: 3,
+  schemaVersion: 1,
+  kind: 'ci',
   repository: 'mbaxszy7/Pact',
-  repositoryId: 1416403312,
-  pullRequest: 3,
-  headRepositoryId: 1416403312,
-  authorId: 31481964,
-  channel: 'dev',
-  headSha: 'a'.repeat(40),
-  baseSha: 'b'.repeat(40),
-  candidateSha: 'c'.repeat(40),
-  treeSha: 'd'.repeat(40),
-  policySha: 'b'.repeat(40),
-  sourceKind: 'main',
-  controllerSha: 'b'.repeat(40),
-  controllerRef: 'refs/heads/main',
-  product: {
-    before: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
-    after: { version: '0.1.0', candidateVersion: '0.1.0-unreleased' },
-  },
+  sourceSha: 'a'.repeat(40),
+  runId: 1234,
+  runAttempt: 2,
+  eventName: 'pull_request',
+  ref: 'refs/pull/12/merge',
 }
 const reportOptions = {
   lane: 'ui',
@@ -348,7 +337,7 @@ await test('no-credential reports show actual failure status and fixed categorie
   assert.equal(report.cases[0].durationMs, 12)
   assert.equal(report.cases[0].failureCategory, 'case-timeout')
   assert.equal((JSON.stringify(report) + uiReportMarkdown(report)).includes(secret), false)
-  assert.equal(report.identity.treeSha, reportIdentity.treeSha)
+  assert.deepEqual(report.identity, reportIdentity)
 })
 
 await test('missing and cancelled executions retain every discovered case and never invent a passing outcome', () => {
@@ -409,7 +398,12 @@ await test('deferral cannot excuse invalid identity, discovery, unexpected evide
     ),
   )
   assert.throws(() => evaluateUiReport(null, { ...options, scope: 'full' }), /Invalid/)
-  assert.throws(() => evaluateUiReport(null, { ...options, identityKind: 'release' }), /Invalid/)
+  assert(
+    evaluateUiReport(null, {
+      ...options,
+      identity: { ...reportIdentity, runAttempt: 0 },
+    }).issues.includes('missing-or-invalid-ci-code-identity'),
+  )
 })
 
 await test('CI core report entry preserves both deferred inventories and rejects absent discovery', async (context) => {
@@ -517,6 +511,16 @@ await test('both native lane reports persist even when the second lane did not s
     platform: 'darwin',
     architecture: 'arm64',
   })
+  await assert.rejects(
+    writeUiReports({
+      evidence: join(root, 'mismatched-attempt'),
+      workspace: root,
+      identityPath,
+      inventoryPath,
+      runAttempt: 3,
+    }),
+    /attempt differs/,
+  )
   assert.equal(reports.length, 2)
   assert.equal(reports[1].report.cases[0].status, 'not-run')
   const text = await readFile(summary, 'utf8')
@@ -537,28 +541,16 @@ await test('both native lane reports persist even when the second lane did not s
   }
 })
 
-await test('release summaries keep signed identity private and list skipped lanes in distinct release artifacts', async (context) => {
-  const root = await mkdtemp(join(tmpdir(), 'pact-release-ui-reports-'))
+await test('CI reports use the same native run projection for Stable and Dev and reject removed identity modes', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-run-ui-reports-'))
   context.after(() => rm(root, { recursive: true, force: true }))
   const evidence = join(root, 'evidence'),
     identityPath = join(root, 'identity.json'),
     inventoryPath = join(root, 'inventory.json'),
     summary = join(root, 'summary.md'),
-    secret = 'synthetic-private-signed-release-state'
-  const identity = {
-    schemaVersion: 1,
-    repository: 'mbaxszy7/Pact',
-    releasePR: 14,
-    version: '0.1.0',
-    sourceSha: 'a'.repeat(40),
-    tag: 'v0.1.0',
-    releaseId: 1234,
-    signature: secret,
-    staging: { key: secret },
-    extensions: secret,
-  }
+    secret = 'synthetic-private-state-extension'
   await mkdir(evidence)
-  await writeFile(identityPath, JSON.stringify(identity))
+  await writeFile(identityPath, JSON.stringify({ ...reportIdentity, privateExtension: secret }))
   await writeFile(
     inventoryPath,
     JSON.stringify({
@@ -575,42 +567,45 @@ await test('release summaries keep signed identity private and list skipped lane
     execution: { ui: 'completed' },
     platform: 'darwin',
     architecture: 'arm64',
-    identityKind: 'release',
     runAttempt: 2,
   })
-  assert.equal(reports[0].report.identityKind, 'release')
-  assert.equal(reports[0].report.identity.releaseId, 1234)
+  assert.deepEqual(reports[0].report.identity, reportIdentity)
+  assert.equal(Object.hasOwn(reports[0].report, 'identityKind'), false)
   assert.equal(reports[1].report.cases[0].status, 'not-run')
-  assert.equal(reports[0].report.reportFiles.artifactName, 'release-e2e-darwin-arm64-a2')
-  assert.equal(reports[0].report.diagnosticArtifact, 'release-ui-diagnostics-darwin-arm64-a2')
+  assert.equal(reports[0].report.reportFiles.artifactName, 'e2e-darwin-arm64-a2')
+  assert.equal(reports[0].report.diagnosticArtifact, 'ui-diagnostics-darwin-arm64-a2')
   const text = await readFile(summary, 'utf8')
-  assert(text.includes('Release PR: #14'))
-  assert(text.includes('v0.1.0'))
-  assert(text.includes('Release ID: 1234'))
-  assert(text.includes('does not replace signed release-state'))
-  assert.equal(text.includes('PR: undefined'), false)
+  assert(text.includes('Actions run: 1234, attempt 2'))
+  assert.equal(text.includes('undefined'), false)
   assert.equal(text.includes(secret) || JSON.stringify(reports).includes(secret), false)
-  assert.equal(Object.hasOwn(reports[0].report.identity, 'candidateSha'), false)
-  const invalid = evaluateUiReport(null, {
-    ...reportOptions,
-    identityKind: 'release',
-    identity: { ...identity, releaseId: null },
-  })
-  assert(invalid.issues.includes('missing-or-invalid-release-identity'))
-  assert.equal(invalid.identity, null)
+  const args = [
+    '--reports',
+    '--release',
+    '--evidence',
+    join(root, 'removed'),
+    '--workspace',
+    root,
+    '--identity',
+    identityPath,
+    '--inventory',
+    inventoryPath,
+  ]
+  await assert.rejects(
+    main(args, { GITHUB_ACTIONS: 'true', PACT_CI_DIAGNOSTIC_LANE: 'uncredentialed' }),
+    /explicit no-credential/,
+  )
 })
 
-await test('trusted controller discovery and tested source use distinct absolute roots without losing case identities', () => {
+await test('inventory and execution accept absolute case paths from the same checkout', () => {
   const inventory = reportFixture(),
     raw = reportFixture(),
     local = inventory.suites[0].specs[0].file
-  inventory.suites[0].specs[0].file = `/workspace/control/tests/e2e/${local}`
-  raw.suites[0].specs[0].file = `/workspace/source/tests/e2e/${local}`
+  inventory.suites[0].specs[0].file = `/workspace/Pact/tests/e2e/${local}`
+  raw.suites[0].specs[0].file = `/workspace/Pact/tests/e2e/${local}`
   const report = evaluateUiReport(raw, {
     ...reportOptions,
     inventory,
-    workspace: '/workspace/source',
-    inventoryWorkspace: '/workspace/control',
+    workspace: '/workspace/Pact',
   })
   assert.equal(report.cases[0].status, 'passed')
   assert.equal(report.issues.includes('missing-or-invalid-discovery-inventory'), false)

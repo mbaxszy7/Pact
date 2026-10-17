@@ -443,7 +443,6 @@ export async function main(args = process.argv.slice(2), source = process.env) {
         completed: code === 0 || code === 1,
         exitCode: code,
         identityPath: source.PACT_CI_NATIVE_IDENTITY_FILE,
-        identityKind: source.PACT_CI_NATIVE_IDENTITY_KIND ?? 'ci',
         artifactName: source.PACT_CI_NATIVE_ARTIFACT,
         summary: source.GITHUB_STEP_SUMMARY,
       })

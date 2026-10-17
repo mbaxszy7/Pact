@@ -8,6 +8,7 @@ import {
   diagnosticRecordSchema,
   type DiagnosticRecord,
 } from '../../packages/contracts/src/diagnostics.js'
+import { quitPact } from './native-quit.js'
 import { createRuntimeFixture, test } from './runtime-fixture.js'
 
 /** UI-only data; Main/Utility, Worker, IPC and log files are the production implementation. */
@@ -120,6 +121,7 @@ test(
         (await readRecords()).filter((record) => record.requestType === 'runtime.health.request'),
       ).toHaveLength(2)
     } finally {
+      await quitPact(app)
       await fixture.dispose()
     }
   },

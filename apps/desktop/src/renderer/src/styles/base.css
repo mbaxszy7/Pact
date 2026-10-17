@@ -184,10 +184,103 @@
     }
   }
 
-  .pact-permission-popover {
+  .pact-project-context {
+    display: flex;
+    align-items: center;
+    border-radius: var(--radius-control);
+    background: color-mix(in srgb, var(--pact-surface-muted) 65%, transparent);
+  }
+  .pact-project-trigger {
+    display: inline-flex;
+    height: 32px;
+    min-width: 0;
+    align-items: center;
+    gap: 6px;
+    padding: 0 9px;
+    border-radius: var(--radius-control);
+    color: var(--pact-text-secondary);
+    cursor: pointer;
+    transition:
+      background-color 150ms var(--ease-out-pact),
+      color 150ms var(--ease-out-pact);
+  }
+  .pact-project-folder {
+    max-width: 160px;
+  }
+  .pact-project-branch {
+    max-width: 240px;
+  }
+  .pact-project-trigger:hover,
+  .pact-project-trigger[aria-expanded='true'] {
+    background: var(--pact-surface-raised);
+    color: var(--pact-text-primary);
+  }
+  .pact-project-trigger:focus-visible {
+    outline: 2px solid var(--pact-focus);
+    outline-offset: 2px;
+  }
+  .pact-project-chevron {
+    transition: transform 160ms var(--ease-out-pact);
+  }
+  .pact-project-trigger[aria-expanded='true'] .pact-project-chevron {
+    transform: rotate(180deg);
+  }
+  .pact-project-divider {
+    width: 1px;
+    height: 12px;
+    margin-inline: var(--pact-space-compact);
+    flex-shrink: 0;
+    background: var(--pact-border-strong);
+  }
+  .pact-project-popover {
+    position: fixed;
+    inset: auto;
+    right: anchor(right);
+    bottom: anchor(top);
+    position-try-fallbacks: flip-block, flip-inline;
+    width: min(288px, calc(100vw - 32px));
+    max-height: calc(100dvh - 64px);
+    margin: 0 0 8px;
+    --pact-menu-origin: bottom right;
+  }
+  .pact-project-copied {
+    color: var(--pact-status-ready-foreground);
+    animation: pact-project-copy 180ms var(--ease-out-pact);
+  }
+  @keyframes pact-project-copy {
+    from {
+      transform: scale(0.75);
+      opacity: 0.5;
+    }
+    to {
+      transform: none;
+      opacity: 1;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .pact-project-trigger,
+    .pact-project-chevron {
+      transition: none;
+      transform: none;
+    }
+    .pact-project-copied {
+      animation: none;
+    }
+  }
+
+  .pact-composer-popover {
+    overflow-y: auto;
+    padding: 0.5rem;
+    border: 1px solid var(--pact-border);
+    border-radius: 0.875rem;
+    background: var(--pact-surface-raised);
+    box-shadow: 0 6px 18px rgb(0 0 0 / 18%);
+    color: var(--pact-text-primary);
+    font-size: 0.75rem;
+    line-height: 1rem;
     opacity: 0;
     transform: translateY(4px) scale(0.985);
-    transform-origin: bottom left;
+    transform-origin: var(--pact-menu-origin, bottom left);
     transition:
       opacity 110ms ease-out,
       transform 110ms cubic-bezier(0.16, 1, 0.3, 1),
@@ -195,31 +288,72 @@
       overlay 110ms allow-discrete;
   }
 
-  .pact-permission-popover:popover-open {
+  .pact-composer-popover:popover-open {
     opacity: 1;
     transform: none;
     transition-duration: 160ms;
   }
 
   @starting-style {
-    .pact-permission-popover:popover-open {
+    .pact-composer-popover:popover-open {
       opacity: 0;
       transform: translateY(4px) scale(0.985);
     }
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .pact-permission-popover,
-    .pact-permission-popover:popover-open {
+    .pact-composer-popover,
+    .pact-composer-popover:popover-open {
       transform: none;
       transition-duration: 60ms;
     }
 
     @starting-style {
-      .pact-permission-popover:popover-open {
+      .pact-composer-popover:popover-open {
         transform: none;
       }
     }
+  }
+
+  .pact-composer-menu-heading {
+    display: flex;
+    min-height: 1.75rem;
+    align-items: center;
+    margin-bottom: 0.25rem;
+    padding-inline: 0.5rem;
+    font-weight: 500;
+    overflow-wrap: anywhere;
+  }
+  .pact-composer-menu-item {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.5rem;
+    text-align: left;
+    cursor: pointer;
+  }
+  .pact-composer-menu-item > svg {
+    flex-shrink: 0;
+  }
+  .pact-composer-menu-item:hover {
+    background: var(--pact-surface-muted);
+  }
+  .pact-composer-menu-item:focus-visible {
+    outline: 2px solid var(--pact-focus);
+    outline-offset: 2px;
+  }
+  .pact-composer-menu-item:disabled {
+    cursor: default;
+  }
+  .pact-composer-menu-detail {
+    margin-top: 0.25rem;
+    padding: 0.5rem 0.75rem 0;
+    border-top: 1px solid var(--pact-border);
+    color: var(--pact-text-secondary);
+    overflow-wrap: anywhere;
+    user-select: text;
   }
 
   html[data-material='translucent'] [data-workspace-shell] {

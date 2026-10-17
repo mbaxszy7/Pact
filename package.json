@@ -16,6 +16,7 @@
     "dev": "pnpm --filter @pact/desktop dev",
     "dist:mac": "pnpm --filter @pact/desktop dist:mac",
     "dist:win": "pnpm --filter @pact/desktop dist:win",
+    "dist:win:preview": "pnpm --filter @pact/desktop dist:win:preview",
     "docs:check": "node scripts/check-publication.mjs",
     "format": "oxfmt -c ./oxfmt.config.ts .",
     "format:check": "oxfmt -c ./oxfmt.config.ts --check .",
@@ -23,7 +24,9 @@
     "lint:fix": "oxlint -c ./oxlint.config.ts --fix .",
     "lint:staged": "lint-staged --max-arg-length 2048 --concurrent 1",
     "package:dir": "pnpm --filter @pact/desktop package:dir",
+    "package:dir:local": "pnpm --filter @pact/desktop package:dir:local",
     "package:smoke": "node scripts/package-smoke.mjs",
+    "package:smoke:local": "node scripts/package-smoke.mjs",
     "prepare": "simple-git-hooks",
     "secrets:check": "node scripts/check-secrets.mjs --staged",
     "secrets:history": "node scripts/check-secrets.mjs --history",
@@ -39,7 +42,8 @@
     "test:watch": "vitest",
     "typecheck": "pnpm typecheck:tests && pnpm -r --if-present typecheck",
     "typecheck:tests": "tsc --noEmit -p tests/tsconfig.json",
-    "verify:package": "node scripts/package-smoke.mjs"
+    "verify:package": "node scripts/package-smoke.mjs",
+    "verify:package:local": "node scripts/package-smoke.mjs"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",
@@ -53,7 +57,6 @@
     "oxfmt": "0.67.0",
     "oxlint": "1.82.0",
     "oxlint-tsgolint": "7.0.2001",
-    "release-please": "17.3.0",
     "simple-git-hooks": "2.14.0",
     "smol-toml": "1.8.0",
     "typescript": "7.0.2",

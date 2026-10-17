@@ -2,10 +2,13 @@ import { BrowserWindow, ipcMain, shell } from 'electron'
 
 import {
   IPC_CHANNELS,
+  workspaceArchivePrepareInputSchema,
+  workspaceArchiveOperationInputSchema,
   nativePermissionRespondInputSchema,
   nativeInputReadSchema,
   nativeInputRespondSchema,
   projectArchiveInputSchema,
+  projectContextInputSchema,
   projectNameChangeSchema,
   projectFileReadInputSchema,
   sessionArchiveInputSchema,
@@ -31,6 +34,24 @@ export function registerWorkspaceIpcHandlers(
   utilityClient: UtilityProcessClient,
   projectCatalog: ProjectCatalogController,
 ): () => void {
+  ipcMain.handle(IPC_CHANNELS.workspaceArchivePrepare, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = workspaceArchivePrepareInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.prepareWorkspaceArchive(input.data)
+      : { ok: false, error: { code: 'VALIDATION', message: 'Choose a valid item to archive.' } }
+  })
+  for (const channel of [IPC_CHANNELS.workspaceArchiveRead, IPC_CHANNELS.workspaceArchiveCancel]) {
+    ipcMain.handle(channel, (event, rawInput: unknown) => {
+      trust.assertTrustedMainFrame(event)
+      const input = workspaceArchiveOperationInputSchema.safeParse(rawInput)
+      return input.success
+        ? channel === IPC_CHANNELS.workspaceArchiveRead
+          ? utilityClient.readWorkspaceArchive(input.data)
+          : utilityClient.cancelWorkspaceArchive(input.data)
+        : { ok: false, error: { code: 'VALIDATION', message: 'Choose a valid archive operation.' } }
+    })
+  }
   ipcMain.handle(IPC_CHANNELS.nativeInputRead, (event, rawInput: unknown) => {
     trust.assertTrustedMainFrame(event)
     const parsed = nativeInputReadSchema.safeParse(rawInput)
@@ -99,6 +120,21 @@ export function registerWorkspaceIpcHandlers(
     return projectCatalog.load()
   })
 
+  ipcMain.handle(IPC_CHANNELS.projectContextRead, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = projectContextInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.readProjectContext(input.data)
+      : { ok: false, error: { code: 'VALIDATION', message: 'Choose a valid project.' } }
+  })
+  ipcMain.handle(IPC_CHANNELS.projectDirectoryOpen, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = projectContextInputSchema.safeParse(rawInput)
+    return input.success
+      ? projectCatalog.openDirectory(input.data, () => trust.assertTrustedMainFrame(event))
+      : { ok: false, error: { code: 'VALIDATION', message: 'Choose a valid project.' } }
+  })
+
   ipcMain.handle(IPC_CHANNELS.projectCatalogChooseAndAdd, (event) => {
     trust.assertTrustedMainFrame(event)
     const owner = BrowserWindow.fromWebContents(event.sender)
@@ -119,16 +155,19 @@ export function registerWorkspaceIpcHandlers(
         })
   })
 
-  ipcMain.handle(IPC_CHANNELS.projectCatalogArchive, (event, projectIdInput: unknown) => {
-    trust.assertTrustedMainFrame(event)
-    const input = projectArchiveInputSchema.safeParse({ projectId: projectIdInput })
-    return input.success
-      ? projectCatalog.archive(input.data.projectId)
-      : Promise.resolve({
-          ok: false as const,
-          error: { code: 'VALIDATION' as const, message: 'Choose a valid Project to archive.' },
-        })
-  })
+  ipcMain.handle(
+    IPC_CHANNELS.projectCatalogArchive,
+    (event, projectIdInput: unknown, operationId: unknown) => {
+      trust.assertTrustedMainFrame(event)
+      const input = projectArchiveInputSchema.safeParse({ projectId: projectIdInput, operationId })
+      return input.success
+        ? projectCatalog.archive(input.data.projectId, input.data.operationId)
+        : Promise.resolve({
+            ok: false as const,
+            error: { code: 'VALIDATION' as const, message: 'Choose a valid Project to archive.' },
+          })
+    },
+  )
 
   ipcMain.handle(IPC_CHANNELS.projectCatalogRestore, (event, projectIdInput: unknown) => {
     trust.assertTrustedMainFrame(event)
@@ -202,16 +241,19 @@ export function registerWorkspaceIpcHandlers(
         })
   })
 
-  ipcMain.handle(IPC_CHANNELS.sessionArchive, (event, sessionIdInput: unknown) => {
-    trust.assertTrustedMainFrame(event)
-    const input = sessionArchiveInputSchema.safeParse({ sessionId: sessionIdInput })
-    return input.success
-      ? utilityClient.archiveSession(input.data)
-      : Promise.resolve({
-          ok: false as const,
-          error: { code: 'VALIDATION' as const, message: 'Choose a valid Session.' },
-        })
-  })
+  ipcMain.handle(
+    IPC_CHANNELS.sessionArchive,
+    (event, sessionIdInput: unknown, operationId: unknown) => {
+      trust.assertTrustedMainFrame(event)
+      const input = sessionArchiveInputSchema.safeParse({ sessionId: sessionIdInput, operationId })
+      return input.success
+        ? utilityClient.archiveSession(input.data)
+        : Promise.resolve({
+            ok: false as const,
+            error: { code: 'VALIDATION' as const, message: 'Choose a valid Session.' },
+          })
+    },
+  )
 
   ipcMain.handle(IPC_CHANNELS.sessionRestore, (event, sessionIdInput: unknown) => {
     trust.assertTrustedMainFrame(event)
@@ -305,6 +347,12 @@ export function registerWorkspaceIpcHandlers(
   })
 
   return () => {
+    ipcMain.removeHandler(IPC_CHANNELS.workspaceArchivePrepare)
+    ipcMain.removeHandler(IPC_CHANNELS.workspaceArchiveRead)
+    ipcMain.removeHandler(IPC_CHANNELS.workspaceArchiveCancel)
+    projectCatalog.dispose()
+    ipcMain.removeHandler(IPC_CHANNELS.projectContextRead)
+    ipcMain.removeHandler(IPC_CHANNELS.projectDirectoryOpen)
     ipcMain.removeHandler(IPC_CHANNELS.nativeInputRead)
     ipcMain.removeHandler(IPC_CHANNELS.nativeInputRespond)
     ipcMain.removeHandler(IPC_CHANNELS.nativeInputOpen)

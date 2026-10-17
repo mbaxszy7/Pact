@@ -6,6 +6,7 @@ import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { IPC_CHANNELS } from '../../packages/contracts/src/index.js'
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture, type RuntimeFixture } from './runtime-fixture.js'
 
@@ -120,7 +121,7 @@ test(
       await expect(window.getByText('Background result complete.', { exact: true })).toBeVisible()
       expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(1)
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -321,7 +322,7 @@ test(
       }
       throw error
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -385,7 +386,7 @@ test(
       await expect(window.getByLabel('Full work log detail')).toBeVisible()
       await expect(window.locator('[data-pact-speaker="user"]')).toHaveCount(1)
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },

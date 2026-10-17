@@ -1,5 +1,7 @@
 import { flipFuses, FuseV1Options, FuseVersion } from '@electron/fuses'
 
+import identities from '../app-identities.json' with { type: 'json' }
+
 // electron-builder's Arch enum uses 3 for arm64. Keep this local so the packaging hook does not
 // depend on electron-builder's internal utility package resolution.
 const ELECTRON_BUILDER_ARM64 = 3
@@ -9,9 +11,18 @@ import { join } from 'node:path'
 
 export default async function afterPack(context) {
   const distribution = context.packager.info.metadata.pactDistribution
-  if (!distribution || !['dev', 'stable'].includes(distribution.channel)) {
-    throw new Error('Packaging requires the build-distribution entry point and a channel identity.')
+  const profile = context.packager.info.metadata.pactBuildProfile
+  const local =
+    profile && ['development-local', 'production-local', 'installer-preview'].includes(profile)
+      ? identities[profile]
+      : undefined
+  if (!local && (!distribution || !['dev', 'stable'].includes(distribution.channel))) {
+    throw new Error(
+      'Packaging requires an explicit local profile or validated distribution identity.',
+    )
   }
+  const selected =
+    local ?? identities[distribution.channel === 'dev' ? 'development-ci' : 'production-ci']
   const productFilename = context.packager.appInfo.productFilename
   const arch =
     context.arch === ELECTRON_BUILDER_ARM64
@@ -21,10 +32,14 @@ export default async function afterPack(context) {
         : undefined
   if (
     !arch ||
-    distribution.arch !== arch ||
-    distribution.platform !== context.electronPlatformName ||
-    distribution.appId !== context.packager.appInfo.id ||
-    distribution.productName !== productFilename
+    selected.appId !== context.packager.appInfo.id ||
+    selected.name !== productFilename ||
+    context.packager.info.metadata.name !== selected.packageName ||
+    (distribution &&
+      (distribution.arch !== arch ||
+        distribution.platform !== context.electronPlatformName ||
+        distribution.appId !== selected.appId ||
+        distribution.productName !== selected.name))
   )
     throw new Error('Builder application identity differs from the requested distribution.')
   const isMac = context.electronPlatformName === 'darwin'

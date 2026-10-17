@@ -17,6 +17,7 @@ import {
   sessionSettingsRevisions,
   sessions,
 } from '../../packages/persistence/src/schema/index.js'
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture, type RuntimeFixture } from './runtime-fixture.js'
 
@@ -171,7 +172,7 @@ test(
       )
       expect(marked).toMatchObject({ ok: true })
 
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       window = await app.firstWindow()
       await expect(window.getByRole('button', { name: 'Session 990', exact: true })).toBeVisible()
@@ -190,7 +191,7 @@ test(
         activity: { state: 'error', agentId: 'codex' },
       })
     } finally {
-      await app?.close()
+      if (app) await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -287,7 +288,7 @@ test(
         window.getByRole('button', { name: 'Rename Project Project 999', exact: true }),
       ).toHaveText('Project 999')
     } finally {
-      await app?.close()
+      if (app) await quitPact(app)
       await fixture.dispose()
     }
   },

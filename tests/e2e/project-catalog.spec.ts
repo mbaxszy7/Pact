@@ -1,5 +1,6 @@
 import { expect } from '@playwright/test'
 
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture } from './runtime-fixture.js'
 
@@ -44,7 +45,7 @@ test(
       await expect(projectRow).toHaveAttribute('aria-expanded', 'true')
       await expect(projectRow).toHaveAccessibleName('Collapse Project sample-project')
 
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       window = await app.firstWindow()
       const restoredProject = window.getByRole('button', {
@@ -68,19 +69,22 @@ test(
       await expect(window.getByRole('heading', { name: 'Start with a project' })).toBeVisible()
       await expect(window.getByRole('button', { name: 'Hide navigation panel' })).toHaveCount(0)
       await expect(window.getByRole('button', { name: 'Open settings' })).toBeVisible()
-      const archiveNotice = window.getByText('Project archived', { exact: true }).locator('..')
+      const archiveNotice = window.getByRole('region', { name: 'Archive results', exact: true })
       await expect(archiveNotice).toBeVisible()
-      await expect(archiveNotice.getByRole('button', { name: 'View' })).toHaveCount(0)
+      await expect(archiveNotice.getByRole('button', { name: 'View' })).toHaveCount(1)
       await expect
         .poll(async () => (await archiveNotice.boundingBox())?.y)
         .toBeGreaterThanOrEqual(64)
-      await archiveNotice.getByRole('button', { name: 'Undo' }).click()
+      await archiveNotice.getByRole('button', { name: 'View', exact: true }).click()
+      await archiveNotice
+        .getByRole('button', { name: 'Undo archive of sample-project', exact: true })
+        .click()
       await expect(restoredProject).toBeVisible()
       await expect(restoredProject).toHaveText('sample-project')
 
       await restoredProject.hover()
       await archive.click()
-      await window.getByRole('button', { name: 'Dismiss archive notice' }).click()
+      await window.getByRole('button', { name: 'Dismiss completed archive results' }).click()
       await app.evaluate(({ dialog }, directoryPath) => {
         Reflect.set(dialog, 'showOpenDialog', async () => ({
           canceled: false,

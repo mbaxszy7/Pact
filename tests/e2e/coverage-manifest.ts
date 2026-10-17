@@ -90,6 +90,12 @@ export const e2eBusinessExpansionTargets: ReadonlyArray<E2EMigrationTarget & { a
       title: `real ${agent} UI Stop interrupts its foreground command before the delayed filesystem effect`,
     },
   ]),
+  ...(['codex', 'claude'] as const).map((agent) => ({
+    area: 'archive',
+    project: 'real' as const,
+    path: 'tests/e2e/real-stop.spec.ts',
+    title: `real ${agent} UI archive interrupts its foreground command before the delayed filesystem effect`,
+  })),
   {
     area: 'settings',
     project: 'real',
@@ -479,22 +485,6 @@ function journey(
           })),
         }
       : {}),
-    ...(file === 'session-workspace.spec.ts' &&
-    title === 'keeps Project context while creating, reopening, archiving, and restoring a Session'
-      ? {
-          contractUpdates: [
-            {
-              originalLine: 19,
-              reason:
-                'The existing addProject helper retains its exact owner and checks the named Rename Project action plus the complete displayed Project name. Both selected-Project Session ownership assertions remain unchanged.',
-              replacementAssertions: [
-                "expect(window.getByRole('button', { name: `Rename Project ${name}`, exact: true })).toBeVisible()",
-                "expect(window.getByRole('button', { name: `Rename Project ${name}`, exact: true })).toHaveText(name)",
-              ],
-            },
-          ],
-        }
-      : {}),
     ...(file === 'workspace-shell.spec.ts' && title.startsWith('resizes and collapses')
       ? {
           contractUpdates: [
@@ -536,6 +526,49 @@ function journey(
               replacementAssertions: [
                 `expect(drafts).toHaveCount(11)`,
                 `expect(drafts).toHaveCount(11)`,
+              ],
+            },
+          ],
+        }
+      : {}),
+    ...(['project-catalog.spec.ts', 'session-workspace.spec.ts'].includes(file)
+      ? {
+          contractUpdates: [
+            ...(file === 'session-workspace.spec.ts'
+              ? [
+                  {
+                    originalLine: 19,
+                    reason:
+                      'The existing addProject helper retains its exact owner and checks the named Rename Project action plus the complete displayed Project name. Both selected-Project Session ownership assertions remain unchanged.',
+                    replacementAssertions: [
+                      "expect(window.getByRole('button', { name: `Rename Project ${name}`, exact: true })).toBeVisible()",
+                      "expect(window.getByRole('button', { name: `Rename Project ${name}`, exact: true })).toHaveText(name)",
+                    ],
+                  },
+                ]
+              : []),
+            {
+              originalLine: file === 'project-catalog.spec.ts' ? 53 : 76,
+              reason:
+                'The accepted archive feedback now retains multiple results in one summary. View expands individual Undo actions; restoration, item identity and notice placement remain required.',
+              replacementAssertions: [
+                `expect(archiveNotice.getByRole('button', { name: 'View' })).toHaveCount(1)`,
+              ],
+            },
+          ],
+        }
+      : {}),
+    ...(file === 'workspace-shell.spec.ts' &&
+    title === 'resizes and collapses the Project navigation without squeezing its content'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 39,
+              reason:
+                'The accepted Project name control now exposes its rename action in its accessible name. The same Project must remain visible with the exact original display text.',
+              replacementAssertions: [
+                `expect(window.getByRole('button', { name: 'Rename Project layout-project', exact: true })).toBeVisible()`,
+                `expect(window.getByRole('button', { name: 'Rename Project layout-project', exact: true })).toHaveText('layout-project')`,
               ],
             },
           ],
@@ -675,7 +708,7 @@ export const e2eMigrationCases: readonly E2EMigrationCase[] = [
         47,
         80,
         'real',
-        'Archive returns Empty State and a top notice without View; Undo restores it and re-add restores the archived identity.',
+        'Archive returns Empty State and a top result summary; View exposes its own Undo, which restores it, and re-add restores the archived identity. The accepted disclosure change is recorded in contractUpdates.',
       ],
     ],
   ),
@@ -696,7 +729,7 @@ export const e2eMigrationCases: readonly E2EMigrationCase[] = [
         73,
         90,
         'real',
-        'Archive removes Session; top Undo notice without View restores its identity.',
+        'Archive removes Session; the top result summary expands to its own Undo, which restores the same identity. The accepted disclosure change is recorded in contractUpdates.',
       ],
     ],
   ),

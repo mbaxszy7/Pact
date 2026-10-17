@@ -9,11 +9,8 @@ import { imageCodecResultSchema } from '@pact/contracts/images'
 import type { AppearanceController } from './modules/appearance/controller'
 import type { UtilityProcessClient } from './utility-process/client'
 
-import {
-  defaultProductPaths,
-  readConfiguredDefaultPaths,
-  readProductIdentity,
-} from './product-identity'
+import { defaultProductPaths, readProductIdentity } from './product-identity'
+import { readConfiguredDefaultPaths } from './utility-process/runtime-paths'
 
 const PACKAGE_SMOKE_ENV = 'PACT_PACKAGE_SMOKE'
 const PACKAGE_SMOKE_PHASE_ENV = 'PACT_PACKAGE_SMOKE_PHASE'

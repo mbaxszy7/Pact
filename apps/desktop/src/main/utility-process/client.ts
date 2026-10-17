@@ -4,6 +4,10 @@ import { realpathSync } from 'node:fs'
 import { dirname, isAbsolute, join } from 'node:path'
 
 import type {
+  WorkspaceArchivePrepareInput,
+  WorkspaceArchiveOperationInput,
+  WorkspaceArchivePreview,
+  WorkspaceArchiveReceipt,
   AppError,
   CommentDraftRemoveInput,
   CommentDraftSaveInput,
@@ -26,6 +30,8 @@ import type {
   ProjectCatalogState,
   ProjectDirectoryAddInput,
   ProjectNameChange,
+  ProjectContext,
+  ProjectContextInput,
   ProjectFile,
   ProjectFileReadInput,
   RpcResult,
@@ -57,6 +63,26 @@ import type {
 } from '@pact/contracts'
 
 import {
+  rpcResultSchema,
+  nativePresenceSnapshotSchema,
+  nativeAttentionPageSchema,
+  sessionCatalogChangeSchema,
+  nativeSessionOpenedResultSchema,
+  nativeJumpListSuppressionResultSchema,
+  nativeQuitPreparationSchema,
+  nativeQuitCancelledResultSchema,
+  type NativePresenceSnapshot,
+  type NativePresenceVersion,
+  type NativeSessionRow,
+  type NativeAttentionReadInput,
+  type NativeAttentionPage,
+  type NativeSessionResolveInput,
+  type NativeSessionOpenInput,
+  type NativeJumpListSuppressionInput,
+  type NativeQuitOperationInput,
+  type NativeQuitPreparation,
+  type NativeResultSchema,
+  NATIVE_METADATA_TIMEOUT_MS,
   utilityEventSchema,
   utilityResponseSchema,
   utilityRequestSchema,
@@ -78,6 +104,7 @@ import {
 import { DirectoryFileOperations } from './directory-file-operations'
 
 const REQUEST_TIMEOUT_MS = 2_000
+const STARTUP_TIMEOUT_MS = 10_000
 const RUNTIME_PREPARATION_TIMEOUT_MS = 12_000
 const DEFAULT_SESSION_SETTINGS_TIMEOUT_MS = 25_000
 const WORKSPACE_OPERATION_TIMEOUT_MS = 5_000
@@ -94,6 +121,7 @@ export interface UtilityProcessStartOptions {
   migrationsFolder: string
   workspaceStorageRoot?: string
   simulateAppearanceWriteFailure?: boolean
+  onExit?: () => void
   diagnostics?: Pick<DiagnosticLogs, 'identity' | 'record' | 'attachUtility' | 'acceptUtility'>
   onStartupFailed?: (failure: import('@pact/contracts').RuntimeStartupFailure) => void
 }
@@ -107,7 +135,35 @@ export type UtilityTransportResult =
   | { kind: 'not-sent'; error: AppError }
   | { kind: 'unknown-delivery'; error: AppError }
 
+export type NativeQuitPreparationAttempt =
+  | { kind: 'not-sent'; error: AppError }
+  | { kind: 'attempted'; result: RpcResult<NativeQuitPreparation> }
+
 export interface UtilityProcessClient {
+  getNativePresence(): Promise<RpcResult<NativePresenceSnapshot>>
+  readNativeAttention(input: NativeAttentionReadInput): Promise<RpcResult<NativeAttentionPage>>
+  resolveNativeSession(input: NativeSessionResolveInput): Promise<RpcResult<SessionCatalogChange>>
+  recordNativeSessionOpened(input: NativeSessionOpenInput): Promise<RpcResult<{ recorded: true }>>
+  updateNativeJumpListSuppression(
+    input: NativeJumpListSuppressionInput,
+  ): Promise<RpcResult<{ updated: true }>>
+  prepareNativeQuit(input: NativeQuitOperationInput): Promise<NativeQuitPreparationAttempt>
+  cancelNativeQuit(
+    input: NativeQuitOperationInput,
+  ): Promise<RpcResult<{ operationId: string; cancelled: true }>>
+  subscribeNativePresence(listener: (version: NativePresenceVersion) => void): () => void
+  subscribeNativeQuitRecent(
+    listener: (version: NativePresenceVersion, sessions: NativeSessionRow[]) => void,
+  ): () => void
+  prepareWorkspaceArchive(
+    input: WorkspaceArchivePrepareInput,
+  ): Promise<RpcResult<WorkspaceArchivePreview>>
+  readWorkspaceArchive(
+    input: WorkspaceArchiveOperationInput,
+  ): Promise<RpcResult<WorkspaceArchiveReceipt>>
+  cancelWorkspaceArchive(
+    input: WorkspaceArchiveOperationInput,
+  ): Promise<RpcResult<WorkspaceArchiveReceipt>>
   forkSession(input: SessionForkInput): Promise<RpcResult<SessionForkResult>>
   saveSessionPermission(input: SessionPermissionSaveInput): Promise<RpcResult<SessionCatalogChange>>
   readNativeInput(
@@ -123,6 +179,8 @@ export interface UtilityProcessClient {
     input: import('@pact/contracts').NativePermissionRespondInput,
   ): Promise<RpcResult<ConversationPatch>>
   start(options: UtilityProcessStartOptions): void
+  /** Wait for this child to install its request handler; never restarts it. */
+  waitUntilReady(): Promise<RpcResult<{ ready: true }>>
   getHealth(): Promise<RpcResult<RuntimeHealth>>
   getRuntimePreparation(): Promise<RpcResult<RuntimePreparation>>
   updateRuntimeExecutablePath(
@@ -133,6 +191,7 @@ export interface UtilityProcessClient {
     input: DefaultSessionSettingsSaveInput,
   ): Promise<RpcResult<DefaultSessionSettingsState>>
   getProjectCatalog(): Promise<RpcResult<ProjectCatalogState>>
+  readProjectContext(input: ProjectContextInput): Promise<RpcResult<ProjectContext>>
   addProjectDirectory(input: ProjectDirectoryAddInput): Promise<RpcResult<ProjectCatalogState>>
   archiveProject(input: ProjectArchiveInput): Promise<RpcResult<ProjectCatalogState>>
   restoreProject(input: ProjectArchiveInput): Promise<RpcResult<ProjectCatalogState>>
@@ -212,6 +271,7 @@ export interface UtilityProcessClient {
     timeoutMs?: number,
   ): Promise<UtilityTransportResult>
   dispose(): void
+  isRunning(): boolean
   shutdown(): Promise<RpcResult<{ flushed: true }>>
 }
 
@@ -254,6 +314,17 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   >()
   private shutdownTask: Promise<RpcResult<{ flushed: true }>> | undefined
   private child: UtilityProcess | undefined
+  private readyChild: UtilityProcess | undefined
+  private startupDeadline: number | undefined
+  private startupWait:
+    | {
+        child: UtilityProcess
+        promise: Promise<RpcResult<{ ready: true }>>
+        resolve: (result: RpcResult<{ ready: true }>) => void
+        timeout: ReturnType<typeof setTimeout>
+      }
+    | undefined
+  private terminatingChild: UtilityProcess | undefined
   private startupFailure: import('@pact/contracts').RuntimeStartupFailure | undefined
   private startupFailureCallback: UtilityProcessStartOptions['onStartupFailed']
   private diagnostics: UtilityProcessStartOptions['diagnostics']
@@ -263,6 +334,132 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   private readonly conversationListeners = new Set<
     (patch: ConversationPatch, progress: boolean) => void
   >()
+  private readonly nativePresenceListeners = new Set<(version: NativePresenceVersion) => void>()
+  private readonly nativeQuitRecentListeners = new Set<
+    (version: NativePresenceVersion, sessions: NativeSessionRow[]) => void
+  >()
+
+  getNativePresence(): Promise<RpcResult<NativePresenceSnapshot>> {
+    return this.nativeRequest(
+      { type: 'native-presence.read.request' },
+      'native-presence.read.response',
+      nativePresenceSnapshotSchema,
+    )
+  }
+
+  readNativeAttention(input: NativeAttentionReadInput): Promise<RpcResult<NativeAttentionPage>> {
+    return this.nativeRequest(
+      { type: 'native-attention.read.request', input },
+      'native-attention.read.response',
+      nativeAttentionPageSchema,
+    )
+  }
+
+  resolveNativeSession(input: NativeSessionResolveInput): Promise<RpcResult<SessionCatalogChange>> {
+    return this.nativeRequest(
+      { type: 'native-session.resolve.request', input },
+      'native-session.resolve.response',
+      sessionCatalogChangeSchema,
+    )
+  }
+
+  recordNativeSessionOpened(input: NativeSessionOpenInput): Promise<RpcResult<{ recorded: true }>> {
+    return this.nativeRequest(
+      { type: 'native-session.opened.request', input },
+      'native-session.opened.response',
+      nativeSessionOpenedResultSchema,
+    )
+  }
+
+  updateNativeJumpListSuppression(
+    input: NativeJumpListSuppressionInput,
+  ): Promise<RpcResult<{ updated: true }>> {
+    return this.nativeRequest(
+      { type: 'native-jump-list.suppression.request', input },
+      'native-jump-list.suppression.response',
+      nativeJumpListSuppressionResultSchema,
+    )
+  }
+
+  async prepareNativeQuit(input: NativeQuitOperationInput): Promise<NativeQuitPreparationAttempt> {
+    if (!this.child || this.readyChild !== this.child)
+      return {
+        kind: 'not-sent',
+        error: ElectronUtilityProcessClient.unavailable(
+          'Utility runtime is not ready to prepare exit.',
+        ),
+      }
+    const result = await this.request(
+      { type: 'native-quit.prepare.request', input },
+      'native-quit.prepare.response',
+      NATIVE_METADATA_TIMEOUT_MS,
+    )
+    return result.kind === 'not-sent'
+      ? result
+      : {
+          kind: 'attempted',
+          result: ElectronUtilityProcessClient.toNativeResult(
+            result,
+            'native-quit.prepare.response',
+            nativeQuitPreparationSchema,
+          ),
+        }
+  }
+
+  cancelNativeQuit(
+    input: NativeQuitOperationInput,
+  ): Promise<RpcResult<{ operationId: string; cancelled: true }>> {
+    return this.nativeRequest(
+      { type: 'native-quit.cancel.request', input },
+      'native-quit.cancel.response',
+      nativeQuitCancelledResultSchema,
+    )
+  }
+
+  subscribeNativePresence(listener: (version: NativePresenceVersion) => void): () => void {
+    this.nativePresenceListeners.add(listener)
+    return () => this.nativePresenceListeners.delete(listener)
+  }
+
+  subscribeNativeQuitRecent(
+    listener: (version: NativePresenceVersion, sessions: NativeSessionRow[]) => void,
+  ): () => void {
+    this.nativeQuitRecentListeners.add(listener)
+    return () => this.nativeQuitRecentListeners.delete(listener)
+  }
+
+  private async nativeRequest<Value>(
+    payload: UtilityRequestPayload,
+    responseType: UtilityResponse['type'],
+    schema: NativeResultSchema<Value>,
+  ): Promise<RpcResult<Value>> {
+    const result = await this.request(payload, responseType, NATIVE_METADATA_TIMEOUT_MS)
+    return ElectronUtilityProcessClient.toNativeResult(result, responseType, schema)
+  }
+
+  private static toNativeResult<Value>(
+    result: UtilityTransportResult,
+    responseType: UtilityResponse['type'],
+    schema: NativeResultSchema<Value>,
+  ): RpcResult<Value> {
+    if (result.kind !== 'response')
+      return {
+        ok: false,
+        error: {
+          ...result.error,
+          ...(result.kind === 'unknown-delivery' ? { code: 'UNCERTAIN' as const } : {}),
+        },
+      }
+    if (result.response.type !== responseType || !('result' in result.response))
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'Invalid native metadata response.' },
+      }
+    const parsed = rpcResultSchema(schema).safeParse(result.response.result)
+    return parsed.success
+      ? parsed.data
+      : { ok: false, error: { code: 'INTERNAL', message: 'Invalid native metadata response.' } }
+  }
 
   start(options: UtilityProcessStartOptions): void {
     if (this.child) return
@@ -277,6 +474,10 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     if (options.workspaceStorageRoot) workspaceStorageRootSchema.parse(options.workspaceStorageRoot)
 
     this.diagnostics = options.diagnostics
+    this.shutdownTask = undefined
+    this.terminatingChild = undefined
+    this.readyChild = undefined
+    this.startupDeadline = performance.now() + STARTUP_TIMEOUT_MS
     this.startupFailure = undefined
     this.startupFailureCallback = options.onStartupFailed
     const startedChild = utilityProcess.fork(
@@ -327,12 +528,66 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       this.cancelDirectoryRequests(startedChild)
       if (this.child !== startedChild) return
       this.child = undefined
+      this.readyChild = undefined
+      this.startupDeadline = undefined
+      this.settleStartup(startedChild, {
+        ok: false,
+        error: ElectronUtilityProcessClient.unavailable(
+          'Utility runtime exited before startup completed.',
+        ),
+      })
       this.failChildRequests(
         startedChild,
         this.startupFailureError() ??
           ElectronUtilityProcessClient.unavailable(`Utility runtime exited with code ${code}.`),
       )
+      options.onExit?.()
     })
+  }
+
+  waitUntilReady(): Promise<RpcResult<{ ready: true }>> {
+    const startupError = this.startupFailureError()
+    if (startupError) return Promise.resolve({ ok: false, error: startupError })
+    const target = this.child
+    if (!target || this.terminatingChild || this.shutdownTask)
+      return Promise.resolve({
+        ok: false,
+        error: ElectronUtilityProcessClient.unavailable(
+          'Utility runtime is not available for startup.',
+        ),
+      })
+    if (this.readyChild === target) return Promise.resolve({ ok: true, value: { ready: true } })
+    if (this.startupWait?.child === target) return this.startupWait.promise
+
+    // The first wait includes fork/module loading. Only an explicit caller retry
+    // starts another bounded wait; timeout never releases or restarts the child.
+    this.startupDeadline ??= performance.now() + STARTUP_TIMEOUT_MS
+    const completion = Promise.withResolvers<RpcResult<{ ready: true }>>()
+    const timeout = setTimeout(
+      () => {
+        this.startupDeadline = undefined
+        this.settleStartup(target, {
+          ok: false,
+          error: { code: 'TIMEOUT', message: 'Pact local runtime startup timed out.' },
+        })
+      },
+      Math.max(0, this.startupDeadline - performance.now()),
+    )
+    this.startupWait = {
+      child: target,
+      promise: completion.promise,
+      resolve: completion.resolve,
+      timeout,
+    }
+    return completion.promise
+  }
+
+  private settleStartup(target: UtilityProcess, result: RpcResult<{ ready: true }>): void {
+    const waiting = this.startupWait
+    if (waiting?.child !== target) return
+    clearTimeout(waiting.timeout)
+    this.startupWait = undefined
+    waiting.resolve(result)
   }
 
   request(
@@ -342,7 +597,10 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   ): Promise<UtilityTransportResult> {
     const startupError = this.startupFailureError()
     if (startupError) return Promise.resolve({ kind: 'not-sent', error: startupError })
-    if (this.shutdownTask && payload.type !== 'runtime.shutdown.request') {
+    if (
+      this.terminatingChild ||
+      (this.shutdownTask && payload.type !== 'runtime.shutdown.request')
+    ) {
       return Promise.resolve({
         kind: 'not-sent',
         error: ElectronUtilityProcessClient.unavailable('Utility runtime is shutting down.'),
@@ -489,6 +747,48 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     )
   }
 
+  async prepareWorkspaceArchive(
+    input: WorkspaceArchivePrepareInput,
+  ): Promise<RpcResult<WorkspaceArchivePreview>> {
+    const result = await this.request(
+      { type: 'workspace-archive.prepare.request', input },
+      'workspace-archive.prepare.response',
+      5_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'workspace-archive.prepare.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Invalid archive preview response.' } }
+  }
+
+  async readWorkspaceArchive(
+    input: WorkspaceArchiveOperationInput,
+  ): Promise<RpcResult<WorkspaceArchiveReceipt>> {
+    const result = await this.request(
+      { type: 'workspace-archive.read.request', input },
+      'workspace-archive.receipt.response',
+      5_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'workspace-archive.receipt.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Invalid archive receipt.' } }
+  }
+
+  async cancelWorkspaceArchive(
+    input: WorkspaceArchiveOperationInput,
+  ): Promise<RpcResult<WorkspaceArchiveReceipt>> {
+    const result = await this.request(
+      { type: 'workspace-archive.cancel.request', input },
+      'workspace-archive.receipt.response',
+      5_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'workspace-archive.receipt.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Invalid archive cancellation receipt.' } }
+  }
+
   async getProjectCatalog(): Promise<RpcResult<ProjectCatalogState>> {
     return ElectronUtilityProcessClient.toProjectCatalogResult(
       await this.request(
@@ -497,6 +797,18 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         WORKSPACE_OPERATION_TIMEOUT_MS,
       ),
     )
+  }
+
+  async readProjectContext(input: ProjectContextInput): Promise<RpcResult<ProjectContext>> {
+    const result = await this.request(
+      { type: 'project-context.read.request', input },
+      'project-context.read.response',
+      5_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'project-context.read.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Invalid project context response.' } }
   }
 
   async addProjectDirectory(
@@ -512,13 +824,20 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   }
 
   async archiveProject(input: ProjectArchiveInput): Promise<RpcResult<ProjectCatalogState>> {
-    return ElectronUtilityProcessClient.toProjectCatalogResult(
-      await this.request(
-        { type: 'project-catalog.archive.request', input },
-        'project-catalog.response',
-        WORKSPACE_OPERATION_TIMEOUT_MS,
-      ),
+    const result = await this.request(
+      { type: 'project-catalog.archive.request', input },
+      'project-catalog.response',
+      20_000,
     )
+    if (result.kind === 'unknown-delivery')
+      return {
+        ok: false,
+        error: {
+          code: 'UNCERTAIN',
+          message: 'The archive result is unconfirmed. Check this operation before trying again.',
+        },
+      }
+    return ElectronUtilityProcessClient.toProjectCatalogResult(result)
   }
 
   async restoreProject(input: ProjectArchiveInput): Promise<RpcResult<ProjectCatalogState>> {
@@ -605,13 +924,20 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   }
 
   async archiveSession(input: SessionArchiveInput): Promise<RpcResult<SessionCatalogChange>> {
-    return ElectronUtilityProcessClient.toSessionCatalogChangeResult(
-      await this.request(
-        { type: 'session.archive.request', input },
-        'session-catalog.response',
-        WORKSPACE_OPERATION_TIMEOUT_MS,
-      ),
+    const result = await this.request(
+      { type: 'session.archive.request', input },
+      'session-catalog.response',
+      20_000,
     )
+    if (result.kind === 'unknown-delivery')
+      return {
+        ok: false,
+        error: {
+          code: 'UNCERTAIN',
+          message: 'The archive result is unconfirmed. Check this operation before trying again.',
+        },
+      }
+    return ElectronUtilityProcessClient.toSessionCatalogChangeResult(result)
   }
 
   async restoreSession(input: SessionArchiveInput): Promise<RpcResult<SessionCatalogChange>> {
@@ -1046,38 +1372,86 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   }
 
   shutdown(): Promise<RpcResult<{ flushed: true }>> {
+    const target = this.child
+    if (target)
+      this.settleStartup(target, {
+        ok: false,
+        error: ElectronUtilityProcessClient.unavailable('Utility runtime is shutting down.'),
+      })
+    const deadline = performance.now() + WORKSPACE_OPERATION_TIMEOUT_MS
     this.shutdownTask ??= this.request(
       { type: 'runtime.shutdown.request' },
       'runtime.shutdown.response',
-      WORKSPACE_OPERATION_TIMEOUT_MS,
-    )
-      .then((result) => {
-        if (result.kind !== 'response') return { ok: false as const, error: result.error }
-        return result.response.type === 'runtime.shutdown.response'
-          ? result.response.result
-          : {
-              ok: false as const,
-              error: { code: 'INTERNAL' as const, message: 'Unexpected shutdown acknowledgement.' },
-            }
-      })
-      .finally(() => this.dispose())
+      WORKSPACE_OPERATION_TIMEOUT_MS - 1_000,
+    ).then(async (result): Promise<RpcResult<{ flushed: true }>> => {
+      const acknowledged: RpcResult<{ flushed: true }> =
+        result.kind !== 'response'
+          ? { ok: false, error: result.error }
+          : result.response.type === 'runtime.shutdown.response'
+            ? result.response.result
+            : {
+                ok: false,
+                error: { code: 'INTERNAL', message: 'Unexpected shutdown acknowledgement.' },
+              }
+      this.dispose()
+      if (target && !(await this.waitForExit(target, deadline)))
+        return {
+          ok: false,
+          error: {
+            code: 'UNCERTAIN',
+            message: 'Utility runtime exit could not be confirmed. Its ownership is retained.',
+          },
+        }
+      return acknowledged
+    })
     return this.shutdownTask
+  }
+
+  isRunning(): boolean {
+    return this.child !== undefined
+  }
+
+  private waitForExit(target: UtilityProcess, deadline: number): Promise<boolean> {
+    if (this.child !== target) return Promise.resolve(true)
+    return new Promise((resolve) => {
+      const completed = (exited: boolean): void => {
+        clearTimeout(timeout)
+        target.removeListener('exit', exitedHandler)
+        resolve(exited)
+      }
+      const exitedHandler = (): void => completed(true)
+      const timeout = setTimeout(() => completed(false), Math.max(0, deadline - performance.now()))
+      target.on('exit', exitedHandler)
+    })
   }
 
   dispose(): void {
     // Main's measurement lives through child shutdown and diagnostic-log close. Its fixed
     // counters survive late deliveries/restarts; disposing this client must not reset them.
     this.conversationListeners.clear()
+    this.nativePresenceListeners.clear()
+    this.nativeQuitRecentListeners.clear()
     const target = this.child
-    this.child = undefined
+    this.readyChild = undefined
+    this.startupDeadline = undefined
+    if (target)
+      this.settleStartup(target, {
+        ok: false,
+        error: ElectronUtilityProcessClient.unavailable('Utility runtime is shutting down.'),
+      })
     for (const request of this.directoryRequests.values()) request.controller.abort()
     void this.directoryOperations.dispose().catch(() => undefined)
-    if (!target) return
+    if (!target || this.terminatingChild === target) return
+    this.terminatingChild = target
     this.failChildRequests(
       target,
       ElectronUtilityProcessClient.unavailable('Utility runtime is shutting down.'),
     )
-    target.kill()
+    try {
+      target.kill()
+    } catch {
+      // A failed kill request does not release the child or its profile ownership.
+    }
   }
 
   private static unavailable(message: string): AppError {
@@ -1337,7 +1711,10 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     if (event.success) {
       this.traffic?.record(
         'utility-main.event',
-        event.data.type === 'runtime.startup-failed.event' ? 'control' : 'business',
+        event.data.type === 'runtime.startup-failed.event' ||
+          event.data.type === 'runtime.ready.event'
+          ? 'control'
+          : 'business',
         message,
       )
       if (this.child !== source) return
@@ -1345,6 +1722,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         if (this.startupFailure) return
         this.startupFailure = event.data
         const error = this.startupFailureError()!
+        this.settleStartup(source, { ok: false, error })
         for (const [requestId, request] of this.inFlightRequests) {
           if (request.child !== source) continue
           this.finishRequest(
@@ -1376,6 +1754,19 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
           })
         }
         return
+      }
+      if (event.data.type === 'runtime.ready.event') {
+        if (this.shutdownTask || this.terminatingChild) return
+        this.readyChild = source
+        this.startupDeadline = undefined
+        this.settleStartup(source, { ok: true, value: { ready: true } })
+      }
+      if (event.data.type === 'native-presence.quit-recent.event') {
+        for (const listener of this.nativeQuitRecentListeners)
+          listener(event.data.version, event.data.sessions)
+      }
+      if (event.data.type === 'native-presence.changed.event') {
+        for (const listener of this.nativePresenceListeners) listener(event.data.version)
       }
       if (event.data.type === 'conversation.patch.event') {
         for (const listener of this.conversationListeners)

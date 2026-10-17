@@ -7,6 +7,7 @@ import type { NativeRpc, NativeThread } from '../native/native-harness.js'
 
 import { markdownVisibleProjection } from '../../apps/desktop/src/shared/message-anchor-text.js'
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { quitPact } from './native-quit.js'
 import {
   closeRealWorkspace,
   launchRealWorkspace,
@@ -120,7 +121,7 @@ test.describe('real business input return', { tag: '@real' }, () => {
           expect(settings.after.agents).toEqual(settings.before.agents)
 
           // Close Pact before another actual app-server owns this same Native writer.
-          await ctx.app.close()
+          await quitPact(ctx.app)
           stage = 'writer-initialize'
           writer = await ctx.fixture.openCodexClient('Codex Desktop')
           stage = 'writer-resume'
@@ -298,7 +299,7 @@ test.describe('real business input return', { tag: '@real' }, () => {
             )?.content,
           ).toContain(rejectedMarker)
           await expect.poll(() => coldComposer.textContent()).toBe('')
-          await ctx.app.close()
+          await quitPact(ctx.app)
           stage = 'durable-readback'
           const database = await PactDatabase.open({
             filePath: ctx.fixture.databaseFile,

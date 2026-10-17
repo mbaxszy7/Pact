@@ -1,0 +1,17 @@
+extends: ./electron-builder.yml
+appId: com.pact.desktop.installer-preview
+productName: Pact Installer Preview
+publish: null
+directories:
+  output: release/installer-preview
+extraMetadata:
+  name: pact-desktop-installer-preview
+  productName: Pact Installer Preview
+  pactBuildProfile: installer-preview
+  version: 0.0.0-preview
+win:
+  executableName: Pact Installer Preview
+nsis:
+  artifactName: Pact-Installer-Preview-${version}-win-x64.${ext}
+  shortcutName: Pact Installer Preview
+  uninstallDisplayName: Pact Installer Preview

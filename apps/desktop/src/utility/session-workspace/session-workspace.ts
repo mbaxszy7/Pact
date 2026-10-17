@@ -15,6 +15,9 @@ import type {
   SessionSettingsInput,
   SessionSettingsSaveInput,
   SessionPermissionSaveInput,
+  NativeSessionOpenInput,
+  NativeJumpListSuppressionInput,
+  NativeSessionRow,
 } from '@pact/contracts'
 
 import {
@@ -32,7 +35,52 @@ export class SessionWorkspace {
     private readonly sessions: SessionRepository,
     private readonly defaultSettings: DefaultSessionSettings,
     private readonly onTitleChanged?: (sessionId: string) => void,
+    private readonly onNativeMetadataChanged?: () => void,
   ) {}
+
+  readQuitRecent(): NativeSessionRow[] {
+    return this.sessions.nativeQuitRecent()
+  }
+
+  resolveNativeSession(sessionId: string): RpcResult<SessionCatalogChange> {
+    try {
+      return { ok: true, value: this.sessions.resolveNativeSession(sessionId) }
+    } catch {
+      return {
+        ok: false,
+        error: {
+          code: 'VALIDATION',
+          message: 'This Session or its Project is archived or no longer available.',
+        },
+      }
+    }
+  }
+
+  recordNativeSessionOpened(input: NativeSessionOpenInput): RpcResult<{ recorded: true }> {
+    try {
+      if (this.sessions.recordNativeOpened(input)) this.nativeMetadataChanged()
+      return { ok: true, value: { recorded: true } }
+    } catch {
+      return {
+        ok: false,
+        error: { code: 'CONFLICT', message: 'This Session opening could not be recorded.' },
+      }
+    }
+  }
+
+  updateNativeJumpListSuppression(
+    input: NativeJumpListSuppressionInput,
+  ): RpcResult<{ updated: true }> {
+    try {
+      if (this.sessions.updateNativeJumpListSuppression(input)) this.nativeMetadataChanged()
+      return { ok: true, value: { updated: true } }
+    } catch {
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'Taskbar preferences could not be saved.' },
+      }
+    }
+  }
 
   load(input: SessionCatalogPageInput): RpcResult<SessionCatalogPage> {
     try {
@@ -95,14 +143,26 @@ export class SessionWorkspace {
       }
     } catch (error) {
       return SessionWorkspace.catalogMutationFailure(error, 'Session could not be created.')
+    } finally {
+      this.nativeMetadataChanged()
     }
   }
 
   archive(input: SessionArchiveInput): RpcResult<SessionCatalogChange> {
     try {
-      return { ok: true, value: this.sessions.archive(input.sessionId) }
+      return { ok: true, value: this.sessions.archive(input.sessionId, input.operationId) }
     } catch (error) {
       return SessionWorkspace.catalogMutationFailure(error, 'Session could not be deleted.')
+    } finally {
+      this.nativeMetadataChanged()
+    }
+  }
+
+  archiveReceipt(sessionId: string): RpcResult<SessionCatalogChange> {
+    try {
+      return { ok: true, value: this.sessions.change(sessionId) }
+    } catch (error) {
+      return SessionWorkspace.catalogMutationFailure(error, 'The archive result could not be read.')
     }
   }
 
@@ -119,6 +179,7 @@ export class SessionWorkspace {
       } catch {
         /* Cosmetic sync cannot fail a saved rename. */
       }
+      this.nativeMetadataChanged()
     }
   }
 
@@ -130,6 +191,8 @@ export class SessionWorkspace {
       }
     } catch (error) {
       return SessionWorkspace.catalogMutationFailure(error, 'Session could not be marked read.')
+    } finally {
+      this.nativeMetadataChanged()
     }
   }
 
@@ -138,6 +201,8 @@ export class SessionWorkspace {
       return { ok: true, value: this.sessions.restore(input.sessionId) }
     } catch (error) {
       return SessionWorkspace.catalogMutationFailure(error, 'Session could not be restored.')
+    } finally {
+      this.nativeMetadataChanged()
     }
   }
 
@@ -228,5 +293,13 @@ export class SessionWorkspace {
           },
         }
       : { ok: false, error: { code: 'INTERNAL', message: fallback } }
+  }
+
+  private nativeMetadataChanged(): void {
+    try {
+      this.onNativeMetadataChanged?.()
+    } catch {
+      /* Metadata invalidation cannot invalidate a durable mutation receipt. */
+    }
   }
 }

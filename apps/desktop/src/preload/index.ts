@@ -13,6 +13,23 @@ import {
   runtimeHealthSchema,
   rendererFaultSchema,
   monacoIpcObservationSchema,
+  projectContextSchema,
+  projectDirectoryOpenResultSchema,
+  workspaceArchivePreviewSchema,
+  workspaceArchiveReceiptSchema,
+  nativeSessionResolveInputSchema,
+  nativeSessionOpenInputSchema,
+  nativeAttentionReadInputSchema,
+  nativeAttentionPageSchema,
+  nativePresenceVersionSchema,
+  nativeNavigationIntentSchema,
+  nativeNavigationAckInputSchema,
+  nativeNavigationAckResultSchema,
+  nativeQuitStateSchema,
+  nativeQuitDecisionInputSchema,
+  nativeQuitDecisionResultSchema,
+  nativeSessionOpenedResultSchema,
+  sessionCatalogChangeSchema,
 } from '@pact/contracts'
 
 import {
@@ -81,7 +98,7 @@ function eventSubscription<T>(
   lane: 'business' | 'control',
 ): (listener: (input: T) => void) => () => void {
   if (traffic) {
-    // Four fixed observation taps own no consumer registry. Actual business
+    // Seven fixed observation taps own no consumer registry. Actual business
     // registrations keep Electron's duplicate and dispatch-snapshot semantics.
     const observe = (_event: Electron.IpcRendererEvent, raw: unknown): void => {
       try {
@@ -141,7 +158,68 @@ if (traffic) {
   else traffic.invalidate('cleanup_unavailable')
 }
 
+const onNativePresenceChanged = eventSubscription(
+  IPC_CHANNELS.nativePresenceChanged,
+  nativePresenceVersionSchema,
+  'business',
+)
+
+const onNativeNavigationChanged = eventSubscription(
+  IPC_CHANNELS.nativeNavigationChanged,
+  nativeNavigationIntentSchema,
+  'business',
+)
+
+const onNativeQuitStateChanged = eventSubscription(
+  IPC_CHANNELS.nativeQuitChanged,
+  nativeQuitStateSchema.nullable(),
+  'business',
+)
+
 const bridge: DesktopBridge = {
+  resolveNativeSession: async (input) =>
+    rpcResultSchema(sessionCatalogChangeSchema).parse(
+      await invoke(IPC_CHANNELS.nativeSessionResolve, nativeSessionResolveInputSchema.parse(input)),
+    ),
+  recordNativeSessionOpened: async (input) =>
+    rpcResultSchema(nativeSessionOpenedResultSchema).parse(
+      await invoke(IPC_CHANNELS.nativeSessionOpened, nativeSessionOpenInputSchema.parse(input)),
+    ),
+  readNativeAttention: async (input) =>
+    rpcResultSchema(nativeAttentionPageSchema).parse(
+      await invoke(IPC_CHANNELS.nativeAttentionRead, nativeAttentionReadInputSchema.parse(input)),
+    ),
+  onNativePresenceChanged,
+  getNativeNavigation: async () =>
+    rpcResultSchema(nativeNavigationIntentSchema.nullable()).parse(
+      await invoke(IPC_CHANNELS.nativeNavigationGet),
+    ),
+  acknowledgeNativeNavigation: async (input) =>
+    rpcResultSchema(nativeNavigationAckResultSchema).parse(
+      await invoke(IPC_CHANNELS.nativeNavigationAck, nativeNavigationAckInputSchema.parse(input)),
+    ),
+  onNativeNavigationChanged,
+  getNativeQuitState: async () =>
+    rpcResultSchema(nativeQuitStateSchema.nullable()).parse(
+      await invoke(IPC_CHANNELS.nativeQuitGet),
+    ),
+  respondNativeQuit: async (input) =>
+    rpcResultSchema(nativeQuitDecisionResultSchema).parse(
+      await invoke(IPC_CHANNELS.nativeQuitRespond, nativeQuitDecisionInputSchema.parse(input)),
+    ),
+  onNativeQuitStateChanged,
+  prepareWorkspaceArchive: async (input) =>
+    rpcResultSchema(workspaceArchivePreviewSchema).parse(
+      await invoke(IPC_CHANNELS.workspaceArchivePrepare, input),
+    ),
+  readWorkspaceArchive: async (input) =>
+    rpcResultSchema(workspaceArchiveReceiptSchema).parse(
+      await invoke(IPC_CHANNELS.workspaceArchiveRead, input),
+    ),
+  cancelWorkspaceArchive: async (input) =>
+    rpcResultSchema(workspaceArchiveReceiptSchema).parse(
+      await invoke(IPC_CHANNELS.workspaceArchiveCancel, input),
+    ),
   ...(monacoTraffic
     ? {
         observeMonacoWorkerTraffic: (
@@ -219,8 +297,25 @@ const bridge: DesktopBridge = {
   getDefaultSessionSettingsEditorState: () => invoke(IPC_CHANNELS.defaultSessionSettingsGet),
   saveDefaultSessionSettings: (input) => invoke(IPC_CHANNELS.defaultSessionSettingsSave, input),
   getProjectCatalog: () => invoke(IPC_CHANNELS.projectCatalogGet),
+  readProjectContext: async (input) => {
+    const result = rpcResultSchema(projectContextSchema).safeParse(
+      await invoke(IPC_CHANNELS.projectContextRead, input),
+    )
+    return result.success
+      ? result.data
+      : { ok: false, error: { code: 'INTERNAL', message: 'Invalid project context response.' } }
+  },
+  openProjectDirectory: async (input) => {
+    const result = rpcResultSchema(projectDirectoryOpenResultSchema).safeParse(
+      await invoke(IPC_CHANNELS.projectDirectoryOpen, input),
+    )
+    return result.success
+      ? result.data
+      : { ok: false, error: { code: 'INTERNAL', message: 'Invalid folder open response.' } }
+  },
   chooseAndAddProject: () => invoke(IPC_CHANNELS.projectCatalogChooseAndAdd),
-  archiveProject: (projectId) => invoke(IPC_CHANNELS.projectCatalogArchive, projectId),
+  archiveProject: (projectId, operationId) =>
+    invoke(IPC_CHANNELS.projectCatalogArchive, projectId, operationId),
   restoreProject: (projectId) => invoke(IPC_CHANNELS.projectCatalogRestore, projectId),
   renameProject: async (input) => {
     const result = rpcResultSchema(projectNameChangeSchema).safeParse(
@@ -236,7 +331,8 @@ const bridge: DesktopBridge = {
   createSession: (input) => invoke(IPC_CHANNELS.sessionCreate, input),
   renameSession: (input) => invoke(IPC_CHANNELS.sessionRename, input),
   markSessionRead: (input) => invoke(IPC_CHANNELS.sessionMarkRead, input),
-  archiveSession: (sessionId) => invoke(IPC_CHANNELS.sessionArchive, sessionId),
+  archiveSession: (sessionId, operationId) =>
+    invoke(IPC_CHANNELS.sessionArchive, sessionId, operationId),
   restoreSession: (sessionId) => invoke(IPC_CHANNELS.sessionRestore, sessionId),
   getSessionSettings: (sessionId) => invoke(IPC_CHANNELS.sessionSettingsGet, sessionId),
   saveSessionSettings: (input) => invoke(IPC_CHANNELS.sessionSettingsSave, input),

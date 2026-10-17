@@ -1,6 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/v17.3.0/schemas/config.json",
   "release-type": "node",
+  "initial-version": "0.1.0",
   "bump-minor-pre-major": true,
   "bump-patch-for-minor-pre-major": false,
   "include-component-in-tag": false,
@@ -25,7 +26,6 @@
       "package-name": "pact",
       "extra-files": [
         { "type": "json", "path": "version.json", "jsonpath": "$.version" },
-        { "type": "json", "path": "version.json", "jsonpath": "$.candidateVersion" },
         { "type": "json", "path": "apps/desktop/package.json", "jsonpath": "$.version" }
       ]
     }

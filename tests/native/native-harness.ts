@@ -912,6 +912,25 @@ interface Pending {
 }
 
 type CleanupStage = 'observe' | 'eof' | 'eof-grace' | 'group' | 'terminate' | 'kill' | 'close'
+export interface NativeInitializeTimeoutObservation {
+  readonly elapsedMs: number | null
+  readonly writeCallbackDone: boolean
+  readonly writeCallbackError: boolean
+  readonly writeCallbackElapsedMs: number | null
+  readonly stdoutBytes: number | null
+  readonly stderrBytes: number | null
+  readonly partialFrameBytes: number | null
+  readonly matchingReplies: number | null
+  readonly unmatchedReplies: number | null
+  readonly childExit: boolean
+  readonly childClosed: boolean
+  readonly stdinWritable: boolean
+}
+
+// Diagnostic values are capped, never an extension of the existing request/lifetime bounds.
+const boundedObservation = (value: number, limit: number): number | null =>
+  Number.isFinite(value) ? Math.min(limit, Math.max(0, Math.round(value))) : null
+
 export interface NativeCleanupFacts {
   phase: 'open' | 'closing' | 'released' | 'released-with-errors' | 'unconfirmed'
   stages: Array<{
@@ -930,6 +949,7 @@ export interface NativeCleanupFacts {
   windowsJobEmpty: boolean | null
   helperReleased: boolean
   windowsControl?: ReturnType<NativeProcessOwner['facts']>['windowsControl']
+  initializeTimeout?: Readonly<NativeInitializeTimeoutObservation>
   previousAttempt?: Omit<NativeCleanupFacts, 'previousAttempt'>
 }
 
@@ -1045,6 +1065,9 @@ export class NativeRpc {
   private ended = false
   private fatal: Error | undefined
   private stderrBytes = 0
+  private matchingReplies = 0
+  private unmatchedReplies = 0
+  private initializeTimeout: Readonly<NativeInitializeTimeoutObservation> | undefined
   private readonly deadline: ReturnType<typeof setTimeout>
   private closing: Promise<void> | undefined
   private closingRequested = false
@@ -1172,10 +1195,11 @@ export class NativeRpc {
           if (event.id != null && !event.method) {
             const pending = this.pending.get(event.id)
             if (pending) {
+              this.matchingReplies = Math.min(8 * 1024 * 1024, this.matchingReplies + 1)
               clearTimeout(pending.timer)
               this.pending.delete(event.id)
               pending.resolve(event)
-            }
+            } else this.unmatchedReplies = Math.min(8 * 1024 * 1024, this.unmatchedReplies + 1)
           } else {
             if (this.events.length >= 512) throw new Error('Native event capacity exceeded')
             this.events.push(event)
@@ -1207,8 +1231,33 @@ export class NativeRpc {
       return Promise.reject(new Error('Native RPC admission bound exceeded'))
     const id = ++this.next
     this.methods.push(method)
+    const initializeWrite =
+      method === 'initialize'
+        ? {
+            startedAt: performance.now(),
+            callbackDone: false,
+            callbackError: false,
+            callbackElapsedMs: null as number | null,
+          }
+        : undefined
     return new Promise<Reply<T>>((resolveReply, reject) => {
       const timer = setTimeout(() => {
+        if (initializeWrite && !this.initializeTimeout) {
+          this.initializeTimeout = Object.freeze({
+            elapsedMs: boundedObservation(performance.now() - initializeWrite.startedAt, 50_000),
+            writeCallbackDone: initializeWrite.callbackDone,
+            writeCallbackError: initializeWrite.callbackError,
+            writeCallbackElapsedMs: initializeWrite.callbackElapsedMs,
+            stdoutBytes: boundedObservation(this.bytes, 8 * 1024 * 1024),
+            stderrBytes: boundedObservation(this.stderrBytes, 64 * 1024),
+            partialFrameBytes: boundedObservation(this.buffer.length, 1024 * 1024),
+            matchingReplies: boundedObservation(this.matchingReplies, 8 * 1024 * 1024),
+            unmatchedReplies: boundedObservation(this.unmatchedReplies, 8 * 1024 * 1024),
+            childExit: this.childExit,
+            childClosed: this.childClosed,
+            stdinWritable: this.child.stdin.writable,
+          })
+        }
         this.pending.delete(id)
         const error = new Error(`unknown_delivery: ${method} exceeded 10s`)
         this.fail(error)
@@ -1220,7 +1269,18 @@ export class NativeRpc {
         reject,
         timer,
       })
-      this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
+      const input = `${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`
+      if (initializeWrite)
+        this.child.stdin.write(input, (error) => {
+          if (this.initializeTimeout) return
+          initializeWrite.callbackDone = true
+          initializeWrite.callbackError = Boolean(error)
+          initializeWrite.callbackElapsedMs = boundedObservation(
+            performance.now() - initializeWrite.startedAt,
+            50_000,
+          )
+        })
+      else this.child.stdin.write(input)
     })
   }
   async initialize(): Promise<void> {
@@ -1312,6 +1372,7 @@ export class NativeRpc {
       windowsJobEmpty: this.scope.facts().windowsJobEmpty,
       helperReleased: this.scope.facts().helperReleased,
       windowsControl: this.scope.facts().windowsControl,
+      ...(this.initializeTimeout ? { initializeTimeout: this.initializeTimeout } : {}),
       ...(this.previousAttempt
         ? {
             previousAttempt: {

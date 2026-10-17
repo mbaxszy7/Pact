@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { realpath, stat } from 'node:fs/promises'
 import { basename, isAbsolute, join } from 'node:path'
+import { setImmediate as yieldImmediate } from 'node:timers/promises'
 import { Worker } from 'node:worker_threads'
 
 import type {
@@ -45,6 +46,18 @@ import type {
   SessionForkInput,
   SessionForkResult,
   AgentNativeForkBoundary,
+  WorkspaceArchivePrepareInput,
+  WorkspaceArchivePreview,
+  WorkspaceArchiveReceipt,
+  WorkspaceArchiveScope,
+  WorkspaceArchiveTask,
+  NativePresenceVersion,
+  NativePresenceSnapshot,
+  NativeAttentionPage,
+  NativeAttentionReadInput,
+  NativeSessionRow,
+  NativeQuitOperationInput,
+  NativeQuitPreparation,
 } from '@pact/contracts'
 import type {
   ConversationImage,
@@ -92,6 +105,10 @@ import {
 } from '@pact/contracts'
 import {
   conversationInterestsSchema,
+  WORKSPACE_ARCHIVE_PREVIEW_MS,
+  WORKSPACE_ARCHIVE_STOP_MS,
+  WORKSPACE_ARCHIVE_TASK_LIMIT,
+  NATIVE_QUIT_PREPARATION_MS,
   conversationPatchSchema,
   CONVERSATION_PATCH_BYTES,
   CONVERSATION_MARKDOWN_BYTES,
@@ -120,6 +137,7 @@ import {
   ProjectCatalogRepository,
   SessionRepository,
   StaleConversationCursorError,
+  WorkspaceArchiveConflictError,
 } from '@pact/persistence'
 
 import { recordDiagnostic } from '../../diagnostics/utility-log'
@@ -150,6 +168,7 @@ const PREPARATION_TIMEOUT_MS = 10_000
 const CAPACITY_NOTICE = 'At most 5 Sessions can run Agents at once. Try again when one finishes.'
 
 interface ActiveExecution {
+  adapter?: AgentAdapter | undefined
   run: AgentRun
   protectedAgentId?: RuntimeAgentId | undefined
   deliveryPossible: boolean
@@ -173,6 +192,7 @@ interface ActiveTitleEnrichment {
 }
 
 interface ActiveNativeRebuild {
+  adapter?: AgentAdapter | undefined
   agentId: RuntimeAgentId
   rebuildId: string
   abortController: AbortController
@@ -250,6 +270,21 @@ interface NativeInteractionOwner {
 }
 
 export class Conversation {
+  private readonly nativeIncarnation = randomUUID()
+  private nativeRevision = 0
+  private nativeInitialization: Promise<void> | undefined
+  private readonly nativeListeners = new Set<(version: NativePresenceVersion) => void>()
+  private nativeQuitPreparation:
+    | {
+        operationId: string
+        result: RpcResult<NativeQuitPreparation>
+        sealed: boolean
+        expired: boolean
+        timer?: ReturnType<typeof setTimeout> | undefined
+      }
+    | undefined
+  private readonly archiveOwnerId = randomUUID()
+  private readonly archiveOperations = new Set<string>()
   // Single flight for duplicate document/StrictMode preparation, under the same five operation slots.
   private readonly forkPreparations = new Map<
     string,
@@ -263,6 +298,7 @@ export class Conversation {
       operationId?: string
       controller: AbortController
       completion?: Promise<void>
+      activeAdapters?: Set<AgentAdapter>
     }
   >()
   private readonly listeners = new Set<(patch: ConversationPatch, progress: boolean) => void>()
@@ -312,7 +348,11 @@ export class Conversation {
   private readonly nativeObservations = new Map<string, NativeObservation>()
   private readonly nativeChecks = new Map<
     string,
-    { controller: AbortController; task: Promise<RpcResult<ConversationPatch>> }
+    {
+      controller: AbortController
+      task: Promise<RpcResult<ConversationPatch>>
+      adapter?: AgentAdapter | undefined
+    }
   >()
   private adapterSlotTail: Promise<void> = Promise.resolve()
   private pendingContinuationScheduled = false
@@ -350,6 +390,7 @@ export class Conversation {
     private readonly images?: ConversationImages,
     private readonly ipcTraffic?: LogicalIpcWorkerTraffic,
   ) {
+    this.conversations.archives.recover(this.archiveOwnerId)
     this.conversations.expireNativePermissions()
     this.conversations.recoverInterruptedRuns()
     this.conversations.recoverCollaborationTasks()
@@ -359,6 +400,716 @@ export class Conversation {
 
   sessionTitleChanged(sessionId: string): void {
     this.scheduleNativeTitleSync(sessionId)
+  }
+
+  subscribeNativePresence(listener: (version: NativePresenceVersion) => void): () => void {
+    if (this.nativeListeners.size >= 1)
+      throw new Error('Native metadata already has its Utility subscriber.')
+    this.nativeListeners.add(listener)
+    return () => {
+      this.nativeListeners.delete(listener)
+    }
+  }
+
+  nativeMetadataChanged(): void {
+    if (this.disposed) return
+    this.nativeRevision += 1
+    const version = this.nativePresenceVersion()
+    for (const listener of this.nativeListeners) listener(version)
+  }
+
+  nativePresenceVersion(): NativePresenceVersion {
+    return { incarnation: this.nativeIncarnation, revision: this.nativeRevision }
+  }
+
+  initializeNativePresence(): Promise<void> {
+    this.nativeInitialization ??= (async () => {
+      if (this.sessions.nativeInitialized()) return
+      let after: string | undefined
+      while (!this.disposed) {
+        const ids = this.sessions.nativeInitializationPage(after)
+        if (!ids.length) {
+          this.sessions.finishNativeInitialization()
+          this.nativeMetadataChanged()
+          return
+        }
+        this.conversations.initializeNativeAttention(ids)
+        after = ids.at(-1)
+        // oxlint-disable-next-line no-await-in-loop -- Initial migration projects at most 25 metadata rows before yielding; later restarts never scan the Catalog.
+        await yieldImmediate()
+      }
+    })()
+    return this.nativeInitialization
+  }
+
+  private liveNativeRows(): { running: NativeSessionRow[]; attention: NativeSessionRow[] } {
+    const states = new Map<string, NativeSessionRow['state']>()
+    const add = (id: string, state: NativeSessionRow['state']): void => {
+      if (!states.has(id) || state === 'recovering') states.set(id, state)
+    }
+    const referenced = new Set<AgentAdapter>()
+    for (const owner of this.activeExecutions.values())
+      if (owner.adapter) referenced.add(owner.adapter)
+    for (const owner of this.nativeRebuilds.values())
+      if (owner.adapter) referenced.add(owner.adapter)
+    for (const owner of this.nativeChecks.values()) if (owner.adapter) referenced.add(owner.adapter)
+    for (const owner of this.nativeForks.values())
+      for (const adapter of owner.activeAdapters ?? []) referenced.add(adapter)
+    const cached = new Set([...this.adapters.values()].map((entry) => entry.adapter))
+    if ([...referenced].some((adapter) => !cached.has(adapter)))
+      throw new Error('An active native Adapter is absent from its physical owner.')
+    for (const entry of this.adapters.values()) {
+      if (!referenced.has(entry.adapter) && !entry.adapter.hasActiveBackgroundWork?.()) continue
+      const recovering =
+        [...this.nativeRebuilds.values()].some((owner) => owner.adapter === entry.adapter) ||
+        [...this.nativeChecks.values()].some((owner) => owner.adapter === entry.adapter) ||
+        [...this.nativeForks.values()].some((owner) => owner.activeAdapters?.has(entry.adapter)) ||
+        [...this.activeExecutions.values()].some(
+          (owner) =>
+            owner.adapter === entry.adapter &&
+            this.conversations.nativeRunStatus(owner.run.id) === 'recovering',
+        )
+      add(entry.sessionId, recovering ? 'recovering' : 'running')
+    }
+    const attention = new Map<string, NativeSessionRow>()
+    for (const pending of this.permissions.values()) {
+      if (!this.interactionCurrent(pending)) continue
+      const row = this.sessions.findNativeRow(pending.sessionId)
+      if (!row) continue
+      const prior = attention.get(row.sessionId)
+      if (!prior || pending.request.kind === 'approval')
+        attention.set(row.sessionId, {
+          ...row,
+          state:
+            pending.request.kind === 'approval' || pending.request.kind === undefined
+              ? 'approval'
+              : 'input',
+        })
+    }
+    if (attention.size > 8 || states.size > 5)
+      throw new Error('Native owner metadata exceeds its item budget.')
+    const running = [...states].flatMap(([id, state]) => {
+      const row = this.sessions.findNativeRow(id)
+      return row ? [{ ...row, state }] : []
+    })
+    return { running, attention: [...attention.values()] }
+  }
+
+  private nativeLogicalPreparation(sessionId: string): boolean {
+    return (
+      [...this.preparingSends.values()].some((owner) => owner.input.sessionId === sessionId) ||
+      this.preparingContinuations.has(sessionId) ||
+      this.nativeRebuilds.has(sessionId) ||
+      [...this.nativeChecks.keys()].some((key) => key.startsWith(`${sessionId}:`)) ||
+      this.forkPreparations.has(sessionId) ||
+      [...this.nativeForks.values()].some(
+        (owner) => (owner.sessionId ?? owner.sourceSessionId) === sessionId,
+      )
+    )
+  }
+
+  getNativePresence(): RpcResult<NativePresenceSnapshot> {
+    if (!this.sessions.nativeInitialized())
+      return {
+        ok: false,
+        error: { code: 'RUNTIME_UNAVAILABLE', message: 'Session metadata is starting.' },
+      }
+    try {
+      const live = this.liveNativeRows()
+      const liveIds = new Set(live.attention.map((row) => row.sessionId))
+      const durable = this.sessions
+        .nativeAttention()
+        .filter((item) => !liveIds.has(item.row.sessionId))
+      const attention = [...live.attention, ...durable.map((item) => item.row)].slice(0, 5)
+      const attentionIds = new Set(attention.map((row) => row.sessionId))
+      const running = live.running.filter(
+        (row) => !attentionIds.has(row.sessionId) && !liveIds.has(row.sessionId),
+      )
+      const grouped = new Set([
+        ...liveIds,
+        ...attentionIds,
+        ...live.running.map((row) => row.sessionId),
+      ])
+      const recent = this.sessions
+        .nativeRecent()
+        .filter((row) => !grouped.has(row.sessionId))
+        .slice(0, 5)
+        .map((row) => {
+          if (this.nativeLogicalPreparation(row.sessionId)) row.state = 'preparing'
+          return row
+        })
+      const attentionTotal =
+        this.sessions.nativeAttentionTotal() +
+        live.attention.filter((row) => !this.sessions.nativeNeedsAttention(row.sessionId)).length
+      return {
+        ok: true,
+        value: {
+          version: this.nativePresenceVersion(),
+          running,
+          attention,
+          recent,
+          attentionTotal,
+        },
+      }
+    } catch {
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'Native Session metadata could not be loaded.' },
+      }
+    }
+  }
+
+  readNativeAttention(input: NativeAttentionReadInput): RpcResult<NativeAttentionPage> {
+    if (!this.sessions.nativeInitialized())
+      return {
+        ok: false,
+        error: { code: 'RUNTIME_UNAVAILABLE', message: 'Session metadata is starting.' },
+      }
+    const version = this.nativePresenceVersion()
+    if (
+      input.cursor &&
+      (input.cursor.incarnation !== version.incarnation ||
+        input.cursor.revision !== version.revision)
+    )
+      return {
+        ok: false,
+        error: { code: 'CONFLICT', message: 'Session attention changed. Reload its first page.' },
+      }
+    try {
+      const live = this.liveNativeRows().attention
+      const liveIds = new Set(live.map((row) => row.sessionId))
+      let liveOffset = input.cursor?.liveOffset ?? 0
+      const rows = live.slice(liveOffset, liveOffset + 5)
+      liveOffset += rows.length
+      let after = input.cursor?.after
+      const candidates = this.sessions.nativeAttention(after)
+      for (const item of candidates) {
+        if (rows.length === 5) break
+        after = { ordinal: item.ordinal, id: item.row.sessionId }
+        if (!liveIds.has(item.row.sessionId)) rows.push(item.row)
+      }
+      const remainingDurable = candidates.some(
+        (item) =>
+          !liveIds.has(item.row.sessionId) &&
+          !rows.some((row) => row.sessionId === item.row.sessionId) &&
+          (!after ||
+            item.ordinal < after.ordinal ||
+            (item.ordinal === after.ordinal && item.row.sessionId < after.id)),
+      )
+      const total =
+        this.sessions.nativeAttentionTotal() +
+        live.filter((row) => !this.sessions.nativeNeedsAttention(row.sessionId)).length
+      return {
+        ok: true,
+        value: {
+          version,
+          sessions: rows,
+          total,
+          ...(liveOffset < live.length || remainingDurable
+            ? { nextCursor: { ...version, liveOffset, ...(after ? { after } : {}) } }
+            : {}),
+        },
+      }
+    } catch {
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'Sessions needing attention could not be loaded.' },
+      }
+    }
+  }
+
+  prepareNativeQuit(
+    input: NativeQuitOperationInput,
+    otherPreparationActive = false,
+  ): RpcResult<NativeQuitPreparation> {
+    if (this.disposed) return Conversation.shuttingDown()
+    if (this.nativeQuitPreparation?.operationId === input.operationId)
+      return this.nativeQuitPreparation.expired
+        ? Conversation.quitPrepared()
+        : this.nativeQuitPreparation.result
+    if (this.nativeQuitPreparation?.sealed) return Conversation.quitPrepared()
+    clearTimeout(this.nativeQuitPreparation?.timer)
+    // Even a failed metadata query must leave this accepted operation
+    // cancellable. Keep the failure itself, never an invented idle result.
+    const quitOwner = {
+      operationId: input.operationId,
+      result: {
+        ok: false,
+        error: {
+          code: 'UNCERTAIN',
+          message: 'Running work could not be confirmed. Review before exiting.',
+        },
+      } as RpcResult<NativeQuitPreparation>,
+      sealed: false,
+      expired: false,
+      timer: undefined as ReturnType<typeof setTimeout> | undefined,
+    }
+    this.nativeQuitPreparation = quitOwner
+    quitOwner.timer = setTimeout(() => {
+      if (this.nativeQuitPreparation === quitOwner) {
+        quitOwner.sealed = false
+        quitOwner.expired = true
+        this.schedulePendingRoutedContinuations()
+      }
+    }, NATIVE_QUIT_PREPARATION_MS)
+    quitOwner.timer.unref()
+    try {
+      const rows = this.liveNativeRows()
+      const identities = new Set([...rows.running, ...rows.attention].map((row) => row.sessionId))
+      for (const owner of this.preparingSends.values()) identities.add(owner.input.sessionId)
+      for (const owner of this.preparingContinuations.values()) identities.add(owner.sessionId)
+      for (const id of this.nativeRebuilds.keys()) identities.add(id)
+      for (const key of this.nativeChecks.keys()) identities.add(key.split(':')[0]!)
+      for (const id of this.forkPreparations.keys()) identities.add(id)
+      for (const owner of this.nativeForks.values())
+        identities.add(owner.sessionId ?? owner.sourceSessionId)
+      for (const id of this.workspaceChanges?.pendingSessionIds() ?? []) identities.add(id)
+      for (const id of this.titleEnrichments.keys()) identities.add(id)
+      for (const id of this.nativeTitleSyncs.keys()) identities.add(id)
+      for (const owner of this.skillDiscoveries.values()) identities.add(owner.sessionId)
+      for (const owner of this.conversations.pendingRoutedContinuations())
+        identities.add(owner.sessionId)
+      for (const owner of this.conversations.pendingCollaborationInputs())
+        identities.add(owner.sessionId)
+      const unsettled = this.conversations.nativeQuitUnsettled([...identities])
+      const activeCount =
+        identities.size +
+        unsettled.count +
+        Number(otherPreparationActive && identities.size === 0 && unsettled.count === 0)
+      const listed = [...new Set([...identities, ...unsettled.sessionIds])]
+        .slice(0, 5)
+        .flatMap((id) => {
+          const row = this.sessions.findNativeRow(id)
+          return row
+            ? [
+                {
+                  ...row,
+                  state:
+                    rows.running.find((item) => item.sessionId === id)?.state ??
+                    ('recovering' as const),
+                },
+              ]
+            : []
+        })
+      const result: NativeQuitPreparation = {
+        operationId: input.operationId,
+        state: activeCount ? 'confirmation_required' : 'idle_prepared',
+        activeCount,
+        sessions: listed,
+      }
+      quitOwner.result = { ok: true, value: result }
+      quitOwner.sealed = activeCount === 0
+    } catch {
+      // The bounded owner retains the uncertain result for cancellation/readback.
+    }
+    return quitOwner.result
+  }
+
+  cancelNativeQuit(
+    input: NativeQuitOperationInput,
+  ): RpcResult<{ operationId: string; cancelled: true }> {
+    const owner = this.nativeQuitPreparation
+    if (!owner || owner.operationId !== input.operationId)
+      return {
+        ok: false,
+        error: { code: 'CONFLICT', message: 'This exit preparation is no longer current.' },
+      }
+    clearTimeout(owner.timer)
+    owner.sealed = false
+    owner.expired = true
+    this.schedulePendingRoutedContinuations()
+    return { ok: true, value: { operationId: input.operationId, cancelled: true } }
+  }
+
+  private nativeQuitSealed(): boolean {
+    return this.nativeQuitPreparation?.sealed === true
+  }
+  private static quitPrepared(): RpcResult<never> {
+    return {
+      ok: false,
+      error: {
+        code: 'CONFLICT',
+        message: 'Pact is preparing to exit. Cancel Exit before starting new work.',
+      },
+    }
+  }
+
+  prepareWorkspaceArchive(input: WorkspaceArchivePrepareInput): RpcResult<WorkspaceArchivePreview> {
+    if (this.disposed) return Conversation.shuttingDown()
+    try {
+      // A fresh user request may inspect old receipts; it never repeats their Stop or commit.
+      for (const operationId of this.conversations.archives.unresolvedOperations(input.scope))
+        this.readWorkspaceArchive(operationId)
+      const context = this.conversations.archives.context(input.scope)
+      const work = this.archiveWork(input.scope)
+      return {
+        ok: true,
+        value: this.conversations.archives.prepare(
+          {
+            operationId: input.operationId,
+            scope: input.scope,
+            ...context,
+            tasks: work.tasks,
+            ...(work.blockedReason ? { blockedReason: work.blockedReason } : {}),
+            expiresAt: new Date(Date.now() + WORKSPACE_ARCHIVE_PREVIEW_MS).toISOString(),
+          },
+          this.archiveOwnerId,
+        ),
+      }
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    }
+  }
+
+  readWorkspaceArchive(operationId: string): RpcResult<WorkspaceArchiveReceipt> {
+    try {
+      const receipt = this.conversations.archives.read(operationId)
+      if (!receipt)
+        throw new WorkspaceArchiveConflictError('This archive operation no longer exists.')
+      if (receipt.state === 'unresolved') {
+        const work = this.archiveWork(receipt.preview.scope)
+        if (
+          !work.tasks.length &&
+          !work.blockedReason &&
+          !this.workspaceChanges?.hasPendingFinalization(receipt.preview.scope)
+        )
+          this.conversations.archives.releaseResolved(operationId)
+      }
+      return { ok: true, value: this.conversations.archives.read(operationId)! }
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    }
+  }
+
+  cancelWorkspaceArchive(operationId: string): RpcResult<WorkspaceArchiveReceipt> {
+    try {
+      return { ok: true, value: this.conversations.archives.cancel(operationId) }
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    }
+  }
+
+  private archiveWork(scope: WorkspaceArchiveScope): {
+    tasks: WorkspaceArchiveTask[]
+    blockedReason?: string
+  } {
+    const projectId = this.conversations.archives.context(scope).projectId
+    const belongs = (sessionId: string): boolean =>
+      scope.kind === 'session'
+        ? sessionId === scope.sessionId
+        : this.conversations.archives.sessionMetadata(sessionId)?.projectId === projectId
+    const identities = new Map<string, { ids: string[]; state: WorkspaceArchiveTask['state'] }>()
+    const add = (
+      sessionId: string,
+      identity: string,
+      state: WorkspaceArchiveTask['state'],
+    ): void => {
+      if (!belongs(sessionId)) return
+      const prior = identities.get(sessionId)
+      if (prior) prior.ids.push(identity)
+      else identities.set(sessionId, { ids: [identity], state })
+    }
+    const runs: string[] = []
+    for (const entry of this.activeExecutions.values()) {
+      add(entry.run.sessionId, `run:${entry.run.id}:${entry.run.bindingGeneration}`, 'running')
+      if (belongs(entry.run.sessionId)) runs.push(entry.run.id)
+    }
+    for (const entry of this.preparingSends.values())
+      add(entry.input.sessionId, `send:${entry.input.clientMessageId}`, 'preparing')
+    for (const entry of this.preparingContinuations.values())
+      add(entry.sessionId, `route:${entry.userMessageId}:${entry.protectedAgentId}`, 'continuing')
+    for (const entry of this.conversations.pendingRoutedContinuations(scope))
+      add(entry.sessionId, `pending:${entry.userMessageId}:${entry.agentId}`, 'continuing')
+    for (const entry of this.conversations.archives.pendingInputs(scope))
+      add(entry.sessionId, `input:${entry.id}`, 'continuing')
+    const tasks = [...identities].map(([sessionId, entry]) => ({
+      sessionId,
+      title: this.conversations.archives.sessionMetadata(sessionId)!.title,
+      state: entry.state,
+      identity: entry.ids.toSorted().join('|'),
+    }))
+    if (tasks.length > WORKSPACE_ARCHIVE_TASK_LIMIT)
+      throw new WorkspaceArchiveConflictError(
+        'Too many tasks changed at once. Nothing was stopped; try again.',
+      )
+    const unsupported =
+      [...this.nativeRebuilds.keys()].some(belongs) ||
+      [...this.nativeForks.values()].some(
+        (entry) =>
+          belongs(entry.sourceSessionId) || Boolean(entry.sessionId && belongs(entry.sessionId)),
+      ) ||
+      [...this.nativeChecks.keys()].some((key) => belongs(key.split(':')[0]!)) ||
+      [...this.adapters.values()].some((entry) => {
+        if (!belongs(entry.sessionId) || !entry.adapter.hasActiveBackgroundWork?.()) return false
+        const foreground = this.activeExecutions.get(entry.sessionId)
+        return !foreground || Boolean(this.conversations.findRun(foreground.run.id)?.nativeOutcome)
+      }) ||
+      this.conversations.archives.hasNativeWork(scope, runs)
+    return {
+      tasks,
+      ...(unsupported
+        ? {
+            blockedReason:
+              'Native work is still recovering, rebuilding, forking, running in the background, or has an unconfirmed ending. Check or finish that work before archiving. Nothing was stopped.',
+          }
+        : {}),
+    }
+  }
+
+  async archiveWorkspace<T>(
+    scope: WorkspaceArchiveScope,
+    operationId: string | undefined,
+    commit: (operationId: string) => RpcResult<T>,
+    readCommitted: () => RpcResult<T>,
+  ): Promise<RpcResult<T>> {
+    if (this.disposed) return Conversation.shuttingDown()
+    const id = operationId ?? randomUUID()
+    const outcomes: WorkspaceArchiveReceipt['tasks'] = []
+    let confirmedTasks: WorkspaceArchiveTask[] = []
+    let claimed = false
+    try {
+      const previous = this.conversations.archives.read(id)
+      if (previous && JSON.stringify(previous.preview.scope) !== JSON.stringify(scope))
+        throw new WorkspaceArchiveConflictError('This confirmation belongs to another item.')
+      if (previous?.state === 'archived') {
+        if (JSON.stringify(previous.preview.scope) !== JSON.stringify(scope))
+          throw new WorkspaceArchiveConflictError('This receipt belongs to another item.')
+        return readCommitted()
+      }
+      if (!operationId) {
+        const preview = this.prepareWorkspaceArchive({ operationId: id, scope })
+        if (!preview.ok) return preview
+        if (preview.value.tasks.length || preview.value.blockedReason)
+          throw new WorkspaceArchiveConflictError(
+            'Review the running tasks before archiving this item.',
+          )
+      }
+      const work = this.archiveWork(scope)
+      if (work.blockedReason) throw new WorkspaceArchiveConflictError(work.blockedReason)
+      if (this.archiveOperations.size >= WORKSPACE_ARCHIVE_TASK_LIMIT)
+        throw new WorkspaceArchiveConflictError(
+          'Archive operations are busy. Nothing new was stopped; try again shortly.',
+        )
+      const ownedRunIds = [...this.activeExecutions.values()]
+        .filter((entry) => work.tasks.some((task) => task.sessionId === entry.run.sessionId))
+        .map((entry) => entry.run.id)
+      const retiredPatches: ConversationPatch[] = []
+      const receipt = this.conversations.archives.claim(
+        id,
+        this.archiveOwnerId,
+        work.tasks,
+        ownedRunIds,
+        () => {
+          for (const task of work.tasks) {
+            this.conversations.setReceivedInputState(task.sessionId, 'cancelled')
+            this.conversations.pauseCollaboration(task.sessionId)
+            retiredPatches.push(this.conversations.cancelPendingRoutedContinuation(task.sessionId))
+          }
+        },
+      )
+      if (JSON.stringify(receipt.preview.scope) !== JSON.stringify(scope))
+        throw new WorkspaceArchiveConflictError('This confirmation belongs to another item.')
+      claimed = true
+      this.archiveOperations.add(id)
+      confirmedTasks = receipt.preview.tasks
+      for (const task of confirmedTasks)
+        if (!work.tasks.some((current) => current.sessionId === task.sessionId))
+          outcomes.push({ sessionId: task.sessionId, outcome: 'finished' })
+      const deadline = performance.now() + WORKSPACE_ARCHIVE_STOP_MS
+      const pending = new Set<string>()
+      const failures = new Set<string>()
+      const runIds: string[] = []
+      for (const patch of retiredPatches) {
+        try {
+          this.publish(patch)
+        } catch {
+          /* Durable retirement remains authoritative; the Renderer resyncs. */
+        }
+      }
+      const scopeSessionIds = new Set(work.tasks.map((task) => task.sessionId))
+      for (const entry of this.adapters.values()) {
+        if (
+          scope.kind === 'session'
+            ? entry.sessionId === scope.sessionId
+            : this.conversations.archives.sessionMetadata(entry.sessionId)?.projectId ===
+              receipt.preview.projectId
+        )
+          scopeSessionIds.add(entry.sessionId)
+      }
+      for (const task of work.tasks) {
+        const sessionId = task.sessionId
+        const execution = this.activeExecutions.get(sessionId)
+        const preparations = [...this.preparingSends.values()].filter(
+          (entry) => entry.input.sessionId === sessionId,
+        )
+        const continuation = this.preparingContinuations.get(sessionId)
+        const promises = [
+          execution?.completion,
+          continuation?.completion,
+          ...preparations.map((entry) => entry.task),
+        ].filter((promise): promise is Promise<void> | Promise<RpcResult<ConversationPatch>> =>
+          Boolean(promise),
+        )
+        if (execution) runIds.push(execution.run.id)
+        const stop = this.stop({ sessionId })
+        if (!stop.ok) failures.add(sessionId)
+        pending.add(sessionId)
+        void Promise.allSettled(promises).then((results) => {
+          if (results.some((result) => result.status === 'rejected')) failures.add(sessionId)
+          pending.delete(sessionId)
+          return undefined
+        })
+      }
+      for (const sessionId of scopeSessionIds) {
+        // Pending stages retired in the claim transaction cannot resume after a crash.
+        const enrichment = this.titleEnrichments.get(sessionId)
+        enrichment?.abortController.abort()
+        // oxlint-disable-next-line no-await-in-loop -- The existing title owners have bounded native I/O and share the archive deadline.
+        await Conversation.awaitArchiveFinalization(
+          Promise.all([this.cancelNativeTitleSync(sessionId), enrichment?.promise]).then(
+            () => undefined,
+          ),
+          deadline,
+        )
+      }
+      // One bounded wait chain per admitted archive (no Run queue, no provider replay).
+      while (!this.disposed && performance.now() < deadline) {
+        const current = [...scopeSessionIds].some(
+          (sessionId) =>
+            this.activeExecutions.has(sessionId) ||
+            this.preparingContinuations.has(sessionId) ||
+            [...this.preparingSends.values()].some((entry) => entry.input.sessionId === sessionId),
+        )
+        const background = [...this.adapters.values()].some(
+          (entry) =>
+            scopeSessionIds.has(entry.sessionId) && entry.adapter.hasActiveBackgroundWork?.(),
+        )
+        if (!pending.size && !current && !background) break
+        // oxlint-disable-next-line no-await-in-loop -- One absolute 15-second settlement chain, at most one timer.
+        await new Promise<void>((resolve) => setTimeout(resolve, 100))
+      }
+      for (const task of work.tasks) {
+        const unresolved =
+          pending.has(task.sessionId) ||
+          this.conversations.archives.hasNativeWork({
+            kind: 'session',
+            sessionId: task.sessionId,
+          }) ||
+          this.activeExecutions.has(task.sessionId) ||
+          [...this.adapters.values()].some(
+            (entry) =>
+              entry.sessionId === task.sessionId && entry.adapter.hasActiveBackgroundWork?.(),
+          )
+        outcomes.push({
+          sessionId: task.sessionId,
+          outcome: unresolved ? 'unresolved' : failures.has(task.sessionId) ? 'failed' : 'stopped',
+        })
+      }
+      if (
+        this.disposed ||
+        performance.now() >= deadline ||
+        failures.size ||
+        this.conversations.archives.hasNativeWork(scope) ||
+        this.archiveWork(scope).tasks.length
+      )
+        throw new WorkspaceArchiveConflictError(
+          'Not archived. Some tasks were stopped, but other work or saved output could not be confirmed. Check the task results; stopped tasks will not restart automatically.',
+        )
+      for (const runId of runIds) {
+        // Joining the existing owner also joins background-triggered finalization.
+        // oxlint-disable-next-line no-await-in-loop -- At most five captured Runs, under the same absolute deadline.
+        await Conversation.awaitArchiveFinalization(this.finalizeWorkspaceChanges(runId), deadline)
+      }
+      if (this.workspaceChanges)
+        await Conversation.awaitArchiveFinalization(
+          this.workspaceChanges.awaitFinalization(scope),
+          deadline,
+        )
+      if (this.disposed || performance.now() >= deadline)
+        throw new WorkspaceArchiveConflictError(
+          'Pact closed or archive settlement timed out. Nothing was archived.',
+        )
+      return this.conversations.archives.finish(id, outcomes, () => {
+        const result = commit(id)
+        if (!result.ok) throw new WorkspaceArchiveConflictError(result.error.message)
+        return result
+      })
+    } catch (error) {
+      if (claimed) {
+        for (const task of confirmedTasks)
+          if (!outcomes.some((result) => result.sessionId === task.sessionId)) {
+            const remaining =
+              this.conversations.archives.hasNativeWork({
+                kind: 'session',
+                sessionId: task.sessionId,
+              }) ||
+              this.activeExecutions.has(task.sessionId) ||
+              [...this.preparingSends.values()].some(
+                (entry) => entry.input.sessionId === task.sessionId,
+              ) ||
+              this.preparingContinuations.has(task.sessionId) ||
+              this.workspaceChanges?.hasPendingFinalization({
+                kind: 'session',
+                sessionId: task.sessionId,
+              })
+            outcomes.push({
+              sessionId: task.sessionId,
+              outcome: remaining ? 'unresolved' : 'finished',
+            })
+          }
+        try {
+          const remaining = this.archiveWork(scope)
+          const unresolved =
+            this.conversations.archives.hasNativeWork(scope) ||
+            remaining.tasks.length > 0 ||
+            Boolean(remaining.blockedReason) ||
+            Boolean(this.workspaceChanges?.hasPendingFinalization(scope))
+          this.conversations.archives.fail(
+            id,
+            outcomes,
+            error instanceof Error ? error.message : 'Nothing was archived.',
+            unresolved,
+          )
+        } catch {
+          return {
+            ok: false,
+            error: {
+              code: 'UNCERTAIN',
+              message:
+                'The archive result could not be saved. Check this operation after restarting Pact; it will not automatically repeat.',
+            },
+          }
+        }
+      }
+      return Conversation.sendFailure(error)
+    } finally {
+      if (claimed) this.archiveOperations.delete(id)
+    }
+  }
+
+  private static async awaitArchiveFinalization(
+    work: Promise<void>,
+    deadline: number,
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        work,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                new WorkspaceArchiveConflictError(
+                  'Saving the stopped task took too long. Nothing was archived.',
+                ),
+              ),
+            Math.max(1, deadline - performance.now()),
+          )
+        }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   private observeNativeTitle(
@@ -384,6 +1135,8 @@ export class Conversation {
   }
 
   private nativeTitleState(sessionId: string, adapter: AgentAdapter) {
+    if (this.nativeQuitSealed()) return undefined
+    if (this.conversations.archives.blocksSession(sessionId)) return undefined
     const cached = this.adapters.get(`${sessionId}:codex`)
     if (this.disposed || cached?.adapter !== adapter || !adapter.setNativeTitle) return undefined
     const session = this.sessions.find(sessionId)
@@ -429,6 +1182,8 @@ export class Conversation {
   }
 
   private scheduleNativeTitleSync(sessionId: string): void {
+    if (this.nativeQuitSealed()) return
+    if (this.conversations.archives.blocksSession(sessionId)) return
     const cached = this.adapters.get(`${sessionId}:codex`)
     if (!cached?.adapter.setNativeTitle || this.disposed) return
     const state = this.nativeTitleState(sessionId, cached.adapter)
@@ -520,9 +1275,11 @@ export class Conversation {
       })
     const entry = { messageId: input.messageId, task: this.executeForkRequest(input) }
     this.forkPreparations.set(input.sourceSessionId, entry)
+    this.nativeMetadataChanged()
     const release = (): void => {
       if (this.forkPreparations.get(input.sourceSessionId) === entry)
         this.forkPreparations.delete(input.sourceSessionId)
+      this.nativeMetadataChanged()
     }
     void entry.task.then(release, release)
     return entry.task
@@ -538,6 +1295,10 @@ export class Conversation {
           operation: this.conversations.forkOperation(input.sessionId) ?? null,
         },
       }
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
+    const archiveSessionId = 'sourceSessionId' in input ? input.sourceSessionId : input.sessionId
+    if (this.conversations.archives.blocksSession(archiveSessionId, input.action === 'check'))
+      return Conversation.archiveBusy()
     const sourceSessionId =
       input.action === 'prepare' || input.action === 'create'
         ? input.sourceSessionId
@@ -590,6 +1351,7 @@ export class Conversation {
       operationId?: string
       controller: AbortController
       completion?: Promise<void>
+      activeAdapters?: Set<AgentAdapter>
     }
     this.nativeForks.set(sourceSessionId, owner)
     this.publish(this.conversations.metadataPatch(sourceSessionId))
@@ -631,23 +1393,28 @@ export class Conversation {
               owner.controller.signal,
               prepared.value.projectDirectory,
             )
-            if (!adapter.prepareNativeFork)
-              throw new Error(`${agentId} does not support native forking.`)
-            const response = this.conversations.forkResponse(run.id, selection.prepared.sequence)
-            boundaries[agentId] = await adapter.prepareNativeFork(
-              {
-                cwd: prepared.value.projectDirectory,
-                nativeSessionId: run.nativeSessionId!,
-                nativeTurnId: run.nativeTurnId!,
-                runId: run.id,
-                bindingGeneration: run.bindingGeneration,
-                throughSequence: response.sequence,
-                deliveryCursor: response.deliveryCursor,
-                responseHash: response.responseHash,
-                ...(run.answerFormat ? { answerFormat: run.answerFormat } : {}),
-              },
-              owner.controller.signal,
-            )
+            const releaseAdapter = this.holdForkAdapter(owner, adapter)
+            try {
+              if (!adapter.prepareNativeFork)
+                throw new Error(`${agentId} does not support native forking.`)
+              const response = this.conversations.forkResponse(run.id, selection.prepared.sequence)
+              boundaries[agentId] = await adapter.prepareNativeFork(
+                {
+                  cwd: prepared.value.projectDirectory,
+                  nativeSessionId: run.nativeSessionId!,
+                  nativeTurnId: run.nativeTurnId!,
+                  runId: run.id,
+                  bindingGeneration: run.bindingGeneration,
+                  throughSequence: response.sequence,
+                  deliveryCursor: response.deliveryCursor,
+                  responseHash: response.responseHash,
+                  ...(run.answerFormat ? { answerFormat: run.answerFormat } : {}),
+                },
+                owner.controller.signal,
+              )
+            } finally {
+              releaseAdapter()
+            }
           }),
         )
         for (const result of inspected) if (result.status === 'rejected') throw result.reason
@@ -743,8 +1510,27 @@ export class Conversation {
     return { adapter, prepared: prepared.value }
   }
 
+  private holdForkAdapter(
+    owner: { activeAdapters?: Set<AgentAdapter> },
+    adapter: AgentAdapter,
+  ): () => void {
+    owner.activeAdapters ??= new Set()
+    const alreadyHeld = owner.activeAdapters.has(adapter)
+    owner.activeAdapters.add(adapter)
+    this.nativeMetadataChanged()
+    return () => {
+      if (!alreadyHeld) owner.activeAdapters?.delete(adapter)
+      this.nativeMetadataChanged()
+    }
+  }
+
   private forkAdapterInput(
-    owner: { sessionId?: string; operationId?: string; controller: AbortController },
+    owner: {
+      sessionId?: string
+      operationId?: string
+      controller: AbortController
+      activeAdapters?: Set<AgentAdapter>
+    },
     agentId: RuntimeAgentId,
     prepared: PreparedSession,
     phase: 'fork' | 'initialize',
@@ -842,7 +1628,12 @@ export class Conversation {
   }
 
   private async checkForkSide(
-    owner: { sessionId?: string; operationId?: string; controller: AbortController },
+    owner: {
+      sessionId?: string
+      operationId?: string
+      controller: AbortController
+      activeAdapters?: Set<AgentAdapter>
+    },
     agentId: RuntimeAgentId,
   ): Promise<void> {
     const sessionId = owner.sessionId!,
@@ -862,73 +1653,84 @@ export class Conversation {
       return
     }
     const { adapter, prepared } = await this.forkAdapter(owner, agentId)
-    if (!adapter.inspectNativeFork)
-      throw new Error('The native runtime does not support pure fork inspection.')
-    const probe = this.forkAdapterInput(owner, agentId, prepared, 'initialize')
-    // Later ordinary settings apply to the next task. Inspect the actual completed setup receipt.
-    if (alreadyReady && intent.witness) {
-      probe.model = intent.witness.model
-      probe.effort = intent.witness.effort
-      probe.permissionMode = intent.witness.permissionMode
-    }
-    const result = await adapter.inspectNativeFork(probe, owner.controller.signal)
-    if (result.kind === 'verified') {
-      if (alreadyReady && result.ready) {
-        this.publish(this.conversations.metadataPatch(sessionId))
-        this.scheduleNativeTitleSync(sessionId)
-        return
+    const releaseAdapter = this.holdForkAdapter(owner, adapter)
+    try {
+      if (!adapter.inspectNativeFork)
+        throw new Error('The native runtime does not support pure fork inspection.')
+      const probe = this.forkAdapterInput(owner, agentId, prepared, 'initialize')
+      // Later ordinary settings apply to the next task. Inspect the actual completed setup receipt.
+      if (alreadyReady && intent.witness) {
+        probe.model = intent.witness.model
+        probe.effort = intent.witness.effort
+        probe.permissionMode = intent.witness.permissionMode
       }
-      const saved = this.conversations.forkIntent(sessionId, operationId, agentId)
-      const maySettle = result.workSettled || saved.nativeWorkState === 'settled'
-      this.publish(
-        this.conversations.updateForkIntent(sessionId, operationId, agentId, {
-          nativeSessionId: result.result.nativeSessionId,
-          witnessJson: JSON.stringify(result.result.witness),
-          candidateVerified: true,
-          candidateMissing: false,
-          ...(maySettle ? { nativeWorkState: 'settled' as const } : {}),
-          state: result.ready
-            ? 'unconfirmed'
-            : saved.phase === 'initialize' && !maySettle
-              ? 'unconfirmed'
-              : 'error',
-          reason: result.ready
-            ? null
-            : maySettle
-              ? 'Native fork verified. Continue initialization to make it ready.'
-              : 'Native fork verified, but previous startup work has not been confirmed finished.',
-        }),
-      )
-      if (result.ready) {
+      const result = await adapter.inspectNativeFork(probe, owner.controller.signal)
+      if (result.kind === 'verified') {
+        if (alreadyReady && result.ready) {
+          this.publish(this.conversations.metadataPatch(sessionId))
+          this.scheduleNativeTitleSync(sessionId)
+          return
+        }
+        const saved = this.conversations.forkIntent(sessionId, operationId, agentId)
+        const maySettle = result.workSettled || saved.nativeWorkState === 'settled'
         this.publish(
-          this.conversations.completeForkSide(
-            sessionId,
-            operationId,
-            agentId,
-            result.result.nativeSessionId,
-            result.result.witness,
-          ),
+          this.conversations.updateForkIntent(sessionId, operationId, agentId, {
+            nativeSessionId: result.result.nativeSessionId,
+            witnessJson: JSON.stringify(result.result.witness),
+            candidateVerified: true,
+            candidateMissing: false,
+            ...(maySettle ? { nativeWorkState: 'settled' as const } : {}),
+            state: result.ready
+              ? 'unconfirmed'
+              : saved.phase === 'initialize' && !maySettle
+                ? 'unconfirmed'
+                : 'error',
+            reason: result.ready
+              ? null
+              : maySettle
+                ? 'Native fork verified. Continue initialization to make it ready.'
+                : 'Native fork verified, but previous startup work has not been confirmed finished.',
+          }),
         )
-        this.scheduleNativeTitleSync(sessionId)
-      }
-    } else
-      this.publish(
-        this.conversations.updateForkIntent(sessionId, operationId, agentId, {
-          state: result.kind === 'missing' ? 'error' : 'unconfirmed',
-          candidateVerified: false,
-          candidateMissing: result.kind === 'missing',
-          reason: safeNativePermissionText(result.reason).slice(0, 1024),
-        }),
-      )
+        if (result.ready) {
+          this.publish(
+            this.conversations.completeForkSide(
+              sessionId,
+              operationId,
+              agentId,
+              result.result.nativeSessionId,
+              result.result.witness,
+            ),
+          )
+          this.scheduleNativeTitleSync(sessionId)
+        }
+      } else
+        this.publish(
+          this.conversations.updateForkIntent(sessionId, operationId, agentId, {
+            state: result.kind === 'missing' ? 'error' : 'unconfirmed',
+            candidateVerified: false,
+            candidateMissing: result.kind === 'missing',
+            reason: safeNativePermissionText(result.reason).slice(0, 1024),
+          }),
+        )
+    } finally {
+      releaseAdapter()
+    }
   }
 
   private async runForkSide(
-    owner: { sessionId?: string; operationId?: string; controller: AbortController },
+    owner: {
+      sessionId?: string
+      operationId?: string
+      controller: AbortController
+      activeAdapters?: Set<AgentAdapter>
+    },
     agentId: RuntimeAgentId,
     action: 'continue' | 'initialize',
   ): Promise<void> {
     const sessionId = owner.sessionId!,
       operationId = owner.operationId!
+    let releaseAdapter: (() => void) | undefined
     try {
       let intent = this.conversations.forkIntent(sessionId, operationId, agentId)
       if (intent.state === 'ready') return
@@ -939,6 +1741,7 @@ export class Conversation {
         }),
       )
       const { adapter, prepared } = await this.forkAdapter(owner, agentId)
+      releaseAdapter = this.holdForkAdapter(owner, adapter)
       if (!adapter.forkNativeContext || !adapter.initializeNativeFork || !adapter.inspectNativeFork)
         throw new Error(`${agentId} cannot perform and verify a true native fork.`)
       if (action === 'continue') {
@@ -1014,6 +1817,8 @@ export class Conversation {
           ).slice(0, 1024),
         }),
       )
+    } finally {
+      releaseAdapter?.()
     }
   }
 
@@ -1249,6 +2054,9 @@ export class Conversation {
         waitingForWork,
       )
       if (received) return { ok: true, value: received }
+      if (this.nativeQuitSealed()) return Conversation.quitPrepared()
+      if (this.conversations.archives.blocksSession(input.sessionId))
+        return Conversation.archiveBusy()
       if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
         return Conversation.nativeRecoveryRequired()
 
@@ -1449,6 +2257,7 @@ export class Conversation {
   }
 
   respondNativePermission(input: NativePermissionRespondInput): RpcResult<ConversationPatch> {
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
     const pending = this.permissions.get(input.permissionId)
     if (
       !pending ||
@@ -1519,6 +2328,7 @@ export class Conversation {
   }
 
   respondNativeInput(input: NativeInputRespond): RpcResult<ConversationPatch> {
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
     const pending = this.permissions.get(input.requestId)
     if (
       !pending ||
@@ -1559,6 +2369,7 @@ export class Conversation {
   }
 
   confirmNativeInputURL(input: NativeInputRead): RpcResult<ConversationPatch> {
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
     const pending = this.permissions.get(input.requestId)
     if (
       !pending ||
@@ -1844,6 +2655,7 @@ export class Conversation {
   async undoWorkspaceChanges(
     input: WorkspaceChangesUndoInput,
   ): Promise<RpcResult<ConversationPatch>> {
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
     try {
       if (!this.workspaceChanges || this.disposed) throw new Error('Protected Undo is unavailable.')
       const summary = await this.workspaceChanges.undo(input.changeSetId, (projectId) =>
@@ -1881,6 +2693,9 @@ export class Conversation {
     options: SendOptions,
   ): Promise<RpcResult<ConversationPatch>> {
     if (this.disposed) return Promise.resolve(Conversation.shuttingDown())
+    if (this.nativeQuitSealed()) return Promise.resolve(Conversation.quitPrepared())
+    if (this.conversations.archives.blocksSession(input.sessionId))
+      return Promise.resolve(Conversation.archiveBusy())
     if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
       return Promise.resolve(Conversation.nativeRecoveryRequired())
     if (
@@ -1959,6 +2774,9 @@ export class Conversation {
   }
 
   async actOnCollaboration(input: CollaborationActionInput): Promise<RpcResult<ConversationPatch>> {
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
+    if (this.conversations.archives.blocksSession(input.sessionId))
+      return Conversation.archiveBusy()
     try {
       const context = this.sessions.find(input.sessionId)
       const task = this.conversations.collaboration(input.sessionId)
@@ -2074,6 +2892,7 @@ export class Conversation {
 
   acceptPeerProposal(input: PeerProposalAcceptInput): Promise<RpcResult<ConversationPatch>> {
     if (this.disposed) return Promise.resolve(Conversation.shuttingDown())
+    if (this.nativeQuitSealed()) return Promise.resolve(Conversation.quitPrepared())
     if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
       return Promise.resolve(Conversation.nativeRecoveryRequired())
     const proposal = this.conversations.peerProposal(input.sessionId, input.proposalId)
@@ -2142,6 +2961,7 @@ export class Conversation {
   }
 
   async readSkillDocument(input: SkillDocumentRead): Promise<RpcResult<SkillDocument>> {
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
     if (this.disposed || this.skillDocumentOwner)
       return {
         ok: false,
@@ -2234,6 +3054,7 @@ export class Conversation {
   }
 
   async readSkillCatalog(input: SkillCatalogRead): Promise<RpcResult<SkillCatalogPage>> {
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
     try {
       const entries = await this.skillBindings(
         input.sessionId,
@@ -2822,7 +3643,8 @@ export class Conversation {
         code:
           error instanceof WorkspaceChangeError
             ? error.code
-            : error instanceof RunOperationConflictError
+            : error instanceof RunOperationConflictError ||
+                error instanceof WorkspaceArchiveConflictError
               ? 'CONFLICT'
               : error instanceof HandoffTooLargeError ||
                   error instanceof OversizedConversationEntityError ||
@@ -2858,8 +3680,10 @@ export class Conversation {
     sessionId: string,
     includeBackground = false,
     ignoreFork?: object,
+    allowUnresolvedArchive = false,
   ): boolean {
     return (
+      this.conversations.archives.blocksSession(sessionId, allowUnresolvedArchive) ||
       [...this.nativeForks.values()].some(
         (owner) =>
           owner !== ignoreFork &&
@@ -2887,6 +3711,16 @@ export class Conversation {
     }
   }
 
+  private static archiveBusy(): RpcResult<never> {
+    return {
+      ok: false,
+      error: {
+        code: 'CONFLICT',
+        message: 'This item is archived or its archive is still settling. Nothing new was started.',
+      },
+    }
+  }
+
   stop(input: ConversationStopInput): RpcResult<ConversationPatch> {
     if (this.disposed) return Conversation.shuttingDown()
     try {
@@ -2906,6 +3740,7 @@ export class Conversation {
           streamSaved = execution.streamBuffer?.dispose() ?? true
         } finally {
           execution.streamBuffer = undefined
+          execution.adapter = undefined
           execution.cancelledByUser = true
           execution.abortController.abort()
         }
@@ -2960,6 +3795,7 @@ export class Conversation {
 
   async retry(input: ConversationRetryInput): Promise<RpcResult<ConversationPatch>> {
     if (this.disposed) return Conversation.shuttingDown()
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
     const original = this.conversations.findRun(input.runId)
     if (original?.forkSourceRunId)
       return {
@@ -2997,7 +3833,10 @@ export class Conversation {
             'The previous task has no confirmed native identity. The current binding was not changed.',
         },
       })
-    if (this.hasSessionOperation(run.sessionId) || this.nativeChecks.size >= MAX_AGENT_OPERATIONS)
+    if (
+      this.hasSessionOperation(run.sessionId, false, undefined, true) ||
+      this.nativeChecks.size >= MAX_AGENT_OPERATIONS
+    )
       return Promise.resolve(Conversation.capacityFailure())
     const controller = new AbortController()
     const task = (async (): Promise<RpcResult<ConversationPatch>> => {
@@ -3016,6 +3855,13 @@ export class Conversation {
           executable,
           controller.signal,
           project.directoryPath,
+          (acquired) => {
+            const owner = this.nativeChecks.get(key)
+            if (owner?.controller !== controller || controller.signal.aborted)
+              throw new RunOperationConflictError('The native check is no longer current.')
+            owner.adapter = acquired
+            this.nativeMetadataChanged()
+          },
         )
         const evidence = await Conversation.withRecoveryDeadline(
           controller,
@@ -3083,11 +3929,15 @@ export class Conversation {
           },
         }
       } finally {
+        const physicalOwner = this.nativeChecks.get(key)
+        if (physicalOwner?.controller === controller) physicalOwner.adapter = undefined
         this.nativeChecks.delete(key)
+        this.nativeMetadataChanged()
         this.schedulePendingRoutedContinuations()
       }
     })()
     this.nativeChecks.set(key, { controller, task })
+    this.nativeMetadataChanged()
     return task
   }
 
@@ -3109,7 +3959,8 @@ export class Conversation {
     const key = `${sessionId}:${agentId}`
     const pending = this.nativeChecks.get(key)
     if (pending) return pending.task
-    if (this.hasSessionOperation(sessionId)) return Promise.resolve(Conversation.capacityFailure())
+    if (this.hasSessionOperation(sessionId, false, undefined, true))
+      return Promise.resolve(Conversation.capacityFailure())
     if (this.nativeChecks.size >= MAX_AGENT_OPERATIONS)
       return Promise.resolve(Conversation.capacityFailure())
     const controller = new AbortController()
@@ -3156,6 +4007,13 @@ export class Conversation {
           executable,
           controller.signal,
           project.directoryPath,
+          (acquired) => {
+            const owner = this.nativeChecks.get(key)
+            if (owner?.controller !== controller || controller.signal.aborted)
+              throw new RunOperationConflictError('The native check is no longer current.')
+            owner.adapter = acquired
+            this.nativeMetadataChanged()
+          },
         )
         const observeCheckedTitle = (nativeSessionId: string, logicalTitle?: string): void => {
           const current = this.conversations.nativeContext(sessionId, agentId)
@@ -3372,10 +4230,15 @@ export class Conversation {
         }
       }
     })().finally(() => {
-      if (this.nativeChecks.get(key)?.controller === controller) this.nativeChecks.delete(key)
+      if (this.nativeChecks.get(key)?.controller === controller) {
+        this.nativeChecks.get(key)!.adapter = undefined
+        this.nativeChecks.delete(key)
+        this.nativeMetadataChanged()
+      }
       this.schedulePendingRoutedContinuations()
     })
     this.nativeChecks.set(key, { controller, task })
+    this.nativeMetadataChanged()
     return task
   }
 
@@ -3383,6 +4246,7 @@ export class Conversation {
     input: NativeContextRebuildInput,
   ): Promise<RpcResult<ConversationPatch>> {
     if (this.disposed) return Conversation.shuttingDown()
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
     if (input.intent === 'claim_input' || input.intent === 'discard_input') {
       try {
         if (!input.expectedRebuildId || this.hasSessionOperation(input.sessionId))
@@ -3562,6 +4426,8 @@ export class Conversation {
     if (pending) return pending.task
     if (this.nativeChecks.size >= MAX_AGENT_OPERATIONS)
       return Promise.resolve(Conversation.capacityFailure())
+    if (this.hasSessionOperation(sessionId, false, undefined, true))
+      return Promise.resolve(Conversation.archiveBusy())
     const controller = new AbortController()
     const expectedNativeSessionId = this.conversations.nativeContext(
       sessionId,
@@ -3584,6 +4450,13 @@ export class Conversation {
           executable,
           controller.signal,
           project.directoryPath,
+          (acquired) => {
+            const owner = this.nativeChecks.get(key)
+            if (owner?.controller !== controller || controller.signal.aborted)
+              throw new RunOperationConflictError('The native check is no longer current.')
+            owner.adapter = acquired
+            this.nativeMetadataChanged()
+          },
         )
         const chunks = this.conversations.readNativeRebuildSource(operation.id)
 
@@ -3647,11 +4520,16 @@ export class Conversation {
         return Conversation.sendFailure(error)
       }
     })().finally(() => {
-      if (this.nativeChecks.get(key)?.controller === controller) this.nativeChecks.delete(key)
+      if (this.nativeChecks.get(key)?.controller === controller) {
+        this.nativeChecks.get(key)!.adapter = undefined
+        this.nativeChecks.delete(key)
+        this.nativeMetadataChanged()
+      }
       this.schedulePendingRoutedContinuations()
       if (!this.disposed) this.recoveryResult(sessionId)
     })
     this.nativeChecks.set(key, { controller, task })
+    this.nativeMetadataChanged()
     this.recoveryResult(sessionId)
     return task
   }
@@ -3672,6 +4550,8 @@ export class Conversation {
         rebuild.abortController.signal,
         prepared.value.projectDirectory,
       )
+      rebuild.adapter = adapter
+      this.nativeMetadataChanged()
       if (this.permissions.size >= NATIVE_PERMISSION_REQUESTS)
         throw new AgentExecutionError(
           'runtime_incompatible',
@@ -3784,6 +4664,9 @@ export class Conversation {
           error instanceof Error ? error.message : 'Native initialization could not be confirmed.',
         ),
       )
+    } finally {
+      rebuild.adapter = undefined
+      this.nativeMetadataChanged()
     }
   }
 
@@ -4046,6 +4929,9 @@ export class Conversation {
   }
 
   dispose(): Promise<void> {
+    clearTimeout(this.nativeQuitPreparation?.timer)
+    this.nativeQuitPreparation = undefined
+    this.nativeListeners.clear()
     this.skillDocumentOwner?.controller.abort()
     for (const owner of this.skillDiscoveries.values()) owner.controller.abort()
     this.skillCatalogs.clear()
@@ -4180,6 +5066,8 @@ export class Conversation {
     sessionId: string,
     signal?: AbortSignal,
   ): Promise<RpcResult<PreparedSession>> {
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
+    if (this.conversations.archives.blocksSession(sessionId)) return Conversation.archiveBusy()
     const session = this.sessions.find(sessionId)
     if (!session || session.status === 'archived') {
       return { ok: false, error: { code: 'VALIDATION', message: 'Session is unavailable.' } }
@@ -4190,6 +5078,7 @@ export class Conversation {
     }
     const readiness = await this.runtimePreparation.inspectReadiness(signal)
     if (!readiness.ok) return readiness
+    if (this.conversations.archives.blocksSession(sessionId)) return Conversation.archiveBusy()
     let claudeExecutablePath: string | undefined
     let codexExecutablePath: string | undefined
     for (const agent of readiness.value.agents) {
@@ -4405,6 +5294,7 @@ export class Conversation {
   private async dispatchReceivedInput(sessionId: string): Promise<void> {
     if (
       this.disposed ||
+      this.nativeQuitSealed() ||
       this.hasSessionOperation(sessionId, true) ||
       this.operationCount() >= MAX_AGENT_OPERATIONS ||
       this.conversations.nativeRecoveryBlocksInput(sessionId)
@@ -4493,6 +5383,7 @@ export class Conversation {
     for (const pending of this.conversations.pendingRoutedContinuations()) {
       if (
         this.disposed ||
+        this.nativeQuitSealed() ||
         this.conversations.nativeRecoveryBlocksInput(pending.sessionId) ||
         this.hasSessionOperation(pending.sessionId) ||
         this.operationCount() >= MAX_AGENT_OPERATIONS
@@ -4723,6 +5614,8 @@ export class Conversation {
       signal,
       cwd,
     )
+    execution.adapter = adapter
+    this.nativeMetadataChanged()
     const currentBinding = this.conversations.nativeContext(run.sessionId, run.agentId)
     if (
       currentBinding &&
@@ -5760,6 +6653,7 @@ export class Conversation {
     executablePath: string,
     signal?: AbortSignal,
     cwd?: string,
+    onAcquired?: (adapter: AgentAdapter) => void,
   ): Promise<AgentAdapter> {
     // Serialize only slot replacement, not Runs. A disposing Adapter still
     // owns its slot until the child/session cleanup has actually settled.
@@ -5770,15 +6664,21 @@ export class Conversation {
     try {
       if (this.disposed || signal?.aborted)
         throw new Error('Pact is shutting down or recovery was cancelled.')
+      if (this.nativeQuitSealed()) throw new RunOperationConflictError('Pact is preparing to exit.')
       if (!cwd) throw new Error('The Agent Adapter requires a confirmed project directory.')
       const key = `${sessionId}:${agentId}`
       const cached = this.adapters.get(key)
       if (cached?.executablePath === executablePath && cached.cwd === cwd) {
         this.adapters.delete(key)
         this.adapters.set(key, cached)
+        onAcquired?.(cached.adapter)
         return cached.adapter
       }
       if (cached) {
+        if ([...this.nativeChecks.values()].some((owner) => owner.adapter === cached.adapter))
+          throw new RunOperationConflictError(
+            'The previous native check is still using this Adapter. Its configuration was not replaced.',
+          )
         if (cached.adapter.hasActiveBackgroundWork?.())
           throw new RunOperationConflictError(
             'The previous native runtime still has background work. Its configuration will not be replaced while it is running.',
@@ -5796,6 +6696,7 @@ export class Conversation {
         const idle = [...this.adapters].find(
           ([, candidate]) =>
             !candidate.adapter.hasActiveBackgroundWork?.() &&
+            [...this.nativeChecks.values()].every((owner) => owner.adapter !== candidate.adapter) &&
             [...this.skillDiscoveries.values()].every(
               (owner) =>
                 owner.sessionId !== candidate.sessionId || owner.agentId !== candidate.agentId,
@@ -5855,6 +6756,7 @@ export class Conversation {
           discovery.controller.abort()
         }
       })
+      onAcquired?.(adapter)
       return adapter
     } finally {
       gate.resolve()
@@ -5867,7 +6769,7 @@ export class Conversation {
     nativeSessionId: string,
     cwd: string,
   ): void {
-    if (!adapter.enrichTitle || this.disposed) return
+    if (!adapter.enrichTitle || this.disposed || this.nativeQuitSealed()) return
     this.cancelTitleEnrichment(run.sessionId)
     const abortController = new AbortController()
     const promise = adapter
@@ -5931,6 +6833,7 @@ export class Conversation {
   }
 
   private publish(patch: ConversationPatch, progress = false): void {
+    if (!progress) this.nativeMetadataChanged()
     if (!progress) patch.forkBlocked = this.forkBlocked(patch.sessionId)
     if (!progress)
       patch.sessionIssues = this.sessionIssues(patch.sessionId, patch.nativeContexts ?? [])

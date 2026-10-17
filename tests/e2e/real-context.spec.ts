@@ -11,6 +11,7 @@ import {
   MAX_COMMENTS_PER_MESSAGE,
   MESSAGE_ANCHOR_TEXT_BASIS,
 } from '../../packages/contracts/src/index.js'
+import { quitPact } from './native-quit.js'
 import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import {
   addRealSession,
@@ -104,7 +105,7 @@ test.describe('real evidence', { tag: ['@real', '@real-extended'] }, () => {
       // SIGKILL does not prove a Native Turn ending. Preserve the actual Native
       // file, close every owned executor, then let real Retry establish that the
       // old identity is unavailable before an explicit confirmed Rebuild.
-      await ctx.app.close()
+      await quitPact(ctx.app)
       const preserved = await preserveOwnedClaudeHistory(ctx, peer.nativeSessionId)
       ctx.app = await ctx.fixture.launch()
       ctx.page = await ctx.app.firstWindow()

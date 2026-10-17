@@ -9,6 +9,7 @@ import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { IPC_TRAFFIC_UNIT } from '../../packages/contracts/src/index.js'
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { quitPact } from './native-quit.js'
 import { createRuntimeFixture, test } from './runtime-fixture.js'
 
 const migrationsFolder = resolve(import.meta.dirname, '../../packages/persistence/drizzle')
@@ -296,7 +297,7 @@ test(
         await cdp.detach()
       }
     } finally {
-      await app?.close()
+      if (app) await quitPact(app)
       await fixture.dispose()
     }
   },

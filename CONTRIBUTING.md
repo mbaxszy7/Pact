@@ -33,6 +33,69 @@ pnpm secrets:check    # Staged content
 pnpm secrets:history  # All reachable commits
 ```
 
+## Windows installer preview
+
+`pnpm dist:win:preview` builds the Windows x64 NSIS installer for visual review. It regenerates the
+Windows brand assets, typechecks/builds the desktop app, and writes to the ignored
+`apps/desktop/release/installer-preview/` directory. It does not run test suites or publish artifacts.
+
+The preview uses a separate application ID, product name, shortcuts and package name so it does not
+replace a production Pact installation. It installs for the current Windows account, allows a custom
+directory, offers a desktop shortcut, and leaves Open Pact unchecked. The Start menu shortcut is
+always created. Projects, provider configuration and application data are outside the installer-owned
+files and are retained on uninstall.
+
+Inspect the actual native welcome, directory, shortcut, progress and completion pages before visual
+acceptance. Only then run the applicable checks in [Required verification](#required-verification),
+including real installation/upgrade/uninstall checks beyond unpacked package smoke. A preview is not
+a signed production release or evidence that runtime, migration, accessibility or platform gates passed.
+
+## Local application builds
+
+`pnpm dev` uses the shared Pact artwork and the `Pact - Development - Local` native application
+identity. Its browser profile is partitioned by repository. The existing development SQLite and
+historical image/Changes object root are retained; no development data is moved or deleted.
+
+On macOS, `dev` and `start` prepare a checkout-local development `.app` under
+`.pact-data/mac-development-runtime/`, with the registry's bundle name, identifier and shared ICNS.
+The generated copy is ad-hoc signed without changing Electron's entitlements or Fuses; pnpm's
+installed Electron remains untouched. The existing electron-vite CLI runs with that executable,
+including normal hot reload. One generated runtime is reused until its source, branding or launcher
+changes. Exit the running development instance before starting another from the same checkout.
+A forcibly terminated launch may leave `launch.lock`; remove only that generated lock after
+confirming the previous instance has exited. This development bundle is not a distribution package.
+
+`pnpm dist:win` and `pnpm dist:mac` explicitly build `Pact - Production - Local`. Its application ID,
+executable/bundle name, installation directory, shortcuts, package identity and persistent profile
+are distinct from the preserved official `Pact` identity. Outputs are ignored under a fresh
+`apps/desktop/release/production-local-PLATFORM-ARCH-BUILD-SHA/` directory. These commands do not
+publish or certify a signed release.
+
+From the repository root, build a local unpacked application with
+`pnpm package:dir:local --output "$PWD/.pact-data/distributions/local-review"`
+using a fresh output directory. After visual acceptance, run
+`pnpm package:smoke:local --manifest "$PWD/.pact-data/distributions/local-review/distribution-manifest.json" --unpacked`.
+`verify:package:local` is an alias for this manifest-required smoke command; it does not build.
+`package:dir` builds CI Dev, while `package:smoke` and `verify:package` also require the exact
+generated manifest. Smoke never guesses an executable from an old output directory.
+
+CI development and production use distinct registry identities. Validated development packages are
+delivered by Actions; formal releases use the protected-main pipeline. Packaged identity comes from embedded metadata,
+not the launch environment. Project files and native provider configuration remain user-owned and
+shared; application identity does not establish a cross-process Project writer lease.
+
+The canonical logo is [resources/icon.svg](apps/desktop/resources/icon.svg).
+`pnpm --filter @pact/desktop brand` regenerates PNG, Windows ICO and macOS ICNS from that source.
+Windows installer bitmaps are reviewed committed inputs: regenerate them explicitly with
+`pnpm --filter @pact/desktop brand:win` on Windows. Ordinary builds retain those bytes because
+SVG text otherwise depends on host fonts and dirties a clean distribution checkout.
+The same generator builds monochrome Windows tray artwork and macOS Template images
+from their canonical SVGs. Inspect tray, packaged taskbar navigation and Pact exit confirmation on
+the actual platform before running their formal tests. Windows development supports tray navigation
+and Session JumpLists for the running repository-specific instance; after a full exit,
+start it with `pnpm dev`. Packaged Session JumpLists also support cold launch. macOS
+packaging/native appearance still requires verification on macOS.
+
 ## Change discipline
 
 Keep a change focused on one reviewable feature or infrastructure concern. Before extending a module,
@@ -62,9 +125,7 @@ pnpm db:studio
 ```
 
 The tool default `.pact-data/dev/pact.sqlite` is an isolated repository database, separate from the
-application's normal Dev database under the OS appData directory in `Pact Dev`. Source and packaged
-Dev launches share that application root across branches; Stable uses `Pact`. Existing repository
-tool data is preserved and is not automatically copied into the application root.
+local source database and historical object roots without moving existing data. CI Dev uses the OS appData `Pact Dev` root across branches; Stable uses `Pact`. Local browser profiles and local Production data remain isolated under their existing names.
 
 `db:migrate:dev` and `db:studio` run `packages/persistence/scripts/development-database.ts` through
 tsx and `PactDatabase.open`. They hold the sibling `.pact-writer.sqlite` reservation for their actual
@@ -147,6 +208,14 @@ total deadline with a five-minute build budget. Forward file names and `--grep` 
 override the project's lane with a second `--project`. UI/native changes follow the visual-first
 acceptance order in [change discipline above](#change-discipline).
 
+Native workspace journeys use the ordinary Pact Quit action and confirm pending work before waiting
+for physical process exit. `tests/e2e/native-quit.ts` provides this bounded teardown; an Electron
+context close alone can wait indefinitely at the application's exit confirmation. macOS Dock
+navigation cases exercise the actual native menu and durable cross-Project recent order. Their
+stale-response check pauses only the validated fixture Utility PID, resumes it in `finally`, and
+requires the newer selection to survive without creating Messages or Runs. These UI/protocol
+fixtures do not establish real-provider execution. The macOS Project-context journey disables Playwright focus emulation before checking actual window return events, and checks clipboard equality inside Main without emitting clipboard contents. The migration fixture applies the original migration prefix through 0060 before testing 0061/0062, comparing all legacy columns and the consistent pre-upgrade backup. Named shared-helper assertion revisions retain the exact helper owner and all registered replacement assertions; the immutable baseline is never regenerated.
+
 CI configuration and a successful build do not establish repository enforcement or release
 acceptance. Required lanes need current code identity, their actual prerequisites and successful
 execution on the appropriate native architecture. Automatic external PR jobs must not receive private
@@ -163,140 +232,51 @@ Discovery must match that inventory and its tags; a missing, new, duplicate or r
 case cannot silently change the merge gate. Test titles, assertions and the immutable
 baseline remain unchanged.
 
-Dev-scope PRs require one real smoke case on Windows x64 and macOS arm64:
-`real @all completes each Agent once and keeps ordered distinct response rows`.
-It launches the actual App, creates a Project and Session through the UI, sends one
-`@all` message, and verifies that Codex and Claude each complete exactly one real Run,
-return the request marker in separate responses, and release the Composer. Startup,
-Session creation, either Agent's reply, or cleanup failure still blocks this gate.
+Automatic CI requires the existing `@real-core` business case on Windows x64 and macOS arm64:
+`real @all completes each Agent once and keeps ordered distinct response rows`. It launches the
+actual App, creates a Project and Session, sends one `@all` message, and verifies that Codex and
+Claude each finish one real Run with separate responses and a released Composer. Missing replies,
+invalid configuration, failed source integrity, cancellation or uncertain cleanup block acceptance.
+Extended real, UI and deterministic cases retain their assertions and remain available through the
+explicit local commands above. Unexecuted cases are reported as deferred, never passed.
 
-The other 60 real cases are extended regression. They retain their original assertions
-for permissions, Stop, recovery, settings, drafts, collaboration, Changes/Undo, appearance,
-images and performance, with execution deferred on automatic Dev-scope PR runs. This is
-an explicitly narrowed smoke acceptance scope; a passing smoke does not establish those
-extended behaviors. Ordinary PRs also defer the `@ui` and `@deterministic` App E2E
-lanes to extended regression, including the bare Secondary build collaboration journey.
-Their reports list every discovered case as extended, not required, and deferred; no
-deferred case is counted as passed. Select `extended_e2e` on a manual workflow run to
-execute those complete lanes, or use the existing local UI/deterministic commands.
-The deferred reports still require authentic code identity and a complete case inventory.
-Static checks, unit/script tests, builds and native CLI protocol/process safety tests
-remain required. Main protection is unchanged. Stable publication remains disabled.
+`ci-native.yml` runs for maintained `dev` pushes and PRs targeting `main`. Its reusable
+`distributions.yml` has independent quality, per-platform native protocol, package, installed-smoke
+and real-core jobs. Each job checks out the exact event commit. The unconditional `CI complete`
+check rejects every missing, failed, cancelled or unexpectedly skipped mandatory dependency.
+Packaging and installed smoke have no model credentials or repository write token. Only real-core
+jobs use the model environment; build, test and publication never share one omnibus job.
 
-Provider execution belongs to the same **Pact CI - Code quality and app tests** root run and attempt
-as its prerequisite checks. The root calls **Pact CI - Claude and Codex tests** as a reusable workflow; it has no independent
-dispatch or completion-triggered run. Add `pact:real-full` to a Dev-scope PR to execute the
-full regression; the label requests cases and does not authorize model credentials.
-Owner-authored same-repository code and API-verified release-only App changes use
-`pact-provider-ci`. Other sources wait for owner approval in `pact-provider-reviewed-ci`.
-Review the attested head/base/tree and root run/attempt before approving that environment;
-the trusted preflight revalidates their current identity and prerequisites before model
-configuration is exposed. Execution authorization is separate from Approve PR. A new
-candidate needs its own verified execution; missing or stale authorization blocks the gate.
-For a Dev-scope PR, an extended case failure is reported while the core gate remains
-eligible. Any Stable-scope candidate forces `suite=full` and a full gate regardless of
-author or input, so
-extended failures, missing results and skips block release-candidate acceptance.
-Native cases explicitly assigned to another platform are reported as not applicable; for
-example macOS window Alpha is required on macOS rather than converted into a passing Windows
-test. Any skip of an applicable core/full case remains a failure of the selected gate.
+Repository writers are trusted with test credentials and model spending before review. Model
+configuration stays in `pact-provider-ci`, with native ref restrictions and no runtime approval.
+External forks receive public credential-free checks only. Missing core evidence cannot claim a
+complete acceptance pass. GitHub's own external-contributor workflow restrictions remain applicable;
+privileged events are not used to execute fork code around those restrictions.
 
-Each native platform publishes `provider-report-PLATFORM-aATTEMPT`: `real-summary.md` and
-`real-summary.json`, retained for 14 days, plus an Actions step summary. Every reviewed
-case is listed with tier/scenario, result, duration, required status and a fixed safe reason;
-unexecuted extended cases say deferred rather than passed. The report records head/base,
-tree, tested commit and policy hash. Errors, model output, attachments, traces and private
-configuration stay out of these artifacts. Missing configuration, execution cancellation,
-global runner errors, invalid evidence, failed source-integrity or cleanup checks cannot
-be treated as an optional extended failure. Full execution coverage still uses the existing
-unmodified assertion obligations; `--real-scope core` changes only which real execution
-results are currently required, and never certifies a complete baseline run.
-
-Local `test:e2e` commands also preserve safe, immutable JSON/Markdown under
-`.pact-data/e2e-reports/<unique-run>/`; the command prints the report location even
-when configuration admission fails. Raw Provider evidence and disposable test output
-remain private and are removed after safe projection. Failed local `ui` or
-`deterministic` invocations also preserve bounded traces/snapshots beside the case
-summary, with a `diagnostics.md` index and hashed `diagnostics/inventory.json`, using
-the same no-follow 32 MiB collector as CI. Explicit `--output` remains caller-owned;
-mixed or real-provider invocations preserve safe summaries only. A local clean-tree receipt is
-distinct from a PR attestation; a dirty or changing working tree has no captured code
-identity. Deliberately filtered local runs list unexecuted obligations and cannot claim
-a complete core/full gate. UI/deterministic Actions summaries link `e2e-PLATFORM-aATTEMPT`
-reports and, on failure, `ui-diagnostics-PLATFORM-aATTEMPT` snapshots/traces; both retain
-14 days. The identity producer exports its immutable upload Artifact ID to the
-uncredentialed platform jobs instead of guessing a filename from their own attempt. A single
-uncredentialed platform rerun can therefore use its retained producer identity, still
-verified against the exact checked-out commit/tree and current PR head/base. Missing
-or expired artifacts fail without fallback. This does not reuse test results: execution
-reports keep their actual attempt numbers. Candidate attestation, Provider admission,
-check publication and the final PR gate retain current-attempt identity artifact names;
-a retained producer cannot issue a fresh attestation. These trusted paths still require
-all prerequisite jobs, attestations and Provider results in the same current root
-attempt; use **Re-run all jobs** for a complete trusted replacement. The native **PR checks complete** job fails
-when any required dependency failed, was cancelled, skipped or not executed.
-
-UI and deterministic failure output uses separate `ui/` and `deterministic/` directories.
-Both diagnostic lanes share the original 32 MiB budget; a later lane cannot overwrite
-an earlier snapshot or silently increase the upload capacity. JSON/Markdown case reports
-remain separate from these disposable traces.
-
-Credential-free CLI protocol checks publish `native-e2e-PLATFORM-aATTEMPT` containing
-`native-summary.json` and `native-summary.md`, with an Actions summary and 14-day retention.
-Release jobs use `release-native-e2e-PLATFORM-aATTEMPT`. These reports list every actual
-Vitest case, including failed and unexecuted cases, with duration and a fixed failure
-category. Missing, invalid or incomplete execution evidence blocks the native check.
-Raw errors, native output and configuration are excluded; uncertain physical process
-cleanup retains its private recovery evidence and cannot be reported as complete.
-
-Stable release jobs preserve `release-e2e-PLATFORM-aATTEMPT` JSON/Markdown reports and
-failure-only `release-ui-diagnostics-PLATFORM-aATTEMPT` snapshots/traces for 14 days.
-Their Actions summaries list every trusted-discovered UI/deterministic case, including
-cases not run after an earlier failure. These no-credential reports record the release
-version, source SHA, tag, Release PR and Release ID; they omit signed-state extensions
-and do not replace the release controller's authenticated staging or publication checks.
-
-Branch pushes and PRs require static checks, unit/script tests, builds and native protocol checks
-on Windows x64 and macOS arm64. PRs also require the real smoke case above; UI/deterministic
-E2E is extended regression. All Windows arm64 CI and installer build/smoke and publication currently
-are deferred until native-machine acceptance. `PACT_PACKAGING_READY` must remain unset or false
-until that acceptance is complete. Windows arm64 installers remain excluded from the future automated
-release set. Both active CI architectures retain mandatory native protocol checks. Stable candidates additionally require
-full provider verification; publication validates every final installer and its content-bound
-smoke report. CI platform jobs allow 90 minutes and release platform jobs allow two hours
-for their required checks, packaging and cleanup. Deadlines do not establish completed tests.
+Safe case reports record source SHA, native Actions run and producing attempt, platform, outcomes
+and fixed failure categories. They exclude raw model output, configuration and credentials. Local
+reports use only a clean source identity and never claim a CI receipt. Filtered runs list unexecuted
+obligations; neither discovery nor a scoped run proves full regression. Existing local UI diagnostics
+retain their combined 32 MiB bound. Failed or physically uncertain fixtures retain recovery evidence.
+Actions reports and candidate artifacts retain 14 days. Installed smoke downloads its exact package
+artifact ID and records the consumed digest; same-run successful producers may retain an earlier
+attempt. Native summaries list actual cases, including failed and unexecuted entries.
 
 ### Product version and release intent
 
-`version.json` contains the product `version` and `candidateVersion` release-intent
-marker. Initially they are `0.1.0` and `0.1.0-unreleased`; the root package, desktop package
-and Release Please manifest remain `0.1.0`. The unreleased marker is not an application
-version and never enters a Stable installer. The first Release Please PR changes the
-marker to `0.1.0`; its pinned JSON updaters subsequently advance both fields together
-with all package/manifest versions. No permanent `release-as: 0.1.0` override remains.
+`version.json.version` is the runtime product version. Root and desktop package versions are
+synchronized by standard Release Please extra-file updates. The initial empty release manifest and
+`initial-version: 0.1.0` select the first release without a permanent override or a second intent
+marker. A first version PR may add its changelog and manifest while application versions already
+read `0.1.0`.
 
-Candidate scope follows the actual product metadata transition. Unchanged metadata uses
-Dev/core scope. The initial marker transition, or a later strictly increasing synchronized
-version and marker, uses Stable/full scope regardless of PR author, branch name or labels.
-Malformed metadata, rollback, a version change without its marker or restoration of the
-initial sentinel blocks candidate admission. Release Please previews and validates the
-exact updates once before creating/updating its PR; same-version `Release-As` overrides
-and unapproved major versions cannot generate a new release PR.
-
-The marker selects required tests and packaging; it grants no credential or publication
-permission. Formal publication additionally requires the fixed App's merged Release PR,
-the owner's approval and manual squash merge, and a legal transition from the actual
-squash parent to the merged metadata. Copying release metadata into an owner business PR
-cannot create a formal Release or reset the first-release override. An unfinished version
-waits for recovery of its original authenticated Release PR and Draft rather than creating
-another same-version PR. Repository enforcement and native environment approval behavior
-still require live verification before CI/CD is considered ready.
-
-Native main rules dismiss stale approvals when the PR diff changes. Formal publication
-checks the owner's latest effective API review state before the protected manual merge;
-ordinary comments cannot replace it, and dismissal or requested changes blocks it.
-An approval still marked effective after a diff-equivalent update may refer to an older
-head commit. Model execution approval does not satisfy this PR review requirement.
+Release Please uses a repository-scoped App token only for version PR maintenance and labels, so
+its PRs start CI automatically. Its action uses `skip-github-release: true`; it does not publish or
+merge. The App key remains in the main-only `pact-control-plane` environment and is referenced only
+by that job. The separate publisher uses the native job token. Neither environment requires manual
+runtime approval. Owner-authored PRs need passing CI but no Approve; other authors, including the
+version bot, need the owner's effective Approve. Reviewable changes dismiss stale approval. All
+merges are owner-operated squash merges; automatic merge stays disabled and CI has no bypass.
 
 ### Distribution build and smoke
 
@@ -326,10 +306,12 @@ node scripts/build-distribution.mjs --channel stable --platform darwin --arch ar
 node scripts/package-smoke.mjs --manifest .pact-data/distributions/stable/distribution-manifest.json --production-paths --report .pact-data/distributions/stable/smoke.json
 ```
 
-Automatic installer jobs and Stable publication are deferred (TODO) until native-machine acceptance;
-`PACT_PACKAGING_READY` defaults to disabled. The commands above remain available for isolated manual
-validation. Windows x64 and macOS arm64 are the candidate automated installer targets; Windows arm64
-needs a separate later integration decision. Do not treat deferred packaging as passing release evidence.
+For pre-merge validation of either CI identity, dispatch `ci-native.yml` on the maintained branch
+with channel `dev` or `stable`. This runs the same separate jobs and installed-byte checks;
+dispatch never publishes a formal release. A successful preflight does not establish live
+protected-main publication. Ordinary branch and PR validation needs no readiness switches.
+
+Local production uses the same entry point with `--profile production-local --channel stable`; its name and existing data directories remain separate from both CI channels. Local `dist:mac`, `dist:win`, and `package:dir:local` select this profile. Smoke commands require the exact generated manifest.
 
 The manifest identifies the exact executable/bundle, channel/version, source SHA, architecture,
 application identity, application-content hash and installation-artifact hashes. Smoke does not guess
@@ -356,8 +338,8 @@ cleanup is attempted. It records a fixed failure phase/code, validated identity 
 and separate application-process, installation, provider-copy and private-root cleanup facts.
 Unknown process release or failed installation cleanup retains the owned recovery directory;
 neither deleting a directory nor calling terminate proves physical process cleanup.
-Release Actions retain these reports in `packaged-verification-PLATFORM-aATTEMPT` even after
-failure, separately from the successful artifacts eligible for signed release staging.
+Release Actions retain these reports in `smoke-PLATFORM-CHANNEL-aATTEMPT` even after
+failure, separately from the successful artifacts eligible for release publication.
 
 Windows arm64 installer build, installation acceptance and publication are deferred (TODO).
 Windows x64 installed-launch validation and full Windows/macOS Dev/Stable coexistence, upgrade
@@ -495,54 +477,42 @@ eight sockets. Claude's non-model HEAD probe is allowed; model POSTs fail. Codex
 no provider requests beyond the two fixture source Turns. These test-harness limits are not production
 large-content policy. Cleanup owns every root, bundle, process, and socket, including failures.
 
-### CI control and release recovery
+### Native CI and release recovery
 
-Use separate `pact-control-plane` and `pact-provider-ci` environments. Both permit only the
-`main` branch and disable administrator bypass. App credentials belong only to the control-plane
-environment; model configuration belongs only to the Provider environment. Do not use repository
-secrets for either identity. GitHub App installation tokens are short-lived; the installation and
-private key remain configured until explicitly revoked or rotated.
+The main release workflow first resolves whether its exact push commit is the merge of a standard
+version PR. Only that commit can become the release source. Ordinary main pushes maintain the next
+version PR without publishing. Every Stable executor uses the resolved immutable SHA, not a later
+main tip or a one-time `release_created` action output. The installed NSIS artwork is included in
+the Windows unpacked payload, so its bytes participate in the same strict content manifest.
 
-Keep `PACT_GOVERNANCE_READY=false` until the repository can enforce the exact author/reviewer/merger
-policy, shared-commit association, current mandatory evidence, and failure/cancellation boundaries.
-An asynchronous App result does not prove synchronous revocation. The required native root graph
-and the final App writer validate the current execution attempt; queued cancellation, copied heads
-and partial reruns still require repository-level acceptance evidence. The executor's report trust
-boundary still requires completion; a mutable local
-controller is not OS isolation. Missing authority, configuration, observations or platforms block
-acceptance.
+After both platforms' protocol, core and installed-package checks pass, the separate publisher
+admits exact package and smoke artifact IDs, archive digests, source, version, native target and
+producing attempts. It treats downloaded artifacts as bounded data, never executable publisher
+code. Each actual DMG/ZIP/NSIS hash, application content hash, cold restart, default data root and
+physical cleanup receipt must match. Rebuilt bytes require a new matching installation report.
 
-The approval policy requires renewed approval when the reviewable diff changes and permits reuse
-when that diff is unchanged. Native CODEOWNERS and stale-review dismissal must enforce this per PR;
-an App check attached to a shared SHA cannot supply atomic author exemption or review revocation.
-Keep approval blocked until native check consumption, latest-attempt isolation and trusted main-only
-workflow bootstrap are verified. Test identity records the exact PR, author and head repository,
-head and current main base, merged code tree, and trusted policy commit. GitHub may regenerate a
-merge commit with a new timestamp and SHA. Evidence can remain eligible only when its ordered
-base/head parents and complete code tree match, and neither head, current main base nor policy
-changed. Always retain the actual tested merge SHA in execution receipts; equivalence does not
-claim execution of the replacement commit. Shared-SHA test evidence never supplies another PR's
-author exemption or review approval.
+The publisher creates or reconciles one Draft for the exact tag/version/source, uploads the complete
+verified asset set, downloads and hashes the uploaded bytes, then publishes an immutable Release.
+GitHub's native Release attestation, its tag commit and asset hashes are verified after publication;
+this is release integrity evidence, not a claim of independent build attestation. Existing same-name
+assets must be byte-identical; ambiguous delivery, conflicting Drafts, expiry or missing evidence
+stop recovery. Published assets are never replaced. No platform staging releases or signed run
+ledger provides a second recovery route.
 
-Release Please owns the single product version and `CHANGELOG.md`. Its initial `0.1.0` override is
-transient. Automatic Release PR execution admits synchronized version fields and bounded changelog
-text; it does not admit executable changes. The publication controller verifies the owner's actual
-head review, fixed source/tag/Release identity, signed content commitment and completed publication
-proof before treating a release as complete.
+Use GitHub's failed-jobs rerun with the original run. Successful producers may come from an earlier
+attempt; package IDs and consumed digests, not the consumer's current attempt number or an artifact
+name, govern reuse. Source changes or artifacts from another run cannot substitute for those bytes.
+After publication and verification, the publisher idempotently marks the exact version PR
+`autorelease: tagged` and removes `autorelease: pending`, including already-published recovery.
+Only then does the standard version-maintenance job process the latest main changes, so a release
+failure or a missing label transition cannot silently finish the cycle.
 
-Recover a merged Release PR by starting a **new** Stable Release `workflow_dispatch` with its PR
-number. Each successful platform is durably staged in an authenticated, unpublished draft. Recovery
-uses the exact staged installer and content-bound smoke reports even after Actions artifacts
-expire. A complete signed upload intent can finish its interrupted completion marker. Unknown,
-partial-starter or mismatched bytes stop recovery; they are not overwritten or adopted. A frozen
-selection cannot be rebuilt into different bytes, and an already published release remains read-only.
-The failed-jobs rerun path across producer attempts and recovery after signing-key rotation are not
-verified alternatives to this entry point.
-
-The controller bounds each API/evidence document, paginates to establish completion, retains at most
-128 authenticated run records and 128 stage attempts per version, and admits at most 32 formal assets.
-Exhausted bounds stop admission while preserving records. Do not remove records or raise a limit to
-force a release through the gate.
+API JSON is bounded to 2 MiB per response, release evidence to 4 MiB per manifest, and each native
+asset to 2 GiB. Publication admits at most 32 assets, streams binary hashes, paginates at most 100
+pages of 100 items, has a 30-minute operation lifetime and at most 1024 API operations. Exhaustion
+fails visibly without discarding facts or retrying an uncertain write. Live main-only acceptance
+requires an actual version PR, manual owner merge, automatic publication, downloaded integrity
+verification and a subsequent automatic version PR cycle. Pre-merge tests do not prove those steps.
 
 ### Immutable coverage obligations
 
@@ -550,7 +520,7 @@ force a release through the gate.
 `6fade3636a7d77060ec4b35a50cdd764e3726228`. It is source evidence, not an execution report. Its checked
 SHA-256 and bounded loader replace dependence on private Git history; a fresh public clone can audit
 the unchanged 54 original cases and 631 assertion sites. `coverage-manifest.ts` retains original
-identities, assertion mappings, explicit contract revisions, and 12 separately registered business
+identities, assertion mappings, explicit contract revisions, and 14 separately registered business
 expansion obligations. Do not regenerate the baseline from current tests or reset its obligations.
 
 ```sh

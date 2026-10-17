@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path'
 import type { ConversationSnapshot, DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { diagnosticRecordSchema } from '../../packages/contracts/src/diagnostics.js'
+import { quitPact } from './native-quit.js'
 import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import { resolveRealConfiguredModel } from './real-model-selection.js'
 import {
@@ -458,14 +459,20 @@ export async function waitForRealCompletion(
 }
 
 export async function restartRealWorkspace(context: RealWorkspace): Promise<void> {
-  await context.app.close()
+  await quitPact(context.app)
   context.app = await context.fixture.launch()
   context.page = await context.app.firstWindow()
   await selectRealSession(context, context.sessionId)
 }
 
-export async function closeRealWorkspace(context: RealWorkspace): Promise<void> {
-  await context.fixture.dispose()
+export async function closeRealWorkspace(
+  context: Pick<RealWorkspace, 'app' | 'fixture'>,
+): Promise<void> {
+  try {
+    await quitPact(context.app)
+  } finally {
+    await context.fixture.dispose()
+  }
 }
 
 export function authMarker(prefix: string): string {

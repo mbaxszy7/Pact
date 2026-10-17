@@ -4,9 +4,6 @@ inputs:
   workspace:
     description: Relative source checkout directory
     default: .
-  controller:
-    description: Relative trusted controller checkout directory (empty uses workspace)
-    default: ''
   native:
     description: Install actual pinned Claude and Codex CLIs without provider credentials
     default: 'false'
@@ -29,20 +26,24 @@ runs:
       shell: bash
       working-directory: ${{ inputs.workspace }}
       run: pnpm install --frozen-lockfile
-    - name: Install frozen trusted controller dependencies
-      if: inputs.controller != '' && inputs.controller != inputs.workspace
+    - name: Admit the exact native pnpm entry for every Windows job
+      if: runner.os == 'Windows'
       shell: bash
-      working-directory: ${{ inputs.controller || inputs.workspace }}
-      run: pnpm install --frozen-lockfile
+      working-directory: ${{ inputs.workspace }}
+      run: |
+        node --input-type=module <<'NODE'
+        import { publishWindowsPnpmPath } from './scripts/ci-native.mjs'
+        await publishWindowsPnpmPath()
+        NODE
     - name: Install exact native CLIs in a private temporary directory
       if: inputs.native == 'true'
       shell: bash
-      working-directory: ${{ inputs.controller || inputs.workspace }}
+      working-directory: ${{ inputs.workspace }}
       run: node scripts/ci-native.mjs
     - name: Prepare and verify the native macOS logical desktop work area
       if: runner.os == 'macOS' && inputs.display == 'true'
       shell: bash
-      working-directory: ${{ inputs.controller || inputs.workspace }}
+      working-directory: ${{ inputs.workspace }}
       run: node scripts/ci-display.mjs configure
     - name: Enable and verify full keyboard navigation for macOS UI tests
       if: runner.os == 'macOS' && inputs.display == 'true'

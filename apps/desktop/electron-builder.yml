@@ -21,6 +21,7 @@ files:
 artifactName: Pact-${version}-${os}-${arch}.${ext}
 npmRebuild: true
 mac:
+  icon: build/icon.icns
   category: public.app-category.developer-tools
   identity: '-'
   hardenedRuntime: true
@@ -36,6 +37,10 @@ mac:
         - arm64
 win:
   executableName: Pact
+  icon: build/icon.ico
+  extraFiles:
+    - from: build/icon.ico
+      to: uninstallerIcon.ico
   signExecutable: false
   target:
     - target: nsis
@@ -45,8 +50,18 @@ win:
 nsis:
   oneClick: false
   perMachine: false
+  allowElevation: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
+  createStartMenuShortcut: true
+  include: build/installer.nsh
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerSidebar: build/installer-sidebar.bmp
+  uninstallerSidebar: build/installer-sidebar.bmp
+  installerHeader: build/installer-header.bmp
+  installerLanguages:
+    - en_US
   shortcutName: Pact
   uninstallDisplayName: Pact
   deleteAppDataOnUninstall: false

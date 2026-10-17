@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { promisify } from 'node:util'
 
+import identities from '../apps/desktop/app-identities.json' with { type: 'json' }
 import {
   loadProviderConfiguration,
   prepareProviderEnvironment,
@@ -66,9 +67,17 @@ export async function readDistributionManifest(path) {
   if ((await lstat(path)).size > MAX_MANIFEST_BYTES)
     throw new Error('Distribution manifest exceeds its byte bound.')
   const manifest = JSON.parse(await readFile(path, 'utf8'))
-  const expectedName = manifest.channel === 'dev' ? 'Pact Dev' : 'Pact'
-  const expectedId = manifest.channel === 'dev' ? 'com.pact.desktop.dev' : 'com.pact.desktop'
+  const profile =
+    manifest.profile ?? (manifest.channel === 'dev' ? 'development-ci' : 'production-ci')
+  const expected = Object.hasOwn(identities, profile) ? identities[profile] : undefined
+  const expectedChannel = profile.startsWith('production-') ? 'stable' : 'dev'
+  const expectedName = expected?.name
+  const expectedId = expected?.appId
   if (
+    !expected ||
+    manifest.channel !== expectedChannel ||
+    profile === 'development-local' ||
+    profile === 'installer-preview' ||
     manifest.schemaVersion !== 1 ||
     !['dev', 'stable'].includes(manifest.channel) ||
     manifest.platform !== process.platform ||

@@ -16,6 +16,7 @@ import {
   anchoredComments,
   conversationMessages,
 } from '../../packages/persistence/src/schema/index.js'
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture, type RuntimeFixture } from './runtime-fixture.js'
 
@@ -235,7 +236,7 @@ test(
       )
       expect(await transcriptRows.count()).toBeLessThan(pageItems)
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -348,7 +349,7 @@ test(
         ).toBeVisible()
       }
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },

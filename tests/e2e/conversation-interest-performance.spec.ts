@@ -5,6 +5,7 @@ import { resolve } from 'node:path'
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture } from './runtime-fixture.js'
 
@@ -180,7 +181,7 @@ test(
       await expect(window.locator('[data-pact-speaker="user"]')).toHaveCount(3)
       await expect(window.getByText('Background result complete.', { exact: true })).toHaveCount(3)
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },

@@ -10,6 +10,7 @@ import {
   conversationMessages,
   nativeRebuildOperations,
 } from '../../packages/persistence/src/schema/index.js'
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture } from './runtime-fixture.js'
 
@@ -64,7 +65,7 @@ test(
       expect((await fixture.readClaudeFacts()).count).toBe(1)
       await expect(window.getByRole('combobox', { name: 'Message' })).toBeEnabled()
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -107,7 +108,7 @@ test(
       await fixture.captureUiFailure(testInfo).catch(() => undefined)
       throw error
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -234,7 +235,7 @@ test(
         window.getByText('Context supplied · 4 messages involving Claude Code'),
       ).toBeVisible()
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -296,7 +297,7 @@ test(
         await expect.poll(() => composer.textContent()).toBe('Keep this draft')
       }
     } finally {
-      await app.close()
+      await quitPact(app)
       try {
         const persisted = await PactDatabase.open({
           filePath: fixture.databaseFile,
@@ -360,7 +361,7 @@ test(
         { timeout: 10_000 },
       )
     } finally {
-      await app.close()
+      await quitPact(app)
       try {
         const persisted = await PactDatabase.open({
           filePath: fixture.databaseFile,
@@ -495,7 +496,7 @@ test(
       await expect(window.getByText('Codex native session rebuilt', { exact: true })).toHaveCount(1)
       expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(0)
       expect((await fixture.readCodexFacts()).threadStarts).toBe(1)
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       window = await app.firstWindow()
       await window.getByRole('button', { name: 'Recovery Session', exact: true }).click()
@@ -513,7 +514,7 @@ test(
       await expect(window.getByRole('combobox', { name: 'Message' })).toBeEnabled()
       expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(0)
     } finally {
-      await app.close()
+      await quitPact(app)
     }
 
     const persisted = await PactDatabase.open({ filePath: fixture.databaseFile, migrationsFolder })
@@ -660,7 +661,7 @@ test(
       }, sessionId)
       expect(returned?.route).toEqual({ type: 'primary', agentId: 'codex' })
       expect(returned?.state).toBe('installed')
-      await app.close()
+      await quitPact(app)
       appClosed = true
       const persisted = await PactDatabase.open({
         filePath: fixture.databaseFile,
@@ -690,7 +691,7 @@ test(
         persisted.close()
       }
     } finally {
-      if (!appClosed) await app.close()
+      if (!appClosed) await quitPact(app)
       await fixture.dispose()
     }
   },

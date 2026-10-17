@@ -25,31 +25,64 @@ Keep Renderer sandbox, Context Isolation, ASAR integrity, and packaging Fuse res
 
 ## Owners and entry points
 
-| Module / primary interface                                                            | Callers                                                      | State, side effects, and lifecycle                                                                                                                                                                                      |
-| ------------------------------------------------------------------------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `AppearanceController.refresh/update/reset`                                           | Main startup, named appearance IPC, windows                  | Main owns effective theme/material, revision ordering, publication, and theme/window listeners; Utility owns persisted preferences; detach/dispose removes resources                                                    |
-| `RuntimePreparation.inspectReadiness/selectExecutable`                                | Onboarding, settings, Conversation                           | Utility owns discovery and bounded version/auth probes; SQLite owns paths/first-use marker; each probe closes its child                                                                                                 |
-| `DefaultSessionSettings.loadEditorState/saveDefaults`                                 | First use, App settings, SessionWorkspace                    | Utility owns zero-input catalogs and actual probe disposal; one transaction saves defaults and completes onboarding                                                                                                     |
-| `ProjectCatalog`                                                                      | Native folder picker and named catalog IPC                   | Utility validates canonical directory identity/mutations; repository owns rows; archive never edits Project files                                                                                                       |
-| `SessionWorkspace`                                                                    | Creation/settings/catalog IPC                                | Utility validates Project-scoped settings; repository owns Session/settings revisions; Renderer editors are disposable                                                                                                  |
-| `Conversation.send/actOnCollaboration/retry/rebuildNativeContext/forkSession/dispose` | Named Main/Preload operations                                | Sole admission/execution/routing owner; owns preparation, Adapters, interactions, source grants, subscriptions, cancellation, and settlement                                                                            |
-| `ConversationRepository`                                                              | Conversation, source reads, recovery, Fork                   | Durable Message/Run/Comment/Batch/Todo/source/review facts, indexed pages, CAS gates, transactions                                                                                                                      |
-| `AgentAdapter`                                                                        | Conversation                                                 | Codex App Server or Claude SDK encoding, native connections/Queries, actor identity, observed work, checks/Fork; retains responsibility until actual cleanup                                                            |
-| `codexProcessEnvironment`                                                             | Codex startup/inspection/recovery; owned native test clients | Builds bounded child-only proxy exclusions for Pact's loopback MCP, preserving external proxy fields and the source environment; Adapter keeps process lifecycle and connection identity ownership                      |
-| `ProjectFileReader.read`                                                              | File/Skill previews, Comment validation                      | Session-bound descriptors with path/encoding/size/stability checks; closes in `finally`                                                                                                                                 |
-| `WorkspaceChanges`                                                                    | Native callbacks and named review/Undo                       | Passive capture, immutable versions, recording finalization, preflight, installation/recovery; repository owns metadata/intents                                                                                         |
-| `ConversationImages`                                                                  | Conversation and three named image operations                | UUID source/thumbnail files, segmented I/O, holds, physical codec Workers; repository owns immutable refs                                                                                                               |
-| Renderer `useConversation` / `ConversationView`                                       | App workspace                                                | One selected-Session projection, draft/pending/returned-input authority, source navigation, virtual Transcript; switch/unmount cancels read generations                                                                 |
-| `ApplicationMenu` / `DiagnosticLogs`                                                  | Main composition                                             | One native root menu and bounded editor receipts; metadata logging with one file Worker and explicit close                                                                                                              |
-| `readProductIdentity/configureProductIdentity` / `resolveRuntimePaths`                | Main startup and packaged path inspection                    | Immutable packaged channel, native identity, profile/session/log paths and database/workspace locations; Main configures them before readiness and acquires the channel's single-instance lock                          |
-| `PactDatabase.open/close`                                                             | Utility startup and development database tools               | Sole compatibility/backup/migration owner; holds the data-directory writer reservation through business use and physical close; failed cleanup prevents another open in that process                                    |
-| Distribution builder `main`                                                           | Explicit local and CI packaging commands                     | Owns temporary version injection, native packaging, artifact/application hashes and the manifest; preserves previous outputs and restores source metadata after success, failure or cancellation                        |
-| Packaged `prepareApplication/completePackagedSmoke`                                   | Manifest-based smoke commands                                | Own actual installation/extraction, isolated fixtures, process admission, receipts, deadlines and cleanup; reports remain bound to the exact application content and installation artifacts                             |
-| `RuntimeHealth.performance` / `PactDatabase.performanceDiagnostics`                   | Isolated diagnostic fixtures through named health operations | Utility owns opt-in event-loop/resource sampling and database counters/query-plan summaries in an isolated fixture; database/Utility disposal removes probes; snapshots do not export SQL bindings or business contents |
+| Module / primary interface                                                                           | Callers                                                      | State, side effects, and lifecycle                                                                                                                                                   |
+| ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `AppearanceController.refresh/update/reset`                                                          | Main startup, named appearance IPC, windows                  | Main owns effective theme/material, revision ordering, publication, and theme/window listeners; Utility owns persisted preferences; detach/dispose removes resources                 |
+| `RuntimePreparation.inspectReadiness/selectExecutable`                                               | Onboarding, settings, Conversation                           | Utility owns discovery and bounded version/auth probes; SQLite owns paths/first-use marker; each probe closes its child                                                              |
+| `DefaultSessionSettings.loadEditorState/saveDefaults`                                                | First use, App settings, SessionWorkspace                    | Utility owns zero-input catalogs and actual probe disposal; one transaction saves defaults and completes onboarding                                                                  |
+| `ProjectCatalog`                                                                                     | Native folder picker and named catalog IPC                   | Utility validates canonical directory identity/mutations; repository owns rows; archive never edits Project files                                                                    |
+| `SessionWorkspace`                                                                                   | Creation/settings/catalog IPC                                | Utility validates Project-scoped settings; repository owns Session/settings revisions; Renderer editors are disposable                                                               |
+| `Conversation.send/actOnCollaboration/retry/rebuildNativeContext/forkSession/dispose`                | Named Main/Preload operations                                | Sole admission/execution/routing owner; owns preparation, Adapters, interactions, source grants, subscriptions, cancellation, and settlement                                         |
+| `ConversationRepository`                                                                             | Conversation, source reads, recovery, Fork                   | Durable Message/Run/Comment/Batch/Todo/source/review facts, indexed pages, CAS gates, transactions                                                                                   |
+| `AgentAdapter`                                                                                       | Conversation                                                 | Codex App Server or Claude SDK encoding, native connections/Queries, actor identity, observed work, checks/Fork; retains responsibility until actual cleanup                         |
+| `codexProcessEnvironment`                                                                            | Codex startup/inspection/recovery; owned native test clients | Owns bounded child-only loopback MCP proxy exclusions. Preserves external proxy/source environment; Adapter owns connection/process lifecycle.                                       |
+| `ProjectFileReader.read`                                                                             | File/Skill previews, Comment validation                      | Session-bound descriptors with path/encoding/size/stability checks; closes in `finally`                                                                                              |
+| `WorkspaceChanges`                                                                                   | Native callbacks and named review/Undo                       | Passive capture, immutable versions, recording finalization, preflight, installation/recovery; repository owns metadata/intents                                                      |
+| `ConversationImages`                                                                                 | Conversation and three named image operations                | UUID source/thumbnail files, segmented I/O, holds, physical codec Workers; repository owns immutable refs                                                                            |
+| Renderer `useConversation` / `ConversationView`                                                      | App workspace                                                | One selected-Session projection, draft/pending/returned-input authority, source navigation, virtual Transcript; switch/unmount cancels read generations                              |
+| `ApplicationMenu` / `DiagnosticLogs`                                                                 | Main composition                                             | One native root menu and bounded editor receipts; metadata logging with one file Worker and explicit close                                                                           |
+| `resolveApplicationIdentity/readProductIdentity` / `configureApplicationProfile/resolveRuntimePaths` | Main startup and packaged path inspection                    | Registry owns immutable identity; runtime-paths owns profile/session/log and durable paths before readiness and single-instance locking.                                             |
+| `PactDatabase.open/close`                                                                            | Utility startup and development database tools               | Sole compatibility/backup/migration owner; holds the data-directory writer reservation through business use and physical close; failed cleanup prevents another open in that process |
+| Distribution builder `main`                                                                          | Explicit local and CI packaging commands                     | Owns temporary version injection, native build, hashes and manifest; retains previous outputs and restores source metadata on every settlement.                                      |
+| Packaged `prepareApplication/completePackagedSmoke`                                                  | Manifest-based smoke commands                                | Owns installation/extraction, private fixtures, process admission, receipts/deadlines and cleanup; reports bind exact app/artifact contents.                                         |
+| `RuntimeHealth.performance` / `PactDatabase.performanceDiagnostics`                                  | Isolated diagnostic fixtures through named health operations | Utility owns isolated opt-in event-loop/resource and database/query-plan probes; database/Utility disposal removes them. Snapshots omit SQL bindings and business contents.          |
 
 Entry points compose and dispose these owners. Do not add a parallel Controller, Store, Gateway, scheduler, permission engine, or recovery path for an existing concern. A new seam needs real behavioral variation or a process/trust boundary. State each affected Module's responsibility, interface, callers, resource owner, and lifecycle before extending it.
 
 Codex child exclusions cover the native environment-proxy transport. The native `RespectSystemProxy`/PAC route can ignore environment exclusions and is not established by that verification. Windows transport, HTTPS CONNECT and arbitrary external MCP compatibility require their own evidence; the helper is not a guarantee for every native proxy configuration.
+
+## Application identities and local builds
+
+One finite registry supplies packaging and Main identities. Source launches use local development;
+local Production stays separate, CI Dev uses `Pact Dev`, and Stable uses `Pact`. Packaged identity
+comes from immutable metadata, with CI channel/source/build/platform/architecture checked against
+the registry, package version and native runtime. Conflicting profiles fail before Utility starts.
+Launch environment cannot select another packaged identity. One startup manifest read is bounded
+to 16 KiB; only validated identity scalars survive it, with no queue or retry.
+
+The sole runtime-path owner configures profiles before readiness and the single-instance lock.
+Fixtures create only private profiles. Normal local development retains repository-partitioned
+browser data, `.pact-data/dev/pact.sqlite` and historical
+`Pact/workspace-versions-development/<repository hash>` image/Changes objects. Local Production
+retains its separate profile. CI channels use their own normal OS roots; no directory is automatically
+moved, copied or deleted. Managed Project files and native provider homes/authentication remain shared
+according to their existing owners.
+
+Packaged Windows AUMIDs use the registry. Source development appends the normalized profile-path
+SHA256; process, window and launch entries use that same effective ID, preserving per-repository
+Shell separation. The toolkit must not replace the development executable. The window owner retains
+native build titles across HTML updates. Mac development Dock PNG and packaged ICNS share canonical
+SVG artwork and optical margins. Builder names, IDs, executable/shortcut/uninstall names agree.
+Installer execution/publication remain gated by platform acceptance.
+
+The development launcher prepares the Mac bundle before handing off to the existing electron-vite
+CLI in the same Node process; only `dev`/`start` call it. Windows uses installed Electron. One ignored
+checkout-local runtime and one staging copy permit 8192 entries/1 GiB source, one 45 s cancellation
+deadline, 64 KiB command output and no retry. Plist edits/ad-hoc signing preserve entitlements/fuses.
+A SHA256 receipt covers executable generation, plist, registry entry, ICNS and launcher; changed inputs
+replace generated files, and failure removes staging without publication. An exclusive lock remains
+through CLI exit with no queue/stale reclamation. Forced termination requires proven exit before lock
+removal. No application-data migration or new resident process is introduced.
 
 ## Persistence and projections
 
@@ -65,6 +98,65 @@ New databases initialize in a private staging file, verify the complete migratio
 constructing a query projection alone performs no recovery writes. Test-only active observations use
 an owned fixture's native readonly connection, without WAL changes or migrations, and explicitly close
 their bounded query/lease owner. They cannot acquire or release the application's writer reservation.
+
+### Native presence and resident lifecycle
+
+Main composes one `NativePresence` owner for tray, close-to-hide, Windows JumpList, macOS Dock,
+navigation and quit confirmation. Show, activation and second-instance events reuse the window;
+the window owner recreates a destroyed window. Only the current trusted frame invokes named,
+schema-validated operations. Launch arguments contain one Session UUID and cannot select profiles,
+Projects, paths, URLs or provider configuration. Packaged Windows tasks use the current executable.
+Development tasks use the exact Electron executable, quoted absolute app root, a 32-hex-character
+identity marker and UUID. Main validates one matching marker before the profile lock and verifies
+the compiled entry in the 16 KiB package manifest. The command envelope is 8192 units; Windows
+relaunch properties allow 255 UTF-16 units. Overflow reports actual length and refuses launch.
+Mismatched, malformed and legacy bare markers exit without contacting another profile. Markers
+never reconstruct profiles. Matching ownerless development entries exit before runtime/window
+startup, without starting Vite or loading stale Renderer code. Relaunch metadata is set before show.
+Removed tasks must match the exact executable/canonical argument prefix. Disposal removes macOS
+menus/Template resources and clears Windows categories unless pending removals require retention;
+guarded stale development tasks remain inert without their live owner.
+
+Before JumpList publication consumes Windows removal records, Main durably acknowledges all
+validated removed UUIDs, including rows outside the current menu. The existing 64-ID bound remains;
+overflow or failed acknowledgements retain OS records and defer publication. Idempotent out-of-view
+acknowledgements do not force refresh. SessionWorkspace/repositories own opening order/receipts,
+visibility and suppression. An accepted selection atomically records its UUID receipt and monotonic
+ordinal; same-UUID readback cannot move MRU again. These durable facts do not cap Session history.
+Native navigation reads catalog metadata without directory probes, Adapters or conversation bodies.
+Presentation acknowledges only the latest successful intent; stale completion cannot replace a newer
+selection. Settings, Fork and image views add no execution/cancellation owner.
+
+Conversation projects physical Running rows from existing Adapters and exact execution/check/
+Rebuild/Fork references. Preparation decorates existing Recent rows as Starting. Private interactions
+supply sanitized status; attention shares the workspace's pure Session-issues predicate. Transactions
+update Session flags and Project/global counts together. Initialization pages precede metadata
+availability; recovery touches indexed pending scope, and archive/restore only the affected Project.
+Progress/token events and native reads never recompute/write metadata; unread answers remain separate.
+
+Quit preparation seals admission only after matching known-idle preflight; it neither flushes nor
+releases resources. Active, late or unavailable results require confirmation. Cancel awaits the same
+operation's response; confirmation authorizes the existing physical shutdown owner. System logout
+bypasses confirmation. Unconfirmed physical exit retains tray/window. After owner cleanup, Utility
+publishes bounded final MRU before database close and shutdown ACK. Main retains cold recent tasks
+and honors removed entries. There is no new shutdown deadline, replacement runtime or mutation replay.
+
+### Archive and other projections
+
+Workspace archive coordination belongs to Conversation. Named prepare/read/cancel operations pass
+through frame-validated Main and the typed Preload bridge; Renderer owns one disposable confirmation
+and updates catalog/Undo only on confirmed success. The archive repositories retain Session/Project
+mutation ownership. SQLite archive operation receipts bind an immutable scope and captured task
+identities to a nonce. Confirmation claims the scope in a transaction before requesting supported
+cancellation; admission and final archive commit honor the persisted scope barrier. Stop acknowledgement
+alone is insufficient: execution/preparation, native background effects and existing Changes
+finalization must settle. The Changes owner shares its actual finishing promise. Native uncertainty
+retains a barrier and readable receipt; restart does not repeat Stop or complete an interrupted
+archive. Reading a settled failed operation releases its barrier without archiving. Same-nonce success
+readback is idempotent. Session archive metadata remains authoritative across late Run status writes.
+Main claims the selected browser profile's single-instance lock before Utility starts; another launch
+reveals the existing window. Different identities and repository-partitioned development profiles
+retain independent locks.
 
 `appendAgentEvent` allocates each Session Journal sequence within the same SQL insertion/transaction. Callers must not reserve `MAX(sequence)+1` before nested appends can consume it. Rollback preserves sequence/fact consistency. Journal accompanies repository transitions; it is not yet complete replay or disaster recovery.
 
@@ -162,7 +254,31 @@ All path/object/hash/mode/candidate preflight completes before mutation and reva
 
 Images are UUID originals/thumbnails outside Project, with ordered immutable refs. Bytes/Base64/paths never enter Patches/Journal/ordinary logs. Main owns selection/trusted document identity; Renderer gets refs/parts. Cancel/removal cannot resurrect draft imports; durable Message/Fork/return refs survive temporary cleanup. Claude actual image blocks and Codex localImage/multimodal history carry original group. Native conversion is not compared with Pact original SHA or downgraded to text. Native compaction never rewrites Pact history or triggers hidden recap/Rebuild. Sharp is desktop runtime dependency in Utility codec Worker, covered by packaged restart smoke. Slides own URLs/reads; close/switch waits for actual Worker settlement before freeing physical capacity.
 
-Appearance is App-global, separate from Session revisions. One controller owns requested/effective material, windows/theme listener, revision ordering, and uncertain-write gate; OS theme cannot unlock it. macOS and Windows 11 build 22621 or newer use transparent `#00000000` backing plus semantic Alpha: no macOS Vibrancy, no Windows Mica/system backdrop. Windows is frameless with native Window Controls Overlay. Solid is complete accessibility/platform/error fallback preserving preferences. Never whole-window opacity. Visible strength 0–100 maps stored 100–70/default 85; surfaces vary and text/code/focus stay readable. Selected API state/page Alpha is not compositor proof: validate actual rear-window pixels/native controls/package per platform. See [DESIGN](../apps/desktop/DESIGN.md).
+Appearance is App-global, separate from Session revisions. One controller owns requested/effective material, windows/theme listener, revision ordering, and uncertain-write gate; OS theme cannot unlock it. macOS and supported Windows Translucent use transparent `#00000000` backing plus semantic Alpha: no macOS Vibrancy, no Windows Mica/system backdrop. Windows Solid is constructed opaque with native thick-frame styles; both Windows modes retain native Window Controls Overlay. Solid is complete accessibility/platform/error fallback preserving preferences. Never use whole-window opacity as a material preference; the Main window owner's bounded visibility fade applies only to macOS and transparent-backed Windows and restores opacity 1. Visible strength 0–100 maps stored 100–70/default 85; surfaces vary and text/code/focus stay readable. Selected API state/page Alpha is not compositor proof: validate actual rear-window pixels/native controls/package per platform. See [DESIGN](../apps/desktop/DESIGN.md).
+
+Before constructing the first workspace, Main waits for the validated Utility `runtime.ready.event`
+and then reads Appearance through its ordinary RPC. Utility publishes readiness only after its
+existing request handler and required owners are initialized; it is not Agent/provider readiness.
+`UtilityProcessClient.waitUntilReady` owns one shared wait and one timer per live child. The first
+10 s absolute deadline starts at fork, separate from the unchanged 2 s read deadline. Timeout does
+not release or restart the child; an explicit Retry can wait again, and a late ready event does not
+create a workspace automatically. Ready, exit, shutdown and disposal settle the wait and clear its
+timer; replacement-child events cannot settle another child's wait. This startup bound is not a
+measured cold-start performance guarantee.
+
+Only after a successful read, `getWindowAppearance` pins the Windows startup preference
+and its resolved native material using the existing material policy. Every recreated workspace in
+that process uses the same native material; subsequent saves update durable preferences but apply
+the pinned background choice until full exit. Main projects optional `restartRequired` through the
+existing validated Appearance snapshot, not a new database field or IPC operation. Theme and strength
+remain live. Accessibility still paints Solid immediately; an opaque window cannot apply newly
+permitted translucency without restart. Calling it before settings are loaded fails instead of
+inventing a preference. NativePresence owns startup Retry/Exit and uses its existing native quit
+fallback while no Renderer is available, including cancellation retry and unconfirmed physical exit.
+Main only composes startup and the existing safe shutdown; late reads cannot bypass a pending quit.
+The controller retains only two finite material values, adds no timers,
+queues or listeners, and releases the startup pin on disposal. Existing revision and uncertain-write
+reconciliation remain authoritative.
 
 Window external-link owner accepts only credential-free bounded trusted HTTP(S), one physical launch. Timeout reports failure but retains active OS slot; no repeat. Other schemes/credentials/oversized URLs fail. This is distinct from live native authorization consent.
 
@@ -170,13 +286,25 @@ Diagnostics uses validated finite operation/method/code/source/executor metadata
 
 ## Distribution channels and packaged verification
 
-Pact Dev uses `com.pact.desktop.dev`; Pact uses `com.pact.desktop`. All development branches share the Dev channel. The builder owns installation/shortcut/uninstall identity; Main reads immutable package metadata and configures the application name, Windows AppUserModelId, native userData, session/cache, logs, database and managed workspace roots. Normal application data lives under the OS appData directory in `Pact Dev` or `Pact`; source development also uses the Dev root. The repository's `.pact-data/dev` database remains independent tooling data and is not copied or adopted automatically. Test root overrides do not establish normal production-path correctness.
+The shared registry owns four identities: local development/Production, CI `Pact Dev` and Stable
+`Pact`. CI development branches share one channel; local data and historical object roots remain
+unchanged. Profile configuration precedes the single-instance lock; fixture overrides do not prove
+normal production-path correctness.
 
-`version.json` is the product version authority. The distribution entry point verifies the desktop package version and checked-out source SHA. Stable builds use that product version; Dev builds inject a platform-compatible prerelease with build number and source identity only in the build workspace, then restore the original metadata after checking its hash. Manual native OS/architecture builds support Windows x64 NSIS installers and macOS arm64 DMG/ZIP artifacts. Automatic installer jobs and Stable publication remain disabled unless `PACT_PACKAGING_READY` is explicitly true after native-machine acceptance. Windows arm64 installer build, installation acceptance and publication are deferred (TODO); its UI/deterministic and native protocol checks remain mandatory. Windows certificate signing and macOS distribution-certificate signing/notarization are not enabled; macOS retains explicit ad-hoc signing. Dependency rebuilding, sandboxing, Context Isolation, ASAR integrity and the existing fuses remain required.
+`version.json` owns the product version. Distribution verifies desktop version and checked-out SHA,
+injects a compatible Dev prerelease/build/source identity or Stable version, then hash-checks metadata
+restoration. Native Windows x64 produces NSIS; macOS arm64 produces DMG/ZIP. Separate native package, installed-smoke and core E2E jobs gate delivery and publication. Windows ARM64 CI/installers
+remain deferred. Certificate signing/notarization stay disabled; macOS retains ad-hoc signing.
+Native dependency rebuilding, sandboxing, Context Isolation, ASAR integrity and fuses remain required.
 
-The manifest records channel, version, source identity, OS, architecture, application identity, installation-artifact hashes and the final signed application-content hash. Smoke takes that explicit manifest and validates the installed or extracted application, including native dependencies and a cold restart. An unpacked-directory check is identified separately and cannot satisfy an installation gate. The optional normal-path probe exits before starting Utility, a database, providers or diagnostic Workers and never bypasses the normal channel single-instance lock.
+The manifest binds channel/version/source/OS/architecture/identity, artifact hashes and final signed
+application-content hash. Smoke validates exact installed/extracted bytes, native dependencies and
+cold restart. Directory-only checks cannot satisfy installation acceptance. The normal-path probe
+exits before Utility, database, providers, Renderer or diagnostic Workers and retains single-instance
+rules. Explicit local profiles use the same manifest-based verification without becoming CI Releases.
 
-These interfaces are implemented verification paths, not complete platform acceptance. Windows arm64 installers remain deferred (TODO). Windows x64 installed-launch validation and full Windows/macOS Dev/Stable coexistence, upgrade and uninstall debugging still need their actual acceptance evidence. Publication requires enforceable repository gates, authorized environments, all required platforms and complete validation bound to the final application and installer hashes. Missing or ambiguous provenance, failed checks and absent performance evidence block publication.
+These interfaces require actual platform evidence for coexistence, upgrades and uninstall cleanup.
+Publication uses the exact merged version-PR source and same-run package IDs/digests with matching installed evidence. A separate main-only publisher reconciles one Draft, verifies uploaded bytes and native immutable Release integrity, then finalizes standard version labels before maintaining the next PR. Native review rules exempt only the owner-author; CI is never bypassed and Merge stays manual. Model and version-bot environments use ref restrictions without runtime approvals. Missing evidence, expired artifacts or uncertain writes stop; no signed controller, staging Release or alternate recovery path is retained.
 
 ## Verification and remaining scope
 
@@ -203,6 +331,81 @@ Performance is a correctness property for long-running local Sessions on macOS a
 - Cache keys include effective executable/configuration/CWD generation and relevant binding/executor. Use capacity, byte budget, TTL/LRU, single-flight, explicit invalidation. Ready/auth state is not indefinitely cached.
 - Separate platform evidence. A macOS result does not verify Windows, build success does not verify performance, and scoped reruns do not turn a failed broad run into a full pass.
 - An in-scope acceptance failure blocks delivery. Raise no budget to obtain passing results without new product evidence and user approval. Existing documented gaps may be preserved by unrelated work but not worsened.
+
+Project context remains a disposable Renderer projection. ProjectCatalog resolves the saved canonical directory and reads Git HEAD in Utility through the existing bounded Git owner. Branch inspection checks at most 128 ancestor directory markers under the same read deadline, stopping at the nearest `.git` file/directory or filesystem root. Nested selections retain their exact Project identity/classification; only branch metadata follows the containing repository. Exhausted discovery fails visibly rather than classifying an unchecked ancestor as absent. Main opens only that registered directory after revalidating the calling frame; Renderer copies validated text with the browser clipboard API. One Utility context read is active, same-Project requests share it, and other Projects receive a visible busy result; there is no queue, cache or polling. The read aborts after 2 s, shares Git's five-child/output/exit bounds, and uses the normal 5 s Main RPC. Context identifiers are bounded (path 32,768 units; folder/branch 4096); a complete receipt stays below 128 KiB. Shutdown aborts and drains the read before closing persistence. One native directory launch has no queue, a 5 s reporting deadline after resolution, and retains its slot until physical completion; disposal clears its timer. Renderer owns one context, one copy-feedback timer (1.6 s), and focus/visibility listeners only while visible. One active read retains at most one latest refresh intention; a generation fence rejects superseded, hidden and disposed results. Session switches dispose the view. The existing AppInfo platform selects Finder, Explorer or generic folder wording without another native query. Restart reads current facts afresh.
+
+The Main window owner applies the Windows 8px corner region only to transparent-backed windows, on creation and native resize/maximize/full-screen changes. Each update uses at most 17 rectangles and no timer, IPC or cache; five window-state listeners are removed on close. Maximized/full-screen regions are rectangular. The native region clips content and pointer input, including when accessibility paints that window Solid. Opaque Solid Windows windows do not call `setShape` and leave corners/shadow to the system; macOS retains native rounding. Restart recreates the region from current native window configuration.
+
+The same Main window owner selects the pointer display's work area in DIP, computes centered 80%
+startup bounds with a 720 by 520 minimum capped to that work area, and owns workspace presentation.
+Its typed show/hide interface is passed to NativePresence before loading; first readiness, tray,
+Session navigation and close-to-tray use that one presentation owner. No Renderer IPC, persistence,
+geometry cache or experimental window-state persistence is added. Reveal checks the existing title
+bar's reachability and recovers inaccessible geometry without resetting ordinary warm reveals.
+
+Per window, presentation retains one latest visibility target, one active transition record and at
+most one 16 ms timer. Durations are 150 ms in and 100 ms out; reversal scales the remaining duration
+from current opacity. Monotonic elapsed time skips stale frames after a delayed tick instead of
+queuing frames. System animation preferences are read on each new transition, without polling;
+disabled/reduced motion, native minimize/restore and fullscreen use immediate/native behavior.
+Resize and window-state events cancel a fade, restore opacity 1, and complete an interrupted hide
+when it remains the latest visibility intent. They never show a window over a native state change.
+Destruction cancels the timer
+and removes the seven presentation listeners; restart recreates transient state. Visibility changes
+do not await Utility work or delay physical application shutdown, and Appearance retains sole
+ownership of persistent material preferences.
+
+Opaque Solid Windows presentation bypasses the custom fade branch entirely, including opacity resets;
+show/hide and minimize/restore use native window operations. No opacity writes, shape mutations or
+animation timer turn that window into a custom layered animation surface. Its native minimize,
+maximize and restore effects remain subject to Windows settings and actual platform verification.
+
+NativePresence owns one menu/snapshot of at most 15 Session rows and 32 KiB, one metadata read with
+one coalesced dirty flag, one latest navigation and one quit confirmation. Native RPCs allow 5 s;
+quit preparation has one 15 s logical seal timer and never changes the physical shutdown budget.
+The client never sends quit preparation before runtime readiness and returns explicit not-sent
+evidence without a deferred send. Only that evidence permits local cancellation; attempted delivery
+requires Utility cancellation acknowledgement. Conversation installs its bounded quit owner before
+querying metadata and caches the complete success or uncertain result. Failed queries remain
+cancellable, duplicate preparations do not requery or extend the timer, and wrong operation IDs
+remain rejected.
+The current trusted primary Renderer becomes eligible for Pact quit confirmation after its existing
+initial quit-state read, following listener installation. NativePresence owns nine window/content
+listeners that invalidate readiness on main-document navigation, failed load or crash and track
+responsiveness. It detaches them on replacement, destruction and disposal. One native fallback task
+handles unavailable confirmation UI, rechecks availability before each presentation and reconciles
+the current operation when its dialog settles. A recovered Pact UI retains cancellation errors;
+stale dialog responses cannot decide a newer operation. No new readiness timer or shutdown owner
+is introduced, and closing never recreates a destroyed workspace. Native confirmation waits for
+application readiness. Presentation failure retains the quit owner without automatic retry; a
+later explicit Show or Quit may retry it.
+During accepted shutdown, Main retains the existing desktop IPC, Appearance and application-menu
+owners until Electron's `will-quit` event, following document shutdown. Native window `closed`
+alone is not an IPC-drain receipt. After confirmed physical Utility exit, Main closes diagnostics,
+disposes NativePresence and requests ordinary Electron quit; one process-lifetime `will-quit`
+listener then releases the remaining desktop owners. Cancellation retains the same live owners;
+uncertain physical exit keeps the closing workspace available without starting another runtime.
+Disposal removes subscriptions, IPC handlers, tray/menu references and its transient projections.
+Restart rebuilds menus from current durable facts and existing live owners, with no navigation replay.
+
+Native menu reads use partial MRU/attention indexes, at most 18 recent or 14 attention candidates,
+at most eight live interactions and the existing five physical Adapters. Each candidate uses indexed
+current metadata lookups, not history aggregation or JSON/body decoding. The App attention view
+renders five rows per incarnation/revision-fenced keyset page with one active read and one latest
+pending intent. Initialization and restart recovery yield after at most 25 Session IDs. Final quit
+MRU merges at most ten indexed candidates and resolves five rows before the existing shutdown ACK.
+Opening/suppression writes use primary keys; attention facts use current Agent/generation and
+completed-visible-response indexes. Required measurements include these query plans, returned rows,
+lookup counts, changed-scope write cost and zero native projection SQL during token progress while
+unrelated retained history grows tenfold.
+
+Renderer opening notifications have one in-flight request and at most 18 coalesced Session intents,
+each with a 5 s pending TTL. Capacity, expiry and uncertain delivery report a visible error, preserving
+the accepted selection without blindly repeating its mutation. Navigation, attention and quit
+listeners are installed before their initial read; matching acknowledgment cannot clear a newer
+intent. Renderer disposal drops transient intents and view state; durable receipts remain authoritative.
+Windows removed-task inspection accepts at most 1024 OS entries; suppression mutations contain at
+most 64 Session IDs per direction and never consume arbitrary executable arguments.
 
 ### Application, distribution, and database startup
 
@@ -263,35 +466,75 @@ Required SQL: latest Run by Session/creation; latest completed Assistant/mark-re
 
 ### Admission, transport, and processes
 
-| Owner                                   | Numerical bound                                                                                                                                            | Settlement                                                                                                                                                            |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Conversation Run admission              | 5 preparing/active operations App-wide; 0 queued Runs                                                                                                      | Reserve before awaits; sixth refuses before User/Run/Journal write and retains draft; duplicate receipt bypasses new admission                                        |
-| Conversation Adapter lifetime           | 5 total slots including create/title/dispose; ≤ 8 native contexts per Adapter/40 observations App-wide                                                     | Evict only eligible idle owners; pending native work is not TTL-evicted; confirm actual release before reuse                                                          |
-| Conversation native checks/interactions | ≤ 8 checks; ≤ 8 private requests App-wide                                                                                                                  | Operation/Run/generation fences; expiry/abort is application settlement, not a fabricated user/native decision                                                        |
-| Native interaction                      | 10 min absolute response lifetime; ≤ 32 fields/32 KiB request or answer; 4 fields/page; ≤ 64 options                                                       | Question radio rows ≤ 6 choices, longer complete lists use native select; private templates/answers/URLs stay transient; cancel/Stop/dispose invalidates operation    |
-| Main private native detail read         | One result/read owner; 30 s                                                                                                                                | Session/request/generation fence; close/change cancels and clears; no durable private-data overlay                                                                    |
-| Runtime Preparation                     | Fixed child command 4 s; capture ≤ 64 KiB; Main request12 s                                                                                                | Both Agent probes independent; abort closes owned child; no Ready/auth cache or model call                                                                            |
-| DefaultSessionSettings                  | ≤ 4 catalog operations/8 probes; 24 s whole operation; 4 s cleanup reserve; catalog command 15 s; Main25 s                                                 | Zero-input native catalog; awaits physical close before ACK/disposal; no early capacity release after SDK close                                                       |
-| UtilityProcessClient                    | Default2 s; catalog/workspace5 s; saved workspace file15 s; Skill/image operation12 s; native reply 30 s; Fork prepare45 s/create15 s; normal shutdown 5 s | Request ID/response-kind/one settlement; not-sent versus unknown-delivery; no automatic Utility restart                                                               |
-| Codex connection                        | Init 10 s; Thread RPC 15 s; Turn acceptance 30 s; optional title 2 s                                                                                       | Absolute request deadlines and cancellation; uncertain acceptance persists evidence; title runs after terminal truth                                                  |
-| Claude Adapter                          | Startup/native acceptance 30 s; permission-mode gate15 s; optional title 2 s; interrupt acknowledgement2 s                                                 | Native work/Hook receipt remains authoritative; gate failure ends empty input naturally without inventing termination                                                 |
-| Codex cold feature probe                | 2 s plus1 s exit confirmation; ≤ 64 KiB/256 lines                                                                                                          | Bounded fixed args and owned child; no model input/cached Ready result                                                                                                |
-| Codex loaded Threads                    | ≤ 8 entries/64 KiB each; 5 min idle connection close                                                                                                       | Keyed connection/CWD/config; close/dispose clears; active/unresolved native work is not closed merely by idle age                                                     |
-| Codex pending transport                 | ≤ 64 RPCs; outbound queue ≤ 4096 items                                                                                                                     | Each admitted request owns deadline/abort; final pending count0 after confirmed disposal                                                                              |
-| Codex inbound notifications             | hard 8 MiB/4096 items; high 4 MiB, low 2 MiB; count pause at 2048                                                                                          | Independent hysteresis latch; parsing pause cannot choose low-water incorrectly; RPC/control bypass, ACK/cancel/deadline re-evaluate pause                            |
-| Codex framing/managed parse admission   | Compatibility single-frame bound16 MiB (`128 MiB/8`); 8× raw/decoded/Worker/clone estimate; 4×64 KiB framing workspace                                     | Reject while framing, not after unlimited newline accumulation; correct split UTF-8/FIFO; one physical parser per Connection                                          |
-| NativeFrameWriter                       | One exclusive writer; ≤ 64 KiB chunk; 10 s whole-frame deadline                                                                                            | At most one chunk/drain pending; no control interleaving into partial JSONL; post-first-byte logical cancel lets frame finish; transport failure retains uncertainty  |
-| Codex stderr                            | ≤ 16 KiB                                                                                                                                                   | Drain without unbounded retained output; discovery stderr can be discarded; close removes listeners                                                                   |
-| Codex connection listeners              | ≤ 9 background /8 server-request listeners                                                                                                                 | Owner removes on settlement/disposal; late actor/generation facts cannot become current                                                                               |
-| Early native facts / Connection         | ≤ 128 items/8 MiB; 30 s attribution                                                                                                                        | Retain managed reservation across callbacks/requeue; empty replay clears timer; expiry/close/dispose releases same reservation                                        |
-| Terminal evidence cache / Adapter       | ≤ 8 entries/16 MiB managed bytes; recent-access ordering                                                                                                   | Capacity eviction only of cached evidence, not unresolved physical work; dispose clears                                                                               |
-| Agent answer assembly                   | ≤ 128 output identities; ID ≤ 512 B; Native managed allocation below                                                                                       | Complete body size is no longer the old 1 MiB logical limit; preserve ordered items/durable seal and exact source                                                     |
-| Native working memory                   | 128 MiB per named owner; 512 MiB shared App                                                                                                                | Charge SDK/encoder copies, raw/decode/Worker/receiving clones, queues, answers, evidence and counting workspace before construction; not process RSS                  |
-| Native JSON parser                      | ≤ 5 physical Workers/8 waiters; 10 s includes admission; heap old 128/young 8/stack 4 MiB                                                                  | Caller reserves work before Worker; abort/OOM/timeout await termination before returning capacity                                                                     |
-| Native title synchronization            | ≤ 5 tasks; one in-flight/latest flag per Session; ≤ 3 revisions/4 s; RPC 2 s/8 KiB                                                                         | Existing initialized connection only; pump rechecks owner after backpressure; uncertain write blocks later executor writes; cancel/await on eviction/dispose          |
-| Metadata Session title                  | ≤ 120 characters; one accepted root result                                                                                                                 | Existing native tool server below; actual adoption index is authority, never a provider-controlled flag                                                               |
-| OwnedProcessGroup                       | 256 identities/32 KiB; 4 s cleanup; 250 ms TERM grace                                                                                                      | POSIX identity query 1 s/256 KiB/4096 rows; one shared in-flight observation, no cache; startup ≤ 20 observations/2 s; prove child close/group absence before release |
-| Codex explicit Stop command ownership   | ≤ 64 commands; identity ≤ 64 KiB; discovery ≤ 256 KiB; 5 s stop                                                                                            | Verify original child ancestry; cleanup does not imply delivered task ended; no external writer kill                                                                  |
+Archive coordination permits at most five in-flight operations with no queue; each preview/receipt
+contains at most five distinct task identities. Overflow refuses instead of hiding affected work.
+One open preview per Utility expires after 120 s and stores at most 16 KiB; one receipt read is at most
+32 KiB. Durable completed/unresolved receipts are not a resident cache or a total-history cap.
+One stopping chain has a 15 s monotonic reporting deadline and one 100 ms wait timer; it checks the
+bounded existing owners rather than repeatedly scanning a Project. Main archive RPC allows 20 s.
+Timeout disables that operation's final commit, preserves unresolved native reservations and reports
+unarchived outcomes. Disposal ends the reporting chain; restart reads durable facts without replay.
+Scope queries use indexed metadata and primary-key receipt reads; representative SQL and physical
+settlement checks remain required independently of build or visual evidence.
+
+Rebuild candidate checks cannot enter a stopping or archived scope; unresolved scopes permit reading
+native evidence but not activating a binding. Candidate activation revalidates archive availability
+inside its binding transaction after any completed-nonce readback. WorkspaceChanges retains each
+finishing Run's recording slot until its directory handle and disposable staging are physically
+released; disposal joins the same complete finish promise. A rejected close or staging cleanup
+retains the original failed owner and outcome until process exit. Recording preparations and Undo
+retain their own existing slots, actual handles, and unreleased scratch credits on cleanup failure;
+scope settlement reads all three owners without retrying close, Stop, finalization, or file writes.
+An invalidated JavaScript descriptor alone is not evidence of physical release.
+
+Main's normal Utility shutdown keeps its existing five-second deadline: up to four seconds for the
+flush response and the remaining time for actual child exit. A kill request does not release the
+child identity. Unconfirmed exit reports uncertainty and keeps Main and its profile alive; the
+existing exit notification completes quitting when the old child actually exits. No replacement
+Utility, polling, or additional shutdown deadline is introduced.
+
+App owns the archive-result projection and the single prepare/confirm/check/restore action gate.
+ArchiveNotice receives result rows and named callbacks; it owns only disclosure, details, page and
+keyboard-focus state. The projection retains at most 50 entries, each bounded by the archive DTOs
+and 2048-character local error text (at most 64 KiB serialized UTF-16 per entry, 3.2 MiB aggregate).
+The view renders ten entries per page and at most five Stop outcomes per expanded entry. Admission
+reserves an entry before prepare; a full projection refuses another archive instead of evicting Undo
+or uncertainty. One scoped Escape listener exists only while expanded and is removed on collapse
+or unmount. No timer, polling, automatic Retry or new persistence owner is added. Explicit
+dismissal releases resolved entries; confirmed restore releases only its own entry. Unconfirmed
+entries retain their original nonce until checked. One action uses the existing Main RPC deadlines;
+the confirmation remains user-owned until Cancel, completion or Renderer disposal. Renderer restart
+clears this projection; durable receipts and scope barriers retain their existing recovery semantics.
+
+| Owner                                   | Numerical bound                                                                                                                                                                             | Settlement                                                                                                                                                               |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Conversation Run admission              | 5 preparing/active operations App-wide; 0 queued Runs                                                                                                                                       | Reserve before awaits; sixth refuses before User/Run/Journal write and retains draft; duplicate receipt bypasses new admission                                           |
+| Conversation Adapter lifetime           | 5 total slots including create/title/dispose; ≤ 8 native contexts per Adapter/40 observations App-wide                                                                                      | Evict only eligible idle owners; pending native work is not TTL-evicted; confirm actual release before reuse                                                             |
+| Conversation native checks/interactions | ≤ 8 checks; ≤ 8 private requests App-wide                                                                                                                                                   | Operation/Run/generation fences; expiry/abort is application settlement, not a fabricated user/native decision                                                           |
+| Native interaction                      | 10 min absolute response lifetime; ≤ 32 fields/32 KiB request or answer; 4 fields/page; ≤ 64 options                                                                                        | Question radio rows ≤ 6 choices, longer complete lists use native select; private templates/answers/URLs stay transient; cancel/Stop/dispose invalidates operation       |
+| Main private native detail read         | One result/read owner; 30 s                                                                                                                                                                 | Session/request/generation fence; close/change cancels and clears; no durable private-data overlay                                                                       |
+| Runtime Preparation                     | Fixed child command 4 s; capture ≤ 64 KiB; Main request12 s                                                                                                                                 | Both Agent probes independent; abort closes owned child; no Ready/auth cache or model call                                                                               |
+| DefaultSessionSettings                  | ≤ 4 catalog operations/8 probes; 24 s whole operation; 4 s cleanup reserve; catalog command 15 s; Main25 s                                                                                  | Zero-input native catalog; awaits physical close before ACK/disposal; no early capacity release after SDK close                                                          |
+| UtilityProcessClient                    | Startup ready10 s from fork; default RPC2 s; catalog/workspace5 s; saved workspace file15 s; Skill/image operation12 s; native reply 30 s; Fork prepare45 s/create15 s; normal shutdown 5 s | One startup waiter/timer per child; explicit startup Retry only; request ID/response-kind/one settlement; not-sent versus unknown-delivery; no automatic Utility restart |
+| Codex connection                        | Init 10 s; Thread RPC 15 s; Turn acceptance 30 s; optional title 2 s                                                                                                                        | Absolute request deadlines and cancellation; uncertain acceptance persists evidence; title runs after terminal truth                                                     |
+| Claude Adapter                          | Startup/native acceptance 30 s; permission-mode gate15 s; optional title 2 s; interrupt acknowledgement2 s                                                                                  | Native work/Hook receipt remains authoritative; gate failure ends empty input naturally without inventing termination                                                    |
+| Codex cold feature probe                | 2 s plus1 s exit confirmation; ≤ 64 KiB/256 lines                                                                                                                                           | Bounded fixed args and owned child; no model input/cached Ready result                                                                                                   |
+| Codex loaded Threads                    | ≤ 8 entries/64 KiB each; 5 min idle connection close                                                                                                                                        | Keyed connection/CWD/config; close/dispose clears; active/unresolved native work is not closed merely by idle age                                                        |
+| Codex pending transport                 | ≤ 64 RPCs; outbound queue ≤ 4096 items                                                                                                                                                      | Each admitted request owns deadline/abort; final pending count0 after confirmed disposal                                                                                 |
+| Codex inbound notifications             | hard 8 MiB/4096 items; high 4 MiB, low 2 MiB; count pause at 2048                                                                                                                           | Independent hysteresis latch; parsing pause cannot choose low-water incorrectly; RPC/control bypass, ACK/cancel/deadline re-evaluate pause                               |
+| Codex framing/managed parse admission   | Compatibility single-frame bound16 MiB (`128 MiB/8`); 8× raw/decoded/Worker/clone estimate; 4×64 KiB framing workspace                                                                      | Reject while framing, not after unlimited newline accumulation; correct split UTF-8/FIFO; one physical parser per Connection                                             |
+| NativeFrameWriter                       | One exclusive writer; ≤ 64 KiB chunk; 10 s whole-frame deadline                                                                                                                             | At most one chunk/drain pending; no control interleaving into partial JSONL; post-first-byte logical cancel lets frame finish; transport failure retains uncertainty     |
+| Codex stderr                            | ≤ 16 KiB                                                                                                                                                                                    | Drain without unbounded retained output; discovery stderr can be discarded; close removes listeners                                                                      |
+| Codex connection listeners              | ≤ 9 background /8 server-request listeners                                                                                                                                                  | Owner removes on settlement/disposal; late actor/generation facts cannot become current                                                                                  |
+| Early native facts / Connection         | ≤ 128 items/8 MiB; 30 s attribution                                                                                                                                                         | Retain managed reservation across callbacks/requeue; empty replay clears timer; expiry/close/dispose releases same reservation                                           |
+| Terminal evidence cache / Adapter       | ≤ 8 entries/16 MiB managed bytes; recent-access ordering                                                                                                                                    | Capacity eviction only of cached evidence, not unresolved physical work; dispose clears                                                                                  |
+| Agent answer assembly                   | ≤ 128 output identities; ID ≤ 512 B; Native managed allocation below                                                                                                                        | Complete body size is no longer the old 1 MiB logical limit; preserve ordered items/durable seal and exact source                                                        |
+| Native working memory                   | 128 MiB per named owner; 512 MiB shared App                                                                                                                                                 | Charge SDK/encoder copies, raw/decode/Worker/receiving clones, queues, answers, evidence and counting workspace before construction; not process RSS                     |
+| Native JSON parser                      | ≤ 5 physical Workers/8 waiters; 10 s includes admission; heap old 128/young 8/stack 4 MiB                                                                                                   | Caller reserves work before Worker; abort/OOM/timeout await termination before returning capacity                                                                        |
+| Native title synchronization            | ≤ 5 tasks; one in-flight/latest flag per Session; ≤ 3 revisions/4 s; RPC 2 s/8 KiB                                                                                                          | Existing initialized connection only; pump rechecks owner after backpressure; uncertain write blocks later executor writes; cancel/await on eviction/dispose             |
+| Metadata Session title                  | ≤ 120 characters; one accepted root result                                                                                                                                                  | Existing native tool server below; actual adoption index is authority, never a provider-controlled flag                                                                  |
+| OwnedProcessGroup                       | 256 identities/32 KiB; 4 s cleanup; 250 ms TERM grace                                                                                                                                       | POSIX identity query 1 s/256 KiB/4096 rows; one shared in-flight observation, no cache; startup ≤ 20 observations/2 s; prove child close/group absence before release    |
+| Codex explicit Stop command ownership   | ≤ 64 commands; identity ≤ 64 KiB; discovery ≤ 256 KiB; 5 s stop                                                                                                                             | Verify original child ancestry; cleanup does not imply delivered task ended; no external writer kill                                                                     |
 
 There is no native meaningful-progress inactivity classifier anymore: the old renewable five-minute timeout, stable-absence resend, polling reconciliation, latest40/50,000 B reconstruction, and read-only fresh-generation Retry policy are superseded by evidence-only recovery. Five minutes now denotes idle connection lifetime, not a Turn deadline. Unknown delivery and unresolved background work cannot be shortened away to release slots.
 

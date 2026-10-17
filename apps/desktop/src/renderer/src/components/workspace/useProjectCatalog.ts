@@ -17,7 +17,7 @@ interface ProjectCatalogFlow {
   error: string | undefined
   retry(): void
   chooseAndAdd(): Promise<void>
-  archive(projectId: string): Promise<boolean>
+  archive(projectId: string, operationId?: string): Promise<boolean>
   restore(projectId: string): Promise<boolean>
   rename(projectId: string, name: string): Promise<RpcResult<ProjectNameChange>>
 }
@@ -76,12 +76,17 @@ export function useProjectCatalog(enabled: boolean): ProjectCatalogFlow {
     }
   }
 
-  const archive = async (projectId: string): Promise<boolean> => {
+  const archive = async (projectId: string, operationId?: string): Promise<boolean> => {
     if (!(await beginMutation())) return false
     setArchivingProjectId(projectId)
     setActionError(undefined)
     try {
-      const result = await window.pact.archiveProject(projectId)
+      let result = await window.pact.archiveProject(projectId, operationId)
+      if (!result.ok && result.error.code === 'UNCERTAIN' && operationId) {
+        const receipt = await window.pact.readWorkspaceArchive({ operationId })
+        if (receipt.ok && receipt.value.state === 'archived')
+          result = await window.pact.archiveProject(projectId, operationId)
+      }
       if (result.ok) {
         queryClient.setQueryData(projectCatalogQueryKeys.catalog, result.value)
         return true

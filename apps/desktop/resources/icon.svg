@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>Pact</title>
+  <desc>Two complementary strokes form a shared P, on Pact's midnight canvas.</desc>
+  <rect x="8" y="8" width="496" height="496" rx="112" fill="#0f1720"/>
+  <path d="M164 376V184c0-40 32-72 72-72h24" fill="none" stroke="#ebf5ff" stroke-width="56" stroke-linecap="round"/>
+  <path d="M290 112c57 0 102 43 102 98s-45 98-102 98h-54" fill="none" stroke="#a9dfc3" stroke-width="56" stroke-linecap="round"/>
+</svg>

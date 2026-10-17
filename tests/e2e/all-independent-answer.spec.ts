@@ -5,6 +5,7 @@ import { resolve } from 'node:path'
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { quitPact } from './native-quit.js'
 import { createRuntimeFixture, test } from './runtime-fixture.js'
 
 test(
@@ -137,7 +138,7 @@ test(
       )
       expect(answers).toEqual(['claude', 'codex'])
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },

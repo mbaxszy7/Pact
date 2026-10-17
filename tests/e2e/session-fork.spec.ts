@@ -7,6 +7,7 @@ import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { agentRuns, conversationMessages } from '../../packages/persistence/src/schema/index.js'
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture, type RuntimeFixture } from './runtime-fixture.js'
 
@@ -313,7 +314,7 @@ test(
       await expect(page.getByRole('dialog')).toContainText(/codex.*(?:history|source)/iu)
       await expect(page.getByRole('button', { name: 'Create fork', exact: true })).toBeDisabled()
       await page.getByRole('button', { name: 'Cancel', exact: true }).click()
-      await app.close()
+      await quitPact(app)
       app = undefined
       const db = await PactDatabase.open({ filePath: fixture.databaseFile, migrationsFolder })
       try {
@@ -326,7 +327,7 @@ test(
         db.close()
       }
     } finally {
-      await app?.close()
+      if (app) await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -355,7 +356,7 @@ test(
       await expect(
         page.getByRole('button', { name: 'Continue native fork', exact: true }),
       ).toHaveCount(2)
-      await app.close()
+      await quitPact(app)
       app = undefined
       const db = await PactDatabase.open({ filePath: fixture.databaseFile, migrationsFolder })
       try {
@@ -369,7 +370,7 @@ test(
         db.close()
       }
     } finally {
-      await app?.close()
+      if (app) await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -444,7 +445,7 @@ for (const resolvedModel of ['custom-fixture-one[1m]', 'custom-fixture-two']) {
         await expect(page.getByText('Bounded lifecycle response.', { exact: true })).toHaveCount(0)
         await expect.poll(() => composer.textContent()).toBe('Keep the source draft')
       } finally {
-        await app?.close()
+        if (app) await quitPact(app)
         await fixture.dispose()
       }
     },
@@ -491,7 +492,7 @@ test(
         recovery.getByRole('button', { name: 'Continue initialization', exact: true }),
       ).toBeEnabled()
       expect((await fixture.readClaudeFacts()).settingsReads).toBe(before.settingsReads)
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       page = await app.firstWindow()
       await page.getByRole('button', { name: 'Native fork source (fork)', exact: true }).click()
@@ -515,7 +516,7 @@ test(
         (await fixture.readCodexFacts()).methods.filter((method) => method === 'thread/fork'),
       ).toHaveLength(1)
     } finally {
-      await app?.close()
+      if (app) await quitPact(app)
       await fixture.dispose()
     }
   },

@@ -1,7 +1,11 @@
 import { app } from 'electron'
-import { randomUUID } from 'node:crypto'
-import { realpathSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { mkdirSync, realpathSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
+
+import type { ApplicationIdentity } from '../application-identity'
+
+import { defaultProductPaths, readProductIdentity } from '../product-identity'
 
 export interface RuntimePaths {
   databaseFile: string
@@ -13,6 +17,43 @@ export interface RuntimePaths {
 const TEST_DATABASE_FILE_ENV = 'PACT_TEST_DB_FILE'
 const TEST_APPEARANCE_WRITE_FAILURE_ENV = 'PACT_TEST_APPEARANCE_WRITE_FAILURE'
 const ISOLATED_ROOT_ENV = 'PACT_E2E_ROOT'
+const repositoryRoot = resolvePath(__dirname, '../../../..')
+const repositoryIdentity = createHash('sha256').update(repositoryRoot).digest('hex')
+
+let configuredDefaultPaths: ReturnType<typeof defaultProductPaths> | undefined
+
+/** Sole browser-profile owner; local durable paths remain repository compatible. */
+export function configureApplicationProfile(identity: ApplicationIdentity): void {
+  const root = isolatedRoot()
+  if (root) {
+    const appData = join(root, 'channel-app-data')
+    mkdirSync(appData, { recursive: true, mode: 0o700 })
+    app.setPath('appData', appData)
+  }
+  const paths = defaultProductPaths(readProductIdentity(identity), repositoryIdentity)
+  mkdirSync(paths.sessionData, { recursive: true, mode: 0o700 })
+  app.setPath('userData', paths.userData)
+  app.setPath('sessionData', paths.sessionData)
+  app.setAppLogsPath(paths.logs)
+  configuredDefaultPaths = {
+    userData: app.getPath('userData'),
+    sessionData: app.getPath('sessionData'),
+    logs: app.getPath('logs'),
+  }
+  if (
+    root &&
+    !(
+      process.env.PACT_PACKAGE_SMOKE === '1' &&
+      process.env.PACT_PACKAGE_SMOKE_PHASE === 'production-paths'
+    )
+  )
+    configureIsolatedProfile()
+}
+
+export function readConfiguredDefaultPaths(): ReturnType<typeof defaultProductPaths> {
+  if (!configuredDefaultPaths) throw new Error('Product paths have not been configured.')
+  return configuredDefaultPaths
+}
 
 /** Data location only: isolated launches retain the normal IPC, permissions and runtime. */
 export function configureIsolatedProfile(): void {
@@ -33,8 +74,6 @@ function isolatedRoot(): string | undefined {
 }
 
 export function resolveRuntimePaths(): RuntimePaths {
-  const repositoryRoot = resolvePath(__dirname, '../../../..')
-
   const root = isolatedRoot()
   if (root) {
     const databaseFile = join(root, 'pact.sqlite')
@@ -75,11 +114,22 @@ export function resolveRuntimePaths(): RuntimePaths {
     }
   }
 
+  if (app.isPackaged)
+    return {
+      databaseFile: join(app.getPath('userData'), 'pact.sqlite'),
+      workspaceStorageRoot: join(app.getPath('userData'), 'workspace-versions'),
+      migrationsFolder: join(process.resourcesPath, 'persistence-migrations'),
+    }
+
   return {
-    databaseFile: join(app.getPath('userData'), 'pact.sqlite'),
-    workspaceStorageRoot: join(app.getPath('userData'), 'workspace-versions'),
-    migrationsFolder: app.isPackaged
-      ? join(process.resourcesPath, 'persistence-migrations')
-      : join(repositoryRoot, 'packages/persistence/drizzle'),
+    databaseFile: join(repositoryRoot, '.pact-data/dev/pact.sqlite'),
+    workspaceStorageRoot: join(
+      // Existing development image/file references use this historical object root.
+      app.getPath('appData'),
+      'Pact',
+      'workspace-versions-development',
+      repositoryIdentity,
+    ),
+    migrationsFolder: join(repositoryRoot, 'packages/persistence/drizzle'),
   }
 }
