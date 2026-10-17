@@ -312,11 +312,8 @@ export function ArchiveNotice({
             )
           })}
         </ul>
-        <div className="pact-archive-notice-footer">
-          <p className="text-caption text-secondary">
-            Undo restores visibility. Stopped tasks stay stopped.
-          </p>
-          {pageCount > 1 ? (
+        {pageCount > 1 ? (
+          <div className="pact-archive-notice-footer">
             <div className="pact-archive-result-pages text-caption">
               <button
                 className="pact-archive-notice-button hover:bg-surface-muted disabled:opacity-45"
@@ -340,8 +337,8 @@ export function ArchiveNotice({
                 Next
               </button>
             </div>
-          ) : null}
-        </div>
+          </div>
+        ) : null}
       </div>
     </section>
   )

@@ -50,6 +50,15 @@ a signed production release or evidence that runtime, migration, accessibility o
 identity. Its browser profile is partitioned by repository. The existing development SQLite and
 historical image/Changes object root are retained; no development data is moved or deleted.
 
+On macOS, `dev` and `start` prepare a checkout-local development `.app` under
+`.pact-data/mac-development-runtime/`, with the registry's bundle name, identifier and shared ICNS.
+The generated copy is ad-hoc signed without changing Electron's entitlements or Fuses; pnpm's
+installed Electron remains untouched. The existing electron-vite CLI runs with that executable,
+including normal hot reload. One generated runtime is reused until its source, branding or launcher
+changes. Exit the running development instance before starting another from the same checkout.
+A forcibly terminated launch may leave `launch.lock`; remove only that generated lock after
+confirming the previous instance has exited. This development bundle is not a distribution package.
+
 `pnpm dist:win` and `pnpm dist:mac` explicitly build `Pact - Production - Local`. Its application ID,
 executable/bundle name, installation directory, shortcuts, package identity and persistent profile
 are distinct from the preserved official `Pact` identity. Outputs are ignored under
@@ -175,6 +184,14 @@ total deadline with a five-minute build budget. Forward file names and `--grep` 
 override the project's lane with a second `--project`. UI/native changes follow the visual-first
 acceptance order in [change discipline above](#change-discipline).
 
+Native workspace journeys use the ordinary Pact Quit action and confirm pending work before waiting
+for physical process exit. `tests/e2e/native-quit.ts` provides this bounded teardown; an Electron
+context close alone can wait indefinitely at the application's exit confirmation. macOS Dock
+navigation cases exercise the actual native menu and durable cross-Project recent order. Their
+stale-response check pauses only the validated fixture Utility PID, resumes it in `finally`, and
+requires the newer selection to survive without creating Messages or Runs. These UI/protocol
+fixtures do not establish real-provider execution. The macOS Project-context journey disables Playwright focus emulation before checking actual window return events, and checks clipboard equality inside Main without emitting clipboard contents. The migration fixture applies the original migration prefix through 0060 before testing 0061/0062, comparing all legacy columns and the consistent pre-upgrade backup. Named shared-helper assertion revisions retain the exact helper owner and all registered replacement assertions; the immutable baseline is never regenerated.
+
 Public CI scans history and publication policy, runs quality/build and infrastructure checks, and
 executes UI/deterministic Electron tests plus packaged smoke on macOS and Windows. Native protocol CI
 installs pinned CLIs on macOS and uses dummy authentication/loopback endpoints. External PR jobs do
@@ -288,7 +305,7 @@ large-content policy. Cleanup owns every root, bundle, process, and socket, incl
 `6fade3636a7d77060ec4b35a50cdd764e3726228`. It is source evidence, not an execution report. Its checked
 SHA-256 and bounded loader replace dependence on private Git history; a fresh public clone can audit
 the unchanged 54 original cases and 631 assertion sites. `coverage-manifest.ts` retains original
-identities, assertion mappings, explicit contract revisions, and 12 separately registered business
+identities, assertion mappings, explicit contract revisions, and 14 separately registered business
 expansion obligations. Do not regenerate the baseline from current tests or reset its obligations.
 
 ```sh

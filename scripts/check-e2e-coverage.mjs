@@ -221,6 +221,7 @@ export function sourceEvidence(path, text, { baseline = false } = {}) {
           ownerSource: ownerNode
             ? text.slice(owner.arguments[0].start, owner.arguments[0].end)
             : undefined,
+          helperName: owner ? undefined : helper?.id?.name,
           signature: JSON.stringify([
             owner ? canonical(ownerNode) : (helper?.id?.name ?? 'module'),
             assertionCanonical(chain),
@@ -281,13 +282,16 @@ export function compareAssertions(path, baseline, current, updates = []) {
     const update = updateByLine.get(assertion.line)
     let required = [assertion.signature]
     if (update) {
-      if (!assertion.ownerSource) throw new Error('Contract update requires an exact test owner')
+      if (!assertion.ownerSource && !assertion.helperName)
+        throw new Error('Contract update requires an exact test or named helper owner')
       required = update.replacementAssertions.map((expression) => {
         if (Buffer.byteLength(expression) > 8192)
           throw new Error('Assertion replacement exceeds its byte bound')
         const parsed = sourceEvidence(
           path,
-          `test(${assertion.ownerSource}, async () => { ${expression} })`,
+          assertion.ownerSource
+            ? `test(${assertion.ownerSource}, async () => { ${expression} })`
+            : `async function ${assertion.helperName}() { ${expression} }`,
         )
         if (parsed.assertions.length !== 1)
           throw new Error('Each replacement must contain exactly one assertion')

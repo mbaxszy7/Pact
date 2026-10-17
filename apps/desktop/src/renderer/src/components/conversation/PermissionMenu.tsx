@@ -52,6 +52,7 @@ export function PermissionMenu({
   run,
   busy,
   disabled,
+  visible = true,
   onSave,
   onNotice,
 }: {
@@ -61,12 +62,16 @@ export function PermissionMenu({
   run?: AgentRun | undefined
   busy?: boolean | undefined
   disabled?: boolean | undefined
+  visible?: boolean | undefined
   onSave: (input: SessionPermissionSaveInput) => Promise<boolean>
   onNotice: (message: string) => void
 }): React.JSX.Element {
   const [confirming, setConfirming] = useState(false)
   const [saving, setSaving] = useState(false)
   const panel = useRef<HTMLDivElement>(null)
+  const trigger = useRef<HTMLButtonElement>(null)
+  const open = useRef(false)
+  const resumeFocus = useRef(false)
   const inFlight = useRef(false)
   const mounted = useRef(true)
   useEffect(() => {
@@ -75,6 +80,18 @@ export function PermissionMenu({
       mounted.current = false
     }
   }, [])
+  useEffect(() => {
+    if (!visible) {
+      resumeFocus.current =
+        open.current &&
+        (panel.current?.contains(document.activeElement) ||
+          document.activeElement === trigger.current)
+      panel.current?.hidePopover()
+    } else if (resumeFocus.current) {
+      resumeFocus.current = false
+      trigger.current?.focus({ preventScroll: true })
+    }
+  }, [visible])
   const selected =
     session.settings.permissionModes?.[agent] ?? (agent === 'claude' ? 'ask' : 'native')
   const { label, Icon } = modes[selected]
@@ -123,6 +140,7 @@ export function PermissionMenu({
   return (
     <div className="flex min-h-8 min-w-0 max-w-full flex-wrap items-center gap-2 text-caption">
       <button
+        ref={trigger}
         type="button"
         popoverTarget={id}
         disabled={disabled}
@@ -142,6 +160,7 @@ export function PermissionMenu({
         ref={panel}
         popover="auto"
         onBeforeToggle={(event) => {
+          open.current = event.newState === 'open'
           if (event.newState === 'open') setConfirming(false)
         }}
         style={{

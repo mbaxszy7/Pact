@@ -7,6 +7,7 @@ import type { ConversationImage } from '../../packages/contracts/src/images.js'
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { quitPact } from './native-quit.js'
 import { createRuntimeFixture, test, type RuntimeFixture } from './runtime-fixture.js'
 
 const migrationsFolder = resolve(import.meta.dirname, '../../packages/persistence/drizzle')
@@ -294,7 +295,7 @@ test(
       await expect(editor()).toHaveText('Keep this next question.')
       expect((await fixture.readClaudeFacts()).count).toBe(2)
 
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       page = await app.firstWindow()
       await selectSession(page, sessionId)
@@ -312,7 +313,7 @@ test(
       await expect(preview).toBeFocused()
       expect((await fixture.readClaudeFacts()).count).toBe(2)
     } finally {
-      await app?.close()
+      if (app) await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -463,7 +464,7 @@ test(
       // No Model request launches the synthetic Claude protocol child in this UI-only journey.
       await expect(fixture.readClaudeFacts()).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
-      await app?.close()
+      if (app) await quitPact(app)
       await fixture.dispose()
     }
   },

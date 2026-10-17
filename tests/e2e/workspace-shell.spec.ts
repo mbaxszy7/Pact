@@ -1,5 +1,6 @@
 import { expect, type ElectronApplication, type Page } from '@playwright/test'
 
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture, type RuntimeFixture } from './runtime-fixture.js'
 
@@ -37,7 +38,12 @@ async function addProject(
     }))
   }, projectDirectory)
   await window.getByRole('button', { name: 'Add project', exact: true }).click()
-  await expect(window.getByRole('button', { name: 'layout-project', exact: true })).toBeVisible()
+  await expect(
+    window.getByRole('button', { name: 'Rename Project layout-project', exact: true }),
+  ).toBeVisible()
+  await expect(
+    window.getByRole('button', { name: 'Rename Project layout-project', exact: true }),
+  ).toHaveText('layout-project')
 }
 
 test(
@@ -87,7 +93,7 @@ test(
         .toBeGreaterThan(190)
       await expect(window.getByRole('button', { name: 'Open context panel' })).toHaveCount(0)
     } finally {
-      await electronApp.close()
+      await quitPact(electronApp)
       await fixture.dispose()
     }
   },
@@ -158,7 +164,7 @@ test(
         )
         .toBe(true)
     } finally {
-      await electronApp.close()
+      await quitPact(electronApp)
       await fixture.dispose()
     }
   },

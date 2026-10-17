@@ -79,7 +79,6 @@ describe('Archive result notice', () => {
     expect(
       screen.queryByRole('button', { name: 'Dismiss archive result for Lost receipt' }),
     ).toBeNull()
-    expect(screen.getByText('Undo restores visibility. Stopped tasks stay stopped.')).not.toBeNull()
   })
 
   it('shows partial Project Stop outcomes before offering a fresh review', () => {

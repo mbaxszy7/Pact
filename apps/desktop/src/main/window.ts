@@ -235,8 +235,12 @@ export function createMainWindow(options: CreateMainWindowOptions): BrowserWindo
     hide: () => present(false),
   }
   const nativeStateChanging = (): void => {
+    const finishHiding = transition !== undefined && !wantedVisible
     cancelTransition()
     resetOpacity()
+    // Cancelling a fade must still honor the latest close-to-hide request. Do not
+    // show here: native minimize/fullscreen/restore keeps ownership of its state.
+    if (finishHiding && !window.isDestroyed()) window.hide()
   }
   const enterFullScreen = (): void => {
     fullScreen = true

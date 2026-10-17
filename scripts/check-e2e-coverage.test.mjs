@@ -81,6 +81,47 @@ const update = {
   reason: 'Accepted Comment contract; check creation and cold restart.',
   replacementAssertions: ['expect(drafts).toHaveCount(11)', 'expect(drafts).toHaveCount(11)'],
 }
+
+await test('an explicit shared-helper revision retains helper identity and every exact replacement', () => {
+  const helperBaseline = sourceEvidence(
+    'fixture',
+    `async function addProject() { expect(project).toBeVisible() }`,
+  )
+  const replacements = [
+    'expect(renamedProject).toBeVisible()',
+    'expect(renamedProject).toHaveText("project")',
+  ]
+  const revision = {
+    originalLine: 1,
+    reason: 'The same Project exposes its rename action; retain visible display text.',
+    replacementAssertions: replacements,
+  }
+  const current = sourceEvidence(
+    'fixture',
+    `async function addProject() { ${replacements.join('; ')} }`,
+  )
+  assert.deepEqual(compareAssertions('fixture', helperBaseline, current, [revision]), [])
+  for (const source of [
+    `async function differentHelper() { ${replacements.join('; ')} }`,
+    `async function addProject() { ${replacements[0]} }`,
+    `async function addProject() { expect(renamedProject).toBeVisible(); expect(renamedProject).toHaveText("other") }`,
+  ])
+    assert.equal(
+      compareAssertions('fixture', helperBaseline, sourceEvidence('fixture', source), [revision])
+        .length,
+      1,
+    )
+  assert.throws(
+    () =>
+      compareAssertions(
+        'fixture',
+        sourceEvidence('fixture', 'expect(project).toBeVisible()'),
+        current,
+        [revision],
+      ),
+    /exact test or named helper owner/u,
+  )
+})
 await test('a contract revision requires both exact replacement assertions', () => {
   assert.deepEqual(
     compareAssertions(

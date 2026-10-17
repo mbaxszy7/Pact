@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect } from '@playwright/test'
 import { open } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
@@ -8,7 +8,8 @@ import {
   diagnosticRecordSchema,
   type DiagnosticRecord,
 } from '../../packages/contracts/src/diagnostics.js'
-import { createRuntimeFixture } from './runtime-fixture.js'
+import { quitPact } from './native-quit.js'
+import { createRuntimeFixture, test } from './runtime-fixture.js'
 
 /** UI-only data; Main/Utility, Worker, IPC and log files are the production implementation. */
 test(
@@ -120,6 +121,7 @@ test(
         (await readRecords()).filter((record) => record.requestType === 'runtime.health.request'),
       ).toHaveLength(2)
     } finally {
+      await quitPact(app)
       await fixture.dispose()
     }
   },

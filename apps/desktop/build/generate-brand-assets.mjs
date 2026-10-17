@@ -20,6 +20,22 @@ const renderIcon = (size) => {
   return renderedSizes.get(size)
 }
 
+// macOS displays app artwork inside the icon canvas. Keep the shared mark intact
+// and give Dock PNG and ICNS frames the same transparent optical margin.
+const renderMacIcon = async (size) => {
+  const inset = Math.round(size * 0.08)
+  return sharp(await renderIcon(size - inset * 2))
+    .extend({
+      top: inset,
+      bottom: inset,
+      left: inset,
+      right: inset,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
+    .png()
+    .toBuffer()
+}
+
 const sizes = [16, 20, 24, 32, 40, 48, 64, 128, 256]
 const images = await Promise.all(sizes.map(renderIcon))
 
@@ -45,6 +61,7 @@ await writeFile(join(buildDirectory, 'icon.ico'), createIco(sizes, images))
 const png = await renderIcon(512)
 await writeFile(join(resourcesDirectory, 'icon.png'), png)
 await writeFile(join(buildDirectory, 'icon.png'), png)
+await writeFile(join(buildDirectory, 'icon-mac.png'), await renderMacIcon(512))
 
 // Modern ICNS frames store PNG data; include normal and Retina sizes through 1024px.
 const macFrames = [
@@ -63,7 +80,7 @@ const macFrames = [
 const macChunks = (
   await Promise.all(
     macFrames.map(async ([type, size]) => {
-      const frame = await renderIcon(size)
+      const frame = await renderMacIcon(size)
       const chunkHeader = Buffer.alloc(8)
       chunkHeader.write(type, 0, 'ascii')
       chunkHeader.writeUInt32BE(frame.length + 8, 4)

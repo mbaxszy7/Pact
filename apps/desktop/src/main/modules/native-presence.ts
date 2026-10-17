@@ -189,6 +189,10 @@ function unavailable(message: string): RpcResult<never> {
 export class NativePresence {
   private window: BrowserWindow | undefined
   private presentation: WindowPresentation | undefined
+  private detachWindow: (() => void) | undefined
+  private quitUiReady = false
+  private rendererResponsive = true
+  private shutdownNoticeShown = false
   private tray: Tray | undefined
   private menu: Menu | undefined
   private snapshot: NativePresenceSnapshot | undefined
@@ -291,8 +295,12 @@ export class NativePresence {
   }
 
   attachWindow(window: BrowserWindow, presentation: WindowPresentation): void {
+    this.detachWindow?.()
+    const contents = window.webContents
     this.window = window
     this.presentation = presentation
+    this.quitUiReady = false
+    this.rendererResponsive = true
     const target = this.taskbarTarget
     if (target?.development) {
       window.setAppDetails({
@@ -303,35 +311,97 @@ export class NativePresence {
         relaunchDisplayName: this.identity.name,
       })
     }
-    window.on('close', (event) => {
+    const close = (event: Electron.Event): void => {
       if (this.disposed || this.systemEnding) return
       event.preventDefault()
       presentation.hide()
-    })
-    window.once('closed', () => {
+    }
+    const closed = (): void => {
+      detach()
+      this.refreshQuitFallback()
+    }
+    const documentChanged = (): void => {
+      if (this.window !== window) return
+      this.quitUiReady = false
+      this.rendererResponsive = true
+      this.refreshQuitFallback()
+    }
+    const failedLoad = (
+      _event: Electron.Event,
+      errorCode: number,
+      _description: string,
+      _url: string,
+      isMainFrame: boolean,
+    ): void => {
+      // Aborted navigation can leave the existing Pact document usable.
+      if (this.window !== window || !isMainFrame || errorCode === -3) return
+      this.quitUiReady = false
+      this.refreshQuitFallback()
+    }
+    const loaded = (): void => {
+      if (this.window !== window) return
+      if (this.navigation) this.send(IPC_CHANNELS.nativeNavigationChanged, this.navigation)
+      if (this.quitState) this.send(IPC_CHANNELS.nativeQuitChanged, this.quitState)
+    }
+    const unresponsive = (): void => {
+      if (this.window !== window) return
+      this.rendererResponsive = false
+      this.refreshQuitFallback()
+    }
+    const responsive = (): void => {
+      if (this.window === window) this.rendererResponsive = true
+    }
+    const rendererGone = (): void => {
+      if (this.window !== window) return
+      this.quitUiReady = false
+      this.rendererResponsive = false
+      this.refreshQuitFallback()
+    }
+    const detach = (): void => {
+      window.removeListener('close', close)
+      window.removeListener('closed', closed)
+      window.removeListener('session-end', this.systemShutdown)
+      window.removeListener('unresponsive', unresponsive)
+      window.removeListener('responsive', responsive)
+      contents.removeListener('did-navigate', documentChanged)
+      contents.removeListener('did-fail-load', failedLoad)
+      contents.removeListener('did-finish-load', loaded)
+      contents.removeListener('render-process-gone', rendererGone)
       if (this.window === window) {
         this.window = undefined
         this.presentation = undefined
+        this.quitUiReady = false
       }
-    })
+      if (this.detachWindow === detach) this.detachWindow = undefined
+    }
+    this.detachWindow = detach
+    window.on('close', close)
+    window.once('closed', closed)
     window.on('session-end', this.systemShutdown)
-    window.webContents.on('did-finish-load', () => {
-      if (this.navigation) this.send(IPC_CHANNELS.nativeNavigationChanged, this.navigation)
-      if (this.quitState) this.send(IPC_CHANNELS.nativeQuitChanged, this.quitState)
-    })
-    window.webContents.on('render-process-gone', () => {
-      if (this.quitState?.phase === 'confirming') void this.fallbackQuit()
-    })
+    window.on('unresponsive', unresponsive)
+    window.on('responsive', responsive)
+    contents.on('did-navigate', documentChanged)
+    contents.on('did-fail-load', failedLoad)
+    contents.on('did-finish-load', loaded)
+    contents.on('render-process-gone', rendererGone)
   }
 
   show(): void {
     if (this.disposed || this.systemEnding) return
     if (!this.started) {
       this.showRequested = true
+      this.refreshQuitFallback()
       return
     }
-    if (!this.window || this.window.isDestroyed()) this.createWindow()
+    if (!this.window || this.window.isDestroyed()) {
+      if (this.isClosing()) {
+        this.refreshQuitFallback()
+        return
+      }
+      this.createWindow()
+    }
     this.presentation?.show()
+    this.refreshQuitFallback()
   }
 
   navigate(sessionId: string): void {
@@ -388,11 +458,7 @@ export class NativePresence {
     if (this.systemEnding || this.disposed || !this.publishShell) return Promise.resolve(true)
     if (this.quitOwner) {
       this.show()
-      if (
-        this.quitState?.phase === 'confirming' &&
-        (!this.started || this.window?.webContents.isCrashed())
-      )
-        void this.fallbackQuit()
+      this.refreshQuitFallback()
       return this.quitOwner.promise
     }
     const operationId = randomUUID(),
@@ -403,6 +469,7 @@ export class NativePresence {
       promise: completion.promise,
       resolve: completion.resolve,
     }
+    this.shutdownNoticeShown = false
     const deadline = performance.now() + NATIVE_METADATA_TIMEOUT_MS
     void this.utility.prepareNativeQuit({ operationId }).then((attempt) => {
       if (this.quitOwner?.operationId !== operationId || this.systemEnding) return undefined
@@ -436,7 +503,6 @@ export class NativePresence {
           : {}),
       })
       this.show()
-      if (!this.started || this.window?.webContents.isCrashed()) void this.fallbackQuit()
       return undefined
     })
     return completion.promise
@@ -453,18 +519,47 @@ export class NativePresence {
         'Runtime exit has not been confirmed. Pact is keeping its workspace open while cleanup finishes.',
     })
     this.updateMenu()
-    if (!this.started) {
-      this.fallbackTask ??= dialog
-        .showMessageBox({
-          type: 'warning',
-          title: 'Pact is still closing',
-          message: 'Pact is waiting for its local runtime to exit.',
-          detail:
-            'Cleanup has not been confirmed. Pact will remain running until the runtime exits.',
-          buttons: ['OK'],
-          noLink: true,
-        })
-        .then(() => undefined)
+  }
+
+  private quitUiAvailable(): boolean {
+    const window = this.window
+    return Boolean(
+      this.started &&
+      this.quitUiReady &&
+      this.rendererResponsive &&
+      window &&
+      !window.isDestroyed() &&
+      !window.webContents.isDestroyed() &&
+      !window.webContents.isCrashed() &&
+      [...this.trust.trustedWindows()].includes(window),
+    )
+  }
+
+  private refreshQuitFallback(): void {
+    if (this.disposed || this.systemEnding || this.quitUiAvailable()) return
+    if (this.quitState?.phase === 'confirming') void this.fallbackQuit()
+    else if (
+      this.quitState?.phase === 'unconfirmed' &&
+      !this.shutdownNoticeShown &&
+      !this.fallbackTask
+    ) {
+      this.shutdownNoticeShown = true
+      this.fallbackTask ??= Promise.resolve()
+        .then(() =>
+          dialog.showMessageBox({
+            type: 'warning',
+            title: 'Pact is still closing',
+            message: 'Pact is waiting for its local runtime to exit.',
+            detail:
+              'Cleanup has not been confirmed. Pact will remain running until the runtime exits.',
+            buttons: ['OK'],
+            noLink: true,
+          }),
+        )
+        .then(
+          () => undefined,
+          () => undefined,
+        )
         .finally(() => {
           this.fallbackTask = undefined
         })
@@ -509,14 +604,30 @@ export class NativePresence {
   }
 
   private fallbackQuit(): Promise<void> {
-    this.fallbackTask ??= this.showFallbackQuit().finally(() => {
-      this.fallbackTask = undefined
-    })
+    this.fallbackTask ??= this.showFallbackQuit().then(
+      () => {
+        this.fallbackTask = undefined
+        this.refreshQuitFallback()
+        return undefined
+      },
+      () => {
+        // Presentation failure does not settle the quit operation or replay it.
+        // A later explicit Show/Quit can try to present confirmation again.
+        this.fallbackTask = undefined
+        return undefined
+      },
+    )
     return this.fallbackTask
   }
 
   private async showFallbackQuit(): Promise<void> {
-    while (!this.disposed && !this.systemEnding && this.quitState?.phase === 'confirming') {
+    await app.whenReady()
+    while (
+      !this.disposed &&
+      !this.systemEnding &&
+      this.quitState?.phase === 'confirming' &&
+      !this.quitUiAvailable()
+    ) {
       const state = this.quitState
       const result = await dialog.showMessageBox({
         type: 'warning',
@@ -539,6 +650,7 @@ export class NativePresence {
   private setQuitState(state: NativeQuitState): void {
     this.quitState = nativeQuitStateSchema.parse(state)
     this.send(IPC_CHANNELS.nativeQuitChanged, this.quitState)
+    this.refreshQuitFallback()
   }
 
   private isClosing(): boolean {
@@ -814,6 +926,8 @@ export class NativePresence {
     })
     ipcMain.handle(IPC_CHANNELS.nativeQuitGet, (event) => {
       this.trust.assertTrustedMainFrame(event)
+      // The Pact view installs its quit listener before this initial state read.
+      if (this.window?.webContents === event.sender) this.quitUiReady = true
       return { ok: true, value: this.quitState ?? null }
     })
     ipcMain.handle(IPC_CHANNELS.nativeQuitRespond, (event, raw: unknown) => {
@@ -834,7 +948,7 @@ export class NativePresence {
     app.removeListener('activate', this.activate)
     app.removeListener('second-instance', this.secondInstance)
     if (this.started) powerMonitor.removeListener('shutdown', this.systemShutdown)
-    this.window?.removeListener('session-end', this.systemShutdown)
+    this.detachWindow?.()
     for (const channel of nativeChannels) ipcMain.removeHandler(channel)
     this.tray?.destroy()
     this.tray = undefined

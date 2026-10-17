@@ -496,6 +496,22 @@ function journey(
           ],
         }
       : {}),
+    ...(file === 'workspace-shell.spec.ts' &&
+    title === 'resizes and collapses the Project navigation without squeezing its content'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 39,
+              reason:
+                'The accepted Project name control now exposes its rename action in its accessible name. The same Project must remain visible with the exact original display text.',
+              replacementAssertions: [
+                `expect(window.getByRole('button', { name: 'Rename Project layout-project', exact: true })).toBeVisible()`,
+                `expect(window.getByRole('button', { name: 'Rename Project layout-project', exact: true })).toHaveText('layout-project')`,
+              ],
+            },
+          ],
+        }
+      : {}),
     classification,
     status: 'planned',
     targets,

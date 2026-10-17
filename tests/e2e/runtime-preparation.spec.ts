@@ -4,6 +4,7 @@ import { join } from 'node:path'
 
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
+import { quitPact } from './native-quit.js'
 import { waitForWindowsRuntimeReady } from './real-harness.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture } from './runtime-fixture.js'
@@ -24,7 +25,7 @@ test('shows independent first-use readiness for both CLIs', { tag: '@ui' }, asyn
 
     await expect(window.getByRole('button', { name: 'Continue' })).toBeEnabled()
   } finally {
-    await app.close()
+    await quitPact(app)
     await fixture.dispose()
   }
 })
@@ -51,7 +52,7 @@ test(
       await claudeRow.hover()
       await expect(changePath).toHaveCSS('opacity', '1')
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -95,7 +96,7 @@ test('keeps returning work readable while Agent actions are gated', { tag: '@ui'
       }
     }
   } finally {
-    await app.close()
+    await quitPact(app)
     await fixture.dispose()
   }
 })

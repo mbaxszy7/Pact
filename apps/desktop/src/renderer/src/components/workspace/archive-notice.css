@@ -71,8 +71,7 @@
     overflow-wrap: anywhere;
   }
   .pact-archive-result-label p,
-  .pact-archive-result-detail p,
-  .pact-archive-notice-footer p {
+  .pact-archive-result-detail p {
     margin: 0;
   }
   .pact-archive-result-status {

@@ -1484,6 +1484,7 @@ function App(): React.JSX.Element {
             openingId: crypto.randomUUID(),
           })}
           nativePresentationSuspended={nativeAttentionOpen || Boolean(nativeQuitState)}
+          platform={appInfo?.platform}
           onForkSessionCreated={(change, enter, opening) => {
             acceptSessionCatalogChange(queryClient, change)
             if (enter && opening?.selectionEpoch === userSelectionEpoch.current)

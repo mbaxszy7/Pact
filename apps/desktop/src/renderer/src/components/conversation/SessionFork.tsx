@@ -116,6 +116,7 @@ export function SessionForkDialog({
   suspended?: boolean | undefined
 }): React.JSX.Element {
   const dialog = useRef<HTMLDialogElement>(null)
+  const pausedFocus = useRef<HTMLElement | undefined>(undefined)
   const alive = useRef(true)
   const operationRef = useRef<SessionForkOperation | undefined>(undefined)
   const changeRef = useRef<SessionCatalogChange | undefined>(undefined)
@@ -143,7 +144,16 @@ export function SessionForkDialog({
       return undefined
     }
     element?.showModal()
-    return () => element?.close()
+    const focus = pausedFocus.current
+    if (focus?.isConnected && element?.contains(focus)) focus.focus({ preventScroll: true })
+    return () => {
+      if (
+        document.activeElement instanceof HTMLElement &&
+        element?.contains(document.activeElement)
+      )
+        pausedFocus.current = document.activeElement
+      element?.close()
+    }
   }, [suspended])
   const finishCreation = useCallback(
     (next: SessionForkOperation): void => {

@@ -77,6 +77,65 @@ afterEach(async () => {
 })
 
 describe('Native metadata and quit through production owners', () => {
+  it('deduplicates durable attention from recent Sessions and pages it with revision-fenced cursors', async () => {
+    const f = await fixture()
+    for (const sessionId of f.sessionIds) {
+      f.db.sessionRepository.recordNativeOpened({ sessionId, openingId: randomUUID() })
+    }
+    for (const sessionId of f.sessionIds.slice(0, 6)) {
+      const run = f.db.conversationRepository.beginRun({
+        sessionId,
+        clientMessageId: randomUUID(),
+        content: 'Unconfirmed prior delivery',
+        expectedCommentsRevision: 0,
+        commentIds: [],
+        agentId: 'codex',
+        settingsRevision: 1,
+        model: null,
+        effort: null,
+      }).run
+      f.db.conversationRepository.recordDispatch(run.id, 'possibly_sent')
+      f.db.conversationRepository.failRun(
+        run.id,
+        'unknown_delivery',
+        'Native delivery was not confirmed.',
+        true,
+      )
+    }
+    f.flow.nativeMetadataChanged()
+    const completeReads = f.db.conversationRepository.diagnostics().completeReads
+    const snapshot = value(f.flow.getNativePresence())
+    expect(snapshot.attentionTotal).toBe(6)
+    expect(snapshot.attention.map((row) => row.sessionId)).toEqual(
+      f.sessionIds.slice(1, 6).toReversed(),
+    )
+    expect(snapshot.recent.map((row) => row.sessionId)).toEqual([f.sessionIds[6]])
+    expect(snapshot.running).toEqual([])
+    const first = value(f.flow.readNativeAttention({}))
+    expect(first.sessions.map((row) => row.sessionId)).toEqual(
+      snapshot.attention.map((row) => row.sessionId),
+    )
+    if (!first.nextCursor) throw new Error('Attention tail cursor missing')
+    const second = value(f.flow.readNativeAttention({ cursor: first.nextCursor }))
+    expect(second.sessions.map((row) => row.sessionId)).toEqual([f.sessionIds[0]])
+    expect(second.total).toBe(6)
+    expect(second.nextCursor).toBeUndefined()
+    expect(new Set([...first.sessions, ...second.sessions].map((row) => row.sessionId)).size).toBe(
+      6,
+    )
+    f.db.sessionRepository.recordNativeOpened({
+      sessionId: f.sessionIds[0]!,
+      openingId: randomUUID(),
+    })
+    f.flow.nativeMetadataChanged()
+    expect(f.flow.readNativeAttention({ cursor: first.nextCursor })).toMatchObject({
+      ok: false,
+      error: { code: 'CONFLICT' },
+    })
+    expect(value(f.flow.readNativeAttention({})).sessions[0]?.sessionId).toBe(f.sessionIds[0])
+    expect(f.db.conversationRepository.diagnostics().completeReads).toBe(completeReads)
+  })
+
   it('returns the most recent five explicit openings, treats duplicate opening IDs idempotently and persists them across restart', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'pact-native-metadata-'))
     directories.push(directory)

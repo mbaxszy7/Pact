@@ -15,7 +15,7 @@ import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 're
 import type { ProjectContext } from '@pact/contracts'
 
 function focusMenu(menu: HTMLDivElement | null): void {
-  if (!menu) return
+  if (!menu || menu.contains(document.activeElement)) return
   const item = menu.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')
   ;(item ?? menu).focus()
 }
@@ -26,11 +26,13 @@ export function ProjectContextMenu({
   visible,
   refreshKey,
   onNotice,
+  platform,
 }: {
   projectId: string
   visible: boolean
   refreshKey: string
   onNotice: (message: string) => void
+  platform?: string | undefined
 }): React.JSX.Element {
   const [context, setContext] = useState<ProjectContext>()
   const [loading, setLoading] = useState(true)
@@ -44,41 +46,62 @@ export function ProjectContextMenu({
   const branchMenu = useRef<HTMLDivElement>(null)
   const mounted = useRef(false)
   const reading = useRef(false)
+  const refreshPending = useRef(false)
+  const readGeneration = useRef(0)
+  const isVisible = useRef(visible)
   const actionPending = useRef(false)
   const feedbackTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const folderId = `project-folder-${projectId}`
   const branchId = `project-branch-${projectId}`
 
   const refresh = useCallback(async (): Promise<void> => {
-    if (reading.current || !mounted.current) return
+    const request = { projectId }
+    if (!mounted.current || !isVisible.current) return
+    readGeneration.current += 1
+    refreshPending.current = true
+    if (reading.current) return
     reading.current = true
     setLoading(true)
     try {
-      const result = await window.pact.readProjectContext({ projectId })
-      if (!mounted.current) return
-      if (result.ok) {
-        setContext(result.value)
-        setError(undefined)
-      } else {
-        setError(result.error.message)
+      // Keep one active read and one latest refresh intention.
+      while (refreshPending.current && mounted.current && isVisible.current) {
+        refreshPending.current = false
+        const generation = readGeneration.current
+        try {
+          // oxlint-disable-next-line no-await-in-loop -- Refresh latest facts after the sole active read settles.
+          const result = await window.pact.readProjectContext(request)
+          if (!mounted.current || !isVisible.current || generation !== readGeneration.current)
+            continue
+          if (result.ok) {
+            setContext(result.value)
+            setError(undefined)
+          } else setError(result.error.message)
+        } catch {
+          if (mounted.current && isVisible.current && generation === readGeneration.current)
+            setError('Couldn’t read project details. Try again.')
+        }
       }
-    } catch {
-      if (mounted.current) setError('Couldn’t read project details. Try again.')
     } finally {
       reading.current = false
       if (mounted.current) setLoading(false)
     }
+    // oxlint-disable-next-line react/memo-dependencies -- Project identity scopes the async read and visible subscriptions.
   }, [projectId])
 
   useEffect(() => {
     mounted.current = true
     return () => {
       mounted.current = false
+      refreshPending.current = false
+      readGeneration.current += 1
       clearTimeout(feedbackTimer.current)
     }
   }, [])
   useEffect(() => {
+    isVisible.current = visible
     if (!visible || !refreshKey) {
+      refreshPending.current = false
+      readGeneration.current += 1
       folderMenu.current?.hidePopover()
       branchMenu.current?.hidePopover()
       return undefined
@@ -285,7 +308,13 @@ export function ProjectContextMenu({
           onClick={() => void showFolder()}
         >
           <FolderOpen aria-hidden="true" className="size-4" strokeWidth={1.75} />
-          <span className="font-medium">Show in Explorer</span>
+          <span className="font-medium">
+            {platform === 'darwin'
+              ? 'Open in Finder'
+              : platform === 'win32'
+                ? 'Show in Explorer'
+                : 'Open folder'}
+          </span>
           {acting ? (
             <LoaderCircle aria-hidden="true" className="ml-auto size-3.5 animate-spin" />
           ) : null}

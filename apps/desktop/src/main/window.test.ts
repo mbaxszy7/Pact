@@ -288,12 +288,53 @@ describe.each(['win32', 'darwin'] as const)('%s workspace visibility', (platform
     expect(vi.getTimerCount()).toBe(0)
   })
 
+  it.each(['resize', 'minimize', 'enter-full-screen'] as const)(
+    'completes the latest hide when %s interrupts its fade',
+    (event) => {
+      const { window, presentation } = workspace()
+      window.emit('ready-to-show')
+      vi.runAllTimers()
+      presentation.hide()
+      vi.advanceTimersByTime(32)
+      expect(window.visible).toBe(true)
+      window.show.mockClear()
+      window.emit(event)
+      expect(window.visible).toBe(false)
+      expect(window.opacity).toBe(1)
+      expect(window.show).not.toHaveBeenCalled()
+      expect(vi.getTimerCount()).toBe(0)
+      vi.runAllTimers()
+      expect(window.visible).toBe(false)
+    },
+  )
+
+  it('keeps a newer reveal when geometry recovery interrupts an earlier hide', () => {
+    const { window, presentation } = workspace()
+    window.emit('ready-to-show')
+    vi.runAllTimers()
+    presentation.hide()
+    vi.advanceTimersByTime(32)
+    window.bounds = { x: -1800, y: -100, width: 900, height: 650 }
+    presentation.show()
+    expect(window.setBounds).toHaveBeenCalled()
+    expect(window.hide).not.toHaveBeenCalled()
+    vi.runAllTimers()
+    expect(window.visible).toBe(true)
+    expect(window.opacity).toBe(1)
+    expect(window.bounds).toEqual({ x: 510, y: 191, width: 900, height: 650 })
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('releases animation work on destruction and leaves native state changes in control', () => {
     const { window, presentation } = workspace()
     window.emit('ready-to-show')
     vi.advanceTimersByTime(32)
     window.minimized = true
+    window.visible = false
+    window.show.mockClear()
     window.emit('minimize')
+    expect(window.visible).toBe(false)
+    expect(window.show).not.toHaveBeenCalled()
     expect(window.opacity).toBe(1)
     expect(vi.getTimerCount()).toBe(0)
     presentation.show()

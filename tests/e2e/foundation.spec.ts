@@ -1,5 +1,6 @@
 import { expect } from '@playwright/test'
 
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture } from './runtime-fixture.js'
 
@@ -108,7 +109,7 @@ test(
         )
         .toBe(true)
     } finally {
-      await electronApp.close()
+      await quitPact(electronApp)
       await fixture.dispose()
     }
   },

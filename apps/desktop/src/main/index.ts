@@ -2,7 +2,7 @@ import { optimizer } from '@electron-toolkit/utils'
 import { app, BrowserWindow, nativeTheme } from 'electron'
 import { dirname, join } from 'node:path'
 
-import icon from '../../build/icon.png?asset'
+import macIcon from '../../build/icon-mac.png?asset'
 import { registerAppProtocol } from './app-protocol'
 import {
   resolveApplicationIdentity,
@@ -113,7 +113,7 @@ async function bootstrap(): Promise<void> {
   await app.whenReady()
   if (quitting) return
   if (process.platform === 'win32') app.setAppUserModelId(nativeIdentity.appId)
-  if (process.platform === 'darwin' && !app.isPackaged) app.dock?.setIcon(icon)
+  if (process.platform === 'darwin' && !app.isPackaged) app.dock?.setIcon(macIcon)
   registerAppProtocol(join(__dirname, '../renderer'))
   const paths = resolveRuntimePaths()
   diagnostics = new DiagnosticLogs(
@@ -187,6 +187,13 @@ function finishQuit(): Promise<void> {
   })()
   return quitCompletion
 }
+// will-quit follows Electron's document shutdown. Keep named handlers available
+// for late Renderer cleanup instead of treating native window closure as an IPC drain.
+app.once('will-quit', () => {
+  applicationMenu?.dispose()
+  removeDesktopModules?.()
+  appearanceSettings?.dispose()
+})
 app.on('before-quit', (event) => {
   if (quitReady) return
   event.preventDefault()
@@ -199,9 +206,6 @@ app.on('before-quit', (event) => {
     const accepted = await (nativePresence?.requestQuit() ?? Promise.resolve(true))
     if (!accepted) return
     quitting = true
-    applicationMenu?.dispose()
-    removeDesktopModules?.()
-    appearanceSettings?.dispose()
     const result = await utilityClient.shutdown()
     if (!result.ok) console.error('Pact shutdown was not acknowledged:', result.error.code)
     if (!utilityClient.isRunning()) await finishQuit()

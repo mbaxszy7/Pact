@@ -1,5 +1,8 @@
 import { expect, type ElectronApplication, type Page } from '@playwright/test'
 
+import type { AppearanceSnapshot, RpcResult } from '../../packages/contracts/src/index.js'
+
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture, type RuntimeFixture } from './runtime-fixture.js'
 
@@ -35,7 +38,7 @@ test(
       await expect
         .poll(() => window.evaluate('window.pact.getAppearanceSettings()'))
         .toMatchObject({ ok: true, value: { requested: { windowMaterial: 'translucent' } } })
-      await app.close()
+      await quitPact(app)
       app = await launchAppearanceApp(fixture)
       window = await app.firstWindow()
       await openAppearanceSettings(window)
@@ -95,7 +98,7 @@ test(
             effective: { windowMaterial: 'translucent', restartRequired: true },
           },
         })
-      await app.close()
+      await quitPact(app)
       app = await launchAppearanceApp(fixture)
       window = await app.firstWindow()
       await openAppearanceSettings(window)
@@ -114,7 +117,7 @@ test(
       })
       expect(solidAlpha).toBe(255)
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -160,7 +163,7 @@ test(
         await expect
           .poll(() => window.evaluate('window.pact.getAppearanceSettings()'))
           .toMatchObject({ ok: true, value: { requested: { windowMaterial: 'solid' } } })
-        await app.close()
+        await quitPact(app)
         app = await launchAppearanceApp(fixture)
         window = await app.firstWindow()
         await openAppearanceSettings(window)
@@ -180,7 +183,7 @@ test(
               effective: { windowMaterial: 'solid', restartRequired: true },
             },
           })
-        await app.close()
+        await quitPact(app)
         app = await launchAppearanceApp(fixture)
         window = await app.firstWindow()
         await openAppearanceSettings(window)
@@ -268,7 +271,7 @@ test(
         await expect(window.getByText(/Using Solid/)).toBeVisible()
       }
 
-      await app.close()
+      await quitPact(app)
       app = await launchAppearanceApp(fixture)
       window = await app.firstWindow()
       await expect(window.locator('html')).toHaveAttribute('data-theme', 'dark')
@@ -323,7 +326,7 @@ test(
       await expect(window.getByRole('dialog', { name: 'Context fixture' })).toHaveCount(0)
       await expect(settingsEntry(window)).toBeFocused()
     } finally {
-      await app?.close()
+      if (app) await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -348,7 +351,7 @@ test('restores the last committed appearance when a save fails', { tag: '@real' 
     const stored: unknown = await window.evaluate('window.pact.getAppearanceSettings()')
     expect(stored).toMatchObject({ ok: true, value: { requested: { theme: 'system' } } })
   } finally {
-    await app.close()
+    await quitPact(app)
     await fixture.dispose()
   }
 })
@@ -449,7 +452,82 @@ test(
       )
       expect(await navigationAlpha()).toBe(255)
     } finally {
-      await app.close()
+      await quitPact(app)
+      await fixture.dispose()
+    }
+  },
+)
+
+test(
+  'macOS changes material in the same window without a restart notice and restores it on cold launch',
+  { tag: '@ui' },
+  async () => {
+    test.skip(process.platform !== 'darwin', 'macOS live material policy only')
+    const fixture = await createRuntimeFixture({ mode: 'ui' })
+    let app = await launchAppearanceApp(fixture)
+    try {
+      let window = await app.firstWindow()
+      await openAppearanceSettings(window)
+      const before = await app.evaluate(({ BrowserWindow, nativeTheme }) => ({
+        id: BrowserWindow.getAllWindows()[0]!.id,
+        accessibilitySolid:
+          nativeTheme.prefersReducedTransparency ||
+          nativeTheme.shouldUseHighContrastColors ||
+          nativeTheme.inForcedColorsMode,
+      }))
+      await window.getByRole('radio', { name: 'Dark' }).click()
+      await window.getByRole('radio', { name: 'Solid' }).click()
+      await expect(window.locator('html')).toHaveAttribute('data-material', 'solid')
+      await window.getByRole('radio', { name: 'Translucent' }).click()
+      const effectiveMaterial = before.accessibilitySolid ? 'solid' : 'translucent'
+      await expect(window.locator('html')).toHaveAttribute('data-material', effectiveMaterial)
+      const strength = window.getByRole('slider', { name: 'Transparency strength' })
+      if (!before.accessibilitySolid) {
+        await strength.focus()
+        await strength.press('End')
+      }
+      const expectedOpacity = before.accessibilitySolid ? 85 : 70
+      const expected = {
+        ok: true,
+        value: {
+          requested: {
+            theme: 'dark',
+            windowMaterial: 'translucent',
+            materialOpacity: expectedOpacity,
+          },
+          effective: { theme: 'dark', windowMaterial: effectiveMaterial },
+        },
+      }
+      await expect
+        .poll(() =>
+          window.evaluate<RpcResult<AppearanceSnapshot>>('window.pact.getAppearanceSettings()'),
+        )
+        .toMatchObject(expected)
+      const live = await window.evaluate<RpcResult<AppearanceSnapshot>>(
+        'window.pact.getAppearanceSettings()',
+      )
+      expect(live.ok && live.value.effective.restartRequired).toBeUndefined()
+      expect(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.id)).toBe(
+        before.id,
+      )
+
+      await quitPact(app)
+      app = await launchAppearanceApp(fixture)
+      window = await app.firstWindow()
+      await openAppearanceSettings(window)
+      await expect
+        .poll(() =>
+          window.evaluate<RpcResult<AppearanceSnapshot>>('window.pact.getAppearanceSettings()'),
+        )
+        .toMatchObject(expected)
+      await expect(window.locator('html')).toHaveAttribute('data-theme', 'dark')
+      await expect(window.locator('html')).toHaveAttribute('data-material', effectiveMaterial)
+      const restored = await window.evaluate<RpcResult<AppearanceSnapshot>>(
+        'window.pact.getAppearanceSettings()',
+      )
+      expect(restored.ok && restored.value.effective.restartRequired).toBeUndefined()
+    } finally {
+      await quitPact(app)
       await fixture.dispose()
     }
   },

@@ -65,11 +65,25 @@ the normalized configured browser-profile path to its base AUMID; process, windo
 data share that effective identity. Separate repositories cannot overwrite each other's taskbar
 categories. This does not change the identity registry, browser profile or existing database/object
 paths. The toolkit development override must not substitute the Electron executable path. The window owner supplies the shared icon and
-retains the native build title across HTML title updates. macOS development receives the shared Dock
-icon after ready. Packaging aligns application ID, package/product/executable names and shortcuts;
+retains the native build title across HTML title updates. macOS development receives the Mac Dock
+PNG after ready; it and packaged ICNS frames use the same transparent margin around the canonical
+SVG artwork. Packaging aligns application ID, package/product/executable names and shortcuts;
 the existing NSIS/fuse owners retain installation and security policy. CI development is reserved,
 not delivered as a new CI workflow. Application profiles do not isolate shared Project files or
 change native provider homes/authentication. Visual and formal verification remain separate gates.
+
+The development launcher owns macOS bundle preparation before handing control to the existing
+electron-vite CLI in the same Node process. Its only callers are `dev` and `start`; Windows retains
+the installed Electron executable. macOS uses one checkout-local generated runtime and at most one
+staging copy under ignored `.pact-data/mac-development-runtime/`. Preparation permits 8192 entries
+and 1 GiB of logical source bytes, with one 45 s cancellation deadline, bounded 64 KiB command output
+and no retry. Ordered plist edits and ad-hoc signing retain existing entitlements and Fuses.
+The ready receipt contains one SHA-256 fingerprint of the source executable generation, plist,
+identity registry entry, ICNS and launcher. A changed fingerprint replaces only generated artifacts;
+failed preparation removes staging and never publishes it. One exclusive launch lock remains until
+CLI exit, with no queue or stale-owner reclamation. A forcibly terminated launch requires confirming
+its exit before removing that generated lock. No new resident process, package dependency, application
+data migration or native runtime policy is introduced.
 
 ## Persistence and projections
 
@@ -307,7 +321,7 @@ Performance is a correctness property for long-running local Sessions on macOS a
 - Separate platform evidence. A macOS result does not verify Windows, build success does not verify performance, and scoped reruns do not turn a failed broad run into a full pass.
 - An in-scope acceptance failure blocks delivery. Raise no budget to obtain passing results without new product evidence and user approval. Existing documented gaps may be preserved by unrelated work but not worsened.
 
-Project context remains a disposable Renderer projection. ProjectCatalog resolves the saved canonical directory and reads Git HEAD in Utility through the existing bounded Git owner. Branch inspection checks at most 128 ancestor directory markers under the same read deadline, stopping at the nearest `.git` file/directory or filesystem root. Nested selections retain their exact Project identity/classification; only branch metadata follows the containing repository. Exhausted discovery fails visibly rather than classifying an unchecked ancestor as absent. Main opens only that registered directory after revalidating the calling frame; Renderer copies validated text with the browser clipboard API. One Utility context read is active, same-Project requests share it, and other Projects receive a visible busy result; there is no queue, cache or polling. The read aborts after 2 s, shares Git's five-child/output/exit bounds, and uses the normal 5 s Main RPC. Context identifiers are bounded (path 32,768 units; folder/branch 4096); a complete receipt stays below 128 KiB. Shutdown aborts and drains the read before closing persistence. One native directory launch has no queue, a 5 s reporting deadline after resolution, and retains its slot until physical completion; disposal clears its timer. Renderer owns one context, one copy-feedback timer (1.6 s), and focus/visibility listeners only while visible; Session switches dispose the view and fence late results. Restart reads current facts afresh.
+Project context remains a disposable Renderer projection. ProjectCatalog resolves the saved canonical directory and reads Git HEAD in Utility through the existing bounded Git owner. Branch inspection checks at most 128 ancestor directory markers under the same read deadline, stopping at the nearest `.git` file/directory or filesystem root. Nested selections retain their exact Project identity/classification; only branch metadata follows the containing repository. Exhausted discovery fails visibly rather than classifying an unchecked ancestor as absent. Main opens only that registered directory after revalidating the calling frame; Renderer copies validated text with the browser clipboard API. One Utility context read is active, same-Project requests share it, and other Projects receive a visible busy result; there is no queue, cache or polling. The read aborts after 2 s, shares Git's five-child/output/exit bounds, and uses the normal 5 s Main RPC. Context identifiers are bounded (path 32,768 units; folder/branch 4096); a complete receipt stays below 128 KiB. Shutdown aborts and drains the read before closing persistence. One native directory launch has no queue, a 5 s reporting deadline after resolution, and retains its slot until physical completion; disposal clears its timer. Renderer owns one context, one copy-feedback timer (1.6 s), and focus/visibility listeners only while visible. One active read retains at most one latest refresh intention; a generation fence rejects superseded, hidden and disposed results. Session switches dispose the view. The existing AppInfo platform selects Finder, Explorer or generic folder wording without another native query. Restart reads current facts afresh.
 
 The Main window owner applies the Windows 8px corner region only to transparent-backed windows, on creation and native resize/maximize/full-screen changes. Each update uses at most 17 rectangles and no timer, IPC or cache; five window-state listeners are removed on close. Maximized/full-screen regions are rectangular. The native region clips content and pointer input, including when accessibility paints that window Solid. Opaque Solid Windows windows do not call `setShape` and leave corners/shadow to the system; macOS retains native rounding. Restart recreates the region from current native window configuration.
 
@@ -323,7 +337,9 @@ most one 16 ms timer. Durations are 150 ms in and 100 ms out; reversal scales th
 from current opacity. Monotonic elapsed time skips stale frames after a delayed tick instead of
 queuing frames. System animation preferences are read on each new transition, without polling;
 disabled/reduced motion, native minimize/restore and fullscreen use immediate/native behavior.
-Resize and window-state events cancel a fade and restore opacity 1. Destruction cancels the timer
+Resize and window-state events cancel a fade, restore opacity 1, and complete an interrupted hide
+when it remains the latest visibility intent. They never show a window over a native state change.
+Destruction cancels the timer
 and removes the seven presentation listeners; restart recreates transient state. Visibility changes
 do not await Utility work or delay physical application shutdown, and Appearance retains sole
 ownership of persistent material preferences.
@@ -342,6 +358,22 @@ requires Utility cancellation acknowledgement. Conversation installs its bounded
 querying metadata and caches the complete success or uncertain result. Failed queries remain
 cancellable, duplicate preparations do not requery or extend the timer, and wrong operation IDs
 remain rejected.
+The current trusted primary Renderer becomes eligible for Pact quit confirmation after its existing
+initial quit-state read, following listener installation. NativePresence owns nine window/content
+listeners that invalidate readiness on main-document navigation, failed load or crash and track
+responsiveness. It detaches them on replacement, destruction and disposal. One native fallback task
+handles unavailable confirmation UI, rechecks availability before each presentation and reconciles
+the current operation when its dialog settles. A recovered Pact UI retains cancellation errors;
+stale dialog responses cannot decide a newer operation. No new readiness timer or shutdown owner
+is introduced, and closing never recreates a destroyed workspace. Native confirmation waits for
+application readiness. Presentation failure retains the quit owner without automatic retry; a
+later explicit Show or Quit may retry it.
+During accepted shutdown, Main retains the existing desktop IPC, Appearance and application-menu
+owners until Electron's `will-quit` event, following document shutdown. Native window `closed`
+alone is not an IPC-drain receipt. After confirmed physical Utility exit, Main closes diagnostics,
+disposes NativePresence and requests ordinary Electron quit; one process-lifetime `will-quit`
+listener then releases the remaining desktop owners. Cancellation retains the same live owners;
+uncertain physical exit keeps the closing workspace available without starting another runtime.
 Disposal removes subscriptions, IPC handlers, tray/menu references and its transient projections.
 Restart rebuilds menus from current durable facts and existing live owners, with no navigation replay.
 

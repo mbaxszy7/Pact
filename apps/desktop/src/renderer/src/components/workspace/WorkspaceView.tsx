@@ -55,6 +55,7 @@ interface WorkspaceViewProps {
   ) => void
   onForkSessionStarted?: (() => SessionForkOpening) | undefined
   nativePresentationSuspended?: boolean | undefined
+  platform?: string | undefined
   onSaveSessionPermission: (input: SessionPermissionSaveInput) => Promise<boolean>
   projects: Project[]
   sessions: CollaborationSession[]
@@ -425,6 +426,7 @@ function workspaceContent(
               onForkSessionCreated={props.onForkSessionCreated}
               onForkSessionStarted={props.onForkSessionStarted}
               nativePresentationSuspended={props.nativePresentationSuspended}
+              platform={props.platform}
               onSaveSessionPermission={props.onSaveSessionPermission}
               sessionSettingsSaving={props.savingSessionSettings}
               session={selectedSession}

@@ -271,7 +271,7 @@ User messages are right-aligned on lavender. Claude and Codex messages are left-
 
 The Composer is a stable dense surface at least two lines high. Native Skills and the selected route are atomic inline units; attached Comments and answers are removable source chips above the input. Images show thumbnails, filename and state, with Add image below full-width text. Send is the local action anchor and becomes Stop during an observed response, while editing the next draft remains available under normal gates. Do not auto-send that draft when the response ends.
 
-Composer permission, Project-folder and branch popovers share one presentation: raised surface, neutral hairline border, one subtle shadow (6px downward offset, 18px blur, 18% black), 14px radius, 8px padding, 12px text, 8px action-row corners and the same Hover/focus treatment. Use a title, actions and a divided footer for supplementary context; complete selectable paths and branch names live in that footer. All use the permission menu's 160ms opening/110ms closing motion with reduced-motion support. Width and alignment follow the content and trigger; do not introduce a separate background or shadow treatment for these menus.
+Composer permission, Project-folder and branch popovers share one presentation: raised surface, neutral hairline border, one subtle shadow (6px downward offset, 18px blur, 18% black), 14px radius, 8px padding, 12px text, 8px action-row corners and the same Hover/focus treatment. Use a title, actions and a divided footer for supplementary context; complete selectable paths and branch names live in that footer. All use the permission menu's 160ms opening/110ms closing motion with reduced-motion support. Width and alignment follow the content and trigger; do not introduce a separate background or shadow treatment for these menus. The registered folder opens with `Open in Finder` on macOS and `Show in Explorer` on Windows. Keyboard navigation must retain the chosen item when the asynchronous popover toggle arrives. Native attention and exit confirmation hide composer popovers; returning restores the permission trigger focus. Suspended image previews and Fork dialogs retain their selected image, form state and focused control.
 
 ### Artifact, Diff, and Review
 
@@ -299,6 +299,11 @@ canonical [SVG](resources/icon.svg) supplies development PNG, multi-size Windows
 through one shared asset generator. Welcome/completion artwork uses Sky Canvas,
 with the same mark; intermediate pages use a small header mark on white. Artwork is decorative.
 Instructions, paths, options, progress and results remain native text and controls.
+
+macOS Dock PNG and ICNS exports inset the shared artwork by 8% on each edge of the transparent
+canvas, keeping its visible size aligned with neighboring app icons. Development and packaged
+applications use the same margin. Windows exports and the separate menu-bar Template icon retain
+their existing artwork bounds.
 
 The installer preview has its own application identity, directory, shortcuts and package name. The
 desktop shortcut is optional, the Start menu entry is retained, and Open Pact starts unchecked. The

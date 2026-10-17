@@ -5,6 +5,7 @@ import { resolve } from 'node:path'
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture, type RuntimeFixture } from './runtime-fixture.js'
 
@@ -73,7 +74,7 @@ test.describe('Native Session permission lifetime', () => {
           ])
           expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(1)
         } finally {
-          await app.close()
+          await quitPact(app)
           await fixture.dispose()
         }
       },
@@ -118,7 +119,7 @@ test(
       await expect(composer).toBeEnabled({ timeout: 1_000 })
       expect((await fixture.readCodexFacts()).methods).toContain('thread/read')
 
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       window = await app.firstWindow()
       await window
@@ -127,7 +128,7 @@ test(
       await expect(window.getByText('Bounded lifecycle response.', { exact: true })).toHaveCount(2)
       await expect(window.getByRole('combobox', { name: 'Message' })).toBeEnabled()
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -174,7 +175,7 @@ test(
       await expect(window.getByText('Run failed')).toHaveCount(0)
       expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(1)
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -257,7 +258,7 @@ test(
           .getByText('Never replay solely because native history is absent', { exact: true }),
       ).toHaveCount(1)
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -284,7 +285,7 @@ test(
       const facts = await fixture.readCodexFacts()
       expect(facts.modelStarts).toHaveLength(0)
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -305,7 +306,7 @@ test(
       await expect(window.getByRole('button', { name: 'Reexecute…', exact: true })).toHaveCount(0)
       await expect(window.getByRole('combobox', { name: 'Message' })).toBeEnabled()
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -330,7 +331,7 @@ test(
       await expect(window.locator('[data-pact-speaker="codex"]')).toHaveCount(1)
       await expect(window.getByText('Run interrupted', { exact: true })).toHaveCount(0)
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -371,6 +372,8 @@ test(
       await app.evaluate(({ app: electronApp }) => {
         setImmediate(() => electronApp.quit())
       })
+      await expect(window.getByRole('heading', { name: 'Exit Pact?', exact: true })).toBeVisible()
+      await window.getByRole('button', { name: 'Exit Pact', exact: true }).click()
       await closed
       app = undefined
       const database = await PactDatabase.open({ filePath: fixture.databaseFile, migrationsFolder })
@@ -404,8 +407,18 @@ test(
       await expect(
         reopened.getByRole('button', { name: 'Check session', exact: true }),
       ).toBeVisible()
+      // Interrupted native work still needs an explicit exit choice after restart.
+      const reopenedClosed = app.waitForEvent('close', { timeout: 15_000 })
+      await app.evaluate(({ app: electronApp }) => {
+        setImmediate(() => electronApp.quit())
+      })
+      await expect(reopened.getByRole('heading', { name: 'Exit Pact?', exact: true })).toBeVisible()
+      await reopened.getByRole('button', { name: 'Exit Pact', exact: true }).click()
+      await reopenedClosed
+      app = undefined
     } finally {
-      await app?.close()
+      // A failed assertion cannot leave this owned active fixture at a quit prompt.
+      if (app) await app.evaluate(({ app: electronApp }) => electronApp.exit(1))
       await fixture.dispose()
     }
   },
@@ -429,7 +442,7 @@ test(
       expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(0)
       await expect(window.getByRole('combobox', { name: 'Message', exact: true })).toBeDisabled()
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },
@@ -472,7 +485,7 @@ test(
           .getByText('New independently submitted task', { exact: true }),
       ).toHaveCount(1)
       expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(1)
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       window = await app.firstWindow()
       await window
@@ -485,7 +498,7 @@ test(
       await expect(window.getByText('Did the Agent receive this?', { exact: true })).toHaveCount(1)
       expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(1)
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },

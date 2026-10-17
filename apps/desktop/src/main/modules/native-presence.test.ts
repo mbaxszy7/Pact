@@ -22,6 +22,7 @@ const harness = vi.hoisted(() => ({
   quit: vi.fn<() => void>(),
   setJumpList: vi.fn<() => string>(() => 'ok'),
   template: vi.fn<(value: boolean) => void>(),
+  ready: vi.fn<() => Promise<void>>(),
   getAppPath: () => 'C:/pact-presence-fixture',
   packaged: true,
 }))
@@ -34,6 +35,7 @@ vi.mock('electron', () => ({
     getAppPath: () => harness.getAppPath(),
     getPath: () => 'C:/pact-presence-fixture',
     quit: () => harness.quit(),
+    whenReady: () => harness.ready(),
     on: (event: string, listener: (...args: unknown[]) => void) =>
       harness.appEvents.set(event, listener),
     removeListener: (event: string) => harness.appEvents.delete(event),
@@ -100,6 +102,7 @@ beforeEach(() => {
   harness.trays.length = 0
   harness.setJumpList.mockClear()
   harness.template.mockClear()
+  harness.ready.mockReset().mockResolvedValue(undefined)
 })
 afterEach(() => {
   for (const owner of owners.splice(0)) owner.dispose()
@@ -260,6 +263,211 @@ describe('Native presence core behavior', () => {
     f.owner.start()
     await vi.waitFor(() => expect(f.utility.getNativePresence).toHaveBeenCalledOnce())
     expect(harness.template).toHaveBeenCalledWith(true)
+    harness.trays[0]!.emit('click')
+    expect(f.presentation.show).toHaveBeenCalledOnce()
+    harness.trays[0]!.emit('right-click')
+    expect(harness.trays[0]!.popUpContextMenu).toHaveBeenCalledOnce()
+  })
+
+  it('uses the ready Pact document for unknown work and awaits cancellation acknowledgement', async () => {
+    const f = fixture()
+    f.attach()
+    f.owner.start()
+    f.invoke(IPC_CHANNELS.nativeQuitGet)
+    f.utility.prepareNativeQuit.mockResolvedValue({
+      kind: 'attempted',
+      result: { ok: false, error: { code: 'UNCERTAIN', message: 'Lost preparation ACK.' } },
+    })
+    const ack =
+      Promise.withResolvers<Awaited<ReturnType<UtilityProcessClient['cancelNativeQuit']>>>()
+    f.utility.cancelNativeQuit.mockReturnValue(ack.promise)
+    const pending = f.owner.requestQuit()
+    await vi.waitFor(() =>
+      expect(f.invoke(IPC_CHANNELS.nativeQuitGet)).toMatchObject({
+        ok: true,
+        value: { phase: 'confirming', unknown: true },
+      }),
+    )
+    const operationId = f.utility.prepareNativeQuit.mock.calls[0]![0].operationId
+    const cancelled = f.invoke(IPC_CHANNELS.nativeQuitRespond, { operationId, decision: 'cancel' })
+    expect(f.invoke(IPC_CHANNELS.nativeQuitGet)).toMatchObject({ value: { phase: 'cancelling' } })
+    expect(harness.dialog).not.toHaveBeenCalled()
+    ack.resolve({ ok: true, value: { operationId, cancelled: true } })
+    await expect(cancelled).resolves.toMatchObject({ ok: true })
+    await expect(pending).resolves.toBe(false)
+    expect(f.invoke(IPC_CHANNELS.nativeQuitGet)).toEqual({ ok: true, value: null })
+  })
+
+  it.each(['failed-load', 'crash', 'unresponsive'] as const)(
+    'falls back when the Pact document becomes unavailable through %s',
+    async (reason) => {
+      const f = fixture()
+      f.attach()
+      f.owner.start()
+      f.invoke(IPC_CHANNELS.nativeQuitGet)
+      f.utility.prepareNativeQuit.mockResolvedValue({
+        kind: 'not-sent',
+        error: { code: 'RUNTIME_UNAVAILABLE', message: 'Not ready.' },
+      })
+      harness.dialog.mockResolvedValue({ response: 0 })
+      if (reason === 'failed-load')
+        f.window.webContents.emit(
+          'did-fail-load',
+          {},
+          -6,
+          'Missing',
+          'app://bundle/missing.html',
+          true,
+        )
+      else if (reason === 'crash') f.window.webContents.emit('render-process-gone')
+      else f.window.emit('unresponsive')
+      await expect(f.owner.requestQuit()).resolves.toBe(false)
+      expect(harness.dialog).toHaveBeenCalledOnce()
+    },
+  )
+
+  it('keeps the existing Pact document eligible after aborted or subframe navigation', async () => {
+    const f = fixture()
+    f.attach()
+    f.owner.start()
+    f.invoke(IPC_CHANNELS.nativeQuitGet)
+    f.window.webContents.emit('did-fail-load', {}, -3, 'Aborted', 'app://bundle/next.html', true)
+    f.window.webContents.emit('did-fail-load', {}, -6, 'Missing', 'app://bundle/frame.html', false)
+    f.utility.prepareNativeQuit.mockResolvedValue({
+      kind: 'not-sent',
+      error: { code: 'RUNTIME_UNAVAILABLE', message: 'Not ready.' },
+    })
+    const pending = f.owner.requestQuit()
+    await vi.waitFor(() =>
+      expect(f.invoke(IPC_CHANNELS.nativeQuitGet)).toMatchObject({
+        value: { phase: 'confirming' },
+      }),
+    )
+    expect(harness.dialog).not.toHaveBeenCalled()
+    const operationId = f.utility.prepareNativeQuit.mock.calls[0]![0].operationId
+    await f.invoke(IPC_CHANNELS.nativeQuitRespond, { operationId, decision: 'cancel' })
+    await expect(pending).resolves.toBe(false)
+  })
+
+  it('returns failed native cancellation to the recovered Pact document without a second dialog', async () => {
+    const f = fixture()
+    f.attach()
+    f.owner.start()
+    f.invoke(IPC_CHANNELS.nativeQuitGet)
+    f.utility.prepareNativeQuit.mockResolvedValue({
+      kind: 'attempted',
+      result: { ok: false, error: { code: 'UNCERTAIN', message: 'Lost ACK.' } },
+    })
+    const dialogResult = Promise.withResolvers<{ response: number }>()
+    const ack =
+      Promise.withResolvers<Awaited<ReturnType<UtilityProcessClient['cancelNativeQuit']>>>()
+    harness.dialog.mockReturnValue(dialogResult.promise)
+    f.utility.cancelNativeQuit.mockReturnValue(ack.promise)
+    f.window.emit('unresponsive')
+    const pending = f.owner.requestQuit()
+    await vi.waitFor(() => expect(harness.dialog).toHaveBeenCalledOnce())
+    dialogResult.resolve({ response: 0 })
+    await vi.waitFor(() => expect(f.utility.cancelNativeQuit).toHaveBeenCalledOnce())
+    f.window.emit('responsive')
+    ack.resolve({ ok: false, error: { code: 'TIMEOUT', message: 'No cancel ACK.' } })
+    await vi.waitFor(() =>
+      expect(f.invoke(IPC_CHANNELS.nativeQuitGet)).toMatchObject({
+        value: {
+          phase: 'confirming',
+          message: expect.stringContaining('could not confirm cancellation'),
+        },
+      }),
+    )
+    expect(harness.dialog).toHaveBeenCalledOnce()
+    const operationId = f.utility.prepareNativeQuit.mock.calls[0]![0].operationId
+    await f.invoke(IPC_CHANNELS.nativeQuitRespond, { operationId, decision: 'exit' })
+    await expect(pending).resolves.toBe(true)
+  })
+
+  it('does not let a stale native dialog decide a newer quit operation', async () => {
+    const f = fixture()
+    f.attach()
+    f.owner.start()
+    f.invoke(IPC_CHANNELS.nativeQuitGet)
+    f.utility.prepareNativeQuit.mockResolvedValue({
+      kind: 'not-sent',
+      error: { code: 'RUNTIME_UNAVAILABLE', message: 'Not ready.' },
+    })
+    const dialogResult = Promise.withResolvers<{ response: number }>()
+    harness.dialog.mockReturnValue(dialogResult.promise)
+    f.window.emit('unresponsive')
+    const first = f.owner.requestQuit()
+    await vi.waitFor(() => expect(harness.dialog).toHaveBeenCalledOnce())
+    f.window.emit('responsive')
+    const firstId = f.utility.prepareNativeQuit.mock.calls[0]![0].operationId
+    await f.invoke(IPC_CHANNELS.nativeQuitRespond, { operationId: firstId, decision: 'cancel' })
+    await expect(first).resolves.toBe(false)
+    const second = f.owner.requestQuit()
+    const secondId = f.utility.prepareNativeQuit.mock.calls[1]![0].operationId
+    await vi.waitFor(() =>
+      expect(f.invoke(IPC_CHANNELS.nativeQuitGet)).toMatchObject({
+        value: { operationId: secondId, phase: 'confirming' },
+      }),
+    )
+    dialogResult.resolve({ response: 1 })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(f.invoke(IPC_CHANNELS.nativeQuitGet)).toMatchObject({
+      value: { operationId: secondId, phase: 'confirming' },
+    })
+    await f.invoke(IPC_CHANNELS.nativeQuitRespond, { operationId: secondId, decision: 'cancel' })
+    await expect(second).resolves.toBe(false)
+    expect(harness.dialog).toHaveBeenCalledOnce()
+  })
+
+  it('waits for application readiness and retries failed startup presentation only on an explicit Show', async () => {
+    const f = fixture()
+    const ready = Promise.withResolvers<void>()
+    harness.ready.mockReturnValue(ready.promise)
+    harness.dialog
+      .mockRejectedValueOnce(new Error('Presentation failed'))
+      .mockResolvedValue({ response: 0 })
+    f.utility.prepareNativeQuit.mockResolvedValue({
+      kind: 'not-sent',
+      error: { code: 'RUNTIME_UNAVAILABLE', message: 'Not ready.' },
+    })
+    const pending = f.owner.requestQuit()
+    await Promise.resolve()
+    expect(harness.dialog).not.toHaveBeenCalled()
+    ready.resolve()
+    await vi.waitFor(() => expect(harness.dialog).toHaveBeenCalledOnce())
+    await Promise.resolve()
+    expect(harness.dialog).toHaveBeenCalledOnce()
+    f.owner.show()
+    await expect(pending).resolves.toBe(false)
+    expect(harness.dialog).toHaveBeenCalledTimes(2)
+  })
+
+  it('releases window listeners on replacement and never recreates a window during accepted exit', async () => {
+    const f = fixture()
+    for (let index = 0; index < 50; index += 1) f.attach()
+    expect(f.window.listenerCount('close')).toBe(1)
+    expect(f.window.webContents.listenerCount('did-navigate')).toBe(1)
+    f.owner.start()
+    await expect(f.owner.requestQuit()).resolves.toBe(true)
+    f.window.emit('closed')
+    f.owner.show()
+    expect(f.create).not.toHaveBeenCalled()
+    expect(f.window.listenerCount('close')).toBe(0)
+    expect(f.window.webContents.eventNames()).toEqual([])
+  })
+
+  it('detaches from captured contents after the native window has been destroyed', () => {
+    const f = fixture()
+    const contents = f.window.webContents
+    f.attach()
+    Object.defineProperty(f.window, 'webContents', {
+      get: () => {
+        throw new Error('Object has been destroyed')
+      },
+    })
+    expect(() => f.window.emit('closed')).not.toThrow()
+    expect(contents.eventNames()).toEqual([])
   })
 
   it('rejects untrusted native IPC and an acknowledgement for another navigation', () => {
@@ -322,7 +530,7 @@ describe('Native presence core behavior', () => {
     await expect(unknown.owner.requestQuit()).resolves.toBe(true)
     expect(harness.dialog).toHaveBeenCalledOnce()
     unknown.owner.shutdownUnconfirmed()
-    expect(harness.dialog).toHaveBeenCalledTimes(2)
+    await vi.waitFor(() => expect(harness.dialog).toHaveBeenCalledTimes(2))
   })
 
   it('validates native launch input and keeps development taskbar invocation scoped to its identity', () => {

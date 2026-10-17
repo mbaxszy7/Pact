@@ -149,6 +149,7 @@ interface ConversationViewProps {
     | undefined
   onForkSessionStarted?: (() => SessionForkOpening) | undefined
   nativePresentationSuspended?: boolean | undefined
+  platform?: string | undefined
   sessionSettingsSaving?: boolean | undefined
   onSaveSessionPermission?: ((input: SessionPermissionSaveInput) => Promise<boolean>) | undefined
   visible: boolean
@@ -294,6 +295,7 @@ export function ConversationView({
   onForkSessionCreated,
   onForkSessionStarted,
   nativePresentationSuspended = false,
+  platform,
   sessionSettingsSaving,
   onSaveSessionPermission,
   visible,
@@ -4320,6 +4322,7 @@ export function ConversationView({
                     run={activeRun ?? latestRun}
                     busy={responseInProgress}
                     disabled={sessionSettingsSaving}
+                    visible={visible && !nativePresentationSuspended}
                     onSave={onSaveSessionPermission}
                     onNotice={onNotice}
                   />
@@ -4329,6 +4332,7 @@ export function ConversationView({
             <ProjectContextMenu
               key={`${session.id}-${session.projectId}`}
               projectId={session.projectId}
+              platform={platform}
               visible={visible}
               refreshKey={`${latestRun?.id ?? ''}:${latestRun?.status ?? ''}`}
               onNotice={onNotice}

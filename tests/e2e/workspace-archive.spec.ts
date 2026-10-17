@@ -1,9 +1,10 @@
-import { expect, type Page } from '@playwright/test'
+import { expect, type ElectronApplication, type Page } from '@playwright/test'
 import { randomUUID } from 'node:crypto'
 import { readFile, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { quitPact } from './native-quit.js'
 import { createRuntimeFixture, test, type RuntimeFixture } from './runtime-fixture.js'
 
 async function seed(fixture: RuntimeFixture) {
@@ -64,8 +65,9 @@ test(
   async () => {
     const fixture = await createRuntimeFixture({ codexAppServer: 'controlled_stop' })
     const f = await seed(fixture)
+    let app: ElectronApplication | undefined
     try {
-      let app = await fixture.launch()
+      app = await fixture.launch()
       let page = await app.firstWindow()
       const original = await readFile(f.sentinel, 'utf8')
       for (const title of ['First archive Session', 'Second archive Session']) {
@@ -106,7 +108,8 @@ test(
       await expect(
         readFile(join(fixture.directory, 'codex-app-server-state.json'), 'utf8'),
       ).rejects.toMatchObject({ code: 'ENOENT' })
-      await app.close()
+      await quitPact(app, page)
+      app = undefined
       app = await fixture.launch()
       page = await app.firstWindow()
       await expect(
@@ -118,8 +121,10 @@ test(
       await expect(page.getByRole('region', { name: 'Archive results', exact: true })).toHaveCount(
         0,
       )
-      await app.close()
+      await quitPact(app, page)
+      app = undefined
     } finally {
+      if (app) await app.evaluate(({ app: nativeApp }) => nativeApp.exit(1))
       f.database.close()
       await fixture.dispose()
     }
@@ -132,8 +137,9 @@ test(
   async () => {
     const fixture = await createRuntimeFixture({ codexAppServer: 'controlled_stop' })
     const f = await seed(fixture)
+    let app: ElectronApplication | undefined
     try {
-      const app = await fixture.launch()
+      app = await fixture.launch()
       const page = await app.firstWindow()
       await page.getByRole('button', { name: 'First archive Session', exact: true }).click()
       const composer = page.getByRole('combobox', { name: 'Message', exact: true })
@@ -202,8 +208,104 @@ test(
       expect(await readFile(f.sentinel, 'utf8')).toBe(
         'User project content must survive archive and Undo.\n',
       )
-      await app.close()
+      await quitPact(app, page)
+      app = undefined
     } finally {
+      if (app) await app.evaluate(({ app: nativeApp }) => nativeApp.exit(1))
+      f.database.close()
+      await fixture.dispose()
+    }
+  },
+)
+
+test(
+  'Project archive stops current work and preserves an independently archived Session until its Project is restored',
+  { tag: '@deterministic' },
+  async () => {
+    const fixture = await createRuntimeFixture({ codexAppServer: 'controlled_stop' })
+    const f = await seed(fixture)
+    let app: ElectronApplication | undefined
+    try {
+      app = await fixture.launch()
+      const page = await app.firstWindow()
+      const second = page.getByRole('button', {
+        name: 'Archive Session Second archive Session',
+        exact: true,
+      })
+      await second.focus()
+      await second.click()
+      const results = page.getByRole('region', { name: 'Archive results', exact: true })
+      await expect(results.getByRole('status')).toHaveText('1 archived')
+      await page.getByRole('button', { name: 'First archive Session', exact: true }).click()
+      const composer = page.getByRole('combobox', { name: 'Message', exact: true })
+      await composer.fill('@all Preserve Project archive output')
+      await composer.press('Enter')
+      await expect(page.getByText('Controlled partial response remains visible.')).toBeVisible()
+      const original = f.database.conversationRepository.read(f.first)
+      const run = original.runs[0]!
+      const answer = original.messages.find((item) => item.role === 'assistant')!
+      const archive = page.getByRole('button', {
+        name: 'Archive Project Archive Project',
+        exact: true,
+      })
+      await archive.focus()
+      await archive.click()
+      const confirmation = page.getByRole('dialog', { name: 'Stop and archive?', exact: true })
+      await expect(confirmation).toBeVisible()
+      await confirmation.getByRole('button', { name: 'Cancel', exact: true }).click()
+      expect(f.database.projectCatalogRepository.find(f.projectId)?.archivedAt).toBeUndefined()
+      expect(
+        (await fixture.readCodexFacts()).methods.filter((method) => method === 'turn/interrupt'),
+      ).toHaveLength(0)
+      await archive.focus()
+      await archive.click()
+      await expect(confirmation).toBeVisible()
+      await confirmation.getByRole('button', { name: 'Stop and archive', exact: true }).click()
+      await expect(results.getByRole('status')).toHaveText('2 archived', { timeout: 25_000 })
+      await expect(
+        page.getByRole('button', { name: 'Rename Project Archive Project', exact: true }),
+      ).toHaveCount(0)
+      const stopped = f.database.conversationRepository.read(f.first)
+      expect(stopped.runs).toHaveLength(1)
+      expect(stopped.runs[0]).toMatchObject({
+        id: run.id,
+        nativeOutcome: 'interrupted',
+        nativeEffectsState: 'settled',
+      })
+      expect(
+        stopped.messages.find((item) => item.id === answer.id)?.content.startsWith(answer.content),
+      ).toBe(true)
+      await undo(page, 'Second archive Session')
+      await expect(results.getByRole('alert')).toHaveText(
+        'Restore or re-add its Project first, then undo this Session archive.',
+      )
+      expect(f.database.sessionRepository.find(f.second)?.status).toBe('archived')
+      await undo(page, 'Archive Project')
+      await expect(
+        page.getByRole('button', { name: 'Rename Project Archive Project', exact: true }),
+      ).toBeVisible()
+      await expect(page.locator(`[data-session-menu="${f.first}"]`)).toBeVisible()
+      await expect(page.locator(`[data-session-menu="${f.second}"]`)).toHaveCount(0)
+      await undo(page, 'Second archive Session')
+      await expect(
+        page.getByRole('button', { name: 'Second archive Session', exact: true }),
+      ).toBeVisible()
+      expect(f.database.conversationRepository.read(f.first).runs.map((item) => item.id)).toEqual([
+        run.id,
+      ])
+      const facts = await fixture.readCodexFacts()
+      expect(facts.modelStarts).toHaveLength(1)
+      expect(facts.methods.filter((method) => method === 'turn/interrupt')).toHaveLength(1)
+      await expect(
+        readFile(join(fixture.directory, 'claude-sdk-state.json'), 'utf8'),
+      ).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(await readFile(f.sentinel, 'utf8')).toBe(
+        'User project content must survive archive and Undo.\n',
+      )
+      await quitPact(app, page)
+      app = undefined
+    } finally {
+      if (app) await app.evaluate(({ app: nativeApp }) => nativeApp.exit(1))
       f.database.close()
       await fixture.dispose()
     }

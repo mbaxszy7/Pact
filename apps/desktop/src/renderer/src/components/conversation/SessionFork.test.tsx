@@ -229,6 +229,28 @@ it('shows inherited choices and confirms Full access through the creation comman
   )
 })
 
+it('restores the focused Fork control after native presentation suspension without preparing again', async () => {
+  Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+    configurable: true,
+    value(this: HTMLDialogElement) {
+      this.open = true
+      this.querySelector<HTMLButtonElement>('button')?.focus()
+    },
+  })
+  const f = fixture()
+  const view = render(<SessionForkDialog {...f.props} />)
+  const create = await screen.findByRole<HTMLButtonElement>('button', {
+    name: 'Create fork with Full access',
+  })
+  await waitFor(() => expect(create.disabled).toBe(false))
+  create.focus()
+  view.rerender(<SessionForkDialog {...f.props} suspended />)
+  expect(screen.queryByRole('dialog')).toBeNull()
+  view.rerender(<SessionForkDialog {...f.props} />)
+  expect(document.activeElement).toBe(create)
+  expect(f.forkSession).toHaveBeenCalledOnce()
+})
+
 it('shows a missing native history rejection and never offers a creation request', async () => {
   const f = fixture()
   f.forkSession.mockResolvedValueOnce({
