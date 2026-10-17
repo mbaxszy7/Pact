@@ -12,6 +12,10 @@ on:
         description: Run extended UI and deterministic regression
         type: boolean
         default: false
+      validate_installers:
+        description: Validate Dev and Stable native installers before enabling automatic packaging
+        type: boolean
+        default: false
 
 # The authenticated controller source controls PR jobs. Frozen bootstrap execution
 # stays disabled until its public identity tuple and separate environments are set.
@@ -87,8 +91,9 @@ jobs:
           All Windows ARM64 CI is explicitly deferred by the owner. Its cold native
           launcher exceeded the unchanged 15-second startup budget; it is not a pass.
           Re-enable its native and Provider jobs together after resolving that failure
-          and obtaining native-machine acceptance. Installer builds and publication
-          remain disabled pending their separate acceptance.
+          and obtaining native-machine acceptance. Native installer validation can be
+          dispatched before the packaging switch is enabled; publication keeps its
+          separate owner-approved release gates.
           EOF
 
   publication:
@@ -295,16 +300,16 @@ jobs:
         run: pnpm exec playwright test --list --reporter=json > "$RUNNER_TEMP/pact-e2e-inventory.json"
       - name: Extended Electron UI regression
         id: ui
-        if: ${{ inputs.extended_e2e == true }}
+        if: ${{ needs.identity.outputs.channel == 'stable' || inputs.extended_e2e == true }}
         run: node control/scripts/ci.mjs ui
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
           PACT_CI_EVIDENCE_DIR: ${{ runner.temp }}/pact-evidence/${{ matrix.key }}
       - name: Extended deterministic business and lifecycle regression
         id: deterministic
-        # Manual full regression keeps its own failures. Ordinary PR smoke does
-        # not select either extended lane and reports every case as deferred.
-        if: ${{ !cancelled() && inputs.extended_e2e == true && steps.ui.outputs.ui_execution_completed == 'true' }}
+        # Stable candidates always select full regression. Dev selects it only
+        # explicitly; a completed failing UI lane still permits deterministic evidence.
+        if: ${{ !cancelled() && (needs.identity.outputs.channel == 'stable' || inputs.extended_e2e == true) && steps.ui.outputs.ui_execution_completed == 'true' }}
         run: node control/scripts/ci.mjs deterministic
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
@@ -339,7 +344,7 @@ jobs:
           PACT_CI_DIAGNOSTIC_LANE: uncredentialed
           PACT_UI_EXECUTION_COMPLETED: ${{ steps.ui.outputs.ui_execution_completed }}
           PACT_DETERMINISTIC_EXECUTION_COMPLETED: ${{ steps.deterministic.outputs.deterministic_execution_completed }}
-          PACT_E2E_REPORT_SCOPE: ${{ inputs.extended_e2e == true && 'full' || 'core' }}
+          PACT_E2E_REPORT_SCOPE: ${{ (needs.identity.outputs.channel == 'stable' || inputs.extended_e2e == true) && 'full' || 'core' }}
       - name: Preserve actual uncredentialed test results and readable failure reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -379,7 +384,7 @@ jobs:
           retention-days: 14
       - name: Build Dev or Stable-candidate installers
         id: distribution
-        if: ${{ !cancelled() && steps.native.outcome == 'success' && matrix.package && vars.PACT_PACKAGING_READY == 'true' }}
+        if: ${{ !cancelled() && steps.native.outcome == 'success' && matrix.package && (vars.PACT_PACKAGING_READY == 'true' || (github.event_name == 'workflow_dispatch' && inputs.validate_installers == true)) }}
         working-directory: source
         run: >-
           node scripts/build-distribution.mjs --channel "$CHANNEL"
@@ -393,12 +398,12 @@ jobs:
           PLATFORM_KEY: ${{ matrix.key }}
           CANDIDATE_SHA: ${{ needs.identity.outputs.candidate }}
       - name: Record deferred installers without waiving native checks
-        if: ${{ !cancelled() && (!matrix.package || vars.PACT_PACKAGING_READY != 'true') }}
+        if: ${{ !cancelled() && (!matrix.package || (vars.PACT_PACKAGING_READY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.validate_installers == true))) }}
         run: >-
           node --input-type=module -e
           'import { appendFile } from "node:fs/promises";
           await appendFile(process.env.GITHUB_STEP_SUMMARY,
-          "Automated installers and release acceptance are deferred (TODO) until native-machine validation. Native protocol checks and real dual-Agent smoke remain required; extended UI/deterministic cases are reported separately.\n");'
+          "Installer validation is not selected. Enable the packaging switch after native acceptance or dispatch validate_installers for a no-credential preflight. Native protocol checks remain required; Stable candidates also require complete E2E.\n");'
       - name: Install and cold-start the exact NSIS or DMG application
         id: package-smoke
         if: ${{ !cancelled() && steps.distribution.outcome == 'success' }}
@@ -428,13 +433,41 @@ jobs:
           '
         env:
           PLATFORM_KEY: ${{ matrix.key }}
+      - name: Validate the separate Stable identity during manual installer preflight
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.validate_installers == true && steps.package-smoke.outcome == 'success' }}
+        working-directory: source
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFile } from 'node:fs/promises';
+          import { join } from 'node:path';
+          import { spawnSync } from 'node:child_process';
+          const output = join(process.env.RUNNER_TEMP, 'pact-distribution', process.env.PLATFORM_KEY, 'stable-preflight');
+          const manifest = join(output, 'distribution-manifest.json');
+          const invoke = (args) => {
+            const result = spawnSync(process.execPath, args, { shell: false, stdio: 'inherit' });
+            if (result.error) throw result.error;
+            if (result.status !== 0) throw Error('Stable installer preflight failed');
+          };
+          invoke(['scripts/build-distribution.mjs', '--channel', 'stable', '--platform', process.env.TARGET_PLATFORM, '--arch', process.env.TARGET_ARCH, '--sha', process.env.CANDIDATE_SHA, '--build-number', process.env.GITHUB_RUN_NUMBER, '--output', output]);
+          invoke(['scripts/package-smoke.mjs', '--manifest', manifest, '--production-paths', '--report', join(output, 'package-smoke-report.json')]);
+          if (process.env.TARGET_PLATFORM === 'darwin') {
+            const zip = JSON.parse(await readFile(manifest, 'utf8')).artifacts.find((item) => item.kind === 'zip');
+            if (!zip) throw Error('Stable ZIP is required');
+            invoke(['scripts/package-smoke.mjs', '--manifest', manifest, '--production-paths', '--artifact', join(output, zip.path), '--report', join(output, 'package-zip-smoke-report.json')]);
+          }
+          NODE
+        env:
+          PLATFORM_KEY: ${{ matrix.key }}
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          TARGET_ARCH: ${{ matrix.arch }}
+          CANDIDATE_SHA: ${{ needs.identity.outputs.candidate }}
       - name: Revalidate current head and base after physical cleanup
         run: node control/scripts/ci-identity.mjs verify "$RUNNER_TEMP/pact-identity/ci-identity.json"
         env:
           PACT_CI_WORKSPACE: ${{ github.workspace }}/source
           GITHUB_TOKEN: ${{ github.token }}
       - name: Preserve installers and bounded fixture-only verification records
-        if: ${{ always() && matrix.package && vars.PACT_PACKAGING_READY == 'true' }}
+        if: ${{ always() && matrix.package && (vars.PACT_PACKAGING_READY == 'true' || (github.event_name == 'workflow_dispatch' && inputs.validate_installers == true)) }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ needs.identity.outputs.channel }}-${{ matrix.key }}-a${{ github.run_attempt }}
@@ -444,6 +477,11 @@ jobs:
             ${{ runner.temp }}/pact-distribution/${{ matrix.key }}/*.zip
             ${{ runner.temp }}/pact-distribution/${{ matrix.key }}/*.json
             ${{ runner.temp }}/pact-distribution/${{ matrix.key }}/SHA256SUMS
+            ${{ runner.temp }}/pact-distribution/${{ matrix.key }}/stable-preflight/*.exe
+            ${{ runner.temp }}/pact-distribution/${{ matrix.key }}/stable-preflight/*.dmg
+            ${{ runner.temp }}/pact-distribution/${{ matrix.key }}/stable-preflight/*.zip
+            ${{ runner.temp }}/pact-distribution/${{ matrix.key }}/stable-preflight/*.json
+            ${{ runner.temp }}/pact-distribution/${{ matrix.key }}/stable-preflight/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
 
@@ -465,7 +503,7 @@ jobs:
       controller: ${{ needs.identity.outputs.controller }}
       source_kind: ${{ needs.identity.outputs.source_kind }}
       suite: ${{ contains(github.event.pull_request.labels.*.name, 'pact:real-full') && 'full' || 'core' }}
-      extended_e2e: ${{ inputs.extended_e2e == true }}
+      extended_e2e: ${{ needs.identity.outputs.channel == 'stable' || inputs.extended_e2e == true }}
       root_run_id: ${{ github.run_id }}
       root_attempt: ${{ github.run_attempt }}
 

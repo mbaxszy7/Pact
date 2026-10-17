@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash, generateKeyPairSync } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -98,7 +99,7 @@ function apiFixture({ published = false, version = '0.1.0' } = {}) {
     stages: [],
     archives: new Map(),
     run: {
-      name: 'Stable Release',
+      name: 'Pact Release - Publish app downloads',
       run_attempt: 1,
       path: '.github/workflows/release.yml',
       event: 'pull_request_target',
@@ -789,6 +790,10 @@ void test('workflow keeps App credentials out of builds and forbids automatic/pa
     new URL('../.github/workflows/release.yml', import.meta.url),
     'utf8',
   )
+  const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url))
+  const builderRequire = createRequire(desktopRequire.resolve('electron-builder/package.json'))
+  const parsedWorkflow = builderRequire('js-yaml').load(workflow)
+  assert.equal(apiFixture().state.run.name, parsedWorkflow.name)
   for (const key of RELEASE_PLATFORMS) {
     const build = workflow.split(`\n  build-${key}:`)[1].split(`\n  stage-${key}:`)[0]
     assert.ok(!build.includes('PACT_CI_APP_PRIVATE_KEY'))
@@ -805,7 +810,7 @@ void test('workflow keeps App credentials out of builds and forbids automatic/pa
   assert.doesNotMatch(ci, /run_soak|run-soak|package-soak-report|SOAK_DURATION/u)
   assert.doesNotMatch(ci, /key: win32-arm64|runner: windows-11-arm/u)
   assert.match(ci, /steps\.native\.outcome == 'success' && matrix\.package/u)
-  assert.match(ci, /matrix\.package && vars\.PACT_PACKAGING_READY == 'true'/u)
+  assert.match(ci, /matrix\.package && \(vars\.PACT_PACKAGING_READY == 'true'/u)
   assert.match(workflow, /vars\.PACT_PACKAGING_READY == 'true'/u)
   const config = JSON.parse(
     await readFile(new URL('../release-please-config.json', import.meta.url), 'utf8'),

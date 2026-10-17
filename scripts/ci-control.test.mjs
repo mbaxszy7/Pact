@@ -37,6 +37,48 @@ const platformJobs = (job, purpose) => {
   })
 }
 
+void test('manual installer preflight cannot authorize publication or model credentials', async () => {
+  const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url))
+  const builderRequire = createRequire(desktopRequire.resolve('electron-builder/package.json'))
+  const { load } = builderRequire('js-yaml')
+  const root = load(await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8'))
+  const release = load(
+    await readFile(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8'),
+  )
+  assert.equal(root.on.workflow_dispatch.inputs.validate_installers.default, false)
+  assert.equal(root.on.workflow_dispatch.inputs.validate_installers.type, 'boolean')
+  const admission =
+    "vars.PACT_PACKAGING_READY == 'true' || (github.event_name == 'workflow_dispatch' && inputs.validate_installers == true)"
+  const steps = root.jobs.platform.steps
+  assert(steps.find((step) => step.id === 'distribution').if.includes(admission))
+  const upload = steps.find(
+    (step) =>
+      step.with?.name ===
+      '${{ needs.identity.outputs.channel }}-${{ matrix.key }}-a${{ github.run_attempt }}',
+  )
+  assert(upload.if.includes(admission))
+  assert.equal(upload.with['retention-days'], 14)
+  const stable = steps.find(
+    (step) =>
+      step.name === 'Validate the separate Stable identity during manual installer preflight',
+  )
+  assert(
+    stable.if.includes(
+      "github.event_name == 'workflow_dispatch' && inputs.validate_installers == true",
+    ),
+  )
+  assert(stable.if.includes("steps.package-smoke.outcome == 'success'"))
+  assert(stable.run.includes("'--channel', 'stable'"))
+  assert(stable.run.includes("'--production-paths'"))
+  assert(stable.run.includes("'package-zip-smoke-report.json'"))
+  assert(upload.with.path.includes('/stable-preflight/*.json'))
+  assert(!root.jobs.provider.if.includes('validate_installers'))
+  assert(!JSON.stringify(release).includes('validate_installers'))
+  assert(release.jobs.identity.if.includes("vars.PACT_PACKAGING_READY == 'true'"))
+  assert.equal(root.permissions.contents, 'read')
+  assert(!JSON.stringify(root.jobs.platform).includes('PACT_CI_APP_PRIVATE_KEY'))
+})
+
 void test('partial Windows reruns download the retained producer artifact, not the consumer attempt name', async () => {
   const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url))
   const builderRequire = createRequire(desktopRequire.resolve('electron-builder/package.json'))
@@ -183,17 +225,16 @@ void test('ordinary PR E2E selects only real smoke while extended reports and na
   const provider = load(
     await readFile(new URL('../.github/workflows/provider-e2e.yml', import.meta.url), 'utf8'),
   )
-  assert.equal(root.jobs.provider.with.extended_e2e, '${{ inputs.extended_e2e == true }}')
+  const fullCondition = "needs.identity.outputs.channel == 'stable' || inputs.extended_e2e == true"
+  assert.equal(root.jobs.provider.with.extended_e2e, '${{ ' + fullCondition + ' }}')
   assert.deepEqual(provider.on.workflow_call.inputs.extended_e2e, {
     description: 'Require the UI and deterministic execution results selected by the caller',
     default: false,
     type: 'boolean',
   })
   const steps = root.jobs.platform.steps
-  assert.equal(steps.find((step) => step.id === 'ui').if, '${{ inputs.extended_e2e == true }}')
-  assert(
-    steps.find((step) => step.id === 'deterministic').if.includes('inputs.extended_e2e == true'),
-  )
+  assert.equal(steps.find((step) => step.id === 'ui').if, '${{ ' + fullCondition + ' }}')
+  assert(steps.find((step) => step.id === 'deterministic').if.includes('(' + fullCondition + ')'))
   const native = steps.find((step) => step.id === 'native')
   assert.equal(native.if, "${{ !cancelled() && steps.build.outcome == 'success' }}")
   assert(!native.if.includes('ui_execution_completed'))
@@ -202,7 +243,7 @@ void test('ordinary PR E2E selects only real smoke while extended reports and na
   assert.equal(report.if, 'always()')
   assert.equal(
     report.env.PACT_E2E_REPORT_SCOPE,
-    "${{ inputs.extended_e2e == true && 'full' || 'core' }}",
+    '${{ (' + fullCondition + ") && 'full' || 'core' }}",
   )
   assert(root.jobs.provider.needs.includes('platform'))
   assert(root.jobs.provider.needs.includes('quality'))

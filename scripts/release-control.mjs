@@ -1009,7 +1009,7 @@ export async function verifyArtifactRun(api, identity, runId, context) {
   )
   const run = await api.request(api.path(`/actions/runs/${runId}`))
   requireFact(
-    run.name === 'Stable Release' &&
+    run.name === 'Pact Release - Publish app downloads' &&
       run.path === '.github/workflows/release.yml' &&
       run.repository.full_name === api.repository &&
       ['workflow_dispatch', 'pull_request_target'].includes(run.event),

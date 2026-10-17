@@ -29,8 +29,9 @@ See the [product specification](docs/product/requirements.md) for current behavi
 - On Windows, Python 3 and Visual Studio Build Tools with **Desktop development with C++** for
   Electron native dependency rebuilds.
 
-Required CI currently covers Windows x64 and macOS arm64. Windows arm64 CI and all
-automatic installer builds/publication are deferred pending native-machine acceptance.
+Required CI covers Windows x64 and macOS arm64, including their guarded installer validation.
+CI builds use `Pact Dev`; Stable downloads use `Pact`. Publication requires the approved version
+PR and both platforms' final installer evidence. Windows arm64 CI remains deferred.
 
 ```sh
 corepack enable
@@ -49,7 +50,7 @@ pnpm build                  # Production output
 pnpm start                  # Production output with the development Electron executable
 pnpm test:e2e:ui            # No provider credentials
 pnpm test:e2e:deterministic # Protocol and fixed-load fixtures
-pnpm verify:package         # Build and test an isolated unpacked application
+pnpm verify:package --manifest MANIFEST # Verify an exact distribution; add --unpacked for dir builds
 pnpm dist:mac               # Build macOS installers on macOS
 pnpm dist:win               # Build the Windows installer on Windows
 ```

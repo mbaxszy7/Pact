@@ -323,11 +323,11 @@ version, source SHA, tag, Release PR and Release ID; they omit signed-state exte
 and do not replace the release controller's authenticated staging or publication checks.
 
 Branch pushes and PRs require static checks, unit/script tests, builds and native protocol checks
-on Windows x64 and macOS arm64. PRs also require the real smoke case above; UI/deterministic
-E2E is extended regression. All Windows arm64 CI and installer build/smoke and publication currently
-are deferred until native-machine acceptance. `PACT_PACKAGING_READY` must remain unset or false
-until that acceptance is complete. Windows arm64 installers remain excluded from the future automated
-release set. Both active CI architectures retain mandatory native protocol checks. Stable candidates additionally require
+on Windows x64 and macOS arm64. Dev PRs require the real smoke case above; UI/deterministic
+E2E is optional extended regression for Dev and mandatory for Stable candidates. Windows arm64 CI
+and installers remain deferred. `PACT_PACKAGING_READY` enables automatic installer build/smoke;
+enable it only after both native targets pass installer validation. Both active CI architectures
+retain mandatory native protocol checks. Stable candidates additionally require
 full provider verification; publication validates every final installer and its content-bound
 smoke report. CI platform jobs allow 90 minutes and release platform jobs allow two hours
 for their required checks, packaging and cleanup. Deadlines do not establish completed tests.
@@ -392,10 +392,13 @@ node scripts/build-distribution.mjs --channel stable --platform darwin --arch ar
 node scripts/package-smoke.mjs --manifest .pact-data/distributions/stable/distribution-manifest.json --production-paths --report .pact-data/distributions/stable/smoke.json
 ```
 
-Automatic installer jobs and Stable publication are deferred (TODO) until native-machine acceptance;
-`PACT_PACKAGING_READY` defaults to disabled. The commands above remain available for isolated manual
-validation. Windows x64 and macOS arm64 are the candidate automated installer targets; Windows arm64
-needs a separate later integration decision. Do not treat deferred packaging as passing release evidence.
+Before enabling automatic packaging, dispatch `ci.yml` on the intended branch with
+`validate_installers=true`. This validates both Dev and Stable identities with the same macOS
+DMG/ZIP and Windows NSIS installation, cold-start, default-path and cleanup checks without App or model credentials. Add
+`extended_e2e=true` to require both no-credential Electron lanes. The manual input cannot enable
+Stable publication or model execution. Review both platform results and their exact manifest-bound
+reports, then enable `PACT_PACKAGING_READY`; `PACT_GOVERNANCE_READY` separately requires verified
+repository rules, environments and fixed-App identity. A successful preflight is not a formal Release.
 
 Local production uses the same entry point with `--profile production-local --channel stable`; its name and existing data directories remain separate from both CI channels. Local `dist:mac`, `dist:win`, and `package:dir:local` select this profile. Smoke commands require the exact generated manifest.
 
