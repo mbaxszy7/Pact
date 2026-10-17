@@ -4,6 +4,7 @@ import { join } from 'node:path'
 
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
+import { quitPact } from './native-quit.js'
 import {
   authMarker,
   closeRealWorkspace,
@@ -85,7 +86,7 @@ test(
         .toBe('Preserve my source draft')
       await selectRealSession(ctx, childId)
       await ctx.fixture.controlTransportFault('release')
-      await ctx.app.close()
+      await quitPact(ctx.app)
       ctx.app = await ctx.fixture.launch()
       ctx.page = await ctx.app.firstWindow()
       await selectRealSession(ctx, childId)
@@ -161,7 +162,7 @@ test(
       const source = await waitForRealCompletion(ctx, 1)
       const old = source.nativeContexts.find((row) => row.agentId === 'codex')!
       const evidence = await findNativeRecord(ctx, 'codex', old.nativeSessionId)
-      await ctx.app.close()
+      await quitPact(ctx.app)
       const backup = join(ctx.fixture.directory, 'native-backup')
       await mkdir(backup, { mode: 0o700 })
       await rename(evidence.path, join(backup, 'source.jsonl'))
@@ -213,7 +214,7 @@ test(
         .poll(() => ctx.page.getByRole('combobox', { name: 'Message' }).textContent())
         .toBe('Preserve this unsubmitted draft')
       await ctx.fixture.controlTransportFault('release')
-      await ctx.app.close()
+      await quitPact(ctx.app)
       const candidate = await findNativeRecord(ctx, 'codex', pending.provisionalNativeSessionId)
       await rename(candidate.path, join(backup, 'candidate.jsonl'))
       ctx.app = await ctx.fixture.launch()

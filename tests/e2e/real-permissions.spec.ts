@@ -5,6 +5,7 @@ import { parse, stringify } from 'smol-toml'
 
 import type { ConversationSnapshot, DesktopBridge } from '../../packages/contracts/src/index.js'
 
+import { quitPact } from './native-quit.js'
 import {
   addRealSession,
   authMarker,
@@ -35,7 +36,7 @@ for (const choice of ['once', 'session'] as const) {
         if (choice === 'session') {
           // This Native tool is disabled by default in CLI 0.159.2. Enable only
           // its capability in the owned copy; original auth/model files stay exact.
-          await context.app.close()
+          await quitPact(context.app)
           const path = join(context.fixture.codexHome, 'config.toml')
           const original = await readFile(path, 'utf8')
           const configuration = parse(original)

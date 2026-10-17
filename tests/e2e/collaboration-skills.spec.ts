@@ -7,6 +7,7 @@ import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { conversationMessages } from '../../packages/persistence/src/schema/index.js'
+import { quitPact } from './native-quit.js'
 import { createRuntimeFixture, test } from './runtime-fixture.js'
 
 const resultCard = (page: Page): Locator =>
@@ -229,7 +230,7 @@ for (const primary of ['codex', 'claude'] as const)
       ])
       expect(await f.counts()).toEqual({ codex: 3, claude: 3 })
     } finally {
-      await f.app.close()
+      await quitPact(f.app)
       await f.fixture.dispose()
     }
   })
@@ -302,7 +303,7 @@ test('@deterministic Pact questions accept a deliberate answer and direct Review
     })
     expect(await f.counts()).toEqual({ codex: 4, claude: 1 })
   } finally {
-    await f.app.close()
+    await quitPact(f.app)
     await f.fixture.dispose()
   }
 })
@@ -378,7 +379,7 @@ test('@deterministic Pact build coalesces a running update into a readonly respo
     }
     throw error
   } finally {
-    await f.app.close()
+    await quitPact(f.app)
     await f.fixture.dispose()
   }
 })
@@ -439,7 +440,7 @@ test('@deterministic plan Comments survive restart and return to the frozen sour
     await page.getByRole('textbox', { name: 'Comment' }).fill('Keep this exact plan decision.')
     await page.getByRole('textbox', { name: 'Comment' }).press('Enter')
     await expect(page.getByLabel('Attached Comment drafts')).toContainText('Plan v1')
-    await app.close()
+    await quitPact(app)
     const db = await PactDatabase.open({
       filePath: f.fixture.databaseFile,
       migrationsFolder: resolve(import.meta.dirname, '../../packages/persistence/drizzle'),
@@ -489,7 +490,7 @@ test('@deterministic plan Comments survive restart and return to the frozen sour
     expect(await f.counts()).toEqual({ codex: 2, claude: 0 })
     await expect(page.getByRole('button', { name: 'Not now', exact: true })).toHaveCount(0)
   } finally {
-    await app.close()
+    await quitPact(app)
     await f.fixture.dispose()
   }
 })
@@ -510,7 +511,7 @@ test('@deterministic source edits do not block an authorized repair and normal r
     await expectCompleteReview(f.page)
     expect(await f.counts()).toEqual({ codex: 2, claude: 2 })
   } finally {
-    await f.app.close()
+    await quitPact(f.app)
     await f.fixture.dispose()
   }
 })
@@ -567,7 +568,7 @@ test(
       ).toBeEnabled()
       expect(await f.counts()).toEqual({ codex: 0, claude: 3 })
     } finally {
-      await f.app.close()
+      await quitPact(f.app)
       await f.fixture.dispose()
     }
   },
@@ -708,7 +709,7 @@ test('@deterministic right Todos titles align the exact loaded item and preserve
     await expect(f.page.getByLabel('Attached Comment drafts')).toHaveCount(0)
     expect(await f.counts()).toEqual({ codex: 2, claude: 1 })
   } finally {
-    await f.app.close()
+    await quitPact(f.app)
     await f.fixture.dispose()
   }
 })

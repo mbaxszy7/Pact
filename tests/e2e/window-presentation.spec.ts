@@ -1,5 +1,6 @@
 import { expect } from '@playwright/test'
 
+import { quitPact } from './native-quit.js'
 import { createRuntimeFixture, test } from './runtime-fixture.js'
 
 test(
@@ -49,7 +50,7 @@ test(
       ).toEqual(resized.bounds)
       await expect(page.getByRole('heading', { name: 'Start with a project' })).toBeVisible()
     } finally {
-      await app.close()
+      await quitPact(app)
       await fixture.dispose()
     }
   },

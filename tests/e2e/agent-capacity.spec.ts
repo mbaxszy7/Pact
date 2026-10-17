@@ -5,6 +5,8 @@ import { resolve } from 'node:path'
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { quitPact } from './native-quit.js'
+import { closeRealWorkspace } from './real-harness.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture, type RuntimeFixture } from './runtime-fixture.js'
 
@@ -116,8 +118,8 @@ test(
         adapterSlots: 5,
       })
     } finally {
-      await app?.close()
-      await fixture.dispose()
+      if (app) await closeRealWorkspace({ app, fixture })
+      else await fixture.dispose()
     }
   },
 )
@@ -161,7 +163,7 @@ test('sequential Sessions keep at most five Adapter slots', { tag: '@determinist
       expect(health.ok && (health.value.conversation?.adapterSlots ?? 0) <= 5).toBe(true)
     }
   } finally {
-    await app?.close()
+    if (app) await quitPact(app)
     await fixture.dispose()
   }
 })

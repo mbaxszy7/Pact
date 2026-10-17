@@ -449,9 +449,11 @@ jobs:
             if (result.status !== 0) throw Error('Stable installer preflight failed');
           };
           invoke(['scripts/build-distribution.mjs', '--channel', 'stable', '--platform', process.env.TARGET_PLATFORM, '--arch', process.env.TARGET_ARCH, '--sha', process.env.CANDIDATE_SHA, '--build-number', process.env.GITHUB_RUN_NUMBER, '--output', output]);
+          const distribution = JSON.parse(await readFile(manifest, 'utf8'));
+          if (distribution.sourceDirty !== false) throw Error('Stable preflight requires a clean source checkout');
           invoke(['scripts/package-smoke.mjs', '--manifest', manifest, '--production-paths', '--report', join(output, 'package-smoke-report.json')]);
           if (process.env.TARGET_PLATFORM === 'darwin') {
-            const zip = JSON.parse(await readFile(manifest, 'utf8')).artifacts.find((item) => item.kind === 'zip');
+            const zip = distribution.artifacts.find((item) => item.kind === 'zip');
             if (!zip) throw Error('Stable ZIP is required');
             invoke(['scripts/package-smoke.mjs', '--manifest', manifest, '--production-paths', '--artifact', join(output, zip.path), '--report', join(output, 'package-zip-smoke-report.json')]);
           }

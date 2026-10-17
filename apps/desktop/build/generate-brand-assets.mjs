@@ -2,6 +2,13 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import sharp from 'sharp'
 
+const args = process.argv.slice(2)
+if (args.length > 1 || args.some((argument) => argument !== '--installer-artwork'))
+  throw new Error('Brand generation accepts only --installer-artwork.')
+const installerArtwork = args[0] === '--installer-artwork'
+if (installerArtwork && process.platform !== 'win32')
+  throw new Error('Generate and review installer artwork on Windows before committing it.')
+
 const buildDirectory = import.meta.dirname
 const resourcesDirectory = join(buildDirectory, '../resources')
 const icon = await readFile(join(resourcesDirectory, 'icon.svg'))
@@ -113,37 +120,39 @@ await Promise.all(
   }),
 )
 
-// NSIS Modern UI consumes an opaque, bottom-up 24-bit Windows bitmap.
-await Promise.all(
-  ['installer-sidebar', 'installer-header'].map(async (name) => {
-    const template = await readFile(join(buildDirectory, `${name}.svg`), 'utf8')
-    const { data, info } = await sharp(
-      Buffer.from(template.replaceAll('__PACT_ICON__', iconDataUri)),
-    )
-      .flatten({ background: '#ffffff' })
-      .removeAlpha()
-      .raw()
-      .toBuffer({ resolveWithObject: true })
-    const stride = Math.ceil((info.width * 3) / 4) * 4
-    const bitmap = Buffer.alloc(54 + stride * info.height)
-    bitmap.write('BM')
-    bitmap.writeUInt32LE(bitmap.length, 2)
-    bitmap.writeUInt32LE(54, 10)
-    bitmap.writeUInt32LE(40, 14)
-    bitmap.writeInt32LE(info.width, 18)
-    bitmap.writeInt32LE(info.height, 22)
-    bitmap.writeUInt16LE(1, 26)
-    bitmap.writeUInt16LE(24, 28)
-    bitmap.writeUInt32LE(stride * info.height, 34)
-    for (let y = 0; y < info.height; y += 1) {
-      for (let x = 0; x < info.width; x += 1) {
-        const source = (y * info.width + x) * 3
-        const target = 54 + (info.height - y - 1) * stride + x * 3
-        bitmap[target] = data[source + 2]
-        bitmap[target + 1] = data[source + 1]
-        bitmap[target + 2] = data[source]
+// NSIS bitmaps depend on installed Windows fonts. Ordinary builds consume the
+// reviewed committed artwork instead of rewriting it with another host's fonts.
+if (installerArtwork)
+  await Promise.all(
+    ['installer-sidebar', 'installer-header'].map(async (name) => {
+      const template = await readFile(join(buildDirectory, `${name}.svg`), 'utf8')
+      const { data, info } = await sharp(
+        Buffer.from(template.replaceAll('__PACT_ICON__', iconDataUri)),
+      )
+        .flatten({ background: '#ffffff' })
+        .removeAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true })
+      const stride = Math.ceil((info.width * 3) / 4) * 4
+      const bitmap = Buffer.alloc(54 + stride * info.height)
+      bitmap.write('BM')
+      bitmap.writeUInt32LE(bitmap.length, 2)
+      bitmap.writeUInt32LE(54, 10)
+      bitmap.writeUInt32LE(40, 14)
+      bitmap.writeInt32LE(info.width, 18)
+      bitmap.writeInt32LE(info.height, 22)
+      bitmap.writeUInt16LE(1, 26)
+      bitmap.writeUInt16LE(24, 28)
+      bitmap.writeUInt32LE(stride * info.height, 34)
+      for (let y = 0; y < info.height; y += 1) {
+        for (let x = 0; x < info.width; x += 1) {
+          const source = (y * info.width + x) * 3
+          const target = 54 + (info.height - y - 1) * stride + x * 3
+          bitmap[target] = data[source + 2]
+          bitmap[target + 1] = data[source + 1]
+          bitmap[target + 2] = data[source]
+        }
       }
-    }
-    await writeFile(join(buildDirectory, `${name}.bmp`), bitmap)
-  }),
-)
+      await writeFile(join(buildDirectory, `${name}.bmp`), bitmap)
+    }),
+  )

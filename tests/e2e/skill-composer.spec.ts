@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { quitPact } from './native-quit.js'
 import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import { createRuntimeFixture, test, type RuntimeFixture } from './runtime-fixture.js'
 
@@ -66,12 +67,13 @@ async function prepare() {
       fixture: owned,
       skills,
       sessionId,
-      async dispose() {
+      async dispose(app?: Awaited<ReturnType<RuntimeFixture['launch']>>) {
         try {
-          await owned.dispose()
+          if (app) await quitPact(app)
         } finally {
-          await rm(documents, { recursive: true, force: true })
+          await owned.dispose()
         }
+        await rm(documents, { recursive: true, force: true })
       },
     }
   } catch (error) {
@@ -89,9 +91,10 @@ test(
   { tag: '@deterministic' },
   async () => {
     const owned = await prepare()
+    let app: Awaited<ReturnType<RuntimeFixture['launch']>> | undefined
     try {
-      const app = await owned.fixture.launch(),
-        window = await app.firstWindow()
+      app = await owned.fixture.launch()
+      const window = await app.firstWindow()
       await window.getByRole('button', { name: 'Skill Composer', exact: true }).click()
       const editor = window.getByRole('combobox', { name: 'Message' })
       await editor.fill('/')
@@ -120,7 +123,7 @@ test(
       await expect(window.getByRole('button', { name: 'Send message', exact: true })).toBeEnabled()
       expect((await owned.fixture.readCodexFacts()).modelStarts).toHaveLength(0)
     } finally {
-      await owned.dispose()
+      await owned.dispose(app)
     }
   },
 )
@@ -130,9 +133,10 @@ test(
   { tag: '@deterministic' },
   async () => {
     const owned = await prepare()
+    let app: Awaited<ReturnType<RuntimeFixture['launch']>> | undefined
     try {
-      const app = await owned.fixture.launch(),
-        window = await app.firstWindow()
+      app = await owned.fixture.launch()
+      const window = await app.firstWindow()
       await window.getByRole('button', { name: 'Skill Composer', exact: true }).click()
       const editor = window.getByRole('combobox', { name: 'Message' })
       await editor.fill('1. first')
@@ -175,7 +179,7 @@ test(
         [{ name: 'check', path: owned.skills.find((skill) => skill.name === 'check')!.path }],
       ])
     } finally {
-      await owned.dispose()
+      await owned.dispose(app)
     }
   },
 )

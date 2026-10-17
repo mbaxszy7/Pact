@@ -85,8 +85,11 @@ not the launch environment. Project files and native provider configuration rema
 shared; application identity does not establish a cross-process Project writer lease.
 
 The canonical logo is [resources/icon.svg](apps/desktop/resources/icon.svg).
-`pnpm --filter @pact/desktop brand` regenerates PNG, Windows ICO, macOS ICNS and installer artwork from
-that source. The same generator builds monochrome Windows tray artwork and macOS Template images
+`pnpm --filter @pact/desktop brand` regenerates PNG, Windows ICO and macOS ICNS from that source.
+Windows installer bitmaps are reviewed committed inputs: regenerate them explicitly with
+`pnpm --filter @pact/desktop brand:win` on Windows. Ordinary builds retain those bytes because
+SVG text otherwise depends on host fonts and dirties a clean distribution checkout.
+The same generator builds monochrome Windows tray artwork and macOS Template images
 from their canonical SVGs. Inspect tray, packaged taskbar navigation and Pact exit confirmation on
 the actual platform before running their formal tests. Windows development supports tray navigation
 and Session JumpLists for the running repository-specific instance; after a full exit,

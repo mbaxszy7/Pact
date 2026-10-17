@@ -1280,14 +1280,18 @@ describe('Conversation workspace archive', () => {
     const gate = Promise.withResolvers<void>()
     cleanupGates.push(() => gate.resolve())
     const reservations: WorkspaceReservation[] = []
+    const entered = Promise.withResolvers<void>()
     const originalRelease = workspace.release.bind(workspace)
     vi.spyOn(workspace, 'release').mockImplementation(async (reservation) => {
       reservations.push(reservation)
+      if (reservations.length === runs.length) entered.resolve()
       await gate.promise
       await originalRelease(reservation)
     })
     const finishing = runs.map((run) => workspace.finish(run.id))
-    await vi.waitFor(() => expect(reservations).toHaveLength(5))
+    // Actual directory Workers own their deadlines; release-entry readiness is
+    // a physical seam, not Vitest's default one-second polling expectation.
+    await entered.promise
     const handlesOpen = await Promise.all(
       reservations.map(async (reservation) => (await reservation.handle.stat()).isDirectory()),
     )

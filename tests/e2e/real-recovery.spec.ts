@@ -9,6 +9,7 @@ import type {
   NativeAgentContext,
 } from '../../packages/contracts/src/index.js'
 
+import { quitPact } from './native-quit.js'
 import {
   authMarker,
   closeRealWorkspace,
@@ -250,7 +251,7 @@ test(
       const oldBinding = nativeBinding(completed, 'codex')
       const oldRun = completed.runs[0]
       if (!oldRun) throw new Error('Completed real Native Run is unavailable')
-      await ctx.app.close()
+      await quitPact(ctx.app)
       const original = await findNativeRecord(ctx, 'codex', oldBinding.nativeSessionId)
       const backupDirectory = join(ctx.fixture.directory, 'native-recovery-evidence')
       await mkdir(backupDirectory, { mode: 0o700 })

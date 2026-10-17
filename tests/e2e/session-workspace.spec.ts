@@ -1,5 +1,6 @@
 import { expect, type ElectronApplication, type Page } from '@playwright/test'
 
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture, type RuntimeFixture } from './runtime-fixture.js'
 
@@ -64,7 +65,7 @@ test(
       ).toBeVisible()
       await expect(window.getByRole('heading', { name: 'New session' })).toBeVisible()
 
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       window = await app.firstWindow()
       const restoredSession = window.getByRole('button', { name: 'New session', exact: true })

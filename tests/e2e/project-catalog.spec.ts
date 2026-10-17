@@ -1,5 +1,6 @@
 import { expect } from '@playwright/test'
 
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture } from './runtime-fixture.js'
 
@@ -44,7 +45,7 @@ test(
       await expect(projectRow).toHaveAttribute('aria-expanded', 'true')
       await expect(projectRow).toHaveAccessibleName('Collapse Project sample-project')
 
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       window = await app.firstWindow()
       const restoredProject = window.getByRole('button', {

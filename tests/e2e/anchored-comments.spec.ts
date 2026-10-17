@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture, type RuntimeFixture } from './runtime-fixture.js'
 
@@ -36,7 +37,7 @@ test(
         'Please verify this boundary.',
       )
 
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       window = await app.firstWindow()
       await openSeededSession(window, seeded.sessionTitle)
@@ -74,7 +75,7 @@ test(
       await window.getByRole('textbox', { name: 'Comment' }).press('Enter')
       await expect(drafts).toHaveCount(11)
       await expect(window.locator('[data-pact-toast-tone="warning"]')).toHaveCount(0)
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       window = await app.firstWindow()
       await openSeededSession(window, seeded.sessionTitle)

@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
+import { quitPact } from './native-quit.js'
 import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import { createRuntimeFixture, test } from './runtime-fixture.js'
 
@@ -131,7 +132,7 @@ test(
       await expect(
         readFile(join(fixture.directory, 'claude-sdk-state.json'), 'utf8'),
       ).rejects.toMatchObject({ code: 'ENOENT' })
-      await app.close()
+      await quitPact(app)
       app = await fixture.launch()
       await (
         await app.firstWindow()
@@ -156,7 +157,7 @@ test(
       )
       expect(cold.messages).toEqual(complete.messages)
       expect(cold.comments).toEqual(complete.comments)
-      await app.close()
+      await quitPact(app)
     } finally {
       observer?.close()
       db.close()

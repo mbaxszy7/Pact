@@ -8,7 +8,7 @@
   "main": "./out/main/index.js",
   "scripts": {
     "brand": "node build/generate-brand-assets.mjs",
-    "brand:win": "pnpm brand",
+    "brand:win": "node build/generate-brand-assets.mjs --installer-artwork",
     "build": "pnpm brand && pnpm typecheck && electron-vite build",
     "dev": "pnpm brand && node build/launch-development.mjs dev",
     "dist:mac": "node ../../scripts/build-distribution.mjs --profile production-local --channel stable --platform darwin",

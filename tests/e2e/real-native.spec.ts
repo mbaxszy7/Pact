@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 
 import type { ConversationSnapshot } from '../../packages/contracts/src/index.js'
 
+import { quitPact } from './native-quit.js'
 import {
   closeRealWorkspace,
   launchRealWorkspace,
@@ -141,7 +142,7 @@ test(
       // App-server 0.159.2 does not promise an automatic name. Exercise an
       // actual Native rename while its writer is closed, then a fresh resume.
       expect(['local', 'agent']).toContain(first.session.titleSource)
-      await ctx.app.close()
+      await quitPact(ctx.app)
       const native = await ctx.fixture.openCodexClient()
       const resumed = await native.request('thread/resume', {
         threadId: nativeSessionId,
