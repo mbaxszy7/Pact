@@ -109,6 +109,16 @@ jobs:
           PACT_RELEASE_PR: ${{ needs.resolve.outputs.release_pr }}
           PACT_RELEASE_ARTIFACTS_JSON: >-
             {"darwin-arm64":{"packageId":"${{ needs.validate.outputs.package_mac_id }}","packageDigest":"${{ needs.validate.outputs.package_mac_digest }}","smokeId":"${{ needs.validate.outputs.smoke_mac_id }}","smokeDigest":"${{ needs.validate.outputs.smoke_mac_digest }}"},"win32-x64":{"packageId":"${{ needs.validate.outputs.package_win_id }}","packageDigest":"${{ needs.validate.outputs.package_win_digest }}","smokeId":"${{ needs.validate.outputs.smoke_win_id }}","smokeDigest":"${{ needs.validate.outputs.smoke_win_digest }}"}}
+      - name: Preserve release verification metadata outside public downloads
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-evidence-stable-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/release/pact-release-manifest.json
+            ${{ runner.temp }}/release/SHA256SUMS
+          if-no-files-found: warn
+          retention-days: 14
 
   version_pr:
     name: Maintain version PR

@@ -296,6 +296,7 @@ async function admitReleaseFiles(api, root, identity, artifacts, runId) {
     'Both native platform artifact sets are required',
   )
   const files = [],
+    evidence = [],
     projections = [],
     ids = new Set()
   for (const key of platforms) {
@@ -326,7 +327,8 @@ async function admitReleaseFiles(api, root, identity, artifacts, runId) {
         channel: 'stable',
       },
     })
-    files.push(...validated.files)
+    files.push(...validated.installers)
+    evidence.push(...validated.files)
     projections.push({
       platform: key,
       packageArtifactId: Number(input.packageId),
@@ -360,12 +362,13 @@ async function admitReleaseFiles(api, root, identity, artifacts, runId) {
         'Existing release evidence cannot be replaced',
       )
     }
-    files.push({ path, name, bytes: Buffer.byteLength(bytes), sha256: digest(bytes) })
+    evidence.push({ path, name, bytes: Buffer.byteLength(bytes), sha256: digest(bytes) })
   }
   await add('pact-release-manifest.json', manifestBytes)
-  await add('SHA256SUMS', files.map((file) => `${file.sha256}  ${file.name}\n`).join(''))
+  await add('SHA256SUMS', evidence.map((file) => `${file.sha256}  ${file.name}\n`).join(''))
   requireFact(
-    files.length <= maximumAssets && new Set(files.map((file) => file.name)).size === files.length,
+    evidence.length <= maximumAssets &&
+      new Set(evidence.map((file) => file.name)).size === evidence.length,
     'Release asset set exceeds its bound or has collisions',
   )
   return files
@@ -405,18 +408,29 @@ async function nativeReleaseProof(identity) {
 
 export async function publishRelease(
   api,
-  { root, identity: input, artifacts, runId: inputRunId, verifyProof = nativeReleaseProof },
+  {
+    root,
+    identity: input,
+    artifacts,
+    runId: inputRunId,
+    verifyProof = nativeReleaseProof,
+    reportPhase = () => {},
+  },
 ) {
   const identity = releaseIdentity(input)
   const runId = positive(inputRunId)
+  reportPhase('admit-candidates')
   const files = await admitReleaseFiles(api, root, identity, artifacts, runId)
+  reportPhase('verify-initial-tag')
   await verifyTag(api, identity, true)
+  reportPhase('resolve-release')
   const matches = (await api.list('/releases')).filter(
     (release) => release.tag_name === identity.tag,
   )
   requireFact(matches.length <= 1, 'Ambiguous Draft or published release identity')
   let release = matches[0]
-  if (!release)
+  if (!release) {
+    reportPhase('create-draft')
     release = await api.request('/releases', {
       method: 'POST',
       body: {
@@ -428,32 +442,43 @@ export async function publishRelease(
         prerelease: false,
       },
     })
+  }
   requireFact(
     release.prerelease === false &&
       release.target_commitish === identity.sourceSha &&
       release.tag_name === identity.tag,
     'Draft or published version points to another source',
   )
+  reportPhase('verify-existing-assets')
   const present = await verifyAssets(api, release.id, files, !release.draft)
   if (release.draft) {
+    reportPhase('upload-installers')
     for (const file of files)
       if (!present.has(file.name)) {
         await api.upload(release.id, file)
       }
+    reportPhase('verify-draft-assets')
     await verifyAssets(api, release.id, files, true)
+    reportPhase('verify-draft-tag')
     await verifyTag(api, identity, true)
+    reportPhase('publish-draft')
     release = await api.request(`/releases/${positive(release.id)}`, {
       method: 'PATCH',
       body: { draft: false, make_latest: 'true' },
     })
   }
+  reportPhase('verify-immutable-release')
   requireFact(
     release.draft === false && release.immutable === true,
     'Release must be published with native immutability enabled',
   )
+  reportPhase('verify-published-tag')
   await verifyTag(api, identity, false)
+  reportPhase('verify-published-assets')
   await verifyAssets(api, release.id, files, true)
+  reportPhase('verify-native-attestation')
   await verifyProof(identity)
+  reportPhase('verify-version-pr')
   const pr = await api.request(`/pulls/${identity.releasePR}`)
   requireFact(
     pr.merged === true &&
@@ -462,15 +487,19 @@ export async function publishRelease(
       pr.head?.ref === 'release-please--branches--main',
     'Published release no longer matches its version PR',
   )
+  reportPhase('add-tagged-label')
   await api.request(`/issues/${identity.releasePR}/labels`, {
     method: 'POST',
     body: { labels: ['autorelease: tagged'] },
   })
-  if (pr.labels?.some((label) => label.name === 'autorelease: pending'))
+  if (pr.labels?.some((label) => label.name === 'autorelease: pending')) {
+    reportPhase('remove-pending-label')
     await api.request(
       `/issues/${identity.releasePR}/labels/${encodeURIComponent('autorelease: pending')}`,
       { method: 'DELETE' },
     )
+  }
+  reportPhase('complete')
   return { releaseId: release.id, version: identity.version, sourceSha: identity.sourceSha }
 }
 
@@ -520,6 +549,7 @@ export async function main(args = process.argv.slice(2), source = process.env) {
     identity,
     artifacts: JSON.parse(source.PACT_RELEASE_ARTIFACTS_JSON),
     runId: source.GITHUB_RUN_ID,
+    reportPhase: (phase) => console.log(`[pact-release] phase=${phase}`),
   })
 }
 

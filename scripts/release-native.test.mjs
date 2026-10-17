@@ -358,7 +358,7 @@ void test('CLI rejects wrong events and source SHA before any network operation'
   )
 })
 
-void test('first publication admits both native targets, uploads exact files, verifies native proof and finalizes labels', async (t) => {
+void test('first publication uploads only admitted installers and retains complete verification metadata in CI', async (t) => {
   const { api, options, manifests, proofCount } = await releaseFixture(t)
   const result = await publishRelease(api, options)
   assert.deepEqual(result, { releaseId: 77, version: '0.1.0', sourceSha })
@@ -366,12 +366,15 @@ void test('first publication admits both native targets, uploads exact files, ve
   assert.equal(api.release.immutable, true)
   assert.equal(proofCount(), 1)
   assert.deepEqual(api.pr.labels, [{ name: 'autorelease: tagged' }])
-  for (const manifest of Object.values(manifests))
-    for (const installer of manifest.artifacts)
-      assert.equal(api.uploads.filter((name) => name === installer.path).length, 1)
-  const publication = JSON.parse(
-    api.assets.find((asset) => asset.name === 'pact-release-manifest.json').bytes.toString('utf8'),
+  const installerNames = Object.values(manifests).flatMap((manifest) =>
+    manifest.artifacts.map((installer) => installer.path),
   )
+  assert.equal(api.uploads.length, installerNames.length)
+  assert.deepEqual(new Set(api.uploads), new Set(installerNames))
+  assert.equal(api.assets.length, installerNames.length)
+  assert.deepEqual(new Set(api.assets.map((asset) => asset.name)), new Set(installerNames))
+  const manifestBytes = await readFile(join(options.root, 'pact-release-manifest.json'))
+  const publication = JSON.parse(manifestBytes.toString('utf8'))
   assert.deepEqual(
     publication.platforms.map((item) => [item.platform, item.packageAttempt, item.smokeAttempt]),
     [
@@ -380,7 +383,66 @@ void test('first publication admits both native targets, uploads exact files, ve
     ],
   )
   assert.equal(publication.runId, runId)
+  assert.equal(publication.sourceSha, sourceSha)
+  assert.equal(publication.platforms.flatMap((item) => item.files).length, 12)
+  const checksumLines = (await readFile(join(options.root, 'SHA256SUMS'), 'utf8'))
+    .trimEnd()
+    .split('\n')
+  assert.deepEqual(
+    checksumLines,
+    [
+      ...publication.platforms.flatMap((item) => item.files),
+      { name: 'pact-release-manifest.json', sha256: hash(manifestBytes) },
+    ].map((file) => `${file.sha256}  ${file.name}`),
+  )
   assert.equal(api.calls.filter((call) => call.method === 'PATCH').length, 1)
+})
+
+void test('missing or corrupt non-public reports block publication before any Draft mutation', async (t) => {
+  for (const mode of ['missing', 'corrupt']) {
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Separate fixtures prove omission and malformed evidence independently.
+    const { api, options } = await releaseFixture(t)
+    const path = join(options.root, 'darwin-arm64', 'smoke', 'package-zip-smoke-report.json')
+    if (mode === 'missing') {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Mutate only this fixture's receipt.
+      await rm(path)
+    } else {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Malformed JSON must remain fatal even though it is not a public asset.
+      await writeFile(path, '{invalid receipt')
+    }
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Exercise the full publisher before any external write.
+    await assert.rejects(
+      publishRelease(api, options),
+      mode === 'missing' ? /ENOENT/u : /Evidence file is not valid JSON/u,
+    )
+    assert.equal(api.uploads.length, 0)
+    assert.equal(
+      api.calls.some((call) => call.method && call.method !== 'GET'),
+      false,
+    )
+  }
+})
+
+void test('unexpected report assets on an immutable Release are rejected without deletion or replacement', async (t) => {
+  const { api, options } = await releaseFixture(t)
+  await publishRelease(api, options)
+  const bytes = Buffer.from('{}\n')
+  api.assets.push({
+    id: 2000,
+    name: 'darwin-arm64-package-smoke-report.json',
+    state: 'uploaded',
+    size: bytes.length,
+    bytes,
+  })
+  api.calls = []
+  const uploads = api.uploads.length
+  await assert.rejects(publishRelease(api, options), /unexpected asset bytes/u)
+  assert.equal(api.uploads.length, uploads)
+  assert.equal(api.release.immutable, true)
+  assert.equal(
+    api.calls.some((call) => call.method && call.method !== 'GET'),
+    false,
+  )
 })
 
 void test('uncertain upload retries reconcile the same Draft and reuse original successful producer attempts', async (t) => {
@@ -523,9 +585,11 @@ void test('an existing tag or Draft pointing at another commit is rejected witho
 
 void test('native immutable Release proof failure prevents label finalization and is recoverable', async (t) => {
   const { api, options } = await releaseFixture(t)
+  const phases = []
   await assert.rejects(
     publishRelease(api, {
       ...options,
+      reportPhase: (phase) => phases.push(phase),
       verifyProof: async () => {
         throw new Error('Synthetic native proof failure')
       },
@@ -533,6 +597,7 @@ void test('native immutable Release proof failure prevents label finalization an
     /native proof failure/u,
   )
   assert.equal(api.release.immutable, true)
+  assert.equal(phases.at(-1), 'verify-native-attestation')
   assert.deepEqual(api.pr.labels, [{ name: 'autorelease: pending' }])
   assert.equal(
     api.calls.some((call) => call.path.startsWith('/issues/')),
@@ -542,6 +607,25 @@ void test('native immutable Release proof failure prevents label finalization an
   await publishRelease(api, options)
   assert.equal(api.uploads.length, count)
   assert.deepEqual(api.pr.labels, [{ name: 'autorelease: tagged' }])
+})
+
+void test('label failure is distinguishable after publication and proof without logging arbitrary failure content', async (t) => {
+  const { api, options, proofCount } = await releaseFixture(t)
+  const request = api.request.bind(api)
+  api.request = (path, input) => {
+    if (path === '/issues/42/labels') throw new Error('Synthetic private failure details')
+    return request(path, input)
+  }
+  const phases = []
+  await assert.rejects(
+    publishRelease(api, { ...options, reportPhase: (phase) => phases.push(phase) }),
+    /Synthetic private failure details/u,
+  )
+  assert.equal(api.release.immutable, true)
+  assert.equal(proofCount(), 1)
+  assert.equal(phases.at(-1), 'add-tagged-label')
+  assert.deepEqual(api.pr.labels, [{ name: 'autorelease: pending' }])
+  assert.ok(phases.every((phase) => /^[a-z-]{1,40}$/u.test(phase)))
 })
 
 void test('repository API pins destination, rejects redirects and bounds JSON responses', async () => {
