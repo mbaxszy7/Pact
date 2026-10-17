@@ -20,6 +20,12 @@ Keep pnpm's isolated dependency layout and exact lockfile. Do not switch to hois
 hand-edit links, or introduce another package manager. Native runtime dependencies belong in
 `apps/desktop/package.json` and must be rebuilt for Electron. Use Oxlint and Oxfmt only.
 
+Release Please owns the serialization of the root `CHANGELOG.md` and
+`.release-please-manifest.json`. Oxfmt excludes exactly those generated paths, including when
+pre-commit passes them explicitly. Keep the generator's output intact. Authored version files,
+release configuration, source and nested changelogs remain subject to Oxfmt; the existing publication
+and release-version checks still validate generated release content.
+
 Install [Gitleaks 8.30.1](https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1) before committing.
 Keep it on PATH or set `PACT_GITLEAKS_EXECUTABLE` to its absolute executable path. The pre-commit hook
 runs formatting/lint, checks the complete staged publication file set, and scans staged changes.
