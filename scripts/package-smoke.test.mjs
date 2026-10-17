@@ -9,6 +9,7 @@ import { applicationContent, hashFile } from './build-distribution.mjs'
 import {
   main,
   packageSmokeFailureReport,
+  privateRootCleanupFailure,
   packagedRuntimeFailureFacts,
   applicationContentDifference,
   verifyApplication,
@@ -729,6 +730,129 @@ await test('existing reports stop admission and cleanup failures remain explicit
   assert.equal(JSON.stringify(report).includes(secret), false)
   assert.equal(Object.hasOwn(report.processes[0], 'pid'), false)
 })
+
+await test('private-root diagnostics retain only fixed filesystem facts and reject private error material', () => {
+  const root = join(tmpdir(), 'synthetic-private-cleanup-root')
+  for (const [path, category] of [
+    [root, 'root'],
+    [join(root, 'installed', 'private.exe'), 'installed-payload'],
+    [join(root, 'electron-profile', 'private.sqlite'), 'profile'],
+    [join(root, 'electron-session', 'private'), 'profile'],
+    [join(root, 'tmp', 'private'), 'temporary-files'],
+    [join(root, 'home', 'private'), 'fixture-home'],
+    [join(root, 'claude-home', 'private'), 'fixture-home'],
+    [join(root, 'production-path-probe', 'private'), 'production-probe'],
+    [join(root, '..', 'outside-private'), 'unknown'],
+    ['relative-private-path', 'unknown'],
+    [join(root, 'unknown-private-child'), 'unknown'],
+  ]) {
+    const failure = privateRootCleanupFailure(
+      { code: 'EPERM', syscall: 'unlink', path, message: 'synthetic-secret-message' },
+      root,
+      'remove-root',
+      17,
+    )
+    assert.deepEqual(failure, {
+      operation: 'remove-root',
+      code: 'EPERM',
+      syscall: 'unlink',
+      category,
+      rootState: 'unconfirmed',
+      milliseconds: 17,
+    })
+    const report = packageSmokeFailureReport({
+      phase: 'cleanup',
+      processes: [],
+      cleanupFailed: true,
+      privateRootCleanupFailure: { ...failure, path, message: 'synthetic-secret-message' },
+    })
+    assert.deepEqual(report.privateRootCleanupFailure, failure)
+    assert.equal(report.status, 'blocked')
+    assert.equal(report.cleanupVerified, false)
+    assert.equal(/private|synthetic-secret/u.test(JSON.stringify(failure)), false)
+    assert.equal(JSON.stringify(report).includes(path), false)
+  }
+  assert.deepEqual(
+    privateRootCleanupFailure(
+      { code: 'secret-code', syscall: 'secret-syscall', path: `${root}\nsecret` },
+      root,
+      'verify-root-absence',
+      -1,
+    ),
+    {
+      operation: 'verify-root-absence',
+      code: 'UNKNOWN',
+      syscall: 'unknown',
+      category: 'unknown',
+      rootState: 'unconfirmed',
+      milliseconds: 0,
+    },
+  )
+  const report = packageSmokeFailureReport({
+    phase: 'cleanup',
+    processes: [],
+    privateRootCleanupFailure: {
+      operation: 'remove-root',
+      code: 'secret',
+      syscall: 'secret',
+      category: 'secret',
+      rootState: 'secret',
+      milliseconds: Infinity,
+      message: 'secret',
+    },
+  })
+  assert.equal(JSON.stringify(report).includes('secret'), false)
+  assert.equal(Object.hasOwn(report.privateRootCleanupFailure, 'milliseconds'), false)
+  assert.equal(
+    privateRootCleanupFailure({ rootStillExists: true }, root, 'verify-root-absence', 1).rootState,
+    'present',
+  )
+})
+
+await test(
+  'a real Windows current-directory lock keeps root cleanup blocked and reports no private paths',
+  { skip: process.platform !== 'win32' },
+  async (context) => {
+    context.mock.method(console, 'log', () => {})
+    const directory = await mkdtemp(join(tmpdir(), 'pact-smoke-cleanup-report-'))
+    const reportPath = join(directory, 'report.json'),
+      calls = [],
+      previousCwd = process.cwd()
+    let ownedRoot
+    try {
+      await assert.rejects(
+        main({
+          executable: '/synthetic/Pact',
+          sourceEnvironment,
+          reportPath,
+          spawnProcess: simulatedSpawn(calls, {
+            inspect: ({ env }) => {
+              ownedRoot = env.PACT_E2E_ROOT
+              process.chdir(ownedRoot)
+            },
+          }),
+        }),
+        /Packaged cleanup could not be confirmed/u,
+      )
+      const bytes = await readFile(reportPath, 'utf8'),
+        report = JSON.parse(bytes)
+      assert.equal(report.failureCode, 'CLEANUP_UNCONFIRMED')
+      assert.equal(report.cleanupFailureStage, 'private-root-removal')
+      assert.equal(report.cleanupVerified, false)
+      assert.equal(report.recoveryPreserved, true)
+      assert.equal(report.privateRootCleanupFailure.operation, 'remove-root')
+      assert.equal(report.privateRootCleanupFailure.category, 'root')
+      assert.ok(['EBUSY', 'EPERM'].includes(report.privateRootCleanupFailure.code))
+      assert.equal(report.privateRootCleanupFailure.syscall, 'rmdir')
+      assert.equal(bytes.includes(ownedRoot), false)
+      assert.equal((await stat(ownedRoot)).isDirectory(), true)
+    } finally {
+      process.chdir(previousCwd)
+      if (ownedRoot) await rm(ownedRoot, { recursive: true, force: true })
+      await rm(directory, { recursive: true, force: true })
+    }
+  },
+)
 
 await test('a parsed manifest contributes only validated distribution identity to a pre-launch failure report', async (context) => {
   const directory = await mkdtemp(join(tmpdir(), 'pact-smoke-identity-report-'))

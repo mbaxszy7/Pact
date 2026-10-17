@@ -38,6 +38,78 @@ const PACKAGE_SMOKE_KILL_GRACE_MS = 5_000
 const MAX_LOG_LENGTH = 16_000
 const execFileAsync = promisify(execFile)
 const MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+const cleanupCodes = new Set([
+  'EACCES',
+  'EBUSY',
+  'EEXIST',
+  'EIO',
+  'EISDIR',
+  'EMFILE',
+  'ENFILE',
+  'ENOENT',
+  'ENOTDIR',
+  'ENOTEMPTY',
+  'EPERM',
+  'UNKNOWN',
+])
+const cleanupSyscalls = new Set(['lstat', 'rmdir', 'scandir', 'unlink', 'unknown'])
+const cleanupCategories = new Set([
+  'root',
+  'installed-payload',
+  'profile',
+  'temporary-files',
+  'fixture-home',
+  'production-probe',
+  'unknown',
+])
+
+/** Project filesystem errors without exporting messages, paths or directory contents. */
+export function privateRootCleanupFailure(error, root, operation, milliseconds) {
+  let category = 'unknown'
+  if (
+    typeof error?.path === 'string' &&
+    error.path.length <= 32_768 &&
+    !/[\r\n\0]/u.test(error.path) &&
+    isAbsolute(error.path)
+  ) {
+    const remainder = relative(root, error.path)
+    if (!remainder) category = 'root'
+    else if (
+      !isAbsolute(remainder) &&
+      remainder !== '..' &&
+      !remainder.startsWith('../') &&
+      !remainder.startsWith('..\\')
+    ) {
+      const first = remainder.split(/[\\/]/u)[0]
+      category =
+        first === 'installed'
+          ? 'installed-payload'
+          : ['electron-profile', 'electron-session'].includes(first)
+            ? 'profile'
+            : first === 'tmp'
+              ? 'temporary-files'
+              : ['home', 'claude-home', 'codex-home'].includes(first)
+                ? 'fixture-home'
+                : first === 'production-path-probe'
+                  ? 'production-probe'
+                  : 'unknown'
+    }
+  }
+  return {
+    operation: operation === 'verify-root-absence' ? operation : 'remove-root',
+    code: cleanupCodes.has(error?.code) ? error.code : 'UNKNOWN',
+    syscall: cleanupSyscalls.has(error?.syscall) ? error.syscall : 'unknown',
+    category,
+    rootState:
+      operation === 'verify-root-absence' && error?.rootStillExists === true
+        ? 'present'
+        : 'unconfirmed',
+    milliseconds:
+      Number.isSafeInteger(milliseconds) && milliseconds >= 0 && milliseconds <= 1_000_000_000
+        ? milliseconds
+        : 0,
+  }
+}
 
 async function pathExists(path) {
   try {
@@ -808,6 +880,29 @@ export function packageSmokeFailureReport(facts) {
           : [],
       ),
     ),
+    ...(['remove-root', 'verify-root-absence'].includes(facts.privateRootCleanupFailure?.operation)
+      ? {
+          privateRootCleanupFailure: {
+            operation: facts.privateRootCleanupFailure.operation,
+            code: cleanupCodes.has(facts.privateRootCleanupFailure.code)
+              ? facts.privateRootCleanupFailure.code
+              : 'UNKNOWN',
+            syscall: cleanupSyscalls.has(facts.privateRootCleanupFailure.syscall)
+              ? facts.privateRootCleanupFailure.syscall
+              : 'unknown',
+            category: cleanupCategories.has(facts.privateRootCleanupFailure.category)
+              ? facts.privateRootCleanupFailure.category
+              : 'unknown',
+            rootState:
+              facts.privateRootCleanupFailure.rootState === 'present' ? 'present' : 'unconfirmed',
+            ...(Number.isSafeInteger(facts.privateRootCleanupFailure.milliseconds) &&
+            facts.privateRootCleanupFailure.milliseconds >= 0 &&
+            facts.privateRootCleanupFailure.milliseconds <= 1_000_000_000
+              ? { milliseconds: facts.privateRootCleanupFailure.milliseconds }
+              : {}),
+          },
+        }
+      : {}),
     ...([
       'HOST_ENVIRONMENT_BOUNDS',
       'OWNED_DIRECTORY_IDENTITY',
@@ -932,16 +1027,27 @@ async function performPackagedSmoke(
       cleanupError ??= new Error('Provider copy cleanup was not confirmed')
     }
     if (!preserveRoot) {
+      const began = performance.now()
+      let operation = 'remove-root'
       try {
         await rm(requestedRoot, { force: true, recursive: true })
+        operation = 'verify-root-absence'
         try {
           await lstat(requestedRoot)
-          throw new Error('Packaged private root still exists')
+          throw Object.assign(new Error('Packaged private root still exists'), {
+            rootStillExists: true,
+          })
         } catch (error) {
           if (error.code !== 'ENOENT') throw error
           facts.privateRootCleanupVerified = true
         }
       } catch (error) {
+        facts.privateRootCleanupFailure = privateRootCleanupFailure(
+          error,
+          requestedRoot,
+          operation,
+          Math.ceil(performance.now() - began),
+        )
         facts.cleanupFailureStage ??= 'private-root-removal'
         preserveRoot = true
         cleanupError ??= error
