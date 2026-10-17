@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/mbaxszy7/Pact/compare/v0.1.0...v0.1.1) (2026-10-17)
+
+
+### Bug Fixes
+
+* **ci:** focus release downloads and retry failed jobs once ([#14](https://github.com/mbaxszy7/Pact/issues/14)) ([cd9e7e4](https://github.com/mbaxszy7/Pact/commit/cd9e7e418e2a222522a4c37c88ab3bb5d4031fa0))
+
 ## 0.1.0 (2026-10-17)
 
 
