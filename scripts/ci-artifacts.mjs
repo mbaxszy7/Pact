@@ -281,7 +281,8 @@ export async function validateCandidate({
       smokeContext.producerAttempt >= packageContext.producerAttempt,
     'Smoke consumed a different package or invalid attempt',
   )
-  const files = []
+  const files = [],
+    installers = []
   for (const artifact of manifest.artifacts) {
     // oxlint-disable-next-line eslint/no-await-in-loop -- Hash one installer stream at a time.
     const actual = await admittedFile(packageRoot, artifact.path)
@@ -290,6 +291,7 @@ export async function validateCandidate({
       'Installer content differs from its manifest',
     )
     files.push(actual)
+    installers.push(actual)
     const name =
       artifact.kind === 'zip' ? 'package-zip-smoke-report.json' : 'package-smoke-report.json'
     // oxlint-disable-next-line eslint/no-await-in-loop -- Admit one bounded native report per installer.
@@ -323,7 +325,7 @@ export async function validateCandidate({
     new Set(files.map((file) => file.name)).size === files.length,
     'Distribution asset names collide',
   )
-  return { manifest, files, packageContext, smokeContext }
+  return { manifest, installers, files, packageContext, smokeContext }
 }
 
 export async function runInstalledSmoke(

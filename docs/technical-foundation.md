@@ -306,6 +306,10 @@ rules. Explicit local profiles use the same manifest-based verification without 
 These interfaces require actual platform evidence for coexistence, upgrades and uninstall cleanup.
 Publication uses the exact merged version-PR source and same-run package IDs/digests with matching installed evidence. A separate main-only publisher reconciles one Draft, verifies uploaded bytes and native immutable Release integrity, then finalizes standard version labels before maintaining the next PR. Native review rules exempt only the owner-author; CI is never bypassed and Merge stays manual. Model and version-bot environments use ref restrictions without runtime approvals. Missing evidence, expired artifacts or uncertain writes stop; no signed controller, staging Release or alternate recovery path is retained.
 
+Release uploads contain only macOS arm64 DMG/ZIP and Windows x64 NSIS EXE; GitHub supplies source
+archives and native attestation. Full validation remains mandatory. Package/smoke evidence and
+aggregate manifests/checksums stay in Actions artifacts for 14 days; published Releases stay immutable.
+
 ## Verification and remaining scope
 
 Trace a normal action and failure/restart through these same owners for lifecycle changes. Main closes admission and awaits Conversation/default-settings requests, owned work, durable flush, and logs before quit. Unconfirmed physical release retains reservation/evidence. POSIX OwnedProcessGroup validates PID/PGID/birth before signaling and confirms absence. Windows test Jobs prove fixture release; they are no production supervisor.

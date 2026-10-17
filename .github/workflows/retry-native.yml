@@ -1,0 +1,61 @@
+name: Retry failed Pact jobs once
+
+on:
+  workflow_run:
+    workflows: [Pact CI, Pact release]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: pact-retry-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    name: Retry failed jobs once
+    if: github.repository_id == '1416403312' && github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      actions: write
+    steps:
+      - name: Recheck the original run and request one native failed-jobs rerun
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          retries: 0
+          script: |
+            if (context.repo.owner !== 'mbaxszy7' || context.repo.repo !== 'Pact')
+              throw new Error('Unexpected retry repository');
+            const runId = context.payload.workflow_run.id;
+            if (!Number.isSafeInteger(runId) || runId <= 0)
+              throw new Error('Invalid retry run identifier');
+            const args = { ...context.repo, run_id: runId, request: { timeout: 30000 } };
+            let run;
+            try {
+              ({ data: run } = await github.request(
+                'GET /repos/{owner}/{repo}/actions/runs/{run_id}', args));
+            } catch {
+              core.setFailed('Automatic retry could not read the current run; no retry was requested.');
+              return;
+            }
+            const path = run.path?.split('@')[0];
+            const allowed =
+              (run.name === 'Pact CI' && path === '.github/workflows/ci-native.yml' &&
+                ((run.event === 'push' && run.head_branch === 'dev') ||
+                  ['pull_request', 'workflow_dispatch'].includes(run.event))) ||
+              (run.name === 'Pact release' && path === '.github/workflows/release-native.yml' &&
+                run.event === 'push' && run.head_branch === 'main');
+            if (run.id !== runId || run.repository?.id !== 1416403312 || !allowed ||
+                run.status !== 'completed' || run.conclusion !== 'failure' || run.run_attempt !== 1) {
+              core.info('No automatic retry: run is ineligible or has already been retried.');
+              return;
+            }
+            try {
+              await github.request(
+                'POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs', args);
+            } catch {
+              core.setFailed('Automatic retry request failed or was unconfirmed; the request was not repeated.');
+              return;
+            }
+            core.info('Requested the single automatic failed-jobs retry; original source and permissions are preserved.');

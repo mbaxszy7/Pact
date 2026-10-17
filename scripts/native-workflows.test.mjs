@@ -13,6 +13,7 @@ const [ci, distribution, release] = await Promise.all(
   ['ci-native', 'distributions', 'release-native'].map(loadWorkflow),
 )
 const allWorkflows = [ci, distribution, release]
+const retry = await loadWorkflow('retry-native')
 const setup = load(
   await readFile(new URL('../.github/actions/setup/action.yml', import.meta.url), 'utf8'),
 )
@@ -21,6 +22,161 @@ const upload = (job) =>
   job.steps.filter((step) => step.uses?.startsWith('actions/upload-artifact@'))
 const downloads = (job) =>
   job.steps.filter((step) => step.uses?.startsWith('actions/download-artifact@'))
+const retryStep = retry.jobs.retry.steps[0]
+const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor
+const runRetry = new AsyncFunction('github', 'context', 'core', retryStep.with.script)
+
+async function retryFixture(
+  change = {},
+  { failRead = false, failWrite = false, context: replacement } = {},
+) {
+  const context = replacement ?? {
+    repo: { owner: 'mbaxszy7', repo: 'Pact' },
+    payload: { workflow_run: { id: 123, run_attempt: 1 } },
+  }
+  const run = {
+    id: 123,
+    repository: { id: 1416403312 },
+    name: 'Pact CI',
+    path: '.github/workflows/ci-native.yml',
+    event: 'pull_request',
+    head_branch: 'feature',
+    status: 'completed',
+    conclusion: 'failure',
+    run_attempt: 1,
+    ...change,
+  }
+  const calls = []
+  const failures = []
+  const execute = () =>
+    runRetry(
+      {
+        request: async (route, args) => {
+          calls.push({ route, args })
+          if (route.startsWith('GET ') && !failRead) return { data: run }
+          if (failRead || failWrite)
+            throw Object.assign(new Error('Synthetic private failure body'), {
+              request: { headers: { authorization: 'unregistered-fixture-secret' } },
+              response: { data: 'Synthetic private API response' },
+            })
+          return { status: 201 }
+        },
+      },
+      context,
+      { info: () => {}, setFailed: (message) => failures.push(message) },
+    )
+  return { calls, failures, execute }
+}
+
+void test('one metadata-only retry job uses native failed-job recovery without consuming untrusted code or artifacts', () => {
+  assert.deepEqual(retry.on, {
+    workflow_run: { workflows: ['Pact CI', 'Pact release'], types: ['completed'] },
+  })
+  assert.deepEqual(retry.permissions, {})
+  assert.deepEqual(Object.keys(retry.jobs), ['retry'])
+  assert.deepEqual(retry.jobs.retry.permissions, { actions: 'write' })
+  assert.equal(retry.jobs.retry['timeout-minutes'], 2)
+  assert.match(retry.jobs.retry.if, /conclusion == 'failure'.*run_attempt == 1/u)
+  assert.equal(retry.jobs.retry.steps.length, 1)
+  assert.match(retryStep.uses, /^actions\/github-script@[a-f0-9]{40}$/u)
+  assert.equal(retryStep.with.retries, 0)
+  assert.equal(retry.concurrency['cancel-in-progress'], false)
+  assert.equal(retry.concurrency.group, 'pact-retry-${{ github.event.workflow_run.id }}')
+  assert.doesNotMatch(
+    JSON.stringify(retry),
+    /checkout|download-artifact|cache@|secrets\.|environment|head_sha|eval\(|exec\(/u,
+  )
+})
+
+void test('initial CI and release failures request exactly one rerun of failed jobs with their native dependents', async () => {
+  for (const change of [
+    {},
+    { event: 'push', head_branch: 'dev' },
+    { event: 'workflow_dispatch' },
+    {
+      name: 'Pact release',
+      path: '.github/workflows/release-native.yml@refs/heads/main',
+      event: 'push',
+      head_branch: 'main',
+    },
+  ]) {
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Execute the actual workflow policy against each distinct native trigger.
+    const fixture = await retryFixture(change)
+    // oxlint-disable-next-line eslint/no-await-in-loop -- No real Actions or provider work is requested by the fixture boundary.
+    await fixture.execute()
+    assert.deepEqual(fixture.failures, [])
+    assert.deepEqual(
+      fixture.calls.map((call) => call.route),
+      [
+        'GET /repos/{owner}/{repo}/actions/runs/{run_id}',
+        'POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs',
+      ],
+    )
+    assert.deepEqual(fixture.calls[1].args, {
+      owner: 'mbaxszy7',
+      repo: 'Pact',
+      run_id: 123,
+      request: { timeout: 30000 },
+    })
+  }
+})
+
+void test('fresh attempt and run identity checks suppress retry loops, already-observed manual reruns and unrelated execution', async () => {
+  for (const change of [
+    { run_attempt: 2 },
+    { run_attempt: 4 },
+    { status: 'in_progress' },
+    { conclusion: 'success' },
+    { conclusion: 'cancelled' },
+    { id: 456 },
+    { repository: { id: 1 } },
+    { name: 'Unrelated workflow' },
+    { path: '.github/workflows/untrusted.yml' },
+    { event: 'workflow_run' },
+    { event: 'push', head_branch: 'main' },
+    {
+      name: 'Pact release',
+      path: '.github/workflows/release-native.yml',
+      event: 'push',
+      head_branch: 'dev',
+    },
+  ]) {
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Recheck live API state independently of the initial completed event.
+    const fixture = await retryFixture(change)
+    // oxlint-disable-next-line eslint/no-await-in-loop -- The original event still says attempt 1; a newer live attempt must consume the opportunity.
+    await fixture.execute()
+    assert.equal(fixture.calls.length, 1)
+    assert.ok(fixture.calls[0].route.startsWith('GET '))
+  }
+})
+
+void test('an uncertain retry request is not repeated and invalid repository or run input never reaches the API', async () => {
+  const uncertain = await retryFixture({}, { failWrite: true })
+  await uncertain.execute()
+  assert.deepEqual(uncertain.failures, [
+    'Automatic retry request failed or was unconfirmed; the request was not repeated.',
+  ])
+  assert.equal(uncertain.calls.filter((call) => call.route.startsWith('POST ')).length, 1)
+  const unreadable = await retryFixture({}, { failRead: true })
+  await unreadable.execute()
+  assert.deepEqual(unreadable.failures, [
+    'Automatic retry could not read the current run; no retry was requested.',
+  ])
+  assert.equal(unreadable.calls.length, 1)
+  for (const context of [
+    { repo: { owner: 'external', repo: 'Pact' }, payload: { workflow_run: { id: 123 } } },
+    {
+      repo: { owner: 'mbaxszy7', repo: 'Pact' },
+      payload: { workflow_run: { id: '123; echo unsafe' } },
+    },
+  ]) {
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Boundary rejection precedes even the read request.
+    const invalid = await retryFixture({}, { context })
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Never interpolate event text into commands or routes.
+    await assert.rejects(invalid.execute(), /Unexpected retry repository|Invalid retry run/u)
+    assert.equal(invalid.calls.length, 0)
+  }
+})
 
 void test('shared Windows toolchain publishes native pnpm independently of optional CLI installation', () => {
   const steps = setup.runs.steps
@@ -268,6 +424,16 @@ void test('delivery and publication consume exact accepted IDs in separate non-e
   assert.deepEqual(release.on, { push: { branches: ['main'] } })
   assert.deepEqual(publish.needs, ['resolve', 'validate'])
   assert.equal(downloads(publish).length, 4)
+  const evidence = upload(publish)
+  assert.equal(evidence.length, 1)
+  assert.equal(evidence[0].if, 'always()')
+  assert.equal(evidence[0].with.name, 'release-evidence-stable-a${{ github.run_attempt }}')
+  assert.deepEqual(evidence[0].with.path.trim().split('\n'), [
+    '${{ runner.temp }}/release/pact-release-manifest.json',
+    '${{ runner.temp }}/release/SHA256SUMS',
+  ])
+  assert.equal(evidence[0].with['retention-days'], 14)
+  assert.equal(evidence[0].with['if-no-files-found'], 'warn')
   for (const job of [delivery, publish]) {
     for (const step of downloads(job)) {
       assert.ok(step.with['artifact-ids'])

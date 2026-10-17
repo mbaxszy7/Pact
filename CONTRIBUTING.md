@@ -268,6 +268,16 @@ Actions reports and candidate artifacts retain 14 days. Installed smoke download
 artifact ID and records the consumed digest; same-run successful producers may retain an earlier
 attempt. Native summaries list actual cases, including failed and unexecuted entries.
 
+`retry-native.yml` listens only for completed Pact CI/release runs and requests one native failed-jobs
+rerun after an initial failure. It rechecks current run identity and attempt before its single write;
+manual reruns already visible at that check suppress automatic retry. The read and rerun request are
+not atomic: the native API has no expected-attempt precondition, so an intervening completed manual
+rerun can still be followed by the automatic request. Successful jobs are reused, and source, original actor
+permissions, assertions and gates remain unchanged. A second failure, cancellation or in-progress run
+does not trigger another retry. The two-minute metadata-only job has `actions: write`, no checkout,
+artifacts, caches, provider secrets, App key or environment approval. Its workflow must be merged into
+the default branch before it can run. This does not change zero retries inside the Electron runner.
+
 ### Product version and release intent
 
 `version.json.version` is the runtime product version. Root and desktop package versions are
@@ -497,8 +507,15 @@ producing attempts. It treats downloaded artifacts as bounded data, never execut
 code. Each actual DMG/ZIP/NSIS hash, application content hash, cold restart, default data root and
 physical cleanup receipt must match. Rebuilt bytes require a new matching installation report.
 
-The publisher creates or reconciles one Draft for the exact tag/version/source, uploads the complete
-verified asset set, downloads and hashes the uploaded bytes, then publishes an immutable Release.
+The publisher creates or reconciles one Draft for the exact tag/version/source, uploads only the
+verified macOS arm64 DMG/ZIP and Windows x64 NSIS EXE, downloads and hashes the uploaded bytes, then
+publishes an immutable Release. GitHub supplies source archives and its native Release attestation.
+Distribution manifests, execution contexts and installed-smoke reports remain in their original
+package/smoke Actions artifacts. The aggregate `pact-release-manifest.json` and `SHA256SUMS` are saved
+as a separate Actions artifact, including on publication failure once generated. All these CI
+artifacts have 14-day retention; none is added to public Release downloads. Full evidence admission
+is mandatory even though only installers are uploaded. Already published immutable Releases keep
+their original asset sets.
 GitHub's native Release attestation, its tag commit and asset hashes are verified after publication;
 this is release integrity evidence, not a claim of independent build attestation. Existing same-name
 assets must be byte-identical; ambiguous delivery, conflicting Drafts, expiry or missing evidence
@@ -512,6 +529,11 @@ After publication and verification, the publisher idempotently marks the exact v
 `autorelease: tagged` and removes `autorelease: pending`, including already-published recovery.
 Only then does the standard version-maintenance job process the latest main changes, so a release
 failure or a missing label transition cannot silently finish the cycle.
+
+The publisher emits fixed `[pact-release] phase=...` progress codes for candidate admission, Draft
+publication, uploaded-byte and native-attestation verification, and version-label finalization. The
+last phase distinguishes a published-but-unconfirmed result without printing credentials, raw API
+responses or child-process output. A visible Release does not establish completion of later checks.
 
 API JSON is bounded to 2 MiB per response, release evidence to 4 MiB per manifest, and each native
 asset to 2 GiB. Publication admits at most 32 assets, streams binary hashes, paginates at most 100

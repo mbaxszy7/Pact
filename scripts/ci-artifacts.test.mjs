@@ -140,6 +140,10 @@ void test('native candidates admit exact bytes and earlier successful producer a
     assert.equal(result.packageContext.producerAttempt, 1)
     assert.equal(result.smokeContext.producerAttempt, 2)
     assert.equal(result.files.length, platform === 'darwin' ? 7 : 5)
+    assert.deepEqual(
+      result.installers.map(({ name, bytes, sha256 }) => ({ path: name, bytes, sha256 })),
+      candidate.manifest.artifacts.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })),
+    )
     assert.equal(new Set(result.files.map((file) => file.name)).size, result.files.length)
     assert.equal(result.manifest.sourceSha, sourceSha)
   }
