@@ -1,14 +1,20 @@
 !include "LogicLib.nsh"
 !include "nsDialogs.nsh"
 
-!define MUI_WELCOMEPAGE_TITLE "Welcome to ${PRODUCT_NAME}"
-!define MUI_WELCOMEPAGE_TEXT "A local workspace where Claude Code and Codex collaborate.$\r$\n$\r$\nPlan, build and review together. Your conversation history is stored locally on your computer.$\r$\n$\r$\nChoose where to install Pact and how you open it. Your existing projects and agent settings are kept."
-!define MUI_FINISHPAGE_TITLE "${PRODUCT_NAME} is installed"
-!define MUI_FINISHPAGE_TEXT "You're ready to open Pact.$\r$\n$\r$\nConnect your existing Claude Code and Codex tools, then choose your default session settings.$\r$\n$\r$\nClick Finish to close Setup."
-!define MUI_FINISHPAGE_RUN_TEXT "Open ${PRODUCT_NAME}"
-!define MUI_FINISHPAGE_RUN_NOTCHECKED
-!define MUI_UNWELCOMEPAGE_TITLE "Uninstall ${PRODUCT_NAME}"
-!define MUI_UNWELCOMEPAGE_TEXT "Setup will remove Pact and its shortcuts.$\r$\n$\r$\nYour projects, conversation data and agent configuration will be kept."
+; MUI uses the same page-text defines for installation and uninstallation.
+!ifdef BUILD_UNINSTALLER
+  !define MUI_WELCOMEPAGE_TITLE "Uninstall ${PRODUCT_NAME}"
+  !define MUI_WELCOMEPAGE_TEXT "Setup will remove Pact and its shortcuts.$\r$\n$\r$\nYour projects, conversation data and agent configuration will be kept."
+  !define MUI_FINISHPAGE_TITLE "${PRODUCT_NAME} was removed"
+  !define MUI_FINISHPAGE_TEXT "Pact and its shortcuts have been removed.$\r$\n$\r$\nYour projects, conversation data and agent configuration have been kept.$\r$\n$\r$\nClick Finish to close Setup."
+!else
+  !define MUI_WELCOMEPAGE_TITLE "Welcome to ${PRODUCT_NAME}"
+  !define MUI_WELCOMEPAGE_TEXT "A local workspace where Claude Code and Codex collaborate.$\r$\n$\r$\nPlan, build and review together. Your conversation history is stored locally on your computer.$\r$\n$\r$\nChoose where to install Pact and how you open it. Your existing projects and agent settings are kept."
+  !define MUI_FINISHPAGE_TITLE "${PRODUCT_NAME} is installed"
+  !define MUI_FINISHPAGE_TEXT "You're ready to open Pact.$\r$\n$\r$\nConnect your existing Claude Code and Codex tools, then choose your default session settings.$\r$\n$\r$\nClick Finish to close Setup."
+  !define MUI_FINISHPAGE_RUN_TEXT "Open ${PRODUCT_NAME}"
+  !define MUI_FINISHPAGE_RUN_NOTCHECKED
+!endif
 
 !ifndef BUILD_UNINSTALLER
   Var PactDesktopShortcut

@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { existsSync, readdirSync } from 'node:fs'
 import {
@@ -12,6 +13,7 @@ import {
   unlink,
   writeFile,
 } from 'node:fs/promises'
+import { createServer, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -97,6 +99,187 @@ it.skipIf(process.platform !== 'win32')(
       owner.cancel()
       await owner.disposeControl()
       await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 })
+    }
+  },
+  20000,
+)
+
+it.skipIf(process.platform !== 'win32')(
+  'keeps the authenticated receipt readable while a cancelled Job takes time to drain',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-delayed-job-cancel-'))
+    const owner = await writeWindowsObservedLauncher(root, process.execPath, 10000)
+    let child: ReturnType<typeof spawn> | undefined
+    let closed: Promise<unknown> | undefined
+    let targetPid: number | undefined
+    try {
+      const source = await readFile(resolve('scripts/windows-e2e-job.cs'), 'utf8')
+      const boundary = 'if (stoppedAt < 0 && reason != null) {'
+      expect(source.split(boundary)).toHaveLength(2)
+      const delayed = join(root, 'job.cs')
+      await writeFile(
+        delayed,
+        source.replace(
+          boundary,
+          boundary + '\nif (generation != null && reason == "control-closed") Thread.Sleep(150);',
+        ),
+      )
+      await unlink(owner.executablePath)
+      execFileSync(
+        join(
+          process.env.SystemRoot ?? 'C:\\Windows',
+          'Microsoft.NET',
+          process.arch === 'ia32' ? 'Framework' : 'Framework64',
+          'v4.0.30319/csc.exe',
+        ),
+        [
+          '/nologo',
+          '/target:exe',
+          '/reference:System.Web.Extensions.dll',
+          `/out:${owner.executablePath}`,
+          delayed,
+          resolve('tests/e2e/windows-cli-launcher.cs'),
+        ],
+        { timeout: 10000, maxBuffer: 16384, shell: false, windowsHide: true },
+      )
+      owner.armStartup(performance.now() + 10000)
+      child = spawn(owner.executablePath, ['-e', 'setInterval(()=>{},1000)'], {
+        shell: false,
+        windowsHide: true,
+        stdio: ['pipe', 'ignore', 'ignore'],
+      })
+      closed = once(child, 'close')
+      targetPid = (await owner.started).pid
+      owner.cancel()
+      expect(await owner.empty).toEqual({ generation: owner.generation, active: 0, exitCode: 1 })
+      await within(closed, 1500, 'Delayed Job helper did not close')
+      expect(owner.diagnostic().stoppingReason).toBe('control-closed')
+      expect(gone(targetPid)).toBe(true)
+      expect(child.exitCode).toBe(1)
+    } finally {
+      owner.cancel()
+      await owner.disposeControl()
+      if (child && child.exitCode === null && child.signalCode === null) child.kill()
+      await closed
+      if (targetPid === undefined || gone(targetPid))
+        await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 })
+    }
+  },
+  20000,
+)
+
+it.skipIf(process.platform !== 'win32').each(['delayed-ack-cancel', 'missing-ack', 'eof'] as const)(
+  'observed helper bounds final receipt acknowledgement: %s',
+  async (mode) => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-job-final-receipt-'))
+    const server = createServer()
+    server.maxConnections = 1
+    const generation = randomUUID(),
+      token = randomUUID()
+    const pipe = `pact-fixture-${process.pid}-${generation}`
+    let connection: Socket | undefined
+    let child: ReturnType<typeof spawn> | undefined
+    let closed: Promise<unknown> | undefined
+    let targetPid: number | undefined
+    let didEmpty = false
+    let emptyFact: { active: unknown; exitCode: unknown } | undefined
+    const exitCodesBeforeAck: Array<number | null> = []
+    let resolveEmpty!: () => void
+    let rejectEmpty!: (error: unknown) => void
+    const empty = new Promise<void>((done, reject) => {
+      resolveEmpty = done
+      rejectEmpty = reject
+    })
+    void empty.catch(() => undefined)
+    server.on('connection', (socket) => {
+      if (connection) {
+        socket.destroy()
+        return
+      }
+      connection = socket
+      let buffer = Buffer.alloc(0)
+      let authenticated = false
+      socket.on('data', (chunk) => {
+        try {
+          buffer = Buffer.concat([buffer, chunk])
+          if (buffer.length > 4096) throw new Error('Final receipt fixture frame overflow')
+          for (;;) {
+            const newline = buffer.indexOf(10)
+            if (newline < 0) break
+            const packet: Record<string, unknown> = JSON.parse(
+              buffer.subarray(0, newline).toString('utf8'),
+            )
+            buffer = buffer.subarray(newline + 1)
+            expect(packet.generation).toBe(generation)
+            if (!authenticated) {
+              if (packet.kind !== 'hello' || packet.token !== token)
+                throw new Error('Invalid final receipt handshake')
+              authenticated = true
+              socket.write('go\n')
+            } else if (packet.kind === 'started') {
+              if (typeof packet.pid !== 'number' || !Number.isSafeInteger(packet.pid))
+                throw new Error('Missing real target PID')
+              targetPid = packet.pid
+            } else if (packet.kind === 'empty') {
+              emptyFact = { active: packet.active, exitCode: packet.exitCode }
+              didEmpty = true
+              resolveEmpty()
+            }
+          }
+        } catch (error) {
+          rejectEmpty(error)
+        }
+      })
+      socket.on('error', rejectEmpty)
+      socket.once('close', () => {
+        if (!didEmpty) rejectEmpty(new Error('Real Job receipt was lost'))
+      })
+    })
+    try {
+      const executable = await writeWindowsNodeLauncher(root, 'receipt-client', [])
+      await writeFile(
+        join(root, 'receipt-client.json'),
+        JSON.stringify({
+          executable: process.execPath,
+          prefix: [],
+          pipe,
+          token,
+          generation,
+          timeout: 10000,
+        }),
+      )
+      await new Promise<void>((done, reject) => {
+        server.once('error', reject)
+        server.listen(`\\\\.\\pipe\\${pipe}`, done)
+      })
+      child = spawn(executable, ['-e', 'process.exit(23)'], {
+        shell: false,
+        windowsHide: true,
+        stdio: ['pipe', 'ignore', 'ignore'],
+      })
+      closed = once(child, 'close')
+      await within(empty, 5000, 'Real final Job receipt deadline')
+      expect(emptyFact).toEqual({ active: 0, exitCode: 23 })
+      expect(targetPid).toBeDefined()
+      expect(gone(targetPid!)).toBe(true)
+      if (mode === 'delayed-ack-cancel') {
+        await new Promise((done) => setTimeout(done, 150))
+        exitCodesBeforeAck.push(child.exitCode)
+        connection!.write('cancel\n')
+        await new Promise((done) => setTimeout(done, 150))
+        exitCodesBeforeAck.push(child.exitCode)
+        connection!.end('received\n')
+      } else if (mode === 'eof') connection!.end()
+      await within(closed, 2500, 'Final acknowledgement did not release the helper')
+      expect(exitCodesBeforeAck).toEqual(mode === 'delayed-ack-cancel' ? [null, null] : [])
+      expect(child.exitCode).toBe(mode === 'missing-ack' ? 1 : 23)
+    } finally {
+      connection?.destroy()
+      if (child && child.exitCode === null && child.signalCode === null) child.kill()
+      await closed
+      if (server.listening) await new Promise<void>((done) => server.close(() => done()))
+      if (targetPid === undefined || gone(targetPid))
+        await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 })
     }
   },
   20000,

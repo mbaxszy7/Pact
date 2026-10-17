@@ -42,7 +42,8 @@ export async function workspaceGit(
       Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')),
     )
     env['GIT_CONFIG_NOSYSTEM'] = '1'
-    env['GIT_CONFIG_GLOBAL'] = process.platform === 'win32' ? 'NUL' : '/dev/null'
+    // Git for Windows maps /dev/null itself; its config reader can reject the NUL device.
+    env['GIT_CONFIG_GLOBAL'] = '/dev/null'
     env['GIT_OPTIONAL_LOCKS'] = '0'
     env['GIT_CEILING_DIRECTORIES'] = cwd
     const child = spawn(

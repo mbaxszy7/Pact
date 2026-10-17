@@ -99,6 +99,16 @@ jobs:
           artifact-ids: ${{ needs.validate.outputs.smoke_win_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/release/win32-x64/smoke
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.validate.outputs.package_win_arm64_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release/win32-arm64/package
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.validate.outputs.smoke_win_arm64_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release/win32-arm64/smoke
       - name: Verify, publish immutable assets, and finalize the standard version PR
         run: node scripts/release-native.mjs publish --root "$RUNNER_TEMP/release"
         env:
@@ -108,7 +118,7 @@ jobs:
           PACT_RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
           PACT_RELEASE_PR: ${{ needs.resolve.outputs.release_pr }}
           PACT_RELEASE_ARTIFACTS_JSON: >-
-            {"darwin-arm64":{"packageId":"${{ needs.validate.outputs.package_mac_id }}","packageDigest":"${{ needs.validate.outputs.package_mac_digest }}","smokeId":"${{ needs.validate.outputs.smoke_mac_id }}","smokeDigest":"${{ needs.validate.outputs.smoke_mac_digest }}"},"win32-x64":{"packageId":"${{ needs.validate.outputs.package_win_id }}","packageDigest":"${{ needs.validate.outputs.package_win_digest }}","smokeId":"${{ needs.validate.outputs.smoke_win_id }}","smokeDigest":"${{ needs.validate.outputs.smoke_win_digest }}"}}
+            {"darwin-arm64":{"packageId":"${{ needs.validate.outputs.package_mac_id }}","packageDigest":"${{ needs.validate.outputs.package_mac_digest }}","smokeId":"${{ needs.validate.outputs.smoke_mac_id }}","smokeDigest":"${{ needs.validate.outputs.smoke_mac_digest }}"},"win32-x64":{"packageId":"${{ needs.validate.outputs.package_win_id }}","packageDigest":"${{ needs.validate.outputs.package_win_digest }}","smokeId":"${{ needs.validate.outputs.smoke_win_id }}","smokeDigest":"${{ needs.validate.outputs.smoke_win_digest }}"},"win32-arm64":{"packageId":"${{ needs.validate.outputs.package_win_arm64_id }}","packageDigest":"${{ needs.validate.outputs.package_win_arm64_digest }}","smokeId":"${{ needs.validate.outputs.smoke_win_arm64_id }}","smokeDigest":"${{ needs.validate.outputs.smoke_win_arm64_digest }}"}}
       - name: Preserve release verification metadata outside public downloads
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

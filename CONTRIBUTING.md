@@ -4,11 +4,14 @@
 
 Use `.node-version` and the pnpm version in `package.json`.
 Supported desktop targets are Windows x64, Windows arm64 and macOS arm64. Shared CI
-jobs run on macOS arm64. Required platform jobs currently use Windows x64 and macOS arm64
-native runners; all Windows arm64 CI is explicitly deferred, not counted as passed.
-Its native launcher has exceeded the unchanged 15-second cold-start budget. Restore its
-native and Provider jobs together only after that failure is resolved and native-machine
-acceptance is complete. The arm64 source implementation and tests remain available.
+jobs run on macOS arm64. Each target has independent native protocol, package, installed-smoke
+and real-core jobs. Windows arm64 uses `windows-11-arm` and checks `win32/arm64` before setup;
+the native launcher retains its 15-second cold-start budget. Missing native-machine or installed
+execution evidence cannot count as passing acceptance.
+
+The previously reported Windows arm64 launcher cold-start budget exceedance remains a performance
+verification obligation. Keep fresh-helper and repeated-start evidence separate; passing local runs
+does not establish OS-first-cold or p95 compliance.
 
 ```sh
 corepack enable
@@ -19,6 +22,12 @@ pnpm dev
 Keep pnpm's isolated dependency layout and exact lockfile. Do not switch to hoisted dependencies,
 hand-edit links, or introduce another package manager. Native runtime dependencies belong in
 `apps/desktop/package.json` and must be rebuilt for Electron. Use Oxlint and Oxfmt only.
+
+Windows file-symlink boundary tests require permission to create symbolic links. Run them in a
+suitably privileged session, or manually enable
+[Developer Mode](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createsymboliclinkw)
+before testing. An `EPERM` during fixture creation blocks verification; do not skip these assertions
+or substitute hard links or junctions.
 
 Release Please owns the serialization of the root `CHANGELOG.md` and
 `.release-please-manifest.json`. Oxfmt excludes exactly those generated paths, including when
@@ -238,7 +247,7 @@ Discovery must match that inventory and its tags; a missing, new, duplicate or r
 case cannot silently change the merge gate. Test titles, assertions and the immutable
 baseline remain unchanged.
 
-Automatic CI requires the existing `@real-core` business case on Windows x64 and macOS arm64:
+Automatic CI requires the existing `@real-core` business case on Windows x64/arm64 and macOS arm64:
 `real @all completes each Agent once and keeps ordered distinct response rows`. It launches the
 actual App, creates a Project and Session, sends one `@all` message, and verifies that Codex and
 Claude each finish one real Run with separate responses and a released Composer. Missing replies,
@@ -306,7 +315,7 @@ and restores the desktop package metadata without a version commit.
 | ------------- | -------------------------------- | ----------------------- |
 | macOS arm64   | `--platform darwin --arch arm64` | DMG and ZIP             |
 | Windows x64   | `--platform win32 --arch x64`    | Separate NSIS installer |
-| Windows arm64 | Deferred (TODO)                  | No CI/Release installer |
+| Windows arm64 | `--platform win32 --arch arm64`  | Separate NSIS installer |
 
 For example, on macOS arm64:
 
@@ -328,6 +337,14 @@ dispatch never publishes a formal release. A successful preflight does not estab
 protected-main publication. Ordinary branch and PR validation needs no readiness switches.
 
 Local production uses the same entry point with `--profile production-local --channel stable`; its name and existing data directories remain separate from both CI channels. Local `dist:mac`, `dist:win`, and `package:dir:local` select this profile. Smoke commands require the exact generated manifest.
+
+For an isolated Windows arm64 local package, use the native toolchain and a new output directory.
+Running through pnpm supplies its exact native executable entry to Windows command supervision:
+
+```sh
+pnpm exec node scripts/build-distribution.mjs --profile production-local --channel stable --platform win32 --arch arm64 --dir --output .pact-data/distributions/windows-arm64-local
+pnpm exec node scripts/package-smoke.mjs --manifest .pact-data/distributions/windows-arm64-local/distribution-manifest.json --unpacked --report .pact-data/distributions/windows-arm64-local/smoke.json
+```
 
 The manifest identifies the exact executable/bundle, channel/version, source SHA, architecture,
 application identity, application-content hash and installation-artifact hashes. Smoke does not guess
@@ -357,7 +374,9 @@ neither deleting a directory nor calling terminate proves physical process clean
 Release Actions retain these reports in `smoke-PLATFORM-CHANNEL-aATTEMPT` even after
 failure, separately from the successful artifacts eligible for release publication.
 
-Windows arm64 installer build, installation acceptance and publication are deferred (TODO).
+Windows arm64 package, installed-smoke, Dev delivery and Stable publication use the same exact
+artifact-evidence contract as the other targets. Local unpacked or manual installation results do
+not replace the GitHub-hosted ephemeral runner’s automatic NSIS installation evidence.
 Windows x64 installed-launch validation and full Windows/macOS Dev/Stable coexistence, upgrade
 and uninstall debugging still require their actual evidence. Code integration does not establish those platform gates.
 
@@ -501,14 +520,14 @@ version PR without publishing. Every Stable executor uses the resolved immutable
 main tip or a one-time `release_created` action output. The installed NSIS artwork is included in
 the Windows unpacked payload, so its bytes participate in the same strict content manifest.
 
-After both platforms' protocol, core and installed-package checks pass, the separate publisher
+After all three targets' protocol, core and installed-package checks pass, the separate publisher
 admits exact package and smoke artifact IDs, archive digests, source, version, native target and
 producing attempts. It treats downloaded artifacts as bounded data, never executable publisher
 code. Each actual DMG/ZIP/NSIS hash, application content hash, cold restart, default data root and
 physical cleanup receipt must match. Rebuilt bytes require a new matching installation report.
 
 The publisher creates or reconciles one Draft for the exact tag/version/source, uploads only the
-verified macOS arm64 DMG/ZIP and Windows x64 NSIS EXE, downloads and hashes the uploaded bytes, then
+four verified installers (macOS arm64 DMG/ZIP and Windows x64/arm64 NSIS EXE), hashes their uploaded bytes, then
 publishes an immutable Release. GitHub supplies source archives and its native Release attestation.
 Distribution manifests, execution contexts and installed-smoke reports remain in their original
 package/smoke Actions artifacts. The aggregate `pact-release-manifest.json` and `SHA256SUMS` are saved

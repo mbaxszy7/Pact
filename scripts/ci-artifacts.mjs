@@ -8,7 +8,7 @@ import { isScriptEntry } from './script-entry.mjs'
 
 const hashPattern = /^[a-f0-9]{64}$/u
 const sourcePattern = /^[a-f0-9]{40}$/u
-const targets = new Set(['darwin-arm64', 'win32-x64'])
+const targets = new Set(['darwin-arm64', 'win32-x64', 'win32-arm64'])
 const requireFact = (fact, message) => {
   if (!fact) throw new Error(message)
 }

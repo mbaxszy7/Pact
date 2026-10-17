@@ -46,7 +46,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 5
     steps:
-      - name: Require complete quality and two-platform acceptance
+      - name: Require complete quality and three-platform acceptance
         run: test "$RESULT" = success
         env:
           RESULT: ${{ needs.checks.result }}
@@ -103,7 +103,25 @@ jobs:
           PACT_CI_PLATFORM: win32-x64
           PACKAGE_ID: ${{ needs.checks.outputs.package_win_id }}
           PACKAGE_DIGEST: ${{ needs.checks.outputs.package_win_digest }}
-      - name: Deliver both accepted native development packages and evidence
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.checks.outputs.package_win_arm64_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/delivery/win32-arm64/package
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.checks.outputs.smoke_win_arm64_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/delivery/win32-arm64/smoke
+      - name: Verify the exact accepted win32-arm64 candidate before delivery
+        run: >-
+          node scripts/ci-artifacts.mjs verify "$RUNNER_TEMP/delivery/win32-arm64/package"
+          "$RUNNER_TEMP/delivery/win32-arm64/smoke" "$PACKAGE_ID" "$PACKAGE_DIGEST"
+        env:
+          PACT_CI_PLATFORM: win32-arm64
+          PACKAGE_ID: ${{ needs.checks.outputs.package_win_arm64_id }}
+          PACKAGE_DIGEST: ${{ needs.checks.outputs.package_win_arm64_digest }}
+      - name: Deliver all three accepted native development packages and evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Pact-Dev-${{ github.sha }}-a${{ github.run_attempt }}

@@ -150,6 +150,7 @@ async function releaseFixture(t) {
   for (const [key, firstId, attempt] of [
     ['darwin-arm64', 101, 1],
     ['win32-x64', 201, 2],
+    ['win32-arm64', 301, 1],
   ]) {
     const [platform, arch] = key.split('-')
     const packageRoot = join(root, key, 'package'),
@@ -165,7 +166,7 @@ async function releaseFixture(t) {
       const extension = kind === 'nsis' ? 'exe' : kind
       const artifact = {
         kind,
-        path: `Pact-0.1.0-${key}.${extension}`,
+        path: `Pact-0.1.0-${platform === 'darwin' ? 'mac' : 'win'}-${arch}.${extension}`,
         bytes: bytes.length,
         sha256: hash(bytes),
       }
@@ -369,6 +370,12 @@ void test('first publication uploads only admitted installers and retains comple
   const installerNames = Object.values(manifests).flatMap((manifest) =>
     manifest.artifacts.map((installer) => installer.path),
   )
+  assert.deepEqual(installerNames, [
+    'Pact-0.1.0-mac-arm64.dmg',
+    'Pact-0.1.0-mac-arm64.zip',
+    'Pact-0.1.0-win-x64.exe',
+    'Pact-0.1.0-win-arm64.exe',
+  ])
   assert.equal(api.uploads.length, installerNames.length)
   assert.deepEqual(new Set(api.uploads), new Set(installerNames))
   assert.equal(api.assets.length, installerNames.length)
@@ -380,11 +387,12 @@ void test('first publication uploads only admitted installers and retains comple
     [
       ['darwin-arm64', 1, 1],
       ['win32-x64', 2, 2],
+      ['win32-arm64', 1, 1],
     ],
   )
   assert.equal(publication.runId, runId)
   assert.equal(publication.sourceSha, sourceSha)
-  assert.equal(publication.platforms.flatMap((item) => item.files).length, 12)
+  assert.equal(publication.platforms.flatMap((item) => item.files).length, 17)
   const checksumLines = (await readFile(join(options.root, 'SHA256SUMS'), 'utf8'))
     .trimEnd()
     .split('\n')
@@ -530,8 +538,8 @@ void test('expired, wrong-run, wrong-source and changed-digest producer artifact
 
 void test('missing target, duplicate artifact identity or incomplete native installer formats block publication', async (t) => {
   const missing = await releaseFixture(t)
-  delete missing.options.artifacts['win32-x64']
-  await assert.rejects(publishRelease(missing.api, missing.options), /Both native platform/u)
+  delete missing.options.artifacts['win32-arm64']
+  await assert.rejects(publishRelease(missing.api, missing.options), /All native platform/u)
   const duplicate = await releaseFixture(t)
   duplicate.options.artifacts['win32-x64'].smokeId = 101
   await assert.rejects(publishRelease(duplicate.api, duplicate.options), /IDs must be distinct/u)
@@ -543,6 +551,54 @@ void test('missing target, duplicate artifact identity or incomplete native inst
   )
   await assert.rejects(publishRelease(format.api, format.options), /installer must be present/u)
   for (const fixture of [missing, duplicate, format]) assert.equal(fixture.api.release, undefined)
+})
+
+void test('ARM64 producer identity and installed evidence must pass before any release write', async (t) => {
+  for (const mode of ['expired', 'source', 'digest', 'missing-smoke', 'x64-smoke', 'unpacked']) {
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Each failed ARM64 boundary starts with independent valid three-platform inputs.
+    const { api, options } = await releaseFixture(t)
+    const path = join(options.root, 'win32-arm64', 'smoke', 'package-smoke-report.json')
+    if (mode === 'expired') api.artifacts.get(301).expired = true
+    else if (mode === 'source') api.artifacts.get(302).workflow_run.head_sha = otherSha
+    else if (mode === 'digest') options.artifacts['win32-arm64'].smokeDigest = '0'.repeat(64)
+    else if (mode === 'missing-smoke') {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Removing this fixture's installed receipt cannot be replaced by another platform's pass.
+      await rm(path)
+    } else {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Alter only the specific receipt fact under test.
+      const report = JSON.parse(await readFile(path, 'utf8'))
+      if (mode === 'x64-smoke') report.arch = 'x64'
+      else report.verificationMode = 'unpacked'
+      // oxlint-disable-next-line eslint/no-await-in-loop -- The publisher reads actual evidence bytes through validateCandidate.
+      await json(path, report)
+    }
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Every rejection must precede all public mutation.
+    await assert.rejects(
+      publishRelease(api, options),
+      /Artifact identity|ENOENT|smoke identity|exact installer/u,
+    )
+    assert.equal(api.release, undefined)
+    assert.equal(api.uploads.length, 0)
+    assert.equal(
+      api.calls.some((call) => call.method && call.method !== 'GET'),
+      false,
+    )
+  }
+})
+
+void test('a published two-platform release never receives a retroactive ARM64 asset', async (t) => {
+  const { api, options } = await releaseFixture(t)
+  await publishRelease(api, options)
+  api.assets = api.assets.filter((asset) => !asset.name.endsWith('-win-arm64.exe'))
+  api.calls = []
+  const uploaded = api.uploads.length
+  await assert.rejects(publishRelease(api, options), /unexpected asset|missing/u)
+  assert.equal(api.release.immutable, true)
+  assert.equal(api.uploads.length, uploaded)
+  assert.equal(
+    api.calls.some((call) => call.method && call.method !== 'GET'),
+    false,
+  )
 })
 
 void test('dirty source and missing default root or cleanup facts remain fatal in formal publication', async (t) => {

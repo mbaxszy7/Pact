@@ -293,8 +293,9 @@ normal production-path correctness.
 
 `version.json` owns the product version. Distribution verifies desktop version and checked-out SHA,
 injects a compatible Dev prerelease/build/source identity or Stable version, then hash-checks metadata
-restoration. Native Windows x64 produces NSIS; macOS arm64 produces DMG/ZIP. Separate native package, installed-smoke and core E2E jobs gate delivery and publication. Windows ARM64 CI/installers
-remain deferred. Certificate signing/notarization stay disabled; macOS retains ad-hoc signing.
+restoration. Windows x64/arm64 produce NSIS; macOS arm64 produces DMG/ZIP. Each target has separate
+native protocol, package, installed-smoke and core E2E jobs gating delivery and publication.
+Certificate signing/notarization stay disabled; macOS retains ad-hoc signing.
 Native dependency rebuilding, sandboxing, Context Isolation, ASAR integrity and fuses remain required.
 
 The manifest binds channel/version/source/OS/architecture/identity, artifact hashes and final signed
@@ -306,7 +307,7 @@ rules. Explicit local profiles use the same manifest-based verification without 
 These interfaces require actual platform evidence for coexistence, upgrades and uninstall cleanup.
 Publication uses the exact merged version-PR source and same-run package IDs/digests with matching installed evidence. A separate main-only publisher reconciles one Draft, verifies uploaded bytes and native immutable Release integrity, then finalizes standard version labels before maintaining the next PR. Native review rules exempt only the owner-author; CI is never bypassed and Merge stays manual. Model and version-bot environments use ref restrictions without runtime approvals. Missing evidence, expired artifacts or uncertain writes stop; no signed controller, staging Release or alternate recovery path is retained.
 
-Release uploads contain only macOS arm64 DMG/ZIP and Windows x64 NSIS EXE; GitHub supplies source
+Release uploads contain four installers: macOS arm64 DMG/ZIP and Windows x64/arm64 NSIS EXE; GitHub supplies source
 archives and native attestation. Full validation remains mandatory. Package/smoke evidence and
 aggregate manifests/checksums stay in Actions artifacts for 14 days; published Releases stay immutable.
 
@@ -643,6 +644,8 @@ These bounds belong to test owners and do not certify production CLI readiness, 
 | Claude Windows accounting suffix | Existing10 s Fork owner/10,000 records/8 MiB text/32 MiB aggregate; ≤ 10,000 model entries/4096-char labels/nonnegative numeric fields and four token totals each ≤ 10^15; totalCostUSD ≤ 10^9 | Strict candidate identity/schema/empty-input counter checks; unchanged prefix/raw SHA; no extra I/O/model/native rewrite                                                                 |
 
 The cache key includes actual source/effective compiler and Node file generation, architecture, canonical compilation CWD. It caches no Ready/auth state, warms no process, and starts no model. Cold startup still must fit the caller budget; reduced repeat compilation/FileId cost does not establish cold p95 or an OS/Defender cause. Permission tests admit only the exact bounded next native command when necessary, not retained rules or broad Session grants.
+
+Observed cancel preserves reads; ≤2 cancel/ACK lines, ACK ≤1 s within cleanup; EOF/ACK is no Job proof.
 
 Native protocol setup uses one 60-second deadline for CLI discovery, cold launcher preparation,
 two version probes and the Adapter bundle. Each actual version probe remains bounded to five
