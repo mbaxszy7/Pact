@@ -155,6 +155,7 @@ export interface RuntimeFixture {
     args: string[],
   ): Promise<{ exitCode: number; stdout: string; stderr: string }>
   readConfigurationModels(): { claude: string | null; codex: string | null }
+  appJobDiagnostic(this: void): ReturnType<WindowsLaunchOwner['diagnostic']> | undefined
   databaseFile: string
   claudeHome: string
   codexHome: string
@@ -1047,6 +1048,7 @@ export async function createRuntimeFixture(
             contentType: 'image/png',
           })
         },
+        appJobDiagnostic: () => appOwner?.diagnostic(),
         dispose,
         readCodexFacts: async () => {
           if (mode === 'real')

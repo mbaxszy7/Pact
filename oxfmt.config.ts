@@ -10,6 +10,9 @@ export default defineConfig({
   endOfLine: 'lf',
   insertFinalNewline: true,
   ignorePatterns: [
+    // Release Please owns serialization of these root-level generated files.
+    '/CHANGELOG.md',
+    '/.release-please-manifest.json',
     'tests/e2e/baseline.json',
     '**/.claude/settings.local.json',
     '**/node_modules/**',

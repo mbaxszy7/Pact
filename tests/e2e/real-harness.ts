@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path'
 import type { ConversationSnapshot, DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { diagnosticRecordSchema } from '../../packages/contracts/src/diagnostics.js'
-import { quitPact } from './native-quit.js'
+import { quitPact, recordQuitFailure } from './native-quit.js'
 import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import { resolveRealConfiguredModel } from './real-model-selection.js'
 import {
@@ -468,10 +468,19 @@ export async function restartRealWorkspace(context: RealWorkspace): Promise<void
 export async function closeRealWorkspace(
   context: Pick<RealWorkspace, 'app' | 'fixture'>,
 ): Promise<void> {
+  let quitFailed = false
   try {
-    await quitPact(context.app)
+    await quitPact(context.app, undefined, context.fixture.appJobDiagnostic)
+  } catch (error) {
+    quitFailed = true
+    throw error
   } finally {
-    await context.fixture.dispose()
+    try {
+      await context.fixture.dispose()
+    } finally {
+      if (quitFailed)
+        recordQuitFailure(context.app, context.fixture.appJobDiagnostic, 'after-dispose')
+    }
   }
 }
 
