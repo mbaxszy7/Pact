@@ -22,7 +22,7 @@
   <a href="#a-shared-workspace">Features</a> ·
   <a href="#get-started">Get started</a> ·
   <a href="#cli-compatibility">CLI compatibility</a> ·
-  <a href="CONTRIBUTING.md">Contribute</a>
+  <a href="#contributing">Contribute</a>
 </p>
 
 <p align="center">
@@ -105,7 +105,7 @@ Signed distribution, automatic updates and full checkpoint restore are not compl
 
 ### CLI compatibility
 
-Start with the exact versions pinned by Pact's [native CI setup](scripts/ci-native.mjs):
+Start with the exact CLI versions pinned in Pact's CI:
 
 | CLI         | CI-pinned version | Check your installation |
 | ----------- | ----------------- | ----------------------- |
@@ -119,13 +119,13 @@ CLI's capabilities. Codex per-turn Standard/Fast speed overrides require **0.159
 older or unrecognized versions retain their native speed configuration.
 
 Pact does not install or authenticate the CLIs for you. Keep provider configuration in the native
-tools. See [runtime preparation](docs/product/requirements.md#runtime-preparation-and-first-use)
-for readiness, model discovery and fallback behavior.
+tools. Pact checks readiness and discovers available models during setup, and explains when a native
+capability is unavailable.
 
 ## Quality you can inspect
 
 The live CI badge links to the actual **dev** workflow. It reports workflow status, rather than a
-self-assigned quality score. The [validation pipeline](.github/workflows/distributions.yml) includes:
+self-assigned quality score. The validation pipeline includes:
 
 | Layer                  | Evidence                                                                                                      |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------- |
@@ -136,7 +136,7 @@ self-assigned quality score. The [validation pipeline](.github/workflows/distrib
 
 Real-provider checks need private configuration and can incur model fees; external pull requests do
 not receive provider credentials. The workflow run is the authority for what passed, failed or was
-skipped. See the [testing guide](CONTRIBUTING.md#testing) for the complete verification contract.
+skipped.
 
 <details>
 <summary><strong>Build and verification commands</strong></summary>
@@ -157,13 +157,11 @@ Current signing and notarization settings produce development artifacts, not sig
 
 </details>
 
-## Explore further
+## Contributing
 
-- [Contributing](CONTRIBUTING.md) — setup, testing, migrations and change discipline.
-- [Product specification](docs/product/requirements.md) — behavior, terminology and current limitations.
-- [Architecture](docs/technical-foundation.md) — interfaces, ownership, recovery and resource budgets.
-- [Desktop product](apps/desktop/PRODUCT.md) and [design system](apps/desktop/DESIGN.md) — interaction and visual principles.
-- [Agent instructions](AGENTS.md) — repository guidance for coding agents.
+Bug reports, thoughtful feature proposals and focused contributions are welcome. Include reproduction
+steps, your operating system and both CLI versions when reporting an issue. Keep credentials and
+private conversation content out of public reports.
 
 ---
 
