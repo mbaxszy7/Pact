@@ -463,7 +463,8 @@ export async function writeWindowsObservedLauncher(
     if (cancelled) return
     cancelled = true
     if (authenticated && !didEmpty && socket && !socket.destroyed && !socket.writableEnded)
-      socket.end('cancel\n')
+      // Windows named-pipe shutdown can end reads before the Job's final receipt arrives.
+      socket.write('cancel\n')
   }
   const armStartup = (deadline: number): void => {
     const remaining = deadline - performance.now()
@@ -597,6 +598,9 @@ export async function writeWindowsObservedLauncher(
         rejectRootExit(new Error('Windows Job root exit is unavailable after release'))
       // Authenticated empty proves physical release independently of a missing
       // root observation on an error path. It cannot prove natural exit/takeover.
+      // The helper keeps the pipe open until this ACK so a concurrent cancellation
+      // cannot write into a closed peer and discard an unread empty receipt.
+      socket!.end('received\n')
       resolveEmpty({ generation, active: 0, exitCode: message.exitCode })
     } else if (message.kind === 'counts') {
       if (

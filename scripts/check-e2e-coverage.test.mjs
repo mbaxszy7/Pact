@@ -14,6 +14,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
+import { pathToFileURL } from 'node:url'
 
 import { compareAssertions, discoveryEnvironment, sourceEvidence } from './check-e2e-coverage.mjs'
 
@@ -348,7 +349,7 @@ syncBuiltinESMExports()
       process.execPath,
       [
         '--import',
-        guard,
+        pathToFileURL(guard).href,
         join(controller, 'scripts/check-e2e-coverage.mjs'),
         '--source-only',
         '--json',

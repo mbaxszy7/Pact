@@ -11,7 +11,7 @@ import { isScriptEntry } from './script-entry.mjs'
 const repository = 'mbaxszy7/Pact'
 const shaPattern = /^[a-f0-9]{40}$/u
 const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
-const platforms = ['darwin-arm64', 'win32-x64']
+const platforms = ['darwin-arm64', 'win32-x64', 'win32-arm64']
 const maximumAssets = 32
 const maximumAssetBytes = 2 * 1024 ** 3
 const execFileAsync = promisify(execFile)
@@ -301,7 +301,7 @@ async function checkArtifact(api, id, expectedDigest, runId, sourceSha) {
 async function admitReleaseFiles(api, root, identity, artifacts, runId) {
   requireFact(
     artifacts && Object.keys(artifacts).toSorted().join() === [...platforms].toSorted().join(),
-    'Both native platform artifact sets are required',
+    'All native platform artifact sets are required',
   )
   const files = [],
     evidence = [],
@@ -317,7 +317,7 @@ async function admitReleaseFiles(api, root, identity, artifacts, runId) {
     ]) {
       requireFact(!ids.has(positive(id)), 'Release artifact IDs must be distinct')
       ids.add(Number(id))
-      // oxlint-disable-next-line no-await-in-loop -- Four immutable producer artifacts are admitted serially with bounded API work.
+      // oxlint-disable-next-line no-await-in-loop -- Six immutable producer artifacts are admitted serially with bounded API work.
       await checkArtifact(api, id, hash, runId, identity.sourceSha)
     }
     // oxlint-disable-next-line no-await-in-loop -- Hash one platform's bounded file set at a time.

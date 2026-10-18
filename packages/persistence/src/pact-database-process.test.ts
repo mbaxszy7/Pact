@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { resolve, join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { test, expect } from 'vitest'
 
 import { PactDatabase } from './pact-database.js'
@@ -25,7 +26,7 @@ test('the primary database interface reserves the entire root across processes a
   const children: ChildProcess[] = []
   const start = async (file = filePath) => {
     const child = fork(worker, [file, migrationsFolder], {
-      execArgv: ['--import', require.resolve('tsx')],
+      execArgv: ['--import', pathToFileURL(require.resolve('tsx')).href],
       stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
     })
     children.push(child)

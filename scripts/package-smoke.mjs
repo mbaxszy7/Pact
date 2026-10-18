@@ -14,6 +14,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
 
 import identities from '../apps/desktop/app-identities.json' with { type: 'json' }
@@ -38,6 +39,210 @@ const PACKAGE_SMOKE_KILL_GRACE_MS = 5_000
 const MAX_LOG_LENGTH = 16_000
 const execFileAsync = promisify(execFile)
 const MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+const cleanupCodes = new Set([
+  'EACCES',
+  'EBUSY',
+  'EEXIST',
+  'EIO',
+  'EISDIR',
+  'EMFILE',
+  'ENFILE',
+  'ENOENT',
+  'ENOTDIR',
+  'ENOTEMPTY',
+  'EPERM',
+  'UNKNOWN',
+])
+const cleanupSyscalls = new Set(['lstat', 'rmdir', 'scandir', 'unlink', 'unknown'])
+const cleanupCategories = new Set([
+  'root',
+  'installed-payload',
+  'profile',
+  'temporary-files',
+  'fixture-home',
+  'production-probe',
+  'unknown',
+])
+
+/** Project filesystem errors without exporting messages, paths or directory contents. */
+export function privateRootCleanupFailure(error, root, operation, milliseconds) {
+  let category = 'unknown'
+  if (
+    typeof error?.path === 'string' &&
+    error.path.length <= 32_768 &&
+    !/[\r\n\0]/u.test(error.path) &&
+    isAbsolute(error.path)
+  ) {
+    const remainder = relative(root, error.path)
+    if (!remainder) category = 'root'
+    else if (
+      !isAbsolute(remainder) &&
+      remainder !== '..' &&
+      !remainder.startsWith('../') &&
+      !remainder.startsWith('..\\')
+    ) {
+      const first = remainder.split(/[\\/]/u)[0]
+      category =
+        first === 'installed'
+          ? 'installed-payload'
+          : ['electron-profile', 'electron-session'].includes(first)
+            ? 'profile'
+            : first === 'tmp'
+              ? 'temporary-files'
+              : ['home', 'claude-home', 'codex-home'].includes(first)
+                ? 'fixture-home'
+                : first === 'production-path-probe'
+                  ? 'production-probe'
+                  : 'unknown'
+    }
+  }
+  return {
+    operation: operation === 'verify-root-absence' ? operation : 'remove-root',
+    code: cleanupCodes.has(error?.code) ? error.code : 'UNKNOWN',
+    syscall: cleanupSyscalls.has(error?.syscall) ? error.syscall : 'unknown',
+    category,
+    rootState:
+      operation === 'verify-root-absence' && error?.rootStillExists === true
+        ? 'present'
+        : 'unconfirmed',
+    milliseconds:
+      Number.isSafeInteger(milliseconds) && milliseconds >= 0 && milliseconds <= 1_000_000_000
+        ? milliseconds
+        : 0,
+  }
+}
+
+function cleanupFailureProjection(failure) {
+  if (!['remove-root', 'verify-root-absence'].includes(failure?.operation)) return undefined
+  return {
+    operation: failure.operation,
+    code: cleanupCodes.has(failure.code) ? failure.code : 'UNKNOWN',
+    syscall: cleanupSyscalls.has(failure.syscall) ? failure.syscall : 'unknown',
+    category: cleanupCategories.has(failure.category) ? failure.category : 'unknown',
+    rootState: failure.rootState === 'present' ? 'present' : 'unconfirmed',
+    ...(Number.isSafeInteger(failure.milliseconds) &&
+    failure.milliseconds >= 0 &&
+    failure.milliseconds <= 1_000_000_000
+      ? { milliseconds: failure.milliseconds }
+      : {}),
+  }
+}
+
+function privateRootCleanupReport(facts) {
+  const failure = cleanupFailureProjection(facts.privateRootCleanupFailure)
+  const retry = facts.privateRootCleanupRetry
+  const initialFailure = cleanupFailureProjection(retry?.initialFailure)
+  return {
+    ...(failure ? { privateRootCleanupFailure: failure } : {}),
+    ...(initialFailure && [1, 2].includes(retry.attempts)
+      ? {
+          privateRootCleanupRetry: {
+            initialFailure,
+            attempts: retry.attempts,
+            identityCheck: ['verified', 'absent', 'changed'].includes(retry.identityCheck)
+              ? retry.identityCheck
+              : 'unconfirmed',
+            outcome: ['recovered', 'failed', 'identity-blocked', 'already-absent'].includes(
+              retry.outcome,
+            )
+              ? retry.outcome
+              : 'unconfirmed',
+          },
+        }
+      : {}),
+  }
+}
+
+/** The smoke owner calls this only after its process, uninstall and provider-copy gates. */
+export async function removePackagedPrivateRoot(root, identity, facts) {
+  const remove = async () => {
+    const began = performance.now()
+    let operation = 'remove-root'
+    try {
+      await rm(root, { force: true, recursive: true })
+      operation = 'verify-root-absence'
+      try {
+        await lstat(root)
+        throw Object.assign(new Error('Packaged private root still exists'), {
+          rootStillExists: true,
+        })
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error
+        facts.privateRootCleanupVerified = true
+      }
+    } catch (error) {
+      facts.privateRootCleanupFailure = privateRootCleanupFailure(
+        error,
+        root,
+        operation,
+        Math.ceil(performance.now() - began),
+      )
+      throw error
+    }
+  }
+  try {
+    await remove()
+    return privateRootCleanupReport(facts)
+  } catch (error) {
+    const initialFailure = facts.privateRootCleanupFailure
+    if (
+      process.platform !== 'win32' ||
+      initialFailure.operation !== 'remove-root' ||
+      initialFailure.code !== 'EPERM' ||
+      initialFailure.syscall !== 'unlink' ||
+      initialFailure.category !== 'temporary-files' ||
+      facts.installationCleanupVerified !== true ||
+      facts.providerCopiesCleanupVerified !== true ||
+      !facts.processes.every((item) => item.releaseVerified === true)
+    )
+      throw error
+    const retry = {
+      initialFailure,
+      attempts: 1,
+      identityCheck: 'unconfirmed',
+      outcome: 'identity-blocked',
+    }
+    facts.privateRootCleanupRetry = retry
+    await delay(250)
+    try {
+      const current = await lstat(root, { bigint: true })
+      if (
+        !identity?.stat?.isDirectory() ||
+        identity.stat.isSymbolicLink() ||
+        typeof identity.stat.ino !== 'bigint' ||
+        identity.stat.ino === 0n ||
+        !current.isDirectory() ||
+        current.isSymbolicLink() ||
+        current.dev !== identity.stat.dev ||
+        current.ino !== identity.stat.ino ||
+        current.birthtimeNs !== identity.stat.birthtimeNs ||
+        (await realpath(root)) !== identity.canonicalPath
+      ) {
+        retry.identityCheck = 'changed'
+        throw error
+      }
+      retry.identityCheck = 'verified'
+    } catch (identityError) {
+      if (identityError.code !== 'ENOENT') throw error
+      retry.identityCheck = 'absent'
+      // No deletion of an absent root; retain the ordinary independent absence check.
+      try {
+        await lstat(root)
+      } catch (absenceError) {
+        if (absenceError.code !== 'ENOENT') throw error
+        facts.privateRootCleanupVerified = true
+        retry.outcome = 'already-absent'
+        return privateRootCleanupReport(facts)
+      }
+      throw error
+    }
+    retry.attempts = 2
+    retry.outcome = 'failed'
+    await remove()
+    retry.outcome = 'recovered'
+    return privateRootCleanupReport(facts)
+  }
+}
 
 async function pathExists(path) {
   try {
@@ -808,6 +1013,7 @@ export function packageSmokeFailureReport(facts) {
           : [],
       ),
     ),
+    ...privateRootCleanupReport(facts),
     ...([
       'HOST_ENVIRONMENT_BOUNDS',
       'OWNED_DIRECTORY_IDENTITY',
@@ -895,6 +1101,8 @@ async function performPackagedSmoke(
   let pendingReport
   let preserveRoot = false
   let providerHomes = []
+  let privateRootIdentity
+  let privateRootReport = {}
   const cleanup = async () => {
     let cleanupError
     const unresolvedProcess =
@@ -933,14 +1141,11 @@ async function performPackagedSmoke(
     }
     if (!preserveRoot) {
       try {
-        await rm(requestedRoot, { force: true, recursive: true })
-        try {
-          await lstat(requestedRoot)
-          throw new Error('Packaged private root still exists')
-        } catch (error) {
-          if (error.code !== 'ENOENT') throw error
-          facts.privateRootCleanupVerified = true
-        }
+        privateRootReport = await removePackagedPrivateRoot(
+          requestedRoot,
+          privateRootIdentity,
+          facts,
+        )
       } catch (error) {
         facts.cleanupFailureStage ??= 'private-root-removal'
         preserveRoot = true
@@ -957,6 +1162,10 @@ async function performPackagedSmoke(
   try {
     facts.phase = 'environment'
     const root = await realpath(requestedRoot)
+    privateRootIdentity = {
+      canonicalPath: root,
+      stat: await lstat(requestedRoot, { bigint: true }),
+    }
     const prepared = await prepareProviderEnvironment(root, config, sourceEnvironment)
     providerHomes = [prepared.claudeHome, prepared.codexHome]
     await mkdir(join(root, 'logs', 'production'), { recursive: true, mode: 0o700 })
@@ -1169,7 +1378,11 @@ async function performPackagedSmoke(
   }
   if (pendingReport && reportPath) {
     facts.phase = 'report'
-    await writeSmokeReport(reportPath, { ...pendingReport, cleanupVerified: true })
+    await writeSmokeReport(reportPath, {
+      ...pendingReport,
+      ...privateRootReport,
+      cleanupVerified: true,
+    })
   }
 }
 

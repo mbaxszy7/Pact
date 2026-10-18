@@ -253,18 +253,23 @@ void test('each native responsibility is a separate job with exact package-to-sm
     'quality',
     'native_mac',
     'native_win',
+    'native_win_arm64',
     'package_mac',
     'package_win',
+    'package_win_arm64',
     'smoke_mac',
     'smoke_win',
+    'smoke_win_arm64',
     'real_mac',
     'real_win',
+    'real_win_arm64',
     'complete',
   ]
   assert.deepEqual(Object.keys(distribution.jobs).toSorted(), expectedJobs.toSorted())
   for (const [suffix, runner] of [
     ['mac', 'macos-15'],
     ['win', 'windows-2025'],
+    ['win_arm64', 'windows-11-arm'],
   ]) {
     const native = distribution.jobs[`native_${suffix}`]
     const pack = distribution.jobs[`package_${suffix}`]
@@ -273,6 +278,13 @@ void test('each native responsibility is a separate job with exact package-to-sm
     for (const job of [native, pack, smoke, real]) {
       assert.equal(job['runs-on'], runner)
       assert.equal(job.strategy, undefined)
+      if (suffix === 'win_arm64') {
+        assert.equal(job.steps[0].shell, 'pwsh')
+        assert.equal(job.steps[0].name, 'Require native Windows ARM64 before setup')
+        assert.match(job.steps[0].run, /process\.platform!=="win32"\|\|process\.arch!=="arm64"/u)
+        assert.match(job.steps[0].run, /\$LASTEXITCODE/u)
+        assert.match(job.steps[1].uses, /^actions\/checkout@/u)
+      }
     }
     assert.match(commands(native), /node scripts\/ci\.mjs native/u)
     assert.doesNotMatch(
@@ -326,7 +338,13 @@ void test('each native responsibility is a separate job with exact package-to-sm
 void test('complete gate actually rejects failures, cancellation, missing jobs and skipped model execution', () => {
   const complete = distribution.jobs.complete
   assert.equal(complete.if, 'always()')
-  assert.equal(complete.needs.length, 9)
+  assert.equal(complete.needs.length, 13)
+  assert.deepEqual(
+    complete.needs.toSorted(),
+    Object.keys(distribution.jobs)
+      .filter((name) => name !== 'complete')
+      .toSorted(),
+  )
   const baseline = Object.fromEntries(complete.needs.map((name) => [name, { result: 'success' }]))
   const script = complete.steps[0].run
   const execute = (needs) =>
@@ -375,7 +393,7 @@ void test('model secrets and version App credentials are confined to their sole 
           assert.ok(job === ci.jobs.checks || job === release.jobs.validate)
         } else {
           assert.equal(workflow, distribution)
-          assert.ok(['real_mac', 'real_win'].includes(name))
+          assert.ok(['real_mac', 'real_win', 'real_win_arm64'].includes(name))
           for (const step of job.steps)
             if (/secrets\.PACT_(CLAUDE|CODEX)_/u.test(JSON.stringify(step)))
               assert.equal(step.id, 'execute')
@@ -414,7 +432,7 @@ void test('delivery and publication consume exact accepted IDs in separate non-e
   const publish = release.jobs.publish
   assert.deepEqual(delivery.needs, ['checks', 'ci_complete'])
   assert.match(delivery.if, /event_name == 'push'.*refs\/heads\/dev/u)
-  assert.equal(downloads(delivery).length, 4)
+  assert.equal(downloads(delivery).length, 6)
   assert.equal(upload(delivery).length, 1)
   assert.match(commands(delivery), /ci-artifacts\.mjs verify/u)
   assert.doesNotMatch(
@@ -423,7 +441,7 @@ void test('delivery and publication consume exact accepted IDs in separate non-e
   )
   assert.deepEqual(release.on, { push: { branches: ['main'] } })
   assert.deepEqual(publish.needs, ['resolve', 'validate'])
-  assert.equal(downloads(publish).length, 4)
+  assert.equal(downloads(publish).length, 6)
   const evidence = upload(publish)
   assert.equal(evidence.length, 1)
   assert.equal(evidence[0].if, 'always()')
@@ -454,11 +472,35 @@ void test('delivery and publication consume exact accepted IDs in separate non-e
   })
   const command = publish.steps.find((step) => step.run?.includes('release-native.mjs publish'))
   const artifacts = JSON.parse(command.env.PACT_RELEASE_ARTIFACTS_JSON)
-  assert.deepEqual(Object.keys(artifacts).toSorted(), ['darwin-arm64', 'win32-x64'])
+  assert.deepEqual(Object.keys(artifacts).toSorted(), ['darwin-arm64', 'win32-arm64', 'win32-x64'])
   for (const [platform, suffix] of [
     ['darwin-arm64', 'mac'],
     ['win32-x64', 'win'],
+    ['win32-arm64', 'win_arm64'],
   ]) {
+    for (const [job, caller, root] of [
+      [delivery, 'checks', 'delivery'],
+      [publish, 'validate', 'release'],
+    ]) {
+      for (const kind of ['package', 'smoke']) {
+        const step = downloads(job).find(
+          (download) =>
+            download.with.path === '${{ runner.temp }}/' + root + '/' + platform + '/' + kind,
+        )
+        assert.equal(
+          step?.with['artifact-ids'],
+          '${{ needs.' + caller + '.outputs.' + kind + '_' + suffix + '_id }}',
+        )
+      }
+    }
+    const verify = delivery.steps.find((step) => step.env?.PACT_CI_PLATFORM === platform)
+    assert.equal(verify?.env.PACKAGE_ID, '${{ needs.checks.outputs.package_' + suffix + '_id }}')
+    assert.equal(
+      verify?.env.PACKAGE_DIGEST,
+      '${{ needs.checks.outputs.package_' + suffix + '_digest }}',
+    )
+    assert.ok(verify.run.includes('delivery/' + platform + '/package'))
+    assert.ok(verify.run.includes('delivery/' + platform + '/smoke'))
     assert.equal(
       artifacts[platform].packageId,
       '${{ needs.validate.outputs.package_' + suffix + '_id }}',

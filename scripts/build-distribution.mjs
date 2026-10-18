@@ -471,6 +471,10 @@ export async function main(args = process.argv.slice(2)) {
     await writeFile(configPath, `module.exports = ${JSON.stringify(config)}\n`, { mode: 0o600 })
     const environment = {
       ...process.env,
+      // Nsis7z 19 cannot decode the ARM64 filter selected by newer 7-Zip versions.
+      ...(options.platform === 'win32' && options.arch === 'arm64'
+        ? { ELECTRON_BUILDER_7Z_FILTER: 'BCJ' }
+        : {}),
       CSC_IDENTITY_AUTO_DISCOVERY: 'false',
       PACT_DISTRIBUTION_APPLICATION_RECORD: recordPath,
     }

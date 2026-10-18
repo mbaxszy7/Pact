@@ -132,8 +132,9 @@ void test('native candidates admit exact bytes and earlier successful producer a
   for (const [platform, arch] of [
     ['darwin', 'arm64'],
     ['win32', 'x64'],
+    ['win32', 'arm64'],
   ]) {
-    // oxlint-disable-next-line eslint/no-await-in-loop -- Verify two disjoint native evidence fixtures sequentially.
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Verify disjoint native evidence fixtures sequentially.
     const candidate = await fixture(t, platform, arch)
     // oxlint-disable-next-line eslint/no-await-in-loop -- Each bounded validation streams only its own installer.
     const result = await validateCandidate(candidate.options)
@@ -147,6 +148,17 @@ void test('native candidates admit exact bytes and earlier successful producer a
     assert.equal(new Set(result.files.map((file) => file.name)).size, result.files.length)
     assert.equal(result.manifest.sourceSha, sourceSha)
   }
+})
+
+void test('Windows arm64 evidence cannot reuse x64 package or smoke execution context', async (t) => {
+  const { options, packageContext, smokeContext } = await fixture(t, 'win32', 'arm64')
+  await validateCandidate(options)
+  const packagePath = join(options.packageRoot, 'execution-context.json')
+  await json(packagePath, { ...packageContext, arch: 'x64' })
+  await assert.rejects(validateCandidate(options), /Execution evidence differs/u)
+  await json(packagePath, packageContext)
+  await json(join(options.smokeRoot, 'execution-context.json'), { ...smokeContext, arch: 'x64' })
+  await assert.rejects(validateCandidate(options), /Execution evidence differs/u)
 })
 
 void test('same-name installer changes cannot reuse passing installed smoke', async (t) => {
