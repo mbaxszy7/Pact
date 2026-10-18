@@ -31,8 +31,14 @@ export const defaultSessionSettings = sqliteTable('default_session_settings', {
   primaryAgentId: text('primary_agent_id', { enum: ['claude', 'codex'] }).notNull(),
   claudeModel: text('claude_model'),
   claudeEffort: text('claude_effort'),
+  claudeSpeed: text('claude_speed', { enum: ['native', 'standard', 'fast'] })
+    .notNull()
+    .default('native'),
   codexModel: text('codex_model'),
   codexEffort: text('codex_effort'),
+  codexSpeed: text('codex_speed', { enum: ['native', 'standard', 'fast'] })
+    .notNull()
+    .default('native'),
   maxDiscussionRounds: integer('max_discussion_rounds').notNull(),
   runningMessagePolicy: text('running_message_policy', {
     enum: ['immediate_safe_point', 'next_round'],
@@ -102,6 +108,9 @@ export const sessions = sqliteTable(
     jumpListRemovalObserved: integer('jump_list_removal_observed', { mode: 'boolean' })
       .notNull()
       .default(false),
+    queueEnabled: integer('queue_enabled', { mode: 'boolean' }).notNull().default(true),
+    queueRevision: integer('queue_revision').notNull().default(0),
+    queuePauseReason: text('queue_pause_reason'),
     commentsRevision: integer('comments_revision').notNull().default(0),
     createdAt: text('created_at').notNull(),
     updatedAt: text('updated_at').notNull(),
@@ -169,8 +178,14 @@ export const sessionSettingsRevisions = sqliteTable(
     primaryAgentId: text('primary_agent_id', { enum: ['claude', 'codex'] }).notNull(),
     claudeModel: text('claude_model'),
     claudeEffort: text('claude_effort'),
+    claudeSpeed: text('claude_speed', { enum: ['native', 'standard', 'fast'] })
+      .notNull()
+      .default('native'),
     codexModel: text('codex_model'),
     codexEffort: text('codex_effort'),
+    codexSpeed: text('codex_speed', { enum: ['native', 'standard', 'fast'] })
+      .notNull()
+      .default('native'),
     claudePermissionMode: text('claude_permission_mode', {
       enum: ['native', 'ask', 'auto', 'full'],
     })
@@ -244,6 +259,48 @@ export const conversationMessages = sqliteTable(
     index('conversation_messages_pending_route_idx')
       .on(table.routePendingAgentId, table.sessionId)
       .where(sql`${table.routePendingAgentId} IS NOT NULL`),
+  ],
+)
+
+/** Presentation cut points; bodies and Comment identity remain ordinary Message sources. */
+export const conversationOutputSnapshots = sqliteTable(
+  'conversation_output_snapshots',
+  {
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    runId: text('run_id')
+      .notNull()
+      .references(() => agentRuns.id, { onDelete: 'cascade' }),
+    ordinal: integer('ordinal').notNull(),
+    afterMessageId: text('after_message_id')
+      .notNull()
+      .references(() => conversationMessages.id),
+    sourceMessageId: text('source_message_id').references(() => conversationMessages.id),
+    sourceSequence: integer('source_sequence'),
+    afterSequence: integer('after_sequence').notNull().default(0),
+    hasBody: integer('has_body', { mode: 'boolean' }).notNull().default(false),
+    frozen: integer('frozen', { mode: 'boolean' }).notNull().default(false),
+    contextSequence: integer('context_sequence').notNull(),
+    contextRank: integer('context_rank').notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.runId, table.ordinal] }),
+    uniqueIndex('conversation_output_snapshots_source_unique').on(table.sourceMessageId),
+    index('conversation_output_snapshots_session_idx').on(table.sessionId, table.runId),
+    index('conversation_output_snapshots_source_order_idx').on(
+      table.sessionId,
+      table.sourceSequence,
+      table.sourceMessageId,
+    ),
+    index('conversation_output_snapshots_input_order_idx').on(
+      table.sessionId,
+      table.afterSequence,
+      table.runId,
+    ),
+    index('conversation_output_snapshots_context_order_idx')
+      .on(table.sessionId, table.contextSequence, table.runId)
+      .where(sql`${table.ordinal}=0`),
   ],
 )
 
@@ -450,8 +507,14 @@ export const agentRuns = sqliteTable(
       .notNull()
       .default('native'),
     effort: text('effort'),
+    speed: text('speed', { enum: ['native', 'standard', 'fast'] })
+      .notNull()
+      .default('native'),
+    observedSpeed: text('observed_speed', { enum: ['standard', 'fast'] }),
+    speedDetail: text('speed_detail'),
     nativeSessionId: text('native_session_id'),
     nativeTurnId: text('native_turn_id'),
+    nativeInputIdsJson: text('native_input_ids_json').notNull().default('[]'),
     forkSourceRunId: text('fork_source_run_id'),
     bindingGeneration: integer('binding_generation').notNull().default(1),
     executorId: text('executor_id'),
@@ -1205,6 +1268,8 @@ export const collaborationRequiredInputMembers = sqliteTable(
       .notNull()
       .references(() => conversationInputBatches.id, { onDelete: 'cascade' }),
     memberId: text('member_id').notNull(),
+    inputRevision: integer('input_revision').notNull().default(0),
+    active: integer('active', { mode: 'boolean' }).notNull().default(true),
   },
   (t) => [primaryKey({ columns: [t.runId, t.batchId, t.memberId] })],
 )
@@ -1376,9 +1441,7 @@ export const collaborationInputs = sqliteTable(
     sessionId: text('session_id')
       .notNull()
       .references(() => sessions.id, { onDelete: 'cascade' }),
-    taskId: text('task_id')
-      .notNull()
-      .references(() => collaborationTasks.id, { onDelete: 'cascade' }),
+    taskId: text('task_id').references(() => collaborationTasks.id, { onDelete: 'cascade' }),
     anchorRunId: text('anchor_run_id').notNull(),
     inputId: text('input_id')
       .notNull()
@@ -1391,6 +1454,14 @@ export const collaborationInputs = sqliteTable(
     materializedRunId: text('materialized_run_id'),
     createdAt: text('created_at').notNull(),
     deadline: text('deadline').notNull(),
+    queueState: text('queue_state', {
+      enum: ['queued', 'paused', 'dispatching', 'unknown', 'returned', 'removed', 'delivered'],
+    })
+      .notNull()
+      .default('queued'),
+    queueReason: text('queue_reason'),
+    queueRevision: integer('queue_revision').notNull().default(0),
+    preview: text('preview').notNull().default(''),
   },
   (t) => [
     uniqueIndex('collaboration_inputs_pending_session')
@@ -1401,7 +1472,66 @@ export const collaborationInputs = sqliteTable(
   ],
 )
 
+/** Durable queue operation receipts and append-only same-Run input grants. */
+export const conversationQueueOperations = sqliteTable(
+  'conversation_queue_operations',
+  {
+    id: text('id').primaryKey(),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    inputId: text('input_id').references(() => collaborationInputs.id),
+    kind: text('kind', { enum: ['enabled', 'resume', 'remove', 'return', 'steer'] }).notNull(),
+    state: text('state', {
+      enum: [
+        'complete',
+        'returned',
+        'installed',
+        'consumed',
+        'prepared',
+        'possibly_sent',
+        'accepted',
+        'unknown',
+        'refused',
+      ],
+    }).notNull(),
+    expectedRevision: integer('expected_revision').notNull(),
+    claimId: text('claim_id'),
+    claimExpectedCommentsRevision: integer('claim_expected_comments_revision'),
+    installedCommentsRevision: integer('installed_comments_revision'),
+    enabled: integer('enabled', { mode: 'boolean' }),
+    targetRunId: text('target_run_id').references(() => agentRuns.id),
+    bindingGeneration: integer('binding_generation'),
+    nativeTurnId: text('native_turn_id'),
+    executorId: text('executor_id'),
+    inputRevision: integer('input_revision'),
+    resultNonce: text('result_nonce'),
+    inputScopeJson: text('input_scope_json'),
+    candidateCarrierJson: text('candidate_carrier_json'),
+    batchId: text('batch_id').references(() => conversationInputBatches.id),
+    messageId: text('message_id'),
+    createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (t) => [
+    index('conversation_queue_operations_session_idx').on(t.sessionId, t.createdAt),
+    index('conversation_queue_operations_run_idx').on(t.targetRunId, t.inputRevision),
+    index('conversation_queue_operations_kind_state_idx').on(t.kind, t.state, t.createdAt),
+    index('conversation_queue_operations_input_kind_idx').on(t.inputId, t.kind, t.createdAt),
+    index('conversation_queue_operations_active_grant_idx')
+      .on(t.targetRunId, t.inputRevision)
+      .where(
+        sql`${t.kind} = 'steer' AND ${t.state} IN ('prepared','possibly_sent','accepted','consumed','unknown')`,
+      ),
+    uniqueIndex('conversation_queue_operations_returned_idx')
+      .on(t.sessionId)
+      .where(sql`${t.state} IN ('returned','installed')`),
+  ],
+)
+
 export const schema = {
+  conversationOutputSnapshots,
+  conversationQueueOperations,
   nativePresenceMetadata,
   sessionOpenOperations,
   workspaceArchiveOperations,

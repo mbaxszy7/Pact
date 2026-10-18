@@ -1494,6 +1494,7 @@ function App(): React.JSX.Element {
               })
           }}
           onSaveSessionPermission={(input) => sessionWorkspace.savePermission(input)}
+          onSaveSessionSpeed={(input) => sessionWorkspace.saveSpeed(input)}
           projects={projectCatalog.catalog?.projects ?? []}
           sessions={sessionWorkspace.catalog?.sessions ?? []}
           sessionProjectPages={sessionWorkspace.catalog?.projectPages ?? {}}

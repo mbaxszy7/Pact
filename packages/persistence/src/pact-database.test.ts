@@ -237,7 +237,14 @@ describe('Pact database migrations', () => {
       status: 'draft',
       activity: { state: 'idle' },
       hasUnread: false,
-      settings: { ...settings, permissionModes: { claude: 'ask', codex: 'native' } },
+      settings: {
+        ...settings,
+        agents: {
+          claude: { ...settings.agents.claude, speed: 'native' },
+          codex: { ...settings.agents.codex, speed: 'native' },
+        },
+        permissionModes: { claude: 'ask', codex: 'native' },
+      },
       settingsRevision: 1,
       createdAt: project.createdAt,
       updatedAt: project.createdAt,

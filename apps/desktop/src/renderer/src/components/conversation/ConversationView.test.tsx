@@ -89,6 +89,77 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
+it('defers a completed Steer fold while reading history and resumes when scrolling back to latest', async () => {
+  const { props, run } = recordingFixture()
+  delete run.workspaceChanges
+  run.status = 'running'
+  run.outputSnapshots = {
+    count: 2,
+    lastInputMessageId: crypto.randomUUID(),
+    lastInputSequence: 1,
+    settled: false,
+  }
+  props.snapshot!.messages.push({
+    id: crypto.randomUUID(),
+    sessionId: props.session.id,
+    runId: run.id,
+    replyToMessageId: run.userMessageId,
+    role: 'assistant',
+    agentId: 'codex',
+    content: 'Canonical response.',
+    contentRevision: 0,
+    state: 'complete',
+    sequence: 2,
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+    outputSnapshot: {
+      ordinal: 1,
+      frozen: false,
+      canonical: true,
+      order: { sequence: 2, rank: 1, id: run.id },
+    },
+  })
+  props.history.window!.preserveRunId = run.id
+  props.history.collapseEarlierResponses = vi
+    .fn<NonNullable<typeof props.history.collapseEarlierResponses>>()
+    .mockResolvedValue(undefined)
+  const mounted = render(<ConversationView {...props} />)
+  const transcript = screen.getByRole('region', { name: 'Conversation messages' })
+  Object.defineProperties(transcript, {
+    scrollHeight: { configurable: true, value: 1200 },
+    clientHeight: { configurable: true, value: 400 },
+  })
+  fireEvent.wheel(transcript, { deltaY: -100 })
+  transcript.scrollTop = 300
+  fireEvent.scroll(transcript)
+  run.status = 'completed'
+  run.nativeEffectsState = 'settled'
+  run.outputSnapshots = { ...run.outputSnapshots, settled: true }
+  props.snapshot = { ...props.snapshot!, runs: [{ ...run }] }
+  mounted.rerender(<ConversationView {...props} />)
+  expect(props.history.collapseEarlierResponses).not.toHaveBeenCalled()
+  fireEvent.keyDown(transcript, { key: 'End' })
+  transcript.scrollTop = 800
+  fireEvent.scroll(transcript)
+  await waitFor(() => expect(props.history.collapseEarlierResponses).toHaveBeenCalledWith(run.id))
+  expect(props.history.protectReading).toHaveBeenLastCalledWith(undefined)
+})
+
+it('keeps the completion fold guard closed while a historical Message selection is active', () => {
+  const { props } = recordingFixture()
+  let guard: (() => boolean) | undefined
+  props.history.setSnapshotFoldGuard = (value) => {
+    guard = value
+  }
+  const mounted = render(<ConversationView {...props} />)
+  expect(guard?.()).toBe(true)
+  const host = mounted.container.querySelector<HTMLElement>('[data-pact-message-content]')!
+  expect(focusProjectionRange(host, 0, 4, { scroll: false, highlight: false })).toBe(true)
+  expect(guard?.()).toBe(false)
+  window.getSelection()?.removeAllRanges()
+  expect(guard?.()).toBe(true)
+})
+
 it.each(['no-output', 'structured-only', 'changes-only', 'answered-changes'] as const)(
   'shows exactly one collaboration recovery/action entry for a settled %s Run',
   async (mode) => {

@@ -413,7 +413,12 @@ describe('App-wide Agent admission', () => {
     try {
       const firstInput = sendInput(f.sessionIds[0]!)
       const first = f.conversation.send(firstInput)
-      const joined = f.conversation.send({ ...firstInput, expectedCommentsRevision: 99 })
+      const joined = f.conversation.send({
+        ...firstInput,
+        expectedCommentsRevision: 99,
+        batchId: firstInput.clientMessageId,
+        freezeDrafts: true,
+      })
       expect(
         await f.conversation.send({ ...firstInput, content: 'Different content' }),
       ).toMatchObject({
@@ -450,6 +455,41 @@ describe('App-wide Agent admission', () => {
       f.db.close()
     }
   })
+
+  it.each([
+    'freezeDrafts',
+    'batchId',
+    'returnedInputOperationId',
+    'queueReturnOperationId',
+  ] as const)(
+    'rejects changed %s on a duplicate preparing message without starting another preparation',
+    async (field) => {
+      const f = await fixture()
+      const gate = Promise.withResolvers<RpcResult<RuntimePreparation>>()
+      const probe = vi
+        .spyOn(f.preparation, 'inspectReadiness')
+        .mockImplementation(() => gate.promise)
+      try {
+        const input = { ...sendInput(f.sessionIds[0]!), freezeDrafts: false }
+        const first = f.conversation.send(input)
+        const changed = f.conversation.send({
+          ...input,
+          [field]: field === 'freezeDrafts' ? true : randomUUID(),
+        })
+        await vi.waitFor(() => expect(probe).toHaveBeenCalledTimes(1))
+        gate.resolve(unavailable)
+        const [original, duplicate] = await Promise.all([first, changed])
+        expect(original).toEqual(unavailable)
+        expect(duplicate).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
+        expect(probe).toHaveBeenCalledTimes(1)
+        expect(f.conversation.diagnostics().preparingExecutions).toBe(0)
+      } finally {
+        gate.resolve(unavailable)
+        await f.conversation.dispose()
+        f.db.close()
+      }
+    },
+  )
 
   it('does not dispatch replacement work when checking an old Run with all Send slots reserved', async () => {
     const f = await fixture()

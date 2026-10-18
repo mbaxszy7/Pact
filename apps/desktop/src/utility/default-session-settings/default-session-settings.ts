@@ -36,6 +36,7 @@ interface CodexModel {
   displayName: string
   defaultReasoningEffort?: string
   supportedReasoningEfforts?: CodexEffort[]
+  serviceTiers?: { id: string; name: string; description: string }[]
 }
 
 interface CollectedEditorState {
@@ -515,6 +516,9 @@ export class DefaultSessionSettings {
       ...(model.resolvedModel ? { resolvedModel: model.resolvedModel } : {}),
       displayName: model.displayName,
       supportedEfforts: model.supportedEffortLevels ?? [],
+      ...(typeof model.supportsFastMode === 'boolean'
+        ? { supportsFastMode: model.supportsFastMode }
+        : {}),
     }
   }
 
@@ -526,6 +530,10 @@ export class DefaultSessionSettings {
         model.supportedReasoningEfforts?.map((effort) => effort.reasoningEffort) ?? [],
     }
     if (model.defaultReasoningEffort) option.defaultEffort = model.defaultReasoningEffort
+    if (Array.isArray(model.serviceTiers))
+      option.supportsFastMode = model.serviceTiers.some(
+        (tier) => tier.id === 'priority' && tier.name === 'Fast',
+      )
     return option
   }
 
@@ -543,9 +551,21 @@ export class DefaultSessionSettings {
 
   private static isCodexModel(value: unknown): value is CodexModel {
     if (typeof value !== 'object' || value === null) return false
+    const tiers = Reflect.get(value, 'serviceTiers')
     return (
       typeof Reflect.get(value, 'id') === 'string' &&
-      typeof Reflect.get(value, 'displayName') === 'string'
+      typeof Reflect.get(value, 'displayName') === 'string' &&
+      (tiers === undefined ||
+        (Array.isArray(tiers) &&
+          tiers.length <= 16 &&
+          tiers.every(
+            (tier) =>
+              tier &&
+              typeof tier === 'object' &&
+              typeof Reflect.get(tier, 'id') === 'string' &&
+              typeof Reflect.get(tier, 'name') === 'string' &&
+              typeof Reflect.get(tier, 'description') === 'string',
+          )))
     )
   }
 

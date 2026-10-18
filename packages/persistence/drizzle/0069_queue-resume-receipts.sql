@@ -1,0 +1,1 @@
+CREATE INDEX `conversation_queue_operations_input_kind_idx` ON `conversation_queue_operations` (`input_id`,`kind`,`created_at`);

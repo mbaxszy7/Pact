@@ -20,6 +20,7 @@ import {
   sessionSettingsInputSchema,
   sessionSettingsSaveInputSchema,
   sessionPermissionSaveInputSchema,
+  sessionSpeedSaveInputSchema,
   workspaceChangeFileReadInputSchema,
   workspaceChangesReadInputSchema,
   workspaceChangesUndoInputSchema,
@@ -302,6 +303,17 @@ export function registerWorkspaceIpcHandlers(
         })
   })
 
+  ipcMain.handle(IPC_CHANNELS.sessionSpeedSave, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = sessionSpeedSaveInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.saveSessionSpeed(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Choose a valid Agent speed.' },
+        })
+  })
+
   ipcMain.handle(IPC_CHANNELS.projectFileRead, (event, rawInput: unknown) => {
     trust.assertTrustedMainFrame(event)
     const input = projectFileReadInputSchema.safeParse(rawInput)
@@ -372,6 +384,7 @@ export function registerWorkspaceIpcHandlers(
     ipcMain.removeHandler(IPC_CHANNELS.sessionSettingsGet)
     ipcMain.removeHandler(IPC_CHANNELS.sessionSettingsSave)
     ipcMain.removeHandler(IPC_CHANNELS.sessionPermissionSave)
+    ipcMain.removeHandler(IPC_CHANNELS.sessionSpeedSave)
     ipcMain.removeHandler(IPC_CHANNELS.projectFileRead)
     ipcMain.removeHandler(IPC_CHANNELS.workspaceChangesRead)
     ipcMain.removeHandler(IPC_CHANNELS.workspaceChangeFileRead)

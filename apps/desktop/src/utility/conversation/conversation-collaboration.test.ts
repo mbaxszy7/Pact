@@ -35,6 +35,7 @@ import {
 import { markdownVisibleProjection } from '../../shared/message-anchor-text.js'
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
+import { readCollaborationAnswer } from './collaboration-answer.js'
 import { opinionDelta } from './collaboration-fixture.test-support.js'
 import { collaborationReadOnly } from './collaboration-prompt.js'
 import { Conversation } from './conversation.js'
@@ -356,6 +357,19 @@ function adapter(agentId: RuntimeAgentId) {
           bindingGeneration: input.bindingGeneration ?? 1,
         },
       })
+      if (!native.output) {
+        // Both real Adapters publish a valid carrier's canonical answer even
+        // when the provider emitted no ordinary prose or streaming text.
+        const answer = readCollaborationAnswer(carrier, input.answerFormat)
+        if (answer === undefined) throw Error('The valid fixture carrier has no answer')
+        yield {
+          agentId,
+          type: 'text.completed',
+          turnId: input.runId,
+          outputId: input.runId,
+          text: answer,
+        }
+      }
       yield { agentId, type: 'turn.completed', turnId: input.runId, outcome: 'completed' }
       input.reportNativeEffects?.({
         runId: input.runId,
@@ -624,7 +638,7 @@ describe('Pact workflow admission and durable dispatch', () => {
   )
 
   it.each([true, false])(
-    'validates and resolves a frozen plan Comment after a newer version, with answer output=%s',
+    'validates and resolves a frozen plan Comment after a newer version, with native prose=%s and a complete carrier answer projection',
     async (output) => {
       const f = await fixture()
       const original = '## Plan v1\n\nKeep **cancellation ownership** together.'

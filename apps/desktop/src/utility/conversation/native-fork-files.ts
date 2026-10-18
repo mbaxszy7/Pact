@@ -6,7 +6,6 @@ import type { AgentNativeForkBoundary, AgentNativeForkWitness } from '@pact/agen
 import { ipcTrafficMeasurementSchema } from '@pact/contracts'
 import {
   collaborationResultSchema,
-  collaborationAnswerFormatSchema,
   type CollaborationResult,
   type CollaborationAnswerFormat,
 } from '@pact/contracts'
@@ -86,6 +85,8 @@ export interface NativeForkFileInput {
   cwd: string
   nativeSessionId: string
   nativeTurnId?: string
+  /** Private exact ordered provider input identities, including the root. */
+  nativeInputIds?: readonly string[]
   responseHash?: string
   answerFormat?: CollaborationAnswerFormat
   source?: AgentNativeForkBoundary
@@ -174,7 +175,7 @@ export class NativeForkFiles {
   async readAnswer(
     input: Pick<
       NativeForkFileInput,
-      'cwd' | 'nativeSessionId' | 'storageRoot' | 'path' | 'answerFormat'
+      'cwd' | 'nativeSessionId' | 'nativeInputIds' | 'storageRoot' | 'path' | 'answerFormat'
     > & {
       nativeTurnId: string
     },
@@ -185,7 +186,6 @@ export class NativeForkFiles {
         ...input,
         provider: 'claude',
         action: 'read-answer',
-        answerFormat: input.answerFormat ?? collaborationAnswerFormatSchema.value,
       },
       signal,
       answerResult,

@@ -452,6 +452,14 @@ describe('Durable collaboration receipt and phase ownership', () => {
       f.repo.setReceivedInputState(f.sessionId, 'blocked', a.send.clientMessageId),
     ).toThrow(/Cancelled/)
     f.repo.setReceivedInputState(f.sessionId, 'accepted', b.send.clientMessageId)
+    const queue = f.repo.queueState(f.sessionId)
+    expect(queue.input?.state).toBe('paused')
+    f.repo.resumeConversationQueue({
+      sessionId: f.sessionId,
+      inputId: b.send.clientMessageId,
+      operationId: randomUUID(),
+      expectedRevision: queue.revision,
+    })
     f.materialize()
     expect(
       f.db.drizzle
@@ -485,7 +493,7 @@ describe('Durable collaboration receipt and phase ownership', () => {
     db.conversationRepository.recoverCollaborationTasks()
     expect(db.conversationRepository.collaboration(f.sessionId)?.status).toBe('failed')
     expect(db.conversationRepository.readReceivedInput(f.sessionId)?.content).toBe(
-      received.send.content.trim(),
+      received.send.content,
     )
     expect(
       db.conversationRepository
@@ -561,6 +569,12 @@ describe('Durable collaboration receipt and phase ownership', () => {
       next = prepareCollaborationSupplement(frozen, 'codex', settings)
     f.repo.setReceivedInputState(f.sessionId, 'blocked', received.send.clientMessageId)
     f.repo.setReceivedInputState(f.sessionId, 'accepted', received.send.clientMessageId)
+    f.repo.resumeConversationQueue({
+      sessionId: f.sessionId,
+      inputId: received.send.clientMessageId,
+      operationId: randomUUID(),
+      expectedRevision: f.repo.queueState(f.sessionId).revision,
+    })
     expect(() =>
       f.repo.beginRun({
         sessionId: f.sessionId,

@@ -60,7 +60,9 @@ export function AgentModelSelector({
           <SettingsSelect
             value={selection.model ?? ''}
             disabled={disabled}
-            onChange={(event) => onChange({ model: event.target.value || null, effort: null })}
+            onChange={(event) =>
+              onChange({ ...selection, model: event.target.value || null, effort: null })
+            }
           >
             <option value="">Use CLI default</option>
             {modelIsUnavailable ? (

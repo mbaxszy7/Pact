@@ -25,6 +25,13 @@ const turnEvent = { ...agentEvent, turnId: opaqueId }
 
 export const normalizedAgentEventSchema = z.discriminatedUnion('type', [
   z.strictObject({
+    ...agentEvent,
+    type: z.literal('run.speed.resolved'),
+    requested: z.enum(['native', 'standard', 'fast']),
+    speed: z.enum(['standard', 'fast']).optional(),
+    detail: z.string().max(512).optional(),
+  }),
+  z.strictObject({
     ...turnEvent,
     type: z.literal('collaboration.result_incomplete'),
     reason: z.enum(['missing', 'invalid']),

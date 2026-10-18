@@ -46,6 +46,29 @@ function patch(): ConversationPatch {
 }
 describe('AgentStreamBuffer', () => {
   afterEach(() => vi.useRealTimers())
+  it('discards a failed output tail and queued publication without committing it during cleanup', async () => {
+    vi.useFakeTimers()
+    const commit = vi.fn<(events: readonly NormalizedAgentEvent[]) => ConversationPatch>(() =>
+      patch(),
+    )
+    const publish = vi.fn<(value: ConversationPatch) => void>(),
+      onError = vi.fn<(error: unknown) => void>()
+    const buffer = new AgentStreamBuffer(commit, publish, onError)
+    buffer.push(delta('Committed prefix'))
+    await vi.advanceTimersByTimeAsync(DURABLE_STREAM_INTERVAL_MS)
+    expect(commit).toHaveBeenCalledTimes(1)
+    expect(buffer.diagnostics().publicationItems).toBe(1)
+    buffer.push(delta('Unconfirmed tail'))
+    buffer.discard()
+    buffer.push(delta('Late output'))
+    buffer.dispose()
+    await vi.advanceTimersByTimeAsync(DURABLE_STREAM_INTERVAL_MS + VISIBLE_STREAM_INTERVAL_MS)
+    expect(commit).toHaveBeenCalledTimes(1)
+    expect(publish).not.toHaveBeenCalled()
+    expect(onError).not.toHaveBeenCalled()
+    expect(buffer.diagnostics()).toMatchObject({ pendingItems: 0, publicationItems: 0, timers: 0 })
+    expect(vi.getTimerCount()).toBe(0)
+  })
   it('checkpoints 64 distinct keys before accepting another and releases all timers', () => {
     vi.useFakeTimers()
     const commit = vi.fn<() => ConversationPatch>(() => patch()),

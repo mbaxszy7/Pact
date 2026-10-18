@@ -46,8 +46,10 @@ test(
           window.locator('[data-pact-row-key]').evaluateAll((nodes) => {
             const keys = nodes.map((node) => node.getAttribute('data-pact-row-key') ?? '')
             return {
-              codex: keys.some((key) => key.endsWith(':codex')),
-              claude: keys.some((key) => key.endsWith(':claude')),
+              codex: keys.some((key) => key.startsWith('reply:') && key.split(':')[2] === 'codex'),
+              claude: keys.some(
+                (key) => key.startsWith('reply:') && key.split(':')[2] === 'claude',
+              ),
               unique: new Set(keys).size === keys.length,
             }
           }),

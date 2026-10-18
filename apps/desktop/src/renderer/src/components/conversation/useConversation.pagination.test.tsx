@@ -20,6 +20,7 @@ import type {
   DesktopBridge,
 } from '@pact/contracts'
 
+import { createQueueFixture } from '../../../../../../../packages/persistence/src/conversation-queue.test-helper.js'
 import { createRendererQueryClient } from '../../query-client'
 import { NativeInputCard } from './NativeInputCard'
 import { useConversation } from './useConversation'
@@ -92,7 +93,7 @@ function historyFixture(header: Partial<MessagePage['header']> = {}) {
           scope: 'drafts',
           sessionId,
           observation: { incarnation, sequence: 1 },
-          commentsRevision: 0,
+          commentsRevision: header.commentsRevision ?? 0,
           comments: [],
           hasMore: false,
         },
@@ -153,8 +154,479 @@ function historyFixture(header: Partial<MessagePage['header']> = {}) {
     }))
     return (value: MessagePage) => resolve(value)
   }
-  return { ...hook, page, firstId, getConversation, deliver, change, defer, client }
+  return { ...hook, page, firstId, getConversation, deliver, change, defer, client, onNotice }
 }
+
+function snapshotRun(
+  f: ReturnType<typeof historyFixture>,
+  status: AgentRun['status'] = 'running',
+): AgentRun {
+  const source = f.page()
+  return {
+    id: crypto.randomUUID(),
+    sessionId: source.sessionId,
+    userMessageId: f.firstId,
+    agentId: 'codex',
+    status,
+    attemptCount: 1,
+    settingsRevision: 1,
+    model: null,
+    effort: null,
+    outputSnapshots: {
+      count: 1,
+      lastInputMessageId: crypto.randomUUID(),
+      lastInputSequence: 102,
+      settled: status === 'completed',
+    },
+    createdAt: source.header.session.updatedAt,
+    updatedAt: source.header.session.updatedAt,
+  }
+}
+
+it('preserves a resident historical reading anchor outside latest25 when another Steer Run folds', async () => {
+  const fixture = await createQueueFixture()
+  const client = createRendererQueryClient()
+  let unmount: (() => void) | undefined
+  try {
+    const a = fixture.root()
+    fixture.finish(a)
+    fixture.repo.recordNativeEffects(a.id, 'settled')
+    const sourceId = fixture.repo.findRun(a.id)!.responseMessageId!
+    for (let index = 0; index < 15; index += 1) {
+      const filler = fixture.root()
+      fixture.finish(filler)
+      fixture.repo.recordNativeEffects(filler.id, 'settled')
+    }
+    const b = fixture.root()
+    fixture.consume(b, 'Current Run supplement')
+    fixture.repo.applyEvent(fixture.sessionId, b.id, {
+      type: 'text.delta',
+      agentId: 'codex',
+      turnId: b.nativeTurnId,
+      outputId: 'answer',
+      text: 'Current response.',
+    })
+    let listener: ((patch: ConversationPatch) => void) | undefined
+    const getConversation = vi.fn<DesktopBridge['getConversation']>(async (input) => ({
+      ok: true,
+      value: fixture.repo.readPage(input),
+    }))
+    vi.stubGlobal('pact', {
+      getConversation,
+      setConversationInterest: vi
+        .fn<DesktopBridge['setConversationInterest']>()
+        .mockResolvedValue({ ok: true, value: { ready: true } }),
+      onConversationChanged: (callback: (patch: ConversationPatch) => void) => {
+        listener = callback
+        return () => {
+          listener = undefined
+        }
+      },
+    })
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children)
+    const onNotice = vi.fn<(message: string) => void>()
+    const hook = renderHook(() => useConversation(fixture.sessionId, onNotice), { wrapper })
+    unmount = hook.unmount
+    await waitFor(() => expect(hook.result.current.history.window).toBeDefined())
+    expect(
+      hook.result.current.history.window?.view.messages.some((message) => message.id === sourceId),
+    ).toBe(false)
+    await act(async () => hook.result.current.history.loadOlder())
+    expect(hook.result.current.history.window!.view.messages.length).toBeGreaterThan(25)
+    await act(async () => hook.result.current.history.ensureMessage(sourceId))
+    act(() => {
+      hook.result.current.history.protectReading(sourceId)
+      hook.result.current.history.setSnapshotFoldGuard?.(() => true)
+      listener?.(
+        fixture.repo.applyEvent(fixture.sessionId, b.id, {
+          type: 'text.completed',
+          agentId: 'codex',
+          turnId: b.nativeTurnId,
+          outputId: 'answer',
+          text: 'Full final response.',
+        }),
+      )
+      listener?.(
+        fixture.repo.recordNativeEvidence({
+          kind: 'ended',
+          source: 'live_terminal',
+          outcome: 'completed',
+          identity: { ...fixture.proof(b), agentId: 'codex', requestId: b.id },
+        }),
+      )
+      listener?.(
+        fixture.repo.applyEvent(fixture.sessionId, b.id, {
+          type: 'turn.completed',
+          agentId: 'codex',
+          turnId: b.nativeTurnId,
+          outcome: 'completed',
+        }),
+      )
+      listener?.(fixture.repo.settleKnownNativeEnding(b.id))
+      listener?.(fixture.repo.recordNativeEffects(b.id, 'settled'))
+    })
+    expect(hook.result.current.history.window?.preserveRunId).toBe(b.id)
+    expect(
+      hook.result.current.history.window?.view.runs.find((run) => run.id === b.id)?.outputSnapshots
+        ?.settled,
+    ).toBe(true)
+    expect(hook.result.current.history.gapRecoveryPending).toBe(false)
+    expect(
+      Object.values(hook.result.current.history.window!.messageMeta).some(
+        (meta) => meta.bodyResync,
+      ),
+    ).toBe(false)
+    const readsBeforeFold = getConversation.mock.calls.length
+    await act(async () => hook.result.current.history.collapseEarlierResponses?.(b.id))
+    expect(getConversation.mock.calls).toHaveLength(readsBeforeFold)
+    expect(
+      hook.result.current.history.window?.view.messages.some((message) => message.id === sourceId),
+    ).toBe(true)
+    expect(hook.result.current.history.window?.sourceMessageId).toBe(sourceId)
+    expect(hook.result.current.history.window?.preserveRunId).toBe(b.id)
+    await act(async () => hook.result.current.history.loadLatest())
+    expect(hook.result.current.history.window?.sourceMessageId).toBeUndefined()
+    await act(async () => hook.result.current.history.collapseEarlierResponses?.(b.id))
+    expect(hook.result.current.history.window?.preserveRunId).toBeUndefined()
+    expect(
+      hook.result.current.history.window?.view.messages.some(
+        (message) => message.runId === b.id && message.outputSnapshot?.canonical === false,
+      ),
+    ).toBe(false)
+  } finally {
+    unmount?.()
+    client.clear()
+    fixture.close()
+  }
+})
+
+it('keeps historical A selected while B gets its first cut, then folds only B after its guard passes', async () => {
+  const f = historyFixture()
+  await waitFor(() => expect(f.result.current.history.window).toBeDefined())
+  const a = snapshotRun(f, 'completed'),
+    b = snapshotRun(f)
+  const sourceId = crypto.randomUUID()
+  const release = f.defer()
+  let reading!: Promise<void>
+  act(() => {
+    reading = f.result.current.history.ensureMessage(sourceId)
+  })
+  act(() => f.deliver(2, [], { runs: [a, b], latestRunId: b.id }))
+  expect(f.result.current.history.window?.preserveRunId).toBe(b.id)
+  const source = f.page(sourceId, 80, 2)
+  source.sourceMessageId = sourceId
+  source.snapshotView = { runId: a.id, mode: 'expanded' }
+  source.preserveRunId = b.id
+  source.runs = [a, b]
+  f.getConversation.mockResolvedValueOnce({ ok: true, value: source })
+  await act(async () => {
+    release(source)
+    await reading
+  })
+  await waitFor(() => expect(f.result.current.history.window?.sourceMessageId).toBe(sourceId))
+  expect(f.getConversation).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      aroundMessageId: sourceId,
+      includeHistoricalSource: true,
+      preserveRunId: b.id,
+    }),
+  )
+  expect(f.result.current.history.window?.snapshotView).toEqual(source.snapshotView)
+  const done = {
+    ...b,
+    status: 'completed' as const,
+    outputSnapshots: { ...b.outputSnapshots!, settled: true },
+  }
+  act(() => f.deliver(3, [], { runs: [done] }))
+  act(() => f.result.current.history.setSnapshotFoldGuard?.(() => false))
+  const before = f.getConversation.mock.calls.length
+  await act(async () => f.result.current.history.collapseEarlierResponses?.(b.id))
+  expect(f.getConversation.mock.calls).toHaveLength(before)
+  act(() => f.result.current.history.setSnapshotFoldGuard?.(() => true))
+  const folded = f.page(sourceId, 80, 3)
+  folded.snapshotView = source.snapshotView
+  folded.runs = [a, done]
+  f.getConversation.mockResolvedValueOnce({ ok: true, value: folded })
+  await act(async () => f.result.current.history.collapseEarlierResponses?.(b.id))
+  expect(f.getConversation).toHaveBeenLastCalledWith(
+    expect.objectContaining({ snapshotView: source.snapshotView }),
+  )
+  expect(f.getConversation.mock.calls.at(-1)?.[0]).not.toHaveProperty('preserveRunId')
+  expect(f.result.current.history.window?.preserveRunId).toBeUndefined()
+  expect(f.result.current.history.window?.snapshotView).toEqual(source.snapshotView)
+  f.client.clear()
+})
+
+it.each(['resident', 'latest', 'recover-latest'] as const)(
+  'supersedes an in-flight historical target with %s during a new Run cut',
+  async (intent) => {
+    const f = historyFixture()
+    await waitFor(() => expect(f.result.current.history.window).toBeDefined())
+    const oldTarget = crypto.randomUUID(),
+      b = snapshotRun(f)
+    const release = f.defer()
+    let reading!: Promise<void>
+    act(() => {
+      reading = f.result.current.history.ensureMessage(oldTarget)
+    })
+    if (intent !== 'resident') {
+      await act(async () => f.result.current.history.loadLatest())
+    }
+    act(() => f.deliver(2, [], { runs: [b], latestRunId: b.id }))
+    if (intent === 'resident')
+      await act(async () => f.result.current.history.ensureMessage(f.firstId))
+    if (intent === 'recover-latest')
+      await act(async () => f.result.current.history.recoverLatest!())
+    const latest = f.page(f.firstId, 100, 2)
+    latest.runs = [b]
+    latest.preserveRunId = b.id
+    f.getConversation.mockResolvedValueOnce({ ok: true, value: latest })
+    await act(async () => {
+      release(f.page(oldTarget, 50, 1))
+      await reading
+    })
+    await waitFor(() => expect(f.result.current.history.loadingPage).toBe(false))
+    expect(f.result.current.history.window?.view.messages[0]?.id).toBe(f.firstId)
+    expect(f.result.current.history.window?.preserveRunId).toBe(b.id)
+    const around = f.getConversation.mock.calls.filter(
+      ([input]) => input.scope === 'messages' && input.aroundMessageId === oldTarget,
+    )
+    expect(around).toHaveLength(1)
+    expect(f.result.current.history.window?.sourceMessageId).toBe(
+      intent === 'resident' ? f.firstId : undefined,
+    )
+    const latestReads = f.getConversation.mock.calls.filter(
+      ([input]) => input.scope === 'messages' && !input.aroundMessageId,
+    )
+    expect(latestReads).toHaveLength(intent === 'resident' ? 1 : 2)
+    expect(latestReads.at(-1)?.[0]).toMatchObject(
+      intent === 'resident' ? { scope: 'messages' } : { scope: 'messages', preserveRunId: b.id },
+    )
+    expect(f.result.current.history.gapRecoveryPending).toBe(false)
+    f.client.clear()
+  },
+)
+
+it('reissues a no-anchor gap recovery if the first live Steer cut invalidates its page', async () => {
+  const f = historyFixture()
+  await waitFor(() => expect(f.result.current.history.window).toBeDefined())
+  const release = f.defer(),
+    b = snapshotRun(f)
+  let recovery!: Promise<void>
+  act(() => {
+    recovery = f.result.current.history.recoverLatest!()
+  })
+  act(() => f.deliver(3, [], { runs: [b], latestRunId: b.id }))
+  const latest = f.page(f.firstId, 100, 3)
+  latest.runs = [b]
+  f.getConversation.mockResolvedValueOnce({ ok: true, value: latest })
+  await act(async () => {
+    release(f.page())
+    await recovery
+  })
+  await waitFor(() => expect(f.result.current.history.loadingPage).toBe(false))
+  expect(f.getConversation.mock.calls.at(-1)?.[0]).toMatchObject({ preserveRunId: b.id })
+  expect(f.result.current.history.gapRecoveryPending).toBe(false)
+  expect(f.result.current.history.window?.view.observation.sequence).toBe(3)
+  f.client.clear()
+})
+
+it('cannot let a stale A completion fold release the live preservation of B', async () => {
+  const f = historyFixture()
+  await waitFor(() => expect(f.result.current.history.window).toBeDefined())
+  const a = snapshotRun(f),
+    b = snapshotRun(f)
+  act(() => f.deliver(2, [], { runs: [a], latestRunId: a.id }))
+  const done = {
+    ...a,
+    status: 'completed' as const,
+    outputSnapshots: { ...a.outputSnapshots!, settled: true },
+  }
+  act(() => f.deliver(3, [], { runs: [done] }))
+  act(() => f.result.current.history.setSnapshotFoldGuard?.(() => true))
+  const release = f.defer()
+  let folding!: Promise<void>
+  act(() => {
+    folding = f.result.current.history.collapseEarlierResponses!(a.id)
+  })
+  act(() => f.deliver(4, [], { runs: [b], latestRunId: b.id }))
+  const stale = f.page(f.firstId, 100, 3)
+  stale.runs = [done]
+  await act(async () => {
+    release(stale)
+    await folding
+  })
+  expect(f.result.current.history.window?.preserveRunId).toBe(b.id)
+  expect(f.result.current.history.window?.view.runs.find((run) => run.id === b.id)).toEqual(b)
+  expect(f.result.current.history.window?.view.observation.sequence).toBe(4)
+  f.client.clear()
+})
+
+async function queueReturnFixture(state: 'pending' | 'installed' = 'installed') {
+  const returned = {
+    inputId: crypto.randomUUID(),
+    operationId: crypto.randomUUID(),
+    expectedRevision: 3,
+    state,
+    ...(state === 'installed'
+      ? { claimId: crypto.randomUUID(), installedCommentsRevision: 0 }
+      : {}),
+  }
+  const header: Partial<MessagePage['header']> = {
+    commentsRevision: 0,
+    queue: { enabled: true, revision: 3, input: null, returnedInput: returned },
+  }
+  const f = historyFixture(header)
+  await waitFor(() => expect(f.result.current.history.window).toBeDefined())
+  const original = f.getConversation.getMockImplementation()!
+  const body: Extract<ConversationPage, { scope: 'queued-input' }> = {
+    scope: 'queued-input',
+    source: 'returned',
+    sessionId: f.page().sessionId,
+    inputId: returned.inputId,
+    operationId: returned.operationId,
+    text: '@codex Returned body',
+    offset: 0,
+    nextOffset: 20,
+    hasMore: false,
+    comments: [],
+    commentsNextPosition: null,
+    route: { type: 'agent', agentId: 'codex' },
+  }
+  body.nextOffset = body.text.length
+  f.getConversation.mockImplementation(async (input) =>
+    input.scope === 'queued-input' ? { ok: true, value: body } : original(input),
+  )
+  let observation = 1
+  const claim = vi.fn<DesktopBridge['returnQueuedConversationMessage']>(async (input) => ({
+    ok: true,
+    value: {
+      version: 'conversation-patch-v1',
+      sessionId: body.sessionId,
+      observation: {
+        ...f.page().observation,
+        sequence: (observation = Math.max(
+          observation + 1,
+          (f.result.current.snapshot?.observation.sequence ?? 0) + 1,
+        )),
+      },
+      session: f.page().header.session,
+      messages: [],
+      runs: [],
+      activities: [],
+      activityStates: [],
+      queue: {
+        ...header.queue!,
+        returnedInput: {
+          ...returned,
+          state: 'installed',
+          claimId: input.claimId!,
+          installedCommentsRevision: header.commentsRevision!,
+        },
+      },
+    },
+  }))
+  vi.stubGlobal('pact', { ...window.pact, returnQueuedConversationMessage: claim })
+  return { ...f, body, header, returned, claim }
+}
+
+it.each(['pending', 'installed'] as const)(
+  'reuses the original %s Return claim across repeated Restore actions',
+  async (state) => {
+    const f = await queueReturnFixture(state)
+    act(() => f.result.current.setComposer('Draft to overwrite'))
+    await act(async () =>
+      expect(await f.result.current.history.queueActions?.restoreReturned()).toBe(true),
+    )
+    expect(f.result.current.composer).toBe(f.body.text)
+    act(() => f.result.current.setComposer('Another draft to overwrite'))
+    await act(async () =>
+      expect(await f.result.current.history.queueActions?.restoreReturned()).toBe(true),
+    )
+    expect(f.result.current.composer).toBe(f.body.text)
+    expect(f.claim).toHaveBeenCalledTimes(2)
+    for (const [input] of f.claim.mock.calls)
+      expect(input).toMatchObject({
+        phase: 'claim',
+        expectedCommentsRevision: 0,
+        claimId: state === 'installed' ? f.returned.claimId : f.returned.operationId,
+      })
+    expect(f.result.current.composerRoute).toEqual(f.body.route)
+    f.client.clear()
+  },
+)
+
+it.each(['comments', 'session'] as const)(
+  'keeps new %s changes made during a paginated Return read',
+  async (change) => {
+    const f = await queueReturnFixture()
+    act(() => f.result.current.setComposer('Original draft'))
+    let release!: (page: ConversationPage) => void
+    const pending = new Promise<ConversationPage>((resolve) => {
+      release = resolve
+    })
+    const original = f.getConversation.getMockImplementation()!
+    f.getConversation.mockImplementation(async (input) =>
+      input.scope === 'queued-input' ? { ok: true, value: await pending } : original(input),
+    )
+    let restoring!: Promise<boolean>
+    act(() => {
+      restoring = f.result.current.history.queueActions!.restoreReturned()
+    })
+    if (change === 'comments') {
+      f.header.commentsRevision = 1
+      act(() => f.deliver(2, [], { comments: { revision: 1, upserts: [], removedIds: [] } }))
+    } else f.rerender({ selected: undefined })
+    await act(async () => {
+      release(f.body)
+      expect(await restoring).toBe(false)
+    })
+    expect(f.claim).not.toHaveBeenCalled()
+    expect(f.result.current.composer).toBe(change === 'session' ? '' : 'Original draft')
+    f.client.clear()
+  },
+)
+
+it('locks Composer edits while its Return body is being restored', async () => {
+  const f = await queueReturnFixture()
+  act(() => f.result.current.setComposer('Original draft'))
+  let release!: (page: ConversationPage) => void
+  const pending = new Promise<ConversationPage>((resolve) => {
+    release = resolve
+  })
+  const original = f.getConversation.getMockImplementation()!
+  f.getConversation.mockImplementation(async (input) =>
+    input.scope === 'queued-input' ? { ok: true, value: await pending } : original(input),
+  )
+  let restoring!: Promise<boolean>
+  act(() => {
+    restoring = f.result.current.history.queueActions!.restoreReturned()
+  })
+  act(() => f.result.current.setComposer('Blocked edit'))
+  expect(f.result.current.composer).toBe('Original draft')
+  await act(async () => {
+    release(f.body)
+    expect(await restoring).toBe(true)
+  })
+  expect(f.result.current.composer).toBe(f.body.text)
+  expect(f.claim).toHaveBeenCalledTimes(1)
+  f.client.clear()
+})
+
+it('uses a fresh claim only for an explicit Restore after Comments changed, with the click-start CAS revision', async () => {
+  const f = await queueReturnFixture()
+  f.header.commentsRevision = 1
+  act(() => f.deliver(2, [], { comments: { revision: 1, upserts: [], removedIds: [] } }))
+  await act(async () =>
+    expect(await f.result.current.history.queueActions?.restoreReturned()).toBe(true),
+  )
+  const claim = f.claim.mock.calls[0]![0]
+  expect(claim.expectedCommentsRevision).toBe(1)
+  expect(claim.claimId).not.toBe(f.returned.claimId)
+  expect(f.result.current.composer).toBe(f.body.text)
+  f.client.clear()
+})
 
 it.each(['new-selection', 'collapse'] as const)(
   'settles old activity reads without overwriting %s and coalesces resync through one owner',

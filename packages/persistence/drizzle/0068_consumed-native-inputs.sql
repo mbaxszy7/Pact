@@ -1,0 +1,1 @@
+ALTER TABLE `agent_runs` ADD `native_input_ids_json` text DEFAULT '[]' NOT NULL;

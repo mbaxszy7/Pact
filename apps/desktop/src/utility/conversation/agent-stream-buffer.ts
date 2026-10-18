@@ -133,6 +133,12 @@ export class AgentStreamBuffer {
   dispose(): boolean {
     if (this.closed) return !this.failed
     const flushed = this.flush()
+    this.discard()
+    return flushed
+  }
+
+  /** Close a failed output lane without committing after its frozen prefix. */
+  discard(): void {
     this.closed = true
     this.clearDurableTimer()
     clearTimeout(this.visibleTimer)
@@ -141,7 +147,6 @@ export class AgentStreamBuffer {
     this.pendingBytes = 0
     this.committed.length = 0
     this.committedBytes = 0
-    return flushed
   }
 
   diagnostics() {

@@ -20,6 +20,9 @@ import type {
   ConversationRetryInput,
   ConversationSendInput,
   ConversationStopInput,
+  ConversationQueueActionInput,
+  ConversationQueueReturnInput,
+  ConversationQueueEnabledInput,
   ConversationSnapshot,
   DefaultSessionSettings,
   NativeContextRebuildInput,
@@ -176,6 +179,15 @@ interface ActiveExecution {
   abortController: AbortController
   streamBuffer?: AgentStreamBuffer | undefined
   completion?: Promise<void> | undefined
+  promptEnvelope?: AgentPromptEnvelope | undefined
+  steering?:
+    | {
+        operationId: string
+        inputId: string
+        invocation?: FrozenSkillInvocation | undefined
+        task: Promise<RpcResult<ConversationPatch>>
+      }
+    | undefined
 }
 
 interface PreparedSession {
@@ -240,6 +252,7 @@ interface SendOptions {
   collaboration?: CollaborationTask | undefined
   receivedInputId?: string | undefined
   receivedComments?: AnchoredComment[] | undefined
+  queuedRoute?: ConversationMessageRoute | undefined
 }
 
 interface PreparingContinuation {
@@ -258,6 +271,7 @@ interface NativeObservation {
   archivePending: number
   archiveController: AbortController
   archiveMemory: NativeWorkingMemory
+  outputFailure?: AgentExecutionError
 }
 
 interface NativeInteractionOwner {
@@ -303,6 +317,8 @@ export class Conversation {
   >()
   private readonly listeners = new Set<(patch: ConversationPatch, progress: boolean) => void>()
   private interestedSessionIds = new Set<string>()
+  /** One finite receipt-check intent per interested Session; never rotated by message resync. */
+  private readonly steerReceiptChecks = new Map<string, string>()
   private suppressedProgress = 0
   private publishedProgress = 0
   private readonly activeExecutions = new Map<string, ActiveExecution>()
@@ -352,12 +368,12 @@ export class Conversation {
       controller: AbortController
       task: Promise<RpcResult<ConversationPatch>>
       adapter?: AgentAdapter | undefined
+      receiptSessionId?: string | undefined
     }
   >()
   private adapterSlotTail: Promise<void> = Promise.resolve()
   private pendingContinuationScheduled = false
   private pendingContinuationWakeAgain = false
-  private receivedDeadlineTimer: ReturnType<typeof setTimeout> | undefined
   private readonly markdownPreparations = new Map<string, Promise<void>>()
   private markdownTail: Promise<void> = Promise.resolve()
   private markdownWorker: Worker | undefined
@@ -1403,6 +1419,7 @@ export class Conversation {
                   cwd: prepared.value.projectDirectory,
                   nativeSessionId: run.nativeSessionId!,
                   nativeTurnId: run.nativeTurnId!,
+                  nativeInputIds: this.conversations.nativeInputIdsForRun(run.id),
                   runId: run.id,
                   bindingGeneration: run.bindingGeneration,
                   throughSequence: response.sequence,
@@ -1969,6 +1986,8 @@ export class Conversation {
           input.sessionId,
           page.header.nativeContexts ?? [],
         )
+      if (page.scope === 'messages' && input.scope === 'messages')
+        this.scheduleSteerReceiptCheck(page, input)
       return { ok: true, value: page }
     } catch (error) {
       return {
@@ -2044,9 +2063,8 @@ export class Conversation {
     let releaseImages: (() => void) | undefined
     try {
       const task = this.conversations.collaboration(input.sessionId)
-      const waitingForWork =
-        task?.status !== 'paused' &&
-        (task?.status === 'running' || this.hasSessionOperation(input.sessionId, true))
+      const preparing = this.preparingSends.has(input.clientMessageId)
+      const waitingForWork = task?.status === 'running' || this.hasSessionOperation(input.sessionId)
       const received = this.conversations.receivedInputReceipt(
         input.sessionId,
         input.clientMessageId,
@@ -2054,6 +2072,25 @@ export class Conversation {
         waitingForWork,
       )
       if (received) return { ok: true, value: received }
+      const content = input.inputId
+        ? this.conversations
+            .resolveConversationInput(
+              input.sessionId,
+              input.clientMessageId,
+              input.inputId,
+              ownerKey ?? '',
+            )
+            .trim()
+        : input.content
+      const submitted = this.conversations.submittedRunReceipt({ ...input, content })
+      if (submitted) {
+        this.publish(submitted.patch)
+        return { ok: true, value: submitted.patch }
+      }
+      if (this.conversations.receivedCollaborationInput(input.sessionId))
+        throw new RunOperationConflictError(
+          'One message is already queued. Your draft was preserved.',
+        )
       if (this.nativeQuitSealed()) return Conversation.quitPrepared()
       if (this.conversations.archives.blocksSession(input.sessionId))
         return Conversation.archiveBusy()
@@ -2065,16 +2102,6 @@ export class Conversation {
         this.conversations.resolveMessageImages(input.sessionId, input.imageIds, ownerKey)
         releaseImages = this.images.hold(input.imageIds)
       }
-      const content = input.inputId
-        ? this.conversations
-            .resolveConversationInput(
-              input.sessionId,
-              input.clientMessageId,
-              input.inputId,
-              ownerKey ?? '',
-            )
-            .trim()
-        : input.content
       if (
         input.planningAction &&
         (!task ||
@@ -2083,27 +2110,45 @@ export class Conversation {
           task.approvedPlanVersion !== undefined)
       )
         throw new RunOperationConflictError('Planning feedback requires a current unapproved plan.')
-      if (
-        task &&
-        !parseComposerCommandPrefix(content, input.skills).pact &&
-        !parseComposerCommandPrefix(content, input.skills).skills.length &&
-        !input.skills?.length
-      ) {
-        if (input.route?.type === 'all')
+      const prefix = parseComposerCommandPrefix(content, input.skills)
+      if (!preparing && ((task && !prefix.pact) || waitingForWork)) {
+        if (task && !prefix.pact && input.route?.type === 'all')
           throw new RunOperationConflictError('Finish or stop this Pact task before using @all.')
+        const session = this.sessions.find(input.sessionId)
+        if (!session || session.status === 'archived')
+          throw new RunOperationConflictError('The Session is unavailable.')
         const actor =
           input.route?.type === 'agent'
             ? input.route.agentId
-            : this.conversations.collaborationAnswerResolver(task)
+            : task && !prefix.pact
+              ? this.conversations.collaborationAnswerResolver(task)
+              : session.settings.primaryAgentId
         if (
           input.planningAction &&
+          task &&
           actor !==
             (input.planningAction === 'maintain_plan' ? task.primary : otherAgent(task.primary))
         )
           throw new RunOperationConflictError('The selected Agent does not own this planning duty.')
-        const session = this.sessions.find(input.sessionId)
-        if (!session || session.status === 'archived')
-          throw new RunOperationConflictError('The Session is unavailable.')
+        if (!waitingForWork && task && task.status !== 'paused') {
+          const { inputId, ...fields } = input
+          return await this.enqueueSend(
+            { ...fields, content },
+            {
+              ...(ownerKey ? { imageOwnerKey: ownerKey } : {}),
+              collaboration: prepareCollaborationSupplement(
+                task,
+                actor,
+                session.settings,
+                input.planningAction,
+              ),
+            },
+          ).then((result) => {
+            if (result.ok && inputId)
+              this.conversations.consumeConversationInput(input.sessionId, inputId, ownerKey!)
+            return result
+          })
+        }
         const bodyOwner = ownerKey ?? 'pact-received-input'
         let retainedId = input.inputId
         if (!retainedId) {
@@ -2138,13 +2183,25 @@ export class Conversation {
             bodyOwner,
           )
         }
-        const patch = this.conversations.receiveCollaborationInput(
+        const anchor =
+          this.activeExecutions.get(input.sessionId)?.run ??
+          (task ? this.conversations.findRun(task.runId) : undefined) ??
+          [
+            this.conversations.latestAgentRun(input.sessionId, 'claude'),
+            this.conversations.latestAgentRun(input.sessionId, 'codex'),
+          ]
+            .filter((run): run is AgentRun => Boolean(run))
+            .toSorted((left, right) => right.createdAt.localeCompare(left.createdAt))[0]
+        if (!anchor)
+          throw new RunOperationConflictError(
+            'Wait for the current execution to start before queuing a message.',
+          )
+        const patch = this.conversations.receiveQueuedInput(
           { ...input, content },
           retainedId,
           actor,
-          session.settings.runningMessagePolicy,
           bodyOwner,
-          waitingForWork,
+          anchor.id,
         )
         this.publish(patch)
         this.schedulePendingRoutedContinuations()
@@ -2164,6 +2221,323 @@ export class Conversation {
     } finally {
       releaseImages?.()
     }
+  }
+
+  private mutateQueue(
+    sessionId: string,
+    mutation: () => ConversationPatch,
+  ): RpcResult<ConversationPatch> {
+    if (this.disposed) return Conversation.shuttingDown()
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
+    if (this.conversations.archives.blocksSession(sessionId)) return Conversation.archiveBusy()
+    try {
+      const patch = mutation()
+      this.publish(patch)
+      this.schedulePendingRoutedContinuations()
+      return { ok: true, value: patch }
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    }
+  }
+
+  setConversationQueueEnabled(input: ConversationQueueEnabledInput): RpcResult<ConversationPatch> {
+    return this.mutateQueue(input.sessionId, () =>
+      this.conversations.setConversationQueueEnabled(input),
+    )
+  }
+
+  resumeConversationQueue(input: ConversationQueueActionInput): RpcResult<ConversationPatch> {
+    if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
+      return Conversation.nativeRecoveryRequired()
+    return this.mutateQueue(input.sessionId, () =>
+      this.conversations.resumeConversationQueue(input),
+    )
+  }
+
+  removeQueuedConversationMessage(
+    input: ConversationQueueActionInput,
+  ): RpcResult<ConversationPatch> {
+    return this.mutateQueue(input.sessionId, () =>
+      this.conversations.removeQueuedConversationMessage(input),
+    )
+  }
+
+  returnQueuedConversationMessage(
+    input: ConversationQueueReturnInput,
+  ): RpcResult<ConversationPatch> {
+    return this.mutateQueue(input.sessionId, () =>
+      this.conversations.returnQueuedConversationMessage(input),
+    )
+  }
+
+  private refreshExecutionInputScope(execution: ActiveExecution): void {
+    if (
+      this.activeExecutions.get(execution.run.sessionId) !== execution ||
+      !this.conversations.ownsNativeControl(execution.run.id)
+    )
+      return
+    const envelope = execution.promptEnvelope
+    if (!envelope) return
+    const authorization = this.conversations.collaborationTurnAuthorization(execution.run.id)
+    execution.promptEnvelope = {
+      ...envelope,
+      collaborationAuthorization: authorization,
+      requiredInputScopeRef: authorization?.requiredInputScopeRef ?? undefined,
+    }
+  }
+
+  async steerQueuedConversationMessage(
+    input: ConversationQueueActionInput,
+  ): Promise<RpcResult<ConversationPatch>> {
+    if (this.disposed) return Conversation.shuttingDown()
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
+    if (this.conversations.archives.blocksSession(input.sessionId))
+      return Conversation.archiveBusy()
+    const execution = this.activeExecutions.get(input.sessionId)
+    if (execution?.steering)
+      return execution.steering.operationId === input.operationId
+        ? execution.steering.task
+        : {
+            ok: false,
+            error: { code: 'CONFLICT', message: 'A steering request is already being checked.' },
+          }
+    try {
+      const receipt = this.conversations.queuedSteerReceipt(input)
+      if (receipt) return { ok: true, value: receipt }
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    }
+    const run = execution && this.conversations.findRun(execution.run.id)
+    const owner = run && this.nativeObservations.get(run.id)
+    const adapter = execution?.adapter
+    if (
+      !execution ||
+      !run?.nativeSessionId ||
+      !run.nativeTurnId ||
+      !owner ||
+      !adapter?.steer ||
+      execution.abortController.signal.aborted ||
+      !execution.promptEnvelope
+    )
+      return {
+        ok: false,
+        error: {
+          code: 'CONFLICT',
+          message:
+            'The current execution cannot accept native steering. Your message remains queued.',
+        },
+      }
+    const sessionId = input.sessionId
+    const signal = execution.abortController.signal
+    const current = (): boolean =>
+      !this.disposed &&
+      this.activeExecutions.get(sessionId) === execution &&
+      this.nativeObservations.get(run.id) === owner &&
+      this.conversations.ownsNativeControl(run.id) &&
+      !signal.aborted
+    const work = Promise.resolve().then(async (): Promise<RpcResult<ConversationPatch>> => {
+      let prepared = false
+      const delivery = {
+        phase: 'prepared' as 'prepared' | 'possibly_sent' | 'accepted' | 'rejected',
+      }
+      let invocation: FrozenSkillInvocation | undefined
+      try {
+        const queued = this.conversations.readReceivedInput(sessionId)
+        if (!queued || queued.id !== input.inputId)
+          throw new RunOperationConflictError('This queued message is no longer current.')
+        const prefix = parseComposerCommandPrefix(queued.content, queued.metadata.skills)
+        if (prefix.pact || queued.metadata.route?.type === 'all' || queued.actor !== run.agentId)
+          throw new RunOperationConflictError(
+            'This message must stay queued for its selected task and recipient.',
+          )
+        invocation = await this.prepareSkillInvocation(
+          { sessionId, content: queued.content, skills: queued.metadata.skills },
+          [run.agentId],
+          signal,
+        )
+        if (execution.steering?.operationId === input.operationId)
+          execution.steering.invocation = invocation
+        if (!current())
+          throw new RunOperationConflictError('The target execution ended before steering.')
+        const attempt = this.conversations.prepareQueuedSteer(
+          input,
+          {
+            runId: run.id,
+            bindingGeneration: run.bindingGeneration ?? 1,
+            nativeTurnId: run.nativeTurnId!,
+            ...(run.executorId ? { executorId: run.executorId } : {}),
+          },
+          invocation,
+        )
+        if (!attempt.created)
+          return { ok: true, value: this.conversations.metadataPatch(sessionId) }
+        prepared = true
+        const images = this.conversations.resolveMessageImages(sessionId, queued.metadata.imageIds)
+        const envelope = this.promptEnvelope(
+          sessionId,
+          { id: queued.id, content: queued.content },
+          [],
+          [],
+          images,
+        )
+        if (queued.inputBatchRef)
+          envelope.inputBatchRef = {
+            id: queued.inputBatchRef.id,
+            revision: queued.inputBatchRef.commentsRevision,
+            memberCount: queued.inputBatchRef.memberCount,
+          }
+        envelope.sourceGrant = { runId: run.id, grant: owner.generation }
+        envelope.targetAgentId = run.agentId
+        envelope.skillInvocation = invocation
+        envelope.collaboration = this.conversations.collaboration(sessionId, run.id, false)
+        envelope.collaborationAuthorization = this.conversations.collaborationTurnAuthorization(
+          run.id,
+        )
+        envelope.requiredInputScopeRef =
+          envelope.collaborationAuthorization?.requiredInputScopeRef ?? undefined
+        this.refreshExecutionInputScope(execution)
+        this.publish(this.conversations.metadataPatch(sessionId))
+        const accepted = (): void => {
+          if (current()) this.flushRunOutput(run)
+          this.publish(this.conversations.markQueuedSteerAccepted(input.operationId, invocation))
+          this.refreshExecutionInputScope(execution)
+        }
+        const result = await adapter.steer!(
+          {
+            runId: run.id,
+            inputId: queued.id,
+            nativeSessionId: run.nativeSessionId!,
+            nativeTurnId: run.nativeTurnId!,
+            bindingGeneration: run.bindingGeneration ?? 1,
+            nativeGeneration: owner.generation,
+            promptEnvelope: envelope,
+            recordDispatch: (next) => {
+              if (
+                next === 'possibly_sent'
+                  ? !current()
+                  : this.nativeObservations.get(run.id) !== owner
+              )
+                throw new RunOperationConflictError(
+                  'The steering observation changed before its receipt.',
+                )
+              if (next === 'possibly_sent')
+                this.publish(this.conversations.markQueuedSteerPossiblySent(input.operationId))
+              else if (next === 'accepted') accepted()
+              else
+                this.publish(
+                  this.conversations.markQueuedSteerRefused(
+                    input.operationId,
+                    'The native execution refused this steering request.',
+                    true,
+                  ),
+                )
+              delivery.phase = next
+              this.refreshExecutionInputScope(execution)
+            },
+            recordConsumption: (id) => {
+              if (id !== queued.id || this.nativeObservations.get(run.id) !== owner) return
+              if (current()) this.flushRunOutput(run)
+              this.publish(
+                this.conversations.markQueuedSteerConsumed(input.operationId, id, invocation),
+              )
+              this.refreshExecutionInputScope(execution)
+            },
+          },
+          signal,
+        )
+        if (result.status === 'accepted' && delivery.phase !== 'accepted') accepted()
+        else if (
+          (result.status === 'unsupported' || result.status === 'rejected') &&
+          delivery.phase !== 'rejected'
+        )
+          this.publish(
+            this.conversations.markQueuedSteerRefused(
+              input.operationId,
+              result.reason,
+              result.status === 'rejected',
+            ),
+          )
+        this.refreshExecutionInputScope(execution)
+        return { ok: true, value: this.conversations.metadataPatch(sessionId) }
+      } catch (error) {
+        if (prepared) {
+          // The original observer can persist incorporation before this RPC
+          // loses its ACK. That stronger fact must not be downgraded or retried.
+          const consumed = this.conversations.queuedSteerReceipt(input, run.id)
+          if (consumed) {
+            this.refreshExecutionInputScope(execution)
+            return { ok: true, value: consumed }
+          }
+          if (delivery.phase === 'prepared')
+            this.publish(
+              this.conversations.markQueuedSteerRefused(
+                input.operationId,
+                'Steering could not be prepared. Your message remains queued.',
+              ),
+            )
+          else if (delivery.phase !== 'rejected' && delivery.phase !== 'accepted')
+            this.publish(
+              this.conversations.markQueuedSteerUnknown(
+                input.operationId,
+                'Native steering delivery could not be confirmed. It will not be sent again automatically.',
+              ),
+            )
+          this.refreshExecutionInputScope(execution)
+        }
+        return Conversation.sendFailure(error)
+      }
+    })
+    const entry: NonNullable<ActiveExecution['steering']> = {
+      operationId: input.operationId,
+      inputId: input.inputId,
+      task: work,
+    }
+    execution.steering = entry
+    try {
+      return await work
+    } finally {
+      if (execution.steering === entry) execution.steering = undefined
+      this.schedulePendingRoutedContinuations()
+    }
+  }
+
+  /** A Steer boundary freezes only output committed before its accepted User. */
+  private flushRunOutput(run: Pick<AgentRun, 'id' | 'sessionId'>): void {
+    const owner = this.nativeObservations.get(run.id)
+    if (owner?.outputFailure) return
+    const execution = this.activeExecutions.get(run.sessionId)
+    const foreground = execution?.run.id === run.id ? execution.streamBuffer : undefined
+    const archived = this.nativeObservations.get(run.id)?.archiveBuffer
+    if ((foreground && !foreground.flush()) || (archived && !archived.flush()))
+      this.failRunOutput(
+        run,
+        new AgentExecutionError(
+          'protocol_error',
+          'The current output could not be committed before its input boundary.',
+          false,
+        ),
+      )
+  }
+
+  /** Quarantine only the body lane; exact native control callbacks stay live. */
+  private failRunOutput(
+    run: Pick<AgentRun, 'id' | 'sessionId'>,
+    error: unknown,
+  ): AgentExecutionError {
+    const owner = this.nativeObservations.get(run.id)
+    if (owner?.outputFailure) return owner.outputFailure
+    const failure = classifyAgentError(error)
+    if (owner) {
+      owner.outputFailure = failure
+      owner.archiveController.abort()
+    }
+    const execution = this.activeExecutions.get(run.sessionId)
+    if (execution?.run.id === run.id) execution.streamBuffer?.discard()
+    owner?.archiveBuffer?.discard()
+    this.publish(this.conversations.recordOutputFailure(run.id, failure))
+    if (this.conversations.findRun(run.id)?.dispatchPhase === 'ended')
+      this.publish(this.conversations.settleKnownNativeEnding(run.id))
+    return failure
   }
 
   private interactionCurrent(pending: {
@@ -2725,6 +3099,12 @@ export class Conversation {
         JSON.stringify(prior.imageIds ?? []) === JSON.stringify(input.imageIds ?? []) &&
         JSON.stringify(prior.skills ?? []) === JSON.stringify(input.skills ?? []) &&
         JSON.stringify(prior.route) === JSON.stringify(input.route) &&
+        prior.planningAction === input.planningAction &&
+        (prior.batchId ?? prior.clientMessageId) === (input.batchId ?? input.clientMessageId) &&
+        (prior.freezeDrafts ?? !preparing.options.preserveDraftComments) ===
+          (input.freezeDrafts ?? !options.preserveDraftComments) &&
+        prior.returnedInputOperationId === input.returnedInputOperationId &&
+        prior.queueReturnOperationId === input.queueReturnOperationId &&
         prior.commentIds.length === input.commentIds.length &&
         prior.commentIds.every((id, index) => id === input.commentIds[index]) &&
         preparing.options.sourceProposalId === options.sourceProposalId
@@ -3305,7 +3685,7 @@ export class Conversation {
   }
 
   private async prepareSkillInvocation(
-    input: ConversationSendInput,
+    input: Pick<ConversationSendInput, 'sessionId' | 'content' | 'skills'>,
     targets: RuntimeAgentId[],
     signal: AbortSignal,
   ): Promise<FrozenSkillInvocation | undefined> {
@@ -3386,7 +3766,12 @@ export class Conversation {
       if (!context.ok) return context
       const commandPrefix = parseComposerCommandPrefix(input.content, input.skills)
       if (commandPrefix.error) throw new RunOperationConflictError(commandPrefix.error)
-      if (commandPrefix.pact && this.conversations.receivedCollaborationInput(input.sessionId))
+      if (
+        commandPrefix.pact &&
+        this.conversations.receivedCollaborationInput(input.sessionId)?.id !==
+          options.receivedInputId &&
+        this.conversations.receivedCollaborationInput(input.sessionId)
+      )
         throw new RunOperationConflictError(
           'Handle or cancel the received input before starting a new Pact task.',
         )
@@ -3394,7 +3779,8 @@ export class Conversation {
       const primaryAgentId = context.value.session.settings.primaryAgentId
       const secondaryAgentId: RuntimeAgentId = primaryAgentId === 'claude' ? 'codex' : 'claude'
       let route: ConversationMessageRoute =
-        requestedRoute?.type === 'agent'
+        options.queuedRoute ??
+        (requestedRoute?.type === 'agent'
           ? { type: 'agent', agentId: requestedRoute.agentId }
           : requestedRoute?.type === 'all'
             ? {
@@ -3408,7 +3794,7 @@ export class Conversation {
                   options.collaboration && !commandPrefix.pact
                     ? this.conversations.collaborationAnswerResolver(options.collaboration)
                     : primaryAgentId,
-              }
+              })
       if (input.returnedInputOperationId) {
         const original = this.conversations.returnedInputRoute(
           input.sessionId,
@@ -3581,6 +3967,9 @@ export class Conversation {
         ...(input.returnedInputOperationId
           ? { returnedInputOperationId: input.returnedInputOperationId }
           : {}),
+        ...(input.queueReturnOperationId
+          ? { queueReturnOperationId: input.queueReturnOperationId }
+          : {}),
         expectedCommentsRevision: input.expectedCommentsRevision,
         commentIds: input.commentIds,
         freezeDrafts: input.freezeDrafts ?? !options.preserveDraftComments,
@@ -3724,7 +4113,13 @@ export class Conversation {
   stop(input: ConversationStopInput): RpcResult<ConversationPatch> {
     if (this.disposed) return Conversation.shuttingDown()
     try {
-      this.conversations.setReceivedInputState(input.sessionId, 'cancelled')
+      if (this.conversations.receivedCollaborationInput(input.sessionId))
+        this.publish(
+          this.conversations.pauseConversationQueue(
+            input.sessionId,
+            'The execution was stopped. Resume the queued message when ready.',
+          ),
+        )
       this.conversations.pauseCollaboration(input.sessionId)
       const execution = this.activeExecutions.get(input.sessionId)
       const continuation = this.preparingContinuations.get(input.sessionId)
@@ -3810,6 +4205,8 @@ export class Conversation {
         error: { code: 'VALIDATION', message: 'The native binding is unavailable.' },
       }
     const binding = this.conversations.nativeContext(sessionId, agentId)
+    const receiptCheck = original && this.nativeChecks.get(`${sessionId}:${agentId}:${original.id}`)
+    if (receiptCheck?.receiptSessionId) return receiptCheck.task.then(() => this.retry(input))
     if (
       original &&
       (!binding ||
@@ -3820,10 +4217,98 @@ export class Conversation {
     return this.checkNativeBinding(sessionId, agentId)
   }
 
-  private inspectPreviousRun(run: AgentRun): Promise<RpcResult<ConversationPatch>> {
+  private scheduleSteerReceiptCheck(
+    page: Extract<ConversationPage, { scope: 'messages' }>,
+    input: Extract<ConversationGetInput, { scope: 'messages' }>,
+  ): void {
+    if (!this.interestedSessionIds.has(page.sessionId) || this.disposed || this.nativeQuitSealed())
+      return
+    const intent =
+      input.includeHistoricalSource && input.aroundMessageId ? input.aroundMessageId : 'latest'
+    const previous = this.steerReceiptChecks.get(page.sessionId)
+    if (previous && (intent === 'latest' || previous === intent)) return
+    const target = page.messages.find((item) => item.message.id === input.aroundMessageId)?.message
+      .runId
+    const candidates = target
+      ? page.runs.filter((run) => run.id === target)
+      : page.runs.toReversed()
+    const run = candidates.find(
+      (entry) =>
+        entry.agentId === 'codex' &&
+        entry.nativeSessionId &&
+        entry.nativeTurnId &&
+        !entry.forkSourceRunId &&
+        !this.nativeObservations.has(entry.id) &&
+        this.conversations.unresolvedSteerInputs(entry.id).length > 0,
+    )
+    if (!run) return
+    // The page RPC never waits for native I/O. A receipt publishes its own bounded resync.
+    void this.inspectPreviousRun(run, true)
+    if (this.nativeChecks.has(`${run.sessionId}:${run.agentId}:${run.id}`))
+      this.steerReceiptChecks.set(page.sessionId, intent)
+  }
+
+  private async probeSteerInputs(
+    run: AgentRun,
+    adapter: AgentAdapter,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (
+      run.agentId !== 'codex' ||
+      run.forkSourceRunId ||
+      !run.nativeSessionId ||
+      !run.nativeTurnId ||
+      !adapter.probeNativeInputs ||
+      this.nativeObservations.has(run.id)
+    )
+      return
+    const ids = this.conversations
+      .unresolvedSteerInputs(run.id)
+      .flatMap((entry) => (entry.inputId ? [entry.inputId] : []))
+    if (!ids.length) return
+    const proof = {
+      runId: run.id,
+      sessionId: run.sessionId,
+      nativeSessionId: run.nativeSessionId,
+      nativeTurnId: run.nativeTurnId,
+      bindingGeneration: run.bindingGeneration ?? 1,
+      executorId: run.executorId,
+    }
+    const controller = new AbortController()
+    const readSignal = AbortSignal.any([signal, controller.signal])
+    const timer = setTimeout(() => controller.abort(), DELIVERY_RECONCILIATION_TIMEOUT_MS)
+    try {
+      await adapter.probeNativeInputs(
+        {
+          ...proof,
+          requestId: run.id,
+          agentId: run.agentId,
+          cwd: this.projects.find(this.sessions.find(run.sessionId)!.projectId)!.directoryPath,
+          model: run.model,
+          effort: run.effort,
+          unresolvedInputIds: ids,
+          recordConsumption: (id) => {
+            if (this.disposed || readSignal.aborted || !ids.includes(id)) return
+            this.publish(this.conversations.recordQueuedSteerConsumption(proof, id))
+          },
+        },
+        readSignal,
+      )
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  private inspectPreviousRun(
+    run: AgentRun,
+    receiptsOnly = false,
+  ): Promise<RpcResult<ConversationPatch>> {
     const key = `${run.sessionId}:${run.agentId}:${run.id}`
     const pending = this.nativeChecks.get(key)
-    if (pending) return pending.task
+    if (pending)
+      return !receiptsOnly && pending.receiptSessionId
+        ? pending.task.then(() => this.inspectPreviousRun(run))
+        : pending.task
     if (!run.nativeSessionId)
       return Promise.resolve({
         ok: false,
@@ -3863,6 +4348,14 @@ export class Conversation {
             this.nativeMetadataChanged()
           },
         )
+        try {
+          await this.probeSteerInputs(run, adapter, controller.signal)
+        } catch (error) {
+          if (receiptsOnly) throw error
+          // An unavailable input receipt must not suppress independent root inspection.
+        }
+        if (receiptsOnly)
+          return { ok: true, value: this.conversations.metadataPatch(run.sessionId) }
         const evidence = await Conversation.withRecoveryDeadline(
           controller,
           async () =>
@@ -3875,6 +4368,7 @@ export class Conversation {
                 nativeSessionId: run.nativeSessionId!,
                 bindingGeneration: run.bindingGeneration ?? 1,
                 ...(run.nativeTurnId ? { nativeTurnId: run.nativeTurnId } : {}),
+                nativeInputIds: this.conversations.nativeInputIdsForRun(run.id),
                 ...(run.answerFormat ? { answerFormat: run.answerFormat } : {}),
                 ...(run.executorId ? { executorId: run.executorId } : {}),
                 cwd: project.directoryPath,
@@ -3885,8 +4379,11 @@ export class Conversation {
             ),
           undefined,
         )
+        const archiveTail = this.nativeObservations.get(run.id)?.archiveTail
+        if (archiveTail) await archiveTail
         if (!evidence || this.disposed || controller.signal.aborted)
           throw new Error('The previous native result could not be checked.')
+        this.flushRunOutput(run)
         this.publish(this.conversations.recordNativeEvidence(evidence))
         if ('output' in evidence && evidence.output)
           this.publish(
@@ -3936,7 +4433,11 @@ export class Conversation {
         this.schedulePendingRoutedContinuations()
       }
     })()
-    this.nativeChecks.set(key, { controller, task })
+    this.nativeChecks.set(key, {
+      controller,
+      task,
+      ...(receiptsOnly ? { receiptSessionId: run.sessionId } : {}),
+    })
     this.nativeMetadataChanged()
     return task
   }
@@ -4015,6 +4516,13 @@ export class Conversation {
             this.nativeMetadataChanged()
           },
         )
+        if (run) {
+          try {
+            await this.probeSteerInputs(run, adapter, controller.signal)
+          } catch {
+            // Receipt availability cannot change the separately checked root outcome.
+          }
+        }
         const observeCheckedTitle = (nativeSessionId: string, logicalTitle?: string): void => {
           const current = this.conversations.nativeContext(sessionId, agentId)
           if (
@@ -4102,6 +4610,7 @@ export class Conversation {
                 ...(run ? { runId: run.id } : {}),
                 nativeSessionId: context.nativeSessionId,
                 ...(run?.nativeTurnId ? { nativeTurnId: run.nativeTurnId } : {}),
+                ...(run ? { nativeInputIds: this.conversations.nativeInputIdsForRun(run.id) } : {}),
                 ...(run?.answerFormat ? { answerFormat: run.answerFormat } : {}),
                 bindingGeneration: generation,
                 ...(run?.executorId ? { executorId: run.executorId } : {}),
@@ -4142,11 +4651,15 @@ export class Conversation {
         )
         if (!evidence || controller.signal.aborted)
           throw new Error('The native check did not return evidence.')
+        const archiveTail = run && this.nativeObservations.get(run.id)?.archiveTail
+        if (archiveTail) await archiveTail
         if (
           this.disposed ||
+          controller.signal.aborted ||
           this.conversations.nativeContext(sessionId, agentId)?.bindingGeneration !== generation
         )
           throw new RunOperationConflictError('The binding changed while checking.')
+        if (run) this.flushRunOutput(run)
         this.publish(this.conversations.recordNativeEvidence(evidence))
         if (run && 'output' in evidence && evidence.output) {
           this.publish(
@@ -4901,6 +5414,11 @@ export class Conversation {
       }
     for (const owner of this.skillDiscoveries.values())
       if (!input.data.sessionIds.includes(owner.sessionId)) this.cancelSkillCatalog(owner.sessionId)
+    for (const id of this.steerReceiptChecks.keys())
+      if (!input.data.sessionIds.includes(id)) this.steerReceiptChecks.delete(id)
+    for (const check of this.nativeChecks.values())
+      if (check.receiptSessionId && !input.data.sessionIds.includes(check.receiptSessionId))
+        check.controller.abort()
     this.interestedSessionIds = new Set(input.data.sessionIds)
     return { ok: true, value: { ready: true } }
   }
@@ -4943,13 +5461,13 @@ export class Conversation {
     this.disposed = true
     await this.markdownWorker?.terminate()
     await this.markdownTail
-    clearTimeout(this.receivedDeadlineTimer)
     const forkOwners = [...this.nativeForks.values()]
     const forkPreparations = [...this.forkPreparations.values()]
     for (const owner of forkOwners) owner.controller.abort()
     for (const check of this.nativeChecks.values()) check.controller.abort()
     this.nativeChecks.clear()
     this.interestedSessionIds.clear()
+    this.steerReceiptChecks.clear()
     const executions = [...this.activeExecutions.values()]
     const preparing = [...this.preparingSends.values()]
     const preparingContinuations = [...this.preparingContinuations.values()]
@@ -5300,28 +5818,80 @@ export class Conversation {
       this.conversations.nativeRecoveryBlocksInput(sessionId)
     )
       return
+    const queue = this.conversations.queueState(sessionId)
+    if (!queue.enabled || queue.input?.state !== 'queued') return
+    // Preserve the original @all context boundary: queued work cannot enter the
+    // Secondary's native history before its already-authorized independent stage.
+    if (
+      this.conversations
+        .pendingRoutedContinuations()
+        .some((pending) => pending.sessionId === sessionId)
+    )
+      return
     const input = this.conversations.readReceivedInput(sessionId)
     const task = this.conversations.collaboration(sessionId),
       session = this.sessions.find(sessionId)
-    if (!input || input.state !== 'accepted' || !task || !session || session.status === 'archived')
-      return
+    if (!input || input.state !== 'accepted' || !session || session.status === 'archived') return
+    const prefix = parseComposerCommandPrefix(input.content, input.metadata.skills)
     if (
-      input.taskId !== task.id ||
-      (this.conversations.findRun(task.runId)?.failureKind === 'unknown_delivery' &&
-        this.conversations.findRun(task.runId)?.dispatchPhase !== 'ended')
+      prefix.error ||
+      Boolean(prefix.pact) !== input.metadata.workflowCommand ||
+      (prefix.pact && input.taskId)
     ) {
-      this.publish(this.conversations.setReceivedInputState(sessionId, 'blocked', input.id))
+      this.publish(
+        this.conversations.pauseConversationQueue(
+          sessionId,
+          prefix.error ??
+            'The queued message no longer matches its frozen task. Edit it before sending.',
+        ),
+      )
       return
     }
-    if (task.status === 'running' || task.status === 'paused') return
-    // A user wait is a boundary: Next Round cannot require an unapproved peer Turn.
-    const next = prepareCollaborationSupplement(
-      task,
-      input.actor,
-      session.settings,
-      input.metadata.planningAction,
+    const anchor = this.conversations.findRun(input.anchorRunId)
+    if (!anchor || (input.taskId && input.taskId !== task?.id)) {
+      this.publish(
+        this.conversations.pauseConversationQueue(
+          sessionId,
+          'The queued message needs its original execution to be checked.',
+        ),
+      )
+      return
+    }
+    if (['starting', 'running', 'recovering'].includes(anchor.status)) return
+    if (
+      !input.manuallyResumed &&
+      (anchor.status !== 'completed' ||
+        anchor.nativeOutcome !== 'completed' ||
+        !this.conversations.hasCompleteResponse(anchor.id))
+    ) {
+      this.publish(
+        this.conversations.pauseConversationQueue(
+          sessionId,
+          'The execution did not complete normally. Resume the queued message when ready.',
+        ),
+      )
+      return
+    }
+    if (
+      (anchor.dispatchPhase !== 'ended' &&
+        !(
+          input.manuallyResumed &&
+          ['not_sent', 'rejected'].includes(anchor.dispatchPhase ?? 'not_sent')
+        )) ||
+      (anchor.nativeEffectsState !== 'settled' && anchor.nativeEffectsState !== 'not_dispatched')
     )
-    next.latestUserMessageId = input.id
+      return
+    if (input.taskId && task?.status === 'running') return
+    const next =
+      input.taskId && task
+        ? prepareCollaborationSupplement(
+            task,
+            input.actor,
+            session.settings,
+            input.metadata.planningAction,
+          )
+        : undefined
+    if (next) next.latestUserMessageId = input.id
     const currentDrafts = this.conversations.readPage({ scope: 'drafts', sessionId })
     if (currentDrafts.scope !== 'drafts') return
     const result = await this.enqueueSend(
@@ -5329,7 +5899,11 @@ export class Conversation {
         sessionId,
         clientMessageId: input.id,
         content: input.content,
-        route: { type: 'agent', agentId: input.actor },
+        route:
+          input.metadata.route?.type === 'all'
+            ? { type: 'all' }
+            : { type: 'agent', agentId: input.actor },
+        ...(input.metadata.skills.length ? { skills: input.metadata.skills } : {}),
         expectedCommentsRevision: currentDrafts.commentsRevision,
         commentIds: [],
         ...(input.metadata.batchId ? { batchId: input.metadata.batchId } : {}),
@@ -5337,26 +5911,22 @@ export class Conversation {
         ...(input.metadata.imageIds.length ? { imageIds: input.metadata.imageIds } : {}),
       },
       {
-        collaboration: next,
+        ...(next ? { collaboration: next } : {}),
+        queuedRoute:
+          input.metadata.route?.type === 'all'
+            ? { type: 'all', firstAgentId: input.actor, secondAgentId: otherAgent(input.actor) }
+            : { type: 'agent', agentId: input.actor },
         preserveDraftComments: true,
         receivedInputId: input.id,
         receivedComments: input.comments,
       },
     )
     if (!result.ok && this.conversations.receivedCollaborationInput(sessionId)?.id === input.id)
-      this.publish(this.conversations.setReceivedInputState(sessionId, 'blocked', input.id))
+      this.publish(this.conversations.pauseConversationQueue(sessionId, result.error.message))
   }
 
   private async resumePendingRoutedContinuations(): Promise<void> {
-    clearTimeout(this.receivedDeadlineTimer)
-    this.receivedDeadlineTimer = undefined
     for (const pending of this.conversations.pendingCollaborationInputs()) {
-      if (Date.parse(pending.deadline) <= Date.now()) {
-        this.publish(
-          this.conversations.setReceivedInputState(pending.sessionId, 'blocked', pending.id),
-        )
-        continue
-      }
       // oxlint-disable-next-line no-await-in-loop -- Admission reserves shared Session/App capacity before considering the next receipt.
       await this.dispatchReceivedInput(pending.sessionId).catch(() => {
         if (
@@ -5364,21 +5934,12 @@ export class Conversation {
           this.conversations.receivedCollaborationInput(pending.sessionId)?.id === pending.id
         )
           this.publish(
-            this.conversations.setReceivedInputState(pending.sessionId, 'blocked', pending.id),
+            this.conversations.pauseConversationQueue(
+              pending.sessionId,
+              'Automatic delivery could not be prepared. Resume when ready.',
+            ),
           )
       })
-    }
-    const pendingDeadlines = this.conversations.pendingCollaborationInputs()
-    if (!this.disposed && pendingDeadlines.length) {
-      const delay = Math.max(
-        1,
-        Math.min(...pendingDeadlines.map((row) => Date.parse(row.deadline))) - Date.now(),
-      )
-      this.receivedDeadlineTimer = setTimeout(
-        () => this.schedulePendingRoutedContinuations(),
-        delay,
-      )
-      this.receivedDeadlineTimer.unref()
     }
     for (const pending of this.conversations.pendingRoutedContinuations()) {
       if (
@@ -5536,6 +6097,24 @@ export class Conversation {
         } finally {
           execution.streamBuffer?.dispose()
           execution.streamBuffer = undefined
+          const finished = this.conversations.findRun(run.id)
+          const task = this.conversations.collaboration(run.sessionId)
+          if (
+            !this.disposed &&
+            this.conversations.queueState(run.sessionId).input?.state === 'queued' &&
+            (finished?.status !== 'completed' ||
+              finished.dispatchPhase !== 'ended' ||
+              finished.nativeOutcome !== 'completed' ||
+              !this.conversations.hasCompleteResponse(run.id) ||
+              finished.nativeEffectsState === 'unknown' ||
+              (task?.runId === run.id && task.status === 'failed'))
+          )
+            this.publish(
+              this.conversations.pauseConversationQueue(
+                run.sessionId,
+                'The execution did not complete normally. Check its state, then resume the queued message when ready.',
+              ),
+            )
           if (this.activeExecutions.get(run.sessionId) === execution)
             this.activeExecutions.delete(run.sessionId)
           if (!this.disposed) this.publish(this.conversations.metadataPatch(run.sessionId))
@@ -5653,26 +6232,39 @@ export class Conversation {
     let completedNativeReportReceipt:
       | { nativeTurnId: string; source: 'live_terminal'; executorId: string }
       | undefined
-    let streamFailed = false
     const buffer = new AgentStreamBuffer(
       (events) =>
         ownsCurrentNativeRun()
           ? this.conversations.applyStreamBatch(run.sessionId, run.id, events)
           : this.conversations.applyArchivedBatch(run.sessionId, run.id, events),
       (patch) => this.publish(patch, true),
-      () => {
-        streamFailed = true
+      (error) => {
+        this.failRunOutput(run, error)
       },
     )
     execution.streamBuffer = buffer
     const archive = (event: import('@pact/contracts').NormalizedAgentEvent): void => {
       if (!stillOwned()) return
-      const fact = normalizedAgentEventSchema.parse(event)
+      if (owner.outputFailure) {
+        if (
+          event.type === 'turn.completed' &&
+          this.conversations.findRun(run.id)?.dispatchPhase === 'ended'
+        )
+          this.publish(this.conversations.settleKnownNativeEnding(run.id, owner.outputFailure))
+        return
+      }
+      let fact: import('@pact/contracts').NormalizedAgentEvent
+      try {
+        fact = normalizedAgentEventSchema.parse(event)
+      } catch (error) {
+        this.failRunOutput(run, error)
+        return
+      }
       const large =
         fact.type === 'text.completed' &&
         Buffer.byteLength(fact.text, 'utf8') > CONVERSATION_MARKDOWN_BYTES
       const apply = async (): Promise<void> => {
-        if (!stillOwned() || owner.archiveController.signal.aborted) return
+        if (!stillOwned() || owner.archiveController.signal.aborted || owner.outputFailure) return
         // Late facts preserve their answer, but never establish workflow acceptance.
         if (fact.type === 'collaboration.result') {
           this.conversations.recordRecoveredCollaborationResult(
@@ -5686,11 +6278,21 @@ export class Conversation {
           owner.archiveBuffer ??= new AgentStreamBuffer(
             (events) => this.conversations.applyArchivedBatch(run.sessionId, run.id, events),
             (patch) => this.publish(patch, true),
-            () => this.workspaceChanges?.observeUncertainEffects(run.id),
+            (error) => {
+              this.failRunOutput(run, error)
+            },
           )
           owner.archiveBuffer.push(fact)
         } else {
-          owner.archiveBuffer?.flush()
+          this.flushRunOutput(run)
+          if (owner.outputFailure) {
+            if (
+              fact.type === 'turn.completed' &&
+              this.conversations.findRun(run.id)?.dispatchPhase === 'ended'
+            )
+              this.publish(this.conversations.settleKnownNativeEnding(run.id, owner.outputFailure))
+            return
+          }
           if (large && fact.type === 'text.completed') {
             const { text, ...metadata } = fact
             this.publish(
@@ -5714,6 +6316,7 @@ export class Conversation {
       if (!large && !owner.archiveTail) {
         // Small facts preserve their existing synchronous durable commit order.
         void apply().catch((error: unknown) => {
+          this.failRunOutput(run, error)
           recordDiagnostic({
             operation: 'native_check',
             phase: 'failed',
@@ -5734,15 +6337,25 @@ export class Conversation {
         return
       }
       if (owner.archivePending >= 8)
-        throw new AgentExecutionError('protocol_error', 'Archived answer work is full.', false)
+        return void this.failRunOutput(
+          run,
+          new AgentExecutionError('protocol_error', 'Archived answer work is full.', false),
+        )
       const text = 'text' in fact ? fact.text : ''
-      const reservation = owner.archiveMemory.reserve(
-        4096 + text.length * 10 + Buffer.byteLength(text, 'utf8') * 2,
-      )
+      let reservation: ReturnType<NativeWorkingMemory['reserve']>
+      try {
+        reservation = owner.archiveMemory.reserve(
+          4096 + text.length * 10 + Buffer.byteLength(text, 'utf8') * 2,
+        )
+      } catch (error) {
+        this.failRunOutput(run, error)
+        return
+      }
       owner.archivePending += 1
       const task = (owner.archiveTail ?? Promise.resolve())
         .then(apply)
         .catch((error: unknown) => {
+          this.failRunOutput(run, error)
           recordDiagnostic({
             operation: 'native_check',
             phase: 'failed',
@@ -5779,13 +6392,10 @@ export class Conversation {
         )
       )
         return
-      if (
-        !buffer.flush() ||
-        (owner.archiveBuffer && (!owner.archiveBuffer.flush() || !owner.archiveBuffer.dispose()))
-      ) {
-        this.workspaceChanges?.observeUncertainEffects(run.id)
-        return
-      }
+      this.flushRunOutput(run)
+      buffer.dispose()
+      owner.archiveBuffer?.dispose()
+      if (owner.outputFailure) this.workspaceChanges?.observeUncertainEffects(run.id)
       this.nativeObservations.delete(run.id)
       void this.finalizeWorkspaceChanges(run.id).catch(() => undefined)
     }
@@ -5817,6 +6427,7 @@ export class Conversation {
         promptEnvelope.handoffContext?.some((source) => source.inputBatchRef)
           ? { runId: run.id, grant: generation }
           : undefined
+      execution.promptEnvelope = promptEnvelope
       if (promptEnvelope.collaboration?.reportRecovery)
         promptEnvelope.collaboration.reportRecovery.document =
           this.conversations.collaborationCarrierSource(
@@ -5834,6 +6445,7 @@ export class Conversation {
         peerAssistanceAllowed,
         model: run.model,
         effort: run.effort,
+        speed: run.speed ?? 'native',
       })
       const titleSource = this.sessions.find(run.sessionId)?.titleSource
       if (
@@ -5886,8 +6498,10 @@ export class Conversation {
           peerAssistanceAllowed,
           cwd,
           promptEnvelope,
+          currentPromptEnvelope: () => execution.promptEnvelope ?? promptEnvelope,
           model: settings.agents[run.agentId].model,
           effort: settings.agents[run.agentId].effort,
+          speed: run.speed ?? 'native',
           recordDispatch: (phase, nativeId, executorId) => {
             if (stillOwned())
               recordDiagnostic({
@@ -5917,7 +6531,29 @@ export class Conversation {
                 evidence.identity.executorId !== this.conversations.findRun(run.id)?.executorId)
             )
               return
-            this.publish(this.conversations.recordNativeEvidence(evidence, 'retry'))
+            // Keep the bounded ending durable before any optional body flush or report work.
+            const metadata =
+              evidence.kind === 'ended'
+                ? {
+                    kind: evidence.kind,
+                    identity: evidence.identity,
+                    source: evidence.source,
+                    outcome: evidence.outcome,
+                  }
+                : evidence
+            this.publish(this.conversations.recordNativeEvidence(metadata, 'retry'))
+            if (evidence.kind === 'ended') {
+              this.flushRunOutput(run)
+              if (owner.outputFailure) {
+                if (!currentControl())
+                  this.publish(
+                    this.conversations.settleKnownNativeEnding(run.id, owner.outputFailure),
+                  )
+                return
+              }
+              if (evidence.output?.submittedReport)
+                this.publish(this.conversations.recordNativeEvidence(evidence, 'retry'))
+            }
             if (
               evidence.kind === 'ended' &&
               evidence.source === 'live_terminal' &&
@@ -5932,6 +6568,29 @@ export class Conversation {
                 executorId: evidence.identity.executorId,
               }
           },
+          recordInputConsumption: (id, identity) => {
+            if (!stillOwned() || !identity.nativeTurnId) return
+            this.flushRunOutput(run)
+            const steering = execution.steering
+            this.publish(
+              this.conversations.recordQueuedSteerConsumption(
+                {
+                  runId: run.id,
+                  sessionId: run.sessionId,
+                  bindingGeneration: run.bindingGeneration ?? 1,
+                  nativeSessionId: identity.nativeSessionId,
+                  nativeTurnId: identity.nativeTurnId,
+                  executorId: identity.executorId,
+                },
+                id,
+                steering?.inputId === id ? steering.invocation : undefined,
+              ),
+            )
+            this.refreshExecutionInputScope(execution)
+          },
+          recordOutputFailure: (error) => {
+            if (stillOwned()) this.failRunOutput(run, error)
+          },
           recordArchivedEvent: archive,
           readCollaborationSourcePart:
             promptEnvelope.collaboration ||
@@ -5944,7 +6603,7 @@ export class Conversation {
                     const input = collaborationSourceReadSchema.parse(raw)
                     if (input.runId !== run.id || input.grant !== generation)
                       throw new Error('This source capability does not belong to the current root.')
-                    const auth = promptEnvelope.collaborationAuthorization
+                    const auth = this.conversations.collaborationTurnAuthorization(run.id)
                     if (input.taskId && input.taskId !== auth?.taskId)
                       throw new Error('The source is outside the frozen task.')
                     if (
@@ -5999,7 +6658,11 @@ export class Conversation {
                       }
                     }
                     if (input.source === 'required_inputs') {
-                      const page = this.conversations.readRequiredInputMembers(run.id, input.offset)
+                      const page = this.conversations.readRequiredInputMembers(
+                        run.id,
+                        input.offset,
+                        input.inputRevision,
+                      )
                       return {
                         source: input.source,
                         offset: input.offset,
@@ -6048,7 +6711,24 @@ export class Conversation {
             if (stillOwned()) this.conversations.recordCollaborationCarrierText(run.id, text)
           },
           recordCollaborationCarrier: (value) => {
-            if (stillOwned()) this.conversations.recordCollaborationCarrier(run.id, value)
+            if (!stillOwned()) return
+            const result =
+              value && typeof value === 'object' ? Reflect.get(value, 'result') : undefined
+            const responses =
+              result && typeof result === 'object'
+                ? Reflect.get(result, 'inputResponses')
+                : undefined
+            const proof = owner.archiveMemory.reserve(
+              8192 + (Array.isArray(responses) ? responses.length : 0) * 512,
+            )
+            try {
+              this.flushRunOutput(run)
+              const patch = this.conversations.recordCollaborationCarrier(run.id, value)
+              if (patch) this.publish(patch)
+              this.refreshExecutionInputScope(execution)
+            } finally {
+              proof.release()
+            }
           },
           recordFileChange: async (change, ioSignal) => {
             if (!stillOwned()) return
@@ -6088,13 +6768,24 @@ export class Conversation {
         signal,
       )) {
         if (this.disposed) return
-        const fact = normalizedAgentEventSchema.parse(event)
+        let fact: import('@pact/contracts').NormalizedAgentEvent
+        try {
+          fact = normalizedAgentEventSchema.parse(event)
+        } catch (error) {
+          if (
+            event.type === 'text.delta' ||
+            event.type === 'text.completed' ||
+            event.type === 'reasoning.summary.delta' ||
+            event.type === 'reasoning.summary.completed'
+          )
+            throw this.failRunOutput(run, error)
+          throw error
+        }
         if (!currentControl()) {
           archive(fact)
           continue
         }
-        if (streamFailed)
-          throw new AgentExecutionError('protocol_error', 'The stream could not be saved.', false)
+        if (owner.outputFailure) throw owner.outputFailure
         if (fact.type === 'session.title.updated') {
           if (reportedTitle) continue
         }
@@ -6114,20 +6805,25 @@ export class Conversation {
         if (fact.type === 'peer.assistance.requested' && !peerAssistanceAllowed) continue
         if (fact.type === 'text.delta' || fact.type === 'reasoning.summary.delta') buffer.push(fact)
         else {
-          buffer.flush()
+          this.flushRunOutput(run)
+          if (owner.outputFailure) throw owner.outputFailure
           if (
             fact.type === 'text.completed' &&
             Buffer.byteLength(fact.text, 'utf8') > CONVERSATION_MARKDOWN_BYTES
           ) {
             const { text, ...metadata } = fact
-            this.publish(
-              await this.conversations.completeAnswer(
-                run.id,
-                metadata,
-                (bodySignal) => Conversation.answerParts(text, bodySignal),
-                signal,
-              ),
-            )
+            try {
+              this.publish(
+                await this.conversations.completeAnswer(
+                  run.id,
+                  metadata,
+                  (bodySignal) => Conversation.answerParts(text, bodySignal),
+                  AbortSignal.any([signal, owner.archiveController.signal]),
+                ),
+              )
+            } catch (error) {
+              throw this.failRunOutput(run, error)
+            }
           } else {
             try {
               const patch = this.conversations.applyEvent(run.sessionId, run.id, fact)
@@ -6138,6 +6834,8 @@ export class Conversation {
             } catch (error) {
               // Failed optional metadata keeps the local title; the substantive Turn continues.
               if (fact.type === 'session.title.updated' && fact.origin === 'turn_result') continue
+              if (fact.type === 'text.completed' || fact.type === 'reasoning.summary.completed')
+                throw this.failRunOutput(run, error)
               throw error
             }
           }
@@ -6193,6 +6891,7 @@ export class Conversation {
       buffer.flush()
       if (this.disposed) return
       const failure = classifyAgentError(error)
+      if (failure.kind === 'response_too_large') this.failRunOutput(run, error)
       this.conversations.finishCollaboration(run.id, false, failure.message)
       recordDiagnostic({
         operation: 'send',

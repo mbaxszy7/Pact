@@ -10,6 +10,7 @@ import {
   CornerUpLeft,
   LoaderCircle,
   ImagePlus,
+  Info,
   MessageSquarePlus,
   MessageSquareText,
   Square,
@@ -23,6 +24,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -45,12 +47,17 @@ import type {
   RuntimeAgentId,
   WorkspaceChangeSet,
   SessionPermissionSaveInput,
+  SessionSpeedSaveInput,
   SessionCatalogChange,
+  ConversationRunContext,
+  ConversationDisplayOrder,
 } from '@pact/contracts'
 import type { SkillSelection } from '@pact/contracts'
 import type { ConversationImage } from '@pact/contracts/images'
 
 import {
+  compareConversationDisplayOrder,
+  conversationMessageOrder,
   CONVERSATION_MARKDOWN_BYTES,
   collaborationRequiresPlan,
   collaborationPendingPhase,
@@ -85,7 +92,11 @@ import {
   type ComposerDocument,
 } from './composer-document'
 import { ComposerEditor, type ComposerEditorHandle } from './ComposerEditor'
-import { nativeInputRequests } from './conversation-window'
+import {
+  nativeInputRequests,
+  conversationWindowStartOrder,
+  isRunResponseComplete,
+} from './conversation-window'
 import { ConversationImages } from './ConversationImages'
 import { CurrentPlanPanel, type CurrentPlanDocument } from './CurrentPlanPanel'
 import { ImageGallery } from './ImageGallery'
@@ -104,9 +115,11 @@ import { NativeInputCard } from './NativeInputCard'
 import { NativePermissionCard } from './NativePermissionCard'
 import { PermissionMenu } from './PermissionMenu'
 import { ProjectContextMenu } from './ProjectContextMenu'
+import { QueueMessageBar } from './QueueMessageBar'
 import { SentComments } from './SentComments'
 import { NativeForkRecovery, SessionForkDialog, type SessionForkOpening } from './SessionFork'
 import { SessionWarningCard } from './SessionWarningCard'
+import { SpeedMenu } from './SpeedMenu'
 import { commentDraftSaveSucceeded, type CommentDraftSaveOutcome } from './useConversation'
 import { useSkillComposer, type ComposerEdit } from './useSkillComposer'
 import { WorkspaceChangesCard, type WorkspaceChangesList } from './WorkspaceChangesCard'
@@ -153,6 +166,7 @@ interface ConversationViewProps {
   platform?: string | undefined
   sessionSettingsSaving?: boolean | undefined
   onSaveSessionPermission?: ((input: SessionPermissionSaveInput) => Promise<boolean>) | undefined
+  onSaveSessionSpeed?: ((input: SessionSpeedSaveInput) => Promise<boolean>) | undefined
   visible: boolean
   session: CollaborationSession
   snapshot?: ConversationViewProjection | undefined
@@ -300,6 +314,7 @@ export function ConversationView({
   platform,
   sessionSettingsSaving,
   onSaveSessionPermission,
+  onSaveSessionSpeed,
   visible,
   session,
   snapshot,
@@ -580,7 +595,7 @@ export function ConversationView({
   const lastScrollRef = useRef({ top: 0, backward: false })
   const historyReadDirectionRef = useRef<'older' | 'latest'>('older')
   const prependAnchorRef = useRef<
-    { messageId: string; top: number; beforeSequence: number } | undefined
+    { messageId: string; top: number; beforeDisplay: ConversationDisplayOrder } | undefined
   >(undefined)
   const focusAfterPageRef = useRef<'latest' | undefined>(undefined)
   const commentTextareaRef = useRef<HTMLTextAreaElement>(null)
@@ -662,10 +677,16 @@ export function ConversationView({
   const activityOwnerMessageByRun = useMemo(() => {
     const owners = new Map<string, string>()
     for (const message of snapshot?.messages ?? []) {
-      if (message.role === 'assistant' && message.runId) owners.set(message.runId, message.id)
+      if (
+        message.role === 'assistant' &&
+        message.runId &&
+        (!message.outputSnapshot ||
+          (message.outputSnapshot.canonical && isRunResponseComplete(runsById.get(message.runId))))
+      )
+        owners.set(message.runId, message.id)
     }
     return owners
-  }, [snapshot?.messages])
+  }, [snapshot?.messages, runsById])
   const latestRun = history.window?.latestRun
   const [currentPlan, setCurrentPlan] = useState<{
     sessionId: string
@@ -1047,7 +1068,8 @@ export function ConversationView({
     snapshot?.messages.some(
       (message) =>
         (message.runId === activeRun.id ||
-          (message.replyToMessageId === activeRun.userMessageId &&
+          (message.outputSnapshot?.canonical !== false &&
+            message.replyToMessageId === activeRun.userMessageId &&
             message.agentId === activeRun.agentId &&
             history.window?.sourceMessageId !== message.id)) &&
         message.role === 'assistant' &&
@@ -1076,6 +1098,23 @@ export function ConversationView({
       })
   }, [activeSkillId, skillComposer.revealActive])
   const returnedInput = history.window?.view.rebuildInputRecovery
+  const queue = snapshot?.queue
+  const queueEnabled = queue?.enabled ?? true
+  const queuedInput = queue?.input
+  const queueActions = history.queueActions
+  const canSteerQueuedInput = Boolean(
+    queuedInput &&
+    queuedInput.recipient !== 'all' &&
+    queuedInput.recipient === activeRun?.agentId &&
+    activeRun.status === 'running' &&
+    activeRun.dispatchPhase === 'accepted' &&
+    !queuedInput.workflowCommand,
+  )
+  const steerUnavailableReason = queuedInput?.workflowCommand
+    ? 'New workflows wait until the current response finishes.'
+    : queuedInput?.recipient === 'all'
+      ? 'Messages for all Agents stay queued.'
+      : 'Steer is available only for the Agent currently responding.'
   const disabled =
     choosingImages ||
     composerImages.some((image) => image.status !== 'ready') ||
@@ -1083,9 +1122,6 @@ export function ConversationView({
     skillComposer.checking ||
     composerDisabled ||
     (inputGate === 'send_blocked' && !activeRun?.collaboration) ||
-    (Boolean(activeRun) && !activeRun?.collaboration) ||
-    (responseInProgress && !latestRun?.collaboration) ||
-    Boolean(pendingRoutedAgentId) ||
     sending ||
     stopping ||
     history.draftsLoading
@@ -1164,11 +1200,14 @@ export function ConversationView({
     history.window &&
     (history.window.hasNewer ||
       (history.window.latestCompleteAssistantSequence ?? -1) >
-        (residentMessages?.at(-1)?.sequence ?? -1)),
+        (residentMessages?.reduce(
+          (latest, message) => Math.max(latest, conversationMessageOrder(message).sequence),
+          -1,
+        ) ?? -1)),
   )
   const ensureMessage = history.ensureMessage
   const recoverFromGap = history.recoverFromGap
-  const loadLatestForGap = history.loadLatest
+  const loadLatestForGap = history.recoverLatest ?? history.loadLatest
   const historyLoading = history.loadingPage
   const gapRecoveryPending = history.gapRecoveryPending
   const historyResyncToken = history.historyResyncToken
@@ -1307,6 +1346,38 @@ export function ConversationView({
     selection.removeAllRanges()
     setSelectionMessageIds([])
   }, [selectionMessageIds, selectionPlan])
+  const snapshotFoldGuard = useCallback(
+    (): boolean =>
+      visible &&
+      stickToBottomRef.current &&
+      !hasProtectedSelection() &&
+      !history.gapRecoveryPending &&
+      !Object.values(history.window?.messageMeta ?? {}).some((meta) => meta.bodyResync),
+    [visible, hasProtectedSelection, history.gapRecoveryPending, history.window?.messageMeta],
+  )
+  useLayoutEffect(() => {
+    history.setSnapshotFoldGuard?.(snapshotFoldGuard)
+    return () => history.setSnapshotFoldGuard?.(undefined)
+  }, [history, snapshotFoldGuard])
+  const collapseCompletedOutput = useCallback(() => {
+    const runId = history.window?.preserveRunId
+    if (!runId) return
+    const run = runsById.get(runId)
+    if (
+      !run?.outputSnapshots?.settled ||
+      history.loadingPage ||
+      history.pageError ||
+      !snapshotFoldGuard()
+    )
+      return
+    const canonical = snapshot?.messages.find(
+      (message) => message.runId === run.id && message.outputSnapshot?.canonical,
+    )
+    if (!canonical || canonical.state !== 'complete') return
+    void history.collapseEarlierResponses?.(run.id)
+  }, [history, runsById, snapshotFoldGuard, snapshot?.messages])
+  useEffect(collapseCompletedOutput, [collapseCompletedOutput])
+
   const rows = useMemo(() => {
     const messages = (snapshot?.messages ?? []).filter(
       (message) =>
@@ -1322,33 +1393,45 @@ export function ConversationView({
     )
     const result = messages.map((message) => ({
       key:
-        history.window?.sourceMessageId === message.id
-          ? `source:${message.id}`
-          : message.replyToMessageId
-            ? `reply:${message.replyToMessageId}:${message.agentId ?? 'unknown'}`
-            : `message:${message.id}`,
+        message.outputSnapshot && message.outputSnapshot.ordinal > 0
+          ? `message:${message.id}`
+          : history.window?.sourceMessageId === message.id
+            ? `source:${message.id}`
+            : message.replyToMessageId
+              ? `reply:${message.replyToMessageId}:${message.agentId ?? 'unknown'}:${message.runId ?? 'unknown'}`
+              : `message:${message.id}`,
       message,
       run: undefined as AgentRun | undefined,
+      context: undefined as ConversationRunContext | undefined,
     })) as Array<{
       key: string
       message: (typeof messages)[number] | undefined
       run: AgentRun | undefined
+      context?: ConversationRunContext | undefined
     }>
+    for (const context of history.window?.runContexts ?? []) {
+      const run = runsById.get(context.runId)
+      if (run && !isRunResponseComplete(run))
+        result.push({ key: `run-context:${context.runId}`, message: undefined, run, context })
+    }
+    result.sort((left, right) =>
+      compareConversationDisplayOrder(
+        left.message ? conversationMessageOrder(left.message) : left.context!.order,
+        right.message ? conversationMessageOrder(right.message) : right.context!.order,
+      ),
+    )
     const artifactGroups = history.window?.runArtifacts ?? []
     const latestArtifactIds = new Set(artifactGroups.map((group) => group.latestRunId))
     for (const run of snapshot?.runs ?? []) {
-      if (
-        (!hasVisibleChanges(run) &&
-          !hasRecordingWarning(run) &&
-          run.controlDisposition !== 'abandoned') ||
-        !latestArtifactIds.has(run.id)
-      )
+      if ((!hasVisibleChanges(run) && !hasRecordingWarning(run)) || !latestArtifactIds.has(run.id))
         continue
       const replyIndex = result.findIndex(
         (row) =>
           row.message?.replyToMessageId === run.userMessageId &&
-          row.message.agentId === run.agentId,
+          row.message.agentId === run.agentId &&
+          row.message.outputSnapshot?.canonical !== false,
       )
+      if (run.outputSnapshots?.count && replyIndex < 0) continue
       const userIndex =
         replyIndex >= 0
           ? replyIndex
@@ -1387,14 +1470,18 @@ export function ConversationView({
       const userIndex = result.findIndex((row) => row.message?.id === run.userMessageId)
       if (userIndex >= 0)
         result.splice(userIndex + 1, 0, {
-          key: `reply:${run.userMessageId}:${run.agentId}`,
+          key: `reply:${run.userMessageId}:${run.agentId}:${run.id}`,
           message: undefined,
           run,
         })
     }
-    if (activeRun && !activeRunHasMessage)
+    if (
+      activeRun &&
+      !activeRunHasMessage &&
+      !result.some((row) => row.context?.runId === activeRun.id)
+    )
       result.push({
-        key: `reply:${activeRun.userMessageId}:${activeRun.agentId}`,
+        key: `reply:${activeRun.userMessageId}:${activeRun.agentId}:${activeRun.id}`,
         message: undefined,
         run: activeRun,
       })
@@ -1407,6 +1494,7 @@ export function ConversationView({
     activeRunHasMessage,
     snapshot?.runs,
     history.window?.runArtifacts,
+    history.window?.runContexts,
     runsById,
   ])
   // Body Patches can replace a row without changing its logical key. Keep
@@ -1422,6 +1510,9 @@ export function ConversationView({
     const workLogRunId = history.window?.activityView?.manual
       ? history.window.activityView.runId
       : undefined
+    const workLogComplete = isRunResponseComplete(
+      workLogRunId ? runsById.get(workLogRunId) : undefined,
+    )
     const planRunId =
       selectionPlan?.runId ??
       selectionReport?.runId ??
@@ -1436,8 +1527,21 @@ export function ConversationView({
     return rows.flatMap((row, index) =>
       row.key === focusedRowKey ||
       (row.message && ids.has(row.message.id)) ||
-      Boolean(planRunId && (row.run?.id === planRunId || row.message?.runId === planRunId)) ||
-      Boolean(workLogRunId && (row.run?.id === workLogRunId || row.message?.runId === workLogRunId))
+      Boolean(
+        planRunId &&
+        !row.context &&
+        row.message?.outputSnapshot?.canonical !== false &&
+        (row.run?.id === planRunId || row.message?.runId === planRunId),
+      ) ||
+      Boolean(
+        workLogRunId &&
+        (workLogComplete
+          ? row.message?.id === activityOwnerMessageByRun.get(workLogRunId)
+          : row.context?.runId === workLogRunId ||
+            (!history.window?.runContexts?.some((context) => context.runId === workLogRunId) &&
+              (row.run?.id === workLogRunId ||
+                row.message?.id === activityOwnerMessageByRun.get(workLogRunId)))),
+      )
         ? [index]
         : [],
     )
@@ -1453,6 +1557,9 @@ export function ConversationView({
     dismissedNavigation,
     rows,
     history.window?.activityView,
+    history.window?.runContexts,
+    activityOwnerMessageByRun,
+    runsById,
   ])
   // TanStack owns mutable measurements; React Compiler must not memoize its methods.
   // oxlint-disable-next-line react/incompatible-library
@@ -1652,7 +1759,8 @@ export function ConversationView({
     if (!residentMessages) return undefined
     const anchor = prependAnchorRef.current
     if (!anchor) return undefined
-    if ((residentMessages[0]?.sequence ?? anchor.beforeSequence) >= anchor.beforeSequence)
+    const oldest = history.window ? conversationWindowStartOrder(history.window) : undefined
+    if (!oldest || compareConversationDisplayOrder(oldest, anchor.beforeDisplay) >= 0)
       return undefined
     const message = messageRefs.current.get(anchor.messageId)
     const transcript = transcriptRef.current
@@ -1682,7 +1790,7 @@ export function ConversationView({
       return undefined
     })
     return () => cancelAnimationFrame(frame)
-  }, [residentMessages, rows, virtualizer, virtualRows, isViewportCommitted])
+  }, [residentMessages, history.window, rows, virtualizer, virtualRows, isViewportCommitted])
   useLayoutEffect(() => {
     const restore = gapRestoreRef.current
     const transcript = transcriptRef.current
@@ -2043,7 +2151,8 @@ export function ConversationView({
   const loadOlder = useCallback(async (): Promise<void> => {
     if (
       snapshot &&
-      snapshot.messages.length >= CONVERSATION_WINDOW_MESSAGES &&
+      snapshot.messages.length + (history.window?.runContexts?.length ?? 0) >=
+        CONVERSATION_WINDOW_MESSAGES &&
       hasProtectedSelection()
     ) {
       return
@@ -2071,7 +2180,7 @@ export function ConversationView({
       prependAnchorRef.current = {
         messageId: firstVisible.id,
         top: element.getBoundingClientRect().top,
-        beforeSequence: snapshot!.messages[0]!.sequence,
+        beforeDisplay: conversationWindowStartOrder(history.window!)!,
       }
       setRestorationMessageIds([firstVisible.id])
     }
@@ -2252,6 +2361,11 @@ export function ConversationView({
   }
 
   const submit = async (purpose?: ConversationSendInput['planningAction']): Promise<void> => {
+    if (responseInProgress && !queueEnabled) return
+    if (responseInProgress && queuedInput) {
+      onNotice('One message is already queued. Edit or remove it before queuing another.')
+      return
+    }
     if (
       (!composerHasContent(composerRef.current?.document().text ?? composer) &&
         draftComments.length === 0 &&
@@ -2307,6 +2421,19 @@ export function ConversationView({
       skillComposer.close()
       setMentionQuery(undefined)
     }
+  }
+
+  const returnQueueMessageToComposer = async (restore: boolean): Promise<boolean> => {
+    const restored = await (restore
+      ? queueActions?.restoreReturned()
+      : queueActions?.returnToComposer())
+    if (restored) {
+      setCommentEditor(undefined)
+      setMentionQuery(undefined)
+      skillComposer.close()
+      composerRef.current?.focus()
+    }
+    return Boolean(restored)
   }
 
   const createMessageComment = useCallback(
@@ -2850,6 +2977,38 @@ export function ConversationView({
   const renderRow = (row: (typeof rows)[number]): React.JSX.Element | null => {
     const { message } = row
     const placeholderRun = row.run ?? activeRun
+    if (row.context && row.run) {
+      const run = row.run
+      return (
+        <article className="w-fit max-w-[92%] min-w-0 self-start" data-pact-run-context-id={run.id}>
+          <div
+            className={`rounded-message ${run.agentId === 'claude' ? 'bg-speaker-claude' : 'bg-speaker-codex'} px-4 py-3`}
+          >
+            <p className="flex min-w-0 items-baseline gap-1.5 text-caption text-secondary">
+              <span className="shrink-0 font-medium">
+                {run.agentId === 'claude' ? 'Claude Code' : 'Codex'}
+              </span>
+              <RunConfiguration run={run} />
+            </p>
+            {run.handoffMessageCount ? (
+              <ContextReceipt
+                count={run.handoffMessageCount}
+                target={run.agentId}
+                accepted={Boolean(run.nativeTurnId)}
+              />
+            ) : null}
+            <RunWorkLog
+              runId={run.id}
+              activities={activitiesByRun.get(run.id) ?? []}
+              active={['starting', 'running', 'recovering'].includes(run.status)}
+              available
+              history={history}
+              onRead={beginDetailRead}
+            />
+          </div>
+        </article>
+      )
+    }
     if (!message && row.key.startsWith('changes:') && row.run)
       return (
         <article className="flex w-full min-w-0 flex-col" data-pact-change-run-id={row.run.id}>
@@ -2899,11 +3058,7 @@ export function ConversationView({
                 <span className="shrink-0 font-medium">
                   {placeholderRun.agentId === 'claude' ? 'Claude Code' : 'Codex'}
                 </span>
-                {formatRunConfiguration(placeholderRun) ? (
-                  <span className="truncate font-normal text-tertiary">
-                    · {formatRunConfiguration(placeholderRun)}
-                  </span>
-                ) : null}
+                <RunConfiguration run={placeholderRun} />
               </p>
               {placeholderRun.handoffMessageCount ? (
                 <ContextReceipt
@@ -2984,6 +3139,7 @@ export function ConversationView({
           : 'bg-speaker-codex'
     const retryInThisSlot =
       activeRun &&
+      message.outputSnapshot?.canonical !== false &&
       message.replyToMessageId === activeRun.userMessageId &&
       message.agentId === activeRun.agentId &&
       history.window?.sourceMessageId !== message.id
@@ -2998,15 +3154,17 @@ export function ConversationView({
     const sentComments = history.window?.sentCommentsByMessage[message.id]
     const commentsLoaded = Boolean(history.window?.loadedCommentMessageIds[message.id])
     const commentOnly = message.role === 'user' && !message.content && messageMeta?.hasComments
-    const runConfiguration =
-      message.role === 'assistant' && messageRun ? formatRunConfiguration(messageRun) : undefined
     const ownsRunActivity = Boolean(
-      retryInThisSlot ||
-      (message.runId && activityOwnerMessageByRun.get(message.runId) === message.id),
+      (message.outputSnapshot?.canonical && isRunResponseComplete(messageRun)) ||
+      (!messageRun?.outputSnapshots &&
+        !history.window?.runContexts?.some((context) => context.runId === activityRunId) &&
+        (retryInThisSlot ||
+          (message.runId && activityOwnerMessageByRun.get(message.runId) === message.id))),
     )
     const activities =
       ownsRunActivity && activityRunId ? (activitiesByRun.get(activityRunId) ?? []) : []
     const runActive = Boolean(
+      message.outputSnapshot?.canonical !== false &&
       messageRun &&
       messageRun.controlDisposition !== 'abandoned' &&
       (messageRun.id === activeRun?.id ||
@@ -3021,6 +3179,7 @@ export function ConversationView({
       !activeRun &&
       !recoveryLocked &&
       message.role === 'assistant' &&
+      message.outputSnapshot?.canonical !== false &&
       message.replyToMessageId === pendingRoutedMessage?.id &&
       message.agentId !== pendingRoutedAgentId
         ? pendingRoutedAgentId
@@ -3051,8 +3210,8 @@ export function ConversationView({
             <div data-pact-message-bubble className={`rounded-message ${background} px-4 py-3`}>
               <p className="flex min-w-0 items-baseline gap-1.5 text-caption text-secondary">
                 <span className="shrink-0 font-medium">{speaker}</span>
-                {runConfiguration ? (
-                  <span className="truncate font-normal text-tertiary">· {runConfiguration}</span>
+                {message.role === 'assistant' && messageRun ? (
+                  <RunConfiguration run={messageRun} />
                 ) : null}
               </p>
               {ownsRunActivity && messageRun?.handoffMessageCount ? (
@@ -3065,6 +3224,7 @@ export function ConversationView({
               {ownsRunActivity && activityRunId ? (
                 <RunWorkLog
                   runId={activityRunId}
+                  completed={isRunResponseComplete(messageRun)}
                   activities={activities}
                   active={runActive}
                   available={
@@ -3134,7 +3294,10 @@ export function ConversationView({
               copyResult={copyFeedback?.messageId === message.id ? copyFeedback.result : undefined}
               onCopy={copyMessage}
               onFork={
-                message.role === 'assistant' && message.state === 'complete' && onForkSessionCreated
+                message.role === 'assistant' &&
+                message.outputSnapshot?.canonical !== false &&
+                message.state === 'complete' &&
+                onForkSessionCreated
                   ? () =>
                       setForkPoint({
                         sourceSessionId: session.id,
@@ -3159,6 +3322,7 @@ export function ConversationView({
           ) : null}
         </div>
         {message.role === 'assistant' &&
+        message.outputSnapshot?.canonical !== false &&
         messageRun?.collaboration &&
         !['starting', 'running', 'recovering'].includes(messageRun.status) ? (
           <CollaborationReview
@@ -3186,6 +3350,7 @@ export function ConversationView({
           />
         ) : null}
         {message.role === 'assistant' &&
+        message.outputSnapshot?.canonical !== false &&
         messageRun?.peerProposal &&
         messageRun.status === 'completed' &&
         messageRun.peerProposal.state === 'pending' ? (
@@ -3441,6 +3606,10 @@ export function ConversationView({
           else if (intent === 'newer' || intent === 'drag')
             stickToBottomRef.current =
               element.scrollHeight - element.scrollTop - element.clientHeight < 36
+          if (stickToBottomRef.current && !hasProtectedSelection()) {
+            protectReading(undefined)
+            collapseCompletedOutput()
+          }
           if ((intent === 'older' || intent === 'start' || intent === 'drag') && scrollingUp)
             requestOlderAtTop(element.scrollTop)
         }}
@@ -3487,17 +3656,20 @@ export function ConversationView({
               <div className="h-20 animate-pulse rounded-message bg-surface-muted" />
               <div className="ml-auto h-16 w-3/4 animate-pulse rounded-message bg-surface-muted" />
             </div>
-          ) : snapshot?.messages.length ? (
+          ) : rows.length ? (
             <ol
               ref={messageListRef}
               data-pact-virtual-transcript
               aria-busy={history.loadingPage}
-              data-pact-resident-message-count={snapshot.messages.length}
-              data-pact-oldest-sequence={snapshot.messages[0]?.sequence}
+              data-pact-resident-message-count={
+                (snapshot?.messages.length ?? 0) + (history.window?.runContexts?.length ?? 0)
+              }
+              data-pact-oldest-sequence={
+                history.window ? conversationWindowStartOrder(history.window)?.sequence : undefined
+              }
             >
               {virtualRows.map((virtualRow, position) => {
                 const row = rows[virtualRow.index]!
-                const message = row.message
                 const previousEnd = position === 0 ? listOffset : virtualRows[position - 1]!.end
                 return (
                   <Fragment key={virtualRow.key}>
@@ -3509,7 +3681,7 @@ export function ConversationView({
                       ref={measureRow}
                       data-index={virtualRow.index}
                       data-pact-row-key={virtualRow.key}
-                      aria-posinset={message ? message.sequence + 1 : undefined}
+                      aria-posinset={virtualRow.index + 1}
                       aria-setsize={-1}
                       className="pb-2"
                     >
@@ -3736,6 +3908,46 @@ export function ConversationView({
                 strokeWidth={1.75}
               />
               <span>{skillComposer.warning}</span>
+            </div>
+          ) : null}
+          {queue && queueActions ? (
+            <QueueMessageBar
+              queue={queue}
+              pending={queueActions.pending}
+              disabled={composerDisabled || sending || stopping}
+              canSteer={canSteerQueuedInput}
+              steerUnavailableReason={steerUnavailableReason}
+              respondingAgentId={respondingAgentId}
+              onSteer={queueActions.steer}
+              onRemove={queueActions.remove}
+              onEdit={() => returnQueueMessageToComposer(false)}
+              onResume={queueActions.resume}
+              onSetEnabled={queueActions.setEnabled}
+              onCheckStatus={
+                queuedInput?.state === 'unknown' && queuedInput.delivery
+                  ? queueActions.checkStatus
+                  : undefined
+              }
+            />
+          ) : null}
+          {queue?.returnedInput &&
+          queueActions &&
+          (composerReturnedInputOperationId !== queue.returnedInput.operationId ||
+            (!composer && !composerImages.length && !draftComments.length)) ? (
+            <div
+              className="flex min-h-8 flex-wrap items-center gap-2 px-2 text-caption text-secondary"
+              role="status"
+            >
+              <span>Returned message available</span>
+              <button
+                type="button"
+                className="min-h-7 rounded-control px-2 font-medium text-primary hover:bg-surface-muted disabled:opacity-40"
+                disabled={composerDisabled || sending || stopping || queueActions.pending}
+                title="Replace the current draft with the returned message"
+                onClick={() => void returnQueueMessageToComposer(true)}
+              >
+                {history.restoringInput ? 'Restoring message…' : 'Restore returned message'}
+              </button>
             </div>
           ) : null}
           <div
@@ -4235,25 +4447,13 @@ export function ConversationView({
                     }
                   }
                   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+                    if (responseInProgress && !queueEnabled) return
                     event.preventDefault()
                     void submit()
                   }
                 }}
               />
               <div className="flex items-center justify-between">
-                {responseInProgress && latestRun?.collaboration ? (
-                  <button
-                    type="button"
-                    disabled={
-                      disabled ||
-                      (!composerContentReady && !draftComments.length && !composerImages.length)
-                    }
-                    onClick={() => void submit()}
-                    className="min-h-8 rounded-control px-3 py-1.5 text-caption font-medium text-secondary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
-                  >
-                    Send update · after current work
-                  </button>
-                ) : null}
                 {onChooseComposerImages ? (
                   <button
                     type="button"
@@ -4310,25 +4510,42 @@ export function ConversationView({
               </div>
             </div>
           </div>
-          <div
-            className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1"
-            style={{ anchorName: `--composer-permissions-${session.id}` }}
-          >
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
             {onSaveSessionPermission ? (
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 {(['claude', 'codex'] as const).map((agent) => (
-                  <PermissionMenu
+                  <div
                     key={`${session.id}-${agent}`}
-                    session={session}
-                    agent={agent}
-                    composerAnchor={`--composer-permissions-${session.id}`}
-                    run={activeRun ?? latestRun}
-                    busy={responseInProgress}
-                    disabled={sessionSettingsSaving}
-                    visible={visible && !nativePresentationSuspended}
-                    onSave={onSaveSessionPermission}
-                    onNotice={onNotice}
-                  />
+                    role="group"
+                    aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} settings`}
+                    className="pact-agent-controls min-w-0 max-w-full text-caption"
+                  >
+                    <PermissionMenu
+                      session={session}
+                      agent={agent}
+                      run={activeRun ?? latestRun}
+                      busy={responseInProgress}
+                      disabled={sessionSettingsSaving}
+                      visible={visible && !nativePresentationSuspended}
+                      onSave={onSaveSessionPermission}
+                      onNotice={onNotice}
+                    />
+                    {onSaveSessionSpeed ? (
+                      <>
+                        <span className="pact-agent-divider" aria-hidden="true" />
+                        <SpeedMenu
+                          session={session}
+                          agent={agent}
+                          run={activeRun ?? latestRun}
+                          busy={responseInProgress}
+                          disabled={sessionSettingsSaving}
+                          visible={visible && !nativePresentationSuspended}
+                          onSave={onSaveSessionSpeed}
+                          onNotice={onNotice}
+                        />
+                      </>
+                    ) : null}
+                  </div>
                 ))}
               </div>
             ) : null}
@@ -4488,6 +4705,7 @@ function RunWorkLog({
   runId,
   activities,
   active,
+  completed = false,
   available,
   history,
   onRead,
@@ -4495,6 +4713,7 @@ function RunWorkLog({
   runId: string
   activities: AgentActivity[]
   active: boolean
+  completed?: boolean
   available: boolean
   history: ConversationHistoryControls
   onRead: () => void
@@ -4519,9 +4738,12 @@ function RunWorkLog({
       {activities.length > 0 ? (
         <>
           <AgentActivityList
+            key={completed ? 'complete' : 'pending'}
             activities={activities}
             active={active}
-            defaultExpanded={viewing}
+            defaultExpanded={
+              viewing && (!completed || Boolean(history.window?.activityView?.manual))
+            }
             preserveExpanded={viewing && Boolean(history.window?.activityView?.manual)}
             onExpandedChange={(expanded) => {
               if (expanded) onRead()
@@ -4647,7 +4869,43 @@ async function sha256Hex(value: string): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
-function formatRunConfiguration(run: AgentRun): string | undefined {
-  const details = [run.model, run.effort].filter((value): value is string => Boolean(value))
-  return details.length > 0 ? details.join(' · ') : undefined
+function RunConfiguration({ run }: { run: AgentRun }): React.JSX.Element | null {
+  const tooltipId = useId()
+  const speed = run.observedSpeed
+    ? run.observedSpeed === 'fast'
+      ? 'Fast'
+      : 'Standard speed'
+    : run.speedDetail
+      ? 'Native speed'
+      : run.speed === 'fast'
+        ? 'Fast requested'
+        : run.speed === 'standard'
+          ? 'Standard requested'
+          : undefined
+  const details = [run.model, run.effort, speed].filter((value): value is string => Boolean(value))
+  if (!details.length) return null
+  return (
+    <span className="relative inline-flex min-w-0 items-center gap-1 font-normal text-tertiary">
+      <span className="truncate">· {details.join(' · ')}</span>
+      {run.speedDetail ? (
+        <>
+          <button
+            type="button"
+            aria-label="Speed information"
+            aria-describedby={tooltipId}
+            className="peer grid size-6 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-raised hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+          >
+            <Info aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
+          </button>
+          <span
+            id={tooltipId}
+            role="tooltip"
+            className="pointer-events-none invisible absolute left-0 top-[calc(100%+0.25rem)] z-30 w-80 max-w-[calc(100vw-2rem)] whitespace-normal break-words rounded-control border border-border bg-surface-raised px-3 py-2 text-left text-caption font-normal leading-relaxed text-primary opacity-0 shadow-popover transition-opacity duration-150 peer-hover:visible peer-hover:opacity-100 peer-focus-visible:visible peer-focus-visible:opacity-100"
+          >
+            {run.speedDetail}
+          </span>
+        </>
+      ) : null}
+    </span>
+  )
 }

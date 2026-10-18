@@ -22,6 +22,7 @@ import {
   collaborationTurnAuthorizationSchema,
   collaborationDocumentSchema,
   type CollaborationDocument,
+  type CollaborationTurnAuthorization,
   nativeForkBoundarySchema,
   nativeForkWitnessSchema,
   commentAnchorSchema,
@@ -61,6 +62,7 @@ import {
   anchoredComments,
   conversationMessages,
   conversationMessageImages,
+  conversationOutputSnapshots,
   nativeAgentContexts,
   nativeForkIntents,
   nativeForkCandidateReceipts,
@@ -116,6 +118,24 @@ export function selectForkSource(
       !selected.isVisible
     )
       throw new Error('Only a completed Agent message can be forked.')
+    // A Steer User is appended after the root assistant's reserved sequence.
+    // The selected complete answer includes those inputs, so its frozen bundle
+    // extends through its own last User and never through a later Run's answer.
+    const selectedInputSequence = selected.runId
+      ? database
+          .select({ value: max(conversationMessages.sequence) })
+          .from(conversationMessages)
+          .where(
+            and(
+              eq(conversationMessages.sessionId, sourceSessionId),
+              eq(conversationMessages.runId, selected.runId),
+              eq(conversationMessages.role, 'user'),
+              eq(conversationMessages.state, 'complete'),
+            ),
+          )
+          .get()?.value
+      : undefined
+    const selectedSequence = Math.max(selected.sequence, selectedInputSequence ?? selected.sequence)
     const journalSequence = database
       .select({ value: max(agentEventJournal.sequence) })
       .from(agentEventJournal)
@@ -144,7 +164,7 @@ export function selectForkSource(
             eq(conversationMessages.role, 'assistant'),
             eq(conversationMessages.state, 'complete'),
             eq(conversationMessages.isVisible, true),
-            lte(conversationMessages.sequence, selected.sequence),
+            lte(conversationMessages.sequence, selectedSequence),
           ),
         )
         .orderBy(desc(conversationMessages.sequence))
@@ -175,7 +195,7 @@ export function selectForkSource(
         messageRevision: selected.contentRevision,
         settingsRevision: session.settingsRevision,
         sourceRevision,
-        sequence: selected.sequence,
+        sequence: selectedSequence,
         preview: selected.content.slice(0, 256),
         settings,
       },
@@ -207,8 +227,9 @@ export function forkResponse(
   const cursor = database.get<{ sequence: number }>(sql`
     SELECT max(sequence) AS sequence FROM ${conversationMessages}
     WHERE session_id=(SELECT session_id FROM ${agentRuns} WHERE id=${runId})
-      AND sequence<=${row.sequence}
+      AND sequence<=${throughSequence}
       AND (id=(SELECT user_message_id FROM ${agentRuns} WHERE id=${runId}) OR
+        (run_id=${runId} AND role='user' AND state='complete') OR
         id IN (SELECT json_extract(value,'$.id') FROM json_each(
           (SELECT handoff_source_ids FROM ${agentRuns} WHERE id=${runId}))))
   `)
@@ -216,7 +237,7 @@ export function forkResponse(
     throw new Error('The source native delivery cursor is unavailable.')
   return {
     responseHash: createHash('sha256').update(row.content).digest('hex'),
-    sequence: row.sequence,
+    sequence: Math.max(row.sequence, cursor.sequence),
     deliveryCursor: cursor.sequence,
   }
 }
@@ -248,6 +269,7 @@ export function commitFork(
   selection: ForkSelection,
   boundaries: Record<RuntimeAgentId, AgentNativeForkBoundary>,
   fullConsent: RuntimeAgentId[],
+  authorizationForRun?: (runId: string) => CollaborationTurnAuthorization | undefined,
 ): SessionForkOperation {
   const prior = database
     .select()
@@ -451,6 +473,30 @@ export function commitFork(
               .all(),
         )
       : []
+    const runById = new Map(runs.map((run) => [run.id, run]))
+    const historicalAuthorizations = new Map(
+      authorizationRows.map((row) => {
+        const base = collaborationTurnAuthorizationSchema.parse(JSON.parse(row.authorizationJson))
+        const run = runById.get(row.runId)
+        const effective =
+          run?.status === 'completed' && run.nativeOutcome === 'completed'
+            ? authorizationForRun?.(row.runId)
+            : undefined
+        const appended = (effective?.inputRevision ?? 0) > (base.inputRevision ?? 0)
+        const authorization = appended
+          ? collaborationTurnAuthorizationSchema.parse(effective)
+          : base
+        if (
+          authorization.runId !== base.runId ||
+          authorization.taskId !== base.taskId ||
+          authorization.actor !== base.actor ||
+          authorization.duty !== base.duty
+        )
+          throw new Error('The historical Run input grant does not match its immutable duty.')
+        if (appended) bound([authorization])
+        return [row.runId, authorization] as const
+      }),
+    )
     const todoRevisionRows = runIds.length
       ? readBounded(
           collaborationTodoRevisions,
@@ -500,12 +546,20 @@ export function commitFork(
     const requiredRows = runIds.length
       ? readBounded(
           collaborationRequiredInputMembers,
-          inArray(collaborationRequiredInputMembers.runId, runIds),
+          and(
+            inArray(collaborationRequiredInputMembers.runId, runIds),
+            eq(collaborationRequiredInputMembers.active, true),
+          ),
           () =>
             database
               .select()
               .from(collaborationRequiredInputMembers)
-              .where(inArray(collaborationRequiredInputMembers.runId, runIds))
+              .where(
+                and(
+                  inArray(collaborationRequiredInputMembers.runId, runIds),
+                  eq(collaborationRequiredInputMembers.active, true),
+                ),
+              )
               .limit(MAX_ENTITIES + 1)
               .all(),
         )
@@ -573,6 +627,23 @@ export function commitFork(
               .all(),
         )
       : []
+    const outputSnapshotRows = runIds.length
+      ? readBounded(
+          conversationOutputSnapshots,
+          inArray(conversationOutputSnapshots.runId, runIds),
+          () =>
+            database
+              .select()
+              .from(conversationOutputSnapshots)
+              .where(inArray(conversationOutputSnapshots.runId, runIds))
+              .orderBy(
+                asc(conversationOutputSnapshots.runId),
+                asc(conversationOutputSnapshots.ordinal),
+              )
+              .limit(MAX_ENTITIES + 1)
+              .all(),
+        )
+      : []
     const identity = (
       kind: 'run' | 'message' | 'comment' | 'collaboration' | 'batch',
       id: string,
@@ -631,7 +702,7 @@ export function commitFork(
       }
     }
     for (const row of authorizationRows) {
-      const auth = JSON.parse(row.authorizationJson)
+      const auth = historicalAuthorizations.get(row.runId)!
       for (const ref of [
         auth.requiredInputScopeRef,
         auth.effectiveDecisionIndexRef,
@@ -1105,6 +1176,25 @@ export function commitFork(
           routePendingAgentId: null,
         })
         .run()
+    for (const row of outputSnapshotRows) {
+      if (
+        row.sessionId !== source.id ||
+        !Number.isInteger(row.ordinal) ||
+        row.ordinal < 0 ||
+        row.ordinal >= 64
+      )
+        throw new Error('The Fork output snapshot is outside its original Run boundary.')
+      database
+        .insert(conversationOutputSnapshots)
+        .values({
+          ...row,
+          sessionId,
+          runId: identity('run', row.runId),
+          afterMessageId: identity('message', row.afterMessageId),
+          sourceMessageId: row.sourceMessageId ? identity('message', row.sourceMessageId) : null,
+        })
+        .run()
+    }
     for (const row of imageReferences)
       database
         .insert(conversationMessageImages)
@@ -1202,12 +1292,7 @@ export function commitFork(
         .filter((row) => row.state === 'applied' && completedResponseRuns.has(row.runId))
         .map((row) => row.runId),
     )
-    const reportAuthorizations = new Map(
-      authorizationRows.map((row) => [
-        row.runId,
-        collaborationTurnAuthorizationSchema.parse(JSON.parse(row.authorizationJson)),
-      ]),
-    )
+    const reportAuthorizations = historicalAuthorizations
     const settledReportLineages = new Set<string>()
     for (const runId of appliedRuns) {
       const auth = reportAuthorizations.get(runId)
@@ -1386,7 +1471,8 @@ export function commitFork(
           documentsJson: JSON.stringify(remapMetadata(JSON.parse(row.documentsJson))),
         })
         .run()
-    for (const row of authorizationRows)
+    for (const row of authorizationRows) {
+      const authorization = historicalAuthorizations.get(row.runId)!
       database
         .insert(collaborationTurnAuthorizations)
         .values({
@@ -1394,10 +1480,12 @@ export function commitFork(
           runId: identity('run', row.runId),
           taskId: identity('collaboration', row.taskId),
           inputBatchId: row.inputBatchId ? identity('batch', row.inputBatchId) : null,
+          inputSequence: authorization.inputSequence,
           basisJson: JSON.stringify(remapMetadata(JSON.parse(row.basisJson))),
-          authorizationJson: JSON.stringify(remapMetadata(JSON.parse(row.authorizationJson))),
+          authorizationJson: JSON.stringify(remapMetadata(authorization)),
         })
         .run()
+    }
     for (const row of requiredRows)
       database
         .insert(collaborationRequiredInputMembers)
@@ -1825,7 +1913,11 @@ export function completeForkSide(
       )
     const map = new Map(validated.idMap)
     const inherited = database
-      .select({ id: agentRuns.id, turnId: agentRuns.nativeTurnId })
+      .select({
+        id: agentRuns.id,
+        turnId: agentRuns.nativeTurnId,
+        nativeInputIdsJson: agentRuns.nativeInputIdsJson,
+      })
       .from(agentRuns)
       .where(
         and(
@@ -1842,12 +1934,37 @@ export function completeForkSide(
       throw new Error('The native identity map exceeds its record bound.')
     for (const run of inherited) {
       const turnId = run.turnId ? map.get(run.turnId) : undefined
-      if (turnId)
+      if (turnId) {
+        if (Buffer.byteLength(run.nativeInputIdsJson) > 8192)
+          throw new Error('The inherited native input identities exceed their byte bound.')
+        const nativeInputIds: unknown = JSON.parse(run.nativeInputIdsJson)
+        if (
+          !Array.isArray(nativeInputIds) ||
+          nativeInputIds.length > 64 ||
+          new Set(nativeInputIds).size !== nativeInputIds.length ||
+          nativeInputIds.some((id) => typeof id !== 'string' || !id || id.length > 1024) ||
+          (nativeInputIds.length > 0 && nativeInputIds[0] !== run.turnId)
+        )
+          throw new Error('The inherited native input identities are incomplete or invalid.')
+        const mappedInputIds = nativeInputIds.map((id) => {
+          // Codex preserves opaque Turn/client-message identities verbatim; its
+          // witness maps Turn boundaries only. Claude remaps native message UUIDs.
+          const mapped = map.get(String(id)) ?? (agentId === 'codex' ? String(id) : undefined)
+          if (!mapped)
+            throw new Error('The native Fork omitted a consumed input from its identity map.')
+          return mapped
+        })
         database
           .update(agentRuns)
-          .set({ nativeSessionId, nativeTurnId: turnId, bindingGeneration: 1 })
+          .set({
+            nativeSessionId,
+            nativeTurnId: turnId,
+            nativeInputIdsJson: JSON.stringify(mappedInputIds),
+            bindingGeneration: 1,
+          })
           .where(eq(agentRuns.id, run.id))
           .run()
+      }
     }
     if (intent.state !== 'ready')
       database

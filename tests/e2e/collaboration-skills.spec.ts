@@ -315,13 +315,11 @@ test('@deterministic Pact build coalesces a running update into a readonly respo
   try {
     await f.send('@claude /build Build cancellation')
     await expect(
-      f.page.getByRole('button', { name: 'Send update · after current work', exact: true }),
+      f.page.getByRole('button', { name: 'Stop Claude Code response', exact: true }),
     ).toBeVisible()
     const editor = f.page.getByRole('combobox', { name: 'Message', exact: true })
     await editor.fill('Also inspect the restart path')
-    await f.page
-      .getByRole('button', { name: 'Send update · after current work', exact: true })
-      .click()
+    await editor.press('Enter')
     await expect(
       f.page.getByRole('button', { name: 'Review changes · Codex', exact: true }),
     ).toBeEnabled({ timeout: 30_000 })

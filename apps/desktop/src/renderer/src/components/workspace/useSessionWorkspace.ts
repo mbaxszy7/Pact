@@ -10,6 +10,7 @@ import type {
   SessionCatalogPage,
   SessionSettingsEditorState,
   SessionPermissionSaveInput,
+  SessionSpeedSaveInput,
 } from '@pact/contracts'
 
 import { SESSION_CATALOG_PAGE_ITEMS } from '@pact/contracts'
@@ -222,6 +223,7 @@ async function readInitialCatalog(
 
 export interface SessionWorkspaceFlow {
   savePermission(input: SessionPermissionSaveInput): Promise<boolean>
+  saveSpeed(input: SessionSpeedSaveInput): Promise<boolean>
   catalog: SessionCatalogCache | undefined
   loading: boolean
   loadingMoreProjectId: string | undefined
@@ -256,6 +258,7 @@ export function useSessionWorkspace(
   const queryClient = useQueryClient()
   const [creating, setCreating] = useState(false)
   const [savingSettings, setSavingSettings] = useState(false)
+  const settingsMutationPending = useRef(false)
   const [renamingSessionId, setRenamingSessionId] = useState<string | undefined>()
   const [archivingSessionId, setArchivingSessionId] = useState<string | undefined>()
   const [restoringSessionId, setRestoringSessionId] = useState<string | undefined>()
@@ -456,7 +459,8 @@ export function useSessionWorkspace(
     sessionId: string,
     settings: DefaultSessionSettings,
   ): Promise<SessionSettingsEditorState | undefined> => {
-    if (savingSettings) return undefined
+    if (settingsMutationPending.current) return undefined
+    settingsMutationPending.current = true
     setSavingSettings(true)
     setActionError(undefined)
     try {
@@ -495,48 +499,59 @@ export function useSessionWorkspace(
       )
       return undefined
     } finally {
+      settingsMutationPending.current = false
+      setSavingSettings(false)
+    }
+  }
+
+  const saveAgentSetting = async (
+    input: SessionPermissionSaveInput | SessionSpeedSaveInput,
+  ): Promise<boolean> => {
+    if (settingsMutationPending.current) return false
+    settingsMutationPending.current = true
+    setSavingSettings(true)
+    setActionError(undefined)
+    try {
+      const saved = unwrapRpcResult(
+        await ('speed' in input
+          ? window.pact.saveSessionSpeed(input)
+          : window.pact.saveSessionPermission(input)),
+      )
+      acceptSessionCatalogChange(queryClient, saved)
+      queryClient.setQueryData<SessionSettingsEditorState>(
+        sessionWorkspaceQueryKeys.settings(input.sessionId),
+        (previous) => (previous ? { ...previous, session: saved.session } : undefined),
+      )
+      return true
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'Agent settings could not be saved.')
+      // A lost reply may follow a committed setting. Read this exact Session back;
+      // initial Catalog loading skips loaded Projects and can omit the affected Session.
+      try {
+        const editor = unwrapRpcResult(await window.pact.getSessionSettings(input.sessionId))
+        if (editor.session.id !== input.sessionId)
+          throw new Error('Agent settings readback returned another Session.', { cause: error })
+        patchCatalogSession(queryClient, {
+          id: editor.session.id,
+          settings: editor.session.settings,
+          settingsRevision: editor.session.settingsRevision,
+          updatedAt: editor.session.updatedAt,
+        })
+        queryClient.setQueryData(sessionWorkspaceQueryKeys.settings(input.sessionId), editor)
+      } catch {
+        // Keep the original failure visible; never resend an uncertain mutation.
+      }
+      return false
+    } finally {
+      settingsMutationPending.current = false
       setSavingSettings(false)
     }
   }
 
   return {
     catalog: catalogQuery.data,
-    savePermission: async (input) => {
-      if (savingSettings) return false
-      setSavingSettings(true)
-      setActionError(undefined)
-      try {
-        const saved = unwrapRpcResult(await window.pact.saveSessionPermission(input))
-        acceptSessionCatalogChange(queryClient, saved)
-        queryClient.setQueryData<SessionSettingsEditorState>(
-          sessionWorkspaceQueryKeys.settings(input.sessionId),
-          (previous) => (previous ? { ...previous, session: saved.session } : undefined),
-        )
-        return true
-      } catch (error) {
-        setActionError(error instanceof Error ? error.message : 'Permissions could not be saved.')
-        // A lost reply may follow a committed setting; read it back, never resend a grant.
-        try {
-          // Refetch this exact Session: initial Catalog loading deliberately
-          // skips already-loaded Projects and its first page may not contain it.
-          const editor = unwrapRpcResult(await window.pact.getSessionSettings(input.sessionId))
-          if (editor.session.id !== input.sessionId)
-            throw new Error('Permission readback returned another Session.', { cause: error })
-          patchCatalogSession(queryClient, {
-            id: editor.session.id,
-            settings: editor.session.settings,
-            settingsRevision: editor.session.settingsRevision,
-            updatedAt: editor.session.updatedAt,
-          })
-          queryClient.setQueryData(sessionWorkspaceQueryKeys.settings(input.sessionId), editor)
-        } catch {
-          // The original failure remains visible; never resend an uncertain grant.
-        }
-        return false
-      } finally {
-        setSavingSettings(false)
-      }
-    },
+    savePermission: saveAgentSetting,
+    saveSpeed: saveAgentSetting,
     loading: catalogQuery.isFetching,
     loadingMoreProjectId,
     loadMoreErrors,

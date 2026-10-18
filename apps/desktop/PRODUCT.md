@@ -42,7 +42,7 @@ Forward execution preserves native tools and user permissions. Recorded Changes 
 - Default Session settings are mandatory during onboarding and copied into each new Session. Runs freeze their own settings and permission revision.
 - The Renderer is browser-only and uses the typed DesktopBridge. It cannot import native/filesystem/persistence/runtime APIs.
 - Current recovery is explicit inspection or user-confirmed Rebuild; unknown delivery never causes blind replay. Fork uses both providers' genuine native boundary histories.
-- Native steering, full audit export, unlimited history, complete capability management and automatic Checkpoints remain future scopes, not design claims about available UI.
+- Composer supports one complete queued input per Session and explicit native Steer where the current CLI supports its lifecycle; complete recovery and unknown-delivery facts remain authoritative. Steer preserves full output snapshots in one Run, collapses Work Log in the final answer on completion and collapses earlier responses after normal settled completion without changing Comment sources or canonical native history. Full audit export, unlimited history, complete capability management and automatic Checkpoints remain future scopes.
 - Agent provenance, workflow state, Diff meaning, warnings and consequential actions never depend on color alone.
 - macOS and Windows share functional requirements; each platform's actual native effects and release verification must be established separately.
 

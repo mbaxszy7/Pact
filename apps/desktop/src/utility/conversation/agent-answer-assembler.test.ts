@@ -23,7 +23,22 @@ describe('AgentAnswerAssembler', () => {
 
   it('rejects an answer that crosses its bounded item budget', () => {
     using assembler = new AgentAnswerAssembler('run-1')
-    for (let index = 0; index < 128; index += 1) assembler.begin(`assistant-${index}`)
-    expect(() => assembler.begin('assistant-overflow')).toThrowError(AgentExecutionError)
+    for (let index = 0; index < 128; index += 1) assembler.append(`assistant-${index}`, 'Text')
+    expect(() => assembler.append('assistant-overflow', 'Overflow')).toThrowError(
+      AgentExecutionError,
+    )
+    expect(assembler.text.split('\n\n')).toHaveLength(128)
+  })
+
+  it('does not let empty native items consume answer slots or emit an empty response', () => {
+    using assembler = new AgentAnswerAssembler('run-1')
+    for (let index = 0; index < 256; index += 1) {
+      expect(assembler.append(`empty-${index}`, '')).toBe('')
+      expect(assembler.complete(`empty-${index}`, '')).toBeUndefined()
+    }
+    expect(assembler.finalize()).toBeUndefined()
+    expect(assembler.append('answer', 'Final answer')).toBe('Final answer')
+    expect(assembler.complete('answer', 'Final answer')).toBe('Final answer')
+    expect(assembler.finalize()).toBeUndefined()
   })
 })

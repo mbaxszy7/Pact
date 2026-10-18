@@ -7,7 +7,6 @@ import type {
 
 import { AgentModelSelector } from './AgentModelSelector'
 import { InfoTip } from './InfoTip'
-import { SettingsSelect } from './SettingsSelect'
 
 interface SessionSettingsFieldsProps {
   idPrefix: string
@@ -24,8 +23,8 @@ interface SessionSettingsFieldsProps {
 export const initialSessionSettings: DefaultSessionSettings = {
   primaryAgentId: 'claude',
   agents: {
-    claude: { model: null, effort: null },
-    codex: { model: null, effort: null },
+    claude: { model: null, effort: null, speed: 'native' },
+    codex: { model: null, effort: null, speed: 'native' },
   },
   maxDiscussionRounds: 6,
   runningMessagePolicy: 'immediate_safe_point',
@@ -213,35 +212,6 @@ export function SessionSettingsFields({
             description="One round is peer review plus the original drafter responding or confirming, whichever Agent drafted first. Review starts the round; a new version needs a new review round."
             onChange={(maxDiscussionRounds) => onChange({ ...settings, maxDiscussionRounds })}
           />
-          <div>
-            <SettingLabel label="Messages sent during a run">
-              Updates are saved and delivered after the current authorized Agent work finishes.
-              Native Steering will be added later.
-            </SettingLabel>
-            <SettingsSelect
-              aria-label="Messages sent during a run"
-              value={
-                settings.runningMessagePolicy === 'next_round'
-                  ? 'immediate_safe_point'
-                  : settings.runningMessagePolicy
-              }
-              disabled={disabled}
-              onChange={(event) => {
-                const runningMessagePolicy = event.target.value
-                if (
-                  runningMessagePolicy === 'immediate_safe_point' ||
-                  runningMessagePolicy === 'next_round'
-                ) {
-                  onChange({ ...settings, runningMessagePolicy })
-                }
-              }}
-            >
-              <option value="immediate_safe_point">Deliver after the current Agent step</option>
-              <option value="native_steering" disabled>
-                Native Steering · planned
-              </option>
-            </SettingsSelect>
-          </div>
           <NumberSetting
             label="Maximum review cycles"
             value={settings.maxReviewCycles}

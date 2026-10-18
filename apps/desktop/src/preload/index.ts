@@ -337,6 +337,7 @@ const bridge: DesktopBridge = {
   getSessionSettings: (sessionId) => invoke(IPC_CHANNELS.sessionSettingsGet, sessionId),
   saveSessionSettings: (input) => invoke(IPC_CHANNELS.sessionSettingsSave, input),
   saveSessionPermission: (input) => invoke(IPC_CHANNELS.sessionPermissionSave, input),
+  saveSessionSpeed: (input) => invoke(IPC_CHANNELS.sessionSpeedSave, input),
   cancelSkillCatalog: (sessionId) => invoke(IPC_CHANNELS.skillCatalogCancel, sessionId),
   readSkillCatalog: (input) => invoke(IPC_CHANNELS.skillCatalogRead, input),
   readSkillDocument: (input) => invoke(IPC_CHANNELS.skillDocumentRead, input),
@@ -350,6 +351,14 @@ const bridge: DesktopBridge = {
   readConversationImage: (input) => invoke(IPC_CHANNELS.conversationImageRead, input),
   writeConversationInput: (input) => invoke(IPC_CHANNELS.conversationInput, input),
   sendConversationMessage: (input) => invoke(IPC_CHANNELS.conversationSend, input),
+  steerQueuedConversationMessage: (input) =>
+    invoke(IPC_CHANNELS.steerQueuedConversationMessage, input),
+  returnQueuedConversationMessage: (input) =>
+    invoke(IPC_CHANNELS.returnQueuedConversationMessage, input),
+  removeQueuedConversationMessage: (input) =>
+    invoke(IPC_CHANNELS.removeQueuedConversationMessage, input),
+  resumeConversationQueue: (input) => invoke(IPC_CHANNELS.resumeConversationQueue, input),
+  setConversationQueueEnabled: (input) => invoke(IPC_CHANNELS.setConversationQueueEnabled, input),
   stopConversation: (input) => invoke(IPC_CHANNELS.conversationStop, input),
   acceptPeerProposal: (input) => invoke(IPC_CHANNELS.peerProposalAccept, input),
   dismissPeerProposal: (input) => invoke(IPC_CHANNELS.peerProposalDismiss, input),

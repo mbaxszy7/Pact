@@ -34,10 +34,14 @@ export function SessionWarningCard({
   const inFlight = useRef(false)
   const confirming = value.agents.find((issue) => scopeOf(issue) === confirmation?.scope)
   if (!value.agents.length) return null
-  const perform = async (issue: SessionIssue, action: () => Promise<boolean>): Promise<void> => {
+  const perform = async (
+    issue: SessionIssue,
+    action: () => Promise<boolean>,
+    check = false,
+  ): Promise<void> => {
     if (inFlight.current) return
     inFlight.current = true
-    setWorking(scopeOf(issue))
+    setWorking(check ? `check:${scopeOf(issue)}` : scopeOf(issue))
     setError(undefined)
     try {
       await action()
@@ -122,7 +126,25 @@ export function SessionWarningCard({
                 <p className="mt-1.5 break-words leading-relaxed">{issue.reason}</p>
               ) : null}
               {issue.action !== 'none' ? (
-                <div className="mt-2 flex justify-end">
+                <div className="mt-2 flex justify-end gap-1.5">
+                  {issue.action === 'rebuild' &&
+                  issue.runId &&
+                  issue.nativeSessionId &&
+                  !issue.rebuildId ? (
+                    <button
+                      type="button"
+                      disabled={!enabled || busy}
+                      onClick={() => void perform(issue, () => onRetry(issue), true)}
+                      className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-control px-3 font-medium hover:bg-surface-raised/40 focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-50"
+                    >
+                      {working === `check:${scopeOf(issue)}` ? (
+                        <LoaderCircle className="size-3.5 animate-spin" aria-hidden="true" />
+                      ) : (
+                        <RotateCcw className="size-3.5" aria-hidden="true" />
+                      )}
+                      {working === `check:${scopeOf(issue)}` ? 'Checking…' : 'Check session'}
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     disabled={!enabled || busy}

@@ -6,8 +6,14 @@ import { appendFile, lstat, mkdir, realpath, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
-import type { AgentNativeContextRebuildInput } from '../../packages/agent-runtime/src/index.js'
-import type { NativeContextRebuildChunk } from '../../packages/contracts/src/index.js'
+import type {
+  AgentNativeContextRebuildInput,
+  AgentRunInput,
+} from '../../packages/agent-runtime/src/index.js'
+import type {
+  NativeContextRebuildChunk,
+  NormalizedAgentEvent,
+} from '../../packages/contracts/src/index.js'
 
 import {
   actualSdk,
@@ -885,6 +891,321 @@ it.each([{ longCwd: false }, { longCwd: true }])(
     }
   },
 )
+
+it('real Claude Steer sends next-priority input and consumes only its matching native UUID', async () => {
+  const owned = await ownedRoot(),
+    adapters: NativeAdapter[] = []
+  const firstRequest = Promise.withResolvers<void>(),
+    releaseFirst = Promise.withResolvers<void>()
+  const provider = new LoopbackProvider(
+    ['NATIVE_CLAUDE_INITIAL_REPLY', 'NATIVE_CLAUDE_STEER_REPLY'],
+    {
+      mode: 'claude-live',
+      beforeResponse: async (index) => {
+        if (index !== 1) return
+        firstRequest.resolve()
+        await releaseFirst.promise
+      },
+    },
+  )
+  const controller = new AbortController(),
+    deadlineAt = performance.now() + 45_000
+  const deadline = setTimeout(() => controller.abort(), 45_000)
+  const previousConfig = process.env.CLAUDE_CONFIG_DIR,
+    sdk = actualSdk()
+  const runId = randomUUID(),
+    sessionId = randomUUID(),
+    inputId = randomUUID()
+  const identity = { nativeSessionId: '', nativeTurnId: runId }
+  const started = Promise.withResolvers<void>()
+  const consumed: string[] = [],
+    phases: string[] = [],
+    events: NormalizedAgentEvent[] = []
+  const nativeInputMetadata: object[] = []
+  try {
+    await provider.start()
+    await owned.processes.prepare(claudeExecutable, 4, deadlineAt)
+    process.env.CLAUDE_CONFIG_DIR = owned.home
+    const env = { ...isolatedEnv(owned.root, owned.home), ANTHROPIC_BASE_URL: provider.url }
+    const adapter = new bundle.ClaudeAgentAdapter(claudeExecutable, {
+      getSessionInfo: sdk.getSessionInfo,
+      query: (input: SdkQueryInput) => {
+        // Observe only input identity/priority while forwarding every genuine
+        // production prompt to the installed SDK and CLI unchanged.
+        const prompt = input.prompt
+        if (!prompt || typeof prompt !== 'object' || !(Symbol.asyncIterator in prompt))
+          throw new Error('Native Steer fixture requires a streaming prompt')
+        return sdk.query({
+          ...input,
+          prompt: (async function* () {
+            // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- The production streaming prompt is checked above, not provider data.
+            for await (const message of prompt as AsyncIterable<unknown>) {
+              if (!message || typeof message !== 'object' || nativeInputMetadata.length >= 2)
+                throw new Error('Native Steer input metadata capacity exceeded')
+              nativeInputMetadata.push({
+                uuid: Reflect.get(message, 'uuid'),
+                priority: Reflect.get(message, 'priority'),
+                origin: Reflect.get(message, 'origin'),
+              })
+              yield message
+            }
+          })(),
+          options: { ...input.options, env },
+        })
+      },
+      spawn: (command: string, args: string[], options: Parameters<typeof spawn>[2]) =>
+        owned.processes.spawn(command, args, options ?? {}),
+    })
+    adapters.push(adapter)
+    const completed = (async () => {
+      for await (const event of adapter.run(
+        {
+          runId,
+          sessionId,
+          cwd: owned.cwd,
+          model: 'sonnet',
+          effort: 'low',
+          nativeGeneration: 'native-claude-steer-fixture',
+          bindingGeneration: 1,
+          permissionMode: 'full',
+          promptEnvelope: {
+            version: 'pact-agent-prompt-v1',
+            sessionId,
+            message: { id: randomUUID(), content: 'NATIVE_CLAUDE_INITIAL_INPUT. No tools.' },
+            comments: [],
+          },
+        },
+        controller.signal,
+      )) {
+        events.push(event)
+        if (event.type === 'session.started') {
+          // Use the native identity returned by the actual actor, not a synthetic Session.
+          Object.assign(identity, { nativeSessionId: event.nativeSessionId })
+        }
+        if (event.type === 'turn.started') started.resolve()
+      }
+    })()
+    void completed.catch(() => undefined)
+    await within(firstRequest.promise, 15_000, 'Real Claude did not reach the controlled provider')
+    await within(started.promise, 10_000, 'Real Claude root did not start')
+    await expect(
+      adapter.steer(
+        {
+          runId,
+          inputId,
+          ...identity,
+          nativeGeneration: 'native-claude-steer-fixture',
+          bindingGeneration: 1,
+          promptEnvelope: {
+            version: 'pact-agent-prompt-v1',
+            sessionId,
+            message: {
+              id: inputId,
+              content: 'NATIVE_CLAUDE_STEER_INPUT. Same execution, no tools.',
+            },
+            comments: [],
+          },
+          recordDispatch: (phase) => phases.push(phase),
+          recordConsumption: (id) => consumed.push(id),
+        },
+        controller.signal,
+      ),
+    ).resolves.toEqual({ status: 'submitted' })
+    expect(phases).toEqual(['possibly_sent'])
+    expect(nativeInputMetadata).toEqual([
+      { uuid: runId, priority: undefined, origin: undefined },
+      { uuid: inputId, priority: 'next', origin: { kind: 'human' } },
+    ])
+    expect(consumed).toEqual([])
+    releaseFirst.resolve()
+    await within(completed, 20_000, 'Real Claude Steer did not complete its logical Run')
+    expect(consumed).toEqual([inputId])
+    expect(events.filter((event) => event.type === 'turn.started')).toHaveLength(1)
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'turn.completed', outcome: 'completed', turnId: runId }),
+    )
+    expect(provider.requests.filter((request) => request.method === 'POST')).toHaveLength(2)
+    expect(provider.errors).toEqual([])
+  } finally {
+    releaseFirst.resolve()
+    controller.abort()
+    clearTimeout(deadline)
+    if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previousConfig
+    await finishFixture(owned, { adapters, provider })
+  }
+})
+
+it('real Codex Steer incorporates the exact client UUID in its original Turn and survives a cold receipt-only read', async () => {
+  const owned = await ownedRoot(),
+    adapters: NativeAdapter[] = []
+  const clients: NativeRpc[] = [],
+    children = new Set<ChildProcess>()
+  const firstRequest = Promise.withResolvers<void>(),
+    releaseFirst = Promise.withResolvers<void>()
+  const provider = new LoopbackProvider(['NATIVE_INITIAL_REPLY', 'NATIVE_STEER_REPLY'], {
+    mode: 'codex',
+    beforeResponse: async (index) => {
+      if (index !== 1) return
+      firstRequest.resolve()
+      await releaseFirst.promise
+    },
+  })
+  const controller = new AbortController(),
+    deadlineAt = performance.now() + 45_000
+  const deadline = setTimeout(() => controller.abort(), 45_000)
+  const runId = randomUUID(),
+    sessionId = randomUUID(),
+    inputId = randomUUID()
+  const events: NormalizedAgentEvent[] = [],
+    consumed: string[] = [],
+    phases: string[] = []
+  const started = Promise.withResolvers<{ nativeSessionId: string; nativeTurnId: string }>()
+  let nativeSessionId: string | undefined
+  try {
+    await provider.start()
+    await provider.configureCodex(owned.home)
+    const env = isolatedEnv(owned.root, owned.home)
+    const factory = async (cwd: string) => {
+      if (children.size >= 4) throw new Error('Owned Codex child capacity exceeded')
+      const handle = await owned.processes.spawnOwnedAsync(
+        codexExecutable,
+        ['app-server'],
+        {
+          cwd,
+          env,
+          shell: false,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        },
+        deadlineAt,
+      )
+      children.add(handle.child)
+      handle.child.once('close', () => children.delete(handle.child))
+      return handle
+    }
+    const adapter = new bundle.CodexAgentAdapter(codexExecutable, factory, {
+      storageRoot: owned.home,
+    })
+    adapters.push(adapter)
+    const run: AgentRunInput = {
+      runId,
+      sessionId,
+      cwd: owned.cwd,
+      model: null,
+      effort: null,
+      nativeGeneration: 'native-steer-fixture',
+      bindingGeneration: 1,
+      permissionMode: 'full',
+      promptEnvelope: {
+        version: 'pact-agent-prompt-v1',
+        sessionId,
+        message: { id: randomUUID(), content: 'NATIVE_INITIAL_INPUT. Do not use tools.' },
+        comments: [],
+      },
+      recordInputConsumption: (id, identity) => {
+        expect(id).toBe(inputId)
+        expect(identity.nativeSessionId).toBe(nativeSessionId)
+        expect(identity.executorId).toEqual(expect.any(String))
+        consumed.push(id)
+      },
+    }
+    const completed = (async () => {
+      for await (const event of adapter.run(run, controller.signal)) {
+        events.push(event)
+        if (event.type === 'session.started') nativeSessionId = event.nativeSessionId
+        if (event.type === 'turn.started' && nativeSessionId)
+          started.resolve({ nativeSessionId, nativeTurnId: event.turnId })
+      }
+    })()
+    // Attach a handler immediately so an early native failure is never unhandled.
+    void completed.catch(() => undefined)
+    const identity = await within(started.promise, 10_000, 'Real Codex root did not start')
+    await within(firstRequest.promise, 10_000, 'Real Codex did not reach the controlled provider')
+    await expect(
+      adapter.steer(
+        {
+          runId,
+          inputId,
+          ...identity,
+          nativeGeneration: 'native-steer-fixture',
+          bindingGeneration: 1,
+          promptEnvelope: {
+            version: 'pact-agent-prompt-v1',
+            sessionId,
+            message: {
+              id: inputId,
+              content: 'NATIVE_STEER_INPUT. Keep the same execution; no tools.',
+            },
+            comments: [],
+          },
+          recordDispatch: (phase) => phases.push(phase),
+          recordConsumption: () => {
+            throw new Error('Codex root observer must own input incorporation')
+          },
+        },
+        controller.signal,
+      ),
+    ).resolves.toEqual({ status: 'accepted' })
+    expect(phases).toEqual(['possibly_sent', 'accepted'])
+    expect(consumed).toEqual([])
+    releaseFirst.resolve()
+    await within(completed, 20_000, 'Real Codex Steer did not complete its original root')
+    expect(consumed).toEqual([inputId])
+    expect(events.filter((event) => event.type === 'turn.started')).toHaveLength(1)
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'turn.completed',
+        outcome: 'completed',
+        turnId: identity.nativeTurnId,
+      }),
+    )
+    expect(provider.requests.filter((request) => request.method === 'POST')).toHaveLength(2)
+    expect(provider.errors).toEqual([])
+    await adapter.dispose()
+    const reader = await NativeRpc.create(codexExecutable, owned.cwd, env, {
+      deadlineAt,
+      processes: owned.processes,
+    })
+    clients.push(reader)
+    await reader.initialize()
+    const thread = result(
+      await reader.request<{ thread: NativeThread }>('thread/read', {
+        threadId: identity.nativeSessionId,
+        includeTurns: false,
+      }),
+    ).thread
+    const sourceHash = hash(await boundedNativeText(thread.path, owned.home))
+    await reader.close()
+    const cold = new bundle.CodexAgentAdapter(codexExecutable, factory, { storageRoot: owned.home })
+    adapters.push(cold)
+    const coldConsumed: string[] = []
+    await cold.probeNativeInputs(
+      {
+        agentId: 'codex',
+        requestId: runId,
+        runId,
+        sessionId,
+        ...identity,
+        bindingGeneration: 1,
+        cwd: owned.cwd,
+        model: null,
+        effort: null,
+        unresolvedInputIds: [inputId, randomUUID()],
+        recordConsumption: (id) => coldConsumed.push(id),
+      },
+      controller.signal,
+    )
+    expect(coldConsumed).toEqual([inputId])
+    expect(cold.hasActiveBackgroundWork()).toBe(false)
+    expect(hash(await boundedNativeText(thread.path, owned.home))).toBe(sourceHash)
+    expect(provider.requests.filter((request) => request.method === 'POST')).toHaveLength(2)
+  } finally {
+    releaseFirst.resolve()
+    controller.abort()
+    clearTimeout(deadline)
+    await finishFixture(owned, { adapters, clients, provider })
+  }
+})
 
 async function writeTurn(client: NativeRpc, threadId: string, text: string): Promise<string> {
   const turn = result(

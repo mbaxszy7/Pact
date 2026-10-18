@@ -20,6 +20,9 @@ import type {
   ConversationRetryInput,
   ConversationSendInput,
   ConversationStopInput,
+  ConversationQueueActionInput,
+  ConversationQueueReturnInput,
+  ConversationQueueEnabledInput,
   NativeContextRebuildInput,
   PeerProposalAcceptInput,
   PeerProposalDismissInput,
@@ -53,6 +56,7 @@ import type {
   SessionSettingsInput,
   SessionSettingsSaveInput,
   SessionPermissionSaveInput,
+  SessionSpeedSaveInput,
   UtilityRequest,
   UtilityResponse,
   WorkspaceChangeFileReadInput,
@@ -166,6 +170,7 @@ export interface UtilityProcessClient {
   ): Promise<RpcResult<WorkspaceArchiveReceipt>>
   forkSession(input: SessionForkInput): Promise<RpcResult<SessionForkResult>>
   saveSessionPermission(input: SessionPermissionSaveInput): Promise<RpcResult<SessionCatalogChange>>
+  saveSessionSpeed(input: SessionSpeedSaveInput): Promise<RpcResult<SessionCatalogChange>>
   readNativeInput(
     input: import('@pact/contracts').NativeInputRead,
   ): Promise<RpcResult<import('@pact/contracts').NativeInteractionDetails>>
@@ -244,6 +249,21 @@ export interface UtilityProcessClient {
     ownerKey?: string,
   ): Promise<RpcResult<ConversationPatch>>
   stopConversation(input: ConversationStopInput): Promise<RpcResult<ConversationPatch>>
+  steerQueuedConversationMessage(
+    input: ConversationQueueActionInput,
+  ): Promise<RpcResult<ConversationPatch>>
+  returnQueuedConversationMessage(
+    input: ConversationQueueReturnInput,
+  ): Promise<RpcResult<ConversationPatch>>
+  removeQueuedConversationMessage(
+    input: ConversationQueueActionInput,
+  ): Promise<RpcResult<ConversationPatch>>
+  resumeConversationQueue(
+    input: ConversationQueueActionInput,
+  ): Promise<RpcResult<ConversationPatch>>
+  setConversationQueueEnabled(
+    input: ConversationQueueEnabledInput,
+  ): Promise<RpcResult<ConversationPatch>>
   acceptPeerProposal(input: PeerProposalAcceptInput): Promise<RpcResult<ConversationPatch>>
   dismissPeerProposal(input: PeerProposalDismissInput): Promise<RpcResult<ConversationPatch>>
   saveCommentDraft(input: CommentDraftSaveInput): Promise<RpcResult<ConversationPatch>>
@@ -986,6 +1006,16 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     )
   }
 
+  async saveSessionSpeed(input: SessionSpeedSaveInput): Promise<RpcResult<SessionCatalogChange>> {
+    return ElectronUtilityProcessClient.toSessionCatalogChangeResult(
+      await this.request(
+        { type: 'session-speed.save.request', input },
+        'session-catalog.response',
+        WORKSPACE_OPERATION_TIMEOUT_MS,
+      ),
+    )
+  }
+
   async cancelSkillCatalog(sessionId: string): Promise<RpcResult<{ ready: true }>> {
     const result = await this.request(
       { type: 'skills.cancel.request', input: { sessionId } },
@@ -1145,6 +1175,66 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         { type: 'conversation.send.request', input, ...(ownerKey ? { ownerKey } : {}) },
         'conversation.patch.response',
         RUNTIME_PREPARATION_TIMEOUT_MS,
+      ),
+    )
+  }
+
+  async steerQueuedConversationMessage(
+    input: ConversationQueueActionInput,
+  ): Promise<RpcResult<ConversationPatch>> {
+    return ElectronUtilityProcessClient.toConversationPatchResult(
+      await this.request(
+        { type: 'conversation.queue.steer.request', input },
+        'conversation.patch.response',
+        RUNTIME_PREPARATION_TIMEOUT_MS,
+      ),
+    )
+  }
+
+  async returnQueuedConversationMessage(
+    input: ConversationQueueReturnInput,
+  ): Promise<RpcResult<ConversationPatch>> {
+    return ElectronUtilityProcessClient.toConversationPatchResult(
+      await this.request(
+        { type: 'conversation.queue.return.request', input },
+        'conversation.patch.response',
+        WORKSPACE_OPERATION_TIMEOUT_MS,
+      ),
+    )
+  }
+
+  async removeQueuedConversationMessage(
+    input: ConversationQueueActionInput,
+  ): Promise<RpcResult<ConversationPatch>> {
+    return ElectronUtilityProcessClient.toConversationPatchResult(
+      await this.request(
+        { type: 'conversation.queue.remove.request', input },
+        'conversation.patch.response',
+        WORKSPACE_OPERATION_TIMEOUT_MS,
+      ),
+    )
+  }
+
+  async resumeConversationQueue(
+    input: ConversationQueueActionInput,
+  ): Promise<RpcResult<ConversationPatch>> {
+    return ElectronUtilityProcessClient.toConversationPatchResult(
+      await this.request(
+        { type: 'conversation.queue.resume.request', input },
+        'conversation.patch.response',
+        WORKSPACE_OPERATION_TIMEOUT_MS,
+      ),
+    )
+  }
+
+  async setConversationQueueEnabled(
+    input: ConversationQueueEnabledInput,
+  ): Promise<RpcResult<ConversationPatch>> {
+    return ElectronUtilityProcessClient.toConversationPatchResult(
+      await this.request(
+        { type: 'conversation.queue.enabled.request', input },
+        'conversation.patch.response',
+        WORKSPACE_OPERATION_TIMEOUT_MS,
       ),
     )
   }

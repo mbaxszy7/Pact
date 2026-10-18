@@ -25,15 +25,9 @@ export class AgentAnswerAssembler {
     this.outputId = `${runId}:assistant`
   }
 
-  begin(itemId: string): void {
-    if (this.items.has(itemId)) return
-    this.assertNewItem(itemId)
-    this.itemOrder.push(itemId)
-    this.items.set(itemId, { text: '', encodedBytes: 0 })
-  }
-
   append(itemId: string, text: string): string {
     const previous = this.items.get(itemId)
+    if (!previous && text.length === 0) return ''
     if (!previous) this.assertNewItem(itemId)
     const previousText = previous?.text ?? ''
     // Count only the incoming fragment, correcting a surrogate pair formed at its seam.
@@ -60,6 +54,7 @@ export class AgentAnswerAssembler {
 
   complete(itemId: string, text: string): string | undefined {
     const previous = this.items.get(itemId)
+    if (!previous && text.length === 0) return undefined
     if (!previous) this.assertNewItem(itemId)
     const nextBytes = AgentAnswerAssembler.encodedBytes(text)
     this.admit(
