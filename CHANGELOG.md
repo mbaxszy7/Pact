@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/mbaxszy7/Pact/compare/v0.2.0...v0.3.0) (2026-10-18)
+
+
+### Features
+
+* **desktop:** add native speed controls and queued steering ([#20](https://github.com/mbaxszy7/Pact/issues/20)) ([0aba527](https://github.com/mbaxszy7/Pact/commit/0aba527e8cadb41986b03cf216e0cc5a4dfe7958))
+
 ## [0.2.0](https://github.com/mbaxszy7/Pact/compare/v0.1.2...v0.2.0) (2026-10-18)
 
 
