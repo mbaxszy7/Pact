@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/mbaxszy7/Pact/compare/v0.1.2...v0.2.0) (2026-10-18)
+
+
+### Features
+
+* **windows:** validate and deliver native ARM64 builds ([#18](https://github.com/mbaxszy7/Pact/issues/18)) ([04d372e](https://github.com/mbaxszy7/Pact/commit/04d372ecd6adbeca6820c46978dee934553ede8d))
+
 ## [0.1.2](https://github.com/mbaxszy7/Pact/compare/v0.1.1...v0.1.2) (2026-10-17)
 
 
