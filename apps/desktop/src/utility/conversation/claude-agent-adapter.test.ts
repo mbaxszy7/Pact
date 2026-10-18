@@ -1,9 +1,32 @@
 /* oxlint-disable typescript/no-unsafe-type-assertion, typescript/no-unnecessary-type-assertion, vitest/require-mock-type-parameters -- The SDK protocol stubs intentionally provide only fields consumed by the Adapter. */
 import type { SDKMessage, SDKUserMessage, query as sdkQuery } from '@anthropic-ai/claude-agent-sdk'
 
+import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+
+const forkWorker = vi.hoisted(() => ({ path: '' }))
+vi.mock('node:worker_threads', async (original) => {
+  const actual = await original<typeof import('node:worker_threads')>()
+  return {
+    ...actual,
+    Worker: class extends actual.Worker {
+      constructor(
+        filename: ConstructorParameters<typeof actual.Worker>[0],
+        options?: ConstructorParameters<typeof actual.Worker>[1],
+      ) {
+        super(
+          String(filename).endsWith('native-fork-worker.js') ? forkWorker.path : filename,
+          options,
+        )
+      }
+    },
+  }
+})
 
 import type {
   AgentNativeProbeInput,
@@ -14,12 +37,258 @@ import type {
 import { NativeCapacityError } from './agent-execution-error'
 import { CLAUDE_TITLE_TIMEOUT_MS, ClaudeAgentAdapter } from './claude-agent-adapter.js'
 import { planEnvelope, planRunInput } from './collaboration-fixture.test-support.js'
+import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
+
+let workerFixture: Awaited<ReturnType<typeof nativeWorkerFixture>>
+beforeAll(async () => {
+  workerFixture = await nativeWorkerFixture(['native-fork-worker'])
+  forkWorker.path = workerFixture.paths['native-fork-worker']!
+}, 20_000)
+afterAll(async () => {
+  await workerFixture?.dispose()
+})
 
 afterEach(() => {
   vi.useRealTimers()
+  vi.unstubAllEnvs()
 })
 
 describe('Claude Agent lifecycle', () => {
+  it.each([false, true])(
+    'keeps reading Steer consumption and final control receipts with background carrier failure=%s',
+    async (carrierFails) => {
+      const input = {
+        ...planRunInput('claude'),
+        nativeSessionId: 'claude-carrier-failure',
+        nativeGeneration: 'carrier-failure-fixture',
+        bindingGeneration: 1,
+      }
+      const steerId = randomUUID(),
+        carrier = planEnvelope('Exact plan carrier')
+      const overflow = Promise.withResolvers<void>(),
+        deliverCarrier = Promise.withResolvers<void>()
+      const rootPrompt = Promise.withResolvers<void>()
+      const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
+      const failure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
+      const consumption = vi.fn<(inputId: string) => void>()
+      const persistCarrier = vi.fn<NonNullable<AgentRunInput['recordCollaborationCarrier']>>(() => {
+        if (carrierFails) throw new Error('The final-proof working reservation is unavailable.')
+      })
+      const prompts: SDKUserMessage[] = []
+      let reachedEof = false,
+        inputDrain: Promise<void> | undefined
+      const query = ((request: { prompt: AsyncIterable<SDKUserMessage> }) => {
+        inputDrain = (async () => {
+          for await (const message of request.prompt) {
+            prompts.push(message)
+            if (prompts.length === 1) rootPrompt.resolve()
+          }
+        })()
+        void inputDrain.catch(() => undefined)
+        const output = (async function* () {
+          await rootPrompt.promise
+          yield {
+            type: 'system',
+            subtype: 'init',
+            session_id: input.nativeSessionId,
+            capabilities: ['interrupt_cancel_queued_v1'],
+          } as SDKMessage
+          yield {
+            type: 'assistant',
+            session_id: input.nativeSessionId,
+            parent_tool_use_id: null,
+            user_message_uuid: input.runId,
+            uuid: 'initial-empty',
+            message: { id: 'initial-empty', model: 'fixture', content: [] },
+          } as unknown as SDKMessage
+          await overflow.promise
+          for (let index = 0; index < 129; index += 1)
+            yield {
+              type: 'assistant',
+              session_id: input.nativeSessionId,
+              parent_tool_use_id: null,
+              user_message_uuid: input.runId,
+              uuid: `overflow-${index}`,
+              message: {
+                id: `overflow-${index}`,
+                model: 'fixture',
+                content: [{ type: 'text', text: 'Nonempty' }],
+              },
+            } as SDKMessage
+          await deliverCarrier.promise
+          yield {
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            session_id: input.nativeSessionId,
+            user_message_uuid: input.runId,
+            structured_output: carrier,
+            result: JSON.stringify(carrier),
+          } as SDKMessage
+          yield {
+            type: 'user',
+            session_id: input.nativeSessionId,
+            uuid: steerId,
+            user_message_uuid: steerId,
+            parent_tool_use_id: null,
+            message: { role: 'user', content: 'Supplement incorporated' },
+          } as SDKMessage
+          yield {
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            session_id: input.nativeSessionId,
+            user_message_uuid: steerId,
+            structured_output: carrier,
+            result: JSON.stringify(carrier),
+          } as SDKMessage
+          reachedEof = true
+        })()
+        return {
+          [Symbol.asyncIterator]: () => output,
+          cancelAsyncMessage: vi.fn(async () => false),
+          interrupt: vi.fn(async () => ({ cancelled: [], still_queued: [] })),
+          close: vi.fn(),
+          return: () => output.return(undefined),
+        }
+      }) as never
+      const adapter = new ClaudeAgentAdapter('/fake/claude', {
+        query,
+        getSessionInfo: vi.fn() as never,
+      })
+      const started = Promise.withResolvers<void>()
+      const outcome = (async () => {
+        for await (const event of adapter.run(
+          {
+            ...input,
+            recordNativeEvidence: evidence,
+            recordOutputFailure: failure,
+            recordCollaborationCarrier: persistCarrier,
+          },
+          new AbortController().signal,
+        ))
+          if (event.type === 'turn.started') started.resolve()
+      })().catch((error: unknown) => error)
+      try {
+        await started.promise
+        await expect(
+          adapter.steer(
+            {
+              runId: input.runId,
+              inputId: steerId,
+              nativeSessionId: input.nativeSessionId,
+              nativeTurnId: input.runId,
+              nativeGeneration: input.nativeGeneration,
+              bindingGeneration: 1,
+              promptEnvelope: {
+                ...input.promptEnvelope,
+                message: { id: steerId, content: 'Supplement' },
+              },
+              recordDispatch: () => undefined,
+              recordConsumption: consumption,
+            },
+            new AbortController().signal,
+          ),
+        ).resolves.toEqual({ status: 'submitted' })
+        expect(prompts.map((message) => message.uuid)).toEqual([input.runId, steerId])
+        overflow.resolve()
+        expect(await outcome).toMatchObject({ kind: 'response_too_large' })
+        expect(failure).toHaveBeenCalledTimes(1)
+        deliverCarrier.resolve()
+        await vi.waitFor(() => expect(persistCarrier).toHaveBeenCalled())
+        await vi.waitFor(() =>
+          expect({
+            consumedIds: consumption.mock.calls.map(([id]) => id),
+            nativeEnded: evidence.mock.calls.some(
+              ([fact]) => fact.kind === 'ended' && fact.outcome === 'completed',
+            ),
+            reachedEof,
+          }).toEqual({ consumedIds: [steerId], nativeEnded: true, reachedEof: true }),
+        )
+      } finally {
+        overflow.resolve()
+        deliverCarrier.resolve()
+        await adapter.dispose()
+        await inputDrain
+        await outcome
+      }
+    },
+  )
+
+  it.each([false, true])(
+    'keeps the exact native ending independent of empty items or projection overflow=%s',
+    async (overflow) => {
+      const input = runInput(),
+        evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
+      const failure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
+      const query = ((request: { prompt: AsyncIterable<SDKUserMessage> }) => ({
+        async *[Symbol.asyncIterator]() {
+          const prompt = await request.prompt[Symbol.asyncIterator]().next()
+          expect(prompt.value?.uuid).toBe(input.runId)
+          for (let index = 0; index < (overflow ? 129 : 256); index += 1)
+            yield {
+              type: 'assistant',
+              uuid: `assistant-${index}`,
+              session_id: input.nativeSessionId,
+              user_message_uuid: input.runId,
+              parent_tool_use_id: null,
+              message: {
+                id: `answer-${index}`,
+                model: 'fixture',
+                content: [{ type: 'text', text: overflow ? 'Nonempty' : '' }],
+              },
+            } as SDKMessage
+          yield {
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            session_id: input.nativeSessionId,
+            user_message_uuid: input.runId,
+            result: 'Final answer',
+          } as SDKMessage
+        },
+        close: vi.fn(),
+        return: vi.fn(async () => ({ done: true, value: undefined })),
+      })) as never
+      const adapter = new ClaudeAgentAdapter('/fake/claude', {
+        query,
+        getSessionInfo: vi.fn() as never,
+      })
+      const events: string[] = []
+      try {
+        const outcome = (async () => {
+          for await (const event of adapter.run(
+            { ...input, recordNativeEvidence: evidence, recordOutputFailure: failure },
+            new AbortController().signal,
+          ))
+            events.push(event.type)
+        })().catch((error: unknown) => error)
+        const result: unknown = await outcome
+        expect(result === undefined).toBe(!overflow)
+        expect(result && typeof result === 'object' ? Reflect.get(result, 'kind') : undefined).toBe(
+          overflow ? 'response_too_large' : undefined,
+        )
+        expect(failure).toHaveBeenCalledTimes(Number(overflow))
+        expect(events.includes('turn.completed')).toBe(!overflow)
+        await vi.waitFor(() =>
+          expect(evidence).toHaveBeenCalledWith(
+            expect.objectContaining({
+              kind: 'ended',
+              source: 'live_terminal',
+              outcome: 'completed',
+              identity: expect.objectContaining({
+                requestId: input.runId,
+                nativeSessionId: input.nativeSessionId,
+              }),
+            }),
+          ),
+        )
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  )
+
   it.each([true, false])(
     'keeps the complete native carrier private with valid submission=%s and enforces the readonly source-reader route',
     async (valid) => {
@@ -245,9 +514,11 @@ describe('Claude Agent lifecycle', () => {
           next: async (): Promise<IteratorResult<SDKMessage>> => {
             if (firstRead) {
               firstRead = false
-              for await (const prompt of request.prompt as AsyncIterable<SDKUserMessage>) {
-                state.prompt = prompt
-                nativeInputs.push(prompt)
+              const promptStream = request.prompt as AsyncIterable<SDKUserMessage>
+              const first = await promptStream[Symbol.asyncIterator]().next()
+              if (!first.done) {
+                state.prompt = first.value
+                nativeInputs.push(first.value)
               }
               if (!state.prompt) throw new Error('Input was cancelled before consumption.')
               return {
@@ -657,8 +928,9 @@ describe('Claude Agent lifecycle', () => {
     },
   )
   it('requires exact persisted terminal identity and native existence, without resuming', async () => {
+    const source = await savedClaudeAnswerFixture()
     const query = vi.fn(),
-      info = vi.fn(async () => ({ sessionId: 'claude-session-1' })),
+      info = vi.fn(async () => ({ sessionId: source.nativeSessionId })),
       read = vi.fn(async () => [])
     const adapter = new ClaudeAgentAdapter('/fake/claude', {
       query: query as never,
@@ -670,14 +942,14 @@ describe('Claude Agent lifecycle', () => {
       agentId: 'claude' as const,
       runId: runInput().runId,
       requestId: runInput().runId,
-      nativeSessionId: 'claude-session-1',
+      nativeSessionId: source.nativeSessionId,
       nativeTurnId: runInput().runId,
       bindingGeneration: 1,
       executorId: 'executor-1',
     }
     const input: AgentNativeProbeInput = {
       ...identity,
-      cwd: '/project',
+      cwd: source.cwd,
       model: null,
       effort: null,
       confirmedTerminal: {
@@ -691,7 +963,8 @@ describe('Claude Agent lifecycle', () => {
       await expect(
         adapter.probeNativeStatus(input, new AbortController().signal),
       ).resolves.toMatchObject({ kind: 'ended', outcome: 'completed' })
-      expect(read).toHaveBeenCalledOnce()
+      expect(info).toHaveBeenCalledOnce()
+      expect(read).not.toHaveBeenCalled()
       await expect(
         adapter.probeNativeStatus({ ...input, executorId: 'other' }, new AbortController().signal),
       ).resolves.toMatchObject({ kind: 'no_evidence' })
@@ -700,32 +973,22 @@ describe('Claude Agent lifecycle', () => {
         adapter.probeNativeStatus(input, new AbortController().signal),
       ).resolves.toMatchObject({ kind: 'no_evidence' })
       expect(query).not.toHaveBeenCalled()
+      expect(await readFile(source.path, 'utf8')).toBe(source.original)
     } finally {
       await adapter.dispose()
+      await source.dispose()
     }
   })
   it('recovers the exact saved response after a persisted native terminal receipt', async () => {
     const requestId = runInput().runId
+    const source = await savedClaudeAnswerFixture()
     const query = vi.fn()
-    const read = vi.fn(async () => [
-      {
-        type: 'user',
-        uuid: requestId,
-        session_id: 'claude-session-1',
-        parent_tool_use_id: null,
-        message: { role: 'user', content: 'Original task' },
-      },
-      {
-        type: 'assistant',
-        uuid: 'saved-answer',
-        session_id: 'claude-session-1',
-        parent_tool_use_id: null,
-        message: { role: 'assistant', content: [{ type: 'text', text: 'Exact saved answer' }] },
-      },
-    ])
+    const read = vi.fn(async () => {
+      throw new Error('Exact native Turn read must use its bounded Worker')
+    })
     const adapter = new ClaudeAgentAdapter('/fake/claude', {
       query: query as never,
-      getSessionInfo: vi.fn(async () => ({ sessionId: 'claude-session-1' })) as never,
+      getSessionInfo: vi.fn(async () => ({ sessionId: source.nativeSessionId })) as never,
       getSessionMessages: read as never,
     })
     const identity = {
@@ -733,7 +996,7 @@ describe('Claude Agent lifecycle', () => {
       agentId: 'claude' as const,
       runId: requestId,
       requestId,
-      nativeSessionId: 'claude-session-1',
+      nativeSessionId: source.nativeSessionId,
       nativeTurnId: requestId,
       bindingGeneration: 1,
       executorId: 'executor-1',
@@ -742,7 +1005,7 @@ describe('Claude Agent lifecycle', () => {
       const result = await adapter.probeNativeStatus(
         {
           ...identity,
-          cwd: '/project',
+          cwd: source.cwd,
           model: null,
           effort: null,
           confirmedTerminal: {
@@ -759,8 +1022,11 @@ describe('Claude Agent lifecycle', () => {
         output: { text: 'Exact saved answer', completeness: 'complete' },
       })
       expect(query).not.toHaveBeenCalled()
+      expect(read).not.toHaveBeenCalled()
+      expect(await readFile(source.path, 'utf8')).toBe(source.original)
     } finally {
       await adapter.dispose()
+      await source.dispose()
     }
   })
 
@@ -1345,7 +1611,7 @@ describe('Claude Agent lifecycle', () => {
           [Symbol.asyncIterator]: () => ({
             next: async () => {
               if (reads++ === 0) {
-                for await (const message of request.prompt) void message
+                await request.prompt[Symbol.asyncIterator]().next()
                 return pending
               }
               return { done: true, value: undefined }
@@ -1387,7 +1653,7 @@ describe('Claude Agent lifecycle', () => {
   it('does not infer Agent completion from a model response or resume-worded error', async () => {
     const query = ((request: { prompt: AsyncIterable<SDKUserMessage> }) => ({
       async *[Symbol.asyncIterator]() {
-        for await (const message of request.prompt) void message
+        await request.prompt[Symbol.asyncIterator]().next()
         yield {
           type: 'assistant',
           session_id: 'claude-session-1',
@@ -1418,6 +1684,58 @@ describe('Claude Agent lifecycle', () => {
     await adapter.dispose()
   })
 })
+
+async function savedClaudeAnswerFixture() {
+  const created = await mkdtemp(join(tmpdir(), 'pact-claude-answer-test-'))
+  try {
+    const cwd = await realpath(created),
+      profile = join(cwd, 'profile'),
+      nativeSessionId = randomUUID()
+    const project = join(profile, 'projects', cwd.replace(/[^a-z0-9]/giu, '-'))
+    await mkdir(project, { recursive: true })
+    const original =
+      [
+        {
+          type: 'user',
+          uuid: runInput().runId,
+          parentUuid: null,
+          message: { role: 'user', content: 'Original task' },
+        },
+        {
+          type: 'assistant',
+          uuid: randomUUID(),
+          parentUuid: runInput().runId,
+          message: {
+            id: 'saved-answer',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Exact saved answer' }],
+          },
+        },
+      ]
+        .map((record) =>
+          JSON.stringify({
+            ...record,
+            sessionId: nativeSessionId,
+            cwd,
+            timestamp: new Date().toISOString(),
+          }),
+        )
+        .join('\n') + '\n'
+    const path = join(project, nativeSessionId + '.jsonl')
+    await writeFile(path, original)
+    vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
+    return {
+      cwd,
+      nativeSessionId,
+      path,
+      original,
+      dispose: () => rm(created, { recursive: true, force: true }),
+    }
+  } catch (error) {
+    await rm(created, { recursive: true, force: true })
+    throw error
+  }
+}
 
 function runInput() {
   return {
@@ -1483,8 +1801,9 @@ function cancellationFixture(
         next: async () => {
           if (reads++ === 0) {
             if (beforePrompt) await beforePrompt
-            for await (const message of request.prompt as AsyncIterable<SDKUserMessage>)
-              prompts.push(message)
+            const promptStream = request.prompt as AsyncIterable<SDKUserMessage>
+            const first = await promptStream[Symbol.asyncIterator]().next()
+            if (!first.done) prompts.push(first.value)
             inputClosed = true
             if (!prompts.length) return { done: true, value: undefined }
             return {
@@ -1558,7 +1877,10 @@ function fakeQuery(
   return ((request: Parameters<typeof sdkQuery>[0]) => ({
     async *[Symbol.asyncIterator]() {
       if (typeof request.prompt === 'string') throw new Error('Fixture requires streaming input.')
-      for await (const message of request.prompt) controls.onInput?.(message)
+      // A one-input native actor responds while the streaming producer remains
+      // open for Steer; EOF can only follow the actor's terminal receipt.
+      const first = await request.prompt[Symbol.asyncIterator]().next()
+      if (!first.done) controls.onInput?.(first.value)
       yield* messages
     },
     initializationResult: controls.initializationResult ?? vi.fn(async () => ({})),

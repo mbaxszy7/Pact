@@ -66,7 +66,12 @@ vi.mock('../owned-process-group', () => ({
   },
 }))
 
-import type { AgentNativeContextRebuildInput, AgentRunInput } from '@pact/agent-runtime'
+import type {
+  AgentNativeContextRebuildInput,
+  AgentNativeInputProbeInput,
+  AgentRunInput,
+  AgentSteerInput,
+} from '@pact/agent-runtime'
 import type { NormalizedAgentEvent } from '@pact/contracts'
 
 import { collaborationTaskSchema } from '@pact/contracts'
@@ -3045,6 +3050,361 @@ describe('Codex Agent lifecycle', () => {
     }
   })
 })
+
+describe('Codex native Steer receipts', () => {
+  it('keeps an ACK accepted until the exact root Turn and clientId are incorporated once', async () => {
+    const fixture = codexSteerFixture((request, respond) =>
+      respond({ id: Reflect.get(request, 'id'), result: { turnId: 'turn-1' } }),
+    )
+    try {
+      await fixture.ready()
+      await expect(fixture.steer()).resolves.toEqual({ status: 'accepted' })
+      expect(fixture.phases).toEqual(['possibly_sent', 'accepted'])
+      expect(fixture.consumed).not.toHaveBeenCalled()
+      for (const event of [
+        fixture.inputEvent({ method: 'item/started' }),
+        fixture.inputEvent({ threadId: 'another-thread' }),
+        fixture.inputEvent({ turnId: 'another-turn' }),
+        fixture.inputEvent({ type: 'agentMessage' }),
+        fixture.inputEvent({ clientId: randomUUID() }),
+      ])
+        fixture.notify(event)
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(fixture.consumed).not.toHaveBeenCalled()
+      fixture.notify(fixture.inputEvent())
+      fixture.notify(fixture.inputEvent())
+      await vi.waitFor(() => expect(fixture.consumed).toHaveBeenCalledTimes(1))
+      expect(fixture.consumed).toHaveBeenCalledWith(fixture.inputId, {
+        nativeSessionId: 'thread-1',
+        nativeTurnId: 'turn-1',
+        executorId: expect.any(String),
+      })
+      // Codex's long-lived root observer owns this proof, not the RPC callback.
+      expect(fixture.rpcConsumption).not.toHaveBeenCalled()
+      await fixture.finish()
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it.each(['negative', 'lost'] as const)(
+    'retains incorporation observed before a %s ACK without resending',
+    async (ack) => {
+      const requestAbort = new AbortController()
+      const fixture = codexSteerFixture((request, respond, notify) => {
+        notify(fixture.inputEvent())
+        if (ack === 'negative')
+          respond({
+            id: Reflect.get(request, 'id'),
+            error: { code: -32000, message: 'Late error' },
+          })
+      })
+      try {
+        await fixture.ready()
+        const delivery = fixture.steer(requestAbort.signal)
+        await vi.waitFor(() => expect(fixture.consumed).toHaveBeenCalledTimes(1))
+        if (ack === 'lost') requestAbort.abort()
+        await expect(delivery).resolves.toEqual({ status: 'accepted' })
+        expect(fixture.phases).toEqual(['possibly_sent'])
+        expect(fixture.methods.filter((method) => method === 'turn/steer')).toHaveLength(1)
+        await fixture.finish()
+      } finally {
+        requestAbort.abort()
+        await fixture.dispose()
+      }
+    },
+  )
+
+  it('keeps observing exact incorporation after foreground cancellation', async () => {
+    const fixture = codexSteerFixture((request, respond) =>
+      respond({ id: Reflect.get(request, 'id'), result: { turnId: 'turn-1' } }),
+    )
+    try {
+      await fixture.ready()
+      await fixture.steer()
+      fixture.controller.abort()
+      expect(await fixture.outcome).toMatchObject({ kind: 'unknown_delivery' })
+      expect(fixture.adapter.hasActiveBackgroundWork('run-1')).toBe(true)
+      fixture.notify(fixture.inputEvent())
+      await vi.waitFor(() => expect(fixture.consumed).toHaveBeenCalledTimes(1))
+      await fixture.finish('interrupted')
+      expect(fixture.evidence).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'ended', outcome: 'interrupted' }),
+      )
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('does not allocate answer slots for empty native items and still records the ending', async () => {
+    const fixture = codexSteerFixture()
+    try {
+      await fixture.ready()
+      for (let index = 0; index < 256; index += 1)
+        fixture.notify({
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: `empty-${index}`, text: '' },
+          },
+        })
+      fixture.notify({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: { type: 'agentMessage', id: 'actual-answer', text: 'Complete answer' },
+        },
+      })
+      await fixture.finish()
+      expect(fixture.failure).not.toHaveBeenCalled()
+      expect(fixture.events).toContainEqual(
+        expect.objectContaining({
+          type: 'text.completed',
+          text: 'Complete answer',
+        }),
+      )
+      expect(fixture.evidence).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'ended',
+          outcome: 'completed',
+          output: expect.objectContaining({ text: 'Complete answer', completeness: 'complete' }),
+        }),
+      )
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('preserves control receipts when a real answer-item limit fails projection', async () => {
+    const fixture = codexSteerFixture((request, respond) =>
+      respond({ id: Reflect.get(request, 'id'), result: { turnId: 'turn-1' } }),
+    )
+    try {
+      await fixture.ready()
+      await fixture.steer()
+      for (let index = 0; index < 129; index += 1)
+        fixture.notify({
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: `answer-${index}`, text: 'Nonempty' },
+          },
+        })
+      await vi.waitFor(() => expect(fixture.failure).toHaveBeenCalledTimes(1))
+      fixture.notify(fixture.inputEvent())
+      await fixture.finish()
+      expect(fixture.consumed).toHaveBeenCalledTimes(1)
+      expect(fixture.evidence).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'ended',
+          source: 'live_terminal',
+          outcome: 'completed',
+        }),
+      )
+      expect(fixture.events).not.toContainEqual(expect.objectContaining({ type: 'turn.completed' }))
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('cold-reads only exact input identities and leaves the independent root check unproven', async () => {
+    const matched = randomUUID(),
+      absent = randomUUID(),
+      wrongTurn = randomUUID()
+    const methods: string[] = []
+    const entries = [
+      { turnId: 'other-turn', item: { type: 'userMessage', clientId: wrongTurn } },
+      { turnId: 'turn-1', item: { type: 'agentMessage', clientId: absent } },
+      { turnId: 'turn-1', item: { type: 'userMessage', clientId: matched } },
+      { turnId: 'turn-1', item: { type: 'userMessage', clientId: matched } },
+    ]
+    const child = fakeCodexProcess((request, respond) => {
+      const id = Reflect.get(request, 'id'),
+        method = String(Reflect.get(request, 'method'))
+      methods.push(method)
+      if (method === 'initialize') respond({ id, result: {} })
+      else if (method === 'thread/read')
+        respond({ id, result: { thread: { id: 'thread-1', status: { type: 'notLoaded' } } } })
+      else if (method === 'thread/turns/list')
+        respond({ id, result: { data: [], nextCursor: null } })
+      else if (method === 'thread/items/list') {
+        const params = Reflect.get(request, 'params') as {
+          threadId: string
+          turnId: string
+          cursor?: string
+          limit: number
+        }
+        if (params.threadId !== 'thread-1' || params.turnId !== 'turn-1')
+          throw new Error('Receipt reader escaped its exact native Turn')
+        const offset = Number(params.cursor ?? 0)
+        respond({
+          id,
+          result: {
+            data: entries.slice(offset, offset + params.limit),
+            nextCursor:
+              offset + params.limit < entries.length ? String(offset + params.limit) : null,
+          },
+        })
+      }
+    })
+    const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child))
+    const consumption = vi.fn<AgentNativeInputProbeInput['recordConsumption']>()
+    const probe: AgentNativeInputProbeInput = {
+      agentId: 'codex',
+      runId: 'run-1',
+      requestId: 'run-1',
+      sessionId: 'session-1',
+      bindingGeneration: 1,
+      nativeSessionId: 'thread-1',
+      nativeTurnId: 'turn-1',
+      cwd: '/project',
+      model: null,
+      effort: null,
+      unresolvedInputIds: [matched, absent, wrongTurn],
+      recordConsumption: consumption,
+    }
+    try {
+      await adapter.probeNativeInputs(probe, new AbortController().signal)
+      expect(consumption.mock.calls).toEqual([[matched]])
+      await expect(
+        adapter.probeNativeStatus(probe, new AbortController().signal),
+      ).resolves.toMatchObject({ kind: 'no_evidence' })
+      expect(methods).not.toContain('turn/start')
+      expect(methods).not.toContain('turn/steer')
+      expect(methods).not.toContain('thread/resume')
+      expect(adapter.hasActiveBackgroundWork()).toBe(false)
+    } finally {
+      await adapter.dispose()
+    }
+  })
+})
+
+function codexSteerFixture(onSteer?: Parameters<typeof fakeCodexProcess>[0]) {
+  const inputId = randomUUID(),
+    controller = new AbortController(),
+    methods: string[] = []
+  const consumed = vi.fn<NonNullable<AgentRunInput['recordInputConsumption']>>()
+  const rpcConsumption = vi.fn<AgentSteerInput['recordConsumption']>()
+  const dispatch = vi.fn<NonNullable<AgentRunInput['recordDispatch']>>()
+  const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
+  const failure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
+  const phases: string[] = [],
+    events: NormalizedAgentEvent[] = []
+  let notifyNative: ((event: object) => void) | undefined
+  const child = fakeCodexProcess((request, respond, notify) => {
+    const id = Reflect.get(request, 'id'),
+      method = String(Reflect.get(request, 'method'))
+    methods.push(method)
+    if (method === 'initialize') respond({ id, result: {} })
+    else if (method === 'thread/start') respond({ id, result: { thread: { id: 'thread-1' } } })
+    else if (method === 'turn/start') {
+      notifyNative = notify
+      respond({ id, result: { turn: { id: 'turn-1' } } })
+    } else if (method === 'turn/steer') {
+      const params: object = Reflect.get(request, 'params')
+      if (
+        Reflect.get(params, 'threadId') !== 'thread-1' ||
+        Reflect.get(params, 'expectedTurnId') !== 'turn-1' ||
+        Reflect.get(params, 'clientUserMessageId') !== inputId
+      )
+        throw new Error('Steer escaped its exact native input scope')
+      onSteer?.(request, respond, notify)
+    } else if (method === 'turn/interrupt') respond({ id, result: {} })
+  })
+  const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child))
+  const outcome = collectRun(
+    adapter,
+    {
+      nativeGeneration: 'generation-1',
+      bindingGeneration: 1,
+      recordDispatch: dispatch,
+      recordInputConsumption: consumed,
+      recordNativeEvidence: evidence,
+      recordOutputFailure: failure,
+    },
+    controller.signal,
+    (event) => events.push(event),
+  ).catch((error: unknown) => error)
+  const notify = (event: object) => {
+    if (!notifyNative) throw new Error('Native fixture has not started')
+    notifyNative(event)
+  }
+  return {
+    adapter,
+    inputId,
+    controller,
+    methods,
+    consumed,
+    rpcConsumption,
+    evidence,
+    failure,
+    phases,
+    events,
+    outcome,
+    notify,
+    inputEvent: (
+      overrides: {
+        method?: string
+        threadId?: string
+        turnId?: string
+        type?: string
+        clientId?: string
+      } = {},
+    ) => ({
+      method: overrides.method ?? 'item/completed',
+      params: {
+        threadId: overrides.threadId ?? 'thread-1',
+        turnId: overrides.turnId ?? 'turn-1',
+        item: {
+          id: 'steered-user',
+          type: overrides.type ?? 'userMessage',
+          clientId: overrides.clientId ?? inputId,
+          content: [],
+        },
+      },
+    }),
+    ready: () =>
+      vi.waitFor(() =>
+        expect(dispatch).toHaveBeenCalledWith('accepted', 'thread-1', expect.any(String)),
+      ),
+    steer: (signal = new AbortController().signal) =>
+      adapter.steer(
+        {
+          runId: 'run-1',
+          inputId,
+          nativeSessionId: 'thread-1',
+          nativeTurnId: 'turn-1',
+          nativeGeneration: 'generation-1',
+          bindingGeneration: 1,
+          promptEnvelope: {
+            version: 'pact-agent-prompt-v1',
+            sessionId: 'session-1',
+            message: { id: inputId, content: 'Additional instruction' },
+            comments: [],
+          },
+          recordDispatch: (phase) => phases.push(phase),
+          recordConsumption: rpcConsumption,
+        },
+        signal,
+      ),
+    finish: async (status: 'completed' | 'interrupted' = 'completed') => {
+      notify({
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1', status } },
+      })
+      await outcome
+      await vi.waitFor(() => expect(adapter.hasActiveBackgroundWork('run-1')).toBe(false))
+    },
+    dispose: async () => {
+      controller.abort()
+      await adapter.dispose()
+      await outcome
+    },
+  }
+}
 
 describe('Codex Native display metadata', () => {
   it('keeps the metadata deadline absolute while a real native approval is waiting', async () => {

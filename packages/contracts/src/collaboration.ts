@@ -34,6 +34,8 @@ export const collaborationPlanOutputSchema = z.union([
   collaborationPlanReferenceSchema,
 ])
 export const collaborationResultShape = {
+  inputRevision: z.number().int().nonnegative().optional(),
+  resultNonce: z.string().uuid().nullable().optional(),
   submission: collaborationDutySchema,
   outcome: z.enum(['complete', 'needs_user', 'blocked', 'paused']),
   summary: z
@@ -529,6 +531,8 @@ export function collaborationOutputSchema(
   const schema = collaborationEnvelopeSchema.extend({
     result: z.strictObject({
       ...collaborationResultShape,
+      inputRevision: z.number().int().nonnegative(),
+      resultNonce: z.string().uuid().nullable(),
       submission: z.literal(submission),
       plan: publishes ? (supplied ? z.union([planText, reference]) : planText) : z.null(),
       reviewedPlan:

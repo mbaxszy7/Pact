@@ -30,6 +30,10 @@ import type {
   CommentDraftRemoveInput,
   CommentDraftSaveInput,
   ConversationMessage,
+  ConversationQueueState,
+  ConversationQueueActionInput,
+  ConversationQueueEnabledInput,
+  ConversationQueueReturnInput,
   ConversationMessageRoute,
   ConversationMessageChange,
   ConversationActivityChange,
@@ -82,6 +86,8 @@ import {
 } from '@pact/contracts'
 import {
   frozenSkillInvocationSchema,
+  parseComposerCommandPrefix,
+  skillArguments,
   skillSelectionsSchema,
   type FrozenSkillInvocation,
   type SkillSelection,
@@ -121,11 +127,24 @@ import type { PactDrizzleDatabase } from './drizzle-database.js'
 import { appendAgentEvent } from './agent-event-journal.js'
 import * as forkFacts from './conversation-fork.js'
 import {
+  freezeOutputAtSteer,
+  outputSnapshotMetadata,
+  outputHasBodySql,
+  outputSnapshotSummarySql,
+  parseOutputSnapshotSummary,
+  outputRunContext,
+  outputTimelineSql,
+  beforeOutputOrder,
+  afterOutputOrder,
+  type OutputTimelineItem,
+} from './conversation-output-snapshots.js'
+import {
   nativeSessionIssueMetadata,
   refreshNativeSessionMetadata,
 } from './native-presence-metadata.js'
 import {
   collaborationInputs,
+  conversationQueueOperations,
   collaborationTasks,
   collaborationTurns,
   collaborationReportItems,
@@ -148,6 +167,7 @@ import {
   anchoredComments,
   commentDraftReceipts,
   conversationMessages,
+  conversationOutputSnapshots,
   conversationImageAssets,
   conversationMessageImages,
   conversationBodyInputs,
@@ -170,6 +190,112 @@ import {
   WorkspaceArchiveRepository,
   assertSessionAvailable,
 } from './workspace-archive-repository.js'
+
+/** Read only root result identity, with bounded stack/key/scalar memory. */
+function carrierInputIdentity(
+  text: string,
+): { inputRevision?: number; resultNonce?: string } | undefined {
+  let cursor = 0
+  const ws = () => {
+    while (/\s/u.test(text[cursor] ?? '') && cursor < text.length) cursor++
+  }
+  const stringEnd = () => {
+    if (text[cursor++] !== '"') throw new Error('string')
+    const start = cursor - 1
+    while (cursor < text.length) {
+      const char = text[cursor++]
+      if (char === '\\') cursor++
+      else if (char === '"') return { start, end: cursor }
+    }
+    throw new Error('string')
+  }
+  const key = () => {
+    const range = stringEnd()
+    if (range.end - range.start > 256) return ''
+    const parsed: unknown = JSON.parse(text.slice(range.start, range.end))
+    return typeof parsed === 'string' ? parsed : ''
+  }
+  const skip = () => {
+    ws()
+    if (text[cursor] === '"') {
+      stringEnd()
+      return
+    }
+    if (text[cursor] !== '{' && text[cursor] !== '[') {
+      while (cursor < text.length && !/[\s,}\]]/u.test(text[cursor]!)) cursor++
+      return
+    }
+    let depth = 0
+    do {
+      const char = text[cursor]
+      if (char === '"') {
+        stringEnd()
+        continue
+      }
+      if (char === '{' || char === '[') {
+        if (++depth > 1024) throw new Error('depth')
+      } else if (char === '}' || char === ']') depth--
+      cursor++
+    } while (depth > 0 && cursor < text.length)
+    if (depth) throw new Error('value')
+  }
+  try {
+    ws()
+    if (text[cursor++] !== '{') return undefined
+    let found = false,
+      identity: { inputRevision?: number; resultNonce?: string } = {}
+    for (;;) {
+      ws()
+      if (text[cursor] === '}') return found ? identity : undefined
+      const name = key()
+      ws()
+      if (text[cursor++] !== ':') return undefined
+      ws()
+      if (name === 'result') {
+        if (found || text[cursor++] !== '{') return undefined
+        found = true
+        const seen = new Set<string>()
+        for (;;) {
+          ws()
+          if (text[cursor] === '}') {
+            cursor++
+            break
+          }
+          const field = key()
+          ws()
+          if (text[cursor++] !== ':') return undefined
+          ws()
+          const start = cursor
+          skip()
+          if (field === 'inputRevision' || field === 'resultNonce') {
+            if (seen.has(field) || cursor - start > 128) return undefined
+            seen.add(field)
+            const scalar: unknown = JSON.parse(text.slice(start, cursor))
+            if (
+              field === 'inputRevision' &&
+              typeof scalar === 'number' &&
+              Number.isSafeInteger(scalar) &&
+              scalar >= 0
+            )
+              identity.inputRevision = scalar
+            if (field === 'resultNonce' && typeof scalar === 'string') identity.resultNonce = scalar
+          }
+          ws()
+          if (text[cursor] === '}') {
+            cursor++
+            break
+          }
+          if (text[cursor++] !== ',') return undefined
+        }
+      } else skip()
+      ws()
+      if (text[cursor] === '}') return found ? identity : undefined
+      if (text[cursor++] !== ',') return undefined
+    }
+  } catch {
+    return undefined
+  }
+}
 
 const activeRunStatuses = ['starting', 'running', 'recovering'] as const
 const INLINE_CONTENT_BYTES = CONVERSATION_MARKDOWN_BYTES
@@ -199,6 +325,9 @@ const publicRunColumns = {
   permissionMode: agentRuns.permissionMode,
   model: agentRuns.model,
   effort: agentRuns.effort,
+  speed: agentRuns.speed,
+  observedSpeed: agentRuns.observedSpeed,
+  speedDetail: agentRuns.speedDetail,
   nativeSessionId: agentRuns.nativeSessionId,
   nativeTurnId: agentRuns.nativeTurnId,
   forkSourceRunId: agentRuns.forkSourceRunId,
@@ -210,6 +339,8 @@ const publicRunColumns = {
   responseMessageId: sql<
     string | null
   >`(SELECT id FROM conversation_messages WHERE run_id = "agent_runs"."id" AND role = 'assistant' ORDER BY sequence DESC LIMIT 1)`,
+  // Keep the outer identity qualified inside correlated projection subqueries.
+  outputSnapshotsJson: outputSnapshotSummarySql(sql`"agent_runs"."id"`),
   nativeEffectsState: agentRuns.nativeEffectsState,
   nativeEffectsReason: agentRuns.nativeEffectsReason,
   workspaceRecordingUnavailableReason: agentRuns.workspaceRecordingUnavailableReason,
@@ -433,6 +564,7 @@ export interface BeginRunInput {
   skills?: SkillSelection[] | undefined
   skillInvocation?: FrozenSkillInvocation | undefined
   returnedInputOperationId?: string | undefined
+  queueReturnOperationId?: string | undefined
   content: string
   imageIds?: string[] | undefined
   imageOwnerKey?: string | undefined
@@ -467,6 +599,7 @@ export interface BeginRoutedContinuationInput {
 }
 
 interface PatchInput {
+  runContexts?: ConversationPatch['runContexts']
   commentDraftReceipt?: ConversationPatch['commentDraftReceipt']
   receivedInputIds?: ConversationPatch['receivedInputIds']
   queuedInputIds?: ConversationPatch['queuedInputIds']
@@ -480,6 +613,7 @@ interface PatchInput {
 }
 
 interface EventChanges {
+  snapshotMessageId?: string | undefined
   removedMessageIds?: string[]
   message?:
     | {
@@ -623,8 +757,24 @@ export class ConversationRepository {
     ),
     authorization: lazyStatement(() =>
       this.database
-        .select()
+        .select({
+          authorization: collaborationTurnAuthorizations,
+          grant: conversationQueueOperations,
+          batch: conversationInputBatches,
+        })
         .from(collaborationTurnAuthorizations)
+        .leftJoin(
+          conversationQueueOperations,
+          sql`${conversationQueueOperations.id}=(SELECT id FROM conversation_queue_operations
+            INDEXED BY conversation_queue_operations_active_grant_idx
+            WHERE target_run_id=${collaborationTurnAuthorizations.runId} AND kind='steer'
+            AND state IN ('prepared','possibly_sent','accepted','consumed','unknown')
+            ORDER BY input_revision DESC LIMIT 1)`,
+        )
+        .leftJoin(
+          conversationInputBatches,
+          eq(conversationInputBatches.id, conversationQueueOperations.batchId),
+        )
         .where(eq(collaborationTurnAuthorizations.runId, sql.placeholder('runId'))),
     ),
     todoDocument: lazyStatement(() =>
@@ -650,7 +800,7 @@ export class ConversationRepository {
         .from(sql`collaboration_required_input_members r
           JOIN conversation_input_batches b ON b.id=r.batch_id
           LEFT JOIN conversation_input_batch_members m ON m.batch_id=r.batch_id AND m.member_id=r.member_id`)
-        .where(sql`r.run_id=${sql.placeholder('runId')} AND
+        .where(sql`r.run_id=${sql.placeholder('runId')} AND r.active=1 AND
           (json_extract(b.body_document_json,'$.id')=${sql.placeholder('documentId')}
           OR json_extract(m.body_document_json,'$.id')=${sql.placeholder('documentId')}
           OR json_extract(m.anchor_document_json,'$.id')=${sql.placeholder('documentId')})`)
@@ -1555,7 +1705,14 @@ export class ConversationRepository {
     boundaries: Record<RuntimeAgentId, import('@pact/contracts').AgentNativeForkBoundary>,
     fullConsent: RuntimeAgentId[],
   ) {
-    return forkFacts.commitFork(this.database, operationId, selection, boundaries, fullConsent)
+    return forkFacts.commitFork(
+      this.database,
+      operationId,
+      selection,
+      boundaries,
+      fullConsent,
+      (runId) => this.collaborationTurnAuthorization(runId),
+    )
   }
 
   forkOperation(sessionId: string) {
@@ -1851,7 +2008,8 @@ export class ConversationRepository {
               eq(conversationMessages.role, 'user'),
               sql`EXISTS (
                 SELECT 1 FROM agent_runs AS accepted
-                WHERE accepted.user_message_id = ${conversationMessages.id}
+                WHERE (accepted.user_message_id = ${conversationMessages.id}
+                  OR accepted.id = ${conversationMessages.runId})
                   AND accepted.agent_id <> ${targetAgentId}
                   AND accepted.native_turn_id IS NOT NULL
                   AND (accepted.failure_kind IS NULL OR accepted.failure_kind NOT IN ('context_limit', 'unknown_delivery'))
@@ -2103,12 +2261,6 @@ export class ConversationRepository {
   }
 
   inputBatchForRun(runId: string): CollaborationInputBatchReference | undefined {
-    const row = this.database
-      .select()
-      .from(conversationInputBatches)
-      .where(eq(conversationInputBatches.runId, runId))
-      .get()
-    if (row) return { id: row.id, revision: row.commentsRevision, memberCount: row.memberCount }
     const run = this.findRun(runId)
     return run ? this.inputBatchForMessage(run.sessionId, run.userMessageId) : undefined
   }
@@ -2151,6 +2303,38 @@ export class ConversationRepository {
       )
       .get()
     if (existing) {
+      if (
+        input.pendingReceiptId &&
+        !existing.taskId &&
+        input.taskId &&
+        !existing.runId &&
+        !existing.messageId
+      ) {
+        const ownerTask = this.database
+          .select()
+          .from(collaborationTasks)
+          .where(eq(collaborationTasks.id, input.taskId))
+          .get()
+        if (!ownerTask)
+          throw new RunOperationConflictError('The queued workflow task is unavailable.')
+        existing.taskId = input.taskId
+        existing.sequence = ownerTask.inputSequence + 1
+        this.database
+          .update(conversationInputBatches)
+          .set({ taskId: existing.taskId, sequence: existing.sequence })
+          .where(eq(conversationInputBatches.id, existing.id))
+          .run()
+        this.database
+          .update(collaborationTasks)
+          .set({ inputSequence: existing.sequence })
+          .where(eq(collaborationTasks.id, input.taskId))
+          .run()
+        this.database
+          .update(collaborationInputs)
+          .set({ taskId: input.taskId })
+          .where(eq(collaborationInputs.id, input.pendingReceiptId))
+          .run()
+      }
       if (
         existing.actor !== input.actor ||
         existing.taskId !== (input.taskId ?? null) ||
@@ -2332,7 +2516,7 @@ export class ConversationRepository {
         .run()
       this.database
         .run(sql`INSERT INTO collaboration_required_input_members(run_id,batch_id,member_id)
-        SELECT ${runId},batch_id,member_id FROM collaboration_required_input_members WHERE run_id=${source.id}`)
+        SELECT ${runId},batch_id,member_id FROM collaboration_required_input_members WHERE run_id=${source.id} AND active=1`)
       this.database
         .run(sql`INSERT OR IGNORE INTO conversation_run_source_refs(run_id,source_message_id,source_revision,batch_id,documents_json)
         SELECT ${runId},source_message_id,source_revision,batch_id,documents_json FROM conversation_run_source_refs WHERE run_id=${source.id}`)
@@ -2531,11 +2715,169 @@ export class ConversationRepository {
     }
   }
 
+  private latestSteerGrant(runId: string) {
+    return this.database
+      .select()
+      .from(conversationQueueOperations)
+      .where(
+        and(
+          eq(conversationQueueOperations.targetRunId, runId),
+          eq(conversationQueueOperations.kind, 'steer'),
+          inArray(conversationQueueOperations.state, [
+            'prepared',
+            'possibly_sent',
+            'accepted',
+            'consumed',
+            'unknown',
+          ]),
+        ),
+      )
+      .orderBy(desc(conversationQueueOperations.inputRevision))
+      .limit(1)
+      .get()
+  }
+
   collaborationTurnAuthorization(runId: string): FrozenCollaborationAuthorization | undefined {
     const row = this.sourceQueries.authorization().get({ runId })
-    return row
-      ? collaborationTurnAuthorizationSchema.parse(JSON.parse(row.authorizationJson))
-      : undefined
+    if (!row) return undefined
+    const base = collaborationTurnAuthorizationSchema.parse(
+      JSON.parse(row.authorization.authorizationJson),
+    )
+    const grant = row.grant
+    if (!grant?.inputRevision || !grant.resultNonce || !grant.batchId) return base
+    const batch = row.batch
+    if (!batch || batch.taskId !== base.taskId || batch.actor !== base.actor)
+      throw new RunOperationConflictError(
+        'The appended input grant does not match the immutable Run duty.',
+      )
+    return {
+      ...base,
+      inputRevision: grant.inputRevision,
+      resultNonce: grant.resultNonce,
+      inputSequence: Math.max(base.inputSequence, batch.sequence),
+      requiredInputScopeRef: grant.inputScopeJson
+        ? collaborationDocumentSchema.parse(JSON.parse(grant.inputScopeJson))
+        : base.requiredInputScopeRef,
+    }
+  }
+
+  private resultMatchesInputGrant(runId: string, result: unknown): boolean {
+    const grant = this.latestSteerGrant(runId)
+    if (!grant) return true
+    return (
+      ['accepted', 'consumed'].includes(grant.state) &&
+      Boolean(
+        result &&
+        typeof result === 'object' &&
+        Reflect.get(result, 'inputRevision') === grant.inputRevision &&
+        Reflect.get(result, 'resultNonce') === grant.resultNonce,
+      )
+    )
+  }
+
+  /** Caller reserves 8192 + 512 * inputResponses.length bytes in its Native archive owner. */
+  private confirmSteerFinalEvidence(
+    runId: string,
+    result: unknown,
+    skillInvocation?: FrozenSkillInvocation,
+  ): ConversationPatch | undefined {
+    const grant = this.latestSteerGrant(runId)
+    if (
+      !grant ||
+      !['possibly_sent', 'unknown'].includes(grant.state) ||
+      !result ||
+      typeof result !== 'object' ||
+      Reflect.get(result, 'inputRevision') !== grant.inputRevision ||
+      Reflect.get(result, 'resultNonce') !== grant.resultNonce
+    )
+      return undefined
+    const run = this.findRun(runId)
+    if (
+      !run ||
+      run.bindingGeneration !== grant.bindingGeneration ||
+      run.nativeTurnId !== grant.nativeTurnId ||
+      (grant.executorId && run.executorId !== grant.executorId) ||
+      run.controlDisposition === 'abandoned'
+    )
+      return undefined
+    const responses: unknown = Reflect.get(result, 'inputResponses')
+    if (!Array.isArray(responses)) return undefined
+    // Identity-only workspace is pre-admitted by the existing Native working-memory owner.
+    // Original carrier text/DTO and complete member bodies remain in their existing owners.
+    const members = new Set<string>(),
+      deadline = Date.now() + 10_000
+    for (const response of responses) {
+      if (Date.now() >= deadline)
+        throw new RunOperationConflictError(
+          'The complete native input proof could not be checked before its deadline. Delivery remains unresolved.',
+        )
+      if (!response || typeof response !== 'object') return undefined
+      const batchId: unknown = Reflect.get(response, 'batchId'),
+        memberId: unknown = Reflect.get(response, 'memberId')
+      if (
+        typeof batchId !== 'string' ||
+        batchId.length !== 36 ||
+        typeof memberId !== 'string' ||
+        !memberId.length ||
+        memberId.length > 80
+      )
+        return undefined
+      const key = `${batchId}:${memberId}`
+      if (members.has(key)) return undefined
+      members.add(key)
+    }
+    let batchCursor = '',
+      memberCursor = ''
+    for (;;) {
+      if (Date.now() >= deadline)
+        throw new RunOperationConflictError(
+          'The complete native input proof could not be checked before its deadline. Delivery remains unresolved.',
+        )
+      const page = this.database
+        .select({
+          batchId: collaborationRequiredInputMembers.batchId,
+          memberId: collaborationRequiredInputMembers.memberId,
+        })
+        .from(collaborationRequiredInputMembers)
+        .where(
+          and(
+            eq(collaborationRequiredInputMembers.runId, runId),
+            eq(collaborationRequiredInputMembers.active, true),
+            or(
+              gt(collaborationRequiredInputMembers.batchId, batchCursor),
+              and(
+                eq(collaborationRequiredInputMembers.batchId, batchCursor),
+                gt(collaborationRequiredInputMembers.memberId, memberCursor),
+              ),
+            ),
+          ),
+        )
+        .orderBy(
+          asc(collaborationRequiredInputMembers.batchId),
+          asc(collaborationRequiredInputMembers.memberId),
+        )
+        .limit(COLLABORATION_INDEX_ITEMS)
+        .all()
+      if (!page.length) break
+      for (const member of page)
+        if (!members.delete(`${member.batchId}:${member.memberId}`)) return undefined
+      batchCursor = page.at(-1)!.batchId
+      memberCursor = page.at(-1)!.memberId
+    }
+    if (members.size) return undefined
+    this.markQueuedSteerAccepted(grant.id, skillInvocation)
+    const patch = this.markQueuedSteerConsumed(grant.id, grant.inputId!, skillInvocation)
+    patch.resync = { messages: true, drafts: true, activityRunIds: [] }
+    return patch
+  }
+
+  private archiveObsoleteSteerCarrier(runId: string, text: string): CollaborationDocument {
+    const source = this.saveCollaborationDocument(runId, text)
+    this.nativeFact(runId, 'conversation.steer_obsolete_carrier', {
+      sourceId: source.id,
+      sha256: source.sha256,
+    })
+    return source
   }
 
   private quotedSource(sessionId: string, messageId: string) {
@@ -2555,7 +2897,11 @@ export class ConversationRepository {
       .from(collaborationTurns)
       .where(eq(collaborationTurns.runId, message.runId))
       .get()
-    if (message.role === 'assistant' && turn?.answerProjectionBodyId) {
+    if (
+      message.role === 'assistant' &&
+      turn?.answerProjectionBodyId &&
+      !outputSnapshotMetadata(this.database, message.id)?.frozen
+    ) {
       const body = this.database
         .select()
         .from(conversationBodyInputs)
@@ -2760,10 +3106,18 @@ export class ConversationRepository {
     return task.implementer
   }
 
-  readRequiredInputMembers(runId: string, offset = 0) {
+  readRequiredInputMembers(runId: string, offset = 0, inputRevision?: number) {
     const auth = this.collaborationTurnAuthorization(runId)
-    if (!auth || !Number.isSafeInteger(offset) || offset < 0)
-      throw new RunOperationConflictError('The required input scope is unavailable.')
+    if (
+      !auth ||
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      (inputRevision !== undefined && inputRevision !== (auth.inputRevision ?? 0)) ||
+      (offset > 0 && (auth.inputRevision ?? 0) > 0 && inputRevision === undefined)
+    )
+      throw new RunOperationConflictError(
+        'The required input scope changed. Restart its complete paginated read.',
+      )
     const rows = this.database
       .select({
         batchId: collaborationRequiredInputMembers.batchId,
@@ -2788,7 +3142,13 @@ export class ConversationRepository {
           eq(conversationInputBatchMembers.memberId, collaborationRequiredInputMembers.memberId),
         ),
       )
-      .where(eq(collaborationRequiredInputMembers.runId, runId))
+      .where(
+        and(
+          eq(collaborationRequiredInputMembers.runId, runId),
+          eq(collaborationRequiredInputMembers.active, true),
+          lte(collaborationRequiredInputMembers.inputRevision, auth.inputRevision ?? 0),
+        ),
+      )
       .orderBy(asc(conversationInputBatches.sequence), asc(conversationInputBatchMembers.ordinal))
       .limit(COLLABORATION_INDEX_ITEMS + 1)
       .offset(offset)
@@ -2801,6 +3161,7 @@ export class ConversationRepository {
     return {
       runId,
       taskId: auth.taskId,
+      inputRevision: auth.inputRevision ?? 0,
       items,
       offset,
       nextOffset: rows.length > items.length ? offset + items.length : null,
@@ -2829,6 +3190,7 @@ export class ConversationRepository {
             .where(
               and(
                 eq(collaborationRequiredInputMembers.runId, runId),
+                eq(collaborationRequiredInputMembers.active, true),
                 eq(collaborationRequiredInputMembers.batchId, batchId),
               ),
             )
@@ -3531,6 +3893,1412 @@ export class ConversationRepository {
     })
   }
 
+  private receivedBodyPreview(inputId: string): string {
+    return (
+      this.database
+        .select({ text: conversationBodyParts.text })
+        .from(conversationBodyParts)
+        .where(eq(conversationBodyParts.inputId, inputId))
+        .orderBy(asc(conversationBodyParts.offset))
+        .limit(1)
+        .get()
+        ?.text.slice(0, 512) ?? ''
+    )
+  }
+
+  private queueRoute(row: typeof collaborationInputs.$inferSelect): ConversationMessageRoute {
+    const metadata = collaborationReceivedMetadataSchema.parse(JSON.parse(row.metadataJson))
+    if (metadata.route?.type === 'all')
+      return {
+        type: 'all',
+        firstAgentId: row.actor,
+        secondAgentId: row.actor === 'claude' ? 'codex' : 'claude',
+      }
+    return { type: metadata.route?.type === 'agent' ? 'agent' : 'primary', agentId: row.actor }
+  }
+
+  /** Original delivery scope, independent of the Session's current native binding. */
+  private queuedSteerDelivery(row: typeof collaborationInputs.$inferSelect) {
+    const op = this.database
+      .select()
+      .from(conversationQueueOperations)
+      .where(
+        and(
+          eq(conversationQueueOperations.inputId, row.id),
+          eq(conversationQueueOperations.kind, 'steer'),
+        ),
+      )
+      .orderBy(desc(conversationQueueOperations.createdAt))
+      .limit(1)
+      .get()
+    const run = op?.targetRunId ? this.findRun(op.targetRunId) : undefined
+    if (
+      !op ||
+      !run ||
+      !['prepared', 'possibly_sent', 'unknown', 'accepted', 'consumed', 'refused'].includes(
+        op.state,
+      ) ||
+      op.sessionId !== row.sessionId ||
+      run.sessionId !== row.sessionId ||
+      run.agentId !== row.actor ||
+      run.bindingGeneration !== op.bindingGeneration ||
+      run.nativeTurnId !== op.nativeTurnId ||
+      (op.executorId && run.executorId !== op.executorId)
+    )
+      return undefined
+    const context = this.nativeContext(row.sessionId, row.actor)
+    const rebuild =
+      run.controlDisposition === 'abandoned' &&
+      run.nativeSessionId &&
+      context?.nativeSessionId &&
+      context.nativeSessionId !== run.nativeSessionId &&
+      (context.bindingGeneration ?? 1) > (run.bindingGeneration ?? 1)
+        ? this.database
+            .select({ id: nativeRebuildOperations.id })
+            .from(nativeRebuildOperations)
+            .where(
+              and(
+                eq(nativeRebuildOperations.sessionId, row.sessionId),
+                eq(nativeRebuildOperations.agentId, row.actor),
+                eq(nativeRebuildOperations.oldRunId, run.id),
+                eq(nativeRebuildOperations.oldGeneration, run.bindingGeneration ?? 1),
+                eq(nativeRebuildOperations.oldNativeSessionId, run.nativeSessionId),
+                eq(nativeRebuildOperations.abandon, true),
+                eq(nativeRebuildOperations.stage, 'completed'),
+                isNotNull(nativeRebuildOperations.provisionalNativeSessionId),
+                ne(nativeRebuildOperations.provisionalNativeSessionId, run.nativeSessionId),
+              ),
+            )
+            .limit(1)
+            .get()
+        : undefined
+    return { run, operationId: op.id, rebuildId: rebuild?.id }
+  }
+
+  queueState(sessionId: string): ConversationQueueState {
+    const session = this.database
+      .select({
+        enabled: sessions.queueEnabled,
+        revision: sessions.queueRevision,
+        reason: sessions.queuePauseReason,
+      })
+      .from(sessions)
+      .where(eq(sessions.id, sessionId))
+      .get()
+    if (!session) throw new RunOperationConflictError('The Session is unavailable.')
+    const row = this.receivedCollaborationInput(sessionId)
+    const returned = this.database
+      .select({
+        inputId: conversationQueueOperations.inputId,
+        operationId: conversationQueueOperations.id,
+        expectedRevision: conversationQueueOperations.expectedRevision,
+        claimId: conversationQueueOperations.claimId,
+        installedCommentsRevision: conversationQueueOperations.installedCommentsRevision,
+        state: conversationQueueOperations.state,
+      })
+      .from(conversationQueueOperations)
+      .where(
+        and(
+          eq(conversationQueueOperations.sessionId, sessionId),
+          inArray(conversationQueueOperations.state, ['returned', 'installed']),
+        ),
+      )
+      .get()
+    const metadata = row
+      ? collaborationReceivedMetadataSchema.parse(JSON.parse(row.metadataJson))
+      : undefined
+    const batch = row
+      ? this.database
+          .select({ count: conversationInputBatches.memberCount })
+          .from(conversationInputBatches)
+          .where(eq(conversationInputBatches.clientMessageId, row.id))
+          .get()
+      : undefined
+    const state =
+      row &&
+      (row.queueState === 'queued' ||
+        row.queueState === 'paused' ||
+        row.queueState === 'dispatching' ||
+        row.queueState === 'unknown')
+        ? row.queueState
+        : 'paused'
+    const delivery =
+      row && (state === 'unknown' || state === 'dispatching')
+        ? this.queuedSteerDelivery(row)
+        : undefined
+    return {
+      enabled: session.enabled,
+      revision: session.revision,
+      input: row
+        ? {
+            id: row.id,
+            revision: session.revision,
+            recipient: metadata?.route?.type === 'all' ? 'all' : row.actor,
+            preview: row.preview,
+            workflowCommand: metadata?.workflowCommand ?? false,
+            state,
+            ...(delivery
+              ? { delivery: { runId: delivery.run.id, canRemove: Boolean(delivery.rebuildId) } }
+              : {}),
+            ...(row.queueReason || session.reason
+              ? { reason: row.queueReason ?? session.reason! }
+              : {}),
+            imageCount: metadata?.imageIds.length ?? 0,
+            commentCount: batch?.count ?? 0,
+            skillCount: metadata?.skills.length ?? 0,
+          }
+        : null,
+      returnedInput: returned?.inputId
+        ? {
+            inputId: returned.inputId,
+            operationId: returned.operationId,
+            expectedRevision: returned.expectedRevision,
+            ...(returned.claimId ? { claimId: returned.claimId } : {}),
+            ...(returned.installedCommentsRevision === null
+              ? {}
+              : { installedCommentsRevision: returned.installedCommentsRevision }),
+            state: returned.state === 'installed' ? 'installed' : 'pending',
+          }
+        : null,
+    }
+  }
+
+  receiveQueuedInput(
+    input: import('@pact/contracts').ConversationSendInput,
+    inputId: string,
+    actor: RuntimeAgentId,
+    ownerKey: string,
+    anchorRunId: string,
+  ): ConversationPatch {
+    const run = this.findRun(anchorRunId)
+    if (!run || run.sessionId !== input.sessionId)
+      throw new RunOperationConflictError('The queue anchor Run is unavailable.')
+    return this.database.transaction(() => {
+      const patch = this.receiveCollaborationInput(
+        input,
+        inputId,
+        actor,
+        'next_round',
+        ownerKey,
+        true,
+        anchorRunId,
+      )
+      this.database
+        .update(collaborationInputs)
+        .set({ anchorRunId })
+        .where(eq(collaborationInputs.id, input.clientMessageId))
+        .run()
+      return patch
+    })
+  }
+
+  private queueOperation(
+    input: ConversationQueueActionInput | ConversationQueueEnabledInput,
+    kind: typeof conversationQueueOperations.$inferSelect.kind,
+  ) {
+    assertSessionAvailable(this.database, input.sessionId)
+    const old = this.database
+      .select()
+      .from(conversationQueueOperations)
+      .where(eq(conversationQueueOperations.id, input.operationId))
+      .get()
+    if (old) {
+      if (
+        old.kind !== kind ||
+        old.sessionId !== input.sessionId ||
+        old.expectedRevision !== input.expectedRevision ||
+        old.inputId !== ('inputId' in input ? input.inputId : null) ||
+        old.enabled !== ('enabled' in input ? input.enabled : null)
+      )
+        throw new RunOperationConflictError('This operation belongs to a different queue action.')
+      return { old, row: undefined, delivery: undefined }
+    }
+    const session = this.database
+      .select()
+      .from(sessions)
+      .where(eq(sessions.id, input.sessionId))
+      .get()
+    if (!session || session.queueRevision !== input.expectedRevision)
+      throw new RunOperationConflictError('The queue changed. Refresh and try again.')
+    const row = 'inputId' in input ? this.receivedCollaborationInput(input.sessionId) : undefined
+    if ('inputId' in input && (!row || row.id !== input.inputId))
+      throw new RunOperationConflictError('This queued message is no longer available.')
+    const locked = row && ['dispatching', 'unknown'].includes(row.queueState)
+    const delivery = locked && kind === 'remove' ? this.queuedSteerDelivery(row) : undefined
+    if (kind !== 'steer' && locked && !(kind === 'remove' && delivery?.rebuildId))
+      throw new RunOperationConflictError(
+        'Delivery may have started. Resolve the original delivery before changing this message.',
+      )
+    return { old: undefined, row, delivery }
+  }
+
+  private saveQueueOperation(
+    input: ConversationQueueActionInput | ConversationQueueEnabledInput,
+    kind: typeof conversationQueueOperations.$inferSelect.kind,
+    state: typeof conversationQueueOperations.$inferSelect.state = 'complete',
+  ) {
+    const now = new Date().toISOString()
+    this.database
+      .insert(conversationQueueOperations)
+      .values({
+        id: input.operationId,
+        sessionId: input.sessionId,
+        inputId: 'inputId' in input ? input.inputId : null,
+        kind,
+        state,
+        expectedRevision: input.expectedRevision,
+        enabled: 'enabled' in input ? input.enabled : null,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run()
+  }
+
+  private advanceQueue(sessionId: string, reason?: string | null) {
+    this.database
+      .update(sessions)
+      .set({
+        queueRevision: sql`${sessions.queueRevision} + 1`,
+        ...(reason === undefined ? {} : { queuePauseReason: reason }),
+      })
+      .where(eq(sessions.id, sessionId))
+      .run()
+  }
+
+  setConversationQueueEnabled(input: ConversationQueueEnabledInput): ConversationPatch {
+    return this.database.transaction(() => {
+      if (this.queueOperation(input, 'enabled').old) return this.createPatch(input.sessionId)
+      this.saveQueueOperation(input, 'enabled')
+      this.database
+        .update(sessions)
+        .set({ queueEnabled: input.enabled })
+        .where(eq(sessions.id, input.sessionId))
+        .run()
+      this.advanceQueue(input.sessionId)
+      return this.createPatch(input.sessionId)
+    })
+  }
+
+  resumeConversationQueue(input: ConversationQueueActionInput): ConversationPatch {
+    return this.database.transaction(() => {
+      const check = this.queueOperation(input, 'resume')
+      if (check.old) return this.createPatch(input.sessionId)
+      this.saveQueueOperation(input, 'resume')
+      this.database
+        .update(collaborationInputs)
+        .set({
+          state: 'accepted',
+          queueState: 'queued',
+          queueReason: null,
+          deadline: new Date(Date.now() + 10 * 60_000).toISOString(),
+        })
+        .where(eq(collaborationInputs.id, input.inputId))
+        .run()
+      this.advanceQueue(input.sessionId, null)
+      return this.createPatch(input.sessionId)
+    })
+  }
+
+  pauseConversationQueue(sessionId: string, reason: string): ConversationPatch {
+    return this.database.transaction(() => {
+      const row = this.receivedCollaborationInput(sessionId)
+      if (!row) return this.createPatch(sessionId)
+      if (!['dispatching', 'unknown'].includes(row.queueState))
+        this.database
+          .update(collaborationInputs)
+          .set({ queueState: 'paused', queueReason: reason.slice(0, 512) })
+          .where(eq(collaborationInputs.id, row.id))
+          .run()
+      this.advanceQueue(sessionId, reason.slice(0, 512))
+      return this.createPatch(sessionId)
+    })
+  }
+
+  removeQueuedConversationMessage(input: ConversationQueueActionInput): ConversationPatch {
+    return this.database.transaction(() => {
+      const check = this.queueOperation(input, 'remove')
+      if (check.old) return this.createPatch(input.sessionId)
+      this.saveQueueOperation(input, 'remove')
+      const batch = this.database
+        .select({ id: conversationInputBatches.id })
+        .from(conversationInputBatches)
+        .where(eq(conversationInputBatches.clientMessageId, input.inputId))
+        .get()
+      if (check.delivery?.rebuildId) {
+        const { run, operationId, rebuildId } = check.delivery
+        this.database
+          .update(conversationQueueOperations)
+          .set({ targetRunId: run.id, bindingGeneration: run.bindingGeneration })
+          .where(eq(conversationQueueOperations.id, input.operationId))
+          .run()
+        this.nativeFact(run.id, 'conversation.queue_item_removed', {
+          operationId: input.operationId,
+          inputId: input.inputId,
+          steerOperationId: operationId,
+          bindingGeneration: run.bindingGeneration,
+          rebuildId,
+          deliveryUnconfirmed: true,
+        })
+      } else if (batch) this.withdrawInputBatch(batch.id)
+      this.database
+        .update(collaborationInputs)
+        .set({ state: 'cancelled', queueState: 'removed' })
+        .where(eq(collaborationInputs.id, input.inputId))
+        .run()
+      this.advanceQueue(input.sessionId, null)
+      return this.createPatch(input.sessionId)
+    })
+  }
+
+  private requireInstalledQueueReturn(sessionId: string, operationId: string) {
+    const row = this.database
+      .select()
+      .from(conversationQueueOperations)
+      .where(
+        and(
+          eq(conversationQueueOperations.id, operationId),
+          eq(conversationQueueOperations.sessionId, sessionId),
+          eq(conversationQueueOperations.kind, 'return'),
+          eq(conversationQueueOperations.state, 'installed'),
+        ),
+      )
+      .get()
+    if (!row)
+      throw new RunOperationConflictError('Restore the complete queue input before sending it.')
+  }
+
+  private consumeQueuedReturn(sessionId: string, operationId?: string) {
+    this.database
+      .update(conversationQueueOperations)
+      .set({ state: 'consumed', updatedAt: new Date().toISOString() })
+      .where(
+        and(
+          eq(conversationQueueOperations.sessionId, sessionId),
+          eq(conversationQueueOperations.kind, 'return'),
+          ...(operationId ? [eq(conversationQueueOperations.id, operationId)] : []),
+          inArray(conversationQueueOperations.state, ['returned', 'installed']),
+        ),
+      )
+      .run()
+  }
+
+  returnQueuedConversationMessage(input: ConversationQueueReturnInput): ConversationPatch {
+    return this.database.transaction(() => {
+      const checked = this.queueOperation(input, 'return')
+      if (checked.old && input.phase !== 'claim') return this.createPatch(input.sessionId)
+      if (
+        input.phase === 'claim' &&
+        (!checked.old || !['returned', 'installed'].includes(checked.old.state))
+      )
+        throw new RunOperationConflictError('Return this input before restoring it.')
+      const row =
+        checked.row ??
+        this.database
+          .select()
+          .from(collaborationInputs)
+          .where(
+            and(
+              eq(collaborationInputs.id, input.inputId),
+              eq(collaborationInputs.sessionId, input.sessionId),
+            ),
+          )
+          .get()!
+      const body = this.database
+        .select()
+        .from(conversationBodyInputs)
+        .where(eq(conversationBodyInputs.id, row.inputId))
+        .get()
+      if (!body?.sealed || this.readBody(body, false).hash !== row.digest)
+        throw new RunOperationConflictError(
+          'The queued input source changed. Its original content remains saved.',
+        )
+      const batch = this.database
+        .select()
+        .from(conversationInputBatches)
+        .where(eq(conversationInputBatches.clientMessageId, row.id))
+        .get()
+      if (!batch) throw new RunOperationConflictError('The queued input manifest is unavailable.')
+      if (input.phase !== 'claim') {
+        this.consumeQueuedReturn(input.sessionId)
+        this.saveQueueOperation(input, 'return', 'returned')
+        this.withdrawInputBatch(batch.id)
+        this.database
+          .update(collaborationInputs)
+          .set({ state: 'cancelled', queueState: 'returned' })
+          .where(eq(collaborationInputs.id, row.id))
+          .run()
+        this.advanceQueue(input.sessionId, null)
+        return this.createPatch(input.sessionId)
+      }
+      const session = this.database
+        .select()
+        .from(sessions)
+        .where(eq(sessions.id, input.sessionId))
+        .get()!
+      const claimId = input.claimId ?? input.operationId
+      if (checked.old?.state === 'installed' && checked.old.claimId === claimId) {
+        if (session.commentsRevision !== checked.old.installedCommentsRevision)
+          throw new RunOperationConflictError(
+            'Comment drafts changed after this input was restored. Restore explicitly to replace them again.',
+          )
+        return this.createPatch(input.sessionId)
+      }
+      if (
+        input.expectedCommentsRevision === undefined ||
+        session.commentsRevision !== input.expectedCommentsRevision
+      )
+        throw new RunOperationConflictError('Comment drafts changed before restoring this message.')
+      const rebuildReturns = this.database
+        .select({
+          id: nativeRebuildOperations.id,
+          record: nativeRebuildOperations.returnedInputJson,
+        })
+        .from(nativeRebuildOperations)
+        .where(
+          and(
+            eq(nativeRebuildOperations.sessionId, input.sessionId),
+            sql`json_extract(${nativeRebuildOperations.returnedInputJson}, '$.state') IN ('pending','installed')`,
+          ),
+        )
+        .limit(2)
+        .all()
+      for (const prior of rebuildReturns) {
+        const record = this.parseReturnedInput(prior.record)
+        if (record) {
+          record.state = 'consumed'
+          this.database
+            .update(nativeRebuildOperations)
+            .set({ returnedInputJson: JSON.stringify(record) })
+            .where(eq(nativeRebuildOperations.id, prior.id))
+            .run()
+        }
+      }
+      // Explicit Edit overwrites current drafts; archived Batch sources remain immutable.
+      this.database
+        .update(anchoredComments)
+        .set({ pendingReceiptId: input.operationId })
+        .where(
+          and(
+            eq(anchoredComments.sessionId, input.sessionId),
+            isNull(anchoredComments.sentWithMessageId),
+            isNull(anchoredComments.pendingReceiptId),
+          ),
+        )
+        .run()
+      let position =
+        (this.database
+          .select({ value: max(anchoredComments.position) })
+          .from(anchoredComments)
+          .where(eq(anchoredComments.sessionId, input.sessionId))
+          .get()?.value ?? -1) + 1
+      let ordinal = -1
+      const deadline = Date.now() + 10_000
+      for (;;) {
+        const page = this.database
+          .select({ member: conversationInputBatchMembers, comment: anchoredComments })
+          .from(conversationInputBatchMembers)
+          .innerJoin(
+            anchoredComments,
+            eq(anchoredComments.id, conversationInputBatchMembers.commentId),
+          )
+          .where(
+            and(
+              eq(conversationInputBatchMembers.batchId, batch.id),
+              gt(conversationInputBatchMembers.ordinal, ordinal),
+            ),
+          )
+          .orderBy(asc(conversationInputBatchMembers.ordinal))
+          .limit(COLLABORATION_INDEX_ITEMS)
+          .all()
+        if (!page.length) break
+        if (Date.now() >= deadline)
+          throw new RunOperationConflictError(
+            'The complete message could not be returned before its deadline. It remains queued.',
+          )
+        for (const { member, comment } of page) {
+          if (
+            comment.draftRevision !== member.commentRevision ||
+            createHash('sha256').update(comment.body).digest('hex') !== member.bodySha256
+          )
+            throw new RunOperationConflictError('A frozen queued Comment changed.')
+          this.database
+            .insert(anchoredComments)
+            .values({
+              ...comment,
+              id: randomUUID(),
+              position: position++,
+              pendingReceiptId: null,
+              sentWithMessageId: null,
+              returnOperationId: input.operationId,
+              draftRevision: 1,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            })
+            .run()
+        }
+        ordinal = page.at(-1)!.member.ordinal
+      }
+      this.database
+        .update(conversationQueueOperations)
+        .set({
+          state: 'installed',
+          claimId,
+          claimExpectedCommentsRevision: session.commentsRevision,
+          installedCommentsRevision: session.commentsRevision + 1,
+          updatedAt: new Date().toISOString(),
+        })
+        .where(eq(conversationQueueOperations.id, input.operationId))
+        .run()
+      this.database
+        .update(sessions)
+        .set({ commentsRevision: sql`${sessions.commentsRevision} + 1` })
+        .where(eq(sessions.id, input.sessionId))
+        .run()
+      this.advanceQueue(input.sessionId, null)
+      return this.createPatch(input.sessionId, {
+        resync: { messages: false, drafts: true, activityRunIds: [] },
+        comments: {
+          revision: this.database
+            .select({ value: sessions.commentsRevision })
+            .from(sessions)
+            .where(eq(sessions.id, input.sessionId))
+            .get()!.value,
+          upserts: [],
+          removedIds: [],
+        },
+      })
+    })
+  }
+
+  /** Exact provider identities, with the root retained across Claude native-round rollover. */
+  nativeInputIdsForRun(runId: string): string[] {
+    const row = this.database
+      .select({ nativeTurnId: agentRuns.nativeTurnId, json: agentRuns.nativeInputIdsJson })
+      .from(agentRuns)
+      .where(eq(agentRuns.id, runId))
+      .get()
+    if (!row) return []
+    if (Buffer.byteLength(row.json) > 8192)
+      throw new RunOperationConflictError(
+        'The native input identity receipt exceeds its existing history budget.',
+      )
+    const value: unknown = JSON.parse(row.json)
+    if (
+      !Array.isArray(value) ||
+      value.length > 64 ||
+      value.some((id) => typeof id !== 'string' || !id.length || id.length > 1024) ||
+      new Set(value).size !== value.length
+    )
+      throw new RunOperationConflictError('The native input identity receipt is invalid.')
+    const ids: string[] = []
+    for (const id of value) {
+      if (typeof id !== 'string')
+        throw new RunOperationConflictError('The native input identity receipt is invalid.')
+      ids.push(id)
+    }
+    return ids.length ? ids : row.nativeTurnId ? [row.nativeTurnId] : []
+  }
+
+  private activeSteerInputs(runId: string) {
+    // Literal predicate matches the existing partial index and excludes unbounded refused retries.
+    const rows = this.database.all<{
+      operationId: string
+      inputId: string | null
+      revision: number
+      state: string
+      sessionId: string
+      bindingGeneration: number | null
+      nativeTurnId: string | null
+      executorId: string | null
+    }>(sql`SELECT id AS operationId,input_id AS inputId,input_revision AS revision,state,
+      session_id AS sessionId,binding_generation AS bindingGeneration,
+      native_turn_id AS nativeTurnId,executor_id AS executorId
+      FROM conversation_queue_operations INDEXED BY conversation_queue_operations_active_grant_idx
+      WHERE target_run_id=${runId} AND kind='steer'
+      AND state IN ('prepared','possibly_sent','accepted','consumed','unknown')
+      ORDER BY input_revision LIMIT 65`)
+    if (rows.length > 64)
+      throw new RunOperationConflictError(
+        'Native input history exceeds its existing receipt capacity.',
+      )
+    return rows
+  }
+
+  unresolvedSteerInputs(runId: string) {
+    return this.activeSteerInputs(runId).filter((entry) =>
+      ['possibly_sent', 'accepted', 'unknown'].includes(entry.state),
+    )
+  }
+
+  recordQueuedSteerConsumption(
+    proof: {
+      runId: string
+      sessionId: string
+      nativeSessionId: string
+      nativeTurnId: string
+      bindingGeneration: number
+      executorId?: string | undefined
+    },
+    inputId: string,
+    invocation?: FrozenSkillInvocation,
+  ): ConversationPatch {
+    return this.database.transaction(() => {
+      const run = this.findRun(proof.runId)
+      const op = this.activeSteerInputs(proof.runId).find(
+        (entry) =>
+          entry.inputId === inputId &&
+          ['possibly_sent', 'accepted', 'unknown', 'consumed'].includes(entry.state),
+      )
+      if (
+        !run ||
+        !op ||
+        run.sessionId !== proof.sessionId ||
+        op.sessionId !== proof.sessionId ||
+        run.nativeSessionId !== proof.nativeSessionId ||
+        run.nativeTurnId !== proof.nativeTurnId ||
+        run.bindingGeneration !== proof.bindingGeneration ||
+        op.bindingGeneration !== proof.bindingGeneration ||
+        op.nativeTurnId !== proof.nativeTurnId ||
+        (run.executorId ?? undefined) !== proof.executorId ||
+        (op.executorId ?? undefined) !== proof.executorId
+      )
+        throw new RunOperationConflictError(
+          'The native input receipt does not match its original execution.',
+        )
+      if (op.state === 'consumed') return this.createPatch(proof.sessionId)
+      // The original native User has this UUID too. It cannot prove that a
+      // legacy supplemental intent arrived; leave that intent unresolved.
+      if (inputId === run.id) return this.createPatch(proof.sessionId)
+      const patch = this.markQueuedSteerConsumed(op.operationId, inputId, invocation)
+      return { ...patch, resync: { messages: true, drafts: true, activityRunIds: [] } }
+    })
+  }
+
+  /** Receipt-only duplicate RPC recovery; never requires a still-active native Run. */
+  queuedSteerReceipt(
+    input: ConversationQueueActionInput,
+    consumedByRunId?: string,
+  ): ConversationPatch | undefined {
+    const op = this.database
+      .select()
+      .from(conversationQueueOperations)
+      .where(eq(conversationQueueOperations.id, input.operationId))
+      .get()
+    if (!op) return undefined
+    if (
+      op.kind !== 'steer' ||
+      op.sessionId !== input.sessionId ||
+      op.inputId !== input.inputId ||
+      op.expectedRevision !== input.expectedRevision
+    )
+      throw new RunOperationConflictError('This operation belongs to a different queue action.')
+    if (
+      consumedByRunId !== undefined &&
+      (op.targetRunId !== consumedByRunId || op.state !== 'consumed')
+    )
+      return undefined
+    return this.createPatch(input.sessionId)
+  }
+
+  prepareQueuedSteer(
+    input: ConversationQueueActionInput,
+    target: { runId: string; bindingGeneration: number; nativeTurnId: string; executorId?: string },
+    invocation?: FrozenSkillInvocation,
+  ) {
+    return this.database.transaction(() => {
+      const checked = this.queueOperation(input, 'steer')
+      if (checked.old) {
+        if (
+          checked.old.targetRunId !== target.runId ||
+          checked.old.bindingGeneration !== target.bindingGeneration ||
+          checked.old.nativeTurnId !== target.nativeTurnId
+        )
+          throw new RunOperationConflictError(
+            'This Steer operation belongs to a different execution.',
+          )
+        return {
+          created: false,
+          state: checked.old.state,
+          operationId: checked.old.id,
+          inputId: input.inputId,
+          inputRevision: checked.old.inputRevision!,
+          resultNonce: checked.old.resultNonce!,
+          runId: target.runId,
+          bindingGeneration: target.bindingGeneration,
+        }
+      }
+      const row = checked.row!,
+        run = this.findRun(target.runId)
+      if (
+        !run ||
+        run.sessionId !== input.sessionId ||
+        run.agentId !== row.actor ||
+        run.bindingGeneration !== target.bindingGeneration ||
+        run.nativeTurnId !== target.nativeTurnId ||
+        run.dispatchPhase === 'ended' ||
+        !['starting', 'running'].includes(run.status) ||
+        (target.executorId && run.executorId !== target.executorId) ||
+        row.queueState === 'dispatching' ||
+        row.queueState === 'unknown'
+      )
+        throw new RunOperationConflictError(
+          'The target execution changed before Steer. This message remains queued.',
+        )
+      const meta = collaborationReceivedMetadataSchema.parse(JSON.parse(row.metadataJson))
+      if (input.inputId === run.id)
+        throw new RunOperationConflictError(
+          'The supplemental input reuses the original native request identity. It remains queued.',
+        )
+      if (invocation) {
+        if (!isDeepStrictEqual(invocation.selections, meta.skills))
+          throw new RunOperationConflictError('The frozen Skill selections changed before Steer.')
+        const { arguments: _arguments, ...metadata } = frozenSkillInvocationSchema.parse(invocation)
+        meta.steerSkillInvocation = this.saveCollaborationDocument(run.id, JSON.stringify(metadata))
+        const json = JSON.stringify(meta)
+        if (Buffer.byteLength(json) > 64 * 1024)
+          throw new RunOperationConflictError('Received metadata exceeds 64 KiB.')
+        this.database
+          .update(collaborationInputs)
+          .set({ metadataJson: json })
+          .where(eq(collaborationInputs.id, row.id))
+          .run()
+      }
+      if (
+        meta.workflowCommand ||
+        meta.route?.type === 'all' ||
+        row.taskId !== (run.collaboration?.taskId ?? null)
+      )
+        throw new RunOperationConflictError(
+          'This input cannot be steered into the target execution.',
+        )
+      const frozen = this.database
+        .select()
+        .from(collaborationTurns)
+        .where(eq(collaborationTurns.runId, run.id))
+        .get()
+      if (frozen?.pendingEnvelopeBodyId || frozen?.nativeEnvelopeBodyId || frozen?.resultJson)
+        throw new RunOperationConflictError(
+          'This execution is already submitting its result. The message remains queued.',
+        )
+      const reservedNativeInputs = this.database
+        .select({ count: sql<number>`count(*)` })
+        .from(conversationQueueOperations)
+        .where(
+          and(
+            eq(conversationQueueOperations.targetRunId, run.id),
+            eq(conversationQueueOperations.kind, 'steer'),
+            inArray(conversationQueueOperations.state, [
+              'prepared',
+              'possibly_sent',
+              'accepted',
+              'consumed',
+              'unknown',
+            ]),
+          ),
+        )
+        .get()!.count
+      if (reservedNativeInputs >= 63)
+        throw new RunOperationConflictError(
+          'This execution reached its native input history budget. The message remains queued for the next execution.',
+        )
+      const unresolved = this.latestSteerGrant(run.id)
+      if (unresolved && !['accepted', 'consumed'].includes(unresolved.state))
+        throw new RunOperationConflictError('A previous input delivery is unresolved.')
+      const batch = this.database
+        .select()
+        .from(conversationInputBatches)
+        .where(eq(conversationInputBatches.clientMessageId, row.id))
+        .get()
+      if (!batch || batch.actor !== run.agentId)
+        throw new RunOperationConflictError(
+          'The frozen input manifest does not match this execution.',
+        )
+      const wrongResolver = this.database
+        .select({ id: conversationInputBatchMembers.memberId })
+        .from(conversationInputBatchMembers)
+        .where(
+          and(
+            eq(conversationInputBatchMembers.batchId, batch.id),
+            isNotNull(conversationInputBatchMembers.answerResolver),
+            ne(conversationInputBatchMembers.answerResolver, run.agentId),
+          ),
+        )
+        .limit(1)
+        .get()
+      if (wrongResolver)
+        throw new RunOperationConflictError(
+          'This answer belongs to another Agent and remains queued.',
+        )
+      const revision =
+        (this.database
+          .select({ value: max(conversationQueueOperations.inputRevision) })
+          .from(conversationQueueOperations)
+          .where(eq(conversationQueueOperations.targetRunId, run.id))
+          .get()?.value ?? 0) + 1
+      const resultNonce = randomUUID(),
+        now = new Date().toISOString()
+      this.saveQueueOperation(input, 'steer', 'prepared')
+      const body = this.database
+        .select()
+        .from(conversationBodyInputs)
+        .where(eq(conversationBodyInputs.id, row.inputId))
+        .get()
+      if (!body?.sealed || body.hash !== row.digest)
+        throw new RunOperationConflictError('The frozen body changed before Steer.')
+      const source = this.saveCollaborationDocument(run.id, this.readBody(body, true).text)
+      this.database
+        .update(conversationInputBatches)
+        .set({ bodyDocumentJson: JSON.stringify(source) })
+        .where(eq(conversationInputBatches.id, batch.id))
+        .run()
+      this.sealInputBatchSources(batch.id, run.id)
+      const scope = row.taskId
+        ? this.saveCollaborationDocument(
+            run.id,
+            JSON.stringify({
+              kind: 'required_inputs',
+              runId: run.id,
+              taskId: row.taskId,
+              inputRevision: revision,
+            }),
+          )
+        : undefined
+      this.database
+        .update(conversationQueueOperations)
+        .set({
+          targetRunId: run.id,
+          bindingGeneration: target.bindingGeneration,
+          nativeTurnId: target.nativeTurnId,
+          executorId: target.executorId ?? run.executorId ?? null,
+          inputRevision: revision,
+          resultNonce,
+          batchId: batch.id,
+          inputScopeJson: scope ? JSON.stringify(scope) : null,
+          updatedAt: now,
+        })
+        .where(eq(conversationQueueOperations.id, input.operationId))
+        .run()
+      if (row.taskId) {
+        this.database.run(
+          sql`INSERT INTO collaboration_required_input_members(run_id,batch_id,member_id,input_revision) SELECT ${run.id},${batch.id},member_id,${revision} FROM conversation_input_batch_members WHERE batch_id=${batch.id} ON CONFLICT(run_id,batch_id,member_id) DO UPDATE SET input_revision=excluded.input_revision,active=1`,
+        )
+        this.database
+          .insert(collaborationRequiredInputMembers)
+          .values({ runId: run.id, batchId: batch.id, memberId: '$body', inputRevision: revision })
+          .onConflictDoUpdate({
+            target: [
+              collaborationRequiredInputMembers.runId,
+              collaborationRequiredInputMembers.batchId,
+              collaborationRequiredInputMembers.memberId,
+            ],
+            set: { inputRevision: revision, active: true },
+          })
+          .run()
+      }
+      this.database
+        .update(collaborationInputs)
+        .set({ queueState: 'dispatching', queueReason: 'Delivering to the current execution.' })
+        .where(eq(collaborationInputs.id, row.id))
+        .run()
+      this.advanceQueue(input.sessionId)
+      this.nativeFact(run.id, 'conversation.steer_prepared', {
+        operationId: input.operationId,
+        inputId: row.id,
+        inputRevision: revision,
+        bindingGeneration: target.bindingGeneration,
+        nativeTurnId: target.nativeTurnId,
+      })
+      return {
+        created: true,
+        state: 'prepared' as const,
+        operationId: input.operationId,
+        inputId: row.id,
+        inputRevision: revision,
+        resultNonce,
+        runId: run.id,
+        bindingGeneration: target.bindingGeneration,
+      }
+    })
+  }
+
+  markQueuedSteerPossiblySent(operationId: string): ConversationPatch {
+    return this.transitionQueuedSteer(operationId, 'possibly_sent')
+  }
+
+  markQueuedSteerUnknown(
+    operationId: string,
+    reason = 'Delivery is uncertain. Resolve the original execution before continuing.',
+  ): ConversationPatch {
+    return this.transitionQueuedSteer(operationId, 'unknown', reason)
+  }
+
+  markQueuedSteerRefused(
+    operationId: string,
+    reason = 'The provider did not accept this input. It remains queued.',
+    provenNativeRejection = false,
+  ): ConversationPatch {
+    return this.transitionQueuedSteer(operationId, 'refused', reason, provenNativeRejection)
+  }
+
+  private transitionQueuedSteer(
+    operationId: string,
+    state: 'possibly_sent' | 'unknown' | 'refused',
+    reason?: string,
+    provenNativeRejection = false,
+  ): ConversationPatch {
+    return this.database.transaction(() => {
+      const op = this.database
+        .select()
+        .from(conversationQueueOperations)
+        .where(
+          and(
+            eq(conversationQueueOperations.id, operationId),
+            eq(conversationQueueOperations.kind, 'steer'),
+          ),
+        )
+        .get()
+      if (!op?.inputId || !op.targetRunId)
+        throw new RunOperationConflictError('The durable Steer intent is unavailable.')
+      if (op.state === state) return this.createPatch(op.sessionId)
+      if (state === 'refused' && op.state !== 'prepared' && !provenNativeRejection)
+        throw new RunOperationConflictError(
+          'Possibly delivered input cannot be automatically requeued.',
+        )
+      if (op.state === 'accepted' || op.state === 'consumed' || op.state === 'refused')
+        throw new RunOperationConflictError('The Steer delivery was already settled.')
+      const row = this.database
+        .select()
+        .from(collaborationInputs)
+        .where(eq(collaborationInputs.id, op.inputId))
+        .get()
+      const historical =
+        row?.queueState === 'removed' ||
+        this.findRun(op.targetRunId)?.controlDisposition === 'abandoned'
+      this.database
+        .update(conversationQueueOperations)
+        .set({ state, updatedAt: new Date().toISOString() })
+        .where(eq(conversationQueueOperations.id, operationId))
+        .run()
+      if (!historical)
+        this.database
+          .update(collaborationInputs)
+          .set({
+            queueState:
+              state === 'refused' ? 'paused' : state === 'unknown' ? 'unknown' : 'dispatching',
+            queueReason: reason?.slice(0, 512) ?? null,
+          })
+          .where(eq(collaborationInputs.id, op.inputId))
+          .run()
+      if (state === 'refused' && !historical)
+        this.database
+          .update(collaborationRequiredInputMembers)
+          .set({ active: false })
+          .where(
+            and(
+              eq(collaborationRequiredInputMembers.runId, op.targetRunId),
+              eq(collaborationRequiredInputMembers.inputRevision, op.inputRevision!),
+            ),
+          )
+          .run()
+      if (!historical) this.advanceQueue(op.sessionId)
+      this.nativeFact(op.targetRunId, `conversation.steer_${state}`, {
+        operationId,
+        inputId: op.inputId,
+        inputRevision: op.inputRevision,
+        historical,
+      })
+      return this.createPatch(op.sessionId)
+    })
+  }
+
+  markQueuedSteerAccepted(
+    operationId: string,
+    skillInvocation?: FrozenSkillInvocation,
+  ): ConversationPatch {
+    return this.database.transaction(() => {
+      const op = this.database
+        .select()
+        .from(conversationQueueOperations)
+        .where(
+          and(
+            eq(conversationQueueOperations.id, operationId),
+            eq(conversationQueueOperations.kind, 'steer'),
+          ),
+        )
+        .get()
+      if (!op?.inputId || !op.targetRunId || !op.batchId)
+        throw new RunOperationConflictError('The durable Steer intent is unavailable.')
+      if (op.state === 'accepted' || op.state === 'consumed') return this.createPatch(op.sessionId)
+      if (!['prepared', 'possibly_sent', 'unknown'].includes(op.state))
+        throw new RunOperationConflictError('This Steer intent was already refused.')
+      const row = this.database
+        .select()
+        .from(collaborationInputs)
+        .where(eq(collaborationInputs.id, op.inputId))
+        .get()
+      const run = this.findRun(op.targetRunId)
+      if (
+        !row ||
+        !run ||
+        row.sessionId !== op.sessionId ||
+        row.actor !== run.agentId ||
+        run.bindingGeneration !== op.bindingGeneration ||
+        run.nativeTurnId !== op.nativeTurnId ||
+        run.sessionId !== op.sessionId ||
+        (op.executorId && run.executorId !== op.executorId)
+      )
+        throw new RunOperationConflictError(
+          'The accepted input no longer matches the original execution. Its intent remains saved.',
+        )
+      if (run.controlDisposition === 'abandoned') {
+        // Native acknowledgement is an archival fact, never authority over a replacement binding.
+        this.database
+          .update(conversationQueueOperations)
+          .set({ state: 'accepted', updatedAt: new Date().toISOString() })
+          .where(eq(conversationQueueOperations.id, operationId))
+          .run()
+        this.nativeFact(run.id, 'conversation.steer_accepted', {
+          operationId,
+          inputId: row.id,
+          inputRevision: op.inputRevision,
+          batchId: op.batchId,
+          historical: true,
+        })
+        return this.createPatch(op.sessionId)
+      }
+      const received = this.readReceivedInput(op.sessionId)
+      if (!received || received.id !== row.id)
+        throw new RunOperationConflictError('The accepted input source changed.')
+      if (
+        !skillInvocation &&
+        (received.metadata.steerSkillInvocation ||
+          received.metadata.skills.length ||
+          parseComposerCommandPrefix(received.content, received.metadata.skills).skills.length)
+      ) {
+        const source = received.metadata.steerSkillInvocation
+        if (!source)
+          throw new RunOperationConflictError(
+            'The frozen native Skill invocation is unavailable. Original delivery remains saved.',
+          )
+        const metadata: unknown = JSON.parse(this.collaborationDocumentText(op.sessionId, source))
+        if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata))
+          throw new RunOperationConflictError('The frozen native Skill invocation changed.')
+        skillInvocation = frozenSkillInvocationSchema.parse({
+          ...metadata,
+          arguments: skillArguments(received.content, received.metadata.skills),
+        })
+      }
+      const route = this.queueRoute(row),
+        now = new Date().toISOString()
+      const sequence =
+        (this.database
+          .select({ value: max(conversationMessages.sequence) })
+          .from(conversationMessages)
+          .where(eq(conversationMessages.sessionId, op.sessionId))
+          .get()?.value ?? -1) + 1
+      this.database
+        .insert(conversationMessages)
+        .values({
+          id: row.id,
+          sessionId: op.sessionId,
+          runId: run.id,
+          role: 'user',
+          routeKind: route.type,
+          routeAgentsJson: JSON.stringify([run.agentId]),
+          content: received.content,
+          state: 'complete',
+          sequence,
+          skillInvocationJson: skillInvocation ? JSON.stringify(skillInvocation) : null,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run()
+      const frozenSourceId = freezeOutputAtSteer(this.database, run, row.id)
+      this.database
+        .update(conversationInputBatches)
+        .set({ runId: run.id, messageId: row.id })
+        .where(eq(conversationInputBatches.id, op.batchId))
+        .run()
+      this.database
+        .update(anchoredComments)
+        .set({ sentWithMessageId: row.id, pendingReceiptId: null, updatedAt: now })
+        .where(eq(anchoredComments.pendingReceiptId, row.id))
+        .run()
+      for (const [ordinal, imageId] of received.metadata.imageIds.entries())
+        this.database
+          .insert(conversationMessageImages)
+          .values({ messageId: row.id, ordinal, imageId })
+          .run()
+      this.database
+        .update(conversationImageAssets)
+        .set({ pendingReceiptId: null, committed: true })
+        .where(eq(conversationImageAssets.pendingReceiptId, row.id))
+        .run()
+      this.database
+        .update(conversationBodyInputs)
+        .set({ committedMessageId: row.id, pendingReceiptId: null })
+        .where(eq(conversationBodyInputs.id, row.inputId))
+        .run()
+      this.database
+        .update(collaborationInputs)
+        .set({
+          state: 'materialized',
+          materializedRunId: run.id,
+          queueState: 'delivered',
+          queueReason: null,
+        })
+        .where(eq(collaborationInputs.id, row.id))
+        .run()
+      this.database
+        .update(conversationQueueOperations)
+        .set({ state: 'accepted', messageId: row.id, updatedAt: now })
+        .where(eq(conversationQueueOperations.id, operationId))
+        .run()
+      this.database
+        .insert(conversationRunSourceRefs)
+        .values({
+          runId: run.id,
+          sourceMessageId: row.id,
+          sourceRevision: 0,
+          batchId: op.batchId,
+          documentsJson: '[]',
+        })
+        .onConflictDoNothing()
+        .run()
+      const task = this.collaboration(op.sessionId)
+      if (task?.runId === run.id) {
+        task.authorization = this.collaborationTurnAuthorization(run.id)
+        task.requiredInputScopeRef = task.authorization?.requiredInputScopeRef ?? undefined
+        task.inputSequence = task.authorization?.inputSequence ?? task.inputSequence
+        task.revision++
+        this.saveCollaboration(task)
+      }
+      this.advanceQueue(op.sessionId)
+      this.nativeFact(run.id, 'conversation.steer_accepted', {
+        operationId,
+        inputId: row.id,
+        inputRevision: op.inputRevision,
+        batchId: op.batchId,
+      })
+      return this.createPatch(op.sessionId, {
+        messages: [
+          ...(frozenSourceId ? [this.messageChange(frozenSourceId, 'metadata')] : []),
+          this.messageChange(row.id, 'replace'),
+        ],
+        runs: [this.findRun(run.id)!],
+        runContexts: [outputRunContext(this.database, run.id)!],
+        resync: { messages: false, drafts: true, activityRunIds: [] },
+      })
+    })
+  }
+
+  /** Exact native input UUID consumption is distinct from a transport acknowledgement. */
+  markQueuedSteerConsumed(
+    operationId: string,
+    nativeInputId: string,
+    skillInvocation?: FrozenSkillInvocation,
+  ): ConversationPatch {
+    return this.database.transaction(() => {
+      const op = this.database
+        .select()
+        .from(conversationQueueOperations)
+        .where(
+          and(
+            eq(conversationQueueOperations.id, operationId),
+            eq(conversationQueueOperations.kind, 'steer'),
+          ),
+        )
+        .get()
+      if (!op?.inputId || nativeInputId !== op.inputId)
+        throw new RunOperationConflictError(
+          'The native input UUID does not match the durable Steer intent.',
+        )
+      if (op.state === 'consumed') return this.createPatch(op.sessionId)
+      if (!['prepared', 'possibly_sent', 'unknown', 'accepted'].includes(op.state))
+        throw new RunOperationConflictError(
+          'This native input is no longer eligible for consumption.',
+        )
+      if (op.state !== 'accepted') this.markQueuedSteerAccepted(operationId, skillInvocation)
+      this.database
+        .update(conversationQueueOperations)
+        .set({ state: 'consumed', updatedAt: new Date().toISOString() })
+        .where(eq(conversationQueueOperations.id, operationId))
+        .run()
+      const savedIds = this.nativeInputIdsForRun(op.targetRunId!)
+      const root = savedIds[0] ?? op.nativeTurnId!
+      const consumed = this.database
+        .select({ id: conversationQueueOperations.inputId })
+        .from(conversationQueueOperations)
+        .where(
+          and(
+            eq(conversationQueueOperations.targetRunId, op.targetRunId!),
+            eq(conversationQueueOperations.kind, 'steer'),
+            eq(conversationQueueOperations.state, 'consumed'),
+          ),
+        )
+        .orderBy(asc(conversationQueueOperations.inputRevision))
+        .limit(64)
+        .all()
+      const inputIds = [root]
+      for (const entry of consumed)
+        if (entry.id && !inputIds.includes(entry.id)) inputIds.push(entry.id)
+      if (inputIds.length > 64)
+        throw new RunOperationConflictError(
+          'The native input history budget is occupied. Original input evidence remains saved.',
+        )
+      this.database
+        .update(agentRuns)
+        .set({ nativeInputIdsJson: JSON.stringify(inputIds) })
+        .where(eq(agentRuns.id, op.targetRunId!))
+        .run()
+      this.nativeFact(op.targetRunId!, 'conversation.steer_consumed', {
+        operationId,
+        inputId: nativeInputId,
+        inputRevision: op.inputRevision,
+      })
+      const updatedRun = this.findRun(op.targetRunId!)
+      const context = outputRunContext(this.database, op.targetRunId!)
+      return this.createPatch(op.sessionId, {
+        ...(updatedRun ? { runs: [updatedRun] } : {}),
+        ...(context ? { runContexts: [context] } : {}),
+      })
+    })
+  }
+
+  readQueuedInputSource(
+    input: Extract<ConversationGetInput, { scope: 'queued-input' }>,
+  ): Extract<ConversationPage, { scope: 'queued-input' }> {
+    const row = this.database
+      .select()
+      .from(collaborationInputs)
+      .where(
+        and(
+          eq(collaborationInputs.id, input.inputId),
+          eq(collaborationInputs.sessionId, input.sessionId),
+        ),
+      )
+      .get()
+    const returned =
+      input.source === 'returned' && input.operationId
+        ? this.database
+            .select()
+            .from(conversationQueueOperations)
+            .where(
+              and(
+                eq(conversationQueueOperations.id, input.operationId),
+                eq(conversationQueueOperations.sessionId, input.sessionId),
+                eq(conversationQueueOperations.inputId, input.inputId),
+                inArray(conversationQueueOperations.state, ['returned', 'installed']),
+              ),
+            )
+            .get()
+        : undefined
+    if (
+      !row ||
+      (input.source === 'returned' ? !returned : !['accepted', 'blocked'].includes(row.state))
+    )
+      throw new RunOperationConflictError('The requested queue source is unavailable.')
+    const body = this.database
+      .select()
+      .from(conversationBodyInputs)
+      .where(eq(conversationBodyInputs.id, row.inputId))
+      .get()
+    if (!body?.sealed || body.hash !== row.digest || input.offset > body.chars)
+      throw new RunOperationConflictError('The queued body or cursor changed.')
+    const start =
+      this.database
+        .select({ offset: conversationBodyParts.offset })
+        .from(conversationBodyParts)
+        .where(
+          and(
+            eq(conversationBodyParts.inputId, body.id),
+            lte(conversationBodyParts.offset, input.offset),
+          ),
+        )
+        .orderBy(desc(conversationBodyParts.offset))
+        .limit(1)
+        .get()?.offset ?? 0
+    const parts = this.database
+      .select()
+      .from(conversationBodyParts)
+      .where(
+        and(eq(conversationBodyParts.inputId, body.id), gte(conversationBodyParts.offset, start)),
+      )
+      .orderBy(asc(conversationBodyParts.offset))
+      .limit(2)
+      .all()
+    const available = parts
+      .map((part) => part.text)
+      .join('')
+      .slice(input.offset - start)
+    if (/[\uDC00-\uDFFF]/u.test(available[0] ?? ''))
+      throw new RunOperationConflictError('The queued body cursor splits a character.')
+    let text = available.slice(0, 4096)
+    if (/[\uD800-\uDBFF]/u.test(text.at(-1) ?? '')) text = text.slice(0, -1)
+    if (input.offset < body.chars && !text)
+      throw new RunOperationConflictError('The queued body has a missing segment.')
+    const meta = collaborationReceivedMetadataSchema.parse(JSON.parse(row.metadataJson))
+    const sourceComments = this.database
+      .select()
+      .from(anchoredComments)
+      .where(
+        and(
+          eq(anchoredComments.sessionId, input.sessionId),
+          eq(anchoredComments.pendingReceiptId, row.id),
+          gt(anchoredComments.position, input.commentsAfterPosition ?? -1),
+        ),
+      )
+      .orderBy(asc(anchoredComments.position))
+      .limit(CONVERSATION_PAGE_ITEMS + 1)
+      .all()
+    const comments: AnchoredComment[] = []
+    for (const comment of sourceComments.slice(0, CONVERSATION_PAGE_ITEMS)) {
+      const next = ConversationRepository.toComment(comment)
+      if (
+        Buffer.byteLength(JSON.stringify([...comments, next])) >
+        CONVERSATION_PAGE_BYTES - 64 * 1024
+      ) {
+        if (!comments.length) throw new OversizedConversationEntityError()
+        break
+      }
+      comments.push(next)
+    }
+    const batch = this.database
+      .select({ id: conversationInputBatches.id })
+      .from(conversationInputBatches)
+      .where(eq(conversationInputBatches.clientMessageId, row.id))
+      .get()
+    const page: Extract<ConversationPage, { scope: 'queued-input' }> = {
+      scope: 'queued-input',
+      source: input.source,
+      offset: input.offset,
+      sessionId: input.sessionId,
+      inputId: input.inputId,
+      ...(input.operationId ? { operationId: input.operationId } : {}),
+      text,
+      nextOffset: input.offset + text.length,
+      hasMore: input.offset + text.length < body.chars,
+      comments,
+      commentsNextPosition:
+        sourceComments.length > comments.length ? (comments.at(-1)?.position ?? null) : null,
+      route: this.queueRoute(row),
+      ...(batch ? { batchId: batch.id } : {}),
+      ...(input.offset === 0
+        ? { images: this.resolveMessageImages(input.sessionId, meta.imageIds), skills: meta.skills }
+        : {}),
+      ...(meta.planningAction ? { planningAction: meta.planningAction } : {}),
+    }
+    while (!ConversationRepository.fitsPage(page) && comments.length) comments.pop()
+    page.commentsNextPosition =
+      sourceComments.length > comments.length ? (comments.at(-1)?.position ?? null) : null
+    if (
+      !ConversationRepository.fitsPage(page) ||
+      (sourceComments.length > 0 && comments.length === 0)
+    )
+      throw new OversizedConversationEntityError()
+    return page
+  }
+
   receivedCollaborationInput(sessionId: string, includeCancelled = false) {
     return this.database
       .select()
@@ -3539,7 +5307,10 @@ export class ConversationRepository {
         and(
           eq(collaborationInputs.sessionId, sessionId),
           includeCancelled
-            ? ne(collaborationInputs.state, 'materialized')
+            ? and(
+                ne(collaborationInputs.state, 'materialized'),
+                sql`NOT EXISTS (SELECT 1 FROM ${conversationQueueOperations} WHERE ${conversationQueueOperations.inputId} = ${collaborationInputs.id} AND ${conversationQueueOperations.kind} = 'remove' AND ${conversationQueueOperations.targetRunId} IS NOT NULL AND ${conversationQueueOperations.state} = 'complete')`,
+              )
             : inArray(collaborationInputs.state, ['accepted', 'blocked']),
         ),
       )
@@ -3594,9 +5365,8 @@ export class ConversationRepository {
     policy: 'immediate_safe_point' | 'next_round',
     ownerKey: string,
     waitingForWork = false,
+    anchorRunId?: string,
   ): ConversationPatch {
-    const task = this.collaboration(input.sessionId)
-    if (!task) throw new RunOperationConflictError('The active collaboration task is unavailable.')
     return this.database.transaction(() => {
       assertSessionAvailable(this.database, input.sessionId)
       if (this.receivedCollaborationInput(input.sessionId))
@@ -3619,6 +5389,8 @@ export class ConversationRepository {
         .get()
       if (!session || session.commentsRevision !== input.expectedCommentsRevision)
         throw new RunOperationConflictError('Comment drafts changed before receipt.')
+      if (!session.queueEnabled)
+        throw new RunOperationConflictError('The queue is disabled. Your draft was preserved.')
       const freezeDrafts = input.freezeDrafts ?? true
       if (!freezeDrafts && input.commentIds.length)
         throw new RunOperationConflictError(
@@ -3649,12 +5421,25 @@ export class ConversationRepository {
         (input.inputId && input.inputId !== inputId)
       )
         throw new RunOperationConflictError('The received nonce has different body content.')
+      const source = this.readBody(body, true)
+      if (source.hash !== body.hash)
+        throw new RunOperationConflictError('The received body changed after sealing.')
+      const prefix = parseComposerCommandPrefix(source.text, input.skills)
+      if (prefix.error) throw new RunOperationConflictError(prefix.error)
+      const workflowCommand = Boolean(prefix.pact)
+      const candidate = this.collaboration(input.sessionId)
+      const anchor = anchorRunId ? this.findRun(anchorRunId) : undefined
+      const task =
+        !workflowCommand && (!anchor || anchor.collaboration?.taskId === candidate?.id)
+          ? candidate
+          : undefined
       const images = this.resolveMessageImages(input.sessionId, input.imageIds ?? [], ownerKey)
       if (!commentCount && !images.length && !this.bodyHasText(body))
         throw new RunOperationConflictError(
           'Write a message, add a Comment, or attach an image before sending.',
         )
       const metadata = JSON.stringify({
+        workflowCommand,
         skills: input.skills ?? [],
         imageIds: images.map((v) => v.id),
         commentIds: [],
@@ -3671,7 +5456,7 @@ export class ConversationRepository {
         clientMessageId: input.clientMessageId,
         commentsRevision: session.commentsRevision,
         actor,
-        taskId: task.id,
+        ...(task ? { taskId: task.id } : {}),
         inputId,
         preserveDraftComments: !freezeDrafts,
         ...(input.batchId ? { batchId: input.batchId } : {}),
@@ -3681,10 +5466,26 @@ export class ConversationRepository {
         .values({
           id: input.clientMessageId,
           sessionId: input.sessionId,
-          taskId: task.id,
-          anchorRunId: task.runId,
+          taskId: task?.id ?? null,
+          anchorRunId:
+            task?.runId ??
+            this.database
+              .select({ id: agentRuns.id })
+              .from(agentRuns)
+              .where(
+                and(
+                  eq(agentRuns.sessionId, input.sessionId),
+                  inArray(agentRuns.status, [...activeRunStatuses]),
+                ),
+              )
+              .get()?.id ??
+            input.clientMessageId,
+          preview: this.receivedBodyPreview(body.id),
+          queueRevision: session.queueRevision + 1,
+          queueState: 'queued',
+          queueReason: null,
           inputId,
-          digest: body.hash!,
+          digest: body.hash,
           actor,
           policy,
           metadataJson: metadata,
@@ -3723,7 +5524,11 @@ export class ConversationRepository {
           .run()
       this.database
         .update(sessions)
-        .set({ commentsRevision: session.commentsRevision + 1 })
+        .set({
+          commentsRevision: session.commentsRevision + 1,
+          queueRevision: session.queueRevision + 1,
+          queuePauseReason: null,
+        })
         .where(eq(sessions.id, input.sessionId))
         .run()
       this.database
@@ -3733,13 +5538,19 @@ export class ConversationRepository {
           and(eq(agentRuns.sessionId, input.sessionId), eq(agentRuns.peerProposalState, 'pending')),
         )
         .run()
-      task.revision++
-      this.saveCollaboration(task)
+      if (input.queueReturnOperationId) {
+        this.requireInstalledQueueReturn(input.sessionId, input.queueReturnOperationId)
+        this.consumeQueuedReturn(input.sessionId, input.queueReturnOperationId)
+      }
+      if (task) {
+        task.revision++
+        this.saveCollaboration(task)
+      }
       return this.createPatch(input.sessionId, {
         receivedInputIds: [input.clientMessageId],
         ...(waitingForWork ? { queuedInputIds: [input.clientMessageId] } : {}),
         resync: { messages: false, drafts: true, activityRunIds: [] },
-        runs: [this.findRun(task.runId)!],
+        runs: task ? [this.findRun(task.runId)!] : [],
         comments: {
           revision: session.commentsRevision + 1,
           upserts: [],
@@ -3757,7 +5568,12 @@ export class ConversationRepository {
         deadline: collaborationInputs.deadline,
       })
       .from(collaborationInputs)
-      .where(eq(collaborationInputs.state, 'accepted'))
+      .where(
+        and(
+          eq(collaborationInputs.state, 'accepted'),
+          eq(collaborationInputs.queueState, 'queued'),
+        ),
+      )
       .orderBy(asc(collaborationInputs.createdAt))
       .limit(5)
       .all()
@@ -3779,7 +5595,23 @@ export class ConversationRepository {
     const metadata = collaborationReceivedMetadataSchema.parse(JSON.parse(input.metadataJson))
     return {
       ...input,
-      content: read.text.trim(),
+      manuallyResumed: Boolean(
+        this.database
+          .select({ id: conversationQueueOperations.id })
+          .from(conversationQueueOperations)
+          .where(
+            and(
+              eq(conversationQueueOperations.sessionId, sessionId),
+              eq(conversationQueueOperations.inputId, input.id),
+              eq(conversationQueueOperations.kind, 'resume'),
+              eq(conversationQueueOperations.state, 'complete'),
+            ),
+          )
+          .orderBy(desc(conversationQueueOperations.createdAt))
+          .limit(1)
+          .get(),
+      ),
+      content: read.text,
       metadata,
       comments: [] as AnchoredComment[],
       inputBatchRef: this.database
@@ -3813,13 +5645,26 @@ export class ConversationRepository {
           throw new RunOperationConflictError('This received input is no longer available.')
         return this.metadataPatch(sessionId)
       }
+      if (row.queueState === 'dispatching' || row.queueState === 'unknown')
+        return this.metadataPatch(sessionId)
       if (state !== 'cancelled' && row.state === 'cancelled')
         throw new RunOperationConflictError(
           'Cancelled input cannot be reauthorized. Send a new message.',
         )
       this.database
         .update(collaborationInputs)
-        .set({ state, deadline: new Date(Date.now() + 10 * 60_000).toISOString() })
+        .set({
+          state,
+          ...(state === 'blocked'
+            ? {
+                queueState: 'paused' as const,
+                queueReason: 'Automatic queue delivery is paused. Resume when ready.',
+              }
+            : state === 'cancelled'
+              ? { queueState: 'removed' as const }
+              : {}),
+          deadline: new Date(Date.now() + 10 * 60_000).toISOString(),
+        })
         .where(eq(collaborationInputs.id, row.id))
         .run()
       if (state === 'cancelled') {
@@ -3830,6 +5675,7 @@ export class ConversationRepository {
           .get()
         if (batch) this.withdrawInputBatch(batch.id)
       }
+      this.advanceQueue(sessionId)
       const task = this.collaboration(sessionId)
       if (task) {
         task.revision++
@@ -3840,6 +5686,79 @@ export class ConversationRepository {
   }
 
   recoverCollaborationTasks(): void {
+    this.database
+      .update(collaborationInputs)
+      .set({
+        queueState: 'paused',
+        queueReason: 'Application restarted before delivery began. Resume when ready.',
+      })
+      .where(
+        sql`${collaborationInputs.id} IN (SELECT q.input_id FROM conversation_queue_operations q WHERE q.kind='steer' AND q.state='prepared')`,
+      )
+      .run()
+    this.database
+      .update(collaborationRequiredInputMembers)
+      .set({ active: false })
+      .where(
+        sql`${collaborationRequiredInputMembers.runId} IN (SELECT q.target_run_id FROM conversation_queue_operations q WHERE q.kind='steer' AND q.state='prepared') AND EXISTS (SELECT 1 FROM conversation_queue_operations q WHERE q.target_run_id=${collaborationRequiredInputMembers.runId} AND q.input_revision=${collaborationRequiredInputMembers.inputRevision} AND q.kind='steer' AND q.state='prepared')`,
+      )
+      .run()
+    this.database
+      .update(conversationQueueOperations)
+      .set({ state: 'refused' })
+      .where(
+        and(
+          eq(conversationQueueOperations.kind, 'steer'),
+          eq(conversationQueueOperations.state, 'prepared'),
+        ),
+      )
+      .run()
+    this.database
+      .update(collaborationInputs)
+      .set({
+        queueState: 'paused',
+        queueReason: 'Application restarted. Resume the queue when ready.',
+      })
+      .where(
+        and(
+          inArray(collaborationInputs.state, ['accepted', 'blocked']),
+          inArray(collaborationInputs.queueState, ['queued', 'paused']),
+        ),
+      )
+      .run()
+    this.database
+      .update(collaborationInputs)
+      .set({
+        queueState: 'unknown',
+        queueReason: 'Delivery was interrupted. Resolve the original delivery before continuing.',
+      })
+      .where(
+        and(
+          inArray(collaborationInputs.state, ['accepted', 'blocked']),
+          eq(collaborationInputs.queueState, 'dispatching'),
+        ),
+      )
+      .run()
+    this.database
+      .update(conversationQueueOperations)
+      .set({ state: 'unknown' })
+      .where(
+        and(
+          eq(conversationQueueOperations.kind, 'steer'),
+          eq(conversationQueueOperations.state, 'possibly_sent'),
+        ),
+      )
+      .run()
+    this.database
+      .update(sessions)
+      .set({
+        queuePauseReason: 'Application restarted. Resume the queue when ready.',
+        queueRevision: sql`${sessions.queueRevision} + 1`,
+      })
+      .where(
+        sql`${sessions.id} IN (SELECT i.session_id FROM collaboration_inputs i WHERE i.state IN ('accepted','blocked'))`,
+      )
+      .run()
     // One indexed SQL update: never materialize all task bodies at startup.
     this.database
       .update(collaborationTasks)
@@ -4047,6 +5966,7 @@ export class ConversationRepository {
   }
 
   naturalMessageProjection(messageId: string, sessionId: string): string | undefined {
+    if (outputSnapshotMetadata(this.database, messageId)?.frozen) return undefined
     const row = this.database
       .select({ id: collaborationTurns.answerProjectionBodyId })
       .from(conversationMessages)
@@ -4282,6 +6202,15 @@ export class ConversationRepository {
   }
 
   collaborationPromptState(task: CollaborationTask): CollaborationTask {
+    const effective = this.collaborationTurnAuthorization(task.runId)
+    if (effective)
+      task = {
+        ...task,
+        authorization: effective,
+        inputSequence: effective.inputSequence,
+        requiredInputScopeRef: effective.requiredInputScopeRef ?? undefined,
+      }
+
     if (task.reportRecovery)
       task = {
         ...task,
@@ -4369,8 +6298,10 @@ export class ConversationRepository {
     source: CollaborationDocument,
   ) {
     const auth = this.collaborationTurnAuthorization(runId)
-    if (!auth)
-      throw new RunOperationConflictError('The submitted result has no immutable authorization.')
+    if (!auth || !this.resultMatchesInputGrant(runId, result))
+      throw new RunOperationConflictError(
+        'The submitted result does not match the current immutable input obligation.',
+      )
     const digest = source.sha256
     const old = this.database
       .select()
@@ -4603,6 +6534,7 @@ export class ConversationRepository {
           .where(
             and(
               eq(collaborationRequiredInputMembers.runId, run.id),
+              eq(collaborationRequiredInputMembers.active, true),
               eq(conversationInputBatchMembers.commentId, sourceId),
               ne(conversationInputBatchMembers.state, 'withdrawn'),
               isNotNull(anchoredComments.sentWithMessageId),
@@ -4697,6 +6629,7 @@ export class ConversationRepository {
         .where(
           and(
             eq(collaborationRequiredInputMembers.runId, run.id),
+            eq(collaborationRequiredInputMembers.active, true),
             eq(anchoredComments.id, sourceId),
             isNotNull(anchoredComments.sentWithMessageId),
           ),
@@ -4706,7 +6639,7 @@ export class ConversationRepository {
       const bodySource = this.database.get<{
         found: number
       }>(sql`SELECT 1 AS found FROM collaboration_required_input_members r
-        JOIN conversation_input_batches b ON b.id=r.batch_id WHERE r.run_id=${run.id} AND r.member_id='$body' AND b.message_id=${sourceId} LIMIT 1`)
+        JOIN conversation_input_batches b ON b.id=r.batch_id WHERE r.run_id=${run.id} AND r.active=1 AND r.member_id='$body' AND b.message_id=${sourceId} LIMIT 1`)
       const historical = this.database
         .select({ member: conversationInputBatchMembers, batch: conversationInputBatches })
         .from(conversationInputBatchMembers)
@@ -5000,11 +6933,11 @@ export class ConversationRepository {
       memberId: string
     }>(sql`SELECT r.member_id AS memberId FROM collaboration_required_input_members r
       LEFT JOIN collaboration_result_input_responses s ON s.run_id=r.run_id AND s.batch_id=r.batch_id AND s.member_id=r.member_id
-      WHERE r.run_id=${run.id} AND s.member_id IS NULL LIMIT 1`)
+      WHERE r.run_id=${run.id} AND r.active=1 AND s.member_id IS NULL LIMIT 1`)
     const foreign = this.database.get<{
       memberId: string
     }>(sql`SELECT s.member_id AS memberId FROM collaboration_result_input_responses s
-      LEFT JOIN collaboration_required_input_members r ON r.run_id=s.run_id AND r.batch_id=s.batch_id AND r.member_id=s.member_id
+      LEFT JOIN collaboration_required_input_members r ON r.run_id=s.run_id AND r.batch_id=s.batch_id AND r.member_id=s.member_id AND r.active=1
       WHERE s.run_id=${run.id} AND r.member_id IS NULL LIMIT 1`)
     if (missing || foreign)
       throw new RunOperationConflictError(
@@ -5202,10 +7135,15 @@ export class ConversationRepository {
         task.actor !== run.agentId ||
         run.dispatchPhase !== 'ended' ||
         run.nativeOutcome !== 'completed' ||
+        !this.hasCompleteResponse(runId) ||
         run.controlDisposition === 'abandoned'
       )
         throw new RunOperationConflictError(
           'Only the matching completed Native Turn can settle its submitted result.',
+        )
+      if (!this.resultMatchesInputGrant(runId, indexed.manifest.header))
+        throw new RunOperationConflictError(
+          'The result predates appended input or delivery is unresolved.',
         )
       if (indexed.row.state === 'applied') return this.collaboration(task.sessionId) ?? task
       if (indexed.row.state !== 'archived')
@@ -5363,6 +7301,24 @@ export class ConversationRepository {
         .where(eq(collaborationTasks.id, task.id))
         .run()
       const processedWatermark = this.applyIndexedInputResponses(prepared, run)
+      const provenInputs = this.database
+        .select({
+          operationId: conversationQueueOperations.id,
+          inputId: conversationQueueOperations.inputId,
+        })
+        .from(conversationQueueOperations)
+        .where(
+          and(
+            eq(conversationQueueOperations.targetRunId, runId),
+            eq(conversationQueueOperations.kind, 'steer'),
+            eq(conversationQueueOperations.state, 'accepted'),
+          ),
+        )
+        .orderBy(asc(conversationQueueOperations.inputRevision))
+        .limit(64)
+        .all()
+      for (const proven of provenInputs)
+        if (proven.inputId) this.markQueuedSteerConsumed(proven.operationId, proven.inputId)
       const counts = this.todoCounts(task.id)
       prepared.ledgerRevision = ledgerRevision
       prepared.ledgerOpenCount = counts.open
@@ -5510,6 +7466,24 @@ export class ConversationRepository {
     const run = this.findRun(runId)
     if (!run?.answerFormat) return
     this.database.transaction(() => {
+      const grant = this.latestSteerGrant(runId)
+      if (grant) {
+        const identity = carrierInputIdentity(text)
+        if (!this.resultMatchesInputGrant(runId, identity)) {
+          const source = this.archiveObsoleteSteerCarrier(runId, text)
+          if (
+            ['possibly_sent', 'unknown'].includes(grant.state) &&
+            identity?.inputRevision === grant.inputRevision &&
+            identity.resultNonce === grant.resultNonce
+          )
+            this.database
+              .update(conversationQueueOperations)
+              .set({ candidateCarrierJson: JSON.stringify(source) })
+              .where(eq(conversationQueueOperations.id, grant.id))
+              .run()
+          return
+        }
+      }
       const original = this.collaborationCarrierSource(run.sessionId, runId)
       const frozen = this.database
         .select({ source: collaborationTurns.nativeEnvelopeBodyId })
@@ -5533,19 +7507,28 @@ export class ConversationRepository {
   }
 
   /** Original Native carrier and natural display are separate from immutable Message proof. */
-  recordCollaborationCarrier(runId: string, carrier: unknown): void {
+  recordCollaborationCarrier(
+    runId: string,
+    carrier: unknown,
+    skillInvocation?: FrozenSkillInvocation,
+  ): ConversationPatch | undefined {
     const run = this.findRun(runId)
     if (!run?.answerFormat || !carrier || typeof carrier !== 'object' || Array.isArray(carrier))
-      return
+      return undefined
     const frozen = this.database
       .select()
       .from(collaborationTurns)
       .where(eq(collaborationTurns.runId, runId))
       .get()
-    if (!frozen) return
-    this.database.transaction(() => {
+    if (!frozen) return undefined
+    return this.database.transaction(() => {
+      const grant = this.latestSteerGrant(runId)
+      const candidate = grant?.candidateCarrierJson
+        ? collaborationDocumentSchema.parse(JSON.parse(grant.candidateCarrierJson))
+        : undefined
       const source =
         this.collaborationCarrierSource(run.sessionId, runId) ??
+        candidate ??
         this.saveCollaborationDocument(runId, JSON.stringify(carrier))
       // The parsed DTO is a projection of these saved Native bytes, never a second authority.
       const original: unknown = JSON.parse(this.collaborationDocumentText(run.sessionId, source))
@@ -5553,7 +7536,16 @@ export class ConversationRepository {
         throw new RunOperationConflictError(
           'The result does not match the original final submission.',
         )
-      const answer = Reflect.get(original, 'answer')
+      const result: unknown = Reflect.get(original, 'result')
+      const proofPatch = this.confirmSteerFinalEvidence(runId, result, skillInvocation)
+      if (!this.resultMatchesInputGrant(runId, result)) {
+        this.nativeFact(runId, 'conversation.steer_obsolete_carrier', {
+          sourceId: source.id,
+          sha256: source.sha256,
+        })
+        return undefined
+      }
+      const answer: unknown = Reflect.get(original, 'answer')
       const projection =
         typeof answer === 'string' && answer.trim()
           ? this.saveCollaborationDocument(runId, answer)
@@ -5563,6 +7555,7 @@ export class ConversationRepository {
         .set({ nativeEnvelopeBodyId: source.id, answerProjectionBodyId: projection?.id ?? null })
         .where(eq(collaborationTurns.runId, runId))
         .run()
+      return proofPatch
     })
   }
 
@@ -5672,6 +7665,10 @@ export class ConversationRepository {
       .where(eq(collaborationTurns.runId, runId))
       .get()
     if (!frozen) throw new RunOperationConflictError('The submitted report has no frozen duty.')
+    if (!this.resultMatchesInputGrant(runId, result)) {
+      this.archiveObsoleteSteerCarrier(runId, JSON.stringify(result))
+      return
+    }
     const parsed = this.verifiedCollaborationResult(run, result),
       json = JSON.stringify(parsed)
     if (frozen.resultJson) {
@@ -5820,6 +7817,10 @@ export class ConversationRepository {
       .get()
     if (!task || task.runId !== runId || task.status !== 'running' || !frozen)
       throw new RunOperationConflictError('The collaboration result belongs to a retired task.')
+    if (!this.resultMatchesInputGrant(runId, result)) {
+      this.archiveObsoleteSteerCarrier(runId, JSON.stringify(result))
+      return
+    }
     const parsed = this.verifiedCollaborationResult(run, result)
     if (
       frozen.resultJson &&
@@ -5853,6 +7854,10 @@ export class ConversationRepository {
         .from(collaborationTurns)
         .where(eq(collaborationTurns.runId, runId))
         .get()
+      if (complete && !this.hasCompleteResponse(runId)) {
+        complete = false
+        notice ??= 'The native task ended, but its complete response is unavailable.'
+      }
       const nativeCompleted =
         complete && run.dispatchPhase === 'ended' && run.nativeOutcome === 'completed'
       // A repeated terminal may not move or renew an already frozen recovery boundary.
@@ -6243,6 +8248,7 @@ export class ConversationRepository {
         }),
       }
     }
+    if (input.scope === 'queued-input') return this.readQueuedInputSource(input)
     if (input.scope === 'rebuild-input')
       return this.readReturnedInput(input.sessionId, input.operationId, input.offset)
     this.pageReadCount += 1
@@ -6319,7 +8325,9 @@ export class ConversationRepository {
     if (input.scope === 'messages') {
       this.requireIncarnation(input.sessionId, input.incarnation)
       if (
-        Number(input.beforeSequence !== undefined) + Number(input.aroundMessageId !== undefined) >
+        Number(input.beforeSequence !== undefined) +
+          Number(input.beforeDisplay !== undefined) +
+          Number(input.aroundMessageId !== undefined) >
         1
       ) {
         throw new Error('Choose one Conversation history direction.')
@@ -6342,7 +8350,60 @@ export class ConversationRepository {
             )
             .get()
         : undefined
-      if (target && !target.visible && !input.includeHistoricalSource && target.replyTo) {
+      const targetSnapshot = target ? outputSnapshotMetadata(this.database, target.id) : undefined
+      const preserveRunId =
+        input.preserveRunId ??
+        (input.snapshotView?.mode === 'preserve' ? input.snapshotView.runId : undefined)
+      if (
+        preserveRunId &&
+        !this.database
+          .select({ id: conversationOutputSnapshots.runId })
+          .from(conversationOutputSnapshots)
+          .where(
+            and(
+              eq(conversationOutputSnapshots.sessionId, input.sessionId),
+              eq(conversationOutputSnapshots.runId, preserveRunId),
+              eq(conversationOutputSnapshots.ordinal, 0),
+            ),
+          )
+          .get()
+      )
+        throw new RunOperationConflictError(
+          'The preserved response is unavailable in this Session.',
+        )
+      const snapshotView =
+        targetSnapshot && input.includeHistoricalSource
+          ? {
+              runId: this.database
+                .select({ runId: conversationMessages.runId })
+                .from(conversationMessages)
+                .where(eq(conversationMessages.id, target!.id))
+                .get()!.runId!,
+              mode: 'expanded' as const,
+            }
+          : input.snapshotView
+      if (
+        snapshotView &&
+        !this.database
+          .select({ runId: conversationOutputSnapshots.runId })
+          .from(conversationOutputSnapshots)
+          .where(
+            and(
+              eq(conversationOutputSnapshots.runId, snapshotView.runId),
+              eq(conversationOutputSnapshots.sessionId, input.sessionId),
+            ),
+          )
+          .limit(1)
+          .get()
+      )
+        throw new Error('The selected output snapshots are unavailable.')
+      if (
+        target &&
+        !targetSnapshot &&
+        !target.visible &&
+        !input.includeHistoricalSource &&
+        target.replyTo
+      ) {
         target = this.database
           .select({
             id: conversationMessages.id,
@@ -6369,23 +8430,41 @@ export class ConversationRepository {
       // For a direct Comment jump, admit the target first. Filling context before the
       // target could exhaust the byte budget and return a page that never contains it.
       const goingNewer = targetSequence !== undefined
-      const conditions = and(
-        eq(conversationMessages.sessionId, input.sessionId),
-        eq(conversationMessages.isVisible, true),
-        target && input.includeHistoricalSource
-          ? sql`(${conversationMessages.id} <> ${target.id} AND
-              (${target.replyTo} IS NULL OR ${conversationMessages.replyToMessageId} IS NULL OR
-                ${conversationMessages.replyToMessageId} <> ${target.replyTo} OR
-                ${target.agentId} IS NULL OR ${conversationMessages.agentId} IS NULL OR
-                ${conversationMessages.agentId} <> ${target.agentId}))`
-          : undefined,
-        input.beforeSequence === undefined
-          ? undefined
-          : lt(conversationMessages.sequence, input.beforeSequence),
-        targetSequence === undefined
-          ? undefined
-          : gte(conversationMessages.sequence, targetSequence),
-      )
+      const legacy = !this.database
+        .select({ runId: conversationOutputSnapshots.runId })
+        .from(conversationOutputSnapshots)
+        .where(eq(conversationOutputSnapshots.sessionId, input.sessionId))
+        .limit(1)
+        .get()
+      const timelineFor = (filter: ReturnType<typeof sql>, newer: boolean) =>
+        outputTimelineSql(input.sessionId, snapshotView, { filter, newer, legacy, preserveRunId })
+      const snapshotOrder = target
+        ? outputSnapshotMetadata(this.database, target.id, snapshotView, preserveRunId)?.order
+        : undefined
+      const targetOrder = target
+        ? (snapshotOrder ?? { sequence: target.sequence, rank: 1, id: target.id })
+        : undefined
+      const oldHistoricalSource =
+        target && input.includeHistoricalSource && !targetSnapshot ? target : undefined
+      const directionCondition = input.beforeDisplay
+        ? beforeOutputOrder(input.beforeDisplay)
+        : input.beforeSequence !== undefined
+          ? sql`sequence<${input.beforeSequence}`
+          : targetOrder
+            ? afterOutputOrder({ ...targetOrder, id: targetOrder.id }, true)
+            : targetSequence !== undefined
+              ? sql`sequence>=${targetSequence}`
+              : sql`1=1`
+      const pageCondition = oldHistoricalSource
+        ? sql`${directionCondition} AND id<>${oldHistoricalSource.id}
+        AND (kind='context' OR id NOT IN (SELECT id FROM conversation_messages
+          WHERE reply_to_message_id=${oldHistoricalSource.replyTo} AND agent_id=${oldHistoricalSource.agentId}))`
+        : directionCondition
+      const timeline = timelineFor(pageCondition, goingNewer)
+      const timelineItems = this.database.all<OutputTimelineItem>(sql`${timeline}
+        SELECT * FROM timeline WHERE ${pageCondition}
+        ORDER BY sequence ${goingNewer ? sql`ASC` : sql`DESC`}, rank ${goingNewer ? sql`ASC` : sql`DESC`},
+          id ${goingNewer ? sql`ASC` : sql`DESC`} LIMIT ${CONVERSATION_PAGE_ITEMS + 1}`)
       const messageQuery = () =>
         this.database
           .select({
@@ -6415,18 +8494,35 @@ export class ConversationRepository {
             content: sql<string>`CASE WHEN length(CAST(${conversationMessages.content} AS BLOB)) <= ${INLINE_CONTENT_BYTES} THEN ${conversationMessages.content} ELSE substr(${conversationMessages.content}, 1, ${BODY_PREVIEW_CHARS}) END`,
           })
           .from(conversationMessages)
-      const candidates = messageQuery()
-        .where(conditions)
-        .orderBy(
-          goingNewer ? asc(conversationMessages.sequence) : desc(conversationMessages.sequence),
-        )
-        .limit(CONVERSATION_PAGE_ITEMS + 1)
-        .all()
-      if (target && input.includeHistoricalSource) {
+      const messageIds = timelineItems
+        .filter((item) => item.kind === 'message')
+        .map((item) => item.id)
+      const candidateMap = new Map(
+        (messageIds.length
+          ? messageQuery().where(inArray(conversationMessages.id, messageIds)).all()
+          : []
+        ).map((row) => [row.id, row]),
+      )
+      const candidates = timelineItems.flatMap((item) =>
+        item.kind === 'message' && candidateMap.has(item.id) ? [candidateMap.get(item.id)!] : [],
+      )
+      if (oldHistoricalSource) {
         // Read an old source by primary key separately so hidden retries cannot
         // turn around-navigation into a scan of every superseded response.
-        const source = messageQuery().where(eq(conversationMessages.id, target.id)).get()
-        if (source) candidates.unshift(source)
+        const source = messageQuery()
+          .where(eq(conversationMessages.id, oldHistoricalSource.id))
+          .get()
+        if (source) {
+          candidates.unshift(source)
+          candidateMap.set(source.id, source)
+          timelineItems.unshift({
+            id: source.id,
+            kind: 'message',
+            runId: source.runId,
+            sequence: source.sequence,
+            rank: 1,
+          })
+        }
       }
       const latestRunRow = this.database
         .select(publicRunColumns)
@@ -6451,6 +8547,7 @@ export class ConversationRepository {
       const title = projectSessionTitle(session.title, session.titleSource)
       const receivedInput = this.receivedCollaborationInput(input.sessionId)
       const header: Extract<ConversationPage, { scope: 'messages' }>['header'] = {
+        queue: this.queueState(input.sessionId),
         ...(receivedInput ? { receivedInputIds: [receivedInput.id] } : {}),
         session: {
           id: session.id,
@@ -6481,6 +8578,9 @@ export class ConversationRepository {
         observation,
         header,
         messages: [],
+        runContexts: [],
+        ...(snapshotView ? { snapshotView } : {}),
+        ...(preserveRunId ? { preserveRunId } : {}),
         runs: [],
         runArtifacts: [],
         hasOlder: false,
@@ -6488,7 +8588,9 @@ export class ConversationRepository {
         ...(target && input.includeHistoricalSource ? { sourceMessageId: target.id } : {}),
       }
       const candidateRunIds = [
-        ...new Set(candidates.flatMap((candidate) => (candidate.runId ? [candidate.runId] : []))),
+        ...new Set(
+          timelineItems.flatMap((candidate) => (candidate.runId ? [candidate.runId] : [])),
+        ),
       ]
       const candidateRuns = new Map(
         (candidateRunIds.length === 0
@@ -6515,7 +8617,28 @@ export class ConversationRepository {
       )
       const candidateImages = this.imagesForMessages(candidates.map((row) => row.id))
       const runIds = new Set<string>()
-      for (const row of candidates.slice(0, CONVERSATION_PAGE_ITEMS)) {
+      const admitted: OutputTimelineItem[] = []
+      for (const item of timelineItems.slice(0, CONVERSATION_PAGE_ITEMS)) {
+        if (item.kind === 'context') {
+          const context = outputRunContext(this.database, item.id)!
+          const candidate = candidateRuns.get(item.id)
+          const addRun = candidate && !runIds.has(item.id)
+          page.runContexts!.push(context)
+          if (addRun) page.runs.push(ConversationRepository.toRun(candidate))
+          if (
+            page.runs.length > CONVERSATION_PAGE_ITEMS ||
+            !ConversationRepository.fitsPage(page)
+          ) {
+            page.runContexts!.pop()
+            if (addRun) page.runs.pop()
+            if (!admitted.length) throw new OversizedConversationEntityError()
+            break
+          }
+          if (addRun) runIds.add(item.id)
+          admitted.push(item)
+          continue
+        }
+        const row = candidateMap.get(item.id)!
         const natural =
           row.role === 'assistant'
             ? this.naturalMessageProjection(row.id, input.sessionId)
@@ -6527,6 +8650,12 @@ export class ConversationRepository {
         const previousRuns = [...page.runs]
         const previousArtifacts = [...page.runArtifacts!]
         const message = {
+          outputSnapshot: outputSnapshotMetadata(
+            this.database,
+            row.id,
+            snapshotView,
+            preserveRunId,
+          ),
           id: row.id,
           sessionId: row.sessionId,
           role: row.role,
@@ -6571,8 +8700,11 @@ export class ConversationRepository {
           runIds.add(candidateRun.id)
         }
         const userId = row.replyToMessageId ?? row.id
-        for (const group of candidateArtifacts.filter((item) => item.userMessageId === userId)) {
-          if (page.runArtifacts!.some((item) => item.latestRunId === group.latestRunId)) continue
+        for (const group of candidateArtifacts.filter(
+          (artifact) => artifact.userMessageId === userId,
+        )) {
+          if (page.runArtifacts!.some((artifact) => artifact.latestRunId === group.latestRunId))
+            continue
           page.runArtifacts!.push(group)
           const latest = artifactRuns.get(group.latestRunId)
           if (latest && !runIds.has(latest.id)) {
@@ -6590,44 +8722,31 @@ export class ConversationRepository {
           page.runArtifacts = previousArtifacts
           runIds.clear()
           for (const run of previousRuns) runIds.add(run.id)
-          if (page.messages.length === 0) throw new OversizedConversationEntityError()
+          if (admitted.length === 0) throw new OversizedConversationEntityError()
           break
         }
+        admitted.push(item)
       }
-      if (!goingNewer) page.messages.reverse()
-      const first = page.messages[0]?.message.sequence
-      const last = page.messages.at(-1)?.message.sequence
+      if (!goingNewer) {
+        page.messages.reverse()
+        page.runContexts!.reverse()
+        admitted.reverse()
+      }
+      const first = admitted[0]
+      const last = admitted.at(-1)
       page.hasOlder =
         first !== undefined &&
         Boolean(
-          this.database
-            .select({ id: conversationMessages.id })
-            .from(conversationMessages)
-            .where(
-              and(
-                eq(conversationMessages.sessionId, input.sessionId),
-                eq(conversationMessages.isVisible, true),
-                lt(conversationMessages.sequence, first),
-              ),
-            )
-            .limit(1)
-            .get(),
+          this.database.get(
+            sql`${timelineFor(beforeOutputOrder(first), false)} SELECT id FROM timeline WHERE ${beforeOutputOrder(first)} LIMIT 1`,
+          ),
         )
       page.hasNewer =
         last !== undefined &&
         Boolean(
-          this.database
-            .select({ id: conversationMessages.id })
-            .from(conversationMessages)
-            .where(
-              and(
-                eq(conversationMessages.sessionId, input.sessionId),
-                eq(conversationMessages.isVisible, true),
-                gt(conversationMessages.sequence, last),
-              ),
-            )
-            .limit(1)
-            .get(),
+          this.database.get(
+            sql`${timelineFor(afterOutputOrder(last), true)} SELECT id FROM timeline WHERE ${afterOutputOrder(last)} LIMIT 1`,
+          ),
         )
       if (!ConversationRepository.fitsPage(page)) throw new OversizedConversationEntityError()
       if (target && input.includeHistoricalSource && !target.visible) page.hasNewer = true
@@ -6955,6 +9074,7 @@ export class ConversationRepository {
         : requestedMode
     return {
       message: {
+        outputSnapshot: outputSnapshotMetadata(this.database, row.id),
         id: row.id,
         sessionId: row.sessionId,
         role: row.role,
@@ -7043,6 +9163,8 @@ export class ConversationRepository {
       .get()
     const patch: ConversationPatch = {
       version: 'conversation-patch-v1',
+      ...(input.runContexts ? { runContexts: input.runContexts } : {}),
+      queue: this.queueState(sessionId),
       ...(input.receivedInputIds
         ? { receivedInputIds: input.receivedInputIds }
         : received
@@ -7072,9 +9194,11 @@ export class ConversationRepository {
 
     return conversationPatchSchema.parse({
       version: 'conversation-patch-v1',
+      ...(patch.runContexts ? { runContexts: patch.runContexts } : {}),
       sessionId,
       observation,
       session: patch.session,
+      queue: patch.queue,
       ...(patch.receivedInputIds ? { receivedInputIds: patch.receivedInputIds } : {}),
       ...(patch.queuedInputIds ? { queuedInputIds: patch.queuedInputIds } : {}),
       messages: [],
@@ -7397,6 +9521,23 @@ export class ConversationRepository {
             sourceProposal.sourceMessageAgentId !== sourceProposal.sourceAgentId)
         )
           throw new RunOperationConflictError('This peer request is no longer available.')
+        const queueReturn = input.queueReturnOperationId
+          ? transaction
+              .select()
+              .from(conversationQueueOperations)
+              .where(
+                and(
+                  eq(conversationQueueOperations.id, input.queueReturnOperationId),
+                  eq(conversationQueueOperations.sessionId, input.sessionId),
+                  eq(conversationQueueOperations.kind, 'return'),
+                ),
+              )
+              .get()
+          : undefined
+        if (input.queueReturnOperationId && (!queueReturn || queueReturn.state !== 'installed'))
+          throw new RunOperationConflictError('The returned queue source was already consumed.')
+        if (input.queueReturnOperationId)
+          this.consumeQueuedReturn(input.sessionId, input.queueReturnOperationId)
         const returnId =
           input.returnedInputOperationId ??
           (!input.preserveDraftComments
@@ -7448,7 +9589,14 @@ export class ConversationRepository {
 
         if (input.receivedInputId) {
           const received = this.receivedCollaborationInput(input.sessionId)
-          if (!received || received.id !== input.receivedInputId || received.state !== 'accepted')
+          if (
+            !received ||
+            received.id !== input.receivedInputId ||
+            received.state !== 'accepted' ||
+            received.queueState !== 'queued' ||
+            !session.queueEnabled ||
+            session.queuePauseReason
+          )
             throw new RunOperationConflictError('This received input is no longer eligible.')
         }
         if (input.collaboration) {
@@ -7550,11 +9698,7 @@ export class ConversationRepository {
             nativeEffectsState: 'not_dispatched',
             attemptCount: 1,
             settingsRevision: input.settingsRevision,
-            permissionMode: this.permissionModeAt(
-              input.sessionId,
-              input.agentId,
-              input.settingsRevision,
-            ),
+            ...this.runSettingsAt(input.sessionId, input.agentId, input.settingsRevision),
             model: input.model,
             effort: input.effort,
             handoffSourceIds,
@@ -7598,7 +9742,7 @@ export class ConversationRepository {
         if (input.receivedInputId) {
           transaction
             .update(collaborationInputs)
-            .set({ state: 'materialized', materializedRunId: runId })
+            .set({ state: 'materialized', materializedRunId: runId, queueState: 'delivered' })
             .where(eq(collaborationInputs.id, input.receivedInputId))
             .run()
           transaction
@@ -7814,11 +9958,7 @@ export class ConversationRepository {
           nativeEffectsState: 'not_dispatched',
           attemptCount: 1,
           settingsRevision: input.settingsRevision,
-          permissionMode: this.permissionModeAt(
-            input.sessionId,
-            input.agentId,
-            input.settingsRevision,
-          ),
+          ...this.runSettingsAt(input.sessionId, input.agentId, input.settingsRevision),
           model: input.model,
           effort: input.effort,
           handoffSourceIds,
@@ -8186,7 +10326,7 @@ export class ConversationRepository {
     })
   }
 
-  private permissionModeAt(sessionId: string, agentId: RuntimeAgentId, revision: number) {
+  private runSettingsAt(sessionId: string, agentId: RuntimeAgentId, revision: number) {
     const settings = this.database
       .select()
       .from(sessionSettingsRevisions)
@@ -8199,7 +10339,9 @@ export class ConversationRepository {
       .get()
     if (!settings)
       throw new RunOperationConflictError('The task permission settings are unavailable.')
-    return agentId === 'claude' ? settings.claudePermissionMode : settings.codexPermissionMode
+    return agentId === 'claude'
+      ? { permissionMode: settings.claudePermissionMode, speed: settings.claudeSpeed }
+      : { permissionMode: settings.codexPermissionMode, speed: settings.codexSpeed }
   }
 
   recordExecutor(runId: string, executorId: string): ConversationPatch {
@@ -8446,8 +10588,8 @@ export class ConversationRepository {
           .update(agentRuns)
           .set({
             status: 'interrupted',
-            failureKind: 'transient_transport',
-            failureMessage: reason.slice(0, 240),
+            failureKind: run.failureKind ?? 'transient_transport',
+            failureMessage: run.failureMessage ?? reason.slice(0, 240),
           })
           .where(eq(agentRuns.id, runId))
           .run()
@@ -8491,6 +10633,77 @@ export class ConversationRepository {
     return this.createPatch(run.sessionId, {
       runs: [this.findRun(runId)!],
       messages: retired ? [this.messageChange(retired, 'metadata')] : [],
+    })
+  }
+
+  /** Preserve the durable prefix without promoting it to a complete native answer. */
+  recordOutputFailure(
+    runId: string,
+    failure: { kind: RunFailureKind; message: string },
+  ): ConversationPatch {
+    const run = this.findRun(runId)
+    if (!run) throw new RunOperationConflictError('The failed output has no Run owner.')
+    return this.database.transaction(() => {
+      const current = this.database
+        .select({ id: conversationMessages.id, state: conversationMessages.state })
+        .from(conversationMessages)
+        .where(
+          and(
+            eq(conversationMessages.runId, runId),
+            eq(conversationMessages.role, 'assistant'),
+            eq(conversationMessages.isVisible, true),
+          ),
+        )
+        .orderBy(desc(conversationMessages.sequence))
+        .limit(1)
+        .get()
+      const frozen = current && outputSnapshotMetadata(this.database, current.id)?.frozen
+      // A completed current answer is immutable; an earlier frozen snapshot is
+      // not the response to a newer accepted input.
+      const completedRun =
+        run.status === 'completed' &&
+        run.dispatchPhase === 'ended' &&
+        run.nativeOutcome === 'completed'
+      if (
+        current?.state === 'complete' &&
+        (completedRun || !frozen || !this.mayProjectNativeBody(run))
+      )
+        return this.runPatch(runId)
+      this.database
+        .update(agentRuns)
+        .set({ failureKind: failure.kind, failureMessage: failure.message.slice(0, 240) })
+        .where(eq(agentRuns.id, runId))
+        .run()
+      this.nativeFact(runId, 'pact.output_unavailable', {
+        kind: failure.kind,
+        reason: failure.message.slice(0, 240),
+      })
+      if ((!current || frozen) && run.nativeTurnId)
+        return this.commitEvents(
+          run.sessionId,
+          runId,
+          [
+            {
+              agentId: run.agentId,
+              type: 'text.completed',
+              turnId: run.nativeTurnId,
+              outputId: `${run.id}:assistant`,
+              text: '',
+            },
+          ],
+          true,
+          'incomplete',
+        )
+      if (current && current.state !== 'complete')
+        this.database
+          .update(conversationMessages)
+          .set({ state: 'incomplete' })
+          .where(eq(conversationMessages.id, current.id))
+          .run()
+      return this.createPatch(run.sessionId, {
+        runs: [this.findRun(runId)!],
+        messages: current ? [this.messageChange(current.id, 'metadata')] : [],
+      })
     })
   }
 
@@ -8604,23 +10817,21 @@ export class ConversationRepository {
     const run = this.findRun(runId)
     if (!run || run.dispatchPhase !== 'ended')
       throw new RunOperationConflictError('The native ending has no evidence.')
+    if (failure) this.recordOutputFailure(runId, failure)
+    const completeResponse = this.hasCompleteResponse(runId)
     this.nativeMetadataTransaction(run.sessionId, () => {
       this.database
         .update(agentRuns)
         .set({
           status: run.nativeOutcome ?? 'interrupted',
           failureKind:
-            run.nativeOutcome === 'completed'
+            run.nativeOutcome === 'completed' && completeResponse
               ? null
-              : ((run.nativeOutcome === 'failed' ? failure?.kind : undefined) ??
-                run.failureKind ??
-                null),
+              : (failure?.kind ?? run.failureKind ?? null),
           failureMessage: run.nativeOutcome
-            ? run.nativeOutcome === 'completed'
+            ? run.nativeOutcome === 'completed' && completeResponse
               ? null
-              : ((run.nativeOutcome === 'failed' ? failure?.message : undefined) ??
-                run.failureMessage ??
-                null)
+              : (failure?.message ?? run.failureMessage ?? null)
             : 'The Turn ended, but its outcome was not recorded.',
         })
         .where(eq(agentRuns.id, runId))
@@ -8638,7 +10849,11 @@ export class ConversationRepository {
           )
           .run()
     })
-    this.finishCollaboration(runId, run.nativeOutcome === 'completed', failure?.message)
+    this.finishCollaboration(
+      runId,
+      run.nativeOutcome === 'completed' && completeResponse,
+      failure?.message,
+    )
     return this.runPatch(runId)
   }
 
@@ -9750,6 +11965,9 @@ export class ConversationRepository {
         }),
         createdAt: now,
       })
+      const queued = this.receivedCollaborationInput(row.sessionId)
+      if (queued && this.queuedSteerDelivery(queued)?.rebuildId === id)
+        this.advanceQueue(row.sessionId)
     })
     return this.createPatch(row.sessionId, {
       ...(returnedMessageId ? { removedMessageIds: [returnedMessageId] } : {}),
@@ -10630,7 +12848,12 @@ export class ConversationRepository {
             .set({ updatedAt: new Date().toISOString() })
             .where(eq(sessions.id, sessionId))
             .run()
-        const messageChanges = changes.flatMap((change) => (change.message ? [change.message] : []))
+        const messageChanges = changes.flatMap((change) => [
+          ...(change.snapshotMessageId
+            ? [{ id: change.snapshotMessageId, mode: 'metadata' as const }]
+            : []),
+          ...(change.message ? [change.message] : []),
+        ])
         if (
           events.some((event) => event.type === 'turn.completed' && event.outcome !== 'completed')
         ) {
@@ -10654,7 +12877,7 @@ export class ConversationRepository {
                 .select({ visible: conversationMessages.isVisible })
                 .from(conversationMessages)
                 .where(eq(conversationMessages.id, change.id))
-                .get()?.visible,
+                .get()?.visible || outputSnapshotMetadata(this.database, change.id)?.frozen,
           )
           .map((change) =>
             this.messageChange(change.id, change.mode, change.text, change.previousRevision),
@@ -10676,7 +12899,9 @@ export class ConversationRepository {
         )
           refreshNativeSessionMetadata(transaction, sessionId)
         const run = this.findRun(runId)
+        const runContext = outputRunContext(this.database, runId)
         return this.createPatch(sessionId, {
+          ...(runContext ? { runContexts: [runContext] } : {}),
           messages,
           removedMessageIds: changes.flatMap((change) => change.removedMessageIds ?? []),
           activities,
@@ -10717,6 +12942,7 @@ export class ConversationRepository {
           previousRevision?: number
         }
       | undefined
+    let snapshotMessageId: string | undefined
     let activityChange:
       | {
           id: string
@@ -10809,6 +13035,16 @@ export class ConversationRepository {
       transaction
         .update(agentRuns)
         .set({ nativeSessionId: event.nativeSessionId, status: 'running', updatedAt: now })
+        .where(eq(agentRuns.id, runId))
+        .run()
+    } else if (event.type === 'run.speed.resolved') {
+      transaction
+        .update(agentRuns)
+        .set({
+          ...(event.speed ? { observedSpeed: event.speed } : {}),
+          speedDetail: event.detail ?? null,
+          updatedAt: now,
+        })
         .where(eq(agentRuns.id, runId))
         .run()
     } else if (event.type === 'run.model.resolved') {
@@ -11058,6 +13294,16 @@ export class ConversationRepository {
           .set({ nativeTurnId: event.turnId })
           .where(and(eq(agentRuns.id, runId), sql`${agentRuns.nativeTurnId} IS NULL`))
           .run()
+      // Re-read the cut inside this transaction, after any asynchronous answer seal.
+      const cut = transaction
+        .select()
+        .from(conversationOutputSnapshots)
+        .where(eq(conversationOutputSnapshots.runId, runId))
+        .orderBy(desc(conversationOutputSnapshots.ordinal))
+        .limit(1)
+        .get()
+      if (cut && event.type === 'text.delta' && !event.text)
+        return { activityStates, removedMessageIds }
       const previous = transaction
         .select({
           ...getTableColumns(conversationMessages),
@@ -11065,7 +13311,11 @@ export class ConversationRepository {
         })
         .from(conversationMessages)
         .where(
-          and(eq(conversationMessages.runId, runId), eq(conversationMessages.role, 'assistant')),
+          and(
+            eq(conversationMessages.runId, runId),
+            eq(conversationMessages.role, 'assistant'),
+            cut && mayProjectBody ? eq(conversationMessages.isVisible, true) : undefined,
+          ),
         )
         .orderBy(desc(conversationMessages.sequence))
         .limit(1)
@@ -11077,6 +13327,24 @@ export class ConversationRepository {
         : event.type === 'text.delta'
           ? `${previous?.content ?? ''}${event.text}`
           : event.text
+      const previousSnapshot = previous
+        ? transaction
+            .select({ frozen: conversationOutputSnapshots.frozen })
+            .from(conversationOutputSnapshots)
+            .where(eq(conversationOutputSnapshots.sourceMessageId, previous.id))
+            .get()
+        : undefined
+      const identicalFrozenSnapshot = Boolean(
+        cut &&
+        !cut.sourceMessageId &&
+        previous &&
+        event.type === 'text.completed' &&
+        transaction
+          .select({ same: sql<number>`${conversationMessages.content} = ${nextContent}` })
+          .from(conversationMessages)
+          .where(eq(conversationMessages.id, previous.id))
+          .get()?.same,
+      )
       const anchoredSource =
         archive &&
         previous &&
@@ -11097,6 +13365,7 @@ export class ConversationRepository {
       // Recovery can extend a body already referenced by a Comment; preserve its source row.
       const existing =
         previous &&
+        !previousSnapshot?.frozen &&
         !(
           (archive && (previous.isVisible || previous.state !== 'streaming' || anchoredSource)) ||
           (event.type === 'text.completed' &&
@@ -11105,7 +13374,16 @@ export class ConversationRepository {
         )
           ? previous
           : undefined
-      if (existing) {
+      if (identicalFrozenSnapshot && previous) {
+        // No new text after Steer: retain one exact source, relocate only its final display.
+        if (bodyState)
+          transaction
+            .update(conversationMessages)
+            .set({ state: bodyState, updatedAt: now })
+            .where(eq(conversationMessages.id, previous.id))
+            .run()
+        messageChange = { id: previous.id, mode: 'metadata' }
+      } else if (existing) {
         transaction
           .update(conversationMessages)
           .set({
@@ -11116,6 +13394,16 @@ export class ConversationRepository {
           })
           .where(eq(conversationMessages.id, existing.id))
           .run()
+        if (cut)
+          transaction
+            .update(conversationOutputSnapshots)
+            .set({
+              hasBody: sealedBody
+                ? sql`(SELECT ${outputHasBodySql(conversationMessages.content)} FROM conversation_messages WHERE id=${existing.id})`
+                : typeof nextContent === 'string' && nextContent.trim().length > 0,
+            })
+            .where(eq(conversationOutputSnapshots.sourceMessageId, existing.id))
+            .run()
         messageChange = {
           id: existing.id,
           mode: event.type === 'text.delta' ? 'append' : 'replace',
@@ -11144,13 +13432,19 @@ export class ConversationRepository {
           .get()
         const replacesRecoveredSource =
           bodyState === 'complete' && visible?.runId === runId && this.ownsNativeControl(runId)
-        if (visible && ((!visible.hasBody && !archive) || replacesRecoveredSource)) {
+        const replacesSnapshot = Boolean(cut && mayProjectBody && visible?.runId === runId)
+        if (
+          visible &&
+          ((!visible.hasBody && !archive) || replacesRecoveredSource || replacesSnapshot)
+        ) {
           transaction
             .update(conversationMessages)
             .set({ isVisible: false })
             .where(eq(conversationMessages.id, visible.id))
             .run()
-          removedMessageIds.push(visible.id)
+          if (replacesSnapshot && outputSnapshotMetadata(this.database, visible.id)?.frozen)
+            snapshotMessageId = visible.id
+          else removedMessageIds.push(visible.id)
         }
         const messageSequence =
           (transaction
@@ -11167,7 +13461,8 @@ export class ConversationRepository {
             runId,
             role: 'assistant',
             replyToMessageId: run.userMessageId,
-            isVisible: mayProjectBody && (replacesRecoveredSource || !visible?.hasBody),
+            isVisible:
+              mayProjectBody && (replacesSnapshot || replacesRecoveredSource || !visible?.hasBody),
             agentId: event.agentId,
             content: nextContent,
             state: bodyState ?? 'streaming',
@@ -11176,14 +13471,33 @@ export class ConversationRepository {
             updatedAt: now,
           })
           .run()
+        if (cut && mayProjectBody)
+          transaction
+            .update(conversationOutputSnapshots)
+            .set({
+              sourceMessageId: messageId,
+              sourceSequence: messageSequence,
+              hasBody: sealedBody
+                ? sql`(SELECT ${outputHasBodySql(conversationMessages.content)} FROM conversation_messages WHERE id=${messageId})`
+                : typeof nextContent === 'string' && nextContent.trim().length > 0,
+            })
+            .where(
+              and(
+                eq(conversationOutputSnapshots.runId, runId),
+                eq(conversationOutputSnapshots.ordinal, cut.ordinal),
+              ),
+            )
+            .run()
         messageChange = {
           id: messageId,
           mode: 'replace',
-          ...(sealedBody ? {} : { text: event.text }),
+          // A delta starting a snapshot needs the prior complete prefix too.
+          ...(sealedBody
+            ? {}
+            : { text: typeof nextContent === 'string' ? nextContent : event.text }),
         }
       }
     } else if (event.type === 'turn.completed') {
-      if (!archive) this.finishCollaboration(runId, event.outcome === 'completed')
       if (!archive)
         transaction
           .update(nativeAgentContexts)
@@ -11247,7 +13561,9 @@ export class ConversationRepository {
       const assistantMessage = transaction
         .select({
           id: conversationMessages.id,
+          state: conversationMessages.state,
           visible: conversationMessages.isVisible,
+          sequence: conversationMessages.sequence,
           replyTo: conversationMessages.replyToMessageId,
           hasBody: sql<number>`length(trim(${conversationMessages.content}, char(9) || char(10) || char(13) || ' ')) > 0`,
         })
@@ -11262,7 +13578,12 @@ export class ConversationRepository {
         assistantMessage &&
         (!archive || !assistantMessage.visible || this.ownsNativeControl(runId))
       ) {
-        if (event.outcome === 'completed' && assistantMessage.replyTo && assistantMessage.hasBody) {
+        if (
+          event.outcome === 'completed' &&
+          assistantMessage.state !== 'incomplete' &&
+          assistantMessage.replyTo &&
+          assistantMessage.hasBody
+        ) {
           const previous = transaction
             .select({
               id: conversationMessages.id,
@@ -11291,18 +13612,51 @@ export class ConversationRepository {
               .set({ isVisible: false })
               .where(eq(conversationMessages.id, previous.id))
               .run()
-            removedMessageIds.push(previous.id)
+            if (outputSnapshotMetadata(this.database, previous.id)?.frozen)
+              snapshotMessageId = previous.id
+            else removedMessageIds.push(previous.id)
           }
-          if (!archive || replacesArchivedSource)
+          if (!archive || replacesArchivedSource) {
             transaction
               .update(conversationMessages)
               .set({ isVisible: true })
               .where(eq(conversationMessages.id, assistantMessage.id))
               .run()
+            if (!assistantMessage.visible) {
+              const cut = transaction
+                .select()
+                .from(conversationOutputSnapshots)
+                .where(eq(conversationOutputSnapshots.runId, runId))
+                .orderBy(desc(conversationOutputSnapshots.ordinal))
+                .limit(1)
+                .get()
+              if (cut)
+                transaction
+                  .update(conversationOutputSnapshots)
+                  .set({
+                    sourceMessageId: assistantMessage.id,
+                    sourceSequence: assistantMessage.sequence,
+                    hasBody: sql`(SELECT ${outputHasBodySql(conversationMessages.content)} FROM conversation_messages WHERE id=${assistantMessage.id})`,
+                  })
+                  .where(
+                    and(
+                      eq(conversationOutputSnapshots.runId, runId),
+                      eq(conversationOutputSnapshots.ordinal, cut.ordinal),
+                    ),
+                  )
+                  .run()
+            }
+          }
         }
         transaction
           .update(conversationMessages)
-          .set({ state: event.outcome === 'completed' ? 'complete' : 'incomplete', updatedAt: now })
+          .set({
+            state:
+              event.outcome === 'completed' && assistantMessage.state !== 'incomplete'
+                ? 'complete'
+                : 'incomplete',
+            updatedAt: now,
+          })
           .where(eq(conversationMessages.id, assistantMessage.id))
           .run()
         messageChange = {
@@ -11310,6 +13664,7 @@ export class ConversationRepository {
           mode: assistantMessage.visible ? 'metadata' : 'replace',
         }
       }
+      if (!archive) this.finishCollaboration(runId, event.outcome === 'completed')
       if (event.outcome === 'completed' && !assistantMessage?.hasBody)
         transaction
           .update(agentRuns)
@@ -11360,7 +13715,13 @@ export class ConversationRepository {
         }),
       })
     }
-    return { message: messageChange, activity: activityChange, activityStates, removedMessageIds }
+    return {
+      message: messageChange,
+      snapshotMessageId,
+      activity: activityChange,
+      activityStates,
+      removedMessageIds,
+    }
   }
 
   failRun(
@@ -11969,6 +14330,7 @@ export class ConversationRepository {
       sessionId: row.sessionId,
       role: row.role,
       content: row.content,
+      outputSnapshot: outputSnapshotMetadata(this.database, row.id),
       ...this.messageImageMetadata(row.id),
       contentRevision: row.contentRevision,
       state: row.state,
@@ -12034,11 +14396,13 @@ export class ConversationRepository {
   }
 
   private static toRun(
-    row: Omit<typeof agentRuns.$inferSelect, 'handoffSourceIds'> & {
+    row: Omit<typeof agentRuns.$inferSelect, 'handoffSourceIds' | 'nativeInputIdsJson'> & {
       responseMessageId?: string | null
+      outputSnapshotsJson?: string | null
     },
   ): AgentRun {
     return {
+      outputSnapshots: parseOutputSnapshotSummary(row.outputSnapshotsJson),
       ...(row.answerFormat ? { answerFormat: row.answerFormat } : {}),
       ...(row.collaborationTaskId && row.collaborationKind && row.collaborationStage
         ? {
@@ -12072,6 +14436,9 @@ export class ConversationRepository {
       permissionMode: row.permissionMode,
       model: row.model,
       effort: row.effort,
+      speed: row.speed,
+      ...(row.observedSpeed ? { observedSpeed: row.observedSpeed } : {}),
+      ...(row.speedDetail ? { speedDetail: row.speedDetail } : {}),
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
       ...(row.nativeSessionId ? { nativeSessionId: row.nativeSessionId } : {}),

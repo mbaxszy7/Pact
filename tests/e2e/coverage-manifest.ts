@@ -574,6 +574,30 @@ function journey(
           ],
         }
       : {}),
+    ...(file === 'agent-handoff.spec.ts' &&
+    title === '@all preserves ordered distinct Agent rows while the second response is pending'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 39,
+              reason:
+                'Accepted Steer segmentation includes the Run ID in reply row identity. Preserve both Agent rows and uniqueness while reading the Agent field instead of assuming it is the final key component; ordered final rows and exactly-once native request assertions remain unchanged.',
+              replacementAssertions: [
+                `expect.poll(async () =>
+              window.locator('[data-pact-row-key]').evaluateAll((nodes) => {
+                const keys = nodes.map((node) => node.getAttribute('data-pact-row-key') ?? '')
+                return {
+                  codex: keys.some((key) => key.startsWith('reply:') && key.split(':')[2] === 'codex'),
+                  claude: keys.some((key) => key.startsWith('reply:') && key.split(':')[2] === 'claude'),
+                  unique: new Set(keys).size === keys.length,
+                }
+              })
+            ).toEqual({ codex: true, claude: true, unique: true })`,
+              ],
+            },
+          ],
+        }
+      : {}),
     classification,
     status: 'planned',
     targets,

@@ -48,7 +48,6 @@ function focusConfirmationCancel(button: HTMLButtonElement | null): void {
 export function PermissionMenu({
   session,
   agent = session.settings.primaryAgentId,
-  composerAnchor,
   run,
   busy,
   disabled,
@@ -58,7 +57,6 @@ export function PermissionMenu({
 }: {
   session: CollaborationSession
   agent?: RuntimeAgentId | undefined
-  composerAnchor?: string | undefined
   run?: AgentRun | undefined
   busy?: boolean | undefined
   disabled?: boolean | undefined
@@ -68,6 +66,7 @@ export function PermissionMenu({
 }): React.JSX.Element {
   const [confirming, setConfirming] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [expanded, setExpanded] = useState(false)
   const panel = useRef<HTMLDivElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
   const open = useRef(false)
@@ -143,16 +142,23 @@ export function PermissionMenu({
         ref={trigger}
         type="button"
         popoverTarget={id}
-        disabled={disabled}
+        disabled={disabled || saving}
         title="Permissions for the next task"
+        aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} permissions: ${label}`}
+        aria-haspopup="menu"
+        aria-expanded={expanded}
         style={{ anchorName: anchor }}
-        className={`inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-control px-2 hover:bg-surface-raised focus-visible:outline-2 focus-visible:outline-focus ${selected === 'full' ? 'text-status-warning-foreground' : 'text-secondary hover:text-primary'}`}
+        className="pact-agent-trigger max-w-full"
       >
-        <Icon aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
-        <span>
+        <Icon
+          aria-hidden="true"
+          className={`size-3.5 shrink-0 ${selected === 'full' ? 'text-status-warning-foreground' : ''}`}
+          strokeWidth={1.75}
+        />
+        <span className={`truncate ${selected === 'full' ? 'text-status-warning-foreground' : ''}`}>
           {agent === 'claude' ? 'Claude' : 'Codex'} · {label}
         </span>
-        <ChevronDown aria-hidden="true" className="size-3" />
+        <ChevronDown aria-hidden="true" className="pact-agent-chevron size-3 shrink-0" />
       </button>
       {pending ? <output className="text-tertiary">Pending · next task</output> : null}
       <div
@@ -161,10 +167,11 @@ export function PermissionMenu({
         popover="auto"
         onBeforeToggle={(event) => {
           open.current = event.newState === 'open'
+          setExpanded(open.current)
           if (event.newState === 'open') setConfirming(false)
         }}
         style={{
-          positionAnchor: composerAnchor ?? anchor,
+          positionAnchor: anchor,
           left: 'anchor(left)',
           bottom: 'anchor(top)',
           top: 'auto',
@@ -172,7 +179,7 @@ export function PermissionMenu({
           width: 'min(360px, calc(100vw - 32px))',
           maxHeight: 'calc(100dvh - 64px)',
         }}
-        className="pact-composer-popover"
+        className="pact-agent-popover pact-composer-popover"
         aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} permissions`}
       >
         <p className="pact-composer-menu-heading">

@@ -11,6 +11,7 @@ import type {
   ConversationSendInput,
   SessionSettingsEditorState,
   SessionPermissionSaveInput,
+  SessionSpeedSaveInput,
   SessionCatalogChange,
   ProjectNameChange,
   RpcResult,
@@ -57,6 +58,7 @@ interface WorkspaceViewProps {
   nativePresentationSuspended?: boolean | undefined
   platform?: string | undefined
   onSaveSessionPermission: (input: SessionPermissionSaveInput) => Promise<boolean>
+  onSaveSessionSpeed: (input: SessionSpeedSaveInput) => Promise<boolean>
   projects: Project[]
   sessions: CollaborationSession[]
   sessionProjectPages: SessionCatalogCache['projectPages']
@@ -458,6 +460,7 @@ function WorkspaceContent({
               nativePresentationSuspended={props.nativePresentationSuspended}
               platform={props.platform}
               onSaveSessionPermission={props.onSaveSessionPermission}
+              onSaveSessionSpeed={props.onSaveSessionSpeed}
               sessionSettingsSaving={props.savingSessionSettings}
               session={selectedSession}
               visible={props.conversationVisible}

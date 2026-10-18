@@ -154,7 +154,7 @@ test(
           },
         })
       })
-      await assistant.hover()
+      await assistant.locator('[data-pact-message-bubble]').hover()
       await expect(assistantActions).toHaveCSS('opacity', '1')
       const assistantBubbleBox = await assistant.locator('[data-pact-message-bubble]').boundingBox()
       const assistantActionsBox = await assistantActions.boundingBox()
@@ -170,7 +170,7 @@ test(
       await window.evaluate(() => {
         if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
       })
-      await assistant.hover()
+      await assistant.locator('[data-pact-message-bubble]').hover()
       await expect(assistantActions).toHaveCSS('opacity', '1')
       await window.mouse.move(1_000, 650)
       await window.waitForTimeout(100)

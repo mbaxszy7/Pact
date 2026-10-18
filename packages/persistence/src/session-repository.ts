@@ -19,6 +19,7 @@ import type {
   DefaultSessionSettings,
   SessionSettings,
   SessionPermissionSaveInput,
+  SessionSpeedSaveInput,
   SessionCatalogChange,
   SessionCatalogCursor,
   SessionCatalogPage,
@@ -527,7 +528,20 @@ export class SessionRepository {
         .run()
       transaction
         .insert(sessionSettingsRevisions)
-        .values(SessionRepository.settingsValues(record.id, 1, settings, record.createdAt))
+        .values(
+          SessionRepository.settingsValues(
+            record.id,
+            1,
+            {
+              ...settings,
+              agents: {
+                claude: { ...settings.agents.claude, speed: 'native' },
+                codex: { ...settings.agents.codex, speed: 'native' },
+              },
+            },
+            record.createdAt,
+          ),
+        )
         .run()
       transaction
         .update(sessionCatalogRevisions)
@@ -583,6 +597,27 @@ export class SessionRepository {
       return this.saveSettings(input.sessionId, {
         ...current.settings,
         permissionModes: { ...modes, [input.agentId]: input.mode },
+      })
+    })
+  }
+
+  saveSpeed(input: SessionSpeedSaveInput): SessionCatalogChange {
+    return this.database.transaction(() => {
+      const current = this.find(input.sessionId)
+      if (
+        !current ||
+        current.status === 'archived' ||
+        current.settingsRevision !== input.expectedRevision
+      )
+        throw new Error('Session settings changed. Reopen the Speed menu and try again.')
+      const selected = current.settings.agents[input.agentId]
+      if ((selected.speed ?? 'native') === input.speed) return this.change(input.sessionId)
+      return this.saveSettings(input.sessionId, {
+        ...current.settings,
+        agents: {
+          ...current.settings.agents,
+          [input.agentId]: { ...selected, speed: input.speed },
+        },
       })
     })
   }
@@ -737,8 +772,10 @@ export class SessionRepository {
       primaryAgentId: settings.primaryAgentId,
       claudeModel: settings.agents.claude.model,
       claudeEffort: settings.agents.claude.effort,
+      claudeSpeed: settings.agents.claude.speed ?? 'native',
       codexModel: settings.agents.codex.model,
       codexEffort: settings.agents.codex.effort,
+      codexSpeed: settings.agents.codex.speed ?? 'native',
       claudePermissionMode: settings.permissionModes?.claude ?? 'ask',
       codexPermissionMode: settings.permissionModes?.codex ?? 'native',
       maxDiscussionRounds: settings.maxDiscussionRounds,
@@ -784,8 +821,16 @@ export class SessionRepository {
         codex: settings.codexPermissionMode,
       },
       agents: {
-        claude: { model: settings.claudeModel, effort: settings.claudeEffort },
-        codex: { model: settings.codexModel, effort: settings.codexEffort },
+        claude: {
+          model: settings.claudeModel,
+          effort: settings.claudeEffort,
+          speed: settings.claudeSpeed,
+        },
+        codex: {
+          model: settings.codexModel,
+          effort: settings.codexEffort,
+          speed: settings.codexSpeed,
+        },
       },
       maxDiscussionRounds: settings.maxDiscussionRounds,
       runningMessagePolicy: settings.runningMessagePolicy,

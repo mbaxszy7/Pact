@@ -17,10 +17,13 @@ import type {
 import {
   type AgentAdapter,
   type AgentNativeProbeInput,
+  type AgentNativeInputProbeInput,
   type AgentNativeInitializedBindingProbeInput,
   type AgentNativeContextRebuildInput,
   type AgentNativeContextRebuildResult,
   type AgentRunInput,
+  type AgentSteerInput,
+  type AgentSteerResult,
   type AgentTitleEnrichmentInput,
   type AgentNativeForkSourceInput,
   type AgentNativeForkBoundary,
@@ -173,6 +176,10 @@ interface NativeBackground {
   foregroundCommandBytes: number
   cancellationPending: boolean
   connection?: CodexAppServerConnection
+  steering?: boolean
+  steeringDone?: Promise<void>
+  steerInputIds: Set<string>
+  steeringInput?: { id: string; consumed: boolean } | undefined
 }
 
 interface ApprovalItem {
@@ -581,6 +588,8 @@ export class CodexAgentAdapter implements AgentAdapter {
       }
     | undefined
   private initialized = false
+  // Protocol support belongs to this initialized actor, never to a saved Thread.
+  private turnSpeedOverrideSupported = false
   private running = false
   private disposed = false
   private readonly loadedThreadIds = new Set<string>()
@@ -1307,6 +1316,54 @@ export class CodexAgentAdapter implements AgentAdapter {
         owner.release()
         this.nativeForkOwners.delete(input.operationId)
       }
+      this.scheduleIdleDisconnect()
+    }
+  }
+
+  async probeNativeInputs(input: AgentNativeInputProbeInput, signal: AbortSignal): Promise<void> {
+    if (
+      !input.nativeTurnId ||
+      input.unresolvedInputIds.length > 64 ||
+      input.unresolvedInputIds.some((id) => !/^[a-f\d-]{36}$/iu.test(id))
+    )
+      throw new AgentExecutionError('protocol_error', 'Invalid native input receipt scope.', false)
+    const pending = new Set(input.unresolvedInputIds)
+    if (!pending.size) return
+    clearTimeout(this.idleTimer)
+    this.idleTimer = undefined
+    try {
+      const connection = await this.ensureConnection(input.cwd)
+      await this.initializeConnection(connection, signal)
+      await this.withNativeInspectionConnection(
+        connection,
+        input.cwd,
+        signal,
+        async (reader, readSignal) => {
+          for await (const entry of this.readNativeItems(
+            reader,
+            input.nativeSessionId,
+            input.nativeTurnId,
+            readSignal,
+            10_000,
+            8 * 1024 * 1024,
+          )) {
+            const item = Reflect.get(entry, 'item')
+            if (
+              Reflect.get(entry, 'turnId') !== input.nativeTurnId ||
+              !item ||
+              typeof item !== 'object' ||
+              Reflect.get(item, 'type') !== 'userMessage'
+            )
+              continue
+            const id = Reflect.get(item, 'clientId')
+            if (typeof id !== 'string' || !pending.has(id)) continue
+            input.recordConsumption(id)
+            pending.delete(id)
+            if (!pending.size) break
+          }
+        },
+      )
+    } finally {
       this.scheduleIdleDisconnect()
     }
   }
@@ -2764,6 +2821,155 @@ export class CodexAgentAdapter implements AgentAdapter {
       )
   }
 
+  async steer(input: AgentSteerInput, signal: AbortSignal): Promise<AgentSteerResult> {
+    const owner = [...this.nativeBackground].find((entry) => entry.input.runId === input.runId)
+    const current = (): boolean =>
+      Boolean(
+        owner &&
+        this.running &&
+        !this.disposed &&
+        !signal.aborted &&
+        !owner.closed &&
+        !owner.foregroundReleased &&
+        !owner.rootTerminal &&
+        !owner.rootNotStarted &&
+        !owner.cancellationPending &&
+        !owner.observation.signal.aborted &&
+        owner.input.nativeGeneration === input.nativeGeneration &&
+        (owner.input.bindingGeneration ?? 1) === input.bindingGeneration &&
+        owner.primaryThreadId === input.nativeSessionId &&
+        owner.primaryTurnId === input.nativeTurnId &&
+        owner.connection === this.connection &&
+        owner.connection?.isOpen,
+      )
+    if (!owner || !current())
+      return {
+        status: 'rejected',
+        reason: 'The target execution is no longer available for steering.',
+      }
+    if (owner.steering)
+      return { status: 'rejected', reason: 'Another steering request is still being delivered.' }
+    owner.steering = true
+    const receipt = { id: input.inputId, consumed: false }
+    owner.steeringInput = receipt
+    const done = Promise.withResolvers<void>()
+    owner.steeringDone = done.promise
+    let sent = false
+    const deadline = Date.now() + 10_000
+    try {
+      this.preflightPrompt({ ...owner.input, promptEnvelope: input.promptEnvelope })
+      const workflow = input.promptEnvelope.collaboration
+      if (input.promptEnvelope.skillInvocation) {
+        const listed = await owner.connection!.request(
+          'skills/list',
+          { cwds: [owner.input.cwd], forceReload: true },
+          { timeoutMs: Math.max(1, deadline - Date.now()), signal, canDispatch: current },
+        )
+        if (Reflect.get(listed, 'error')) throw new Error('Native Skills are unavailable.')
+        const catalog = nativeCodexSkillListSchema.parse(Reflect.get(listed, 'result'))
+        const directory = catalog.data.find((entry) => entry.cwd === owner.input.cwd)
+        if (!directory || directory.errors.length) throw new Error('Native Skills are incomplete.')
+        const bindings = nativeSkillCatalog(
+          'codex',
+          owner.input.cwd,
+          this.executablePath,
+          directory.skills,
+        )
+        const selected = input.promptEnvelope.skillInvocation.bindings.filter(
+          (binding) => binding.agentId === 'codex',
+        )
+        if (selected.some((binding) => !bindings.some((candidate) => candidate.id === binding.id)))
+          throw new Error('The steering Skill binding no longer matches the native catalog.')
+      }
+      if (owner.steerInputIds.size >= 64)
+        throw new AgentExecutionError(
+          'runtime_incompatible',
+          'Native input observation capacity is occupied.',
+          false,
+        )
+      owner.steerInputIds.add(input.inputId)
+      const response = await owner.connection!.request(
+        'turn/steer',
+        {
+          threadId: input.nativeSessionId,
+          expectedTurnId: input.nativeTurnId,
+          clientUserMessageId: input.inputId,
+          input: [
+            ...(workflow || owner.input.readCollaborationSourcePart
+              ? [
+                  {
+                    type: 'text',
+                    text: workflow
+                      ? collaborationInstructions(
+                          workflow,
+                          input.promptEnvelope.collaborationAuthorization,
+                        )
+                      : frozenSourceInstructions,
+                  },
+                ]
+              : []),
+            ...codexPromptInput(input.promptEnvelope),
+          ],
+        },
+        {
+          timeoutMs: Math.max(1, deadline - Date.now()),
+          signal,
+          canDispatch: current,
+          onDispatch: () => {
+            sent = true
+            input.recordDispatch('possibly_sent')
+          },
+        },
+      )
+      const error = Reflect.get(response, 'error')
+      if (receipt.consumed) return { status: 'accepted' }
+      if (error) {
+        owner.steerInputIds.delete(input.inputId)
+        input.recordDispatch('rejected')
+        return {
+          status:
+            typeof error === 'object' && Reflect.get(error, 'code') === -32601
+              ? 'unsupported'
+              : 'rejected',
+          reason:
+            typeof error === 'object' && Reflect.get(error, 'code') === -32601
+              ? 'This Codex version does not support steering an active turn.'
+              : 'Codex rejected steering for this exact active turn. The message was kept.',
+        }
+      }
+      const result = Reflect.get(response, 'result')
+      if (
+        !result ||
+        typeof result !== 'object' ||
+        Reflect.get(result, 'turnId') !== input.nativeTurnId
+      )
+        throw new AgentExecutionError(
+          'unknown_delivery',
+          'Codex did not confirm the steering request for its exact turn. Do not resend it automatically.',
+          false,
+        )
+      input.recordDispatch('accepted')
+      // ACK proves native acceptance, not when the model consumed this input.
+      return { status: 'accepted' }
+    } catch (error) {
+      if (receipt.consumed) return { status: 'accepted' }
+      if (sent)
+        throw new AgentExecutionError(
+          'unknown_delivery',
+          'Codex may have received this steering message. Do not resend it automatically.',
+          false,
+        )
+      owner.steerInputIds.delete(input.inputId)
+      input.recordDispatch('rejected')
+      if (signal.aborted) throw error
+      return { status: 'rejected', reason: 'The steering message was not delivered to Codex.' }
+    } finally {
+      owner.steering = false
+      if (owner.steeringInput === receipt) owner.steeringInput = undefined
+      done.resolve()
+    }
+  }
+
   async *run(input: AgentRunInput, signal: AbortSignal): AsyncIterable<NormalizedAgentEvent> {
     if (this.peerToolServer.hasSourceGrant())
       throw new NativeCapacityError(
@@ -2842,6 +3048,7 @@ export class CodexAgentAdapter implements AgentAdapter {
       untrackedWork: false,
       turns: new Map(),
       turnIds: new Set(),
+      steerInputIds: new Set(),
       recordings: new Set(),
       recordingTail: Promise.resolve(),
       foregroundCommands: new Map(),
@@ -2872,13 +3079,44 @@ export class CodexAgentAdapter implements AgentAdapter {
     const answer = new AgentAnswerAssembler(input.runId)
     const carrierMemory = new NativeWorkingMemory().reserve(0)
     let finalCarrier: unknown
+    let finalCarrierText: string | undefined
     let projectionFailure: unknown
+    const failProjection = (error: unknown): void => {
+      if (projectionFailure) return
+      const failure = classifyAgentError(error)
+      projectionFailure = failure
+      answer.dispose()
+      input.recordOutputFailure?.(failure)
+    }
+    const projectOutput = <T>(project: () => T): T | undefined => {
+      if (projectionFailure) return undefined
+      try {
+        return project()
+      } catch (error) {
+        failProjection(error)
+        return undefined
+      }
+    }
+    const captureCarrier = (text: string): void => {
+      finalCarrier = undefined
+      finalCarrierText = undefined
+      try {
+        // Control proof may remain readable after natural-answer projection fails.
+        carrierMemory.resize(4096 + text.length * 4 + Buffer.byteLength(text) * 2)
+        finalCarrierText = text
+        finalCarrier = readCollaborationEnvelopeText(text)
+      } catch (error) {
+        carrierMemory.resize(0)
+        failProjection(error)
+      }
+    }
     background.release = () => {
       if (sourceGrant) this.peerToolServer.retireSourceReader(sourceGrant)
       releaseNativeRequests?.()
       releaseApprovalMetadata?.()
       answer.dispose()
       finalCarrier = undefined
+      finalCarrierText = undefined
       carrierMemory.release()
     }
     const reasoningSummaryStates = new Map<string, { pendingPrefix: string; emitted: boolean }>()
@@ -3077,6 +3315,28 @@ export class CodexAgentAdapter implements AgentAdapter {
         ? eventTurnId === background.primaryTurnId
         : typeof eventTurnId === 'string' &&
           background.turnIds.has(JSON.stringify([eventThread, eventTurnId]))
+      if (
+        root &&
+        ownedTurn &&
+        typeof eventTurnId === 'string' &&
+        eventMethod === 'item/completed' &&
+        input.recordInputConsumption
+      ) {
+        const item = Reflect.get(eventParams, 'item')
+        const id =
+          item && typeof item === 'object' && Reflect.get(item, 'type') === 'userMessage'
+            ? Reflect.get(item, 'clientId')
+            : undefined
+        if (typeof id === 'string' && background.steerInputIds.has(id)) {
+          input.recordInputConsumption(id, {
+            nativeSessionId: eventThread,
+            nativeTurnId: eventTurnId,
+            executorId: nativeConnection.executorId,
+          })
+          background.steerInputIds.delete(id)
+          if (background.steeringInput?.id === id) background.steeringInput.consumed = true
+        }
+      }
       if (eventMethod === 'turn/started' && !root && typeof eventTurnId === 'string') {
         if (
           background.turnIds.size >= 256 &&
@@ -3171,7 +3431,13 @@ export class CodexAgentAdapter implements AgentAdapter {
       }
       if (observed.has(event)) return !root || background.foregroundReleased
       observed.add(event)
-      if (envelopeMode && root && ownedTurn && eventMethod === 'item/completed') {
+      if (
+        envelopeMode &&
+        root &&
+        ownedTurn &&
+        !background.rootTerminal &&
+        eventMethod === 'item/completed'
+      ) {
         const item = Reflect.get(eventParams, 'item')
         if (
           item &&
@@ -3181,7 +3447,7 @@ export class CodexAgentAdapter implements AgentAdapter {
           typeof Reflect.get(item, 'text') === 'string' &&
           Reflect.get(item, 'phase') === 'commentary'
         )
-          answer.complete(Reflect.get(item, 'id'), Reflect.get(item, 'text'))
+          projectOutput(() => answer.complete(Reflect.get(item, 'id'), Reflect.get(item, 'text')))
         if (
           item &&
           typeof item === 'object' &&
@@ -3189,15 +3455,12 @@ export class CodexAgentAdapter implements AgentAdapter {
           Reflect.get(item, 'phase') !== 'commentary'
         ) {
           const text = Reflect.get(item, 'text')
-          finalCarrier = undefined
           if (typeof text === 'string') {
-            input.recordCollaborationCarrierText?.(text)
-            // Raw DTO text and the parsed string workspace; ordered dump/projection copies were removed.
-            carrierMemory.resize(4096 + text.length * 4 + Buffer.byteLength(text) * 2)
-            finalCarrier = readCollaborationEnvelopeText(text)
+            captureCarrier(text)
             if (finalCarrier === undefined) {
               const natural = collaborationNaturalFallback(text)
-              if (natural !== undefined) answer.complete(String(Reflect.get(item, 'id')), natural)
+              if (natural !== undefined)
+                projectOutput(() => answer.complete(String(Reflect.get(item, 'id')), natural))
             }
           }
         }
@@ -3209,64 +3472,82 @@ export class CodexAgentAdapter implements AgentAdapter {
             eventTurn && typeof eventTurn === 'object'
               ? Reflect.get(eventTurn, 'status')
               : undefined
-          if (status === 'completed' || status === 'failed' || status === 'interrupted') {
+          if (
+            !background.rootTerminal &&
+            (status === 'completed' || status === 'failed' || status === 'interrupted')
+          ) {
             background.rootTerminal = true
             if (sourceGrant) this.peerToolServer.retireSourceReader(sourceGrant)
-            let submittedReport: ReturnType<typeof readSubmittedCollaborationReport>
-            if (envelopeMode) {
-              try {
+            const settleTerminal = (): void => {
+              // Native termination is independent of carrier persistence or display.
+              this.recordTerminal(
+                input,
+                background.primaryThreadId!,
+                background.primaryTurnId!,
+                status,
+                { outputId: answer.outputId, text: '' },
+              )
+              let submittedReport: ReturnType<typeof readSubmittedCollaborationReport>
+              if (envelopeMode) {
+                if (finalCarrierText !== undefined)
+                  input.recordCollaborationCarrierText?.(finalCarrierText)
                 input.recordCollaborationCarrier?.(finalCarrier)
-                const canonical = readCollaborationAnswer(finalCarrier, input.answerFormat)
-                if (canonical !== undefined) answer.replace(canonical)
-                submittedReport = readSubmittedCollaborationReport(finalCarrier, input.answerFormat)
-              } catch (error) {
-                projectionFailure = error
-                recordDiagnostic({
-                  operation: 'native_check',
-                  phase: 'failed',
-                  level: 'warn',
-                  scope: 'run',
-                  agentId: 'codex',
-                  sessionId: input.sessionId,
-                  runId: input.runId,
-                  runtimeBoundary: 'projection',
-                  code: classifyAgentError(error).kind,
-                  runtimeErrorType:
-                    diagnosticEventSchema.shape.runtimeErrorType.safeParse(
-                      error instanceof Error ? error.name : 'other',
-                    ).data ?? 'other',
+                projectOutput(() => {
+                  const canonical = readCollaborationAnswer(finalCarrier, input.answerFormat)
+                  if (canonical !== undefined) answer.replace(canonical)
+                  submittedReport = readSubmittedCollaborationReport(
+                    finalCarrier,
+                    input.answerFormat,
+                  )
                 })
               }
+              if (!projectionFailure)
+                this.recordTerminal(
+                  input,
+                  background.primaryThreadId!,
+                  background.primaryTurnId!,
+                  status,
+                  answer,
+                  submittedReport,
+                )
+              if (background.foregroundReleased) {
+                const text = projectionFailure
+                  ? undefined
+                  : envelopeMode
+                    ? answer.text
+                    : answer.finalize()
+                if (text !== undefined)
+                  input.recordArchivedEvent?.({
+                    agentId: 'codex',
+                    type: 'text.completed',
+                    turnId: background.primaryTurnId!,
+                    outputId: answer.outputId,
+                    text,
+                  })
+                if (!projectionFailure)
+                  input.recordArchivedEvent?.({
+                    agentId: 'codex',
+                    type: 'turn.completed',
+                    turnId: background.primaryTurnId!,
+                    outcome: status,
+                  })
+              }
             }
-            this.recordTerminal(
-              input,
-              background.primaryThreadId!,
-              background.primaryTurnId!,
-              status,
-              projectionFailure ? { outputId: answer.outputId, text: '' } : answer,
-              submittedReport,
-            )
-            if (background.foregroundReleased) {
-              const text = projectionFailure
-                ? undefined
-                : envelopeMode
-                  ? answer.text
-                  : answer.finalize()
-              if (text !== undefined)
-                input.recordArchivedEvent?.({
-                  agentId: 'codex',
-                  type: 'text.completed',
-                  turnId: background.primaryTurnId!,
-                  outputId: answer.outputId,
-                  text,
+            if (background.steering && background.steeringDone) {
+              const settling = background.steeringDone
+                .then(settleTerminal)
+                .catch((error: unknown) => {
+                  projectionFailure = error
+                  reportUnknown(
+                    'Native completion could not be reconciled with its steering receipt.',
+                  )
                 })
-              input.recordArchivedEvent?.({
-                agentId: 'codex',
-                type: 'turn.completed',
-                turnId: background.primaryTurnId!,
-                outcome: status,
+              background.interactions.add(settling)
+              void settling.finally(() => {
+                background.interactions.delete(settling)
+                maybeSettle()
               })
-            }
+            } else settleTerminal()
           }
         } else if (background.turns.get(eventThread) === eventTurnId)
           background.threads.delete(eventThread)
@@ -3276,14 +3557,15 @@ export class CodexAgentAdapter implements AgentAdapter {
           const itemId = Reflect.get(eventParams, 'itemId'),
             delta = Reflect.get(eventParams, 'delta')
           if (typeof itemId === 'string' && typeof delta === 'string') {
-            const text = answer.append(itemId, delta)
-            input.recordArchivedEvent?.({
-              agentId: 'codex',
-              type: 'text.delta',
-              turnId: background.primaryTurnId!,
-              outputId: answer.outputId,
-              text,
-            })
+            const text = projectOutput(() => answer.append(itemId, delta))
+            if (text !== undefined)
+              input.recordArchivedEvent?.({
+                agentId: 'codex',
+                type: 'text.delta',
+                turnId: background.primaryTurnId!,
+                outputId: answer.outputId,
+                text,
+              })
           }
         } else if (!envelopeMode && eventMethod === 'item/completed') {
           const item = Reflect.get(eventParams, 'item')
@@ -3291,7 +3573,7 @@ export class CodexAgentAdapter implements AgentAdapter {
             const itemId = Reflect.get(item, 'id'),
               text = Reflect.get(item, 'text')
             if (typeof itemId === 'string' && typeof text === 'string') {
-              const completed = answer.complete(itemId, text)
+              const completed = projectOutput(() => answer.complete(itemId, text))
               if (completed !== undefined)
                 input.recordArchivedEvent?.({
                   agentId: 'codex',
@@ -3739,6 +4021,14 @@ export class CodexAgentAdapter implements AgentAdapter {
             false,
           )
       }
+      const acceptanceDeadline = Date.now() + CODEX_TURN_ACCEPT_TIMEOUT_MS
+      const speed = await this.resolveTurnSpeed(
+        connection,
+        input.speed ?? 'native',
+        input.model ?? this.loadedThreadConfigurations.get(threadId)?.model,
+        signal,
+        acceptanceDeadline,
+      )
       const turnResponse = await connection.request(
         'turn/start',
         {
@@ -3771,9 +4061,10 @@ export class CodexAgentAdapter implements AgentAdapter {
             : {}),
           ...(input.model ? { model: input.model } : {}),
           ...(input.effort ? { effort: input.effort } : {}),
+          ...(speed.serviceTier ? { serviceTierForTurn: speed.serviceTier } : {}),
         },
         {
-          timeoutMs: CODEX_TURN_ACCEPT_TIMEOUT_MS,
+          timeoutMs: Math.max(1, acceptanceDeadline - Date.now()),
           signal,
           onDispatch: () => {
             delivery.phase = 'possibly_delivered'
@@ -3787,6 +4078,13 @@ export class CodexAgentAdapter implements AgentAdapter {
         background.rootNotStarted = true
         input.recordDispatch?.('rejected', threadId, connection.executorId)
         throw classifyAgentError(new Error(JSON.stringify(turnRpcError)))
+      }
+      yield {
+        agentId: 'codex',
+        type: 'run.speed.resolved',
+        requested: input.speed ?? 'native',
+        ...(speed.serviceTier === 'default' ? { speed: 'standard' as const } : {}),
+        ...(speed.detail ? { detail: speed.detail } : {}),
       }
       const turnResult = Reflect.get(turnResponse, 'result')
       const turn =
@@ -3819,6 +4117,19 @@ export class CodexAgentAdapter implements AgentAdapter {
         const method = Reflect.get(message, 'method')
         const params = Reflect.get(message, 'params')
         if (typeof method !== 'string' || !params || typeof params !== 'object') continue
+        if (background.steering && background.steeringDone) {
+          const item = Reflect.get(params, 'item')
+          if (
+            method === 'turn/completed' ||
+            (method === 'item/completed' &&
+              item &&
+              typeof item === 'object' &&
+              Reflect.get(item, 'type') === 'agentMessage' &&
+              Reflect.get(item, 'phase') !== 'commentary')
+          )
+            // oxlint-disable-next-line no-await-in-loop -- One same-owner steering RPC has its existing absolute deadline.
+            await background.steeringDone
+        }
         if (handleOwnedNativeEvent(message)) continue
         // The cached connection can still deliver notifications from an earlier Turn.
         // Filter before progress accounting or stream coalescing; the ACK owns identity.
@@ -3953,14 +4264,15 @@ export class CodexAgentAdapter implements AgentAdapter {
           const itemId = Reflect.get(params, 'itemId')
           if (typeof delta === 'string' && typeof itemId === 'string') {
             if (!turnId) continue
-            const appended = answer.append(itemId, delta)
-            yield {
-              agentId: 'codex',
-              type: 'text.delta',
-              turnId,
-              outputId: answer.outputId,
-              text: appended,
-            }
+            const appended = projectOutput(() => answer.append(itemId, delta))
+            if (appended !== undefined)
+              yield {
+                agentId: 'codex',
+                type: 'text.delta',
+                turnId,
+                outputId: answer.outputId,
+                text: appended,
+              }
           }
         } else if (method === 'item/completed') {
           const item = Reflect.get(params, 'item')
@@ -3970,7 +4282,7 @@ export class CodexAgentAdapter implements AgentAdapter {
             const text = Reflect.get(item, 'text')
             const itemId = Reflect.get(item, 'id')
             if (typeof text === 'string' && typeof itemId === 'string') {
-              const completed = answer.complete(itemId, text)
+              const completed = projectOutput(() => answer.complete(itemId, text))
               if (completed !== undefined)
                 yield {
                   agentId: 'codex',
@@ -4117,7 +4429,7 @@ export class CodexAgentAdapter implements AgentAdapter {
               workflow,
               turnId,
               input.answerFormat,
-              input.promptEnvelope.collaborationAuthorization,
+              (input.currentPromptEnvelope?.() ?? input.promptEnvelope).collaborationAuthorization,
             )
           yield {
             agentId: 'codex',
@@ -4627,6 +4939,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     background.closed = true
     if (background.sourceGrant) this.peerToolServer.retireSourceReader(background.sourceGrant)
     background.foregroundCommands.clear()
+    background.steerInputIds.clear()
     background.foregroundCommandBytes = 0
     background.release?.()
     clearTimeout(background.earlyTimer)
@@ -5036,11 +5349,105 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.processCwd = cwd
     this.processEnvironmentKey = environmentKey
     this.initialized = false
+    this.turnSpeedOverrideSupported = false
     this.retiredNativeTurns.clear()
     this.retiredNativeChildren.clear()
     this.loadedThreadIds.clear()
     this.loadedThreadConfigurations.clear()
     return connection
+  }
+
+  private async resolveTurnSpeed(
+    connection: CodexAppServerConnection,
+    speed: 'native' | 'standard' | 'fast',
+    model: string | undefined,
+    signal: AbortSignal,
+    acceptanceDeadline: number,
+  ): Promise<{ serviceTier?: 'default' | 'priority'; detail?: string }> {
+    if (speed === 'native') return {}
+    if (!this.turnSpeedOverrideSupported)
+      return {
+        detail:
+          'This Codex version cannot safely override speed for one execution. Native speed is unchanged; update Codex to select Standard or Fast.',
+      }
+    if (speed === 'standard') return { serviceTier: 'default' }
+    if (!model)
+      return {
+        serviceTier: 'default',
+        detail:
+          'The native model could not be confirmed for Fast. Continuing at standard speed with the same model and effort.',
+      }
+    const controller = new AbortController()
+    const observed = AbortSignal.any([signal, controller.signal])
+    const timeout = setTimeout(
+      () => controller.abort(),
+      Math.max(1, Math.min(10_000, acceptanceDeadline - Date.now())),
+    )
+    let cursor: string | undefined
+    let items = 0
+    let bytes = 0
+    try {
+      do {
+        // Uncached ordered pages, owned by this Run's existing connection. The
+        // catalog is capability evidence, never proof of provider entitlement.
+        // oxlint-disable-next-line no-await-in-loop
+        const page = await connection.request(
+          'model/list',
+          { limit: 25, includeHidden: true, ...(cursor ? { cursor } : {}) },
+          { timeoutMs: Math.max(1, acceptanceDeadline - Date.now()), signal: observed },
+        )
+        const result = Reflect.get(page, 'result')
+        const data = result && typeof result === 'object' ? Reflect.get(result, 'data') : null
+        const next = result && typeof result === 'object' ? Reflect.get(result, 'nextCursor') : null
+        if (
+          Reflect.get(page, 'error') ||
+          !Array.isArray(data) ||
+          data.length > 25 ||
+          (next != null && (typeof next !== 'string' || next.length > 8192 || next === cursor))
+        )
+          throw new Error('Codex did not provide a bounded service-tier catalog.')
+        for (const entry of data) {
+          bytes += Buffer.byteLength(JSON.stringify(entry))
+          if (++items > 200 || bytes > 256 * 1024 || !entry || typeof entry !== 'object')
+            throw new Error('Codex service-tier catalog exceeded its bounded read.')
+          if (Reflect.get(entry, 'model') !== model && Reflect.get(entry, 'id') !== model) continue
+          const tiers = Reflect.get(entry, 'serviceTiers')
+          const supported =
+            Array.isArray(tiers) &&
+            tiers.length <= 16 &&
+            tiers.some(
+              (tier) =>
+                tier &&
+                typeof tier === 'object' &&
+                Reflect.get(tier, 'id') === 'priority' &&
+                Reflect.get(tier, 'name') === 'Fast',
+            )
+          return supported
+            ? { serviceTier: 'priority' }
+            : {
+                serviceTier: 'default',
+                detail:
+                  'This model does not advertise a native Fast service tier. Continuing at standard speed with the same model and effort.',
+              }
+        }
+        cursor = next ?? undefined
+      } while (cursor)
+      return {
+        serviceTier: 'default',
+        detail:
+          'The native model catalog could not confirm Fast compatibility. Continuing at standard speed.',
+      }
+    } catch {
+      signal.throwIfAborted()
+      return {
+        serviceTier: 'default',
+        detail:
+          'Native Fast availability could not be checked before dispatch. Continuing at standard speed.',
+      }
+    } finally {
+      clearTimeout(timeout)
+      controller.abort()
+    }
   }
 
   private async initializeConnection(
@@ -5067,6 +5474,23 @@ export class CodexAgentAdapter implements AgentAdapter {
           false,
         )
       await connection.notify('initialized', {}, { signal })
+      const userAgent = Reflect.get(Reflect.get(response, 'result') ?? {}, 'userAgent')
+      // 0.159.2 is the first installed version whose stable generated schema
+      // proves serviceTierForTurn. Older/unknown actors keep their native tier;
+      // using serviceTier instead would silently change subsequent Native runs.
+      // Our child-only originator override also changes this prefix to "pact".
+      const version =
+        typeof userAgent === 'string'
+          ? /^(?:pact|Codex [^/\r\n]{1,64}|codex_cli_rs)\/(\d+)\.(\d+)\.(\d+)(?:\s|$|\+)/u.exec(
+              userAgent,
+            )
+          : null
+      this.turnSpeedOverrideSupported = Boolean(
+        version &&
+        (Number(version[1]) > 0 ||
+          Number(version[2]) > 159 ||
+          (Number(version[2]) === 159 && Number(version[3]) >= 2)),
+      )
       this.initialized = true
     } catch (error) {
       // A cancelled acknowledgement cannot leave a half-initialized actor reusable.
@@ -5086,6 +5510,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.processCwd = undefined
     this.processEnvironmentKey = undefined
     this.initialized = false
+    this.turnSpeedOverrideSupported = false
     this.loadedThreadIds.clear()
     this.loadedThreadConfigurations.clear()
     for (const receipt of this.nativeRebuildReceipts.values()) {

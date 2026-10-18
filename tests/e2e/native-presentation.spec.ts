@@ -124,6 +124,9 @@ test(
       observer = ReadonlyFixtureDatabase.open(fixture)
       app = await fixture.launch()
       const page = await app.firstWindow()
+      await page
+        .getByRole('button', { name: 'Load more Sessions in Presentation workspace', exact: true })
+        .click()
       await page.getByRole('button', { name: 'Preserved workspace', exact: true }).click()
       const editor = page.getByRole('combobox', { name: 'Message', exact: true })
       await expect(editor).toBeEnabled()
@@ -155,17 +158,22 @@ test(
         await page.keyboard.press('Escape')
         await expect(quit).toHaveCount(0)
       }
-      await page.getByRole('button', { name: 'Claude · Ask for approval', exact: true }).click()
+      await page
+        .getByRole('button', { name: 'Claude Code permissions: Ask for approval', exact: true })
+        .click()
       await attention()
       await expect(page.getByLabel('Claude Code permissions', { exact: true })).toBeHidden()
       await back()
       await expect(
-        page.getByRole('button', { name: 'Claude · Ask for approval', exact: true }),
+        page.getByRole('button', {
+          name: 'Claude Code permissions: Ask for approval',
+          exact: true,
+        }),
       ).toBeFocused()
       await expect(editor).toHaveText('Preserved input\nSecond line')
       await page.keyboard.press('Escape')
       const answer = page.locator('article[data-pact-speaker="claude"]')
-      await answer.hover()
+      await answer.locator('[data-pact-message-bubble]').hover()
       await answer.getByRole('button', { name: 'Fork conversation from this reply' }).click()
       const fork = page.getByRole('dialog', { name: 'Fork conversation', exact: true })
       await expect(fork).toBeVisible()

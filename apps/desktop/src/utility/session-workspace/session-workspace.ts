@@ -15,6 +15,7 @@ import type {
   SessionSettingsInput,
   SessionSettingsSaveInput,
   SessionPermissionSaveInput,
+  SessionSpeedSaveInput,
   NativeSessionOpenInput,
   NativeJumpListSuppressionInput,
   NativeSessionRow,
@@ -231,12 +232,25 @@ export class SessionWorkspace {
     if (!validation.ok) return validation
 
     try {
+      const current = this.sessions.find(input.sessionId)
+      if (!current || current.status === 'archived')
+        throw new Error('This Session is no longer available.')
       return {
         ok: true,
         value: {
           catalogChange: this.sessions.saveSettings(input.sessionId, {
             ...input.settings,
-            permissionModes: this.sessions.find(input.sessionId)?.settings.permissionModes,
+            permissionModes: current.settings.permissionModes,
+            agents: {
+              claude: {
+                ...input.settings.agents.claude,
+                speed: current.settings.agents.claude.speed ?? 'native',
+              },
+              codex: {
+                ...input.settings.agents.codex,
+                speed: current.settings.agents.codex.speed ?? 'native',
+              },
+            },
           }),
           modelCatalogs: validation.value.modelCatalogs,
         },
@@ -255,6 +269,20 @@ export class SessionWorkspace {
         error: {
           code: 'CONFLICT',
           message: error instanceof Error ? error.message : 'Permissions could not be saved.',
+        },
+      }
+    }
+  }
+
+  saveSpeed(input: SessionSpeedSaveInput): RpcResult<SessionCatalogChange> {
+    try {
+      return { ok: true, value: this.sessions.saveSpeed(input) }
+    } catch (error) {
+      return {
+        ok: false,
+        error: {
+          code: 'CONFLICT',
+          message: error instanceof Error ? error.message : 'Speed could not be saved.',
         },
       }
     }

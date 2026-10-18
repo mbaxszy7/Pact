@@ -96,6 +96,8 @@ export const collaborationTurnAuthorizationSchema = z.strictObject({
   inputBatchId: z.string().uuid().nullable(),
   inputWatermark: z.number().int().nonnegative(),
   inputSequence: z.number().int().nonnegative(),
+  inputRevision: z.number().int().nonnegative().optional(),
+  resultNonce: z.string().uuid().optional(),
   inputBatchRef: collaborationInputBatchReferenceSchema.nullable(),
   basis: collaborationDocumentSchema.nullable(),
   requiredInputScopeRef: collaborationDocumentSchema.nullable(),
@@ -145,6 +147,7 @@ export const collaborationTodoPageSchema = z
   )
 export type CollaborationTodoPage = z.infer<typeof collaborationTodoPageSchema>
 export const collaborationSourceReadSchema = z.strictObject({
+  inputRevision: z.number().int().nonnegative().optional(),
   runId: z
     .string()
     .uuid()

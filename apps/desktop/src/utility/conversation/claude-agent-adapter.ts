@@ -30,6 +30,8 @@ import {
   type AgentNativeContextRebuildInput,
   type AgentNativeContextRebuildResult,
   type AgentRunInput,
+  type AgentSteerInput,
+  type AgentSteerResult,
   type AgentTitleEnrichmentInput,
   type AgentNativeForkSourceInput,
   type AgentNativeForkBoundary,
@@ -117,6 +119,10 @@ export const CLAUDE_TITLE_TIMEOUT_MS = 2_000
 const MAX_NATIVE_CLAUDE_QUERIES = 8
 const PERMISSION_MODE_TIMEOUT_MS = 15_000
 const NATIVE_INTERRUPT_TIMEOUT_MS = 2_000
+const FAST_MODE_CHECK_TIMEOUT_MS = 10_000
+const RUN_STARTUP_TIMEOUT_MS = 30_000
+// The native consumption list has 64 UUID slots, including the initial input.
+const MAX_STEERING_INPUTS = 63
 
 interface ClaudeAgentDependencies {
   query: typeof query
@@ -124,6 +130,18 @@ interface ClaudeAgentDependencies {
   startup?: typeof startup
   getSessionMessages?: typeof getSessionMessages
   spawn?: typeof spawn
+}
+
+interface ClaudeSteeringInput {
+  request: AgentSteerInput
+  signal: AbortSignal
+  result: PromiseWithResolvers<AgentSteerResult>
+  started: boolean
+  yielded: boolean
+  consumed: boolean
+  finished: boolean
+  cancelled: boolean
+  reservation?: NativeMemoryReservation
 }
 
 const defaultClaudeAgentDependencies: ClaudeAgentDependencies = {
@@ -211,6 +229,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       recordings: Set<Promise<void>>
       executorId: string
       sourceGrant?: { runId: string; grant: string; active: boolean } | undefined
+      steer?: (input: AgentSteerInput, signal: AbortSignal) => Promise<AgentSteerResult>
     }
   >()
   private readonly peerServerName = `pact_peer_${randomUUID().replaceAll('-', '')}`
@@ -866,9 +885,15 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       }
       if (verifiedTerminal?.output?.completeness === 'complete') return verifiedTerminal
 
-      if (input.answerFormat && nativeTurnId) {
+      if (nativeTurnId) {
         const recovered = await this.nativeForkFiles.readAnswer(
-          { cwd: input.cwd, nativeSessionId, nativeTurnId, answerFormat: input.answerFormat },
+          {
+            cwd: input.cwd,
+            nativeSessionId,
+            nativeTurnId,
+            ...(input.answerFormat ? { answerFormat: input.answerFormat } : {}),
+            ...(input.nativeInputIds ? { nativeInputIds: input.nativeInputIds } : {}),
+          },
           signal,
         )
         const output = recovered.answer
@@ -1725,7 +1750,15 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     }
   }
 
+  async steer(input: AgentSteerInput, signal: AbortSignal): Promise<AgentSteerResult> {
+    const owner = this.backgroundRuns.get(input.runId)
+    return owner?.steer
+      ? owner.steer(input, signal)
+      : { status: 'rejected', reason: 'The target execution is no longer available for steering.' }
+  }
+
   async *run(input: AgentRunInput, signal: AbortSignal): AsyncIterable<NormalizedAgentEvent> {
+    const startupDeadline = Date.now() + RUN_STARTUP_TIMEOUT_MS
     if (this.disposed) {
       throw new AgentExecutionError('agent_process_crash', 'Claude Code is shutting down.', false)
     }
@@ -1764,6 +1797,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     let permissionRefused = false
     let turnStarted = false
     let assistantMessageId = input.runId
+    let nativeResultAssistantText = false
+    let nativeResultNumber = 0
     const answer = new AgentAnswerAssembler(input.runId)
     let resolvedModel = input.model
     let terminalKnown = false
@@ -1834,6 +1869,12 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     let titleRecorded = false
     const peerToolName = `mcp__${this.peerServerName}__request_peer_assistance`
     let iterator: AsyncIterator<SDKMessage> | undefined
+    const speedInput = input.speed === 'fast' ? Promise.withResolvers<boolean>() : undefined
+    let speedDetail: string | undefined
+    let lastSpeedState: string | undefined
+    let nativeActor: ChildProcess | undefined
+    let nativeQueueCancellationSupported = false
+    let skillCatalogChangedDuringRun = false
     const skillInput = input.promptEnvelope.skillInvocation
       ? Promise.withResolvers<boolean>()
       : undefined
@@ -1971,7 +2012,278 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     let readerEof = false
     let transportReleased = false
     const inputMemory = new NativeWorkingMemory()
+    const deferredResultMemory = inputMemory.reserve(0)
+    let deferredResult: SDKMessage | undefined
+    let deferredEnding: 'completed' | 'failed' | 'interrupted' | undefined
+    let deferredResultHasText = false
+    let projectionFailure: AgentExecutionError | undefined
+    const failProjection = (error: unknown): void => {
+      if (!projectionFailure) {
+        projectionFailure = classifyAgentError(error)
+        reasoningBlocks.clear()
+        reasoningBytes = 0
+        tools.clear()
+        answer.dispose()
+        deferredResult = undefined
+        deferredResultMemory.resize(0)
+        input.recordOutputFailure?.(projectionFailure)
+      }
+      // Report once, then let the existing background reader retain control
+      // receipts even when a later body/carrier cannot be retained.
+      if (!foregroundReleased) throw projectionFailure
+    }
+    const recordCarrier = (value: unknown): void => {
+      try {
+        input.recordCollaborationCarrier?.(value)
+      } catch (error) {
+        failProjection(error)
+      }
+    }
+    const recordEnding = (outcome: 'completed' | 'failed' | 'interrupted'): void => {
+      terminalKnown = true
+      this.recordEvidence(input, resolvedSessionId, {
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome,
+      })
+    }
     let inputReservation: NativeMemoryReservation | undefined
+    // One producer owns the SDK input stream for this complete Pact Run.
+    // Native consumption frees its single pending slot; <=64 total input UUIDs
+    // and the existing managed byte owner bound history retained until close.
+    let inputOpen = true
+    let pendingInput: ClaudeSteeringInput | undefined
+    let wakeInput: (() => void) | undefined
+    const steeredInputs = new Map<string, ClaudeSteeringInput>()
+    let interruptTask: Promise<void> | undefined
+    const unfinishedSteering = (): boolean =>
+      [...steeredInputs.values()].some((entry) => entry.yielded && !entry.finished)
+    const closeInput = (): void => {
+      inputOpen = false
+      if (pendingInput && !pendingInput.yielded) {
+        const entry = pendingInput
+        pendingInput = undefined
+        steeredInputs.delete(entry.request.inputId)
+        try {
+          entry.request.recordDispatch('rejected')
+        } catch {
+          reportUnknown()
+        }
+        entry.result.resolve({
+          status: 'rejected',
+          reason: 'The message was not delivered before the target execution ended.',
+        })
+      }
+      wakeInput?.()
+      wakeInput = undefined
+    }
+    const steerCurrent = (request: AgentSteerInput, requestSignal: AbortSignal): boolean =>
+      inputOpen &&
+      !this.disposed &&
+      !signal.aborted &&
+      !requestSignal.aborted &&
+      !foregroundReleased &&
+      !terminalKnown &&
+      !transportReleased &&
+      turnStarted &&
+      request.runId === input.runId &&
+      request.nativeSessionId === resolvedSessionId &&
+      request.nativeTurnId === input.runId &&
+      request.nativeGeneration === input.nativeGeneration &&
+      request.bindingGeneration === (input.bindingGeneration ?? 1) &&
+      request.promptEnvelope.sessionId === input.sessionId
+    const steer = async (
+      request: AgentSteerInput,
+      requestSignal: AbortSignal,
+    ): Promise<AgentSteerResult> => {
+      if (!steerCurrent(request, requestSignal) || !session)
+        return {
+          status: 'rejected',
+          reason: 'The target execution is no longer available for steering.',
+        }
+      if (
+        !nativeQueueCancellationSupported ||
+        typeof Reflect.get(session, 'cancelAsyncMessage') !== 'function'
+      )
+        return {
+          status: 'unsupported',
+          reason:
+            'This Claude runtime cannot confirm safe cancellation of queued steering messages on Stop.',
+        }
+      if (
+        pendingInput ||
+        steeredInputs.size >= MAX_STEERING_INPUTS ||
+        steeredInputs.has(request.inputId)
+      )
+        return {
+          status: 'rejected',
+          reason: 'This execution has no available steering input capacity.',
+        }
+      if (!ClaudeAgentAdapter.isRequestUuid(request.inputId))
+        return {
+          status: 'rejected',
+          reason: 'The steering message has an invalid native input identity.',
+        }
+      const duty = request.promptEnvelope.collaboration
+      const scope = request.promptEnvelope.collaborationAuthorization
+      if (
+        Boolean(duty) !== Boolean(workflow) ||
+        (duty &&
+          (!scope ||
+            duty.id !== workflow?.id ||
+            duty.actor !== this.id ||
+            scope.taskId !== duty.id ||
+            scope.runId !== input.runId ||
+            scope.actor !== this.id))
+      )
+        return {
+          status: 'rejected',
+          reason: 'The steering input does not belong to this execution duty.',
+        }
+      const controller = new AbortController()
+      const entry: ClaudeSteeringInput = {
+        request,
+        signal: AbortSignal.any([signal, requestSignal, controller.signal]),
+        result: Promise.withResolvers<AgentSteerResult>(),
+        started: false,
+        yielded: false,
+        consumed: false,
+        finished: false,
+        cancelled: false,
+      }
+      pendingInput = entry
+      steeredInputs.set(request.inputId, entry)
+      wakeInput?.()
+      wakeInput = undefined
+      try {
+        return await ClaudeAgentAdapter.withDeadline(entry.result.promise, 10_000, requestSignal)
+      } catch (error) {
+        if (entry.yielded)
+          throw new AgentExecutionError(
+            'unknown_delivery',
+            'Claude Code may have received this steering message. Do not resend it automatically.',
+            false,
+          )
+        request.recordDispatch('rejected')
+        if (requestSignal.aborted) throw error
+        return {
+          status: 'rejected',
+          reason: 'The steering message was not delivered to Claude Code.',
+        }
+      } finally {
+        controller.abort()
+        if (!entry.yielded) {
+          if (pendingInput === entry) pendingInput = undefined
+          steeredInputs.delete(request.inputId)
+          entry.reservation?.release()
+        }
+      }
+    }
+    const steeringMessages = async function* (
+      this: ClaudeAgentAdapter,
+    ): AsyncIterable<SDKUserMessage> {
+      while (true) {
+        if (!inputOpen) return
+        const entry = pendingInput
+        if (!entry || entry.started) {
+          // Exactly one parked producer waiter, woken by admission or close.
+          // oxlint-disable-next-line no-await-in-loop
+          await new Promise<void>((resolve) => {
+            wakeInput = resolve
+          })
+          continue
+        }
+        entry.started = true
+        const envelope = entry.request.promptEnvelope
+        try {
+          if (envelope.skillInvocation) {
+            if (skillCatalogChangedDuringRun || !session)
+              throw new Error('The native Skill catalog changed during this execution.')
+            // oxlint-disable-next-line no-await-in-loop -- Read the same initialized Query's bounded command snapshot before this message can escape.
+            const commands = await ClaudeAgentAdapter.withDeadline(
+              session.supportedCommands(),
+              10_000,
+              entry.signal,
+            )
+            const selected = envelope.skillInvocation.bindings.filter(
+              (binding) => binding.agentId === 'claude',
+            )
+            const current = nativeSkillCatalog(
+              'claude',
+              input.cwd,
+              this.executablePath,
+              commands.filter((command) =>
+                selected.some((binding) => binding.name === command.name),
+              ),
+            )
+            if (
+              selected.some((binding) => !current.some((candidate) => candidate.id === binding.id))
+            )
+              throw new Error('The steering Skill binding no longer matches the native catalog.')
+          }
+          yield* ClaudeAgentAdapter.promptMessages(
+            { ...input, runId: entry.request.inputId, promptEnvelope: envelope },
+            resolvedSessionId,
+            () => {
+              if (!steerCurrent(entry.request, entry.signal)) return false
+              entry.request.recordDispatch('possibly_sent')
+              entry.yielded = true
+              return true
+            },
+            undefined,
+            entry.signal,
+            undefined,
+            inputMemory,
+            (reservation) => {
+              entry.reservation = reservation
+            },
+            {
+              priority: 'next',
+              prefix: envelope.collaboration
+                ? collaborationInstructions(
+                    envelope.collaboration,
+                    envelope.collaborationAuthorization,
+                  )
+                : input.readCollaborationSourcePart
+                  ? frozenSourceInstructions
+                  : undefined,
+            },
+          )
+          entry.result.resolve(
+            entry.yielded
+              ? { status: 'submitted' }
+              : {
+                  status: 'rejected',
+                  reason: 'The target execution ended before this input was sent.',
+                },
+          )
+        } catch {
+          if (entry.yielded)
+            entry.result.reject(
+              new AgentExecutionError(
+                'unknown_delivery',
+                'Steering input delivery is unconfirmed.',
+                false,
+              ),
+            )
+          else
+            entry.result.resolve({
+              status: 'rejected',
+              reason: 'The steering input could not be prepared.',
+            })
+        }
+        if (!entry.yielded) {
+          try {
+            entry.request.recordDispatch('rejected')
+          } catch {
+            // A retired foreground cannot turn one refused supplemental input
+            // into an exception from the SDK producer and kill its native work.
+            reportUnknown()
+          }
+          if (pendingInput === entry) pendingInput = undefined
+        }
+      }
+    }.bind(this)
     const releaseExitedQuery = async (): Promise<void> => {
       if (
         transportReleased ||
@@ -1983,6 +2295,10 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       answer.dispose()
       inputReservation?.release()
       inputReservation = undefined
+      deferredResult = undefined
+      deferredResultMemory.release()
+      for (const entry of steeredInputs.values()) entry.reservation?.release()
+      await interruptTask
       await Promise.allSettled([recordingTail, ...recordings])
       // oxlint-disable-next-line no-await-in-loop -- Accepted callbacks can append to this eight-item queue while its preceding durable writes settle.
       while (recordings.size) await Promise.allSettled(recordings)
@@ -1991,13 +2307,14 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       this.activeControllers.delete(abortController)
       const workConfirmed =
         (terminalKnown || permissionRefused || nativeNotStarted) &&
+        !unfinishedSteering() &&
         !nativeWork.pending &&
         !permissionWait.waiting
       // Actor exit retires transport capacity; it does not prove unobserved
       // descendants or a missing native ending. Keep the recovery/work fence.
       if (
         workConfirmed ||
-        (readerEof && !nativeWork.pending && !permissionWait.waiting) ||
+        (readerEof && !unfinishedSteering() && !nativeWork.pending && !permissionWait.waiting) ||
         (!session && !actorObserved)
       ) {
         this.backgroundRuns.delete(input.runId)
@@ -2011,20 +2328,55 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     }
     const abort = (): void => {
       skillInput?.resolve(false)
+      speedInput?.resolve(false)
       confirmPermissionInput?.(false)
+      closeInput()
       if (!session || !deliveryAttempted || interruptRequested) return
       interruptRequested = true
       // Stop cancels the foreground/permission wait while this independent SDK
       // lifetime remains open to receive the real matching termination receipt.
-      void ClaudeAgentAdapter.withDeadline(
-        Promise.resolve().then(() => session!.interrupt()),
+      interruptTask = ClaudeAgentAdapter.withDeadline(
+        (async () => {
+          // The pinned SDK runtime exposes the atomic queue sweep even though
+          // its public declaration omits the optional argument. It shares the
+          // SDK's exclusive frame writer with the long-lived input producer.
+          const interrupt = Reflect.get(session, 'interrupt') as (options: {
+            cancelQueued: true
+          }) => Promise<{ still_queued?: unknown; cancelled?: unknown } | undefined>
+          const receipt = unfinishedSteering()
+            ? await interrupt.call(session, { cancelQueued: true })
+            : await session.interrupt()
+          const cancelled = receipt?.cancelled
+          const queued = receipt?.still_queued
+          const cancel = Reflect.get(session, 'cancelAsyncMessage')
+          for (const entry of steeredInputs.values()) {
+            if (!entry.yielded || entry.finished) continue
+            let recalled = Array.isArray(cancelled) && cancelled.includes(entry.request.inputId)
+            if (
+              !recalled &&
+              Array.isArray(queued) &&
+              queued.includes(entry.request.inputId) &&
+              typeof cancel === 'function'
+            )
+              // oxlint-disable-next-line no-await-in-loop -- Exact queued UUIDs share one native writer and one interrupt deadline.
+              recalled = (await cancel.call(session, entry.request.inputId)) === true
+            if (recalled) {
+              entry.cancelled = true
+              entry.finished = true
+              if (!entry.consumed) entry.request.recordDispatch('rejected')
+            }
+          }
+          if (unfinishedSteering() && !Array.isArray(cancelled) && !Array.isArray(queued))
+            reportUnknown()
+        })(),
         NATIVE_INTERRUPT_TIMEOUT_MS,
         abortController.signal,
       ).catch(() => {
         if (!terminalKnown && !permissionRefused) {
           this.recordEvidence(input, resolvedSessionId, {
             kind: 'no_evidence',
-            reason: 'Native interruption was not acknowledged; observation remains active.',
+            reason:
+              'Native interruption or queued-input cancellation was not confirmed; observation remains active.',
           })
           reportUnknown()
         }
@@ -2081,12 +2433,36 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         )
       }
       nativeWork.observe(message)
+      if (message.type === 'system' && message.subtype === 'init')
+        nativeQueueCancellationSupported =
+          Array.isArray(message.capabilities) &&
+          message.capabilities.length <= 256 &&
+          message.capabilities.includes('interrupt_cancel_queued_v1')
       const echoed = Reflect.get(message, 'user_message_uuid')
       const echoes = Reflect.get(message, 'user_message_uuids')
       const explicit = typeof echoed === 'string' || Array.isArray(echoes)
+      const inputIds = new Set(
+        [
+          typeof echoed === 'string' ? echoed : undefined,
+          ...(Array.isArray(echoes) && echoes.length <= 64 ? echoes : []),
+        ].filter((value): value is string => typeof value === 'string'),
+      )
+      for (const entry of steeredInputs.values()) {
+        if (!entry.yielded || !inputIds.has(entry.request.inputId)) continue
+        if (!entry.consumed && !entry.cancelled) {
+          entry.request.recordConsumption(entry.request.inputId)
+          entry.consumed = true
+          if (pendingInput === entry) pendingInput = undefined
+          wakeInput?.()
+          wakeInput = undefined
+        }
+        if (message.type === 'result') entry.finished = true
+      }
       const matched =
-        echoed === input.runId ||
-        (Array.isArray(echoes) && echoes.length <= 64 && echoes.includes(input.runId))
+        inputIds.has(input.runId) ||
+        [...steeredInputs.values()].some(
+          (entry) => entry.yielded && inputIds.has(entry.request.inputId),
+        )
       if (explicit) {
         if (currentRequestMatched && !matched && !terminalKnown)
           this.recordEvidence(input, resolvedSessionId, {
@@ -2109,29 +2485,38 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           })
         else if (message.state === 'running')
           this.recordEvidence(input, resolvedSessionId, { kind: 'running', source: 'live_runtime' })
-        else if (message.state === 'idle' && turnStarted) {
-          // The same native Query reports turn-over after consuming our exact
-          // client UUID. This proves ended, not a success outcome or full text.
-          terminalKnown = true
-          this.recordEvidence(input, resolvedSessionId, {
-            kind: 'ended',
-            source: 'live_terminal',
-            ...(answer.text
-              ? {
-                  output: {
-                    outputId: answer.outputId,
-                    text: answer.text,
-                    completeness: 'partial' as const,
-                  },
-                }
-              : {}),
-          })
-        }
+        // Idle can be the boundary before a submitted `next` input starts.
+        // Only the exact result(s), not this state level, end the logical Run.
       }
-      if (message.type === 'system' && message.subtype === 'commands_changed')
+      if (message.type === 'system' && message.subtype === 'commands_changed') {
+        skillCatalogChangedDuringRun = true
         this.skillCatalogChanged?.()
+      }
       if (['assistant', 'stream_event', 'result'].includes(message.type) && !currentRequestMatched)
         return
+      if (message.type === 'system' || message.type === 'result') {
+        const state = Reflect.get(message, 'fast_mode_state')
+        const reason = Reflect.get(message, 'fast_mode_disabled_reason')
+        if (state === 'on' || state === 'off' || state === 'cooldown') {
+          const detail =
+            state === 'cooldown'
+              ? 'Fast is cooling down after a native rate limit. Continuing at standard speed.'
+              : state === 'off'
+                ? (speedDetail ?? ClaudeAgentAdapter.fastModeDisabledDetail(reason))
+                : undefined
+          const identity = JSON.stringify([state, detail])
+          if (identity !== lastSpeedState) {
+            lastSpeedState = identity
+            yield {
+              agentId: 'claude',
+              type: 'run.speed.resolved',
+              requested: input.speed ?? 'native',
+              speed: state === 'on' ? 'fast' : 'standard',
+              ...(detail ? { detail } : {}),
+            }
+          }
+        }
+      }
       // SDK initialization alone does not prove this prompt was accepted.
       // An actual model event or successful terminal result is the first
       // durable evidence that the Native Context received this Turn.
@@ -2150,248 +2535,257 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         if (proposal) yield proposal
       }
 
-      if (message.type === 'assistant' && message.parent_tool_use_id === null) {
-        const model = message.message.model
-        if (model && model !== resolvedModel) {
-          resolvedModel = model
-          yield { agentId: 'claude', type: 'run.model.resolved', model }
-        }
-      }
-
-      if (message.type === 'stream_event') {
-        const event = message.event
-        if (event.type === 'message_start') {
-          assistantMessageId = event.message.id
-          answer.begin(assistantMessageId)
-          const model = event.message.model
-          if (typeof model === 'string' && model && model !== resolvedModel) {
-            resolvedModel = model
-            yield { agentId: 'claude', type: 'run.model.resolved', model }
+      if (!projectionFailure) {
+        try {
+          if (message.type === 'assistant' && message.parent_tool_use_id === null) {
+            const model = message.message.model
+            if (model && model !== resolvedModel) {
+              resolvedModel = model
+              yield { agentId: 'claude', type: 'run.model.resolved', model }
+            }
           }
-        }
-        if (showReasoningSummaries && event.type === 'content_block_start') {
-          const block = event.content_block
-          if (block.type === 'thinking') {
-            if (!reasoningBlocks.has(event.index) && reasoningBlocks.size >= 64)
-              throw new AgentExecutionError(
-                'response_too_large',
-                'Claude reasoning activity exceeded the bounded item owner.',
-                false,
-              )
-            const activityId = `${assistantMessageId}:reasoning:${event.index}`
-            const text = block.thinking ?? ''
-            const bytes = Buffer.byteLength(text, 'utf8')
-            reasoningBytes += bytes - (reasoningBlocks.get(event.index)?.bytes ?? 0)
-            if (reasoningBytes > 2 * 1024 * 1024)
-              throw new AgentExecutionError(
-                'response_too_large',
-                'Claude reasoning activity exceeded its 2 MiB owner budget.',
-                false,
-              )
-            const emitted = Boolean(text.trim())
-            reasoningBlocks.set(event.index, { activityId, text, bytes, emitted })
-            if (emitted) {
+
+          if (message.type === 'stream_event') {
+            const event = message.event
+            if (event.type === 'message_start') {
+              assistantMessageId = event.message.id
+              const model = event.message.model
+              if (typeof model === 'string' && model && model !== resolvedModel) {
+                resolvedModel = model
+                yield { agentId: 'claude', type: 'run.model.resolved', model }
+              }
+            }
+            if (showReasoningSummaries && event.type === 'content_block_start') {
+              const block = event.content_block
+              if (block.type === 'thinking') {
+                if (!reasoningBlocks.has(event.index) && reasoningBlocks.size >= 64)
+                  throw new AgentExecutionError(
+                    'response_too_large',
+                    'Claude reasoning activity exceeded the bounded item owner.',
+                    false,
+                  )
+                const activityId = `${assistantMessageId}:reasoning:${event.index}`
+                const text = block.thinking ?? ''
+                const bytes = Buffer.byteLength(text, 'utf8')
+                reasoningBytes += bytes - (reasoningBlocks.get(event.index)?.bytes ?? 0)
+                if (reasoningBytes > 2 * 1024 * 1024)
+                  throw new AgentExecutionError(
+                    'response_too_large',
+                    'Claude reasoning activity exceeded its 2 MiB owner budget.',
+                    false,
+                  )
+                const emitted = Boolean(text.trim())
+                reasoningBlocks.set(event.index, { activityId, text, bytes, emitted })
+                if (emitted) {
+                  yield {
+                    agentId: 'claude',
+                    type: 'reasoning.summary.delta',
+                    turnId: input.runId,
+                    activityId,
+                    text,
+                  }
+                }
+              }
+            }
+            if (
+              showReasoningSummaries &&
+              event.type === 'content_block_delta' &&
+              event.delta.type === 'thinking_delta'
+            ) {
+              const current = reasoningBlocks.get(event.index)
+              if (!current && reasoningBlocks.size >= 64)
+                throw new AgentExecutionError(
+                  'response_too_large',
+                  'Claude reasoning activity exceeded the bounded item owner.',
+                  false,
+                )
+              const activityId =
+                current?.activityId ?? `${assistantMessageId}:reasoning:${event.index}`
+              const text = event.delta.thinking
+              const deltaBytes = Buffer.byteLength(text, 'utf8')
+              reasoningBytes += deltaBytes
+              if (reasoningBytes > 2 * 1024 * 1024)
+                throw new AgentExecutionError(
+                  'response_too_large',
+                  'Claude reasoning activity exceeded its 2 MiB owner budget.',
+                  false,
+                )
+              const reasoning = {
+                activityId,
+                text: `${current?.text ?? ''}${text}`,
+                bytes: (current?.bytes ?? 0) + deltaBytes,
+                emitted: current?.emitted ?? false,
+              }
+              reasoningBlocks.set(event.index, reasoning)
+              if (!reasoning.emitted && text.trim()) {
+                reasoning.emitted = true
+                yield {
+                  agentId: 'claude',
+                  type: 'reasoning.summary.delta',
+                  turnId: input.runId,
+                  activityId,
+                  text: reasoning.text,
+                }
+              } else if (reasoning.emitted && text) {
+                yield {
+                  agentId: 'claude',
+                  type: 'reasoning.summary.delta',
+                  turnId: input.runId,
+                  activityId,
+                  text,
+                }
+              }
+            }
+            if (showReasoningSummaries && event.type === 'content_block_stop') {
+              const reasoning = reasoningBlocks.get(event.index)
+              if (reasoning) {
+                reasoningBlocks.delete(event.index)
+                reasoningBytes -= reasoning.bytes
+                if (reasoning.text.trim()) {
+                  yield {
+                    agentId: 'claude',
+                    type: 'reasoning.summary.completed',
+                    turnId: input.runId,
+                    activityId: reasoning.activityId,
+                    text: reasoning.text,
+                  }
+                }
+              }
+            }
+          }
+
+          if (message.type === 'assistant' && !message.parent_tool_use_id) {
+            for (const block of message.message.content) {
+              if (block.type !== 'tool_use') continue
+              if (block.name === titleToolName && input.promptEnvelope.requestSessionTitle) {
+                if (
+                  !titleRecorded &&
+                  titleCalls.size === 0 &&
+                  block.id.length > 0 &&
+                  block.id.length <= 256
+                ) {
+                  const title = sessionTitleInputSchema.safeParse(block.input)
+                  if (title.success) titleCalls.set(block.id, title.data.title)
+                }
+                continue
+              }
+              if (block.name === 'StructuredOutput' && envelopeMode) continue
+              if (block.name === peerToolName) {
+                if (!peerToolCallIds.has(block.id) && peerToolCallIds.size >= 64)
+                  throw new AgentExecutionError(
+                    'response_too_large',
+                    'Claude peer activity exceeded the bounded item owner.',
+                    false,
+                  )
+                peerToolCallIds.add(block.id)
+                continue
+              }
+              const activity = ClaudeAgentAdapter.describeTool(block.name, block.input, input.cwd)
+              if (block.name === 'Skill' && block.input && typeof block.input === 'object') {
+                const name = Reflect.get(block.input, 'skill')
+                const selected = input.promptEnvelope.skillInvocation?.bindings.find(
+                  (entry) => entry.agentId === 'claude' && entry.name === name,
+                )
+                if (
+                  selected &&
+                  (Reflect.get(block.input, 'args') ?? '') !==
+                    input.promptEnvelope.skillInvocation!.arguments
+                )
+                  activity.title += ' · Arguments differ from request'
+              }
+              if (!tools.has(block.id) && tools.size >= 64)
+                throw new AgentExecutionError(
+                  'response_too_large',
+                  'Claude outstanding tool activity exceeded the bounded item owner.',
+                  false,
+                )
+              tools.set(block.id, { toolName: block.name, ...activity })
               yield {
                 agentId: 'claude',
-                type: 'reasoning.summary.delta',
+                type: 'tool.started',
                 turnId: input.runId,
-                activityId,
+                toolCallId: block.id,
+                toolName: block.name,
+                title: activity.title,
+                ...(activity.detail ? { detail: activity.detail } : {}),
+              }
+            }
+          }
+
+          if (
+            message.type === 'user' &&
+            !message.parent_tool_use_id &&
+            Array.isArray(message.message.content)
+          ) {
+            for (const block of message.message.content) {
+              if (block.type !== 'tool_result') continue
+              const title = titleCalls.get(block.tool_use_id)
+              if (title) {
+                if (!block.is_error && !titleRecorded) {
+                  titleRecorded = true
+                  yield {
+                    agentId: 'claude',
+                    type: 'session.title.updated',
+                    title,
+                    origin: 'turn_result',
+                  }
+                }
+                titleCalls.delete(block.tool_use_id)
+                continue
+              }
+              if (peerToolCallIds.delete(block.tool_use_id)) continue
+              const activity = tools.get(block.tool_use_id) ?? {
+                toolName: 'tool',
+                title: 'Used a tool',
+              }
+              tools.delete(block.tool_use_id)
+              yield {
+                agentId: 'claude',
+                type: 'tool.completed',
+                turnId: input.runId,
+                toolCallId: block.tool_use_id,
+                toolName: activity.toolName,
+                title:
+                  activity.toolName === 'Skill'
+                    ? `${activity.title} · ${block.is_error ? 'Invocation failed' : 'Loaded'}`
+                    : activity.title,
+                ...(activity.detail ? { detail: activity.detail } : {}),
+                outcome: block.is_error ? 'failed' : 'completed',
+              }
+            }
+          }
+
+          const delta = ClaudeAgentAdapter.textDelta(message)
+          if (delta) {
+            nativeResultAssistantText = true
+            const appended = answer.append(assistantMessageId, delta)
+            if (!envelopeMode)
+              yield {
+                agentId: 'claude',
+                type: 'text.delta',
+                turnId: input.runId,
+                outputId: answer.outputId,
+                text: appended,
+              }
+          }
+
+          const completed = ClaudeAgentAdapter.completedText(message)
+          if (completed !== undefined && message.type === 'assistant') {
+            if (completed) nativeResultAssistantText = true
+            const text = answer.complete(message.message.id, completed)
+            if (text !== undefined && !envelopeMode)
+              yield {
+                agentId: 'claude',
+                type: 'text.completed',
+                turnId: input.runId,
+                outputId: answer.outputId,
                 text,
               }
-            }
           }
+        } catch (error) {
+          failProjection(error)
+          return
         }
-        if (
-          showReasoningSummaries &&
-          event.type === 'content_block_delta' &&
-          event.delta.type === 'thinking_delta'
-        ) {
-          const current = reasoningBlocks.get(event.index)
-          if (!current && reasoningBlocks.size >= 64)
-            throw new AgentExecutionError(
-              'response_too_large',
-              'Claude reasoning activity exceeded the bounded item owner.',
-              false,
-            )
-          const activityId = current?.activityId ?? `${assistantMessageId}:reasoning:${event.index}`
-          const text = event.delta.thinking
-          const deltaBytes = Buffer.byteLength(text, 'utf8')
-          reasoningBytes += deltaBytes
-          if (reasoningBytes > 2 * 1024 * 1024)
-            throw new AgentExecutionError(
-              'response_too_large',
-              'Claude reasoning activity exceeded its 2 MiB owner budget.',
-              false,
-            )
-          const reasoning = {
-            activityId,
-            text: `${current?.text ?? ''}${text}`,
-            bytes: (current?.bytes ?? 0) + deltaBytes,
-            emitted: current?.emitted ?? false,
-          }
-          reasoningBlocks.set(event.index, reasoning)
-          if (!reasoning.emitted && text.trim()) {
-            reasoning.emitted = true
-            yield {
-              agentId: 'claude',
-              type: 'reasoning.summary.delta',
-              turnId: input.runId,
-              activityId,
-              text: reasoning.text,
-            }
-          } else if (reasoning.emitted && text) {
-            yield {
-              agentId: 'claude',
-              type: 'reasoning.summary.delta',
-              turnId: input.runId,
-              activityId,
-              text,
-            }
-          }
-        }
-        if (showReasoningSummaries && event.type === 'content_block_stop') {
-          const reasoning = reasoningBlocks.get(event.index)
-          if (reasoning) {
-            reasoningBlocks.delete(event.index)
-            reasoningBytes -= reasoning.bytes
-            if (reasoning.text.trim()) {
-              yield {
-                agentId: 'claude',
-                type: 'reasoning.summary.completed',
-                turnId: input.runId,
-                activityId: reasoning.activityId,
-                text: reasoning.text,
-              }
-            }
-          }
-        }
-      }
-
-      if (message.type === 'assistant' && !message.parent_tool_use_id) {
-        for (const block of message.message.content) {
-          if (block.type !== 'tool_use') continue
-          if (block.name === titleToolName && input.promptEnvelope.requestSessionTitle) {
-            if (
-              !titleRecorded &&
-              titleCalls.size === 0 &&
-              block.id.length > 0 &&
-              block.id.length <= 256
-            ) {
-              const title = sessionTitleInputSchema.safeParse(block.input)
-              if (title.success) titleCalls.set(block.id, title.data.title)
-            }
-            continue
-          }
-          if (block.name === 'StructuredOutput' && envelopeMode) continue
-          if (block.name === peerToolName) {
-            if (!peerToolCallIds.has(block.id) && peerToolCallIds.size >= 64)
-              throw new AgentExecutionError(
-                'response_too_large',
-                'Claude peer activity exceeded the bounded item owner.',
-                false,
-              )
-            peerToolCallIds.add(block.id)
-            continue
-          }
-          const activity = ClaudeAgentAdapter.describeTool(block.name, block.input, input.cwd)
-          if (block.name === 'Skill' && block.input && typeof block.input === 'object') {
-            const name = Reflect.get(block.input, 'skill')
-            const selected = input.promptEnvelope.skillInvocation?.bindings.find(
-              (entry) => entry.agentId === 'claude' && entry.name === name,
-            )
-            if (
-              selected &&
-              (Reflect.get(block.input, 'args') ?? '') !==
-                input.promptEnvelope.skillInvocation!.arguments
-            )
-              activity.title += ' · Arguments differ from request'
-          }
-          if (!tools.has(block.id) && tools.size >= 64)
-            throw new AgentExecutionError(
-              'response_too_large',
-              'Claude outstanding tool activity exceeded the bounded item owner.',
-              false,
-            )
-          tools.set(block.id, { toolName: block.name, ...activity })
-          yield {
-            agentId: 'claude',
-            type: 'tool.started',
-            turnId: input.runId,
-            toolCallId: block.id,
-            toolName: block.name,
-            title: activity.title,
-            ...(activity.detail ? { detail: activity.detail } : {}),
-          }
-        }
-      }
-
-      if (
-        message.type === 'user' &&
-        !message.parent_tool_use_id &&
-        Array.isArray(message.message.content)
-      ) {
-        for (const block of message.message.content) {
-          if (block.type !== 'tool_result') continue
-          const title = titleCalls.get(block.tool_use_id)
-          if (title) {
-            if (!block.is_error && !titleRecorded) {
-              titleRecorded = true
-              yield {
-                agentId: 'claude',
-                type: 'session.title.updated',
-                title,
-                origin: 'turn_result',
-              }
-            }
-            titleCalls.delete(block.tool_use_id)
-            continue
-          }
-          if (peerToolCallIds.delete(block.tool_use_id)) continue
-          const activity = tools.get(block.tool_use_id) ?? {
-            toolName: 'tool',
-            title: 'Used a tool',
-          }
-          tools.delete(block.tool_use_id)
-          yield {
-            agentId: 'claude',
-            type: 'tool.completed',
-            turnId: input.runId,
-            toolCallId: block.tool_use_id,
-            toolName: activity.toolName,
-            title:
-              activity.toolName === 'Skill'
-                ? `${activity.title} · ${block.is_error ? 'Invocation failed' : 'Loaded'}`
-                : activity.title,
-            ...(activity.detail ? { detail: activity.detail } : {}),
-            outcome: block.is_error ? 'failed' : 'completed',
-          }
-        }
-      }
-
-      const delta = ClaudeAgentAdapter.textDelta(message)
-      if (delta) {
-        const appended = answer.append(assistantMessageId, delta)
-        if (!envelopeMode)
-          yield {
-            agentId: 'claude',
-            type: 'text.delta',
-            turnId: input.runId,
-            outputId: answer.outputId,
-            text: appended,
-          }
-      }
-
-      const completed = ClaudeAgentAdapter.completedText(message)
-      if (completed !== undefined && message.type === 'assistant') {
-        const text = answer.complete(message.message.id, completed)
-        if (text !== undefined && !envelopeMode)
-          yield {
-            agentId: 'claude',
-            type: 'text.completed',
-            turnId: input.runId,
-            outputId: answer.outputId,
-            text,
-          }
       }
 
       if (message.type === 'result') {
@@ -2402,13 +2796,67 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           })
           return
         }
-        if (message.subtype !== 'success' || message.is_error) {
-          terminalKnown = true
-          const outcome =
-            message.terminal_reason === 'aborted_streaming' ||
-            message.terminal_reason === 'aborted_tools'
-              ? 'interrupted'
+        nativeResultNumber += 1
+        const outcome =
+          message.terminal_reason === 'aborted_streaming' ||
+          message.terminal_reason === 'aborted_tools'
+            ? 'interrupted'
+            : message.subtype === 'success' && !message.is_error
+              ? 'completed'
               : 'failed'
+        if (unfinishedSteering()) {
+          // Exact control evidence remains available even if retaining the
+          // optional full result/body exceeds its independent work budget.
+          deferredEnding = outcome
+          if (envelopeMode) recordCarrier(Reflect.get(message, 'structured_output'))
+          if (projectionFailure) return
+          try {
+            deferredResultMemory.resize(4096 + freezeNativeJsonFrame(message) * 6)
+            deferredResult = message
+            if (
+              !envelopeMode &&
+              !nativeResultAssistantText &&
+              message.subtype === 'success' &&
+              !message.is_error &&
+              message.result
+            ) {
+              const text = answer.complete(
+                `${input.runId}:result:${nativeResultNumber}`,
+                message.result,
+              )
+              if (text !== undefined)
+                yield {
+                  agentId: 'claude',
+                  type: 'text.completed',
+                  turnId: input.runId,
+                  outputId: answer.outputId,
+                  text,
+                }
+              nativeResultAssistantText = true
+            }
+            deferredResultHasText = nativeResultAssistantText
+            nativeResultAssistantText = false
+          } catch (error) {
+            failProjection(error)
+            return
+          }
+          // This real result belongs to an earlier native input. Its carrier
+          // keeps its original nonce; the current logical Run remains open.
+          return
+        }
+        deferredResult = undefined
+        deferredEnding = undefined
+        deferredResultMemory.resize(0)
+        closeInput()
+        // A body/report failure must not revoke the exact native ending.
+        recordEnding(outcome)
+        if (envelopeMode && message.subtype === 'success' && !message.is_error)
+          recordCarrier(message.structured_output)
+        if (projectionFailure) {
+          if (!foregroundReleased) throw projectionFailure
+          return
+        }
+        if (message.subtype !== 'success' || message.is_error) {
           this.recordEvidence(input, resolvedSessionId, {
             kind: 'ended',
             source: 'live_terminal',
@@ -2431,17 +2879,11 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           yield { agentId: 'claude', type: 'turn.completed', turnId: input.runId, outcome }
           return
         }
-        terminalKnown = true
-        const outcome =
-          message.terminal_reason === 'aborted_streaming' ||
-          message.terminal_reason === 'aborted_tools'
-            ? 'interrupted'
-            : 'completed'
         let finalText: string | undefined
         let submittedReport: ReturnType<typeof readSubmittedCollaborationReport>
         try {
           if (
-            !answer.text &&
+            !nativeResultAssistantText &&
             message.result &&
             !(
               envelopeMode &&
@@ -2449,7 +2891,10 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 collaborationNaturalFallback(message.result) === undefined)
             )
           ) {
-            const resultText = answer.complete(`${input.runId}:result`, message.result)
+            const resultText = answer.complete(
+              `${input.runId}:result:${nativeResultNumber}`,
+              message.result,
+            )
             if (resultText !== undefined && !envelopeMode)
               yield {
                 agentId: 'claude',
@@ -2459,7 +2904,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 text: resultText,
               }
           }
-          if (envelopeMode) input.recordCollaborationCarrier?.(message.structured_output)
           const canonical = envelopeMode
             ? readCollaborationAnswer(message.structured_output, input.answerFormat)
             : undefined
@@ -2470,12 +2914,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
               input.answerFormat,
             )
         } catch (error) {
-          this.recordEvidence(input, resolvedSessionId, {
-            kind: 'ended',
-            source: 'live_terminal',
-            outcome,
-          })
-          throw error
+          failProjection(error)
+          return
         }
         this.recordEvidence(input, resolvedSessionId, {
           kind: 'ended',
@@ -2507,7 +2947,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             workflow,
             input.runId,
             input.answerFormat,
-            input.promptEnvelope.collaborationAuthorization,
+            (input.currentPromptEnvelope?.() ?? input.promptEnvelope).collaborationAuthorization,
           )
         yield {
           agentId: 'claude',
@@ -2520,27 +2960,34 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     }.bind(this)
     try {
       input.recordExecutor?.(nativeExecutorId)
-      if (!permissionInput) {
+      if (!permissionInput && !speedInput) {
         sessionStarted = true
         yield { agentId: 'claude', type: 'session.started', nativeSessionId: resolvedSessionId }
       }
       session = this.dependencies.query({
-        prompt: ClaudeAgentAdapter.promptMessages(
-          input,
-          resolvedSessionId,
-          () => {
-            deliveryAttempted = true
-            input.recordDispatch?.('possibly_sent', resolvedSessionId, nativeExecutorId)
-            if (signal.aborted) abort()
-          },
-          permissionInput,
-          signal,
-          skillInput?.promise,
-          inputMemory,
-          (reservation) => {
-            inputReservation = reservation
-          },
-        ),
+        prompt: (async function* () {
+          yield* ClaudeAgentAdapter.promptMessages(
+            input,
+            resolvedSessionId,
+            () => {
+              deliveryAttempted = true
+              input.recordDispatch?.('possibly_sent', resolvedSessionId, nativeExecutorId)
+              if (signal.aborted) abort()
+            },
+            permissionInput,
+            signal,
+            speedInput
+              ? Promise.all([speedInput.promise, skillInput?.promise ?? true]).then((gates) =>
+                  gates.every(Boolean),
+                )
+              : skillInput?.promise,
+            inputMemory,
+            (reservation) => {
+              inputReservation = reservation
+            },
+          )
+          if (deliveryAttempted) yield* steeringMessages()
+        })(),
         options: {
           abortController,
           cwd: input.cwd,
@@ -2554,6 +3001,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
               windowsHide: true,
               shell: false,
             })
+            nativeActor = child
             ClaudeAgentAdapter.drainStderr(child)
 
             actorObserved = true
@@ -2733,7 +3181,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           ...(input.nativeSessionId ? { resume: input.nativeSessionId } : {}),
           ...(!input.nativeSessionId ? { sessionId: resolvedSessionId } : {}),
           ...(input.model ? { model: input.model } : {}),
-          ...ClaudeAgentAdapter.explicitEffortOptions(input.effort),
+          ...ClaudeAgentAdapter.runSettingsOptions(input),
           ...(showReasoningSummaries
             ? { thinking: { type: 'adaptive' as const, display: 'summarized' as const } }
             : {}),
@@ -2746,15 +3194,32 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         sourceGrant,
         recordings,
         executorId: nativeExecutorId,
+        steer,
       })
       iterator = session[Symbol.asyncIterator]()
+      if (speedInput) {
+        speedDetail = await this.configureFastMode(
+          session,
+          () => nativeActor,
+          input,
+          signal,
+          inputMemory,
+          startupDeadline,
+        )
+        yield {
+          agentId: 'claude',
+          type: 'run.speed.resolved',
+          requested: 'fast',
+          ...(speedDetail ? { speed: 'standard' as const, detail: speedDetail } : {}),
+        }
+      }
       if (input.promptEnvelope.skillInvocation) {
         const selected = input.promptEnvelope.skillInvocation.bindings.filter(
           (entry) => entry.agentId === 'claude',
         )
         const commands = await ClaudeAgentAdapter.withDeadline(
           session.supportedCommands(),
-          10_000,
+          Math.max(1, Math.min(10_000, startupDeadline - Date.now())),
           signal,
         )
         const current = nativeSkillCatalog(
@@ -2772,12 +3237,24 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         skillInput?.resolve(true)
       }
       if (permissionInput) {
-        await ClaudeAgentAdapter.confirmAutoMode(session, signal)
+        await ClaudeAgentAdapter.confirmAutoMode(
+          session,
+          signal,
+          Math.max(1, startupDeadline - Date.now()),
+        )
         // Do not mark a binding responding until its native mode is accepted.
         // The consumer persists this event before the gated input can escape.
         sessionStarted = true
         yield { agentId: 'claude', type: 'session.started', nativeSessionId: resolvedSessionId }
         confirmPermissionInput?.(true)
+      }
+      if (speedInput) {
+        if (!sessionStarted) {
+          sessionStarted = true
+          yield { agentId: 'claude', type: 'session.started', nativeSessionId: resolvedSessionId }
+        }
+        signal.throwIfAborted()
+        speedInput.resolve(true)
       }
       while (true) {
         // A quiet native Query is not a failed/unknown Turn. Keep one read until
@@ -2789,7 +3266,16 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         )
         pendingRead = undefined
         if (next.done) {
+          // oxlint-disable-next-line no-await-in-loop -- Native EOF must include the one bounded Stop receipt before settling queued inputs.
+          await interruptTask
+          if (deferredResult && !unfinishedSteering()) {
+            nativeResultAssistantText = deferredResultHasText
+            yield* projectMessage(deferredResult)
+          } else if (deferredEnding && !unfinishedSteering()) {
+            recordEnding(deferredEnding)
+          }
           iteratorDone = true
+          if (terminalKnown) return
           break
         }
         yield* projectMessage(next.value)
@@ -2844,7 +3330,9 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       // A resolved-false gate produces natural EOF. Throwing from SDK input
       // would abort its process and could terminate native startup Hook work.
       skillInput?.resolve(false)
+      speedInput?.resolve(false)
       confirmPermissionInput?.(false)
+      closeInput()
       foregroundReleased = true
       const emptyRejectedOwner =
         nativeNotStarted &&
@@ -2863,6 +3351,15 @@ export class ClaudeAgentAdapter implements AgentAdapter {
               // oxlint-disable-next-line no-await-in-loop -- The native stream remains owned until actual EOF.
               const result = await next
               if (result.done) {
+                // oxlint-disable-next-line no-await-in-loop -- Native EOF must include the one bounded Stop receipt before settling queued inputs.
+                await interruptTask
+                if (deferredResult && !unfinishedSteering()) {
+                  nativeResultAssistantText = deferredResultHasText
+                  for (const event of projectMessage(deferredResult))
+                    input.recordArchivedEvent?.(event)
+                } else if (deferredEnding && !unfinishedSteering()) {
+                  recordEnding(deferredEnding)
+                }
                 if (!terminalKnown && !permissionRefused)
                   this.recordEvidence(input, resolvedSessionId, {
                     kind: 'no_evidence',
@@ -2958,7 +3455,11 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       : { permissionMode: mode === 'auto' ? ('auto' as const) : ('default' as const) }
   }
 
-  private static async confirmAutoMode(session: ReturnType<typeof query>, signal: AbortSignal) {
+  private static async confirmAutoMode(
+    session: ReturnType<typeof query>,
+    signal: AbortSignal,
+    timeoutMs = PERMISSION_MODE_TIMEOUT_MS,
+  ) {
     let active = true
     try {
       await ClaudeAgentAdapter.withDeadline(
@@ -2985,11 +3486,220 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             throw error
           }
         })(),
-        PERMISSION_MODE_TIMEOUT_MS,
+        Math.min(PERMISSION_MODE_TIMEOUT_MS, timeoutMs),
         signal,
       )
     } finally {
       active = false
+    }
+  }
+
+  private static runSettingsOptions(input: Pick<AgentRunInput, 'effort' | 'speed'>) {
+    const options = ClaudeAgentAdapter.explicitEffortOptions(input.effort)
+    if (!input.speed || input.speed === 'native') return options
+    // Fast starts disabled until the same Query confirms model compatibility.
+    // Keep the explicit effort's env overlay in this single flag settings object.
+    return { ...options, settings: { ...options.settings, fastMode: false } }
+  }
+
+  private async configureFastMode(
+    session: ReturnType<typeof query>,
+    actor: () => ChildProcess | undefined,
+    input: AgentRunInput,
+    signal: AbortSignal,
+    memory: NativeWorkingMemory,
+    startupDeadline: number,
+  ): Promise<string | undefined> {
+    const controller = new AbortController()
+    const observed = AbortSignal.any([signal, controller.signal])
+    let flagAttempted = false
+    let identityMismatch = false
+    try {
+      return await ClaudeAgentAdapter.withDeadline(
+        (async () => {
+          const initialization = await session.initializationResult()
+          observed.throwIfAborted()
+          const models = initialization.models
+          if (!Array.isArray(models) || models.length > 200)
+            return 'The native model catalog could not confirm Fast compatibility. Continuing at standard speed.'
+          const selection = models.find((entry) =>
+            input.model ? entry.value === input.model : entry.value === 'default',
+          )
+          const wireModel = selection?.resolvedModel ?? input.model
+          const model =
+            selection?.supportsFastMode !== undefined
+              ? selection
+              : (models.find(
+                  (entry) =>
+                    wireModel &&
+                    (entry.value === wireModel || entry.resolvedModel === wireModel) &&
+                    entry.supportsFastMode === true,
+                ) ?? selection)
+          if (model?.supportsFastMode !== true)
+            return model?.supportsFastMode === false
+              ? 'This model does not support Fast. Continuing at standard speed with the same model and effort.'
+              : 'The native model catalog could not confirm Fast compatibility. Continuing at standard speed.'
+          if (typeof session.applyFlagSettings !== 'function')
+            return 'This Claude Code version cannot apply Fast to this execution. Continuing at standard speed.'
+          const before = await ClaudeAgentAdapter.readRunSettings(actor(), observed, memory)
+          const expectedModel = model.resolvedModel ?? model.value
+          if (
+            (before.model !== expectedModel && before.model !== model.value) ||
+            (input.effort && before.effort !== input.effort)
+          ) {
+            identityMismatch = true
+            throw new AgentExecutionError(
+              'runtime_incompatible',
+              'Claude Code did not confirm the selected model and effort before enabling Fast. No task was submitted.',
+              false,
+            )
+          }
+          observed.throwIfAborted()
+          // This is the Query-scoped flag layer, including the SDK's explicit
+          // opt-in. Unlike /fast it does not promote or replace the model.
+          flagAttempted = true
+          await session.applyFlagSettings({ fastMode: true })
+          observed.throwIfAborted()
+          const after = await ClaudeAgentAdapter.readRunSettings(actor(), observed, memory)
+          if (after.model !== before.model || after.effort !== before.effort)
+            throw new AgentExecutionError(
+              'runtime_incompatible',
+              'Claude Code changed the model or effort while applying Fast. No task was submitted.',
+              false,
+            )
+          return undefined
+        })(),
+        Math.max(1, Math.min(FAST_MODE_CHECK_TIMEOUT_MS, startupDeadline - Date.now())),
+        signal,
+      )
+    } catch (error) {
+      signal.throwIfAborted()
+      if (flagAttempted || identityMismatch) throw error
+      // Catalog/read-only control failures cannot make the already-disabled
+      // Query faster. Fall back without recreating it or delivering twice.
+      return 'Native Fast compatibility could not be checked before dispatch. Continuing at standard speed.'
+    } finally {
+      // Retire read-only control listeners even if the SDK's own pending ACK
+      // arrives late. Unknown flag application leaves the prompt gate closed.
+      controller.abort()
+    }
+  }
+
+  private static readRunSettings(
+    child: ChildProcess | undefined,
+    signal: AbortSignal,
+    memory: NativeWorkingMemory,
+  ): Promise<{ model: string; effort: string | null }> {
+    signal.throwIfAborted()
+    if (!child?.stdout || !child.stdin)
+      throw new Error('Claude Code has no owned native settings transport.')
+    const requestId = randomUUID()
+    const reservation = memory.reserve(8 * 1024 * 1024)
+    return new Promise((resolve, reject) => {
+      const decoder = new StringDecoder('utf8')
+      let pending = ''
+      let bytes = 0
+      let settled = false
+      const cleanup = (): void => {
+        child.stdout!.off('data', data)
+        child.off('close', closed)
+        signal.removeEventListener('abort', aborted)
+        pending = ''
+        reservation.release()
+      }
+      const fail = (): void => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(new Error('Claude Code did not confirm its native execution settings.'))
+      }
+      const closed = (): void => fail()
+      const aborted = (): void => fail()
+      const data = (chunk: Buffer): void => {
+        bytes += chunk.byteLength
+        if (bytes > 1024 * 1024) return fail()
+        pending += decoder.write(chunk)
+        for (;;) {
+          const newline = pending.indexOf('\n')
+          if (newline < 0) return
+          const line = pending.slice(0, newline)
+          pending = pending.slice(newline + 1)
+          let message: unknown
+          try {
+            message = JSON.parse(line)
+          } catch {
+            return fail()
+          }
+          if (!message || typeof message !== 'object') continue
+          const response = Reflect.get(message, 'response')
+          if (
+            Reflect.get(message, 'type') !== 'control_response' ||
+            !response ||
+            typeof response !== 'object' ||
+            Reflect.get(response, 'request_id') !== requestId
+          )
+            continue
+          const value = Reflect.get(response, 'response')
+          const applied = value && typeof value === 'object' ? Reflect.get(value, 'applied') : null
+          const model =
+            applied && typeof applied === 'object' ? Reflect.get(applied, 'model') : null
+          const effort =
+            applied && typeof applied === 'object' ? Reflect.get(applied, 'effort') : null
+          if (
+            Reflect.get(response, 'subtype') !== 'success' ||
+            typeof model !== 'string' ||
+            !model ||
+            model.length > 240 ||
+            (effort != null && (typeof effort !== 'string' || effort.length > 80))
+          )
+            return fail()
+          if (settled) return
+          settled = true
+          cleanup()
+          resolve({ model, effort: typeof effort === 'string' ? effort : null })
+          return
+        }
+      }
+      child.stdout!.on('data', data)
+      child.once('close', closed)
+      signal.addEventListener('abort', aborted, { once: true })
+      child.stdin!.write(
+        JSON.stringify({
+          type: 'control_request',
+          request_id: requestId,
+          request: { subtype: 'get_settings' },
+        }) + '\n',
+        (error) => {
+          if (error) fail()
+        },
+      )
+    })
+  }
+
+  private static fastModeDisabledDetail(reason: unknown): string | undefined {
+    switch (reason) {
+      case 'free':
+        return 'Fast is unavailable for this account. Continuing at standard speed.'
+      case 'preference':
+        return 'Fast is disabled by native preferences or policy. Continuing at standard speed.'
+      case 'extra_usage_disabled':
+        return 'Fast requires native extra usage to be enabled. Continuing at standard speed.'
+      case 'network_error':
+        return 'Fast is unavailable because of a native connectivity issue. Continuing at standard speed.'
+      case 'not_first_party':
+        return 'Fast is unavailable for this provider. Continuing at standard speed.'
+      case 'disabled_by_env':
+        return 'Fast is disabled by the native environment. Continuing at standard speed.'
+      case 'model_not_allowed':
+        return 'The native model policy does not allow Fast. Continuing at standard speed.'
+      case 'sdk_opt_in_required':
+        return 'The native SDK has not enabled Fast for this execution. Continuing at standard speed.'
+      case 'pending':
+        return 'Native Fast availability is still being checked. Currently at standard speed.'
+      case 'unknown':
+        return 'The native runtime reports that Fast is unavailable. Continuing at standard speed.'
+      default:
+        return undefined
     }
   }
 
@@ -3264,12 +3974,13 @@ export class ClaudeAgentAdapter implements AgentAdapter {
   private static async *promptMessages(
     input: AgentRunInput,
     sessionId: string,
-    dispatched: () => void,
+    dispatched: () => void | boolean,
     permissionInput?: Promise<boolean>,
     signal?: AbortSignal,
     skillInput?: Promise<boolean>,
     memory = new NativeWorkingMemory(),
     hold?: (reservation: NativeMemoryReservation) => void,
+    steering?: { priority: 'next'; prefix?: string | undefined },
   ): AsyncIterable<SDKUserMessage> {
     if (!ClaudeAgentAdapter.isRequestUuid(input.runId)) throw new Error('Invalid request identity.')
     if (permissionInput && !(await permissionInput)) return
@@ -3286,12 +3997,21 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     let message: SDKUserMessage
     let held: number
     try {
+      const content = await claudePromptContent(input.promptEnvelope, signal)
       message = {
         type: 'user',
-        message: { role: 'user', content: await claudePromptContent(input.promptEnvelope, signal) },
+        message: {
+          role: 'user',
+          content: steering?.prefix
+            ? typeof content === 'string'
+              ? `${steering.prefix}\n\n${content}`
+              : [{ type: 'text', text: steering.prefix }, ...content]
+            : content,
+        },
         parent_tool_use_id: null,
         session_id: sessionId,
         uuid: input.runId,
+        ...(steering ? { priority: steering.priority, origin: { kind: 'human' as const } } : {}),
       }
       held =
         freezeNativeJsonFrame(input.promptEnvelope) + freezeNativeJsonFrame(message) + 256 * 1024
@@ -3310,7 +4030,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         reservation.resize(held + encodedBytes * 4)
       }
       if (signal?.aborted) return
-      dispatched()
+      if (dispatched() === false) return
       dispatchedToSdk = true
       yield message
     } finally {

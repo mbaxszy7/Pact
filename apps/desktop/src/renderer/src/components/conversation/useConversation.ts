@@ -6,11 +6,14 @@ import type {
   AnchoredComment,
   CommentAnchor,
   ConversationPatch,
+  ConversationPage,
   ConversationSendInput,
+  ConversationQueueActionInput,
   RuntimeAgentId,
   NativeInputValues,
   NativePermissionRequest,
   NativeContextRebuildInput,
+  ConversationSnapshotView,
 } from '@pact/contracts'
 
 import {
@@ -44,6 +47,8 @@ import {
   windowFromPage,
   withCommentError,
   nativeInputRequests,
+  conversationWindowStartOrder,
+  isRunResponseComplete,
   type ActivityBodySource,
   type ConversationWindow,
   type ConversationViewProjection,
@@ -53,6 +58,18 @@ import {
 import { uploadConversationImage, releaseDraftImage, type DraftImage } from './image-client'
 
 export interface ConversationHistoryControls {
+  collapseEarlierResponses?: ((runId: string) => Promise<void>) | undefined
+  setSnapshotFoldGuard?: ((guard: (() => boolean) | undefined) => void) | undefined
+  queueActions?: {
+    pending: boolean
+    steer: () => Promise<boolean>
+    remove: () => Promise<boolean>
+    returnToComposer: () => Promise<boolean>
+    restoreReturned: () => Promise<boolean>
+    resume: () => Promise<boolean>
+    checkStatus: () => Promise<boolean>
+    setEnabled: (enabled: boolean) => Promise<boolean>
+  }
   admitComposerEdit?: ((nextChars: number) => boolean) | undefined
   restoringInput?: boolean
   restoreReturnedInput?: () => Promise<boolean>
@@ -81,6 +98,7 @@ export interface ConversationHistoryControls {
   activityError?: { runId: string; message: string } | undefined
   loadOlder: () => Promise<void>
   loadLatest: () => Promise<void>
+  recoverLatest?: (() => Promise<void>) | undefined
   recoverFromGap: (messageId: string) => Promise<void>
   historyResyncToken: number
   ensureMessage: (messageId: string) => Promise<void>
@@ -297,6 +315,8 @@ interface ConversationComposerDraft {
   images?: DraftImage[] | undefined
   revision?: number
   returnedInputOperationId?: string | undefined
+  queueReturnOperationId?: string | undefined
+  planningAction?: ConversationSendInput['planningAction'] | undefined
   skills?: SkillSelection[] | undefined
   mention?: ConversationComposerMention | undefined
   route?: import('./composer-document').ComposerDocument['route']
@@ -332,6 +352,7 @@ interface PendingSubmission {
   inputPreparation?: AbortController | undefined
   composerRevision?: number
   returnedInputOperationId?: string | undefined
+  queueReturnOperationId?: string | undefined
   acknowledgementError?: string
   operationId: string
   clientMessageId: string
@@ -347,6 +368,7 @@ interface ReturnedInputRead {
   sessionId: string
   controller: AbortController
   draft?: ConversationComposerDraft
+  commentBytes?: number
 }
 
 function emptyComposerDraft(value: ConversationComposerDraft): boolean {
@@ -356,6 +378,7 @@ function emptyComposerDraft(value: ConversationComposerDraft): boolean {
     !value.skills?.length &&
     !value.mention &&
     !value.returnedInputOperationId &&
+    !value.queueReturnOperationId &&
     (!value.route || (value.route.type === 'primary' && !value.route.agentId))
   )
 }
@@ -371,6 +394,7 @@ interface SessionOperationState {
   choosingImages?: boolean | undefined
   sendingOperationId?: string | undefined
   stoppingOperationId?: string | undefined
+  queueOperationId?: string | undefined
   nativeCheck?: { operationId: string; runId: string } | undefined
   error?: string | undefined
 }
@@ -399,6 +423,9 @@ export function useConversation(
   const imageChoosers = useRef(new Map<string, AbortController>())
   const draftCapacityNotified = useRef(false)
   const returnOperation = useRef<ReturnedInputRead | undefined>(undefined)
+  const queueOperation = useRef<
+    { sessionId: string; operationId: string; controller: AbortController } | undefined
+  >(undefined)
   const [restoringInput, setRestoringInput] = useState(false)
   const returnAttempt = useRef<string | undefined>(undefined)
   // Sensitive answers are bounded, ephemeral interaction state, never history/query data.
@@ -424,7 +451,7 @@ export function useConversation(
           .map(([, value]) => value),
       )
       if (returnOperation.current?.draft) documents.add(returnOperation.current.draft)
-      let bytes = 0,
+      let bytes = returnOperation.current?.commentBytes ?? 0,
         items = 0
       const pending = new Map(pendingBySessionRef.current)
       if (pendingCandidate) pending.set(pendingCandidate.sessionId, pendingCandidate.value)
@@ -463,6 +490,7 @@ export function useConversation(
               mention: value.mention,
               route: value.route,
               returnedInputOperationId: value.returnedInputOperationId,
+              queueReturnOperationId: value.queueReturnOperationId,
             }),
           ).byteLength
         if (bytes > COMPOSER_DRAFT_BYTES || items > COMPOSER_DRAFT_ITEMS) break
@@ -527,6 +555,10 @@ export function useConversation(
   const [windowState, setWindowState] = useState<ConversationWindow | undefined>()
   const windowRef = useRef<ConversationWindow | undefined>(undefined)
   const readingMessageIdRef = useRef<string | undefined>(undefined)
+  const snapshotViewRef = useRef<ConversationSnapshotView | undefined>(undefined)
+  const preserveRunIdRef = useRef<string | undefined>(undefined)
+  const snapshotViewGenerationRef = useRef(0)
+  const snapshotFoldGuardRef = useRef<(() => boolean) | undefined>(undefined)
   const [readingPositionLost, setReadingPositionLost] = useState(false)
   const [readPending, setReadPending] = useState(true)
   const visibleRef = useRef(visible)
@@ -574,7 +606,7 @@ export function useConversation(
   const resyncGenerationRef = useRef(0)
   const pageInFlightRef = useRef(false)
   const pendingAroundMessageRef = useRef<
-    { messageId: string; historicalSource: boolean } | undefined
+    { messageId?: string | undefined; historicalSource: boolean } | undefined
   >(undefined)
   const activityInFlightRef = useRef<string | undefined>(undefined)
   const pendingActivityRunRef = useRef<string | undefined>(undefined)
@@ -612,6 +644,7 @@ export function useConversation(
     queryKey: conversationQueryKeys.session(sessionId ?? 'none'),
     queryFn: async ({ signal }) => {
       const generation = ++interestGenerationRef.current
+      const snapshotViewGeneration = snapshotViewGenerationRef.current
       initialPatchesRef.current = {
         sessionId: sessionId ?? '',
         generation,
@@ -638,7 +671,12 @@ export function useConversation(
       })
       const checkCurrent = (): void => {
         signal.throwIfAborted()
-        if (expired || !visibleRef.current || initialPatchesRef.current?.generation !== generation)
+        if (
+          expired ||
+          !visibleRef.current ||
+          initialPatchesRef.current?.generation !== generation ||
+          snapshotViewGeneration !== snapshotViewGenerationRef.current
+        )
           throw new DOMException('Conversation read cancelled.', 'AbortError')
       }
       const read = async () => {
@@ -649,6 +687,8 @@ export function useConversation(
         let result = await window.pact.getConversation({
           sessionId: sessionId ?? '',
           scope: 'messages',
+          ...(snapshotViewRef.current ? { snapshotView: snapshotViewRef.current } : {}),
+          ...(preserveRunIdRef.current ? { preserveRunId: preserveRunIdRef.current } : {}),
           ...(aroundMessageId
             ? {
                 aroundMessageId,
@@ -665,10 +705,14 @@ export function useConversation(
           result = await window.pact.getConversation({
             sessionId: sessionId ?? '',
             scope: 'messages',
+            ...(snapshotViewRef.current ? { snapshotView: snapshotViewRef.current } : {}),
+            ...(preserveRunIdRef.current ? { preserveRunId: preserveRunIdRef.current } : {}),
           })
           checkCurrent()
         }
         const page = unwrapRpcResult(result)
+        if (page.scope === 'messages' && aroundMessageId && page.snapshotView)
+          snapshotViewRef.current = page.snapshotView
         if (initialPatchesRef.current?.generation === generation)
           initialPatchesRef.current.receivedAt = Date.now()
         return page
@@ -727,6 +771,8 @@ export function useConversation(
       initialPatchesRef.current = undefined
       returnOperation.current?.controller.abort()
       returnOperation.current = undefined
+      queueOperation.current?.controller.abort()
+      queueOperation.current = undefined
       for (const owner of imageUploads.current.values()) owner.controller.abort()
       imageUploads.current.clear()
       for (const owner of imageChoosers.current.values()) owner.abort()
@@ -789,15 +835,21 @@ export function useConversation(
     const draft = {
       ...previous,
       ...editing,
-      route: previous.returnedInputOperationId
-        ? editing.route
-        : releaseComposerRoute(editing.route),
+      route:
+        previous.returnedInputOperationId || previous.queueReturnOperationId
+          ? editing.route
+          : releaseComposerRoute(editing.route),
+      planningAction:
+        previous.text === editing.text &&
+        JSON.stringify(previous.route) === JSON.stringify(editing.route)
+          ? previous.planningAction
+          : undefined,
       revision: (previous.revision ?? 0) + 1,
     }
     return putComposerDraft(sessionId, draft)
   }
   const setComposerSkills = (skills: SkillSelection[]): void => {
-    if (!sessionId) return
+    if (!sessionId || returnOperation.current?.sessionId === sessionId) return
     const previous = composerDraftsRef.current[sessionId]
     putComposerDraft(sessionId, {
       ...previous,
@@ -814,6 +866,7 @@ export function useConversation(
       putComposerDraft(sessionId, {
         ...previous,
         text: value,
+        planningAction: previous?.text === value ? previous.planningAction : undefined,
         revision: (previous?.revision ?? 0) + 1,
       })
     },
@@ -828,6 +881,7 @@ export function useConversation(
         ...previous,
         text: previous?.text ?? '',
         mention: value,
+        planningAction: undefined,
         revision: (previous?.revision ?? 0) + 1,
       })
     },
@@ -1056,6 +1110,20 @@ export function useConversation(
           }
         }
         if (
+          pending.queueReturnOperationId &&
+          draft?.queueReturnOperationId === pending.queueReturnOperationId
+        ) {
+          const { queueReturnOperationId: _consumed, ...kept } = draft
+          return {
+            ...kept,
+            images: kept.images?.filter(
+              (entry) => !entry.image || !pending.imageIds.includes(entry.image.id),
+            ),
+            route: releaseComposerRoute(kept.route),
+            revision: (kept.revision ?? 0) + 1,
+          }
+        }
+        if (
           draft?.images?.some((entry) => entry.image && pending.imageIds.includes(entry.image.id))
         )
           return {
@@ -1108,8 +1176,63 @@ export function useConversation(
     [settleSubmission],
   )
 
+  const releaseSupersededQueueReturn = useCallback(
+    (next: ConversationWindow | undefined): void => {
+      if (!next?.view.queue) return
+      const ownerSessionId = next.view.sessionId
+      if (returnOperation.current?.sessionId === ownerSessionId) return
+      const draft = composerDraftsRef.current[ownerSessionId]
+      if (
+        !draft?.queueReturnOperationId ||
+        draft.queueReturnOperationId === next.view.queue.returnedInput?.operationId
+      )
+        return
+      // Reconcile only the receipt against the latest authoritative projection. Keep the
+      // latest document, including edits made after a replacement return lost its ACK.
+      const { queueReturnOperationId: _superseded, ...kept } = draft
+      putComposerDraft(ownerSessionId, {
+        ...kept,
+        route: releaseComposerRoute(kept.route),
+        revision: (kept.revision ?? 0) + 1,
+      })
+    },
+    [putComposerDraft],
+  )
+
   const commitWindow = useCallback(
     (next: ConversationWindow | undefined): void => {
+      const previousWindow = windowRef.current
+      if (next?.activityView && previousWindow?.view.sessionId === next.view.sessionId) {
+        const runId = next.activityView.runId
+        const previousRun = previousWindow.view.runs.find((run) => run.id === runId)
+        const nextRun = next.view.runs.find((run) => run.id === runId)
+        if (previousRun && !isRunResponseComplete(previousRun) && isRunResponseComplete(nextRun)) {
+          // Completion ends this reading intent once. A later explicit expansion
+          // remains selected through ordinary paging and virtualization.
+          next = { ...next, activityView: { ...next.activityView, manual: undefined } }
+          bodyRequestGenerationRef.current += 1
+          setExpandedActivityBody(undefined)
+        }
+      }
+      if (next) {
+        // A live cut remains in place until the View makes one guarded completion
+        // decision. This is disposable selected-window state, never Run state.
+        const running = next.view.runs.findLast(
+          (run) =>
+            run.outputSnapshots &&
+            !run.outputSnapshots.settled &&
+            ['starting', 'running', 'recovering'].includes(run.status),
+        )
+        if (running && preserveRunIdRef.current !== running.id) {
+          preserveRunIdRef.current = running.id
+          snapshotViewGenerationRef.current += 1
+        }
+        next = {
+          ...next,
+          snapshotView: snapshotViewRef.current,
+          preserveRunId: preserveRunIdRef.current,
+        }
+      }
       windowRef.current = next
       setWindowState(next)
       if (next) {
@@ -1124,6 +1247,7 @@ export function useConversation(
           )
         )
           settleSubmission(next.view.sessionId, pending.clientMessageId)
+        releaseSupersededQueueReturn(next)
         const live = nativeInputRequests(next.view)
         setNativeInputDrafts((current) => {
           const retained = Object.entries(current).filter(([id, draft]) =>
@@ -1137,7 +1261,7 @@ export function useConversation(
         })
       }
     },
-    [settleSubmission],
+    [releaseSupersededQueueReturn, settleSubmission],
   )
 
   const setNativeInputDraft = useCallback(
@@ -1214,6 +1338,8 @@ export function useConversation(
     setArtifactError(undefined)
     windowRef.current = undefined
     readingMessageIdRef.current = undefined
+    snapshotViewRef.current = undefined
+    preserveRunIdRef.current = undefined
     setReadingPositionLost(false)
     setReadPending(true)
     setWindowState(undefined)
@@ -1393,7 +1519,14 @@ export function useConversation(
         pending.bytes += bytes
         return
       }
-      const merged = mergeConversationPatch(current, patch)
+      const merged = mergeConversationPatch(
+        {
+          ...current,
+          snapshotView: snapshotViewRef.current,
+          preserveRunId: preserveRunIdRef.current,
+        },
+        patch,
+      )
       if (merged.applied) {
         commitWindow(merged.window)
         if (patch.comments) {
@@ -1766,20 +1899,31 @@ export function useConversation(
       direction: 'older' | 'around' | 'latest',
       messageId?: string,
       historicalSource = false,
+      foldingRunId?: string,
     ): Promise<void> {
       const current = windowRef.current
       if (!visibleRef.current || !sessionId || !current) return
-      if (direction === 'latest') readingMessageIdRef.current = undefined
+      if (direction === 'latest' && !foldingRunId) readingMessageIdRef.current = undefined
+      const navigationTarget =
+        direction === 'around' && messageId
+          ? { messageId, historicalSource }
+          : direction === 'latest' && !foldingRunId && !pendingAroundMessageRef.current?.messageId
+            ? (pendingAroundMessageRef.current ?? { historicalSource: false })
+            : undefined
+      if (navigationTarget) pendingAroundMessageRef.current = navigationTarget
       if (pageInFlightRef.current) {
         // One pending target, newest intent wins. Comment navigation is executed
         // after the current page settles instead of requiring another click.
-        if (direction === 'around' && messageId)
-          pendingAroundMessageRef.current = { messageId, historicalSource }
+        if (direction === 'latest' && !foldingRunId && !pendingAroundMessageRef.current)
+          pendingAroundMessageRef.current = { historicalSource: false }
         return
       }
-      const boundary = current.view.messages[0]?.sequence
+      const boundary = conversationWindowStartOrder(current)
       if (direction === 'older' && boundary === undefined) return
       const generation = requestGenerationRef.current
+      const viewGeneration = snapshotViewGenerationRef.current
+      const requestedSnapshotView = snapshotViewRef.current
+      const requestedPreserveRunId = foldingRunId ? undefined : preserveRunIdRef.current
       pageInFlightRef.current = true
       setLoadingPage(true)
       setPageError(undefined)
@@ -1797,7 +1941,9 @@ export function useConversation(
             scope: 'messages',
             sessionId,
             incarnation: current.view.observation.incarnation,
-            ...(direction === 'older' ? { beforeSequence: boundary } : {}),
+            ...(direction === 'older' ? { beforeDisplay: boundary } : {}),
+            ...(requestedSnapshotView ? { snapshotView: requestedSnapshotView } : {}),
+            ...(requestedPreserveRunId ? { preserveRunId: requestedPreserveRunId } : {}),
             ...(direction === 'around' && messageId && !fallbackToLatest
               ? { aroundMessageId: messageId, includeHistoricalSource: historicalSource }
               : {}),
@@ -1815,6 +1961,8 @@ export function useConversation(
             result = await window.pact.getConversation({
               scope: 'messages',
               sessionId,
+              ...(requestedSnapshotView ? { snapshotView: requestedSnapshotView } : {}),
+              ...(requestedPreserveRunId ? { preserveRunId: requestedPreserveRunId } : {}),
               ...(anchorId
                 ? { aroundMessageId: anchorId, includeHistoricalSource: historicalSource }
                 : {}),
@@ -1830,12 +1978,22 @@ export function useConversation(
             // Explicit Comment navigation keeps its exact target; only a
             // disposable reading-position recovery may fall back to latest.
             // oxlint-disable-next-line no-await-in-loop -- One bounded fallback inside the current recovery owner.
-            result = await window.pact.getConversation({ scope: 'messages', sessionId })
+            result = await window.pact.getConversation({
+              scope: 'messages',
+              sessionId,
+              ...(requestedSnapshotView ? { snapshotView: requestedSnapshotView } : {}),
+              ...(requestedPreserveRunId ? { preserveRunId: requestedPreserveRunId } : {}),
+            })
           }
           if (Date.now() > deadline) throw new Error('Conversation recovery timed out. Try again.')
           const page = unwrapRpcResult(result)
           if (page.scope !== 'messages') throw new Error('Unexpected Message page.')
-          if (generation !== requestGenerationRef.current) return
+          if (navigationTarget && pendingAroundMessageRef.current !== navigationTarget) return
+          if (
+            generation !== requestGenerationRef.current ||
+            viewGeneration !== snapshotViewGenerationRef.current
+          )
+            return
           const resident = windowRef.current
           if (!resident || resident.view.sessionId !== page.sessionId) return
           if (
@@ -1843,6 +2001,17 @@ export function useConversation(
             resident.view.observation.incarnation !== page.observation.incarnation
           )
             return
+          if (foldingRunId) {
+            if (
+              !snapshotFoldGuardRef.current?.() ||
+              readingMessageIdRef.current ||
+              pendingAroundMessageRef.current ||
+              preserveRunIdRef.current !== foldingRunId
+            )
+              return
+            preserveRunIdRef.current = undefined
+          }
+          if (historicalSource && page.snapshotView) snapshotViewRef.current = page.snapshotView
           const next = mergeMessagePage(resident, page, effectiveDirection)
           commitWindow(next)
           const recovered =
@@ -1866,11 +2035,20 @@ export function useConversation(
             bodyRequestGenerationRef.current += 1
             setExpandedActivityBody(undefined)
           }
-          if (effectiveDirection !== 'around' || recovered) return
+          if (effectiveDirection !== 'around' || recovered) {
+            if (pendingAroundMessageRef.current === navigationTarget)
+              pendingAroundMessageRef.current = undefined
+            return
+          }
         }
         throw new Error('Conversation is changing. Try again.')
       } catch (error) {
-        if (generation === requestGenerationRef.current) {
+        if (pendingAroundMessageRef.current === navigationTarget)
+          pendingAroundMessageRef.current = undefined
+        if (
+          generation === requestGenerationRef.current &&
+          viewGeneration === snapshotViewGenerationRef.current
+        ) {
           setPageError(
             error instanceof Error ? error.message : 'Conversation history could not load.',
           )
@@ -1880,19 +2058,46 @@ export function useConversation(
           pageInFlightRef.current = false
           setLoadingPage(false)
           const pendingMessageId = pendingAroundMessageRef.current
-          pendingAroundMessageRef.current = undefined
           if (pendingMessageId)
-            void loadPage('around', pendingMessageId.messageId, pendingMessageId.historicalSource)
+            void loadPage(
+              pendingMessageId.messageId ? 'around' : 'latest',
+              pendingMessageId.messageId,
+              pendingMessageId.historicalSource,
+            )
         }
       }
     },
     [commitWindow, sessionId],
   )
 
+  const collapseEarlierResponses = useCallback(
+    async (runId: string): Promise<void> => {
+      const current = windowRef.current
+      if (
+        !current ||
+        pageInFlightRef.current ||
+        readingMessageIdRef.current ||
+        pendingAroundMessageRef.current ||
+        current.preserveRunId !== runId ||
+        !snapshotFoldGuardRef.current?.()
+      )
+        return
+      snapshotViewGenerationRef.current += 1
+      await loadHistory('latest', undefined, false, runId)
+    },
+    [loadHistory],
+  )
+
   const ensureMessage = useCallback(
     async (messageId: string): Promise<void> => {
       const current = windowRef.current
-      if (current?.view.messages.some((message) => message.id === messageId)) {
+      const residentMessage = current?.view.messages.find((message) => message.id === messageId)
+      if (current && residentMessage) {
+        pendingAroundMessageRef.current = undefined
+        if (residentMessage.outputSnapshot?.canonical === false && residentMessage.runId) {
+          snapshotViewRef.current = { runId: residentMessage.runId, mode: 'expanded' }
+          snapshotViewGenerationRef.current += 1
+        }
         if (current.sourceMessageId !== messageId)
           commitWindow({ ...current, sourceMessageId: messageId })
         return
@@ -2069,7 +2274,7 @@ export function useConversation(
     skills?: SkillSelection[],
     planningAction?: ConversationSendInput['planningAction'],
   ): Promise<boolean> => {
-    if (!sessionId || sending) return false
+    if (!sessionId || sending || returnOperation.current?.sessionId === sessionId) return false
     const content = composerSnapshot.trim()
     const images = composerDraftsRef.current[sessionId]?.images ?? []
     if (images.some((image) => image.status !== 'ready' || !image.image)) {
@@ -2124,6 +2329,8 @@ export function useConversation(
           : composerDraftsBySession[sessionId]
         )?.revision ?? 0,
       returnedInputOperationId: composerDraftsBySession[sessionId]?.returnedInputOperationId,
+      queueReturnOperationId:
+        preserved?.queueReturnOperationId ?? sourceDocument.queueReturnOperationId,
       operationId,
       content,
       composerSnapshot,
@@ -2132,7 +2339,7 @@ export function useConversation(
       expectedCommentsRevision,
       clientMessageId,
       route: submissionRoute,
-      planningAction: preserved?.planningAction ?? planningAction,
+      planningAction: preserved?.planningAction ?? planningAction ?? sourceDocument.planningAction,
     }
     if (!admitComposerResidency(composerDraftsRef.current, { sessionId, value: frozen }))
       return false
@@ -2148,6 +2355,9 @@ export function useConversation(
       clientMessageId,
       ...(frozen.returnedInputOperationId
         ? { returnedInputOperationId: frozen.returnedInputOperationId }
+        : {}),
+      ...(frozen.queueReturnOperationId
+        ? { queueReturnOperationId: frozen.queueReturnOperationId }
         : {}),
       expectedCommentsRevision,
       commentIds: [],
@@ -2518,6 +2728,24 @@ export function useConversation(
     return inspectNativeContext(run?.id ?? sessionId, agentId)
   }
 
+  const checkQueuedDelivery = async (): Promise<boolean> => {
+    const entry = windowRef.current?.view.queue?.input
+    if (!entry?.delivery || entry.recipient === 'all') return false
+    try {
+      const checked = await inspectNativeContext(entry.delivery.runId, entry.recipient)
+      if (!checked || windowRef.current?.view.queue?.input?.id === entry.id) {
+        onNotice('The original delivery is still unconfirmed. Nothing was resent.')
+        return false
+      }
+      return true
+    } catch (error) {
+      onNotice(
+        error instanceof Error ? error.message : 'The original delivery could not be checked.',
+      )
+      return false
+    }
+  }
+
   const rebuildNativeContext = async (
     agentId: RuntimeAgentId,
     options?: Omit<NativeContextRebuildInput, 'sessionId' | 'agentId'>,
@@ -2538,6 +2766,327 @@ export function useConversation(
     }
   }
 
+  const performQueueAction = async (
+    action: 'steer' | 'remove' | 'resume' | 'enabled',
+    enabled?: boolean,
+  ): Promise<boolean> => {
+    const queue = windowRef.current?.view.queue
+    if (
+      !sessionId ||
+      !queue ||
+      queueOperation.current ||
+      returnOperation.current ||
+      (action !== 'enabled' && !queue.input)
+    )
+      return false
+    const operationId = crypto.randomUUID()
+    const owner = { sessionId, operationId, controller: new AbortController() }
+    queueOperation.current = owner
+    updateSessionOperations(sessionId, (current) => ({ ...current, queueOperationId: operationId }))
+    const timer = window.setTimeout(() => owner.controller.abort(), 10_000)
+    try {
+      const input: ConversationQueueActionInput = {
+        sessionId,
+        inputId: queue.input?.id ?? crypto.randomUUID(),
+        expectedRevision: queue.revision,
+        operationId,
+      }
+      const request =
+        action === 'steer'
+          ? window.pact.steerQueuedConversationMessage(input)
+          : action === 'remove'
+            ? window.pact.removeQueuedConversationMessage(input)
+            : action === 'resume'
+              ? window.pact.resumeConversationQueue(input)
+              : window.pact.setConversationQueueEnabled({
+                  sessionId,
+                  enabled: enabled ?? true,
+                  expectedRevision: queue.revision,
+                  operationId,
+                })
+      const result = await new Promise<Awaited<typeof request>>((resolve, reject) => {
+        const abort = () =>
+          reject(
+            new Error(
+              'The queue action could not be confirmed. Check its status before trying again.',
+            ),
+          )
+        owner.controller.signal.addEventListener('abort', abort, { once: true })
+        if (owner.controller.signal.aborted) abort()
+        void request
+          .then(resolve, reject)
+          .finally(() => owner.controller.signal.removeEventListener('abort', abort))
+      })
+      if (owner.controller.signal.aborted) return false
+      cachePatch(unwrapRpcResult(result))
+      return true
+    } catch (error) {
+      if (activeSessionIdRef.current === sessionId) {
+        onNotice(
+          error instanceof Error ? error.message : 'The queue action could not be confirmed.',
+        )
+        void refetchConversation({ cancelRefetch: false })
+      }
+      return false
+    } finally {
+      window.clearTimeout(timer)
+      if (queueOperation.current === owner) queueOperation.current = undefined
+      updateSessionOperations(sessionId, (current) =>
+        current.queueOperationId === operationId
+          ? { ...current, queueOperationId: undefined }
+          : current,
+      )
+    }
+  }
+
+  const returnQueuedInputToComposer = async (fromQueue: boolean): Promise<boolean> => {
+    const current = windowRef.current
+    const queue = current?.view.queue
+    if (
+      !sessionId ||
+      current?.view.sessionId !== sessionId ||
+      !queue ||
+      returnOperation.current ||
+      queueOperation.current ||
+      pendingBySessionRef.current.has(sessionId) ||
+      (fromQueue && (!queue.input || ['dispatching', 'unknown'].includes(queue.input.state))) ||
+      (!fromQueue && !queue.returnedInput)
+    )
+      return false
+    const draft = composerDraftsRef.current[sessionId] ?? { text: '' }
+    const operationId = fromQueue ? crypto.randomUUID() : queue.returnedInput!.operationId
+    const inputId = fromQueue ? queue.input!.id : queue.returnedInput!.inputId
+    const expectedRevision = fromQueue ? queue.revision : queue.returnedInput!.expectedRevision
+    const commentsRevision = current.view.commentsRevision
+    const returned = queue.returnedInput
+    const replay =
+      !fromQueue &&
+      returned?.state === 'installed' &&
+      returned.installedCommentsRevision === commentsRevision
+    if (replay && !returned.claimId) {
+      onNotice('The original restoration receipt is unavailable. Your current draft was kept.')
+      return false
+    }
+    const claimId = replay
+      ? returned.claimId!
+      : fromQueue || returned?.state !== 'installed'
+        ? operationId
+        : crypto.randomUUID()
+    const owner: ReturnedInputRead = { sessionId, controller: new AbortController() }
+    returnOperation.current = owner
+    setRestoringInput(true)
+    const timeout = window.setTimeout(() => owner.controller.abort(), 10_000)
+    const bounded = async <T>(task: Promise<T>): Promise<T> =>
+      new Promise((resolve, reject) => {
+        const abort = () =>
+          reject(
+            new Error(
+              'Returning the message was cancelled or timed out. The message remains available to restore.',
+            ),
+          )
+        owner.controller.signal.addEventListener('abort', abort, { once: true })
+        if (owner.controller.signal.aborted) abort()
+        void task
+          .then(resolve, reject)
+          .finally(() => owner.controller.signal.removeEventListener('abort', abort))
+      })
+    let installed = false
+    try {
+      if (fromQueue) {
+        const patch = unwrapRpcResult(
+          await bounded(
+            window.pact.returnQueuedConversationMessage({
+              sessionId,
+              inputId,
+              operationId,
+              expectedRevision,
+              phase: 'return',
+            }),
+          ),
+        )
+        if (patch.queue?.returnedInput?.operationId !== operationId)
+          throw new Error(
+            'The returned message could not be confirmed. Refresh its status before restoring it.',
+          )
+        cachePatch(patch)
+      }
+      let chars = 0,
+        offset = 0,
+        afterPosition: number | undefined,
+        first = true
+      let restoredImages: ConversationImage[] = [],
+        restoredSkills: SkillSelection[] = []
+      let restoredRoute: import('@pact/contracts').ConversationMessageRoute | undefined
+      let planningAction: ConversationSendInput['planningAction'] | undefined
+      const chunks: string[] = []
+      while (true) {
+        if (owner.controller.signal.aborted)
+          throw new Error('Message restoration was cancelled or timed out.')
+        const page: ConversationPage = unwrapRpcResult(
+          // oxlint-disable-next-line no-await-in-loop -- Body and Comment cursors advance together under one ten-second owner.
+          await bounded(
+            window.pact.getConversation({
+              scope: 'queued-input',
+              source: 'returned',
+              sessionId,
+              inputId,
+              operationId,
+              offset,
+              ...(afterPosition === undefined ? {} : { commentsAfterPosition: afterPosition }),
+            }),
+          ),
+        )
+        if (
+          page.scope !== 'queued-input' ||
+          page.sessionId !== sessionId ||
+          page.source !== 'returned' ||
+          page.inputId !== inputId ||
+          page.operationId !== operationId ||
+          page.offset !== offset ||
+          page.nextOffset !== offset + page.text.length ||
+          (page.hasMore && (!page.text || page.nextOffset <= offset))
+        )
+          throw new Error('The returned message changed or could not load. Try restoring it again.')
+        if (first) {
+          restoredImages = page.images ?? []
+          restoredSkills = page.skills ?? []
+          restoredRoute = page.route
+          planningAction = page.planningAction
+          first = false
+        } else if (JSON.stringify(restoredRoute) !== JSON.stringify(page.route)) {
+          throw new Error('The returned message routing changed while loading.')
+        }
+        chars += page.text.length
+        assertComposerEditLengths(draft.text.length, chars)
+        chunks.push(page.text)
+        offset = page.nextOffset
+        for (const comment of page.comments) {
+          if (afterPosition !== undefined && comment.position <= afterPosition)
+            throw new Error('The returned Comments did not advance.')
+          afterPosition = comment.position
+        }
+        if (
+          page.commentsNextPosition !== null &&
+          (!page.comments.length || page.commentsNextPosition !== afterPosition)
+        )
+          throw new Error('The returned Comment cursor did not advance.')
+        if (!page.hasMore && page.commentsNextPosition === null) break
+      }
+      if (
+        owner.controller.signal.aborted ||
+        returnOperation.current !== owner ||
+        activeSessionIdRef.current !== sessionId ||
+        (composerDraftsRef.current[sessionId]?.revision ?? 0) !== (draft.revision ?? 0)
+      )
+        return false
+      const restoredDraft: ConversationComposerDraft = {
+        text: chunks.join(''),
+        revision: (draft.revision ?? 0) + 1,
+        queueReturnOperationId: operationId,
+        planningAction,
+        skills: restoredSkills,
+        route: restoredRoute,
+        images: restoredImages.map((image) => ({
+          id: image.id,
+          name: image.name,
+          status: 'ready',
+          image,
+        })),
+      }
+      owner.draft = restoredDraft
+      if (!admitComposerResidency({ ...composerDraftsRef.current, [sessionId]: restoredDraft }))
+        return false
+      const fresh = windowRef.current
+      if (
+        fresh?.view.sessionId !== sessionId ||
+        fresh.view.queue?.returnedInput?.operationId !== operationId ||
+        fresh.view.commentsRevision !== commentsRevision
+      )
+        throw new Error('The returned message or Comment drafts changed while loading.')
+      const patch = unwrapRpcResult(
+        await bounded(
+          window.pact.returnQueuedConversationMessage({
+            sessionId,
+            inputId,
+            operationId,
+            expectedRevision,
+            phase: 'claim',
+            claimId,
+            expectedCommentsRevision: commentsRevision,
+          }),
+        ),
+      )
+      const receipt = patch.queue?.returnedInput
+      if (
+        receipt?.operationId !== operationId ||
+        receipt.claimId !== claimId ||
+        receipt.state !== 'installed' ||
+        receipt.installedCommentsRevision === undefined
+      )
+        throw new Error('The original restoration could not be confirmed. Your draft was kept.')
+      cachePatch(patch)
+      if (
+        owner.controller.signal.aborted ||
+        returnOperation.current !== owner ||
+        activeSessionIdRef.current !== sessionId ||
+        windowRef.current?.view.commentsRevision !== receipt.installedCommentsRevision ||
+        (composerDraftsRef.current[sessionId]?.revision ?? 0) !== (draft.revision ?? 0)
+      )
+        return false
+      installed = putComposerDraft(sessionId, restoredDraft)
+      if (!installed) return false
+      for (const [id, upload] of imageUploads.current) {
+        if (upload.sessionId !== sessionId) continue
+        upload.controller.abort()
+        imageUploads.current.delete(id)
+      }
+      imageChoosers.current.get(sessionId)?.abort()
+      imageChoosers.current.delete(sessionId)
+      updateSessionOperations(sessionId, (value) => ({ ...value, choosingImages: false }))
+      const restoredImageIds = new Set(restoredImages.map((image) => image.id))
+      for (const image of draft.images ?? [])
+        if (image.image && !restoredImageIds.has(image.image.id))
+          releaseDraftImage(sessionId, image.image.id)
+      return installed
+    } catch (error) {
+      if (activeSessionIdRef.current === sessionId) {
+        onNotice(
+          error instanceof Error
+            ? error.message
+            : 'The returned message remains available to restore.',
+        )
+        void refetchConversation({ cancelRefetch: false })
+      }
+      return false
+    } finally {
+      window.clearTimeout(timeout)
+      if (returnOperation.current === owner) {
+        returnOperation.current = undefined
+        releaseSupersededQueueReturn(windowRef.current)
+        setRestoringInput(false)
+        if (!installed) {
+          const value = composerDraftsRef.current[sessionId]
+          const failed = value?.images?.some(
+            (image) => image.status === 'preparing' && !imageUploads.current.has(image.id),
+          )
+          if (failed)
+            putComposerDraft(sessionId, {
+              ...value!,
+              revision: (value?.revision ?? 0) + 1,
+              images: value!.images?.map((image) =>
+                image.status === 'preparing' && !imageUploads.current.has(image.id)
+                  ? Object.assign({}, image, {
+                      status: 'failed',
+                      error: 'Image preparation was cancelled. Remove it and try again.',
+                    })
+                  : image,
+              ),
+            })
+        }
+      }
+    }
+  }
+
   const restoreReturnedInput = useCallback(
     async (automatic = false): Promise<boolean> => {
       const current = windowRef.current,
@@ -2551,6 +3100,7 @@ export function useConversation(
       )
         return false
       const draft = composerDraftsBySession[sessionId]
+      if (draft?.queueReturnOperationId) return false
       const attempt = `${sessionId}:${recovery.operationId}`
       if (
         automatic &&
@@ -2775,6 +3325,11 @@ export function useConversation(
         returnOperation.current = undefined
         setRestoringInput(false)
       }
+      const queueOwner = queueOperation.current
+      if (queueOwner && queueOwner.sessionId === ownerSession) {
+        queueOwner.controller.abort()
+        queueOperation.current = undefined
+      }
     }
   }, [sessionId])
 
@@ -2890,7 +3445,8 @@ export function useConversation(
     setComposer,
     setComposerDocument,
     composerRoute: composerDraft?.route,
-    composerReturnedInputOperationId: composerDraft?.returnedInputOperationId,
+    composerReturnedInputOperationId:
+      composerDraft?.returnedInputOperationId ?? composerDraft?.queueReturnOperationId,
     composerSkills,
     setComposerSkills,
     composerMention,
@@ -2913,6 +3469,16 @@ export function useConversation(
     rebuildNativeContext,
     checkNativeContext,
     history: {
+      queueActions: {
+        pending: Boolean(currentOperations?.queueOperationId) || restoringInput,
+        steer: () => performQueueAction('steer'),
+        remove: () => performQueueAction('remove'),
+        resume: () => performQueueAction('resume'),
+        checkStatus: checkQueuedDelivery,
+        setEnabled: (enabled) => performQueueAction('enabled', enabled),
+        returnToComposer: () => returnQueuedInputToComposer(true),
+        restoreReturned: () => returnQueuedInputToComposer(false),
+      },
       admitComposerEdit: (nextChars) =>
         Boolean(
           sessionId &&
@@ -2960,7 +3526,17 @@ export function useConversation(
       pageError: visibleWindow ? pageError : undefined,
       activityError: visibleWindow ? activityError : undefined,
       loadOlder: () => loadHistory('older'),
-      loadLatest: () => loadHistory('latest'),
+      loadLatest: () => {
+        pendingAroundMessageRef.current = { historicalSource: false }
+        snapshotViewRef.current = undefined
+        snapshotViewGenerationRef.current += 1
+        return loadHistory('latest')
+      },
+      recoverLatest: () => loadHistory('latest'),
+      collapseEarlierResponses,
+      setSnapshotFoldGuard: (guard) => {
+        snapshotFoldGuardRef.current = guard
+      },
       recoverFromGap,
       historyResyncToken: visibleWindow ? historyResyncToken : 0,
       ensureMessage,

@@ -442,6 +442,62 @@
       "when": 1792001398385,
       "tag": "0062_native_presence",
       "breakpoints": true
+    },
+    {
+      "idx": 63,
+      "version": "6",
+      "when": 1792255223582,
+      "tag": "0063_agent-speed",
+      "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "6",
+      "when": 1792256227140,
+      "tag": "0064_conversation-queue",
+      "breakpoints": true
+    },
+    {
+      "idx": 65,
+      "version": "6",
+      "when": 1792256406942,
+      "tag": "0065_steer-membership-state",
+      "breakpoints": true
+    },
+    {
+      "idx": 66,
+      "version": "6",
+      "when": 1792256692222,
+      "tag": "0066_queue-return-claims",
+      "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "6",
+      "when": 1792257002582,
+      "tag": "0067_steer-final-evidence",
+      "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "6",
+      "when": 1792257159652,
+      "tag": "0068_consumed-native-inputs",
+      "breakpoints": true
+    },
+    {
+      "idx": 69,
+      "version": "6",
+      "when": 1792257266552,
+      "tag": "0069_queue-resume-receipts",
+      "breakpoints": true
+    },
+    {
+      "idx": 70,
+      "version": "6",
+      "when": 1792294703784,
+      "tag": "0070_steer_output_snapshots",
+      "breakpoints": true
     }
   ]
 }

@@ -11,9 +11,16 @@ import type {
   AgentRun,
   RuntimeAgentId,
   SessionIssues,
+  ConversationQueueState,
+  ConversationRunContext,
+  ConversationSnapshotView,
+  ConversationDisplayOrder,
 } from '@pact/contracts'
 
 import {
+  compareConversationMessages,
+  compareConversationDisplayOrder,
+  conversationMessageOrder,
   CONVERSATION_PAGE_ITEMS,
   CONVERSATION_MARKDOWN_BYTES,
   CONVERSATION_WINDOW_MESSAGES,
@@ -54,9 +61,13 @@ export interface ConversationViewProjection {
   rebuildOperations?: ConversationSnapshot['rebuildOperations']
   rebuildInputRecovery?: ConversationSnapshot['rebuildInputRecovery']
   sessionIssues?: SessionIssues | undefined
+  queue?: ConversationQueueState | undefined
 }
 
 export interface ConversationWindow {
+  runContexts?: ConversationRunContext[] | undefined
+  snapshotView?: ConversationSnapshotView | undefined
+  preserveRunId?: string | undefined
   view: ConversationViewProjection
   /** Same-incarnation gap floor; an older page cannot certify an unknown body. */
   bodyResyncObservation?: number | undefined
@@ -112,6 +123,49 @@ const textEncoder = new TextEncoder()
 const MAX_ARTIFACT_RUNS = 25
 const MAX_ARTIFACT_GROUPS = 50
 const MAX_ARTIFACT_BYTES = 1024 * 1024
+
+// Context hosts share the transcript's existing row budget with source bodies.
+function boundTranscriptRows(
+  messages: ConversationViewProjection['messages'],
+  contexts: ConversationRunContext[],
+  direction: 'older' | 'latest',
+): {
+  messages: ConversationViewProjection['messages']
+  contexts: ConversationRunContext[]
+  trimmed: boolean
+} {
+  const rows = [
+    ...messages.map((message) => ({
+      message,
+      context: undefined,
+      order: conversationMessageOrder(message),
+    })),
+    ...contexts.map((context) => ({ message: undefined, context, order: context.order })),
+  ].toSorted((left, right) => compareConversationDisplayOrder(left.order, right.order))
+  const retained =
+    direction === 'older'
+      ? rows.slice(0, CONVERSATION_WINDOW_MESSAGES)
+      : rows.slice(-CONVERSATION_WINDOW_MESSAGES)
+  return {
+    messages: retained.flatMap((row) => (row.message ? [row.message] : [])),
+    contexts: retained.flatMap((row) => (row.context ? [row.context] : [])),
+    trimmed: rows.length > retained.length,
+  }
+}
+
+export function isRunResponseComplete(run: AgentRun | undefined): boolean {
+  return run?.outputSnapshots ? run.outputSnapshots.settled : run?.status === 'completed'
+}
+
+export function conversationWindowStartOrder(
+  window: ConversationWindow,
+): ConversationDisplayOrder | undefined {
+  const orders = [
+    ...window.view.messages.slice(0, 1).map(conversationMessageOrder),
+    ...(window.runContexts ?? []).map((context) => context.order),
+  ]
+  return orders.toSorted(compareConversationDisplayOrder)[0]
+}
 
 // A shared projection for the Composer and file-Comment surface; never infer
 // native execution from file recording or transport timeout metadata.
@@ -207,6 +261,7 @@ function boundRunArtifacts(
   direction: 'older' | 'latest',
 ): ConversationWindow {
   let messages = [...window.view.messages]
+  let contexts = window.runContexts ?? []
   const allRuns = window.view.runs
   const opened = window.artifactHistory
   const protectedUserId = opened?.userMessageId
@@ -218,6 +273,7 @@ function boundRunArtifacts(
     groups = (window.runArtifacts ?? []).filter((group) => users.has(group.userMessageId))
     const retainedIds = new Set([
       ...messages.flatMap((message) => (message.runId ? [message.runId] : [])),
+      ...contexts.map((context) => context.runId),
       ...groups.map((group) => group.latestRunId),
       ...(opened?.runIds ?? []),
       ...(window.latestRun ? [window.latestRun.id] : []),
@@ -242,12 +298,31 @@ function boundRunArtifacts(
             (other.replyToMessageId ?? other.id) === (message.replyToMessageId ?? message.id),
         ),
     )
-    if (!remove)
+    if (!remove) {
+      const orderedContexts = direction === 'older' ? contexts.toReversed() : contexts
+      const removeContext = orderedContexts.find((context) => {
+        const run = allRuns.find((candidate) => candidate.id === context.runId)
+        return (
+          run?.userMessageId !== protectedUserId &&
+          !messages.some(
+            (message) => message.id === window.sourceMessageId && message.runId === context.runId,
+          )
+        )
+      })
+      if (removeContext) {
+        contexts = contexts.filter((context) => context.runId !== removeContext.runId)
+        trimmed = true
+        continue
+      }
       throw new Error(
         'Saved change history exceeds its reading limit. Close earlier records and try again.',
       )
+    }
     const userId = remove.replyToMessageId ?? remove.id
     messages = messages.filter((message) => (message.replyToMessageId ?? message.id) !== userId)
+    contexts = contexts.filter(
+      (context) => allRuns.find((run) => run.id === context.runId)?.userMessageId !== userId,
+    )
     trimmed = true
   }
   const ids = new Set(messages.map((message) => message.id))
@@ -256,6 +331,7 @@ function boundRunArtifacts(
   )
   return {
     ...window,
+    runContexts: contexts,
     view: {
       ...window.view,
       messages,
@@ -405,9 +481,16 @@ function uniqueRuns(page: MessagePage): ConversationSnapshot['runs'] {
 // Reply versions remain durable; only one occupies a logical answer slot.
 // An exact Comment source wins until navigation leaves that source.
 function sameReplySlot(
-  left: Pick<ConversationViewProjection['messages'][number], 'replyToMessageId' | 'agentId'>,
-  right: Pick<ConversationViewProjection['messages'][number], 'replyToMessageId' | 'agentId'>,
+  left: Pick<
+    ConversationViewProjection['messages'][number],
+    'replyToMessageId' | 'agentId' | 'runId' | 'outputSnapshot'
+  >,
+  right: Pick<
+    ConversationViewProjection['messages'][number],
+    'replyToMessageId' | 'agentId' | 'runId' | 'outputSnapshot'
+  >,
 ): boolean {
+  if ((left.outputSnapshot || right.outputSnapshot) && left.runId === right.runId) return false
   return Boolean(
     left.replyToMessageId &&
     left.replyToMessageId === right.replyToMessageId &&
@@ -451,6 +534,7 @@ export function windowFromPage(page: MessagePage): ConversationWindow {
         forkBlocked: page.header.forkBlocked,
         rebuildInputRecovery: page.header.rebuildInputRecovery,
         sessionIssues: page.header.sessionIssues,
+        queue: page.header.queue,
       },
       messageMeta: pageMeta(page),
       activityMeta: {},
@@ -463,6 +547,9 @@ export function windowFromPage(page: MessagePage): ConversationWindow {
       latestRun: page.header.latestRun,
       latestCompleteAssistantSequence: page.header.latestCompleteAssistantSequence,
       runArtifacts: page.runArtifacts,
+      runContexts: page.runContexts,
+      snapshotView: page.snapshotView,
+      preserveRunId: page.preserveRunId,
     },
     'latest',
   )
@@ -513,6 +600,14 @@ export function mergeMessagePage(
               ...existing,
               content: body.content,
               contentRevision: Math.max(existing.contentRevision, body.contentRevision),
+              ...(existing.outputSnapshot && item.message.outputSnapshot
+                ? {
+                    outputSnapshot: {
+                      ...existing.outputSnapshot,
+                      order: item.message.outputSnapshot.order,
+                    },
+                  }
+                : {}),
             }
           : body,
         sourceMessageId,
@@ -548,11 +643,29 @@ export function mergeMessagePage(
       }
     }
   }
-  const ordered = [...messages.values()].toSorted((a, b) => a.sequence - b.sequence)
-  const retained =
-    ordered.length <= CONVERSATION_WINDOW_MESSAGES
-      ? ordered
-      : ordered.slice(0, CONVERSATION_WINDOW_MESSAGES)
+  const ordered = [...messages.values()].toSorted(compareConversationMessages)
+  const contexts = new Map(
+    (replacing ? [] : (current.runContexts ?? [])).map((context) => [context.runId, context]),
+  )
+  for (const context of page.runContexts ?? []) contexts.set(context.runId, context)
+  if (keepCurrentValues)
+    for (const context of current.runContexts ?? []) {
+      if (
+        contexts.has(context.runId) ||
+        ordered.some(
+          (message) =>
+            message.runId === context.runId &&
+            (current.messageMeta[message.id]?.introducedAt ?? 0) > page.observation.sequence,
+        )
+      )
+        contexts.set(context.runId, context)
+    }
+  const bounded = boundTranscriptRows(
+    ordered,
+    [...contexts.values()],
+    direction === 'older' ? 'older' : 'latest',
+  )
+  const retained = bounded.messages
   const retainedIds = new Set(retained.map((message) => message.id))
   const retainedUsers = new Set(retained.map((message) => message.replyToMessageId ?? message.id))
   const artifactGroups = new Map(
@@ -575,6 +688,7 @@ export function mergeMessagePage(
       ? current.artifactHistory
       : undefined
   const runIds = new Set(retained.flatMap((message) => (message.runId ? [message.runId] : [])))
+  for (const context of bounded.contexts) runIds.add(context.runId)
   for (const group of runArtifacts) runIds.add(group.latestRunId)
   for (const id of artifactHistory?.runIds ?? []) runIds.add(id)
   const latestRun = keepCurrentValues
@@ -618,7 +732,7 @@ export function mergeMessagePage(
         })
     : []
   const activitiesById = new Map(activities.map((activity) => [activity.id, activity]))
-  const trimmed = ordered.length > retained.length
+  const trimmed = bounded.trimmed
   return boundRunArtifacts(
     {
       bodyResyncObservation: sameIncarnation ? current.bodyResyncObservation : undefined,
@@ -652,6 +766,7 @@ export function mergeMessagePage(
         sessionIssues: keepCurrentValues
           ? current.view.sessionIssues
           : (page.header.sessionIssues ?? current.view.sessionIssues),
+        queue: keepCurrentValues ? current.view.queue : page.header.queue,
         commentsRevision,
       },
       messageMeta: meta,
@@ -695,6 +810,9 @@ export function mergeMessagePage(
         : page.header.latestCompleteAssistantSequence,
       runArtifacts,
       artifactHistory,
+      runContexts: bounded.contexts,
+      snapshotView: page.snapshotView,
+      preserveRunId: page.preserveRunId,
     },
     direction === 'older' ? 'older' : 'latest',
   )
@@ -917,7 +1035,25 @@ export function mergeConversationPatch(
   if (patch.resync?.messages) {
     for (const id of messages.keys()) messageMeta[id] = { ...messageMeta[id]!, bodyResync: true }
   }
-  for (const change of patch.messages) {
+  for (const incomingChange of patch.messages) {
+    const previous = messages.get(incomingChange.message.id)
+    const change =
+      incomingChange.message.runId ===
+        (current.preserveRunId ??
+          (current.snapshotView?.mode === 'preserve' ? current.snapshotView.runId : undefined)) &&
+      previous?.outputSnapshot &&
+      incomingChange.message.outputSnapshot
+        ? {
+            ...incomingChange,
+            message: {
+              ...incomingChange.message,
+              outputSnapshot: {
+                ...incomingChange.message.outputSnapshot,
+                order: previous.outputSnapshot.order,
+              },
+            },
+          }
+        : incomingChange
     if (
       pinnedSource?.replyToMessageId &&
       sameReplySlot(change.message, pinnedSource) &&
@@ -1063,18 +1199,22 @@ export function mergeConversationPatch(
     if (introducedAt !== undefined && messageMeta[id])
       messageMeta[id] = { ...messageMeta[id], introducedAt }
   }
-  const orderedMessages = [...messages.values()].toSorted((a, b) => a.sequence - b.sequence)
-  const retainedMessages =
-    orderedMessages.length <= CONVERSATION_WINDOW_MESSAGES
-      ? orderedMessages
-      : orderedMessages.slice(-CONVERSATION_WINDOW_MESSAGES)
+  const orderedMessages = [...messages.values()].toSorted(compareConversationMessages)
+  const contexts = new Map((current.runContexts ?? []).map((context) => [context.runId, context]))
+  for (const context of patch.runContexts ?? []) contexts.set(context.runId, context)
+  const bounded = boundTranscriptRows(orderedMessages, [...contexts.values()], 'latest')
+  const retainedMessages = bounded.messages
   const retainedMessageIds = new Set(retainedMessages.map((message) => message.id))
   for (const id of Object.keys(messageMeta)) {
     if (!retainedMessageIds.has(id)) delete messageMeta[id]
   }
 
   const runs = new Map(current.view.runs.map((run) => [run.id, run]))
-  for (const run of patch.runs) runs.set(run.id, run)
+  for (const run of patch.runs) {
+    if (runs.get(run.id)?.outputSnapshots?.settled && run.outputSnapshots?.settled === false)
+      resyncMessages = true
+    runs.set(run.id, run)
+  }
   const artifactGroups = new Map(
     (current.runArtifacts ?? []).map((group) => [`${group.userMessageId}:${group.agentId}`, group]),
   )
@@ -1319,12 +1459,14 @@ export function mergeConversationPatch(
   const retainedRunIds = new Set(
     retainedMessages.flatMap((message) => (message.runId ? [message.runId] : [])),
   )
+  for (const context of bounded.contexts) retainedRunIds.add(context.runId)
   for (const run of patch.runs) retainedRunIds.add(run.id)
   for (const group of artifactGroups.values()) retainedRunIds.add(group.latestRunId)
   for (const id of current.artifactHistory?.runIds ?? []) retainedRunIds.add(id)
   if (latestRun) retainedRunIds.add(latestRun.id)
   const next: ConversationWindow = {
     ...current,
+    runContexts: bounded.contexts,
     bodyResyncObservation: gap ? patch.observation.sequence : current.bodyResyncObservation,
     view: {
       observation: patch.observation,
@@ -1346,6 +1488,7 @@ export function mergeConversationPatch(
           ? current.view.rebuildInputRecovery
           : patch.rebuildInputRecovery,
       sessionIssues: patch.sessionIssues ?? current.view.sessionIssues,
+      queue: patch.queue === undefined ? current.view.queue : patch.queue,
     },
     messageMeta,
     activityMeta,
@@ -1357,14 +1500,17 @@ export function mergeConversationPatch(
     loadedCommentMessageIds: Object.fromEntries(
       Object.entries(loadedCommentMessageIds).filter(([id]) => retainedMessageIds.has(id)),
     ),
-    hasOlder: current.hasOlder || orderedMessages.length > retainedMessages.length,
+    hasOlder: current.hasOlder || bounded.trimmed,
     hasNewer: current.hasNewer || deferredAnswer,
     latestRun,
     runArtifacts: [...artifactGroups.values()],
-    latestCompleteAssistantSequence:
-      retainedMessages.findLast(
-        (message) => message.role === 'assistant' && message.state === 'complete',
-      )?.sequence ?? current.latestCompleteAssistantSequence,
+    latestCompleteAssistantSequence: retainedMessages.reduce(
+      (latest, message) =>
+        message.role === 'assistant' && message.state === 'complete'
+          ? Math.max(latest ?? -1, message.sequence)
+          : latest,
+      current.latestCompleteAssistantSequence,
+    ),
   }
   return {
     window: boundRunArtifacts(next, 'latest'),

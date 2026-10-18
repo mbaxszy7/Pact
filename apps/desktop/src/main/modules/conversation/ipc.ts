@@ -23,6 +23,9 @@ import {
   conversationInputWriteSchema,
   CONVERSATION_INPUT_WRITE_BYTES,
   conversationStopInputSchema,
+  conversationQueueActionInputSchema,
+  conversationQueueReturnInputSchema,
+  conversationQueueEnabledInputSchema,
   nativeContextRebuildInputSchema,
   sessionForkInputSchema,
   peerProposalAcceptInputSchema,
@@ -298,6 +301,42 @@ export function registerConversationIpcHandlers(
         })
   })
 
+  ipcMain.handle(IPC_CHANNELS.steerQueuedConversationMessage, (event, raw: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = conversationQueueActionInputSchema.safeParse(raw)
+    return input.success
+      ? utilityClient.steerQueuedConversationMessage(input.data)
+      : { ok: false, error: { code: 'VALIDATION', message: 'Choose a current queued message.' } }
+  })
+  ipcMain.handle(IPC_CHANNELS.returnQueuedConversationMessage, (event, raw: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = conversationQueueReturnInputSchema.safeParse(raw)
+    return input.success
+      ? utilityClient.returnQueuedConversationMessage(input.data)
+      : { ok: false, error: { code: 'VALIDATION', message: 'Choose a current queued message.' } }
+  })
+  ipcMain.handle(IPC_CHANNELS.removeQueuedConversationMessage, (event, raw: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = conversationQueueActionInputSchema.safeParse(raw)
+    return input.success
+      ? utilityClient.removeQueuedConversationMessage(input.data)
+      : { ok: false, error: { code: 'VALIDATION', message: 'Choose a current queued message.' } }
+  })
+  ipcMain.handle(IPC_CHANNELS.resumeConversationQueue, (event, raw: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = conversationQueueActionInputSchema.safeParse(raw)
+    return input.success
+      ? utilityClient.resumeConversationQueue(input.data)
+      : { ok: false, error: { code: 'VALIDATION', message: 'Choose a current paused message.' } }
+  })
+  ipcMain.handle(IPC_CHANNELS.setConversationQueueEnabled, (event, raw: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = conversationQueueEnabledInputSchema.safeParse(raw)
+    return input.success
+      ? utilityClient.setConversationQueueEnabled(input.data)
+      : { ok: false, error: { code: 'VALIDATION', message: 'Choose a current Session queue.' } }
+  })
+
   ipcMain.handle(IPC_CHANNELS.conversationRetry, (event, runIdInput: unknown) => {
     trust.assertTrustedMainFrame(event)
     const input = conversationRetryInputSchema.safeParse(
@@ -452,6 +491,11 @@ export function registerConversationIpcHandlers(
     ipcMain.removeHandler(IPC_CHANNELS.skillDocumentCancel)
     ipcMain.removeHandler(IPC_CHANNELS.conversationGet)
     ipcMain.removeHandler(IPC_CHANNELS.conversationSend)
+    ipcMain.removeHandler(IPC_CHANNELS.steerQueuedConversationMessage)
+    ipcMain.removeHandler(IPC_CHANNELS.returnQueuedConversationMessage)
+    ipcMain.removeHandler(IPC_CHANNELS.removeQueuedConversationMessage)
+    ipcMain.removeHandler(IPC_CHANNELS.resumeConversationQueue)
+    ipcMain.removeHandler(IPC_CHANNELS.setConversationQueueEnabled)
     ipcMain.removeHandler(IPC_CHANNELS.conversationStop)
     ipcMain.removeHandler(IPC_CHANNELS.peerProposalAccept)
     ipcMain.removeHandler(IPC_CHANNELS.peerProposalDismiss)

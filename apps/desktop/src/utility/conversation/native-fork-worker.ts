@@ -122,6 +122,22 @@ function isInput(value: unknown): value is NativeForkFileInput {
     )
       return false
   if (
+    value.nativeInputIds !== undefined &&
+    (!Array.isArray(value.nativeInputIds) ||
+      value.nativeInputIds.length < 1 ||
+      value.nativeInputIds.length > 64 ||
+      new Set(value.nativeInputIds).size !== value.nativeInputIds.length ||
+      value.nativeInputIds[0] !== value.nativeTurnId ||
+      !value.nativeInputIds.every(
+        (id) =>
+          typeof id === 'string' &&
+          id.length > 0 &&
+          id.length <= 1024 &&
+          (value.provider !== 'claude' || uuid.test(id)),
+      ))
+  )
+    return false
+  if (
     value.answerFormat !== undefined &&
     !collaborationAnswerFormatSchema.safeParse(value.answerFormat).success
   )
@@ -134,7 +150,6 @@ function isInput(value: unknown): value is NativeForkFileInput {
   if (
     value.action === 'read-answer' &&
     (value.provider !== 'claude' ||
-      value.answerFormat === undefined ||
       typeof value.nativeTurnId !== 'string' ||
       !uuid.test(value.nativeTurnId))
   )
@@ -620,18 +635,54 @@ async function claude(
   )
   if (start < 0) throw new Error('The complete Claude turn source is missing.')
   let next = main.length
-  for (let index = start + 1; index < main.length; index++) {
-    const entry = main[index]!
-    if (entry.type !== 'user') continue
-    const content = object(entry.message).content
-    const toolResult =
-      Array.isArray(content) &&
-      content.length > 0 &&
-      content.every((block) => object(block).type === 'tool_result')
-    if (!toolResult && !entry.isMeta) {
-      next = index
-      break
+  let nativeInputIds: readonly string[]
+  if (input.source) {
+    // Preparation already bound the complete prefix to an immutable hash/cut.
+    // Later Fork/readback must reuse that exact cut, including accepted next Turns.
+    const cut = main.findIndex((entry) => entry.uuid === input.source!.nativeCutId)
+    if (cut < start) throw new Error('The prepared Claude Run cutoff is unavailable.')
+    next = cut + 1
+    nativeInputIds = main.slice(start, next).flatMap((entry) => {
+      if (entry.type !== 'user' || entry.isMeta || typeof entry.uuid !== 'string') return []
+      const content = object(entry.message).content
+      return Array.isArray(content) &&
+        content.length > 0 &&
+        content.every((block) => object(block).type === 'tool_result')
+        ? []
+        : [entry.uuid]
+    })
+    if (
+      nativeInputIds.length < 1 ||
+      nativeInputIds.length > 64 ||
+      nativeInputIds[0] !== input.nativeTurnId ||
+      new Set(nativeInputIds).size !== nativeInputIds.length
+    )
+      throw new Error('The prepared Claude Run input chain is invalid.')
+  } else {
+    nativeInputIds = input.nativeInputIds ?? [input.nativeTurnId!]
+    const members = new Set(nativeInputIds)
+    const seen = new Set<string>()
+    let matched = 0
+    for (let index = start; index < main.length; index++) {
+      const entry = main[index]!
+      if (entry.type !== 'user') continue
+      const content = object(entry.message).content
+      const toolResult =
+        Array.isArray(content) &&
+        content.length > 0 &&
+        content.every((block) => object(block).type === 'tool_result')
+      if (toolResult || entry.isMeta) continue
+      if (typeof entry.uuid !== 'string' || !members.has(entry.uuid)) {
+        next = index
+        break
+      }
+      if (seen.has(entry.uuid) || entry.uuid !== nativeInputIds[matched])
+        throw new Error('The Claude Run native input chain is duplicated or out of order.')
+      seen.add(entry.uuid)
+      matched++
     }
+    if (matched !== nativeInputIds.length)
+      throw new Error('A consumed Claude Run input is missing from its exact native chain.')
   }
   const selected = main.slice(start + 1, next)
   // A formal output attachment must belong to this exact User-root chain, rather
@@ -644,7 +695,7 @@ async function claude(
         .slice(start, next)
         .flatMap((entry) => (typeof entry.uuid === 'string' ? [[entry.uuid, entry] as const] : [])),
     )
-    const ancestry = new Map<string, boolean>([[input.nativeTurnId!, true]])
+    const ancestry = new Map<string, boolean>(nativeInputIds.map((id) => [id, true]))
     belongsToRoot = (entry: RecordValue): boolean => {
       const visited = new Set<string>()
       let cursor: RecordValue | undefined = entry
@@ -715,8 +766,9 @@ async function claude(
   )
     throw new Error('Claude native answer does not match the complete selected Pact answer.')
   const rawStart = sourceEntries.findIndex((entry) => entry.uuid === input.nativeTurnId)
-  const rawEnd =
-    next < main.length
+  const rawEnd = input.source
+    ? sourceEntries.findIndex((entry) => entry.uuid === input.source!.nativeCutId) + 1
+    : next < main.length
       ? sourceEntries.findIndex((entry) => entry.uuid === main[next]!.uuid)
       : sourceEntries.length
   if (rawStart < 0 || rawEnd <= rawStart)

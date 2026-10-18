@@ -485,15 +485,22 @@ describe('Read-only answer regeneration', () => {
     async (scenario) => {
       const f = await fixture()
       try {
-        if (scenario === 'complete')
+        let acceptedRunId = f.runId
+        if (scenario === 'complete') {
+          f.repo.recordNativeOutput(f.runId, {
+            outputId: 'old-output',
+            text: 'Original response',
+            completeness: 'complete',
+          })
           f.repo.applyArchivedEvent(f.sessionId, f.runId, {
             agentId: 'codex',
             type: 'turn.completed',
             turnId: 'old',
             outcome: 'completed',
           })
-        else {
+        } else {
           const retry = seedHistoricalAnswerAttempt(f.db, f.runId)
+          acceptedRunId = retry.run.id
           f.repo.applyEvent(f.sessionId, retry.run.id, {
             agentId: 'codex',
             type: 'text.completed',
@@ -508,6 +515,7 @@ describe('Read-only answer regeneration', () => {
             outcome: 'completed',
           })
         }
+        expect(f.repo.hasCompleteResponse(acceptedRunId)).toBe(true)
         const source = f.repo.message(f.oldMessage.id, f.sessionId)
         f.repo.applyArchivedBatch(f.sessionId, f.runId, [
           {

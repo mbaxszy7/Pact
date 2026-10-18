@@ -12,9 +12,10 @@ import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
 import type {
+  AgentAdapter,
   AgentNativeContextRebuildInput,
   AgentNativeContextRebuildResult,
-  AgentNativeInitializedBindingProbeInput,
+  AgentNativeProbeInput,
   AgentNativeTitleInput,
 } from '../../packages/agent-runtime/src/index.js'
 import type {
@@ -616,6 +617,9 @@ export interface ForkInput {
   reportNativeWork: (work: { executorId: string; state: string }) => void
 }
 export interface NativeAdapter {
+  run: AgentAdapter['run']
+  steer: NonNullable<AgentAdapter['steer']>
+  probeNativeInputs: NonNullable<AgentAdapter['probeNativeInputs']>
   setNativeTitle?(
     input: AgentNativeTitleInput,
     signal: AbortSignal,
@@ -625,10 +629,7 @@ export interface NativeAdapter {
     source: AsyncIterable<NativeContextRebuildChunk>,
     signal: AbortSignal,
   ): Promise<AgentNativeContextRebuildResult>
-  probeNativeStatus(
-    input: AgentNativeInitializedBindingProbeInput,
-    signal: AbortSignal,
-  ): Promise<NativeProbeResult>
+  probeNativeStatus(input: AgentNativeProbeInput, signal: AbortSignal): Promise<NativeProbeResult>
   prepareNativeFork(
     input: {
       cwd: string
@@ -688,7 +689,7 @@ export async function buildAdapters(root: string): Promise<AdapterBundle> {
   const configFile = join(root, 'native.config.mjs')
   await writeFile(
     configFile,
-    `import {externalizeDepsPlugin} from ${JSON.stringify(pathToFileURL(desktopRequire.resolve('electron-vite')).href)}; export default {main:{plugins:[externalizeDepsPlugin({exclude:['@pact/contracts','@pact/agent-runtime']})],build:{outDir:${JSON.stringify(join(root, 'bundle'))},rollupOptions:{input:{'native-adapters':${JSON.stringify(entry)},'native-fork-worker':${JSON.stringify(join(desktopRoot, 'src/utility/conversation/native-fork-worker.ts'))}}}}}};`,
+    `import {externalizeDepsPlugin} from ${JSON.stringify(pathToFileURL(desktopRequire.resolve('electron-vite')).href)}; export default {main:{plugins:[externalizeDepsPlugin({exclude:['@pact/contracts','@pact/agent-runtime']})],build:{outDir:${JSON.stringify(join(root, 'bundle'))},rollupOptions:{input:{'native-adapters':${JSON.stringify(entry)},'native-fork-worker':${JSON.stringify(join(desktopRoot, 'src/utility/conversation/native-fork-worker.ts'))},'native-json-parser-worker':${JSON.stringify(join(desktopRoot, 'src/utility/conversation/native-json-parser-worker.ts'))}}}}}};`,
   )
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- This is the installed, trusted build API rather than provider data.
   const { build } = desktopRequire('electron-vite') as {
@@ -1469,7 +1470,8 @@ export async function within<T>(
 }
 
 type LoopbackMode =
-  | { mode: 'codex' }
+  | { mode: 'codex'; beforeResponse?: (index: number) => Promise<void> }
+  | { mode: 'claude-live'; beforeResponse: (index: number) => Promise<void> }
   | {
       mode: 'claude'
       historicalUser: string
@@ -1527,6 +1529,56 @@ export class LoopbackProvider {
           }
           const index = this.requests.filter((value) => value.method === 'POST').length
           const text = this.replies[index - 1]
+          if (this.mode.mode === 'claude-live') {
+            const endpoint = new URL(request.url ?? '', 'http://127.0.0.1')
+            if (
+              request.method !== 'POST' ||
+              endpoint.pathname !== '/v1/messages' ||
+              !['', '?beta=true'].includes(endpoint.search) ||
+              index > 2 ||
+              text === undefined
+            )
+              throw new Error('Unexpected or excess live Claude loopback request')
+            const body: unknown = JSON.parse(
+              new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)),
+            )
+            if (
+              !body ||
+              typeof body !== 'object' ||
+              Array.isArray(body) ||
+              Reflect.get(body, 'stream') !== true ||
+              typeof Reflect.get(body, 'model') !== 'string' ||
+              !Array.isArray(Reflect.get(body, 'messages'))
+            )
+              throw new Error('Malformed live Claude loopback request')
+            const event = (type: string, payload: object): void => {
+              response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`)
+            }
+            response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+            event('message_start', {
+              message: {
+                id: `msg_pact_native_steer_${index}`,
+                type: 'message',
+                role: 'assistant',
+                model: Reflect.get(body, 'model'),
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: { input_tokens: 1, output_tokens: 0 },
+              },
+            })
+            event('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
+            await this.mode.beforeResponse(index)
+            event('content_block_delta', { index: 0, delta: { type: 'text_delta', text } })
+            event('content_block_stop', { index: 0 })
+            event('message_delta', {
+              delta: { stop_reason: 'end_turn', stop_sequence: null },
+              usage: { output_tokens: 1 },
+            })
+            event('message_stop', {})
+            response.end()
+            return
+          }
           if (this.mode.mode === 'claude') {
             const endpoint = new URL(request.url ?? '', 'http://127.0.0.1')
             if (
@@ -1730,6 +1782,9 @@ export class LoopbackProvider {
           }
           if (request.method !== 'POST' || request.url !== '/v1/responses' || text === undefined)
             throw new Error('Unexpected or excess loopback model request')
+          // A fixture-owned gate keeps the genuine CLI Turn active for native
+          // input races. Each test's deadline and finally release its waiter.
+          await this.mode.beforeResponse?.(index)
           const reasoning = {
             id: `native-reasoning-${index}`,
             type: 'reasoning',

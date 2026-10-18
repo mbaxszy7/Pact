@@ -144,6 +144,72 @@ const sessionId = crypto.randomUUID()
 const incarnation = crypto.randomUUID()
 const timestamp = '2026-09-26T00:00:00.000Z'
 
+it('requests authoritative history again when settled output becomes uncertain without replacing frozen facts', () => {
+  const user = message(0),
+    answer = message(3, 'Complete answer')
+  const run: AgentRun = {
+    id: crypto.randomUUID(),
+    sessionId,
+    userMessageId: user.id,
+    agentId: 'codex',
+    status: 'completed',
+    attemptCount: 1,
+    settingsRevision: 1,
+    model: null,
+    effort: null,
+    nativeEffectsState: 'settled',
+    outputSnapshots: {
+      count: 2,
+      lastInputMessageId: crypto.randomUUID(),
+      lastInputSequence: 2,
+      settled: true,
+    },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  }
+  answer.runId = run.id
+  answer.outputSnapshot = {
+    ordinal: 1,
+    frozen: false,
+    canonical: true,
+    order: { sequence: 3, rank: 1, id: answer.id },
+  }
+  const initial = page([user, answer])
+  initial.runs = [run]
+  const current = windowFromPage(initial)
+  const update = patch(2)
+  update.runs = [
+    {
+      ...run,
+      nativeEffectsState: 'unknown',
+      outputSnapshots: { ...run.outputSnapshots!, settled: false },
+    },
+  ]
+  const changed = mergeConversationPatch(current, update)
+  expect(changed.resyncMessages).toBe(true)
+  expect(changed.window.view.messages.find((item) => item.id === answer.id)?.content).toBe(
+    'Complete answer',
+  )
+  const frozen = message(1, 'Frozen response')
+  frozen.runId = run.id
+  frozen.outputSnapshot = {
+    ordinal: 0,
+    frozen: true,
+    canonical: false,
+    order: { sequence: 1, rank: 1, id: frozen.id },
+  }
+  const recovered = page([user, frozen, answer], { observationSequence: 2 })
+  recovered.runs = update.runs
+  const restored = mergeMessagePage(changed.window, recovered, 'around')
+  expect(restored.view.messages.map((item) => item.content)).toContain('Frozen response')
+  const canonical = page([user, answer], { observationSequence: 3 })
+  canonical.runs = [run]
+  const folded = mergeMessagePage(restored, canonical, 'around')
+  expect(folded.view.messages.map((item) => item.id)).toEqual([user.id, answer.id])
+  expect(folded.messageMeta[frozen.id]).toBeUndefined()
+  expect(frozen.content).toBe('Frozen response')
+})
+
 function message(sequence: number, content = `Message ${sequence}`): ConversationMessage {
   return {
     id: crypto.randomUUID(),

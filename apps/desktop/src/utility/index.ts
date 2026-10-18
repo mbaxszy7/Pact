@@ -703,6 +703,18 @@ async function bootstrap(
         return
       }
 
+      case 'session-speed.save.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-catalog.response',
+            requestId,
+            result: sessionWorkspace.saveSpeed(input),
+          }),
+        )
+        return
+      }
+
       case 'skills.cancel.request': {
         const { input, requestId } = request.data
         conversation?.cancelSkillCatalog(input.sessionId)
@@ -888,6 +900,51 @@ async function bootstrap(
               }
           parentPort.postMessage(
             utilityResponseSchema.parse({ type: 'conversation.patch.response', requestId, result }),
+          )
+        })
+        return
+      }
+
+      case 'conversation.queue.steer.request':
+      case 'conversation.queue.return.request':
+      case 'conversation.queue.remove.request':
+      case 'conversation.queue.resume.request':
+      case 'conversation.queue.enabled.request': {
+        const operation = request.data
+        runRequest(async () => {
+          let result
+          if (!conversation)
+            result = {
+              ok: false as const,
+              error: {
+                code: 'RUNTIME_UNAVAILABLE' as const,
+                message: 'Conversation runtime is unavailable.',
+              },
+            }
+          else
+            switch (operation.type) {
+              case 'conversation.queue.steer.request':
+                result = await conversation.steerQueuedConversationMessage(operation.input)
+                break
+              case 'conversation.queue.return.request':
+                result = conversation.returnQueuedConversationMessage(operation.input)
+                break
+              case 'conversation.queue.remove.request':
+                result = conversation.removeQueuedConversationMessage(operation.input)
+                break
+              case 'conversation.queue.resume.request':
+                result = conversation.resumeConversationQueue(operation.input)
+                break
+              case 'conversation.queue.enabled.request':
+                result = conversation.setConversationQueueEnabled(operation.input)
+                break
+            }
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'conversation.patch.response',
+              requestId: operation.requestId,
+              result,
+            }),
           )
         })
         return

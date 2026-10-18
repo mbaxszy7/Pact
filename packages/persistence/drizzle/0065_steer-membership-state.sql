@@ -1,0 +1,1 @@
+ALTER TABLE `collaboration_required_input_members` ADD `active` integer DEFAULT true NOT NULL;

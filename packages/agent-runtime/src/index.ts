@@ -20,6 +20,7 @@ import type {
   CollaborationTurnAuthorization,
   CollaborationInputBatchReference,
   CollaborationDocument,
+  AgentSpeed,
 } from '@pact/contracts'
 import type { ConversationImage } from '@pact/contracts/images'
 
@@ -74,6 +75,10 @@ export interface AgentAdapter {
     signal: AbortSignal,
   ): Promise<AgentNativeForkResult>
   run(input: AgentRunInput, signal: AbortSignal): AsyncIterable<NormalizedAgentEvent>
+  /** Append only to the exact live owner; never interrupts, resumes, or starts a replacement Run. */
+  steer?(input: AgentSteerInput, signal: AbortSignal): Promise<AgentSteerResult>
+  /** Read-only receipt checking, separate from root outcome/continuation evidence. */
+  probeNativeInputs?(input: AgentNativeInputProbeInput, signal: AbortSignal): Promise<void>
   enrichTitle?(input: AgentTitleEnrichmentInput, signal: AbortSignal): Promise<string | undefined>
   /** Cosmetic metadata only; never starts/resumes a Native context or submits model input. */
   setNativeTitle?(
@@ -83,11 +88,30 @@ export interface AgentAdapter {
   dispose(): Promise<void>
 }
 
+export interface AgentSteerInput {
+  runId: string
+  inputId: string
+  nativeSessionId: string
+  nativeTurnId: string
+  bindingGeneration: number
+  nativeGeneration: string
+  promptEnvelope: AgentPromptEnvelope
+  recordDispatch: (phase: 'possibly_sent' | 'accepted' | 'rejected') => void
+  /** A matched native input UUID, not merely SDK write completion. */
+  recordConsumption: (inputId: string) => void
+}
+
+export type AgentSteerResult =
+  | { status: 'accepted' | 'submitted' }
+  | { status: 'unsupported' | 'rejected'; reason: string }
+
 export interface AgentNativeForkSourceInput {
   answerFormat?: CollaborationAnswerFormat
   cwd: string
   nativeSessionId: string
   nativeTurnId: string
+  /** Exact ordered native User UUIDs consumed by this logical Run, including its root. */
+  nativeInputIds?: readonly string[]
   runId: string
   bindingGeneration: number
   throughSequence: number
@@ -135,6 +159,8 @@ export interface AgentNativeRunProbeInput
   cwd: string
   model: string | null
   effort: string | null
+  /** Root plus accurately consumed native inputs; absence preserves legacy single-Turn probing. */
+  nativeInputIds?: readonly string[]
   /** Validated native terminal already persisted by Repository, never a legacy Completed label. */
   confirmedTerminal?: Extract<NativeProbeResult, { kind: 'ended' }>
 }
@@ -159,6 +185,12 @@ export interface AgentNativeInitializedBindingProbeInput
 export type AgentNativeProbeInput =
   | AgentNativeRunProbeInput
   | AgentNativeInitializedBindingProbeInput
+
+export interface AgentNativeInputProbeInput extends AgentNativeRunProbeInput {
+  /** At most 64 unresolved candidates; these are not the consumed native input history. */
+  unresolvedInputIds: readonly string[]
+  recordConsumption: (inputId: string) => void
+}
 
 export interface AgentNativeContextRebuildInput extends Pick<
   AgentRunInput,
@@ -217,6 +249,13 @@ export interface AgentRunInput {
   nativeGeneration?: string
   bindingGeneration?: number
   recordNativeEvidence?: (evidence: NativeProbeResult) => void
+  /** Native user input incorporated into the original Turn's context, not fully handled. */
+  recordInputConsumption?: (
+    inputId: string,
+    identity: Pick<NativeEvidenceIdentity, 'nativeSessionId' | 'nativeTurnId' | 'executorId'>,
+  ) => void
+  /** Output processing failed; native control and work observation remain owned. */
+  recordOutputFailure?: (error: Error) => void
   recordArchivedEvent?: (event: NormalizedAgentEvent) => void
   /** Preserve the exact root final carrier independently of natural display and acceptance. */
   recordCollaborationCarrier?: (value: unknown) => void
@@ -250,8 +289,11 @@ export interface AgentRunInput {
   ) => Promise<NativeUserInputResult>
   cwd: string
   promptEnvelope: AgentPromptEnvelope
+  /** Same root's latest append-only input scope; frozen duty/settings remain unchanged. */
+  currentPromptEnvelope?: () => AgentPromptEnvelope
   model: string | null
   effort: string | null
+  speed?: AgentSpeed
 }
 
 /** Native operation evidence, not a whole-working-tree diff or a proposed edit. */

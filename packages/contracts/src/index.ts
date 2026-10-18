@@ -188,6 +188,7 @@ export const IPC_CHANNELS = {
   sessionSettingsGet: 'pact:session-settings:get',
   sessionSettingsSave: 'pact:session-settings:save',
   sessionPermissionSave: 'pact:session-permission:save',
+  sessionSpeedSave: 'pact:session-speed:save',
   collaborationAction: 'pact:collaboration:action',
   conversationGet: 'pact:conversation:get',
   skillCatalogRead: 'pact:skills:read',
@@ -199,6 +200,11 @@ export const IPC_CHANNELS = {
   composerEditReceipt: 'pact:composer:edit-receipt',
   sessionFork: 'pact:session:fork',
   conversationInterest: 'pact:conversation:interest',
+  steerQueuedConversationMessage: 'pact:conversation:queue:steer',
+  returnQueuedConversationMessage: 'pact:conversation:queue:return',
+  removeQueuedConversationMessage: 'pact:conversation:queue:remove',
+  resumeConversationQueue: 'pact:conversation:queue:resume',
+  setConversationQueueEnabled: 'pact:conversation:queue:enabled',
   conversationSend: 'pact:conversation:send',
   conversationInput: 'pact:conversation:input',
   conversationImageWrite: 'pact:conversation:image-write',
@@ -676,10 +682,15 @@ export const runtimeExecutablePathUpdateSchema = z.strictObject({
 })
 export type RuntimeExecutablePathUpdate = z.infer<typeof runtimeExecutablePathUpdateSchema>
 
+export const agentSpeedSchema = z.enum(['native', 'standard', 'fast'])
+export type AgentSpeed = z.infer<typeof agentSpeedSchema>
+
 export const agentModelSelectionSchema = z
   .strictObject({
     model: z.string().min(1).nullable(),
     effort: z.string().min(1).nullable(),
+    // Missing in historical revisions: preserve the native CLI's behavior.
+    speed: agentSpeedSchema.optional(),
   })
   .refine((selection) => selection.model !== null || selection.effort === null, {
     message: 'A concrete effort requires a concrete model.',
@@ -725,6 +736,7 @@ export const agentModelOptionSchema = z.strictObject({
   displayName: z.string().min(1),
   supportedEfforts: z.array(z.string().min(1)),
   defaultEffort: z.string().min(1).optional(),
+  supportsFastMode: z.boolean().optional(),
 })
 export type AgentModelOption = z.infer<typeof agentModelOptionSchema>
 
@@ -975,6 +987,14 @@ export const sessionPermissionSaveInputSchema = z
   )
 export type SessionPermissionSaveInput = z.infer<typeof sessionPermissionSaveInputSchema>
 
+export const sessionSpeedSaveInputSchema = z.strictObject({
+  sessionId: z.string().uuid(),
+  agentId: runtimeAgentIdSchema,
+  speed: agentSpeedSchema,
+  expectedRevision: z.number().int().positive(),
+})
+export type SessionSpeedSaveInput = z.infer<typeof sessionSpeedSaveInputSchema>
+
 export const sessionForkSideSchema = z.strictObject({
   agentId: runtimeAgentIdSchema,
   state: z.enum(['prepared', 'forking', 'unconfirmed', 'initializing', 'ready', 'error']),
@@ -1075,7 +1095,34 @@ export const peerRequestProposalSchema = z.strictObject({
 })
 export type PeerRequestProposal = z.infer<typeof peerRequestProposalSchema>
 
+export const conversationDisplayOrderSchema = z.strictObject({
+  sequence: z.number().int().nonnegative(),
+  rank: z.number().int().min(0).max(2),
+  id: z.string().uuid(),
+})
+export type ConversationDisplayOrder = z.infer<typeof conversationDisplayOrderSchema>
+export const conversationSnapshotViewSchema = z.strictObject({
+  runId: z.string().uuid(),
+  mode: z.enum(['preserve', 'expanded']),
+})
+export type ConversationSnapshotView = z.infer<typeof conversationSnapshotViewSchema>
+export const conversationRunContextSchema = z.strictObject({
+  runId: z.string().uuid(),
+  order: conversationDisplayOrderSchema,
+  earlierResponseCount: z.number().int().nonnegative().max(64),
+  settled: z.boolean(),
+})
+export type ConversationRunContext = z.infer<typeof conversationRunContextSchema>
+
 export const conversationMessageSchema = z.strictObject({
+  outputSnapshot: z
+    .strictObject({
+      ordinal: z.number().int().nonnegative().max(63),
+      frozen: z.boolean(),
+      canonical: z.boolean(),
+      order: conversationDisplayOrderSchema,
+    })
+    .optional(),
   skills: skillSelectionsSchema.optional(),
   images: conversationImagesSchema.optional(),
   id: z.string().uuid(),
@@ -1095,6 +1142,27 @@ export const conversationMessageSchema = z.strictObject({
   updatedAt: z.string().datetime(),
 })
 export type ConversationMessage = z.infer<typeof conversationMessageSchema>
+
+export function conversationMessageOrder(
+  message: Pick<ConversationMessage, 'id' | 'sequence' | 'outputSnapshot'>,
+): ConversationDisplayOrder {
+  return message.outputSnapshot?.order ?? { sequence: message.sequence, rank: 1, id: message.id }
+}
+export function compareConversationDisplayOrder(
+  left: ConversationDisplayOrder,
+  right: ConversationDisplayOrder,
+): number {
+  return left.sequence - right.sequence || left.rank - right.rank || left.id.localeCompare(right.id)
+}
+export function compareConversationMessages(
+  left: ConversationMessage,
+  right: ConversationMessage,
+): number {
+  return compareConversationDisplayOrder(
+    conversationMessageOrder(left),
+    conversationMessageOrder(right),
+  )
+}
 
 export const agentActivitySchema = z.strictObject({
   id: z.string().uuid(),
@@ -1246,6 +1314,14 @@ export const pendingNativeInteractionSchema = z.strictObject({
 export type PendingNativeInteraction = z.infer<typeof pendingNativeInteractionSchema>
 
 export const agentRunSchema = z.strictObject({
+  outputSnapshots: z
+    .strictObject({
+      count: z.number().int().nonnegative().max(64),
+      lastInputMessageId: z.string().uuid(),
+      lastInputSequence: z.number().int().nonnegative(),
+      settled: z.boolean(),
+    })
+    .optional(),
   answerFormat: z.enum(['collaboration_envelope_v5']).optional(),
   collaboration: z
     .strictObject({
@@ -1274,6 +1350,9 @@ export const agentRunSchema = z.strictObject({
   model: z.string().min(1).nullable(),
   permissionMode: sessionPermissionModeSchema.optional(),
   effort: z.string().min(1).nullable(),
+  speed: agentSpeedSchema.optional(),
+  observedSpeed: z.enum(['standard', 'fast']).optional(),
+  speedDetail: z.string().max(512).optional(),
   nativeSessionId: z.string().min(1).optional(),
   nativeTurnId: z.string().min(1).optional(),
   bindingGeneration: z.number().int().positive().optional(),
@@ -1405,6 +1484,59 @@ export const rebuildReturnedInputRecordSchema = z.strictObject({
 })
 export type RebuildReturnedInputRecord = z.infer<typeof rebuildReturnedInputRecordSchema>
 
+/** One durable pending input; previews never carry complete message bodies. */
+export const conversationQueuedInputSchema = z.strictObject({
+  id: z.string().uuid(),
+  revision: z.number().int().nonnegative(),
+  recipient: z.enum(['claude', 'codex', 'all']),
+  preview: z.string().max(512),
+  workflowCommand: z.boolean(),
+  state: z.enum(['queued', 'paused', 'dispatching', 'unknown']),
+  delivery: z.strictObject({ runId: z.string().uuid(), canRemove: z.boolean() }).optional(),
+  reason: z.string().max(512).optional(),
+  imageCount: z.number().int().nonnegative().max(128),
+  commentCount: z.number().int().nonnegative(),
+  skillCount: z.number().int().nonnegative(),
+})
+export type ConversationQueuedInput = z.infer<typeof conversationQueuedInputSchema>
+export const conversationQueueStateSchema = z.strictObject({
+  enabled: z.boolean(),
+  revision: z.number().int().nonnegative(),
+  input: conversationQueuedInputSchema.nullable(),
+  returnedInput: z
+    .strictObject({
+      inputId: z.string().uuid(),
+      operationId: z.string().uuid(),
+      expectedRevision: z.number().int().nonnegative(),
+      claimId: z.string().uuid().optional(),
+      installedCommentsRevision: z.number().int().nonnegative().optional(),
+      state: z.enum(['pending', 'installed']),
+    })
+    .nullable()
+    .optional(),
+})
+export type ConversationQueueState = z.infer<typeof conversationQueueStateSchema>
+export const conversationQueueActionInputSchema = z.strictObject({
+  sessionId: z.string().uuid(),
+  inputId: z.string().uuid(),
+  expectedRevision: z.number().int().nonnegative(),
+  operationId: z.string().uuid(),
+})
+export type ConversationQueueActionInput = z.infer<typeof conversationQueueActionInputSchema>
+export const conversationQueueReturnInputSchema = conversationQueueActionInputSchema.extend({
+  phase: z.enum(['return', 'claim']).default('return'),
+  claimId: z.string().uuid().optional(),
+  expectedCommentsRevision: z.number().int().nonnegative().optional(),
+})
+export type ConversationQueueReturnInput = z.infer<typeof conversationQueueReturnInputSchema>
+export const conversationQueueEnabledInputSchema = z.strictObject({
+  sessionId: z.string().uuid(),
+  enabled: z.boolean(),
+  expectedRevision: z.number().int().nonnegative(),
+  operationId: z.string().uuid(),
+})
+export type ConversationQueueEnabledInput = z.infer<typeof conversationQueueEnabledInputSchema>
+
 export const conversationSnapshotSchema = z.strictObject({
   observation: z.strictObject({
     incarnation: z.string().uuid(),
@@ -1495,6 +1627,14 @@ export const conversationGetInputSchema = z.discriminatedUnion('scope', [
     feedbackId: z.string().min(1).max(80).optional(),
   }),
   conversationPageBaseInputSchema.extend({
+    scope: z.literal('queued-input'),
+    source: z.enum(['queued', 'returned']),
+    inputId: z.string().uuid(),
+    operationId: z.string().uuid().optional(),
+    offset: z.number().int().nonnegative(),
+    commentsAfterPosition: z.number().int().nonnegative().optional(),
+  }),
+  conversationPageBaseInputSchema.extend({
     scope: z.literal('rebuild-input'),
     operationId: z.string().uuid(),
     offset: z.number().int().nonnegative(),
@@ -1502,6 +1642,9 @@ export const conversationGetInputSchema = z.discriminatedUnion('scope', [
   conversationPageBaseInputSchema.extend({
     scope: z.literal('messages'),
     beforeSequence: z.number().int().nonnegative().optional(),
+    beforeDisplay: conversationDisplayOrderSchema.optional(),
+    snapshotView: conversationSnapshotViewSchema.optional(),
+    preserveRunId: z.string().uuid().optional(),
     aroundMessageId: z.string().uuid().optional(),
     includeHistoricalSource: z.boolean().optional(),
     incarnation: z.string().uuid().optional(),
@@ -1578,6 +1721,7 @@ const conversationPageActivitySchema = z.discriminatedUnion('kind', [
 export type ConversationPageActivity = z.infer<typeof conversationPageActivitySchema>
 
 const conversationPageHeaderSchema = z.strictObject({
+  queue: conversationQueueStateSchema.optional(),
   receivedInputIds: z.array(z.string().uuid()).max(1).optional(),
   session: conversationSnapshotSchema.shape.session,
   commentsRevision: z.number().int().nonnegative(),
@@ -1595,127 +1739,159 @@ const conversationPageHeaderSchema = z.strictObject({
     .optional(),
 })
 
-export const conversationPageSchema = z.discriminatedUnion('scope', [
-  z
-    .strictObject({
-      scope: z.literal('collaboration-markdown'),
-      basis: z.enum(['markdown-visible-v2', 'plain-visible-v1']),
+export const conversationPageSchema = z
+  .discriminatedUnion('scope', [
+    z
+      .strictObject({
+        scope: z.literal('collaboration-markdown'),
+        basis: z.enum(['markdown-visible-v2', 'plain-visible-v1']),
+        sessionId: z.string().uuid(),
+        document: collaborationDocumentSchema,
+        offset: z.number().int().nonnegative(),
+        visibleStart: z.number().int().nonnegative(),
+        visibleEnd: z.number().int().nonnegative(),
+        tree: collaborationMarkdownNodeSchema,
+        nextOffset: z.number().int().nonnegative().nullable(),
+        previousOffset: z.number().int().nonnegative().nullable(),
+      })
+      .refine(
+        (v) => new TextEncoder().encode(JSON.stringify(v)).byteLength <= 48 * 1024,
+        'Collaboration Markdown page exceeds its byte budget.',
+      )
+      .refine(
+        (page) => collaborationMarkdownTreeWithinBudget(page.tree),
+        'Markdown page exceeds its node or stack budget.',
+      ),
+    z
+      .strictObject({
+        scope: z.literal('collaboration-text'),
+        sessionId: z.string().uuid(),
+        document: collaborationDocumentSchema,
+        offset: z.number().int().nonnegative(),
+        text: z.string(),
+        nextOffset: z.number().int().nonnegative().nullable(),
+      })
+      .refine(
+        (v) => new TextEncoder().encode(JSON.stringify(v)).byteLength <= 48 * 1024,
+        'Collaboration text page exceeds its byte budget.',
+      ),
+    z.strictObject({
+      scope: z.literal('collaboration'),
       sessionId: z.string().uuid(),
-      document: collaborationDocumentSchema,
+      view: collaborationViewSchema,
+    }),
+    z.strictObject({
+      scope: z.literal('queued-input'),
+      source: z.enum(['queued', 'returned']),
       offset: z.number().int().nonnegative(),
-      visibleStart: z.number().int().nonnegative(),
-      visibleEnd: z.number().int().nonnegative(),
-      tree: collaborationMarkdownNodeSchema,
-      nextOffset: z.number().int().nonnegative().nullable(),
-      previousOffset: z.number().int().nonnegative().nullable(),
-    })
-    .refine(
-      (v) => new TextEncoder().encode(JSON.stringify(v)).byteLength <= 48 * 1024,
-      'Collaboration Markdown page exceeds its byte budget.',
-    )
-    .refine(
-      (page) => collaborationMarkdownTreeWithinBudget(page.tree),
-      'Markdown page exceeds its node or stack budget.',
-    ),
-  z
-    .strictObject({
-      scope: z.literal('collaboration-text'),
       sessionId: z.string().uuid(),
-      document: collaborationDocumentSchema,
+      inputId: z.string().uuid(),
+      operationId: z.string().uuid().optional(),
+      text: z.string().max(8192),
+      nextOffset: z.number().int().nonnegative(),
+      hasMore: z.boolean(),
+      comments: z.array(anchoredCommentSchema).max(CONVERSATION_PAGE_ITEMS),
+      commentsNextPosition: z.number().int().nonnegative().nullable(),
+      images: conversationImagesSchema.optional(),
+      skills: skillSelectionsSchema.optional(),
+      route: conversationMessageRouteSchema,
+      batchId: z.string().uuid().optional(),
+      planningAction: z.enum(['maintain_plan', 'review_plan']).optional(),
+    }),
+    z.strictObject({
+      scope: z.literal('rebuild-input'),
+      images: conversationImagesSchema.optional(),
+      skills: skillSelectionsSchema.optional(),
+      sessionId: z.string().uuid(),
+      operationId: z.string().uuid(),
+      messageId: z.string().uuid(),
+      text: z.string().max(8192),
+      nextOffset: z.number().int().nonnegative(),
+      hasMore: z.boolean(),
+      route: conversationMessageRouteSchema,
+    }),
+    z.strictObject({
+      scope: z.literal('messages'),
+      sessionId: z.string().uuid(),
+      observation: conversationObservationSchema,
+      header: conversationPageHeaderSchema,
+      messages: z.array(conversationPageMessageSchema).max(CONVERSATION_PAGE_ITEMS),
+      runContexts: z.array(conversationRunContextSchema).max(CONVERSATION_PAGE_ITEMS).optional(),
+      snapshotView: conversationSnapshotViewSchema.optional(),
+      preserveRunId: z.string().uuid().optional(),
+      runs: z.array(agentRunSchema).max(CONVERSATION_PAGE_ITEMS),
+      runArtifacts: z
+        .array(
+          z.strictObject({
+            userMessageId: z.string().uuid(),
+            agentId: runtimeAgentIdSchema,
+            totalCount: z.number().int().nonnegative(),
+            latestRunId: z.string().uuid(),
+          }),
+        )
+        .max(50)
+        .optional(),
+      hasOlder: z.boolean(),
+      hasNewer: z.boolean(),
+      sourceMessageId: z.string().uuid().optional(),
+    }),
+    z.strictObject({
+      scope: z.literal('drafts'),
+      sessionId: z.string().uuid(),
+      observation: conversationObservationSchema,
+      commentsRevision: z.number().int().nonnegative(),
+      comments: z.array(anchoredCommentSchema).max(CONVERSATION_PAGE_ITEMS),
+      hasMore: z.boolean(),
+    }),
+    z.strictObject({
+      scope: z.literal('comments'),
+      sessionId: z.string().uuid(),
+      observation: conversationObservationSchema,
+      comments: z.array(anchoredCommentSchema).max(CONVERSATION_PAGE_ITEMS),
+      hasMore: z.boolean(),
+    }),
+    z.strictObject({
+      scope: z.literal('activities'),
+      sessionId: z.string().uuid(),
+      observation: conversationObservationSchema,
+      runId: z.string().uuid(),
+      activities: z.array(conversationPageActivitySchema).max(CONVERSATION_WORK_LOG_ITEMS),
+      truncated: z.boolean(),
+    }),
+    z.strictObject({
+      scope: z.literal('run-artifacts'),
+      sessionId: z.string().uuid(),
+      observation: conversationObservationSchema,
+      userMessageId: z.string().uuid(),
+      agentId: runtimeAgentIdSchema,
+      runs: z.array(agentRunSchema).max(3),
+      totalCount: z.number().int().nonnegative(),
+      latestRunId: z.string().uuid().optional(),
+      nextBefore: z
+        .strictObject({ createdAt: z.string().datetime(), id: z.string().uuid() })
+        .optional(),
+    }),
+    z.strictObject({
+      scope: z.literal('activity-body'),
+      sessionId: z.string().uuid(),
+      observation: conversationObservationSchema,
+      activityId: z.string().uuid(),
+      detailRevision: z.number().int().nonnegative(),
       offset: z.number().int().nonnegative(),
       text: z.string(),
-      nextOffset: z.number().int().nonnegative().nullable(),
-    })
-    .refine(
-      (v) => new TextEncoder().encode(JSON.stringify(v)).byteLength <= 48 * 1024,
-      'Collaboration text page exceeds its byte budget.',
-    ),
-  z.strictObject({
-    scope: z.literal('collaboration'),
-    sessionId: z.string().uuid(),
-    view: collaborationViewSchema,
-  }),
-  z.strictObject({
-    scope: z.literal('rebuild-input'),
-    images: conversationImagesSchema.optional(),
-    skills: skillSelectionsSchema.optional(),
-    sessionId: z.string().uuid(),
-    operationId: z.string().uuid(),
-    messageId: z.string().uuid(),
-    text: z.string().max(8192),
-    nextOffset: z.number().int().nonnegative(),
-    hasMore: z.boolean(),
-    route: conversationMessageRouteSchema,
-  }),
-  z.strictObject({
-    scope: z.literal('messages'),
-    sessionId: z.string().uuid(),
-    observation: conversationObservationSchema,
-    header: conversationPageHeaderSchema,
-    messages: z.array(conversationPageMessageSchema).max(CONVERSATION_PAGE_ITEMS),
-    runs: z.array(agentRunSchema).max(CONVERSATION_PAGE_ITEMS),
-    runArtifacts: z
-      .array(
-        z.strictObject({
-          userMessageId: z.string().uuid(),
-          agentId: runtimeAgentIdSchema,
-          totalCount: z.number().int().nonnegative(),
-          latestRunId: z.string().uuid(),
-        }),
-      )
-      .max(50)
-      .optional(),
-    hasOlder: z.boolean(),
-    hasNewer: z.boolean(),
-    sourceMessageId: z.string().uuid().optional(),
-  }),
-  z.strictObject({
-    scope: z.literal('drafts'),
-    sessionId: z.string().uuid(),
-    observation: conversationObservationSchema,
-    commentsRevision: z.number().int().nonnegative(),
-    comments: z.array(anchoredCommentSchema).max(CONVERSATION_PAGE_ITEMS),
-    hasMore: z.boolean(),
-  }),
-  z.strictObject({
-    scope: z.literal('comments'),
-    sessionId: z.string().uuid(),
-    observation: conversationObservationSchema,
-    comments: z.array(anchoredCommentSchema).max(CONVERSATION_PAGE_ITEMS),
-    hasMore: z.boolean(),
-  }),
-  z.strictObject({
-    scope: z.literal('activities'),
-    sessionId: z.string().uuid(),
-    observation: conversationObservationSchema,
-    runId: z.string().uuid(),
-    activities: z.array(conversationPageActivitySchema).max(CONVERSATION_WORK_LOG_ITEMS),
-    truncated: z.boolean(),
-  }),
-  z.strictObject({
-    scope: z.literal('run-artifacts'),
-    sessionId: z.string().uuid(),
-    observation: conversationObservationSchema,
-    userMessageId: z.string().uuid(),
-    agentId: runtimeAgentIdSchema,
-    runs: z.array(agentRunSchema).max(3),
-    totalCount: z.number().int().nonnegative(),
-    latestRunId: z.string().uuid().optional(),
-    nextBefore: z
-      .strictObject({ createdAt: z.string().datetime(), id: z.string().uuid() })
-      .optional(),
-  }),
-  z.strictObject({
-    scope: z.literal('activity-body'),
-    sessionId: z.string().uuid(),
-    observation: conversationObservationSchema,
-    activityId: z.string().uuid(),
-    detailRevision: z.number().int().nonnegative(),
-    offset: z.number().int().nonnegative(),
-    text: z.string(),
-    nextOffset: z.number().int().nonnegative().optional(),
-  }),
-])
+      nextOffset: z.number().int().nonnegative().optional(),
+    }),
+  ])
+  .superRefine((page, context) => {
+    if (
+      page.scope === 'messages' &&
+      page.messages.length + (page.runContexts?.length ?? 0) > CONVERSATION_PAGE_ITEMS
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Message and Run context rows exceed the shared page limit.',
+      })
+  })
 export type ConversationPage = z.infer<typeof conversationPageSchema>
 
 const conversationPatchTextEncoder = new TextEncoder()
@@ -1793,6 +1969,8 @@ export type ConversationActivityChange = z.infer<typeof conversationActivityChan
 export const conversationPatchSchema = z
   .strictObject({
     version: z.literal('conversation-patch-v1'),
+    runContexts: z.array(conversationRunContextSchema).max(1).optional(),
+    queue: conversationQueueStateSchema.optional(),
     commentDraftReceipt: z
       .strictObject({ requestId: z.string().uuid(), commentId: z.string().uuid() })
       .optional(),
@@ -1903,6 +2081,7 @@ export const conversationSendInputSchema = z
     sessionId: z.string().uuid(),
     clientMessageId: z.string().uuid(),
     returnedInputOperationId: z.string().uuid().optional(),
+    queueReturnOperationId: z.string().uuid().optional(),
     inputId: z.string().uuid().optional(),
     imageIds: z.array(z.string().uuid()).max(128).optional(),
     skills: skillSelectionsSchema.optional(),
@@ -1950,6 +2129,8 @@ export const conversationSendInputSchema = z
   })
 export type ConversationSendInput = z.infer<typeof conversationSendInputSchema>
 export const collaborationReceivedMetadataSchema = z.strictObject({
+  steerSkillInvocation: collaborationDocumentSchema.optional(),
+  workflowCommand: z.boolean().default(false),
   skills: skillSelectionsSchema.default([]),
   imageIds: conversationSendInputSchema.shape.imageIds.default([]),
   commentIds: conversationSendInputSchema.shape.commentIds,
@@ -2362,6 +2543,11 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
     input: sessionPermissionSaveInputSchema,
   }),
   z.object({
+    type: z.literal('session-speed.save.request'),
+    requestId: z.string().uuid(),
+    input: sessionSpeedSaveInputSchema,
+  }),
+  z.object({
     type: z.literal('skills.cancel.request'),
     requestId: z.string().uuid(),
     input: z.object({ sessionId: z.string().uuid() }),
@@ -2405,6 +2591,31 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
     type: z.literal('conversation.get.request'),
     requestId: z.string().uuid(),
     input: conversationGetInputSchema,
+  }),
+  z.object({
+    type: z.literal('conversation.queue.steer.request'),
+    requestId: z.string().uuid(),
+    input: conversationQueueActionInputSchema,
+  }),
+  z.object({
+    type: z.literal('conversation.queue.return.request'),
+    requestId: z.string().uuid(),
+    input: conversationQueueReturnInputSchema,
+  }),
+  z.object({
+    type: z.literal('conversation.queue.remove.request'),
+    requestId: z.string().uuid(),
+    input: conversationQueueActionInputSchema,
+  }),
+  z.object({
+    type: z.literal('conversation.queue.resume.request'),
+    requestId: z.string().uuid(),
+    input: conversationQueueActionInputSchema,
+  }),
+  z.object({
+    type: z.literal('conversation.queue.enabled.request'),
+    requestId: z.string().uuid(),
+    input: conversationQueueEnabledInputSchema,
   }),
   z.object({
     type: z.literal('conversation.send.request'),
@@ -2762,6 +2973,7 @@ export interface DesktopBridge {
   reportRendererFault?(fault: RendererFault): void
   forkSession(input: SessionForkInput): Promise<RpcResult<SessionForkResult>>
   saveSessionPermission(input: SessionPermissionSaveInput): Promise<RpcResult<SessionCatalogChange>>
+  saveSessionSpeed(input: SessionSpeedSaveInput): Promise<RpcResult<SessionCatalogChange>>
   readNativeInput(input: NativeInputRead): Promise<RpcResult<NativeInteractionDetails>>
   respondNativeInput(input: NativeInputRespond): Promise<RpcResult<ConversationPatch>>
   openNativeInputURL(input: NativeInputRead): Promise<RpcResult<{ opened: true }>>
@@ -2832,6 +3044,21 @@ export interface DesktopBridge {
     input: import('./images.js').ImageReadInput,
   ): Promise<RpcResult<import('./images.js').ImageReadPart>>
   writeConversationInput(input: ConversationInputWrite): Promise<RpcResult<ConversationInputState>>
+  steerQueuedConversationMessage(
+    input: ConversationQueueActionInput,
+  ): Promise<RpcResult<ConversationPatch>>
+  returnQueuedConversationMessage(
+    input: ConversationQueueReturnInput,
+  ): Promise<RpcResult<ConversationPatch>>
+  removeQueuedConversationMessage(
+    input: ConversationQueueActionInput,
+  ): Promise<RpcResult<ConversationPatch>>
+  resumeConversationQueue(
+    input: ConversationQueueActionInput,
+  ): Promise<RpcResult<ConversationPatch>>
+  setConversationQueueEnabled(
+    input: ConversationQueueEnabledInput,
+  ): Promise<RpcResult<ConversationPatch>>
   sendConversationMessage(input: ConversationSendInput): Promise<RpcResult<ConversationPatch>>
   acceptPeerProposal(input: PeerProposalAcceptInput): Promise<RpcResult<ConversationPatch>>
   dismissPeerProposal(input: PeerProposalDismissInput): Promise<RpcResult<ConversationPatch>>

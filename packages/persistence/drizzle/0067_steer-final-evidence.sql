@@ -1,0 +1,3 @@
+ALTER TABLE `conversation_queue_operations` ADD `candidate_carrier_json` text;--> statement-breakpoint
+CREATE INDEX `conversation_queue_operations_kind_state_idx` ON `conversation_queue_operations` (`kind`,`state`,`created_at`);--> statement-breakpoint
+CREATE INDEX `conversation_queue_operations_active_grant_idx` ON `conversation_queue_operations` (`target_run_id`,`input_revision`) WHERE "conversation_queue_operations"."kind" = 'steer' AND "conversation_queue_operations"."state" IN ('prepared','possibly_sent','accepted','consumed','unknown');
