@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0](https://github.com/mbaxszy7/Pact/compare/v0.3.0...v0.4.0) (2026-10-19)
+
+
+### Features
+
+* **desktop:** add GitHub release checks and version settings ([#22](https://github.com/mbaxszy7/Pact/issues/22)) ([38839c4](https://github.com/mbaxszy7/Pact/commit/38839c4d7d4033e2413310a145e91b5379b9b099))
+
+## [0.3.0](https://github.com/mbaxszy7/Pact/compare/v0.2.0...v0.3.0) (2026-10-18)
+
+
+### Features
+
+* **desktop:** add native speed controls and queued steering ([#20](https://github.com/mbaxszy7/Pact/issues/20)) ([0aba527](https://github.com/mbaxszy7/Pact/commit/0aba527e8cadb41986b03cf216e0cc5a4dfe7958))
+
 ## [0.2.0](https://github.com/mbaxszy7/Pact/compare/v0.1.2...v0.2.0) (2026-10-18)
 
 
