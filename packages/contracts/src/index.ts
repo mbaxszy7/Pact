@@ -1,4 +1,13 @@
 import {
+  updateStoredStateSchema,
+  updatePreferencesInputSchema,
+  updateNoticeInputSchema,
+  updateNoticeResultSchema,
+  type UpdateState,
+  type UpdatePreferencesInput,
+} from './app-updates.js'
+export * from './app-updates.js'
+import {
   collaborationViewSchema,
   collaborationDocumentSchema,
   collaborationMarkdownNodeSchema,
@@ -161,6 +170,11 @@ export const IPC_CHANNELS = {
   diagnosticStatus: 'pact:diagnostics:status',
   diagnosticChanged: 'pact:diagnostics:changed',
   rendererFault: 'pact:diagnostics:renderer-fault',
+  updatesGet: 'pact:updates:get',
+  updatesCheck: 'pact:updates:check',
+  updatesPreferences: 'pact:updates:preferences',
+  updatesClaimNotice: 'pact:updates:claim-notice',
+  updatesChanged: 'pact:updates:changed',
   appInfo: 'pact:app:info',
   runtimeHealth: 'pact:runtime:health',
   appearanceGet: 'pact:appearance:get',
@@ -2344,6 +2358,18 @@ export const appearanceSnapshotSchema = z.object({
 export type AppearanceSnapshot = z.infer<typeof appearanceSnapshotSchema>
 
 export const utilityRequestSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('updates.get.request'), requestId: z.string().uuid() }),
+  z.strictObject({ type: z.literal('updates.check.request'), requestId: z.string().uuid() }),
+  z.strictObject({
+    type: z.literal('updates.preferences.request'),
+    requestId: z.string().uuid(),
+    input: updatePreferencesInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('updates.notice.request'),
+    requestId: z.string().uuid(),
+    input: updateNoticeInputSchema,
+  }),
   z.strictObject({
     type: z.literal('workspace-archive.prepare.request'),
     requestId: z.string().uuid(),
@@ -2699,6 +2725,16 @@ export type UtilityRequest = z.infer<typeof utilityRequestSchema>
 
 export const utilityResponseSchema = z.discriminatedUnion('type', [
   z.strictObject({
+    type: z.literal('updates.state.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(updateStoredStateSchema),
+  }),
+  z.strictObject({
+    type: z.literal('updates.notice.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(updateNoticeResultSchema),
+  }),
+  z.strictObject({
     type: z.literal('workspace-archive.prepare.response'),
     requestId: z.string().uuid(),
     result: rpcResultSchema(workspaceArchivePreviewSchema),
@@ -2945,6 +2981,11 @@ export const utilityEventSchema = z.discriminatedUnion('type', [
 export type UtilityEvent = z.infer<typeof utilityEventSchema>
 
 export interface DesktopBridge {
+  getUpdateState(): Promise<RpcResult<UpdateState>>
+  checkForUpdates(): Promise<RpcResult<UpdateState>>
+  setUpdatePreferences(input: UpdatePreferencesInput): Promise<RpcResult<UpdateState>>
+  claimUpdateNotice(input: { version: string }): Promise<RpcResult<{ claimed: boolean }>>
+  onUpdateStateChanged(listener: (state: UpdateState) => void): () => void
   resolveNativeSession(input: NativeSessionResolveInput): Promise<RpcResult<SessionCatalogChange>>
   recordNativeSessionOpened(input: NativeSessionOpenInput): Promise<RpcResult<{ recorded: true }>>
   readNativeAttention(input: NativeAttentionReadInput): Promise<RpcResult<NativeAttentionPage>>

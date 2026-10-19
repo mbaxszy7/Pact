@@ -18,6 +18,10 @@ export const LOG_RETRY_MS = 30_000
 export const LOG_MAINTENANCE_MS = 60_000
 
 export const diagnosticRequestTypeSchema = z.enum([
+  'updates.get.request',
+  'updates.check.request',
+  'updates.preferences.request',
+  'updates.notice.request',
   'native-presence.read.request',
   'native-attention.read.request',
   'native-session.resolve.request',

@@ -1,8 +1,9 @@
 import { ArrowLeft } from 'lucide-react'
 
-export type SettingsPage = 'session-defaults' | 'appearance' | null
+export type SettingsPage = 'session-defaults' | 'appearance' | 'updates' | null
 
 interface SettingsNavigationProps {
+  updateAvailable?: boolean
   settingsPage: Exclude<SettingsPage, null>
   onBackToApp: () => void
   onOpenSettings: (page: Exclude<SettingsPage, null>) => void
@@ -10,6 +11,7 @@ interface SettingsNavigationProps {
 
 export function SettingsNavigation({
   settingsPage,
+  updateAvailable,
   onBackToApp,
   onOpenSettings,
 }: SettingsNavigationProps): React.JSX.Element {
@@ -43,6 +45,18 @@ export function SettingsNavigation({
             onClick={() => onOpenSettings('appearance')}
           >
             Appearance
+          </button>
+          <button
+            type="button"
+            onClick={() => onOpenSettings('updates')}
+            className="mt-1 flex w-full items-center justify-between gap-2 rounded-control px-group py-2 text-left text-body text-secondary hover:bg-surface-raised data-[active=true]:bg-surface-raised data-[active=true]:font-medium data-[active=true]:text-primary"
+            data-active={settingsPage === 'updates'}
+            aria-current={settingsPage === 'updates' ? 'page' : undefined}
+          >
+            About &amp; updates
+            {updateAvailable ? (
+              <span className="text-caption font-medium text-focus">New</span>
+            ) : null}
           </button>
         </nav>
       </div>

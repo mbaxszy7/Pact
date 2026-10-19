@@ -524,6 +524,39 @@ export class Conversation {
     )
   }
 
+  /** Presentation only: use real app-wide owners, never the truncated tray groups. */
+  canPresentUpdateNotice(): boolean {
+    if (
+      this.disposed ||
+      !this.sessions.nativeInitialized() ||
+      this.nativeQuitPreparation?.sealed ||
+      this.activeExecutions.size ||
+      this.preparingSends.size ||
+      this.preparingContinuations.size ||
+      this.nativeRebuilds.size ||
+      this.nativeChecks.size ||
+      this.forkPreparations.size ||
+      this.nativeForks.size ||
+      this.titleEnrichments.size ||
+      this.nativeTitleSyncs.size ||
+      this.skillDiscoveries.size ||
+      this.workspaceChanges?.pendingSessionIds().length
+    )
+      return false
+    try {
+      const live = this.liveNativeRows()
+      return (
+        live.running.length === 0 &&
+        live.attention.length === 0 &&
+        this.conversations.pendingRoutedContinuations().length === 0 &&
+        this.conversations.pendingCollaborationInputs().length === 0 &&
+        this.conversations.nativeQuitUnsettled([]).count === 0
+      )
+    } catch {
+      return false
+    }
+  }
+
   getNativePresence(): RpcResult<NativePresenceSnapshot> {
     if (!this.sessions.nativeInitialized())
       return {

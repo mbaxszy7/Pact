@@ -14,6 +14,7 @@ import {
   resolveNativeApplicationIdentity,
 } from './application-identity'
 import { registerDesktopModules } from './modules'
+import { ApplicationUpdates } from './modules/app-updates'
 import {
   createAppearanceController,
   type AppearanceController,
@@ -47,6 +48,7 @@ let removeDesktopModules: (() => void) | undefined
 let appearanceSettings: AppearanceController
 let diagnostics: DiagnosticLogs | undefined
 let applicationMenu: ApplicationMenu | undefined
+let applicationUpdates: ApplicationUpdates | undefined
 let nativePresence: NativePresence | undefined
 let startupFailureShown = false
 
@@ -208,7 +210,14 @@ async function bootstrap(): Promise<void> {
         .catch(() => app.quit())
     },
   })
-  applicationMenu = new ApplicationMenu(rendererTrust, () => diagnostics!.createMenuItem())
+  applicationUpdates = new ApplicationUpdates(utilityClient, identity, rendererTrust, () =>
+    nativePresence?.show(),
+  )
+  applicationMenu = new ApplicationMenu(
+    rendererTrust,
+    () => diagnostics!.createMenuItem(),
+    () => applicationUpdates?.openFromMenu(),
+  )
   appearanceSettings = createAppearanceController(utilityClient, nativeTheme)
   removeDesktopModules = registerDesktopModules(rendererTrust, utilityClient, appearanceSettings)
 
@@ -228,6 +237,7 @@ async function bootstrap(): Promise<void> {
     await quitApproval
     if (quitting) return
     if (appearance.ok) {
+      void applicationUpdates.start()
       createPactWindow()
       nativePresence.start()
       return
@@ -270,6 +280,7 @@ function finishQuit(): Promise<void> {
 // will-quit follows Electron's document shutdown. Keep named handlers available
 // for late Renderer cleanup instead of treating native window closure as an IPC drain.
 app.once('will-quit', () => {
+  applicationUpdates?.dispose()
   applicationMenu?.dispose()
   removeDesktopModules?.()
   appearanceSettings?.dispose()
@@ -292,6 +303,7 @@ app.on('before-quit', (event) => {
     const accepted = await (nativePresence?.requestQuit() ?? Promise.resolve(true))
     if (!accepted) return
     quitting = true
+    applicationUpdates?.stop()
     const result = await utilityClient.shutdown()
     if (!result.ok) console.error('Pact shutdown was not acknowledged:', result.error.code)
     if (!utilityClient.isRunning()) await finishQuit()
