@@ -52,6 +52,8 @@ import {
   DefaultSessionSettingsView,
 } from './components/settings/session/DefaultSessionSettingsView'
 import { useDefaultSessionSettings } from './components/settings/session/useDefaultSessionSettings'
+import { AboutUpdatesView } from './components/settings/updates/AboutUpdatesView'
+import { useAppUpdates } from './components/settings/updates/useAppUpdates'
 import { APP_TOAST_DURATION_MS, AppToast, type AppToastTone } from './components/workspace/AppToast'
 import { ArchiveConfirmation } from './components/workspace/ArchiveConfirmation'
 import {
@@ -496,6 +498,25 @@ function App(): React.JSX.Element {
     void save('update', { materialOpacity })
   }
 
+  const updates = useAppUpdates(
+    () => {
+      setNativeAttentionOpen(false)
+      setSettingsPage('updates')
+    },
+    showToast,
+    !toast && !nativeQuitState && runtimePreparationQuery.data?.firstUse === false,
+  )
+  const aboutUpdatesView = (
+    <AboutUpdatesView
+      appInfo={appInfoQuery.data}
+      state={updates.state}
+      busy={updates.busy}
+      error={updates.error}
+      onCheck={() => void updates.check()}
+      onRetry={() => void updates.retry()}
+      onAutoCheckChange={(value) => void updates.setAutoCheck(value)}
+    />
+  )
   const appInfo = appInfoQuery.data
   const showWorkspace = (): void => {
     beginUserSelection()
@@ -1429,7 +1450,10 @@ function App(): React.JSX.Element {
     <NativeQuitConfirmation key={nativeQuitState.operationId} state={nativeQuitState} />
   ) : null
 
-  if (!preparation || (preparation.firstUse && !showFirstUseDefaults) || isRuntimePreparationOpen) {
+  if (
+    settingsPage !== 'updates' &&
+    (!preparation || (preparation.firstUse && !showFirstUseDefaults) || isRuntimePreparationOpen)
+  ) {
     return (
       <>
         <RuntimePreparationView
@@ -1452,7 +1476,7 @@ function App(): React.JSX.Element {
     )
   }
 
-  if (preparation?.firstUse && showFirstUseDefaults) {
+  if (settingsPage !== 'updates' && preparation?.firstUse && showFirstUseDefaults) {
     return (
       <>
         <DefaultSessionOnboardingView
@@ -1511,6 +1535,7 @@ function App(): React.JSX.Element {
           renamingProjectId={projectCatalog.renamingProjectId}
           error={projectCatalog.error}
           sessionError={sessionWorkspace.error}
+          updateAvailable={updates.state?.updateAvailable ?? false}
           settingsPage={settingsPage}
           onOpenSettings={(page) => {
             beginUserSelection()
@@ -1680,7 +1705,7 @@ function App(): React.JSX.Element {
           settingsButtonRef={settingsButtonRef}
           agentActionsEnabled={allAgentsReady}
           runtimeNotice={
-            allAgentsReady ? undefined : (
+            allAgentsReady || !preparation ? undefined : (
               <RuntimeDegradedNotice
                 preparation={preparation}
                 onReview={() => {
@@ -1694,7 +1719,9 @@ function App(): React.JSX.Element {
             )
           }
           settingsView={
-            settingsPage === 'appearance' ? (
+            settingsPage === 'updates' ? (
+              aboutUpdatesView
+            ) : settingsPage === 'appearance' ? (
               <AppearanceSettingsView
                 settings={settings}
                 effective={snapshot?.effective}

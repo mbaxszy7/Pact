@@ -7,6 +7,8 @@ import { appInfoSchema, IPC_CHANNELS } from '@pact/contracts'
 import type { RendererTrust } from '../../renderer-trust'
 import type { UtilityProcessClient } from '../../utility-process/client'
 
+import { readProductIdentity } from '../../product-identity'
+
 export function registerFoundationIpcHandlers(
   trust: RendererTrust,
   utilityClient: UtilityProcessClient,
@@ -16,7 +18,7 @@ export function registerFoundationIpcHandlers(
 
     const info = appInfoSchema.parse({
       name: app.getName(),
-      version: app.getVersion(),
+      version: app.isPackaged ? app.getVersion() : readProductIdentity().version,
       platform: process.platform,
       arch: process.arch,
       packaged: app.isPackaged,

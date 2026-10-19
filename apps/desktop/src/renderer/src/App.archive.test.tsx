@@ -145,6 +145,27 @@ function fixture(projectCount = 2) {
     projects: projects.filter((project) => !archivedProjects.has(project.id)),
   })
   const bridge = {
+    getUpdateState: vi.fn<DesktopBridge['getUpdateState']>(async () => ({
+      ok: true,
+      value: {
+        enabled: false,
+        preferencesReady: true,
+        currentVersion: '0.0.0',
+        autoCheck: true,
+        revision: 0,
+        latest: null,
+        checkedAt: null,
+        retryAt: null,
+        noticePending: false,
+        checking: false,
+        error: null,
+        updateAvailable: false,
+        stateVersion: 0,
+        settingsRequest: 0,
+      },
+    })),
+    onUpdateStateChanged: vi.fn<DesktopBridge['onUpdateStateChanged']>(() => () => undefined),
+    onNativePresenceChanged: vi.fn<DesktopBridge['onNativePresenceChanged']>(() => () => undefined),
     getAppInfo: vi.fn<DesktopBridge['getAppInfo']>(async () => ({
       ok: true,
       value: { name: 'Pact', version: '0.0.0', platform: 'win32', arch: 'x64', packaged: false },
@@ -264,6 +285,9 @@ function fixture(projectCount = 2) {
     }),
   } satisfies Pick<
     DesktopBridge,
+    | 'getUpdateState'
+    | 'onUpdateStateChanged'
+    | 'onNativePresenceChanged'
     | 'getAppInfo'
     | 'getRuntimePreparation'
     | 'getAppearanceSettings'

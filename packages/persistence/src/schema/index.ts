@@ -15,6 +15,21 @@ export const appearanceSettings = sqliteTable('appearance_settings', {
   updatedAt: text('updated_at').notNull(),
 })
 
+export const appUpdateSettings = sqliteTable('app_update_settings', {
+  id: integer('id').primaryKey(),
+  autoCheck: integer('auto_check', { mode: 'boolean' }).notNull().default(true),
+  revision: integer('revision').notNull().default(0),
+  releaseVersion: text('release_version'),
+  releasePublishedAt: text('release_published_at'),
+  releaseUrl: text('release_url'),
+  checkedAt: text('checked_at'),
+  retryAt: text('retry_at'),
+})
+export const appUpdateNotices = sqliteTable('app_update_notices', {
+  version: text('version').primaryKey(),
+  notifiedAt: text('notified_at').notNull(),
+})
+
 export const appSetupState = sqliteTable('app_setup_state', {
   id: integer('id').primaryKey(),
   completedAt: text('completed_at'),
@@ -1557,6 +1572,8 @@ export const schema = {
   conversationMessageImages,
   pactSchemaMeta,
   appearanceSettings,
+  appUpdateSettings,
+  appUpdateNotices,
   appSetupState,
   defaultSessionSettings,
   sessionCatalogRevisions,

@@ -173,6 +173,16 @@ affected real-provider lane in a trusted local environment when its unique behav
 CI's deterministic evidence is complementary. Report commands actually run, failures, skips, warnings,
 deferred checks, and unverified platforms. Missing evidence cannot establish a passing gate.
 
+### Release-check UI verification
+
+Inspect About & updates in the real Electron window before formal UI verification. Preserve
+non-official builds' zero-network eligibility gate; a screenshot fixture may present clearly labelled
+demonstration state, but is not official Stable or live release evidence. After visual acceptance,
+cover single-flight checks, failed-check cache retention, rate limits, per-version notice receipts
+across restart/Latest changes, app-wide busy deferral, disposal and native menu navigation including
+first use. Native macOS menu evidence does not establish Windows acceptance. No update assets,
+installer or restart should be invoked by release checks.
+
 ## Documentation policy
 
 The reviewed Markdown allowlist is `README.md`, `CONTRIBUTING.md`, `AGENTS.md`, `CHANGELOG.md`, the product and

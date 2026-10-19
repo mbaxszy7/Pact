@@ -18,6 +18,7 @@ import { dirname, basename, join, resolve } from 'node:path'
 
 import type { PactDrizzleDatabase } from './drizzle-database.js'
 
+import { AppUpdatesRepository } from './app-updates-repository.js'
 import {
   DrizzleAppearanceSettingsRepository,
   type AppearanceSettingsRepository,
@@ -114,6 +115,7 @@ export class PactDatabase {
     | undefined
   private readonly performanceProbe: DatabasePerformance | undefined
 
+  readonly appUpdatesRepository: AppUpdatesRepository
   readonly appearanceSettingsRepository: AppearanceSettingsRepository
   readonly conversationRepository: ConversationRepository
   readonly defaultSessionSettingsRepository: DefaultSessionSettingsRepository
@@ -132,6 +134,7 @@ export class PactDatabase {
     this.performanceProbe = measurePerformance
       ? new DatabasePerformance(sqlite, drizzle, filePath)
       : undefined
+    this.appUpdatesRepository = new AppUpdatesRepository(drizzle)
     this.appearanceSettingsRepository = new DrizzleAppearanceSettingsRepository(drizzle)
     this.conversationRepository = new ConversationRepository(drizzle)
     this.conversationRepository.recoverAbandonedBodyInputs()

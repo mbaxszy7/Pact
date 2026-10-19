@@ -4,6 +4,8 @@ import type { DesktopBridge } from '@pact/contracts'
 
 import {
   appearanceSnapshotSchema,
+  updateStateSchema,
+  updateNoticeResultSchema,
   conversationPatchSchema,
   diagnosticStatusSchema,
   composerEditCommandSchema,
@@ -136,6 +138,11 @@ const onConversationChanged = eventSubscription(
   conversationPatchSchema,
   'business',
 )
+const onUpdateStateChanged = eventSubscription(
+  IPC_CHANNELS.updatesChanged,
+  updateStateSchema,
+  'business',
+)
 const onAppearanceSettingsChanged = eventSubscription(
   IPC_CHANNELS.appearanceChanged,
   appearanceSnapshotSchema,
@@ -177,6 +184,17 @@ const onNativeQuitStateChanged = eventSubscription(
 )
 
 const bridge: DesktopBridge = {
+  getUpdateState: async () =>
+    rpcResultSchema(updateStateSchema).parse(await invoke(IPC_CHANNELS.updatesGet)),
+  checkForUpdates: async () =>
+    rpcResultSchema(updateStateSchema).parse(await invoke(IPC_CHANNELS.updatesCheck)),
+  setUpdatePreferences: async (input) =>
+    rpcResultSchema(updateStateSchema).parse(await invoke(IPC_CHANNELS.updatesPreferences, input)),
+  claimUpdateNotice: async (input) =>
+    rpcResultSchema(updateNoticeResultSchema).parse(
+      await invoke(IPC_CHANNELS.updatesClaimNotice, input),
+    ),
+  onUpdateStateChanged,
   resolveNativeSession: async (input) =>
     rpcResultSchema(sessionCatalogChangeSchema).parse(
       await invoke(IPC_CHANNELS.nativeSessionResolve, nativeSessionResolveInputSchema.parse(input)),
