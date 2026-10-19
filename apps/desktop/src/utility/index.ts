@@ -15,6 +15,7 @@ import { PactDatabase, DatabaseOpenError } from '@pact/persistence'
 
 import { closeDiagnostics, receiveDiagnostic, recordDiagnostic } from '../diagnostics/utility-log'
 import { hasLogicalIpcFixtureNonce, LogicalIpcWorkerTraffic } from '../shared/logical-ipc-traffic'
+import { AppUpdates } from './app-updates/app-updates'
 import { handleAppearanceRequest } from './appearance/handler'
 import { Conversation } from './conversation/conversation'
 import { ConversationImages } from './conversation/conversation-images'
@@ -173,6 +174,7 @@ async function bootstrap(
     recordDiagnostic({ operation: 'utility', phase: 'failed' })
   })
   const shouldFailAppearanceWrites = process.argv[4] === '1'
+  const appUpdates = new AppUpdates(openedDatabase.appUpdatesRepository)
   const conversationOwner = conversation
   let closing = false
   let activeRequests = 0
@@ -198,6 +200,68 @@ async function bootstrap(
     if (closing && request.data.type !== 'runtime.shutdown.request') return
 
     switch (request.data.type) {
+      case 'updates.check.request': {
+        const requestId = request.data.requestId
+        runRequest(async () => {
+          const result = await appUpdates.check()
+          parentPort.postMessage(
+            utilityResponseSchema.parse({ type: 'updates.state.response', requestId, result }),
+          )
+        })
+        return
+      }
+      case 'updates.get.request':
+      case 'updates.preferences.request':
+      case 'updates.notice.request': {
+        const input = request.data
+        try {
+          const repository = openedDatabase.appUpdatesRepository
+          if (input.type === 'updates.notice.request') {
+            const current = repository.read()
+            const claimed =
+              current.latest?.version === input.input.version &&
+              conversationOwner.canPresentUpdateNotice() &&
+              repository.claimNotice(input.input.version)
+            parentPort.postMessage(
+              utilityResponseSchema.parse({
+                type: 'updates.notice.response',
+                requestId: input.requestId,
+                result: { ok: true, value: { claimed } },
+              }),
+            )
+          } else {
+            const result =
+              input.type === 'updates.preferences.request' && !repository.update(input.input)
+                ? {
+                    ok: false,
+                    error: { code: 'CONFLICT', message: 'Settings changed. Try again.' },
+                  }
+                : { ok: true, value: repository.read() }
+            parentPort.postMessage(
+              utilityResponseSchema.parse({
+                type: 'updates.state.response',
+                requestId: input.requestId,
+                result,
+              }),
+            )
+          }
+        } catch {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type:
+                input.type === 'updates.notice.request'
+                  ? 'updates.notice.response'
+                  : 'updates.state.response',
+              requestId: input.requestId,
+              result: {
+                ok: false,
+                error: { code: 'INTERNAL', message: 'Update settings are unavailable. Try again.' },
+              },
+            }),
+          )
+        }
+        return
+      }
       case 'native-presence.read.request': {
         parentPort.postMessage(
           utilityResponseSchema.parse({
@@ -325,6 +389,7 @@ async function bootstrap(
         const requestId = request.data.requestId
         shutdown ??= (async () => {
           closing = true
+          await appUpdates.dispose()
           projectCatalog.dispose()
           const drainRequests =
             activeRequests === 0

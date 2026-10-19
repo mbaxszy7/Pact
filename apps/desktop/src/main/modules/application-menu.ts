@@ -42,6 +42,7 @@ export class ApplicationMenu {
   constructor(
     private readonly trust: RendererTrust,
     diagnostics: () => MenuItem,
+    checkForUpdates: () => void = () => undefined,
   ) {
     const base =
       this.previous ??
@@ -75,14 +76,26 @@ export class ApplicationMenu {
         click: (clicked, window, event) => item.click(clicked, window, event),
       }
     }
-    this.nativeMenu = Menu.buildFromTemplate([
-      ...base.items.map((item) => clone(item, false)),
-      diagnostics(),
-    ])
-    this.composerMenu = Menu.buildFromTemplate([
-      ...base.items.map((item) => clone(item, true)),
-      diagnostics(),
-    ])
+    const updateItem: MenuItemConstructorOptions = {
+      label: 'Check for Updates…',
+      click: checkForUpdates,
+    }
+    const withUpdates = (composer: boolean): MenuItemConstructorOptions[] => {
+      const template = base.items.map((item) => clone(item, composer))
+      if (process.platform === 'darwin') {
+        const application = template.find((item) => String(item.role).toLowerCase() === 'appmenu')
+        if (application && Array.isArray(application.submenu))
+          application.submenu.splice(1, 0, updateItem, { type: 'separator' })
+        else
+          template.unshift({
+            label: app.getName(),
+            submenu: [{ role: 'about' }, updateItem, { type: 'separator' }, { role: 'quit' }],
+          })
+      } else template.push({ role: 'help', submenu: [updateItem] })
+      return template
+    }
+    this.nativeMenu = Menu.buildFromTemplate([...withUpdates(false), diagnostics()])
+    this.composerMenu = Menu.buildFromTemplate([...withUpdates(true), diagnostics()])
     ipcMain.handle(IPC_CHANNELS.composerEditingState, (event, raw: unknown) => {
       trust.assertTrustedMainFrame(event)
       const input = composerEditingStateSchema.safeParse(raw)

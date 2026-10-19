@@ -2,6 +2,7 @@ import { app } from 'electron'
 import { join } from 'node:path'
 
 import identities from '../../app-identities.json'
+import desktopPackage from '../../package.json'
 import { resolveApplicationIdentity, type ApplicationIdentity } from './application-identity'
 
 export interface ProductIdentity {
@@ -27,7 +28,9 @@ export function readProductIdentity(
       (identity.kind.startsWith('production-') ? 'stable' : 'dev'),
     productName: identity.name,
     appId: identity.appId,
-    version: identity.distribution?.version ?? app.getVersion(),
+    version:
+      identity.distribution?.version ??
+      (app.isPackaged ? app.getVersion() : desktopPackage.version),
     sourceSha: identity.distribution?.sourceSha,
     buildNumber: identity.distribution?.buildNumber,
   }

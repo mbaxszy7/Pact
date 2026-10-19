@@ -7,6 +7,7 @@ import type { SettingsPage } from './SettingsNavigation'
 interface ProjectEmptyStateProps {
   adding: boolean
   error?: string | undefined
+  updateAvailable?: boolean
   settingsButtonRef: React.RefObject<HTMLButtonElement | null>
   onAddProject: () => void
   onOpenSettings: (page: Exclude<SettingsPage, null>) => void
@@ -20,6 +21,7 @@ export function ProjectEmptyState({
   onOpenSettings,
   onRetry,
   settingsButtonRef,
+  updateAvailable,
 }: ProjectEmptyStateProps): React.JSX.Element {
   return (
     <main className="flex min-h-full items-center justify-center px-section py-spacious">
@@ -59,6 +61,9 @@ export function ProjectEmptyState({
             onClick={() => onOpenSettings('session-defaults')}
           >
             Open settings
+            {updateAvailable ? (
+              <span className="ml-2 text-caption font-medium text-focus">New</span>
+            ) : null}
           </button>
         </div>
       </div>

@@ -75,6 +75,7 @@ interface WorkspaceViewProps {
   renamingProjectId?: string | undefined
   error?: string | undefined
   sessionError?: string | undefined
+  updateAvailable?: boolean
   settingsPage: SettingsPage
   settingsView?: ReactNode
   runtimeNotice?: ReactNode
@@ -241,12 +242,14 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
       navigation={
         props.settingsPage ? (
           <SettingsNavigation
+            updateAvailable={props.updateAvailable ?? false}
             settingsPage={props.settingsPage}
             onBackToApp={props.onBackToApp}
             onOpenSettings={props.onOpenSettings}
           />
         ) : (
           <ProjectNavigation
+            updateAvailable={props.updateAvailable ?? false}
             projects={props.projects}
             sessions={props.sessions}
             projectPages={props.sessionProjectPages}
@@ -533,6 +536,7 @@ function WorkspaceContent({
   }
   return (
     <ProjectEmptyState
+      updateAvailable={props.updateAvailable ?? false}
       adding={props.adding}
       error={props.error}
       onAddProject={props.onAddProject}

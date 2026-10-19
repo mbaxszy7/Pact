@@ -40,7 +40,7 @@ Keep Renderer sandbox, Context Isolation, ASAR integrity, and packaging Fuse res
 | `WorkspaceChanges`                                                                                   | Native callbacks and named review/Undo                       | Passive capture, immutable versions, recording finalization, preflight, installation/recovery; repository owns metadata/intents                                                      |
 | `ConversationImages`                                                                                 | Conversation and three named image operations                | UUID source/thumbnail files, segmented I/O, holds, physical codec Workers; repository owns immutable refs                                                                            |
 | Renderer `useConversation` / `ConversationView`                                                      | App workspace                                                | One selected-Session projection, draft/pending/returned-input authority, source navigation, virtual Transcript; switch/unmount cancels read generations                              |
-| `ApplicationMenu` / `DiagnosticLogs`                                                                 | Main composition                                             | One native root menu and bounded editor receipts; metadata logging with one file Worker and explicit close                                                                           |
+| `ApplicationMenu` / `DiagnosticLogs` / `ApplicationUpdates`                                          | Main composition                                             | One native menu, editor receipts and release-check scheduler; Utility owns update I/O and SQLite facts; Diagnostics owns a bounded file Worker and explicit close                    |
 | `resolveApplicationIdentity/readProductIdentity` / `configureApplicationProfile/resolveRuntimePaths` | Main startup and packaged path inspection                    | Registry owns immutable identity; runtime-paths owns profile/session/log and durable paths before readiness and single-instance locking.                                             |
 | `PactDatabase.open/close`                                                                            | Utility startup and development database tools               | Sole compatibility/backup/migration owner; holds the data-directory writer reservation through business use and physical close; failed cleanup prevents another open in that process |
 | Distribution builder `main`                                                                          | Explicit local and CI packaging commands                     | Owns temporary version injection, native build, hashes and manifest; retains previous outputs and restores source metadata on every settlement.                                      |
@@ -294,38 +294,32 @@ Diagnostics uses validated finite operation/method/code/source/executor metadata
 
 ## Distribution channels and packaged verification
 
-The shared registry owns four identities: local development/Production, CI `Pact Dev` and Stable
-`Pact`. CI development branches share one channel; local data and historical object roots remain
-unchanged. Profile configuration precedes the single-instance lock; fixture overrides do not prove
-normal production-path correctness.
+Identity/profile rules above apply; fixture overrides prove no production path. `version.json` owns
+version. Builds verify desktop version/SHA, inject Dev prerelease/build/source or Stable identity,
+and hash-check metadata restoration. Windows
+x64/arm64 use NSIS; macOS arm64 uses DMG/ZIP. Each target gates delivery on native protocol,
+package, installed-smoke and core E2E. Signing/notarization remain disabled (macOS ad-hoc).
+Native rebuilding, sandboxing, Context Isolation, ASAR integrity and fuses remain required.
 
-`version.json` owns the product version. Distribution verifies desktop version and checked-out SHA,
-injects a compatible Dev prerelease/build/source identity or Stable version, then hash-checks metadata
-restoration. Windows x64/arm64 produce NSIS; macOS arm64 produces DMG/ZIP. Each target has separate
-native protocol, package, installed-smoke and core E2E jobs gating delivery and publication.
-Certificate signing/notarization stay disabled; macOS retains ad-hoc signing.
-Native dependency rebuilding, sandboxing, Context Isolation, ASAR integrity and fuses remain required.
+Manifests bind channel/version/source/platform/architecture/identity, artifact and signed-content
+hashes. Smoke checks installed bytes, native dependencies and cold restart; unpacked checks prove
+no installation. Normal-path probes preserve single-instance rules and exit before runtime/UI
+owners. Local checks create no CI Release. Coexistence/upgrade/uninstall need platform evidence.
 
-The manifest binds channel/version/source/OS/architecture/identity, artifact hashes and final signed
-application-content hash. Smoke validates exact installed/extracted bytes, native dependencies and
-cold restart. Directory-only checks cannot satisfy installation acceptance. The normal-path probe
-exits before Utility, database, providers, Renderer or diagnostic Workers and retains single-instance
-rules. Explicit local profiles use the same manifest-based verification without becoming CI Releases.
-
-These interfaces require actual platform evidence for coexistence, upgrades and uninstall cleanup.
-Publication uses the exact merged version-PR source and same-run package IDs/digests with matching installed evidence. A separate main-only publisher reconciles one Draft, verifies uploaded bytes and native immutable Release integrity, then finalizes standard version labels before maintaining the next PR. Native review rules exempt only the owner-author; CI is never bypassed and Merge stays manual. Model and version-bot environments use ref restrictions without runtime approvals. Missing evidence, expired artifacts or uncertain writes stop; no signed controller, staging Release or alternate recovery path is retained.
-
-Release uploads contain four installers: macOS arm64 DMG/ZIP and Windows x64/arm64 NSIS EXE; GitHub supplies source
-archives and native attestation. Full validation remains mandatory. Package/smoke evidence and
-aggregate manifests/checksums stay in Actions artifacts for 14 days; published Releases stay immutable.
+The main-only publisher requires merged version-PR source, same-run artifact IDs/digests and installed
+evidence; reconciles one Draft; verifies bytes/immutability; finalizes labels; then maintains the next
+PR. Only owner-authors are review-exempt; CI is required, Merge manual. Model/version-bot environments
+use ref restrictions without runtime approvals.
+Missing/expired evidence or uncertain writes stop; no signed controller/staging Release/alternate recovery. Releases contain four installers; GitHub supplies source archives/attestation.
+Package/smoke/aggregate manifest/checksum evidence stays in Actions 14 days; Releases are immutable.
 
 ## Verification and remaining scope
 
 Trace a normal action and failure/restart through these same owners for lifecycle changes. Main closes admission and awaits Conversation/default-settings requests, owned work, durable flush, and logs before quit. Unconfirmed physical release retains reservation/evidence. POSIX OwnedProcessGroup validates PID/PGID/birth before signaling and confirms absence. Windows test Jobs prove fixture release; they are no production supervisor.
 
-Real integrations/conversations/routing/Comments/Skills/images/collaboration/native editing/Undo/recovery/Fork/appearance are implemented. Foundation-only narratives and obsolete total-content gates no longer apply. [Contributing](../CONTRIBUTING.md#testing) records methods and unverified scope; builds/scoped repeats cannot prove full suite, packaged percentile, all-platform, or signed-release acceptance.
+Real integrations/conversations/routing/Comments/Skills/images/collaboration/native editing/Undo/recovery/Fork/appearance are implemented. [Contributing](../CONTRIBUTING.md#testing) records methods and unverified scope; builds/scoped repeats cannot prove full suite, packaged percentile, all-platform, or signed-release acceptance.
 
-Remaining: complete Checkpoints/Journal replay, validated recurring backup/restore, reference-aware retention, arbitrary-history expansion, Utility supervision/readiness caching, signing/notarization, updates and release acceptance. Channel/package identity proves no release gate; migration backup is not disaster recovery. Disclose unknown delivery, legacy formats, review scope and non-atomic Undo. Preserve evidence/full sources; never hide limits with automatic model work.
+Remaining: complete Checkpoints/Journal replay, validated recurring backup/restore, reference-aware retention, arbitrary-history expansion, Utility supervision/readiness caching, signing/notarization, automatic update installation and release acceptance. Migration backup is not disaster recovery. Disclose unknown delivery, legacy formats, review scope and non-atomic Undo. Preserve evidence/full sources; never hide limits with automatic model work.
 
 ## Performance and resource requirements
 
@@ -419,6 +413,18 @@ listeners are installed before their initial read; matching acknowledgment canno
 intent. Renderer disposal drops transient intents and view state; durable receipts remain authoritative.
 Windows removed-task inspection accepts at most 1024 OS entries; suppression mutations contain at
 most 64 Session IDs per direction and never consume arbitrary executable arguments.
+
+Main `ApplicationUpdates` owns one 30 s/six-hour timer, wake listener, check, preference mutation
+and notice claim; stop/dispose releases them. Require packaged `production-ci`/embedded
+Stable, never channel/environment alone. Utility reads fixed public GitHub Latest without credentials,
+redirects, assets or raw logging: 30 s deadline/35 s RPC,
+2 MiB JSON (4 MiB concatenation peak), no queue/retry loop. Rate-limit backoff is 60 s–24 h,
+default 15 min. Shutdown aborts/drains before database close; failures retain successful metadata.
+SQLite owns one CAS settings row and indexed per-version receipts, with no history scan/truncation.
+Conversation checks all physical/preparation/interaction owners before claim, never truncated tray
+groups. Existing native events defer notices without polling.
+Renderer subscribes before reading, fences 8 KiB snapshots and removes listeners. One menu intent
+reuses the window at first use; Window opens release links.
 
 ### Application, distribution, and database startup
 

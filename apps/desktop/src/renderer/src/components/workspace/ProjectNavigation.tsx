@@ -50,6 +50,7 @@ interface ProjectNavigationProps {
   renamingProjectId?: string | undefined
   archivingSessionId?: string | undefined
   selectedSessionId?: string | undefined
+  updateAvailable?: boolean
   settingsButtonRef: React.RefObject<HTMLButtonElement | null>
   onAddProject: () => void
   onArchiveProject: (projectId: string) => void
@@ -81,6 +82,7 @@ export function ProjectNavigation({
   archivingSessionId,
   selectedSessionId,
   settingsButtonRef,
+  updateAvailable,
   onAddProject,
   onArchiveProject,
   onRenameProject,
@@ -483,6 +485,9 @@ export function ProjectNavigation({
       >
         <Settings aria-hidden="true" className="size-4 shrink-0" strokeWidth={1.75} />
         Settings
+        {updateAvailable ? (
+          <span className="ml-auto text-caption font-medium text-focus">New</span>
+        ) : null}
       </button>
     </div>
   )

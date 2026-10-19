@@ -452,6 +452,33 @@ HTTP(S) labels remain blue/underlined/keyboard-active with destination tooltip/t
 
 Bound DOM/caches while preserving selection, keyboard/screen-reader access, Comments and reverse navigation. Keystrokes cannot reparse completed history. Delayed above-viewport height changes preserve reading anchor; manual detail pauses tail-following; Home explicitly returns beginning. Late read/error cannot change another source or reacquire retired ownership.
 
+## App version checks
+
+About & updates always shows the running App version, including offline or when local settings
+cannot be loaded. Only packaged official Production CI Stable checks for updates; Dev and local
+Production show their version and the official GitHub download link without update requests.
+
+GitHub Releases in `mbaxszy7/Pact` are the sole remote source. Read its Latest formal Release;
+reject drafts, prereleases, malformed versions/dates and mismatched official release links. Compare
+strict numeric `major.minor.patch` versions and prompt only for a higher version. Show the latest
+version, publication date and a link to that exact GitHub Release in the system browser. Pact does
+not download assets, install, restart, or change task/draft/exit behavior for this feature.
+
+Automatic checks default on and can be disabled independently of manual checks. Check about 30 s
+after startup and every six hours while resident, including the tray; resume checks only when due.
+Concurrent checks share one operation. Disabling automatic checks affects future scheduling, not
+an in-flight check. Respect GitHub rate-limit backoff for automatic and manual requests alike.
+Failures retain the last successful result/time and never claim the App is current. Background
+failures remain quiet; the page provides checking, unavailable, last-known and retry states.
+
+Settings keeps a New marker while a higher version is available. A durable per-version receipt
+allows at most one proactive light notice, including Latest returning to a previously seen version.
+Present only in a visible trusted workspace after Conversation can confirm app-wide inactivity;
+active/preparing/recovering/background work and unavailable state defer it. Do not poll, steal
+focus, send system notifications or replace an existing notice. The receipt controls the notice,
+not the persistent update entry. Native Check for Updates opens the same page, including first use.
+Use restrained copy: version facts and controls are primary, with errors/details only as needed.
+
 ## Appearance, accessibility and diagnostics
 
 App-global persisted appearance includes independent System/Light/Dark theme, System/Solid/Translucent material and stored `materialOpacity` 70–100/default 85. Visible Transparency strength 0/50/100 maps to 100/85/70, not whole-window opacity. Semantic surfaces have distinct alpha; text/icons/code/focus remain opaque.
