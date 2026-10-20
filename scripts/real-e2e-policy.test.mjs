@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { mkdir, mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -19,6 +20,8 @@ import {
 } from './real-e2e-policy.mjs'
 
 const workspace = fileURLToPath(new URL('..', import.meta.url))
+const require = createRequire(import.meta.url)
+const playwrightCli = require.resolve('@playwright/test/cli')
 const compare = (left, right) => left.localeCompare(right)
 const key = (item) => JSON.stringify([item.path, item.title])
 function fixture(suite = 'full') {
@@ -59,8 +62,8 @@ await test('actual Playwright discovery is completely classified and core select
   const discover = (args) =>
     JSON.parse(
       execFileSync(
-        'pnpm',
-        ['exec', 'playwright', 'test', '--project=real', '--list', '--reporter=json', ...args],
+        process.execPath,
+        [playwrightCli, 'test', '--project=real', '--list', '--reporter=json', ...args],
         { cwd: workspace, encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 },
       ),
     )
@@ -184,7 +187,7 @@ await test('immutable coverage keeps all assertions while requiring only selecte
   const directory = await mkdtemp(join(tmpdir(), 'pact-real-policy-coverage-'))
   try {
     const listed = JSON.parse(
-      execFileSync('pnpm', ['exec', 'playwright', 'test', '--list', '--reporter=json'], {
+      execFileSync(process.execPath, [playwrightCli, 'test', '--list', '--reporter=json'], {
         cwd: workspace,
         encoding: 'utf8',
         timeout: 30000,

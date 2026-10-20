@@ -16,6 +16,12 @@ const chainDepth = 3
 const ancestryBytes = 64 * 1024
 const prefix = `[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$ErrorActionPreference='Stop';`
 
+class WindowsProcessObservationError extends Error {
+  constructor(readonly reason: 'ambiguous' | 'tree-limit' | 'missing' | 'query') {
+    super('Owned Windows process observation did not complete')
+  }
+}
+
 function validPid(pid: number): void {
   if (!Number.isSafeInteger(pid) || pid < 2 || pid > 0xffffffff)
     throw new Error('Invalid owned process identity')
@@ -39,7 +45,16 @@ function query(script: string, input?: string, byteLimit = outputBytes): Promise
       },
       (error, stdout) => {
         if (error) {
-          reject(new Error('Owned Windows process observation did not complete'))
+          const reason = error.killed
+            ? 'query'
+            : error.code === 71
+              ? 'ambiguous'
+              : error.code === 72
+                ? 'tree-limit'
+                : error.code === 73
+                  ? 'missing'
+                  : 'query'
+          reject(new WindowsProcessObservationError(reason))
           return
         }
         try {
@@ -99,24 +114,31 @@ function Identity($p) {
   [pscustomobject]@{pid=[int]$p.ProcessId;parentPid=[int]$p.ParentProcessId;executable=$p.ExecutablePath;started=$p.CreationDate.ToUniversalTime().Ticks.ToString()}
 }
 $root=Identity (Get-CimInstance Win32_Process -Filter ('ProcessId = '+$request.utilityPid) -Property ProcessId,ParentProcessId,ExecutablePath,CreationDate)
-$pending=[Collections.Generic.Queue[object]]::new();$pending.Enqueue(@{identity=$root;chain=@()})
+$frontier=@(@{identity=$root;chain=@()})
 $agentMatches=[Collections.Generic.List[object]]::new();$inspected=0
-while($pending.Count -gt 0){
-  $parent=$pending.Dequeue();if($parent.chain.Count -ge 3){continue}
-  $children=@(Get-CimInstance Win32_Process -Filter ('ParentProcessId = '+$parent.identity.pid) -Property ProcessId,ParentProcessId,ExecutablePath,CreationDate|Select-Object -First 33)
+for($depth=0;$depth -lt 3 -and $frontier.Count -gt 0;$depth++){
+  $parents=@{};foreach($parent in $frontier){$parents[[int]$parent.identity.pid]=$parent}
+  $filter=(@($frontier|ForEach-Object{'ParentProcessId = '+[int]$_.identity.pid}) -join ' OR ')
+  $remaining=32-$inspected
+  $children=@(Get-CimInstance Win32_Process -Filter $filter -Property ProcessId,ParentProcessId,ExecutablePath,CreationDate|Select-Object -First ($remaining+1))
+  if($children.Count -gt $remaining){exit 72}
+  $next=[Collections.Generic.List[object]]::new()
   foreach($row in $children){
-    $inspected++;if($inspected -gt 32){throw 'Owned process tree exceeds its bound'}
-    $child=Identity $row;if($child.parentPid -ne $parent.identity.pid){continue}
+    $inspected++
+    $child=Identity $row;if(-not $parents.ContainsKey([int]$child.parentPid)){continue}
+    $parent=$parents[[int]$child.parentPid]
     if([bigint]$child.started -lt [bigint]$parent.identity.started){throw 'Owned process ancestry changed'}
     $chain=@($parent.chain)+@($child)
     $name=[IO.Path]::GetFileName($child.executable)
     if([string]::Equals($name,[IO.Path]::GetFileName($request.executable),[StringComparison]::OrdinalIgnoreCase) -or [string]::Equals($name,($request.agentId+'.exe'),[StringComparison]::OrdinalIgnoreCase)){
       $agentMatches.Add(@{pid=$child.pid;utilityPid=$root.pid;utilityStarted=$root.started;chain=$chain})
     }
-    $pending.Enqueue(@{identity=$child;chain=$chain})
+    $next.Add(@{identity=$child;chain=$chain})
   }
+  $frontier=@($next.ToArray())
 }
-if($agentMatches.Count -ne 1){throw 'Expected exactly one owned Agent'}
+if($agentMatches.Count -gt 1){exit 71}
+if($agentMatches.Count -eq 0){exit 73}
 ConvertTo-Json -Depth 6 -Compress -InputObject $agentMatches[0]
 `,
     JSON.stringify({ utilityPid, executable, agentId }),
@@ -169,11 +191,16 @@ export async function stopWindowsOwnedAgentProcess(owned: WindowsOwnedAgentProce
   const result = await query(
     String.raw`
 $expected=[Console]::In.ReadLine()|ConvertFrom-Json
-$root=Get-CimInstance Win32_Process -Filter ('ProcessId = '+$expected.utilityPid) -Property ProcessId,CreationDate
+$ids=@([int]$expected.utilityPid)+@($expected.chain|ForEach-Object{[int]$_.pid})
+$filter=(@($ids|ForEach-Object{'ProcessId = '+$_}) -join ' OR ')
+$rows=@(Get-CimInstance Win32_Process -Filter $filter -Property ProcessId,ParentProcessId,ExecutablePath,CreationDate|Select-Object -First 5)
+if($rows.Count -ne $ids.Count){throw 'Owned process identities changed'}
+$observed=@{};foreach($row in $rows){if(-not $ids.Contains([int]$row.ProcessId) -or $observed.ContainsKey([int]$row.ProcessId)){throw 'Unexpected process identity'};$observed[[int]$row.ProcessId]=$row}
+$root=$observed[[int]$expected.utilityPid]
 if($null -eq $root -or $root.CreationDate.ToUniversalTime().Ticks.ToString() -cne $expected.utilityStarted){throw 'Utility identity changed'}
 $parent=$expected.utilityPid
 foreach($node in $expected.chain){
-  $current=Get-CimInstance Win32_Process -Filter ('ProcessId = '+$node.pid) -Property ProcessId,ParentProcessId,ExecutablePath,CreationDate
+  $current=$observed[[int]$node.pid]
   if($null -eq $current -or $current.ParentProcessId -ne $parent -or -not [string]::Equals($current.ExecutablePath,$node.executable,[StringComparison]::Ordinal) -or $current.CreationDate.ToUniversalTime().Ticks.ToString() -cne $node.started){throw 'Owned process identity changed'}
   $parent=$node.pid
 }

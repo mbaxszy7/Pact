@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, onTestFailed } from 'vitest'
 
 import {
   advanceCollaboration,
@@ -74,12 +74,13 @@ const todoDelta = (
   ...fields,
 })
 
-async function fixture(filePath = ':memory:') {
+async function fixture(filePath = ':memory:', onOpened?: () => void) {
   const db = await PactDatabase.open({
     filePath,
     migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
   })
   databases.push(db)
+  onOpened?.()
   const repo = db.conversationRepository,
     projectId = randomUUID(),
     sessionId = randomUUID(),
@@ -1422,9 +1423,34 @@ it('a later resolved Batch cannot advance the continuous watermark past an earli
 })
 
 it('seeks the current Done page while preserving the exact historical Todo version and complete ledger acceptance', async () => {
-  const f = await fixture()
+  const phases: Array<{ phase: string; wallMs: number; cpuMs: number }> = []
+  onTestFailed(() => {
+    try {
+      const text = JSON.stringify(phases)
+      console.error(
+        '[pact-done-page-phases]',
+        Buffer.byteLength(text) <= 2048 ? text : 'Diagnostic phase bound exceeded',
+      )
+    } catch {
+      // Failure evidence must not replace the original assertion or timeout.
+    }
+  })
+  let previous = performance.now()
+  let cpu = process.cpuUsage()
+  const phase = (name: string): void => {
+    const now = performance.now()
+    const used = process.cpuUsage(cpu)
+    if (phases.length < 8)
+      phases.push({ phase: name, wallMs: now - previous, cpuMs: (used.user + used.system) / 1000 })
+    previous = now
+    cpu = process.cpuUsage()
+  }
+  phase('before-open')
+  const f = await fixture(':memory:', () => phase('opened'))
+  phase('fixture')
   const created = Array.from({ length: 26 }, (_, index) => todoDelta(`retained-${index}`))
   f.finish(undefined, { ...checked, todoDeltas: created })
+  phase('created')
   const draft = f.repo.collaboration(f.sessionId)!
   const maintenance = prepareCollaborationSupplement(draft, 'codex', settings, 'maintain_plan')
   const proposed = f.repo.beginRun({
@@ -1451,6 +1477,7 @@ it('seeks the current Done page while preserving the exact historical Todo versi
     ),
   })
   expect(f.repo.collaboration(f.sessionId)?.ledgerAwaitingCount).toBe(26)
+  phase('proposed')
   const peer = advanceCollaboration(f.repo.collaboration(f.sessionId)!, 'continue', settings)
   const review = f.repo.beginRun({
     sessionId: f.sessionId,
@@ -1476,6 +1503,7 @@ it('seeks the current Done page while preserving the exact historical Todo versi
     ),
   })
   const ready = f.repo.collaboration(f.sessionId)!
+  phase('reviewed')
   expect(ready).toMatchObject({
     status: 'ready',
     ledgerOpenCount: 0,
@@ -1493,6 +1521,7 @@ it('seeks the current Done page while preserving the exact historical Todo versi
     todoStatus: 'source',
   })
   if (page.scope !== 'collaboration') throw Error('Missing exact Todo source')
+  phase('page')
   expect(page.view).toMatchObject({
     todo: { id: 'retained-25', revision: 1, status: 'open' },
     todoCurrent: { revision: 3, status: 'done' },
@@ -1504,6 +1533,7 @@ it('seeks the current Done page while preserving the exact historical Todo versi
     page.view.todos!.items.some((item) => item.id === 'retained-25' && item.revision === 3),
   ).toBe(true)
   expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(48 * 1024)
+  phase('complete')
 })
 
 it('a live frozen report preserves its plan and a newer acknowledged input without approving the newer scope', async () => {

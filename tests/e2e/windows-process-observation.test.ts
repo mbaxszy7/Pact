@@ -15,18 +15,22 @@ import {
   stopWindowsOwnedAgentProcess,
 } from './windows-process-observation.js'
 
-async function observedTree(nested: boolean, count = 1) {
+async function observedTree(nested: boolean, count = 1, grandchild = false) {
   const root = await mkdtemp(join(tmpdir(), 'pact-process-observer-'))
   const owner = new OwnedProcessGroup()
   try {
     const report = join(root, 'utility-ready.json')
     const entry = join(root, 'utility.mjs')
+    const grandchildReady = join(root, 'grandchild-ready')
+    const childSource = grandchild
+      ? `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(grandchildReady)},String(process.pid));setInterval(()=>{},1000)`)}],{shell:false,windowsHide:true,stdio:'ignore'});setInterval(()=>{},1000)`
+      : 'setInterval(()=>{},1000)'
     const actual = nested
-      ? await writeWindowsNodeLauncher(root, 'nested-target', ['-e', 'setInterval(()=>{},1000)'])
+      ? await writeWindowsNodeLauncher(root, 'nested-target', ['-e', childSource])
       : process.execPath
     await writeFile(
       entry,
-      `import{spawn}from'node:child_process';import{writeFileSync}from'node:fs';const children=Array.from({length:${count}},()=>spawn(${JSON.stringify(actual)},${nested ? '[]' : JSON.stringify(['-e', 'setInterval(()=>{},1000)'])},{shell:false,windowsHide:true,stdio:'ignore'}));writeFileSync(${JSON.stringify(report)},JSON.stringify({pid:process.pid,children:children.map(child=>child.pid)}));process.stdin.resume();setInterval(()=>{},1000);\n`,
+      `import{spawn}from'node:child_process';import{writeFileSync}from'node:fs';const children=Array.from({length:${count}},()=>spawn(${JSON.stringify(actual)},${nested ? '[]' : JSON.stringify(['-e', childSource])},{shell:false,windowsHide:true,stdio:'ignore'}));writeFileSync(${JSON.stringify(report)},JSON.stringify({pid:process.pid,children:children.map(child=>child.pid)}));process.stdin.resume();setInterval(()=>{},1000);\n`,
     )
     const launcher = await writeWindowsNodeLauncher(root, 'utility', [entry])
     const child = owner.spawn(launcher, [], { cwd: root, windowsHide: true })
@@ -48,6 +52,7 @@ async function observedTree(nested: boolean, count = 1) {
     return {
       ...utility,
       root,
+      grandchildReady,
       close: async () => {
         await owner.close()
         await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 })
@@ -113,9 +118,11 @@ it.skipIf(process.platform !== 'win32').each([2, 33])(
   async (count) => {
     const tree = await observedTree(false, count)
     try {
-      await expect(
-        findWindowsOwnedAgentProcess(tree.pid, process.execPath, 'claude'),
-      ).rejects.toThrow('observation did not complete')
+      const discovery = findWindowsOwnedAgentProcess(tree.pid, process.execPath, 'claude')
+      await expect(discovery).rejects.toThrow('observation did not complete')
+      await expect(discovery).rejects.toMatchObject({
+        reason: count === 2 ? 'ambiguous' : 'tree-limit',
+      })
       expect(
         tree.children.every((pid) => {
           try {
@@ -126,6 +133,35 @@ it.skipIf(process.platform !== 'win32').each([2, 33])(
           }
         }),
       ).toBe(true)
+    } finally {
+      await tree.close()
+    }
+  },
+  25_000,
+)
+
+it.skipIf(process.platform !== 'win32')(
+  'checks later ancestry levels after finding the first matching Agent',
+  async () => {
+    const tree = await observedTree(false, 1, true)
+    try {
+      await expect
+        .poll(
+          () =>
+            readFile(tree.grandchildReady, 'utf8')
+              .then(() => true)
+              .catch(() => false),
+          {
+            timeout: 5_000,
+          },
+        )
+        .toBe(true)
+      const descendant = Number(await readFile(tree.grandchildReady, 'utf8'))
+      const discovery = findWindowsOwnedAgentProcess(tree.pid, process.execPath, 'claude')
+      await expect(discovery).rejects.toThrow('observation did not complete')
+      await expect(discovery).rejects.toMatchObject({ reason: 'ambiguous' })
+      expect(await windowsProcessIdentity(tree.children[0]!)).not.toBeNull()
+      expect(await windowsProcessIdentity(descendant)).not.toBeNull()
     } finally {
       await tree.close()
     }

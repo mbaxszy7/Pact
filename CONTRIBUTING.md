@@ -42,6 +42,11 @@ A missing scanner, wrong version, error, timeout, or detected secret blocks the 
 comments and local ignore files do not bypass scanning. Refresh changed hook configuration with
 `pnpm exec simple-git-hooks`.
 
+Local `pnpm test:infra` also requires that pinned scanner. On Windows, add Git for Windows' `bin`
+directory (containing `bash.exe`) to the verification process's PATH: workflow tests execute the
+actual Bash commands from the Actions definitions. Playwright discovery uses the workspace's
+installed CLI through Node and does not depend on whether pnpm is exposed as an EXE or shell shim.
+
 ```sh
 pnpm docs:check
 pnpm secrets:check    # Staged content

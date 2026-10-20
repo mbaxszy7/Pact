@@ -424,6 +424,7 @@ export async function writeWindowsObservedLauncher(
     disposed = false
   let startupTimer: ReturnType<typeof setTimeout> | undefined
   let startupDeadline: number | undefined
+  let preparationDeadline: number | undefined
   let lifetimeTimer: ReturnType<typeof setTimeout> | undefined
   let resolveStarted!: (value: { generation: string; pid: number }) => void
   let rejectStarted!: (error: Error) => void
@@ -466,8 +467,16 @@ export async function writeWindowsObservedLauncher(
       // Windows named-pipe shutdown can end reads before the Job's final receipt arrives.
       socket.write('cancel\n')
   }
+  const watchForRelease = (): void => {
+    clearTimeout(lifetimeTimer)
+    lifetimeTimer = setTimeout(() => {
+      cancel()
+      fail('Windows Job lifetime ended without release confirmation')
+    }, lifetimeMs + 5000)
+  }
   const armStartup = (deadline: number): void => {
-    const remaining = deadline - performance.now()
+    const now = performance.now()
+    const remaining = deadline - now
     if (
       startupDeadline !== undefined ||
       disposed ||
@@ -478,6 +487,13 @@ export async function writeWindowsObservedLauncher(
       remaining > 30_000
     )
       throw new Error('Windows Job startup requires one live bounded caller deadline')
+    if (preparationDeadline === undefined || now >= preparationDeadline) {
+      cancel()
+      fail('Windows Job preparation expired before startup authorization')
+      throw new Error('Windows Job startup requires one live bounded caller deadline')
+    }
+    // Preparation, authorized startup and target runtime have separate deadlines.
+    clearTimeout(lifetimeTimer)
     startupDeadline = deadline
     mark('armed')
     startupTimer = setTimeout(() => {
@@ -530,6 +546,7 @@ export async function writeWindowsObservedLauncher(
       lastActive = 1
       mark('started')
       clearTimeout(startupTimer)
+      watchForRelease()
       resolveStarted({ generation, pid: message.pid })
     } else if (message.kind === 'root-exit') {
       if (
@@ -716,10 +733,9 @@ export async function writeWindowsObservedLauncher(
       { flag: 'wx', mode: 0o600 },
     )
     installImage(executablePath)
-    lifetimeTimer = setTimeout(() => {
-      cancel()
-      fail('Windows Job lifetime ended without release confirmation')
-    }, lifetimeMs + 5000)
+    // An owner that is never armed must still release its prepared control resources.
+    preparationDeadline = performance.now() + lifetimeMs + 5000
+    watchForRelease()
     mark('prepared')
     return {
       executablePath,
