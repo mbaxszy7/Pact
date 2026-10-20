@@ -131,6 +131,41 @@ describe('MessageMarkdown anchor projection', () => {
   })
 })
 
+describe('MessageMarkdown local file navigation', () => {
+  it.each([
+    ['file:///C:/project/source.ts#L3-L5', 'file:///C:/project/source.ts', 3, 5],
+    ['FILE:///C:/project/source.ts#L3', 'FILE:///C:/project/source.ts', 3, 3],
+    ['/C:/project/source.ts#L3-L5', '/C:/project/source.ts', 3, 5],
+    ['C:/project/source.ts:3', 'C:/project/source.ts', 3, 3],
+    [
+      'file:///Users/person/My%20Project/source.ts#L3-L5',
+      'file:///Users/person/My%20Project/source.ts',
+      3,
+      5,
+    ],
+    [
+      'file:///Users/person/project/a%23b%25.ts#L3',
+      'file:///Users/person/project/a%23b%25.ts',
+      3,
+      3,
+    ],
+    ['file://localhost/C:/project/source.ts#L3', 'file://localhost/C:/project/source.ts', 3, 3],
+    ['src/a%20%23%25.ts#L3', 'src/a #%.ts', 3, 3],
+    ['src/a%2520.ts#L3', 'src/a%20.ts', 3, 3],
+    ['src/a%3A42#L3', 'src/a:42', 3, 3],
+    ['src/source.ts#L3-L5', 'src/source.ts', 3, 5],
+  ])('opens %s without losing the filename or line range', (href, path, lineStart, lineEnd) => {
+    const onOpenProjectFile = vi.fn<(target: ProjectFileTarget) => void>()
+    render(
+      <MessageMarkdown content={`[Source](<${href}>)`} onOpenProjectFile={onOpenProjectFile} />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /^Source$/u }))
+
+    expect(onOpenProjectFile).toHaveBeenCalledExactlyOnceWith({ path, lineStart, lineEnd })
+  })
+})
+
 function installRangeGeometry(range: Range): void {
   Object.defineProperties(range, {
     getClientRects: {

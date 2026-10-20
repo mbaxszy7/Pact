@@ -318,27 +318,25 @@ function projectFileTarget(href: string): ProjectFileTarget | undefined {
   if (/^[a-z][a-z\d+.-]*:/iu.test(href) && !/^file:/iu.test(href) && !/^[a-z]:[\\/]/iu.test(href)) {
     return undefined
   }
-  let decoded: string
+  const hashIndex = href.lastIndexOf('#')
+  let path = hashIndex >= 0 ? href.slice(0, hashIndex) : href
+  if (!path) return undefined
+  let hash: string
   try {
-    decoded = decodeURIComponent(href)
+    hash = decodeURIComponent(hashIndex >= 0 ? href.slice(hashIndex + 1) : '')
   } catch {
     return undefined
   }
-  if (decoded.startsWith('file://')) {
-    try {
-      decoded = new URL(decoded).pathname
-    } catch {
-      return undefined
-    }
-  }
-  const hashIndex = decoded.lastIndexOf('#')
-  let path = hashIndex >= 0 ? decoded.slice(0, hashIndex) : decoded
-  if (!path) return undefined
-  const hash = hashIndex >= 0 ? decoded.slice(hashIndex + 1) : ''
   const range = /^L(\d+)(?:-L?(\d+))?$/u.exec(hash)
   if (hash && !range) return undefined
   const suffixRange = hash ? undefined : /^(.*):(\d+)(?::\d+)?(?:-(\d+))?$/u.exec(path)
   if (suffixRange?.[1]) path = suffixRange[1]
+  try {
+    // Utility decodes file URLs with the host platform's native path rules.
+    if (!/^file:/iu.test(path)) path = decodeURIComponent(path)
+  } catch {
+    return undefined
+  }
   const lineStart = range?.[1]
     ? Number(range[1])
     : suffixRange?.[2]

@@ -1,7 +1,8 @@
 import { expect, type Page } from '@playwright/test'
 import { randomUUID } from 'node:crypto'
-import { symlink, writeFile } from 'node:fs/promises'
-import { relative, resolve } from 'node:path'
+import { mkdir, symlink, writeFile } from 'node:fs/promises'
+import { join, relative, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { quitPact } from './native-quit.js'
@@ -194,8 +195,10 @@ async function seedFiles(
   fixture: RuntimeFixture,
   files: Record<string, string>,
   externalLinks: string[] = [],
+  projectDirectory?: string,
 ): Promise<string> {
-  const directoryPath = await fixture.createProjectDirectory('project-file-performance')
+  const directoryPath =
+    projectDirectory ?? (await fixture.createProjectDirectory('project-file-performance'))
   await Promise.all(
     Object.entries(files).map(async ([name, content]) => {
       await writeFile(resolve(directoryPath, name), content)
@@ -260,6 +263,58 @@ async function openSession(window: Page, title: string): Promise<void> {
   await expect(session).toBeVisible()
   await session.click()
 }
+
+test(
+  'opens local file URLs and native URL paths in a nested Project without losing line ranges',
+  { tag: '@ui' },
+  async () => {
+    const fixture = await createRuntimeFixture({ mode: 'ui' })
+    try {
+      const monorepo = await fixture.createProjectDirectory('file-link-monorepo')
+      const projectDirectory = join(monorepo, 'ei-angular/apps/ei-web')
+      await mkdir(projectDirectory, { recursive: true })
+      const sourcePath = join(projectDirectory, 'inside.ts')
+      const encodedPath = join(projectDirectory, 'source #%.ts')
+      const content = 'export const first = 1\nexport const second = 2\nexport const third = 3\n'
+      await writeFile(encodedPath, content)
+      const title = await seedFiles(
+        fixture,
+        { 'inside.ts': content },
+        [
+          `[File URL](${pathToFileURL(sourcePath).href}#L2-L3)`,
+          `[Native URL path](${pathToFileURL(sourcePath).pathname}#L2-L3)`,
+          `[Encoded filename](${pathToFileURL(encodedPath).href}#L2-L3)`,
+        ],
+        projectDirectory,
+      )
+      const app = await fixture.launch()
+      try {
+        const window = await app.firstWindow()
+        await openSession(window, title)
+        // oxlint-disable eslint/no-await-in-loop -- Each click exercises the same panel through the real bridge before closing it.
+        for (const [link, file] of [
+          ['File URL', 'inside.ts'],
+          ['Native URL path', 'inside.ts'],
+          ['Encoded filename', 'source #%.ts'],
+        ] as const) {
+          await window.getByRole('button', { name: link, exact: true }).click()
+          const panel = window.getByRole('region', { name: file, exact: true })
+          await expect(panel.getByRole('heading', { name: file, exact: true })).toBeVisible()
+          await expect(panel.getByText(/ · lines 2–3$/u)).toBeVisible()
+          await expect(panel.getByLabel(`${file} source code`, { exact: true })).toBeAttached()
+          await expect(panel.locator('.pact-monaco-linked-range').first()).toBeVisible()
+          await expect(panel.getByText('export const second = 2', { exact: true })).toBeVisible()
+          await window.getByRole('button', { name: 'Close file preview' }).click()
+        }
+        // oxlint-enable eslint/no-await-in-loop
+      } finally {
+        await quitPact(app)
+      }
+    } finally {
+      await fixture.dispose()
+    }
+  },
+)
 
 test(
   'previews external local file links while retaining Project Comment boundaries',

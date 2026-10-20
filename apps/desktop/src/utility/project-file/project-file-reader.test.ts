@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import * as fs from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { projectFileSchema, type AnchoredComment, type FileCommentAnchor } from '@pact/contracts'
@@ -61,6 +62,70 @@ afterEach(async () => {
 })
 
 describe('Session-bound local file preview', () => {
+  it('reads the native URL pathname inside the Project on either host platform', async () => {
+    const file = join(project, 'source.ts')
+    await fs.writeFile(file, text)
+
+    const result = await reader.read({
+      sessionId,
+      path: pathToFileURL(file).pathname,
+      lineStart: 3,
+    })
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: { relativePath: 'source.ts', content: text, lineStart: 3, lineEnd: 3 },
+    })
+    if (!result.ok) throw new Error(result.error.message)
+    expect(result.value.isExternal).toBeUndefined()
+  })
+
+  it.each(['space name.ts', 'hash#name.ts', 'literal%20.ts', 'source #%.ts', '源文件.ts'])(
+    'decodes the file URL for %s exactly once',
+    async (name) => {
+      const file = join(project, name)
+      await fs.writeFile(file, text)
+
+      const result = await reader.read({ sessionId, path: pathToFileURL(file).href, lineStart: 3 })
+
+      expect(result).toMatchObject({
+        ok: true,
+        value: { relativePath: name, content: text, contentHash, lineStart: 3, lineEnd: 3 },
+      })
+      if (!result.ok) throw new Error(result.error.message)
+      expect(result.value.isExternal).toBeUndefined()
+    },
+  )
+
+  it('classifies an explicit external file URL as external and refuses file Comments', async () => {
+    const path = pathToFileURL(external).href
+    expect(await reader.read({ sessionId, path })).toMatchObject({
+      ok: true,
+      value: { isExternal: true, absolutePath: await fs.realpath(external), content: text },
+    })
+    await expect(
+      reader.validateCommentAnchor(sessionId, {
+        type: 'file',
+        path,
+        contentHash,
+        startLine: 1,
+        startColumn: 1,
+        endLine: 1,
+        endColumn: 13,
+        quote: '# Local file',
+      }),
+    ).rejects.toThrow('File Comments must refer to a file inside this Project.')
+  })
+
+  it.each(['file:///source%2Fname.ts', 'file:///source%GG.ts'])(
+    'refuses an invalid file URL without opening a different path: %s',
+    async (path) => {
+      const open = vi.mocked(fs.open)
+      expect(await reader.read({ sessionId, path })).toMatchObject({ ok: false })
+      expect(open).not.toHaveBeenCalled()
+    },
+  )
+
   it('returns the complete external UTF-8 source and line link through the typed contract', async () => {
     const result = await reader.read({ sessionId, path: external, lineStart: 3 })
     expect(result.ok).toBe(true)
