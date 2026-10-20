@@ -274,7 +274,7 @@ export function ProjectCodeViewer({
         </output>
       ) : selectionAction ? (
         <button
-          className="absolute z-20 inline-flex h-8 w-32 items-center justify-center gap-1.5 whitespace-nowrap rounded-control bg-surface-raised px-2.5 text-caption font-medium text-primary shadow-sm transition-colors duration-150 ease-out-pact hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+          className="absolute z-20 inline-flex h-8 w-32 items-center justify-center gap-1.5 whitespace-nowrap rounded-control bg-surface-inverse px-2.5 text-caption font-medium text-inverse shadow-popover transition-[filter] duration-150 ease-out-pact hover:brightness-95 active:brightness-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
           type="button"
           style={{ left: selectionAction.left, top: selectionAction.top }}
           aria-label="Comment on selected code"
