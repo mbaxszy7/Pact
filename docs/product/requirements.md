@@ -82,11 +82,15 @@ It does not implement a global hard Project Writer Lease, arbitrary full-workspa
 
 Assess Claude Code and Codex independently through executable discovery or a saved manual path, version, the CLI's own authentication status and bounded startup/probe operations. Never read, retain or display credential values. Missing, unauthenticated, unavailable, timed out and unconfirmed are distinct outcomes with installation/login guidance, manual location and retry.
 
+Minimum supported CLI versions are Claude Code **2.1.272** and Codex **0.159.2**. Compare numeric version components, ignoring build metadata; a prerelease of the minimum release is not sufficient. An older version has an explicit Upgrade required warning, showing the detected version and required minimum with upgrade/recheck guidance. Unreadable versions remain unconfirmed, never Ready. Version compatibility is checked before authentication or native execution; Pact does not install or upgrade CLIs automatically.
+
 **CLI Ready** means the selected CLI is discoverable, accepts an effective authentication method and can start its control/probe operation. It guarantees neither network, quota, model availability nor future Run success. Claude's accepted local API authentication is valid without a subscription login. GUI processes inherit only the environment available at launch; a later terminal export does not change an already running Pact.
 
 First-time users remain on Runtime Preparation until both CLIs are Ready, then must complete Default Session Settings. There is no hidden skip or fake-model validation. Saving defaults and completing setup is atomic.
 
 Returning users enter their existing workspace and refresh readiness there. If either CLI is not Ready, **Runtime Degraded** keeps local Projects/history readable and settings available while disabling Agent-start/continue actions with the reason. Recovery restores those actions; each actual execution still checks the runtime, rather than trusting stale Ready state.
+
+The existing top yellow warning bar identifies required CLI upgrades during normal use and links to the same Runtime Preparation page. Readiness refreshes on window focus/visibility and once per minute while visible, with no background polling or automatic retry loop. After upgrading, Check again/Retry rechecks the selected installations and clears the warning when both Agents are Ready.
 
 ### Defaults, Model and Effort
 

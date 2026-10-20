@@ -665,9 +665,15 @@ export type RuntimeHealth = z.infer<typeof runtimeHealthSchema>
 export const runtimeAgentIdSchema = z.enum(['claude', 'codex'])
 export type RuntimeAgentId = z.infer<typeof runtimeAgentIdSchema>
 
+export const RUNTIME_MINIMUM_VERSIONS = {
+  claude: '2.1.272',
+  codex: '0.159.2',
+} as const satisfies Record<RuntimeAgentId, string>
+
 export const runtimeReadinessStateSchema = z.enum([
   'ready',
   'missing',
+  'unsupported_version',
   'authentication_required',
   'startup_failed',
   'cannot_verify',

@@ -96,7 +96,12 @@ export const test = baseTest.extend<{ runtimeOwnership: void }>({
   ],
 })
 
-type ProbeState = 'ready' | 'authentication_required' | 'cannot_verify' | 'startup_failed'
+type ProbeState =
+  | 'ready'
+  | 'unsupported_version'
+  | 'authentication_required'
+  | 'cannot_verify'
+  | 'startup_failed'
 
 export interface RuntimeFixtureOptions {
   /** Credential-free fixture only; the fixture owns the nonce and canonical isolated root. */
@@ -265,7 +270,7 @@ async function readUnpublishedTransportFacts(
 }
 
 function probeExitCode(state: ProbeState): number {
-  if (state === 'ready') return 0
+  if (state === 'ready' || state === 'unsupported_version') return 0
   if (state === 'authentication_required') return 1
   return 2
 }
@@ -277,11 +282,15 @@ async function writeCli(
   appServerPath?: string,
   sdkPath?: string,
 ): Promise<string> {
+  const version =
+    agentId === 'claude'
+      ? `${state === 'unsupported_version' ? '2.1.271' : '2.1.272'} (Claude Code)`
+      : `codex-cli ${state === 'unsupported_version' ? '0.159.1' : '0.159.2'}`
   if (agentId === 'claude' && sdkPath && process.platform === 'win32') {
     const entry = join(directory, 'claude-fixture-entry.mjs')
     await writeFile(
       entry,
-      `const args=process.argv.slice(2);if(args[0]==='--version'){console.log('2.1.272 (Claude Code)');process.exit(${state === 'startup_failed' ? 2 : 0})}else if(args[0]==='auth'&&args[1]==='status')process.exit(${probeExitCode(state)});else await import(${JSON.stringify(pathToFileURL(sdkPath).href)});\n`,
+      `const args=process.argv.slice(2);if(args[0]==='--version'){console.log(${JSON.stringify(version)});process.exit(${state === 'startup_failed' ? 2 : 0})}else if(args[0]==='auth'&&args[1]==='status')process.exit(${probeExitCode(state)});else await import(${JSON.stringify(pathToFileURL(sdkPath).href)});\n`,
       { flag: 'wx', mode: 0o600 },
     )
     return writeWindowsNodeLauncher(directory, 'claude-fixture', [entry])
@@ -293,7 +302,6 @@ async function writeCli(
         ? '.cmd'
         : ''
   const executablePath = join(directory, `${agentId}-fixture${extension}`)
-  const version = agentId === 'claude' ? '2.1.272 (Claude Code)' : 'codex-cli 0.146.0'
   const authCommand = agentId === 'claude' ? 'auth' : 'login'
   const versionExit = state === 'startup_failed' ? 2 : 0
   const authExit = probeExitCode(state)

@@ -2,6 +2,8 @@ import { ArrowLeft, FolderOpen, Plus } from 'lucide-react'
 
 import type { RuntimeAgentId, RuntimeAgentReadiness, RuntimePreparation } from '@pact/contracts'
 
+import { RUNTIME_MINIMUM_VERSIONS } from '@pact/contracts'
+
 interface RuntimePreparationViewProps {
   preparation?: RuntimePreparation | undefined
   loading: boolean
@@ -44,6 +46,14 @@ function statusCopy(
       return { label: 'Ready', detail: 'Authenticated and available to Pact.', tone: 'ready' }
     case 'missing':
       return { label: 'Not installed', detail: agentCopy[agent.agentId].install, tone: 'danger' }
+    case 'unsupported_version':
+      return {
+        label: 'Upgrade required',
+        detail:
+          agent.detail ??
+          `Requires version ${RUNTIME_MINIMUM_VERSIONS[agent.agentId]} or later. Upgrade ${agentCopy[agent.agentId].name}, then check again.`,
+        tone: 'warning',
+      }
     case 'authentication_required':
       return {
         label: agent.agentId === 'claude' ? 'Setup required' : 'Sign-in required',
@@ -164,7 +174,7 @@ function RuntimeRow({
           </div>
         ) : null}
         {!loading && readiness?.version ? (
-          <p className="mt-1 text-caption text-tertiary">{readiness.version}</p>
+          <p className="mt-1 text-caption text-tertiary">Detected: {readiness.version}</p>
         ) : null}
 
         {!hasExecutable && !loading && readiness ? (
@@ -287,7 +297,9 @@ export function RuntimePreparationView({
                   ? canReturnToWorkspace
                     ? 'Both agents are ready. Agent actions can resume.'
                     : 'Both agents are ready. Default collaboration setup comes next.'
-                  : 'Both agents must be ready before first-time setup can continue.'}
+                  : canReturnToWorkspace
+                    ? 'Resolve the issues above, then check again to resume agent actions.'
+                    : 'Both agents must be ready before first-time setup can continue.'}
               </span>
             </output>
             <button
@@ -326,6 +338,14 @@ export function RuntimeDegradedNotice({
   const unavailable = preparation.agents.filter((agent) => agent.state !== 'ready')
   const unavailableNames = unavailable.map((agent) => agentCopy[agent.agentId].name).join(' and ')
   const attentionVerb = unavailable.length === 1 ? 'needs' : 'need'
+  const outdated = unavailable.filter((agent) => agent.state === 'unsupported_version')
+  const upgradeDetails = outdated
+    .map((agent) => `${agentCopy[agent.agentId].name} ${RUNTIME_MINIMUM_VERSIONS[agent.agentId]}+`)
+    .join(' and ')
+  const otherUnavailable = unavailable.filter((agent) => agent.state !== 'unsupported_version')
+  const otherUnavailableNames = otherUnavailable
+    .map((agent) => agentCopy[agent.agentId].name)
+    .join(' and ')
   return (
     <div
       className="flex min-h-11 shrink-0 flex-wrap items-center justify-between gap-group border-b border-status-warning bg-status-warning-muted px-section py-2 text-status-warning-foreground"
@@ -339,8 +359,20 @@ export function RuntimeDegradedNotice({
           !
         </span>
         <p className="min-w-0 text-caption">
-          <strong className="font-medium">Agent actions paused.</strong> {unavailableNames}{' '}
-          {attentionVerb} attention. Existing work remains available.
+          <strong className="font-medium">Agent actions paused.</strong>{' '}
+          {outdated.length > 0 ? (
+            <>
+              Upgrade required: {upgradeDetails}.
+              {otherUnavailable.length > 0
+                ? ` ${otherUnavailableNames} ${otherUnavailable.length === 1 ? 'needs' : 'need'} attention.`
+                : ''}
+            </>
+          ) : (
+            <>
+              {unavailableNames} {attentionVerb} attention.
+            </>
+          )}{' '}
+          Existing work remains available.
         </p>
       </div>
       <div className="flex items-center gap-2">

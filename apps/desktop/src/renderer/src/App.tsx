@@ -100,9 +100,20 @@ function App(): React.JSX.Element {
   const [documentVisible, setDocumentVisible] = useState(() => !document.hidden)
   useEffect(() => {
     const updateVisibility = (): void => setDocumentVisible(!document.hidden)
+    const refreshRuntime = (): void => {
+      if (document.hidden) return
+      void queryClient.refetchQueries(
+        { queryKey: foundationQueryKeys.runtimePreparation, exact: true },
+        { cancelRefetch: false },
+      )
+    }
     document.addEventListener('visibilitychange', updateVisibility)
-    return () => document.removeEventListener('visibilitychange', updateVisibility)
-  }, [])
+    window.addEventListener('focus', refreshRuntime)
+    return () => {
+      document.removeEventListener('visibilitychange', updateVisibility)
+      window.removeEventListener('focus', refreshRuntime)
+    }
+  }, [queryClient])
   const [preview, setPreview] = useState<Omit<AppearanceSettingsUpdate, 'expectedRevision'> | null>(
     null,
   )
@@ -200,6 +211,8 @@ function App(): React.JSX.Element {
     queryFn: async () => unwrapRpcResult(await window.pact.getRuntimePreparation()),
     retry: 0,
     staleTime: 0,
+    refetchOnWindowFocus: true,
+    refetchInterval: documentVisible ? 60_000 : false,
   })
   const defaultSessionSettings = useDefaultSessionSettings(
     showFirstUseDefaults || settingsPage === 'session-defaults',
