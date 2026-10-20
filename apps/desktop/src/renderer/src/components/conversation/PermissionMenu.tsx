@@ -137,7 +137,7 @@ export function PermissionMenu({
   const id = `permissions-${session.id}-${agent}`
   const anchor = `--${id}`
   return (
-    <div className="flex min-h-8 min-w-0 max-w-full flex-wrap items-center gap-2 text-caption">
+    <div className="flex min-h-8 min-w-0 max-w-full items-center text-caption">
       <button
         ref={trigger}
         type="button"
@@ -160,7 +160,11 @@ export function PermissionMenu({
         </span>
         <ChevronDown aria-hidden="true" className="pact-agent-chevron size-3 shrink-0" />
       </button>
-      {pending ? <output className="text-tertiary">Pending · next task</output> : null}
+      {pending ? (
+        <output className="truncate text-tertiary" title="Pending · next task">
+          &nbsp; Pending · next task
+        </output>
+      ) : null}
       <div
         id={id}
         ref={panel}

@@ -4510,15 +4510,15 @@ export function ConversationView({
               </div>
             </div>
           </div>
-          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+          <div className="pact-composer-controls flex min-w-0 items-center gap-2">
             {onSaveSessionPermission ? (
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <>
                 {(['claude', 'codex'] as const).map((agent) => (
                   <div
                     key={`${session.id}-${agent}`}
                     role="group"
                     aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} settings`}
-                    className="pact-agent-controls min-w-0 max-w-full text-caption"
+                    className="pact-agent-controls text-caption"
                   >
                     <PermissionMenu
                       session={session}
@@ -4547,7 +4547,7 @@ export function ConversationView({
                     ) : null}
                   </div>
                 ))}
-              </div>
+              </>
             ) : null}
             <ProjectContextMenu
               key={`${session.id}-${session.projectId}`}
