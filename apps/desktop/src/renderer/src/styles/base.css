@@ -430,11 +430,20 @@
     --pact-text-tertiary: #ffffff;
   }
 
+  html[data-material='translucent']
+    .workspace-layout[data-context-expanded='true']
+    > #workspace-context {
+    background-color: transparent;
+  }
+
   html[data-material='translucent'] #workspace-context {
     background-color: var(--pact-material-code);
   }
 
-  html[data-material='translucent'] .workspace-context-expanded {
+  html[data-material='translucent']
+    .workspace-layout[data-context-expanded='true']
+    > #workspace-context
+    > .workspace-panel-content {
     background-color: var(--pact-material-code);
   }
 
@@ -465,8 +474,34 @@
 }
 
 @layer components {
-  .workspace-context-expanded {
+  /* Keep the workspace and its Plan/Comment portal owner mounted during expansion. */
+  .workspace-layout[data-context-expanded='true'] > #workspace-context[data-panel] {
+    position: static;
+    overflow: visible !important;
+  }
+
+  .workspace-layout[data-context-expanded='true']
+    > #workspace-context[data-panel]
+    > .workspace-panel-content {
+    inset: 0;
+    z-index: 20;
+    width: 100%;
+    height: 100%;
+    transform: none;
     animation: workspace-context-expand 180ms var(--ease-out-pact) both;
+  }
+
+  .workspace-layout[data-context-expanded='true'] > #workspace-navigation,
+  .workspace-layout[data-context-expanded='true'] > #workspace-center {
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .workspace-context-dialog[data-expanded='true'] {
+    max-width: none;
+    border: 0;
+    border-radius: 0;
   }
 
   .session-activity-spin {

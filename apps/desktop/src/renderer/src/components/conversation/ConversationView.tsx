@@ -141,6 +141,8 @@ const commentSourceLabel = (anchor: CommentAnchor): string =>
 interface ConversationViewProps {
   planPanelHost?: HTMLElement | null | undefined
   planPanelOpen?: boolean | undefined
+  planPanelExpanded?: boolean | undefined
+  onPlanPanelExpandedChange?: ((expanded: boolean) => void) | undefined
   planAvailable?: boolean | undefined
   planRestoreFocusRef?: React.RefObject<HTMLButtonElement | null> | undefined
   onPlanAvailable?: ((sessionId: string, taskId?: string) => void) | undefined
@@ -283,6 +285,8 @@ function mentionQueryAt(value: string, cursor: number): MentionQuery | undefined
 
 export function ConversationView({
   planPanelHost,
+  planPanelExpanded = false,
+  onPlanPanelExpandedChange,
   planAvailable,
   planRestoreFocusRef,
   onPlanAvailable,
@@ -1875,7 +1879,7 @@ export function ConversationView({
       textarea?.setSelectionRange(textarea.value.length, textarea.value.length)
     })
     return () => cancelAnimationFrame(frame)
-  }, [activeCommentAnchor])
+  }, [activeCommentAnchor, planPanelExpanded])
   useEffect(() => {
     copyActiveRef.current = true
     return () => {
@@ -3120,11 +3124,185 @@ export function ConversationView({
     )
   }
 
+  const commentEditorView = commentEditor ? (
+    <section
+      className="rounded-card border border-border bg-surface-raised p-3"
+      aria-labelledby="comment-editor-title"
+    >
+      <header className="flex items-start justify-between gap-group">
+        <div className="flex min-w-0 items-start gap-2.5">
+          <span className="grid size-7 shrink-0 place-items-center rounded-control bg-status-info-muted text-status-info-foreground">
+            <MessageSquarePlus aria-hidden="true" className="size-4" strokeWidth={1.75} />
+          </span>
+          <div className="min-w-0">
+            <h2 id="comment-editor-title" className="text-caption font-medium text-primary">
+              {commentEditor.commentId ? 'Edit comment' : 'New comment'}
+            </h2>
+            <p
+              className="mt-0.5 line-clamp-2 text-caption leading-relaxed text-secondary"
+              title={commentEditor.quote}
+            >
+              {commentSourceLabel(commentEditor.anchor)} · “{commentEditor.quote}”
+            </p>
+            {commentEditor.anchor.type === 'unavailable' ? (
+              <p className="mt-1 text-caption text-secondary">{commentEditor.anchor.reason}</p>
+            ) : null}
+          </div>
+        </div>
+        <button
+          className="grid size-7 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+          type="button"
+          aria-label="Close Comment editor"
+          title="Close"
+          disabled={recoveryLocked}
+          onClick={() => setCommentEditor(undefined)}
+        >
+          <X aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
+        </button>
+      </header>
+      <div className="mt-2 flex items-end gap-2 rounded-control bg-surface-muted p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus">
+        <textarea
+          ref={commentTextareaRef}
+          className="field-sizing-content min-h-12 max-h-40 min-w-0 flex-1 resize-none bg-transparent px-1 py-1 text-body leading-relaxed text-primary outline-none placeholder:text-tertiary"
+          value={commentEditor.body}
+          placeholder="What should the Agent notice?"
+          aria-label="Comment"
+          disabled={recoveryLocked}
+          onChange={(event) => setCommentEditor({ ...commentEditor, body: event.target.value })}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') setCommentEditor(undefined)
+            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault()
+              void saveComment()
+            }
+          }}
+        />
+        <button
+          className="h-8 shrink-0 rounded-control bg-surface-inverse px-3 text-caption font-medium text-inverse disabled:cursor-default disabled:opacity-40"
+          type="button"
+          disabled={!commentEditor.body.trim() || disabled || savingComment}
+          onClick={() => void saveComment()}
+        >
+          {savingComment ? 'Adding…' : 'Add to comment'}
+        </button>
+      </div>
+      <p className="mt-2.5 px-1 text-caption text-tertiary">
+        Enter to add · Shift+Enter for a new line
+      </p>
+    </section>
+  ) : null
+  const commentDraftsView = (
+    <>
+      {draftComments.length > 0 ? (
+        <div
+          className="flex max-h-20 w-full flex-wrap gap-1.5 overflow-y-auto px-2 pt-1"
+          aria-label="Attached Comment drafts"
+        >
+          {draftComments.map((comment) => (
+            <span
+              key={comment.id}
+              className={`inline-flex max-w-64 items-center gap-1 rounded-pill bg-status-info-muted px-2.5 py-1 text-caption text-status-info-foreground ${recoveryLocked ? 'opacity-55' : ''}`}
+            >
+              <button
+                className="truncate text-left"
+                type="button"
+                title={
+                  comment.anchor.type === 'unavailable'
+                    ? `${comment.anchor.reason}\n${comment.body}`
+                    : comment.body
+                }
+                disabled={recoveryLocked}
+                onClick={() =>
+                  setCommentEditor({
+                    commentId: comment.id,
+                    draftId: crypto.randomUUID(),
+                    anchor: comment.anchor,
+                    quote: comment.anchor.quote,
+                    body: comment.body,
+                  })
+                }
+              >
+                {commentSourceLabel(comment.anchor)} · {comment.body}
+              </button>
+              {comment.anchor.type !== 'unavailable' ? (
+                <button
+                  type="button"
+                  aria-label="Return to Comment source"
+                  title="Return to source"
+                  disabled={recoveryLocked}
+                  onClick={() => onOpenComment(comment)}
+                  className="grid size-6 shrink-0 place-items-center rounded-control hover:bg-status-info/15 focus-visible:outline-2 focus-visible:outline-focus"
+                >
+                  <CornerUpLeft aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
+                </button>
+              ) : null}
+              <button
+                className="grid size-4 shrink-0 place-items-center rounded-full hover:bg-status-info/15"
+                type="button"
+                aria-label="Remove Comment draft"
+                disabled={disabled}
+                onClick={() => void onRemoveCommentDraft(comment.id)}
+              >
+                <X aria-hidden="true" className="size-3" />
+              </button>
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {history.draftPage?.hasMore || history.draftPage?.hasEarlier ? (
+        <div
+          aria-label="Comment draft pages"
+          className="flex gap-2 px-2 text-caption text-secondary"
+        >
+          {history.draftPage.hasEarlier ? (
+            <button
+              type="button"
+              disabled={history.draftsLoading}
+              onClick={history.firstDraftPage}
+              className="min-h-7 rounded-control px-1.5 hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-45"
+            >
+              First drafts
+            </button>
+          ) : null}
+          {history.draftPage.hasMore ? (
+            <button
+              type="button"
+              disabled={history.draftsLoading}
+              onClick={history.loadMoreDrafts}
+              className="min-h-7 rounded-control px-1.5 hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-45"
+            >
+              More drafts
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </>
+  )
+
   return (
     <main className="@container/conversation flex h-full min-h-0 flex-col">
       {planPanelHost
         ? createPortal(
             <CurrentPlanPanel
+              expanded={planPanelExpanded}
+              onExpandedChange={onPlanPanelExpandedChange}
+              comments={
+                planPanelExpanded &&
+                (commentEditor ||
+                  draftComments.length ||
+                  history.draftPage?.hasMore ||
+                  history.draftPage?.hasEarlier) ? (
+                  <div className="flex flex-col gap-group">
+                    {commentEditorView}
+                    {commentDraftsView}
+                    {error ? (
+                      <p role="alert" className="text-caption text-danger">
+                        {error}
+                      </p>
+                    ) : null}
+                  </div>
+                ) : undefined
+              }
               plan={
                 planSourceKey
                   ? planSourcePreview?.key === planSourceKey
@@ -3610,88 +3788,7 @@ export function ConversationView({
             }
           >
             <div className="flex flex-col gap-2">
-              {commentEditor ? (
-                <section
-                  className="rounded-card border border-border bg-surface-raised p-3"
-                  aria-labelledby="comment-editor-title"
-                >
-                  <header className="flex items-start justify-between gap-group">
-                    <div className="flex min-w-0 items-start gap-2.5">
-                      <span className="grid size-7 shrink-0 place-items-center rounded-control bg-status-info-muted text-status-info-foreground">
-                        <MessageSquarePlus
-                          aria-hidden="true"
-                          className="size-4"
-                          strokeWidth={1.75}
-                        />
-                      </span>
-                      <div className="min-w-0">
-                        <h2
-                          id="comment-editor-title"
-                          className="text-caption font-medium text-primary"
-                        >
-                          {commentEditor.commentId ? 'Edit comment' : 'New comment'}
-                        </h2>
-                        <p
-                          className="mt-0.5 line-clamp-2 text-caption leading-relaxed text-secondary"
-                          title={commentEditor.quote}
-                        >
-                          {commentSourceLabel(commentEditor.anchor)} · “{commentEditor.quote}”
-                        </p>
-                        {commentEditor.anchor.type === 'unavailable' ? (
-                          <p className="mt-1 text-caption text-secondary">
-                            {commentEditor.anchor.reason}
-                          </p>
-                        ) : null}
-                      </div>
-                    </div>
-                    <button
-                      className="grid size-7 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
-                      type="button"
-                      aria-label="Close Comment editor"
-                      title="Close"
-                      disabled={recoveryLocked}
-                      onClick={() => setCommentEditor(undefined)}
-                    >
-                      <X aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
-                    </button>
-                  </header>
-                  <div className="mt-2 flex items-end gap-2 rounded-control bg-surface-muted p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus">
-                    <textarea
-                      ref={commentTextareaRef}
-                      className="field-sizing-content min-h-12 max-h-40 min-w-0 flex-1 resize-none bg-transparent px-1 py-1 text-body leading-relaxed text-primary outline-none placeholder:text-tertiary"
-                      value={commentEditor.body}
-                      placeholder="What should the Agent notice?"
-                      aria-label="Comment"
-                      disabled={recoveryLocked}
-                      onChange={(event) =>
-                        setCommentEditor({ ...commentEditor, body: event.target.value })
-                      }
-                      onKeyDown={(event) => {
-                        if (event.key === 'Escape') setCommentEditor(undefined)
-                        if (
-                          event.key === 'Enter' &&
-                          !event.shiftKey &&
-                          !event.nativeEvent.isComposing
-                        ) {
-                          event.preventDefault()
-                          void saveComment()
-                        }
-                      }}
-                    />
-                    <button
-                      className="h-8 shrink-0 rounded-control bg-surface-inverse px-3 text-caption font-medium text-inverse disabled:cursor-default disabled:opacity-40"
-                      type="button"
-                      disabled={!commentEditor.body.trim() || disabled || savingComment}
-                      onClick={() => void saveComment()}
-                    >
-                      {savingComment ? 'Adding…' : 'Add to comment'}
-                    </button>
-                  </div>
-                  <p className="mt-2.5 px-1 text-caption text-tertiary">
-                    Enter to add · Shift+Enter for a new line
-                  </p>
-                </section>
-              ) : null}
+              {!planPanelExpanded ? commentEditorView : null}
               {skillComposer.warning ? (
                 <div
                   id={`skill-warning-${session.id}`}
@@ -3968,93 +4065,7 @@ export function ConversationView({
                     })}
                   </div>
                 ) : null}
-                {draftComments.length > 0 ? (
-                  <div
-                    className="flex max-h-20 w-full flex-wrap gap-1.5 overflow-y-auto px-2 pt-1"
-                    aria-label="Attached Comment drafts"
-                  >
-                    {draftComments.map((comment) => (
-                      <span
-                        key={comment.id}
-                        className={`inline-flex max-w-64 items-center gap-1 rounded-pill bg-status-info-muted px-2.5 py-1 text-caption text-status-info-foreground ${recoveryLocked ? 'opacity-55' : ''}`}
-                      >
-                        <button
-                          className="truncate text-left"
-                          type="button"
-                          title={
-                            comment.anchor.type === 'unavailable'
-                              ? `${comment.anchor.reason}\n${comment.body}`
-                              : comment.body
-                          }
-                          disabled={recoveryLocked}
-                          onClick={() =>
-                            setCommentEditor({
-                              commentId: comment.id,
-                              draftId: crypto.randomUUID(),
-                              anchor: comment.anchor,
-                              quote: comment.anchor.quote,
-                              body: comment.body,
-                            })
-                          }
-                        >
-                          {commentSourceLabel(comment.anchor)} · {comment.body}
-                        </button>
-                        {comment.anchor.type !== 'unavailable' ? (
-                          <button
-                            type="button"
-                            aria-label="Return to Comment source"
-                            title="Return to source"
-                            disabled={recoveryLocked}
-                            onClick={() => onOpenComment(comment)}
-                            className="grid size-6 shrink-0 place-items-center rounded-control hover:bg-status-info/15 focus-visible:outline-2 focus-visible:outline-focus"
-                          >
-                            <CornerUpLeft
-                              aria-hidden="true"
-                              className="size-3.5"
-                              strokeWidth={1.75}
-                            />
-                          </button>
-                        ) : null}
-                        <button
-                          className="grid size-4 shrink-0 place-items-center rounded-full hover:bg-status-info/15"
-                          type="button"
-                          aria-label="Remove Comment draft"
-                          disabled={disabled}
-                          onClick={() => void onRemoveCommentDraft(comment.id)}
-                        >
-                          <X aria-hidden="true" className="size-3" />
-                        </button>
-                      </span>
-                    ))}
-                  </div>
-                ) : null}
-                {history.draftPage?.hasMore || history.draftPage?.hasEarlier ? (
-                  <div
-                    aria-label="Comment draft pages"
-                    className="flex gap-2 px-2 text-caption text-secondary"
-                  >
-                    {history.draftPage.hasEarlier ? (
-                      <button
-                        type="button"
-                        disabled={history.draftsLoading}
-                        onClick={history.firstDraftPage}
-                        className="min-h-7 rounded-control px-1.5 hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-45"
-                      >
-                        First drafts
-                      </button>
-                    ) : null}
-                    {history.draftPage.hasMore ? (
-                      <button
-                        type="button"
-                        disabled={history.draftsLoading}
-                        onClick={history.loadMoreDrafts}
-                        className="min-h-7 rounded-control px-1.5 hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-45"
-                      >
-                        More drafts
-                      </button>
-                    ) : null}
-                  </div>
-                ) : null}
+                {!planPanelExpanded ? commentDraftsView : null}
                 {returnedInput ? (
                   <div className="mb-2 flex flex-wrap items-center gap-2 px-2 text-caption text-secondary">
                     <span>

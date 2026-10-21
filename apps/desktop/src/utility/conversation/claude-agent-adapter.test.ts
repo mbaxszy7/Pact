@@ -3,11 +3,18 @@ import type { SDKMessage, SDKUserMessage, query as sdkQuery } from '@anthropic-a
 
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+
+import { diagnosticEventSchema, type DiagnosticEvent } from '@pact/contracts/diagnostics'
+
+const planDiagnostics = vi.hoisted(() => ({ events: [] as DiagnosticEvent[] }))
+vi.mock('../../diagnostics/utility-log', () => ({
+  recordDiagnostic: (event: DiagnosticEvent) => planDiagnostics.events.push(event),
+}))
 
 const forkWorker = vi.hoisted(() => ({ path: '' }))
 vi.mock('node:worker_threads', async (original) => {
@@ -51,6 +58,229 @@ afterAll(async () => {
 afterEach(() => {
   vi.useRealTimers()
   vi.unstubAllEnvs()
+})
+
+describe('Claude plan submission diagnostics', () => {
+  it.each([
+    'valid',
+    'missing_prompt',
+    'wrong_prompt',
+    'missing_history',
+    'pending',
+    'binding_missing',
+    'receipt_unavailable',
+    'old_failure',
+    'recovered_prompt',
+  ] as const)('preserves plan authorization and identifies %s', async (mode) => {
+    planDiagnostics.events.length = 0
+    const directory = await mkdtemp(join(tmpdir(), 'pact-plan-diagnostic-'))
+    const cwd = await realpath(directory)
+    const profile = join(cwd, 'profile')
+    const project = join(profile, 'projects', cwd.replace(/[^a-z0-9]/giu, '-'))
+    await mkdir(project, { recursive: true })
+    vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
+    const input = { ...planRunInput('claude'), cwd, nativeSessionId: randomUUID() }
+    const promptId = randomUUID(),
+      attachmentId = randomUUID(),
+      callId = randomUUID(),
+      receiptId = randomUUID()
+    const path = join(profile, 'private-path-not-for-diagnostics.md')
+    const operation = { file_path: path, content: 'private-plan-body-not-for-diagnostics' }
+    const recordPlan = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlan']>>()
+    const transcript = join(project, `${input.nativeSessionId}.jsonl`)
+    const append = async (record: Record<string, unknown>) =>
+      appendFile(
+        transcript,
+        JSON.stringify({
+          ...record,
+          cwd,
+          sessionId: input.nativeSessionId,
+          timestamp: new Date().toISOString(),
+        }) + '\n',
+      )
+    await append({
+      type: 'user',
+      uuid: input.runId,
+      parentUuid: null,
+      promptId,
+      message: { role: 'user', content: 'Plan' },
+    })
+    await append({
+      type: 'attachment',
+      uuid: attachmentId,
+      parentUuid: input.runId,
+      attachment: {
+        type: mode === 'binding_missing' ? 'unknown' : 'plan_mode',
+        isSubAgent: false,
+        planFilePath: path,
+      },
+    })
+    const writeRecord = {
+      type: 'assistant',
+      uuid: callId,
+      parentUuid: attachmentId,
+      message: {
+        id: 'write-message',
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'write-plan', name: 'Write', input: operation }],
+      },
+    }
+    if (mode !== 'missing_history') await append(writeRecord)
+    const f = cancellationFixture(undefined, { ...input, recordWorkflowPlan: recordPlan })
+    try {
+      await f.ready()
+      const hook = {
+        session_id: input.nativeSessionId,
+        transcript_path: transcript,
+        cwd,
+        ...(['missing_prompt', 'old_failure', 'recovered_prompt'].includes(mode)
+          ? {}
+          : { prompt_id: mode === 'wrong_prompt' ? randomUUID() : promptId }),
+        tool_use_id: 'write-plan',
+        tool_name: 'Write',
+        tool_input: operation,
+      }
+      const options = { signal: f.options().abortController!.signal }
+      const pre = f.options().hooks!.PreToolUse![0]!.hooks[0]!
+      const post = f.options().hooks!.PostToolUse![0]!.hooks[0]!
+      await pre({ ...hook, hook_event_name: 'PreToolUse' }, 'write-plan', options)
+      if (mode !== 'pending' && mode !== 'missing_history') {
+        const response = {
+          filePath: path,
+          content: operation.content,
+          userModified: mode === 'receipt_unavailable',
+        }
+        await append({
+          type: 'user',
+          uuid: receiptId,
+          parentUuid: callId,
+          message: {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'write-plan', content: 'Written' }],
+          },
+          toolUseResult: response,
+        })
+        await post(
+          { ...hook, hook_event_name: 'PostToolUse', tool_response: response },
+          'write-plan',
+          options,
+        )
+      }
+      if (mode !== 'missing_history')
+        await append({
+          type: 'assistant',
+          uuid: randomUUID(),
+          parentUuid: mode === 'pending' ? callId : receiptId,
+          message: {
+            id: 'exit-message',
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'exit-plan', name: 'ExitPlanMode', input: {} }],
+          },
+        })
+      if (mode !== 'old_failure')
+        await pre(
+          {
+            ...hook,
+            ...(mode === 'recovered_prompt' ? { prompt_id: promptId } : {}),
+            hook_event_name: 'PreToolUse',
+            tool_use_id: 'exit-plan',
+            tool_name: 'ExitPlanMode',
+            tool_input: {},
+          },
+          'exit-plan',
+          options,
+        )
+      const result = await f.options().canUseTool!(
+        'ExitPlanMode',
+        {},
+        { ...options, toolUseID: 'exit-plan', requestId: 'exit-request' },
+      )
+      expect(result?.behavior).toBe('deny')
+      const message = result?.behavior === 'deny' ? result.message : ''
+      const expected = {
+        valid: 'submitted to Pact',
+        missing_prompt: 'hook_prompt_missing',
+        wrong_prompt: 'hook_prompt_mismatch',
+        missing_history: 'history_lookup_failed',
+        pending: 'plan_pending',
+        binding_missing: 'history_binding_missing',
+        receipt_unavailable: 'plan_unavailable',
+        old_failure: 'Pact diagnostic: submission_hook_unverified.',
+        recovered_prompt: 'submitted to Pact',
+      }[mode]
+      expect(message).toContain(expected)
+      expect(message).not.toContain('private-path')
+      expect(message).not.toContain(operation.content)
+      expect(message).not.toContain(input.runId)
+      expect(message).not.toContain(promptId)
+      expect(message.includes('Latest capture: hook_prompt_missing/Write/success.')).toBe(
+        mode === 'old_failure',
+      )
+      expect(message.includes('Latest capture')).toBe(
+        [
+          'missing_prompt',
+          'wrong_prompt',
+          'missing_history',
+          'binding_missing',
+          'old_failure',
+        ].includes(mode),
+      )
+      const successful = mode === 'valid' || mode === 'recovered_prompt'
+      const events = planDiagnostics.events.filter((event) => event.operation === 'claude_plan')
+      expect(events.length).toBeGreaterThan(0)
+      for (const event of events) {
+        expect(diagnosticEventSchema.safeParse(event).success).toBe(true)
+        expect(event).toMatchObject({
+          sessionId: input.sessionId,
+          runId: input.runId,
+          agentId: 'claude',
+        })
+        expect(['info', 'warn']).toContain(event.level)
+      }
+      expect(events.at(-1)).toMatchObject({
+        planStage: 'submission',
+        planReason: successful
+          ? 'submitted'
+          : mode === 'old_failure'
+            ? 'submission_hook_unverified'
+            : expected,
+        level: successful ? 'info' : 'warn',
+      })
+      expect(events.at(-1)?.planCapture).toEqual(
+        mode === 'old_failure'
+          ? { code: 'hook_prompt_missing', tool: 'Write', phase: 'success' }
+          : ['missing_prompt', 'wrong_prompt', 'missing_history', 'binding_missing'].includes(mode)
+            ? { code: expected, tool: 'ExitPlanMode', phase: 'begin' }
+            : undefined,
+      )
+      const serialized = JSON.stringify(events)
+      for (const sensitive of [path, operation.content, promptId, 'write-plan', 'exit-plan', cwd])
+        expect(serialized).not.toContain(sensitive)
+      // Repeated permission callbacks must not flood the default log or change authorization.
+      for (let attempt = 0; attempt < 70; attempt++) {
+        // oxlint-disable-next-line no-await-in-loop -- Exercise sequential SDK callback retries.
+        await f.options().canUseTool!(
+          'ExitPlanMode',
+          {},
+          {
+            ...options,
+            toolUseID: 'exit-plan',
+            requestId: 'exit-request',
+          },
+        )
+      }
+      expect(planDiagnostics.events).toHaveLength(events.length)
+      expect(recordPlan.mock.calls.length > 0).toBe(mode === 'valid' || mode === 'recovered_prompt')
+      expect(
+        recordPlan.mock.calls.every(
+          ([plan]) => plan.nativeId === 'write-plan' && plan.text === operation.content,
+        ),
+      ).toBe(true)
+    } finally {
+      await f.dispose()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('Claude Agent lifecycle', () => {
@@ -1827,6 +2057,7 @@ function cancellationFixture(
   input: Partial<AgentRunInput> = {},
   beforePrompt?: Promise<void>,
 ) {
+  const effectiveInput = { ...runInput(), ...input }
   const child = Object.assign(new EventEmitter(), {
     stdin: new PassThrough(),
     stdout: new PassThrough(),
@@ -1878,8 +2109,8 @@ function cancellationFixture(
               done: false,
               value: {
                 type: 'user',
-                uuid: runInput().runId,
-                session_id: 'claude-session-1',
+                uuid: effectiveInput.runId,
+                session_id: effectiveInput.nativeSessionId,
                 parent_tool_use_id: null,
                 message: { role: 'user', content: 'accepted' },
               } as SDKMessage,
@@ -1890,6 +2121,9 @@ function cancellationFixture(
         },
       }),
       interrupt,
+      initializationResult: vi.fn(async () => ({
+        current_permission_mode: request.options?.permissionMode ?? 'default',
+      })),
       close: vi.fn(),
       return: vi.fn(async () => ({ done: true, value: undefined })),
     }

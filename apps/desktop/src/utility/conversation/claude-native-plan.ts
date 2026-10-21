@@ -161,6 +161,10 @@ export class ClaudeNativePlan {
     return this.pending.has(id)
   }
 
+  get hasPendingOperations(): boolean {
+    return this.pending.size > 0
+  }
+
   begin(name: string, id: string, input: unknown): boolean {
     const value = object(input)
     if (value.file_path !== this.binding.path) {

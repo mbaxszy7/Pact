@@ -329,6 +329,7 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
     props.onPlanAvailable =
       vi.fn<NonNullable<ComponentProps<typeof ConversationView>['onPlanAvailable']>>()
     props.onClosePlan = vi.fn<() => void>()
+    props.onPlanPanelExpandedChange = vi.fn<(expanded: boolean) => void>()
     if (mode === 'historical-source')
       props.messageNavigation = {
         navigationId: crypto.randomUUID(),
@@ -393,6 +394,51 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
     rerender(<ConversationView {...props} composer="A new draft" />)
     expect(host.querySelector('[data-pact-projection-start]')!.firstChild).toBe(text)
     expect(window.getSelection()?.toString()).toBe('Exact')
+    fireEvent.click(screen.getByRole('button', { name: 'Expand plan panel' }))
+    expect(props.onPlanPanelExpandedChange).toHaveBeenLastCalledWith(true)
+    rerender(<ConversationView {...props} planPanelExpanded />)
+    expect(host.querySelector('[data-pact-projection-start]')!.firstChild).toBe(text)
+    const planContent = host.querySelector<HTMLElement>('[data-pact-plan-run-id]')!
+    expect(focusProjectionRange(planContent, 0, 5, { scroll: false, highlight: false })).toBe(true)
+    // jsdom has no browser caret movement; move to the selected word boundary.
+    Object.defineProperty(window.getSelection()!, 'modify', {
+      configurable: true,
+      value: () => window.getSelection()!.collapse(text, 5),
+    })
+    fireEvent.keyDown(screen.getByRole('textbox', { name: 'Plan text' }), {
+      key: 'ArrowRight',
+      shiftKey: true,
+      ctrlKey: true,
+    })
+    fireEvent.click(await screen.findByRole('button', { name: 'Comment on selected text' }))
+    const editor = await screen.findByRole('textbox', { name: 'Comment' })
+    expect(host.contains(editor)).toBe(true)
+    fireEvent.change(editor, { target: { value: 'Keep this plan detail.' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Restore plan panel' }))
+    expect(props.onPlanPanelExpandedChange).toHaveBeenLastCalledWith(false)
+    rerender(<ConversationView {...props} planPanelExpanded={false} />)
+    expect(host.querySelector('[data-pact-projection-start]')!.firstChild).toBe(text)
+    const restoredEditor = screen.getByRole<HTMLTextAreaElement>('textbox', { name: 'Comment' })
+    expect(container.contains(restoredEditor)).toBe(true)
+    expect(restoredEditor.value).toBe('Keep this plan detail.')
+    fireEvent.click(screen.getByRole('button', { name: 'Expand plan panel' }))
+    rerender(<ConversationView {...props} planPanelExpanded />)
+    expect(screen.getByRole<HTMLTextAreaElement>('textbox', { name: 'Comment' }).value).toBe(
+      'Keep this plan detail.',
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Add to comment' }))
+    await waitFor(() =>
+      expect(props.onSaveCommentDraft).toHaveBeenCalledWith(
+        expect.objectContaining({
+          mode: 'create',
+          body: 'Keep this plan detail.',
+          anchor: expect.objectContaining({
+            quote: 'Exact',
+            plan: { runId: run.id, version: 1 },
+          }),
+        }),
+      ),
+    )
     fireEvent.click(screen.getByRole('button', { name: 'Close context panel' }))
     expect(props.onClosePlan).toHaveBeenCalledOnce()
     unmount()

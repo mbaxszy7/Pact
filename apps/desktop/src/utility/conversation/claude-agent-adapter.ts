@@ -25,6 +25,7 @@ import type {
   CollaborationInputObservation,
   SessionPermissionMode,
 } from '@pact/contracts'
+import type { DiagnosticEvent } from '@pact/contracts/diagnostics'
 
 import {
   agentPromptImageGroups,
@@ -60,6 +61,7 @@ import {
 
 import type { LogicalIpcWorkerTraffic } from '../../shared/logical-ipc-traffic'
 
+import { recordDiagnostic } from '../../diagnostics/utility-log'
 import { AgentActivityDetail } from './agent-activity-detail'
 import { AgentAnswerAssembler } from './agent-answer-assembler'
 import {
@@ -201,6 +203,19 @@ class ClaudeNativeWork {
         this.tasks.delete(message.task_id)
     }
   }
+}
+
+type PlanCaptureFailureCode = NonNullable<DiagnosticEvent['planCapture']>['code']
+type PlanCaptureFailure = NonNullable<DiagnosticEvent['planCapture']> & { operationId?: string }
+type PlanSubmissionRejection = {
+  reason:
+    | PlanCaptureFailureCode
+    | 'submission_hook_unverified'
+    | 'plan_pending'
+    | 'plan_unavailable'
+    | 'plan_missing'
+    | 'retained_basis_mismatch'
+  latestCapture?: Pick<PlanCaptureFailure, 'code' | 'tool' | 'phase'>
 }
 
 export class ClaudeAgentAdapter implements AgentAdapter {
@@ -1896,6 +1911,70 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     let planBindingTask: Promise<ClaudeNativePlan | undefined> | undefined
     let planBindingReads = 0
     const planExitIds = new Set<string>()
+    // Fixed enum keys only, at most 64 records per Run; disposal/restart releases this set.
+    // No native IDs, paths, inputs, receipt bodies, or arbitrary errors enter diagnostics.
+    const planDiagnosticKeys = new Set<string>()
+    const logPlan = (
+      planStage: NonNullable<DiagnosticEvent['planStage']>,
+      planReason: NonNullable<DiagnosticEvent['planReason']>,
+      planCapture?: DiagnosticEvent['planCapture'],
+    ): void => {
+      const key =
+        planStage === 'capture'
+          ? `${planStage}/${planReason}/${planCapture?.tool ?? ''}/${planCapture?.phase ?? ''}`
+          : `${planStage}/${planReason}`
+      if (planDiagnosticKeys.has(key) || planDiagnosticKeys.size >= 64) return
+      planDiagnosticKeys.add(key)
+      recordDiagnostic({
+        operation: 'claude_plan',
+        scope: 'run',
+        phase: ['captured', 'submitted', 'retained'].includes(planReason) ? 'completed' : 'blocked',
+        level: ['captured', 'submitted', 'retained'].includes(planReason) ? 'info' : 'warn',
+        sessionId: input.sessionId,
+        runId: input.runId,
+        agentId: 'claude',
+        planStage,
+        planReason,
+        ...(planCapture ? { planCapture } : {}),
+      })
+    }
+    // One bounded, Run-local diagnostic hint; never used to authorize a plan.
+    let planCaptureFailure: PlanCaptureFailure | undefined
+    const rememberPlanFailure = (
+      code: PlanCaptureFailureCode,
+      hook: { tool_use_id: string; tool_name: string },
+      phase: PlanCaptureFailure['phase'],
+    ): void => {
+      planCaptureFailure = {
+        code,
+        ...(typeof hook.tool_use_id === 'string' &&
+        hook.tool_use_id.length > 0 &&
+        hook.tool_use_id.length <= 1024
+          ? { operationId: hook.tool_use_id }
+          : {}),
+        tool:
+          hook.tool_name === 'Write'
+            ? 'Write'
+            : hook.tool_name === 'Edit'
+              ? 'Edit'
+              : 'ExitPlanMode',
+        phase,
+      }
+      logPlan('capture', code, { code, tool: planCaptureFailure.tool, phase })
+    }
+    const rejectPlanSubmission = (
+      reason: PlanSubmissionRejection['reason'],
+    ): PlanSubmissionRejection => {
+      const latestCapture = planCaptureFailure
+        ? {
+            code: planCaptureFailure.code,
+            tool: planCaptureFailure.tool,
+            phase: planCaptureFailure.phase,
+          }
+        : undefined
+      logPlan('submission', reason, latestCapture)
+      return { reason, ...(latestCapture ? { latestCapture } : {}) }
+    }
     let reviewResult: CollaborationReviewObservation | undefined
     let inputResult: CollaborationInputObservation | undefined
     const workflowCalls = new Map<
@@ -2197,6 +2276,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         submittedPlan = plan
         retainedPlan = undefined
         input.recordWorkflowPlan?.(plan)
+        logPlan('capture', 'captured')
+        planCaptureFailure = undefined
       } catch (error) {
         failProjection(error)
       }
@@ -2207,34 +2288,44 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       if (!planUnavailable) input.recordWorkflowPlanUnavailable?.()
       planUnavailable = true
     }
-    const nativePlanForHook = async (hook: {
-      session_id: string
-      prompt_id?: string
-      agent_id?: string
-      tool_use_id: string
-      tool_name: string
-      tool_input: unknown
-    }): Promise<ClaudeNativePlan | undefined> => {
+    const nativePlanForHook = async (
+      hook: {
+        session_id: string
+        prompt_id?: string
+        agent_id?: string
+        tool_use_id: string
+        tool_name: string
+        tool_input: unknown
+      },
+      failed: (code: PlanCaptureFailureCode) => void,
+    ): Promise<ClaudeNativePlan | undefined> => {
       if (signal.aborted || hook.agent_id || hook.session_id !== resolvedSessionId) return undefined
       if (!planBindingTask) {
         if (planBindingReads >= 64)
           throw new Error('Native plan binding reads exceeded the root budget.')
         planBindingReads++
         planBindingTask = (async () => {
-          const source = await this.nativeForkFiles.readAnswer(
-            {
-              cwd: input.cwd,
-              nativeSessionId: hook.session_id,
-              nativeTurnId: input.runId,
-              planHook: {
-                id: hook.tool_use_id,
-                inputFingerprint: claudePlanInputFingerprint(hook.tool_name, hook.tool_input),
+          const source = await this.nativeForkFiles
+            .readAnswer(
+              {
+                cwd: input.cwd,
+                nativeSessionId: hook.session_id,
+                nativeTurnId: input.runId,
+                planHook: {
+                  id: hook.tool_use_id,
+                  inputFingerprint: claudePlanInputFingerprint(hook.tool_name, hook.tool_input),
+                },
               },
-            },
-            signal,
-          )
-          if (!source.planBinding || !source.planState)
+              signal,
+            )
+            .catch((error: unknown) => {
+              failed('history_lookup_failed')
+              throw error
+            })
+          if (!source.planBinding || !source.planState) {
+            failed('history_binding_missing')
             throw new Error('The current native root has no authenticated plan attachment.')
+          }
           planProofMemory.resize(256 * 1024)
           signal.throwIfAborted()
           nativePlan = ClaudeNativePlan.restore(source.planBinding, source.planState, (bytes) =>
@@ -2246,6 +2337,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       const reading = planBindingTask
       try {
         const artifact = await reading
+        if (artifact && artifact.binding.promptId !== hook.prompt_id) failed('hook_prompt_mismatch')
         return artifact?.binding.promptId === hook.prompt_id ? artifact : undefined
       } catch (error) {
         if (planBindingTask === reading) planBindingTask = undefined
@@ -2264,6 +2356,11 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       },
       phase: 'begin' | 'success' | 'failure',
     ): Promise<void> => {
+      let failureRecorded = false
+      const failed = (code: PlanCaptureFailureCode): void => {
+        failureRecorded = true
+        rememberPlanFailure(code, hook, phase)
+      }
       try {
         if (signal.aborted) {
           if (
@@ -2288,9 +2385,10 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         ) {
           nativePlan?.fail()
           captureUnavailable()
+          failed('hook_prompt_missing')
           return
         }
-        const artifact = await nativePlanForHook(hook)
+        const artifact = await nativePlanForHook(hook, failed)
         if (!artifact || signal.aborted) return
         if (hook.tool_name === 'ExitPlanMode') {
           if (
@@ -2333,6 +2431,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       } catch (error) {
         if (signal.aborted) return
         captureUnavailable()
+        if (!failureRecorded) failed('plan_capture_failed')
         if (error instanceof NativeCapacityError) failProjection(error)
       }
     }
@@ -2612,6 +2711,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       metadataMemory.release()
       planProofMemory.release()
       planExitIds.clear()
+      planDiagnosticKeys.clear()
+      planCaptureFailure = undefined
       workflowCalls.clear()
       planCalls.clear()
       inputReservation?.release()
@@ -3419,10 +3520,18 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             permissionWait,
             nativePlanning
               ? async (id) => {
-                  if (signal.aborted || !planExitIds.has(id)) return false
+                  if (signal.aborted || !planExitIds.has(id))
+                    return rejectPlanSubmission(
+                      planCaptureFailure?.operationId === id &&
+                        planCaptureFailure.tool === 'ExitPlanMode'
+                        ? planCaptureFailure.code
+                        : 'submission_hook_unverified',
+                    )
+                  const pending = nativePlan?.hasPendingOperations
                   nativePlan?.finish()
                   if (nativePlan?.plan) {
                     capturePlan(nativePlan.plan)
+                    logPlan('submission', 'submitted')
                     return 'submitted'
                   }
                   const retained = nativePlan?.retained(id),
@@ -3437,10 +3546,20 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                     retainedPlan = retained
                     planUnavailable = false
                     input.recordWorkflowPlanRetained?.(retained)
+                    planCaptureFailure = undefined
+                    logPlan('submission', 'retained')
                     return 'retained'
                   }
                   captureUnavailable()
-                  return false
+                  return rejectPlanSubmission(
+                    pending
+                      ? 'plan_pending'
+                      : nativePlan?.unavailable
+                        ? 'plan_unavailable'
+                        : retained
+                          ? 'retained_basis_mismatch'
+                          : 'plan_missing',
+                  )
                 }
               : undefined,
           ),
@@ -4226,7 +4345,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     input: Pick<AgentRunInput, 'requestPermission' | 'requestUserInput' | 'cwd' | 'permissionMode'>,
     providerSignal: AbortSignal,
     wait: NativePermissionWait,
-    recordPlan?: (nativeId: string) => Promise<'submitted' | 'retained' | false>,
+    recordPlan?: (nativeId: string) => Promise<'submitted' | 'retained' | PlanSubmissionRejection>,
   ): CanUseTool {
     const fullAccess = input.permissionMode === 'full'
     const pending = new Map<string, ReturnType<CanUseTool>>()
@@ -4259,7 +4378,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
               ? 'The existing plan and your response will be sent for independent review. This is not implementation approval. End with your natural response and wait for Pact.'
               : captured === 'submitted'
                 ? 'The native plan has been submitted to Pact for independent review. This is not implementation approval. Stay in plan mode; end with your natural response now and wait for Pact to arrange review.'
-                : 'No complete authenticated native plan is available. Finish the native plan document before submitting it. This is not implementation approval.',
+                : `No complete authenticated native plan is available. This is not implementation approval. Pact diagnostic: ${captured.reason}.${captured.latestCapture ? ` Latest capture: ${captured.latestCapture.code}/${captured.latestCapture.tool}/${captured.latestCapture.phase}.` : ''} Preserve the plan and report this code; rewriting it is not a confirmed remedy.`,
         }))
       }
       if (toolName === 'AskUserQuestion') {

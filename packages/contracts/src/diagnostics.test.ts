@@ -61,6 +61,12 @@ describe('Diagnostic trust contract', () => {
   })
 
   it.each([
+    { planStage: 'private-stage' },
+    { planReason: 'private-body' },
+    { planCapture: { code: 'hook_prompt_missing', tool: 'Write', phase: 'begin', path: 'secret' } },
+    { planCapture: { code: 'private-body', tool: 'Write', phase: 'begin' } },
+    { planCapture: { code: 'hook_prompt_missing', tool: 'private-tool', phase: 'begin' } },
+    { planCapture: { code: 'hook_prompt_missing', tool: 'Write', phase: 'private-phase' } },
     { requestType: 'arbitrary-user-text' },
     { nativeMethod: 'method-with-a-token' },
     { nativeErrorCode: 'secret' },
@@ -82,6 +88,9 @@ describe('Diagnostic trust contract', () => {
   it('keeps a fully populated error below the record budget with all identifiers', () => {
     const event = diagnosticEventSchema.parse({
       operation: 'process',
+      planStage: 'submission',
+      planReason: 'submission_hook_unverified',
+      planCapture: { code: 'history_binding_missing', tool: 'ExitPlanMode', phase: 'success' },
       scope: 'request',
       phase: 'blocked',
       level: 'warn',

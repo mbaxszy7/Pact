@@ -1,5 +1,5 @@
-import { FileText, RotateCcw, X } from 'lucide-react'
-import { useLayoutEffect, useRef } from 'react'
+import { FileText, Maximize2, Minimize2, RotateCcw, X } from 'lucide-react'
+import { useLayoutEffect, useRef, type ReactNode } from 'react'
 
 import type { CollaborationDocument } from '@pact/contracts'
 
@@ -30,6 +30,9 @@ export function CurrentPlanPanel({
   loading,
   error,
   source = false,
+  expanded = false,
+  onExpandedChange,
+  comments,
   onPlanReady,
   onRevealApplied,
   onClose,
@@ -41,6 +44,9 @@ export function CurrentPlanPanel({
   loading: boolean
   error?: string | undefined
   source?: boolean | undefined
+  expanded?: boolean | undefined
+  onExpandedChange?: ((expanded: boolean) => void) | undefined
+  comments?: ReactNode
   onPlanReady?: ((host: HTMLElement) => (() => void) | undefined) | undefined
   onRevealApplied?: ((id: string) => void) | undefined
   onClose: () => void
@@ -81,14 +87,31 @@ export function CurrentPlanPanel({
             </p>
           ) : null}
         </div>
-        <button
-          type="button"
-          aria-label="Close context panel"
-          onClick={onClose}
-          className="grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
-        >
-          <X aria-hidden="true" className="size-4" strokeWidth={1.75} />
-        </button>
+        <div className="flex shrink-0 gap-1">
+          {onExpandedChange ? (
+            <button
+              type="button"
+              aria-label={expanded ? 'Restore plan panel' : 'Expand plan panel'}
+              title={expanded ? 'Restore plan panel' : 'Expand plan panel'}
+              onClick={() => onExpandedChange(!expanded)}
+              className="grid size-8 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+            >
+              {expanded ? (
+                <Minimize2 aria-hidden="true" className="size-4" strokeWidth={1.75} />
+              ) : (
+                <Maximize2 aria-hidden="true" className="size-4" strokeWidth={1.75} />
+              )}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            aria-label="Close context panel"
+            onClick={onClose}
+            className="grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+          >
+            <X aria-hidden="true" className="size-4" strokeWidth={1.75} />
+          </button>
+        </div>
       </header>
       <div
         ref={scrollRef}
@@ -110,7 +133,7 @@ export function CurrentPlanPanel({
         ) : plan ? (
           <div
             ref={planDocumentRef}
-            className="pact-plan-document mx-auto min-w-0 max-w-[72ch]"
+            className="pact-plan-document min-w-0"
             data-pact-plan-run-id={plan.runId}
             data-pact-plan-version={plan.version}
             data-pact-plan-message-id={plan.messageId}
@@ -191,6 +214,11 @@ export function CurrentPlanPanel({
           </div>
         )}
       </div>
+      {comments ? (
+        <div className="max-h-[45%] shrink-0 overflow-auto border-t border-border bg-surface-raised p-panel">
+          {comments}
+        </div>
+      ) : null}
     </section>
   )
 }

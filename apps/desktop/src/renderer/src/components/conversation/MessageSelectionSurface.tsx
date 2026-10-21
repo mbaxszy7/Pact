@@ -289,7 +289,9 @@ function DocumentSelectionSurface({
         if (atEdge && !moving) {
           const spans = [...host.querySelectorAll<HTMLElement>('[data-pact-projection-start]')]
           const edge = direction === 'next' ? spans.at(-1) : spans[0]
-          if (edge) {
+          // Inside the viewport the caret is exact, even within the auto-scroll band.
+          // Snap only when dragging beyond the visible text to extend across pages.
+          if (edge && (direction === 'previous' ? point.y <= rect.top : point.y >= rect.bottom)) {
             value.focus = Number(
               direction === 'next'
                 ? edge.dataset.pactProjectionEnd

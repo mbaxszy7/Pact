@@ -364,3 +364,116 @@ for (const primary of ['codex', 'claude'] as const) {
     }
   })
 }
+
+for (const width of [1440, 1000])
+  test(`@deterministic Plan panel preserves its document and Comments through expansion and restoration at ${width}px`, async () => {
+    const f = await prepare('codex', { width, height: 900 })
+    try {
+      await f.send('/plan Build reliable cancellation')
+      await expect(
+        f.page.getByRole('button', { name: 'Implement plan · Codex', exact: true }),
+      ).toBeEnabled()
+      await closeContextOverlay(f.page)
+      const composer = f.page.getByRole('combobox', { name: 'Message', exact: true })
+      await composer.fill('Ordinary message draft must survive Plan reading.')
+      await f.page.getByRole('button', { name: 'Plan', exact: true }).click()
+      const plan = f.page.getByRole('region', { name: 'Current plan', exact: true })
+      await expect(plan).toContainText('Keep cancellation with its owner.')
+      if (width === 1440) {
+        await f.page.getByRole('button', { name: 'Hide navigation panel', exact: true }).click()
+        const separator = f.page.getByRole('separator', {
+          name: 'Resize context panel',
+          exact: true,
+        })
+        const handle = await separator.boundingBox()
+        if (!handle) throw new Error('Context resize handle is missing.')
+        await f.page.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2)
+        await f.page.mouse.down()
+        await f.page.mouse.move(width * 0.4, handle.y + handle.height / 2, { steps: 16 })
+        await f.page.mouse.up()
+        await expect
+          .poll(async () => (await plan.boundingBox())!.width)
+          .toBeGreaterThan(width * 0.5)
+      }
+      const document = plan.locator('.pact-plan-document')
+      const originalDocument = await document.elementHandle()
+      const originalWidth = (await plan.boundingBox())!.width
+      await f.page.getByRole('button', { name: 'Expand plan panel', exact: true }).click()
+      await expect(
+        f.page.getByRole('button', { name: 'Restore plan panel', exact: true }),
+      ).toBeVisible()
+      await expect.poll(async () => (await plan.boundingBox())!.width).toBeGreaterThan(width * 0.95)
+      expect(await originalDocument.evaluate((node) => node.isConnected)).toBe(true)
+      const gesture = await document.evaluate((host) => {
+        const phrase = 'Keep cancellation with its owner.'
+        const span = [...host.querySelectorAll('[data-pact-projection-start]')].find((node) =>
+          node.textContent?.includes(phrase),
+        )
+        const node = span?.firstChild
+        if (!node) throw new Error('Plan text geometry is missing.')
+        const offset = node.textContent!.indexOf(phrase)
+        const range = window.document.createRange()
+        range.setStart(node, offset)
+        range.setEnd(node, offset + phrase.length)
+        const boxes = [...range.getClientRects()]
+        const first = boxes[0]!,
+          last = boxes.at(-1)!
+        return {
+          start: { x: first.left + 1, y: first.top + first.height / 2 },
+          end: { x: last.right - 1, y: last.top + last.height / 2 },
+        }
+      })
+      await f.page.mouse.move(gesture.start.x, gesture.start.y)
+      await f.page.mouse.down()
+      await f.page.mouse.move(gesture.end.x, gesture.end.y, { steps: 12 })
+      await f.page.mouse.up()
+      await plan.getByRole('button', { name: 'Comment on selected text', exact: true }).click()
+      await expect(plan.getByRole('heading', { name: 'New comment', exact: true })).toBeVisible()
+      const comment = plan.getByRole('textbox', { name: 'Comment', exact: true })
+      await expect(plan.locator('p[title]')).toHaveAttribute(
+        'title',
+        'Keep cancellation with its owner.',
+      )
+      await comment.fill('Verify cancellation ownership while reading the expanded plan.')
+      await f.page.getByRole('button', { name: 'Restore plan panel', exact: true }).click()
+      await expect(f.page.getByRole('textbox', { name: 'Comment', exact: true })).toHaveValue(
+        'Verify cancellation ownership while reading the expanded plan.',
+      )
+      await expect
+        .poll(async () => Math.abs((await plan.boundingBox())!.width - originalWidth))
+        .toBeLessThan(3)
+      expect(await originalDocument.evaluate((node) => node.isConnected)).toBe(true)
+      // Compact context is modal, so keep editing inside its expanded document.
+      await f.page.getByRole('button', { name: 'Expand plan panel', exact: true }).click()
+      await comment.press('Enter')
+      const drafts = plan.getByLabel('Attached Comment drafts', { exact: true })
+      await expect(drafts).toContainText(
+        'Verify cancellation ownership while reading the expanded plan.',
+      )
+      await drafts
+        .getByRole('button', {
+          name: 'Plan v1 · Verify cancellation ownership while reading the expanded plan.',
+          exact: true,
+        })
+        .click()
+      await comment.fill('Edited plan Comment survives restoration.')
+      await comment.press('Enter')
+      await expect(drafts).toContainText('Edited plan Comment survives restoration.')
+      await f.page.getByRole('button', { name: 'Restore plan panel', exact: true }).click()
+      await closeContextOverlay(f.page)
+      await expect(composer).toHaveText('Ordinary message draft must survive Plan reading.')
+      await expect(f.page.getByLabel('Attached Comment drafts', { exact: true })).toContainText(
+        'Edited plan Comment survives restoration.',
+      )
+      expect(await f.counts()).toEqual({ codex: 1, claude: 1 })
+      await f.page.getByRole('button', { name: 'Return to Comment source', exact: true }).click()
+      const sourcePanel = f.page.getByRole('region', { name: 'Plan source', exact: true })
+      await expect(sourcePanel).toContainText('Keep cancellation with its owner.')
+      await expect(
+        sourcePanel.getByRole('button', { name: 'Expand plan panel', exact: true }),
+      ).toBeVisible()
+    } finally {
+      await quitPact(f.app)
+      await f.fixture.dispose()
+    }
+  })

@@ -124,6 +124,37 @@ export type DiagnosticFailureSource = z.infer<typeof diagnosticFailureSourceSche
 
 const boundedCount = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
 export const diagnosticEventSchema = z.strictObject({
+  planStage: z.enum(['capture', 'submission']).optional(),
+  planReason: z
+    .enum([
+      'captured',
+      'submitted',
+      'retained',
+      'hook_prompt_missing',
+      'hook_prompt_mismatch',
+      'history_binding_missing',
+      'history_lookup_failed',
+      'plan_capture_failed',
+      'submission_hook_unverified',
+      'plan_pending',
+      'plan_unavailable',
+      'plan_missing',
+      'retained_basis_mismatch',
+    ])
+    .optional(),
+  planCapture: z
+    .strictObject({
+      code: z.enum([
+        'hook_prompt_missing',
+        'hook_prompt_mismatch',
+        'history_binding_missing',
+        'history_lookup_failed',
+        'plan_capture_failed',
+      ]),
+      tool: z.enum(['Write', 'Edit', 'ExitPlanMode']),
+      phase: z.enum(['begin', 'success', 'failure']),
+    })
+    .optional(),
   settingsCatalogPhase: z
     .enum([
       'admission',
@@ -201,6 +232,7 @@ export const diagnosticEventSchema = z.strictObject({
     'send',
     'stop',
     'native_check',
+    'claude_plan',
     'native_rebuild',
     'fork',
     'undo',
