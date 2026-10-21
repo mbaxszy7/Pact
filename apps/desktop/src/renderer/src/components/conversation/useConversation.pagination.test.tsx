@@ -1188,8 +1188,8 @@ it('keeps stale decision answers and the ordinary draft across session navigatio
     expect(f.result.current.composer).toBe('Ordinary draft')
     act(() => expect(f.result.current.history.clearDecisionDraft?.(true)).toBe(true))
     expect(f.result.current.history.decisionDraft).toBeUndefined()
-    expect(f.result.current.composer).toContain('Ordinary draft\n\nQuestion: Delivery?')
-    expect(f.result.current.composer).toContain('Selected: Queue')
+    expect(f.result.current.composer).toContain('Ordinary draft\n\n**1. Delivery?**')
+    expect(f.result.current.composer).toContain('**Your answer:**\n\n- Queue')
     expect(f.result.current.composer).toContain('After review')
   } finally {
     f.unmount()
@@ -1210,8 +1210,19 @@ it.each([true, false])(
           decisionInputSequence: 1,
           expectedInputSequence: 1,
         },
-        questions: [{ id: 'q1', prompt: 'Delivery?', selection: 'single' as const }],
-        answers: { q1: { optionIds: [], text: 'After review' } },
+        questions: [
+          { id: 'q1', prompt: 'Delivery?', selection: 'single' as const },
+          {
+            id: 'q2',
+            prompt: 'Keep boundaries/*?',
+            selection: 'single' as const,
+            options: [{ id: 'keep', label: 'Keep _rules_', description: 'Use `ESLint`' }],
+          },
+        ],
+        answers: {
+          q1: { optionIds: [], text: 'After review' },
+          q2: { optionIds: ['keep'], text: '' },
+        },
       }
       const send = vi.fn<DesktopBridge['sendConversationMessage']>().mockResolvedValue(
         acknowledged
@@ -1247,7 +1258,8 @@ it.each([true, false])(
       expect(send).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({
           replyToDecision: decision.reference,
-          content: 'Replies to your questions:\nQuestion: Delivery?\nMy answer: After review',
+          content:
+            '**Replies to your questions**\n\n**1. Delivery?**\n\n**Your answer:**\n\n\nAfter review\n\n**2. Keep boundaries/\\*?**\n\n**Your answer:**\n\n- Keep \\_rules\\_ — Use \\`ESLint\\`',
           freezeDrafts: false,
           commentIds: [],
         }),

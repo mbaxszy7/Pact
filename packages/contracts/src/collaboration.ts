@@ -245,6 +245,20 @@ export const collaborationTaskSchema = z.strictObject({
 })
 export type CollaborationTask = z.infer<typeof collaborationTaskSchema>
 
+/** Only the frozen owner may publish or retain a native plan for this root. */
+export function collaborationPlanMode(
+  task: CollaborationTask | undefined,
+  authorization?: CollaborationTurnAuthorization,
+): boolean {
+  const stage = authorization?.stage ?? task?.stage
+  const actor = authorization?.actor ?? task?.actor
+  return Boolean(
+    task &&
+    actor === task.owner &&
+    (stage === 'plan' || (stage === 'reply' && task.kind === 'plan' && !task.codeRunId)),
+  )
+}
+
 export const collaborationActionSchema = z.enum([
   'continue',
   'execute',
@@ -343,6 +357,12 @@ export function collaborationInputGate(
   task: CollaborationTask,
 ): 'needs_reply' | 'queued' | 'processing' | 'incomplete' | undefined {
   const input = collaborationInputProcessing(task)
+  if (
+    task.stage === 'reply' &&
+    task.status === 'failed' &&
+    (input.settled?.runId !== task.runId || input.settled.inputSequence !== task.inputSequence)
+  )
+    return 'incomplete'
   if (!input.pending) return input.decision ? 'needs_reply' : undefined
   if (task.status === 'failed') return 'incomplete'
   if (task.stage === 'reply' && task.status === 'running') return 'processing'

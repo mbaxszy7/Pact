@@ -198,7 +198,7 @@ async function fixture(filePath = ':memory:', onOpened?: () => void) {
     const patch = repo.receiveCollaborationInput(
       send,
       body.inputId,
-      'codex',
+      repo.collaborationReplyActor(repo.collaboration(sessionId)!, send.replyToDecision),
       'immediate_safe_point',
       owner,
     )
@@ -858,14 +858,19 @@ it('persists structured questions with host IDs and requires a settled native re
   ).toThrow(/Reply/)
   f.receive(decisionInput(f, 'Only current scope.'))
   const reply = f.materialize()
-  f.finish(reply.run.id, { plan: 'Current scope only.' })
+  expect(reply.run.agentId).toBe('claude')
+  f.finish(reply.run.id, { inputOutcome: 'processed' })
   const settled = f.repo.collaboration(f.sessionId)!
   expect(settled.inputProcessing?.decision).toBeUndefined()
   expect(settled.inputProcessing?.pending).toBeUndefined()
-  expect(settled).toMatchObject({ automation: 'paused', planInputSequence: 2 })
+  expect(settled).toMatchObject({
+    automation: 'paused',
+    planInputSequence: 1,
+    inputProcessing: { settled: { runId: reply.run.id, inputSequence: 2 } },
+  })
   expect(advanceCollaboration(settled, 'resume', settings)).toMatchObject({
     automation: 'active',
-    nextStage: 'plan_review',
+    nextStage: 'plan',
   })
 })
 
@@ -875,12 +880,14 @@ it('retains unresolved questions when a reply fails to provide its authenticated
     inputOutcome: 'needs_user',
     questions: [{ prompt: 'Choose scope', selection: 'single' }],
   })
+  const decision = f.repo.collaboration(f.sessionId)!.inputProcessing!.decision!
   f.receive(decisionInput(f, 'Current scope.'))
   const reply = f.materialize()
   f.finish(reply.run.id, { answer: 'Acknowledged, without a native plan.' })
   const current = f.repo.collaboration(f.sessionId)!
-  expect(current.inputProcessing?.decision).toMatchObject({ runId: reply.run.id, inputSequence: 2 })
-  expect(current.inputProcessing?.pending).toBeUndefined()
+  expect(current.inputProcessing?.decision).toEqual(decision)
+  expect(current.inputProcessing?.pending).toMatchObject({ inputSequence: 2 })
+  expect(current).toMatchObject({ status: 'failed', automation: 'paused' })
   expect(() => advanceCollaboration(current, 'resume', settings)).toThrow(/Reply/)
 })
 
@@ -1031,7 +1038,7 @@ it('rejects stale question-card identities and mixed composer drafts atomically'
   ]
   for (const send of candidates) {
     expect(() => f.receive({ ...send, clientMessageId: randomUUID() })).toThrow(
-      /questions changed|card answers/,
+      /questions changed|card answers|could not be verified/,
     )
     expect(f.repo.collaboration(f.sessionId)).toEqual(before)
     expect(f.repo.readReceivedInput(f.sessionId)).toBeUndefined()
@@ -1040,7 +1047,7 @@ it('rejects stale question-card identities and mixed composer drafts atomically'
   const accepted = f.receive(valid)
   expect(accepted.patch.receivedInputIds).toEqual([valid.clientMessageId])
   expect(() => f.receive({ ...valid, clientMessageId: randomUUID() })).toThrow(
-    /One message is already waiting/,
+    /could not be verified/,
   )
 })
 
@@ -1062,4 +1069,185 @@ it('rejects changed review questions as conflicting rather than silently replaci
     review: { verdict: 'incomplete' },
   })
   expect(f.repo.collaboration(f.sessionId)!.inputProcessing?.decision).toBeUndefined()
+})
+
+it('fails a plan with no native result without inventing questions or a restore source', async () => {
+  const f = await fixture()
+  f.finish(undefined, { answer: 'I cannot provide a plan yet.' })
+  const current = f.repo.collaboration(f.sessionId)!
+  expect(current).toMatchObject({
+    status: 'failed',
+    automation: 'paused',
+    pauseReason: 'failure',
+    planVersion: 0,
+  })
+  expect(current.inputProcessing?.decision).toBeUndefined()
+  expect(f.repo.needsWorkflowPlanRecovery(f.first.run.id)).toBe(false)
+})
+
+it.each(['present', 'legacy'] as const)(
+  'verifies the decision source actor when its stored actor is %s',
+  async (kind) => {
+    const f = await fixture()
+    f.finish()
+    const review = advance(f)
+    f.finish(review.id, {
+      verdict: 'needs_user',
+      questions: [{ prompt: 'Which scope?', selection: 'single' }],
+    })
+    const current = f.repo.collaboration(f.sessionId)!
+    const decision = current.inputProcessing!.decision!
+    if (kind !== 'present') {
+      f.repo.setCollaborationState({
+        ...current,
+        revision: current.revision + 1,
+        inputProcessing: {
+          ...current.inputProcessing,
+          decision: { ...decision, actor: undefined },
+        },
+      })
+    }
+    f.receive(decisionInput(f, 'Current scope.'))
+    expect(f.repo.readReceivedInput(f.sessionId)?.actor).toBe('claude')
+    const reply = f.materialize()
+    expect(reply.run.agentId).toBe('claude')
+    expect(() =>
+      f.repo.recordWorkflowPlan(reply.run.id, {
+        nativeId: 'foreign-plan',
+        text: 'Cannot write a plan',
+      }),
+    ).toThrow(/plan author/)
+    f.finish(reply.run.id, { inputOutcome: 'processed' })
+    expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+      status: 'waiting',
+      automation: 'paused',
+      planVersion: 1,
+      inputProcessing: { settled: { runId: reply.run.id, inputSequence: 2 } },
+    })
+  },
+)
+
+it('restores the exact author reply and settles its answer once without rerunning it', async () => {
+  const f = await fixture()
+  f.finish(undefined, {
+    inputOutcome: 'needs_user',
+    questions: [{ prompt: 'Scope?', selection: 'single' }],
+  })
+  f.receive(decisionInput(f, 'Current scope.'))
+  const reply = f.materialize()
+  f.repo.recordWorkflowPlanUnavailable(reply.run.id)
+  f.finish(reply.run.id, { answer: 'Saved the plan but submission failed.' })
+  expect(f.repo.needsWorkflowPlanRecovery(reply.run.id)).toBe(true)
+  expect(f.repo.collaboration(f.sessionId)!.inputProcessing?.pending).toBeDefined()
+  f.repo.recordWorkflowPlan(reply.run.id, {
+    nativeId: 'recovered-author-plan',
+    text: 'Current scope.',
+  })
+  f.repo.reconcileCompletedCollaboration(reply.run.id)
+  const restored = f.repo.collaboration(f.sessionId)!
+  expect(restored).toMatchObject({
+    status: 'waiting',
+    automation: 'paused',
+    planInputSequence: 2,
+    inputProcessing: { settled: { runId: reply.run.id, inputSequence: 2 } },
+  })
+  expect(restored.inputProcessing?.decision).toBeUndefined()
+  expect(restored.inputProcessing?.pending).toBeUndefined()
+  expect(f.repo.read(f.sessionId).runs).toHaveLength(2)
+  f.repo.reconcileCompletedCollaboration(reply.run.id)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(restored)
+})
+
+it('does not clear real unanswered questions when a native plan is recovered', async () => {
+  const f = await fixture()
+  f.finish(undefined, {
+    inputOutcome: 'needs_user',
+    questions: [{ prompt: 'Scope?', selection: 'single' }],
+  })
+  const before = f.repo.collaboration(f.sessionId)!
+  f.repo.recordWorkflowPlan(f.first.run.id, {
+    nativeId: 'late-with-questions',
+    text: 'Draft awaiting scope.',
+  })
+  f.repo.reconcileCompletedCollaboration(f.first.run.id)
+  const current = f.repo.collaboration(f.sessionId)!
+  expect(current).toMatchObject({ status: 'questions', planVersion: 0, automation: 'paused' })
+  expect(current.inputProcessing?.decision).toEqual(before.inputProcessing?.decision)
+  expect(f.repo.needsWorkflowPlanRecovery(f.first.run.id)).toBe(false)
+  expect(() => advanceCollaboration(current, 'resume', settings)).toThrow(/Reply/)
+})
+
+it('keeps a reviewer reply incomplete until its late authenticated result arrives', async () => {
+  const f = await fixture()
+  f.finish()
+  const review = advance(f)
+  f.finish(review.id, {
+    verdict: 'needs_user',
+    questions: [{ prompt: 'Scope?', selection: 'single' }],
+  })
+  const decision = f.repo.collaboration(f.sessionId)!.inputProcessing!.decision!
+  f.receive(decisionInput(f, 'Current scope.'))
+  const reply = f.materialize()
+  f.finish(reply.run.id, { answer: 'Natural language is not settlement evidence.' })
+  const failed = f.repo.collaboration(f.sessionId)!
+  expect(failed).toMatchObject({ status: 'failed', automation: 'paused' })
+  expect(failed.inputProcessing?.decision).toEqual(decision)
+  expect(failed.inputProcessing?.pending).toMatchObject({ inputSequence: 2 })
+  expect(() => advanceCollaboration(failed, 'resume', settings)).toThrow(/Reply/)
+  f.repo.recordWorkflowInputResult(reply.run.id, { outcome: 'processed' })
+  f.repo.reconcileCompletedCollaboration(reply.run.id)
+  const settled = f.repo.collaboration(f.sessionId)!
+  expect(settled).toMatchObject({
+    status: 'waiting',
+    automation: 'paused',
+    nextStage: 'plan',
+    inputProcessing: { settled: { runId: reply.run.id, inputSequence: 2 } },
+  })
+  expect(settled.inputProcessing?.pending).toBeUndefined()
+  expect(settled.inputProcessing?.decision).toBeUndefined()
+  f.repo.reconcileCompletedCollaboration(reply.run.id)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(settled)
+})
+
+it('rejects a decision whose recorded actor conflicts with its authorized source', async () => {
+  const f = await fixture()
+  f.finish()
+  const review = advance(f)
+  f.finish(review.id, {
+    verdict: 'needs_user',
+    questions: [{ prompt: 'Scope?', selection: 'single' }],
+  })
+  const current = f.repo.collaboration(f.sessionId)!
+  f.repo.setCollaborationState({
+    ...current,
+    revision: current.revision + 1,
+    inputProcessing: {
+      ...current.inputProcessing,
+      decision: { ...current.inputProcessing!.decision!, actor: 'codex' },
+    },
+  })
+  const before = f.repo.collaboration(f.sessionId)!
+  expect(() => f.receive(decisionInput(f, 'Current scope.'))).toThrow(/could not be verified/)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(before)
+  expect(f.repo.readReceivedInput(f.sessionId)).toBeUndefined()
+})
+
+it('does not settle a recovered author reply over a newer received answer', async () => {
+  const f = await fixture()
+  f.finish(undefined, {
+    inputOutcome: 'needs_user',
+    questions: [{ prompt: 'Scope?', selection: 'single' }],
+  })
+  f.receive(decisionInput(f, 'Current scope.'))
+  const reply = f.materialize()
+  f.repo.recordWorkflowPlanUnavailable(reply.run.id)
+  f.finish(reply.run.id, { answer: 'Saved source awaiting recovery.' })
+  const newer = f.receive(decisionInput(f, 'Actually include all scopes.'))
+  const before = f.repo.collaboration(f.sessionId)!
+  f.repo.recordWorkflowPlan(reply.run.id, { nativeId: 'stale-reply-plan', text: 'Current scope.' })
+  f.repo.reconcileCompletedCollaboration(reply.run.id)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(before)
+  expect(f.repo.collaboration(f.sessionId)!.inputProcessing?.settled).toBeUndefined()
+  expect(f.repo.readReceivedInput(f.sessionId)?.id).toBe(newer.send.clientMessageId)
+  expect(f.repo.needsWorkflowPlanRecovery(reply.run.id)).toBe(false)
 })

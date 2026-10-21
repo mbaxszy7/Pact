@@ -2149,7 +2149,7 @@ export class Conversation {
           requestedRoute?.type === 'agent'
             ? requestedRoute.agentId
             : task && !prefix.pact
-              ? this.conversations.collaborationReplyActor(task)
+              ? this.conversations.collaborationReplyActor(task, input.replyToDecision)
               : session.settings.primaryAgentId
         const bodyOwner = ownerKey ?? 'pact-received-input'
         let retainedId = input.inputId
@@ -3214,6 +3214,15 @@ export class Conversation {
         )
           throw new RunOperationConflictError(
             'The saved native plan could not be restored to this task. Its source is preserved; no Agent task was started.',
+          )
+        if (
+          recovered.stage === 'reply' &&
+          (collaborationInputGate(recovered) ||
+            recovered.inputProcessing?.settled?.runId !== recovered.runId ||
+            recovered.inputProcessing.settled.inputSequence !== recovered.inputSequence)
+        )
+          throw new RunOperationConflictError(
+            'The plan was restored, but your reply still needs confirmation. Check its response or recovery notice before continuing.',
           )
         return { ok: true, value: this.conversations.metadataPatch(input.sessionId) }
       }

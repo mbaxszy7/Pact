@@ -62,6 +62,10 @@ vi.mock('@tanstack/react-virtual', async (importOriginal) => {
 })
 
 beforeEach(() => {
+  Object.defineProperty(HTMLElement.prototype, 'hidePopover', {
+    configurable: true,
+    value: vi.fn<() => void>(),
+  })
   vi.stubGlobal(
     'ResizeObserver',
     class {
@@ -1419,5 +1423,217 @@ it.each(['read_only', 'send_blocked', 'open'] as const)(
     )
     expect(screen.getByRole('combobox', { name: 'Message' }).textContent).toBe('Preserved draft')
     expect(screen.queryByRole('button', { name: 'Reexecute…' })).toBeNull()
+  },
+)
+
+it.each(['accept', 'cancel'] as const)(
+  'replaces the composer with a native question and restores its draft after %s',
+  async (action) => {
+    const props = fixture()
+    props.composer = 'Keep this ordinary draft'
+    const request = {
+      id: crypto.randomUUID(),
+      operationId: crypto.randomUUID(),
+      kind: 'questions' as const,
+      title: 'Sort notes',
+      detail: '',
+      createdAt: new Date().toISOString(),
+    }
+    props.snapshot!.pendingNativeInteractions = [
+      { agentId: 'claude', bindingGeneration: 1, request },
+    ]
+    props.nativeInputDrafts = {
+      [request.id]: {
+        operationId: request.operationId,
+        agentId: 'claude',
+        expiresAt: Date.now() + 60000,
+        values: { order: 'recent' },
+        page: 0,
+      },
+    }
+    const read = vi.fn<DesktopBridge['readNativeInput']>().mockResolvedValue({
+      ok: true,
+      value: {
+        kind: 'questions',
+        title: 'Sort notes',
+        message: '',
+        fields: [
+          {
+            id: 'order',
+            type: 'select',
+            label: 'Sort order',
+            required: true,
+            options: [
+              { value: 'recent', label: 'Recently edited' },
+              { value: 'title', label: 'Title order' },
+            ],
+            allowOther: true,
+          },
+        ],
+      },
+    })
+    vi.stubGlobal('pact', { ...composerBridgeFixture(), readNativeInput: read })
+    const mounted = render(<ConversationView {...props} />)
+    await screen.findByRole('radio', { name: 'Recently edited' })
+    expect(read).toHaveBeenCalledExactlyOnceWith({
+      operationId: request.operationId,
+      requestId: request.id,
+    })
+    expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull()
+    expect(screen.queryByText('Your message draft is kept while you answer.')).toBeNull()
+    fireEvent.click(
+      screen.getByRole('button', { name: action === 'accept' ? 'Submit answers' : 'Cancel' }),
+    )
+    await waitFor(() =>
+      expect(props.onRespondNativeInput).toHaveBeenCalledExactlyOnceWith({
+        operationId: request.operationId,
+        requestId: request.id,
+        action,
+        ...(action === 'accept' ? { values: { order: 'recent' } } : {}),
+      }),
+    )
+    expect(props.onSend).not.toHaveBeenCalled()
+    expect(props.onStop).not.toHaveBeenCalled()
+    expect(props.onComposerChange).not.toHaveBeenCalled()
+    mounted.rerender(
+      <ConversationView
+        {...props}
+        snapshot={{ ...props.snapshot!, pendingNativeInteractions: [] }}
+      />,
+    )
+    expect(screen.getByRole('combobox', { name: 'Message' }).textContent).toBe(props.composer)
+    expect(screen.queryByRole('region', { name: 'Claude Code native input' })).toBeNull()
+  },
+)
+
+it('keeps native input cancellation available when details fail and retries the same identity', async () => {
+  const props = fixture()
+  const request = {
+    id: crypto.randomUUID(),
+    operationId: crypto.randomUUID(),
+    kind: 'questions' as const,
+    title: 'Unavailable question',
+    detail: '',
+    createdAt: new Date().toISOString(),
+  }
+  props.snapshot!.pendingNativeInteractions = [{ agentId: 'codex', bindingGeneration: 1, request }]
+  const read = vi.fn<DesktopBridge['readNativeInput']>().mockResolvedValue({
+    ok: false,
+    error: { code: 'CONTEXT_UNAVAILABLE', message: 'Request unavailable' },
+  })
+  vi.stubGlobal('pact', { ...composerBridgeFixture(), readNativeInput: read })
+  render(<ConversationView {...props} />)
+  await screen.findByRole('alert')
+  expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Submit answers' }).disabled).toBe(
+    true,
+  )
+  expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+  await waitFor(() => expect(read).toHaveBeenCalledTimes(2))
+  expect(read.mock.calls[1]?.[0]).toEqual({
+    operationId: request.operationId,
+    requestId: request.id,
+  })
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+  await waitFor(() =>
+    expect(props.onRespondNativeInput).toHaveBeenCalledWith({
+      operationId: request.operationId,
+      requestId: request.id,
+      action: 'cancel',
+    }),
+  )
+})
+
+it.each([false, true])(
+  'prioritizes plan recovery over stale question or processing without clearing drafts (pending: %s)',
+  async (pending) => {
+    const props = fixture()
+    const { task, run } = collaborationFixture()
+    task.sessionId = props.session.id
+    run.sessionId = props.session.id
+    task.inputProcessing = {
+      decision: {
+        runId: run.id,
+        inputSequence: 0,
+        actor: 'codex',
+        questions: [{ id: 'q1', prompt: 'Preserve boundaries?', selection: 'single' }],
+      },
+      ...(pending ? { pending: { inputId: crypto.randomUUID(), inputSequence: 1 } } : {}),
+    }
+    if (pending) task.inputSequence = 1
+    props.composer = 'Ordinary unsent draft'
+    props.history.clearDecisionDraft = vi
+      .fn<NonNullable<typeof props.history.clearDecisionDraft>>()
+      .mockReturnValue(true)
+    props.history.decisionDraft = {
+      reference: {
+        taskId: task.id,
+        runId: run.id,
+        decisionInputSequence: 0,
+        expectedInputSequence: task.inputSequence,
+      },
+      questions: task.inputProcessing.decision!.questions!,
+      answers: { q1: { optionIds: [], text: 'Keep boundaries' } },
+    }
+    props.snapshot!.runs = [run]
+    props.history.window!.latestRun = run
+    const read = vi.fn<DesktopBridge['getConversation']>().mockResolvedValue({
+      ok: true,
+      value: reportPage(task, {
+        planSync: { state: 'recovery_required', kind: 'plan', runId: run.id, retainedVersion: 2 },
+        availableActions: [],
+      }),
+    })
+    vi.stubGlobal('pact', { ...composerBridgeFixture(), getConversation: read })
+    render(<ConversationView {...props} />)
+    await screen.findByRole('region', { name: 'Plan recovery required' })
+    expect(screen.queryByText('Preserve boundaries?')).toBeNull()
+    expect(screen.queryByRole('region', { name: 'Answer progress' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Send answers' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull()
+    expect(props.history.clearDecisionDraft).not.toHaveBeenCalled()
+    expect(props.onComposerChange).not.toHaveBeenCalled()
+    expect(props.onSend).not.toHaveBeenCalled()
+  },
+)
+
+it.each([true, false])(
+  'labels decision replies with their actual Codex recipient despite a Claude primary (route recorded: %s)',
+  async (recorded) => {
+    const { props, run } = recordingFixture()
+    props.session.settings.primaryAgentId = 'claude'
+    run.collaboration = { taskId: crypto.randomUUID(), kind: 'plan', stage: 'reply' }
+    delete run.workspaceChanges
+    props.snapshot!.nativeContexts = []
+    const message = props.snapshot!.messages[0]!
+    message.runId = run.id
+    message.content =
+      '**Replies to your questions**\n\n**1. Preserve rules?**\n\n**Your answer:**\n\nYes.'
+    if (recorded) message.route = { type: 'agent', agentId: 'codex' }
+    vi.stubGlobal('pact', {
+      ...composerBridgeFixture(),
+      getConversation: vi.fn<DesktopBridge['getConversation']>().mockResolvedValue({
+        ok: true,
+        value: {
+          scope: 'collaboration',
+          sessionId: props.session.id,
+          view: {
+            task: null,
+            actionable: false,
+            accepted: false,
+            reportAvailable: false,
+            availableActions: [],
+          },
+        },
+      }),
+    })
+    render(<ConversationView {...props} />)
+    expect(await screen.findByText('@codex')).toBeDefined()
+    expect(screen.queryByText('@claude')).toBeNull()
+    expect(screen.getByText('Replies to your questions').closest('strong')).not.toBeNull()
+    expect(screen.getByText('1. Preserve rules?').closest('p')).not.toBe(
+      screen.getByText('Your answer:').closest('p'),
+    )
   },
 )

@@ -25,7 +25,11 @@ import {
 import { markdownVisibleProjection } from '../../shared/message-anchor-text.js'
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
-import { collaborationReadOnly } from './collaboration-prompt.js'
+import {
+  collaborationInputResultRequired,
+  collaborationPlanMode,
+  collaborationReadOnly,
+} from './collaboration-prompt.js'
 import { Conversation } from './conversation.js'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
 const markdownWorker = vi.hoisted(() => ({ path: '' }))
@@ -66,6 +70,7 @@ const native = vi.hoisted(() => ({
         input?: CollaborationInputObservation
       }
     | undefined,
+  nextReview: undefined as CollaborationReviewObservation | undefined,
   hold: undefined as Promise<void> | undefined,
   fail: false,
   sources: [] as Array<{
@@ -129,16 +134,21 @@ function adapter(agentId: RuntimeAgentId) {
       if (report?.input) input.recordWorkflowInputResult?.(report.input)
       else if (
         phase.stage === 'plan' ||
-        (phase.stage === 'reply' && phase.kind === 'plan' && !phase.codeRunId)
+        (phase.stage === 'reply' &&
+          phase.kind === 'plan' &&
+          !phase.codeRunId &&
+          phase.actor === phase.owner)
       ) {
         if (report?.plan !== null)
           input.recordWorkflowPlan?.({
             nativeId: `plan-${input.runId}`,
             text: report?.plan ?? '1. Implement scope. 2. Verify cancellation.',
           })
-      } else if (phase.stage === 'plan_review' || phase.stage === 'code_review')
-        input.recordWorkflowReview?.(report?.review ?? { verdict: 'accepted' })
-      else if (phase.stage === 'reply') input.recordWorkflowInputResult?.({ outcome: 'processed' })
+      } else if (phase.stage === 'plan_review' || phase.stage === 'code_review') {
+        input.recordWorkflowReview?.(report?.review ?? native.nextReview ?? { verdict: 'accepted' })
+        native.nextReview = undefined
+      } else if (phase.stage === 'reply')
+        input.recordWorkflowInputResult?.({ outcome: 'processed' })
       yield {
         agentId,
         type: 'text.completed',
@@ -169,6 +179,7 @@ afterEach(async () => {
   )
   native.inputs = []
   native.next = undefined
+  native.nextReview = undefined
   native.hold = undefined
   native.fail = false
   native.sources = []
@@ -480,6 +491,93 @@ describe('Native workflow admission and durable dispatch', () => {
     expect((await f.act('resume')).status).toBe('ready')
     expect(native.inputs).toHaveLength(3)
   })
+  it.each(['claude', 'codex'] as const)(
+    'routes %s plan reviewer decisions to the actual reviewer and returns to the owner only after Continue',
+    async (owner) => {
+      const f = await fixture(owner)
+      const reviewer = owner === 'claude' ? 'codex' : 'claude'
+      native.nextReview = {
+        verdict: 'needs_user',
+        questions: [
+          {
+            prompt: 'Which scope?',
+            selection: 'single',
+            options: [{ label: 'File' }, { label: 'Module' }],
+          },
+        ],
+      }
+      expect((await f.flow.send(f.input('/plan Confirm scope with the reviewer'))).ok).toBe(true)
+      const asked = await f.settled()
+      expect(asked).toMatchObject({
+        stage: 'plan_review',
+        actor: reviewer,
+        status: 'questions',
+        automation: 'paused',
+      })
+      const decision = asked.inputProcessing!.decision!
+      expect(decision.actor).toBe(reviewer)
+      const answer = {
+        ...f.input('Use the current file.'),
+        freezeDrafts: false,
+        replyToDecision: {
+          taskId: asked.id,
+          runId: decision.runId,
+          decisionInputSequence: decision.inputSequence,
+          expectedInputSequence: asked.inputSequence,
+        },
+      }
+      expect(await f.flow.send(answer)).toMatchObject({ ok: true })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+      const replied = await f.settled(),
+        input = native.inputs[2]!
+      expect(replied).toMatchObject({
+        stage: 'reply',
+        actor: reviewer,
+        automation: 'paused',
+        status: 'waiting',
+        planVersion: 1,
+      })
+      expect(replied.inputProcessing).toEqual({ settled: { runId: input.runId, inputSequence: 2 } })
+      expect(replied.planReference).toEqual(asked.planReference)
+      expect(replied.planInputSequence).toBe(1)
+      expect(input.promptEnvelope.collaborationAuthorization?.actor).toBe(reviewer)
+      expect(
+        collaborationReadOnly(
+          input.promptEnvelope.collaboration,
+          input.promptEnvelope.collaborationAuthorization,
+        ),
+      ).toBe(true)
+      expect(
+        collaborationPlanMode(
+          input.promptEnvelope.collaboration,
+          input.promptEnvelope.collaborationAuthorization,
+        ),
+      ).toBe(false)
+      expect(
+        collaborationInputResultRequired(
+          input.promptEnvelope.collaboration,
+          input.promptEnvelope.collaborationAuthorization,
+        ),
+      ).toBe(true)
+      expect(await f.flow.send(answer)).toMatchObject({ ok: true })
+      expect(native.inputs).toHaveLength(3)
+      expect((await f.act('resume')).status).toBe('ready')
+      expect(native.inputs.map((value) => value.promptEnvelope.collaboration?.stage)).toEqual([
+        'plan',
+        'plan_review',
+        'reply',
+        'plan',
+        'plan_review',
+      ])
+      expect(native.inputs.map((value) => value.promptEnvelope.collaboration?.actor)).toEqual([
+        owner,
+        reviewer,
+        reviewer,
+        owner,
+        reviewer,
+      ])
+    },
+  )
   it('receives a user message during a native turn once and pauses automatic peer dispatch', async () => {
     const f = await fixture(),
       held = Promise.withResolvers<void>()
@@ -504,12 +602,14 @@ describe('Native workflow admission and durable dispatch', () => {
     expect(await f.act('resume')).toMatchObject({ stage: 'code_review', status: 'complete' })
     expect(native.inputs).toHaveLength(3)
   })
-  it('rejects stale actions and keeps missing native plans awaiting clarification without inventing a document', async () => {
+  it('rejects stale actions and keeps missing native plans failed without inventing questions or a document', async () => {
     const f = await fixture()
     native.next = { plan: null }
     expect((await f.flow.send(f.input('/plan Inspect cancellation'))).ok).toBe(true)
     const failed = await f.settled()
-    expect(failed.status).toBe('questions')
+    expect(failed).toMatchObject({ status: 'failed', automation: 'paused' })
+    expect(failed.inputProcessing?.decision).toBeUndefined()
+    expect(f.db.conversationRepository.needsWorkflowPlanRecovery(failed.runId)).toBe(false)
     expect(failed.planReference).toBeUndefined()
     expect(native.inputs).toHaveLength(1)
     expect(
@@ -523,6 +623,82 @@ describe('Native workflow admission and durable dispatch', () => {
     ).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
     expect(native.inputs).toHaveLength(1)
   })
+  it.each([true, false])(
+    'restores the original owner reply without dispatch and requires its actual pending identity: %s',
+    async (pendingPresent) => {
+      const f = await fixture('codex')
+      expect((await f.flow.send(f.input('/plan Preserve recovery authority'))).ok).toBe(true)
+      await f.settled()
+      native.next = { plan: null }
+      expect(
+        (await f.flow.send(f.input('Confirm the plan with this additional requirement.'))).ok,
+      ).toBe(true)
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+      const failed = await f.settled()
+      expect(failed).toMatchObject({ stage: 'reply', status: 'failed', automation: 'paused' })
+      const repository = f.db.conversationRepository
+      const originalRun = repository.findRun(failed.runId)!
+      const originalMessage = repository.internalMessage(
+        originalRun.responseMessageId!,
+        f.sessionId,
+      )
+      repository.recordWorkflowPlanUnavailable(failed.runId)
+      if (!pendingPresent) {
+        const current = repository.collaboration(f.sessionId)!
+        repository.setCollaborationState({
+          ...current,
+          inputProcessing: {},
+          revision: current.revision + 1,
+        })
+      }
+      repository.recordWorkflowPlan(failed.runId, {
+        nativeId: 'recovered-original-plan',
+        text: 'Recovered original plan with the supplied requirement.',
+      })
+      const restore = async () => {
+        const task = repository.collaboration(f.sessionId)!
+        return f.flow.actOnCollaboration({
+          sessionId: f.sessionId,
+          taskId: task.id,
+          revision: task.revision,
+          clientMessageId: randomUUID(),
+          action: 'recover_plan',
+        })
+      }
+      const result = await restore()
+      expect(result.ok).toBe(pendingPresent)
+      const recovered = repository.collaboration(f.sessionId)!
+      expect(recovered).toMatchObject({
+        planVersion: 2,
+        automation: 'paused',
+        status: pendingPresent ? 'waiting' : 'failed',
+      })
+      expect(recovered.inputProcessing?.settled).toEqual(
+        pendingPresent ? { runId: failed.runId, inputSequence: failed.inputSequence } : undefined,
+      )
+      expect(repository.findRun(failed.runId)?.responseMessageId).toBe(
+        originalRun.responseMessageId,
+      )
+      expect(repository.internalMessage(originalRun.responseMessageId!, f.sessionId)).toEqual(
+        originalMessage,
+      )
+      expect(native.inputs).toHaveLength(3)
+      const resume = await f.flow.actOnCollaboration({
+        sessionId: f.sessionId,
+        taskId: recovered.id,
+        revision: recovered.revision,
+        clientMessageId: randomUUID(),
+        action: 'resume',
+      })
+      expect(resume.ok).toBe(pendingPresent)
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(pendingPresent ? 4 : 3))
+      await f.settled()
+      expect(native.inputs).toHaveLength(pendingPresent ? 4 : 3)
+      expect(repository.collaboration(f.sessionId)?.status).toBe(
+        pendingPresent ? 'ready' : 'failed',
+      )
+    },
+  )
   it('validates native plan comment ownership, version, hash and quote without retaining forged drafts', async () => {
     const f = await fixture(),
       content = '## Scope\n\nKeep **cancellation ownership** together.'

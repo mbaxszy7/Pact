@@ -190,9 +190,11 @@ export const CollaborationReview = memo(function CollaborationReview({
     (view?.planSource?.runId === run.id ? task.planVersion : undefined) ??
     (task.review?.runId === run.id ? task.review.planReference?.version : undefined)
   const review = task.review?.runId === run.id ? task.review : undefined
+  const planSync = view?.planSync
   const inputState = collaborationInputProcessing(task)
-  const replyLabel =
-    inputState.decision?.runId === run.id
+  const replyLabel = planSync
+    ? 'Plan recovery required'
+    : inputState.decision?.runId === run.id
       ? actionable
         ? 'Waiting for your answer'
         : 'Asked for your input'
@@ -212,13 +214,12 @@ export const CollaborationReview = memo(function CollaborationReview({
               ? 'Review response'
               : replyLabel
   const paused = actionable && task.status !== 'complete' && task.automation === 'paused'
-  const planSync = view?.planSync
   const inputGate = collaborationInputGate(task)
   const nextStep = planSync || inputGate ? undefined : view?.nextStep
   const actions = actionable
     ? (view?.availableActions ?? []).filter(
         (action) =>
-          action !== 'continue' && (!inputGate || action === 'pause' || action === 'recover_plan'),
+          action !== 'continue' && action !== 'pause' && (!inputGate || action === 'recover_plan'),
       )
     : []
   const actionLabel = (action: CollaborationAction): string =>

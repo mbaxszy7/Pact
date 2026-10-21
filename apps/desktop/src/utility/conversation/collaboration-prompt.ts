@@ -1,6 +1,7 @@
 import {
   COLLABORATION_DISPLAY_TEXT_RULES,
   collaborationInputProcessing,
+  collaborationPlanMode,
   type CollaborationTask,
   type CollaborationTurnAuthorization,
 } from '@pact/contracts'
@@ -16,17 +17,7 @@ export const frozenSourceInstructions = [
   'Read only the supplied references needed for this request. Handle attached comments and images. An available source reader does not require a tool call or start a plan, review or peer conversation.',
 ].join('\n')
 
-export const collaborationPlanMode = (
-  task: CollaborationTask | undefined,
-  authorization?: CollaborationTurnAuthorization,
-): boolean => {
-  const stage = authorization?.stage ?? task?.stage
-  return Boolean(
-    task &&
-    (stage === 'plan' ||
-      (stage === 'reply' && task.kind === 'plan' && !task.codeRunId && task.actor === task.owner)),
-  )
-}
+export { collaborationPlanMode } from '@pact/contracts'
 
 export const collaborationReviewMode = (
   task: CollaborationTask | undefined,
@@ -40,7 +31,7 @@ export const collaborationInputResultRequired = (
   Boolean(
     task &&
     (authorization?.stage ?? task.stage) === 'reply' &&
-    !(task.kind === 'plan' && !task.codeRunId) &&
+    !collaborationPlanMode(task, authorization) &&
     collaborationInputProcessing(task).pending,
   )
 

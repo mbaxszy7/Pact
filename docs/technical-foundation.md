@@ -1,6 +1,6 @@
 # Architecture
 
-Implementation boundaries follow. [Product requirements](product/requirements.md) define behavior, [resource requirements below](#performance-and-resource-requirements) define resource budgets, and [the contribution guide](../CONTRIBUTING.md#testing) defines verification. Read [CONTRIBUTING](../CONTRIBUTING.md) before changing contracts.
+[Product requirements](product/requirements.md) define behavior, [resource requirements below](#performance-and-resource-requirements) define resource budgets, and [the contribution guide](../CONTRIBUTING.md#testing) defines verification. Read [CONTRIBUTING](../CONTRIBUTING.md) before changing contracts.
 
 ## Processes and trust
 
@@ -216,7 +216,7 @@ Plans are versioned segmented native documents. Reports directly reference exist
 
 Repository settlement validates admitted Run/task/source/input, real normal root completion, sealed output and settled native effects before promoting saved candidates. Duplicate events/readback are idempotent. Exact current independent acceptance enables Implement; new input/plan/scope retires dependent acceptance. Conflicting verdicts are incomplete. Cold recovery needs saved authenticated candidates and actual native proof; unknown tool namespaces or missing evidence cannot become acceptance or a formatting-only Turn.
 
-Task JSON owns bounded decision, pending-input and settled-reply identities. A shared gate blocks continuation until input settles. Plan replies need an actual published/retained plan with no unanswered questions. Build/Review use root-bound `submit_input_result` (processed/needs_user), journaled and promoted only after normal completion, sealed response and settled effects. Missing/conflicting signals fail closed; success stays paused. Fork remaps these references.
+Task JSON bounds decision, pending-input and settled-reply identities; its gate blocks continuation until settlement. Decision replies target the verified requesting Run's actor. Owner Plan replies need a published/retained plan with no unanswered questions. Other replies use root-bound `submit_input_result` (processed/needs_user), journaled and promoted only after normal completion, sealed response and settled effects. Missing/conflicting signals fail closed; success stays paused. Fork remaps these references.
 
 Count each plan review, each initial/repeated code review and each new explicit repair separately. Reserve before dispatch; release only proven-unsent reservations. Drafts, questions and author responses do not count; continuing the same unfinished authorized write preserves its repair count. Later admission uses current Session limits without resetting history.
 

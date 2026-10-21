@@ -243,3 +243,25 @@ it('keeps failed action receipts visible after successful refresh and sends the 
     expect.objectContaining({ taskId: task.id, revision: task.revision, action: 'resume' }),
   )
 })
+
+it('omits Pause while preserving the authorized next action and revision receipt', async () => {
+  const { props, task } = collaborationFixture()
+  const bridge = installRead(task)
+  bridge.getConversation.mockResolvedValue({
+    ok: true,
+    value: reportPage(task, { availableActions: ['resume', 'pause'] }),
+  })
+  bridge.actOnCollaboration.mockResolvedValue({
+    ok: false,
+    error: { code: 'CONFLICT', message: 'Revision changed' },
+  })
+  render(<CollaborationReview {...props} />)
+  const resume = await screen.findByRole('button', { name: 'Continue collaboration' })
+  expect(screen.queryByRole('button', { name: /Pause collaboration/i })).toBeNull()
+  fireEvent.click(resume)
+  await waitFor(() =>
+    expect(bridge.actOnCollaboration).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ taskId: task.id, revision: task.revision, action: 'resume' }),
+    ),
+  )
+})

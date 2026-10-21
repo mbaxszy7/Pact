@@ -141,6 +141,7 @@ export interface RuntimeFixtureOptions {
     | 'context_limit'
     | 'native_context_recovery'
     | 'session_permission_scope'
+    | 'native_question'
     | 'fork_complete'
     | 'writer_rejected_once'
     | 'native_title'
@@ -1105,10 +1106,12 @@ const collaborationReport = async (prefix, facts, transport) => {
   const plan='1. Keep cancellation with its owner. 2. Verify Stop and restart. 3. Review the resulting code.'
   const questions=[{prompt:'Which cancellation scope should change?',selection:'single',options:[{label:'Current request'},{label:'All pending requests'}]}]
   const firstQuestion=reference.stage==='plan'&&!reference.plan&&(task.includes('unclear')||task.trim()==='/plan')
-  if((reference.stage==='plan'||reference.stage==='reply')&&reference.kind==='plan') {
+  if((reference.stage==='plan'||reference.stage==='reply')&&reference.kind==='plan'&&auth.actor===reference.owner) {
+    if(task.includes('missing native plan'))return {text:'The native plan was not published.'}
     if(firstQuestion)return {tool:'submit_input_result',args:{outcome:'needs_user',questions},text:'Choose the cancellation scope before preparing the plan.'}
     return {plan,text:'The complete plan is ready for independent review.'}
   }
+  if(reference.stage==='plan_review'&&task.includes('reviewer decision')&&!facts.askedReviewerQuestion){facts.askedReviewerQuestion=true;return {tool:'submit_review',args:{verdict:'needs_user',questions},text:'The reviewer needs your cancellation scope decision.'}}
   if(reference.stage==='plan_review')return {tool:'submit_review',args:{verdict:'accepted'},text:'The plan covers cancellation ownership and restart. Accepted.'}
   if(reference.stage==='code_review') {
     facts.reviewCount=(facts.reviewCount??0)+1
@@ -1320,7 +1323,11 @@ for await (const line of lines) {
     if (state.methods.length >= 4096) throw new Error('Fixture request history budget exceeded.')
     state.methods.push(request.method); persist()
   }
-  if (request.id === 'session-scope-approval' && !request.method) {
+  if (request.id === 'native-question' && !request.method) {
+    if(request.result?.answers?.scope?.answers?.[0]!=='Current request')throw Error('Native answer was not delivered to its root')
+    const finish=approvalComplete;approvalComplete=undefined;finish?.()
+  }
+  else if (request.id === 'session-scope-approval' && !request.method) {
     if (state.permissionDecisions.length >= 8) throw new Error('Fixture permission response budget exceeded.')
     state.permissionDecisions.push(request.result?.decision ?? 'error'); persist()
     const finish = approvalComplete; approvalComplete = undefined
@@ -1457,6 +1464,9 @@ for await (const line of lines) {
         if(report.tool){const result=await call(report.tool,report.args);send({method:'item/completed',params:{threadId,turnId,item:{id:'workflow-'+turnId,type:'mcpToolCall',server:own[0].slice('mcp_servers.'.length),tool:report.tool,arguments:report.args,result,error:null,status:'completed'}}})}
         text=report.text
         persist();complete()
+      } else if (scenario === 'native_question') {
+        approvalComplete = complete
+        setTimeout(()=>send({id:'native-question',method:'item/tool/requestUserInput',params:{threadId,turnId,itemId:'question-tool',questions:[{id:'scope',header:'Cancellation scope',question:'Which cancellation scope?',options:[{label:'Current request',description:'Stop this request only.'},{label:'All requests',description:'Stop every request.'}]}]}}),1000)
       } else if (scenario === 'session_permission_scope') {
         approvalComplete = complete
         send({ id: 'session-scope-approval', method: 'item/commandExecution/requestApproval', params: {

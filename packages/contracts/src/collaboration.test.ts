@@ -354,3 +354,37 @@ describe('bounded source transport without full document truncation', () => {
     ).toBe(false)
   })
 })
+
+describe('failed reply settlement identity', () => {
+  it.each(['missing', 'wrong-run', 'old-input'] as const)(
+    'requires positive exact settlement for %s evidence',
+    (kind) => {
+      const current = task({
+        stage: 'reply',
+        status: 'failed',
+        automation: 'paused',
+        inputSequence: 2,
+        inputProcessing: {},
+      })
+      if (kind !== 'missing')
+        current.inputProcessing = {
+          settled: {
+            runId: kind === 'wrong-run' ? randomUUID() : current.runId,
+            inputSequence: kind === 'old-input' ? 1 : 2,
+          },
+        }
+      expect(collaborationInputGate(current)).toBe('incomplete')
+      {
+        expect(collaborationAvailableActions(current)).toEqual([])
+        for (const action of ['resume', 'continue', 'execute', 'retry'] as const)
+          expect(() => advanceCollaboration(current, action, limits)).toThrow(/Reply/)
+      }
+    },
+  )
+})
+
+it('allows a failed reply gate to clear only for its exact settled run and input', () => {
+  const current = task({ stage: 'reply', status: 'failed', automation: 'paused', inputSequence: 2 })
+  current.inputProcessing = { settled: { runId: current.runId, inputSequence: 2 } }
+  expect(collaborationInputGate(current)).toBeUndefined()
+})

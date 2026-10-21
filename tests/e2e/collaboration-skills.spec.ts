@@ -95,6 +95,9 @@ for (const primary of ['codex', 'claude'] as const)
       await expect(
         f.page.getByRole('button', { name: `Implement plan · ${owner}`, exact: true }),
       ).toBeEnabled()
+      await expect(
+        f.page.getByRole('button', { name: 'Pause collaboration', exact: true }),
+      ).toHaveCount(0)
       expect(await f.counts()).toEqual({ codex: 1, claude: 1 })
       expect(await current(f.page, f.sessionId)).toMatchObject({
         owner: primary,
@@ -262,3 +265,102 @@ test('@deterministic cold restart preserves the accepted native plan and pauses 
     await f.fixture.dispose()
   }
 })
+
+for (const primary of ['codex', 'claude'] as const) {
+  test(`@deterministic ${primary} plan reviewer receives decision answers before explicit author continuation`, async () => {
+    const f = await prepare(primary)
+    const reviewer = primary === 'codex' ? 'claude' : 'codex'
+    try {
+      await f.send('/plan reviewer decision about cancellation')
+      const card = f.page.getByRole('region', { name: 'Collaboration questions', exact: true })
+      await expect(card).toContainText(
+        `${reviewer === 'codex' ? 'Codex' : 'Claude Code'} is waiting for your reply`,
+      )
+      await expect(f.page.getByRole('combobox', { name: 'Message', exact: true })).toHaveCount(0)
+      await card.getByRole('radio', { name: 'Current request', exact: true }).check()
+      await card.getByRole('button', { name: 'Send answers', exact: true }).click()
+      await expect(
+        f.page.getByText(
+          'The supplied scope decision has been handled. Continue explicitly to resume collaboration.',
+          { exact: true },
+        ),
+      ).toBeVisible()
+      await expect(card).toHaveCount(0)
+      const reply = f.page.locator('article').filter({ hasText: 'Replies to your questions' })
+      await expect(reply).toContainText(`@${reviewer}`)
+      await expect(
+        reply.locator('strong').filter({ hasText: 'Replies to your questions' }),
+      ).toHaveCount(1)
+      await expect(
+        reply.locator('p').filter({ hasText: '1. Which cancellation scope should change?' }),
+      ).toHaveCount(1)
+      await expect(reply.locator('li').filter({ hasText: 'Current request' })).toHaveCount(1)
+      expect(await current(f.page, f.sessionId)).toMatchObject({
+        owner: primary,
+        actor: reviewer,
+        stage: 'reply',
+        automation: 'paused',
+        planVersion: 1,
+      })
+      expect(await f.counts()).toEqual(
+        primary === 'codex' ? { codex: 1, claude: 2 } : { codex: 2, claude: 1 },
+      )
+      await f.page.getByRole('button', { name: 'Continue collaboration', exact: true }).click()
+      await expect(
+        f.page.getByRole('button', {
+          name: `Implement plan · ${primary === 'codex' ? 'Codex' : 'Claude Code'}`,
+          exact: true,
+        }),
+      ).toBeEnabled()
+      expect(await f.counts()).toEqual(
+        primary === 'codex' ? { codex: 2, claude: 3 } : { codex: 3, claude: 2 },
+      )
+      await expect(
+        f.page.getByRole('button', { name: 'Pause collaboration', exact: true }),
+      ).toHaveCount(0)
+    } finally {
+      await quitPact(f.app)
+      await f.fixture.dispose()
+    }
+  })
+
+  test(`@deterministic ${primary} missing native plan does not manufacture a user question or restore evidence`, async () => {
+    const f = await prepare(primary)
+    try {
+      await f.send('/plan missing native plan')
+      await expect.poll(async () => (await current(f.page, f.sessionId))?.status).toBe('failed')
+      await expect(
+        f.page.getByRole('region', { name: 'Collaboration questions', exact: true }),
+      ).toHaveCount(0)
+      await expect(f.page.getByRole('button', { name: /Restore plan/ })).toHaveCount(0)
+      await expect(
+        f.page.getByText(
+          `Next: Update the plan with ${primary === 'codex' ? 'Codex' : 'Claude Code'}.`,
+          { exact: false },
+        ),
+      ).toBeVisible()
+      await expect(f.page.getByRole('combobox', { name: 'Message', exact: true })).toBeVisible()
+      expect(await f.counts()).toEqual(
+        primary === 'codex' ? { codex: 1, claude: 0 } : { codex: 0, claude: 1 },
+      )
+      await f.page.getByRole('button', { name: 'Continue collaboration', exact: true }).click()
+      await expect
+        .poll(f.counts)
+        .toEqual(primary === 'codex' ? { codex: 2, claude: 0 } : { codex: 0, claude: 2 })
+      await expect.poll(async () => (await current(f.page, f.sessionId))?.status).toBe('failed')
+      expect(await current(f.page, f.sessionId)).toMatchObject({
+        stage: 'plan',
+        actor: primary,
+        planVersion: 0,
+      })
+      await expect(f.page.getByRole('button', { name: /Implement plan/ })).toHaveCount(0)
+      await expect(
+        f.page.getByRole('region', { name: 'Collaboration questions', exact: true }),
+      ).toHaveCount(0)
+      await expect(f.page.getByRole('button', { name: /Restore plan/ })).toHaveCount(0)
+    } finally {
+      await quitPact(f.app)
+      await f.fixture.dispose()
+    }
+  })
+}

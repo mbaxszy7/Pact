@@ -77,6 +77,7 @@ import {
   collaborationTurnAuthorizationSchema,
   collaborationAvailableActions,
   collaborationNextStage,
+  collaborationPlanMode,
   collaborationActor,
   collaborationStageLabel,
   collaborationRequiresPlan,
@@ -2447,9 +2448,7 @@ export class ConversationRepository {
       if (!run || run.forkSourceRunId || !turn || run.controlDisposition === 'abandoned') return
       const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
       const frozen = this.decodedCollaboration(turn.stateJson)
-      const planner =
-        auth.stage === 'plan' ||
-        (auth.stage === 'reply' && frozen.kind === 'plan' && !frozen.codeRunId)
+      const planner = collaborationPlanMode(frozen, auth)
       if (!planner || auth.actor !== frozen.owner || run.agentId !== auth.actor)
         throw new RunOperationConflictError(
           'Only the current plan author can submit a native plan.',
@@ -2498,10 +2497,7 @@ export class ConversationRepository {
       if (
         auth.actor !== frozen.owner ||
         run.agentId !== auth.actor ||
-        !(
-          auth.stage === 'plan' ||
-          (auth.stage === 'reply' && frozen.kind === 'plan' && !frozen.codeRunId)
-        )
+        !collaborationPlanMode(frozen, auth)
       )
         throw new RunOperationConflictError('This root does not own a plan response.')
       const basis = auth.planReference?.document
@@ -2562,10 +2558,7 @@ export class ConversationRepository {
       if (
         auth.actor !== frozen.owner ||
         run.agentId !== auth.actor ||
-        !(
-          auth.stage === 'plan' ||
-          (auth.stage === 'reply' && frozen.kind === 'plan' && !frozen.codeRunId)
-        )
+        !collaborationPlanMode(frozen, auth)
       )
         return
       this.database
@@ -2698,10 +2691,7 @@ export class ConversationRepository {
     if (!turn) return false
     const task = this.decodedCollaboration(turn.state),
       auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.auth))
-    return (
-      auth.actor === task.owner &&
-      (auth.stage === 'plan' || (auth.stage === 'reply' && task.kind === 'plan' && !task.codeRunId))
-    )
+    return collaborationPlanMode(task, auth)
   }
 
   /** Recovery repairs a missing result; it never resumes business work. */
@@ -2727,8 +2717,7 @@ export class ConversationRepository {
     )
       return false
     const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
-    const planner =
-      auth.stage === 'plan' || (auth.stage === 'reply' && task.kind === 'plan' && !task.codeRunId)
+    const planner = collaborationPlanMode(task, auth)
     const retained = this.workflowPlanRetention(runId, turn.planNativeId)
     return (
       planner &&
@@ -2824,12 +2813,13 @@ export class ConversationRepository {
     const task = this.collaboration(run.sessionId),
       auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson)),
       frozen = this.decodedCollaboration(turn.stateJson)
-    if (task && auth.stage === 'reply' && !(frozen.kind === 'plan' && !frozen.codeRunId)) {
+    if (task && auth.stage === 'reply' && !collaborationPlanMode(frozen, auth)) {
       if (!this.workflowInputResult(runId) || !collaborationInputProcessing(task).pending) return
       const before = { input: task.inputProcessing, status: task.status, notice: task.notice }
       if (this.settleWorkflowInput(task, run, auth, turn, false)) {
         task.status = 'waiting'
-        if (!task.pendingWork) task.nextStage = 'code_review'
+        const stage = collaborationNextStage(task)
+        task.nextStage = stage === 'reply' ? undefined : stage
       }
       if (
         isDeepStrictEqual(before, {
@@ -2854,10 +2844,7 @@ export class ConversationRepository {
       task.id !== turn.taskId ||
       task.runId !== runId ||
       task.stage !== auth.stage ||
-      !(
-        auth.stage === 'plan' ||
-        (auth.stage === 'reply' && frozen.kind === 'plan' && !frozen.codeRunId)
-      ) ||
+      !collaborationPlanMode(frozen, auth) ||
       task.handledInputSequence !== auth.inputSequence
     )
       return
@@ -2901,7 +2888,16 @@ export class ConversationRepository {
     task.nextStage = 'plan_review'
     task.notice = undefined
     if (task.pauseReason === 'failure') task.pauseReason = 'user'
-    if (auth.stage === 'reply') this.settleWorkflowInput(task, run, auth, turn, true)
+    if (
+      auth.stage === 'reply' &&
+      !this.settleWorkflowInput(task, run, auth, turn, true) &&
+      task.status === 'waiting'
+    ) {
+      task.status = 'failed'
+      task.automation = 'paused'
+      task.pauseReason = 'failure'
+      task.notice = 'The plan was restored, but your reply has not been confirmed as processed.'
+    }
     task.revision++
     this.saveCollaboration(task)
     this.database
@@ -2951,10 +2947,7 @@ export class ConversationRepository {
       const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
       const frozen = this.decodedCollaboration(turn.stateJson)
       const pending = (auth.inputProcessing ?? collaborationInputProcessing(frozen)).pending
-      const planner =
-        auth.actor === frozen.owner &&
-        (auth.stage === 'plan' ||
-          (auth.stage === 'reply' && frozen.kind === 'plan' && !frozen.codeRunId))
+      const planner = collaborationPlanMode(frozen, auth)
       const parsed = collaborationInputObservationSchema.parse(result)
       if (
         auth.actor !== run.agentId ||
@@ -3010,7 +3003,7 @@ export class ConversationRepository {
       !this.isCurrentNativeCursor(run, binding)
     )
       return false
-    const planner = frozen.kind === 'plan' && !frozen.codeRunId
+    const planner = collaborationPlanMode(frozen, auth)
     if (task.inputSequence !== auth.inputSequence) {
       const later = this.database
         .select({
@@ -3056,10 +3049,7 @@ export class ConversationRepository {
       this.nativeFact(run.id, 'workflow.input_settled', { inputSequence: auth.inputSequence })
       return true
     }
-    const needsUser =
-      unanswered ||
-      outcome === 'needs_user' ||
-      (planner && !this.workflowInputResult(run.id) && !this.workflowPlanCaptureFailed(run.id))
+    const needsUser = unanswered || outcome === 'needs_user'
     task.inputProcessing = needsUser
       ? {
           ...state,
@@ -3373,8 +3363,33 @@ export class ConversationRepository {
     return Boolean(this.sourceQueries.quotedDocument().get({ runId, documentId: document.id }))
   }
 
-  collaborationReplyActor(task: CollaborationTask): RuntimeAgentId {
-    return task.kind === 'review' ? task.reviewer : task.owner
+  collaborationReplyActor(
+    task: CollaborationTask,
+    reference?: import('@pact/contracts').ConversationSendInput['replyToDecision'],
+  ): RuntimeAgentId {
+    if (!reference) return task.kind === 'review' ? task.reviewer : task.owner
+    const decision = collaborationInputProcessing(task).decision
+    const run = this.findRun(reference.runId)
+    const authorization = this.collaborationTurnAuthorization(reference.runId)
+    if (
+      !decision ||
+      !run ||
+      !authorization ||
+      reference.taskId !== task.id ||
+      decision.runId !== reference.runId ||
+      decision.inputSequence !== reference.decisionInputSequence ||
+      task.inputSequence !== reference.expectedInputSequence ||
+      run.sessionId !== task.sessionId ||
+      authorization.runId !== run.id ||
+      authorization.taskId !== task.id ||
+      authorization.inputSequence !== reference.decisionInputSequence ||
+      authorization.actor !== run.agentId ||
+      (decision.actor !== undefined && decision.actor !== run.agentId)
+    )
+      throw new RunOperationConflictError(
+        'The Agent that asked these questions could not be verified. Your answers were preserved.',
+      )
+    return run.agentId
   }
 
   readWorkflowInputs(runId: string, offset = 0) {
@@ -6332,9 +6347,7 @@ export class ConversationRepository {
         turn.planBodyId && turn.planNativeId
           ? this.documentReference(run.sessionId, turn.planBodyId)
           : undefined
-      const planner =
-        auth.stage === 'plan' ||
-        (auth.stage === 'reply' && frozen.kind === 'plan' && !frozen.codeRunId)
+      const planner = collaborationPlanMode(frozen, auth)
       if (!report && !plan) {
         task.status = 'failed'
         task.automation = 'paused'
@@ -6360,7 +6373,15 @@ export class ConversationRepository {
               ? 'plan_review'
               : 'plan'
         else if (!task.pendingWork) task.nextStage = 'code_review'
-        this.settleWorkflowInput(task, run, auth, turn, planSettled)
+        if (
+          !this.settleWorkflowInput(task, run, auth, turn, planSettled) &&
+          task.status === 'waiting'
+        ) {
+          task.status = 'failed'
+          task.pauseReason = 'failure'
+          task.notice =
+            'Your reply has not been confirmed as processed. Check its response before continuing.'
+        }
       } else if (auth.stage === 'plan') {
         if (planSettled) {
           task.status = 'waiting'
@@ -6375,11 +6396,11 @@ export class ConversationRepository {
               this.workflowPlanCaptureFailed(runId) ||
               this.workflowInputResult(runId),
             )
-          task.status = unavailable ? 'failed' : 'questions'
+          task.status = unanswered ? 'questions' : 'failed'
           task.nextStage = 'plan'
           task.automation = 'paused'
-          task.pauseReason = unavailable ? 'failure' : 'needs_user'
-          if (!unavailable)
+          task.pauseReason = unanswered ? 'needs_user' : 'failure'
+          if (unanswered)
             task.inputProcessing = {
               ...collaborationInputProcessing(task),
               decision: {
@@ -6394,7 +6415,7 @@ export class ConversationRepository {
             ? 'Your answers are needed before this plan response can be reviewed.'
             : unavailable
               ? 'The latest plan has not been synced to Pact. Restore its saved native source before continuing.'
-              : 'The plan author needs your input before continuing.'
+              : 'The Agent ended without a confirmed plan. Ask the plan author to complete it before continuing.'
         }
       } else if (auth.stage === 'plan_review' || auth.stage === 'code_review') {
         const verdict =

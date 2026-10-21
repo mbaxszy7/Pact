@@ -75,26 +75,31 @@ export const hasDecisionAnswers = (draft: DecisionAnswerDraft | undefined): bool
     (draft.originalReply?.trim() ||
       Object.values(draft.answers).some((answer) => answer.optionIds.length || answer.text.trim())),
   )
+const decisionAnswerMarkdownText = (text: string) => text.replace(/[\\`*_[\]<>]/gu, '\\$&')
+
 function formatDecisionAnswers(draft: DecisionAnswerDraft): string {
   if (!draft.questions.length) return draft.originalReply?.trim() ?? ''
   return draft.questions
-    .flatMap((question) => {
+    .flatMap((question, index) => {
       const answer = draft.answers[question.id]
       if (!answer || (!answer.optionIds.length && !answer.text.trim())) return []
       const choices =
         question.options?.filter((option) => answer.optionIds.includes(option.id)) ?? []
       return [
-        `Question: ${question.prompt}`,
-        ...choices.map(
-          (option) =>
-            `Selected: ${option.label}${option.description ? ` — ${option.description}` : ''}`,
-        ),
-        ...(answer.text.trim() ? [`My answer: ${answer.text.trim()}`] : []),
-        '',
+        [
+          `**${index + 1}. ${decisionAnswerMarkdownText(question.prompt)}**`,
+          '',
+          '**Your answer:**',
+          '',
+          ...choices.map(
+            (option) =>
+              `- ${decisionAnswerMarkdownText(option.label)}${option.description ? ` — ${decisionAnswerMarkdownText(option.description)}` : ''}`,
+          ),
+          ...(answer.text.trim() ? ['', decisionAnswerMarkdownText(answer.text.trim())] : []),
+        ].join('\n'),
       ]
     })
-    .join('\n')
-    .trim()
+    .join('\n\n')
 }
 
 export interface ConversationHistoryControls {
@@ -2385,7 +2390,7 @@ export function useConversation(
         ? formatDecisionAnswers(draftAnswers)
         : ''
     if (decision && !answers) return false
-    const content = decision ? `Replies to your questions:\n${answers}` : original
+    const content = decision ? `**Replies to your questions**\n\n${answers}` : original
     const submissionSkills = decision ? undefined : skills
     const selectedRoute = decision ? undefined : route
     const images = decision ? [] : (composerDraftsRef.current[sessionId]?.images ?? [])

@@ -745,6 +745,10 @@ export function ConversationView({
   const planningTask = currentTask?.kind === 'plan' ? currentTask : undefined
   const unfinishedTask = currentTask?.status === 'complete' ? undefined : currentTask
   const inputGateState = unfinishedTask ? collaborationInputGate(unfinishedTask) : undefined
+  const planRecovery =
+    currentPlan?.sessionId === session.id && currentPlan.planSync?.runId === unfinishedTask?.runId
+      ? currentPlan?.planSync
+      : undefined
   const decisionSource = unfinishedTask
     ? collaborationInputProcessing(unfinishedTask).decision
     : undefined
@@ -756,8 +760,14 @@ export function ConversationView({
   // current-task projection is refreshing. A new reply or withdrawn input has
   // a different identity/version and can ask for a decision again.
   const decisionTakeover = Boolean(decisionSource)
+  const nativeRequests = nativeInputRequests(snapshot)
+  const nativeQuestions = nativeRequests.filter(
+    ({ request }) => request.kind && request.kind !== 'approval',
+  )
+  const inputTakeover = decisionTakeover || nativeQuestions.length > 0
   const showDecisionNotice = Boolean(
     decisionSource &&
+    !planRecovery &&
     decisionKey !== answeredDecisionKey &&
     (inputGateState === 'needs_reply' || inputGateState === 'incomplete'),
   )
@@ -841,7 +851,7 @@ export function ConversationView({
     route: composerRoute,
     mention: composerMention,
     returnedInputOperationId: composerReturnedInputOperationId,
-    disabled: composerDisabled || decisionTakeover,
+    disabled: composerDisabled || inputTakeover,
   })
   const activeSkillId = skillComposer.query
     ? skillComposer.options[skillComposer.active]?.id
@@ -2119,7 +2129,7 @@ export function ConversationView({
   }
 
   const submit = async (): Promise<void> => {
-    if (decisionTakeover) return
+    if (inputTakeover) return
     if (responseInProgress && !queueEnabled && !unfinishedTask) return
     if (responseInProgress && queuedInput) {
       onNotice('One message is already queued. Edit or remove it before queuing another.')
@@ -2754,7 +2764,7 @@ export function ConversationView({
               onOpenPlan={openRecordedPlan}
               onOpenProjectFile={openProjectFile}
               onCreateReportComment={
-                recoveryLocked || decisionTakeover ? undefined : handleCreatePlanComment
+                recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
               }
               feedbackDraft={feedbackDraft}
               onTaskChange={() => setPlanRefresh((value) => value + 1)}
@@ -2818,7 +2828,7 @@ export function ConversationView({
               onOpenPlan={openRecordedPlan}
               onOpenProjectFile={openProjectFile}
               onCreateReportComment={
-                recoveryLocked || decisionTakeover ? undefined : handleCreatePlanComment
+                recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
               }
               feedbackDraft={feedbackDraft}
               onTaskChange={() => setPlanRefresh((value) => value + 1)}
@@ -2875,6 +2885,12 @@ export function ConversationView({
       ? activeRun
       : message.runId
         ? runsById.get(message.runId)
+        : undefined
+    const replyRecipient =
+      message.role === 'user' && messageRun?.collaboration?.stage === 'reply'
+        ? message.route?.type === 'agent'
+          ? message.route.agentId
+          : messageRun.agentId
         : undefined
     const activityRunId = messageRun?.id ?? message.runId
     const visibleContent = message.content
@@ -2938,6 +2954,14 @@ export function ConversationView({
             <div data-pact-message-bubble className={`rounded-message ${background} px-4 py-3`}>
               <p className="flex min-w-0 items-baseline gap-1.5 text-caption text-secondary">
                 <span className="shrink-0 font-medium">{speaker}</span>
+                {replyRecipient ? (
+                  <span
+                    className="font-medium text-primary"
+                    aria-label={`Reply to ${replyRecipient === 'codex' ? 'Codex' : 'Claude Code'}`}
+                  >
+                    @{replyRecipient}
+                  </span>
+                ) : null}
                 {message.role === 'assistant' && messageRun ? (
                   <RunConfiguration run={messageRun} />
                 ) : null}
@@ -2978,7 +3002,7 @@ export function ConversationView({
                     onOpenProjectFile={openProjectFile}
                     messageId={message.id}
                     onCreateComment={
-                      recoveryLocked || decisionTakeover ? undefined : handleCreateMessageComment
+                      recoveryLocked || inputTakeover ? undefined : handleCreateMessageComment
                     }
                   />
                 ) : null}
@@ -3063,7 +3087,7 @@ export function ConversationView({
             onOpenPlan={openRecordedPlan}
             onOpenProjectFile={openProjectFile}
             onCreateReportComment={
-              recoveryLocked || decisionTakeover ? undefined : handleCreatePlanComment
+              recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
             }
             feedbackDraft={feedbackDraft}
             onTaskChange={() => setPlanRefresh((value) => value + 1)}
@@ -3175,7 +3199,7 @@ export function ConversationView({
               onRetry={() => setPlanRefresh((value) => value + 1)}
               onOpenProjectFile={openProjectFile}
               onCreatePlanComment={
-                recoveryLocked || decisionTakeover ? undefined : handleCreatePlanComment
+                recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
               }
             />,
             planPanelHost,
@@ -3378,17 +3402,9 @@ export function ConversationView({
           {snapshot?.forkOperation && !snapshot.forkOperation.ready ? (
             <NativeForkRecovery operation={snapshot.forkOperation} />
           ) : null}
-          {nativeInputRequests(snapshot).map(({ agentId, request }) =>
-            request.kind && request.kind !== 'approval' ? (
-              <NativeInputCard
-                key={request.id}
-                request={request}
-                agentId={agentId}
-                onRespond={onRespondNativeInput}
-                draft={nativeInputDrafts[request.id]}
-                onDraftChange={onNativeInputDraftChange}
-              />
-            ) : (
+          {nativeRequests
+            .filter(({ request }) => !request.kind || request.kind === 'approval')
+            .map(({ agentId, request }) => (
               <NativePermissionCard
                 key={request.id}
                 request={request}
@@ -3396,8 +3412,7 @@ export function ConversationView({
                 agentId={agentId}
                 onRespond={onRespondNativePermission}
               />
-            ),
-          )}
+            ))}
 
           {hasNewerHistory ? (
             <div className="mx-auto mt-group">
@@ -3474,14 +3489,14 @@ export function ConversationView({
               queue={queue}
               pending={queueActions.pending}
               disabled={composerDisabled || sending || stopping}
-              canSteer={!decisionTakeover && canSteerQueuedInput}
+              canSteer={!inputTakeover && canSteerQueuedInput}
               steerUnavailableReason={
-                decisionTakeover ? 'Answer the current questions first.' : steerUnavailableReason
+                inputTakeover ? 'Answer the current questions first.' : steerUnavailableReason
               }
               respondingAgentId={respondingAgentId}
               onSteer={queueActions.steer}
               onRemove={queueActions.remove}
-              onEdit={decisionTakeover ? undefined : () => returnQueueMessageToComposer(false)}
+              onEdit={inputTakeover ? undefined : () => returnQueueMessageToComposer(false)}
               onResume={queueActions.resume}
               onSetEnabled={queueActions.setEnabled}
               onCheckStatus={
@@ -3494,71 +3509,104 @@ export function ConversationView({
           <InputReplacement
             key={session.id}
             replacement={
-              decisionTakeover && decisionSource
+              nativeQuestions.length
                 ? {
-                    key: decisionReply ? `question:${decisionKey}` : `processing:${decisionKey}`,
-                    content: decisionReply ? (
-                      <div className="space-y-2">
-                        {inputGateState === 'incomplete' ? (
-                          <p role="status" className="px-group text-caption text-secondary">
-                            {incompleteCanAnswer
-                              ? 'Your previous reply was not confirmed. You can send a follow-up answer.'
-                              : 'Your previous reply needs recovery before another answer can be sent.'}
-                          </p>
-                        ) : null}
-                        <CollaborationQuestionCard
-                          key={decisionKey}
-                          sessionId={session.id}
-                          runId={decisionSource.runId}
-                          messageId={decisionMessageId}
-                          actor={
-                            decisionSource.actor ?? runsById.get(decisionSource.runId)?.agentId
-                          }
-                          decision={decisionReply}
-                          draft={history.decisionDraft}
-                          onDraftChange={history.setDecisionDraft}
-                          onClearDraft={history.clearDecisionDraft}
-                          onSubmit={() => void submitAnswers()}
-                          canSubmit={decisionAnswersReady}
-                          disabled={questionDisabled}
-                          onOpenProjectFile={openProjectFile}
-                        />
+                    key: `native:${nativeQuestions.map(({ request }) => `${request.operationId}:${request.id}`).join(':')}`,
+                    content: (
+                      <div className="max-h-[min(60vh,36rem)] space-y-2 overflow-auto">
+                        {nativeQuestions.map(({ agentId, request }) => (
+                          <NativeInputCard
+                            key={`${request.operationId}:${request.id}`}
+                            request={request}
+                            agentId={agentId}
+                            onRespond={onRespondNativeInput}
+                            draft={nativeInputDrafts[request.id]}
+                            onDraftChange={onNativeInputDraftChange}
+                          />
+                        ))}
                       </div>
-                    ) : (
-                      <section
-                        aria-label="Answer progress"
-                        className="flex items-center gap-group rounded-control border border-border bg-surface-muted px-group py-panel text-caption"
-                      >
-                        <LoaderCircle
-                          aria-hidden="true"
-                          className="size-4 shrink-0 animate-spin text-secondary motion-reduce:animate-none"
-                        />
-                        <div className="min-w-0 flex-1">
-                          <p className="font-medium text-primary">
-                            {inputGateState === 'queued'
-                              ? 'Answers queued'
-                              : responseInProgress
-                                ? 'Processing your answers'
-                                : 'Answers sent'}
-                          </p>
-                          <p className="mt-1 text-secondary">
-                            Your message draft is kept until these questions are resolved.
-                          </p>
-                        </div>
-                        {responseInProgress ? (
-                          <button
-                            type="button"
-                            disabled={stopping}
-                            onClick={() => void onStop()}
-                            className="min-h-8 rounded-control px-3 font-medium text-primary hover:bg-surface-raised focus-visible:outline-2 focus-visible:outline-focus"
-                          >
-                            {stopping ? 'Stopping…' : 'Stop'}
-                          </button>
-                        ) : null}
-                      </section>
                     ),
                   }
-                : undefined
+                : decisionTakeover && decisionSource
+                  ? {
+                      key: planRecovery
+                        ? `recovery:${planRecovery.runId}`
+                        : decisionReply
+                          ? `question:${decisionKey}`
+                          : `processing:${decisionKey}`,
+                      content: planRecovery ? (
+                        <section
+                          aria-label="Plan recovery required"
+                          className="rounded-control border border-border bg-surface-muted px-group py-panel text-caption"
+                        >
+                          <p className="font-medium text-primary">Plan recovery required</p>
+                          <p className="mt-1 text-secondary">
+                            Restore the saved plan using the recovery action above. Your previous
+                            answers and message draft are kept.
+                          </p>
+                        </section>
+                      ) : decisionReply ? (
+                        <div className="space-y-2">
+                          {inputGateState === 'incomplete' ? (
+                            <p role="status" className="px-group text-caption text-secondary">
+                              {incompleteCanAnswer
+                                ? 'Your previous reply was not confirmed. You can send a follow-up answer.'
+                                : 'Your previous reply needs recovery before another answer can be sent.'}
+                            </p>
+                          ) : null}
+                          <CollaborationQuestionCard
+                            key={decisionKey}
+                            sessionId={session.id}
+                            runId={decisionSource.runId}
+                            messageId={decisionMessageId}
+                            actor={
+                              decisionSource.actor ?? runsById.get(decisionSource.runId)?.agentId
+                            }
+                            decision={decisionReply}
+                            draft={history.decisionDraft}
+                            onDraftChange={history.setDecisionDraft}
+                            onClearDraft={history.clearDecisionDraft}
+                            onSubmit={() => void submitAnswers()}
+                            canSubmit={decisionAnswersReady}
+                            disabled={questionDisabled}
+                            onOpenProjectFile={openProjectFile}
+                          />
+                        </div>
+                      ) : (
+                        <section
+                          aria-label="Answer progress"
+                          className="flex items-center gap-group rounded-control border border-border bg-surface-muted px-group py-panel text-caption"
+                        >
+                          <LoaderCircle
+                            aria-hidden="true"
+                            className="size-4 shrink-0 animate-spin text-secondary motion-reduce:animate-none"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <p className="font-medium text-primary">
+                              {inputGateState === 'queued'
+                                ? 'Answers queued'
+                                : responseInProgress
+                                  ? 'Processing your answers'
+                                  : 'Answers sent'}
+                            </p>
+                            <p className="mt-1 text-secondary">
+                              Your message draft is kept until these questions are resolved.
+                            </p>
+                          </div>
+                          {responseInProgress ? (
+                            <button
+                              type="button"
+                              disabled={stopping}
+                              onClick={() => void onStop()}
+                              className="min-h-8 rounded-control px-3 font-medium text-primary hover:bg-surface-raised focus-visible:outline-2 focus-visible:outline-focus"
+                            >
+                              {stopping ? 'Stopping…' : 'Stop'}
+                            </button>
+                          ) : null}
+                        </section>
+                      ),
+                    }
+                  : undefined
             }
           >
             <div className="flex flex-col gap-2">
@@ -3683,7 +3731,7 @@ export function ConversationView({
                 onDragEnter={(event) => {
                   if (
                     !composerDisabled &&
-                    !decisionTakeover &&
+                    !inputTakeover &&
                     event.dataTransfer.types.includes('Files')
                   ) {
                     event.preventDefault()
@@ -3693,7 +3741,7 @@ export function ConversationView({
                 onDragOver={(event) => {
                   if (
                     !composerDisabled &&
-                    !decisionTakeover &&
+                    !inputTakeover &&
                     event.dataTransfer.types.includes('Files')
                   ) {
                     event.preventDefault()
@@ -3714,7 +3762,7 @@ export function ConversationView({
                     event.dataTransfer.files.length &&
                     onAddComposerImages &&
                     !composerDisabled &&
-                    !decisionTakeover
+                    !inputTakeover
                   ) {
                     event.preventDefault()
                     event.stopPropagation()
@@ -4114,7 +4162,7 @@ export function ConversationView({
                             ? 'What should we tackle next?'
                             : 'Agent actions are paused'
                     }
-                    disabled={composerDisabled || decisionTakeover}
+                    disabled={composerDisabled || inputTakeover}
                     onKeyDown={(event) => {
                       if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
                         event.preventDefault()
@@ -4311,7 +4359,7 @@ export function ConversationView({
                           run={activeRun ?? latestRun}
                           busy={responseInProgress}
                           disabled={sessionSettingsSaving}
-                          visible={visible && !nativePresentationSuspended && !decisionTakeover}
+                          visible={visible && !nativePresentationSuspended && !inputTakeover}
                           onSave={onSaveSessionPermission}
                           onNotice={onNotice}
                         />
@@ -4324,7 +4372,7 @@ export function ConversationView({
                               run={activeRun ?? latestRun}
                               busy={responseInProgress}
                               disabled={sessionSettingsSaving}
-                              visible={visible && !nativePresentationSuspended && !decisionTakeover}
+                              visible={visible && !nativePresentationSuspended && !inputTakeover}
                               onSave={onSaveSessionSpeed}
                               onNotice={onNotice}
                             />
@@ -4338,7 +4386,7 @@ export function ConversationView({
                   key={`${session.id}-${session.projectId}`}
                   projectId={session.projectId}
                   platform={platform}
-                  visible={visible && !decisionTakeover}
+                  visible={visible && !inputTakeover}
                   refreshKey={`${latestRun?.id ?? ''}:${latestRun?.status ?? ''}`}
                   onNotice={onNotice}
                 />
