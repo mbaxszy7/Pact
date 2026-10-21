@@ -12,6 +12,8 @@ import type {
 } from '@pact/contracts'
 import type { RuntimePreparationRepository } from '@pact/persistence'
 
+import { RUNTIME_MINIMUM_VERSIONS } from '@pact/contracts'
+
 import { recordDiagnostic } from '../../diagnostics/utility-log'
 
 const PROBE_TIMEOUT_MS = 4_000
@@ -126,6 +128,22 @@ export class RuntimePreparation {
     }
 
     const versionText = this.parseVersionLine(version.output)
+    const minimumVersion = RUNTIME_MINIMUM_VERSIONS[agentId]
+    const agentName = agentId === 'claude' ? 'Claude Code' : 'Codex'
+    const compatibility = this.versionCompatibility(versionText, minimumVersion)
+    if (compatibility !== 'supported') {
+      return {
+        agentId,
+        state: compatibility === 'outdated' ? 'unsupported_version' : 'cannot_verify',
+        executablePath,
+        ...(versionText ? { version: versionText } : {}),
+        detail:
+          compatibility === 'outdated'
+            ? `Requires ${agentName} ${minimumVersion} or later. Upgrade ${agentName}, then check again.`
+            : `Could not read the ${agentName} version. Version ${minimumVersion} or later is required. Upgrade or select a supported installation, then check again.`,
+        checkedAt,
+      }
+    }
 
     // Each CLI owns its authentication truth. Exit 0 means the CLI accepted an effective login or
     // API configuration; Pact does not inspect credential files itself.
@@ -255,6 +273,24 @@ export class RuntimePreparation {
   private parseVersionLine(output: string): string | undefined {
     const firstLine = output.split(/\r?\n/u).find(Boolean)?.trim()
     return firstLine ? firstLine.slice(0, 160) : undefined
+  }
+
+  private versionCompatibility(
+    version: string | undefined,
+    minimumVersion: string,
+  ): 'supported' | 'outdated' | 'unknown' {
+    // Match a complete version token from either CLI's first output line, never a partial or
+    // malformed number. Build metadata does not affect ordering; prereleases precede a release.
+    const match = version?.match(
+      /(?:^|\s)(\d{1,5})\.(\d{1,5})\.(\d{1,5})(-[\da-z]+(?:[.-][\da-z]+)*)?(?:\+[\da-z]+(?:[.-][\da-z]+)*)?(?=$|\s|\()/iu,
+    )
+    if (!match) return 'unknown'
+    const minimum = minimumVersion.split('.').map(Number)
+    for (let index = 0; index < 3; index++) {
+      const difference = Number(match[index + 1]) - minimum[index]!
+      if (difference !== 0) return difference > 0 ? 'supported' : 'outdated'
+    }
+    return match[4] ? 'outdated' : 'supported'
   }
 
   // Run only fixed CLI probes. User-controlled values are passed as arguments, never through a

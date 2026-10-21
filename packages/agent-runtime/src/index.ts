@@ -15,7 +15,7 @@ import type {
   NativeProbeResult,
   NativeInitializationWitness,
   SessionPermissionMode,
-  CollaborationAnswerFormat,
+  CollaborationReviewObservation,
   CollaborationSourceReadResult,
   CollaborationTurnAuthorization,
   CollaborationInputBatchReference,
@@ -106,7 +106,6 @@ export type AgentSteerResult =
   | { status: 'unsupported' | 'rejected'; reason: string }
 
 export interface AgentNativeForkSourceInput {
-  answerFormat?: CollaborationAnswerFormat
   cwd: string
   nativeSessionId: string
   nativeTurnId: string
@@ -163,6 +162,10 @@ export interface AgentNativeRunProbeInput
   nativeInputIds?: readonly string[]
   /** Validated native terminal already persisted by Repository, never a legacy Completed label. */
   confirmedTerminal?: Extract<NativeProbeResult, { kind: 'ended' }>
+  /** Explicit readback of a missing artifact, even when the natural answer is complete. */
+  inspectMissingPlan?: boolean
+  /** Host-frozen planner scope; ordinary/review roots do not recover plan metadata. */
+  planSource?: boolean
 }
 
 export interface AgentNativeInitializedBindingProbeInput
@@ -237,7 +240,6 @@ export interface AgentNativeTitleInput {
 }
 
 export interface AgentRunInput {
-  answerFormat?: CollaborationAnswerFormat
   /** Bind the creating executor before any native startup callback; this is not model dispatch. */
   recordExecutor?: (executorId: string) => void
   /** An owned Native name fact; logicalTitle excludes Pact's derived display prefix. */
@@ -257,9 +259,14 @@ export interface AgentRunInput {
   /** Output processing failed; native control and work observation remain owned. */
   recordOutputFailure?: (error: Error) => void
   recordArchivedEvent?: (event: NormalizedAgentEvent) => void
-  /** Preserve the exact root final carrier independently of natural display and acceptance. */
-  recordCollaborationCarrier?: (value: unknown) => void
-  recordCollaborationCarrierText?: (text: string) => void
+  /** Capture authenticated native metadata; Repository promotes only a normally completed root. */
+  recordWorkflowPlan?: (plan: { nativeId: string; text: string }) => void
+  recordWorkflowPlanUnavailable?: () => void
+  recordWorkflowPlanRetained?: (plan: import('@pact/contracts').CollaborationRetainedPlan) => void
+  recordWorkflowReview?: (result: CollaborationReviewObservation) => void
+  recordWorkflowInputResult?: (
+    result: import('@pact/contracts').CollaborationInputObservation,
+  ) => void
   readCollaborationSourcePart?: ((input: unknown) => CollaborationSourceReadResult) | undefined
   recordDispatch?: (
     phase: 'possibly_sent' | 'accepted' | 'rejected',
@@ -424,14 +431,12 @@ export function serializeAgentPromptEnvelope(envelope: AgentPromptEnvelope): str
             kind: envelope.collaboration.kind,
             stage: envelope.collaboration.stage,
             actor: envelope.collaboration.actor,
-            primary: envelope.collaboration.primary,
-            drafter: envelope.collaboration.drafter,
-            implementer: envelope.collaboration.implementer,
+            owner: envelope.collaboration.owner,
             reviewer: envelope.collaboration.reviewer,
             task: envelope.collaboration.taskDocument ?? envelope.collaboration.task,
-            plan: envelope.collaboration.planDocument ?? envelope.collaboration.planReference,
+            plan: envelope.collaboration.planReference,
             planVersion: envelope.collaboration.planVersion,
-            reportRecovery: envelope.collaboration.reportRecovery,
+            previousReview: envelope.collaboration.review,
           },
         }
       : {}),

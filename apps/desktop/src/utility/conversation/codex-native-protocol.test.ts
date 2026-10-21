@@ -190,6 +190,7 @@ describe('Codex bounded native protocol', () => {
             id,
             result: {
               thread: { id: 'thread-1' },
+              model: 'gpt-test',
               approvalPolicy: 'on-request',
               approvalsReviewer: 'user',
               sandbox: { type: 'dangerFullAccess' },
@@ -745,6 +746,7 @@ describe('Codex bounded native protocol', () => {
           id,
           result: {
             thread: { id: 'live-thread' },
+            model: 'gpt-test',
             approvalPolicy: 'on-request',
             approvalsReviewer: 'user',
             sandbox: { type: 'dangerFullAccess' },

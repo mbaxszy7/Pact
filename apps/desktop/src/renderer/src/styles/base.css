@@ -184,27 +184,53 @@
     }
   }
 
+  .pact-composer-controls {
+    container-type: inline-size;
+  }
   .pact-project-context,
   .pact-agent-controls {
     display: flex;
+    min-width: var(--pact-composer-trigger-min, 56px);
     align-items: center;
     border-radius: var(--radius-control);
     background: color-mix(in srgb, var(--pact-surface-muted) 65%, transparent);
+  }
+  .pact-project-context {
+    flex-basis: 240px;
+    flex-shrink: 3;
+    max-width: max-content;
+  }
+  .pact-project-context:has(.pact-project-divider),
+  .pact-agent-controls:has(.pact-agent-divider) {
+    min-width: calc(
+      2 * var(--pact-composer-trigger-min, 56px) + 2 * var(--pact-space-compact) + 1px
+    );
+  }
+  .pact-agent-controls > div {
+    min-width: var(--pact-composer-trigger-min, 56px);
   }
   .pact-project-trigger,
   .pact-agent-trigger {
     display: inline-flex;
     height: 32px;
-    min-width: 0;
+    min-width: var(--pact-composer-trigger-min, 56px);
     align-items: center;
-    gap: 6px;
-    padding: 0 9px;
+    gap: var(--pact-composer-trigger-gap, 6px);
+    padding: 0 var(--pact-composer-trigger-padding, 9px);
     border-radius: var(--radius-control);
     color: var(--pact-text-secondary);
     cursor: pointer;
     transition:
       background-color 150ms var(--ease-out-pact),
       color 150ms var(--ease-out-pact);
+  }
+  @container (max-width: 600px) {
+    .pact-project-context,
+    .pact-agent-controls {
+      --pact-composer-trigger-min: 46px;
+      --pact-composer-trigger-gap: 4px;
+      --pact-composer-trigger-padding: 6px;
+    }
   }
   .pact-project-folder {
     max-width: 160px;
@@ -404,11 +430,20 @@
     --pact-text-tertiary: #ffffff;
   }
 
+  html[data-material='translucent']
+    .workspace-layout[data-context-expanded='true']
+    > #workspace-context {
+    background-color: transparent;
+  }
+
   html[data-material='translucent'] #workspace-context {
     background-color: var(--pact-material-code);
   }
 
-  html[data-material='translucent'] .workspace-context-expanded {
+  html[data-material='translucent']
+    .workspace-layout[data-context-expanded='true']
+    > #workspace-context
+    > .workspace-panel-content {
     background-color: var(--pact-material-code);
   }
 
@@ -439,8 +474,34 @@
 }
 
 @layer components {
-  .workspace-context-expanded {
+  /* Keep the workspace and its Plan/Comment portal owner mounted during expansion. */
+  .workspace-layout[data-context-expanded='true'] > #workspace-context[data-panel] {
+    position: static;
+    overflow: visible !important;
+  }
+
+  .workspace-layout[data-context-expanded='true']
+    > #workspace-context[data-panel]
+    > .workspace-panel-content {
+    inset: 0;
+    z-index: 20;
+    width: 100%;
+    height: 100%;
+    transform: none;
     animation: workspace-context-expand 180ms var(--ease-out-pact) both;
+  }
+
+  .workspace-layout[data-context-expanded='true'] > #workspace-navigation,
+  .workspace-layout[data-context-expanded='true'] > #workspace-center {
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .workspace-context-dialog[data-expanded='true'] {
+    max-width: none;
+    border: 0;
+    border-radius: 0;
   }
 
   .session-activity-spin {
@@ -1092,6 +1153,46 @@
     }
     .pact-image-gallery header > div:first-child {
       flex-basis: calc(100% - 40px);
+    }
+  }
+}
+
+@layer components {
+  .input-replacement {
+    position: relative;
+    min-width: 0;
+  }
+  .input-replacement[data-transitioning='true'] {
+    overflow: clip;
+  }
+  .input-replacement-pane {
+    position: absolute;
+    inset: 0 0 auto;
+    min-width: 0;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateY(6px);
+    transition:
+      opacity 140ms ease-out,
+      transform 220ms var(--ease-out-pact),
+      visibility 0s 220ms;
+  }
+  .input-replacement-pane[data-active='true'] {
+    position: relative;
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateY(0);
+    transition-delay: 0s;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .input-replacement-pane,
+    .input-replacement-pane[data-active='true'] {
+      transform: none;
+      transition:
+        opacity 60ms linear,
+        visibility 0s;
     }
   }
 }

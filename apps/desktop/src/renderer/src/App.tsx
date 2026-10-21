@@ -100,9 +100,20 @@ function App(): React.JSX.Element {
   const [documentVisible, setDocumentVisible] = useState(() => !document.hidden)
   useEffect(() => {
     const updateVisibility = (): void => setDocumentVisible(!document.hidden)
+    const refreshRuntime = (): void => {
+      if (document.hidden) return
+      void queryClient.refetchQueries(
+        { queryKey: foundationQueryKeys.runtimePreparation, exact: true },
+        { cancelRefetch: false },
+      )
+    }
     document.addEventListener('visibilitychange', updateVisibility)
-    return () => document.removeEventListener('visibilitychange', updateVisibility)
-  }, [])
+    window.addEventListener('focus', refreshRuntime)
+    return () => {
+      document.removeEventListener('visibilitychange', updateVisibility)
+      window.removeEventListener('focus', refreshRuntime)
+    }
+  }, [queryClient])
   const [preview, setPreview] = useState<Omit<AppearanceSettingsUpdate, 'expectedRevision'> | null>(
     null,
   )
@@ -121,14 +132,6 @@ function App(): React.JSX.Element {
   const nativeQuitFocus = useRef<HTMLElement | undefined>(undefined)
   const nativeQuitOperation = useRef<string | undefined>(undefined)
   const nativeOpeningQueue = useRef<NativeOpeningQueue>({ active: true, pending: [] })
-  const [todoNavigation, setTodoNavigation] = useState<{
-    sessionId: string
-    taskId: string
-    todoId: string
-    todoRevision: number
-    navigationId: string
-    selection?: import('@pact/contracts').TodoCommentAnchor['selection']
-  }>()
   const [messageNavigation, setMessageNavigation] = useState<
     | {
         sessionId: string
@@ -200,6 +203,8 @@ function App(): React.JSX.Element {
     queryFn: async () => unwrapRpcResult(await window.pact.getRuntimePreparation()),
     retry: 0,
     staleTime: 0,
+    refetchOnWindowFocus: true,
+    refetchInterval: documentVisible ? 60_000 : false,
   })
   const defaultSessionSettings = useDefaultSessionSettings(
     showFirstUseDefaults || settingsPage === 'session-defaults',
@@ -956,6 +961,10 @@ function App(): React.JSX.Element {
 
   const openSentComment = (comment: AnchoredComment): void => {
     if (!selectedSessionId) return
+    if (comment.anchor.type === 'unavailable') {
+      showToast(`Source unavailable. ${comment.anchor.reason}`, 'warning')
+      return
+    }
     setWorkspaceChangesPanel(undefined)
     setProjectFilePanel(undefined)
     setSessionSettingsOpen(false)
@@ -978,15 +987,8 @@ function App(): React.JSX.Element {
         return
       }
       const anchor = resolved.value.anchor
-      if (anchor.type === 'todo') {
-        setTodoNavigation({
-          sessionId: requestedSessionId,
-          taskId: anchor.taskId,
-          todoId: anchor.todoId,
-          todoRevision: anchor.todoRevision,
-          navigationId: crypto.randomUUID(),
-          ...(anchor.selection ? { selection: anchor.selection } : {}),
-        })
+      if (anchor.type === 'unavailable') {
+        showToast(`Source unavailable. ${anchor.reason}`, 'warning')
         return
       }
       if (anchor.type === 'file') {
@@ -1591,9 +1593,6 @@ function App(): React.JSX.Element {
           messageNavigation={
             messageNavigation?.sessionId === selectedSessionId ? messageNavigation : undefined
           }
-          todoNavigation={
-            todoNavigation?.sessionId === selectedSessionId ? todoNavigation : undefined
-          }
           onSessionSettingsOpenChange={(open) => {
             setSessionSettingsOpen(open)
             if (!open) {
@@ -1618,8 +1617,8 @@ function App(): React.JSX.Element {
           }
           onArchiveSession={(sessionId) => void requestArchive({ kind: 'session', sessionId })}
           onRenameSession={(sessionId, title) => sessionWorkspace.rename(sessionId, title)}
-          onSendMessage={(content, commentIds, route, skills) =>
-            conversation.send(content, commentIds, route, skills)
+          onSendMessage={(content, commentIds, route, skills, decision) =>
+            conversation.send(content, commentIds, route, skills, decision)
           }
           onSaveCommentDraft={(input) => conversation.saveCommentDraft(input)}
           onRemoveCommentDraft={(commentId) => conversation.removeCommentDraft(commentId)}

@@ -7,11 +7,7 @@ import { homedir } from 'node:os'
 import { isAbsolute, join, relative } from 'node:path'
 import { parentPort, workerData } from 'node:worker_threads'
 
-import {
-  nativeForkBoundarySchema,
-  nativeForkWitnessSchema,
-  collaborationAnswerFormatSchema,
-} from '@pact/contracts'
+import { nativeForkBoundarySchema, nativeForkWitnessSchema } from '@pact/contracts'
 
 import type {
   NativeForkFileInput,
@@ -21,11 +17,14 @@ import type {
 } from './native-fork-files'
 
 import {
-  projectCollaborationAnswer,
-  readSubmittedCollaborationReport,
-} from './collaboration-answer'
+  ClaudeNativePlan,
+  claudePlanInputFingerprint,
+  type ClaudePlanBinding,
+} from './claude-native-plan'
+import { projectCollaborationAnswer } from './collaboration-answer'
 import { nativeHistoryImageBytes } from './native-image-content'
 import { measureNativeWorkerReply } from './native-json-encoder'
+import { NATIVE_OWNER_WORKING_BYTES } from './native-working-memory'
 
 const TEXT_BYTES = 8 * 1024 * 1024
 const MAX_BYTES = 32 * 1024 * 1024
@@ -112,6 +111,19 @@ function isInput(value: unknown): value is NativeForkFileInput {
     !['prepare', 'fork', 'inspect', 'read', 'read-answer'].includes(String(value.action))
   )
     return false
+  if (
+    value.planHook !== undefined &&
+    (value.action !== 'read-answer' ||
+      !isObject(value.planHook) ||
+      typeof value.planHook.id !== 'string' ||
+      !value.planHook.id ||
+      value.planHook.id.length > 1024 ||
+      typeof value.planHook.inputFingerprint !== 'string' ||
+      !/^[a-f0-9]{64}$/u.test(value.planHook.inputFingerprint))
+  )
+    return false
+  if (value.includePlan !== undefined && typeof value.includePlan !== 'boolean') return false
+  if (value.planHook && value.includePlan === false) return false
   for (const key of ['cwd', 'nativeSessionId'])
     if (typeof value[key] !== 'string' || !value[key].length || value[key].length > 4096)
       return false
@@ -135,16 +147,6 @@ function isInput(value: unknown): value is NativeForkFileInput {
           id.length <= 1024 &&
           (value.provider !== 'claude' || uuid.test(id)),
       ))
-  )
-    return false
-  if (
-    value.answerFormat !== undefined &&
-    !collaborationAnswerFormatSchema.safeParse(value.answerFormat).success
-  )
-    return false
-  if (
-    (isObject(value.source) && value.source.answerFormat !== value.answerFormat) ||
-    (isObject(value.witness) && value.witness.answerFormat !== value.answerFormat)
   )
     return false
   if (
@@ -216,7 +218,6 @@ async function records(
   endBytes?: number,
   maxRecords = MAX_RECORDS,
   captureBoundaries = false,
-  collaborationContent = false,
 ): Promise<{
   entries: RecordValue[]
   rawHash: string
@@ -320,7 +321,7 @@ async function records(
         offset = end + 1
       }
     }
-    if (!collaborationContent && total - imageBytes > TEXT_BYTES)
+    if (total - imageBytes > TEXT_BYTES)
       throw new Error(
         'Native text/metadata exceeds its existing 8 MiB budget; no image allowance applies.',
       )
@@ -494,7 +495,6 @@ async function claude(
           cwd: input.cwd,
           nativeSessionId: input.source.nativeSessionId,
           nativeTurnId: input.source.nativeTurnId,
-          ...(input.source.answerFormat ? { answerFormat: input.source.answerFormat } : {}),
           source: input.source,
         })
         const after = await lstat(originalDirectory, { bigint: true })
@@ -514,9 +514,7 @@ async function claude(
         )
       }
     }
-    return (
-      await records(nativePath, root, undefined, MAX_RECORDS, false, Boolean(input.answerFormat))
-    ).entries.map(nativeEntry)
+    return (await records(nativePath, root, undefined, MAX_RECORDS, false)).entries.map(nativeEntry)
   }
   let sourceEntries: RecordValue[] = []
   const reading: SessionStore = {
@@ -541,7 +539,6 @@ async function claude(
     undefined,
     MAX_RECORDS,
     false,
-    Boolean(input.answerFormat),
   )
   if (hash(raw.entries) !== hash(sourceEntries))
     throw new Error('Native transcript changed between source reads.')
@@ -685,84 +682,267 @@ async function claude(
       throw new Error('A consumed Claude Run input is missing from its exact native chain.')
   }
   const selected = main.slice(start + 1, next)
-  // A formal output attachment must belong to this exact User-root chain, rather
-  // than a similarly shaped body or a disconnected transcript branch.
-  let structuredOutput: unknown
-  let belongsToRoot: ((entry: RecordValue) => boolean) | undefined
-  if (input.answerFormat) {
-    const chain = new Map(
-      main
-        .slice(start, next)
-        .flatMap((entry) => (typeof entry.uuid === 'string' ? [[entry.uuid, entry] as const] : [])),
-    )
-    const ancestry = new Map<string, boolean>(nativeInputIds.map((id) => [id, true]))
-    belongsToRoot = (entry: RecordValue): boolean => {
-      const visited = new Set<string>()
-      let cursor: RecordValue | undefined = entry
-      let belongs = false
-      while (cursor) {
-        if (typeof cursor.uuid !== 'string' || visited.has(cursor.uuid)) break
-        const known = ancestry.get(cursor.uuid)
-        if (known !== undefined) {
-          belongs = known
-          break
-        }
-        visited.add(cursor.uuid)
-        cursor = typeof cursor.parentUuid === 'string' ? chain.get(cursor.parentUuid) : undefined
+  // Require ancestry to the exact root input for both natural output and metadata.
+  const chain = new Map(
+    main
+      .slice(start, next)
+      .flatMap((entry) => (typeof entry.uuid === 'string' ? [[entry.uuid, entry] as const] : [])),
+  )
+  const ancestry = new Map<string, boolean>(nativeInputIds.map((id) => [id, true]))
+  const belongsToRoot = (entry: RecordValue): boolean => {
+    const visited = new Set<string>()
+    let cursor: RecordValue | undefined = entry
+    let belongs = false
+    while (cursor) {
+      if (typeof cursor.uuid !== 'string' || visited.has(cursor.uuid)) break
+      const known = ancestry.get(cursor.uuid)
+      if (known !== undefined) {
+        belongs = known
+        break
       }
-      for (const id of visited) ancestry.set(id, belongs)
-      return belongs
+      visited.add(cursor.uuid)
+      cursor = typeof cursor.parentUuid === 'string' ? chain.get(cursor.parentUuid) : undefined
     }
-    structuredOutput = selected.findLast(
-      (entry) =>
-        entry.type === 'attachment' &&
-        isObject(entry.attachment) &&
-        entry.attachment.type === 'structured_output' &&
-        belongsToRoot?.(entry),
-    )?.attachment
-    structuredOutput = isObject(structuredOutput) ? structuredOutput.data : undefined
+    for (const id of visited) ancestry.set(id, belongs)
+    return belongs
+  }
+  const rootEntry = main[start]!
+  const sourceWorkingBytes =
+    (raw.rawBytes - raw.imageBytes) * 4 + raw.imageBytes * 2 + raw.rawRecords * 512
+  const reservePlan = (bytes: number): void => {
+    if (sourceWorkingBytes + bytes > NATIVE_OWNER_WORKING_BYTES)
+      throw new Error(
+        'The native plan exceeds its available reconstruction working memory. Its source is preserved.',
+      )
+  }
+  const planRead = input.action === 'read-answer' && input.includePlan !== false
+  const ancestors: RecordValue[] = []
+  if (planRead) {
+    const indexed = new Map<string, { entry: RecordValue; index: number }>()
+    for (let index = 0; index < next; index++) {
+      const entry = main[index]!
+      if (typeof entry.uuid !== 'string') continue
+      if (indexed.has(entry.uuid)) throw new Error('The native ancestry has duplicate identities.')
+      indexed.set(entry.uuid, { entry, index })
+    }
+    let cursor = { entry: rootEntry, index: start }
+    while (typeof cursor.entry.parentUuid === 'string') {
+      const parent = indexed.get(cursor.entry.parentUuid)
+      if (!parent) break
+      if (parent.index >= cursor.index || parent.entry.sessionId !== input.nativeSessionId)
+        throw new Error('The native plan ancestry is ambiguous or incomplete.')
+      ancestors.push(parent.entry)
+      cursor = parent
+    }
+  }
+  ancestors.reverse()
+  const nativeBinding = (entry: RecordValue): ClaudePlanBinding | undefined => {
+    if (entry.type !== 'attachment' || !isObject(entry.attachment)) return undefined
+    const attachment = entry.attachment
+    if (attachment.type !== 'plan_mode' || attachment.isSubAgent !== false) return undefined
+    if (
+      entry.sessionId !== input.nativeSessionId ||
+      typeof rootEntry.promptId !== 'string' ||
+      !uuid.test(rootEntry.promptId) ||
+      typeof attachment.planFilePath !== 'string' ||
+      !isAbsolute(attachment.planFilePath) ||
+      attachment.planFilePath.length > 4096 ||
+      Buffer.byteLength(JSON.stringify(attachment)) > 256 * 1024
+    )
+      throw new Error('The native plan attachment is incomplete or oversized.')
+    return { promptId: rootEntry.promptId, path: attachment.planFilePath }
+  }
+  const realInput = (entry: RecordValue): boolean => {
+    if (entry.type !== 'user' || entry.isMeta) return false
+    const content = object(entry.message).content
+    return (
+      !Array.isArray(content) ||
+      !content.length ||
+      !content.every((block) => object(block).type === 'tool_result')
+    )
+  }
+  let inherited: ClaudeNativePlan | undefined
+  let inheritedCalls = new Map<string, { name: string; input: unknown }>()
+  const observeArtifact = (
+    artifact: ClaudeNativePlan,
+    calls: Map<string, { name: string; input: unknown }>,
+    entry: RecordValue,
+  ): void => {
+    if (entry.type !== 'assistant' && entry.type !== 'user') return
+    const content = object(entry.message).content
+    if (!Array.isArray(content)) return
+    for (const block of content) {
+      if (!isObject(block)) continue
+      if (
+        entry.type === 'assistant' &&
+        block.type === 'tool_use' &&
+        typeof block.id === 'string' &&
+        ['Write', 'Edit'].includes(String(block.name))
+      ) {
+        if (artifact.begin(String(block.name), block.id, block.input) && !calls.has(block.id))
+          calls.set(block.id, { name: String(block.name), input: block.input })
+      } else if (
+        entry.type === 'user' &&
+        block.type === 'tool_result' &&
+        typeof block.tool_use_id === 'string'
+      ) {
+        const call = calls.get(block.tool_use_id)
+        if (!call) continue
+        if (block.is_error) artifact.reject(block.tool_use_id)
+        else artifact.acknowledge(call.name, block.tool_use_id, call.input, entry.toolUseResult)
+      }
+    }
+  }
+  for (const entry of ancestors) {
+    if (entry.isCompactSummary) continue
+    const binding = nativeBinding(entry)
+    if (binding && (!inherited || binding.path !== inherited.binding.path)) {
+      inherited = new ClaudeNativePlan(binding, reservePlan)
+      inheritedCalls = new Map()
+    } else if (inherited && realInput(entry)) {
+      inherited.finish()
+      inherited = new ClaudeNativePlan(inherited.binding, reservePlan, inherited.completeText)
+      inheritedCalls = new Map()
+    }
+    if (inherited) observeArtifact(inherited, inheritedCalls, entry)
+  }
+  inherited?.finish()
+  let currentBinding: ClaudePlanBinding | undefined
+  for (const entry of planRead ? selected : []) {
+    if (!belongsToRoot(entry) || entry.isCompactSummary) continue
+    const binding = nativeBinding(entry)
+    if (!binding) continue
+    if (currentBinding && currentBinding.path !== binding.path)
+      throw new Error('The native root has conflicting plan attachments.')
+    currentBinding = binding
+  }
+  const planBinding = currentBinding ?? inherited?.binding
+  const base = planBinding?.path === inherited?.binding.path ? inherited?.completeText : undefined
+  const artifact = planBinding ? new ClaudeNativePlan(planBinding, reservePlan, base) : undefined
+  const operations = new Map<string, { name: string; input: unknown }>()
+  let hookLocated = false
+  let retainedId: string | undefined
+  if (input.planHook) {
+    let matches = 0
+    for (const entry of selected) {
+      if (
+        !belongsToRoot(entry) ||
+        entry.sessionId !== input.nativeSessionId ||
+        entry.type !== 'assistant' ||
+        entry.isCompactSummary
+      )
+        continue
+      const content = object(entry.message).content
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (!isObject(block) || block.type !== 'tool_use' || block.id !== input.planHook.id)
+          continue
+        matches++
+        if (
+          claudePlanInputFingerprint(String(block.name), block.input) !==
+          input.planHook.inputFingerprint
+        )
+          throw new Error('The live native plan Hook differs from its recorded operation.')
+      }
+    }
+    if (matches !== 1)
+      throw new Error('The exact live native plan operation is not available in the root history.')
   }
   const answerItems = new Map<string, string>()
   for (const entry of selected) {
     if (
-      entry.type !== 'assistant' ||
+      !belongsToRoot(entry) ||
       entry.isCompactSummary ||
-      (input.answerFormat && !belongsToRoot?.(entry))
+      entry.sessionId !== input.nativeSessionId
     )
       continue
+    if (entry.type !== 'assistant' && entry.type !== 'user') continue
     const messageValue = object(entry.message),
       content = messageValue.content
-    if (typeof messageValue.id !== 'string' || !Array.isArray(content))
-      throw new Error('Incomplete native answer.')
-    const text = content
-      .filter((block) => object(block).type === 'text')
-      .map((block) => {
-        const blockText = object(block).text
-        if (typeof blockText !== 'string') throw new Error('Claude native text is incomplete.')
-        return blockText
-      })
-      .join('')
+    if (!Array.isArray(content)) continue
+    if (entry.type === 'user') {
+      for (const block of content) {
+        if (
+          !isObject(block) ||
+          block.type !== 'tool_result' ||
+          typeof block.tool_use_id !== 'string'
+        )
+          continue
+        const operation = operations.get(block.tool_use_id)
+        if (!operation || !artifact || hookLocated) continue
+        if (block.is_error) artifact.reject(block.tool_use_id)
+        else
+          artifact.acknowledge(
+            operation.name,
+            block.tool_use_id,
+            operation.input,
+            entry.toolUseResult,
+          )
+      }
+      continue
+    }
+    if (typeof messageValue.id !== 'string') throw new Error('Incomplete native answer.')
+    let text = ''
+    for (const block of content) {
+      if (!isObject(block)) throw new Error('Claude native content is incomplete.')
+      if (block.type === 'text') {
+        if (typeof block.text !== 'string') throw new Error('Claude native text is incomplete.')
+        text += block.text
+      } else if (input.planHook && block.type === 'tool_use' && block.id === input.planHook.id) {
+        hookLocated = true
+      } else if (
+        artifact &&
+        !hookLocated &&
+        block.type === 'tool_use' &&
+        block.name === 'ExitPlanMode' &&
+        typeof block.id === 'string'
+      ) {
+        artifact.noteSubmission(block.id, block.input)
+        retainedId = block.id
+      } else if (
+        artifact &&
+        !hookLocated &&
+        block.type === 'tool_use' &&
+        typeof block.id === 'string' &&
+        ['Write', 'Edit'].includes(String(block.name)) &&
+        artifact.begin(String(block.name), block.id, block.input)
+      ) {
+        const operation = { name: String(block.name), input: block.input }
+        const previous = operations.get(block.id)
+        if (!previous) operations.set(block.id, operation)
+      }
+    }
     if (text) answerItems.set(messageValue.id, text)
   }
-  const answer = projectCollaborationAnswer(
-    [...answerItems].map(([id, text]) => ({ id, text })),
-    input.answerFormat,
-    structuredOutput ?? null,
-  )
+  if (!input.planHook) artifact?.finish()
+  const plan = artifact?.plan
+  const retainedPlan = retainedId ? artifact?.retained(retainedId) : undefined
+  const answer = projectCollaborationAnswer([...answerItems].map(([id, text]) => ({ id, text })))
   if (input.action === 'read-answer') {
-    const submittedReport = readSubmittedCollaborationReport(structuredOutput, input.answerFormat)
+    if (input.planHook)
+      return {
+        nativeSessionId: input.nativeSessionId,
+        nativeTurnId: input.nativeTurnId!,
+        ...(planBinding ? { planBinding } : {}),
+        ...(artifact ? { planState: artifact.snapshot() } : {}),
+        nativeStorageRoot: await realpath(root),
+        nativePath: join(await realpath(projectDirectory!), `${input.nativeSessionId}.jsonl`),
+      }
     return {
       nativeSessionId: input.nativeSessionId,
       nativeTurnId: input.nativeTurnId!,
-      ...(answer ? { answer } : {}),
-      ...(submittedReport ? { submittedReport } : {}),
+      ...(answer || plan ? { answer } : {}),
+      ...(plan ? { plan } : {}),
+      ...(retainedPlan ? { retainedPlan } : {}),
+      ...(planBinding ? { planBinding } : {}),
+      ...(artifact?.unavailable ? { planUnavailable: true } : {}),
       nativeStorageRoot: await realpath(root),
       nativePath: join(await realpath(projectDirectory!), `${input.nativeSessionId}.jsonl`),
     }
   }
   if (
     input.action === 'prepare' &&
-    (!answer || createHash('sha256').update(answer).digest('hex') !== input.responseHash)
+    createHash('sha256').update(answer).digest('hex') !== input.responseHash
   )
     throw new Error('Claude native answer does not match the complete selected Pact answer.')
   const rawStart = sourceEntries.findIndex((entry) => entry.uuid === input.nativeTurnId)
@@ -844,9 +1024,8 @@ async function claude(
       const outputBytes = Buffer.byteLength(text)
       if (
         outputBytes > MAX_BYTES ||
-        (!input.answerFormat &&
-          outputBytes - values.reduce((sum, entry) => sum + nativeHistoryImageBytes(entry), 0) >
-            TEXT_BYTES)
+        outputBytes - values.reduce((sum, entry) => sum + nativeHistoryImageBytes(entry), 0) >
+          TEXT_BYTES
       )
         throw new Error('Native Fork output exceeds its text/image byte budget.')
       const handle = await open(
@@ -874,7 +1053,6 @@ async function claude(
         undefined,
         MAX_RECORDS,
         false,
-        Boolean(input.answerFormat),
       )
       Object.assign(result, {
         rawHash: readback.rawHash,
@@ -952,19 +1130,11 @@ async function paginatedCodex(
     if (boundary && boundary.bytes > MAX_BYTES - rawBytes)
       throw new Error('Native history reference exceeds the remaining aggregate byte budget.')
     const read =
-      initial ??
-      (await records(
-        path,
-        storageRoot,
-        boundary?.bytes,
-        MAX_RECORDS - rawRecords,
-        true,
-        Boolean(input.answerFormat),
-      ))
+      initial ?? (await records(path, storageRoot, boundary?.bytes, MAX_RECORDS - rawRecords, true))
     rawBytes += read.rawBytes
     rawRecords += read.rawRecords
     imageBytes += read.imageBytes
-    if (!input.answerFormat && rawBytes - imageBytes > TEXT_BYTES)
+    if (rawBytes - imageBytes > TEXT_BYTES)
       throw new Error('Resolved Native text exceeds its existing 8 MiB budget.')
     if (rawBytes > MAX_BYTES || rawRecords > MAX_RECORDS)
       throw new Error('Resolved native history exceeds its aggregate 32 MiB/10,000-record budget.')
@@ -1121,13 +1291,7 @@ async function paginatedCodex(
     }
   }
   if (input.responseHash)
-    validateCodexAnswer(
-      entries,
-      selectedStart,
-      selectedEnd - 1,
-      input.responseHash,
-      input.answerFormat,
-    )
+    validateCodexAnswer(entries, selectedStart, selectedEnd - 1, input.responseHash)
   const prefixSegments: Array<{
     nativeSessionId: string
     endOrdinalExclusive: number
@@ -1198,7 +1362,6 @@ function validateCodexAnswer(
   selectedStart: number,
   selectedComplete: number,
   responseHash: string,
-  answerFormat?: NativeForkFileInput['answerFormat'],
 ): void {
   const answerItems = new Map<string, { id: string; text: string; phase?: unknown }>()
   for (let index = selectedStart + 1; index <= selectedComplete; index++) {
@@ -1210,7 +1373,7 @@ function validateCodexAnswer(
       payload.role !== 'assistant'
     )
       continue
-    if (answerFormat && payload.parent_tool_call_id != null) continue
+    if (payload.parent_tool_call_id != null) continue
     if (!Array.isArray(payload.content))
       throw new Error('Codex native answer content is incomplete.')
     const text = payload.content
@@ -1226,8 +1389,8 @@ function validateCodexAnswer(
       answerItems.set(id, { id, text, phase: payload.phase })
     }
   }
-  const text = projectCollaborationAnswer([...answerItems.values()], answerFormat)
-  if (!text || createHash('sha256').update(text).digest('hex') !== responseHash)
+  const text = projectCollaborationAnswer([...answerItems.values()])
+  if (createHash('sha256').update(text).digest('hex') !== responseHash)
     throw new Error('Codex complete native answer does not match the selected Pact answer.')
 }
 
@@ -1246,7 +1409,6 @@ async function codex(input: NativeForkFileInput): Promise<NativeForkFileResult> 
     undefined,
     MAX_RECORDS,
     input.historyMode === 'paginated',
-    Boolean(input.answerFormat),
   )
   const meta = raw.entries[0]
   if (meta?.type !== 'session_meta')
@@ -1441,13 +1603,7 @@ async function codex(input: NativeForkFileInput): Promise<NativeForkFileResult> 
   }
   if (!opaqueRecords.length) throw new Error('Codex native prefix is empty.')
   if (input.responseHash)
-    validateCodexAnswer(
-      raw.entries,
-      selectedStart,
-      selectedComplete,
-      input.responseHash,
-      input.answerFormat,
-    )
+    validateCodexAnswer(raw.entries, selectedStart, selectedComplete, input.responseHash)
   const prefix = { domain: 'codex-native-prefix-v2', opaqueRecords, turnIdentityEvidence }
   const prefixHash = hash(prefix)
   if (

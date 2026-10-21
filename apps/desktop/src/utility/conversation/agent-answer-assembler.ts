@@ -8,6 +8,7 @@ const ENCODED_SEPARATOR_BYTES = Buffer.byteLength(JSON.stringify('\n\n'), 'utf8'
 interface AnswerItem {
   text: string
   encodedBytes: number
+  completed: boolean
 }
 
 /** Merges bounded provider-native assistant items into Pact's one logical visible answer. */
@@ -27,6 +28,9 @@ export class AgentAnswerAssembler {
 
   append(itemId: string, text: string): string {
     const previous = this.items.get(itemId)
+    // An owned background observer can receive authoritative completion before
+    // the foreground drains older deltas from the same native FIFO.
+    if (previous?.completed) return ''
     if (!previous && text.length === 0) return ''
     if (!previous) this.assertNewItem(itemId)
     const previousText = previous?.text ?? ''
@@ -47,14 +51,15 @@ export class AgentAnswerAssembler {
     const nextText = `${previousText}${text}`
     this.assertTotal(previous, nextText, nextBytes)
     if (!previous) this.itemOrder.push(itemId)
-    this.items.set(itemId, { text: nextText, encodedBytes: nextBytes })
+    this.items.set(itemId, { text: nextText, encodedBytes: nextBytes, completed: false })
     const separator = !previousText && text && this.hasEarlierText(itemId) ? '\n\n' : ''
     return `${separator}${text}`
   }
 
-  complete(itemId: string, text: string): string | undefined {
+  /** Retain authoritative bytes without claiming the foreground displayed them. */
+  capture(itemId: string, text: string): void {
     const previous = this.items.get(itemId)
-    if (!previous && text.length === 0) return undefined
+    if (!previous && text.length === 0) return
     if (!previous) this.assertNewItem(itemId)
     const nextBytes = AgentAnswerAssembler.encodedBytes(text)
     this.admit(
@@ -63,7 +68,12 @@ export class AgentAnswerAssembler {
     )
     this.assertTotal(previous, text, nextBytes)
     if (!previous) this.itemOrder.push(itemId)
-    this.items.set(itemId, { text, encodedBytes: nextBytes })
+    this.items.set(itemId, { text, encodedBytes: nextBytes, completed: true })
+  }
+
+  complete(itemId: string, text: string): string | undefined {
+    if (!this.items.has(itemId) && text.length === 0) return undefined
+    this.capture(itemId, text)
     const snapshot = this.text
     if (snapshot === this.lastSnapshot) return undefined
     this.lastSnapshot = snapshot
@@ -75,19 +85,6 @@ export class AgentAnswerAssembler {
     if (!snapshot || snapshot === this.lastSnapshot) return undefined
     this.lastSnapshot = snapshot
     return snapshot
-  }
-
-  /** A formal final answer supersedes interim assistant commentary. */
-  replace(text: string): string {
-    this.admit(text.length, AgentAnswerAssembler.encodedBytes(text))
-    this.items.clear()
-    this.itemOrder.length = 0
-    this.encodedTextBytes = 0
-    this.nonemptyItems = 0
-    this.chars = 0
-    this.lastSnapshot = undefined
-    this.complete(this.outputId, text)
-    return text
   }
 
   get text(): string {

@@ -10,11 +10,7 @@ import {
   CONVERSATION_PATCH_BYTES,
   conversationPatchSchema,
   collaborationTaskSchema,
-  collaborationEnvelopeSchema,
   type CollaborationDocument,
-  prepareCollaborationSupplement,
-  type CollaborationResult,
-  type CollaborationTodoDelta,
   type ConversationSendInput,
 } from '@pact/contracts'
 
@@ -23,7 +19,6 @@ import {
   agentRuns,
   anchoredComments,
   collaborationInputs,
-  collaborationTurns,
   conversationBodyInputs,
   conversationImageAssets,
   conversationInputBatchMembers,
@@ -39,47 +34,18 @@ const settings = {
   primaryAgentId: 'codex',
   agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
   maxDiscussionRounds: 6,
-  runningMessagePolicy: 'immediate_safe_point',
+
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
 } as const
-const fixturePlan = 'Scope and acceptance.'
-const checked: CollaborationResult = {
-  submission: 'plan_submission',
-  outcome: 'complete',
-  summary: 'Current plan checked.',
-  plan: fixturePlan,
-  todoDeltas: [],
-  inputResponses: [],
-}
 const hash = (text: string) => createHash('sha256').update(text).digest('hex')
-const todoDelta = (
-  todoId: string,
-  fields: Partial<CollaborationTodoDelta> = {},
-): CollaborationTodoDelta => ({
-  todoId,
-  expectedRevision: 0,
-  operation: 'create',
-  kind: 'opinion',
-  title: 'Release resources',
-  detail: 'Pending work must be released.',
-  recommendation: null,
-  evidence: null,
-  question: null,
-  resolutionKind: null,
-  reason: '',
-  mergeTargetId: null,
-  userSourceIds: [],
-  evidenceRefs: [],
-  ...fields,
-})
-
-async function fixture(filePath = ':memory:') {
+async function fixture(filePath = ':memory:', onOpened?: () => void) {
   const db = await PactDatabase.open({
     filePath,
     migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
   })
   databases.push(db)
+  onOpened?.()
   const repo = db.conversationRepository,
     projectId = randomUUID(),
     sessionId = randomUUID(),
@@ -102,23 +68,22 @@ async function fixture(filePath = ':memory:') {
     sessionId,
     kind: 'plan',
     revision: 0,
-    primary: 'codex',
-    drafter: 'codex',
-    implementer: 'claude',
-    reviewer: 'codex',
+    protocol: 'native-workflow-v1',
+    owner: 'codex',
+    reviewer: 'claude',
+    automation: 'active',
+    inputSequence: 0,
+    handledInputSequence: 0,
     task: 'Review cancellation.',
     taskMessageId: messageId,
-    stage: 'draft',
+    stage: 'plan',
     actor: 'codex',
     status: 'running',
     runId: messageId,
     planVersion: 0,
     discussionRounds: 0,
-    discussionHalf: false,
     reviewCycles: 0,
     repairAttempts: 0,
-    rereview: false,
-    nextCycle: false,
   })
   const first = repo.beginRun({
     sessionId,
@@ -132,47 +97,16 @@ async function fixture(filePath = ':memory:') {
     effort: null,
     collaboration: initial,
   })
-  const reportFor = (
+  const finish = (
     runId = first.run.id,
-    report: CollaborationResult = checked,
-    respondToInputs = true,
-  ): CollaborationResult => {
-    const auth = repo.collaborationTurnAuthorization(runId)!
-    const normalized: CollaborationResult = { ...report, submission: auth.duty }
-    if (auth.duty === 'plan_review' || auth.duty === 'code_review' || auth.duty === 'stage_result')
-      normalized.plan = undefined
-    if (auth.duty === 'plan_review') normalized.reviewedPlan = auth.basePlanRef ?? undefined
-    if (auth.duty === 'code_review') normalized.reviewScopeRef = auth.reviewScopeRef ?? undefined
-    if (auth.duty === 'plan_review' || auth.duty === 'code_review')
-      normalized.verdict =
-        report.verdict ??
-        (report.todoDeltas.some(
-          (item) => item.operation === 'create' || item.operation === 'reopen',
-        )
-          ? 'changes_requested'
-          : 'accepted')
-    if (respondToInputs && !report.inputResponses.length) {
-      const inputs: CollaborationResult['inputResponses'] = []
-      let offset = 0
-      for (;;) {
-        const page = repo.readRequiredInputMembers(runId, offset)
-        inputs.push(
-          ...page.items.map((item) => ({
-            batchId: item.batchId,
-            memberId: item.memberId,
-            disposition: 'resolved' as const,
-            reason: 'Applied the fixture input to its authorized scope.',
-            todoId: null,
-          })),
-        )
-        if (page.nextOffset === null) break
-        offset = page.nextOffset
-      }
-      normalized.inputResponses = inputs
-    }
-    return normalized
-  }
-  const finish = (runId = first.run.id, report = checked, expectedFailure?: RegExp) => {
+    result: {
+      plan?: string
+      verdict?: 'accepted' | 'changes_requested' | 'needs_user' | 'incomplete'
+      questions?: import('@pact/contracts').CollaborationQuestions
+      inputOutcome?: 'processed' | 'needs_user' | 'incomplete'
+      answer?: string
+    } = { plan: 'Scope and acceptance.' },
+  ) => {
     const run = repo.findRun(runId)!
     repo.applyEvent(sessionId, runId, {
       type: 'session.started',
@@ -184,23 +118,24 @@ async function fixture(filePath = ':memory:') {
       agentId: run.agentId,
       turnId: `turn-${runId}`,
     })
-    const normalized = reportFor(runId, report, expectedFailure === undefined)
-    const carrier: unknown = JSON.parse(
-      JSON.stringify({
-        version: 'pact-collaboration-envelope-v5',
-        answer: 'Checked current scope.',
-        result: normalized,
-      }),
-    )
-    repo.recordCollaborationCarrier(runId, carrier)
-    repo.recordCollaborationResult(runId, collaborationEnvelopeSchema.parse(carrier).result)
-
+    if (result.plan)
+      repo.recordWorkflowPlan(runId, { nativeId: `plan-${runId}`, text: result.plan })
+    if (result.verdict)
+      repo.recordWorkflowReview(runId, {
+        verdict: result.verdict,
+        ...(result.questions ? { questions: result.questions } : {}),
+      })
+    if (result.inputOutcome)
+      repo.recordWorkflowInputResult(runId, {
+        outcome: result.inputOutcome,
+        ...(result.questions ? { questions: result.questions } : {}),
+      })
     repo.applyEvent(sessionId, runId, {
       type: 'text.completed',
       agentId: run.agentId,
       turnId: `turn-${runId}`,
       outputId: `answer-${runId}`,
-      text: 'Checked current scope.',
+      text: result.answer ?? 'Checked current scope.',
     })
     repo.recordNativeEvidence({
       kind: 'ended',
@@ -214,23 +149,16 @@ async function fixture(filePath = ':memory:') {
         nativeSessionId: `fixture-${run.agentId}`,
         nativeTurnId: `turn-${runId}`,
         bindingGeneration: run.bindingGeneration ?? 1,
-        answerFormat: 'collaboration_envelope_v5',
       },
     })
+    repo.recordNativeEffects(runId, 'settled')
     repo.applyEvent(sessionId, runId, {
       type: 'turn.completed',
       agentId: run.agentId,
       turnId: `turn-${runId}`,
       outcome: 'completed',
     })
-    const settled = repo.collaboration(sessionId)!
-    expect({
-      failure: settled.reportFailure,
-      notice: expectedFailure?.test(settled.notice ?? '') ?? settled.notice,
-    }).toEqual({
-      failure: expectedFailure ? 'invalid' : undefined,
-      notice: expectedFailure ? true : undefined,
-    })
+    repo.recordNativeEffects(runId, 'settled')
   }
   const drafts = () => {
     const value = repo.readPage({ scope: 'drafts', sessionId })
@@ -270,7 +198,7 @@ async function fixture(filePath = ':memory:') {
     const patch = repo.receiveCollaborationInput(
       send,
       body.inputId,
-      'codex',
+      repo.collaborationReplyActor(repo.collaboration(sessionId)!, send.replyToDecision),
       'immediate_safe_point',
       owner,
     )
@@ -279,7 +207,7 @@ async function fixture(filePath = ':memory:') {
   const materialize = () => {
     const received = repo.readReceivedInput(sessionId)!,
       task = repo.collaboration(sessionId)!
-    const next = prepareCollaborationSupplement(task, received.actor, settings)
+    const next = repo.workflowReply(task, received.actor)
     next.latestUserMessageId = received.id
     return repo.beginRun({
       sessionId,
@@ -294,6 +222,7 @@ async function fixture(filePath = ':memory:') {
       effort: null,
       preserveDraftComments: true,
       receivedInputId: received.id,
+      expectedCollaborationRevision: task.revision,
       collaboration: next,
     })
   }
@@ -309,7 +238,6 @@ async function fixture(filePath = ':memory:') {
     receive,
     materialize,
     finish,
-    reportFor,
     drafts,
   }
 }
@@ -491,7 +419,11 @@ describe('Durable collaboration receipt and phase ownership', () => {
     })
     databases.push(db)
     db.conversationRepository.recoverCollaborationTasks()
-    expect(db.conversationRepository.collaboration(f.sessionId)?.status).toBe('failed')
+    expect(db.conversationRepository.collaboration(f.sessionId)).toMatchObject({
+      status: 'running',
+      automation: 'paused',
+      pauseReason: 'restart',
+    })
     expect(db.conversationRepository.readReceivedInput(f.sessionId)?.content).toBe(
       received.send.content,
     )
@@ -524,6 +456,7 @@ describe('Durable collaboration receipt and phase ownership', () => {
       model: null,
       effort: null,
       preserveDraftComments: true,
+      expectedCollaborationRevision: f.repo.collaboration(f.sessionId)!.revision,
       collaboration: next,
     })
     expect(f.repo.collaboration(f.sessionId)?.discussionRounds).toBe(1)
@@ -531,10 +464,11 @@ describe('Durable collaboration receipt and phase ownership', () => {
     f.repo.failRun(started.run.id, 'protocol_error', 'Proved not dispatched', false)
     expect(f.repo.collaboration(f.sessionId)).toMatchObject({
       discussionRounds: 0,
-      releasedReservation: true,
       status: 'failed',
     })
-    const retry = advanceCollaboration(f.repo.collaboration(f.sessionId)!, 'retry', settings)
+    const resumed = advanceCollaboration(f.repo.collaboration(f.sessionId)!, 'resume', settings)
+    f.repo.setCollaborationState(resumed)
+    const retry = advanceCollaboration(resumed, 'continue', settings)
     expect(retry.discussionRounds).toBe(1)
     const again = f.repo.beginRun({
       sessionId: f.sessionId,
@@ -547,6 +481,7 @@ describe('Durable collaboration receipt and phase ownership', () => {
       model: null,
       effort: null,
       preserveDraftComments: true,
+      expectedCollaborationRevision: resumed.revision,
       collaboration: retry,
     })
     f.db.drizzle
@@ -557,7 +492,6 @@ describe('Durable collaboration receipt and phase ownership', () => {
     f.repo.finishCollaboration(again.run.id, false)
     expect(f.repo.collaboration(f.sessionId)).toMatchObject({
       discussionRounds: 1,
-      releasedReservation: false,
     })
   })
 
@@ -566,7 +500,7 @@ describe('Durable collaboration receipt and phase ownership', () => {
     f.finish()
     const received = f.receive()
     const frozen = f.repo.collaboration(f.sessionId)!,
-      next = prepareCollaborationSupplement(frozen, 'codex', settings)
+      next = f.repo.workflowReply(frozen, 'codex')
     f.repo.setReceivedInputState(f.sessionId, 'blocked', received.send.clientMessageId)
     f.repo.setReceivedInputState(f.sessionId, 'accepted', received.send.clientMessageId)
     f.repo.resumeConversationQueue({
@@ -631,1148 +565,6 @@ describe('Durable collaboration receipt and phase ownership', () => {
     expect(f.db.drizzle.select().from(anchoredComments).all()).toHaveLength(0)
   })
 })
-
-it('carries the full submitted plan and opinions with a natural message in Handoff and Rebuild', async () => {
-  const f = await fixture()
-  const controller = new AbortController()
-  const report = {
-    ...checked,
-    todoDeltas: [
-      {
-        ...todoDelta('report-only'),
-        title: 'Plan-only evidence',
-        detail: 'This detailed finding exists only in the report.',
-        recommendation: 'Keep the complete source.',
-      },
-    ],
-  }
-  f.finish(undefined, report)
-  const sources = []
-  for await (const source of f.repo.readHandoffSources(
-    f.sessionId,
-    'claude',
-    -1,
-    100,
-    controller.signal,
-  ))
-    sources.push(source)
-  const reply = sources.find((source) => source.speaker === 'codex')!
-  expect(reply.contextVersion).toBe('collaboration_v2')
-  const stored = f.repo.collaboration(f.sessionId)!
-  expect(reply.content).toContain(stored.planDocument!.id)
-  const originalReport = f.db.drizzle
-    .select()
-    .from(collaborationTurns)
-    .where(eq(collaborationTurns.runId, stored.runId))
-    .get()!
-  const originalRef: CollaborationDocument = JSON.parse(originalReport.resultJson!).source
-  expect(reply.content).toContain(originalRef.id)
-  expect(readDocument(f, stored.planDocument!)).toBe(report.plan)
-  expect(readDocument(f, stored.resultDocument!)).toContain(
-    'This detailed finding exists only in the report.',
-  )
-  const chunks = []
-  for await (const chunk of f.repo.nativeContextRebuildSource(f.sessionId, controller.signal))
-    chunks.push(chunk)
-  expect(
-    chunks
-      .filter((chunk) => chunk.kind === 'message')
-      .map((chunk) => chunk.content)
-      .join(''),
-  ).toContain(originalRef.id)
-  expect(f.repo.internalMessage(reply.messageId, f.sessionId)?.content).toBe(
-    'Checked current scope.',
-  )
-  const oldSource = {
-    messageId: reply.messageId,
-    sequence: reply.sequence,
-    contentRevision: reply.contentRevision,
-    speaker: reply.speaker,
-    handledBy: reply.handledBy,
-    content: 'Checked current scope.',
-    comments: reply.comments,
-  }
-  const oldDigest = hash(JSON.stringify(oldSource))
-  expect(oldDigest).not.toBe(reply.digest)
-  for (const contextVersion of [undefined, 'collaboration_v2'] as const) {
-    const target = f.repo.beginRun({
-      sessionId: f.sessionId,
-      clientMessageId: randomUUID(),
-      content: 'Inspect the exact source.',
-      expectedCommentsRevision: f.drafts().commentsRevision,
-      commentIds: [],
-      agentId: 'claude',
-      settingsRevision: 1,
-      model: null,
-      effort: null,
-      handoffSourceRefs: [
-        {
-          id: reply.messageId,
-          revision: reply.contentRevision,
-          digest: contextVersion ? reply.digest : oldDigest,
-          ...(contextVersion ? { contextVersion } : {}),
-        },
-      ],
-    })
-    // oxlint-disable-next-line no-await-in-loop -- Each frozen digest version owns a distinct Run before its next receipt can be admitted.
-    const saved = await f.repo.readRunHandoff(target.run.id, controller.signal)
-    expect(saved[0]?.digest).toBe(contextVersion ? reply.digest : oldDigest)
-    expect(saved[0]?.content).toBe(contextVersion ? reply.content : oldSource.content)
-    f.repo.failRun(target.run.id, 'protocol_error', 'Fixture refusal before dispatch.', false)
-  }
-})
-
-it.each(['terminal-before-report', 'late-report'] as const)(
-  'preserves %s material across restart without accepting the recovered report',
-  async (fault) => {
-    const directory = await mkdtemp(join(tmpdir(), 'pact-report-restart-'))
-    directories.push(directory)
-    const filePath = join(directory, 'pact.sqlite'),
-      f = await fixture(filePath),
-      signal = new AbortController().signal,
-      report = {
-        ...checked,
-        plan: 'Unique recovered plan: retain cancellation ownership.',
-        todoDeltas: [
-          {
-            ...todoDelta('recovered-opinion'),
-            title: 'Recovered source',
-            detail: 'Unique report-only evidence.',
-            recommendation: 'Keep the original source.',
-          },
-        ],
-      }
-    f.repo.applyEvent(f.sessionId, f.first.run.id, {
-      type: 'session.started',
-      agentId: 'codex',
-      nativeSessionId: 'recovery-source',
-    })
-    f.repo.applyEvent(f.sessionId, f.first.run.id, {
-      type: 'turn.started',
-      agentId: 'codex',
-      turnId: 'recovery-turn',
-    })
-    const evidence = {
-      kind: 'ended' as const,
-      source: 'live_terminal' as const,
-      outcome: 'completed' as const,
-      identity: {
-        sessionId: f.sessionId,
-        agentId: 'codex' as const,
-        requestId: f.first.run.id,
-        runId: f.first.run.id,
-        nativeSessionId: 'recovery-source',
-        nativeTurnId: 'recovery-turn',
-        bindingGeneration: 1,
-        answerFormat: 'collaboration_envelope_v5' as const,
-      },
-      output: {
-        outputId: 'recovered-answer',
-        text: 'The scope needs discussion.',
-        completeness: 'complete' as const,
-        ...(fault === 'terminal-before-report' ? { submittedReport: report } : {}),
-      },
-    }
-    f.repo.recordNativeEvidence(evidence)
-    f.db.close()
-    databases.splice(databases.indexOf(f.db), 1)
-    const reopened = await PactDatabase.open({
-      filePath,
-      migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
-    })
-    databases.push(reopened)
-    const repo = reopened.conversationRepository
-    if (fault === 'late-report') repo.recordRecoveredCollaborationResult(f.first.run.id, report)
-    repo.recordRecoveredCollaborationResult(f.first.run.id, report)
-    expect(() =>
-      repo.recordRecoveredCollaborationResult(f.first.run.id, {
-        ...report,
-        plan: 'A conflicting source.',
-      }),
-    ).toThrow(/different report/)
-    expect(() =>
-      repo.recordNativeEvidence({
-        ...evidence,
-        identity: { ...evidence.identity, nativeTurnId: 'another-root' },
-      }),
-    ).toThrow(/identity/)
-    await repo.recordNativeOutputComplete(f.first.run.id, evidence.output, signal)
-
-    repo.settleKnownNativeEnding(f.first.run.id)
-    const task = repo.collaboration(f.sessionId)!
-    expect(task.status).toBe('failed')
-    expect(task.result).toBeUndefined()
-    expect(task.plan).toBeUndefined()
-    expect(task.reportFailure).toBe('missing')
-    const recovery = advanceCollaboration(task, 'submit_report', settings)
-    recovery.reportRecovery = {
-      sourceRunId: task.runId,
-      sourceMessageId: repo.findRun(task.runId)!.responseMessageId!,
-      sourceContentRevision: repo.internalMessage(
-        repo.findRun(task.runId)!.responseMessageId!,
-        f.sessionId,
-      )!.contentRevision,
-    }
-    const source = await repo.readCollaborationReport(recovery, signal)
-    const recovered = repo.collaborationReportSource(f.sessionId, f.first.run.id)!
-    expect(recovered.plan).toBe(report.plan)
-    expect(recovered.todoDeltas[0]?.detail).toBe('Unique report-only evidence.')
-    expect(source.content).toContain('"acceptedReport":false')
-    expect(repo.internalMessage(source.messageId, f.sessionId)?.content).toBe(evidence.output.text)
-    expect(repo.read(f.sessionId).runs).toHaveLength(1)
-  },
-)
-
-it.each([false, true])(
-  'makes a completed late report available after Stop and resume, with inherited source=%s',
-  async (inheritSource) => {
-    const f = await fixture(),
-      signal = new AbortController().signal
-    let runId = f.first.run.id,
-      agentId = f.first.run.agentId
-    if (inheritSource) {
-      f.finish()
-      const next = advanceCollaboration(f.repo.collaboration(f.sessionId)!, 'continue', settings)
-      const started = f.repo.beginRun({
-        sessionId: f.sessionId,
-        clientMessageId: randomUUID(),
-        content: 'Review the frozen plan.',
-        expectedCommentsRevision: f.drafts().commentsRevision,
-        commentIds: [],
-        agentId: next.actor,
-        settingsRevision: 1,
-        model: null,
-        effort: null,
-        collaboration: next,
-      })
-      runId = started.run.id
-      agentId = started.run.agentId
-    }
-    expect(f.repo.collaboration(f.sessionId)?.sourceMessageId).toBe(
-      inheritSource ? f.repo.findRun(f.first.run.id)?.responseMessageId : undefined,
-    )
-    f.repo.applyEvent(f.sessionId, runId, {
-      type: 'session.started',
-      agentId,
-      nativeSessionId: 'paused-source',
-    })
-    f.repo.applyEvent(f.sessionId, runId, {
-      type: 'turn.started',
-      agentId,
-      turnId: 'paused-root',
-    })
-    f.repo.pauseCollaboration(f.sessionId)
-    f.repo.recordNativeEvidence({
-      kind: 'ended',
-      source: 'live_terminal',
-      outcome: 'completed',
-      identity: {
-        sessionId: f.sessionId,
-        agentId,
-        runId,
-        requestId: runId,
-        nativeSessionId: 'paused-source',
-        nativeTurnId: 'paused-root',
-        bindingGeneration: 1,
-        answerFormat: 'collaboration_envelope_v5',
-      },
-      output: {
-        outputId: 'late-body',
-        text: 'Original completed answer.',
-        completeness: 'complete',
-        submittedReport: checked,
-      },
-    })
-    await f.repo.recordNativeOutputComplete(
-      runId,
-      { outputId: 'late-body', text: 'Original completed answer.', completeness: 'complete' },
-      signal,
-    )
-    f.repo.settleKnownNativeEnding(runId)
-    expect(f.repo.collaboration(f.sessionId)?.status).toBe('paused')
-    f.repo.setCollaborationState(
-      advanceCollaboration(f.repo.collaboration(f.sessionId)!, 'resume', settings),
-    )
-    const resumed = f.repo.collaboration(f.sessionId)!
-    expect(resumed.sourceMessageId).toBe(f.repo.findRun(runId)?.responseMessageId)
-    expect(() => advanceCollaboration(resumed, 'submit_report', settings)).not.toThrow()
-  },
-)
-
-it('preserves a proved native ending when a later report conflicts with an existing candidate', async () => {
-  const f = await fixture()
-  f.repo.applyEvent(f.sessionId, f.first.run.id, {
-    type: 'session.started',
-    agentId: 'codex',
-    nativeSessionId: 'conflicting-source',
-  })
-  f.repo.applyEvent(f.sessionId, f.first.run.id, {
-    type: 'turn.started',
-    agentId: 'codex',
-    turnId: 'conflicting-root',
-  })
-  const identity = {
-    sessionId: f.sessionId,
-    agentId: 'codex' as const,
-    runId: f.first.run.id,
-    requestId: f.first.run.id,
-    nativeSessionId: 'conflicting-source',
-    nativeTurnId: 'conflicting-root',
-    bindingGeneration: 1,
-    answerFormat: 'collaboration_envelope_v5' as const,
-  }
-  f.repo.recordNativeEvidence({
-    kind: 'no_evidence',
-    identity,
-    reason: 'Only a partial source is known.',
-    output: {
-      outputId: 'candidate',
-      text: 'Original source.',
-      completeness: 'partial',
-      submittedReport: checked,
-    },
-  })
-  try {
-    f.repo.recordNativeEvidence({
-      kind: 'ended',
-      source: 'stored_terminal',
-      outcome: 'completed',
-      identity,
-      output: {
-        outputId: 'candidate',
-        text: 'Original source.',
-        completeness: 'complete',
-        submittedReport: { ...checked, plan: 'Different candidate.' },
-      },
-    })
-  } catch {
-    /* Conflicting material may be rejected but cannot revoke the ending. */
-  }
-  expect(f.repo.findRun(f.first.run.id)).toMatchObject({
-    dispatchPhase: 'ended',
-    nativeOutcome: 'completed',
-  })
-  expect(f.repo.collaboration(f.sessionId)?.reportFailure).toBe('invalid')
-  expect(f.repo.collaboration(f.sessionId)?.notice).toContain('different report')
-  const saved = f.db.drizzle
-    .select()
-    .from(collaborationTurns)
-    .where(eq(collaborationTurns.runId, f.first.run.id))
-    .get()!
-  expect(f.repo.collaborationReportSource(f.sessionId, f.first.run.id)).toEqual(checked)
-  expect(JSON.parse(saved.resultJson!)).toHaveProperty('source')
-  const before = f.repo.findRun(f.first.run.id)
-  expect(() =>
-    f.repo.recordNativeEvidence({
-      kind: 'ended',
-      source: 'stored_terminal',
-      outcome: 'completed',
-      identity: { ...identity, nativeTurnId: 'wrong-root' },
-    }),
-  ).toThrow(/identity/)
-  expect(f.repo.findRun(f.first.run.id)).toEqual(before)
-})
-
-function completeWithoutParsedReport(
-  f: Awaited<ReturnType<typeof fixture>>,
-  carrier: { version: string; answer: string; result: CollaborationResult },
-) {
-  const id = f.first.run.id,
-    nativeSessionId = 'saved-root',
-    nativeTurnId = `root-${id}`
-  f.repo.applyEvent(f.sessionId, id, { type: 'session.started', agentId: 'codex', nativeSessionId })
-  f.repo.applyEvent(f.sessionId, id, {
-    type: 'turn.started',
-    agentId: 'codex',
-    turnId: nativeTurnId,
-  })
-  const original = { ...carrier, result: f.reportFor(id, carrier.result) }
-  f.repo.recordCollaborationCarrierText(id, JSON.stringify(original))
-  f.repo.applyEvent(f.sessionId, id, {
-    type: 'text.completed',
-    agentId: 'codex',
-    turnId: nativeTurnId,
-    outputId: 'natural-answer',
-    text: carrier.answer,
-  })
-  f.repo.recordNativeEvidence({
-    kind: 'ended',
-    source: 'live_terminal',
-    outcome: 'completed',
-    identity: {
-      sessionId: f.sessionId,
-      agentId: 'codex',
-      runId: id,
-      requestId: id,
-      nativeSessionId,
-      nativeTurnId,
-      bindingGeneration: 1,
-      answerFormat: 'collaboration_envelope_v5',
-    },
-  })
-  f.repo.applyEvent(f.sessionId, id, {
-    type: 'turn.completed',
-    agentId: 'codex',
-    turnId: nativeTurnId,
-    outcome: 'completed',
-  })
-  f.repo.recordCollaborationCarrier(id, original)
-  f.repo.recordRecoveredCollaborationResult(id, original.result)
-  return {
-    runId: id,
-    nativeSessionId,
-    nativeTurnId,
-    revision: f.repo.collaboration(f.sessionId)!.revision,
-    source: 'stored_terminal' as const,
-  }
-}
-
-it('reconciles only the saved original, rejects candidate mismatch, and preserves terminal/message identity', async () => {
-  const f = await fixture(),
-    carrier = {
-      version: 'pact-collaboration-envelope-v5',
-      answer: 'The original conclusion.',
-      result: checked,
-    }
-  const input = completeWithoutParsedReport(f, carrier),
-    before = f.repo.internalMessage(f.repo.findRun(input.runId)!.responseMessageId!, f.sessionId)!
-  const source = f.repo.collaborationCarrierSource(f.sessionId, input.runId)!
-  const forged = {
-    ...carrier,
-    answer: 'A different message.',
-    result: { ...checked, plan: 'Forged replacement' },
-  }
-  expect(() => f.repo.recordCollaborationCarrier(input.runId, forged)).toThrow(
-    /original final submission/,
-  )
-  expect(() => f.repo.recordRecoveredCollaborationResult(input.runId, forged.result)).toThrow(
-    /original submission/,
-  )
-  expect(() =>
-    f.repo.reconcileCompletedCollaboration({ ...input, nativeTurnId: 'another-root' }),
-  ).toThrow(/identity/)
-  expect(() =>
-    f.repo.reconcileCompletedCollaboration({ ...input, revision: input.revision + 1 }),
-  ).toThrow(/advanced/)
-  expect(f.repo.collaborationCarrierSource(f.sessionId, input.runId)).toEqual(source)
-  f.repo.reconcileCompletedCollaboration(input)
-  const settled = f.repo.collaboration(f.sessionId)!,
-    revision = settled.revision
-  expect(settled).toMatchObject({ status: 'waiting', planVersion: 1 })
-  expect(settled.reportFailure).toBeUndefined()
-  expect(readDocument(f, settled.planDocument!)).toBe(checked.plan)
-  expect(f.repo.internalMessage(before.id, f.sessionId)).toEqual(before)
-  f.repo.reconcileCompletedCollaboration(input)
-  expect(f.repo.collaboration(f.sessionId)?.revision).toBe(revision)
-  expect(() => f.repo.recordCollaborationCarrierText(input.runId, JSON.stringify(forged))).toThrow(
-    /replace/,
-  )
-})
-
-it('cannot accept an original report after pause or after an acknowledged user update', async () => {
-  const f = await fixture(),
-    input = completeWithoutParsedReport(f, {
-      version: 'pact-collaboration-envelope-v5',
-      answer: 'Completed natural answer.',
-      result: checked,
-    })
-  const failed = f.repo.collaboration(f.sessionId)!
-  f.repo.pauseCollaboration(f.sessionId)
-  expect(() =>
-    f.repo.reconcileCompletedCollaboration({
-      ...input,
-      revision: f.repo.collaboration(f.sessionId)!.revision,
-    }),
-  ).toThrow(/advanced/)
-  f.repo.setCollaborationState(failed)
-  f.receive()
-  expect(() =>
-    f.repo.reconcileCompletedCollaboration({
-      ...input,
-      revision: f.repo.collaboration(f.sessionId)!.revision,
-    }),
-  ).toThrow(/advanced/)
-  expect(f.repo.collaboration(f.sessionId)?.planVersion).toBe(0)
-  expect(f.repo.readReceivedInput(f.sessionId)).toBeDefined()
-})
-
-it('stores, pages and cold-reads complete plan/report sources beyond former aggregate and field limits', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'pact-complete-source-regression-'))
-  directories.push(directory)
-  const filePath = join(directory, 'pact.sqlite'),
-    f = await fixture(filePath),
-    report = {
-      ...checked,
-      plan: '界😀'.repeat(25_000),
-      todoDeltas: Array.from({ length: 80 }, (_, i) => ({
-        ...todoDelta(`opinion-${i}`),
-        title: `Complete opinion ${i}`,
-        detail: i === 0 ? 'Full detail. '.repeat(5000) : 'Distinct source.',
-        recommendation: 'Preserve the whole source.',
-      })),
-    }
-  f.finish(undefined, report)
-  const state = f.repo.collaboration(f.sessionId)!,
-    current = f.repo.readPage({
-      scope: 'collaboration',
-      sessionId: f.sessionId,
-      projection: 'current',
-    })
-  expect(current.scope).toBe('collaboration')
-  expect(Buffer.byteLength(JSON.stringify(current))).toBeLessThanOrEqual(48 * 1024)
-  expect(state.plan).toBeUndefined()
-  expect(readDocument(f, state.planDocument!)).toBe(report.plan)
-  const ids: string[] = []
-  let offset = 0
-  for (;;) {
-    const page = f.repo.readPage({
-      scope: 'collaboration',
-      sessionId: f.sessionId,
-      projection: 'todos',
-      todoStatus: 'all',
-      todoOffset: offset,
-    })
-    if (page.scope !== 'collaboration') throw Error('Report unavailable')
-    expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(48 * 1024)
-    expect(page.view.todos!.items.length).toBeLessThanOrEqual(24)
-    ids.push(...page.view.todos!.items.map((item) => item.id))
-    if (page.view.todos!.nextOffset === null) break
-    offset = page.view.todos!.nextOffset
-  }
-  expect(ids).toEqual(report.todoDeltas.map((item) => item.todoId))
-  expect(f.repo.collaborationReportSource(f.sessionId, state.runId)).toEqual(
-    f.reportFor(state.runId, report),
-  )
-  f.db.close()
-  databases.splice(databases.indexOf(f.db), 1)
-  const db = await PactDatabase.open({
-    filePath,
-    migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
-  })
-  databases.push(db)
-  const cold = db.conversationRepository.collaboration(f.sessionId, undefined, true)!
-  expect(cold.plan).toBe(report.plan)
-  expect(cold.result?.todoDeltas).toEqual(report.todoDeltas)
-})
-
-it('uses the same settlement for full unchanged primary submissions and real revisions', async () => {
-  const f = await fixture()
-  f.finish()
-  const drafted = f.repo.collaboration(f.sessionId)!,
-    peer = advanceCollaboration(drafted, 'continue', settings)
-  const reviewed = f.repo.beginRun({
-    sessionId: f.sessionId,
-    clientMessageId: randomUUID(),
-    content: 'Review plan.',
-    commentIds: [],
-    expectedCommentsRevision: f.drafts().commentsRevision,
-    agentId: peer.actor,
-    settingsRevision: 1,
-    model: null,
-    effort: null,
-    collaboration: peer,
-  })
-  f.finish(reviewed.run.id, { ...checked, plan: undefined })
-  let prior = f.repo.collaboration(f.sessionId)!
-  expect(prior.status).toBe('ready')
-  for (const changed of [false, true]) {
-    const phase = prepareCollaborationSupplement(prior, 'codex', settings, 'maintain_plan')
-    const run = f.repo.beginRun({
-      sessionId: f.sessionId,
-      clientMessageId: randomUUID(),
-      content: 'Maintain the plan.',
-      commentIds: [],
-      expectedCommentsRevision: f.drafts().commentsRevision,
-      agentId: 'codex',
-      settingsRevision: 1,
-      model: null,
-      effort: null,
-      collaboration: phase,
-    })
-    f.finish(run.run.id, {
-      ...checked,
-      plan: changed ? 'New source and acceptance.' : checked.plan,
-    })
-    const next = f.repo.collaboration(f.sessionId)!
-    expect(next.planVersion).toBe(prior.planVersion + Number(changed))
-    expect(next.planReference).toEqual(
-      changed
-        ? {
-            type: 'unchanged',
-            version: prior.planVersion + 1,
-            sourceRunId: run.run.id,
-            sha256: hash('New source and acceptance.'),
-          }
-        : prior.planReference,
-    )
-    expect(next.planDocument?.sha256).toBe(
-      hash(changed ? 'New source and acceptance.' : fixturePlan),
-    )
-    expect(next.reviewedPlan).toEqual(changed ? undefined : prior.reviewedPlan)
-    expect(!changed && next.planDocument?.id !== prior.planDocument?.id).toBe(false)
-    prior = next
-  }
-})
-
-it('closes an approved plan after clean code rereview without treating it as plan maintenance', async () => {
-  const f = await fixture()
-  f.finish()
-  const begin = (action: 'continue' | 'execute' | 'repair') => {
-    const phase = advanceCollaboration(f.repo.collaboration(f.sessionId)!, action, settings)
-    return f.repo.beginRun({
-      sessionId: f.sessionId,
-      clientMessageId: randomUUID(),
-      content: 'Continue the authorized phase.',
-      commentIds: [],
-      expectedCommentsRevision: f.drafts().commentsRevision,
-      agentId: phase.actor,
-      settingsRevision: 1,
-      model: null,
-      effort: null,
-      collaboration: phase,
-    }).run.id
-  }
-  f.finish(begin('continue'), { ...checked, plan: undefined })
-  const clean = { ...checked, submission: 'stage_result' as const, plan: undefined }
-  f.finish(begin('execute'), clean)
-  const opinion = {
-    ...todoDelta('cleanup'),
-    title: 'Dispose pending work',
-    detail: 'The owner must release the request.',
-    recommendation: 'Dispose on termination.',
-  }
-  f.finish(begin('continue'), { ...clean, todoDeltas: [opinion] })
-  f.finish(begin('repair'), {
-    ...clean,
-    todoDeltas: [
-      todoDelta('cleanup', {
-        operation: 'propose_resolution',
-        expectedRevision: 1,
-        resolutionKind: 'resolved',
-        reason: 'Disposed pending work with the owner.',
-      }),
-    ],
-  })
-  f.finish(begin('continue'), {
-    ...clean,
-    todoDeltas: [
-      todoDelta('cleanup', {
-        operation: 'confirm',
-        expectedRevision: 2,
-        resolutionKind: 'resolved',
-        reason: 'Independent review confirms the owner releases pending work.',
-      }),
-    ],
-  })
-  expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete')
-  expect(f.repo.collaboration(f.sessionId)?.reportFailure).toBeUndefined()
-  expect(f.repo.collaboration(f.sessionId)?.reviewCycles).toBe(1)
-})
-
-async function frozenBatchFixture() {
-  const f = await fixture()
-  f.finish()
-  const ids: string[] = []
-  for (let index = 0; index < 26; index++) {
-    const id = randomUUID()
-    ids.push(id)
-    f.repo.saveCommentDraft({
-      mode: 'create',
-      sessionId: f.sessionId,
-      commentId: id,
-      expectedCommentsRevision: f.drafts().commentsRevision,
-      body: `Distinct requested check ${index}`,
-      anchor: {
-        type: 'message',
-        messageId: f.first.run.userMessageId,
-        contentHash: hash('/plan Review cancellation.'),
-        textBasis: 'markdown-visible-v2',
-        startOffset: 0,
-        endOffset: 5,
-        quote: '/plan',
-      },
-    })
-  }
-  expect(f.drafts().comments.length).toBeLessThan(ids.length)
-  // The supplied visible subset must not replace the authoritative full draft set.
-  f.receive(f.input('Apply the complete Batch.', ids.slice(0, 10)))
-  const started = f.materialize()
-  const batch = f.repo.inputBatchForRun(started.run.id)!
-  expect(batch.memberCount).toBe(26)
-  const firstPage = f.repo.readFrozenInputBatch(started.run.id, batch.id)
-  expect(firstPage.members).toHaveLength(24)
-  expect(firstPage.hasMore).toBe(true)
-  const lastPage = f.repo.readFrozenInputBatch(started.run.id, batch.id, firstPage.nextOrdinal)
-  expect(lastPage.members).toHaveLength(2)
-  expect(lastPage.hasMore).toBe(false)
-  expect([...firstPage.members, ...lastPage.members].map((item) => item.commentId)).toEqual(ids)
-  const before = f.repo.collaboration(f.sessionId)!
-  const report = f.reportFor(started.run.id, { ...checked, todoDeltas: [todoDelta('atomic')] })
-  expect(report.inputResponses).toHaveLength(27)
-  expect(
-    new Set(report.inputResponses.map((item) => `${item.batchId}:${item.memberId}`)).size,
-  ).toBe(27)
-  return { f, started, batch, before, report, firstPage, lastPage }
-}
-function expectUnsettledBatch(value: Awaited<ReturnType<typeof frozenBatchFixture>>) {
-  const { f, started, batch, before, firstPage, lastPage } = value
-  const settled = f.repo.collaboration(f.sessionId)!
-  expect(settled.ledgerRevision).toBe(before.ledgerRevision)
-  expect(settled.processedWatermark).toBe(before.processedWatermark)
-  expect(() => f.repo.readTodoRevision(settled.id, 'atomic', 1)).toThrow(/unavailable/)
-  expect(f.repo.readFrozenInputBatch(started.run.id, batch.id).members).toEqual(firstPage.members)
-  expect(
-    f.repo.readFrozenInputBatch(started.run.id, batch.id, firstPage.nextOrdinal).members,
-  ).toEqual(lastPage.members)
-}
-it('settles every off-page frozen Batch member exactly once', async () => {
-  const { f, started, batch, before, report } = await frozenBatchFixture()
-  f.finish(started.run.id, report)
-  const settled = f.repo.collaboration(f.sessionId)!
-  expect(settled).toMatchObject({
-    ledgerRevision: before.ledgerRevision + 1,
-    ledgerOpenCount: 1,
-    processedWatermark: settled.inputSequence,
-  })
-  expect(f.repo.readTodoRevision(settled.id, 'atomic', 1).status).toBe('open')
-  expect(
-    f.repo
-      .readFrozenInputBatch(started.run.id, batch.id)
-      .members.every((item) => item.state === 'resolved'),
-  ).toBe(true)
-})
-it.each(['missing-last', 'foreign-member'] as const)(
-  'rejects %s without partial Todo or input settlement',
-  async (fault) => {
-    const value = await frozenBatchFixture()
-    const { f, started, report } = value
-    if (fault === 'missing-last') report.inputResponses.pop()
-    else
-      report.inputResponses.push({
-        batchId: randomUUID(),
-        memberId: 'foreign',
-        disposition: 'resolved',
-        reason: 'A foreign request.',
-        todoId: null,
-      })
-    f.finish(started.run.id, report, /exactly one response/)
-    expect(f.repo.collaboration(f.sessionId)?.reportFailure).toBe('invalid')
-    expectUnsettledBatch(value)
-  },
-)
-it('rejects a duplicate last Batch response without partial Todo or input settlement', async () => {
-  const value = await frozenBatchFixture()
-  const { f, started, report } = value
-  report.inputResponses.push(report.inputResponses.at(-1)!)
-  expect(() => f.finish(started.run.id, report, /unique/)).toThrow(/unique/)
-  expectUnsettledBatch(value)
-})
-
-it('a later resolved Batch cannot advance the continuous watermark past an earlier partial response', async () => {
-  const f = await fixture()
-  f.finish()
-  const priorWatermark = f.repo.collaboration(f.sessionId)!.processedWatermark
-  f.receive(f.input('A still needs a final decision.'))
-  const a = f.materialize()
-  const aBatch = f.repo.inputBatchForRun(a.run.id)!
-  const partial = f.reportFor(a.run.id, checked)
-  partial.inputResponses = partial.inputResponses.map((item) => ({
-    ...item,
-    disposition: 'responded',
-  }))
-  f.finish(a.run.id, partial)
-  expect(f.repo.collaboration(f.sessionId)!.processedWatermark).toBe(priorWatermark)
-  f.receive(f.input('B is fully handled.'))
-  const b = f.materialize()
-  const bBatch = f.repo.inputBatchForRun(b.run.id)!
-  const report = f.reportFor(b.run.id, checked)
-  expect(report.inputResponses.map((item) => item.batchId)).toContain(aBatch.id)
-  expect(report.inputResponses.map((item) => item.batchId)).toContain(bBatch.id)
-  report.inputResponses = report.inputResponses.map((item) => ({
-    ...item,
-    disposition: item.batchId === aBatch.id ? 'responded' : 'resolved',
-  }))
-  f.finish(b.run.id, report)
-  expect(f.repo.collaboration(f.sessionId)).toMatchObject({
-    status: 'waiting',
-    inputSequence: priorWatermark + 2,
-    processedWatermark: priorWatermark,
-  })
-  const current = f.repo.collaboration(f.sessionId)!
-  const peer = advanceCollaboration(current, 'continue', settings)
-  const review = f.repo.beginRun({
-    sessionId: f.sessionId,
-    clientMessageId: randomUUID(),
-    content: 'Review the complete scope.',
-    expectedCommentsRevision: f.drafts().commentsRevision,
-    commentIds: [],
-    agentId: peer.actor,
-    settingsRevision: 1,
-    model: null,
-    effort: null,
-    collaboration: peer,
-  })
-  const rejected = f.reportFor(review.run.id, checked)
-  rejected.inputResponses = rejected.inputResponses.map((item) => ({
-    ...item,
-    disposition: item.batchId === aBatch.id ? 'responded' : 'resolved',
-  }))
-  f.finish(review.run.id, rejected, /input responses remain unresolved/)
-  expect(f.repo.collaboration(f.sessionId)?.processedWatermark).toBe(priorWatermark)
-})
-
-it('seeks the current Done page while preserving the exact historical Todo version and complete ledger acceptance', async () => {
-  const f = await fixture()
-  const created = Array.from({ length: 26 }, (_, index) => todoDelta(`retained-${index}`))
-  f.finish(undefined, { ...checked, todoDeltas: created })
-  const draft = f.repo.collaboration(f.sessionId)!
-  const maintenance = prepareCollaborationSupplement(draft, 'codex', settings, 'maintain_plan')
-  const proposed = f.repo.beginRun({
-    sessionId: f.sessionId,
-    clientMessageId: randomUUID(),
-    content: 'Apply ownership handling.',
-    expectedCommentsRevision: f.drafts().commentsRevision,
-    commentIds: [],
-    agentId: 'codex',
-    settingsRevision: 1,
-    model: null,
-    effort: null,
-    collaboration: maintenance,
-  })
-  f.finish(proposed.run.id, {
-    ...checked,
-    todoDeltas: created.map((item) =>
-      Object.assign({}, item, {
-        expectedRevision: 1,
-        operation: 'propose_resolution',
-        resolutionKind: 'resolved',
-        reason: 'The owner now releases its request.',
-      }),
-    ),
-  })
-  expect(f.repo.collaboration(f.sessionId)?.ledgerAwaitingCount).toBe(26)
-  const peer = advanceCollaboration(f.repo.collaboration(f.sessionId)!, 'continue', settings)
-  const review = f.repo.beginRun({
-    sessionId: f.sessionId,
-    clientMessageId: randomUUID(),
-    content: 'Review every exact resolution.',
-    expectedCommentsRevision: f.drafts().commentsRevision,
-    commentIds: [],
-    agentId: peer.actor,
-    settingsRevision: 1,
-    model: null,
-    effort: null,
-    collaboration: peer,
-  })
-  f.finish(review.run.id, {
-    ...checked,
-    todoDeltas: created.map((item) =>
-      Object.assign({}, item, {
-        expectedRevision: 2,
-        operation: 'confirm',
-        resolutionKind: 'resolved',
-        reason: 'Independent review confirms request cleanup.',
-      }),
-    ),
-  })
-  const ready = f.repo.collaboration(f.sessionId)!
-  expect(ready).toMatchObject({
-    status: 'ready',
-    ledgerOpenCount: 0,
-    ledgerAwaitingCount: 0,
-    doneTodoCount: 26,
-    processedWatermark: ready.inputSequence,
-  })
-  const page = f.repo.readPage({
-    scope: 'collaboration',
-    sessionId: f.sessionId,
-    taskId: ready.id,
-    projection: 'todos',
-    todoId: 'retained-25',
-    todoRevision: 1,
-    todoStatus: 'source',
-  })
-  if (page.scope !== 'collaboration') throw Error('Missing exact Todo source')
-  expect(page.view).toMatchObject({
-    todo: { id: 'retained-25', revision: 1, status: 'open' },
-    todoCurrent: { revision: 3, status: 'done' },
-    todos: { group: 'done', activeCount: 0, doneCount: 26 },
-  })
-  expect(page.view.todos!.items.length).toBeLessThanOrEqual(24)
-  expect(page.view.todos!.items.every((item) => item.status === 'done')).toBe(true)
-  expect(
-    page.view.todos!.items.some((item) => item.id === 'retained-25' && item.revision === 3),
-  ).toBe(true)
-  expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(48 * 1024)
-})
-
-it('a live frozen report preserves its plan and a newer acknowledged input without approving the newer scope', async () => {
-  const f = await fixture()
-  const received = f.receive(f.input('A newer decision still needs handling.'))
-  f.finish()
-  const current = f.repo.collaboration(f.sessionId)!
-  expect(current).toMatchObject({ status: 'waiting', planVersion: 1 })
-  expect(current.reportFailure).toBeUndefined()
-  expect(readDocument(f, current.planDocument!)).toBe(fixturePlan)
-  expect(current.processedWatermark).toBeLessThan(current.inputSequence)
-  expect(f.repo.readReceivedInput(f.sessionId)?.id).toBe(received.send.clientMessageId)
-  expect(f.repo.read(f.sessionId).runs).toHaveLength(1)
-})
-
-it('pause and actual resume cannot restore reconciliation authority for an earlier completed report', async () => {
-  const f = await fixture()
-  const input = completeWithoutParsedReport(f, {
-    version: 'pact-collaboration-envelope-v5',
-    answer: 'Original completed conclusion.',
-    result: checked,
-  })
-  f.repo.pauseCollaboration(f.sessionId)
-  const paused = f.repo.collaboration(f.sessionId)!
-  expect(paused.status).toBe('paused')
-  f.repo.setCollaborationState(advanceCollaboration(paused, 'resume', settings))
-  const resumed = f.repo.collaboration(f.sessionId)!
-  expect(resumed.status).toBe('failed')
-  expect(() =>
-    f.repo.reconcileCompletedCollaboration({ ...input, revision: resumed.revision }),
-  ).toThrow(/advanced/)
-  expect(f.repo.collaboration(f.sessionId)?.planVersion).toBe(0)
-  expect(f.repo.collaborationCarrierSource(f.sessionId, input.runId)).toBeDefined()
-})
-
-it('repeated identical native ending is idempotent and leaves unchanged completed-report reconciliation valid', async () => {
-  const f = await fixture()
-  const input = completeWithoutParsedReport(f, {
-    version: 'pact-collaboration-envelope-v5',
-    answer: 'Original completed conclusion.',
-    result: checked,
-  })
-  const before = f.repo.collaboration(f.sessionId)!
-  f.repo.settleKnownNativeEnding(input.runId)
-  f.repo.settleKnownNativeEnding(input.runId)
-  expect(f.repo.collaboration(f.sessionId)?.revision).toBe(before.revision)
-  f.repo.reconcileCompletedCollaboration({
-    ...input,
-    revision: f.repo.collaboration(f.sessionId)!.revision,
-  })
-  const settled = f.repo.collaboration(f.sessionId)!
-  expect(settled).toMatchObject({ status: 'waiting', planVersion: 1 })
-  expect(settled.reportFailure).toBeUndefined()
-  f.repo.reconcileCompletedCollaboration({ ...input, revision: settled.revision })
-  expect(f.repo.collaboration(f.sessionId)?.revision).toBe(settled.revision)
-  expect(f.repo.collaboration(f.sessionId)?.planVersion).toBe(1)
-})
-
-function completeInvalidReport(f: Awaited<ReturnType<typeof fixture>>) {
-  const report = f.reportFor(f.first.run.id, { ...checked, verdict: 'accepted' })
-  f.finish(undefined, report, /cannot claim review acceptance/)
-  const run = f.repo.findRun(f.first.run.id)!
-  return {
-    runId: run.id,
-    nativeSessionId: run.nativeSessionId!,
-    nativeTurnId: run.nativeTurnId!,
-    revision: f.repo.collaboration(f.sessionId)!.revision,
-    source: 'stored_terminal' as const,
-  }
-}
-async function reopenCollaborationFixture(
-  f: Awaited<ReturnType<typeof fixture>>,
-  filePath: string,
-) {
-  f.db.close()
-  databases.splice(databases.indexOf(f.db), 1)
-  const db = await PactDatabase.open({
-    filePath,
-    migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
-  })
-  databases.push(db)
-  return db
-}
-function receiveColdInput(repo: PactDatabase['conversationRepository'], sessionId: string) {
-  const owner = randomUUID(),
-    clientMessageId = randomUUID(),
-    content = 'A new acknowledged user decision.'
-  const drafts = repo.readPage({ scope: 'drafts', sessionId })
-  if (drafts.scope !== 'drafts') throw Error('Missing cold draft revision')
-  const body = repo.writeConversationInput({ type: 'begin', sessionId, clientMessageId }, owner)
-  repo.writeConversationInput(
-    { type: 'append', sessionId, inputId: body.inputId, offset: 0, text: content },
-    owner,
-  )
-  repo.writeConversationInput({ type: 'seal', sessionId, inputId: body.inputId }, owner)
-  repo.receiveCollaborationInput(
-    {
-      sessionId,
-      clientMessageId,
-      content,
-      commentIds: [],
-      expectedCommentsRevision: drafts.commentsRevision,
-      route: { type: 'primary' },
-    },
-    body.inputId,
-    'codex',
-    'immediate_safe_point',
-    owner,
-  )
-  return clientMessageId
-}
-
-it.each([
-  ['missing', 'ack'],
-  ['missing', 'pause-resume'],
-  ['invalid', 'ack'],
-  ['invalid', 'pause-resume'],
-] as const)(
-  'persists the completed %s report fence across a cold restart and rejects %s revision renewal',
-  async (failure, mutation) => {
-    const directory = await mkdtemp(join(tmpdir(), 'pact-cold-completed-fence-'))
-    directories.push(directory)
-    const filePath = join(directory, 'pact.sqlite'),
-      f = await fixture(filePath)
-    const input =
-      failure === 'missing'
-        ? completeWithoutParsedReport(f, {
-            version: 'pact-collaboration-envelope-v5',
-            answer: 'Original cold conclusion.',
-            result: checked,
-          })
-        : completeInvalidReport(f)
-    const fence = f.db.drizzle
-      .select({ revision: collaborationTurns.completedFailureRevision })
-      .from(collaborationTurns)
-      .where(eq(collaborationTurns.runId, input.runId))
-      .get()!.revision
-    expect(fence).toBe(input.revision)
-    const source = f.repo.collaborationCarrierSource(f.sessionId, input.runId)
-    const db = await reopenCollaborationFixture(f, filePath),
-      repo = db.conversationRepository
-    expect(
-      db.drizzle
-        .select({ revision: collaborationTurns.completedFailureRevision })
-        .from(collaborationTurns)
-        .where(eq(collaborationTurns.runId, input.runId))
-        .get()!.revision,
-    ).toBe(fence)
-    if (mutation === 'ack') receiveColdInput(repo, f.sessionId)
-    else {
-      repo.pauseCollaboration(f.sessionId)
-      repo.setCollaborationState(
-        advanceCollaboration(repo.collaboration(f.sessionId)!, 'resume', settings),
-      )
-    }
-    const current = repo.collaboration(f.sessionId)!
-    expect(current.revision).toBeGreaterThan(fence!)
-    expect(() =>
-      repo.reconcileCompletedCollaboration({ ...input, revision: current.revision }),
-    ).toThrow(/advanced/)
-    expect(repo.collaboration(f.sessionId)).toMatchObject({
-      status: 'failed',
-      planVersion: 0,
-      reportFailure: failure,
-    })
-    expect(repo.collaborationCarrierSource(f.sessionId, input.runId)).toEqual(source)
-    expect(
-      db.drizzle
-        .select({ revision: collaborationTurns.completedFailureRevision })
-        .from(collaborationTurns)
-        .where(eq(collaborationTurns.runId, input.runId))
-        .get()!.revision,
-    ).toBe(fence)
-    expect(
-      advanceCollaboration(current, 'submit_report', settings).reportRecovery?.sourceRunId,
-    ).toBe(input.runId)
-    expect(repo.read(f.sessionId).runs).toHaveLength(1)
-  },
-)
-
-it('a cold unchanged original report reconciles once without renewing its persisted completion fence', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'pact-cold-unchanged-report-'))
-  directories.push(directory)
-  const filePath = join(directory, 'pact.sqlite'),
-    f = await fixture(filePath)
-  const input = completeWithoutParsedReport(f, {
-    version: 'pact-collaboration-envelope-v5',
-    answer: 'Original cold conclusion.',
-    result: checked,
-  })
-  const source = f.repo.collaborationCarrierSource(f.sessionId, input.runId)
-  const originalMessage = f.repo.internalMessage(
-    f.repo.findRun(input.runId)!.responseMessageId!,
-    f.sessionId,
-  )
-  const db = await reopenCollaborationFixture(f, filePath),
-    repo = db.conversationRepository
-  repo.settleKnownNativeEnding(input.runId)
-  expect(repo.collaboration(f.sessionId)?.revision).toBe(input.revision)
-  repo.reconcileCompletedCollaboration(input)
-  const settled = repo.collaboration(f.sessionId)!
-  expect(settled).toMatchObject({ status: 'waiting', planVersion: 1 })
-  expect(settled.reportFailure).toBeUndefined()
-  expect(settled.revision).toBe(input.revision + 1)
-  repo.reconcileCompletedCollaboration({ ...input, revision: settled.revision })
-  expect(repo.collaboration(f.sessionId)?.revision).toBe(settled.revision)
-  expect(repo.collaborationCarrierSource(f.sessionId, input.runId)).toEqual(source)
-  expect(repo.internalMessage(originalMessage!.id, f.sessionId)).toEqual(originalMessage)
-  expect(
-    db.drizzle
-      .select({ revision: collaborationTurns.completedFailureRevision })
-      .from(collaborationTurns)
-      .where(eq(collaborationTurns.runId, input.runId))
-      .get()!.revision,
-  ).toBe(input.revision)
-  expect(repo.read(f.sessionId).runs).toHaveLength(1)
-})
-
-it.each(['missing', 'invalid'] as const)(
-  'legacy completed %s data never gains a fabricated reconciliation fence from repeated endings',
-  async (failure) => {
-    const directory = await mkdtemp(join(tmpdir(), 'pact-legacy-completion-fence-'))
-    directories.push(directory)
-    const filePath = join(directory, 'pact.sqlite'),
-      f = await fixture(filePath)
-    const input =
-      failure === 'missing'
-        ? completeWithoutParsedReport(f, {
-            version: 'pact-collaboration-envelope-v5',
-            answer: 'Retained original conclusion.',
-            result: checked,
-          })
-        : completeInvalidReport(f)
-    const source = f.repo.collaborationCarrierSource(f.sessionId, input.runId)
-    f.db.drizzle
-      .update(collaborationTurns)
-      .set({ completedFailureRevision: null })
-      .where(eq(collaborationTurns.runId, input.runId))
-      .run()
-    const db = await reopenCollaborationFixture(f, filePath),
-      repo = db.conversationRepository
-    const before = repo.collaboration(f.sessionId)!
-    repo.settleKnownNativeEnding(input.runId)
-    repo.settleKnownNativeEnding(input.runId)
-    expect(repo.collaboration(f.sessionId)?.revision).toBe(before.revision)
-    expect(
-      db.drizzle
-        .select({ revision: collaborationTurns.completedFailureRevision })
-        .from(collaborationTurns)
-        .where(eq(collaborationTurns.runId, input.runId))
-        .get()!.revision,
-    ).toBeNull()
-    expect(() =>
-      repo.reconcileCompletedCollaboration({ ...input, revision: before.revision }),
-    ).toThrow(/advanced/)
-    expect(repo.collaborationCarrierSource(f.sessionId, input.runId)).toEqual(source)
-    expect(repo.collaboration(f.sessionId)).toMatchObject({
-      status: 'failed',
-      planVersion: 0,
-      reportFailure: failure,
-    })
-    expect(advanceCollaboration(before, 'submit_report', settings)).toMatchObject({
-      status: 'running',
-      actor: before.actor,
-      reportRecovery: { sourceRunId: input.runId },
-    })
-    expect(repo.read(f.sessionId).runs).toHaveLength(1)
-  },
-)
 
 it('receives one hundred explicit legacy draft IDs during a running Turn with durable receipt, full Batch and bounded ACK', async () => {
   const f = await fixture()
@@ -1885,4 +677,577 @@ it('receives one hundred explicit legacy draft IDs during a running Turn with du
   expect(
     f.repo.receivedInputReceipt(f.sessionId, send.clientMessageId, send)?.receivedInputIds,
   ).toEqual([send.clientMessageId])
+})
+
+function advance(
+  f: Awaited<ReturnType<typeof fixture>>,
+  action: 'continue' | 'execute' | 'repair' | 'respond' = 'continue',
+) {
+  const current = f.repo.collaboration(f.sessionId)!
+  const next = advanceCollaboration(current, action, settings)
+  return f.repo.beginRun({
+    sessionId: f.sessionId,
+    clientMessageId: randomUUID(),
+    content: 'Continue authorized work.',
+    commentIds: [],
+    expectedCommentsRevision: f.drafts().commentsRevision,
+    agentId: next.actor,
+    settingsRevision: 1,
+    model: null,
+    effort: null,
+    preserveDraftComments: true,
+    expectedCollaborationRevision: current.revision,
+    collaboration: next,
+  }).run
+}
+
+it('binds native plan/review facts to their actual actor and exact version, then requires explicit implementation', async () => {
+  const f = await fixture()
+  f.finish()
+  const planned = f.repo.collaboration(f.sessionId)!
+  expect(planned).toMatchObject({
+    status: 'waiting',
+    nextStage: 'plan_review',
+    planVersion: 1,
+    planInputSequence: 1,
+  })
+  expect(readDocument(f, planned.planReference!.document)).toBe('Scope and acceptance.')
+  const review = advance(f)
+  expect(() =>
+    f.repo.recordWorkflowPlan(review.id, { nativeId: 'foreign', text: 'Foreign plan' }),
+  ).toThrow(/plan author/)
+  f.finish(review.id, { verdict: 'accepted' })
+  expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+    status: 'ready',
+    review: { actor: 'claude', verdict: 'accepted', planReference: planned.planReference },
+  })
+  expect(() => advance(f)).toThrow(/no next/)
+  const work = advance(f, 'execute')
+  expect(work.agentId).toBe('codex')
+  f.finish(work.id, { answer: 'Implemented cancellation.' })
+  const codeReview = advance(f)
+  f.finish(codeReview.id, { verdict: 'accepted' })
+  expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+    status: 'complete',
+    codeRunId: work.id,
+    reviewCycles: 1,
+    review: { stage: 'code_review' },
+  })
+})
+
+it('keeps the full natural plan and report in handoff/rebuild sources without an envelope', async () => {
+  const f = await fixture()
+  const full = 'Complete scope with ownership and cleanup.\n'.repeat(5000)
+  f.finish(undefined, { plan: full, answer: 'Natural response.' })
+  const plan = f.repo.collaboration(f.sessionId)!.planReference!
+  expect(plan.document.bytes).toBe(Buffer.byteLength(full))
+  expect(readDocument(f, plan.document)).toBe(full)
+  const sources = []
+  for await (const source of f.repo.readHandoffSources(
+    f.sessionId,
+    'claude',
+    -1,
+    100,
+    new AbortController().signal,
+  ))
+    sources.push(source)
+  const response = sources.find((source) => source.speaker === 'codex')!
+  expect(response.contextVersion).toBe('native_workflow_v1')
+  expect(response.content).toContain(plan.document.id)
+  expect(f.repo.internalMessage(response.messageId, f.sessionId)?.content).toBe('Natural response.')
+  const chunks = []
+  for await (const chunk of f.repo.nativeContextRebuildSource(
+    f.sessionId,
+    new AbortController().signal,
+  ))
+    chunks.push(chunk)
+  expect(
+    chunks
+      .filter((chunk) => chunk.kind === 'message')
+      .map((chunk) => chunk.content)
+      .join(''),
+  ).toContain(plan.document.id)
+})
+
+it('preserves paused native completion and applies the original plan once', async () => {
+  const f = await fixture()
+  f.repo.setCollaborationState(
+    advanceCollaboration(f.repo.collaboration(f.sessionId)!, 'pause', settings),
+  )
+  f.finish()
+  const settled = f.repo.collaboration(f.sessionId)!
+  expect(settled).toMatchObject({ automation: 'paused', planVersion: 1, status: 'waiting' })
+  f.repo.finishCollaboration(f.first.run.id, true)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(settled)
+  expect(() =>
+    f.repo.recordWorkflowPlan(f.first.run.id, { nativeId: 'replacement', text: 'Changed' }),
+  ).toThrow(/cannot be replaced/)
+  expect(f.repo.findRun(f.first.run.id)?.responseMessageId).toBe(settled.sourceMessageId)
+})
+
+it('does not settle stale planning over a newer acknowledged input', async () => {
+  const f = await fixture(),
+    received = f.receive()
+  f.finish()
+  expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+    planVersion: 0,
+    inputSequence: 2,
+    automation: 'paused',
+    inputProcessing: { pending: { inputId: received.send.clientMessageId, inputSequence: 2 } },
+  })
+  const reply = f.materialize()
+  f.finish(reply.run.id, { plan: 'Updated plan respecting the new decision.' })
+  expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+    planVersion: 1,
+    planInputSequence: 2,
+    automation: 'paused',
+    inputProcessing: { settled: { runId: reply.run.id, inputSequence: 2 } },
+  })
+  expect(f.repo.collaboration(f.sessionId)!.inputProcessing?.pending).toBeUndefined()
+})
+
+it.each(['missing', 'conflicting'] as const)(
+  'keeps %s native review conclusions from accepting the plan',
+  async (kind) => {
+    const f = await fixture()
+    f.finish()
+    const run = advance(f)
+    if (kind === 'conflicting') {
+      f.repo.recordWorkflowReview(run.id, { verdict: 'accepted' })
+      f.repo.recordWorkflowReview(run.id, { verdict: 'changes_requested' })
+    }
+    f.finish(run.id, { answer: 'The natural report is not acceptance authority.' })
+    expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+      status: 'failed',
+      automation: 'paused',
+      review: { verdict: 'incomplete' },
+    })
+    expect(() => advance(f, 'execute')).toThrow(/Continue collaboration/)
+  },
+)
+
+it('persists structured questions with host IDs and requires a settled native reply before resuming', async () => {
+  const f = await fixture()
+  f.finish()
+  const review = advance(f)
+  const questions = [
+    {
+      prompt: 'Which scope?',
+      selection: 'single' as const,
+      options: [{ label: 'Current' }, { label: 'All' }],
+    },
+  ]
+  f.finish(review.id, { verdict: 'needs_user', questions })
+  const decision = f.repo.collaboration(f.sessionId)!.inputProcessing!.decision!
+  expect(decision).toMatchObject({
+    runId: review.id,
+    actor: 'claude',
+    questions: [
+      {
+        id: 'q1',
+        prompt: 'Which scope?',
+        options: [
+          { id: 'o1', label: 'Current' },
+          { id: 'o2', label: 'All' },
+        ],
+      },
+    ],
+  })
+  expect(() =>
+    advanceCollaboration(f.repo.collaboration(f.sessionId)!, 'resume', settings),
+  ).toThrow(/Reply/)
+  f.receive(decisionInput(f, 'Only current scope.'))
+  const reply = f.materialize()
+  expect(reply.run.agentId).toBe('claude')
+  f.finish(reply.run.id, { inputOutcome: 'processed' })
+  const settled = f.repo.collaboration(f.sessionId)!
+  expect(settled.inputProcessing?.decision).toBeUndefined()
+  expect(settled.inputProcessing?.pending).toBeUndefined()
+  expect(settled).toMatchObject({
+    automation: 'paused',
+    planInputSequence: 1,
+    inputProcessing: { settled: { runId: reply.run.id, inputSequence: 2 } },
+  })
+  expect(advanceCollaboration(settled, 'resume', settings)).toMatchObject({
+    automation: 'active',
+    nextStage: 'plan',
+  })
+})
+
+it('retains unresolved questions when a reply fails to provide its authenticated plan', async () => {
+  const f = await fixture()
+  f.finish(undefined, {
+    inputOutcome: 'needs_user',
+    questions: [{ prompt: 'Choose scope', selection: 'single' }],
+  })
+  const decision = f.repo.collaboration(f.sessionId)!.inputProcessing!.decision!
+  f.receive(decisionInput(f, 'Current scope.'))
+  const reply = f.materialize()
+  f.finish(reply.run.id, { answer: 'Acknowledged, without a native plan.' })
+  const current = f.repo.collaboration(f.sessionId)!
+  expect(current.inputProcessing?.decision).toEqual(decision)
+  expect(current.inputProcessing?.pending).toMatchObject({ inputSequence: 2 })
+  expect(current).toMatchObject({ status: 'failed', automation: 'paused' })
+  expect(() => advanceCollaboration(current, 'resume', settings)).toThrow(/Reply/)
+})
+
+it('cold-reads exact documents and pauses automation without losing acceptance', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'pact-workflow-cold-'))
+  directories.push(directory)
+  const filePath = join(directory, 'pact.sqlite'),
+    f = await fixture(filePath)
+  f.finish(undefined, { plan: 'Durable plan.\n'.repeat(9000) })
+  const review = advance(f)
+  f.finish(review.id, { verdict: 'accepted' })
+  const before = f.repo.collaboration(f.sessionId)!
+  f.db.close()
+  databases.splice(databases.indexOf(f.db), 1)
+  const db = await PactDatabase.open({
+    filePath,
+    migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
+  })
+  databases.push(db)
+  db.conversationRepository.recoverCollaborationTasks()
+  const cold = db.conversationRepository.collaboration(f.sessionId)!
+  expect(cold).toMatchObject({
+    status: 'ready',
+    automation: 'paused',
+    planReference: before.planReference,
+    review: before.review,
+  })
+  expect(
+    readDocument({ ...f, db, repo: db.conversationRepository }, cold.planReference!.document),
+  ).toBe('Durable plan.\n'.repeat(9000))
+})
+
+function decisionInput(
+  f: Awaited<ReturnType<typeof fixture>>,
+  content: string,
+): ConversationSendInput {
+  const current = f.repo.collaboration(f.sessionId)!,
+    decision = current.inputProcessing!.decision!
+  return {
+    sessionId: f.sessionId,
+    clientMessageId: randomUUID(),
+    content,
+    commentIds: [],
+    freezeDrafts: false,
+    expectedCommentsRevision: f.drafts().commentsRevision,
+    replyToDecision: {
+      taskId: current.id,
+      runId: decision.runId,
+      decisionInputSequence: decision.inputSequence,
+      expectedInputSequence: current.inputSequence,
+    },
+  }
+}
+
+it.each(['identical', 'changed', 'retained'] as const)(
+  'settles %s native plan updates without inventing a version or reusing old acceptance',
+  async (kind) => {
+    const f = await fixture()
+    f.finish()
+    const original = f.repo.collaboration(f.sessionId)!.planReference!
+    const review = advance(f)
+    f.finish(review.id, { verdict: 'accepted' })
+    f.receive()
+    const reply = f.materialize()
+    if (kind === 'retained')
+      f.repo.recordWorkflowPlanRetained(reply.run.id, {
+        nativeId: 'retained-source',
+        sha256: original.document.sha256,
+        bytes: original.document.bytes,
+        chars: original.document.chars,
+      })
+    f.finish(
+      reply.run.id,
+      kind === 'retained'
+        ? { answer: 'The same plan remains appropriate.' }
+        : { plan: kind === 'changed' ? 'Changed exact scope.' : 'Scope and acceptance.' },
+    )
+    const current = f.repo.collaboration(f.sessionId)!
+    expect(current.planVersion).toBe(kind === 'changed' ? 2 : 1)
+    expect(current.planInputSequence).toBe(2)
+    expect(current.inputProcessing?.pending).toBeUndefined()
+    expect(current.automation).toBe('paused')
+    expect(current.review?.inputSequence).toBe(1)
+    const resumed = advanceCollaboration(current, 'resume', settings)
+    expect(resumed.nextStage).toBe('plan_review')
+    expect(() => advanceCollaboration(resumed, 'execute', settings)).toThrow(/not been accepted/)
+    expect(current.planReference?.sourceRunId).toBe(
+      kind === 'retained' ? original.sourceRunId : reply.run.id,
+    )
+  },
+)
+
+it('records capture failure, restores the original native source once, and never resends user input', async () => {
+  const f = await fixture()
+  f.repo.recordWorkflowPlanUnavailable(f.first.run.id)
+  f.finish(undefined, { answer: 'The native plan was saved outside the response.' })
+  const failed = f.repo.collaboration(f.sessionId)!,
+    run = f.repo.findRun(f.first.run.id)!
+  expect(failed).toMatchObject({ status: 'failed', planVersion: 0, automation: 'paused' })
+  expect(f.repo.needsWorkflowPlanRecovery(run.id)).toBe(true)
+  f.repo.recordWorkflowPlan(run.id, {
+    nativeId: 'saved-plan',
+    text: 'Recovered exact native plan.',
+  })
+  f.repo.reconcileCompletedCollaboration(run.id)
+  const recovered = f.repo.collaboration(f.sessionId)!
+  expect(recovered).toMatchObject({
+    status: 'waiting',
+    automation: 'paused',
+    planVersion: 1,
+    nextStage: 'plan_review',
+  })
+  expect(readDocument(f, recovered.planReference!.document)).toBe('Recovered exact native plan.')
+  expect(f.repo.findRun(run.id)?.responseMessageId).toBe(run.responseMessageId)
+  expect(f.repo.read(f.sessionId).runs).toHaveLength(1)
+  f.repo.reconcileCompletedCollaboration(run.id)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(recovered)
+})
+
+it('does not let late plan recovery authorize a newer acknowledged input', async () => {
+  const f = await fixture()
+  f.repo.recordWorkflowPlanUnavailable(f.first.run.id)
+  f.finish(undefined, { answer: 'Saved native source.' })
+  f.receive()
+  const before = f.repo.collaboration(f.sessionId)!
+  f.repo.recordWorkflowPlan(f.first.run.id, { nativeId: 'late-plan', text: 'Previous scope only.' })
+  f.repo.reconcileCompletedCollaboration(f.first.run.id)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(before)
+  expect(before.planVersion).toBe(0)
+  expect(before.inputProcessing?.pending).toBeDefined()
+})
+
+it('rejects stale question-card identities and mixed composer drafts atomically', async () => {
+  const f = await fixture()
+  f.finish(undefined, {
+    inputOutcome: 'needs_user',
+    questions: [{ prompt: 'Which scope?', selection: 'single' }],
+  })
+  const valid = decisionInput(f, 'Current scope.'),
+    before = f.repo.collaboration(f.sessionId)!,
+    messageCount = f.repo.read(f.sessionId).messages.length
+  const candidates = [
+    { ...valid, replyToDecision: { ...valid.replyToDecision!, runId: randomUUID() } },
+    { ...valid, replyToDecision: { ...valid.replyToDecision!, expectedInputSequence: 0 } },
+    { ...valid, freezeDrafts: true },
+    { ...valid, route: { type: 'primary' as const } },
+    { ...valid, content: '/build execute now' },
+  ]
+  for (const send of candidates) {
+    expect(() => f.receive({ ...send, clientMessageId: randomUUID() })).toThrow(
+      /questions changed|card answers|could not be verified/,
+    )
+    expect(f.repo.collaboration(f.sessionId)).toEqual(before)
+    expect(f.repo.readReceivedInput(f.sessionId)).toBeUndefined()
+    expect(f.repo.read(f.sessionId).messages).toHaveLength(messageCount)
+  }
+  const accepted = f.receive(valid)
+  expect(accepted.patch.receivedInputIds).toEqual([valid.clientMessageId])
+  expect(() => f.receive({ ...valid, clientMessageId: randomUUID() })).toThrow(
+    /could not be verified/,
+  )
+})
+
+it('rejects changed review questions as conflicting rather than silently replacing the decision', async () => {
+  const f = await fixture()
+  f.finish()
+  const run = advance(f)
+  f.repo.recordWorkflowReview(run.id, {
+    verdict: 'needs_user',
+    questions: [{ prompt: 'First decision?', selection: 'single' }],
+  })
+  f.repo.recordWorkflowReview(run.id, {
+    verdict: 'needs_user',
+    questions: [{ prompt: 'Different decision?', selection: 'single' }],
+  })
+  f.finish(run.id, { answer: 'Review source.' })
+  expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+    status: 'failed',
+    review: { verdict: 'incomplete' },
+  })
+  expect(f.repo.collaboration(f.sessionId)!.inputProcessing?.decision).toBeUndefined()
+})
+
+it('fails a plan with no native result without inventing questions or a restore source', async () => {
+  const f = await fixture()
+  f.finish(undefined, { answer: 'I cannot provide a plan yet.' })
+  const current = f.repo.collaboration(f.sessionId)!
+  expect(current).toMatchObject({
+    status: 'failed',
+    automation: 'paused',
+    pauseReason: 'failure',
+    planVersion: 0,
+  })
+  expect(current.inputProcessing?.decision).toBeUndefined()
+  expect(f.repo.needsWorkflowPlanRecovery(f.first.run.id)).toBe(false)
+})
+
+it.each(['present', 'legacy'] as const)(
+  'verifies the decision source actor when its stored actor is %s',
+  async (kind) => {
+    const f = await fixture()
+    f.finish()
+    const review = advance(f)
+    f.finish(review.id, {
+      verdict: 'needs_user',
+      questions: [{ prompt: 'Which scope?', selection: 'single' }],
+    })
+    const current = f.repo.collaboration(f.sessionId)!
+    const decision = current.inputProcessing!.decision!
+    if (kind !== 'present') {
+      f.repo.setCollaborationState({
+        ...current,
+        revision: current.revision + 1,
+        inputProcessing: {
+          ...current.inputProcessing,
+          decision: { ...decision, actor: undefined },
+        },
+      })
+    }
+    f.receive(decisionInput(f, 'Current scope.'))
+    expect(f.repo.readReceivedInput(f.sessionId)?.actor).toBe('claude')
+    const reply = f.materialize()
+    expect(reply.run.agentId).toBe('claude')
+    expect(() =>
+      f.repo.recordWorkflowPlan(reply.run.id, {
+        nativeId: 'foreign-plan',
+        text: 'Cannot write a plan',
+      }),
+    ).toThrow(/plan author/)
+    f.finish(reply.run.id, { inputOutcome: 'processed' })
+    expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+      status: 'waiting',
+      automation: 'paused',
+      planVersion: 1,
+      inputProcessing: { settled: { runId: reply.run.id, inputSequence: 2 } },
+    })
+  },
+)
+
+it('restores the exact author reply and settles its answer once without rerunning it', async () => {
+  const f = await fixture()
+  f.finish(undefined, {
+    inputOutcome: 'needs_user',
+    questions: [{ prompt: 'Scope?', selection: 'single' }],
+  })
+  f.receive(decisionInput(f, 'Current scope.'))
+  const reply = f.materialize()
+  f.repo.recordWorkflowPlanUnavailable(reply.run.id)
+  f.finish(reply.run.id, { answer: 'Saved the plan but submission failed.' })
+  expect(f.repo.needsWorkflowPlanRecovery(reply.run.id)).toBe(true)
+  expect(f.repo.collaboration(f.sessionId)!.inputProcessing?.pending).toBeDefined()
+  f.repo.recordWorkflowPlan(reply.run.id, {
+    nativeId: 'recovered-author-plan',
+    text: 'Current scope.',
+  })
+  f.repo.reconcileCompletedCollaboration(reply.run.id)
+  const restored = f.repo.collaboration(f.sessionId)!
+  expect(restored).toMatchObject({
+    status: 'waiting',
+    automation: 'paused',
+    planInputSequence: 2,
+    inputProcessing: { settled: { runId: reply.run.id, inputSequence: 2 } },
+  })
+  expect(restored.inputProcessing?.decision).toBeUndefined()
+  expect(restored.inputProcessing?.pending).toBeUndefined()
+  expect(f.repo.read(f.sessionId).runs).toHaveLength(2)
+  f.repo.reconcileCompletedCollaboration(reply.run.id)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(restored)
+})
+
+it('does not clear real unanswered questions when a native plan is recovered', async () => {
+  const f = await fixture()
+  f.finish(undefined, {
+    inputOutcome: 'needs_user',
+    questions: [{ prompt: 'Scope?', selection: 'single' }],
+  })
+  const before = f.repo.collaboration(f.sessionId)!
+  f.repo.recordWorkflowPlan(f.first.run.id, {
+    nativeId: 'late-with-questions',
+    text: 'Draft awaiting scope.',
+  })
+  f.repo.reconcileCompletedCollaboration(f.first.run.id)
+  const current = f.repo.collaboration(f.sessionId)!
+  expect(current).toMatchObject({ status: 'questions', planVersion: 0, automation: 'paused' })
+  expect(current.inputProcessing?.decision).toEqual(before.inputProcessing?.decision)
+  expect(f.repo.needsWorkflowPlanRecovery(f.first.run.id)).toBe(false)
+  expect(() => advanceCollaboration(current, 'resume', settings)).toThrow(/Reply/)
+})
+
+it('keeps a reviewer reply incomplete until its late authenticated result arrives', async () => {
+  const f = await fixture()
+  f.finish()
+  const review = advance(f)
+  f.finish(review.id, {
+    verdict: 'needs_user',
+    questions: [{ prompt: 'Scope?', selection: 'single' }],
+  })
+  const decision = f.repo.collaboration(f.sessionId)!.inputProcessing!.decision!
+  f.receive(decisionInput(f, 'Current scope.'))
+  const reply = f.materialize()
+  f.finish(reply.run.id, { answer: 'Natural language is not settlement evidence.' })
+  const failed = f.repo.collaboration(f.sessionId)!
+  expect(failed).toMatchObject({ status: 'failed', automation: 'paused' })
+  expect(failed.inputProcessing?.decision).toEqual(decision)
+  expect(failed.inputProcessing?.pending).toMatchObject({ inputSequence: 2 })
+  expect(() => advanceCollaboration(failed, 'resume', settings)).toThrow(/Reply/)
+  f.repo.recordWorkflowInputResult(reply.run.id, { outcome: 'processed' })
+  f.repo.reconcileCompletedCollaboration(reply.run.id)
+  const settled = f.repo.collaboration(f.sessionId)!
+  expect(settled).toMatchObject({
+    status: 'waiting',
+    automation: 'paused',
+    nextStage: 'plan',
+    inputProcessing: { settled: { runId: reply.run.id, inputSequence: 2 } },
+  })
+  expect(settled.inputProcessing?.pending).toBeUndefined()
+  expect(settled.inputProcessing?.decision).toBeUndefined()
+  f.repo.reconcileCompletedCollaboration(reply.run.id)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(settled)
+})
+
+it('rejects a decision whose recorded actor conflicts with its authorized source', async () => {
+  const f = await fixture()
+  f.finish()
+  const review = advance(f)
+  f.finish(review.id, {
+    verdict: 'needs_user',
+    questions: [{ prompt: 'Scope?', selection: 'single' }],
+  })
+  const current = f.repo.collaboration(f.sessionId)!
+  f.repo.setCollaborationState({
+    ...current,
+    revision: current.revision + 1,
+    inputProcessing: {
+      ...current.inputProcessing,
+      decision: { ...current.inputProcessing!.decision!, actor: 'codex' },
+    },
+  })
+  const before = f.repo.collaboration(f.sessionId)!
+  expect(() => f.receive(decisionInput(f, 'Current scope.'))).toThrow(/could not be verified/)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(before)
+  expect(f.repo.readReceivedInput(f.sessionId)).toBeUndefined()
+})
+
+it('does not settle a recovered author reply over a newer received answer', async () => {
+  const f = await fixture()
+  f.finish(undefined, {
+    inputOutcome: 'needs_user',
+    questions: [{ prompt: 'Scope?', selection: 'single' }],
+  })
+  f.receive(decisionInput(f, 'Current scope.'))
+  const reply = f.materialize()
+  f.repo.recordWorkflowPlanUnavailable(reply.run.id)
+  f.finish(reply.run.id, { answer: 'Saved source awaiting recovery.' })
+  const newer = f.receive(decisionInput(f, 'Actually include all scopes.'))
+  const before = f.repo.collaboration(f.sessionId)!
+  f.repo.recordWorkflowPlan(reply.run.id, { nativeId: 'stale-reply-plan', text: 'Current scope.' })
+  f.repo.reconcileCompletedCollaboration(reply.run.id)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(before)
+  expect(f.repo.collaboration(f.sessionId)!.inputProcessing?.settled).toBeUndefined()
+  expect(f.repo.readReceivedInput(f.sessionId)?.id).toBe(newer.send.clientMessageId)
+  expect(f.repo.needsWorkflowPlanRecovery(reply.run.id)).toBe(false)
 })

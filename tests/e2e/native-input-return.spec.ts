@@ -36,7 +36,6 @@ async function seed(fixture: RuntimeFixture) {
         primaryAgentId: 'claude',
         agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
         maxDiscussionRounds: 3,
-        runningMessagePolicy: 'next_round',
         maxReviewCycles: 2,
         maxRepairAttempts: 2,
       },
@@ -213,3 +212,39 @@ for (const keepNewDraft of [false, true]) {
     },
   )
 }
+
+test(
+  'native question replaces Message and restores its unsent draft without an extra Stop footer',
+  { tag: '@deterministic' },
+  async () => {
+    const fixture = await createRuntimeFixture({ codexAppServer: 'native_question' })
+    let app: Awaited<ReturnType<typeof fixture.launch>> | undefined
+    try {
+      await seed(fixture)
+      app = await fixture.launch()
+      const page = await app.firstWindow()
+      await page.getByRole('button', { name: 'Input return Session', exact: true }).click()
+      const composer = page.getByRole('combobox', { name: 'Message', exact: true })
+      await composer.fill('@codex Ask for a cancellation scope')
+      await composer.press('Enter')
+      await expect.poll(() => composer.textContent()).toBe('')
+      await composer.fill('Keep this ordinary message draft')
+      await expect(page.getByText('Codex needs your input', { exact: true })).toBeVisible()
+      await expect(composer).toHaveCount(0)
+      await expect(
+        page.getByText('Your message draft is kept while you answer.', { exact: true }),
+      ).toHaveCount(0)
+      await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0)
+      await expect(page.getByRole('button', { name: 'Cancel', exact: true })).toBeVisible()
+      await page.getByRole('radio', { name: /Current request/ }).check()
+      await page.getByRole('button', { name: 'Submit answers', exact: true }).click()
+      await expect(page.getByText('Bounded lifecycle response.', { exact: true })).toBeVisible()
+      await expect(composer).toBeVisible()
+      await expect.poll(() => composer.textContent()).toBe('Keep this ordinary message draft')
+      expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(1)
+    } finally {
+      if (app) await quitPact(app)
+      await fixture.dispose()
+    }
+  },
+)

@@ -505,6 +505,27 @@
       "when": 1792337889331,
       "tag": "0071_app_update_checks",
       "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "6",
+      "when": 1792392348869,
+      "tag": "0072_lush_galactus",
+      "breakpoints": true
+    },
+    {
+      "idx": 73,
+      "version": "6",
+      "when": 1792394111713,
+      "tag": "0073_bizarre_demogoblin",
+      "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "6",
+      "when": 1792410407823,
+      "tag": "0074_happy_franklin_richards",
+      "breakpoints": true
     }
   ]
 }

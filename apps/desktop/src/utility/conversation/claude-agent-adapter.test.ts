@@ -3,11 +3,18 @@ import type { SDKMessage, SDKUserMessage, query as sdkQuery } from '@anthropic-a
 
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+
+import { diagnosticEventSchema, type DiagnosticEvent } from '@pact/contracts/diagnostics'
+
+const planDiagnostics = vi.hoisted(() => ({ events: [] as DiagnosticEvent[] }))
+vi.mock('../../diagnostics/utility-log', () => ({
+  recordDiagnostic: (event: DiagnosticEvent) => planDiagnostics.events.push(event),
+}))
 
 const forkWorker = vi.hoisted(() => ({ path: '' }))
 vi.mock('node:worker_threads', async (original) => {
@@ -36,7 +43,7 @@ import type {
 
 import { NativeCapacityError } from './agent-execution-error'
 import { CLAUDE_TITLE_TIMEOUT_MS, ClaudeAgentAdapter } from './claude-agent-adapter.js'
-import { planEnvelope, planRunInput } from './collaboration-fixture.test-support.js'
+import { planRunInput } from './collaboration-fixture.test-support.js'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
 
 let workerFixture: Awaited<ReturnType<typeof nativeWorkerFixture>>
@@ -53,10 +60,233 @@ afterEach(() => {
   vi.unstubAllEnvs()
 })
 
+describe('Claude plan submission diagnostics', () => {
+  it.each([
+    'valid',
+    'missing_prompt',
+    'wrong_prompt',
+    'missing_history',
+    'pending',
+    'binding_missing',
+    'receipt_unavailable',
+    'old_failure',
+    'recovered_prompt',
+  ] as const)('preserves plan authorization and identifies %s', async (mode) => {
+    planDiagnostics.events.length = 0
+    const directory = await mkdtemp(join(tmpdir(), 'pact-plan-diagnostic-'))
+    const cwd = await realpath(directory)
+    const profile = join(cwd, 'profile')
+    const project = join(profile, 'projects', cwd.replace(/[^a-z0-9]/giu, '-'))
+    await mkdir(project, { recursive: true })
+    vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
+    const input = { ...planRunInput('claude'), cwd, nativeSessionId: randomUUID() }
+    const promptId = randomUUID(),
+      attachmentId = randomUUID(),
+      callId = randomUUID(),
+      receiptId = randomUUID()
+    const path = join(profile, 'private-path-not-for-diagnostics.md')
+    const operation = { file_path: path, content: 'private-plan-body-not-for-diagnostics' }
+    const recordPlan = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlan']>>()
+    const transcript = join(project, `${input.nativeSessionId}.jsonl`)
+    const append = async (record: Record<string, unknown>) =>
+      appendFile(
+        transcript,
+        JSON.stringify({
+          ...record,
+          cwd,
+          sessionId: input.nativeSessionId,
+          timestamp: new Date().toISOString(),
+        }) + '\n',
+      )
+    await append({
+      type: 'user',
+      uuid: input.runId,
+      parentUuid: null,
+      promptId,
+      message: { role: 'user', content: 'Plan' },
+    })
+    await append({
+      type: 'attachment',
+      uuid: attachmentId,
+      parentUuid: input.runId,
+      attachment: {
+        type: mode === 'binding_missing' ? 'unknown' : 'plan_mode',
+        isSubAgent: false,
+        planFilePath: path,
+      },
+    })
+    const writeRecord = {
+      type: 'assistant',
+      uuid: callId,
+      parentUuid: attachmentId,
+      message: {
+        id: 'write-message',
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'write-plan', name: 'Write', input: operation }],
+      },
+    }
+    if (mode !== 'missing_history') await append(writeRecord)
+    const f = cancellationFixture(undefined, { ...input, recordWorkflowPlan: recordPlan })
+    try {
+      await f.ready()
+      const hook = {
+        session_id: input.nativeSessionId,
+        transcript_path: transcript,
+        cwd,
+        ...(['missing_prompt', 'old_failure', 'recovered_prompt'].includes(mode)
+          ? {}
+          : { prompt_id: mode === 'wrong_prompt' ? randomUUID() : promptId }),
+        tool_use_id: 'write-plan',
+        tool_name: 'Write',
+        tool_input: operation,
+      }
+      const options = { signal: f.options().abortController!.signal }
+      const pre = f.options().hooks!.PreToolUse![0]!.hooks[0]!
+      const post = f.options().hooks!.PostToolUse![0]!.hooks[0]!
+      await pre({ ...hook, hook_event_name: 'PreToolUse' }, 'write-plan', options)
+      if (mode !== 'pending' && mode !== 'missing_history') {
+        const response = {
+          filePath: path,
+          content: operation.content,
+          userModified: mode === 'receipt_unavailable',
+        }
+        await append({
+          type: 'user',
+          uuid: receiptId,
+          parentUuid: callId,
+          message: {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'write-plan', content: 'Written' }],
+          },
+          toolUseResult: response,
+        })
+        await post(
+          { ...hook, hook_event_name: 'PostToolUse', tool_response: response },
+          'write-plan',
+          options,
+        )
+      }
+      if (mode !== 'missing_history')
+        await append({
+          type: 'assistant',
+          uuid: randomUUID(),
+          parentUuid: mode === 'pending' ? callId : receiptId,
+          message: {
+            id: 'exit-message',
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'exit-plan', name: 'ExitPlanMode', input: {} }],
+          },
+        })
+      if (mode !== 'old_failure')
+        await pre(
+          {
+            ...hook,
+            ...(mode === 'recovered_prompt' ? { prompt_id: promptId } : {}),
+            hook_event_name: 'PreToolUse',
+            tool_use_id: 'exit-plan',
+            tool_name: 'ExitPlanMode',
+            tool_input: {},
+          },
+          'exit-plan',
+          options,
+        )
+      const result = await f.options().canUseTool!(
+        'ExitPlanMode',
+        {},
+        { ...options, toolUseID: 'exit-plan', requestId: 'exit-request' },
+      )
+      expect(result?.behavior).toBe('deny')
+      const message = result?.behavior === 'deny' ? result.message : ''
+      const expected = {
+        valid: 'submitted to Pact',
+        missing_prompt: 'hook_prompt_missing',
+        wrong_prompt: 'hook_prompt_mismatch',
+        missing_history: 'history_lookup_failed',
+        pending: 'plan_pending',
+        binding_missing: 'history_binding_missing',
+        receipt_unavailable: 'plan_unavailable',
+        old_failure: 'Pact diagnostic: submission_hook_unverified.',
+        recovered_prompt: 'submitted to Pact',
+      }[mode]
+      expect(message).toContain(expected)
+      expect(message).not.toContain('private-path')
+      expect(message).not.toContain(operation.content)
+      expect(message).not.toContain(input.runId)
+      expect(message).not.toContain(promptId)
+      expect(message.includes('Latest capture: hook_prompt_missing/Write/success.')).toBe(
+        mode === 'old_failure',
+      )
+      expect(message.includes('Latest capture')).toBe(
+        [
+          'missing_prompt',
+          'wrong_prompt',
+          'missing_history',
+          'binding_missing',
+          'old_failure',
+        ].includes(mode),
+      )
+      const successful = mode === 'valid' || mode === 'recovered_prompt'
+      const events = planDiagnostics.events.filter((event) => event.operation === 'claude_plan')
+      expect(events.length).toBeGreaterThan(0)
+      for (const event of events) {
+        expect(diagnosticEventSchema.safeParse(event).success).toBe(true)
+        expect(event).toMatchObject({
+          sessionId: input.sessionId,
+          runId: input.runId,
+          agentId: 'claude',
+        })
+        expect(['info', 'warn']).toContain(event.level)
+      }
+      expect(events.at(-1)).toMatchObject({
+        planStage: 'submission',
+        planReason: successful
+          ? 'submitted'
+          : mode === 'old_failure'
+            ? 'submission_hook_unverified'
+            : expected,
+        level: successful ? 'info' : 'warn',
+      })
+      expect(events.at(-1)?.planCapture).toEqual(
+        mode === 'old_failure'
+          ? { code: 'hook_prompt_missing', tool: 'Write', phase: 'success' }
+          : ['missing_prompt', 'wrong_prompt', 'missing_history', 'binding_missing'].includes(mode)
+            ? { code: expected, tool: 'ExitPlanMode', phase: 'begin' }
+            : undefined,
+      )
+      const serialized = JSON.stringify(events)
+      for (const sensitive of [path, operation.content, promptId, 'write-plan', 'exit-plan', cwd])
+        expect(serialized).not.toContain(sensitive)
+      // Repeated permission callbacks must not flood the default log or change authorization.
+      for (let attempt = 0; attempt < 70; attempt++) {
+        // oxlint-disable-next-line no-await-in-loop -- Exercise sequential SDK callback retries.
+        await f.options().canUseTool!(
+          'ExitPlanMode',
+          {},
+          {
+            ...options,
+            toolUseID: 'exit-plan',
+            requestId: 'exit-request',
+          },
+        )
+      }
+      expect(planDiagnostics.events).toHaveLength(events.length)
+      expect(recordPlan.mock.calls.length > 0).toBe(mode === 'valid' || mode === 'recovered_prompt')
+      expect(
+        recordPlan.mock.calls.every(
+          ([plan]) => plan.nativeId === 'write-plan' && plan.text === operation.content,
+        ),
+      ).toBe(true)
+    } finally {
+      await f.dispose()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('Claude Agent lifecycle', () => {
   it.each([false, true])(
-    'keeps reading Steer consumption and final control receipts with background carrier failure=%s',
-    async (carrierFails) => {
+    'keeps Steer consumption and terminal receipts after projection overflow with legacy structured output=%s',
+    async (legacyStructured) => {
       const input = {
         ...planRunInput('claude'),
         nativeSessionId: 'claude-carrier-failure',
@@ -64,16 +294,17 @@ describe('Claude Agent lifecycle', () => {
         bindingGeneration: 1,
       }
       const steerId = randomUUID(),
-        carrier = planEnvelope('Exact plan carrier')
+        carrier = {
+          version: 'pact-collaboration-envelope-v5',
+          answer: 'Old carrier',
+          result: { plan: 'Untrusted old plan' },
+        }
       const overflow = Promise.withResolvers<void>(),
         deliverCarrier = Promise.withResolvers<void>()
       const rootPrompt = Promise.withResolvers<void>()
       const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
       const failure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
       const consumption = vi.fn<(inputId: string) => void>()
-      const persistCarrier = vi.fn<NonNullable<AgentRunInput['recordCollaborationCarrier']>>(() => {
-        if (carrierFails) throw new Error('The final-proof working reservation is unavailable.')
-      })
       const prompts: SDKUserMessage[] = []
       let reachedEof = false,
         inputDrain: Promise<void> | undefined
@@ -122,7 +353,7 @@ describe('Claude Agent lifecycle', () => {
             is_error: false,
             session_id: input.nativeSessionId,
             user_message_uuid: input.runId,
-            structured_output: carrier,
+            ...(legacyStructured ? { structured_output: carrier } : {}),
             result: JSON.stringify(carrier),
           } as SDKMessage
           yield {
@@ -139,13 +370,15 @@ describe('Claude Agent lifecycle', () => {
             is_error: false,
             session_id: input.nativeSessionId,
             user_message_uuid: steerId,
-            structured_output: carrier,
+            ...(legacyStructured ? { structured_output: carrier } : {}),
             result: JSON.stringify(carrier),
           } as SDKMessage
           reachedEof = true
         })()
         return {
           [Symbol.asyncIterator]: () => output,
+          initializationResult: vi.fn(async () => ({ current_permission_mode: 'plan' })),
+          setPermissionMode: vi.fn(async () => undefined),
           cancelAsyncMessage: vi.fn(async () => false),
           interrupt: vi.fn(async () => ({ cancelled: [], still_queued: [] })),
           close: vi.fn(),
@@ -163,7 +396,6 @@ describe('Claude Agent lifecycle', () => {
             ...input,
             recordNativeEvidence: evidence,
             recordOutputFailure: failure,
-            recordCollaborationCarrier: persistCarrier,
           },
           new AbortController().signal,
         ))
@@ -195,7 +427,6 @@ describe('Claude Agent lifecycle', () => {
         expect(await outcome).toMatchObject({ kind: 'response_too_large' })
         expect(failure).toHaveBeenCalledTimes(1)
         deliverCarrier.resolve()
-        await vi.waitFor(() => expect(persistCarrier).toHaveBeenCalled())
         await vi.waitFor(() =>
           expect({
             consumedIds: consumption.mock.calls.map(([id]) => id),
@@ -289,76 +520,143 @@ describe('Claude Agent lifecycle', () => {
     },
   )
 
-  it.each([true, false])(
-    'keeps the complete native carrier private with valid submission=%s and enforces the readonly source-reader route',
-    async (valid) => {
-      const input = planRunInput('claude'),
-        source = planEnvelope('Detailed plan\n'.repeat(5000)),
-        carrier = valid ? source : { ...source, result: { ...source.result, submission: 'wrong' } },
-        record = vi.fn<NonNullable<AgentRunInput['recordCollaborationCarrier']>>(),
-        query = vi.fn(
-          fakeQuery([
-            {
-              type: 'result',
-              subtype: 'success',
-              is_error: false,
-              session_id: 'claude-envelope',
-              user_message_uuid: input.runId,
-              result: JSON.stringify(carrier),
-              structured_output: carrier,
-            } as SDKMessage,
-          ]),
-        ),
-        adapter = new ClaudeAgentAdapter('/fake/claude', {
-          query: query as never,
-          getSessionInfo: vi.fn() as never,
-        }),
-        events: import('@pact/contracts').NormalizedAgentEvent[] = []
-      try {
-        for await (const event of adapter.run(
+  it('keeps native prose literal and refuses legacy structured output as workflow authority', async () => {
+    const input = planRunInput('claude')
+    const text = JSON.stringify({
+      version: 'pact-collaboration-envelope-v5',
+      answer: 'Literal prose',
+      result: { plan: 'Not a native plan' },
+    })
+    const record = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlan']>>()
+    const query = vi.fn(
+      fakeQuery([
+        {
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          session_id: 'claude-native-plan',
+          user_message_uuid: input.runId,
+          result: text,
+          structured_output: { plan: 'Untrusted plan' },
+        } as SDKMessage,
+      ]),
+    )
+    const adapter = new ClaudeAgentAdapter('/fake/claude', {
+      query: query as never,
+      getSessionInfo: vi.fn() as never,
+    })
+    const events: import('@pact/contracts').NormalizedAgentEvent[] = []
+    try {
+      for await (const event of adapter.run(
+        {
+          ...input,
+          nativeSessionId: 'claude-native-plan',
+          recordWorkflowPlan: record,
+          readCollaborationSourcePart: () => ({
+            source: 'document',
+            offset: 0,
+            text: 'Complete source',
+            nextOffset: null,
+          }),
+        },
+        new AbortController().signal,
+      ))
+        events.push(event)
+      expect(record).not.toHaveBeenCalled()
+      expect(
+        events.filter((event) => event.type === 'text.completed').map((event) => event.text),
+      ).toEqual([text])
+      expect(events.filter((event) => event.type === 'collaboration.plan')).toEqual([])
+      const options = query.mock.calls[0]![0].options!
+      const server = Object.keys(options.mcpServers!)[0]!
+      expect(options.allowedTools).toContain(`mcp__${server}__read_collaboration_source`)
+      expect(options.allowedTools).not.toContain(`mcp__${server}__publish_collaboration_result`)
+      expect(options.allowedTools).not.toContain(`mcp__${server}__request_peer_assistance`)
+      expect(options.permissionMode).toBe('plan')
+      expect(options.canUseTool).toBeTypeOf('function')
+      expect(options.outputFormat).toBeUndefined()
+      expect(query).toHaveBeenCalledOnce()
+    } finally {
+      await adapter.dispose()
+    }
+  })
+  it.each(['default', 'plan'] as const)(
+    'confirms native planning before dispatch when initialized in %s',
+    async (mode) => {
+      const input = planRunInput('claude')
+      const received: SDKUserMessage[] = []
+      const acknowledge = Promise.withResolvers<void>()
+      const setPermissionMode = vi.fn<(mode: string) => Promise<void>>(() => acknowledge.promise)
+      const query = fakeQuery(
+        [
           {
-            ...input,
-            nativeSessionId: 'claude-envelope',
-            recordCollaborationCarrier: record,
-            readCollaborationSourcePart: () => ({
-              source: 'document',
-              offset: 0,
-              text: 'Complete source',
-              nextOffset: null,
-            }),
-          },
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            session_id: 'plan-mode',
+            user_message_uuid: input.runId,
+            result: 'Planning complete.',
+          } as SDKMessage,
+        ],
+        {
+          initializationResult: async () => ({ current_permission_mode: mode }),
+          setPermissionMode,
+          onInput: (message) => received.push(message),
+        },
+      )
+      const adapter = new ClaudeAgentAdapter('/fake/claude', {
+        query,
+        getSessionInfo: vi.fn() as never,
+      })
+      const running = (async () => {
+        for await (const event of adapter.run(
+          { ...input, nativeSessionId: 'plan-mode', permissionMode: 'full' },
           new AbortController().signal,
-        ))
-          events.push(event)
-        expect(record).toHaveBeenCalledOnce()
-        expect(record).toHaveBeenCalledWith(carrier)
-        expect(
-          events.filter((event) => event.type === 'text.completed').map((event) => event.text),
-        ).toEqual([source.answer])
-        expect(
-          events.filter(
-            (event) =>
-              event.type === (valid ? 'collaboration.result' : 'collaboration.result_incomplete'),
+        )) {
+          void event
+        }
+      })()
+      try {
+        await vi.waitFor(() =>
+          expect(mode === 'default' ? setPermissionMode.mock.calls.length : received.length).toBe(
+            1,
           ),
-        ).toHaveLength(1)
-        const submitted = events.find((event) => event.type === 'collaboration.result')
-        expect(submitted?.result.plan).toBe(valid ? source.result.plan : undefined)
-        const options = query.mock.calls[0]![0].options!,
-          server = Object.keys(options.mcpServers!)[0]!
-        expect(options.allowedTools).toContain(`mcp__${server}__read_collaboration_source`)
-        expect(options.allowedTools).not.toContain(`mcp__${server}__publish_collaboration_result`)
-        expect(options.allowedTools).not.toContain(`mcp__${server}__request_peer_assistance`)
-        expect(options.canUseTool).toBeTypeOf('function')
-        const instructions = JSON.stringify(options.systemPrompt)
-        expect(instructions).toContain('source=required_inputs')
-        expect(instructions).toContain('$body')
-        expect(instructions).not.toContain('If the user body is directly present')
-        expect(query).toHaveBeenCalledOnce()
+        )
+        expect(received).toHaveLength(mode === 'default' ? 0 : 1)
+        expect(setPermissionMode.mock.calls).toEqual(mode === 'default' ? [['plan']] : [])
+        acknowledge.resolve()
+        await running
+        expect(received.map((message) => message.uuid)).toEqual([input.runId])
       } finally {
+        acknowledge.resolve()
         await adapter.dispose()
+        await running
       }
     },
   )
+  it('refuses an unknown native planning mode before exposing the user input', async () => {
+    const input = planRunInput('claude'),
+      received = vi.fn<(message: SDKUserMessage) => void>()
+    const query = fakeQuery([], {
+      initializationResult: async () => ({ current_permission_mode: 'unrecognized' }),
+      onInput: received,
+    })
+    const adapter = new ClaudeAgentAdapter('/fake/claude', {
+      query,
+      getSessionInfo: vi.fn() as never,
+    })
+    try {
+      const run = (async () => {
+        for await (const event of adapter.run(input, new AbortController().signal)) {
+          void event
+        }
+      })()
+      await expect(run).rejects.toMatchObject({ kind: 'runtime_incompatible' })
+      expect(received).not.toHaveBeenCalled()
+    } finally {
+      await adapter.dispose()
+    }
+  })
   it('allows only the registered internal title publisher without broadening native tool permissions', async () => {
     const query = vi.fn(
       fakeQuery([
@@ -1759,6 +2057,7 @@ function cancellationFixture(
   input: Partial<AgentRunInput> = {},
   beforePrompt?: Promise<void>,
 ) {
+  const effectiveInput = { ...runInput(), ...input }
   const child = Object.assign(new EventEmitter(), {
     stdin: new PassThrough(),
     stdout: new PassThrough(),
@@ -1810,8 +2109,8 @@ function cancellationFixture(
               done: false,
               value: {
                 type: 'user',
-                uuid: runInput().runId,
-                session_id: 'claude-session-1',
+                uuid: effectiveInput.runId,
+                session_id: effectiveInput.nativeSessionId,
                 parent_tool_use_id: null,
                 message: { role: 'user', content: 'accepted' },
               } as SDKMessage,
@@ -1822,6 +2121,9 @@ function cancellationFixture(
         },
       }),
       interrupt,
+      initializationResult: vi.fn(async () => ({
+        current_permission_mode: request.options?.permissionMode ?? 'default',
+      })),
       close: vi.fn(),
       return: vi.fn(async () => ({ done: true, value: undefined })),
     }
@@ -1883,7 +2185,11 @@ function fakeQuery(
       if (!first.done) controls.onInput?.(first.value)
       yield* messages
     },
-    initializationResult: controls.initializationResult ?? vi.fn(async () => ({})),
+    initializationResult:
+      controls.initializationResult ??
+      vi.fn(async () => ({
+        current_permission_mode: request.options?.permissionMode ?? 'default',
+      })),
     setPermissionMode: controls.setPermissionMode ?? vi.fn(async () => undefined),
     close: vi.fn(),
     return: vi.fn(async () => ({ done: true, value: undefined })),

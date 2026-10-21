@@ -10,6 +10,7 @@ import { afterAll, beforeAll, expect, it, vi } from 'vitest'
 import type { AgentNativeForkWitness } from '@pact/contracts'
 
 import { LogicalIpcWorkerTraffic } from '../../shared/logical-ipc-traffic'
+import { claudePlanInputFingerprint } from './claude-native-plan'
 import {
   NativeForkFiles,
   type NativeForkFileInput,
@@ -359,9 +360,8 @@ const claudeForkProof = {
   },
 }
 it.each(['natural', 'wrong_hash'] as const)(
-  'reads the exact v5 Claude root and validates its %s Fork proof without a Query',
+  'ignores legacy structured attachments and validates natural Claude root %s Fork proof',
   async (proof) => {
-    const answerFormat = 'collaboration_envelope_v5' as const
     const profile = join(directory, randomUUID()),
       nativeSessionId = randomUUID(),
       nativeTurnId = randomUUID(),
@@ -428,12 +428,12 @@ it.each(['natural', 'wrong_hash'] as const)(
     vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
     try {
       const restored = await files.readAnswer(
-        { cwd: directory, nativeSessionId, nativeTurnId, answerFormat },
+        { cwd: directory, nativeSessionId, nativeTurnId },
         new AbortController().signal,
       )
-      expect(restored.answer).toBe(envelope.answer)
-      expect(hash(restored.answer!)).toBe(hash(envelope.answer))
-      expect(restored.submittedReport).toEqual(report)
+      expect(restored.answer).toBe('Original prose.')
+      expect(hash(restored.answer!)).toBe(hash('Original prose.'))
+      expect(restored.plan).toBeUndefined()
       const preparation = files.execute(
         {
           provider: 'claude',
@@ -441,12 +441,156 @@ it.each(['natural', 'wrong_hash'] as const)(
           cwd: directory,
           nativeSessionId,
           nativeTurnId,
-          answerFormat,
-          responseHash: hash(proof === 'natural' ? envelope.answer : 'Foreign answer'),
+          responseHash: hash(proof === 'natural' ? 'Original prose.' : 'Foreign answer'),
         },
         new AbortController().signal,
       )
       await claudeForkProof[proof](preparation, nativeSessionId, nativeTurnId)
+      expect(workerLocation.live).toBe(0)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  },
+)
+it.each(['complete', 'failed', 'pending', 'foreign', 'unbound', 'hook', 'wrong_hook'] as const)(
+  'reconstructs only authenticated Claude root plan operations: %s',
+  async (mode) => {
+    const profile = join(directory, randomUUID())
+    const nativeSessionId = randomUUID(),
+      nativeTurnId = randomUUID(),
+      promptId = randomUUID()
+    const project = join(
+      profile,
+      'projects',
+      (await realpath(directory)).replace(/[^a-z0-9]/giu, '-'),
+    )
+    await mkdir(project, { recursive: true })
+    const planPath = join(profile, 'plan.md'),
+      attachmentId = randomUUID(),
+      callId = randomUUID(),
+      receiptId = randomUUID()
+    await writeFile(planPath, 'Unrelated newer filesystem content must not be read.')
+    const text = 'Complete authenticated plan.\n'.repeat(3000)
+    const operation = { file_path: planPath, content: text }
+    const records = [
+      {
+        type: 'user',
+        uuid: nativeTurnId,
+        parentUuid: null,
+        promptId,
+        message: { role: 'user', content: 'Plan the change.' },
+      },
+      {
+        type: 'attachment',
+        uuid: attachmentId,
+        parentUuid: nativeTurnId,
+        attachment: {
+          type: mode === 'unbound' ? 'unknown' : 'plan_mode',
+          isSubAgent: false,
+          planFilePath: planPath,
+        },
+      },
+      {
+        type: 'assistant',
+        uuid: callId,
+        parentUuid: mode === 'foreign' ? randomUUID() : attachmentId,
+        message: {
+          id: 'plan-call',
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'write-plan', name: 'Write', input: operation }],
+        },
+      },
+      ...(mode === 'pending'
+        ? []
+        : [
+            {
+              type: 'user',
+              uuid: receiptId,
+              parentUuid: callId,
+              message: {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: 'write-plan',
+                    is_error: mode === 'failed',
+                    content: 'Written',
+                  },
+                ],
+              },
+              toolUseResult: { filePath: planPath, content: text, userModified: false },
+            },
+          ]),
+      {
+        type: 'assistant',
+        uuid: randomUUID(),
+        parentUuid: mode === 'pending' ? callId : receiptId,
+        message: {
+          id: 'natural',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Plan ready.' }],
+        },
+      },
+    ]
+    await writeFile(
+      join(project, `${nativeSessionId}.jsonl`),
+      records
+        .map((record) =>
+          JSON.stringify({ ...record, sessionId: nativeSessionId, cwd: directory, timestamp }),
+        )
+        .join('\n') + '\n',
+    )
+    vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
+    try {
+      const reading = files.readAnswer(
+        {
+          cwd: directory,
+          nativeSessionId,
+          nativeTurnId,
+          ...(['hook', 'wrong_hook'].includes(mode)
+            ? {
+                planHook: {
+                  id: 'write-plan',
+                  inputFingerprint: claudePlanInputFingerprint(
+                    'Write',
+                    mode === 'hook' ? operation : { ...operation, content: 'Forged' },
+                  ),
+                },
+              }
+            : {}),
+        },
+        new AbortController().signal,
+      )
+      const outcome = await reading.then(
+        (value) => ({ value, error: undefined }),
+        (error: unknown) => ({
+          value: undefined,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      )
+      expect(Boolean(outcome.error)).toBe(mode === 'wrong_hook')
+      expect(outcome.error ?? '').toContain(
+        mode === 'wrong_hook' ? 'differs from its recorded operation' : '',
+      )
+      expect(outcome.value?.plan).toEqual(
+        mode === 'complete' ? { nativeId: 'write-plan', text } : undefined,
+      )
+      expect(outcome.value?.answer).toBe(
+        ['complete', 'failed', 'pending', 'unbound'].includes(mode) ? 'Plan ready.' : undefined,
+      )
+      expect(outcome.value?.planUnavailable).toBe(
+        ['failed', 'pending'].includes(mode) ? true : undefined,
+      )
+      expect(outcome.value?.planState).toEqual(
+        mode === 'hook'
+          ? { complete: false, unavailable: false, overlapped: false, operations: [], pending: [] }
+          : undefined,
+      )
+      expect(outcome.value?.planBinding).toEqual(
+        ['complete', 'failed', 'pending', 'foreign', 'hook'].includes(mode)
+          ? { path: planPath, promptId }
+          : undefined,
+      )
       expect(workerLocation.live).toBe(0)
     } finally {
       vi.unstubAllEnvs()

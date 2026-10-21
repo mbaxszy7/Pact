@@ -8,7 +8,6 @@ import type {
   DefaultSessionSettings,
   DefaultSessionSettingsEditorState,
   Project,
-  ConversationSendInput,
   SessionSettingsEditorState,
   SessionPermissionSaveInput,
   SessionSpeedSaveInput,
@@ -128,13 +127,7 @@ interface WorkspaceViewProps {
   onSaveSessionSettings: (sessionId: string, settings: DefaultSessionSettings) => void
   onArchiveSession: (sessionId: string) => void
   onRenameSession: (sessionId: string, title: string) => Promise<boolean>
-  onSendMessage: (
-    content: string,
-    commentIds: string[],
-    route?: NonNullable<ConversationSendInput['route']>,
-    skills?: SkillSelection[],
-    planningAction?: ConversationSendInput['planningAction'],
-  ) => Promise<boolean>
+  onSendMessage: ConversationFlow['send']
   onSaveCommentDraft: ConversationFlow['saveCommentDraft']
   onRemoveCommentDraft: (commentId: string) => Promise<boolean>
   onOpenComment: (comment: AnchoredComment) => void
@@ -157,15 +150,6 @@ interface WorkspaceViewProps {
         textBasis?: import('@pact/contracts').MessageCommentAnchor['textBasis']
         plan?: import('@pact/contracts').MessageCommentAnchor['plan']
         report?: import('@pact/contracts').MessageCommentAnchor['report']
-      }
-    | undefined
-  todoNavigation?:
-    | {
-        taskId: string
-        todoId: string
-        todoRevision: number
-        navigationId: string
-        selection?: import('@pact/contracts').TodoCommentAnchor['selection']
       }
     | undefined
   onStopRun: () => Promise<boolean>
@@ -206,7 +190,12 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
     props.projects.find((project) => project.id === props.selectedProjectId) ??
     selectedProject ??
     props.projects.at(0)
-  const [planPane, setPlanPane] = useState<{ sessionId: string; taskId: string; open: boolean }>()
+  const [planPane, setPlanPane] = useState<{
+    sessionId: string
+    taskId: string
+    open: boolean
+    expanded: boolean
+  }>()
   const [planHost, setPlanHost] = useState<HTMLDivElement | null>(null)
   const planRestoreFocusRef = useRef<HTMLButtonElement>(null)
   const sessionSettingsFocusRef = useRef<HTMLButtonElement>(null)
@@ -217,7 +206,7 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
       taskId
         ? current?.sessionId === sessionId && current.taskId === taskId
           ? current
-          : { sessionId, taskId, open: true }
+          : { sessionId, taskId, open: true, expanded: false }
         : current?.sessionId === sessionId
           ? undefined
           : current,
@@ -229,9 +218,14 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
     setPlanPane((current) => (current ? { ...current, open: true } : current))
   }, [onSessionSettingsOpenChange])
   const closePlan = useCallback(
-    (): void => setPlanPane((current) => (current ? { ...current, open: false } : current)),
+    (): void =>
+      setPlanPane((current) => (current ? { ...current, open: false, expanded: false } : current)),
     [],
   )
+
+  const setPlanExpanded = useCallback((expanded: boolean): void => {
+    setPlanPane((current) => (current ? { ...current, expanded } : current))
+  }, [])
 
   return (
     <WorkspaceShell
@@ -297,7 +291,8 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
       agentActionsEnabled={props.agentActionsEnabled}
       isSettingsView={Boolean(props.settingsPage)}
       contextPanelOpen={props.sessionSettingsOpen || planOpen}
-      contextPanelExpanded={props.projectFilePanelExpanded}
+      contextPanelExpanded={planOpen ? planPane?.expanded : props.projectFilePanelExpanded}
+      contextPanelWidthLimited={!planOpen}
       contextPanelRestoreFocusRef={
         planOpen
           ? planRestoreFocusRef
@@ -312,7 +307,9 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
         if (props.sessionSettingsOpen) props.onSessionSettingsOpenChange(open)
         else if (planAvailable)
           setPlanPane((current) =>
-            current && current.open !== open ? { ...current, open } : current,
+            current && current.open !== open
+              ? { ...current, open, expanded: open && current.expanded }
+              : current,
           )
       }}
       showContextToggle={false}
@@ -333,6 +330,8 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
             host: planHost,
             available: planAvailable,
             open: planOpen,
+            expanded: Boolean(planOpen && planPane?.expanded),
+            onExpandedChange: setPlanExpanded,
             onAvailable: acceptPlanTask,
             onOpen: openPlan,
             onClose: closePlan,
@@ -413,6 +412,8 @@ function WorkspaceContent({
     host: HTMLElement | null
     available: boolean
     open: boolean
+    expanded: boolean
+    onExpandedChange: (expanded: boolean) => void
     onAvailable: (sessionId: string, taskId?: string) => void
     onOpen: () => void
     onClose: () => void
@@ -452,9 +453,10 @@ function WorkspaceContent({
             <ConversationView
               planPanelHost={planPane.host}
               planPanelOpen={planPane.open}
+              planPanelExpanded={planPane.expanded}
+              onPlanPanelExpandedChange={planPane.onExpandedChange}
               planAvailable={planPane.available}
               planRestoreFocusRef={planPane.restoreFocusRef}
-              todoNavigation={props.todoNavigation}
               onPlanAvailable={planPane.onAvailable}
               onOpenPlan={planPane.onOpen}
               onClosePlan={planPane.onClose}

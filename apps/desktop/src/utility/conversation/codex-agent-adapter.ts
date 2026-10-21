@@ -6,7 +6,8 @@ import { isDeepStrictEqual } from 'node:util'
 
 import type {
   NativeContextRebuildChunk,
-  CollaborationAnswerFormat,
+  CollaborationReviewObservation,
+  CollaborationInputObservation,
   NativeEvidenceIdentity,
   NativeProbeResult,
   NativeInitializationWitness,
@@ -32,7 +33,6 @@ import {
   type AgentNativeForkInspection,
   type AgentNativeForkWitness,
 } from '@pact/agent-runtime'
-import { collaborationOutputSchema } from '@pact/contracts'
 import { nativeCodexSkillListSchema } from '@pact/contracts'
 import {
   nativePermissionRequestSchema,
@@ -54,6 +54,7 @@ import {
   NativeThreadArchivedError,
   isCodexArchivedSessionRejection,
   NativeCapacityError,
+  NativeInputWithheldError,
   classifyAgentError,
 } from './agent-execution-error'
 import {
@@ -62,17 +63,13 @@ import {
 } from './codex-app-server-connection'
 import { readCodexInitializationRollout } from './codex-native-rollout'
 import { codexProcessEnvironment } from './codex-process-environment'
-import {
-  projectCollaborationAnswer,
-  readCollaborationAnswer,
-  readCollaborationEnvelopeText,
-  collaborationNaturalFallback,
-  readSubmittedCollaborationReport,
-  collaborationResultEvent,
-} from './collaboration-answer'
+import { mergeWorkflowReview, mergeWorkflowInput } from './collaboration-answer'
 import {
   collaborationInstructions,
   collaborationReadOnly,
+  collaborationPlanMode,
+  collaborationReviewMode,
+  collaborationInputResultAllowed,
   frozenSourceInstructions,
 } from './collaboration-prompt'
 import {
@@ -158,6 +155,8 @@ interface NativeBackground {
   foregroundReleased: boolean
   rootTerminal: boolean
   rootNotStarted: boolean
+  /** A host admission fence proved that this root input reached no native byte. */
+  rootInputWithheld?: boolean
   reportedUnknown: boolean
   untrackedWork: boolean
   /** An observation gap, not merely a foreground consumer ending before the native root. */
@@ -649,7 +648,6 @@ export class CodexAgentAdapter implements AgentAdapter {
           readSignal,
           undefined,
           input.responseHash,
-          input.answerFormat,
         )
         const turns = await this.readNativeTurns(
           reader,
@@ -675,7 +673,6 @@ export class CodexAgentAdapter implements AgentAdapter {
           bindingGeneration: input.bindingGeneration,
           throughSequence: input.throughSequence,
           deliveryCursor: input.deliveryCursor,
-          ...(input.answerFormat ? { answerFormat: input.answerFormat } : {}),
           prefixHash: prefix.prefixHash,
           prefixRecords: prefix.prefixRecords,
           prefixBytes: prefix.prefixBytes,
@@ -692,7 +689,6 @@ export class CodexAgentAdapter implements AgentAdapter {
     signal: AbortSignal,
     witness?: AgentNativeForkWitness,
     responseHash?: string,
-    answerFormat?: CollaborationAnswerFormat,
   ): Promise<NativeForkFileResult> {
     const read = await connection.request(
       'thread/read',
@@ -737,11 +733,6 @@ export class CodexAgentAdapter implements AgentAdapter {
         historyMode: thread.historyMode ?? 'legacy',
         ...(witness ? { witness } : {}),
         ...(responseHash ? { responseHash } : {}),
-        ...(answerFormat
-          ? { answerFormat }
-          : witness?.answerFormat
-            ? { answerFormat: witness.answerFormat }
-            : {}),
       },
       signal,
       undefined,
@@ -1062,7 +1053,6 @@ export class CodexAgentAdapter implements AgentAdapter {
                 readSignal,
                 undefined,
                 undefined,
-                input.source.answerFormat,
               ),
           )
         : undefined
@@ -1240,7 +1230,6 @@ export class CodexAgentAdapter implements AgentAdapter {
         nativeSessionId: threadId!,
         sourceNativeSessionId: input.source.nativeSessionId,
         sourceCutId: input.source.nativeCutId,
-        ...(input.source.answerFormat ? { answerFormat: input.source.answerFormat } : {}),
         sourcePrefixHash: input.source.prefixHash,
         candidatePrefixHash: input.source.prefixHash,
         idMap: sourcePrefix?.idMap ?? [],
@@ -1415,7 +1404,6 @@ export class CodexAgentAdapter implements AgentAdapter {
       }
       if (
         terminal &&
-        terminal.identity.answerFormat === input.answerFormat &&
         terminal.identity.nativeSessionId === input.nativeSessionId &&
         terminal.identity.bindingGeneration === input.bindingGeneration &&
         (!input.nativeTurnId || terminal.identity.nativeTurnId === input.nativeTurnId)
@@ -1507,8 +1495,7 @@ export class CodexAgentAdapter implements AgentAdapter {
             this.terminalEvidence.delete(input.requestId)
             this.terminalEvidence.set(input.requestId, observedTerminal)
           }
-          if (observedTerminal && observedTerminal.identity.answerFormat === input.answerFormat)
-            return observedTerminal
+          if (observedTerminal) return observedTerminal
         }
         if (
           matched &&
@@ -2769,6 +2756,9 @@ export class CodexAgentAdapter implements AgentAdapter {
       (!authorization ||
         authorization.runId !== input.runId ||
         authorization.taskId !== workflow.id ||
+        authorization.taskRevision !== workflow.revision ||
+        authorization.stage !== workflow.stage ||
+        authorization.inputSequence !== workflow.inputSequence ||
         workflow.sessionId !== input.sessionId ||
         input.promptEnvelope.sessionId !== input.sessionId ||
         authorization.actor !== this.id ||
@@ -2803,14 +2793,14 @@ export class CodexAgentAdapter implements AgentAdapter {
         ],
         ...(input.model ? { model: input.model } : {}),
         ...(input.effort ? { effort: input.effort } : {}),
-        ...(input.promptEnvelope.collaboration
-          ? {
-              outputSchema: collaborationOutputSchema(
-                input.promptEnvelope.collaboration,
-                input.promptEnvelope.collaborationAuthorization,
-              ),
-            }
-          : {}),
+        collaborationMode: {
+          mode: collaborationPlanMode(workflow, authorization) ? 'plan' : 'default',
+          settings: {
+            model: input.model ?? 'x'.repeat(256),
+            reasoning_effort: input.effort,
+            developer_instructions: null,
+          },
+        },
       },
     }
     if (freezeNativeJsonFrame(request) + 256 * 1024 > NATIVE_OWNER_WORKING_BYTES)
@@ -3013,7 +3003,6 @@ export class CodexAgentAdapter implements AgentAdapter {
     }
 
     const workflow = input.promptEnvelope.collaboration
-    const envelopeMode = Boolean(workflow)
     this.running = true
     clearTimeout(this.idleTimer)
     this.idleTimer = undefined
@@ -3025,6 +3014,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     const delivery: {
       phase: 'before_dispatch' | 'possibly_delivered' | 'accepted' | 'terminal'
     } = { phase: 'before_dispatch' }
+    let inputWithheldError: NativeInputWithheldError | undefined
     let lastSuggestedTitle: string | undefined
     let peerProposalEmitted = false
     let peerReceipt: string | undefined
@@ -3077,9 +3067,10 @@ export class CodexAgentAdapter implements AgentAdapter {
     let releaseNativeRequests: (() => void) | undefined
     let releaseApprovalMetadata: (() => void) | undefined
     const answer = new AgentAnswerAssembler(input.runId)
-    const carrierMemory = new NativeWorkingMemory().reserve(0)
-    let finalCarrier: unknown
-    let finalCarrierText: string | undefined
+    const planMemory = new NativeWorkingMemory().reserve(0)
+    let submittedPlan: { nativeId: string; text: string } | undefined
+    let reviewResult: CollaborationReviewObservation | undefined
+    let inputResult: CollaborationInputObservation | undefined
     let projectionFailure: unknown
     const failProjection = (error: unknown): void => {
       if (projectionFailure) return
@@ -3097,27 +3088,44 @@ export class CodexAgentAdapter implements AgentAdapter {
         return undefined
       }
     }
-    const captureCarrier = (text: string): void => {
-      finalCarrier = undefined
-      finalCarrierText = undefined
-      try {
-        // Control proof may remain readable after natural-answer projection fails.
-        carrierMemory.resize(4096 + text.length * 4 + Buffer.byteLength(text) * 2)
-        finalCarrierText = text
-        finalCarrier = readCollaborationEnvelopeText(text)
-      } catch (error) {
-        carrierMemory.resize(0)
-        failProjection(error)
-      }
+    const capturePlan = (nativeId: string, text: string): void => {
+      if (!collaborationPlanMode(workflow, input.promptEnvelope.collaborationAuthorization)) return
+      projectOutput(() => {
+        planMemory.resize(4096 + Buffer.byteLength(text) * 4 + text.length * 2)
+        submittedPlan = { nativeId, text }
+        input.recordWorkflowPlan?.(submittedPlan)
+      })
+    }
+    const captureReview = (verdict: CollaborationReviewObservation): void => {
+      if (!collaborationReviewMode(workflow, input.promptEnvelope.collaborationAuthorization))
+        return
+      projectOutput(() => {
+        reviewResult = mergeWorkflowReview(reviewResult, verdict)
+        input.recordWorkflowReview?.(reviewResult)
+      })
+    }
+    const captureInputResult = (outcome: CollaborationInputObservation): void => {
+      if (
+        !collaborationInputResultAllowed(
+          workflow,
+          input.promptEnvelope.collaborationAuthorization,
+        ) ||
+        (collaborationPlanMode(workflow, input.promptEnvelope.collaborationAuthorization) &&
+          outcome.outcome === 'processed')
+      )
+        return
+      projectOutput(() => {
+        inputResult = mergeWorkflowInput(inputResult, outcome)
+        input.recordWorkflowInputResult?.(inputResult)
+      })
     }
     background.release = () => {
       if (sourceGrant) this.peerToolServer.retireSourceReader(sourceGrant)
       releaseNativeRequests?.()
       releaseApprovalMetadata?.()
       answer.dispose()
-      finalCarrier = undefined
-      finalCarrierText = undefined
-      carrierMemory.release()
+      submittedPlan = undefined
+      planMemory.release()
     }
     const reasoningSummaryStates = new Map<string, { pendingPrefix: string; emitted: boolean }>()
     const observed = new WeakSet<object>()
@@ -3431,41 +3439,77 @@ export class CodexAgentAdapter implements AgentAdapter {
       }
       if (observed.has(event)) return !root || background.foregroundReleased
       observed.add(event)
-      if (
-        envelopeMode &&
-        root &&
-        ownedTurn &&
-        !background.rootTerminal &&
-        eventMethod === 'item/completed'
-      ) {
+      if (root && ownedTurn && !background.rootTerminal && eventMethod === 'item/completed') {
         const item = Reflect.get(eventParams, 'item')
-        if (
-          item &&
-          typeof item === 'object' &&
-          Reflect.get(item, 'type') === 'agentMessage' &&
-          typeof Reflect.get(item, 'id') === 'string' &&
-          typeof Reflect.get(item, 'text') === 'string' &&
-          Reflect.get(item, 'phase') === 'commentary'
-        )
-          projectOutput(() => answer.complete(Reflect.get(item, 'id'), Reflect.get(item, 'text')))
-        if (
-          item &&
-          typeof item === 'object' &&
-          Reflect.get(item, 'type') === 'agentMessage' &&
-          Reflect.get(item, 'phase') !== 'commentary'
-        ) {
-          const text = Reflect.get(item, 'text')
-          if (typeof text === 'string') {
-            captureCarrier(text)
-            if (finalCarrier === undefined) {
-              const natural = collaborationNaturalFallback(text)
-              if (natural !== undefined)
-                projectOutput(() => answer.complete(String(Reflect.get(item, 'id')), natural))
+        if (item && typeof item === 'object') {
+          if (Reflect.get(item, 'type') === 'agentMessage') {
+            const id = Reflect.get(item, 'id'),
+              text = Reflect.get(item, 'text')
+            if (typeof id === 'string' && typeof text === 'string')
+              projectOutput(() => answer.capture(id, text))
+          } else if (Reflect.get(item, 'type') === 'plan') {
+            const id = Reflect.get(item, 'id'),
+              text = Reflect.get(item, 'text')
+            if (
+              typeof id === 'string' &&
+              id.length > 0 &&
+              id.length <= 1024 &&
+              typeof text === 'string' &&
+              text.trim()
+            )
+              capturePlan(id, text)
+          } else if (
+            Reflect.get(item, 'type') === 'mcpToolCall' &&
+            Reflect.get(item, 'server') === this.peerServerName &&
+            ['submit_review', 'submit_input_result'].includes(String(Reflect.get(item, 'tool'))) &&
+            Reflect.get(item, 'status') === 'completed' &&
+            Reflect.get(item, 'error') === null
+          ) {
+            const result = Reflect.get(item, 'result')
+            const structured =
+              result && typeof result === 'object'
+                ? Reflect.get(result, 'structuredContent')
+                : undefined
+            const inputResultCall = Reflect.get(item, 'tool') === 'submit_input_result'
+            const receipt =
+              structured && typeof structured === 'object'
+                ? Reflect.get(structured, inputResultCall ? 'pactInputResult' : 'pactReview')
+                : undefined
+            if (
+              receipt &&
+              typeof receipt === 'object' &&
+              Reflect.get(receipt, 'receipt') === this.peerToolServer.capabilityReceipt &&
+              peerReceipt
+            ) {
+              if (inputResultCall) {
+                const outcome = this.peerToolServer.acceptInputResult(
+                  Reflect.get(item, 'arguments'),
+                  peerReceipt,
+                )
+                if (
+                  outcome &&
+                  Reflect.get(receipt, 'outcome') === outcome.outcome &&
+                  JSON.stringify(Reflect.get(receipt, 'questions')) ===
+                    JSON.stringify(outcome.questions)
+                )
+                  captureInputResult(outcome)
+              } else {
+                const verdict = this.peerToolServer.acceptReview(
+                  Reflect.get(item, 'arguments'),
+                  peerReceipt,
+                )
+                if (
+                  verdict &&
+                  Reflect.get(receipt, 'verdict') === verdict.verdict &&
+                  JSON.stringify(Reflect.get(receipt, 'questions')) ===
+                    JSON.stringify(verdict.questions)
+                )
+                  captureReview(verdict)
+              }
             }
           }
         }
       }
-      // Envelope deltas are protocol, not natural answer items. The root completed carrier is authoritative.
       if (eventMethod === 'turn/completed') {
         if (root) {
           const status =
@@ -3487,20 +3531,6 @@ export class CodexAgentAdapter implements AgentAdapter {
                 status,
                 { outputId: answer.outputId, text: '' },
               )
-              let submittedReport: ReturnType<typeof readSubmittedCollaborationReport>
-              if (envelopeMode) {
-                if (finalCarrierText !== undefined)
-                  input.recordCollaborationCarrierText?.(finalCarrierText)
-                input.recordCollaborationCarrier?.(finalCarrier)
-                projectOutput(() => {
-                  const canonical = readCollaborationAnswer(finalCarrier, input.answerFormat)
-                  if (canonical !== undefined) answer.replace(canonical)
-                  submittedReport = readSubmittedCollaborationReport(
-                    finalCarrier,
-                    input.answerFormat,
-                  )
-                })
-              }
               if (!projectionFailure)
                 this.recordTerminal(
                   input,
@@ -3508,14 +3538,15 @@ export class CodexAgentAdapter implements AgentAdapter {
                   background.primaryTurnId!,
                   status,
                   answer,
-                  submittedReport,
+                  status === 'completed'
+                    ? { plan: submittedPlan, reviewResult, inputResult }
+                    : undefined,
                 )
               if (background.foregroundReleased) {
                 const text = projectionFailure
                   ? undefined
-                  : envelopeMode
-                    ? answer.text
-                    : answer.finalize()
+                  : (answer.finalize() ??
+                    (status === 'completed' && submittedPlan && !answer.text ? '' : undefined))
                 if (text !== undefined)
                   input.recordArchivedEvent?.({
                     agentId: 'codex',
@@ -3524,6 +3555,22 @@ export class CodexAgentAdapter implements AgentAdapter {
                     outputId: answer.outputId,
                     text,
                   })
+                if (!projectionFailure && status === 'completed') {
+                  if (submittedPlan)
+                    input.recordArchivedEvent?.({
+                      agentId: 'codex',
+                      type: 'collaboration.plan',
+                      turnId: background.primaryTurnId!,
+                      ...submittedPlan,
+                    })
+                  if (reviewResult)
+                    input.recordArchivedEvent?.({
+                      agentId: 'codex',
+                      type: 'collaboration.review',
+                      turnId: background.primaryTurnId!,
+                      ...reviewResult,
+                    })
+                }
                 if (!projectionFailure)
                   input.recordArchivedEvent?.({
                     agentId: 'codex',
@@ -3553,7 +3600,7 @@ export class CodexAgentAdapter implements AgentAdapter {
           background.threads.delete(eventThread)
       }
       if (root && background.foregroundReleased && ownedTurn) {
-        if (!envelopeMode && eventMethod === 'item/agentMessage/delta') {
+        if (eventMethod === 'item/agentMessage/delta') {
           const itemId = Reflect.get(eventParams, 'itemId'),
             delta = Reflect.get(eventParams, 'delta')
           if (typeof itemId === 'string' && typeof delta === 'string') {
@@ -3567,7 +3614,7 @@ export class CodexAgentAdapter implements AgentAdapter {
                 text,
               })
           }
-        } else if (!envelopeMode && eventMethod === 'item/completed') {
+        } else if (eventMethod === 'item/completed') {
           const item = Reflect.get(eventParams, 'item')
           if (item && typeof item === 'object' && Reflect.get(item, 'type') === 'agentMessage') {
             const itemId = Reflect.get(item, 'id'),
@@ -4022,6 +4069,14 @@ export class CodexAgentAdapter implements AgentAdapter {
           )
       }
       const acceptanceDeadline = Date.now() + CODEX_TURN_ACCEPT_TIMEOUT_MS
+      const modeConfiguration = this.loadedThreadConfigurations.get(threadId)
+      const modeModel = input.model ?? modeConfiguration?.model
+      if (!modeModel)
+        throw new AgentExecutionError(
+          'runtime_incompatible',
+          'Codex did not resolve the model required by its native collaboration mode. Nothing was submitted.',
+          false,
+        )
       const speed = await this.resolveTurnSpeed(
         connection,
         input.speed ?? 'native',
@@ -4051,24 +4106,36 @@ export class CodexAgentAdapter implements AgentAdapter {
             ...codexPromptInput(input.promptEnvelope),
           ],
           ...(workflow ? phasePolicy : {}),
-          ...(envelopeMode
-            ? {
-                outputSchema: collaborationOutputSchema(
-                  workflow!,
-                  input.promptEnvelope.collaborationAuthorization,
-                ),
-              }
-            : {}),
           ...(input.model ? { model: input.model } : {}),
           ...(input.effort ? { effort: input.effort } : {}),
+          collaborationMode: {
+            mode: collaborationPlanMode(workflow, input.promptEnvelope.collaborationAuthorization)
+              ? 'plan'
+              : 'default',
+            settings: {
+              model: modeModel,
+              reasoning_effort: input.effort ?? modeConfiguration?.effort ?? null,
+              developer_instructions: null,
+            },
+          },
           ...(speed.serviceTier ? { serviceTierForTurn: speed.serviceTier } : {}),
         },
         {
           timeoutMs: Math.max(1, acceptanceDeadline - Date.now()),
           signal,
           onDispatch: () => {
+            try {
+              input.recordDispatch?.('possibly_sent', threadId, nativeConnection.executorId)
+            } catch (error) {
+              if (error instanceof NativeInputWithheldError) {
+                inputWithheldError = error
+                background.rootNotStarted = true
+                background.rootInputWithheld = true
+                input.recordDispatch?.('rejected', threadId, nativeConnection.executorId)
+              }
+              throw error
+            }
             delivery.phase = 'possibly_delivered'
-            input.recordDispatch?.('possibly_sent', threadId, nativeConnection.executorId)
           },
         },
       )
@@ -4212,7 +4279,9 @@ export class CodexAgentAdapter implements AgentAdapter {
             CodexAgentAdapter.isPeerTool(item, this.peerServerName) ||
             (Reflect.get(item, 'type') === 'mcpToolCall' &&
               Reflect.get(item, 'server') === this.peerServerName &&
-              Reflect.get(item, 'tool') === 'publish_session_title')
+              ['publish_session_title', 'submit_review', 'submit_input_result'].includes(
+                String(Reflect.get(item, 'tool')),
+              ))
           )
             continue
           const activity = CodexAgentAdapter.describeTool(item, input.cwd, false)
@@ -4259,7 +4328,6 @@ export class CodexAgentAdapter implements AgentAdapter {
             }
           }
         } else if (method === 'item/agentMessage/delta') {
-          if (envelopeMode) continue
           const delta = Reflect.get(params, 'delta')
           const itemId = Reflect.get(params, 'itemId')
           if (typeof delta === 'string' && typeof itemId === 'string') {
@@ -4278,7 +4346,6 @@ export class CodexAgentAdapter implements AgentAdapter {
           const item = Reflect.get(params, 'item')
           if (!item || typeof item !== 'object' || !turnId) continue
           if (Reflect.get(item, 'type') === 'agentMessage') {
-            if (envelopeMode) continue
             const text = Reflect.get(item, 'text')
             const itemId = Reflect.get(item, 'id')
             if (typeof text === 'string' && typeof itemId === 'string') {
@@ -4341,6 +4408,13 @@ export class CodexAgentAdapter implements AgentAdapter {
                   origin: 'turn_result',
                 }
             }
+          } else if (
+            Reflect.get(item, 'type') === 'plan' ||
+            (Reflect.get(item, 'type') === 'mcpToolCall' &&
+              Reflect.get(item, 'server') === this.peerServerName &&
+              ['submit_review', 'submit_input_result'].includes(String(Reflect.get(item, 'tool'))))
+          ) {
+            // Root plan/review metadata was captured by the owned native observer.
           } else if (CodexAgentAdapter.isPeerTool(item, this.peerServerName)) {
             const proposal = CodexAgentAdapter.peerProposal(
               item,
@@ -4414,7 +4488,7 @@ export class CodexAgentAdapter implements AgentAdapter {
             const error = Reflect.get(completedTurn, 'error')
             throw classifyAgentError(new Error(JSON.stringify(error ?? 'Codex Run failed.')))
           }
-          const finalText = envelopeMode ? answer.text : answer.finalize()
+          const finalText = answer.finalize() ?? (submittedPlan && !answer.text ? '' : undefined)
           if (finalText !== undefined)
             yield {
               agentId: 'codex',
@@ -4423,14 +4497,17 @@ export class CodexAgentAdapter implements AgentAdapter {
               outputId: answer.outputId,
               text: finalText,
             }
-          if (envelopeMode && workflow && status === 'completed')
-            yield collaborationResultEvent(
-              finalCarrier,
-              workflow,
-              turnId,
-              input.answerFormat,
-              (input.currentPromptEnvelope?.() ?? input.promptEnvelope).collaborationAuthorization,
-            )
+          if (status === 'completed') {
+            if (submittedPlan)
+              yield { agentId: 'codex', type: 'collaboration.plan', turnId, ...submittedPlan }
+            if (reviewResult)
+              yield {
+                agentId: 'codex',
+                type: 'collaboration.review',
+                turnId,
+                ...reviewResult,
+              }
+          }
           yield {
             agentId: 'codex',
             type: 'turn.completed',
@@ -4516,7 +4593,9 @@ export class CodexAgentAdapter implements AgentAdapter {
         }
       }
     } catch (error) {
-      const failure = classifyAgentError(error)
+      // The frame writer wraps callback failures. Preserve the host's exact
+      // proven-unsent reason instead of mistaking that wrapper for native work.
+      const failure = inputWithheldError ?? classifyAgentError(error)
       recordDiagnostic({
         operation: 'native_check',
         phase: 'failed',
@@ -4969,11 +5048,13 @@ export class CodexAgentAdapter implements AgentAdapter {
     nativeFileChangesSettled(
       background.input,
       background.unknown ? 'unknown' : 'settled',
-      background.rootNotStarted
-        ? 'native_turn_not_started'
-        : background.unknown
-          ? 'native_observation_released'
-          : 'native_work_drained',
+      background.rootInputWithheld
+        ? 'workflow_input_withheld'
+        : background.rootNotStarted
+          ? 'native_turn_not_started'
+          : background.unknown
+            ? 'native_observation_released'
+            : 'native_work_drained',
     )
     this.scheduleIdleDisconnect()
   }
@@ -4983,7 +5064,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     request: object,
     method: string,
     params: object,
-    input: Pick<AgentRunInput, 'requestPermission' | 'requestUserInput'> &
+    input: Pick<AgentRunInput, 'requestPermission' | 'requestUserInput' | 'permissionMode'> &
       Partial<Pick<AgentRunInput, 'promptEnvelope'>>,
     threadId: string | undefined,
     turnId: string | undefined,
@@ -5011,13 +5092,6 @@ export class CodexAgentAdapter implements AgentAdapter {
       return
     }
     handled.add(key)
-    if (method === 'item/tool/requestUserInput' && input.promptEnvelope?.collaboration) {
-      await connection.respondError(
-        id,
-        'Return material questions as versioned Todo definitions in this duty’s final structured result.',
-      )
-      return
-    }
     if (method === 'item/tool/requestUserInput' || method === 'mcpServer/elicitation/request') {
       const endWait = connection.beginPermissionWait()
       try {
@@ -5073,6 +5147,13 @@ export class CodexAgentAdapter implements AgentAdapter {
       await connection.respondError(
         id,
         'Pact does not yet have the native interaction UI required for this request. Native configuration was not changed.',
+      )
+      return
+    }
+    if (input.permissionMode === 'full') {
+      await connection.respondError(
+        id,
+        'This operation was blocked by native policy or this task’s scope. Full access does not grant additional permissions, and no tool approval was requested.',
       )
       return
     }
@@ -6260,7 +6341,6 @@ export class CodexAgentAdapter implements AgentAdapter {
       ...(runId ? { runId } : {}),
       ...(nativeTurnId ? { nativeTurnId } : {}),
       ...(executorId ? { executorId } : {}),
-      ...(input.answerFormat ? { answerFormat: input.answerFormat } : {}),
     }
   }
 
@@ -6273,7 +6353,6 @@ export class CodexAgentAdapter implements AgentAdapter {
       sessionId: input.sessionId,
       agentId: this.id,
       runId: input.runId,
-      ...(input.answerFormat ? { answerFormat: input.answerFormat } : {}),
       requestId: input.runId,
       nativeSessionId,
       bindingGeneration: input.bindingGeneration ?? 1,
@@ -6311,20 +6390,26 @@ export class CodexAgentAdapter implements AgentAdapter {
     nativeTurnId: string,
     outcome: 'completed' | 'failed' | 'interrupted',
     answer: Pick<AgentAnswerAssembler, 'outputId' | 'text'>,
-    submittedReport?: ReturnType<typeof readSubmittedCollaborationReport>,
+    metadata?: {
+      plan?: { nativeId: string; text: string } | undefined
+      reviewResult?: CollaborationReviewObservation | undefined
+      inputResult?: CollaborationInputObservation | undefined
+    },
   ): void {
     const evidence: Extract<NativeProbeResult, { kind: 'ended' }> = {
       kind: 'ended',
       identity: this.runIdentity(input, nativeSessionId, nativeTurnId),
       source: 'live_terminal',
       outcome,
-      ...(answer.text
+      ...(answer.text || metadata?.plan || metadata?.reviewResult
         ? {
             output: {
               outputId: answer.outputId,
               text: answer.text,
               completeness: outcome === 'completed' ? ('complete' as const) : ('partial' as const),
-              ...(submittedReport ? { submittedReport } : {}),
+              ...(metadata?.plan ? { plan: metadata.plan } : {}),
+              ...(metadata?.reviewResult ? { reviewResult: metadata.reviewResult } : {}),
+              ...(metadata?.inputResult ? { inputResult: metadata.inputResult } : {}),
             },
           }
         : {}),
@@ -6370,46 +6455,31 @@ export class CodexAgentAdapter implements AgentAdapter {
     using answer = new AgentAnswerAssembler(input.requestId)
     let full = terminalComplete && Reflect.get(turn, 'itemsView') === 'full'
     const ids = new Set<string>()
-    const projectionItems: Array<{ id: string; text: string; phase?: unknown }> = []
+    let plan: { nativeId: string; text: string } | undefined
     for (const item of items) {
       if (!item || typeof item !== 'object' || typeof Reflect.get(item, 'type') !== 'string') {
         full = false
         continue
       }
-      if (Reflect.get(item, 'type') !== 'agentMessage') continue
-      if (input.answerFormat) {
-        const id = Reflect.get(item, 'id'),
-          text = Reflect.get(item, 'text')
-        if (typeof id !== 'string' || typeof text !== 'string' || ids.has(id)) full = false
-        else {
-          ids.add(id)
-          answer.complete(id, text)
-          projectionItems.push({ id, text, phase: Reflect.get(item, 'phase') })
-        }
-        continue
-      }
-      const id = Reflect.get(item, 'id'),
+      const type = Reflect.get(item, 'type'),
+        id = Reflect.get(item, 'id'),
         text = Reflect.get(item, 'text')
-      if (typeof id === 'string' && id.length > 0 && typeof text === 'string') {
-        if (ids.has(id)) full = false
-        answer.complete(id, text)
+      if (type === 'agentMessage' || type === 'plan') {
+        if (typeof id !== 'string' || !id || typeof text !== 'string' || ids.has(id)) {
+          full = false
+          continue
+        }
         ids.add(id)
-      } else full = false
+        if (type === 'agentMessage') answer.complete(id, text)
+        else if (text.trim()) plan = { nativeId: id, text }
+      }
     }
-    if (input.answerFormat)
-      answer.replace(projectCollaborationAnswer(projectionItems, input.answerFormat))
-    const submittedReport = readSubmittedCollaborationReport(
-      readCollaborationEnvelopeText(
-        projectionItems.findLast((item) => item.phase !== 'commentary')?.text ?? '',
-      ),
-      input.answerFormat,
-    )
-    return answer.text
+    return answer.text || plan
       ? {
           outputId: answer.outputId,
           text: answer.text,
           completeness: full ? 'complete' : 'partial',
-          ...(submittedReport ? { submittedReport } : {}),
+          ...(plan ? { plan } : {}),
         }
       : undefined
   }

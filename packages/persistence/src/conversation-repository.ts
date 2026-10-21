@@ -16,7 +16,6 @@ import {
   notInArray,
   or,
   sql,
-  type SQLWrapper,
 } from 'drizzle-orm'
 import { createHash, randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
@@ -59,30 +58,36 @@ import type {
 } from '@pact/contracts'
 
 import {
+  COLLABORATION_PROTOCOL,
   collaborationTaskSchema,
-  collaborationSubmission,
-  collaborationEnvelopeSchema,
   collaborationReceivedMetadataSchema,
-  collaborationResultSchema,
   collaborationViewSchema,
-  settleCollaboration,
   collaborationDocumentSchema,
   collaborationMarkdownNodeSchema,
   collaborationMarkdownTreeWithinBudget,
+  collaborationReviewObservationSchema,
+  bindCollaborationQuestions,
+  collaborationRetainedPlanSchema,
+  collaborationPlanSettlementSchema,
+  collaborationInputProcessing,
+  collaborationInputGate,
+  collaborationInputObservationSchema,
+  type CollaborationInputObservation,
+  type CollaborationRetainedPlan,
+  collaborationTurnAuthorizationSchema,
+  collaborationAvailableActions,
+  collaborationNextStage,
+  collaborationPlanMode,
+  collaborationActor,
+  collaborationStageLabel,
+  collaborationRequiresPlan,
+  collaborationPlanAccepted,
   type CollaborationMarkdownNode,
   type CollaborationDocument,
   type CollaborationTask,
-  type CollaborationResult,
-  collaborationTodoDeltaSchema,
-  collaborationInputResponseSchema,
-  collaborationTodoQuestionSchema,
-  type CollaborationTodoDelta,
-  type CollaborationInputResponse,
-  type CollaborationTodo,
-  type CollaborationTodoPage,
+  type CollaborationReviewObservation,
   type CollaborationTurnAuthorization,
   type CollaborationInputBatchReference,
-  collaborationTurnAuthorizationSchema,
 } from '@pact/contracts'
 import {
   frozenSkillInvocationSchema,
@@ -93,7 +98,7 @@ import {
   type SkillSelection,
 } from '@pact/contracts'
 import {
-  commentAnchorSchema,
+  storedCommentAnchor,
   conversationPatchSchema,
   conversationStreamDeltaKey,
   CONVERSATION_MARKDOWN_BYTES,
@@ -146,19 +151,10 @@ import {
   collaborationInputs,
   conversationQueueOperations,
   collaborationTasks,
-  collaborationTurns,
-  collaborationReportItems,
+  workflowTurns,
   collaborationMarkdownPages,
-  collaborationTodos,
-  collaborationTodoRevisions,
-  collaborationTurnAuthorizations,
-  collaborationRequiredInputMembers,
   conversationRunSourceRefs,
   conversationRebuildSourceRefs,
-  collaborationReviewFacts,
-  collaborationResultApplications,
-  collaborationResultOperations,
-  collaborationResultInputResponses,
   conversationInputBatches,
   conversationInputBatchMembers,
   agentEventJournal,
@@ -192,110 +188,6 @@ import {
 } from './workspace-archive-repository.js'
 
 /** Read only root result identity, with bounded stack/key/scalar memory. */
-function carrierInputIdentity(
-  text: string,
-): { inputRevision?: number; resultNonce?: string } | undefined {
-  let cursor = 0
-  const ws = () => {
-    while (/\s/u.test(text[cursor] ?? '') && cursor < text.length) cursor++
-  }
-  const stringEnd = () => {
-    if (text[cursor++] !== '"') throw new Error('string')
-    const start = cursor - 1
-    while (cursor < text.length) {
-      const char = text[cursor++]
-      if (char === '\\') cursor++
-      else if (char === '"') return { start, end: cursor }
-    }
-    throw new Error('string')
-  }
-  const key = () => {
-    const range = stringEnd()
-    if (range.end - range.start > 256) return ''
-    const parsed: unknown = JSON.parse(text.slice(range.start, range.end))
-    return typeof parsed === 'string' ? parsed : ''
-  }
-  const skip = () => {
-    ws()
-    if (text[cursor] === '"') {
-      stringEnd()
-      return
-    }
-    if (text[cursor] !== '{' && text[cursor] !== '[') {
-      while (cursor < text.length && !/[\s,}\]]/u.test(text[cursor]!)) cursor++
-      return
-    }
-    let depth = 0
-    do {
-      const char = text[cursor]
-      if (char === '"') {
-        stringEnd()
-        continue
-      }
-      if (char === '{' || char === '[') {
-        if (++depth > 1024) throw new Error('depth')
-      } else if (char === '}' || char === ']') depth--
-      cursor++
-    } while (depth > 0 && cursor < text.length)
-    if (depth) throw new Error('value')
-  }
-  try {
-    ws()
-    if (text[cursor++] !== '{') return undefined
-    let found = false,
-      identity: { inputRevision?: number; resultNonce?: string } = {}
-    for (;;) {
-      ws()
-      if (text[cursor] === '}') return found ? identity : undefined
-      const name = key()
-      ws()
-      if (text[cursor++] !== ':') return undefined
-      ws()
-      if (name === 'result') {
-        if (found || text[cursor++] !== '{') return undefined
-        found = true
-        const seen = new Set<string>()
-        for (;;) {
-          ws()
-          if (text[cursor] === '}') {
-            cursor++
-            break
-          }
-          const field = key()
-          ws()
-          if (text[cursor++] !== ':') return undefined
-          ws()
-          const start = cursor
-          skip()
-          if (field === 'inputRevision' || field === 'resultNonce') {
-            if (seen.has(field) || cursor - start > 128) return undefined
-            seen.add(field)
-            const scalar: unknown = JSON.parse(text.slice(start, cursor))
-            if (
-              field === 'inputRevision' &&
-              typeof scalar === 'number' &&
-              Number.isSafeInteger(scalar) &&
-              scalar >= 0
-            )
-              identity.inputRevision = scalar
-            if (field === 'resultNonce' && typeof scalar === 'string') identity.resultNonce = scalar
-          }
-          ws()
-          if (text[cursor] === '}') {
-            cursor++
-            break
-          }
-          if (text[cursor++] !== ',') return undefined
-        }
-      } else skip()
-      ws()
-      if (text[cursor] === '}') return found ? identity : undefined
-      if (text[cursor++] !== ',') return undefined
-    }
-  } catch {
-    return undefined
-  }
-}
 
 const activeRunStatuses = ['starting', 'running', 'recovering'] as const
 const INLINE_CONTENT_BYTES = CONVERSATION_MARKDOWN_BYTES
@@ -310,8 +202,24 @@ const NATIVE_REBUILD_CHUNK_CHARS = 64 * 1024
 export const HANDOFF_SAFETY_BYTES = 8 * 1024 * 1024
 export const HANDOFF_READ_DEADLINE_MS = 10_000
 
+function storedReceivedMetadata(json: string) {
+  const value: unknown = JSON.parse(json)
+  // Retain the stored receipt while discarding a retired, nonexecuting UI action.
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const metadata = { ...value }
+    Reflect.deleteProperty(metadata, 'planningAction')
+    return collaborationReceivedMetadataSchema.parse(metadata)
+  }
+  return collaborationReceivedMetadataSchema.parse(value)
+}
+
 const publicRunColumns = {
-  answerFormat: agentRuns.answerFormat,
+  workflowTaskId: sql<
+    string | null
+  >`(SELECT w.task_id FROM workflow_turns w WHERE w.run_id = ${agentRuns.id})`,
+  collaborationPlanVersion: sql<
+    number | null
+  >`(SELECT json_extract(w.state_json, '$.planReference.version') FROM workflow_turns w WHERE w.run_id = ${agentRuns.id} AND w.applied = 1 AND json_extract(w.state_json, '$.planReference.sourceRunId') = ${agentRuns.id})`,
   collaborationTaskId: agentRuns.collaborationTaskId,
   collaborationKind: agentRuns.collaborationKind,
   collaborationStage: agentRuns.collaborationStage,
@@ -401,7 +309,7 @@ export interface HandoffBundle {
   sequence: number
   contentRevision: number
   digest: string
-  contextVersion?: 'collaboration_v1' | 'collaboration_v2'
+  contextVersion?: 'native_workflow_v1'
   speaker: 'user' | RuntimeAgentId
   handledBy: RuntimeAgentId
   content: string
@@ -413,7 +321,7 @@ export interface HandoffSourceRef {
   id: string
   revision: number
   digest: string
-  contextVersion?: 'collaboration_v1' | 'collaboration_v2'
+  contextVersion?: 'native_workflow_v1'
 }
 
 export interface InputBatchReference {
@@ -503,13 +411,6 @@ function validBodyText(text: string): boolean {
   return true
 }
 
-function storedObject(text: string): Record<string, unknown> {
-  const value: unknown = JSON.parse(text)
-  if (!value || typeof value !== 'object' || Array.isArray(value))
-    throw new RunOperationConflictError('The stored structured source is invalid.')
-  return Object.fromEntries(Object.entries(value))
-}
-
 function storedDocuments(text: string): Array<{ key: string; source: CollaborationDocument }> {
   const value: unknown = JSON.parse(text)
   if (!Array.isArray(value))
@@ -524,41 +425,14 @@ function storedDocuments(text: string): Array<{ key: string; source: Collaborati
   })
 }
 
-function todoAnswerSource(anchor: Extract<AnchoredComment['anchor'], { type: 'todo' }>) {
-  const { question, ...source } = anchor
-  return question
-    ? { ...source, question: { id: question.id, revision: question.revision } }
-    : source
-}
-
-function todoProjectionBytes(title: SQLWrapper, question: SQLWrapper) {
-  return sql<number>`4096 + coalesce(length(CAST(${question} AS BLOB)),0) + 6 * length(CAST(${title} AS BLOB))`
-}
-
-function admittedTodoOrdinal(
-  rows: ReadonlyArray<{ ordinal: number; bytes: number }>,
-  budget: number,
-): number {
-  let used = 0,
-    last = -1
-  for (const row of rows.slice(0, COLLABORATION_INDEX_ITEMS)) {
-    if (row.bytes > budget && last === -1)
-      throw new OversizedConversationEntityError(
-        'This question cannot fit the page read budget. Its complete definition remains saved; no answer was submitted.',
-      )
-    if (used + row.bytes > budget) break
-    used += row.bytes
-    last = row.ordinal
-  }
-  return last
-}
-
 export interface BeginRunInput {
+  replyToDecision?: import('@pact/contracts').ConversationSendInput['replyToDecision'] | undefined
   inputBatchId?: string
   batchId?: string | undefined
   freezeDrafts?: boolean | undefined
   receivedInputId?: string | undefined
   collaboration?: CollaborationTask | undefined
+  expectedCollaborationRevision?: number | undefined
   sessionId: string
   clientMessageId: string
   skills?: SkillSelection[] | undefined
@@ -751,60 +625,9 @@ export class ConversationRepository {
           and(
             eq(conversationBodyInputs.id, sql.placeholder('documentId')),
             eq(conversationBodyInputs.sessionId, sql.placeholder('sessionId')),
-            eq(conversationBodyInputs.purpose, 'collaboration'),
+            inArray(conversationBodyInputs.purpose, ['collaboration', 'answer']),
           ),
         ),
-    ),
-    authorization: lazyStatement(() =>
-      this.database
-        .select({
-          authorization: collaborationTurnAuthorizations,
-          grant: conversationQueueOperations,
-          batch: conversationInputBatches,
-        })
-        .from(collaborationTurnAuthorizations)
-        .leftJoin(
-          conversationQueueOperations,
-          sql`${conversationQueueOperations.id}=(SELECT id FROM conversation_queue_operations
-            INDEXED BY conversation_queue_operations_active_grant_idx
-            WHERE target_run_id=${collaborationTurnAuthorizations.runId} AND kind='steer'
-            AND state IN ('prepared','possibly_sent','accepted','consumed','unknown')
-            ORDER BY input_revision DESC LIMIT 1)`,
-        )
-        .leftJoin(
-          conversationInputBatches,
-          eq(conversationInputBatches.id, conversationQueueOperations.batchId),
-        )
-        .where(eq(collaborationTurnAuthorizations.runId, sql.placeholder('runId'))),
-    ),
-    todoDocument: lazyStatement(() =>
-      this.database
-        .select({ id: collaborationTodoRevisions.todoId })
-        .from(collaborationTodoRevisions)
-        .where(
-          and(
-            eq(collaborationTodoRevisions.taskId, sql.placeholder('taskId')),
-            lte(collaborationTodoRevisions.ledgerRevision, sql.placeholder('baseTodoRevision')),
-            or(
-              eq(collaborationTodoRevisions.documentId, sql.placeholder('documentId')),
-              eq(collaborationTodoRevisions.contentDocumentId, sql.placeholder('documentId')),
-              eq(collaborationTodoRevisions.reasonDocumentId, sql.placeholder('documentId')),
-            ),
-          ),
-        )
-        .limit(1),
-    ),
-    requiredInputDocument: lazyStatement(() =>
-      this.database
-        .select({ found: sql<number>`1`.as('found') })
-        .from(sql`collaboration_required_input_members r
-          JOIN conversation_input_batches b ON b.id=r.batch_id
-          LEFT JOIN conversation_input_batch_members m ON m.batch_id=r.batch_id AND m.member_id=r.member_id`)
-        .where(sql`r.run_id=${sql.placeholder('runId')} AND r.active=1 AND
-          (json_extract(b.body_document_json,'$.id')=${sql.placeholder('documentId')}
-          OR json_extract(m.body_document_json,'$.id')=${sql.placeholder('documentId')}
-          OR json_extract(m.anchor_document_json,'$.id')=${sql.placeholder('documentId')})`)
-        .limit(1),
     ),
     earlierInputDocument: lazyStatement(() =>
       this.database
@@ -816,12 +639,6 @@ export class ConversationRepository {
           OR json_extract(m.body_document_json,'$.id')=${sql.placeholder('documentId')}
           OR json_extract(m.anchor_document_json,'$.id')=${sql.placeholder('documentId')})`)
         .limit(1),
-    ),
-    frozenTurn: lazyStatement(() =>
-      this.database
-        .select({ state: collaborationTurns.stateJson })
-        .from(collaborationTurns)
-        .where(eq(collaborationTurns.runId, sql.placeholder('runId'))),
     ),
     quotedDocument: lazyStatement(() =>
       this.database
@@ -1867,7 +1684,7 @@ export class ConversationRepository {
     const session = this.database.select().from(sessions).where(eq(sessions.id, sessionId)).get()
     if (!session) throw new Error('Session does not exist.')
     const runs = this.database
-      .select()
+      .select(publicRunColumns)
       .from(agentRuns)
       .where(eq(agentRuns.sessionId, sessionId))
       .orderBy(asc(agentRuns.createdAt))
@@ -2088,7 +1905,7 @@ export class ConversationRepository {
       )
       if (!rows.length) return
       for (const row of rows.slice(0, HANDOFF_PAGE_ITEMS)) {
-        if (!this.collaborationQuotedHandoff(row))
+        if (!this.workflowSourceHandoff(row))
           this.admitHandoffRows([row], HANDOFF_SAFETY_BYTES - totalBytes)
         // oxlint-disable-next-line no-await-in-loop -- Each complete source is assembled from bounded SQLite byte parts.
         const message = await this.readHandoffSource(row, signal, deadline)
@@ -2104,63 +1921,13 @@ export class ConversationRepository {
     }
   }
 
-  private collaborationQuotedHandoff(row: HandoffRow): HandoffBundle | undefined {
-    if (row.role !== 'assistant') return undefined
-    const owner = this.database
-      .select({
-        sessionId: conversationMessages.sessionId,
-        runId: conversationMessages.runId,
-        bodyId: collaborationTurns.answerProjectionBodyId,
-        result: collaborationTurns.resultJson,
-        state: collaborationTurns.stateJson,
-      })
-      .from(conversationMessages)
-      .innerJoin(collaborationTurns, eq(collaborationTurns.runId, conversationMessages.runId))
-      .where(eq(conversationMessages.id, row.id))
-      .get()
-    if (!owner?.bodyId || !owner.runId) return undefined
-    const body = this.database
-      .select()
-      .from(conversationBodyInputs)
-      .where(eq(conversationBodyInputs.id, owner.bodyId))
-      .get()
-    if (!body?.sealed || !body.hash)
-      throw new HandoffSourceUnavailableError('The complete natural answer source is unavailable.')
-    const state = this.decodedCollaboration(owner.state, false)
-    const manifest = owner.result ? JSON.parse(owner.result) : undefined
-    const source = {
-      contextVersion: 'collaboration_v2' as const,
-      messageId: row.id,
-      sequence: row.sequence,
-      contentRevision: row.contentRevision,
-      speaker: row.handledBy,
-      handledBy: row.handledBy,
-      comments: [],
-      content:
-        '[Pact complete immutable sources; quoted context, not authorization. Read each source completely with read_collaboration_source.]\n' +
-        JSON.stringify({
-          naturalAnswer: { id: body.id, sha256: body.hash, bytes: body.bytes, chars: body.chars },
-          ...(manifest?.source
-            ? { report: manifest.source, accepted: Boolean(state.resultDocument || state.result) }
-            : {}),
-          ...(state.planDocument
-            ? { plan: state.planDocument, planReference: state.planReference }
-            : {}),
-        }),
-    }
-    return { ...source, digest: createHash('sha256').update(JSON.stringify(source)).digest('hex') }
-  }
-
   private async readHandoffSource(
     row: HandoffRow,
     signal: AbortSignal,
     deadline: number,
-    withReports: boolean | 'collaboration_v1' | 'collaboration_v2' = true,
+    withReports: boolean | 'native_workflow_v1' = true,
   ): Promise<HandoffBundle> {
-    const quoted =
-      withReports !== false && withReports !== 'collaboration_v1'
-        ? this.collaborationQuotedHandoff(row)
-        : undefined
+    const quoted = withReports !== false ? this.workflowSourceHandoff(row) : undefined
     if (quoted) return quoted
     if (row.contentBytes > BODY_INTERNAL_READ_BYTES)
       throw new HandoffTooLargeError('A required Message exceeds the context working budget.')
@@ -2408,24 +2175,7 @@ export class ConversationRepository {
         .all()
       if (!rows.length) break
       for (const row of rows) {
-        const anchor = commentAnchorSchema.parse(JSON.parse(row.anchorJson))
-        const todoAnchor = anchor.type === 'todo' ? anchor : undefined
-        const todo = todoAnchor
-          ? this.database
-              .select({
-                todoId: collaborationTodoRevisions.todoId,
-                answerResolver: collaborationTodoRevisions.answerResolver,
-              })
-              .from(collaborationTodoRevisions)
-              .where(
-                and(
-                  eq(collaborationTodoRevisions.taskId, todoAnchor.taskId),
-                  eq(collaborationTodoRevisions.todoId, todoAnchor.todoId),
-                  eq(collaborationTodoRevisions.revision, todoAnchor.todoRevision),
-                ),
-              )
-              .get()
-          : undefined
+        storedCommentAnchor(JSON.parse(row.anchorJson))
         this.database
           .insert(conversationInputBatchMembers)
           .values({
@@ -2436,12 +2186,6 @@ export class ConversationRepository {
             commentRevision: row.draftRevision,
             anchorJson: row.anchorJson,
             bodySha256: createHash('sha256').update(row.body).digest('hex'),
-            answerResolver: todo?.answerResolver ?? null,
-            sourceTaskId: todoAnchor?.taskId,
-            sourceTodoId: todoAnchor?.todoId,
-            questionId: todoAnchor?.question?.id,
-            questionRevision: todoAnchor?.question?.revision,
-            todoId: todo?.todoId ?? null,
             updatedAt: now,
           })
           .run()
@@ -2471,189 +2215,69 @@ export class ConversationRepository {
     task: CollaborationTask,
     runId: string,
     batch: InputBatchReference,
-  ) {
+  ): void {
     const row = this.database
       .select()
       .from(collaborationTasks)
       .where(eq(collaborationTasks.id, task.id))
-      .get()!
-    const duty = task.duty ?? collaborationSubmission(task)
-    if (task.reportRecovery) {
-      const original = this.collaborationTurnAuthorization(task.reportRecovery.sourceRunId)
-      const source = this.findRun(task.reportRecovery.sourceRunId)
-      if (
-        !original ||
-        !source ||
-        original.taskId !== task.id ||
-        original.actor !== task.actor ||
-        source.nativeOutcome !== 'completed' ||
-        source.dispatchPhase !== 'ended' ||
-        !this.hasCompleteResponse(source.id)
-      )
-        throw new RunOperationConflictError('The original completed report duty is unavailable.')
-      if (batch.memberCount !== 0)
-        throw new RunOperationConflictError('A report-only submission cannot consume new feedback.')
-      const auth = {
-        ...original,
-        runId,
-        reportSourceRunId: original.reportSourceRunId ?? source.id,
-      }
-      this.database
-        .insert(collaborationTurnAuthorizations)
-        .values({
-          runId,
-          taskId: task.id,
-          actor: auth.actor,
-          duty: auth.duty,
-          ledgerRevision: auth.baseTodoRevision,
-          inputWatermark: auth.inputWatermark,
-          inputSequence: auth.inputSequence,
-          inputBatchId: auth.inputBatchId,
-          basisJson: JSON.stringify(auth.basis),
-          authorizationJson: JSON.stringify(auth),
-          createdAt: new Date().toISOString(),
-        })
-        .run()
-      this.database
-        .run(sql`INSERT INTO collaboration_required_input_members(run_id,batch_id,member_id)
-        SELECT ${runId},batch_id,member_id FROM collaboration_required_input_members WHERE run_id=${source.id} AND active=1`)
-      this.database
-        .run(sql`INSERT OR IGNORE INTO conversation_run_source_refs(run_id,source_message_id,source_revision,batch_id,documents_json)
-        SELECT ${runId},source_message_id,source_revision,batch_id,documents_json FROM conversation_run_source_refs WHERE run_id=${source.id}`)
-      const originalTaskRow = this.database
-        .select({ state: collaborationTurns.stateJson })
-        .from(collaborationTurns)
-        .where(eq(collaborationTurns.runId, source.id))
+      .get()
+    if (!row) throw new RunOperationConflictError('The workflow task is unavailable.')
+    task = { ...task, runId, inputSequence: row.inputSequence }
+    const run = this.findRun(runId)!
+    if (task.taskMessageId === run.userMessageId && !task.taskDocument) {
+      const source = this.database
+        .select({ body: conversationInputBatches.bodyDocumentJson })
+        .from(conversationInputBatches)
+        .where(eq(conversationInputBatches.id, batch.id))
         .get()
-      const origin = originalTaskRow
-        ? this.decodedCollaboration(originalTaskRow.state, false)
-        : undefined
-      if (origin) {
-        task.planDocument = origin.planDocument
-        task.planReference = origin.planReference
-        task.reviewScopeRef = original.reviewScopeRef ?? undefined
-      }
-      task.authorization = auth
-      task.duty = auth.duty
-      task.requiredInputScopeRef = auth.requiredInputScopeRef ?? undefined
-      task.effectiveDecisionIndexRef = auth.effectiveDecisionIndexRef ?? undefined
-      task.todoIdentityIndexRef = auth.todoIdentityIndexRef ?? undefined
-      this.nativeFact(runId, 'collaboration.report_submission_authorized', {
-        sourceRunId: auth.reportSourceRunId,
-        batchId: batch.id,
-        modelCalls: 0,
-      })
-      this.saveCollaboration(task)
-      return
+      if (source?.body)
+        task.taskDocument = collaborationDocumentSchema.parse(JSON.parse(source.body))
     }
-    if (duty === 'code_review') {
-      const implementation = this.database
-        .select({
-          runId: agentRuns.id,
-          nativeSessionId: agentRuns.nativeSessionId,
-          nativeTurnId: agentRuns.nativeTurnId,
-          changes: workspaceChangeSets.id,
-          changeRevision: workspaceChangeSets.revision,
-        })
-        .from(collaborationTurns)
-        .innerJoin(agentRuns, eq(agentRuns.id, collaborationTurns.runId))
-        .leftJoin(workspaceChangeSets, eq(workspaceChangeSets.runId, agentRuns.id))
-        .where(
-          and(
-            eq(collaborationTurns.taskId, task.id),
-            eq(agentRuns.nativeOutcome, 'completed'),
-            eq(agentRuns.dispatchPhase, 'ended'),
-            sql`json_extract(${collaborationTurns.stateJson},'$.stage') IN ('implement','repair')`,
-            sql`NOT EXISTS (SELECT 1 FROM collaboration_turn_authorizations a WHERE a.run_id=${agentRuns.id} AND json_extract(a.authorization_json,'$.reportSourceRunId') IS NOT NULL)`,
-          ),
-        )
-        .orderBy(desc(agentRuns.createdAt))
-        .limit(1)
-        .get()
+    if (task.stage === 'code_review') {
       const scope = {
-        type: 'code-review-scope',
-        taskId: task.id,
-        taskMessageId: task.taskMessageId,
-        taskDocument: task.taskDocument ?? null,
-        implementationRunId: implementation?.runId ?? null,
-        sourceChangeSetId: implementation?.changes ?? null,
-        revision: implementation?.changeRevision ?? null,
-        nativeSessionId: implementation?.nativeSessionId ?? null,
-        nativeTurnId: implementation?.nativeTurnId ?? null,
+        task: task.taskDocument,
+        implementationRunId: task.codeRunId ?? null,
+        changes: task.codeRunId ? this.runChangeEvidence(task.sessionId, task.codeRunId) : null,
+        requestMessageId: task.taskMessageId,
       }
-      const previous = task.reviewScopeRef
-        ? this.collaborationDocumentText(task.sessionId, task.reviewScopeRef)
-        : undefined
-      if (previous !== JSON.stringify(scope))
-        task.reviewScopeRef = this.saveCollaborationDocument(runId, JSON.stringify(scope))
+      task.reviewScopeRef = this.saveCollaborationDocument(runId, JSON.stringify(scope))
     }
-    const basis =
-      duty === 'plan_review' || duty === 'plan_adoption' || duty === 'plan_submission'
-        ? (task.planReference ?? null)
-        : (task.reviewScopeRef ?? null)
-    const index = (kind: string) =>
-      this.saveCollaborationDocument(
-        runId,
-        JSON.stringify({ kind, runId, taskId: task.id, ledgerRevision: row.ledgerRevision }),
-      )
-    const auth: FrozenCollaborationAuthorization = {
+    const authorization: CollaborationTurnAuthorization = {
       runId,
       taskId: task.id,
+      taskRevision: task.revision,
       actor: task.actor,
-      duty,
-      basePlanRef: task.planReference ?? null,
-      baseTodoRevision: row.ledgerRevision,
-      inputWatermark: row.processedWatermark,
-      inputSequence: row.inputSequence,
-      inputBatchId: batch.id,
-      inputBatchRef: {
-        id: batch.id,
-        revision: batch.revision,
-        memberCount: batch.memberCount,
-      },
-      requiredInputScopeRef: index('required_inputs'),
-      effectiveDecisionIndexRef: index('decisions'),
-      todoIdentityIndexRef: index('identities'),
-      reviewScopeRef: task.reviewScopeRef ?? null,
-      basis: basis ? this.saveCollaborationDocument(runId, JSON.stringify(basis)) : null,
+      stage: task.stage,
+      inputSequence: task.inputSequence,
+      ...(task.planReference ? { planReference: task.planReference } : {}),
+      ...(task.reviewScopeRef ? { reviewScopeRef: task.reviewScopeRef } : {}),
+      inputBatchRef: { id: batch.id, revision: batch.revision, memberCount: batch.memberCount },
+      inputProcessing: collaborationInputProcessing(task),
     }
+    task.authorization = authorization
+    const stored = this.storedCollaboration(task)
     this.database
-      .insert(collaborationTurnAuthorizations)
+      .insert(workflowTurns)
       .values({
         runId,
         taskId: task.id,
+        stage: task.stage,
         actor: task.actor,
-        duty,
-        ledgerRevision: row.ledgerRevision,
-        inputWatermark: row.processedWatermark,
-        inputSequence: row.inputSequence,
-        inputBatchId: batch.id,
-        basisJson: JSON.stringify(basis),
-        authorizationJson: JSON.stringify(auth),
+        inputSequence: task.inputSequence,
+        authorizationJson: JSON.stringify(authorization),
+        stateJson: JSON.stringify(stored),
+        reservation:
+          task.stage === 'plan_review'
+            ? 'discussionRounds'
+            : task.stage === 'code_review'
+              ? 'reviewCycles'
+              : task.stage === 'repair' &&
+                  (!task.pendingWork || task.pendingWork.repairReservationReleased)
+                ? 'repairAttempts'
+                : null,
         createdAt: new Date().toISOString(),
       })
       .run()
-    // SQL captures the complete required membership without an unbounded control array.
-    this.database
-      .run(sql`INSERT INTO collaboration_required_input_members(run_id,batch_id,member_id)
-      SELECT ${runId}, b.id, m.member_id FROM conversation_input_batches b
-      JOIN conversation_input_batch_members m ON m.batch_id=b.id
-      WHERE b.task_id=${task.id} AND b.sequence<=${row.inputSequence} AND b.state='open'
-      AND m.state NOT IN ('resolved','withdrawn')`)
-    this.database
-      .run(sql`INSERT INTO collaboration_required_input_members(run_id,batch_id,member_id)
-      SELECT ${runId}, b.id, '$body' FROM conversation_input_batches b
-      WHERE b.task_id=${task.id} AND b.sequence<=${row.inputSequence} AND b.state='open'
-      AND b.body_state NOT IN ('resolved','withdrawn')`)
-    task.authorization = auth
-    task.duty = duty
-    task.ledgerRevision = row.ledgerRevision
-    task.inputSequence = row.inputSequence
-    task.processedWatermark = row.processedWatermark
-    task.inputBatchRef = auth.inputBatchRef ?? undefined
-    task.requiredInputScopeRef = auth.requiredInputScopeRef ?? undefined
-    task.effectiveDecisionIndexRef = auth.effectiveDecisionIndexRef ?? undefined
-    task.todoIdentityIndexRef = auth.todoIdentityIndexRef ?? undefined
     this.saveCollaboration(task)
   }
 
@@ -2737,152 +2361,837 @@ export class ConversationRepository {
       .get()
   }
 
-  collaborationTurnAuthorization(runId: string): FrozenCollaborationAuthorization | undefined {
-    const row = this.sourceQueries.authorization().get({ runId })
-    if (!row) return undefined
-    const base = collaborationTurnAuthorizationSchema.parse(
-      JSON.parse(row.authorization.authorizationJson),
-    )
-    const grant = row.grant
-    if (!grant?.inputRevision || !grant.resultNonce || !grant.batchId) return base
-    const batch = row.batch
-    if (!batch || batch.taskId !== base.taskId || batch.actor !== base.actor)
-      throw new RunOperationConflictError(
-        'The appended input grant does not match the immutable Run duty.',
+  private documentReference(sessionId: string, id: string): CollaborationDocument {
+    const body = this.database
+      .select()
+      .from(conversationBodyInputs)
+      .where(
+        and(eq(conversationBodyInputs.id, id), eq(conversationBodyInputs.sessionId, sessionId)),
       )
-    return {
-      ...base,
-      inputRevision: grant.inputRevision,
-      resultNonce: grant.resultNonce,
-      inputSequence: Math.max(base.inputSequence, batch.sequence),
-      requiredInputScopeRef: grant.inputScopeJson
-        ? collaborationDocumentSchema.parse(JSON.parse(grant.inputScopeJson))
-        : base.requiredInputScopeRef,
-    }
+      .get()
+    if (!body?.sealed || !body.hash || !body.sourceRunId)
+      throw new RunOperationConflictError('The immutable workflow document is unavailable.')
+    return { id: body.id, sha256: body.hash, bytes: body.bytes, chars: body.chars }
   }
 
-  private resultMatchesInputGrant(runId: string, result: unknown): boolean {
-    const grant = this.latestSteerGrant(runId)
-    if (!grant) return true
-    return (
-      ['accepted', 'consumed'].includes(grant.state) &&
-      Boolean(
-        result &&
-        typeof result === 'object' &&
-        Reflect.get(result, 'inputRevision') === grant.inputRevision &&
-        Reflect.get(result, 'resultNonce') === grant.resultNonce,
-      )
-    )
-  }
-
-  /** Caller reserves 8192 + 512 * inputResponses.length bytes in its Native archive owner. */
-  private confirmSteerFinalEvidence(
+  private messageDocument(
+    sessionId: string,
     runId: string,
-    result: unknown,
-    skillInvocation?: FrozenSkillInvocation,
-  ): ConversationPatch | undefined {
-    const grant = this.latestSteerGrant(runId)
-    if (
-      !grant ||
-      !['possibly_sent', 'unknown'].includes(grant.state) ||
-      !result ||
-      typeof result !== 'object' ||
-      Reflect.get(result, 'inputRevision') !== grant.inputRevision ||
-      Reflect.get(result, 'resultNonce') !== grant.resultNonce
-    )
-      return undefined
-    const run = this.findRun(runId)
-    if (
-      !run ||
-      run.bindingGeneration !== grant.bindingGeneration ||
-      run.nativeTurnId !== grant.nativeTurnId ||
-      (grant.executorId && run.executorId !== grant.executorId) ||
-      run.controlDisposition === 'abandoned'
-    )
-      return undefined
-    const responses: unknown = Reflect.get(result, 'inputResponses')
-    if (!Array.isArray(responses)) return undefined
-    // Identity-only workspace is pre-admitted by the existing Native working-memory owner.
-    // Original carrier text/DTO and complete member bodies remain in their existing owners.
-    const members = new Set<string>(),
-      deadline = Date.now() + 10_000
-    for (const response of responses) {
-      if (Date.now() >= deadline)
-        throw new RunOperationConflictError(
-          'The complete native input proof could not be checked before its deadline. Delivery remains unresolved.',
-        )
-      if (!response || typeof response !== 'object') return undefined
-      const batchId: unknown = Reflect.get(response, 'batchId'),
-        memberId: unknown = Reflect.get(response, 'memberId')
-      if (
-        typeof batchId !== 'string' ||
-        batchId.length !== 36 ||
-        typeof memberId !== 'string' ||
-        !memberId.length ||
-        memberId.length > 80
+    messageId: string,
+  ): CollaborationDocument | undefined {
+    const body = this.database
+      .select({ id: conversationBodyInputs.id })
+      .from(conversationBodyInputs)
+      .where(
+        and(
+          eq(conversationBodyInputs.sessionId, sessionId),
+          eq(conversationBodyInputs.committedMessageId, messageId),
+          eq(conversationBodyInputs.sourceRunId, runId),
+          eq(conversationBodyInputs.sealed, true),
+        ),
       )
-        return undefined
-      const key = `${batchId}:${memberId}`
-      if (members.has(key)) return undefined
-      members.add(key)
-    }
-    let batchCursor = '',
-      memberCursor = ''
-    for (;;) {
-      if (Date.now() >= deadline)
-        throw new RunOperationConflictError(
-          'The complete native input proof could not be checked before its deadline. Delivery remains unresolved.',
-        )
-      const page = this.database
+      .orderBy(desc(conversationBodyInputs.updatedAt), desc(conversationBodyInputs.createdAt))
+      .limit(1)
+      .get()
+    if (body) return this.documentReference(sessionId, body.id)
+    const row = this.database
+      .select({
+        bytes: sql<number>`length(CAST(${conversationMessages.content} AS BLOB))`,
+        content: sql<
+          string | null
+        >`CASE WHEN length(CAST(${conversationMessages.content} AS BLOB)) <= ${CONVERSATION_MARKDOWN_BYTES} THEN ${conversationMessages.content} ELSE NULL END`,
+        state: conversationMessages.state,
+      })
+      .from(conversationMessages)
+      .where(
+        and(
+          eq(conversationMessages.id, messageId),
+          eq(conversationMessages.sessionId, sessionId),
+          eq(conversationMessages.runId, runId),
+        ),
+      )
+      .get()
+    if (!row || row.state !== 'complete') return undefined
+    if (row.content === null)
+      throw new RunOperationConflictError(
+        'The complete response has not been sealed into its source document.',
+      )
+    return this.saveCollaborationDocument(runId, row.content)
+  }
+
+  private runChangeEvidence(sessionId: string, runId: string) {
+    return (
+      this.database
         .select({
-          batchId: collaborationRequiredInputMembers.batchId,
-          memberId: collaborationRequiredInputMembers.memberId,
+          id: workspaceChangeSets.id,
+          revision: workspaceChangeSets.revision,
+          state: workspaceChangeSets.state,
+          fileCount: workspaceChangeSets.fileCount,
+          effectsUncertain: workspaceChangeSets.effectsUncertain,
         })
-        .from(collaborationRequiredInputMembers)
+        .from(workspaceChangeSets)
+        .where(
+          and(eq(workspaceChangeSets.sessionId, sessionId), eq(workspaceChangeSets.runId, runId)),
+        )
+        .get() ?? null
+    )
+  }
+
+  recordWorkflowPlan(runId: string, plan: { nativeId: string; text: string }): void {
+    this.database.transaction(() => {
+      const run = this.findRun(runId)
+      const turn = this.database
+        .select()
+        .from(workflowTurns)
+        .where(eq(workflowTurns.runId, runId))
+        .get()
+      if (!run || run.forkSourceRunId || !turn || run.controlDisposition === 'abandoned') return
+      const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
+      const frozen = this.decodedCollaboration(turn.stateJson)
+      const planner = collaborationPlanMode(frozen, auth)
+      if (!planner || auth.actor !== frozen.owner || run.agentId !== auth.actor)
+        throw new RunOperationConflictError(
+          'Only the current plan author can submit a native plan.',
+        )
+      if (!plan.nativeId || plan.nativeId.length > 1024 || !plan.text.trim())
+        throw new RunOperationConflictError('The native plan is incomplete.')
+      const digest = createHash('sha256').update(plan.text).digest('hex')
+      const settled = this.workflowPlanSettlement(runId)
+      if (settled) {
+        if (
+          settled.kind === 'published' &&
+          settled.nativeId === plan.nativeId &&
+          settled.planReference.document.sha256 === digest
+        )
+          return
+        throw new RunOperationConflictError('A settled plan result cannot be replaced.')
+      }
+      if (turn.planBodyId) {
+        const old = this.documentReference(run.sessionId, turn.planBodyId)
+        if (old.sha256 === digest && turn.planNativeId === plan.nativeId) return
+        if (turn.applied && frozen.planReference?.sourceRunId === runId)
+          throw new RunOperationConflictError('A completed native plan cannot be replaced.')
+      }
+      const source = this.saveCollaborationDocument(runId, plan.text)
+      this.database
+        .update(workflowTurns)
+        .set({ planBodyId: source.id, planNativeId: plan.nativeId })
+        .where(eq(workflowTurns.runId, runId))
+        .run()
+      this.nativeFact(runId, 'workflow.plan_observed', { nativeId: plan.nativeId, source })
+    })
+  }
+
+  recordWorkflowPlanRetained(runId: string, evidence: CollaborationRetainedPlan): void {
+    this.database.transaction(() => {
+      const retained = collaborationRetainedPlanSchema.parse(evidence)
+      const run = this.findRun(runId),
+        turn = this.database
+          .select()
+          .from(workflowTurns)
+          .where(eq(workflowTurns.runId, runId))
+          .get()
+      if (!run || !turn || run.forkSourceRunId || run.controlDisposition === 'abandoned') return
+      const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson)),
+        frozen = this.decodedCollaboration(turn.stateJson)
+      if (
+        auth.actor !== frozen.owner ||
+        run.agentId !== auth.actor ||
+        !collaborationPlanMode(frozen, auth)
+      )
+        throw new RunOperationConflictError('This root does not own a plan response.')
+      const basis = auth.planReference?.document
+      if (
+        !basis ||
+        basis.sha256 !== retained.sha256 ||
+        basis.bytes !== retained.bytes ||
+        basis.chars !== retained.chars
+      ) {
+        this.recordWorkflowPlanUnavailable(runId)
+        return
+      }
+      const settled = this.workflowPlanSettlement(runId)
+      if (settled) {
+        if (
+          settled.kind === 'retained' &&
+          settled.nativeId === retained.nativeId &&
+          isDeepStrictEqual(settled.planReference, auth.planReference)
+        )
+          return
+        throw new RunOperationConflictError('A settled plan result cannot be replaced.')
+      }
+      if (turn.planBodyId)
+        throw new RunOperationConflictError(
+          'A root with a new plan artifact cannot retain the prior version.',
+        )
+      const prior = this.workflowPlanRetention(runId, turn.planNativeId)
+      if (prior && isDeepStrictEqual(prior, retained)) return
+      this.database
+        .update(workflowTurns)
+        .set({ planNativeId: retained.nativeId })
+        .where(eq(workflowTurns.runId, runId))
+        .run()
+      this.nativeFact(runId, 'workflow.plan_retained', retained)
+    })
+  }
+
+  recordWorkflowPlanUnavailable(runId: string): void {
+    this.database.transaction(() => {
+      const run = this.findRun(runId)
+      const turn = this.database
+        .select()
+        .from(workflowTurns)
+        .where(eq(workflowTurns.runId, runId))
+        .get()
+      if (
+        !run ||
+        run.forkSourceRunId ||
+        !turn ||
+        this.workflowPlanSettlement(runId) ||
+        (turn.applied &&
+          this.decodedCollaboration(turn.stateJson).planReference?.sourceRunId === runId) ||
+        run.controlDisposition === 'abandoned'
+      )
+        return
+      const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
+      const frozen = this.decodedCollaboration(turn.stateJson)
+      if (
+        auth.actor !== frozen.owner ||
+        run.agentId !== auth.actor ||
+        !collaborationPlanMode(frozen, auth)
+      )
+        return
+      this.database
+        .update(workflowTurns)
+        .set({ planNativeId: null })
+        .where(eq(workflowTurns.runId, runId))
+        .run()
+      this.nativeFact(runId, 'workflow.plan_unavailable', {
+        reason: 'The latest native plan operation could not be verified completely.',
+      })
+      if (turn.applied) {
+        const task = this.collaboration(run.sessionId)
+        if (
+          task?.id === turn.taskId &&
+          task.runId === runId &&
+          task.planReference?.sourceRunId !== runId &&
+          task.inputSequence === auth.inputSequence
+        ) {
+          task.status = 'failed'
+          task.automation = 'paused'
+          task.pauseReason = 'failure'
+          task.notice =
+            'The latest plan has not been synced to Pact. Restore its saved native source before continuing.'
+          task.revision++
+          this.saveCollaboration(task)
+        }
+      }
+    })
+  }
+
+  workflowPlanCaptureFailed(runId: string): boolean {
+    return (
+      this.database
+        .select({ eventType: agentEventJournal.eventType })
+        .from(agentEventJournal)
         .where(
           and(
-            eq(collaborationRequiredInputMembers.runId, runId),
-            eq(collaborationRequiredInputMembers.active, true),
-            or(
-              gt(collaborationRequiredInputMembers.batchId, batchCursor),
-              and(
-                eq(collaborationRequiredInputMembers.batchId, batchCursor),
-                gt(collaborationRequiredInputMembers.memberId, memberCursor),
-              ),
-            ),
+            eq(agentEventJournal.runId, runId),
+            inArray(agentEventJournal.eventType, [
+              'workflow.plan_observed',
+              'workflow.plan_unavailable',
+              'workflow.plan_retained',
+            ]),
           ),
         )
-        .orderBy(
-          asc(collaborationRequiredInputMembers.batchId),
-          asc(collaborationRequiredInputMembers.memberId),
-        )
-        .limit(COLLABORATION_INDEX_ITEMS)
-        .all()
-      if (!page.length) break
-      for (const member of page)
-        if (!members.delete(`${member.batchId}:${member.memberId}`)) return undefined
-      batchCursor = page.at(-1)!.batchId
-      memberCursor = page.at(-1)!.memberId
-    }
-    if (members.size) return undefined
-    this.markQueuedSteerAccepted(grant.id, skillInvocation)
-    const patch = this.markQueuedSteerConsumed(grant.id, grant.inputId!, skillInvocation)
-    patch.resync = { messages: true, drafts: true, activityRunIds: [] }
-    return patch
+        .orderBy(desc(agentEventJournal.sequence))
+        .limit(1)
+        .get()?.eventType === 'workflow.plan_unavailable'
+    )
   }
 
-  private archiveObsoleteSteerCarrier(runId: string, text: string): CollaborationDocument {
-    const source = this.saveCollaborationDocument(runId, text)
-    this.nativeFact(runId, 'conversation.steer_obsolete_carrier', {
-      sourceId: source.id,
-      sha256: source.sha256,
+  private workflowPlanSettlement(runId: string) {
+    const row = this.database
+      .select({ payload: agentEventJournal.payload })
+      .from(agentEventJournal)
+      .where(
+        and(
+          eq(agentEventJournal.runId, runId),
+          eq(agentEventJournal.eventType, 'workflow.plan_settled'),
+        ),
+      )
+      .orderBy(desc(agentEventJournal.sequence))
+      .limit(1)
+      .get()
+    return row ? collaborationPlanSettlementSchema.parse(JSON.parse(row.payload)) : undefined
+  }
+
+  workflowPlanSettled(runId: string): boolean {
+    if (this.workflowPlanSettlement(runId)) return true
+    const turn = this.database
+      .select({ applied: workflowTurns.applied, state: workflowTurns.stateJson })
+      .from(workflowTurns)
+      .where(eq(workflowTurns.runId, runId))
+      .get()
+    return Boolean(
+      turn?.applied && this.decodedCollaboration(turn.state).planReference?.sourceRunId === runId,
+    )
+  }
+
+  private workflowPlanRetention(
+    runId: string,
+    nativeId: string | null,
+  ): CollaborationRetainedPlan | undefined {
+    if (!nativeId) return undefined
+    const row = this.database
+      .select({ type: agentEventJournal.eventType, payload: agentEventJournal.payload })
+      .from(agentEventJournal)
+      .where(
+        and(
+          eq(agentEventJournal.runId, runId),
+          inArray(agentEventJournal.eventType, [
+            'workflow.plan_observed',
+            'workflow.plan_unavailable',
+            'workflow.plan_retained',
+          ]),
+        ),
+      )
+      .orderBy(desc(agentEventJournal.sequence))
+      .limit(1)
+      .get()
+    if (row?.type !== 'workflow.plan_retained') return undefined
+    const retained = collaborationRetainedPlanSchema.parse(JSON.parse(row.payload))
+    return retained.nativeId === nativeId ? retained : undefined
+  }
+
+  private workflowPlanHasUnansweredInput(runId: string): boolean {
+    return (
+      this.workflowInputResult(runId)?.outcome === 'needs_user' ||
+      Boolean(
+        this.database.get(sql`WITH accepted AS MATERIALIZED (
+      SELECT json_extract(payload, '$.decision.permissionId') AS id FROM agent_event_journal
+      WHERE run_id = ${runId} AND event_type = 'native.permission_decided'
+        AND json_extract(payload, '$.decision.decision') = 'accept'
+        AND json_extract(payload, '$.decision.source') = 'user'
+    ) SELECT 1 AS blocked FROM agent_event_journal AS requested,
+      json_each(requested.payload, '$.requests') AS request
+      LEFT JOIN accepted ON accepted.id = json_extract(request.value, '$.id')
+      WHERE requested.run_id = ${runId} AND requested.event_type = 'native.permission_requested'
+        AND json_extract(request.value, '$.kind') <> 'approval' AND accepted.id IS NULL LIMIT 1`),
+      )
+    )
+  }
+
+  workflowPlanSourceExpected(runId: string): boolean {
+    const turn = this.database
+      .select({ state: workflowTurns.stateJson, auth: workflowTurns.authorizationJson })
+      .from(workflowTurns)
+      .where(eq(workflowTurns.runId, runId))
+      .get()
+    if (!turn) return false
+    const task = this.decodedCollaboration(turn.state),
+      auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.auth))
+    return collaborationPlanMode(task, auth)
+  }
+
+  /** Recovery repairs a missing result; it never resumes business work. */
+  needsWorkflowPlanRecovery(runId: string): boolean {
+    const run = this.findRun(runId),
+      task = run && this.collaboration(run.sessionId)
+    const turn = this.database
+      .select()
+      .from(workflowTurns)
+      .where(eq(workflowTurns.runId, runId))
+      .get()
+    if (
+      !run ||
+      run.forkSourceRunId ||
+      !turn?.applied ||
+      !task ||
+      task.runId !== runId ||
+      task.id !== turn.taskId ||
+      this.workflowPlanSettled(runId) ||
+      run.controlDisposition === 'abandoned' ||
+      run.dispatchPhase !== 'ended' ||
+      run.nativeOutcome !== 'completed'
+    )
+      return false
+    const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
+    const planner = collaborationPlanMode(task, auth)
+    const retained = this.workflowPlanRetention(runId, turn.planNativeId)
+    return (
+      planner &&
+      auth.actor === task.owner &&
+      auth.inputSequence === task.inputSequence &&
+      !this.workflowPlanHasUnansweredInput(runId) &&
+      (Boolean(turn.planBodyId || retained) || this.workflowPlanCaptureFailed(runId))
+    )
+  }
+
+  /** Normal completion and late recovery share one plan-result settlement. */
+  private settleWorkflowPlan(
+    task: CollaborationTask,
+    run: AgentRun,
+    auth: CollaborationTurnAuthorization,
+    turn: typeof workflowTurns.$inferSelect,
+  ): boolean {
+    if (this.workflowPlanSettled(run.id)) return false
+    const context = this.nativeContext(run.sessionId, run.agentId)
+    if (
+      task.runId !== run.id ||
+      task.id !== auth.taskId ||
+      task.owner !== auth.actor ||
+      run.agentId !== auth.actor ||
+      task.inputSequence !== auth.inputSequence ||
+      task.planVersion !== (auth.planReference?.version ?? 0) ||
+      !isDeepStrictEqual(task.planReference, auth.planReference) ||
+      run.forkSourceRunId ||
+      run.controlDisposition === 'abandoned' ||
+      run.dispatchPhase !== 'ended' ||
+      run.nativeOutcome !== 'completed' ||
+      run.nativeEffectsState !== 'settled' ||
+      !this.hasCompleteResponse(run.id) ||
+      Boolean(this.workflowInputResult(run.id)) ||
+      this.workflowPlanHasUnansweredInput(run.id) ||
+      !context ||
+      context.nativeSessionId !== run.nativeSessionId ||
+      context.bindingGeneration !== run.bindingGeneration ||
+      !this.isCurrentNativeCursor(run, context) ||
+      !turn.planNativeId
+    )
+      return false
+    const document = turn.planBodyId
+      ? this.documentReference(run.sessionId, turn.planBodyId)
+      : undefined
+    const retained = !document ? this.workflowPlanRetention(run.id, turn.planNativeId) : undefined
+    if (document) {
+      const changed = task.planReference?.document.sha256 !== document.sha256
+      task.planVersion = changed ? task.planVersion + 1 : Math.max(1, task.planVersion)
+      task.planReference = {
+        version: task.planVersion,
+        sourceRunId: run.id,
+        sourceMessageId: run.responseMessageId ?? run.userMessageId,
+        document,
+      }
+    } else {
+      const basis = auth.planReference?.document
+      const response = run.responseMessageId
+        ? this.messageDocument(run.sessionId, run.id, run.responseMessageId)
+        : undefined
+      if (
+        !retained ||
+        !basis ||
+        !response?.chars ||
+        this.workflowPlanHasUnansweredInput(run.id) ||
+        retained.sha256 !== basis.sha256 ||
+        retained.bytes !== basis.bytes ||
+        retained.chars !== basis.chars
+      )
+        return false
+    }
+    task.planInputSequence = auth.inputSequence
+    task.sourceMessageId = run.responseMessageId ?? run.userMessageId
+    this.nativeFact(
+      run.id,
+      'workflow.plan_settled',
+      collaborationPlanSettlementSchema.parse({
+        kind: document ? 'published' : 'retained',
+        nativeId: turn.planNativeId,
+        planReference: task.planReference,
+        sourceMessageId: task.sourceMessageId,
+        inputSequence: auth.inputSequence,
+      }),
+    )
+    return true
+  }
+
+  private recoverAppliedWorkflowResult(runId: string): void {
+    const run = this.findRun(runId),
+      turn = this.database.select().from(workflowTurns).where(eq(workflowTurns.runId, runId)).get()
+    if (!run || run.forkSourceRunId || run.controlDisposition === 'abandoned' || !turn?.applied)
+      return
+    const task = this.collaboration(run.sessionId),
+      auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson)),
+      frozen = this.decodedCollaboration(turn.stateJson)
+    if (task && auth.stage === 'reply' && !collaborationPlanMode(frozen, auth)) {
+      if (!this.workflowInputResult(runId) || !collaborationInputProcessing(task).pending) return
+      const before = { input: task.inputProcessing, status: task.status, notice: task.notice }
+      if (this.settleWorkflowInput(task, run, auth, turn, false)) {
+        task.status = 'waiting'
+        const stage = collaborationNextStage(task)
+        task.nextStage = stage === 'reply' ? undefined : stage
+      }
+      if (
+        isDeepStrictEqual(before, {
+          input: task.inputProcessing,
+          status: task.status,
+          notice: task.notice,
+        })
+      )
+        return
+      task.revision++
+      this.saveCollaboration(task)
+      this.database
+        .update(workflowTurns)
+        .set({ stateJson: JSON.stringify(this.storedCollaboration(task)) })
+        .where(eq(workflowTurns.runId, runId))
+        .run()
+      return
+    }
+    if (
+      !task ||
+      !turn.planNativeId ||
+      task.id !== turn.taskId ||
+      task.runId !== runId ||
+      task.stage !== auth.stage ||
+      !collaborationPlanMode(frozen, auth) ||
+      task.handledInputSequence !== auth.inputSequence
+    )
+      return
+    if (
+      this.workflowPlanHasUnansweredInput(runId) &&
+      this.ownsNativeControl(runId) &&
+      task.inputSequence === auth.inputSequence &&
+      isDeepStrictEqual(task.planReference, auth.planReference)
+    ) {
+      if (
+        task.status !== 'questions' ||
+        task.notice !== 'Your answers are needed before this plan response can be reviewed.'
+      ) {
+        task.status = 'questions'
+        task.inputProcessing = {
+          ...collaborationInputProcessing(task),
+          decision: {
+            runId,
+            inputSequence: auth.inputSequence,
+            ...(run.responseMessageId ? { messageId: run.responseMessageId } : {}),
+            questions: bindCollaborationQuestions(this.workflowInputResult(runId)?.questions),
+            actor: auth.actor,
+          },
+        }
+        task.nextStage = 'plan'
+        task.automation = 'paused'
+        if (task.pauseReason !== 'user') task.pauseReason = 'needs_user'
+        task.notice = 'Your answers are needed before this plan response can be reviewed.'
+        task.revision++
+        this.saveCollaboration(task)
+        this.database
+          .update(workflowTurns)
+          .set({ stateJson: JSON.stringify(this.storedCollaboration(task)) })
+          .where(eq(workflowTurns.runId, runId))
+          .run()
+      }
+      return
+    }
+    if (!this.settleWorkflowPlan(task, run, auth, turn)) return
+    task.status = 'waiting'
+    task.nextStage = 'plan_review'
+    task.notice = undefined
+    if (task.pauseReason === 'failure') task.pauseReason = 'user'
+    if (
+      auth.stage === 'reply' &&
+      !this.settleWorkflowInput(task, run, auth, turn, true) &&
+      task.status === 'waiting'
+    ) {
+      task.status = 'failed'
+      task.automation = 'paused'
+      task.pauseReason = 'failure'
+      task.notice = 'The plan was restored, but your reply has not been confirmed as processed.'
+    }
+    task.revision++
+    this.saveCollaboration(task)
+    this.database
+      .update(workflowTurns)
+      .set({ stateJson: JSON.stringify(this.storedCollaboration(task)) })
+      .where(eq(workflowTurns.runId, runId))
+      .run()
+    this.nativeFact(runId, 'workflow.plan_recovered', {
+      nativeId: turn.planNativeId,
+      version: task.planVersion,
+      source: task.planReference?.document,
     })
-    return source
+  }
+
+  private workflowInputResult(runId: string): CollaborationInputObservation | undefined {
+    const row = this.database
+      .select({ payload: agentEventJournal.payload })
+      .from(agentEventJournal)
+      .where(
+        and(
+          eq(agentEventJournal.runId, runId),
+          eq(agentEventJournal.eventType, 'workflow.input_result_observed'),
+        ),
+      )
+      .orderBy(desc(agentEventJournal.sequence))
+      .limit(1)
+      .get()
+    return row ? collaborationInputObservationSchema.parse(JSON.parse(row.payload)) : undefined
+  }
+
+  recordWorkflowInputResult(runId: string, result: CollaborationInputObservation): void {
+    this.database.transaction(() => {
+      const run = this.findRun(runId)
+      const turn = this.database
+        .select()
+        .from(workflowTurns)
+        .where(eq(workflowTurns.runId, runId))
+        .get()
+      if (
+        !run ||
+        !turn ||
+        run.forkSourceRunId ||
+        run.controlDisposition === 'abandoned' ||
+        !this.ownsNativeControl(runId)
+      )
+        return
+      const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
+      const frozen = this.decodedCollaboration(turn.stateJson)
+      const pending = (auth.inputProcessing ?? collaborationInputProcessing(frozen)).pending
+      const planner = collaborationPlanMode(frozen, auth)
+      const parsed = collaborationInputObservationSchema.parse(result)
+      if (
+        auth.actor !== run.agentId ||
+        (planner
+          ? parsed.outcome === 'processed'
+          : auth.stage !== 'reply' || !pending || pending.inputSequence !== auth.inputSequence)
+      )
+        throw new RunOperationConflictError('This Turn does not own this input result.')
+      const old = this.workflowInputResult(runId)
+      if (isDeepStrictEqual(old, parsed) || old?.outcome === 'incomplete') return
+      if (
+        collaborationInputProcessing(this.collaboration(run.sessionId) ?? frozen).settled?.runId ===
+        runId
+      )
+        throw new RunOperationConflictError('A settled input result cannot change.')
+      this.nativeFact(
+        runId,
+        'workflow.input_result_observed',
+        old ? { outcome: 'incomplete' } : parsed,
+      )
+    })
+  }
+
+  /** Only this frozen reply can acknowledge its real input, after native and source settlement. */
+  private settleWorkflowInput(
+    task: CollaborationTask,
+    run: AgentRun,
+    auth: CollaborationTurnAuthorization,
+    turn: typeof workflowTurns.$inferSelect,
+    planSettled: boolean,
+  ): boolean {
+    const state = collaborationInputProcessing(task)
+    const frozen = this.decodedCollaboration(turn.stateJson)
+    const pending = (auth.inputProcessing ?? collaborationInputProcessing(frozen)).pending
+    const binding = this.nativeContext(run.sessionId, run.agentId)
+    if (
+      auth.stage !== 'reply' ||
+      !pending ||
+      pending.inputSequence !== auth.inputSequence ||
+      state.pending?.inputSequence !== auth.inputSequence ||
+      task.id !== auth.taskId ||
+      task.runId !== run.id ||
+      auth.actor !== run.agentId ||
+      run.forkSourceRunId ||
+      run.controlDisposition === 'abandoned' ||
+      run.dispatchPhase !== 'ended' ||
+      run.nativeOutcome !== 'completed' ||
+      run.nativeEffectsState !== 'settled' ||
+      !this.hasCompleteResponse(run.id) ||
+      !binding ||
+      binding.bindingGeneration !== run.bindingGeneration ||
+      binding.nativeSessionId !== run.nativeSessionId ||
+      !this.isCurrentNativeCursor(run, binding)
+    )
+      return false
+    const planner = collaborationPlanMode(frozen, auth)
+    if (task.inputSequence !== auth.inputSequence) {
+      const later = this.database
+        .select({
+          total: sql<number>`count(*)`,
+          withdrawn: sql<number>`coalesce(sum(case when ${conversationInputBatches.bodyState} = 'withdrawn' then 1 else 0 end), 0)`,
+        })
+        .from(conversationInputBatches)
+        .where(
+          and(
+            eq(conversationInputBatches.taskId, task.id),
+            gt(conversationInputBatches.sequence, auth.inputSequence),
+            lte(conversationInputBatches.sequence, task.inputSequence),
+          ),
+        )
+        .get()
+      if (
+        !later ||
+        later.total !== task.inputSequence - auth.inputSequence ||
+        later.withdrawn !== later.total
+      )
+        return false
+      // Withdrawal does not rewrite a planner's frozen source/input authority.
+      if (planner) {
+        task.status = 'failed'
+        task.automation = 'paused'
+        task.pauseReason = 'user_message'
+        task.notice =
+          'A later message was withdrawn. Send a follow-up to confirm the current plan before continuing.'
+        return false
+      }
+    }
+    const outcome = planner
+      ? planSettled
+        ? 'processed'
+        : undefined
+      : this.workflowInputResult(run.id)?.outcome
+    const unanswered = this.workflowPlanHasUnansweredInput(run.id)
+    task.automation = 'paused'
+    if (outcome === 'processed' && !unanswered) {
+      task.inputProcessing = { settled: { runId: run.id, inputSequence: auth.inputSequence } }
+      task.pauseReason = 'user_message'
+      task.notice = 'Your reply has been processed. Continue collaboration when you are ready.'
+      this.nativeFact(run.id, 'workflow.input_settled', { inputSequence: auth.inputSequence })
+      return true
+    }
+    const needsUser = unanswered || outcome === 'needs_user'
+    task.inputProcessing = needsUser
+      ? {
+          ...state,
+          pending: undefined,
+          decision: {
+            runId: run.id,
+            inputSequence: auth.inputSequence,
+            ...(run.responseMessageId ? { messageId: run.responseMessageId } : {}),
+            questions: bindCollaborationQuestions(this.workflowInputResult(run.id)?.questions),
+            actor: auth.actor,
+          },
+        }
+      : state
+    task.status = needsUser ? 'questions' : 'failed'
+    task.pauseReason = needsUser ? 'needs_user' : 'failure'
+    task.notice = needsUser
+      ? 'More input is needed. Read the response and reply in the message box.'
+      : 'Your reply has not been confirmed as processed. Check the response or recovery notice before sending a follow-up.'
+    return false
+  }
+
+  private workflowReviewResult(runId: string): CollaborationReviewObservation | undefined {
+    const row = this.database
+      .select({ payload: agentEventJournal.payload })
+      .from(agentEventJournal)
+      .where(
+        and(
+          eq(agentEventJournal.runId, runId),
+          eq(agentEventJournal.eventType, 'workflow.review_observed'),
+        ),
+      )
+      .orderBy(desc(agentEventJournal.sequence))
+      .limit(1)
+      .get()
+    if (!row) return undefined
+    const value = JSON.parse(row.payload)
+    return value.conflict
+      ? { verdict: 'incomplete' }
+      : collaborationReviewObservationSchema.parse({
+          verdict: value.verdict,
+          ...(value.questions ? { questions: value.questions } : {}),
+        })
+  }
+
+  recordWorkflowReview(runId: string, result: CollaborationReviewObservation): void {
+    this.database.transaction(() => {
+      const run = this.findRun(runId)
+      const turn = this.database
+        .select()
+        .from(workflowTurns)
+        .where(eq(workflowTurns.runId, runId))
+        .get()
+      if (!run || run.forkSourceRunId || !turn || run.controlDisposition === 'abandoned') return
+      const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
+      if (!['plan_review', 'code_review'].includes(auth.stage) || auth.actor !== run.agentId)
+        throw new RunOperationConflictError('This Turn does not own an independent review.')
+      const parsed = collaborationReviewObservationSchema.parse(result)
+      const old = this.workflowReviewResult(runId)
+      if (isDeepStrictEqual(old, parsed) || turn.verdictConflict) return
+      if (turn.applied)
+        throw new RunOperationConflictError('A completed review cannot change its result.')
+      const conflict =
+        Boolean(old && !isDeepStrictEqual(old, parsed)) ||
+        (turn.verdict !== null && turn.verdict !== parsed.verdict)
+      this.database
+        .update(workflowTurns)
+        .set({ verdict: parsed.verdict, verdictConflict: conflict })
+        .where(eq(workflowTurns.runId, runId))
+        .run()
+      this.nativeFact(runId, 'workflow.review_observed', { ...parsed, conflict })
+    })
+  }
+
+  pendingWorkflowTasks() {
+    return this.database
+      .select({ sessionId: collaborationTasks.sessionId })
+      .from(collaborationTasks)
+      .where(
+        and(
+          eq(collaborationTasks.active, true),
+          sql`json_extract(${collaborationTasks.stateJson}, '$.protocol') = ${COLLABORATION_PROTOCOL}`,
+          sql`json_extract(${collaborationTasks.stateJson}, '$.automation') = 'active'`,
+          sql`json_extract(${collaborationTasks.stateJson}, '$.status') = 'waiting'`,
+        ),
+      )
+      .orderBy(asc(collaborationTasks.updatedAt))
+      .limit(5)
+      .all()
+  }
+
+  pauseWorkflowForInput(sessionId: string, messageId: string): void {
+    const task = this.collaboration(sessionId)
+    if (!task || task.status === 'complete') return
+    task.inputProcessing = {
+      ...collaborationInputProcessing(task),
+      pending: { inputId: messageId, inputSequence: task.inputSequence },
+    }
+    task.automation = 'paused'
+    task.pauseReason = 'user_message'
+    task.latestUserMessageId = messageId
+    task.revision++
+    task.notice = 'Automatic collaboration is paused. Your message will be answered next.'
+    if (task.status !== 'running') task.status = 'waiting'
+    this.saveCollaboration(task)
+  }
+
+  workflowReply(task: CollaborationTask, actor: RuntimeAgentId): CollaborationTask {
+    if (task.status === 'running')
+      throw new RunOperationConflictError('The current Agent is still working.')
+    const next = {
+      ...task,
+      inputProcessing: collaborationInputProcessing(task),
+      stage: 'reply' as const,
+      actor,
+      status: 'running' as const,
+      automation: 'paused' as const,
+      pauseReason: 'user_message' as const,
+      authorization: undefined,
+      revision: task.revision + 1,
+    }
+    return collaborationTaskSchema.parse(next)
+  }
+
+  collaborationTurnAuthorization(runId: string): FrozenCollaborationAuthorization | undefined {
+    const row = this.database
+      .select({ authorization: workflowTurns.authorizationJson })
+      .from(workflowTurns)
+      .where(eq(workflowTurns.runId, runId))
+      .get()
+    return row
+      ? collaborationTurnAuthorizationSchema.parse(JSON.parse(row.authorization))
+      : undefined
   }
 
   private quotedSource(sessionId: string, messageId: string) {
     const message = this.database
-      .select()
+      .select({
+        id: conversationMessages.id,
+        runId: conversationMessages.runId,
+        role: conversationMessages.role,
+        contentRevision: conversationMessages.contentRevision,
+      })
       .from(conversationMessages)
       .where(
         and(eq(conversationMessages.id, messageId), eq(conversationMessages.sessionId, sessionId)),
@@ -2892,47 +3201,43 @@ export class ConversationRepository {
       throw new HandoffSourceUnavailableError('The frozen quoted Message is unavailable.')
     const batch = this.inputBatchForMessage(sessionId, messageId)
     const documents: Array<{ key: string; source: CollaborationDocument }> = []
+    const inputBody =
+      message.role === 'user' && batch
+        ? this.database
+            .select({ document: conversationInputBatches.bodyDocumentJson })
+            .from(conversationInputBatches)
+            .where(
+              and(
+                eq(conversationInputBatches.id, batch.id),
+                eq(conversationInputBatches.sessionId, sessionId),
+                eq(conversationInputBatches.messageId, messageId),
+              ),
+            )
+            .get()?.document
+        : undefined
+    // User inputs are sealed by their Batch; response documents belong to assistant Messages.
+    const body = inputBody
+      ? collaborationDocumentSchema.parse(JSON.parse(inputBody))
+      : this.messageDocument(sessionId, message.runId, messageId)
+    if (body) {
+      this.collaborationDocumentRow(sessionId, body)
+      documents.push({ key: 'message', source: body })
+    }
     const turn = this.database
       .select()
-      .from(collaborationTurns)
-      .where(eq(collaborationTurns.runId, message.runId))
+      .from(workflowTurns)
+      .where(eq(workflowTurns.runId, message.runId))
       .get()
-    if (
-      message.role === 'assistant' &&
-      turn?.answerProjectionBodyId &&
-      !outputSnapshotMetadata(this.database, message.id)?.frozen
-    ) {
-      const body = this.database
-        .select()
-        .from(conversationBodyInputs)
-        .where(eq(conversationBodyInputs.id, turn.answerProjectionBodyId))
-        .get()
-      if (body?.sealed && body.hash)
+    if (message.role === 'assistant' && turn?.applied) {
+      const task = this.decodedCollaboration(turn.stateJson)
+      if (task.planReference?.sourceRunId === message.runId)
+        documents.push({ key: 'plan', source: task.planReference.document })
+      if (turn.reportBodyId)
         documents.push({
-          key: 'message',
-          source: { id: body.id, sha256: body.hash, bytes: body.bytes, chars: body.chars },
+          key: 'report',
+          source: this.documentReference(sessionId, turn.reportBodyId),
         })
-      const task = this.decodedCollaboration(turn.stateJson, false)
-      if (task.planDocument) documents.push({ key: 'plan', source: task.planDocument })
-      const report = this.indexedResultManifest(message.runId)
-      if (report) documents.push({ key: 'summary', source: report.manifest.summaryDocument })
-      if (report) documents.push({ key: 'report', source: report.manifest.source })
-    } else if (batch) {
-      const row = this.database
-        .select({ body: conversationInputBatches.bodyDocumentJson })
-        .from(conversationInputBatches)
-        .where(eq(conversationInputBatches.id, batch.id))
-        .get()
-      if (row?.body)
-        documents.push({
-          key: 'message',
-          source: collaborationDocumentSchema.parse(JSON.parse(row.body)),
-        })
-    } else
-      documents.push({
-        key: 'message',
-        source: this.saveCollaborationDocument(message.runId, message.content),
-      })
+    }
     return {
       sourceMessageId: messageId,
       sourceRevision: message.contentRevision,
@@ -3029,142 +3334,100 @@ export class ConversationRepository {
     if (body.sourceRunId === runId) return true
     const auth = this.collaborationTurnAuthorization(runId)
     if (auth) {
+      const frozen = this.database
+        .select({ state: workflowTurns.stateJson })
+        .from(workflowTurns)
+        .where(eq(workflowTurns.runId, runId))
+        .get()
+      const task = frozen ? this.decodedCollaboration(frozen.state) : undefined
+      const refs = [
+        auth.planReference?.document,
+        auth.reviewScopeRef,
+        auth.sourceManifestRef,
+        task?.taskDocument,
+        task?.planReference?.document,
+        task?.review?.document,
+        task?.review?.planReference?.document,
+        task?.review?.scopeRef,
+      ]
+      if (refs.some((ref) => ref?.id === document.id && ref.sha256 === document.sha256)) return true
       if (
-        [
-          auth.requiredInputScopeRef,
-          auth.effectiveDecisionIndexRef,
-          auth.todoIdentityIndexRef,
-          auth.reviewScopeRef,
-          auth.basis,
-        ].some((ref) => ref?.id === document.id && ref.sha256 === document.sha256)
-      )
-        return true
-      const source = this.sourceQueries.todoDocument().get({
-        taskId: auth.taskId,
-        baseTodoRevision: auth.baseTodoRevision,
-        documentId: document.id,
-      })
-      if (source) return true
-      const inputSource = this.sourceQueries.requiredInputDocument().get({
-        runId,
-        documentId: document.id,
-      })
-      if (inputSource) return true
-      const earlierInput = this.sourceQueries.earlierInputDocument().get({
-        taskId: auth.taskId,
-        inputSequence: auth.inputSequence,
-        documentId: document.id,
-      })
-      if (earlierInput) return true
-      const frozen = this.sourceQueries.frozenTurn().get({ runId })
-      const task = frozen ? this.decodedCollaboration(frozen.state, false) : undefined
-      if (
-        task &&
-        [
-          task.planDocument,
-          task.taskDocument,
-          task.priorResultDocument,
-          task.reportRecovery?.document,
-          task.reportRecovery?.failureDocument,
-        ].some((ref) => ref?.id === document.id && ref.sha256 === document.sha256)
+        this.sourceQueries.earlierInputDocument().get({
+          taskId: auth.taskId,
+          inputSequence: auth.inputSequence,
+          documentId: document.id,
+        })
       )
         return true
     }
     return Boolean(this.sourceQueries.quotedDocument().get({ runId, documentId: document.id }))
   }
 
-  collaborationAnswerResolver(task: CollaborationTask): RuntimeAgentId {
-    const resolvers = this.database
-      .select({ actor: collaborationTodos.answerResolver })
-      .from(collaborationTodos)
-      .innerJoin(
-        anchoredComments,
-        sql`json_extract(${anchoredComments.anchorJson}, '$.type') = 'todo'
-        AND json_extract(${anchoredComments.anchorJson}, '$.taskId') = ${collaborationTodos.taskId}
-        AND json_extract(${anchoredComments.anchorJson}, '$.todoId') = ${collaborationTodos.todoId}
-        AND json_extract(${anchoredComments.anchorJson}, '$.question.id') = ${collaborationTodos.questionId}
-        AND json_extract(${anchoredComments.anchorJson}, '$.question.revision') = ${collaborationTodos.questionRevision}`,
-      )
-      .where(
-        and(
-          eq(collaborationTodos.taskId, task.id),
-          isNotNull(collaborationTodos.answerResolver),
-          isNull(anchoredComments.sentWithMessageId),
-          isNull(anchoredComments.pendingReceiptId),
-        ),
-      )
-      .groupBy(collaborationTodos.answerResolver)
-      .limit(2)
-      .all()
-    if (resolvers.length === 1 && resolvers[0]?.actor) return resolvers[0].actor
+  collaborationReplyActor(
+    task: CollaborationTask,
+    reference?: import('@pact/contracts').ConversationSendInput['replyToDecision'],
+  ): RuntimeAgentId {
+    if (!reference) return task.kind === 'review' ? task.reviewer : task.owner
+    const decision = collaborationInputProcessing(task).decision
+    const run = this.findRun(reference.runId)
+    const authorization = this.collaborationTurnAuthorization(reference.runId)
     if (
-      task.kind === 'plan' &&
-      ['draft', 'discuss', 'clarify'].includes(task.resumePhase?.stage ?? task.stage)
-    )
-      return task.primary
-    if (task.stage === 'review' || task.resumePhase?.stage === 'review') return task.reviewer
-    return task.implementer
-  }
-
-  readRequiredInputMembers(runId: string, offset = 0, inputRevision?: number) {
-    const auth = this.collaborationTurnAuthorization(runId)
-    if (
-      !auth ||
-      !Number.isSafeInteger(offset) ||
-      offset < 0 ||
-      (inputRevision !== undefined && inputRevision !== (auth.inputRevision ?? 0)) ||
-      (offset > 0 && (auth.inputRevision ?? 0) > 0 && inputRevision === undefined)
+      !decision ||
+      !run ||
+      !authorization ||
+      reference.taskId !== task.id ||
+      decision.runId !== reference.runId ||
+      decision.inputSequence !== reference.decisionInputSequence ||
+      task.inputSequence !== reference.expectedInputSequence ||
+      run.sessionId !== task.sessionId ||
+      authorization.runId !== run.id ||
+      authorization.taskId !== task.id ||
+      authorization.inputSequence !== reference.decisionInputSequence ||
+      authorization.actor !== run.agentId ||
+      (decision.actor !== undefined && decision.actor !== run.agentId)
     )
       throw new RunOperationConflictError(
-        'The required input scope changed. Restart its complete paginated read.',
+        'The Agent that asked these questions could not be verified. Your answers were preserved.',
       )
+    return run.agentId
+  }
+
+  readWorkflowInputs(runId: string, offset = 0) {
+    const auth = this.collaborationTurnAuthorization(runId)
+    if (!auth || !Number.isSafeInteger(offset) || offset < 0)
+      throw new RunOperationConflictError('The frozen workflow input scope is unavailable.')
     const rows = this.database
-      .select({
-        batchId: collaborationRequiredInputMembers.batchId,
-        memberId: collaborationRequiredInputMembers.memberId,
-        sequence: conversationInputBatches.sequence,
-        ordinal: conversationInputBatchMembers.ordinal,
-        state: conversationInputBatchMembers.state,
-        bodyState: conversationInputBatches.bodyState,
-        actor: conversationInputBatches.actor,
-        commentId: conversationInputBatchMembers.commentId,
-        answerResolver: conversationInputBatchMembers.answerResolver,
-      })
-      .from(collaborationRequiredInputMembers)
-      .innerJoin(
-        conversationInputBatches,
-        eq(conversationInputBatches.id, collaborationRequiredInputMembers.batchId),
-      )
-      .leftJoin(
-        conversationInputBatchMembers,
-        and(
-          eq(conversationInputBatchMembers.batchId, collaborationRequiredInputMembers.batchId),
-          eq(conversationInputBatchMembers.memberId, collaborationRequiredInputMembers.memberId),
-        ),
-      )
+      .select()
+      .from(conversationInputBatches)
       .where(
         and(
-          eq(collaborationRequiredInputMembers.runId, runId),
-          eq(collaborationRequiredInputMembers.active, true),
-          lte(collaborationRequiredInputMembers.inputRevision, auth.inputRevision ?? 0),
+          eq(conversationInputBatches.taskId, auth.taskId),
+          lte(conversationInputBatches.sequence, auth.inputSequence),
+          gt(conversationInputBatches.sequence, offset),
+          ne(conversationInputBatches.bodyState, 'withdrawn'),
         ),
       )
-      .orderBy(asc(conversationInputBatches.sequence), asc(conversationInputBatchMembers.ordinal))
+      .orderBy(asc(conversationInputBatches.sequence))
       .limit(COLLABORATION_INDEX_ITEMS + 1)
-      .offset(offset)
       .all()
-    const items = rows
-      .slice(0, COLLABORATION_INDEX_ITEMS)
-      .map((row) =>
-        Object.assign(row, { state: row.memberId === '$body' ? row.bodyState : row.state }),
-      )
+    const items = rows.slice(0, COLLABORATION_INDEX_ITEMS).map((row) =>
+      Object.assign(
+        {
+          sequence: row.sequence,
+          messageId: row.messageId,
+          batch: { id: row.id, revision: row.commentsRevision, memberCount: row.memberCount },
+        },
+        row.bodyDocumentJson
+          ? { body: collaborationDocumentSchema.parse(JSON.parse(row.bodyDocumentJson)) }
+          : {},
+      ),
+    )
+    if (Buffer.byteLength(JSON.stringify(items)) > COLLABORATION_INDEX_BYTES - 2048)
+      throw new OversizedConversationEntityError()
     return {
-      runId,
-      taskId: auth.taskId,
-      inputRevision: auth.inputRevision ?? 0,
       items,
       offset,
-      nextOffset: rows.length > items.length ? offset + items.length : null,
+      nextOffset: rows.length > items.length ? rows[items.length - 1]!.sequence : null,
     }
   }
 
@@ -3176,27 +3439,13 @@ export class ConversationRepository {
       .from(conversationInputBatches)
       .where(eq(conversationInputBatches.id, batchId))
       .get()
+    const auth = this.collaborationTurnAuthorization(runId)
     const allowed =
       batch &&
       run &&
       batch.sessionId === run.sessionId &&
       (batch.runId === runId ||
-        (this.collaborationTurnAuthorization(runId)?.taskId === batch.taskId &&
-          batch.sequence <= (this.collaborationTurnAuthorization(runId)?.inputSequence ?? -1)) ||
-        Boolean(
-          this.database
-            .select({ runId: collaborationRequiredInputMembers.runId })
-            .from(collaborationRequiredInputMembers)
-            .where(
-              and(
-                eq(collaborationRequiredInputMembers.runId, runId),
-                eq(collaborationRequiredInputMembers.active, true),
-                eq(collaborationRequiredInputMembers.batchId, batchId),
-              ),
-            )
-            .limit(1)
-            .get(),
-        ) ||
+        (auth?.taskId === batch.taskId && batch.sequence <= auth.inputSequence) ||
         this.runHasBatchHandoff(runId, batchId))
     if (!allowed || !batch || !run)
       throw new RunOperationConflictError('The input Batch is outside this Run authorization.')
@@ -3281,312 +3530,6 @@ export class ConversationRepository {
     )
   }
 
-  readCollaborationTodos(
-    taskId: string,
-    ledgerRevision: number,
-    state: 'active' | 'done' | 'all' = 'active',
-    afterOrdinal = -1,
-  ): CollaborationTodoPage {
-    const task = this.database
-      .select()
-      .from(collaborationTasks)
-      .where(eq(collaborationTasks.id, taskId))
-      .get()
-    if (!task || task.ledgerRevision !== ledgerRevision) throw new StaleConversationCursorError()
-    const predicate = and(
-      eq(collaborationTodos.taskId, taskId),
-      gt(collaborationTodos.ordinal, afterOrdinal),
-      state === 'done'
-        ? eq(collaborationTodos.status, 'done')
-        : state === 'active'
-          ? ne(collaborationTodos.status, 'done')
-          : undefined,
-    )
-    const heads = this.database
-      .select({
-        ordinal: collaborationTodos.ordinal,
-        bytes: todoProjectionBytes(
-          collaborationTodos.titlePreview,
-          collaborationTodos.questionJson,
-        ),
-      })
-      .from(collaborationTodos)
-      .where(predicate)
-      .orderBy(asc(collaborationTodos.ordinal))
-      .limit(COLLABORATION_INDEX_ITEMS + 1)
-      .all()
-    const last = admittedTodoOrdinal(heads, COLLABORATION_INDEX_BYTES - 16 * 1024)
-    const rows =
-      last < 0
-        ? []
-        : this.database
-            .select({
-              ...getTableColumns(collaborationTodos),
-              questionJson: sql<
-                string | null
-              >`CASE WHEN length(CAST(${collaborationTodos.questionJson} AS BLOB))<=${COLLABORATION_INDEX_BYTES - 16 * 1024} THEN ${collaborationTodos.questionJson} ELSE NULL END`,
-            })
-            .from(collaborationTodos)
-            .where(and(predicate, lte(collaborationTodos.ordinal, last)))
-            .orderBy(asc(collaborationTodos.ordinal))
-            .limit(COLLABORATION_INDEX_ITEMS)
-            .all()
-    const counts = this.todoCounts(taskId)
-    const previous = this.database
-      .select({ ordinal: collaborationTodos.ordinal })
-      .from(collaborationTodos)
-      .where(
-        and(
-          eq(collaborationTodos.taskId, taskId),
-          lte(collaborationTodos.ordinal, afterOrdinal),
-          state === 'done'
-            ? eq(collaborationTodos.status, 'done')
-            : state === 'active'
-              ? ne(collaborationTodos.status, 'done')
-              : undefined,
-        ),
-      )
-      .orderBy(desc(collaborationTodos.ordinal))
-      .limit(COLLABORATION_INDEX_ITEMS)
-      .all()
-    const items: CollaborationTodo[] = []
-    for (const row of rows.slice(0, COLLABORATION_INDEX_ITEMS)) {
-      const next = this.todoMetadata(row)
-      if (
-        Buffer.byteLength(JSON.stringify([...items, next])) >
-        COLLABORATION_INDEX_BYTES - 16 * 1024
-      ) {
-        if (!items.length) throw new OversizedConversationEntityError()
-        break
-      }
-      items.push(next)
-    }
-    return {
-      taskId,
-      ledgerRevision,
-      group: state,
-      items,
-      offset: afterOrdinal + 1,
-      previousOffset: previous.length ? previous.at(-1)!.ordinal : null,
-      nextOffset: heads.length > items.length ? heads[items.length - 1]!.ordinal + 1 : null,
-      activeCount: counts.open + counts.awaiting,
-      doneCount: counts.done,
-    }
-  }
-
-  readTodoRevision(taskId: string, todoId: string, revision: number): CollaborationTodo {
-    const predicate = and(
-      eq(collaborationTodoRevisions.taskId, taskId),
-      eq(collaborationTodoRevisions.todoId, todoId),
-      eq(collaborationTodoRevisions.revision, revision),
-    )
-    const head = this.database
-      .select({
-        bytes: todoProjectionBytes(
-          collaborationTodoRevisions.titlePreview,
-          collaborationTodoRevisions.questionJson,
-        ),
-      })
-      .from(collaborationTodoRevisions)
-      .where(predicate)
-      .get()
-    if (!head) throw new RunOperationConflictError('The Todo revision is unavailable.')
-    if (head.bytes > COLLABORATION_INDEX_BYTES - 16 * 1024)
-      throw new OversizedConversationEntityError()
-    const row = this.database
-      .select({
-        ...getTableColumns(collaborationTodoRevisions),
-        questionJson: sql<
-          string | null
-        >`CASE WHEN length(CAST(${collaborationTodoRevisions.questionJson} AS BLOB))<=${COLLABORATION_INDEX_BYTES - 16 * 1024} THEN ${collaborationTodoRevisions.questionJson} ELSE NULL END`,
-      })
-      .from(collaborationTodoRevisions)
-      .where(predicate)
-      .get()
-    if (!row) throw new RunOperationConflictError('The Todo revision is unavailable.')
-    return this.todoMetadata(row)
-  }
-
-  private todoMetadata(row: typeof collaborationTodos.$inferSelect): CollaborationTodo {
-    if (row.questionId && !row.questionJson) throw new OversizedConversationEntityError()
-    const run = this.findRun(row.sourceRunId)
-    const question = row.questionJson
-      ? collaborationTodoQuestionSchema.parse(JSON.parse(row.questionJson))
-      : null
-    return {
-      taskId: row.taskId,
-      id: row.todoId,
-      revision: row.revision,
-      kind: row.kind,
-      status: row.status,
-      title: row.titlePreview,
-      author: row.author,
-      sourceRunId: row.sourceRunId,
-      sourceMessageId: run?.responseMessageId ?? run?.userMessageId ?? row.sourceRunId,
-      document: collaborationDocumentSchema.parse(JSON.parse(row.documentJson)),
-      answerResolver: row.answerResolver,
-      needsUserAnswer: Boolean(question && row.status === 'open' && !this.todoHasAnswer(row)),
-      question,
-      resolutionKind: row.resolutionKind,
-      resolutionReasonPreview: row.reasonDocumentJson
-        ? this.documentPreview(JSON.parse(row.reasonDocumentJson), 180)
-        : '',
-    }
-  }
-
-  private todoHasAnswer(row: typeof collaborationTodos.$inferSelect): boolean {
-    if (!row.questionId) return false
-    return Boolean(
-      this.database.get<{
-        found: number
-      }>(sql`SELECT 1 AS found FROM conversation_input_batch_members m
-      JOIN conversation_input_batches b ON b.id=m.batch_id WHERE b.task_id=${row.taskId}
-      AND m.source_task_id=${row.taskId} AND m.source_todo_id=${row.todoId}
-      AND m.question_id=${row.questionId} AND m.question_revision=${row.questionRevision}
-      AND m.state <> 'withdrawn' LIMIT 1`),
-    )
-  }
-
-  private documentPreview(ref: CollaborationDocument, length: number): string {
-    const rows = this.database
-      .select({ text: conversationBodyParts.text })
-      .from(conversationBodyParts)
-      .where(eq(conversationBodyParts.inputId, ref.id))
-      .orderBy(asc(conversationBodyParts.offset))
-      .limit(1)
-      .all()
-    return rows[0]?.text.slice(0, length) ?? ''
-  }
-
-  private todoCounts(taskId: string) {
-    const rows = this.database
-      .select({
-        status: collaborationTodos.status,
-        count: sql<number>`count(*)`,
-        questions: sql<number>`sum(CASE WHEN ${collaborationTodos.status}<>'done' AND ${collaborationTodos.kind} IN ('decision','information') AND ${collaborationTodos.questionId} IS NOT NULL THEN 1 ELSE 0 END)`,
-      })
-      .from(collaborationTodos)
-      .where(eq(collaborationTodos.taskId, taskId))
-      .groupBy(collaborationTodos.status)
-      .all()
-    return {
-      open: rows.find((r) => r.status === 'open')?.count ?? 0,
-      awaiting: rows.find((r) => r.status === 'awaiting_review')?.count ?? 0,
-      done: rows.find((r) => r.status === 'done')?.count ?? 0,
-      questions: rows.reduce((total, row) => total + row.questions, 0),
-    }
-  }
-
-  /** Snapshot queries include off-page completed decisions and stable historical identities. */
-  readFrozenTodoIndex(
-    runId: string,
-    kind: 'active' | 'decisions' | 'identities',
-    afterOrdinal = -1,
-  ) {
-    const auth = this.collaborationTurnAuthorization(runId)
-    if (!auth) throw new RunOperationConflictError('The frozen Todo index is unavailable.')
-    const predicate = and(
-      eq(collaborationTodoRevisions.taskId, auth.taskId),
-      gt(collaborationTodoRevisions.ordinal, afterOrdinal),
-      lte(collaborationTodoRevisions.ledgerRevision, auth.baseTodoRevision),
-      sql`${collaborationTodoRevisions.revision} = (SELECT max(r.revision) FROM collaboration_todo_revisions r WHERE r.task_id = ${auth.taskId} AND r.todo_id = ${collaborationTodoRevisions.todoId} AND r.ledger_revision <= ${auth.baseTodoRevision})`,
-      kind === 'active'
-        ? ne(collaborationTodoRevisions.status, 'done')
-        : kind === 'decisions'
-          ? eq(collaborationTodoRevisions.status, 'done')
-          : undefined,
-    )
-    const heads = this.database
-      .select({
-        ordinal: collaborationTodoRevisions.ordinal,
-        bytes: todoProjectionBytes(
-          collaborationTodoRevisions.titlePreview,
-          collaborationTodoRevisions.questionJson,
-        ),
-      })
-      .from(collaborationTodoRevisions)
-      .where(predicate)
-      .orderBy(asc(collaborationTodoRevisions.ordinal))
-      .limit(COLLABORATION_INDEX_ITEMS + 1)
-      .all()
-    const last = admittedTodoOrdinal(heads, COLLABORATION_INDEX_BYTES / 2)
-    const rows =
-      last < 0
-        ? []
-        : this.database
-            .select({
-              ...getTableColumns(collaborationTodoRevisions),
-              questionJson: sql<
-                string | null
-              >`CASE WHEN length(CAST(${collaborationTodoRevisions.questionJson} AS BLOB))<=${COLLABORATION_INDEX_BYTES / 2} THEN ${collaborationTodoRevisions.questionJson} ELSE NULL END`,
-            })
-            .from(collaborationTodoRevisions)
-            .where(and(predicate, lte(collaborationTodoRevisions.ordinal, last)))
-            .orderBy(asc(collaborationTodoRevisions.ordinal))
-            .limit(COLLABORATION_INDEX_ITEMS)
-            .all()
-    const items: Array<CollaborationTodo & { contentDocument: CollaborationDocument }> = []
-    for (const row of rows.slice(0, COLLABORATION_INDEX_ITEMS)) {
-      const item = {
-        ...this.todoMetadata(row),
-        contentDocument: collaborationDocumentSchema.parse(JSON.parse(row.contentDocumentJson)),
-      }
-      if (Buffer.byteLength(JSON.stringify([...items, item])) > COLLABORATION_INDEX_BYTES / 2) {
-        if (!items.length) throw new OversizedConversationEntityError()
-        break
-      }
-      items.push(item)
-    }
-    return {
-      taskId: auth.taskId,
-      ledgerRevision: auth.baseTodoRevision,
-      items,
-      hasMore: heads.length > items.length,
-      nextOrdinal: rows[items.length - 1]?.ordinal ?? afterOrdinal,
-    }
-  }
-
-  async readCollaborationReport(
-    task: CollaborationTask,
-    signal: AbortSignal,
-  ): Promise<HandoffBundle> {
-    const ref = task.reportRecovery
-    if (!ref) throw new HandoffSourceUnavailableError('The original report is unavailable.')
-    const run = this.findRun(ref.sourceRunId)
-    const row = this.database
-      .select({
-        id: conversationMessages.id,
-        sequence: conversationMessages.sequence,
-        role: conversationMessages.role,
-        contentBytes: sql<number>`length(CAST(${conversationMessages.content} AS BLOB))`,
-        contentRevision: conversationMessages.contentRevision,
-        handledBy: agentRuns.agentId,
-      })
-      .from(conversationMessages)
-      .innerJoin(agentRuns, eq(agentRuns.id, conversationMessages.runId))
-      .where(
-        and(
-          eq(conversationMessages.id, ref.sourceMessageId),
-          eq(conversationMessages.runId, ref.sourceRunId),
-          eq(conversationMessages.sessionId, task.sessionId),
-          eq(conversationMessages.role, 'assistant'),
-          eq(conversationMessages.state, 'complete'),
-          eq(conversationMessages.contentRevision, ref.sourceContentRevision),
-        ),
-      )
-      .get()
-    if (
-      !row ||
-      !row.contentBytes ||
-      run?.dispatchPhase !== 'ended' ||
-      run.nativeOutcome !== 'completed'
-    )
-      throw new HandoffSourceUnavailableError(
-        'The completed original answer is unavailable. Nothing was sent.',
-      )
-    return this.readHandoffSource(row, signal, Date.now() + HANDOFF_READ_DEADLINE_MS)
-  }
-
   async readRunHandoff(runId: string, signal: AbortSignal): Promise<HandoffBundle[]> {
     const run = this.database
       .select({ sourceIds: agentRuns.handoffSourceIds })
@@ -3607,7 +3550,7 @@ export class ConversationRepository {
         typeof Reflect.get(value, 'digest') !== 'string' ||
         !/^[a-f0-9]{64}$/u.test(Reflect.get(value, 'digest')) ||
         (Reflect.get(value, 'contextVersion') !== undefined &&
-          !['collaboration_v1', 'collaboration_v2'].includes(
+          !['native_workflow_v1', 'native_workflow_v1'].includes(
             String(Reflect.get(value, 'contextVersion')),
           ))
       )
@@ -3618,13 +3561,13 @@ export class ConversationRepository {
           revision: Reflect.get(value, 'revision'),
           digest: Reflect.get(value, 'digest'),
         },
-        Reflect.get(value, 'contextVersion') === 'collaboration_v1' ||
-          Reflect.get(value, 'contextVersion') === 'collaboration_v2'
+        Reflect.get(value, 'contextVersion') === 'native_workflow_v1' ||
+          Reflect.get(value, 'contextVersion') === 'native_workflow_v1'
           ? {
               contextVersion:
-                Reflect.get(value, 'contextVersion') === 'collaboration_v2'
-                  ? ('collaboration_v2' as const)
-                  : ('collaboration_v1' as const),
+                Reflect.get(value, 'contextVersion') === 'native_workflow_v1'
+                  ? ('native_workflow_v1' as const)
+                  : ('native_workflow_v1' as const),
             }
           : {},
       )
@@ -3663,7 +3606,7 @@ export class ConversationRepository {
       })
       for (const row of ordered) {
         const ref = page.find((candidate) => candidate.id === row.id)!
-        if (ref.contextVersion !== 'collaboration_v2')
+        if (ref.contextVersion !== 'native_workflow_v1')
           this.admitHandoffRows([row], HANDOFF_SAFETY_BYTES - totalBytes)
         // oxlint-disable-next-line no-await-in-loop -- Each source must be read in its frozen digest version before continuing.
         const message = await this.readHandoffSource(
@@ -3724,40 +3667,65 @@ export class ConversationRepository {
     return admitted
   }
 
-  /** Immutable submitted material and the frozen plan basis travel with the existing context source. */
-  private collaborationContextSuffix(messageId: string): string {
-    const row = this.database
-      .select({ result: collaborationTurns.resultJson, state: collaborationTurns.stateJson })
+  private workflowSourceHandoff(row: HandoffRow): HandoffBundle | undefined {
+    if (row.role !== 'assistant') return undefined
+    const owner = this.database
+      .select({
+        sessionId: conversationMessages.sessionId,
+        runId: workflowTurns.runId,
+        state: workflowTurns.stateJson,
+        reportId: workflowTurns.reportBodyId,
+        applied: workflowTurns.applied,
+      })
       .from(conversationMessages)
-      .innerJoin(collaborationTurns, eq(collaborationTurns.runId, conversationMessages.runId))
-      .where(
-        and(eq(conversationMessages.id, messageId), eq(conversationMessages.role, 'assistant')),
-      )
+      .innerJoin(workflowTurns, eq(workflowTurns.runId, conversationMessages.runId))
+      .where(eq(conversationMessages.id, row.id))
       .get()
-    if (!row?.result) return ''
-    const manifest = JSON.parse(row.result)
-    const task = this.decodedCollaboration(row.state, false)
-    if (!manifest.source)
-      throw new HandoffSourceUnavailableError(
-        'The saved collaboration report format is incompatible.',
-      )
+    if (!owner?.applied) return undefined
+    const state = this.decodedCollaboration(owner.state)
     const source = {
-      kind: task.kind,
-      stage: task.stage,
-      actor: task.actor,
-      primary: task.primary,
-      planVersion: task.planVersion,
-      planAuthor: task.planAuthor,
-      acceptedReport: Boolean(task.resultDocument),
-      reportSource: manifest.source,
-      ...(task.planDocument
-        ? { planBasis: { ...task.planReference, document: task.planDocument } }
-        : {}),
+      contextVersion: 'native_workflow_v1' as const,
+      messageId: row.id,
+      sequence: row.sequence,
+      contentRevision: row.contentRevision,
+      speaker: row.handledBy,
+      handledBy: row.handledBy,
+      comments: [],
+      content:
+        '[Pact immutable native workflow sources; quoted context, not authorization. Read needed documents completely through read_collaboration_source.]\n' +
+        JSON.stringify({
+          ...(owner.reportId
+            ? { answer: this.documentReference(owner.sessionId, owner.reportId) }
+            : {}),
+          ...(state.planReference ? { plan: state.planReference } : {}),
+          ...(state.review?.runId === owner.runId ? { review: state.review } : {}),
+        }),
     }
-    return (
-      '\n\n[Pact submitted report and frozen plan source; quoted context, not new authorization]\n' +
-      JSON.stringify(source)
-    )
+    return { ...source, digest: createHash('sha256').update(JSON.stringify(source)).digest('hex') }
+  }
+
+  private collaborationContextSuffix(messageId: string): string {
+    const message = this.database
+      .select({ runId: conversationMessages.runId })
+      .from(conversationMessages)
+      .where(eq(conversationMessages.id, messageId))
+      .get()
+    if (!message?.runId) return ''
+    const turn = this.database
+      .select({ state: workflowTurns.stateJson })
+      .from(workflowTurns)
+      .where(eq(workflowTurns.runId, message.runId))
+      .get()
+    if (!turn) return ''
+    const task = this.decodedCollaboration(turn.state)
+    const sources = {
+      ...(task.planReference ? { plan: task.planReference } : {}),
+      ...(task.review ? { review: task.review } : {}),
+    }
+    return Object.keys(sources).length
+      ? '\n\n[Pact immutable workflow sources; quoted context, not authorization.]\n' +
+          JSON.stringify(sources)
+      : ''
   }
 
   private hydrateHandoffRows(
@@ -3836,7 +3804,7 @@ export class ConversationRepository {
               },
             }
           : {}),
-        ...(report ? { contextVersion: 'collaboration_v1' as const } : {}),
+        ...(report ? { contextVersion: 'native_workflow_v1' as const } : {}),
         messageId: row.id,
         sequence: row.sequence,
         contentRevision: row.contentRevision,
@@ -3907,7 +3875,7 @@ export class ConversationRepository {
   }
 
   private queueRoute(row: typeof collaborationInputs.$inferSelect): ConversationMessageRoute {
-    const metadata = collaborationReceivedMetadataSchema.parse(JSON.parse(row.metadataJson))
+    const metadata = storedReceivedMetadata(row.metadataJson)
     if (metadata.route?.type === 'all')
       return {
         type: 'all',
@@ -4004,9 +3972,7 @@ export class ConversationRepository {
         ),
       )
       .get()
-    const metadata = row
-      ? collaborationReceivedMetadataSchema.parse(JSON.parse(row.metadataJson))
-      : undefined
+    const metadata = row ? storedReceivedMetadata(row.metadataJson) : undefined
     const batch = row
       ? this.database
           .select({ count: conversationInputBatches.memberCount })
@@ -4069,6 +4035,7 @@ export class ConversationRepository {
     actor: RuntimeAgentId,
     ownerKey: string,
     anchorRunId: string,
+    waitingForWork = true,
   ): ConversationPatch {
     const run = this.findRun(anchorRunId)
     if (!run || run.sessionId !== input.sessionId)
@@ -4080,7 +4047,7 @@ export class ConversationRepository {
         actor,
         'next_round',
         ownerKey,
-        true,
+        waitingForWork,
         anchorRunId,
       )
       this.database
@@ -4217,7 +4184,7 @@ export class ConversationRepository {
   removeQueuedConversationMessage(input: ConversationQueueActionInput): ConversationPatch {
     return this.database.transaction(() => {
       const check = this.queueOperation(input, 'remove')
-      if (check.old) return this.createPatch(input.sessionId)
+      if (check.old) return this.metadataPatch(input.sessionId)
       this.saveQueueOperation(input, 'remove')
       const batch = this.database
         .select({ id: conversationInputBatches.id })
@@ -4246,7 +4213,7 @@ export class ConversationRepository {
         .where(eq(collaborationInputs.id, input.inputId))
         .run()
       this.advanceQueue(input.sessionId, null)
-      return this.createPatch(input.sessionId)
+      return this.metadataPatch(input.sessionId)
     })
   }
 
@@ -4285,7 +4252,7 @@ export class ConversationRepository {
   returnQueuedConversationMessage(input: ConversationQueueReturnInput): ConversationPatch {
     return this.database.transaction(() => {
       const checked = this.queueOperation(input, 'return')
-      if (checked.old && input.phase !== 'claim') return this.createPatch(input.sessionId)
+      if (checked.old && input.phase !== 'claim') return this.metadataPatch(input.sessionId)
       if (
         input.phase === 'claim' &&
         (!checked.old || !['returned', 'installed'].includes(checked.old.state))
@@ -4328,7 +4295,7 @@ export class ConversationRepository {
           .where(eq(collaborationInputs.id, row.id))
           .run()
         this.advanceQueue(input.sessionId, null)
-        return this.createPatch(input.sessionId)
+        return this.metadataPatch(input.sessionId)
       }
       const session = this.database
         .select()
@@ -4644,7 +4611,11 @@ export class ConversationRepository {
         throw new RunOperationConflictError(
           'The target execution changed before Steer. This message remains queued.',
         )
-      const meta = collaborationReceivedMetadataSchema.parse(JSON.parse(row.metadataJson))
+      if (run.collaboration)
+        throw new RunOperationConflictError(
+          'Workflow messages are answered in the next Turn. Continue the queued reply after the current Agent finishes.',
+        )
+      const meta = storedReceivedMetadata(row.metadataJson)
       if (input.inputId === run.id)
         throw new RunOperationConflictError(
           'The supplemental input reuses the original native request identity. It remains queued.',
@@ -4663,22 +4634,9 @@ export class ConversationRepository {
           .where(eq(collaborationInputs.id, row.id))
           .run()
       }
-      if (
-        meta.workflowCommand ||
-        meta.route?.type === 'all' ||
-        row.taskId !== (run.collaboration?.taskId ?? null)
-      )
+      if (meta.workflowCommand || meta.route?.type === 'all' || row.taskId !== null)
         throw new RunOperationConflictError(
           'This input cannot be steered into the target execution.',
-        )
-      const frozen = this.database
-        .select()
-        .from(collaborationTurns)
-        .where(eq(collaborationTurns.runId, run.id))
-        .get()
-      if (frozen?.pendingEnvelopeBodyId || frozen?.nativeEnvelopeBodyId || frozen?.resultJson)
-        throw new RunOperationConflictError(
-          'This execution is already submitting its result. The message remains queued.',
         )
       const reservedNativeInputs = this.database
         .select({ count: sql<number>`count(*)` })
@@ -4713,22 +4671,6 @@ export class ConversationRepository {
         throw new RunOperationConflictError(
           'The frozen input manifest does not match this execution.',
         )
-      const wrongResolver = this.database
-        .select({ id: conversationInputBatchMembers.memberId })
-        .from(conversationInputBatchMembers)
-        .where(
-          and(
-            eq(conversationInputBatchMembers.batchId, batch.id),
-            isNotNull(conversationInputBatchMembers.answerResolver),
-            ne(conversationInputBatchMembers.answerResolver, run.agentId),
-          ),
-        )
-        .limit(1)
-        .get()
-      if (wrongResolver)
-        throw new RunOperationConflictError(
-          'This answer belongs to another Agent and remains queued.',
-        )
       const revision =
         (this.database
           .select({ value: max(conversationQueueOperations.inputRevision) })
@@ -4752,17 +4694,6 @@ export class ConversationRepository {
         .where(eq(conversationInputBatches.id, batch.id))
         .run()
       this.sealInputBatchSources(batch.id, run.id)
-      const scope = row.taskId
-        ? this.saveCollaborationDocument(
-            run.id,
-            JSON.stringify({
-              kind: 'required_inputs',
-              runId: run.id,
-              taskId: row.taskId,
-              inputRevision: revision,
-            }),
-          )
-        : undefined
       this.database
         .update(conversationQueueOperations)
         .set({
@@ -4773,28 +4704,11 @@ export class ConversationRepository {
           inputRevision: revision,
           resultNonce,
           batchId: batch.id,
-          inputScopeJson: scope ? JSON.stringify(scope) : null,
+          inputScopeJson: null,
           updatedAt: now,
         })
         .where(eq(conversationQueueOperations.id, input.operationId))
         .run()
-      if (row.taskId) {
-        this.database.run(
-          sql`INSERT INTO collaboration_required_input_members(run_id,batch_id,member_id,input_revision) SELECT ${run.id},${batch.id},member_id,${revision} FROM conversation_input_batch_members WHERE batch_id=${batch.id} ON CONFLICT(run_id,batch_id,member_id) DO UPDATE SET input_revision=excluded.input_revision,active=1`,
-        )
-        this.database
-          .insert(collaborationRequiredInputMembers)
-          .values({ runId: run.id, batchId: batch.id, memberId: '$body', inputRevision: revision })
-          .onConflictDoUpdate({
-            target: [
-              collaborationRequiredInputMembers.runId,
-              collaborationRequiredInputMembers.batchId,
-              collaborationRequiredInputMembers.memberId,
-            ],
-            set: { inputRevision: revision, active: true },
-          })
-          .run()
-      }
       this.database
         .update(collaborationInputs)
         .set({ queueState: 'dispatching', queueReason: 'Delivering to the current execution.' })
@@ -4889,18 +4803,7 @@ export class ConversationRepository {
           })
           .where(eq(collaborationInputs.id, op.inputId))
           .run()
-      if (state === 'refused' && !historical)
-        this.database
-          .update(collaborationRequiredInputMembers)
-          .set({ active: false })
-          .where(
-            and(
-              eq(collaborationRequiredInputMembers.runId, op.targetRunId),
-              eq(collaborationRequiredInputMembers.inputRevision, op.inputRevision!),
-            ),
-          )
-          .run()
-      if (!historical) this.advanceQueue(op.sessionId)
+      if (state === 'refused' && !historical) if (!historical) this.advanceQueue(op.sessionId)
       this.nativeFact(op.targetRunId, `conversation.steer_${state}`, {
         operationId,
         inputId: op.inputId,
@@ -5065,14 +4968,6 @@ export class ConversationRepository {
         })
         .onConflictDoNothing()
         .run()
-      const task = this.collaboration(op.sessionId)
-      if (task?.runId === run.id) {
-        task.authorization = this.collaborationTurnAuthorization(run.id)
-        task.requiredInputScopeRef = task.authorization?.requiredInputScopeRef ?? undefined
-        task.inputSequence = task.authorization?.inputSequence ?? task.inputSequence
-        task.revision++
-        this.saveCollaboration(task)
-      }
       this.advanceQueue(op.sessionId)
       this.nativeFact(run.id, 'conversation.steer_accepted', {
         operationId,
@@ -5237,7 +5132,7 @@ export class ConversationRepository {
     if (/[\uD800-\uDBFF]/u.test(text.at(-1) ?? '')) text = text.slice(0, -1)
     if (input.offset < body.chars && !text)
       throw new RunOperationConflictError('The queued body has a missing segment.')
-    const meta = collaborationReceivedMetadataSchema.parse(JSON.parse(row.metadataJson))
+    const meta = storedReceivedMetadata(row.metadataJson)
     const sourceComments = this.database
       .select()
       .from(anchoredComments)
@@ -5286,7 +5181,6 @@ export class ConversationRepository {
       ...(input.offset === 0
         ? { images: this.resolveMessageImages(input.sessionId, meta.imageIds), skills: meta.skills }
         : {}),
-      ...(meta.planningAction ? { planningAction: meta.planningAction } : {}),
     }
     while (!ConversationRepository.fitsPage(page) && comments.length) comments.pop()
     page.commentsNextPosition =
@@ -5337,7 +5231,7 @@ export class ConversationRepository {
       .get()
     if (!row) return undefined
     if (input) {
-      const meta = collaborationReceivedMetadataSchema.parse(JSON.parse(row.metadataJson))
+      const meta = storedReceivedMetadata(row.metadataJson)
       if (
         (input.inputId && input.inputId !== row.inputId) ||
         (!input.inputId &&
@@ -5347,8 +5241,8 @@ export class ConversationRepository {
         (input.freezeDrafts ?? true) !== (meta.freezeDrafts ?? true) ||
         JSON.stringify(input.imageIds ?? []) !== JSON.stringify(meta.imageIds) ||
         JSON.stringify(input.skills ?? []) !== JSON.stringify(meta.skills) ||
-        input.planningAction !== meta.planningAction ||
-        JSON.stringify(input.route) !== JSON.stringify(meta.route)
+        JSON.stringify(input.route) !== JSON.stringify(meta.route) ||
+        !isDeepStrictEqual(input.replyToDecision, meta.replyToDecision)
       )
         throw new RunOperationConflictError('This received nonce belongs to different input.')
     }
@@ -5356,6 +5250,70 @@ export class ConversationRepository {
       receivedInputIds: [row.id],
       ...(waitingForWork && row.state === 'accepted' ? { queuedInputIds: [row.id] } : {}),
     })
+  }
+
+  /** New user input admission; durable receipts and authorized workflow dispatch are checked separately. */
+  assertDecisionInput(
+    input: Pick<
+      import('@pact/contracts').ConversationSendInput,
+      | 'sessionId'
+      | 'content'
+      | 'replyToDecision'
+      | 'freezeDrafts'
+      | 'imageIds'
+      | 'commentIds'
+      | 'skills'
+      | 'route'
+      | 'returnedInputOperationId'
+      | 'queueReturnOperationId'
+    >,
+  ): void {
+    const saved = this.collaboration(input.sessionId)
+    const task = saved?.status === 'complete' ? undefined : saved
+    const decision = task && collaborationInputProcessing(task).decision
+    if (!input.replyToDecision) {
+      if (decision)
+        throw new RunOperationConflictError(
+          'Answer the current questions in the question card before sending another message. Your message draft was preserved.',
+        )
+      return
+    }
+    const ref = input.replyToDecision
+    const gate = task && collaborationInputGate(task)
+    const previous = task && this.findRun(task.runId)
+    const confirmedFollowUp =
+      gate === 'incomplete' &&
+      previous &&
+      ((previous.dispatchPhase === 'ended' && previous.nativeEffectsState === 'settled') ||
+        this.workflowInputWasNotSent(previous)) &&
+      !this.nativeRecoveryBlocksInput(input.sessionId)
+    if (
+      !task ||
+      !decision ||
+      task.id !== ref.taskId ||
+      decision.runId !== ref.runId ||
+      decision.inputSequence !== ref.decisionInputSequence ||
+      task.inputSequence !== ref.expectedInputSequence ||
+      (gate !== 'needs_reply' && !confirmedFollowUp)
+    )
+      throw new RunOperationConflictError(
+        'These questions changed or the previous answer is not yet settled. Your answers were preserved; review the current request or recovery notice.',
+      )
+    const prefix = parseComposerCommandPrefix(input.content, input.skills)
+    if (
+      input.freezeDrafts !== false ||
+      input.imageIds?.length ||
+      input.commentIds.length ||
+      input.skills?.length ||
+      input.returnedInputOperationId ||
+      input.queueReturnOperationId ||
+      input.route ||
+      prefix.pact ||
+      prefix.route
+    )
+      throw new RunOperationConflictError(
+        'Submit only the card answers. Your message, attachments and other drafts must stay separate.',
+      )
   }
 
   receiveCollaborationInput(
@@ -5369,6 +5327,13 @@ export class ConversationRepository {
   ): ConversationPatch {
     return this.database.transaction(() => {
       assertSessionAvailable(this.database, input.sessionId)
+      const priorReceipt = this.receivedInputReceipt(
+        input.sessionId,
+        input.clientMessageId,
+        input,
+        waitingForWork,
+      )
+      if (priorReceipt) return priorReceipt
       if (this.receivedCollaborationInput(input.sessionId))
         throw new RunOperationConflictError(
           'One message is already waiting. Your draft was preserved.',
@@ -5389,7 +5354,11 @@ export class ConversationRepository {
         .get()
       if (!session || session.commentsRevision !== input.expectedCommentsRevision)
         throw new RunOperationConflictError('Comment drafts changed before receipt.')
-      if (!session.queueEnabled)
+      if (
+        !session.queueEnabled &&
+        (!this.collaboration(input.sessionId) ||
+          this.collaboration(input.sessionId)?.status === 'complete')
+      )
         throw new RunOperationConflictError('The queue is disabled. Your draft was preserved.')
       const freezeDrafts = input.freezeDrafts ?? true
       if (!freezeDrafts && input.commentIds.length)
@@ -5424,10 +5393,12 @@ export class ConversationRepository {
       const source = this.readBody(body, true)
       if (source.hash !== body.hash)
         throw new RunOperationConflictError('The received body changed after sealing.')
+      this.assertDecisionInput({ ...input, content: source.text })
       const prefix = parseComposerCommandPrefix(source.text, input.skills)
       if (prefix.error) throw new RunOperationConflictError(prefix.error)
       const workflowCommand = Boolean(prefix.pact)
-      const candidate = this.collaboration(input.sessionId)
+      const savedTask = this.collaboration(input.sessionId)
+      const candidate = savedTask?.status === 'complete' ? undefined : savedTask
       const anchor = anchorRunId ? this.findRun(anchorRunId) : undefined
       const task =
         !workflowCommand && (!anchor || anchor.collaboration?.taskId === candidate?.id)
@@ -5446,7 +5417,7 @@ export class ConversationRepository {
         batchId: input.batchId ?? input.clientMessageId,
         freezeDrafts,
         route: input.route,
-        planningAction: input.planningAction,
+        replyToDecision: input.replyToDecision,
       })
       if (Buffer.byteLength(metadata) > 64 * 1024)
         throw new RunOperationConflictError('Received metadata exceeds 64 KiB.')
@@ -5542,10 +5513,7 @@ export class ConversationRepository {
         this.requireInstalledQueueReturn(input.sessionId, input.queueReturnOperationId)
         this.consumeQueuedReturn(input.sessionId, input.queueReturnOperationId)
       }
-      if (task) {
-        task.revision++
-        this.saveCollaboration(task)
-      }
+      this.pauseWorkflowForInput(input.sessionId, input.clientMessageId)
       return this.createPatch(input.sessionId, {
         receivedInputIds: [input.clientMessageId],
         ...(waitingForWork ? { queuedInputIds: [input.clientMessageId] } : {}),
@@ -5592,7 +5560,7 @@ export class ConversationRepository {
     const read = this.readBody(body, true)
     if (read.hash !== input.digest)
       throw new RunOperationConflictError('The received body changed.')
-    const metadata = collaborationReceivedMetadataSchema.parse(JSON.parse(input.metadataJson))
+    const metadata = storedReceivedMetadata(input.metadataJson)
     return {
       ...input,
       manuallyResumed: Boolean(
@@ -5697,13 +5665,6 @@ export class ConversationRepository {
       )
       .run()
     this.database
-      .update(collaborationRequiredInputMembers)
-      .set({ active: false })
-      .where(
-        sql`${collaborationRequiredInputMembers.runId} IN (SELECT q.target_run_id FROM conversation_queue_operations q WHERE q.kind='steer' AND q.state='prepared') AND EXISTS (SELECT 1 FROM conversation_queue_operations q WHERE q.target_run_id=${collaborationRequiredInputMembers.runId} AND q.input_revision=${collaborationRequiredInputMembers.inputRevision} AND q.kind='steer' AND q.state='prepared')`,
-      )
-      .run()
-    this.database
       .update(conversationQueueOperations)
       .set({ state: 'refused' })
       .where(
@@ -5759,16 +5720,17 @@ export class ConversationRepository {
         sql`${sessions.id} IN (SELECT i.session_id FROM collaboration_inputs i WHERE i.state IN ('accepted','blocked'))`,
       )
       .run()
-    // One indexed SQL update: never materialize all task bodies at startup.
+    // Keep native outcome/current work intact; unfinished automation restarts paused.
     this.database
       .update(collaborationTasks)
       .set({
-        stateJson: sql`json_set(${collaborationTasks.stateJson}, '$.status', 'failed', '$.revision', json_extract(${collaborationTasks.stateJson}, '$.revision') + 1, '$.notice', 'Interrupted by restart. Resolve original delivery before continuing.')`,
+        stateJson: sql`json_set(${collaborationTasks.stateJson}, '$.automation', 'paused', '$.pauseReason', 'restart', '$.revision', json_extract(${collaborationTasks.stateJson}, '$.revision') + 1, '$.notice', CASE WHEN json_extract(${collaborationTasks.stateJson}, '$.inputProcessing.pending') IS NOT NULL THEN coalesce(json_extract(${collaborationTasks.stateJson}, '$.notice'), 'Check the previous reply, then send a follow-up before continuing.') ELSE 'Application restarted. Check the original execution, then continue collaboration.' END)`,
       })
       .where(
         and(
           eq(collaborationTasks.active, true),
-          sql`json_extract(${collaborationTasks.stateJson}, '$.status') = 'running'`,
+          sql`json_extract(${collaborationTasks.stateJson}, '$.protocol') = ${COLLABORATION_PROTOCOL}`,
+          sql`json_extract(${collaborationTasks.stateJson}, '$.status') <> 'complete'`,
         ),
       )
       .run()
@@ -5777,69 +5739,35 @@ export class ConversationRepository {
   collaboration(
     sessionId: string,
     runId?: string,
-    hydrate?: boolean,
+    _hydrate?: boolean,
   ): CollaborationTask | undefined {
     if (runId) {
-      const active = this.collaboration(sessionId, undefined, hydrate)
+      const active = this.collaboration(sessionId)
       if (active?.runId === runId) return active
       const run = this.findRun(runId)
       if (!run || run.sessionId !== sessionId)
-        throw new RunOperationConflictError('The collaboration source is unavailable.')
-      const row = this.database
-        .select()
-        .from(collaborationTurns)
-        .where(eq(collaborationTurns.runId, runId))
+        throw new RunOperationConflictError('The workflow source is unavailable.')
+      const turn = this.database
+        .select({ state: workflowTurns.stateJson })
+        .from(workflowTurns)
+        .where(eq(workflowTurns.runId, runId))
         .get()
-      return row
-        ? this.collaborationRecoveryProjection(this.decodedCollaboration(row.stateJson, hydrate))
-        : undefined
+      return turn ? this.decodedCollaboration(turn.state) : undefined
     }
     const row = this.database
       .select()
       .from(collaborationTasks)
-      .where(and(eq(collaborationTasks.sessionId, sessionId), eq(collaborationTasks.active, true)))
-      .get()
-    return row
-      ? this.collaborationRecoveryProjection(this.decodedCollaboration(row.stateJson, hydrate))
-      : undefined
-  }
-
-  /** Recover a completed report's source without changing its immutable facts or frozen duty. */
-  private collaborationRecoveryProjection(task: CollaborationTask): CollaborationTask {
-    task = this.withPlanReference(task)
-    if (task.status !== 'failed') return task
-    if (task.reportRecovery) return { ...task, reportFailure: task.reportFailure ?? 'missing' }
-    const run = this.findRun(task.runId)
-    if (
-      run?.dispatchPhase !== 'ended' ||
-      run.nativeOutcome !== 'completed' ||
-      !run.responseMessageId
-    )
-      return task
-    const body = this.database
-      .select({
-        state: conversationMessages.state,
-        contentBytes: sql<number>`length(CAST(${conversationMessages.content} AS BLOB))`,
-      })
-      .from(conversationMessages)
       .where(
         and(
-          eq(conversationMessages.id, run.responseMessageId),
-          eq(conversationMessages.runId, run.id),
-          eq(conversationMessages.role, 'assistant'),
+          eq(collaborationTasks.sessionId, sessionId),
+          eq(collaborationTasks.active, true),
+          sql`json_extract(${collaborationTasks.stateJson}, '$.protocol') = ${COLLABORATION_PROTOCOL}`,
         ),
       )
       .get()
-    if (body?.state !== 'complete' || !body.contentBytes) return task
-    task.sourceMessageId = run.responseMessageId
-    if (task.reportFailure) return task
-    const receipt = this.database
-      .select({ result: collaborationTurns.resultJson })
-      .from(collaborationTurns)
-      .where(eq(collaborationTurns.runId, run.id))
-      .get()
-    if (receipt && !receipt.result) return { ...task, reportFailure: 'missing' }
-    return task
+    if (!row) return undefined
+    const task = this.decodedCollaboration(row.stateJson)
+    return { ...task, inputSequence: row.inputSequence }
   }
 
   /** Immutable Run-owned content; physical segment limits never bound cumulative text. */
@@ -5898,7 +5826,7 @@ export class ConversationRepository {
       row.chars !== ref.chars
     )
       throw new RunOperationConflictError(
-        'The immutable collaboration source changed or is unavailable.',
+        'The immutable source does not match. Copy its complete id, sha256, bytes and chars from the supplied reference.',
       )
     return row
   }
@@ -5910,94 +5838,25 @@ export class ConversationRepository {
     const runId = anchor.plan?.runId ?? anchor.report?.runId
     if (!runId) return undefined
     const run = this.findRun(runId)
-    if (!run || run.sessionId !== sessionId || run.userMessageId !== anchor.messageId)
-      throw new RunOperationConflictError('The Comment source Run changed.')
-    if (anchor.plan) {
-      const task = this.collaboration(sessionId, runId, false)
-      if (task?.planVersion !== anchor.plan.version)
-        throw new RunOperationConflictError('The plan version changed.')
-      return task.planDocument
-    }
-    const target = anchor.report!.target
-    if (target.type === 'feedback') {
-      const item = this.database
-        .select()
-        .from(collaborationReportItems)
-        .where(
-          and(
-            eq(collaborationReportItems.runId, runId),
-            eq(collaborationReportItems.itemId, target.id),
-          ),
-        )
-        .get()
-      return item ? collaborationDocumentSchema.parse(JSON.parse(item.documentJson)) : undefined
-    }
-    const row = this.database
-      .select({ json: collaborationTurns.resultJson })
-      .from(collaborationTurns)
-      .where(eq(collaborationTurns.runId, runId))
-      .get()
-    const manifest = row?.json ? JSON.parse(row.json) : undefined
-    return manifest?.documents?.find((entry: { key: string }) => entry.key === 'summary')?.source
-  }
-
-  collaborationCarrierSource(sessionId: string, runId: string): CollaborationDocument | undefined {
-    const run = this.findRun(runId)
-    if (!run || run.sessionId !== sessionId)
-      throw new RunOperationConflictError('The original report Run is unavailable.')
-    const row = this.database
-      .select({
-        id: sql<
-          string | null
-        >`coalesce(${collaborationTurns.nativeEnvelopeBodyId}, ${collaborationTurns.pendingEnvelopeBodyId})`,
-      })
-      .from(collaborationTurns)
-      .where(eq(collaborationTurns.runId, runId))
-      .get()
-    if (!row?.id) return undefined
-    const body = this.database
-      .select()
-      .from(conversationBodyInputs)
-      .where(eq(conversationBodyInputs.id, row.id))
-      .get()
-    if (!body?.sealed || !body.hash || body.sessionId !== sessionId || body.sourceRunId !== runId)
-      return undefined
-    return { id: body.id, sha256: body.hash, bytes: body.bytes, chars: body.chars }
-  }
-
-  naturalMessageProjection(messageId: string, sessionId: string): string | undefined {
-    if (outputSnapshotMetadata(this.database, messageId)?.frozen) return undefined
-    const row = this.database
-      .select({ id: collaborationTurns.answerProjectionBodyId })
-      .from(conversationMessages)
-      .innerJoin(collaborationTurns, eq(collaborationTurns.runId, conversationMessages.runId))
-      .where(
-        and(
-          eq(conversationMessages.id, messageId),
-          eq(conversationMessages.sessionId, sessionId),
-          eq(conversationMessages.state, 'complete'),
-        ),
-      )
-      .get()
-    if (!row?.id) return undefined
-    const body = this.database
-      .select()
-      .from(conversationBodyInputs)
-      .where(eq(conversationBodyInputs.id, row.id))
-      .get()
     if (
-      !body?.sealed ||
-      body.sessionId !== sessionId ||
-      !body.hash ||
-      body.bytes > CONVERSATION_MARKDOWN_BYTES
+      !run ||
+      run.sessionId !== sessionId ||
+      (run.userMessageId !== anchor.messageId && run.responseMessageId !== anchor.messageId)
     )
-      return undefined
-    return this.collaborationDocumentText(sessionId, {
-      id: body.id,
-      sha256: body.hash,
-      bytes: body.bytes,
-      chars: body.chars,
-    })
+      throw new RunOperationConflictError('The Comment source Run changed.')
+    const turn = this.database
+      .select()
+      .from(workflowTurns)
+      .where(eq(workflowTurns.runId, runId))
+      .get()
+    if (!turn?.applied) return undefined
+    if (anchor.plan) {
+      const task = this.decodedCollaboration(turn.stateJson)
+      if (task.planReference?.version !== anchor.plan.version)
+        throw new RunOperationConflictError('The plan version changed.')
+      return task.planReference.document
+    }
+    return turn.reportBodyId ? this.documentReference(sessionId, turn.reportBodyId) : undefined
   }
 
   usePlainCollaborationProjection(sessionId: string, source: CollaborationDocument): void {
@@ -6163,748 +6022,54 @@ export class ConversationRepository {
   }
 
   private storedCollaboration(task: CollaborationTask): CollaborationTask {
-    const planDocument =
-      typeof task.plan === 'string'
-        ? task.planDocument?.sha256 === createHash('sha256').update(task.plan).digest('hex')
-          ? task.planDocument
-          : this.saveCollaborationDocument(task.planReference?.sourceRunId ?? task.runId, task.plan)
-        : task.planDocument
-    return {
+    const taskDocument =
+      task.taskDocument ??
+      (task.task.length > 1024 && this.findRun(task.runId)
+        ? this.saveCollaborationDocument(task.runId, task.task)
+        : undefined)
+    return collaborationTaskSchema.parse({
       ...task,
-      plan: undefined,
-      planDocument,
-      notice: task.notice && task.notice.length > 512 ? undefined : task.notice,
-      noticeDocument:
-        task.notice && task.notice.length > 512
-          ? this.saveCollaborationDocument(task.runId, task.notice)
-          : undefined,
-      task: task.task.length > 1024 ? '' : task.task,
-      taskDocument:
-        task.task.length > 1024
-          ? this.saveCollaborationDocument(task.runId, task.task)
-          : task.taskDocument,
-      result: undefined,
-      resultDocument:
-        task.resultDocument ??
-        (task.result
-          ? this.saveCollaborationDocument(task.runId, JSON.stringify(task.result))
-          : undefined),
-      priorResult: undefined,
-      priorResultDocument:
-        task.priorResultDocument ??
-        (task.priorResult
-          ? this.saveCollaborationDocument(
-              task.previousRunId ?? task.runId,
-              JSON.stringify(task.priorResult),
-            )
-          : undefined),
-    }
+      task: taskDocument ? '' : task.task,
+      ...(taskDocument ? { taskDocument } : {}),
+    })
   }
 
   collaborationPromptState(task: CollaborationTask): CollaborationTask {
-    const effective = this.collaborationTurnAuthorization(task.runId)
-    if (effective)
-      task = {
-        ...task,
-        authorization: effective,
-        inputSequence: effective.inputSequence,
-        requiredInputScopeRef: effective.requiredInputScopeRef ?? undefined,
-      }
-
-    if (task.reportRecovery)
-      task = {
-        ...task,
-        reportRecovery: {
-          ...task.reportRecovery,
-          document: this.collaborationCarrierSource(
-            task.sessionId,
-            task.reportRecovery.sourceRunId,
-          ),
-        },
-      }
-    if (task.priorResult && !task.priorResultDocument && task.previousRunId)
-      this.saveSubmittedReport(
-        task.previousRunId,
-        collaborationResultSchema.parse(task.priorResult),
-      )
-    if (this.findRun(task.runId)) return this.storedCollaboration(task)
-    return { ...task, plan: undefined, result: undefined, priorResult: undefined, task: '' }
+    const turn = this.database
+      .select({ state: workflowTurns.stateJson })
+      .from(workflowTurns)
+      .where(eq(workflowTurns.runId, task.runId))
+      .get()
+    return turn ? this.decodedCollaboration(turn.state) : this.storedCollaboration(task)
   }
 
-  private decodedCollaboration(state: string, hydrate?: boolean): CollaborationTask {
-    const task = collaborationTaskSchema.parse(JSON.parse(state))
-    if (hydrate === false) return task
-    if (hydrate === undefined) {
-      const row = this.database
-        .select({ json: collaborationTurns.resultJson })
-        .from(collaborationTurns)
-        .where(eq(collaborationTurns.runId, task.runId))
-        .get()
-      const manifest = row?.json ? JSON.parse(row.json) : undefined
-      return manifest?.header && task.resultDocument
-        ? {
-            ...task,
-            result: { ...manifest.header, control: true },
-            resultFeedbackCount: manifest.feedbackCount,
-            resultHasOpenDecision: Boolean(manifest.hasOpenDecision),
-          }
-        : task
-    }
-    return {
-      ...task,
-      notice:
-        task.notice ??
-        (task.noticeDocument
-          ? this.collaborationDocumentText(task.sessionId, task.noticeDocument)
-          : undefined),
-      plan:
-        task.plan ??
-        (task.planDocument
-          ? this.collaborationDocumentText(task.sessionId, task.planDocument)
-          : undefined),
-      task: task.taskDocument
-        ? this.collaborationDocumentText(task.sessionId, task.taskDocument)
-        : task.task,
-      result:
-        task.result ??
-        (task.resultDocument
-          ? collaborationResultSchema.parse(
-              JSON.parse(this.collaborationDocumentText(task.sessionId, task.resultDocument)),
-            )
-          : undefined),
-      priorResult:
-        task.priorResult ??
-        (task.priorResultDocument
-          ? collaborationResultSchema.parse(
-              JSON.parse(this.collaborationDocumentText(task.sessionId, task.priorResultDocument)),
-            )
-          : undefined),
-    }
-  }
-
-  private storedResult(sessionId: string, json: string): CollaborationResult {
-    const manifest: unknown = JSON.parse(json)
-    if (!manifest || typeof manifest !== 'object')
-      throw new RunOperationConflictError('The stored report has no indexed source.')
-    const ref = collaborationDocumentSchema.parse(Reflect.get(manifest, 'source'))
-    return collaborationResultSchema.parse(
-      JSON.parse(this.collaborationDocumentText(sessionId, ref)),
+  assertWorkflowDispatch(runId: string): void {
+    const run = this.findRun(runId)
+    if (
+      !run?.collaboration ||
+      run.dispatchPhase === 'possibly_sent' ||
+      run.dispatchPhase === 'accepted'
     )
-  }
-
-  private archiveIndexedResult(
-    runId: string,
-    result: CollaborationResult,
-    source: CollaborationDocument,
-  ) {
+      return
     const auth = this.collaborationTurnAuthorization(runId)
-    if (!auth || !this.resultMatchesInputGrant(runId, result))
+    const current = this.collaboration(run.sessionId)
+    if (
+      !auth ||
+      !current ||
+      current.id !== auth.taskId ||
+      current.runId !== runId ||
+      current.revision !== auth.taskRevision ||
+      current.inputSequence !== auth.inputSequence ||
+      (auth.stage !== 'reply' &&
+        (current.automation !== 'active' || Boolean(collaborationInputGate(current))))
+    )
       throw new RunOperationConflictError(
-        'The submitted result does not match the current immutable input obligation.',
+        'The workflow was paused or changed before native dispatch.',
       )
-    const digest = source.sha256
-    const old = this.database
-      .select()
-      .from(collaborationResultApplications)
-      .where(eq(collaborationResultApplications.runId, runId))
-      .get()
-    if (old) {
-      if (old.digest !== digest)
-        throw new RunOperationConflictError(
-          'A different result cannot replace this Turn submission.',
-        )
-      return JSON.parse(old.manifestJson)
-    }
-    const planDocument =
-      typeof result.plan === 'string'
-        ? this.saveCollaborationDocument(runId, result.plan)
-        : undefined
-    const summaryDocument = this.saveCollaborationDocument(runId, result.summary)
-    const header = {
-      ...result,
-      summary: result.summary.slice(0, 512),
-      plan: typeof result.plan === 'string' ? undefined : result.plan,
-      todoDeltas: [],
-      inputResponses: [],
-    }
-    const manifest = {
-      source,
-      header,
-      summaryDocument,
-      planDocument,
-      todoCount: result.todoDeltas.length,
-      inputResponseCount: result.inputResponses.length,
-    }
-    this.database
-      .insert(collaborationResultApplications)
-      .values({
-        runId,
-        taskId: auth.taskId,
-        resultId: `${runId}:${digest}`,
-        sourceJson: JSON.stringify(source),
-        digest,
-        manifestJson: JSON.stringify(manifest),
-        createdAt: new Date().toISOString(),
-      })
-      .run()
-    for (const [ordinal, delta] of result.todoDeltas.entries())
-      this.database
-        .insert(collaborationResultOperations)
-        .values({
-          runId,
-          ordinal,
-          todoId: delta.todoId,
-          expectedRevision: delta.expectedRevision,
-          operation: delta.operation,
-          titlePreview: (
-            delta.title ??
-            this.database
-              .select({ title: collaborationTodos.titlePreview })
-              .from(collaborationTodos)
-              .where(
-                and(
-                  eq(collaborationTodos.taskId, auth.taskId),
-                  eq(collaborationTodos.todoId, delta.todoId),
-                ),
-              )
-              .get()?.title ??
-            delta.todoId
-          ).slice(0, 180),
-          documentJson: JSON.stringify(
-            this.saveCollaborationDocument(runId, JSON.stringify(delta)),
-          ),
-        })
-        .run()
-    for (const response of result.inputResponses)
-      this.database
-        .insert(collaborationResultInputResponses)
-        .values({
-          runId,
-          batchId: response.batchId,
-          memberId: response.memberId,
-          disposition: response.disposition,
-          todoId: response.todoId,
-          documentJson: JSON.stringify(
-            this.saveCollaborationDocument(runId, JSON.stringify(response)),
-          ),
-        })
-        .run()
-    return manifest
   }
 
-  private indexedResultManifest(runId: string) {
-    const row = this.database
-      .select()
-      .from(collaborationResultApplications)
-      .where(eq(collaborationResultApplications.runId, runId))
-      .get()
-    if (!row) return undefined
-    const value = storedObject(row.manifestJson)
-    if (
-      typeof value.todoCount !== 'number' ||
-      !Number.isSafeInteger(value.todoCount) ||
-      value.todoCount < 0 ||
-      typeof value.inputResponseCount !== 'number' ||
-      !Number.isSafeInteger(value.inputResponseCount) ||
-      value.inputResponseCount < 0
-    )
-      throw new RunOperationConflictError('The result index counts are invalid.')
-    return {
-      row,
-      manifest: {
-        source: collaborationDocumentSchema.parse(value.source),
-        header: collaborationResultSchema.parse(value.header),
-        summaryDocument: collaborationDocumentSchema.parse(value.summaryDocument),
-        ...(value.planDocument
-          ? { planDocument: collaborationDocumentSchema.parse(value.planDocument) }
-          : {}),
-        todoCount: value.todoCount,
-        inputResponseCount: value.inputResponseCount,
-      },
-    }
-  }
-
-  private readIndexedDelta(
-    sessionId: string,
-    row: typeof collaborationResultOperations.$inferSelect,
-  ): CollaborationTodoDelta {
-    const value = collaborationTodoDeltaSchema.parse(
-      JSON.parse(this.collaborationDocumentText(sessionId, JSON.parse(row.documentJson))),
-    )
-    if (
-      value.todoId !== row.todoId ||
-      value.expectedRevision !== row.expectedRevision ||
-      value.operation !== row.operation
-    )
-      throw new RunOperationConflictError('The indexed Todo operation changed.')
-    return value
-  }
-
-  private readIndexedResponse(
-    sessionId: string,
-    row: typeof collaborationResultInputResponses.$inferSelect,
-  ): CollaborationInputResponse {
-    const value = collaborationInputResponseSchema.parse(
-      JSON.parse(this.collaborationDocumentText(sessionId, JSON.parse(row.documentJson))),
-    )
-    const applied =
-      this.database
-        .select({ state: collaborationResultApplications.state })
-        .from(collaborationResultApplications)
-        .where(eq(collaborationResultApplications.runId, row.runId))
-        .get()?.state === 'applied'
-    if (
-      value.batchId !== row.batchId ||
-      value.memberId !== row.memberId ||
-      (!applied && (value.disposition !== row.disposition || value.todoId !== row.todoId))
-    )
-      throw new RunOperationConflictError('The indexed input response changed.')
-    return applied
-      ? collaborationInputResponseSchema.parse({
-          ...value,
-          disposition: row.disposition,
-          todoId: row.todoId,
-        })
-      : value
-  }
-
-  private applyTodoDelta(
-    task: CollaborationTask,
-    run: AgentRun,
-    delta: CollaborationTodoDelta,
-    ledgerRevision: number,
-  ) {
-    const current = this.database
-      .select()
-      .from(collaborationTodos)
-      .where(
-        and(eq(collaborationTodos.taskId, task.id), eq(collaborationTodos.todoId, delta.todoId)),
-      )
-      .get()
-    if ((current?.revision ?? 0) !== delta.expectedRevision)
-      throw new RunOperationConflictError('The Todo advanced after this Turn was authorized.')
-    if ((delta.operation === 'create') !== !current)
-      throw new RunOperationConflictError('Create must introduce a new stable Todo identity.')
-    const questionChanged = Boolean(
-      delta.question &&
-      (current?.questionId !== delta.question.id ||
-        current.questionRevision !== delta.question.revision),
-    )
-    if (questionChanged && ['propose_resolution', 'confirm'].includes(delta.operation))
-      throw new RunOperationConflictError(
-        'A new question must be introduced with create, update, or reopen before its resolution can be proposed or confirmed.',
-      )
-    if (questionChanged && current && !delta.reason.trim())
-      throw new RunOperationConflictError(
-        'Changing an existing question requires a reason for the additional user input.',
-      )
-    const resetsResolution = questionChanged || delta.operation === 'reopen'
-    if (resetsResolution && (delta.resolutionKind !== null || delta.mergeTargetId !== null))
-      throw new RunOperationConflictError(
-        'An open question or reopened Todo cannot retain a proposed resolution or merge target.',
-      )
-    const reviewerDuty =
-      task.duty === 'plan_review' || task.duty === 'plan_adoption' || task.duty === 'code_review'
-    let answerConfirmation = false
-    if (
-      delta.operation === 'confirm' &&
-      current?.questionId &&
-      current.answerResolver === run.agentId &&
-      ['decision', 'information'].includes(current.kind) &&
-      ['open', 'awaiting_review'].includes(current.status)
-    ) {
-      for (const sourceId of delta.userSourceIds) {
-        const answer = this.database
-          .select({ id: conversationInputBatchMembers.memberId })
-          .from(collaborationRequiredInputMembers)
-          .innerJoin(
-            conversationInputBatchMembers,
-            and(
-              eq(conversationInputBatchMembers.batchId, collaborationRequiredInputMembers.batchId),
-              eq(
-                conversationInputBatchMembers.memberId,
-                collaborationRequiredInputMembers.memberId,
-              ),
-            ),
-          )
-          .innerJoin(
-            anchoredComments,
-            eq(anchoredComments.id, conversationInputBatchMembers.commentId),
-          )
-          .where(
-            and(
-              eq(collaborationRequiredInputMembers.runId, run.id),
-              eq(collaborationRequiredInputMembers.active, true),
-              eq(conversationInputBatchMembers.commentId, sourceId),
-              ne(conversationInputBatchMembers.state, 'withdrawn'),
-              isNotNull(anchoredComments.sentWithMessageId),
-              eq(conversationInputBatchMembers.sourceTaskId, task.id),
-              eq(conversationInputBatchMembers.sourceTodoId, delta.todoId),
-              eq(conversationInputBatchMembers.questionId, current.questionId),
-              eq(conversationInputBatchMembers.questionRevision, current.questionRevision!),
-            ),
-          )
-          .limit(1)
-          .get()
-        if (answer) {
-          answerConfirmation = true
-          break
-        }
-      }
-    }
-    if (
-      delta.operation === 'confirm' &&
-      !answerConfirmation &&
-      (!reviewerDuty ||
-        current?.status !== 'awaiting_review' ||
-        this.findRun(current.sourceRunId)?.agentId === run.agentId)
-    )
-      throw new RunOperationConflictError(
-        'Only an independent reviewer can confirm the exact proposed resolution.',
-      )
-    if (
-      delta.operation === 'reopen' &&
-      (current?.status !== 'done' || !delta.reason.trim() || !delta.evidenceRefs.length)
-    )
-      throw new RunOperationConflictError(
-        'Reopening a settled Todo requires new evidence and a reason.',
-      )
-    if (current?.status === 'done' && !['reopen'].includes(delta.operation))
-      throw new RunOperationConflictError(
-        'A settled Todo must be explicitly reopened before changing it.',
-      )
-    if (
-      ['propose_resolution', 'confirm'].includes(delta.operation) &&
-      (!delta.reason.trim() || !delta.resolutionKind)
-    )
-      throw new RunOperationConflictError(
-        'Every proposed or confirmed closure needs a resolution kind and concrete reason.',
-      )
-    if (delta.resolutionKind === 'merged') {
-      if (!delta.mergeTargetId || delta.mergeTargetId === delta.todoId)
-        throw new RunOperationConflictError('A merged Todo requires a distinct same-task target.')
-      const target = this.database
-        .select()
-        .from(collaborationTodos)
-        .where(
-          and(
-            eq(collaborationTodos.taskId, task.id),
-            eq(collaborationTodos.todoId, delta.mergeTargetId),
-          ),
-        )
-        .get()
-      if (!target)
-        throw new RunOperationConflictError('The merge target is unavailable in this task.')
-      const cycle = this.database.get<{ found: number }>(sql`WITH RECURSIVE links(id) AS (
-        SELECT ${delta.mergeTargetId} UNION SELECT t.merged_into FROM collaboration_todos t JOIN links l ON l.id=t.todo_id
-        WHERE t.task_id=${task.id} AND t.merged_into IS NOT NULL)
-        SELECT 1 AS found FROM links WHERE id=${delta.todoId} LIMIT 1`)
-      if (cycle) throw new RunOperationConflictError('Todo merges cannot form a cycle.')
-    } else if (delta.mergeTargetId)
-      throw new RunOperationConflictError('Only a merge resolution can name a merge target.')
-    const userSources: Array<{
-      id: string
-      batchId: string
-      memberId: string
-      bodyDocument: CollaborationDocument
-      anchorDocument?: CollaborationDocument
-    }> = []
-    let hasOlderQuestionAnswer = false,
-      hasCurrentQuestionAnswer = false
-    for (const sourceId of delta.userSourceIds) {
-      const source = this.database
-        .select({ id: anchoredComments.id })
-        .from(anchoredComments)
-        .innerJoin(
-          conversationInputBatchMembers,
-          eq(conversationInputBatchMembers.commentId, anchoredComments.id),
-        )
-        .innerJoin(
-          collaborationRequiredInputMembers,
-          and(
-            eq(collaborationRequiredInputMembers.batchId, conversationInputBatchMembers.batchId),
-            eq(collaborationRequiredInputMembers.memberId, conversationInputBatchMembers.memberId),
-          ),
-        )
-        .where(
-          and(
-            eq(collaborationRequiredInputMembers.runId, run.id),
-            eq(collaborationRequiredInputMembers.active, true),
-            eq(anchoredComments.id, sourceId),
-            isNotNull(anchoredComments.sentWithMessageId),
-          ),
-        )
-        .limit(1)
-        .get()
-      const bodySource = this.database.get<{
-        found: number
-      }>(sql`SELECT 1 AS found FROM collaboration_required_input_members r
-        JOIN conversation_input_batches b ON b.id=r.batch_id WHERE r.run_id=${run.id} AND r.active=1 AND r.member_id='$body' AND b.message_id=${sourceId} LIMIT 1`)
-      const historical = this.database
-        .select({ member: conversationInputBatchMembers, batch: conversationInputBatches })
-        .from(conversationInputBatchMembers)
-        .innerJoin(
-          conversationInputBatches,
-          eq(conversationInputBatches.id, conversationInputBatchMembers.batchId),
-        )
-        .where(
-          and(
-            eq(conversationInputBatches.taskId, task.id),
-            lte(
-              conversationInputBatches.sequence,
-              this.collaborationTurnAuthorization(run.id)!.inputSequence,
-            ),
-            eq(conversationInputBatchMembers.commentId, sourceId),
-          ),
-        )
-        .limit(1)
-        .get()
-      const historicalBody = this.database
-        .select()
-        .from(conversationInputBatches)
-        .where(
-          and(
-            eq(conversationInputBatches.taskId, task.id),
-            lte(
-              conversationInputBatches.sequence,
-              this.collaborationTurnAuthorization(run.id)!.inputSequence,
-            ),
-            eq(conversationInputBatches.messageId, sourceId),
-          ),
-        )
-        .limit(1)
-        .get()
-      if (
-        current?.questionId &&
-        historical?.member.sourceTaskId === task.id &&
-        historical.member.sourceTodoId === delta.todoId &&
-        historical.member.questionId
-      ) {
-        if (
-          historical.member.questionId === current.questionId &&
-          historical.member.questionRevision === current.questionRevision
-        )
-          hasCurrentQuestionAnswer = true
-        else hasOlderQuestionAnswer = true
-      }
-      if (!source && !bodySource && !historical && !historicalBody)
-        throw new RunOperationConflictError(
-          'A user decision must cite a real authorized sent Comment, answer, or Batch message.',
-        )
-      if (historical?.member.bodyDocumentJson)
-        userSources.push({
-          id: sourceId,
-          batchId: historical.batch.id,
-          memberId: historical.member.memberId,
-          bodyDocument: JSON.parse(historical.member.bodyDocumentJson),
-          ...(historical.member.anchorDocumentJson
-            ? { anchorDocument: JSON.parse(historical.member.anchorDocumentJson) }
-            : {}),
-        })
-      else if (historicalBody?.bodyDocumentJson)
-        userSources.push({
-          id: sourceId,
-          batchId: historicalBody.id,
-          memberId: '$body',
-          bodyDocument: JSON.parse(historicalBody.bodyDocumentJson),
-        })
-    }
-    if (
-      ['propose_resolution', 'confirm'].includes(delta.operation) &&
-      hasOlderQuestionAnswer &&
-      !hasCurrentQuestionAnswer
-    )
-      throw new RunOperationConflictError(
-        'An older question answer cannot settle the current question version.',
-      )
-    for (const ref of delta.evidenceRefs)
-      if (!this.sourceDocumentAuthorized(run.id, ref))
-        throw new RunOperationConflictError(
-          'The evidence source is outside the frozen authorization.',
-        )
-    if (
-      delta.operation === 'create' &&
-      (!delta.kind || !delta.title?.trim() || !delta.detail?.trim())
-    )
-      throw new RunOperationConflictError(
-        'A new Todo requires its kind, title, and problem with impact.',
-      )
-    if (
-      delta.question &&
-      current?.questionRevision &&
-      delta.question.revision < current.questionRevision
-    )
-      throw new RunOperationConflictError(
-        'A question definition cannot move to an earlier revision.',
-      )
-    const previous = current
-      ? storedObject(
-          this.collaborationDocumentText(run.sessionId, JSON.parse(current.contentDocumentJson)),
-        )
-      : {}
-    if (
-      delta.question &&
-      current?.questionRevision === delta.question.revision &&
-      JSON.stringify(previous.question) !== JSON.stringify(delta.question)
-    )
-      throw new RunOperationConflictError(
-        'A changed question definition requires a new question revision.',
-      )
-    if (
-      delta.question &&
-      current?.questionId &&
-      current.questionId !== delta.question.id &&
-      delta.operation !== 'reopen'
-    )
-      throw new RunOperationConflictError('An existing question identity must remain stable.')
-    const resolutionKind = resetsResolution
-      ? null
-      : (delta.resolutionKind ?? current?.resolutionKind ?? null)
-    const content: Record<string, unknown> = {
-      ...previous,
-      id: delta.todoId,
-      taskId: task.id,
-      ...Object.fromEntries(
-        ['kind', 'title', 'detail', 'recommendation', 'evidence', 'question']
-          .filter((key) => Reflect.get(delta, key) !== null)
-          .map((key) => [key, Reflect.get(delta, key)]),
-      ),
-      reason: delta.reason,
-      resolutionKind,
-      mergeTargetId: delta.mergeTargetId,
-      userSourceIds: delta.userSourceIds,
-      userSources,
-      evidenceRefs: delta.evidenceRefs,
-    }
-    const question =
-      delta.question ??
-      (current?.questionJson
-        ? collaborationTodoQuestionSchema.parse(JSON.parse(current.questionJson))
-        : null)
-    const effectiveKind = delta.kind ?? current!.kind
-    if (!question && ['decision', 'information'].includes(effectiveKind))
-      throw new RunOperationConflictError(
-        'A user decision or information Todo requires a complete question definition.',
-      )
-    if (
-      question &&
-      ((question.type === 'choice' && effectiveKind !== 'decision') ||
-        (question.type === 'text' && effectiveKind !== 'information'))
-    )
-      throw new RunOperationConflictError(
-        'The effective Todo kind must match its retained question definition.',
-      )
-    const status =
-      delta.operation === 'confirm'
-        ? 'done'
-        : delta.operation === 'propose_resolution'
-          ? 'awaiting_review'
-          : current?.status === 'awaiting_review' &&
-              delta.operation === 'update' &&
-              !questionChanged
-            ? 'awaiting_review'
-            : 'open'
-    const contentDocument = this.saveCollaborationDocument(run.id, JSON.stringify(content))
-    const display = [
-      typeof content.title === 'string' && content.title.length > 180
-        ? `**Title**\n\n${content.title}`
-        : '',
-      typeof content.detail === 'string' ? `**Problem & impact**\n\n${content.detail}` : '',
-      typeof content.recommendation === 'string'
-        ? `**Suggestion**\n\n${content.recommendation}`
-        : '',
-      typeof content.evidence === 'string' ? `**Evidence**\n\n${content.evidence}` : '',
-      delta.reason.trim()
-        ? `**${status === 'done' ? 'Resolution' : 'Handling'}**\n\n${delta.reason}`
-        : '',
-      question ? `**Question**\n\n${question.question}\n\n${question.reason}` : '',
-    ]
-      .filter(Boolean)
-      .join('\n\n')
-    const displayDocument = this.saveCollaborationDocument(
-      run.id,
-      display || (typeof content.title === 'string' ? content.title : delta.todoId),
-    )
-    const reasonDocument = delta.reason.trim()
-      ? this.saveCollaborationDocument(run.id, delta.reason)
-      : current?.reasonDocumentJson
-        ? collaborationDocumentSchema.parse(JSON.parse(current.reasonDocumentJson))
-        : undefined
-    const values: typeof collaborationTodos.$inferInsert = {
-      taskId: task.id,
-      todoId: delta.todoId,
-      revision: delta.expectedRevision + 1,
-      ledgerRevision,
-      ordinal:
-        current?.ordinal ??
-        (this.database
-          .select({ value: max(collaborationTodos.ordinal) })
-          .from(collaborationTodos)
-          .where(eq(collaborationTodos.taskId, task.id))
-          .get()?.value ?? -1) + 1,
-      kind: effectiveKind,
-      status,
-      titlePreview: (delta.title ?? current!.titlePreview).slice(0, 180),
-      author: current?.author ?? run.agentId,
-      sourceRunId: run.id,
-      documentJson: JSON.stringify(displayDocument),
-      documentId: displayDocument.id,
-      contentDocumentJson: JSON.stringify(contentDocument),
-      contentDocumentId: contentDocument.id,
-      reasonDocumentJson: reasonDocument ? JSON.stringify(reasonDocument) : null,
-      reasonDocumentId: reasonDocument?.id,
-      resolutionKind,
-      mergedInto: delta.mergeTargetId,
-      questionId: question?.id,
-      questionRevision: question?.revision,
-      questionJson: question ? JSON.stringify(question) : null,
-      answerResolver: question?.answerResolver,
-      confirmedBy: status === 'done' ? run.agentId : null,
-      confirmedRunId: status === 'done' ? run.id : null,
-      updatedAt: new Date().toISOString(),
-    }
-    this.database
-      .insert(collaborationTodos)
-      .values(values)
-      .onConflictDoUpdate({
-        target: [collaborationTodos.taskId, collaborationTodos.todoId],
-        set: values,
-      })
-      .run()
-    this.database.insert(collaborationTodoRevisions).values(values).run()
-  }
-
-  private advanceInputWatermark(taskId: string) {
-    // Close only fully settled batches; a later successful batch never jumps an earlier gap.
-    this.database
-      .run(sql`UPDATE conversation_input_batches SET state='closed',closed_at=${new Date().toISOString()}
-      WHERE task_id=${taskId} AND state='open' AND body_state IN ('resolved','withdrawn')
-      AND NOT EXISTS (SELECT 1 FROM conversation_input_batch_members m WHERE m.batch_id=conversation_input_batches.id AND m.state NOT IN ('resolved','withdrawn'))`)
-    const task = this.database
-      .select()
-      .from(collaborationTasks)
-      .where(eq(collaborationTasks.id, taskId))
-      .get()!
-    const gap = this.database
-      .select({ sequence: conversationInputBatches.sequence })
-      .from(conversationInputBatches)
-      .where(
-        and(
-          eq(conversationInputBatches.taskId, taskId),
-          eq(conversationInputBatches.state, 'open'),
-          gt(conversationInputBatches.sequence, task.processedWatermark),
-        ),
-      )
-      .orderBy(asc(conversationInputBatches.sequence))
-      .limit(1)
-      .get()
-    const watermark = gap ? gap.sequence - 1 : task.inputSequence
-    this.database
-      .update(collaborationTasks)
-      .set({ processedWatermark: watermark })
-      .where(eq(collaborationTasks.id, taskId))
-      .run()
-    return watermark
+  private decodedCollaboration(state: string, _hydrate?: boolean): CollaborationTask {
+    return collaborationTaskSchema.parse(JSON.parse(state))
   }
 
   private withdrawInputBatch(batchId: string) {
@@ -6925,692 +6090,98 @@ export class ConversationRepository {
       .set({ bodyState: 'withdrawn', state: 'closed', closedAt: now })
       .where(eq(conversationInputBatches.id, batchId))
       .run()
-    if (batch.taskId) this.advanceInputWatermark(batch.taskId)
-  }
-
-  private applyIndexedInputResponses(task: CollaborationTask, run: AgentRun) {
-    const missing = this.database.get<{
-      memberId: string
-    }>(sql`SELECT r.member_id AS memberId FROM collaboration_required_input_members r
-      LEFT JOIN collaboration_result_input_responses s ON s.run_id=r.run_id AND s.batch_id=r.batch_id AND s.member_id=r.member_id
-      WHERE r.run_id=${run.id} AND r.active=1 AND s.member_id IS NULL LIMIT 1`)
-    const foreign = this.database.get<{
-      memberId: string
-    }>(sql`SELECT s.member_id AS memberId FROM collaboration_result_input_responses s
-      LEFT JOIN collaboration_required_input_members r ON r.run_id=s.run_id AND r.batch_id=s.batch_id AND r.member_id=s.member_id AND r.active=1
-      WHERE s.run_id=${run.id} AND r.member_id IS NULL LIMIT 1`)
-    if (missing || foreign)
-      throw new RunOperationConflictError(
-        'Every authorized input member must have exactly one response; foreign members are invalid.',
-      )
-    let cursor = ''
-    for (;;) {
-      const rows = this.database
-        .select()
-        .from(collaborationResultInputResponses)
+    const task = this.collaboration(batch.sessionId)
+    if (batch.taskId === task?.id && task.latestUserMessageId === batch.clientMessageId) {
+      const latest = this.database
+        .select({ messageId: conversationInputBatches.messageId })
+        .from(conversationInputBatches)
         .where(
           and(
-            eq(collaborationResultInputResponses.runId, run.id),
-            sql`${collaborationResultInputResponses.batchId} || ':' || ${collaborationResultInputResponses.memberId} > ${cursor}`,
+            eq(conversationInputBatches.taskId, task.id),
+            ne(conversationInputBatches.bodyState, 'withdrawn'),
+            isNotNull(conversationInputBatches.messageId),
           ),
         )
-        .orderBy(
-          asc(collaborationResultInputResponses.batchId),
-          asc(collaborationResultInputResponses.memberId),
-        )
-        .limit(COLLABORATION_INDEX_ITEMS)
-        .all()
-      if (!rows.length) break
-      for (const row of rows) {
-        const response = this.readIndexedResponse(run.sessionId, row)
-        const reason = this.saveCollaborationDocument(run.id, response.reason)
-        if (response.memberId === '$body') {
-          const bodyTodo = response.todoId
-            ? this.database
-                .select()
-                .from(collaborationTodos)
-                .where(
-                  and(
-                    eq(collaborationTodos.taskId, task.id),
-                    eq(collaborationTodos.todoId, response.todoId),
-                  ),
-                )
-                .get()
-            : undefined
-          if (response.todoId && !bodyTodo)
-            throw new RunOperationConflictError(
-              'The input body response names an unavailable Todo.',
-            )
-          const hasProposals =
-            ['plan_submission', 'stage_result'].includes(
-              task.duty ?? collaborationSubmission(task),
-            ) &&
-            Boolean(
-              this.database
-                .select({ id: collaborationTodos.todoId })
-                .from(collaborationTodos)
-                .where(
-                  and(
-                    eq(collaborationTodos.taskId, task.id),
-                    eq(collaborationTodos.status, 'awaiting_review'),
-                  ),
-                )
-                .limit(1)
-                .get(),
-            )
-          const effective =
-            response.disposition === 'resolved' &&
-            (hasProposals || (bodyTodo && bodyTodo.status !== 'done'))
-              ? 'awaiting_confirmation'
-              : response.disposition
-          this.database
-            .update(conversationInputBatches)
-            .set({
-              bodyState: effective,
-            })
-            .where(
-              and(
-                eq(conversationInputBatches.id, response.batchId),
-                eq(conversationInputBatches.taskId, task.id),
-              ),
-            )
-            .run()
-          this.database
-            .update(collaborationResultInputResponses)
-            .set({ disposition: effective, todoId: response.todoId })
-            .where(
-              and(
-                eq(collaborationResultInputResponses.runId, run.id),
-                eq(collaborationResultInputResponses.batchId, response.batchId),
-                eq(collaborationResultInputResponses.memberId, response.memberId),
-              ),
-            )
-            .run()
-          continue
-        }
-        const member = this.database
+        .orderBy(desc(conversationInputBatches.sequence))
+        .limit(1)
+        .get()
+      task.latestUserMessageId = latest?.messageId ?? undefined
+      const processing = collaborationInputProcessing(task)
+      if (processing.pending?.inputSequence === batch.sequence) {
+        const turn = this.database
           .select()
-          .from(conversationInputBatchMembers)
-          .where(
-            and(
-              eq(conversationInputBatchMembers.batchId, response.batchId),
-              eq(conversationInputBatchMembers.memberId, response.memberId),
-            ),
-          )
+          .from(workflowTurns)
+          .where(and(eq(workflowTurns.runId, task.runId), eq(workflowTurns.taskId, task.id)))
           .get()
-        if (!member) throw new RunOperationConflictError('The frozen input member is unavailable.')
-        const relatedTodo =
-          response.todoId ?? (member.sourceTaskId === task.id ? member.sourceTodoId : null)
-        let todo = relatedTodo
+        const auth = turn
+          ? collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
+          : undefined
+        const previous =
+          auth?.stage === 'reply' && turn
+            ? (
+                auth.inputProcessing ??
+                collaborationInputProcessing(this.decodedCollaboration(turn.stateJson))
+              ).pending
+            : undefined
+        const source = previous
           ? this.database
-              .select()
-              .from(collaborationTodos)
+              .select({ id: conversationInputBatches.id })
+              .from(conversationInputBatches)
               .where(
                 and(
-                  eq(collaborationTodos.taskId, task.id),
-                  eq(collaborationTodos.todoId, relatedTodo),
+                  eq(conversationInputBatches.taskId, task.id),
+                  eq(conversationInputBatches.clientMessageId, previous.inputId),
+                  eq(conversationInputBatches.sequence, previous.inputSequence),
+                  ne(conversationInputBatches.bodyState, 'withdrawn'),
                 ),
               )
               .get()
           : undefined
-        if (response.todoId && !todo)
-          throw new RunOperationConflictError('An input response names an unavailable Todo.')
-        const anchor = commentAnchorSchema.parse(JSON.parse(member.anchorJson))
-        const staleAnswer = Boolean(
-          todo &&
-          anchor.type === 'todo' &&
-          anchor.question &&
-          (todo.questionId !== anchor.question.id ||
-            todo.questionRevision !== anchor.question.revision),
-        )
-        if (staleAnswer && response.todoId !== null)
-          throw new RunOperationConflictError('An answer cannot resolve another question revision.')
-        if (staleAnswer) todo = undefined
-        const confirmed = todo?.status === 'done'
-        let state = response.disposition
-        if (
-          state === 'resolved' &&
-          ((member.answerResolver && member.answerResolver !== run.agentId && !confirmed) ||
-            (todo && !confirmed))
-        )
-          state = 'awaiting_confirmation'
-        this.database
-          .update(conversationInputBatchMembers)
-          .set({
-            state,
-            responseRunId: run.id,
-            responseDocumentJson: JSON.stringify(reason),
-            todoId: staleAnswer ? null : relatedTodo,
-          })
-          .where(
-            and(
-              eq(conversationInputBatchMembers.batchId, response.batchId),
-              eq(conversationInputBatchMembers.memberId, response.memberId),
-              notInArray(conversationInputBatchMembers.state, ['resolved', 'withdrawn']),
-            ),
-          )
-          .run()
-        this.database
-          .update(collaborationResultInputResponses)
-          .set({ disposition: state, todoId: staleAnswer ? null : relatedTodo })
-          .where(
-            and(
-              eq(collaborationResultInputResponses.runId, run.id),
-              eq(collaborationResultInputResponses.batchId, response.batchId),
-              eq(collaborationResultInputResponses.memberId, response.memberId),
-            ),
-          )
-          .run()
-      }
-      cursor = `${rows.at(-1)!.batchId}:${rows.at(-1)!.memberId}`
-    }
-    const recovery = this.collaborationTurnAuthorization(run.id)?.reportSourceRunId
-    if (recovery) {
-      this.database
-        .run(sql`UPDATE conversation_input_batches SET body_state='resolved',state='closed',closed_at=${new Date().toISOString()}
-        WHERE task_id=${task.id} AND member_count=0 AND run_id IN (
-          SELECT a.run_id FROM collaboration_turn_authorizations a WHERE a.task_id=${task.id}
-          AND json_extract(a.authorization_json,'$.reportSourceRunId')=${recovery})`)
-      this.nativeFact(run.id, 'collaboration.report_submission_controls_settled', {
-        sourceRunId: recovery,
-      })
-    }
-    return this.advanceInputWatermark(task.id)
-  }
-
-  private applyIndexedCollaborationResult(
-    task: CollaborationTask,
-    runId: string,
-  ): CollaborationTask {
-    return this.database.transaction(() => {
-      const run = this.findRun(runId),
-        indexed = this.indexedResultManifest(runId),
-        auth = this.collaborationTurnAuthorization(runId)
-      if (
-        !run ||
-        !indexed ||
-        !auth ||
-        auth.taskId !== task.id ||
-        auth.actor !== run.agentId ||
-        task.actor !== run.agentId ||
-        run.dispatchPhase !== 'ended' ||
-        run.nativeOutcome !== 'completed' ||
-        !this.hasCompleteResponse(runId) ||
-        run.controlDisposition === 'abandoned'
-      )
-        throw new RunOperationConflictError(
-          'Only the matching completed Native Turn can settle its submitted result.',
-        )
-      if (!this.resultMatchesInputGrant(runId, indexed.manifest.header))
-        throw new RunOperationConflictError(
-          'The result predates appended input or delivery is unresolved.',
-        )
-      if (indexed.row.state === 'applied') return this.collaboration(task.sessionId) ?? task
-      if (indexed.row.state !== 'archived')
-        throw new RunOperationConflictError(
-          'This original result is not eligible for reapplication.',
-        )
-      const prepared = { ...task, duty: auth.duty, authorization: auth }
-      const manifest = indexed.manifest
-      if (
-        auth.duty === 'plan_adoption' &&
-        !manifest.planDocument &&
-        (!manifest.header.verdict ||
-          JSON.stringify(manifest.header.reviewedPlan) !== JSON.stringify(auth.basePlanRef))
-      )
-        throw new RunOperationConflictError(
-          'Unchanged initial-plan adoption requires an explicit verdict for the exact original draft.',
-        )
-      if (['plan_submission', 'plan_adoption'].includes(auth.duty) && !manifest.planDocument) {
-        if (
-          !manifest.header.plan ||
-          typeof manifest.header.plan !== 'object' ||
-          JSON.stringify(manifest.header.plan) !== JSON.stringify(task.planReference) ||
-          JSON.stringify(auth.basePlanRef) !== JSON.stringify(task.planReference)
-        )
-          throw new RunOperationConflictError(
-            'Every plan response must submit a complete plan or the exact frozen current reference.',
-          )
-      }
-      if (
-        auth.duty === 'plan_adoption' &&
-        manifest.planDocument &&
-        manifest.header.verdict === 'accepted'
-      )
-        throw new RunOperationConflictError(
-          'Initial plan adoption requires an exact unchanged reference; a revised plan needs independent review.',
-        )
-      if (
-        auth.duty === 'code_review' &&
-        (run.agentId !== task.reviewer || task.reviewer === task.implementer)
-      )
-        throw new RunOperationConflictError('Code review must use the frozen independent reviewer.')
-      if (
-        auth.duty === 'code_review' &&
-        JSON.stringify(manifest.header.reviewScopeRef) !==
-          JSON.stringify(auth.reviewScopeRef ?? undefined)
-      )
-        throw new RunOperationConflictError(
-          'The review scope does not match the exact frozen reference.',
-        )
-      if (manifest.planDocument) {
-        if (
-          !['plan_submission', 'plan_adoption'].includes(auth.duty) ||
-          (task.planVersion && run.agentId !== task.primary) ||
-          (!task.planVersion && run.agentId !== task.drafter)
-        )
-          throw new RunOperationConflictError(
-            'Only the frozen authorized plan owner can publish this plan.',
-          )
-        if (manifest.planDocument.sha256 !== task.planDocument?.sha256) {
-          prepared.planVersion++
-          prepared.planAuthor = run.agentId
-          prepared.reviewedPlan = undefined
-          prepared.approvedPlanVersion = undefined
-          prepared.planDocument = manifest.planDocument
-          prepared.plan = undefined
-          prepared.planReference = {
-            type: 'unchanged',
-            version: prepared.planVersion,
-            sourceRunId: runId,
-            sha256: manifest.planDocument.sha256,
-          }
-        }
-      }
-      const row = this.database
-        .select()
-        .from(collaborationTasks)
-        .where(eq(collaborationTasks.id, task.id))
-        .get()!
-      const ledgerRevision = manifest.todoCount ? row.ledgerRevision + 1 : row.ledgerRevision
-      let questionCursor = -1,
-        newQuestions = 0
-      for (;;) {
-        const candidates = this.database
-          .select()
-          .from(collaborationResultOperations)
-          .where(
-            and(
-              eq(collaborationResultOperations.runId, runId),
-              gt(collaborationResultOperations.ordinal, questionCursor),
-            ),
-          )
-          .orderBy(asc(collaborationResultOperations.ordinal))
-          .limit(COLLABORATION_INDEX_ITEMS)
-          .all()
-        if (!candidates.length) break
-        for (const candidate of candidates) {
-          const delta = this.readIndexedDelta(run.sessionId, candidate)
-          if (!delta.question) continue
-          const baseline = this.database
-            .select({
-              id: collaborationTodoRevisions.questionId,
-              revision: collaborationTodoRevisions.questionRevision,
-            })
-            .from(collaborationTodoRevisions)
-            .where(
-              and(
-                eq(collaborationTodoRevisions.taskId, task.id),
-                eq(collaborationTodoRevisions.todoId, delta.todoId),
-                lte(collaborationTodoRevisions.ledgerRevision, auth.baseTodoRevision),
-              ),
-            )
-            .orderBy(desc(collaborationTodoRevisions.revision))
-            .limit(1)
-            .get()
-          if (
-            !baseline?.id ||
-            baseline.id !== delta.question.id ||
-            baseline.revision !== delta.question.revision
-          )
-            newQuestions++
-          if (newQuestions > 3)
-            throw new RunOperationConflictError(
-              'Ask at most three new material questions per Turn; existing questions and answers remain preserved.',
-            )
-        }
-        questionCursor = candidates.at(-1)!.ordinal
-      }
-      let ordinal = -1
-      for (;;) {
-        const page = this.database
-          .select()
-          .from(collaborationResultOperations)
-          .where(
-            and(
-              eq(collaborationResultOperations.runId, runId),
-              gt(collaborationResultOperations.ordinal, ordinal),
-            ),
-          )
-          .orderBy(asc(collaborationResultOperations.ordinal))
-          .limit(COLLABORATION_INDEX_ITEMS)
-          .all()
-        if (!page.length) break
-        for (const operation of page)
-          this.applyTodoDelta(
-            prepared,
-            run,
-            this.readIndexedDelta(run.sessionId, operation),
-            ledgerRevision,
-          )
-        ordinal = page.at(-1)!.ordinal
-      }
-      this.database
-        .update(collaborationTasks)
-        .set({ ledgerRevision })
-        .where(eq(collaborationTasks.id, task.id))
-        .run()
-      const processedWatermark = this.applyIndexedInputResponses(prepared, run)
-      const provenInputs = this.database
-        .select({
-          operationId: conversationQueueOperations.id,
-          inputId: conversationQueueOperations.inputId,
-        })
-        .from(conversationQueueOperations)
-        .where(
-          and(
-            eq(conversationQueueOperations.targetRunId, runId),
-            eq(conversationQueueOperations.kind, 'steer'),
-            eq(conversationQueueOperations.state, 'accepted'),
-          ),
-        )
-        .orderBy(asc(conversationQueueOperations.inputRevision))
-        .limit(64)
-        .all()
-      for (const proven of provenInputs)
-        if (proven.inputId) this.markQueuedSteerConsumed(proven.operationId, proven.inputId)
-      const counts = this.todoCounts(task.id)
-      prepared.ledgerRevision = ledgerRevision
-      prepared.ledgerOpenCount = counts.open
-      prepared.ledgerAwaitingCount = counts.awaiting
-      prepared.questionPendingCount = counts.questions
-      prepared.unansweredCount = this.database.get<{
-        count: number
-      }>(sql`SELECT count(*) AS count FROM collaboration_todos t
-        WHERE t.task_id=${task.id} AND t.status<>'done' AND t.question_id IS NOT NULL AND NOT EXISTS (
-          SELECT 1 FROM conversation_input_batch_members m JOIN conversation_input_batches b ON b.id=m.batch_id
-          WHERE b.task_id=t.task_id AND m.source_task_id=t.task_id AND m.source_todo_id=t.todo_id
-          AND m.question_id=t.question_id AND m.question_revision=t.question_revision AND m.state<>'withdrawn')`).count
-      prepared.inputSequence = row.inputSequence
-      prepared.processedWatermark = processedWatermark
-      const result = {
-        ...manifest.header,
-        ...(manifest.planDocument ? { plan: prepared.planReference } : {}),
-      }
-      if (result.verdict === 'accepted') {
-        if (counts.open || counts.awaiting)
-          throw new RunOperationConflictError(
-            'This review cannot be accepted while Todo resolutions still await confirmation.',
-          )
-        if (prepared.unansweredCount)
-          throw new RunOperationConflictError(
-            'This review cannot be accepted while a required user answer is missing.',
-          )
-        if (processedWatermark < auth.inputSequence)
-          throw new RunOperationConflictError(
-            'This review cannot be accepted while required input responses remain unresolved. Settle them using their actual responsibility or submit a blocked review.',
-          )
-      }
-      const adoptionReview = auth.duty === 'plan_adoption' && !manifest.planDocument
-      if (
-        (['plan_review', 'code_review'].includes(auth.duty) || adoptionReview) &&
-        result.verdict
-      ) {
-        if (
-          auth.duty !== 'code_review' &&
-          (prepared.planAuthor === run.agentId ||
-            JSON.stringify(result.reviewedPlan) !== JSON.stringify(prepared.planReference))
-        )
-          throw new RunOperationConflictError(
-            'Plan acceptance must review the exact current version independently.',
-          )
-        this.database
-          .insert(collaborationReviewFacts)
-          .values({
-            id: runId,
-            taskId: task.id,
-            runId,
-            reviewer: run.agentId,
-            phase: auth.duty === 'code_review' ? 'code' : 'plan',
-            basisJson: JSON.stringify(
-              auth.duty === 'code_review' ? auth.reviewScopeRef : auth.basePlanRef,
-            ),
-            ledgerRevision,
-            inputWatermark: processedWatermark,
-            verdict: result.verdict,
-            createdAt: new Date().toISOString(),
-          })
-          .run()
-      }
-      if (auth.reportSourceRunId && result.outcome !== 'complete') {
-        const source = this.findRun(auth.reportSourceRunId)
-        const sourceAuth = this.collaborationTurnAuthorization(auth.reportSourceRunId)
-        const sourceStage = source?.collaboration?.stage
-        if (
-          source?.sessionId === task.sessionId &&
-          source.collaboration?.taskId === task.id &&
-          source.nativeOutcome === 'completed' &&
-          source.dispatchPhase === 'ended' &&
-          sourceAuth?.taskId === task.id &&
-          sourceAuth.actor === source.agentId &&
-          sourceAuth.duty === 'stage_result' &&
-          !sourceAuth.reportSourceRunId &&
-          (sourceStage === 'implement' || sourceStage === 'repair')
-        ) {
-          // The resubmission restores the original writing goal, without making
-          // this report-only Turn a new implementation or changing its scope.
-          prepared.resumePhase = {
-            stage: sourceStage,
-            actor: source.agentId,
-            status:
-              result.outcome === 'needs_user'
-                ? 'questions'
-                : result.outcome === 'blocked'
-                  ? 'failed'
-                  : 'waiting',
-            workPending: true,
-          }
-        }
-      }
-      const next = settleCollaboration(prepared, result, {
-        ledgerRevision,
-        ledgerOpenCount: counts.open,
-        ledgerAwaitingCount: counts.awaiting,
-        doneTodoCount: counts.done,
-        unansweredCount: prepared.unansweredCount,
-        questionPendingCount: counts.questions,
-        inputSequence: row.inputSequence,
-        processedWatermark,
-        planApplied: true,
-        planChanged: prepared.planVersion !== task.planVersion,
-        acceptedReview:
-          result.verdict === 'accepted' &&
-          (['plan_review', 'code_review'].includes(auth.duty) || adoptionReview),
-        reviewInputSequence: auth.inputSequence,
-      })
-      next.resultDocument = manifest.source
-      next.result = undefined
-      next.sourceMessageId = run.responseMessageId ?? task.sourceMessageId
-      this.database
-        .update(collaborationResultApplications)
-        .set({
-          state: 'applied',
-          settlementRevision: ledgerRevision,
-          appliedAt: new Date().toISOString(),
-        })
-        .where(eq(collaborationResultApplications.runId, runId))
-        .run()
-      this.saveCollaboration(next)
-      return next
-    })
-  }
-
-  private saveSubmittedReport(runId: string, result: CollaborationResult): string {
-    const source = this.saveCollaborationDocument(runId, JSON.stringify(result))
-    const manifest = this.database.transaction(() =>
-      this.archiveIndexedResult(runId, result, source),
-    )
-    return JSON.stringify({
-      source,
-      header: manifest.header,
-      documents: [
-        { key: 'summary', source: manifest.summaryDocument },
-        ...(manifest.planDocument ? [{ key: 'plan', source: manifest.planDocument }] : []),
-      ],
-      feedbackCount: manifest.todoCount,
-      hasOpenDecision: false,
-    })
-  }
-
-  recordCollaborationCarrierText(runId: string, text: string): void {
-    const run = this.findRun(runId)
-    if (!run?.answerFormat) return
-    this.database.transaction(() => {
-      const grant = this.latestSteerGrant(runId)
-      if (grant) {
-        const identity = carrierInputIdentity(text)
-        if (!this.resultMatchesInputGrant(runId, identity)) {
-          const source = this.archiveObsoleteSteerCarrier(runId, text)
-          if (
-            ['possibly_sent', 'unknown'].includes(grant.state) &&
-            identity?.inputRevision === grant.inputRevision &&
-            identity.resultNonce === grant.resultNonce
-          )
-            this.database
-              .update(conversationQueueOperations)
-              .set({ candidateCarrierJson: JSON.stringify(source) })
-              .where(eq(conversationQueueOperations.id, grant.id))
-              .run()
-          return
-        }
-      }
-      const original = this.collaborationCarrierSource(run.sessionId, runId)
-      const frozen = this.database
-        .select({ source: collaborationTurns.nativeEnvelopeBodyId })
-        .from(collaborationTurns)
-        .where(eq(collaborationTurns.runId, runId))
-        .get()
-      if (frozen?.source) {
-        if (original?.sha256 !== createHash('sha256').update(text).digest('hex'))
-          throw new RunOperationConflictError(
-            'A different carrier cannot replace the original final submission.',
-          )
-        return
-      }
-      const source = this.saveCollaborationDocument(runId, text)
-      this.database
-        .update(collaborationTurns)
-        .set({ pendingEnvelopeBodyId: source.id })
-        .where(eq(collaborationTurns.runId, runId))
-        .run()
-    })
-  }
-
-  /** Original Native carrier and natural display are separate from immutable Message proof. */
-  recordCollaborationCarrier(
-    runId: string,
-    carrier: unknown,
-    skillInvocation?: FrozenSkillInvocation,
-  ): ConversationPatch | undefined {
-    const run = this.findRun(runId)
-    if (!run?.answerFormat || !carrier || typeof carrier !== 'object' || Array.isArray(carrier))
-      return undefined
-    const frozen = this.database
-      .select()
-      .from(collaborationTurns)
-      .where(eq(collaborationTurns.runId, runId))
-      .get()
-    if (!frozen) return undefined
-    return this.database.transaction(() => {
-      const grant = this.latestSteerGrant(runId)
-      const candidate = grant?.candidateCarrierJson
-        ? collaborationDocumentSchema.parse(JSON.parse(grant.candidateCarrierJson))
-        : undefined
-      const source =
-        this.collaborationCarrierSource(run.sessionId, runId) ??
-        candidate ??
-        this.saveCollaborationDocument(runId, JSON.stringify(carrier))
-      // The parsed DTO is a projection of these saved Native bytes, never a second authority.
-      const original: unknown = JSON.parse(this.collaborationDocumentText(run.sessionId, source))
-      if (!original || typeof original !== 'object' || !isDeepStrictEqual(original, carrier))
-        throw new RunOperationConflictError(
-          'The result does not match the original final submission.',
-        )
-      const result: unknown = Reflect.get(original, 'result')
-      const proofPatch = this.confirmSteerFinalEvidence(runId, result, skillInvocation)
-      if (!this.resultMatchesInputGrant(runId, result)) {
-        this.nativeFact(runId, 'conversation.steer_obsolete_carrier', {
-          sourceId: source.id,
-          sha256: source.sha256,
-        })
-        return undefined
-      }
-      const answer: unknown = Reflect.get(original, 'answer')
-      const projection =
-        typeof answer === 'string' && answer.trim()
-          ? this.saveCollaborationDocument(runId, answer)
+        const settled = source
+          ? this.database
+              .select({ sequence: agentEventJournal.sequence })
+              .from(agentEventJournal)
+              .where(
+                and(
+                  eq(agentEventJournal.runId, task.runId),
+                  eq(agentEventJournal.eventType, 'workflow.input_settled'),
+                ),
+              )
+              .limit(1)
+              .get()
           : undefined
-      this.database
-        .update(collaborationTurns)
-        .set({ nativeEnvelopeBodyId: source.id, answerProjectionBodyId: projection?.id ?? null })
-        .where(eq(collaborationTurns.runId, runId))
-        .run()
-      return proofPatch
-    })
-  }
-
-  private withPlanReference(task: CollaborationTask): CollaborationTask {
-    if (!task.plan || !task.planVersion) return task
-    const sha256 = createHash('sha256').update(task.plan).digest('hex')
-    const reference =
-      task.planReference?.version === task.planVersion && task.planReference.sha256 === sha256
-        ? task.planReference
-        : { type: 'unchanged' as const, version: task.planVersion, sourceRunId: task.runId, sha256 }
-    return {
-      ...task,
-      planReference: reference,
-      result:
-        task.result && typeof task.result.plan === 'string'
-          ? { ...task.result, plan: reference }
-          : task.result,
+        task.inputProcessing = {
+          ...processing,
+          pending: source && !settled ? previous : undefined,
+        }
+      }
+      task.revision++
+      const previousRun = task.inputProcessing?.pending ? this.findRun(task.runId) : undefined
+      if (task.stage === 'reply' && previousRun?.dispatchPhase === 'ended') {
+        task.status = 'failed'
+        task.notice =
+          'A later message was withdrawn. Check the previous reply and send a follow-up if its input still needs confirmation.'
+      }
+      this.saveCollaboration(task)
+      if (previousRun?.dispatchPhase === 'ended') this.recoverAppliedWorkflowResult(task.runId)
     }
-  }
-
-  /** Read exactly one immutable submitted report; candidates retain their independent acceptance state. */
-  collaborationReportSource(sessionId: string, runId: string): CollaborationResult | undefined {
-    const run = this.findRun(runId)
-    if (!run || run.sessionId !== sessionId)
-      throw new RunOperationConflictError('The Review source is unavailable.')
-    const row = this.database
-      .select({ result: collaborationTurns.resultJson })
-      .from(collaborationTurns)
-      .where(eq(collaborationTurns.runId, runId))
-      .get()
-    if (!row?.result) return undefined
-    return this.storedResult(sessionId, row.result)
   }
 
   private saveCollaboration(task: CollaborationTask): void {
+    task = { ...task, inputProcessing: collaborationInputProcessing(task) }
     const persistent = this.database
-      .select()
+      .select({ inputSequence: collaborationTasks.inputSequence })
       .from(collaborationTasks)
       .where(eq(collaborationTasks.id, task.id))
       .get()
-    if (persistent) {
-      task = {
-        ...task,
-        ledgerRevision: persistent.ledgerRevision,
-        inputSequence: persistent.inputSequence,
-        processedWatermark: persistent.processedWatermark,
-        questionPendingCount: this.todoCounts(task.id).questions,
-      }
-    }
-    task = this.withPlanReference(task)
-    collaborationTaskSchema.parse(task)
-    const stored = JSON.stringify(this.storedCollaboration(task))
+    task = this.storedCollaboration({
+      ...task,
+      inputSequence: persistent?.inputSequence ?? task.inputSequence,
+    })
+    const now = new Date().toISOString()
     this.database
       .update(collaborationTasks)
-      .set({ stateJson: stored, updatedAt: new Date().toISOString() })
+      .set({ stateJson: JSON.stringify(task), updatedAt: now })
       .where(eq(collaborationTasks.id, task.id))
       .run()
     const run = this.findRun(task.runId)
@@ -7622,336 +6193,356 @@ export class ConversationRepository {
         })
         .where(eq(agentRuns.id, run.id))
         .run()
-    this.database
-      .update(collaborationTurns)
-      .set({ stateJson: stored })
-      .where(eq(collaborationTurns.runId, task.runId))
-      .run()
   }
 
   setCollaborationState(task: CollaborationTask): ConversationPatch {
-    this.saveCollaboration(task)
-    return this.metadataPatch(task.sessionId)
-  }
-
-  pauseCollaboration(sessionId: string): ConversationPatch {
-    const task = this.collaboration(sessionId)
-    if (task && task.status !== 'complete') {
-      if (task.status !== 'paused')
-        task.pausedStatus = task.status === 'running' ? 'failed' : task.status
-      task.status = 'paused'
-      task.revision++
-      task.notice = 'Paused by the user. Existing feedback and code changes are preserved.'
-      this.saveCollaboration(task)
-    }
-    return this.metadataPatch(sessionId)
-  }
-
-  recordCollaborationReportFailure(runId: string, reason: 'missing' | 'invalid'): void {
-    const run = this.findRun(runId)
-    const task = run ? this.collaboration(run.sessionId) : undefined
-    if (!task || task.runId !== runId || task.status !== 'running') return
-    task.reportFailure = reason
-    this.saveCollaboration(task)
-  }
-
-  /** Cold/late native facts are immutable recovery material, not workflow acceptance. */
-  recordRecoveredCollaborationResult(runId: string, result: CollaborationResult): void {
-    const run = this.findRun(runId)
-    if (!run || !run.answerFormat) return
-    const frozen = this.database
-      .select()
-      .from(collaborationTurns)
-      .where(eq(collaborationTurns.runId, runId))
-      .get()
-    if (!frozen) throw new RunOperationConflictError('The submitted report has no frozen duty.')
-    if (!this.resultMatchesInputGrant(runId, result)) {
-      this.archiveObsoleteSteerCarrier(runId, JSON.stringify(result))
-      return
-    }
-    const parsed = this.verifiedCollaborationResult(run, result),
-      json = JSON.stringify(parsed)
-    if (frozen.resultJson) {
-      if (
-        this.indexedResultManifest(runId)?.row.digest !==
-        createHash('sha256').update(json).digest('hex')
-      )
-        throw new RunOperationConflictError('A different report cannot replace this Turn’s source.')
-      return
-    }
-    this.database
-      .update(collaborationTurns)
-      .set({ resultJson: this.saveSubmittedReport(runId, parsed) })
-      .where(eq(collaborationTurns.runId, runId))
-      .run()
-    const active = this.collaboration(run.sessionId),
-      task = active?.runId === runId ? active : this.decodedCollaboration(frozen.stateJson)
-    if (task.result) return
-    task.reportFailure ??= 'missing'
-    task.notice ??=
-      'The submitted report was recovered. Acceptance still requires a valid report submission.'
-    if (active?.runId === runId) this.saveCollaboration(task)
-    else {
-      task.status = 'failed'
-      this.database
-        .update(collaborationTurns)
-        .set({ stateJson: JSON.stringify(this.storedCollaboration(task)) })
-        .where(eq(collaborationTurns.runId, runId))
-        .run()
-    }
-  }
-
-  private verifiedCollaborationResult(
-    run: AgentRun,
-    result: CollaborationResult,
-  ): CollaborationResult {
-    const parsed = collaborationResultSchema.parse(result)
-    const source = this.collaborationCarrierSource(run.sessionId, run.id)
-    if (source) {
-      const envelope = collaborationEnvelopeSchema.parse(
-        JSON.parse(this.collaborationDocumentText(run.sessionId, source)),
-      )
-      if (!isDeepStrictEqual(envelope.result, parsed))
-        throw new RunOperationConflictError('The report does not match its original submission.')
-    }
-    return parsed
-  }
-
-  /** Revalidate an authenticated original ending; no model input, no counters or stale-task promotion. */
-  reconcileCompletedCollaboration(input: {
-    runId: string
-    nativeSessionId: string
-    nativeTurnId: string
-    revision: number
-    source: 'live_terminal' | 'stored_terminal'
-    executorId?: string
-  }): ConversationPatch {
     return this.database.transaction(() => {
-      const run = this.findRun(input.runId)
-      if (
-        !run ||
-        run.nativeSessionId !== input.nativeSessionId ||
-        run.nativeTurnId !== input.nativeTurnId ||
-        run.dispatchPhase !== 'ended' ||
-        run.nativeOutcome !== 'completed' ||
-        run.controlDisposition === 'abandoned' ||
-        !run.responseMessageId
-      )
-        throw new RunOperationConflictError(
-          'The original completed Native identity is unavailable.',
-        )
-      const binding = this.nativeContext(run.sessionId, run.agentId)
-      if (
-        !binding ||
-        !this.ownsNativeControl(run.id) ||
-        !this.isCurrentNativeCursor(run, binding) ||
-        !this.hasCompleteResponse(run.id) ||
-        (input.source === 'live_terminal' &&
-          (!input.executorId ||
-            input.executorId !== run.executorId ||
-            binding.executorId !== input.executorId))
-      )
-        throw new RunOperationConflictError(
-          'The completed report no longer owns this native binding and visible response.',
-        )
-      const original = this.collaborationCarrierSource(run.sessionId, run.id)
-      if (!original)
-        throw new RunOperationConflictError('The original final submission is unavailable.')
-      // Authenticated native bytes remain immutable evidence; cold workflow settlement uses its compiled indexes.
-      this.collaborationDocumentRow(run.sessionId, original)
-      const indexed = this.indexedResultManifest(run.id)
-      if (!indexed)
-        throw new RunOperationConflictError(
-          'The original result has not been indexed; submit the missing report explicitly.',
-        )
-      const task = this.collaboration(run.sessionId)
-      if (task?.runId !== run.id || indexed.row.state === 'applied') return this.runPatch(run.id)
-      const completedFailureRevision = this.database
-        .select({ revision: collaborationTurns.completedFailureRevision })
-        .from(collaborationTurns)
-        .where(eq(collaborationTurns.runId, run.id))
-        .get()?.revision
-      if (
-        completedFailureRevision == null ||
-        task.revision !== completedFailureRevision ||
-        task.revision !== input.revision ||
-        task.status !== 'failed' ||
-        !task.reportFailure
-      )
-        throw new RunOperationConflictError(
-          'The task advanced before its original report could be reconciled.',
-        )
-      const authorization = this.collaborationTurnAuthorization(run.id)
-      if (
-        !authorization ||
-        authorization.taskId !== task.id ||
-        authorization.actor !== task.actor ||
-        authorization.baseTodoRevision !== task.ledgerRevision ||
-        !isDeepStrictEqual(authorization.basePlanRef, task.planReference ?? null)
-      )
-        throw new RunOperationConflictError(
-          'The completed report no longer matches the frozen plan and Todo basis.',
-        )
-      const next = this.applyIndexedCollaborationResult(task, run.id)
-      next.sourceMessageId = run.responseMessageId
-      this.saveCollaboration(next)
-      this.nativeFact(run.id, 'collaboration.report_reconciled', {
-        revision: input.revision,
-        nativeSessionId: input.nativeSessionId,
-        nativeTurnId: input.nativeTurnId,
-        resultDocument: next.resultDocument?.id,
-        modelCalls: 0,
-      })
-      return this.runPatch(run.id)
+      const current = this.collaboration(task.sessionId)
+      if (!current || current.id !== task.id || current.revision + 1 !== task.revision)
+        throw new RunOperationConflictError('The collaboration changed before this action.')
+      this.saveCollaboration(task)
+      return this.metadataPatch(task.sessionId)
     })
   }
 
-  recordCollaborationResult(runId: string, result: CollaborationResult): void {
+  pauseCollaboration(
+    sessionId: string,
+    reason: NonNullable<CollaborationTask['pauseReason']> = 'user',
+  ): ConversationPatch {
+    return this.database.transaction(() => {
+      const task = this.collaboration(sessionId)
+      if (task && task.status !== 'complete') {
+        task.automation = 'paused'
+        task.pauseReason = reason
+        task.revision++
+        task.notice =
+          reason === 'user_message'
+            ? 'Automatic collaboration is paused. Your message will be answered next.'
+            : 'Collaboration is paused. Continue when ready.'
+        this.saveCollaboration(task)
+      }
+      return this.metadataPatch(sessionId)
+    })
+  }
+
+  reconcileCompletedCollaboration(runId: string): ConversationPatch | undefined {
     const run = this.findRun(runId)
-    if (!run) throw new RunOperationConflictError('The collaboration Run is unavailable.')
-    const task = this.collaboration(run.sessionId)
-    const frozen = this.database
-      .select()
-      .from(collaborationTurns)
-      .where(eq(collaborationTurns.runId, runId))
-      .get()
-    if (!task || task.runId !== runId || task.status !== 'running' || !frozen)
-      throw new RunOperationConflictError('The collaboration result belongs to a retired task.')
-    if (!this.resultMatchesInputGrant(runId, result)) {
-      this.archiveObsoleteSteerCarrier(runId, JSON.stringify(result))
-      return
-    }
-    const parsed = this.verifiedCollaborationResult(run, result)
     if (
-      frozen.resultJson &&
-      this.indexedResultManifest(runId)?.row.digest !==
-        createHash('sha256').update(JSON.stringify(parsed)).digest('hex')
+      !run?.collaboration ||
+      run.forkSourceRunId ||
+      (run.dispatchPhase !== 'ended' && !this.workflowInputWasNotSent(run))
     )
-      throw new RunOperationConflictError('This Turn already reported a different result.')
-    this.database
-      .update(collaborationTurns)
-      .set({ resultJson: this.saveSubmittedReport(runId, parsed) })
-      .where(eq(collaborationTurns.runId, runId))
-      .run()
-    if (parsed.submission !== this.collaborationTurnAuthorization(runId)?.duty) {
-      task.reportFailure = 'invalid'
-      task.notice = 'The result does not match the frozen responsibility.'
-    } else {
-      task.reportFailure = undefined
-      task.notice = undefined
-    }
-    this.saveCollaboration(task)
+      return undefined
+    const task = this.collaboration(run.sessionId)
+    const before = task?.revision
+    this.finishCollaboration(
+      runId,
+      run.dispatchPhase === 'ended' && run.nativeOutcome === 'completed',
+    )
+    return this.collaboration(run.sessionId)?.revision !== before
+      ? this.metadataPatch(run.sessionId)
+      : undefined
+  }
+
+  workflowInputWasNotSent(run: AgentRun): boolean {
+    return Boolean(
+      run.collaboration &&
+      !run.nativeTurnId &&
+      !run.nativeOutcome &&
+      ['not_sent', 'rejected'].includes(run.dispatchPhase ?? '') &&
+      (run.nativeEffectsState === 'not_dispatched' ||
+        (run.nativeEffectsState === 'settled' &&
+          ['workflow_input_withheld', 'native_turn_not_started'].includes(
+            run.nativeEffectsReason ?? '',
+          ))),
+    )
   }
 
   finishCollaboration(runId: string, complete: boolean, notice?: string): void {
     this.database.transaction(() => {
       const run = this.findRun(runId)
-      if (!run) return
-      const task = this.collaboration(run.sessionId)
-      if (!task || task.runId !== runId || !['running', 'failed'].includes(task.status)) return
-      const frozen = this.database
+      const turn = this.database
         .select()
-        .from(collaborationTurns)
-        .where(eq(collaborationTurns.runId, runId))
+        .from(workflowTurns)
+        .where(eq(workflowTurns.runId, runId))
         .get()
-      if (complete && !this.hasCompleteResponse(runId)) {
-        complete = false
-        notice ??= 'The native task ended, but its complete response is unavailable.'
+      if (!run || run.forkSourceRunId || !turn || run.controlDisposition === 'abandoned') return
+      if (turn.applied) {
+        if (complete) this.recoverAppliedWorkflowResult(runId)
+        return
       }
+      const current = this.collaboration(run.sessionId)
+      const isCurrent = current?.id === turn.taskId && current.runId === runId
+      if (!isCurrent) return
+      const task = current
+      task.inputProcessing = collaborationInputProcessing(task)
+      const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
+      const frozen = this.decodedCollaboration(turn.stateJson)
       const nativeCompleted =
         complete && run.dispatchPhase === 'ended' && run.nativeOutcome === 'completed'
-      // A repeated terminal may not move or renew an already frozen recovery boundary.
-      if (
-        nativeCompleted &&
-        (frozen?.completedFailureRevision != null ||
-          (task.status === 'failed' && task.reportFailure))
-      )
-        return
-      let next = task
-      if (complete && !task.reportFailure && frozen?.resultJson) {
-        try {
-          next = this.applyIndexedCollaborationResult(task, runId)
-        } catch (error) {
-          const message = error instanceof Error ? error.message : 'The required result is invalid.'
-          task.reportFailure = 'invalid'
+      const unstarted = this.workflowInputWasNotSent(run)
+      const effectsSettled =
+        run.nativeEffectsState === 'settled' || run.nativeEffectsState === 'not_dispatched'
+      if (nativeCompleted && !effectsSettled) {
+        if (
+          run.nativeEffectsState === 'unknown' &&
+          (task.status !== 'failed' || task.automation !== 'paused')
+        ) {
           task.status = 'failed'
-          task.notice = message
+          task.automation = 'paused'
+          task.pauseReason = 'failure'
+          task.notice =
+            'The native Turn ended, but its side effects are not settled. Check the original execution before continuing.'
           task.revision++
+          this.saveCollaboration(task)
+        }
+        return
+      }
+      if (nativeCompleted && !this.hasCompleteResponse(runId) && run.status !== 'completed') return
+      if (!nativeCompleted) {
+        task.status = 'failed'
+        task.automation = 'paused'
+        task.pauseReason = run.nativeOutcome === 'interrupted' ? 'stopped' : 'failure'
+        task.notice = (
+          notice ?? 'This Turn did not complete. Check its original delivery before continuing.'
+        ).slice(0, 512)
+        if (auth.stage === 'implement' || auth.stage === 'repair') {
+          if (
+            unstarted ||
+            (run.dispatchPhase === 'ended' &&
+              ['failed', 'interrupted'].includes(run.nativeOutcome ?? ''))
+          )
+            task.pendingWork = {
+              stage: auth.stage,
+              runId,
+              inputSequence: auth.inputSequence,
+              ...(auth.planReference ? { planReference: auth.planReference } : {}),
+              ...(unstarted && turn.reservation === 'repairAttempts'
+                ? { repairReservationReleased: true }
+                : {}),
+            }
+        } else if (auth.stage !== 'reply') task.nextStage = auth.stage
+        if (unstarted && turn.reservation)
+          task[turn.reservation] = Math.max(0, task[turn.reservation] - 1)
+        task.revision++
+        this.saveCollaboration(task)
+        if (unstarted || run.dispatchPhase === 'ended')
           this.database
-            .update(collaborationResultApplications)
-            .set({ state: message.includes('advanced') ? 'stale' : 'invalid', reason: message })
-            .where(
-              and(
-                eq(collaborationResultApplications.runId, runId),
-                eq(collaborationResultApplications.state, 'archived'),
-              ),
-            )
+            .update(workflowTurns)
+            .set({
+              applied: true,
+              stateJson: JSON.stringify({
+                ...task,
+                inputSequence: auth.inputSequence,
+                latestUserMessageId: frozen.latestUserMessageId,
+              }),
+            })
+            .where(eq(workflowTurns.runId, runId))
             .run()
-          next = task
+        return
+      }
+      const messageId = run.responseMessageId
+      const report = messageId ? this.messageDocument(run.sessionId, runId, messageId) : undefined
+      const plan =
+        turn.planBodyId && turn.planNativeId
+          ? this.documentReference(run.sessionId, turn.planBodyId)
+          : undefined
+      const planner = collaborationPlanMode(frozen, auth)
+      if (!report && !plan) {
+        task.status = 'failed'
+        task.automation = 'paused'
+        task.pauseReason = 'failure'
+        task.notice = 'The native Turn ended, but its complete response source is unavailable.'
+        task.revision++
+        this.saveCollaboration(task)
+        return
+      }
+      const retained = this.workflowPlanRetention(runId, turn.planNativeId)
+      const planSettled = planner && this.settleWorkflowPlan(task, run, auth, turn)
+      task.sourceMessageId = messageId ?? run.userMessageId
+      task.authorization = auth
+      task.handledInputSequence = Math.max(task.handledInputSequence, auth.inputSequence)
+      task.notice = undefined
+      if (auth.stage === 'reply') {
+        task.status = 'waiting'
+        task.automation = 'paused'
+        task.pauseReason = 'user_message'
+        if (collaborationRequiresPlan(task))
+          task.nextStage =
+            task.planReference && task.planInputSequence === task.inputSequence
+              ? 'plan_review'
+              : 'plan'
+        else if (!task.pendingWork) task.nextStage = 'code_review'
+        if (
+          !this.settleWorkflowInput(task, run, auth, turn, planSettled) &&
+          task.status === 'waiting'
+        ) {
+          task.status = 'failed'
+          task.pauseReason = 'failure'
+          task.notice =
+            'Your reply has not been confirmed as processed. Check its response before continuing.'
+        }
+      } else if (auth.stage === 'plan') {
+        if (planSettled) {
+          task.status = 'waiting'
+          task.nextStage = 'plan_review'
+        } else {
+          const unanswered = this.workflowPlanHasUnansweredInput(runId)
+          const unavailable =
+            !unanswered &&
+            Boolean(
+              plan ||
+              retained ||
+              this.workflowPlanCaptureFailed(runId) ||
+              this.workflowInputResult(runId),
+            )
+          task.status = unanswered ? 'questions' : 'failed'
+          task.nextStage = 'plan'
+          task.automation = 'paused'
+          task.pauseReason = unanswered ? 'needs_user' : 'failure'
+          if (unanswered)
+            task.inputProcessing = {
+              ...collaborationInputProcessing(task),
+              decision: {
+                runId,
+                inputSequence: auth.inputSequence,
+                ...(messageId ? { messageId } : {}),
+                questions: bindCollaborationQuestions(this.workflowInputResult(runId)?.questions),
+                actor: auth.actor,
+              },
+            }
+          task.notice = unanswered
+            ? 'Your answers are needed before this plan response can be reviewed.'
+            : unavailable
+              ? 'The latest plan has not been synced to Pact. Restore its saved native source before continuing.'
+              : 'The Agent ended without a confirmed plan. Ask the plan author to complete it before continuing.'
+        }
+      } else if (auth.stage === 'plan_review' || auth.stage === 'code_review') {
+        const verdict =
+          !turn.verdictConflict && turn.verdict && report?.chars ? turn.verdict : 'incomplete'
+        if (report)
+          task.review = {
+            runId,
+            actor: auth.actor,
+            stage: auth.stage,
+            verdict,
+            inputSequence: auth.inputSequence,
+            ...(auth.planReference ? { planReference: auth.planReference } : {}),
+            ...(auth.reviewScopeRef ? { scopeRef: auth.reviewScopeRef } : {}),
+            document: report,
+          }
+        const currentBasis =
+          auth.inputSequence === task.inputSequence &&
+          (auth.stage !== 'plan_review' ||
+            (auth.planReference?.version === task.planReference?.version &&
+              auth.planReference?.document.sha256 === task.planReference?.document.sha256))
+        if (verdict === 'accepted' && currentBasis) {
+          const resumingUnchangedPlan =
+            auth.stage === 'plan_review' && task.pendingWork && !collaborationRequiresPlan(task)
+          task.status =
+            auth.stage === 'plan_review'
+              ? resumingUnchangedPlan
+                ? 'waiting'
+                : 'ready'
+              : 'complete'
+          task.nextStage = resumingUnchangedPlan ? task.pendingWork!.stage : undefined
+        } else if (verdict === 'changes_requested' && currentBasis) {
+          task.status = 'waiting'
+          task.nextStage = auth.stage === 'plan_review' ? 'plan' : undefined
+        } else if (verdict === 'incomplete') {
+          task.status = 'failed'
+          task.nextStage = auth.stage
+          task.automation = 'paused'
+          task.pauseReason = 'failure'
+          task.notice = turn.verdictConflict
+            ? 'The review returned conflicting conclusions. Start a new review to continue.'
+            : 'The review did not provide a complete conclusion. Start a new review to continue.'
+        } else if (verdict === 'needs_user') {
+          task.status = 'questions'
+          task.nextStage = auth.stage === 'plan_review' ? 'plan' : 'code_review'
+          task.automation = 'paused'
+          task.pauseReason = 'needs_user'
+          task.inputProcessing = {
+            ...collaborationInputProcessing(task),
+            decision: {
+              runId,
+              inputSequence: auth.inputSequence,
+              ...(messageId ? { messageId } : {}),
+              questions: bindCollaborationQuestions(this.workflowReviewResult(runId)?.questions),
+              actor: auth.actor,
+            },
+          }
+          task.notice = 'The review needs your decision before collaboration can continue.'
+        } else {
+          task.status = 'waiting'
+          task.nextStage = auth.stage === 'plan_review' ? 'plan' : 'code_review'
         }
       } else {
-        next.status = 'failed'
-        next.revision++
-        const unstarted =
-          (run.dispatchPhase === 'not_sent' || run.dispatchPhase === 'rejected') &&
-          run.nativeEffectsState === 'not_dispatched'
-        const nativeUnfinished =
-          run.dispatchPhase === 'ended' &&
-          (run.nativeOutcome === 'failed' || run.nativeOutcome === 'interrupted')
-        if (
-          !task.reportRecovery &&
-          (task.stage === 'implement' || task.stage === 'repair') &&
-          (unstarted || nativeUnfinished)
-        ) {
-          next.resumePhase = {
-            ...task.resumePhase,
-            stage: task.stage,
-            actor: task.actor,
-            status: 'failed',
-            workPending: true,
-            ...(unstarted ? { unstarted: true } : {}),
-          }
-        }
-        next.notice =
-          notice ??
-          (task.reportFailure === 'invalid' ? task.notice : undefined) ??
-          (complete
-            ? 'The answer was received, but the required report is missing or invalid. Review acceptance is not established.'
-            : 'This Turn did not complete. Check delivery before retrying.')
-        if (complete && !frozen?.resultJson) next.reportFailure ??= 'missing'
-        if (run.dispatchPhase === 'not_sent' || run.dispatchPhase === 'rejected') {
-          const prior = task.previousRunId
-            ? this.database
-                .select()
-                .from(collaborationTurns)
-                .where(eq(collaborationTurns.runId, task.previousRunId))
-                .get()
-            : undefined
-          const old = prior ? this.decodedCollaboration(prior.stateJson) : undefined
-          next.discussionRounds = old?.discussionRounds ?? 0
-          next.discussionHalf = old?.discussionHalf ?? false
-          next.reviewCycles = old?.reviewCycles ?? 0
-          next.repairAttempts = old?.repairAttempts ?? 0
-          next.releasedReservation = true
+        task.status = 'waiting'
+        task.nextStage = 'code_review'
+        if (auth.stage === 'implement' || auth.stage === 'repair') {
+          task.codeRunId = runId
+          task.pendingWork = undefined
         }
       }
-      if (run.responseMessageId) next.sourceMessageId = run.responseMessageId
-      this.saveCollaboration(next)
-      if (nativeCompleted && next.status === 'failed' && next.reportFailure)
-        this.database
-          .update(collaborationTurns)
-          .set({ completedFailureRevision: next.revision })
-          .where(
-            and(
-              eq(collaborationTurns.runId, runId),
-              sql`${collaborationTurns.completedFailureRevision} IS NULL`,
-            ),
-          )
-          .run()
+      task.revision++
+      const snapshot = this.storedCollaboration({
+        ...task,
+        inputProcessing:
+          task.inputProcessing?.pending &&
+          task.inputProcessing.pending.inputSequence > auth.inputSequence
+            ? (auth.inputProcessing ?? collaborationInputProcessing(frozen))
+            : task.inputProcessing,
+        inputSequence: auth.inputSequence,
+        handledInputSequence: Math.min(task.handledInputSequence, auth.inputSequence),
+        latestUserMessageId: frozen.latestUserMessageId,
+      })
+      this.database
+        .update(workflowTurns)
+        .set({
+          applied: true,
+          reportBodyId: report?.id ?? null,
+          stateJson: JSON.stringify(snapshot),
+        })
+        .where(eq(workflowTurns.runId, runId))
+        .run()
+      this.saveCollaboration(task)
     })
   }
 
   readPage(input: ConversationGetInput): ConversationPage {
+    if (input.scope === 'collaboration-quote') {
+      const row = this.collaborationDocumentRow(input.sessionId, input.document)
+      if (row.sourceRunId !== input.runId)
+        throw new RunOperationConflictError('The source Run changed.')
+      if (
+        input.startOffset < 0 ||
+        input.endOffset <= input.startOffset ||
+        input.endOffset - input.startOffset > 20_000 ||
+        input.offset < input.startOffset ||
+        input.offset >= input.endOffset
+      )
+        throw new RunOperationConflictError('Invalid document selection range.')
+      const end = Math.min(input.endOffset, input.offset + 4096)
+      const text = this.collaborationQuote(
+        input.sessionId,
+        input.document,
+        input.offset,
+        end,
+        input.basis,
+      )
+      return {
+        scope: 'collaboration-quote',
+        sessionId: input.sessionId,
+        document: input.document,
+        basis: input.basis,
+        startOffset: input.startOffset,
+        endOffset: input.endOffset,
+        offset: input.offset,
+        text,
+        nextOffset: end < input.endOffset ? end : null,
+      }
+    }
     if (input.scope === 'collaboration-markdown') {
       const row = this.collaborationDocumentRow(input.sessionId, input.document)
       if (row.sourceRunId !== input.runId)
@@ -7970,7 +6561,7 @@ export class ConversationRepository {
             ),
           )
         )
-          start--
+          start++
         let end = Math.min(row.chars, start + 8192)
         let text = this.collaborationRawRange(input.sessionId, input.document, start, end)
         if (end < row.chars && /[\uD800-\uDBFF]/u.test(text.at(-1)!)) {
@@ -8066,185 +6657,88 @@ export class ConversationRepository {
       }
     }
     if (input.scope === 'collaboration') {
-      const taskRow = input.taskId
+      const task = this.collaboration(input.sessionId, input.runId, false)
+      const active = this.collaboration(input.sessionId)
+      const requestedRunId = input.runId ?? task?.runId
+      const turn = requestedRunId
         ? this.database
             .select()
-            .from(collaborationTasks)
-            .where(
-              and(
-                eq(collaborationTasks.id, input.taskId),
-                eq(collaborationTasks.sessionId, input.sessionId),
-              ),
-            )
+            .from(workflowTurns)
+            .where(eq(workflowTurns.runId, requestedRunId))
             .get()
         : undefined
-      const task = taskRow
-          ? this.decodedCollaboration(taskRow.stateJson, false)
-          : this.collaboration(input.sessionId, input.runId, false),
-        active = this.collaboration(input.sessionId, undefined, false)
-      const indexed = task ? this.indexedResultManifest(task.runId) : undefined
-      const todoSummaries =
-        task && indexed
-          ? this.database
-              .select({
-                id: collaborationResultOperations.todoId,
-                title: collaborationResultOperations.titlePreview,
-                expectedRevision: collaborationResultOperations.expectedRevision,
-              })
-              .from(collaborationResultOperations)
-              .where(eq(collaborationResultOperations.runId, task.runId))
-              .orderBy(asc(collaborationResultOperations.ordinal))
-              .limit(COLLABORATION_INDEX_ITEMS)
-              .all()
-              .map((item) => ({
-                id: item.id,
-                title: item.title,
-                revision: item.expectedRevision + 1,
-              }))
-          : []
-      const result = indexed
-        ? { ...indexed.manifest.header, summary: '', todoDeltas: [], inputResponses: [] }
-        : undefined
-      const currentRow = task
-        ? this.database
-            .select()
-            .from(collaborationTasks)
-            .where(eq(collaborationTasks.id, task.id))
-            .get()
-        : undefined
-      const todoHead =
-        task && input.todoId
-          ? this.database
-              .select({
-                revision: collaborationTodos.revision,
-                ordinal: collaborationTodos.ordinal,
-                status: collaborationTodos.status,
-              })
-              .from(collaborationTodos)
-              .where(
-                and(
-                  eq(collaborationTodos.taskId, task.id),
-                  eq(collaborationTodos.todoId, input.todoId),
-                ),
-              )
-              .get()
-          : undefined
-      if (task && input.todoId && input.todoRevision === undefined && !todoHead)
-        throw new RunOperationConflictError('The Todo source is unavailable.')
-      const todo =
-        task && input.todoId
-          ? this.readTodoRevision(task.id, input.todoId, input.todoRevision ?? todoHead!.revision)
-          : undefined
-      if (input.todoStatus === 'source' && (!todo || input.projection !== 'todos'))
-        throw new RunOperationConflictError('Todo source navigation requires an exact Todo.')
-      const todoGroup =
-        input.todoStatus === 'source'
-          ? (todoHead?.status ?? todo!.status) === 'done'
-            ? 'done'
-            : 'active'
-          : (input.todoStatus ?? 'active')
-      let todoAfterOrdinal = (input.todoOffset ?? 0) - 1
-      if (input.todoStatus === 'source' && todoHead) {
-        // Seek the current item's group and page; the referenced version stays separate.
-        const preceding = this.database
-          .select({
-            ordinal: collaborationTodos.ordinal,
-            bytes: todoProjectionBytes(
-              collaborationTodos.titlePreview,
-              collaborationTodos.questionJson,
-            ),
-          })
-          .from(collaborationTodos)
-          .where(
-            and(
-              eq(collaborationTodos.taskId, task!.id),
-              lte(collaborationTodos.ordinal, todoHead.ordinal),
-              todoGroup === 'done'
-                ? eq(collaborationTodos.status, 'done')
-                : ne(collaborationTodos.status, 'done'),
-            ),
-          )
-          .orderBy(desc(collaborationTodos.ordinal))
-          .limit(COLLABORATION_INDEX_ITEMS)
-          .all()
-        todoAfterOrdinal = admittedTodoOrdinal(preceding, COLLABORATION_INDEX_BYTES - 16 * 1024) - 1
-      }
-      const todos =
-        task && input.projection === 'todos'
-          ? this.readCollaborationTodos(
-              task.id,
-              input.ledgerRevision ?? currentRow!.ledgerRevision,
-              todoGroup,
-              todoAfterOrdinal,
-            )
-          : undefined
-      const source = task?.planReference
-        ? this.database
-            .select({ runId: agentRuns.id, messageId: agentRuns.userMessageId })
-            .from(agentRuns)
-            .where(
-              and(
-                eq(agentRuns.id, task.planReference.sourceRunId),
-                eq(agentRuns.sessionId, input.sessionId),
-              ),
-            )
-            .get()
-        : undefined
-      const receipt = this.receivedCollaborationInput(input.sessionId, true)
-      const received =
-        receipt && receipt.taskId === task?.id && receipt.state !== 'materialized'
-          ? receipt
-          : undefined
+      const received = this.receivedCollaborationInput(input.sessionId)
+      const current = Boolean(task && active?.id === task.id && active.runId === requestedRunId)
+      const actionable = current && !received
+      const documents: Array<{ key: string; source: CollaborationDocument }> = []
+      if (task?.planReference) documents.push({ key: 'plan', source: task.planReference.document })
+      if (turn?.applied && turn.reportBodyId)
+        documents.push({
+          key: 'report',
+          source: this.documentReference(input.sessionId, turn.reportBodyId),
+        })
+      const planRecovery = Boolean(task && current && this.needsWorkflowPlanRecovery(task.runId))
+      const stage = task && !planRecovery ? collaborationNextStage(task) : undefined
       return {
         scope: 'collaboration',
         sessionId: input.sessionId,
         view: collaborationViewSchema.parse({
-          task: task
+          task: task ?? null,
+          accepted: task
+            ? collaborationPlanAccepted(task) ||
+              (task.review?.stage === 'code_review' &&
+                task.review.verdict === 'accepted' &&
+                task.review.inputSequence === task.inputSequence &&
+                task.status === 'complete')
+            : false,
+          reportAvailable: Boolean(turn?.applied && turn.reportBodyId),
+          actionable,
+          availableActions:
+            task && actionable
+              ? planRecovery
+                ? ['recover_plan']
+                : collaborationAvailableActions(task)
+              : [],
+          ...(planRecovery
             ? {
-                ...task,
-                priorResult: undefined,
-                result: input.projection === 'report' ? result : undefined,
-                plan: undefined,
-              }
-            : null,
-          accepted: indexed?.row.state === 'applied',
-          reportAvailable: Boolean(indexed),
-          todoSummaries,
-          ...(indexed && input.projection === 'report'
-            ? {
-                documents: [{ key: 'summary', source: indexed.manifest.summaryDocument }],
-                feedbackCount: indexed.manifest.todoCount,
+                planSync: {
+                  state: 'recovery_required',
+                  kind:
+                    turn && this.workflowPlanRetention(task!.runId, turn.planNativeId)
+                      ? 'response'
+                      : 'plan',
+                  runId: task!.runId,
+                  retainedVersion: task!.planVersion,
+                },
               }
             : {}),
-          ...(source ? { planSource: source } : {}),
-          ...(todos ? { todos } : {}),
-          ...(todo
+          ...(stage
             ? {
-                todo,
-                todoCurrent: todoHead
-                  ? { revision: todoHead.revision, status: todoHead.status }
-                  : null,
+                nextStep:
+                  collaborationStageLabel(stage) +
+                  ' with ' +
+                  (collaborationActor(task!, stage) === 'claude' ? 'Claude Code' : 'Codex'),
               }
             : {}),
-          ...(received
+          ...(task?.planReference
+            ? {
+                planSource: {
+                  runId: task.planReference.sourceRunId,
+                  messageId: task.planReference.sourceMessageId,
+                },
+              }
+            : {}),
+          documents,
+          ...(received && received.taskId === task?.id
             ? {
                 received: {
                   id: received.id,
                   actor: received.actor,
                   state: received.state,
-                  preview:
-                    'A message and its attachments were durably received; no Agent Turn has started.',
+                  preview: received.preview,
                 },
               }
             : {}),
-          actionable: Boolean(
-            (!received || received.state === 'cancelled') &&
-            task &&
-            active &&
-            task.runId === active.runId &&
-            task.revision === active.revision &&
-            task.status !== 'running',
-          ),
         }),
       }
     }
@@ -8639,14 +7133,6 @@ export class ConversationRepository {
           continue
         }
         const row = candidateMap.get(item.id)!
-        const natural =
-          row.role === 'assistant'
-            ? this.naturalMessageProjection(row.id, input.sessionId)
-            : undefined
-        if (natural !== undefined) {
-          row.content = natural
-          row.contentBytes = Buffer.byteLength(natural)
-        }
         const previousRuns = [...page.runs]
         const previousArtifacts = [...page.runArtifacts!]
         const message = {
@@ -9285,6 +7771,7 @@ export class ConversationRepository {
       | 'freezeDrafts'
       | 'preserveDraftComments'
       | 'receivedInputId'
+      | 'replyToDecision'
     >,
   ): BeginRunResult | undefined {
     const existingMessage = this.database
@@ -9328,6 +7815,9 @@ export class ConversationRepository {
     const receipt = this.database
       .select({
         freeze: sql<number | null>`json_extract(${agentEventJournal.payload},'$.freezeDrafts')`,
+        decision: sql<
+          string | null
+        >`json_extract(${agentEventJournal.payload},'$.replyToDecision')`,
       })
       .from(agentEventJournal)
       .where(
@@ -9339,19 +7829,21 @@ export class ConversationRepository {
       .limit(1)
       .get()
     const requestedFreeze = input.receivedInputId
-      ? (collaborationReceivedMetadataSchema.parse(
-          JSON.parse(
-            this.database
-              .select({ json: collaborationInputs.metadataJson })
-              .from(collaborationInputs)
-              .where(eq(collaborationInputs.id, input.receivedInputId))
-              .get()!.json,
-          ),
+      ? (storedReceivedMetadata(
+          this.database
+            .select({ json: collaborationInputs.metadataJson })
+            .from(collaborationInputs)
+            .where(eq(collaborationInputs.id, input.receivedInputId))
+            .get()!.json,
         ).freezeDrafts ?? true)
       : (input.freezeDrafts ?? !input.preserveDraftComments)
     if (
       batch.id !== (input.batchId ?? input.clientMessageId) ||
-      Boolean(receipt?.freeze) !== requestedFreeze
+      Boolean(receipt?.freeze) !== requestedFreeze ||
+      !isDeepStrictEqual(
+        receipt?.decision ? JSON.parse(receipt.decision) : undefined,
+        input.replyToDecision,
+      )
     )
       throw new RunOperationConflictError(
         'This message nonce has a different Batch or draft-freeze intent.',
@@ -9405,14 +7897,12 @@ export class ConversationRepository {
       route.type === 'all' ? [route.firstAgentId, route.secondAgentId] : [route.agentId]
     const supersededProposalRunIds: string[] = []
     const freezeDrafts = input.receivedInputId
-      ? (collaborationReceivedMetadataSchema.parse(
-          JSON.parse(
-            this.database
-              .select({ json: collaborationInputs.metadataJson })
-              .from(collaborationInputs)
-              .where(eq(collaborationInputs.id, input.receivedInputId))
-              .get()!.json,
-          ),
+      ? (storedReceivedMetadata(
+          this.database
+            .select({ json: collaborationInputs.metadataJson })
+            .from(collaborationInputs)
+            .where(eq(collaborationInputs.id, input.receivedInputId))
+            .get()!.json,
         ).freezeDrafts ?? true)
       : (input.freezeDrafts ?? !input.preserveDraftComments)
     if (!freezeDrafts && !input.receivedInputId && input.commentIds.length)
@@ -9424,12 +7914,25 @@ export class ConversationRepository {
       input.sessionId,
       (transaction) => {
         assertSessionAvailable(transaction, input.sessionId)
+        if (
+          !input.receivedInputId &&
+          !(
+            input.collaboration &&
+            input.expectedCollaborationRevision !== undefined &&
+            input.preserveDraftComments
+          )
+        )
+          this.assertDecisionInput(input)
         const session = transaction
           .select()
           .from(sessions)
           .where(eq(sessions.id, input.sessionId))
           .get()
         if (!session) throw new Error('Session does not exist.')
+        if (input.collaboration && session.settingsRevision !== input.settingsRevision)
+          throw new RunOperationConflictError(
+            'Session settings changed during workflow preparation.',
+          )
         const images = this.resolveMessageImages(
           input.sessionId,
           input.imageIds ?? [],
@@ -9594,7 +8097,7 @@ export class ConversationRepository {
             received.id !== input.receivedInputId ||
             received.state !== 'accepted' ||
             received.queueState !== 'queued' ||
-            !session.queueEnabled ||
+            (!session.queueEnabled && !input.collaboration) ||
             session.queuePauseReason
           )
             throw new RunOperationConflictError('This received input is no longer eligible.')
@@ -9602,20 +8105,30 @@ export class ConversationRepository {
         if (input.collaboration) {
           const task = collaborationTaskSchema.parse({ ...input.collaboration, runId })
           const current = this.collaboration(input.sessionId)
-          if (task.previousRunId) {
+          if (current?.id === task.id) {
             if (
-              !current ||
-              current.id !== task.id ||
-              current.revision + 1 !== task.revision ||
-              current.runId !== task.previousRunId
+              input.expectedCollaborationRevision === undefined ||
+              current.revision !== input.expectedCollaborationRevision ||
+              task.revision !== current.revision + 1 ||
+              task.inputSequence !== current.inputSequence ||
+              current.status === 'running' ||
+              (task.stage !== 'reply' &&
+                (current.automation !== 'active' || Boolean(collaborationInputGate(current))))
             )
-              throw new RunOperationConflictError('The collaboration task changed before dispatch.')
+              throw new RunOperationConflictError(
+                'The collaboration changed before this Turn was admitted.',
+              )
             transaction
               .update(collaborationTasks)
               .set({ stateJson: JSON.stringify(task), updatedAt: createdAt })
               .where(eq(collaborationTasks.id, task.id))
               .run()
           } else {
+            if (
+              input.expectedCollaborationRevision !== undefined ||
+              task.taskMessageId !== input.clientMessageId
+            )
+              throw new RunOperationConflictError('This workflow task is no longer current.')
             transaction
               .update(collaborationTasks)
               .set({ active: false })
@@ -9638,16 +8151,7 @@ export class ConversationRepository {
               .run()
           }
         } else if (!input.sourceProposalId) {
-          const task = this.collaboration(input.sessionId)
-          if (task && task.status !== 'complete') {
-            if (task.status !== 'paused')
-              task.pausedStatus = task.status === 'running' ? 'failed' : task.status
-            task.status = 'paused'
-            task.revision++
-            task.notice =
-              'A new user message superseded the previous action. Resume explicitly after handling it.'
-            this.saveCollaboration(task)
-          }
+          this.pauseWorkflowForInput(input.sessionId, userMessageId)
         }
         transaction
           .insert(conversationMessages)
@@ -9688,7 +8192,6 @@ export class ConversationRepository {
             collaborationTaskId: input.collaboration?.id,
             collaborationKind: input.collaboration?.kind,
             collaborationStage: input.collaboration?.stage,
-            answerFormat: input.collaboration ? 'collaboration_envelope_v5' : undefined,
             sessionId: input.sessionId,
             userMessageId,
             agentId: input.agentId,
@@ -9707,23 +8210,17 @@ export class ConversationRepository {
             updatedAt: createdAt,
           })
           .run()
-        if (input.collaboration)
-          transaction
-            .insert(collaborationTurns)
-            .values({
-              runId,
-              taskId: input.collaboration.id,
-              stateJson: JSON.stringify({ ...input.collaboration, runId }),
-            })
-            .run()
-        if (input.collaboration) this.saveCollaboration({ ...input.collaboration, runId })
         const batch = this.freezeInputBatch({
           sessionId: input.sessionId,
           clientMessageId: input.clientMessageId,
           commentsRevision: session.commentsRevision,
           actor: input.agentId,
           ...(input.batchId ? { batchId: input.batchId } : {}),
-          ...(input.collaboration ? { taskId: input.collaboration.id } : {}),
+          ...(input.collaboration &&
+          (input.collaboration.taskMessageId === input.clientMessageId ||
+            input.collaboration.stage === 'reply')
+            ? { taskId: input.collaboration.id }
+            : {}),
           runId,
           messageId: userMessageId,
           ...(input.receivedInputId ? { pendingReceiptId: input.receivedInputId } : {}),
@@ -9825,6 +8322,7 @@ export class ConversationRepository {
             comments: [],
             freezeDrafts,
             inputBatchRef: batch,
+            ...(input.replyToDecision ? { replyToDecision: input.replyToDecision } : {}),
           }),
           createdAt,
         })
@@ -10451,7 +8949,6 @@ export class ConversationRepository {
         run.agentId !== id.agentId ||
         run.id !== id.requestId ||
         run.bindingGeneration !== id.bindingGeneration ||
-        run.answerFormat !== id.answerFormat ||
         (run.nativeSessionId && run.nativeSessionId !== id.nativeSessionId) ||
         (run.nativeTurnId && id.nativeTurnId && run.nativeTurnId !== id.nativeTurnId) ||
         ('source' in evidence &&
@@ -10490,23 +8987,34 @@ export class ConversationRepository {
           })
           .where(eq(agentRuns.id, run.id))
           .run()
-      if (run && 'output' in evidence && evidence.output?.submittedReport) {
-        try {
-          this.recordRecoveredCollaborationResult(run.id, evidence.output.submittedReport)
-        } catch (error) {
-          if (!(error instanceof RunOperationConflictError)) throw error
-          // A rejected candidate cannot revoke independently verified native termination.
-          this.nativeFact(run.id, 'pact.report_source_conflict', {
-            reason: error.message.slice(0, 600),
-          })
-          const task = this.collaboration(run.sessionId)
-          if (task?.runId === run.id && !task.result) {
-            task.reportFailure = 'invalid'
-            task.notice = error.message.slice(0, 600)
-            this.saveCollaboration(task)
-          }
-        }
-      }
+      if (
+        run &&
+        ((evidence.kind === 'ended' && evidence.planUnavailable) ||
+          ('output' in evidence && evidence.output?.planUnavailable))
+      )
+        this.recordWorkflowPlanUnavailable(run.id)
+      else if (run && 'output' in evidence && evidence.output?.plan)
+        this.recordWorkflowPlan(run.id, evidence.output.plan)
+      else if (run && 'output' in evidence && evidence.output?.retainedPlan)
+        this.recordWorkflowPlanRetained(run.id, evidence.output.retainedPlan)
+      if (
+        run &&
+        'output' in evidence &&
+        (evidence.output?.reviewResult || evidence.output?.reviewVerdict)
+      )
+        this.recordWorkflowReview(
+          run.id,
+          evidence.output.reviewResult ?? { verdict: evidence.output.reviewVerdict! },
+        )
+      if (
+        run &&
+        'output' in evidence &&
+        (evidence.output?.inputResult || evidence.output?.inputOutcome)
+      )
+        this.recordWorkflowInputResult(
+          run.id,
+          evidence.output.inputResult ?? { outcome: evidence.output.inputOutcome! },
+        )
       if (!controls) return
       const state: NativeContinuationState =
         evidence.kind === 'ended' &&
@@ -10749,21 +9257,43 @@ export class ConversationRepository {
   }
 
   hasCompleteResponse(runId: string): boolean {
-    return (
+    const message = this.database
+      .select({
+        id: conversationMessages.id,
+        hasBody: sql<boolean>`length(${conversationMessages.content}) > 0`,
+      })
+      .from(conversationMessages)
+      .where(
+        and(
+          eq(conversationMessages.runId, runId),
+          eq(conversationMessages.role, 'assistant'),
+          eq(conversationMessages.isVisible, true),
+          eq(conversationMessages.state, 'complete'),
+        ),
+      )
+      .limit(1)
+      .get()
+    if (!message) return false
+    if (message.hasBody) return true
+    // A native Plan-only ending has a real empty canonical answer, plus its separate complete artifact.
+    return Boolean(
       this.database
-        .select({ id: conversationMessages.id })
-        .from(conversationMessages)
+        .select({ id: workflowTurns.runId })
+        .from(workflowTurns)
+        .innerJoin(agentRuns, eq(agentRuns.id, workflowTurns.runId))
+        .innerJoin(conversationBodyInputs, eq(conversationBodyInputs.id, workflowTurns.planBodyId))
         .where(
           and(
-            eq(conversationMessages.runId, runId),
-            eq(conversationMessages.role, 'assistant'),
-            eq(conversationMessages.isVisible, true),
-            eq(conversationMessages.state, 'complete'),
-            sql`length(${conversationMessages.content}) > 0`,
+            eq(workflowTurns.runId, runId),
+            isNotNull(workflowTurns.planNativeId),
+            eq(agentRuns.dispatchPhase, 'ended'),
+            eq(agentRuns.nativeOutcome, 'completed'),
+            eq(conversationBodyInputs.sealed, true),
+            gt(conversationBodyInputs.chars, 0),
           ),
         )
         .limit(1)
-        .get() !== undefined
+        .get(),
     )
   }
 
@@ -11610,7 +10140,6 @@ export class ConversationRepository {
         .set({ bodyState: 'withdrawn', state: 'closed', closedAt: new Date().toISOString() })
         .where(eq(conversationInputBatches.id, batch.id))
         .run()
-      if (batch.taskId) this.advanceInputWatermark(batch.taskId)
       record.state = 'installed'
       this.database
         .update(nativeRebuildOperations)
@@ -11994,7 +10523,6 @@ export class ConversationRepository {
                 mode: input.mode,
                 commentId: input.commentId,
                 body: input.body,
-                ...(input.anchor ? { anchor: input.anchor } : {}),
               },
         ),
       )
@@ -12042,7 +10570,7 @@ export class ConversationRepository {
       if (
         existing &&
         existing.body === input.body &&
-        (input.anchor === undefined || existing.anchorJson === JSON.stringify(input.anchor)) &&
+        (input.mode === 'edit' || existing.anchorJson === JSON.stringify(input.anchor)) &&
         !existing.sentWithMessageId &&
         !existing.pendingReceiptId
       ) {
@@ -12072,71 +10600,7 @@ export class ConversationRepository {
           throw new RunOperationConflictError(
             'This Comment identity already belongs to another source or frozen draft.',
           )
-        let answerKey: string | null = null
-        if (input.anchor.type === 'todo') {
-          const anchor = input.anchor
-          const task = this.database
-            .select()
-            .from(collaborationTasks)
-            .where(
-              and(
-                eq(collaborationTasks.id, anchor.taskId),
-                eq(collaborationTasks.sessionId, input.sessionId),
-              ),
-            )
-            .get()
-          const todo = this.database
-            .select()
-            .from(collaborationTodoRevisions)
-            .where(
-              and(
-                eq(collaborationTodoRevisions.taskId, anchor.taskId),
-                eq(collaborationTodoRevisions.todoId, anchor.todoId),
-                eq(collaborationTodoRevisions.revision, anchor.todoRevision),
-              ),
-            )
-            .get()
-          if (!task || !todo)
-            throw new RunOperationConflictError('The exact Todo source is unavailable.')
-          if (anchor.question) {
-            if (
-              todo.questionId !== anchor.question.id ||
-              todo.questionRevision !== anchor.question.revision
-            )
-              throw new RunOperationConflictError(
-                'The answer belongs to another question revision.',
-              )
-            const definition = todo.questionJson
-              ? collaborationTodoQuestionSchema.parse(JSON.parse(todo.questionJson))
-              : undefined
-            if (
-              !definition ||
-              (anchor.question.optionIndex !== undefined &&
-                (definition.type !== 'choice' ||
-                  anchor.question.optionIndex >= definition.options.length))
-            )
-              throw new RunOperationConflictError(
-                'The selected answer does not belong to this question.',
-              )
-            answerKey = `${anchor.taskId}:${anchor.todoId}:${anchor.question.id}:${anchor.question.revision}`
-          }
-        }
-        const answer =
-          existing ??
-          (answerKey
-            ? this.database
-                .select()
-                .from(anchoredComments)
-                .where(
-                  and(
-                    eq(anchoredComments.sessionId, input.sessionId),
-                    eq(anchoredComments.answerKey, answerKey),
-                    isNull(anchoredComments.sentWithMessageId),
-                    isNull(anchoredComments.pendingReceiptId),
-                  ),
-                )
-                .get()
-            : undefined)
+        const answer = existing
         if (answer) {
           savedId = answer.id
           this.database
@@ -12163,7 +10627,7 @@ export class ConversationRepository {
               sessionId: input.sessionId,
               body: input.body,
               anchorJson: JSON.stringify(input.anchor),
-              answerKey,
+              answerKey: null,
               draftRevision: 1,
               position,
               createdAt: now,
@@ -12174,47 +10638,11 @@ export class ConversationRepository {
       } else {
         if (!existing || existing.sentWithMessageId || existing.pendingReceiptId)
           throw new RunOperationConflictError('Only an unsent Comment draft can be edited.')
-        let editedAnchor = existing.anchorJson
-        if (input.anchor) {
-          const previous = commentAnchorSchema.parse(JSON.parse(existing.anchorJson))
-          const candidate = commentAnchorSchema.parse(input.anchor)
-          if (previous.type !== 'todo' || candidate.type !== 'todo')
-            throw new RunOperationConflictError('Only a Todo answer choice may update its anchor.')
-          if (
-            JSON.stringify(todoAnswerSource(previous)) !==
-            JSON.stringify(todoAnswerSource(candidate))
-          )
-            throw new RunOperationConflictError(
-              'A Comment edit cannot retarget its immutable source.',
-            )
-          const todo = this.database
-            .select()
-            .from(collaborationTodoRevisions)
-            .where(
-              and(
-                eq(collaborationTodoRevisions.taskId, candidate.taskId),
-                eq(collaborationTodoRevisions.todoId, candidate.todoId),
-                eq(collaborationTodoRevisions.revision, candidate.todoRevision),
-              ),
-            )
-            .get()
-          const question = todo?.questionJson
-            ? collaborationTodoQuestionSchema.parse(JSON.parse(todo.questionJson))
-            : undefined
-          if (
-            candidate.question?.optionIndex !== undefined &&
-            (!question ||
-              question.type !== 'choice' ||
-              candidate.question.optionIndex >= question.options.length)
-          )
-            throw new RunOperationConflictError('The edited answer choice is invalid.')
-          editedAnchor = JSON.stringify(candidate)
-        }
         this.database
           .update(anchoredComments)
           .set({
             body: input.body,
-            anchorJson: editedAnchor,
+            anchorJson: existing.anchorJson,
             draftRevision: existing.draftRevision + 1,
             updatedAt: now,
           })
@@ -14361,13 +12789,11 @@ export class ConversationRepository {
   }
 
   private static toComment(row: typeof anchoredComments.$inferSelect): AnchoredComment {
-    const parsed = commentAnchorSchema.safeParse(JSON.parse(row.anchorJson))
-    if (!parsed.success) throw new Error(`Comment ${row.id} has an invalid persisted anchor.`)
     return {
       id: row.id,
       sessionId: row.sessionId,
       body: row.body,
-      anchor: parsed.data,
+      anchor: storedCommentAnchor(JSON.parse(row.anchorJson)),
       status: row.sentWithMessageId ? 'sent' : 'draft',
       position: row.position,
       createdAt: row.createdAt,
@@ -14396,20 +12822,30 @@ export class ConversationRepository {
   }
 
   private static toRun(
-    row: Omit<typeof agentRuns.$inferSelect, 'handoffSourceIds' | 'nativeInputIdsJson'> & {
+    row: Omit<
+      typeof agentRuns.$inferSelect,
+      'handoffSourceIds' | 'nativeInputIdsJson' | 'answerFormat'
+    > & {
       responseMessageId?: string | null
+      workflowTaskId?: string | null
+      collaborationPlanVersion?: number | null
       outputSnapshotsJson?: string | null
     },
   ): AgentRun {
     return {
       outputSnapshots: parseOutputSnapshotSummary(row.outputSnapshotsJson),
-      ...(row.answerFormat ? { answerFormat: row.answerFormat } : {}),
-      ...(row.collaborationTaskId && row.collaborationKind && row.collaborationStage
+      ...(row.workflowTaskId === row.collaborationTaskId &&
+      row.collaborationTaskId &&
+      row.collaborationKind &&
+      row.collaborationStage
         ? {
             collaboration: {
               taskId: row.collaborationTaskId,
               kind: row.collaborationKind,
               stage: row.collaborationStage,
+              ...(row.collaborationPlanVersion
+                ? { planVersion: row.collaborationPlanVersion }
+                : {}),
             },
           }
         : {}),

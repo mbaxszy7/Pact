@@ -138,7 +138,6 @@ test(
               primaryAgentId: settings.primaryAgentId,
               agents: settings.agents,
               maxDiscussionRounds: 5,
-              runningMessagePolicy: settings.runningMessagePolicy,
               maxReviewCycles: settings.maxReviewCycles,
               maxRepairAttempts: settings.maxRepairAttempts,
             },

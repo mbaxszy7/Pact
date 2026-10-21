@@ -42,6 +42,11 @@ A missing scanner, wrong version, error, timeout, or detected secret blocks the 
 comments and local ignore files do not bypass scanning. Refresh changed hook configuration with
 `pnpm exec simple-git-hooks`.
 
+Local `pnpm test:infra` also requires that pinned scanner. On Windows, add Git for Windows' `bin`
+directory (containing `bash.exe`) to the verification process's PATH: workflow tests execute the
+actual Bash commands from the Actions definitions. Playwright discovery uses the workspace's
+installed CLI through Node and does not depend on whether pnpm is exposed as an EXE or shell shim.
+
 ```sh
 pnpm docs:check
 pnpm secrets:check    # Staged content
@@ -210,6 +215,26 @@ legally required notices.
 Do not commit credentials, provider homes, environment files, databases, checkpoints, logs, traces,
 or raw user/agent output. Ignore rules do not protect tracked/forcibly added files. Test credentials
 must be unmistakably nonfunctional; never broadly exempt test directories from scanning.
+
+## Diagnostic logs
+
+Use **Diagnostics → Open log folder** when the native menu is available. For `pnpm dev`,
+the default directory is `<repository>/.pact-data/dev/logs/development` (on Windows,
+`.pact-data\dev\logs\development`). Logs live beside the active database, under
+`logs/development` or `logs/production`; Electron's AppData profile directory is not the
+source of truth. Custom database locations also relocate the log directory.
+
+Share the relevant `pact-*.jsonl` files with the approximate failure time and platform.
+Claude plan capture and submission events use `operation: "claude_plan"`, with Session/Run
+identifiers, a phase and finite reason codes. Capture failures and submission rejections
+are warnings, and successful capture/submission are informational; neither requires Debug
+logging. `planCapture` is the latest capture failure hint, when present, and is not proof
+that it caused the current rejection. Repeated identical outcomes are deduplicated within
+the Run. The Adapter owns at most 64 fixed-enum keys (under 16 KiB), cleared on Run disposal;
+restart recreates them. Capture keys include tool/Hook phase; submission keys include only
+outcome reason, with no new timer or queue. Authentication and retry policy are unchanged.
+These records contain no plan body, source path, tool input, native receipt body,
+raw exception or credentials. Debug logging does not backfill earlier events.
 
 ## Testing
 

@@ -660,42 +660,75 @@ for (const phase of ['bootstrapping', 'initializing', 'started', 'supervisor-kil
     const fixture = await tree(context, 'hold'),
       driver = join(fixture.root, 'runner.mjs'),
       stateFile = join(fixture.root, 'state.json')
+    const reportedPhases = [
+      'preparing',
+      'prepared',
+      'bootstrapping',
+      'initializing',
+      'started',
+      'stopping',
+      'settled',
+    ]
+    const began = performance.now()
+    const phases = []
     await writeFile(
       driver,
       `import {run} from ${JSON.stringify(pathToFileURL(join(import.meta.dirname, 'run-e2e.mjs')).href)};import{writeFileSync}from'node:fs';
-run([${JSON.stringify(fixture.entry)}],15000,{executable:process.execPath,cwd:${JSON.stringify(fixture.root)},write:()=>{},onState:s=>{if(s.kind===${JSON.stringify(phase === 'supervisor-killed' ? 'started' : phase)})writeFileSync(${JSON.stringify(stateFile)},JSON.stringify(s))}}).then(()=>process.exit(0),()=>process.exit(1));\n`,
+const phases=new Set(${JSON.stringify(reportedPhases)});
+run([${JSON.stringify(fixture.entry)}],15000,{executable:process.execPath,cwd:${JSON.stringify(fixture.root)},write:()=>{},onState:s=>{if(phases.has(s.kind))process.send({kind:s.kind,ownerPid:s.ownerPid},()=>{});if(s.kind===${JSON.stringify(phase === 'supervisor-killed' ? 'started' : phase)})writeFileSync(${JSON.stringify(stateFile)},JSON.stringify(s))}}).then(()=>process.exit(0),()=>process.exit(1));\n`,
     )
     const runner = spawn(process.execPath, [driver], {
         shell: false,
         windowsHide: true,
-        stdio: 'ignore',
+        stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
       }),
       exited = new Promise((r) => runner.once('close', r))
+    const recordPhase = (message) => {
+      if (
+        reportedPhases.includes(message?.kind) &&
+        (message.ownerPid === null || Number.isSafeInteger(message.ownerPid)) &&
+        phases.length < 8
+      )
+        phases.push({
+          kind: message.kind,
+          ownerPid: message.ownerPid,
+          elapsedMs: Math.round(performance.now() - began),
+        })
+    }
+    runner.on('message', recordPhase)
     context.after(async () => {
       if (runner.exitCode === null && runner.signalCode === null) runner.kill()
       await exited
+      runner.removeListener('message', recordPhase)
     })
-    let state
-    await waitFor(async () => {
-      try {
-        state = JSON.parse(await readFile(stateFile, 'utf8'))
-        return true
-      } catch (e) {
-        if (e.code === 'ENOENT' || e instanceof SyntaxError) return false
-        throw e
+    try {
+      let state
+      await waitFor(async () => {
+        try {
+          state = JSON.parse(await readFile(stateFile, 'utf8'))
+          return true
+        } catch (e) {
+          if (e.code === 'ENOENT' || e instanceof SyntaxError) return false
+          throw e
+        }
+      })
+      if (phase === 'initializing' || phase === 'bootstrapping') {
+        runner.kill()
+        await exited
+        await waitFor(() => pidGone(state.ownerPid))
+        await assert.rejects(readFile(fixture.report), { code: 'ENOENT' })
+      } else {
+        const pids = await fixture.pids()
+        if (phase === 'supervisor-killed') process.kill(state.ownerPid, 'SIGKILL')
+        else runner.kill()
+        await exited
+        await waitFor(() => pidGone(state.ownerPid) && pidGone(pids.parent) && pidGone(pids.worker))
       }
-    })
-    if (phase === 'initializing' || phase === 'bootstrapping') {
-      runner.kill()
-      await exited
-      await waitFor(() => pidGone(state.ownerPid))
-      await assert.rejects(readFile(fixture.report), { code: 'ENOENT' })
-    } else {
-      const pids = await fixture.pids()
-      if (phase === 'supervisor-killed') process.kill(state.ownerPid, 'SIGKILL')
-      else runner.kill()
-      await exited
-      await waitFor(() => pidGone(state.ownerPid) && pidGone(pids.parent) && pidGone(pids.worker))
+    } catch (error) {
+      context.diagnostic(
+        JSON.stringify({ phase, phases, exitCode: runner.exitCode, signalCode: runner.signalCode }),
+      )
+      throw error
     }
   })
 }

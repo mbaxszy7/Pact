@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { constants, type Stats } from 'node:fs'
 import { open, realpath } from 'node:fs/promises'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import type {
   AnchoredComment,
@@ -36,12 +37,14 @@ export class ProjectFileReader {
       }
 
       const projectRoot = await realpath(project.directoryPath)
-      const requestedPath = isAbsolute(input.path) ? input.path : resolve(projectRoot, input.path)
+      let localPath = /^file:/iu.test(input.path) ? fileURLToPath(input.path) : input.path
+      if (process.platform === 'win32') localPath = localPath.replace(/^\/(?=[a-z]:[\\/])/iu, '')
+      const requestedPath = isAbsolute(localPath) ? localPath : resolve(projectRoot, localPath)
       const canonicalPath = await realpath(requestedPath)
       const relativePath = relative(projectRoot, canonicalPath)
       const isExternal =
         relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)
-      if (isExternal && !isAbsolute(input.path)) {
+      if (isExternal && !isAbsolute(localPath)) {
         throw new ProjectFileError('Use an absolute path to preview a file outside this Project.')
       }
 

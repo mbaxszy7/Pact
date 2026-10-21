@@ -20,8 +20,12 @@ import type {
   NativeEvidenceIdentity,
   NativeProbeResult,
   NormalizedAgentEvent,
+  CollaborationReviewObservation,
+  CollaborationRetainedPlan,
+  CollaborationInputObservation,
   SessionPermissionMode,
 } from '@pact/contracts'
+import type { DiagnosticEvent } from '@pact/contracts/diagnostics'
 
 import {
   agentPromptImageGroups,
@@ -43,7 +47,8 @@ import {
 import {
   collaborationSourceReadSchema,
   collaborationSourceReadResultSchema,
-  collaborationOutputSchema,
+  collaborationReviewInputSchema,
+  collaborationInputResultSchema,
   sessionTitleInputShape,
   sessionTitleInputSchema,
 } from '@pact/contracts'
@@ -56,6 +61,7 @@ import {
 
 import type { LogicalIpcWorkerTraffic } from '../../shared/logical-ipc-traffic'
 
+import { recordDiagnostic } from '../../diagnostics/utility-log'
 import { AgentActivityDetail } from './agent-activity-detail'
 import { AgentAnswerAssembler } from './agent-answer-assembler'
 import {
@@ -63,17 +69,17 @@ import {
   classifyAgentError,
   NativeCapacityError,
   PermissionModeRejectedError,
+  NativeInputWithheldError,
 } from './agent-execution-error'
-import {
-  readCollaborationAnswer,
-  readCollaborationEnvelopeText,
-  collaborationNaturalFallback,
-  collaborationResultEvent,
-  readSubmittedCollaborationReport,
-} from './collaboration-answer'
+import { ClaudeNativePlan, claudePlanInputFingerprint } from './claude-native-plan'
+import { mergeWorkflowReview, mergeWorkflowInput, readWorkflowReview } from './collaboration-answer'
 import {
   collaborationInstructions,
   collaborationReadOnly,
+  collaborationPlanMode,
+  collaborationReviewMode,
+  collaborationInputResultAllowed,
+  collaborationPlanningInstructions,
   frozenSourceInstructions,
   collaborationToolAllowed,
 } from './collaboration-prompt'
@@ -199,6 +205,19 @@ class ClaudeNativeWork {
   }
 }
 
+type PlanCaptureFailureCode = NonNullable<DiagnosticEvent['planCapture']>['code']
+type PlanCaptureFailure = NonNullable<DiagnosticEvent['planCapture']> & { operationId?: string }
+type PlanSubmissionRejection = {
+  reason:
+    | PlanCaptureFailureCode
+    | 'submission_hook_unverified'
+    | 'plan_pending'
+    | 'plan_unavailable'
+    | 'plan_missing'
+    | 'retained_basis_mismatch'
+  latestCapture?: Pick<PlanCaptureFailure, 'code' | 'tool' | 'phase'>
+}
+
 export class ClaudeAgentAdapter implements AgentAdapter {
   readonly id = 'claude' as const
   private latestExecutorId = randomUUID()
@@ -288,7 +307,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       bindingGeneration: input.bindingGeneration,
       throughSequence: input.throughSequence,
       deliveryCursor: input.deliveryCursor,
-      ...(input.answerFormat ? { answerFormat: input.answerFormat } : {}),
       prefixHash: prefix.prefixHash,
       prefixRecords: prefix.prefixRecords,
       prefixBytes: prefix.prefixBytes,
@@ -320,7 +338,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         nativeSessionId: input.source.nativeSessionId,
         nativeTurnId: input.source.nativeTurnId,
         source: input.source,
-        ...(input.source.answerFormat ? { answerFormat: input.source.answerFormat } : {}),
       },
       signal,
       async (candidate) => {
@@ -329,7 +346,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           nativeSessionId: candidate.nativeSessionId,
           sourceNativeSessionId: input.source.nativeSessionId,
           sourceCutId: input.source.nativeCutId,
-          ...(input.source.answerFormat ? { answerFormat: input.source.answerFormat } : {}),
           sourcePrefixHash: input.source.prefixHash,
           candidatePrefixHash: candidate.prefixHash,
           idMap: candidate.idMap,
@@ -357,7 +373,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       nativeSessionId: prefix.nativeSessionId,
       sourceNativeSessionId: input.source.nativeSessionId,
       sourceCutId: input.source.nativeCutId,
-      ...(input.source.answerFormat ? { answerFormat: input.source.answerFormat } : {}),
       sourcePrefixHash: input.source.prefixHash,
       candidatePrefixHash: prefix.prefixHash,
       idMap: prefix.idMap,
@@ -399,7 +414,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           provider: 'claude',
           action: 'inspect',
           source: input.source,
-          ...(input.source.answerFormat ? { answerFormat: input.source.answerFormat } : {}),
           ...(input.lastDispatchedPhase ? { lastDispatchedPhase: input.lastDispatchedPhase } : {}),
           cwd: input.cwd,
           nativeSessionId: input.nativeSessionId,
@@ -697,9 +711,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             cwd: input.cwd,
             nativeSessionId: candidate.nativeSessionId,
             witness: candidate.witness,
-            ...(candidate.witness.answerFormat
-              ? { answerFormat: candidate.witness.answerFormat }
-              : {}),
           },
           observation.signal,
         )
@@ -815,15 +826,15 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       ...(runId ? { runId } : {}),
       ...(nativeTurnId ? { nativeTurnId } : {}),
       ...(executorId ? { executorId } : {}),
-      ...(input.answerFormat ? { answerFormat: input.answerFormat } : {}),
     }
     const cached = this.nativeEvidence.get(requestId)
-    const known = cached?.identity.answerFormat === input.answerFormat ? cached : undefined
+    const known = cached
     if (known) {
       this.nativeEvidence.delete(requestId)
       this.nativeEvidence.set(requestId, known)
     }
     if (
+      !input.inspectMissingPlan &&
       known &&
       known.identity.nativeSessionId === nativeSessionId &&
       known.identity.bindingGeneration === bindingGeneration &&
@@ -853,7 +864,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             persisted.identity.nativeSessionId === nativeSessionId &&
             persisted.identity.bindingGeneration === bindingGeneration &&
             persisted.identity.nativeTurnId === nativeTurnId &&
-            persisted.identity.answerFormat === input.answerFormat &&
             persisted.identity.executorId === executorId
           ? persisted
           : undefined
@@ -883,7 +893,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             },
           }
       }
-      if (verifiedTerminal?.output?.completeness === 'complete') return verifiedTerminal
+      if (!input.inspectMissingPlan && verifiedTerminal?.output?.completeness === 'complete')
+        return verifiedTerminal
 
       if (nativeTurnId) {
         const recovered = await this.nativeForkFiles.readAnswer(
@@ -891,30 +902,43 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             cwd: input.cwd,
             nativeSessionId,
             nativeTurnId,
-            ...(input.answerFormat ? { answerFormat: input.answerFormat } : {}),
+            includePlan: Boolean(input.planSource || input.inspectMissingPlan),
             ...(input.nativeInputIds ? { nativeInputIds: input.nativeInputIds } : {}),
           },
           signal,
         )
-        const output = recovered.answer
-          ? {
-              outputId: `${requestId}:assistant`,
-              text: recovered.answer,
-              ...(recovered.submittedReport ? { submittedReport: recovered.submittedReport } : {}),
-              completeness:
-                verifiedTerminal?.outcome === 'completed'
-                  ? ('complete' as const)
-                  : ('partial' as const),
-            }
-          : undefined
-        return verifiedTerminal
-          ? { ...verifiedTerminal, ...(output ? { output } : {}) }
-          : {
-              kind: 'no_evidence',
-              identity,
-              reason: 'The stored answer does not prove a native ending.',
-              ...(output ? { output } : {}),
-            }
+        const output =
+          recovered.answer !== undefined ||
+          recovered.plan ||
+          recovered.retainedPlan ||
+          recovered.planUnavailable ||
+          recovered.reviewResult
+            ? {
+                outputId: `${requestId}:assistant`,
+                text: recovered.answer ?? '',
+                ...(recovered.plan ? { plan: recovered.plan } : {}),
+                ...(recovered.retainedPlan ? { retainedPlan: recovered.retainedPlan } : {}),
+                ...(recovered.planUnavailable ? { planUnavailable: true as const } : {}),
+                ...(recovered.reviewResult ? { reviewResult: recovered.reviewResult } : {}),
+                completeness:
+                  verifiedTerminal?.outcome === 'completed'
+                    ? ('complete' as const)
+                    : ('partial' as const),
+              }
+            : undefined
+        if (verifiedTerminal) {
+          const result = { ...verifiedTerminal, ...(output ? { output } : {}) }
+          // A fresh, authenticated source supersedes an earlier hook capture failure.
+          if (!recovered.planUnavailable && (recovered.plan || recovered.retainedPlan))
+            delete result.planUnavailable
+          return result
+        }
+        return {
+          kind: 'no_evidence',
+          identity,
+          reason: 'The stored answer does not prove a native ending.',
+          ...(output ? { output } : {}),
+        }
       }
 
       if (historyInfo?.fileSize !== undefined && historyInfo.fileSize > 32 * 1024 * 1024)
@@ -1032,7 +1056,26 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           : {}),
       }
     } catch (error) {
-      if (verifiedTerminal) return verifiedTerminal
+      if (verifiedTerminal) {
+        if (input.inspectMissingPlan && !signal.aborted) {
+          const output = verifiedTerminal.output
+          return {
+            ...verifiedTerminal,
+            planUnavailable: true,
+            ...(output
+              ? {
+                  output: {
+                    outputId: output.outputId,
+                    text: output.text,
+                    completeness: output.completeness,
+                    ...(output.reviewResult ? { reviewResult: output.reviewResult } : {}),
+                  },
+                }
+              : {}),
+          }
+        }
+        return verifiedTerminal
+      }
       return {
         kind: 'no_evidence',
         identity,
@@ -1805,6 +1848,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     let currentRequestMatched = false
     let foregroundReleased = false
     let nativeNotStarted = false
+    let inputWithheldError: NativeInputWithheldError | undefined
     let observedBackgroundActivity = false
     const nativeWork = new ClaudeNativeWork()
     const observation = new AbortController()
@@ -1839,6 +1883,9 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       (!authorization ||
         authorization.runId !== input.runId ||
         authorization.taskId !== workflow.id ||
+        authorization.taskRevision !== workflow.revision ||
+        authorization.stage !== workflow.stage ||
+        authorization.inputSequence !== workflow.inputSequence ||
         workflow.sessionId !== input.sessionId ||
         input.promptEnvelope.sessionId !== input.sessionId ||
         authorization.actor !== this.id ||
@@ -1852,7 +1899,110 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         false,
       )
     }
-    const envelopeMode = Boolean(workflow)
+    const nativePlanning = collaborationPlanMode(workflow, authorization)
+    const nativeReview = collaborationReviewMode(workflow, authorization)
+    const planMemory = new NativeWorkingMemory().reserve(0)
+    const metadataMemory = new NativeWorkingMemory().reserve(0)
+    const planProofMemory = new NativeWorkingMemory().reserve(0)
+    let submittedPlan: { nativeId: string; text: string } | undefined
+    let planUnavailable = false
+    let retainedPlan: CollaborationRetainedPlan | undefined
+    let nativePlan: ClaudeNativePlan | undefined
+    let planBindingTask: Promise<ClaudeNativePlan | undefined> | undefined
+    let planBindingReads = 0
+    const planExitIds = new Set<string>()
+    // Fixed enum keys only, at most 64 records per Run; disposal/restart releases this set.
+    // No native IDs, paths, inputs, receipt bodies, or arbitrary errors enter diagnostics.
+    const planDiagnosticKeys = new Set<string>()
+    const logPlan = (
+      planStage: NonNullable<DiagnosticEvent['planStage']>,
+      planReason: NonNullable<DiagnosticEvent['planReason']>,
+      planCapture?: DiagnosticEvent['planCapture'],
+    ): void => {
+      const key =
+        planStage === 'capture'
+          ? `${planStage}/${planReason}/${planCapture?.tool ?? ''}/${planCapture?.phase ?? ''}`
+          : `${planStage}/${planReason}`
+      if (planDiagnosticKeys.has(key) || planDiagnosticKeys.size >= 64) return
+      planDiagnosticKeys.add(key)
+      recordDiagnostic({
+        operation: 'claude_plan',
+        scope: 'run',
+        phase: ['captured', 'submitted', 'retained'].includes(planReason) ? 'completed' : 'blocked',
+        level: ['captured', 'submitted', 'retained'].includes(planReason) ? 'info' : 'warn',
+        sessionId: input.sessionId,
+        runId: input.runId,
+        agentId: 'claude',
+        planStage,
+        planReason,
+        ...(planCapture ? { planCapture } : {}),
+      })
+    }
+    // One bounded, Run-local diagnostic hint; never used to authorize a plan.
+    let planCaptureFailure: PlanCaptureFailure | undefined
+    const rememberPlanFailure = (
+      code: PlanCaptureFailureCode,
+      hook: { tool_use_id: string; tool_name: string },
+      phase: PlanCaptureFailure['phase'],
+    ): void => {
+      planCaptureFailure = {
+        code,
+        ...(typeof hook.tool_use_id === 'string' &&
+        hook.tool_use_id.length > 0 &&
+        hook.tool_use_id.length <= 1024
+          ? { operationId: hook.tool_use_id }
+          : {}),
+        tool:
+          hook.tool_name === 'Write'
+            ? 'Write'
+            : hook.tool_name === 'Edit'
+              ? 'Edit'
+              : 'ExitPlanMode',
+        phase,
+      }
+      logPlan('capture', code, { code, tool: planCaptureFailure.tool, phase })
+    }
+    const rejectPlanSubmission = (
+      reason: PlanSubmissionRejection['reason'],
+    ): PlanSubmissionRejection => {
+      const latestCapture = planCaptureFailure
+        ? {
+            code: planCaptureFailure.code,
+            tool: planCaptureFailure.tool,
+            phase: planCaptureFailure.phase,
+          }
+        : undefined
+      logPlan('submission', reason, latestCapture)
+      return { reason, ...(latestCapture ? { latestCapture } : {}) }
+    }
+    let reviewResult: CollaborationReviewObservation | undefined
+    let inputResult: CollaborationInputObservation | undefined
+    const workflowCalls = new Map<
+      string,
+      | { kind: 'review'; value: CollaborationReviewObservation }
+      | { kind: 'input'; value: CollaborationInputObservation }
+    >()
+    const rememberWorkflowCall = (
+      id: string,
+      entry: NonNullable<ReturnType<typeof workflowCalls.get>>,
+    ): void => {
+      let bytes = 0
+      for (const [key, value] of workflowCalls) {
+        if (key === id) continue
+        const encoded = JSON.stringify(value)
+        bytes += Buffer.byteLength(encoded) + encoded.length * 2 + key.length * 2
+      }
+      const encoded = JSON.stringify(entry)
+      bytes += Buffer.byteLength(encoded) + encoded.length * 2 + id.length * 2
+      if (bytes > 64 * 1024)
+        throw new AgentExecutionError(
+          'response_too_large',
+          'Pending question metadata exceeded its bounded owner.',
+          false,
+        )
+      workflowCalls.set(id, entry)
+    }
+    const planCalls = new Set<string>()
     const peerAssistanceAllowed = !workflow && input.peerAssistanceAllowed !== false
     const peerAssistance = new PeerAssistanceTurn('codex', peerAssistanceAllowed)
     const permissionWait = new NativePermissionWait()
@@ -1868,6 +2018,9 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     const titleCalls = new Map<string, string>()
     let titleRecorded = false
     const peerToolName = `mcp__${this.peerServerName}__request_peer_assistance`
+    const reviewToolName = `mcp__${this.peerServerName}__submit_review`
+    const inputResultToolName = `mcp__${this.peerServerName}__submit_input_result`
+    const nativeInputResult = collaborationInputResultAllowed(workflow, authorization)
     let iterator: AsyncIterator<SDKMessage> | undefined
     const speedInput = input.speed === 'fast' ? Promise.withResolvers<boolean>() : undefined
     let speedDetail: string | undefined
@@ -1880,7 +2033,9 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       : undefined
     let confirmPermissionInput: ((confirmed: boolean) => void) | undefined
     const permissionInput =
-      input.permissionMode === 'auto'
+      nativePlanning ||
+      input.permissionMode === 'auto' ||
+      (workflow && input.permissionMode === 'native')
         ? new Promise<boolean>((resolve) => {
             confirmPermissionInput = resolve
           })
@@ -1896,6 +2051,73 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           ? `${PEER_ASSISTANCE_INSTRUCTIONS}\n${frozenSourceInstructions}`
           : PEER_ASSISTANCE_INSTRUCTIONS,
       tools: [
+        ...(nativeInputResult
+          ? [
+              tool(
+                'submit_input_result',
+                'Report whether this root has fully handled the supplied user input and resolved all necessary choices, or still needs user input. needs_user requires up to three questions with optional choices; processed must omit questions. Planners may only submit needs_user. This does not approve code, repair or implementation.',
+                collaborationInputResultSchema.shape,
+                async (raw) => {
+                  if (this.disposed || transportReleased || terminalKnown || signal.aborted)
+                    throw new Error('This input result belongs to a retired root.')
+                  const result = collaborationInputResultSchema.parse(raw)
+                  if (nativePlanning && result.outcome !== 'needs_user')
+                    throw new Error(
+                      'A planner can only submit questions; a native plan settles processed input.',
+                    )
+                  return {
+                    content: [
+                      {
+                        type: 'text' as const,
+                        text: 'Result validated. Finish this root response; Pact will settle it after normal completion.',
+                      },
+                    ],
+                  }
+                },
+                {
+                  alwaysLoad: true,
+                  annotations: {
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false,
+                  },
+                },
+              ),
+            ]
+          : []),
+        ...(nativeReview
+          ? [
+              tool(
+                'submit_review',
+                'Submit this root independent review conclusion after its complete natural-language report. needs_user requires up to three questions with optional choices; omit questions for other verdicts. Pact binds the reviewed sources and actor; this does not start another turn.',
+                collaborationReviewInputSchema.shape,
+                async (raw) => {
+                  if (this.disposed || transportReleased || terminalKnown || signal.aborted)
+                    throw new Error('This review belongs to a retired root turn.')
+                  const parsed = collaborationReviewInputSchema.parse(raw)
+                  return {
+                    content: [
+                      {
+                        type: 'text' as const,
+                        text: 'Verdict validated. Finish this root turn; Pact will bind it after normal completion.',
+                      },
+                    ],
+                    structuredContent: { pactReview: parsed },
+                  }
+                },
+                {
+                  alwaysLoad: true,
+                  annotations: {
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false,
+                  },
+                },
+              ),
+            ]
+          : []),
         ...(input.readCollaborationSourcePart
           ? [
               tool(
@@ -1931,6 +2153,14 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                     content: [{ type: 'text' as const, text: JSON.stringify(page) }],
                   }
                 },
+                {
+                  annotations: {
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false,
+                  },
+                },
               ),
             ]
           : []),
@@ -1953,6 +2183,14 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                     ],
                     isError: !parsed.success,
                   }
+                },
+                {
+                  annotations: {
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false,
+                  },
                 },
               ),
             ]
@@ -2032,9 +2270,184 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       // receipts even when a later body/carrier cannot be retained.
       if (!foregroundReleased) throw projectionFailure
     }
-    const recordCarrier = (value: unknown): void => {
+    const capturePlan = (plan: { nativeId: string; text: string }): void => {
       try {
-        input.recordCollaborationCarrier?.(value)
+        planMemory.resize(4096 + Buffer.byteLength(plan.text) * 4 + plan.text.length * 2)
+        submittedPlan = plan
+        retainedPlan = undefined
+        input.recordWorkflowPlan?.(plan)
+        logPlan('capture', 'captured')
+        planCaptureFailure = undefined
+      } catch (error) {
+        failProjection(error)
+      }
+    }
+    const captureUnavailable = (): void => {
+      submittedPlan = undefined
+      retainedPlan = undefined
+      if (!planUnavailable) input.recordWorkflowPlanUnavailable?.()
+      planUnavailable = true
+    }
+    const nativePlanForHook = async (
+      hook: {
+        session_id: string
+        prompt_id?: string
+        agent_id?: string
+        tool_use_id: string
+        tool_name: string
+        tool_input: unknown
+      },
+      failed: (code: PlanCaptureFailureCode) => void,
+    ): Promise<ClaudeNativePlan | undefined> => {
+      if (signal.aborted || hook.agent_id || hook.session_id !== resolvedSessionId) return undefined
+      if (!planBindingTask) {
+        if (planBindingReads >= 64)
+          throw new Error('Native plan binding reads exceeded the root budget.')
+        planBindingReads++
+        planBindingTask = (async () => {
+          const source = await this.nativeForkFiles
+            .readAnswer(
+              {
+                cwd: input.cwd,
+                nativeSessionId: hook.session_id,
+                nativeTurnId: input.runId,
+                planHook: {
+                  id: hook.tool_use_id,
+                  inputFingerprint: claudePlanInputFingerprint(hook.tool_name, hook.tool_input),
+                },
+              },
+              signal,
+            )
+            .catch((error: unknown) => {
+              failed('history_lookup_failed')
+              throw error
+            })
+          if (!source.planBinding || !source.planState) {
+            failed('history_binding_missing')
+            throw new Error('The current native root has no authenticated plan attachment.')
+          }
+          planProofMemory.resize(256 * 1024)
+          signal.throwIfAborted()
+          nativePlan = ClaudeNativePlan.restore(source.planBinding, source.planState, (bytes) =>
+            planMemory.resize(bytes),
+          )
+          return nativePlan
+        })()
+      }
+      const reading = planBindingTask
+      try {
+        const artifact = await reading
+        if (artifact && artifact.binding.promptId !== hook.prompt_id) failed('hook_prompt_mismatch')
+        return artifact?.binding.promptId === hook.prompt_id ? artifact : undefined
+      } catch (error) {
+        if (planBindingTask === reading) planBindingTask = undefined
+        throw error
+      }
+    }
+    const observePlanHook = async (
+      hook: {
+        session_id: string
+        prompt_id?: string
+        agent_id?: string
+        tool_use_id: string
+        tool_name: string
+        tool_input: unknown
+        tool_response?: unknown
+      },
+      phase: 'begin' | 'success' | 'failure',
+    ): Promise<void> => {
+      let failureRecorded = false
+      const failed = (code: PlanCaptureFailureCode): void => {
+        failureRecorded = true
+        rememberPlanFailure(code, hook, phase)
+      }
+      try {
+        if (signal.aborted) {
+          if (
+            !hook.agent_id &&
+            hook.session_id === resolvedSessionId &&
+            nativePlan &&
+            nativePlan.binding.promptId === hook.prompt_id &&
+            hook.tool_input &&
+            typeof hook.tool_input === 'object' &&
+            Reflect.get(hook.tool_input, 'file_path') === nativePlan.binding.path
+          ) {
+            nativePlan.fail()
+            captureUnavailable()
+          }
+          return
+        }
+        if (
+          !hook.prompt_id &&
+          !hook.agent_id &&
+          hook.session_id === resolvedSessionId &&
+          !signal.aborted
+        ) {
+          nativePlan?.fail()
+          captureUnavailable()
+          failed('hook_prompt_missing')
+          return
+        }
+        const artifact = await nativePlanForHook(hook, failed)
+        if (!artifact || signal.aborted) return
+        if (hook.tool_name === 'ExitPlanMode') {
+          if (
+            phase === 'begin' &&
+            hook.tool_use_id &&
+            hook.tool_use_id.length <= 1024 &&
+            planExitIds.size < 64
+          ) {
+            artifact.noteSubmission(hook.tool_use_id, hook.tool_input)
+            planExitIds.add(hook.tool_use_id)
+          }
+          if (artifact.unavailable) captureUnavailable()
+          return
+        }
+        if (!artifact.begin(hook.tool_name, hook.tool_use_id, hook.tool_input)) {
+          if (artifact.unavailable) captureUnavailable()
+          return
+        }
+        if (phase === 'begin' && !artifact.isPending(hook.tool_use_id)) {
+          if (artifact.unavailable) captureUnavailable()
+          return
+        }
+        submittedPlan = undefined
+        retainedPlan = undefined
+        if (phase === 'begin') captureUnavailable()
+        if (phase === 'failure') artifact.reject(hook.tool_use_id)
+        else if (phase === 'success')
+          artifact.acknowledge(
+            hook.tool_name,
+            hook.tool_use_id,
+            hook.tool_input,
+            hook.tool_response,
+          )
+        if (signal.aborted) return
+        if (artifact.unavailable) captureUnavailable()
+        else if (phase === 'success' && artifact.plan) {
+          planUnavailable = false
+          capturePlan(artifact.plan)
+        }
+      } catch (error) {
+        if (signal.aborted) return
+        captureUnavailable()
+        if (!failureRecorded) failed('plan_capture_failed')
+        if (error instanceof NativeCapacityError) failProjection(error)
+      }
+    }
+    const captureReview = (verdict: CollaborationReviewObservation): void => {
+      try {
+        reviewResult = mergeWorkflowReview(reviewResult, verdict)
+        input.recordWorkflowReview?.(reviewResult)
+      } catch (error) {
+        failProjection(error)
+      }
+    }
+    const captureInputResult = (outcome: CollaborationInputObservation): void => {
+      if (nativePlanning && outcome.outcome === 'processed') return
+      try {
+        inputResult = mergeWorkflowInput(inputResult, outcome)
+        input.recordWorkflowInputResult?.(inputResult)
       } catch (error) {
         failProjection(error)
       }
@@ -2045,6 +2458,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         kind: 'ended',
         source: 'live_terminal',
         outcome,
+        ...(planUnavailable ? { planUnavailable: true as const } : {}),
       })
     }
     let inputReservation: NativeMemoryReservation | undefined
@@ -2293,6 +2707,14 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         return
       transportReleased = true
       answer.dispose()
+      planMemory.release()
+      metadataMemory.release()
+      planProofMemory.release()
+      planExitIds.clear()
+      planDiagnosticKeys.clear()
+      planCaptureFailure = undefined
+      workflowCalls.clear()
+      planCalls.clear()
       inputReservation?.release()
       inputReservation = undefined
       deferredResult = undefined
@@ -2307,6 +2729,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       this.activeControllers.delete(abortController)
       const workConfirmed =
         (terminalKnown || permissionRefused || nativeNotStarted) &&
+        (!inputWithheldError || readerEof) &&
         !unfinishedSteering() &&
         !nativeWork.pending &&
         !permissionWait.waiting
@@ -2323,7 +2746,11 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       nativeFileChangesSettled(
         input,
         workConfirmed ? 'settled' : 'unknown',
-        'native_observation_released',
+        inputWithheldError
+          ? 'workflow_input_withheld'
+          : permissionRefused || nativeNotStarted
+            ? 'native_turn_not_started'
+            : 'native_observation_released',
       )
     }
     const abort = (): void => {
@@ -2372,7 +2799,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         NATIVE_INTERRUPT_TIMEOUT_MS,
         abortController.signal,
       ).catch(() => {
-        if (!terminalKnown && !permissionRefused) {
+        if (!terminalKnown && !permissionRefused && !nativeNotStarted) {
           this.recordEvidence(input, resolvedSessionId, {
             kind: 'no_evidence',
             reason:
@@ -2669,7 +3096,66 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 }
                 continue
               }
-              if (block.name === 'StructuredOutput' && envelopeMode) continue
+              if (block.name === reviewToolName && nativeReview) {
+                const verdict = readWorkflowReview(block.input)
+                if (
+                  !block.id ||
+                  block.id.length > 1024 ||
+                  (!workflowCalls.has(block.id) && workflowCalls.size >= 64)
+                )
+                  throw new AgentExecutionError(
+                    'response_too_large',
+                    'Native review submission activity exceeded its bounded owner.',
+                    false,
+                  )
+                if (verdict) {
+                  const prior = workflowCalls.get(block.id)
+                  const merged =
+                    prior?.kind === 'input'
+                      ? { verdict: 'incomplete' as const }
+                      : mergeWorkflowReview(prior?.value, verdict)
+                  if (merged.verdict === 'incomplete') captureReview(merged)
+                  rememberWorkflowCall(block.id, { kind: 'review', value: merged })
+                }
+                continue
+              }
+              if (block.name === inputResultToolName && nativeInputResult) {
+                if (
+                  !block.id ||
+                  block.id.length > 1024 ||
+                  (!workflowCalls.has(block.id) && workflowCalls.size >= 64)
+                )
+                  throw new AgentExecutionError(
+                    'response_too_large',
+                    'Native input-result activity exceeded its bounded owner.',
+                    false,
+                  )
+                const parsed = collaborationInputResultSchema.safeParse(block.input)
+                if (parsed.success) {
+                  const prior = workflowCalls.get(block.id)
+                  const outcome =
+                    prior && prior.kind !== 'input'
+                      ? { outcome: 'incomplete' as const }
+                      : mergeWorkflowInput(prior?.value, parsed.data)
+                  if (outcome.outcome === 'incomplete') captureInputResult(outcome)
+                  rememberWorkflowCall(block.id, { kind: 'input', value: outcome })
+                }
+                continue
+              }
+              if (nativePlanning && block.name === 'ExitPlanMode') {
+                if (
+                  !block.id ||
+                  block.id.length > 1024 ||
+                  (!planCalls.has(block.id) && planCalls.size >= 64)
+                )
+                  throw new AgentExecutionError(
+                    'response_too_large',
+                    'Native plan submission activity exceeded its bounded owner.',
+                    false,
+                  )
+                planCalls.add(block.id)
+                continue
+              }
               if (block.name === peerToolName) {
                 if (!peerToolCallIds.has(block.id) && peerToolCallIds.size >= 64)
                   throw new AgentExecutionError(
@@ -2733,6 +3219,16 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 titleCalls.delete(block.tool_use_id)
                 continue
               }
+              const submission = workflowCalls.get(block.tool_use_id)
+              if (submission) {
+                workflowCalls.delete(block.tool_use_id)
+                if (!block.is_error) {
+                  if (submission.kind === 'review') captureReview(submission.value)
+                  else captureInputResult(submission.value)
+                }
+                continue
+              }
+              if (planCalls.delete(block.tool_use_id)) continue
               if (peerToolCallIds.delete(block.tool_use_id)) continue
               const activity = tools.get(block.tool_use_id) ?? {
                 toolName: 'tool',
@@ -2759,21 +3255,20 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           if (delta) {
             nativeResultAssistantText = true
             const appended = answer.append(assistantMessageId, delta)
-            if (!envelopeMode)
-              yield {
-                agentId: 'claude',
-                type: 'text.delta',
-                turnId: input.runId,
-                outputId: answer.outputId,
-                text: appended,
-              }
+            yield {
+              agentId: 'claude',
+              type: 'text.delta',
+              turnId: input.runId,
+              outputId: answer.outputId,
+              text: appended,
+            }
           }
 
           const completed = ClaudeAgentAdapter.completedText(message)
           if (completed !== undefined && message.type === 'assistant') {
             if (completed) nativeResultAssistantText = true
             const text = answer.complete(message.message.id, completed)
-            if (text !== undefined && !envelopeMode)
+            if (text !== undefined)
               yield {
                 agentId: 'claude',
                 type: 'text.completed',
@@ -2808,13 +3303,11 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           // Exact control evidence remains available even if retaining the
           // optional full result/body exceeds its independent work budget.
           deferredEnding = outcome
-          if (envelopeMode) recordCarrier(Reflect.get(message, 'structured_output'))
           if (projectionFailure) return
           try {
             deferredResultMemory.resize(4096 + freezeNativeJsonFrame(message) * 6)
             deferredResult = message
             if (
-              !envelopeMode &&
               !nativeResultAssistantText &&
               message.subtype === 'success' &&
               !message.is_error &&
@@ -2850,8 +3343,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         closeInput()
         // A body/report failure must not revoke the exact native ending.
         recordEnding(outcome)
-        if (envelopeMode && message.subtype === 'success' && !message.is_error)
-          recordCarrier(message.structured_output)
         if (projectionFailure) {
           if (!foregroundReleased) throw projectionFailure
           return
@@ -2861,7 +3352,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             kind: 'ended',
             source: 'live_terminal',
             outcome,
-            ...(answer.text
+            ...(answer.text || (outcome === 'completed' && (submittedPlan || reviewResult))
               ? {
                   output: {
                     outputId: answer.outputId,
@@ -2879,23 +3370,16 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           yield { agentId: 'claude', type: 'turn.completed', turnId: input.runId, outcome }
           return
         }
+        nativePlan?.finish()
+        if (nativePlan?.unavailable) captureUnavailable()
         let finalText: string | undefined
-        let submittedReport: ReturnType<typeof readSubmittedCollaborationReport>
         try {
-          if (
-            !nativeResultAssistantText &&
-            message.result &&
-            !(
-              envelopeMode &&
-              (readCollaborationEnvelopeText(message.result) !== undefined ||
-                collaborationNaturalFallback(message.result) === undefined)
-            )
-          ) {
+          if (!nativeResultAssistantText && message.result) {
             const resultText = answer.complete(
               `${input.runId}:result:${nativeResultNumber}`,
               message.result,
             )
-            if (resultText !== undefined && !envelopeMode)
+            if (resultText !== undefined)
               yield {
                 agentId: 'claude',
                 type: 'text.completed',
@@ -2904,15 +3388,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 text: resultText,
               }
           }
-          const canonical = envelopeMode
-            ? readCollaborationAnswer(message.structured_output, input.answerFormat)
-            : undefined
-          finalText = envelopeMode ? answer.replace(canonical ?? answer.text) : answer.finalize()
-          if (envelopeMode)
-            submittedReport = readSubmittedCollaborationReport(
-              message.structured_output,
-              input.answerFormat,
-            )
+          finalText = answer.finalize() ?? (submittedPlan && !answer.text ? '' : undefined)
         } catch (error) {
           failProjection(error)
           return
@@ -2921,14 +3397,19 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           kind: 'ended',
           source: 'live_terminal',
           outcome,
-          ...(answer.text
+          ...(planUnavailable ? { planUnavailable: true as const } : {}),
+          ...(answer.text || (outcome === 'completed' && (submittedPlan || reviewResult))
             ? {
                 output: {
                   outputId: answer.outputId,
                   text: answer.text,
                   completeness:
                     outcome === 'completed' ? ('complete' as const) : ('partial' as const),
-                  ...(submittedReport ? { submittedReport } : {}),
+                  ...(outcome === 'completed' && submittedPlan ? { plan: submittedPlan } : {}),
+                  ...(outcome === 'completed' && retainedPlan ? { retainedPlan } : {}),
+                  ...(planUnavailable ? { planUnavailable: true as const } : {}),
+                  ...(outcome === 'completed' && reviewResult ? { reviewResult } : {}),
+                  ...(outcome === 'completed' && inputResult ? { inputResult } : {}),
                 },
               }
             : {}),
@@ -2941,14 +3422,22 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             outputId: answer.outputId,
             text: finalText,
           }
-        if (envelopeMode && workflow && outcome === 'completed')
-          yield collaborationResultEvent(
-            message.structured_output,
-            workflow,
-            input.runId,
-            input.answerFormat,
-            (input.currentPromptEnvelope?.() ?? input.promptEnvelope).collaborationAuthorization,
-          )
+        if (outcome === 'completed') {
+          if (submittedPlan)
+            yield {
+              agentId: 'claude',
+              type: 'collaboration.plan',
+              turnId: input.runId,
+              ...submittedPlan,
+            }
+          if (reviewResult)
+            yield {
+              agentId: 'claude',
+              type: 'collaboration.review',
+              turnId: input.runId,
+              ...reviewResult,
+            }
+        }
         yield {
           agentId: 'claude',
           type: 'turn.completed',
@@ -2959,6 +3448,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       }
     }.bind(this)
     try {
+      metadataMemory.resize(nativePlanning || nativeReview || nativeInputResult ? 256 * 1024 : 0)
       input.recordExecutor?.(nativeExecutorId)
       if (!permissionInput && !speedInput) {
         sessionStarted = true
@@ -2970,9 +3460,20 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             input,
             resolvedSessionId,
             () => {
+              try {
+                input.recordDispatch?.('possibly_sent', resolvedSessionId, nativeExecutorId)
+              } catch (error) {
+                if (!(error instanceof NativeInputWithheldError)) throw error
+                inputWithheldError = error
+                nativeNotStarted = true
+                input.recordDispatch?.('rejected', resolvedSessionId, nativeExecutorId)
+                // False closes the SDK producer naturally; throwing here would
+                // abort native startup Hooks rather than just withholding input.
+                return false
+              }
               deliveryAttempted = true
-              input.recordDispatch?.('possibly_sent', resolvedSessionId, nativeExecutorId)
               if (signal.aborted) abort()
+              return true
             },
             permissionInput,
             signal,
@@ -3013,14 +3514,63 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             })
             return child
           },
-          canUseTool: ClaudeAgentAdapter.permissionHandler(input, signal, permissionWait),
+          canUseTool: ClaudeAgentAdapter.permissionHandler(
+            input,
+            signal,
+            permissionWait,
+            nativePlanning
+              ? async (id) => {
+                  if (signal.aborted || !planExitIds.has(id))
+                    return rejectPlanSubmission(
+                      planCaptureFailure?.operationId === id &&
+                        planCaptureFailure.tool === 'ExitPlanMode'
+                        ? planCaptureFailure.code
+                        : 'submission_hook_unverified',
+                    )
+                  const pending = nativePlan?.hasPendingOperations
+                  nativePlan?.finish()
+                  if (nativePlan?.plan) {
+                    capturePlan(nativePlan.plan)
+                    logPlan('submission', 'submitted')
+                    return 'submitted'
+                  }
+                  const retained = nativePlan?.retained(id),
+                    basis = authorization?.planReference?.document
+                  if (
+                    retained &&
+                    basis &&
+                    retained.sha256 === basis.sha256 &&
+                    retained.bytes === basis.bytes &&
+                    retained.chars === basis.chars
+                  ) {
+                    retainedPlan = retained
+                    planUnavailable = false
+                    input.recordWorkflowPlanRetained?.(retained)
+                    planCaptureFailure = undefined
+                    logPlan('submission', 'retained')
+                    return 'retained'
+                  }
+                  captureUnavailable()
+                  return rejectPlanSubmission(
+                    pending
+                      ? 'plan_pending'
+                      : nativePlan?.unavailable
+                        ? 'plan_unavailable'
+                        : retained
+                          ? 'retained_basis_mismatch'
+                          : 'plan_missing',
+                  )
+                }
+              : undefined,
+          ),
           ...(input.promptEnvelope.requestSessionTitle ||
           workflow ||
           input.readCollaborationSourcePart
             ? {
                 allowedTools: [
                   ...(input.promptEnvelope.requestSessionTitle ? [titleToolName] : []),
-                  ...(envelopeMode ? ['StructuredOutput'] : []),
+                  ...(nativeReview ? [reviewToolName] : []),
+                  ...(nativeInputResult ? [inputResultToolName] : []),
                   ...(input.readCollaborationSourcePart
                     ? [`mcp__${this.peerServerName}__read_collaboration_source`]
                     : []),
@@ -3028,9 +3578,25 @@ export class ClaudeAgentAdapter implements AgentAdapter {
               }
             : {}),
           ...ClaudeAgentAdapter.permissionOptions(input.permissionMode),
-          ...(collaborationReadOnly(workflow, input.promptEnvelope.collaborationAuthorization)
+          ...(nativePlanning
             ? {
-                tools: ['Read', 'Grep', 'Glob', 'LS', 'WebSearch', 'WebFetch', 'TodoWrite'],
+                permissionMode: 'plan' as const,
+                planModeInstructions: collaborationPlanningInstructions,
+              }
+            : {}),
+          ...(collaborationReadOnly(workflow, input.promptEnvelope.collaborationAuthorization) &&
+          !nativePlanning
+            ? {
+                tools: [
+                  'Read',
+                  'Grep',
+                  'Glob',
+                  'LS',
+                  'WebSearch',
+                  'WebFetch',
+                  'TodoWrite',
+                  'AskUserQuestion',
+                ],
                 strictMcpConfig: true,
               }
             : {}),
@@ -3049,17 +3615,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 ? { append: frozenSourceInstructions }
                 : {}),
           },
-          ...(envelopeMode
-            ? {
-                outputFormat: {
-                  type: 'json_schema' as const,
-                  schema: collaborationOutputSchema(
-                    workflow!,
-                    input.promptEnvelope.collaborationAuthorization,
-                  ),
-                },
-              }
-            : {}),
           hooks: {
             ...(workflow
               ? {
@@ -3067,29 +3622,36 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                     {
                       hooks: [
                         async (hook) => {
+                          if (hook.hook_event_name !== 'PreToolUse') return {}
                           if (
-                            hook.hook_event_name !== 'PreToolUse' ||
-                            ((!collaborationReadOnly(
+                            nativePlanning &&
+                            ['Write', 'Edit', 'ExitPlanMode'].includes(hook.tool_name)
+                          )
+                            await observePlanHook(hook, 'begin')
+                          if (nativePlanning && hook.tool_name === 'ExitPlanMode')
+                            return {
+                              hookSpecificOutput: {
+                                hookEventName: 'PreToolUse' as const,
+                                permissionDecision: 'ask' as const,
+                              },
+                            }
+                          const allowed =
+                            !['Agent', 'Task', 'EnterPlanMode', 'ExitPlanMode'].includes(
+                              hook.tool_name,
+                            ) &&
+                            (!collaborationReadOnly(
                               workflow,
                               input.promptEnvelope.collaborationAuthorization,
                             ) ||
-                              collaborationToolAllowed(hook.tool_name, this.peerServerName) ||
-                              (envelopeMode && hook.tool_name === 'StructuredOutput')) &&
-                              ![
-                                'AskUserQuestion',
-                                'EnterPlanMode',
-                                'ExitPlanMode',
-                                'Agent',
-                                'Task',
-                              ].includes(hook.tool_name))
-                          )
-                            return {}
+                              nativePlanning ||
+                              collaborationToolAllowed(hook.tool_name, this.peerServerName))
+                          if (allowed) return {}
                           return {
                             hookSpecificOutput: {
                               hookEventName: 'PreToolUse' as const,
                               permissionDecision: 'deny' as const,
                               permissionDecisionReason:
-                                'Return material questions as versioned Pact Todos and stay within the frozen duty authority.',
+                                'Stay within this root responsibility. Use native questions for user decisions; Pact schedules independent review and implementation.',
                             },
                           }
                         },
@@ -3103,6 +3665,15 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 hooks: [
                   async (hook) => {
                     if (hook.hook_event_name !== 'PostToolUse') return {}
+                    if (
+                      nativePlanning &&
+                      ['Write', 'Edit', 'ExitPlanMode'].includes(hook.tool_name)
+                    ) {
+                      await observePlanHook(hook, 'success')
+                      return {}
+                    }
+                    if (nativePlanning && ['AskUserQuestion', 'TodoWrite'].includes(hook.tool_name))
+                      return {}
                     if (hook.tool_name === 'Write' || hook.tool_name === 'Edit') {
                       const evidence = claudeFileChanges(
                         hook.tool_name,
@@ -3118,8 +3689,17 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                       hook.tool_name !== peerToolName &&
                       hook.tool_name !== titleToolName &&
                       hook.tool_name !== `mcp__${this.peerServerName}__read_collaboration_source` &&
-                      !(envelopeMode && hook.tool_name === 'StructuredOutput') &&
-                      !['Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch'].includes(hook.tool_name)
+                      hook.tool_name !== reviewToolName &&
+                      hook.tool_name !== inputResultToolName &&
+                      ![
+                        'Read',
+                        'Grep',
+                        'Glob',
+                        'WebSearch',
+                        'WebFetch',
+                        'AskUserQuestion',
+                        'TodoWrite',
+                      ].includes(hook.tool_name)
                     ) {
                       nativeEffectsUncertain(
                         input,
@@ -3136,7 +3716,16 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 hooks: [
                   async (hook) => {
                     if (
+                      hook.hook_event_name === 'PostToolUseFailure' &&
+                      nativePlanning &&
+                      ['Write', 'Edit'].includes(hook.tool_name)
+                    ) {
+                      await observePlanHook(hook, 'failure')
+                      return {}
+                    }
+                    if (
                       hook.hook_event_name !== 'PostToolUseFailure' ||
+                      nativePlanning ||
                       !['Write', 'Edit'].includes(hook.tool_name)
                     )
                       return {}
@@ -3237,11 +3826,25 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         skillInput?.resolve(true)
       }
       if (permissionInput) {
-        await ClaudeAgentAdapter.confirmAutoMode(
-          session,
-          signal,
-          Math.max(1, startupDeadline - Date.now()),
-        )
+        if (nativePlanning)
+          await ClaudeAgentAdapter.confirmNativeExecutionMode(
+            session,
+            signal,
+            Math.max(1, startupDeadline - Date.now()),
+            true,
+          )
+        else if (input.permissionMode === 'auto')
+          await ClaudeAgentAdapter.confirmAutoMode(
+            session,
+            signal,
+            Math.max(1, startupDeadline - Date.now()),
+          )
+        else
+          await ClaudeAgentAdapter.confirmNativeExecutionMode(
+            session,
+            signal,
+            Math.max(1, startupDeadline - Date.now()),
+          )
         // Do not mark a binding responding until its native mode is accepted.
         // The consumer persists this event before the gated input can escape.
         sessionStarted = true
@@ -3289,6 +3892,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         !turnStarted,
       )
     } catch (error) {
+      if (inputWithheldError) throw inputWithheldError
       const failure = classifyAgentError(error)
       if (error instanceof PermissionModeRejectedError && !deliveryAttempted) {
         permissionRefused = true
@@ -3309,7 +3913,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           false,
         )
       }
-      if (!terminalKnown && !permissionRefused)
+      if (!terminalKnown && !permissionRefused && !nativeNotStarted)
         this.recordEvidence(input, resolvedSessionId, {
           kind: 'no_evidence',
           reason: 'The native stream ended without a matching terminal receipt.',
@@ -3336,6 +3940,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       foregroundReleased = true
       const emptyRejectedOwner =
         nativeNotStarted &&
+        !inputWithheldError &&
         !observedBackgroundActivity &&
         !recordings.size &&
         !permissionWait.waiting
@@ -3360,7 +3965,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 } else if (deferredEnding && !unfinishedSteering()) {
                   recordEnding(deferredEnding)
                 }
-                if (!terminalKnown && !permissionRefused)
+                if (!terminalKnown && !permissionRefused && !nativeNotStarted)
                   this.recordEvidence(input, resolvedSessionId, {
                     kind: 'no_evidence',
                     reason: 'The native stream closed without a matching Turn termination receipt.',
@@ -3372,7 +3977,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             }
           } catch {
             nativeEffectsUncertain(input, 'Native background completion could not be confirmed.')
-            if (!terminalKnown && !permissionRefused)
+            if (!terminalKnown && !permissionRefused && !nativeNotStarted)
               this.recordEvidence(input, resolvedSessionId, {
                 kind: 'no_evidence',
                 reason: 'The native stream ended without a matching terminal receipt.',
@@ -3453,6 +4058,39 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     return mode === 'full'
       ? { permissionMode: 'bypassPermissions' as const, allowDangerouslySkipPermissions: true }
       : { permissionMode: mode === 'auto' ? ('auto' as const) : ('default' as const) }
+  }
+
+  /** Preserve native permission defaults while retiring a prior workflow's Plan mode. */
+  private static async confirmNativeExecutionMode(
+    session: ReturnType<typeof query>,
+    signal: AbortSignal,
+    timeoutMs: number,
+    planning = false,
+  ): Promise<void> {
+    let active = true
+    try {
+      await ClaudeAgentAdapter.withDeadline(
+        (async () => {
+          const initialization = await session.initializationResult()
+          if (!active || signal.aborted) return
+          const mode = Reflect.get(initialization, 'current_permission_mode')
+          if (
+            !['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk', 'auto'].includes(
+              String(mode),
+            )
+          )
+            throw new PermissionModeRejectedError(
+              'Claude did not acknowledge its native permission mode. Nothing was submitted.',
+            )
+          if (planning && mode !== 'plan') await session.setPermissionMode('plan')
+          else if (!planning && mode === 'plan') await session.setPermissionMode('default')
+        })(),
+        timeoutMs,
+        signal,
+      )
+    } finally {
+      active = false
+    }
   }
 
   private static async confirmAutoMode(
@@ -3704,10 +4342,12 @@ export class ClaudeAgentAdapter implements AgentAdapter {
   }
 
   private static permissionHandler(
-    input: Pick<AgentRunInput, 'requestPermission' | 'requestUserInput' | 'cwd'>,
+    input: Pick<AgentRunInput, 'requestPermission' | 'requestUserInput' | 'cwd' | 'permissionMode'>,
     providerSignal: AbortSignal,
     wait: NativePermissionWait,
+    recordPlan?: (nativeId: string) => Promise<'submitted' | 'retained' | PlanSubmissionRejection>,
   ): CanUseTool {
+    const fullAccess = input.permissionMode === 'full'
     const pending = new Map<string, ReturnType<CanUseTool>>()
     return (toolName, toolInput, options) => {
       const signal = AbortSignal.any([providerSignal, options.signal])
@@ -3718,6 +4358,28 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         behavior: 'deny' as const,
         message: 'The native permission request was not approved.',
         toolUseID: options.toolUseID,
+      }
+      if (toolName === 'ExitPlanMode' && recordPlan) {
+        if (
+          signal.aborted ||
+          options.agentID ||
+          key.length > 2048 ||
+          !options.toolUseID ||
+          options.toolUseID.length > 1024
+        )
+          return Promise.resolve({
+            ...denied,
+            message: 'This plan submission does not belong to the active root.',
+          })
+        return recordPlan(options.toolUseID).then((captured) => ({
+          ...denied,
+          message:
+            captured === 'retained'
+              ? 'The existing plan and your response will be sent for independent review. This is not implementation approval. End with your natural response and wait for Pact.'
+              : captured === 'submitted'
+                ? 'The native plan has been submitted to Pact for independent review. This is not implementation approval. Stay in plan mode; end with your natural response now and wait for Pact to arrange review.'
+                : `No complete authenticated native plan is available. This is not implementation approval. Pact diagnostic: ${captured.reason}.${captured.latestCapture ? ` Latest capture: ${captured.latestCapture.code}/${captured.latestCapture.tool}/${captured.latestCapture.phase}.` : ''} Preserve the plan and report this code; rewriting it is not a confirmed remedy.`,
+        }))
       }
       if (toolName === 'AskUserQuestion') {
         if (
@@ -3759,6 +4421,12 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         pending.set(key, task)
         return task
       }
+      if (fullAccess)
+        return Promise.resolve({
+          ...denied,
+          message:
+            'This operation was blocked by native policy or this task’s scope. Full access does not override those restrictions, and no tool approval was requested. Continue within the current task’s authority.',
+        })
       if (
         signal.aborted ||
         !input.requestPermission ||
@@ -4079,7 +4747,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         bindingGeneration: input.bindingGeneration ?? 1,
         executorId: this.backgroundRuns.get(input.runId)?.executorId ?? this.executorId,
         nativeTurnId: input.runId,
-        ...(input.answerFormat ? { answerFormat: input.answerFormat } : {}),
       },
     }
     if (!this.disposed) {

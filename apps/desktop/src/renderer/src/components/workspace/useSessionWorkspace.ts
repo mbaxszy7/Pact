@@ -465,14 +465,8 @@ export function useSessionWorkspace(
     setActionError(undefined)
     try {
       // Session projections also carry permissions; only this operation's model/workflow fields cross its contract.
-      const {
-        primaryAgentId,
-        agents,
-        maxDiscussionRounds,
-        runningMessagePolicy,
-        maxReviewCycles,
-        maxRepairAttempts,
-      } = settings
+      const { primaryAgentId, agents, maxDiscussionRounds, maxReviewCycles, maxRepairAttempts } =
+        settings
       const saved = unwrapRpcResult(
         await window.pact.saveSessionSettings({
           sessionId,
@@ -480,7 +474,6 @@ export function useSessionWorkspace(
             primaryAgentId,
             agents,
             maxDiscussionRounds,
-            runningMessagePolicy,
             maxReviewCycles,
             maxRepairAttempts,
           },

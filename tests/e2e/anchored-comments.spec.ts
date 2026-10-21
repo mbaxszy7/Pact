@@ -126,7 +126,6 @@ async function seedConversation(
         codex: { model: null, effort: null },
       },
       maxDiscussionRounds: 6,
-      runningMessagePolicy: 'immediate_safe_point',
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
     },

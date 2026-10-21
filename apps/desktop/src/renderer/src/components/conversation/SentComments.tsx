@@ -37,19 +37,44 @@ export function SentComments({
             {comments.length === 1 ? 'Comment' : 'Comments'}
           </p>
           <div className="mt-1.5 space-y-2">
-            {comments.map((comment) => (
-              <button
-                key={comment.id}
-                className="block w-full rounded-control border border-border/75 bg-surface-raised/20 px-2.5 py-2 text-left text-caption text-secondary transition-colors duration-150 hover:border-border-strong hover:bg-surface-raised/40 focus-visible:outline-2 focus-visible:outline-focus"
-                type="button"
-                onClick={() => onOpenComment(comment)}
-              >
-                <span className="block line-clamp-2 text-tertiary">“{comment.anchor.quote}”</span>
-                <span className="mt-1 block whitespace-pre-wrap break-words text-primary">
-                  {comment.body}
-                </span>
-              </button>
-            ))}
+            {comments.map((comment) => {
+              const unavailable = comment.anchor.type === 'unavailable'
+              const content = (
+                <>
+                  <span
+                    className={`block text-tertiary ${unavailable ? 'whitespace-pre-wrap break-words' : 'line-clamp-2'}`}
+                  >
+                    “{comment.anchor.quote}”
+                  </span>
+                  <span className="mt-1 block whitespace-pre-wrap break-words text-primary">
+                    {comment.body}
+                  </span>
+                  {comment.anchor.type === 'unavailable' ? (
+                    <span className="mt-1.5 block text-secondary">
+                      <span className="font-medium">Source unavailable</span> ·{' '}
+                      {comment.anchor.reason}
+                    </span>
+                  ) : null}
+                </>
+              )
+              return unavailable ? (
+                <div
+                  key={comment.id}
+                  className="block w-full rounded-control border border-border/75 bg-surface-raised/20 px-2.5 py-2 text-left text-caption text-secondary"
+                >
+                  {content}
+                </div>
+              ) : (
+                <button
+                  key={comment.id}
+                  className="block w-full rounded-control border border-border/75 bg-surface-raised/20 px-2.5 py-2 text-left text-caption text-secondary transition-colors duration-150 hover:border-border-strong hover:bg-surface-raised/40 focus-visible:outline-2 focus-visible:outline-focus"
+                  type="button"
+                  onClick={() => onOpenComment(comment)}
+                >
+                  {content}
+                </button>
+              )
+            })}
           </div>
         </div>
       ) : error ? (

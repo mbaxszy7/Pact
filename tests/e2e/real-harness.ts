@@ -334,7 +334,6 @@ export async function selectRealConfiguredEffort(
         primaryAgentId: previous.primaryAgentId,
         agents,
         maxDiscussionRounds: previous.maxDiscussionRounds,
-        runningMessagePolicy: previous.runningMessagePolicy,
         maxReviewCycles: previous.maxReviewCycles,
         maxRepairAttempts: previous.maxRepairAttempts,
       },

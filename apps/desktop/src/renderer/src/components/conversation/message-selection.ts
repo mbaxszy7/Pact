@@ -15,19 +15,15 @@ export function reportSelectionSource(host: HTMLElement): MessageCommentAnchor['
   const runId = source?.dataset.pactReportRunId
   const key = source?.dataset.pactReportKey
   if (!runId || !key) return undefined
-  return key === 'summary'
-    ? { runId, target: { type: 'summary' } }
-    : key.startsWith('feedback:')
-      ? { runId, target: { type: 'feedback', id: key.slice(9) } }
-      : undefined
+  return key === 'summary' ? { runId, target: { type: 'summary' } } : undefined
 }
 
 export function reportSourceSelector(report: NonNullable<MessageCommentAnchor['report']>): string {
-  const key = report.target.type === 'summary' ? 'summary' : `feedback:${report.target.id}`
-  return `[data-pact-report-run-id="${report.runId}"][data-pact-report-key="${CSS.escape(key)}"]`
+  return `[data-pact-report-run-id="${report.runId}"][data-pact-report-key="summary"]`
 }
 
 let ownedHighlight: Range | undefined
+let highlightOwner: object | undefined
 let pulseOwner: HTMLElement | undefined
 let pulseTimer: number | undefined
 
@@ -49,8 +45,13 @@ export function selectedTextRange(
   if (selection.rangeCount !== 1 || selection.isCollapsed) return undefined
   const range = selection.getRangeAt(0)
   if (!container.contains(range.commonAncestorContainer)) return undefined
-  const start = offsetForBoundary(container, range.startContainer, range.startOffset, 'start')
-  const end = offsetForBoundary(container, range.endContainer, range.endOffset, 'end')
+  const start = projectionBoundaryOffset(
+    container,
+    range.startContainer,
+    range.startOffset,
+    'start',
+  )
+  const end = projectionBoundaryOffset(container, range.endContainer, range.endOffset, 'end')
   if (start === undefined || end === undefined || end <= start || end - start > maxLength)
     return undefined
   const quote = projectionText(container, start, end)
@@ -99,10 +100,49 @@ export function focusProjectionRange(
   return false
 }
 
-export function clearProjectionHighlight(): void {
+export function clearProjectionHighlight(owner?: object): void {
+  if (owner && owner !== highlightOwner) return
   if (isProjectionHighlightOwned()) window.getSelection()?.removeAllRanges()
   ownedHighlight = undefined
+  highlightOwner = undefined
   clearCommentPulse()
+}
+
+/** Paint only the mounted part of an already tracked logical range; this is not range verification. */
+export function drawMountedProjectionIntersection(
+  container: HTMLElement,
+  start: number,
+  end: number,
+  owner: object,
+  source = false,
+): void {
+  const spans = [
+    ...container.querySelectorAll<HTMLElement>(
+      source
+        ? '[data-pact-projection-start], [data-pact-source-start]'
+        : '[data-pact-projection-start]',
+    ),
+  ].filter((span) => {
+    const from = Number(span.dataset.pactProjectionStart ?? span.dataset.pactSourceStart)
+    const to = Number(span.dataset.pactProjectionEnd ?? span.dataset.pactSourceEnd)
+    return from < end && to > start
+  })
+  const first = spans[0]
+  const last = spans.at(-1)
+  if (!(first?.firstChild instanceof Text) || !(last?.firstChild instanceof Text)) {
+    clearProjectionHighlight(owner)
+    return
+  }
+  const range = document.createRange()
+  const from = first.dataset.pactProjectionStart
+  const to = last.dataset.pactProjectionStart
+  range.setStart(first.firstChild, from === undefined ? 0 : Math.max(0, start - Number(from)))
+  range.setEnd(
+    last.firstChild,
+    to === undefined ? last.firstChild.length : Math.min(last.firstChild.length, end - Number(to)),
+  )
+  setProjectionSelection(range, true)
+  highlightOwner = owner
 }
 
 function pulseCommentTarget(container: HTMLElement): void {
@@ -119,7 +159,7 @@ function clearCommentPulse(): void {
   pulseOwner = undefined
 }
 
-function offsetForBoundary(
+export function projectionBoundaryOffset(
   container: HTMLElement,
   node: Node,
   offset: number,

@@ -42,7 +42,6 @@ test(
             primaryAgentId: 'codex',
             agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
             maxDiscussionRounds: 3,
-            runningMessagePolicy: 'next_round',
             maxReviewCycles: 3,
             maxRepairAttempts: 3,
           },
@@ -159,14 +158,17 @@ test(
         await expect(quit).toHaveCount(0)
       }
       await page
-        .getByRole('button', { name: 'Claude Code permissions: Ask for approval', exact: true })
+        .getByRole('button', {
+          name: 'Claude Code permissions for the next task: Ask for approval',
+          exact: true,
+        })
         .click()
       await attention()
       await expect(page.getByLabel('Claude Code permissions', { exact: true })).toBeHidden()
       await back()
       await expect(
         page.getByRole('button', {
-          name: 'Claude Code permissions: Ask for approval',
+          name: 'Claude Code permissions for the next task: Ask for approval',
           exact: true,
         }),
       ).toBeFocused()

@@ -110,7 +110,7 @@ function fixture(projectCount = 2) {
     settings: {
       primaryAgentId: 'claude',
       agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
-      runningMessagePolicy: 'next_round',
+
       maxDiscussionRounds: 3,
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
@@ -785,19 +785,24 @@ describe('App archive flow through DesktopBridge', () => {
     const context = fixture(52)
     await screen.findByRole('button', { name: 'Archive Project Project 52' })
     for (const project of context.projects.slice(0, 50)) {
-      fireEvent.click(screen.getByRole('button', { name: `Archive Project ${project.name}` }))
+      const button = screen.getByRole('button', { name: `Archive Project ${project.name}` })
+      fireEvent.click(button)
       // Each operation must settle before the next user action; admission is deliberately serialized.
       // oxlint-disable-next-line eslint/no-await-in-loop
-      await waitFor(() =>
-        expect(
-          screen.queryByRole('button', { name: `Archive Project ${project.name}` }),
-        ).toBeNull(),
-      )
+      await waitFor(() => {
+        // A still-mounted button cannot satisfy the original global absence assertion.
+        expect(button.isConnected).toBe(false)
+        expect(screen.queryByRole('button', { name: `Archive Project ${project.name}` })).toBeNull()
+      })
     }
     expect(screen.getByText('50 archived')).not.toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Archive Project Project 51' }))
     await screen.findByText('Review or dismiss some archive results before archiving more items.')
     expect(context.bridge.prepareWorkspaceArchive).toHaveBeenCalledTimes(50)
+    expect(context.bridge.archiveProject).toHaveBeenCalledTimes(50)
+    expect(context.bridge.archiveProject.mock.calls.map(([projectId]) => projectId)).toEqual(
+      context.projects.slice(0, 50).map((project) => project.id),
+    )
     const list = expandResults()
     fireEvent.click(
       within(list).getByRole('button', { name: 'Dismiss archive result for Project 50' }),
@@ -808,5 +813,23 @@ describe('App archive flow through DesktopBridge', () => {
     )
     expect(context.bridge.prepareWorkspaceArchive).toHaveBeenCalledTimes(51)
     expect(screen.getByText('50 archived')).not.toBeNull()
+    expect(context.bridge.archiveProject).toHaveBeenCalledTimes(51)
+    expect(screen.getByRole('button', { name: 'Archive Project Project 52' })).not.toBeNull()
+    const undoTitles: string[] = []
+    for (let page = 0; page < 50; page++) {
+      undoTitles.push(
+        ...within(expandResults())
+          .getAllByRole('button', { name: /^Undo archive of Project \d+$/u })
+          .map((button) => button.getAttribute('aria-label') ?? ''),
+      )
+      const next = screen.queryByRole<HTMLButtonElement>('button', { name: 'Next' })
+      if (!next || next.disabled) break
+      fireEvent.click(next)
+    }
+    expect(undoTitles.toSorted()).toEqual(
+      [...context.projects.slice(0, 49), context.projects[50]!]
+        .map((project) => `Undo archive of ${project.name}`)
+        .toSorted(),
+    )
   }, 15_000)
 })
