@@ -610,7 +610,7 @@ function DocumentSelectionSurface({
         <button
           ref={actionRef}
           type="button"
-          className="absolute z-10 inline-flex h-8 w-32 items-center justify-center gap-1.5 rounded-control bg-surface-raised px-2.5 text-caption font-medium text-primary shadow-sm hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
+          className="absolute z-10 inline-flex h-8 w-32 items-center justify-center gap-1.5 whitespace-nowrap rounded-control bg-surface-inverse px-2.5 text-caption font-medium text-inverse shadow-popover transition-[filter] duration-150 ease-out-pact hover:brightness-95 active:brightness-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
           style={{ left: view.left, top: view.top }}
           aria-label="Comment on selected text"
           onPointerDown={(event) => event.preventDefault()}
@@ -621,7 +621,8 @@ function DocumentSelectionSurface({
             clear()
           }}
         >
-          <MessageCirclePlus aria-hidden="true" className="size-4 shrink-0" /> Add comment
+          <MessageCirclePlus aria-hidden="true" className="size-4 shrink-0" strokeWidth={1.75} />
+          Add comment
         </button>
       ) : null}
       {view?.phase === 'verifying' ? (
