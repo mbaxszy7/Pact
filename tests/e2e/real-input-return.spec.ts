@@ -104,7 +104,6 @@ test.describe('real business input return', { tag: '@real' }, () => {
                 primaryAgentId: 'claude',
                 agents: current.value.session.settings.agents,
                 maxDiscussionRounds: current.value.session.settings.maxDiscussionRounds,
-                runningMessagePolicy: current.value.session.settings.runningMessagePolicy,
                 maxReviewCycles: current.value.session.settings.maxReviewCycles,
                 maxRepairAttempts: current.value.session.settings.maxRepairAttempts,
               },

@@ -78,14 +78,13 @@ import {
   type AgentNativeForkInput,
 } from '@pact/agent-runtime'
 import {
-  prepareCollaborationSupplement,
-  collaborationSubmission,
+  COLLABORATION_PROTOCOL,
   collaborationTaskSchema,
-  collaborationReportMarkdown,
-  collaborationRequiresPlan,
   advanceCollaboration,
+  collaborationNextStage,
+  collaborationInputGate,
+  collaborationStageLabel,
   otherAgent,
-  collaborationResultSchema,
   collaborationSourceReadSchema,
   collaborationMarkdownPageSchema,
   type CollaborationTask,
@@ -154,6 +153,7 @@ import {
   NativeThreadOccupiedError,
   NativeThreadArchivedError,
   NativeCapacityError,
+  NativeInputWithheldError,
   classifyAgentError,
 } from './agent-execution-error'
 import { AgentStreamBuffer } from './agent-stream-buffer'
@@ -250,6 +250,7 @@ interface SendOptions {
   sourceProposalId?: string
   sourceMessageId?: string
   collaboration?: CollaborationTask | undefined
+  expectedCollaborationRevision?: number | undefined
   receivedInputId?: string | undefined
   receivedComments?: AnchoredComment[] | undefined
   queuedRoute?: ConversationMessageRoute | undefined
@@ -1458,7 +1459,6 @@ export class Conversation {
                   throughSequence: response.sequence,
                   deliveryCursor: response.deliveryCursor,
                   responseHash: response.responseHash,
-                  ...(run.answerFormat ? { answerFormat: run.answerFormat } : {}),
                 },
                 owner.controller.signal,
               )
@@ -2095,7 +2095,8 @@ export class Conversation {
   ): Promise<RpcResult<ConversationPatch>> {
     let releaseImages: (() => void) | undefined
     try {
-      const task = this.conversations.collaboration(input.sessionId)
+      const savedTask = this.conversations.collaboration(input.sessionId)
+      const task = savedTask?.status === 'complete' ? undefined : savedTask
       const preparing = this.preparingSends.has(input.clientMessageId)
       const waitingForWork = task?.status === 'running' || this.hasSessionOperation(input.sessionId)
       const received = this.conversations.receivedInputReceipt(
@@ -2120,6 +2121,7 @@ export class Conversation {
         this.publish(submitted.patch)
         return { ok: true, value: submitted.patch }
       }
+      this.conversations.assertDecisionInput({ ...input, content })
       if (this.conversations.receivedCollaborationInput(input.sessionId))
         throw new RunOperationConflictError(
           'One message is already queued. Your draft was preserved.',
@@ -2135,53 +2137,20 @@ export class Conversation {
         this.conversations.resolveMessageImages(input.sessionId, input.imageIds, ownerKey)
         releaseImages = this.images.hold(input.imageIds)
       }
-      if (
-        input.planningAction &&
-        (!task ||
-          !(task.plan || task.planDocument) ||
-          !collaborationRequiresPlan(task) ||
-          task.approvedPlanVersion !== undefined)
-      )
-        throw new RunOperationConflictError('Planning feedback requires a current unapproved plan.')
       const prefix = parseComposerCommandPrefix(content, input.skills)
-      if (!preparing && ((task && !prefix.pact) || waitingForWork)) {
-        if (task && !prefix.pact && input.route?.type === 'all')
+      if (!preparing && (task || waitingForWork)) {
+        if (task && !prefix.pact && (input.route ?? prefix.route)?.type === 'all')
           throw new RunOperationConflictError('Finish or stop this Pact task before using @all.')
         const session = this.sessions.find(input.sessionId)
         if (!session || session.status === 'archived')
           throw new RunOperationConflictError('The Session is unavailable.')
+        const requestedRoute = input.route ?? prefix.route
         const actor =
-          input.route?.type === 'agent'
-            ? input.route.agentId
+          requestedRoute?.type === 'agent'
+            ? requestedRoute.agentId
             : task && !prefix.pact
-              ? this.conversations.collaborationAnswerResolver(task)
+              ? this.conversations.collaborationReplyActor(task)
               : session.settings.primaryAgentId
-        if (
-          input.planningAction &&
-          task &&
-          actor !==
-            (input.planningAction === 'maintain_plan' ? task.primary : otherAgent(task.primary))
-        )
-          throw new RunOperationConflictError('The selected Agent does not own this planning duty.')
-        if (!waitingForWork && task && task.status !== 'paused') {
-          const { inputId, ...fields } = input
-          return await this.enqueueSend(
-            { ...fields, content },
-            {
-              ...(ownerKey ? { imageOwnerKey: ownerKey } : {}),
-              collaboration: prepareCollaborationSupplement(
-                task,
-                actor,
-                session.settings,
-                input.planningAction,
-              ),
-            },
-          ).then((result) => {
-            if (result.ok && inputId)
-              this.conversations.consumeConversationInput(input.sessionId, inputId, ownerKey!)
-            return result
-          })
-        }
         const bodyOwner = ownerKey ?? 'pact-received-input'
         let retainedId = input.inputId
         if (!retainedId) {
@@ -2235,8 +2204,19 @@ export class Conversation {
           actor,
           bodyOwner,
           anchor.id,
+          waitingForWork,
         )
         this.publish(patch)
+        if (task) {
+          this.abortPreparedWorkflow(input.sessionId)
+          for (const pending of this.permissions.values())
+            if (
+              pending.sessionId === input.sessionId &&
+              pending.details?.kind === 'questions' &&
+              pending.valid()
+            )
+              pending.settle({ action: 'cancel' })
+        }
         this.schedulePendingRoutedContinuations()
         return { ok: true, value: patch }
       }
@@ -2315,7 +2295,7 @@ export class Conversation {
     execution.promptEnvelope = {
       ...envelope,
       collaborationAuthorization: authorization,
-      requiredInputScopeRef: authorization?.requiredInputScopeRef ?? undefined,
+      requiredInputScopeRef: authorization?.sourceManifestRef ?? undefined,
     }
   }
 
@@ -2427,7 +2407,7 @@ export class Conversation {
           run.id,
         )
         envelope.requiredInputScopeRef =
-          envelope.collaborationAuthorization?.requiredInputScopeRef ?? undefined
+          envelope.collaborationAuthorization?.sourceManifestRef ?? undefined
         this.refreshExecutionInputScope(execution)
         this.publish(this.conversations.metadataPatch(sessionId))
         const accepted = (): void => {
@@ -2811,6 +2791,12 @@ export class Conversation {
     signal: AbortSignal,
   ): Promise<NativeUserInputResult> {
     if (
+      input.kind === 'questions' &&
+      this.conversations.findRun(owner.id)?.collaboration &&
+      this.conversations.receivedCollaborationInput(owner.sessionId)
+    )
+      return Promise.resolve({ action: 'cancel' })
+    if (
       owner.valid() &&
       input.nativeSessionId &&
       !this.conversations.nativeContext(owner.sessionId, owner.agentId)
@@ -3132,7 +3118,7 @@ export class Conversation {
         JSON.stringify(prior.imageIds ?? []) === JSON.stringify(input.imageIds ?? []) &&
         JSON.stringify(prior.skills ?? []) === JSON.stringify(input.skills ?? []) &&
         JSON.stringify(prior.route) === JSON.stringify(input.route) &&
-        prior.planningAction === input.planningAction &&
+        JSON.stringify(prior.replyToDecision) === JSON.stringify(input.replyToDecision) &&
         (prior.batchId ?? prior.clientMessageId) === (input.batchId ?? input.clientMessageId) &&
         (prior.freezeDrafts ?? !preparing.options.preserveDraftComments) ===
           (input.freezeDrafts ?? !options.preserveDraftComments) &&
@@ -3195,111 +3181,162 @@ export class Conversation {
       const task = this.conversations.collaboration(input.sessionId)
       if (!context || !task || task.id !== input.taskId || task.revision !== input.revision)
         throw new RunOperationConflictError('This collaboration action is no longer current.')
-      if (input.action === 'resume_input' || input.action === 'cancel_input') {
-        const received = this.conversations.receivedCollaborationInput(input.sessionId)
-        if (!received || received.id !== input.receivedInputId)
-          throw new RunOperationConflictError('This received input is no longer current.')
-        if (input.action === 'resume_input' && task.status === 'paused') {
-          const resumed = advanceCollaboration(task, 'resume', context.settings)
-          this.conversations.setCollaborationState(resumed)
-        }
-        const patch = this.conversations.setReceivedInputState(
-          input.sessionId,
-          input.action === 'cancel_input' ? 'cancelled' : 'accepted',
-          received.id,
+      if (task.status === 'complete')
+        throw new RunOperationConflictError('This collaboration is already complete.')
+      if (input.action === 'pause') {
+        const patch = this.conversations.pauseCollaboration(input.sessionId)
+        this.abortPreparedWorkflow(input.sessionId)
+        this.publish(patch)
+        return { ok: true, value: patch }
+      }
+      if (this.conversations.receivedCollaborationInput(input.sessionId))
+        throw new RunOperationConflictError(
+          'Your queued message will be answered before collaboration continues.',
         )
+      const planRecovery = this.conversations.needsWorkflowPlanRecovery(task.runId)
+      if (input.action === 'recover_plan') {
+        if (!planRecovery || task.automation !== 'paused')
+          throw new RunOperationConflictError('There is no paused native plan source to restore.')
+        const settled = this.conversations.reconcileCompletedCollaboration(task.runId)
+        if (settled) this.publish(settled)
+        if (!this.conversations.workflowPlanSettled(task.runId)) {
+          const checked = await this.checkNativeBinding(input.sessionId, task.owner, task.runId)
+          if (!checked.ok) return checked
+        }
+        const recovered = this.conversations.collaboration(input.sessionId)
+        if (
+          !recovered ||
+          recovered.id !== task.id ||
+          recovered.runId !== task.runId ||
+          recovered.inputSequence !== task.inputSequence ||
+          !this.conversations.workflowPlanSettled(task.runId) ||
+          this.conversations.needsWorkflowPlanRecovery(task.runId)
+        )
+          throw new RunOperationConflictError(
+            'The saved native plan could not be restored to this task. Its source is preserved; no Agent task was started.',
+          )
+        return { ok: true, value: this.conversations.metadataPatch(input.sessionId) }
+      }
+      if (planRecovery)
+        throw new RunOperationConflictError(
+          'Restore the saved native plan before continuing collaboration.',
+        )
+      if (input.action === 'resume') {
+        if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
+          return Conversation.nativeRecoveryRequired()
+        const resumed = advanceCollaboration(task, 'resume', context.settings)
+        const patch = this.conversations.setCollaborationState(resumed)
         this.publish(patch)
         this.schedulePendingRoutedContinuations()
         return { ok: true, value: patch }
       }
-      if (
-        this.conversations.receivedCollaborationInput(input.sessionId) &&
-        input.action !== 'pause'
-      )
-        throw new RunOperationConflictError(
-          'Handle the received user message before continuing this Proposal.',
-        )
-      if (input.action === 'resume') {
-        const resumed = advanceCollaboration(task, 'resume', context.settings)
-        const patch = this.conversations.setCollaborationState(resumed)
-        this.publish(patch)
-        return { ok: true, value: patch }
-      }
-      if (input.action === 'pause') {
-        this.conversations.setReceivedInputState(input.sessionId, 'cancelled')
-        const patch = this.conversations.pauseCollaboration(input.sessionId)
-        this.publish(patch)
-        return { ok: true, value: patch }
-      }
-      if (
-        this.conversations.findRun(task.runId)?.failureKind === 'unknown_delivery' &&
-        this.conversations.findRun(task.runId)?.dispatchPhase !== 'ended'
-      )
-        throw new RunOperationConflictError(
-          'Resolve uncertain delivery before continuing this task.',
-        )
+      if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
+        return Conversation.nativeRecoveryRequired()
       const next = advanceCollaboration(task, input.action, context.settings)
-      if (input.action === 'submit_report') {
-        const sourceRunId = task.reportRecovery?.sourceRunId ?? task.runId
-        const sourceMessageId = task.reportRecovery?.sourceMessageId ?? task.sourceMessageId
-        const sourceRun = this.conversations.findRun(sourceRunId)
-        const metadata = sourceMessageId
-          ? this.conversations.messageMetadata(sourceMessageId, task.sessionId)
-          : undefined
-        if (
-          !sourceMessageId ||
-          !metadata?.contentBytes ||
-          sourceRun?.dispatchPhase !== 'ended' ||
-          sourceRun.nativeOutcome !== 'completed' ||
-          sourceRun.collaboration?.taskId !== task.id ||
-          sourceRun.agentId !== next.actor
-        )
-          throw new RunOperationConflictError(
-            'Only the original Agent can submit a report for its completed answer.',
-          )
-        next.reportRecovery = {
-          ...next.reportRecovery,
-          sourceRunId,
-          sourceMessageId,
-          sourceContentRevision:
-            task.reportRecovery?.sourceContentRevision ?? metadata.contentRevision,
-        }
-      }
-      const drafts = this.conversations.readPage({ scope: 'drafts', sessionId: input.sessionId })
-      if (drafts.scope !== 'drafts')
-        throw new RunOperationConflictError('Comment drafts are unavailable.')
-      const labels = {
-        draft: 'Draft the plan',
-        discuss:
-          collaborationSubmission(next) === 'plan_submission'
-            ? 'Update the current plan using the feedback'
-            : 'Review the current plan and feedback',
-        clarify: 'Clarify the pending questions',
-        implement: `Implement plan v${task.planVersion}`,
-        review: 'Review the current implementation',
-        respond: 'Respond to the Review opinions without editing code',
-        repair: 'Repair the Review opinions within this task',
-        supplement: 'Handle the received user message without editing code',
-      }
-      const request =
-        input.action === 'submit_report'
-          ? `${task.reportFailure === 'invalid' ? 'Correct and submit' : 'Submit'} the ${collaborationSubmission(next) === 'plan_submission' ? 'plan' : 'review'} from your previous completed response`
-          : labels[next.stage]
-      // Native adapters add the frozen report contract separately on every Turn.
-      const content = `@${next.actor} ${request}.`
-      return this.enqueueSend(
-        {
-          sessionId: input.sessionId,
-          clientMessageId: input.clientMessageId,
-          content,
-          route: { type: 'agent', agentId: next.actor },
-          expectedCommentsRevision: drafts.commentsRevision,
-          commentIds: [],
-        },
-        { preserveDraftComments: true, collaboration: next },
-      )
+      return await this.startWorkflowTurn(task, next, input.clientMessageId)
     } catch (error) {
       return Conversation.sendFailure(error)
+    }
+  }
+
+  private abortPreparedWorkflow(sessionId: string): void {
+    for (const preparing of this.preparingSends.values())
+      if (preparing.input.sessionId === sessionId && preparing.options.collaboration)
+        preparing.controller.abort()
+  }
+
+  private startWorkflowTurn(
+    task: CollaborationTask,
+    next: CollaborationTask,
+    clientMessageId: string = randomUUID(),
+  ): Promise<RpcResult<ConversationPatch>> {
+    const drafts = this.conversations.readPage({ scope: 'drafts', sessionId: task.sessionId })
+    if (drafts.scope !== 'drafts')
+      return Promise.resolve(Conversation.sendFailure(new Error('Comment drafts are unavailable.')))
+    const content = `@${next.actor} ${collaborationStageLabel(next.stage)}.`
+    return this.enqueueSend(
+      {
+        sessionId: task.sessionId,
+        clientMessageId,
+        content,
+        route: { type: 'agent', agentId: next.actor },
+        expectedCommentsRevision: drafts.commentsRevision,
+        commentIds: [],
+        freezeDrafts: false,
+      },
+      {
+        preserveDraftComments: true,
+        collaboration: next,
+        expectedCollaborationRevision: task.revision,
+      },
+    )
+  }
+
+  private async dispatchWorkflowContinuation(sessionId: string): Promise<void> {
+    if (
+      this.disposed ||
+      this.nativeQuitSealed() ||
+      this.hasSessionOperation(sessionId, true) ||
+      this.operationCount() >= MAX_AGENT_OPERATIONS ||
+      this.conversations.receivedCollaborationInput(sessionId) ||
+      this.conversations.nativeRecoveryBlocksInput(sessionId) ||
+      this.conversations.hasPendingRoutedContinuation(sessionId)
+    )
+      return
+    const task = this.conversations.collaboration(sessionId)
+    const session = this.sessions.find(sessionId)
+    if (
+      !task ||
+      !session ||
+      session.status === 'archived' ||
+      task.automation !== 'active' ||
+      task.status !== 'waiting'
+    )
+      return
+    if (collaborationInputGate(task)) {
+      this.publish(
+        this.conversations.setCollaborationState({
+          ...task,
+          revision: task.revision + 1,
+          automation: 'paused',
+          pauseReason: 'needs_user',
+          notice: 'Your input must be processed before collaboration can continue.',
+        }),
+      )
+      return
+    }
+    if (!collaborationNextStage(task)) return
+    let next: CollaborationTask
+    try {
+      next = advanceCollaboration(task, 'continue', session.settings)
+    } catch (error) {
+      const current = this.conversations.collaboration(sessionId)
+      if (current?.id !== task.id || current.revision !== task.revision) return
+      const notice = error instanceof Error ? error.message : 'Collaboration could not continue.'
+      this.publish(
+        this.conversations.setCollaborationState({
+          ...task,
+          revision: task.revision + 1,
+          automation: 'paused',
+          pauseReason: notice.includes('limit') ? 'limit' : 'failure',
+          notice: notice.slice(0, 512),
+        }),
+      )
+      return
+    }
+    const result = await this.startWorkflowTurn(task, next)
+    if (!result.ok) {
+      const current = this.conversations.collaboration(sessionId)
+      if (current?.id !== task.id || current.revision !== task.revision) return
+      this.publish(
+        this.conversations.setCollaborationState({
+          ...current,
+          revision: current.revision + 1,
+          automation: 'paused',
+          pauseReason: 'failure',
+          notice: result.error.message.slice(0, 512),
+        }),
+      )
     }
   }
 
@@ -3825,7 +3862,7 @@ export class Conversation {
                 type: 'primary',
                 agentId:
                   options.collaboration && !commandPrefix.pact
-                    ? this.conversations.collaborationAnswerResolver(options.collaboration)
+                    ? this.conversations.collaborationReplyActor(options.collaboration)
                     : primaryAgentId,
               })
       if (input.returnedInputOperationId) {
@@ -3884,50 +3921,28 @@ export class Conversation {
         const task =
           input.content.slice(commandPrefix.argumentsStart).trim() ||
           'Use the explicit conversation context if it establishes the task. Otherwise ask at most three material questions before proceeding. No implementation scope is authorized until clarified.'
-        const implementer =
-          kind === 'plan' ? secondaryAgentId : kind === 'build' ? agentId : otherAgent(agentId)
+        const owner = kind === 'review' ? otherAgent(agentId) : agentId
         collaboration = collaborationTaskSchema.parse({
+          protocol: COLLABORATION_PROTOCOL,
           id: randomUUID(),
           sessionId: input.sessionId,
           kind,
           revision: 0,
-          primary: primaryAgentId,
-          drafter: agentId,
-          implementer,
-          reviewer: kind === 'plan' ? primaryAgentId : otherAgent(implementer),
-          task:
-            Buffer.byteLength(task, 'utf8') <= 8000
-              ? task
-              : 'Use the complete original task message.',
+          owner,
+          reviewer: kind === 'review' ? agentId : otherAgent(owner),
+          task,
           taskMessageId: input.clientMessageId,
-          stage:
-            kind === 'plan'
-              ? 'draft'
-              : kind === 'build'
-                ? input.content.slice(commandPrefix.argumentsStart).trim()
-                  ? 'implement'
-                  : 'clarify'
-                : 'review',
-          ...(!input.content.slice(commandPrefix.argumentsStart).trim() && kind === 'build'
-            ? {
-                resumePhase: {
-                  stage: 'implement',
-                  actor: agentId,
-                  status: 'waiting',
-                  unstarted: true,
-                },
-              }
-            : {}),
+          stage: kind === 'plan' ? 'plan' : kind === 'build' ? 'implement' : 'code_review',
           actor: agentId,
           status: 'running',
+          automation: 'active',
           runId: input.clientMessageId,
+          inputSequence: 0,
+          handledInputSequence: 0,
           planVersion: 0,
           discussionRounds: 0,
-          discussionHalf: false,
           reviewCycles: kind === 'review' ? 1 : 0,
           repairAttempts: 0,
-          rereview: false,
-          nextCycle: false,
         })
       }
       if (collaboration) {
@@ -3952,7 +3967,6 @@ export class Conversation {
           peerAssistanceAllowed: route.type !== 'all',
           cwd: context.value.projectDirectory,
           promptEnvelope: prompt,
-          ...(collaboration ? { answerFormat: 'collaboration_envelope_v5' as const } : {}),
           model: agentSettings.model,
           effort: agentSettings.effort,
         })
@@ -3990,10 +4004,12 @@ export class Conversation {
       const started = this.conversations.beginRun({
         ...(options.receivedInputId ? { receivedInputId: options.receivedInputId } : {}),
         ...(collaboration ? { collaboration } : {}),
+        expectedCollaborationRevision: options.expectedCollaborationRevision,
         ...(skillInvocation ? { skillInvocation } : {}),
         sessionId: input.sessionId,
         clientMessageId: input.clientMessageId,
         content: input.content,
+        ...(input.replyToDecision ? { replyToDecision: input.replyToDecision } : {}),
         ...(input.imageIds?.length ? { imageIds: input.imageIds } : {}),
         ...(options.imageOwnerKey ? { imageOwnerKey: options.imageOwnerKey } : {}),
         ...(input.skills ? { skills: input.skills } : {}),
@@ -4033,8 +4049,10 @@ export class Conversation {
       if (collaboration) {
         prompt.collaborationAuthorization =
           this.conversations.collaborationTurnAuthorization(started.run.id) ?? undefined
-        prompt.requiredInputScopeRef =
-          prompt.collaborationAuthorization?.requiredInputScopeRef ?? undefined
+        prompt.collaboration = this.conversations.collaborationPromptState(
+          this.conversations.collaboration(input.sessionId, started.run.id, false)!,
+        )
+        prompt.requiredInputScopeRef = prompt.collaborationAuthorization?.sourceManifestRef
       }
       this.publish(started.patch)
       if (started.created) {
@@ -4153,7 +4171,7 @@ export class Conversation {
             'The execution was stopped. Resume the queued message when ready.',
           ),
         )
-      this.conversations.pauseCollaboration(input.sessionId)
+      this.conversations.pauseCollaboration(input.sessionId, 'stopped')
       const execution = this.activeExecutions.get(input.sessionId)
       const continuation = this.preparingContinuations.get(input.sessionId)
       const preparingSend = [...this.preparingSends.values()].find(
@@ -4402,7 +4420,7 @@ export class Conversation {
                 bindingGeneration: run.bindingGeneration ?? 1,
                 ...(run.nativeTurnId ? { nativeTurnId: run.nativeTurnId } : {}),
                 nativeInputIds: this.conversations.nativeInputIdsForRun(run.id),
-                ...(run.answerFormat ? { answerFormat: run.answerFormat } : {}),
+                planSource: this.conversations.workflowPlanSourceExpected(run.id),
                 ...(run.executorId ? { executorId: run.executorId } : {}),
                 cwd: project.directoryPath,
                 model: run.model,
@@ -4478,6 +4496,7 @@ export class Conversation {
   private checkNativeBinding(
     sessionId: string,
     agentId: RuntimeAgentId,
+    expectedRunId?: string,
   ): Promise<RpcResult<ConversationPatch>> {
     const fork = this.conversations.forkOperation(sessionId)
     const forkBinding = this.conversations.nativeContext(sessionId, agentId)
@@ -4508,6 +4527,14 @@ export class Conversation {
         candidate?.nativeSessionId === context?.nativeSessionId
           ? candidate
           : undefined
+      if (expectedRunId && run?.id !== expectedRunId)
+        return {
+          ok: false,
+          error: {
+            code: 'CONFLICT',
+            message: 'The native plan source is no longer the current execution.',
+          },
+        }
       if (!context)
         return {
           ok: false,
@@ -4643,8 +4670,15 @@ export class Conversation {
                 ...(run ? { runId: run.id } : {}),
                 nativeSessionId: context.nativeSessionId,
                 ...(run?.nativeTurnId ? { nativeTurnId: run.nativeTurnId } : {}),
-                ...(run ? { nativeInputIds: this.conversations.nativeInputIdsForRun(run.id) } : {}),
-                ...(run?.answerFormat ? { answerFormat: run.answerFormat } : {}),
+                ...(run
+                  ? {
+                      nativeInputIds: this.conversations.nativeInputIdsForRun(run.id),
+                      planSource: this.conversations.workflowPlanSourceExpected(run.id),
+                    }
+                  : {}),
+                ...(run && this.conversations.needsWorkflowPlanRecovery(run.id)
+                  ? { inspectMissingPlan: true }
+                  : {}),
                 bindingGeneration: generation,
                 ...(run?.executorId ? { executorId: run.executorId } : {}),
                 ...(agentId === 'claude' &&
@@ -4664,7 +4698,6 @@ export class Conversation {
                           runId: run.id,
                           nativeSessionId: context.nativeSessionId,
                           nativeTurnId: run.nativeTurnId,
-                          ...(run.answerFormat ? { answerFormat: run.answerFormat } : {}),
                           bindingGeneration: generation,
                           ...(run.executorId ? { executorId: run.executorId } : {}),
                         },
@@ -5224,8 +5257,7 @@ export class Conversation {
       }
       if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
         return Conversation.nativeRecoveryRequired()
-      if (input.mode === 'create' || input.anchor)
-        await this.validateCommentAnchor(input.sessionId, input.anchor!)
+      if (input.mode === 'create') await this.validateCommentAnchor(input.sessionId, input.anchor)
       if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
         return Conversation.nativeRecoveryRequired()
       if (this.disposed) return Conversation.shuttingDown()
@@ -5276,36 +5308,13 @@ export class Conversation {
       return { ok: false, error: { code: 'VALIDATION', message: 'Comment is unavailable.' } }
     }
     const anchor = comment.anchor
+    if (anchor.type === 'unavailable')
+      return {
+        ok: true,
+        value: { status: 'unavailable', commentId, quote: anchor.quote, reason: anchor.reason },
+      }
     if (anchor.type === 'file') return this.projectFiles.resolveCommentSource(sessionId, comment)
-    if (anchor.type === 'todo') {
-      const todo = this.conversations.readTodoRevision(
-        anchor.taskId,
-        anchor.todoId,
-        anchor.todoRevision,
-      )
-      const owner = todo ? this.conversations.findRun(todo.sourceRunId) : undefined
-      if (!todo || owner?.sessionId !== sessionId)
-        return {
-          ok: true,
-          value: {
-            status: 'unavailable',
-            commentId,
-            quote: anchor.quote,
-            reason: 'The original Todo revision is unavailable.',
-          },
-        }
-      if (anchor.selection && anchor.selection.contentHash !== todo.document.sha256)
-        return {
-          ok: true,
-          value: {
-            status: 'outdated',
-            commentId,
-            quote: anchor.quote,
-            reason: 'The immutable Todo source changed.',
-          },
-        }
-      return { ok: true, value: { status: 'resolved', commentId, anchor } }
-    }
+
     if (
       anchor.textBasis !== MESSAGE_ANCHOR_TEXT_BASIS &&
       !(anchor.textBasis === 'plain-visible-v1' && (anchor.plan || anchor.report))
@@ -5332,14 +5341,7 @@ export class Conversation {
         },
       }
     }
-    const natural = this.conversations.naturalMessageProjection(anchor.messageId, sessionId)
-    const naturalBasis = natural !== undefined && Conversation.hash(natural) === anchor.contentHash
-    if (
-      !anchor.plan &&
-      !anchor.report &&
-      !naturalBasis &&
-      metadata.contentBytes > CONVERSATION_MARKDOWN_BYTES
-    ) {
+    if (!anchor.plan && !anchor.report && metadata.contentBytes > CONVERSATION_MARKDOWN_BYTES) {
       return {
         ok: true,
         value: {
@@ -5852,7 +5854,7 @@ export class Conversation {
     )
       return
     const queue = this.conversations.queueState(sessionId)
-    if (!queue.enabled || queue.input?.state !== 'queued') return
+    if (queue.input?.state !== 'queued') return
     // Preserve the original @all context boundary: queued work cannot enter the
     // Secondary's native history before its already-authorized independent stage.
     if (
@@ -5864,7 +5866,14 @@ export class Conversation {
     const input = this.conversations.readReceivedInput(sessionId)
     const task = this.conversations.collaboration(sessionId),
       session = this.sessions.find(sessionId)
-    if (!input || input.state !== 'accepted' || !session || session.status === 'archived') return
+    if (
+      !input ||
+      (!queue.enabled && !input.taskId) ||
+      input.state !== 'accepted' ||
+      !session ||
+      session.status === 'archived'
+    )
+      return
     const prefix = parseComposerCommandPrefix(input.content, input.metadata.skills)
     if (
       prefix.error ||
@@ -5893,6 +5902,7 @@ export class Conversation {
     if (['starting', 'running', 'recovering'].includes(anchor.status)) return
     if (
       !input.manuallyResumed &&
+      !input.taskId &&
       (anchor.status !== 'completed' ||
         anchor.nativeOutcome !== 'completed' ||
         !this.conversations.hasCompleteResponse(anchor.id))
@@ -5908,22 +5918,16 @@ export class Conversation {
     if (
       (anchor.dispatchPhase !== 'ended' &&
         !(
-          input.manuallyResumed &&
-          ['not_sent', 'rejected'].includes(anchor.dispatchPhase ?? 'not_sent')
+          (input.manuallyResumed &&
+            ['not_sent', 'rejected'].includes(anchor.dispatchPhase ?? 'not_sent')) ||
+          (input.taskId && this.conversations.workflowInputWasNotSent(anchor))
         )) ||
       (anchor.nativeEffectsState !== 'settled' && anchor.nativeEffectsState !== 'not_dispatched')
     )
       return
     if (input.taskId && task?.status === 'running') return
     const next =
-      input.taskId && task
-        ? prepareCollaborationSupplement(
-            task,
-            input.actor,
-            session.settings,
-            input.metadata.planningAction,
-          )
-        : undefined
+      input.taskId && task ? this.conversations.workflowReply(task, input.actor) : undefined
     if (next) next.latestUserMessageId = input.id
     const currentDrafts = this.conversations.readPage({ scope: 'drafts', sessionId })
     if (currentDrafts.scope !== 'drafts') return
@@ -5932,6 +5936,9 @@ export class Conversation {
         sessionId,
         clientMessageId: input.id,
         content: input.content,
+        ...(input.metadata.replyToDecision
+          ? { replyToDecision: input.metadata.replyToDecision }
+          : {}),
         route:
           input.metadata.route?.type === 'all'
             ? { type: 'all' }
@@ -5944,7 +5951,7 @@ export class Conversation {
         ...(input.metadata.imageIds.length ? { imageIds: input.metadata.imageIds } : {}),
       },
       {
-        ...(next ? { collaboration: next } : {}),
+        ...(next ? { collaboration: next, expectedCollaborationRevision: task!.revision } : {}),
         queuedRoute:
           input.metadata.route?.type === 'all'
             ? { type: 'all', firstAgentId: input.actor, secondAgentId: otherAgent(input.actor) }
@@ -5960,8 +5967,7 @@ export class Conversation {
 
   private async resumePendingRoutedContinuations(): Promise<void> {
     for (const pending of this.conversations.pendingCollaborationInputs()) {
-      // oxlint-disable-next-line no-await-in-loop -- Admission reserves shared Session/App capacity before considering the next receipt.
-      await this.dispatchReceivedInput(pending.sessionId).catch(() => {
+      void this.dispatchReceivedInput(pending.sessionId).catch(() => {
         if (
           !this.disposed &&
           this.conversations.receivedCollaborationInput(pending.sessionId)?.id === pending.id
@@ -5974,6 +5980,23 @@ export class Conversation {
           )
       })
     }
+    for (const pending of this.conversations.pendingWorkflowTasks())
+      void this.dispatchWorkflowContinuation(pending.sessionId).catch((error) => {
+        const task = this.conversations.collaboration(pending.sessionId)
+        if (!task || task.automation !== 'active') return
+        this.publish(
+          this.conversations.setCollaborationState({
+            ...task,
+            revision: task.revision + 1,
+            automation: 'paused',
+            pauseReason: 'failure',
+            notice: (error instanceof Error
+              ? error.message
+              : 'Collaboration could not continue.'
+            ).slice(0, 512),
+          }),
+        )
+      })
     for (const pending of this.conversations.pendingRoutedContinuations()) {
       if (
         this.disposed ||
@@ -6127,6 +6150,8 @@ export class Conversation {
               )
           }
           await this.finalizeWorkspaceChanges(execution.run.id)
+          const settled = this.conversations.reconcileCompletedCollaboration(execution.run.id)
+          if (settled) this.publish(settled)
         } finally {
           execution.streamBuffer?.dispose()
           execution.streamBuffer = undefined
@@ -6135,6 +6160,7 @@ export class Conversation {
           if (
             !this.disposed &&
             this.conversations.queueState(run.sessionId).input?.state === 'queued' &&
+            !this.conversations.receivedCollaborationInput(run.sessionId)?.taskId &&
             (finished?.status !== 'completed' ||
               finished.dispatchPhase !== 'ended' ||
               finished.nativeOutcome !== 'completed' ||
@@ -6213,6 +6239,7 @@ export class Conversation {
     })
     const context = this.conversations.nativeContext(run.sessionId, run.agentId)
     const peerAssistanceAllowed =
+      !run.collaboration &&
       this.conversations.internalMessage(run.userMessageId, run.sessionId)?.route?.type !== 'all'
     const signal = execution.abortController.signal
     let reportedTitle = false
@@ -6262,7 +6289,7 @@ export class Conversation {
       this.conversations.ownsNativeControl(run.id)
     const currentControl = (): boolean => !this.disposed && ownsCurrentNativeRun()
     // Compact original-live ending receipt only; never retain another complete body.
-    let completedNativeReportReceipt:
+    let completedNativeReceipt:
       | { nativeTurnId: string; source: 'live_terminal'; executorId: string }
       | undefined
     const buffer = new AgentStreamBuffer(
@@ -6299,14 +6326,17 @@ export class Conversation {
       const apply = async (): Promise<void> => {
         if (!stillOwned() || owner.archiveController.signal.aborted || owner.outputFailure) return
         // Late facts preserve their answer, but never establish workflow acceptance.
-        if (fact.type === 'collaboration.result') {
-          this.conversations.recordRecoveredCollaborationResult(
-            run.id,
-            collaborationResultSchema.parse(fact.result),
-          )
+        if (fact.type === 'collaboration.plan') {
+          this.conversations.recordWorkflowPlan(run.id, fact)
           return
         }
-        if (fact.type === 'collaboration.result_incomplete') return
+        if (fact.type === 'collaboration.review') {
+          this.conversations.recordWorkflowReview(run.id, {
+            verdict: fact.verdict,
+            ...(fact.questions ? { questions: fact.questions } : {}),
+          })
+          return
+        }
         if (fact.type === 'text.delta' || fact.type === 'reasoning.summary.delta') {
           owner.archiveBuffer ??= new AgentStreamBuffer(
             (events) => this.conversations.applyArchivedBatch(run.sessionId, run.id, events),
@@ -6341,9 +6371,9 @@ export class Conversation {
           if (
             fact.type === 'turn.completed' &&
             fact.outcome === 'completed' &&
-            completedNativeReportReceipt?.nativeTurnId === fact.turnId
+            completedNativeReceipt?.nativeTurnId === fact.turnId
           )
-            this.reconcileOwnedCompletedCollaboration(run.id, completedNativeReportReceipt)
+            this.reconcileOwnedCompletedCollaboration(run.id, completedNativeReceipt)
         }
       }
       if (!large && !owner.archiveTail) {
@@ -6444,14 +6474,17 @@ export class Conversation {
     try {
       this.publish(this.conversations.updateAttempt(run.id, 1, false))
       this.publish(this.conversations.recordNativeEffects(run.id, 'pending'))
-      promptEnvelope.collaboration = this.conversations.collaboration(run.sessionId, run.id, false)
+      const frozenWorkflow = this.conversations.collaboration(run.sessionId, run.id, false)
+      promptEnvelope.collaboration = frozenWorkflow
+        ? this.conversations.collaborationPromptState(frozenWorkflow)
+        : undefined
       promptEnvelope.collaborationAuthorization = this.conversations.collaborationTurnAuthorization(
         run.id,
       )
       promptEnvelope.inputBatchRef =
         this.conversations.inputBatchForRun(run.id) ?? promptEnvelope.inputBatchRef
       promptEnvelope.requiredInputScopeRef =
-        promptEnvelope.collaborationAuthorization?.requiredInputScopeRef ?? undefined
+        promptEnvelope.collaborationAuthorization?.sourceManifestRef ?? undefined
       // Recovery and Handoff retain their original frozen source scope, but each
       // physical reader always uses this exact current root's ephemeral capability.
       promptEnvelope.sourceGrant =
@@ -6461,18 +6494,11 @@ export class Conversation {
           ? { runId: run.id, grant: generation }
           : undefined
       execution.promptEnvelope = promptEnvelope
-      if (promptEnvelope.collaboration?.reportRecovery)
-        promptEnvelope.collaboration.reportRecovery.document =
-          this.conversations.collaborationCarrierSource(
-            run.sessionId,
-            promptEnvelope.collaboration.reportRecovery.sourceRunId,
-          )
       adapter.preflightPrompt?.({
         runId: run.id,
         sessionId: run.sessionId,
         cwd,
         promptEnvelope,
-        ...(run.answerFormat ? { answerFormat: run.answerFormat } : {}),
         ...(context?.nativeSessionId ? { nativeSessionId: context.nativeSessionId } : {}),
         permissionMode: run.permissionMode,
         peerAssistanceAllowed,
@@ -6497,7 +6523,6 @@ export class Conversation {
         {
           runId: run.id,
           sessionId: run.sessionId,
-          ...(run.answerFormat ? { answerFormat: run.answerFormat } : {}),
           permissionMode: run.permissionMode,
           recordExecutor: (executorId) => {
             if (stillOwned())
@@ -6536,6 +6561,13 @@ export class Conversation {
           effort: settings.agents[run.agentId].effort,
           speed: run.speed ?? 'native',
           recordDispatch: (phase, nativeId, executorId) => {
+            if (phase === 'possibly_sent') {
+              try {
+                this.conversations.assertWorkflowDispatch(run.id)
+              } catch {
+                throw new NativeInputWithheldError()
+              }
+            }
             if (stillOwned())
               recordDiagnostic({
                 operation: 'send',
@@ -6572,6 +6604,9 @@ export class Conversation {
                     identity: evidence.identity,
                     source: evidence.source,
                     outcome: evidence.outcome,
+                    ...(evidence.planUnavailable || evidence.output?.planUnavailable
+                      ? { planUnavailable: true as const }
+                      : {}),
                   }
                 : evidence
             this.publish(this.conversations.recordNativeEvidence(metadata, 'retry'))
@@ -6584,7 +6619,12 @@ export class Conversation {
                   )
                 return
               }
-              if (evidence.output?.submittedReport)
+              if (
+                evidence.output?.plan ||
+                evidence.output?.retainedPlan ||
+                evidence.output?.reviewResult ||
+                evidence.output?.reviewVerdict
+              )
                 this.publish(this.conversations.recordNativeEvidence(evidence, 'retry'))
             }
             if (
@@ -6595,7 +6635,7 @@ export class Conversation {
               evidence.identity.nativeTurnId &&
               evidence.identity.executorId
             )
-              completedNativeReportReceipt = {
+              completedNativeReceipt = {
                 nativeTurnId: evidence.identity.nativeTurnId,
                 source: evidence.source,
                 executorId: evidence.identity.executorId,
@@ -6636,25 +6676,14 @@ export class Conversation {
                     const input = collaborationSourceReadSchema.parse(raw)
                     if (input.runId !== run.id || input.grant !== generation)
                       throw new Error('This source capability does not belong to the current root.')
-                    const auth = this.conversations.collaborationTurnAuthorization(run.id)
-                    if (input.taskId && input.taskId !== auth?.taskId)
-                      throw new Error('The source is outside the frozen task.')
-                    if (
-                      input.revision !== undefined &&
-                      input.source !== 'batch' &&
-                      input.revision !== auth?.baseTodoRevision
-                    )
-                      throw new Error('The source is not the frozen ledger version.')
                     if (input.source === 'document') {
-                      if (
-                        !input.document ||
-                        !this.conversations.sourceDocumentAuthorized(run.id, input.document)
-                      )
-                        throw new Error('The document is outside this Run authorization.')
+                      if (!input.document) throw new Error('Supply the frozen document reference.')
                       const body = this.conversations.collaborationDocumentRow(
                         run.sessionId,
                         input.document,
                       )
+                      if (!this.conversations.sourceDocumentAuthorized(run.id, input.document))
+                        throw new Error('The document is outside this Run authorization.')
                       const page = this.conversations.readPage({
                         scope: 'collaboration-text',
                         sessionId: run.sessionId,
@@ -6690,12 +6719,8 @@ export class Conversation {
                         nextOffset: page.hasMore ? page.nextOrdinal + 1 : null,
                       }
                     }
-                    if (input.source === 'required_inputs') {
-                      const page = this.conversations.readRequiredInputMembers(
-                        run.id,
-                        input.offset,
-                        input.inputRevision,
-                      )
+                    if (input.source === 'inputs') {
+                      const page = this.conversations.readWorkflowInputs(run.id, input.offset)
                       return {
                         source: input.source,
                         offset: input.offset,
@@ -6712,14 +6737,7 @@ export class Conversation {
                         nextOffset: page.nextOffset,
                       }
                     }
-                    const kind = input.source === 'todos' ? 'active' : input.source
-                    const page = this.conversations.readFrozenTodoIndex(run.id, kind, after)
-                    return {
-                      source: input.source,
-                      offset: input.offset,
-                      text: JSON.stringify(page),
-                      nextOffset: page.hasMore ? page.nextOrdinal + 1 : null,
-                    }
+                    throw new Error('The frozen source kind is unavailable.')
                   } catch (error) {
                     recordDiagnostic({
                       operation: 'native_check',
@@ -6740,28 +6758,20 @@ export class Conversation {
                   }
                 }
               : undefined,
-          recordCollaborationCarrierText: (text) => {
-            if (stillOwned()) this.conversations.recordCollaborationCarrierText(run.id, text)
+          recordWorkflowPlan: (plan) => {
+            if (stillOwned()) this.conversations.recordWorkflowPlan(run.id, plan)
           },
-          recordCollaborationCarrier: (value) => {
-            if (!stillOwned()) return
-            const result =
-              value && typeof value === 'object' ? Reflect.get(value, 'result') : undefined
-            const responses =
-              result && typeof result === 'object'
-                ? Reflect.get(result, 'inputResponses')
-                : undefined
-            const proof = owner.archiveMemory.reserve(
-              8192 + (Array.isArray(responses) ? responses.length : 0) * 512,
-            )
-            try {
-              this.flushRunOutput(run)
-              const patch = this.conversations.recordCollaborationCarrier(run.id, value)
-              if (patch) this.publish(patch)
-              this.refreshExecutionInputScope(execution)
-            } finally {
-              proof.release()
-            }
+          recordWorkflowPlanRetained: (plan) => {
+            if (stillOwned()) this.conversations.recordWorkflowPlanRetained(run.id, plan)
+          },
+          recordWorkflowPlanUnavailable: () => {
+            if (stillOwned()) this.conversations.recordWorkflowPlanUnavailable(run.id)
+          },
+          recordWorkflowReview: (verdict) => {
+            if (stillOwned()) this.conversations.recordWorkflowReview(run.id, verdict)
+          },
+          recordWorkflowInputResult: (outcome) => {
+            if (stillOwned()) this.conversations.recordWorkflowInputResult(run.id, outcome)
           },
           recordFileChange: async (change, ioSignal) => {
             if (!stillOwned()) return
@@ -6789,6 +6799,27 @@ export class Conversation {
             )
             if (report.state === 'unknown') this.workspaceChanges?.observeUncertainEffects(run.id)
             if (report.state !== 'pending') {
+              const saved = this.conversations.findRun(run.id)
+              if (
+                report.state === 'settled' &&
+                report.reason === 'workflow_input_withheld' &&
+                saved &&
+                !saved.nativeTurnId &&
+                !saved.nativeOutcome &&
+                ['not_sent', 'rejected'].includes(saved.dispatchPhase ?? '') &&
+                this.conversations.ownsNativeControl(run.id)
+              )
+                this.publish(
+                  this.conversations.setContinuation(
+                    run.sessionId,
+                    run.agentId,
+                    'ready',
+                    undefined,
+                    run.bindingGeneration,
+                  ),
+                )
+              const settled = this.conversations.reconcileCompletedCollaboration(run.id)
+              if (settled) this.publish(settled)
               release()
               this.schedulePendingRoutedContinuations()
             }
@@ -6822,17 +6853,17 @@ export class Conversation {
         if (fact.type === 'session.title.updated') {
           if (reportedTitle) continue
         }
-        if (fact.type === 'collaboration.result_incomplete') {
+        if (fact.type === 'collaboration.plan') {
           buffer.flush()
-          this.conversations.recordCollaborationReportFailure(run.id, fact.reason)
+          this.conversations.recordWorkflowPlan(run.id, fact)
           continue
         }
-        if (fact.type === 'collaboration.result') {
+        if (fact.type === 'collaboration.review') {
           buffer.flush()
-          this.conversations.recordCollaborationResult(
-            run.id,
-            collaborationResultSchema.parse(fact.result),
-          )
+          this.conversations.recordWorkflowReview(run.id, {
+            verdict: fact.verdict,
+            ...(fact.questions ? { questions: fact.questions } : {}),
+          })
           continue
         }
         if (fact.type === 'peer.assistance.requested' && !peerAssistanceAllowed) continue
@@ -6917,7 +6948,7 @@ export class Conversation {
           titleBinding.bindingGeneration === (run.bindingGeneration ?? 1) &&
           currentControl()
         )
-          if (!reportedTitle)
+          if (!reportedTitle && !run.collaboration)
             this.scheduleTitleEnrichment(adapter, run, titleBinding.nativeSessionId, cwd)
       }
     } catch (error) {
@@ -6949,9 +6980,9 @@ export class Conversation {
         this.publish(this.conversations.settleKnownNativeEnding(run.id, failure))
         // The matching terminal can race foreground failure settlement. Commit
         // any already-owned late body before revalidating that original report.
-        if (completedNativeReportReceipt) {
+        if (completedNativeReceipt) {
           if (owner.archiveTail) await owner.archiveTail
-          this.reconcileOwnedCompletedCollaboration(run.id, completedNativeReportReceipt)
+          this.reconcileOwnedCompletedCollaboration(run.id, completedNativeReceipt)
         }
       } else if (saved?.dispatchPhase === 'rejected' || saved?.dispatchPhase === 'not_sent') {
         this.publish(this.conversations.failRun(run.id, failure.kind, failure.message, false))
@@ -7071,7 +7102,6 @@ export class Conversation {
     }
   }
 
-  /** Only a complete, authenticated ending of the still-current original root may settle its recovered report. */
   private reconcileOwnedCompletedCollaboration(
     runId: string,
     receipt: {
@@ -7084,53 +7114,21 @@ export class Conversation {
     const run = this.conversations.findRun(runId)
     if (
       !run ||
+      run.forkSourceRunId ||
       run.nativeTurnId !== receipt.nativeTurnId ||
-      !run.nativeSessionId ||
       run.dispatchPhase !== 'ended' ||
       run.nativeOutcome !== 'completed'
     )
       return
-    const binding = this.conversations.nativeContext(run.sessionId, run.agentId),
-      task = this.conversations.collaboration(run.sessionId)
+    const binding = this.conversations.nativeContext(run.sessionId, run.agentId)
     if (
       !binding ||
       binding.nativeSessionId !== run.nativeSessionId ||
-      binding.bindingGeneration !== (run.bindingGeneration ?? 1) ||
-      task?.runId !== run.id ||
-      task.status !== 'failed' ||
-      !task.reportFailure
+      binding.bindingGeneration !== (run.bindingGeneration ?? 1)
     )
       return
-    try {
-      this.publish(
-        this.conversations.reconcileCompletedCollaboration({
-          runId: run.id,
-          nativeSessionId: run.nativeSessionId,
-          nativeTurnId: receipt.nativeTurnId,
-          source: receipt.source,
-          ...(receipt.executorId ? { executorId: receipt.executorId } : {}),
-          revision: task.revision,
-        }),
-      )
-    } catch (error) {
-      // Preserve the native carrier and ending. A missing/stale workflow candidate
-      // remains unavailable rather than manufacturing a submission or acceptance.
-      recordDiagnostic({
-        operation: 'native_check',
-        phase: 'blocked',
-        level: 'warn',
-        scope: 'run',
-        sessionId: run.sessionId,
-        runId: run.id,
-        agentId: run.agentId,
-        runtimeBoundary: 'workflow_reconcile',
-        code: 'CONFLICT',
-        runtimeErrorType:
-          diagnosticEventSchema.shape.runtimeErrorType.safeParse(
-            error instanceof Error ? error.name : 'other',
-          ).data ?? 'other',
-      })
-    }
+    const patch = this.conversations.reconcileCompletedCollaboration(runId)
+    if (patch) this.publish(patch)
   }
 
   private static async withRecoveryDeadline<T>(
@@ -7222,22 +7220,12 @@ export class Conversation {
         ...(images.length ? { images } : {}),
       }
     }
-    const original = await read(task.taskMessageId),
-      latest =
-        task.latestUserMessageId !== task.taskMessageId
-          ? await read(task.latestUserMessageId)
-          : undefined
-    const report =
-      task.reportRecovery && !task.reportRecovery.document
-        ? await this.conversations.readCollaborationReport(task, signal)
+    const original = await read(task.taskMessageId)
+    const latest =
+      task.latestUserMessageId !== task.taskMessageId
+        ? await read(task.latestUserMessageId)
         : undefined
-    return {
-      ...(original ? { original } : {}),
-      ...(latest ? { latest } : {}),
-      ...(report
-        ? { report: { id: report.messageId, content: report.content, comments: [] } }
-        : {}),
-    }
+    return { ...(original ? { original } : {}), ...(latest ? { latest } : {}) }
   }
 
   private async validateCommentAnchor(
@@ -7248,43 +7236,7 @@ export class Conversation {
       await this.projectFiles.validateCommentAnchor(sessionId, anchor)
       return
     }
-    if (anchor.type === 'todo') {
-      const todo = this.conversations.readTodoRevision(
-        anchor.taskId,
-        anchor.todoId,
-        anchor.todoRevision,
-      )
-      if (!todo || this.conversations.findRun(todo.sourceRunId)?.sessionId !== sessionId)
-        throw new Error('The Todo source is unavailable in this Session.')
-      if (
-        anchor.question &&
-        (!todo.question ||
-          todo.question.id !== anchor.question.id ||
-          todo.question.revision !== anchor.question.revision ||
-          (anchor.question.optionIndex !== undefined &&
-            (todo.question.type !== 'choice' ||
-              anchor.question.optionIndex >= todo.question.options.length)))
-      )
-        throw new Error('This answer does not match the question version.')
-      if (anchor.selection) {
-        if (anchor.selection.contentHash !== todo.document.sha256)
-          throw new Error('The immutable Todo source changed.')
-        await this.prepareMarkdown(sessionId, todo.sourceRunId, todo.document)
-        if (
-          this.conversations.collaborationQuote(
-            sessionId,
-            todo.document,
-            anchor.selection.startOffset,
-            anchor.selection.endOffset,
-            anchor.selection.textBasis === 'plain-visible-v1'
-              ? 'plain-visible-v1'
-              : 'markdown-visible-v2',
-          ) !== anchor.quote
-        )
-          throw new Error('The Todo quote no longer matches its source.')
-      }
-      return
-    }
+
     if (
       anchor.textBasis !== MESSAGE_ANCHOR_TEXT_BASIS &&
       !(anchor.textBasis === 'plain-visible-v1' && (anchor.plan || anchor.report))
@@ -7329,25 +7281,8 @@ export class Conversation {
     sessionId: string,
     anchor: Extract<CommentAnchor, { type: 'message' }>,
   ): string {
-    if (anchor.report) {
-      const run = this.conversations.findRun(anchor.report.runId)
-      if (!run || run.sessionId !== sessionId || run.userMessageId !== anchor.messageId)
-        throw new Error('The selected Review source is unavailable.')
-      const result = this.conversations.collaborationReportSource(sessionId, run.id)
-      if (!result) throw new Error('The selected Review report is unavailable.')
-      return collaborationReportMarkdown(result, anchor.report.target)
-    }
-    if (anchor.plan) {
-      const run = this.conversations.findRun(anchor.plan.runId)
-      if (!run || run.sessionId !== sessionId || run.userMessageId !== anchor.messageId)
-        throw new Error('The selected plan source is unavailable.')
-      const task = this.conversations.collaboration(sessionId, run.id)
-      if (!task?.plan || task.planVersion !== anchor.plan.version)
-        throw new Error('The selected plan version is unavailable.')
-      return task.plan
-    }
-    const natural = this.conversations.naturalMessageProjection(anchor.messageId, sessionId)
-    if (natural !== undefined && Conversation.hash(natural) === anchor.contentHash) return natural
+    if (anchor.plan || anchor.report)
+      throw new Error('The immutable plan or review source is unavailable.')
     const metadata = this.conversations.messageMetadata(anchor.messageId, sessionId)
     if (!metadata) throw new Error('The selected message is unavailable.')
     if (metadata.contentBytes > CONVERSATION_MARKDOWN_BYTES)

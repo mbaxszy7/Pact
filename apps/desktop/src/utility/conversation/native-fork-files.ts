@@ -3,15 +3,23 @@ import { Worker } from 'node:worker_threads'
 
 import type { AgentNativeForkBoundary, AgentNativeForkWitness } from '@pact/agent-runtime'
 
-import { ipcTrafficMeasurementSchema } from '@pact/contracts'
 import {
-  collaborationResultSchema,
-  type CollaborationResult,
-  type CollaborationAnswerFormat,
+  collaborationRetainedPlanSchema,
+  type CollaborationRetainedPlan,
+  ipcTrafficMeasurementSchema,
+} from '@pact/contracts'
+import {
+  collaborationReviewObservationSchema,
+  type CollaborationReviewObservation,
 } from '@pact/contracts'
 
 import { LogicalIpcWorkerTraffic, observeWorkerTraffic } from '../../shared/logical-ipc-traffic'
 import { AgentExecutionError } from './agent-execution-error'
+import {
+  isClaudePlanState,
+  type ClaudePlanBinding,
+  type ClaudePlanState,
+} from './claude-native-plan'
 import { NativeWorkingMemory, NATIVE_OWNER_WORKING_BYTES } from './native-working-memory'
 
 function digest(hash: unknown): boolean {
@@ -81,6 +89,9 @@ function result(value: unknown): NativeForkFileResult {
 export interface NativeForkFileInput {
   provider: 'claude' | 'codex'
   action: 'prepare' | 'fork' | 'inspect' | 'read' | 'read-answer'
+  /** Exact live Hook cutoff; the prefix excludes this operation. */
+  planHook?: { id: string; inputFingerprint: string }
+  includePlan?: boolean
   lastDispatchedPhase?: 'fork' | 'initialize'
   cwd: string
   nativeSessionId: string
@@ -88,7 +99,6 @@ export interface NativeForkFileInput {
   /** Private exact ordered provider input identities, including the root. */
   nativeInputIds?: readonly string[]
   responseHash?: string
-  answerFormat?: CollaborationAnswerFormat
   source?: AgentNativeForkBoundary
   witness?: AgentNativeForkWitness
   storageRoot?: string
@@ -124,7 +134,12 @@ export interface NativeForkAnswerResult {
   nativeSessionId: string
   nativeTurnId: string
   answer?: string
-  submittedReport?: CollaborationResult
+  plan?: { nativeId: string; text: string }
+  planBinding?: ClaudePlanBinding
+  planState?: ClaudePlanState
+  retainedPlan?: CollaborationRetainedPlan
+  planUnavailable?: true
+  reviewResult?: CollaborationReviewObservation
   nativeStorageRoot: string
   nativePath: string
 }
@@ -139,8 +154,26 @@ function isAnswerResult(value: unknown): value is NativeForkAnswerResult {
       (path) => typeof path === 'string' && path.length > 0 && path.length <= 4096,
     ) ||
     (value.answer !== undefined && typeof value.answer !== 'string') ||
-    (value.submittedReport !== undefined &&
-      !collaborationResultSchema.safeParse(value.submittedReport).success)
+    (value.plan !== undefined &&
+      (!isObject(value.plan) ||
+        typeof value.plan.nativeId !== 'string' ||
+        !value.plan.nativeId ||
+        value.plan.nativeId.length > 1024 ||
+        typeof value.plan.text !== 'string')) ||
+    (value.retainedPlan !== undefined &&
+      !collaborationRetainedPlanSchema.safeParse(value.retainedPlan).success) ||
+    (value.planState !== undefined && !isClaudePlanState(value.planState)) ||
+    (value.planUnavailable !== undefined && value.planUnavailable !== true) ||
+    (value.planBinding !== undefined &&
+      (!isObject(value.planBinding) ||
+        typeof value.planBinding.promptId !== 'string' ||
+        !value.planBinding.promptId ||
+        value.planBinding.promptId.length > 1024 ||
+        typeof value.planBinding.path !== 'string' ||
+        !value.planBinding.path ||
+        value.planBinding.path.length > 4096)) ||
+    (value.reviewResult !== undefined &&
+      !collaborationReviewObservationSchema.safeParse(value.reviewResult).success)
   )
     return false
   return true
@@ -175,7 +208,13 @@ export class NativeForkFiles {
   async readAnswer(
     input: Pick<
       NativeForkFileInput,
-      'cwd' | 'nativeSessionId' | 'nativeInputIds' | 'storageRoot' | 'path' | 'answerFormat'
+      | 'cwd'
+      | 'nativeSessionId'
+      | 'nativeInputIds'
+      | 'storageRoot'
+      | 'path'
+      | 'planHook'
+      | 'includePlan'
     > & {
       nativeTurnId: string
     },

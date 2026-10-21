@@ -8,7 +8,6 @@ import type {
   DefaultSessionSettings,
   DefaultSessionSettingsEditorState,
   Project,
-  ConversationSendInput,
   SessionSettingsEditorState,
   SessionPermissionSaveInput,
   SessionSpeedSaveInput,
@@ -128,13 +127,7 @@ interface WorkspaceViewProps {
   onSaveSessionSettings: (sessionId: string, settings: DefaultSessionSettings) => void
   onArchiveSession: (sessionId: string) => void
   onRenameSession: (sessionId: string, title: string) => Promise<boolean>
-  onSendMessage: (
-    content: string,
-    commentIds: string[],
-    route?: NonNullable<ConversationSendInput['route']>,
-    skills?: SkillSelection[],
-    planningAction?: ConversationSendInput['planningAction'],
-  ) => Promise<boolean>
+  onSendMessage: ConversationFlow['send']
   onSaveCommentDraft: ConversationFlow['saveCommentDraft']
   onRemoveCommentDraft: (commentId: string) => Promise<boolean>
   onOpenComment: (comment: AnchoredComment) => void
@@ -157,15 +150,6 @@ interface WorkspaceViewProps {
         textBasis?: import('@pact/contracts').MessageCommentAnchor['textBasis']
         plan?: import('@pact/contracts').MessageCommentAnchor['plan']
         report?: import('@pact/contracts').MessageCommentAnchor['report']
-      }
-    | undefined
-  todoNavigation?:
-    | {
-        taskId: string
-        todoId: string
-        todoRevision: number
-        navigationId: string
-        selection?: import('@pact/contracts').TodoCommentAnchor['selection']
       }
     | undefined
   onStopRun: () => Promise<boolean>
@@ -454,7 +438,6 @@ function WorkspaceContent({
               planPanelOpen={planPane.open}
               planAvailable={planPane.available}
               planRestoreFocusRef={planPane.restoreFocusRef}
-              todoNavigation={props.todoNavigation}
               onPlanAvailable={planPane.onAvailable}
               onOpenPlan={planPane.onOpen}
               onClosePlan={planPane.onClose}

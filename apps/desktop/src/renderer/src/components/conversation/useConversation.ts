@@ -4,7 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import type { SkillSelection } from '@pact/contracts'
 import type {
   AnchoredComment,
-  CommentAnchor,
+  CollaborationDecisionQuestions,
   ConversationPatch,
   ConversationPage,
   ConversationSendInput,
@@ -57,7 +57,50 @@ import {
 } from './conversation-window'
 import { uploadConversationImage, releaseDraftImage, type DraftImage } from './image-client'
 
+export interface DecisionReplyContext {
+  reference: NonNullable<ConversationSendInput['replyToDecision']>
+  questions: CollaborationDecisionQuestions
+}
+export interface DecisionAnswerDraft extends DecisionReplyContext {
+  originalReply?: string | undefined
+  answers: Record<string, { optionIds: string[]; text: string }>
+}
+export const sameDecision = (
+  left: DecisionReplyContext['reference'] | undefined,
+  right: DecisionReplyContext['reference'] | undefined,
+): boolean => JSON.stringify(left) === JSON.stringify(right)
+export const hasDecisionAnswers = (draft: DecisionAnswerDraft | undefined): boolean =>
+  Boolean(
+    draft &&
+    (draft.originalReply?.trim() ||
+      Object.values(draft.answers).some((answer) => answer.optionIds.length || answer.text.trim())),
+  )
+function formatDecisionAnswers(draft: DecisionAnswerDraft): string {
+  if (!draft.questions.length) return draft.originalReply?.trim() ?? ''
+  return draft.questions
+    .flatMap((question) => {
+      const answer = draft.answers[question.id]
+      if (!answer || (!answer.optionIds.length && !answer.text.trim())) return []
+      const choices =
+        question.options?.filter((option) => answer.optionIds.includes(option.id)) ?? []
+      return [
+        `Question: ${question.prompt}`,
+        ...choices.map(
+          (option) =>
+            `Selected: ${option.label}${option.description ? ` — ${option.description}` : ''}`,
+        ),
+        ...(answer.text.trim() ? [`My answer: ${answer.text.trim()}`] : []),
+        '',
+      ]
+    })
+    .join('\n')
+    .trim()
+}
+
 export interface ConversationHistoryControls {
+  decisionDraft?: DecisionAnswerDraft | undefined
+  setDecisionDraft?: ((draft: DecisionAnswerDraft) => boolean) | undefined
+  clearDecisionDraft?: ((keepInMessage: boolean) => boolean) | undefined
   collapseEarlierResponses?: ((runId: string) => Promise<void>) | undefined
   setSnapshotFoldGuard?: ((guard: (() => boolean) | undefined) => void) | undefined
   queueActions?: {
@@ -255,7 +298,7 @@ export interface ConversationFlow {
     commentIds: string[],
     route?: NonNullable<ConversationSendInput['route']>,
     skills?: SkillSelection[],
-    planningAction?: ConversationSendInput['planningAction'],
+    decision?: DecisionReplyContext,
   ): Promise<boolean>
   acceptPeerProposal(proposalId: string): Promise<boolean>
   dismissPeerProposal(proposalId: string): Promise<boolean>
@@ -311,12 +354,12 @@ function liveNativeDraft(
 export type ConversationComposerMention = import('./composer-document').ComposerMention
 
 interface ConversationComposerDraft {
+  decisionAnswers?: DecisionAnswerDraft | undefined
   text: string
   images?: DraftImage[] | undefined
   revision?: number
   returnedInputOperationId?: string | undefined
   queueReturnOperationId?: string | undefined
-  planningAction?: ConversationSendInput['planningAction'] | undefined
   skills?: SkillSelection[] | undefined
   mention?: ConversationComposerMention | undefined
   route?: import('./composer-document').ComposerDocument['route']
@@ -329,12 +372,11 @@ export type CommentDraftInputWithoutRevision =
       sessionId: string
       commentId: string
       body: string
-      anchor: CommentAnchor
+      anchor: Extract<import('@pact/contracts').CommentDraftSaveInput, { mode: 'create' }>['anchor']
     }
   | {
       mode: 'edit'
       requestId?: string | undefined
-      anchor?: import('@pact/contracts').TodoCommentAnchor | undefined
       sessionId: string
       commentId: string
       body: string
@@ -345,7 +387,8 @@ export const commentDraftSaveSucceeded = (value: CommentDraftSaveOutcome): value
   value === true || (typeof value === 'string' && value.length > 0)
 
 interface PendingSubmission {
-  planningAction?: ConversationSendInput['planningAction'] | undefined
+  kind: 'message' | 'decision'
+  replyToDecision?: ConversationSendInput['replyToDecision'] | undefined
   sourceDocument: ConversationComposerDraft
   imageIds: string[]
   inputId?: string | undefined
@@ -373,6 +416,7 @@ interface ReturnedInputRead {
 
 function emptyComposerDraft(value: ConversationComposerDraft): boolean {
   return (
+    !hasDecisionAnswers(value.decisionAnswers) &&
     !value.images?.length &&
     !value.text &&
     !value.skills?.length &&
@@ -467,6 +511,7 @@ export function useConversation(
               imageIds: value.imageIds,
               route: value.route,
               commentIds: value.commentIds,
+              replyToDecision: value.replyToDecision,
             }),
           ).byteLength
         if (value.content !== value.sourceDocument.text) bytes += value.content.length * 2
@@ -491,13 +536,17 @@ export function useConversation(
               route: value.route,
               returnedInputOperationId: value.returnedInputOperationId,
               queueReturnOperationId: value.queueReturnOperationId,
+              decisionAnswers: value.decisionAnswers,
             }),
           ).byteLength
+        if (value.decisionAnswers) bytes += JSON.stringify(value.decisionAnswers).length * 2
         if (bytes > COMPOSER_DRAFT_BYTES || items > COMPOSER_DRAFT_ITEMS) break
       }
       if (textCandidate) {
         items += 1
         bytes += textCandidate.chars * 2 + 64 * 1024 + 1024
+        const answers = drafts[textCandidate.sessionId]?.decisionAnswers
+        if (answers) bytes += JSON.stringify(answers).length * 3
       }
       const imageIdentities = new Set(
         [...documents].flatMap((value) =>
@@ -839,14 +888,53 @@ export function useConversation(
         previous.returnedInputOperationId || previous.queueReturnOperationId
           ? editing.route
           : releaseComposerRoute(editing.route),
-      planningAction:
-        previous.text === editing.text &&
-        JSON.stringify(previous.route) === JSON.stringify(editing.route)
-          ? previous.planningAction
-          : undefined,
       revision: (previous.revision ?? 0) + 1,
     }
     return putComposerDraft(sessionId, draft)
+  }
+  const setDecisionDraft = (decisionAnswers: DecisionAnswerDraft): boolean => {
+    if (!sessionId || sending || returnOperation.current?.sessionId === sessionId) return false
+    const previous = composerDraftsRef.current[sessionId] ?? { text: '' }
+    if (
+      hasDecisionAnswers(previous.decisionAnswers) &&
+      !sameDecision(previous.decisionAnswers?.reference, decisionAnswers.reference)
+    )
+      return false
+    if (
+      (decisionAnswers.originalReply?.length ?? 0) > 4096 ||
+      (decisionAnswers.questions.length > 0 && Boolean(decisionAnswers.originalReply?.trim())) ||
+      decisionAnswers.questions.length > 3 ||
+      Object.keys(decisionAnswers.answers).length > 3 ||
+      Object.entries(decisionAnswers.answers).some(([id, answer]) => {
+        const question = decisionAnswers.questions.find((item) => item.id === id)
+        return (
+          !question ||
+          answer.text.length > 4096 ||
+          answer.optionIds.length > (question.selection === 'single' ? 1 : 6) ||
+          answer.optionIds.some(
+            (optionId) => !question.options?.some((option) => option.id === optionId),
+          )
+        )
+      })
+    )
+      return false
+    return putComposerDraft(sessionId, {
+      ...previous,
+      decisionAnswers,
+      revision: (previous.revision ?? 0) + 1,
+    })
+  }
+  const clearDecisionDraft = (keepInMessage: boolean): boolean => {
+    if (!sessionId || sending || returnOperation.current?.sessionId === sessionId) return false
+    const previous = composerDraftsRef.current[sessionId]
+    if (!previous?.decisionAnswers) return true
+    const saved = keepInMessage ? formatDecisionAnswers(previous.decisionAnswers) : ''
+    return putComposerDraft(sessionId, {
+      ...previous,
+      text: saved ? [previous.text, saved].filter(Boolean).join('\n\n') : previous.text,
+      decisionAnswers: undefined,
+      revision: (previous.revision ?? 0) + 1,
+    })
   }
   const setComposerSkills = (skills: SkillSelection[]): void => {
     if (!sessionId || returnOperation.current?.sessionId === sessionId) return
@@ -866,7 +954,6 @@ export function useConversation(
       putComposerDraft(sessionId, {
         ...previous,
         text: value,
-        planningAction: previous?.text === value ? previous.planningAction : undefined,
         revision: (previous?.revision ?? 0) + 1,
       })
     },
@@ -881,7 +968,6 @@ export function useConversation(
         ...previous,
         text: previous?.text ?? '',
         mention: value,
-        planningAction: undefined,
         revision: (previous?.revision ?? 0) + 1,
       })
     },
@@ -1082,6 +1168,13 @@ export function useConversation(
       const settleDraft = (
         draft: ConversationComposerDraft | undefined,
       ): ConversationComposerDraft | undefined => {
+        if (pending.kind === 'decision') {
+          return draft?.decisionAnswers &&
+            JSON.stringify(draft.decisionAnswers) ===
+              JSON.stringify(pending.sourceDocument.decisionAnswers)
+            ? { ...draft, decisionAnswers: undefined, revision: (draft.revision ?? 0) + 1 }
+            : draft
+        }
         if (
           (draft?.revision ?? 0) === (pending.composerRevision ?? 0) &&
           shouldClearComposerAfterAck(draft?.text ?? '', pending)
@@ -2272,11 +2365,30 @@ export function useConversation(
     commentIds: string[],
     route?: NonNullable<ConversationSendInput['route']>,
     skills?: SkillSelection[],
-    planningAction?: ConversationSendInput['planningAction'],
+    decision?: DecisionReplyContext,
   ): Promise<boolean> => {
     if (!sessionId || sending || returnOperation.current?.sessionId === sessionId) return false
-    const content = composerSnapshot.trim()
-    const images = composerDraftsRef.current[sessionId]?.images ?? []
+    const original = composerSnapshot.trim()
+    const draftAnswers = composerDraftsRef.current[sessionId]?.decisionAnswers
+    if (
+      decision &&
+      hasDecisionAnswers(draftAnswers) &&
+      !sameDecision(draftAnswers?.reference, decision.reference)
+    ) {
+      onNotice(
+        'Saved answers belong to an earlier request. Keep them in your message or discard them before answering the current questions.',
+      )
+      return false
+    }
+    const answers =
+      decision && draftAnswers && sameDecision(draftAnswers.reference, decision.reference)
+        ? formatDecisionAnswers(draftAnswers)
+        : ''
+    if (decision && !answers) return false
+    const content = decision ? `Replies to your questions:\n${answers}` : original
+    const submissionSkills = decision ? undefined : skills
+    const selectedRoute = decision ? undefined : route
+    const images = decision ? [] : (composerDraftsRef.current[sessionId]?.images ?? [])
     if (images.some((image) => image.status !== 'ready' || !image.image)) {
       onNotice('Wait for images to finish preparing, or remove an image that could not be added.')
       return false
@@ -2284,7 +2396,7 @@ export function useConversation(
     const imageIds = images.map((entry) => entry.image!.id)
     const currentRevision = windowRef.current?.view.commentsRevision
     if (currentRevision === undefined) return false
-    if (draftsReadyRevision !== currentRevision) {
+    if (!decision && draftsReadyRevision !== currentRevision) {
       updateSessionOperations(sessionId, (current) => ({
         ...current,
         error: 'Comment drafts are still loading. Try again in a moment.',
@@ -2296,9 +2408,9 @@ export function useConversation(
       pending &&
       (JSON.stringify(pending.imageIds) !== JSON.stringify(imageIds) ||
         pending.content !== content ||
-        JSON.stringify(pending.route) !== JSON.stringify(route) ||
-        pending.planningAction !== planningAction ||
-        JSON.stringify(pending.skills ?? []) !== JSON.stringify(skills ?? []))
+        JSON.stringify(pending.route) !== JSON.stringify(selectedRoute) ||
+        JSON.stringify(pending.skills ?? []) !== JSON.stringify(submissionSkills ?? []) ||
+        !sameDecision(pending.replyToDecision, decision?.reference))
     ) {
       pending.acknowledgementError =
         'Confirm the previous message before sending different content.'
@@ -2310,8 +2422,8 @@ export function useConversation(
     }
     const preserved = pending
     const expectedCommentsRevision = preserved?.expectedCommentsRevision ?? currentRevision
-    const submissionCommentIds = preserved?.commentIds ?? commentIds
-    const submissionRoute = preserved?.route ?? route
+    const submissionCommentIds = preserved?.commentIds ?? (decision ? [] : commentIds)
+    const submissionRoute = preserved?.route ?? selectedRoute
     const clientMessageId = preserved?.clientMessageId ?? crypto.randomUUID()
     const operationId = crypto.randomUUID()
     const sourceDocument =
@@ -2320,6 +2432,7 @@ export function useConversation(
         ? latestComposerDraft.current.draft
         : (composerDraftsRef.current[sessionId] ?? { text: composerSnapshot }))
     const frozen: PendingSubmission = {
+      kind: decision ? 'decision' : 'message',
       sourceDocument,
       imageIds: preserved?.imageIds ?? imageIds,
       inputId: preserved?.inputId,
@@ -2328,18 +2441,21 @@ export function useConversation(
           ? latestComposerDraft.current.draft
           : composerDraftsBySession[sessionId]
         )?.revision ?? 0,
-      returnedInputOperationId: composerDraftsBySession[sessionId]?.returnedInputOperationId,
-      queueReturnOperationId:
-        preserved?.queueReturnOperationId ?? sourceDocument.queueReturnOperationId,
+      returnedInputOperationId: decision
+        ? undefined
+        : composerDraftsBySession[sessionId]?.returnedInputOperationId,
+      queueReturnOperationId: decision
+        ? undefined
+        : (preserved?.queueReturnOperationId ?? sourceDocument.queueReturnOperationId),
       operationId,
       content,
       composerSnapshot,
-      skills: preserved?.skills ?? skills,
+      skills: preserved?.skills ?? submissionSkills,
       commentIds: submissionCommentIds,
       expectedCommentsRevision,
       clientMessageId,
       route: submissionRoute,
-      planningAction: preserved?.planningAction ?? planningAction ?? sourceDocument.planningAction,
+      replyToDecision: preserved?.replyToDecision ?? decision?.reference,
     }
     if (!admitComposerResidency(composerDraftsRef.current, { sessionId, value: frozen }))
       return false
@@ -2360,12 +2476,12 @@ export function useConversation(
         ? { queueReturnOperationId: frozen.queueReturnOperationId }
         : {}),
       expectedCommentsRevision,
+      ...(frozen.replyToDecision ? { replyToDecision: frozen.replyToDecision } : {}),
       commentIds: [],
-      freezeDrafts: true,
+      freezeDrafts: frozen.kind !== 'decision',
       batchId: clientMessageId,
       ...(submissionRoute ? { route: submissionRoute } : {}),
       ...(frozen.skills?.length ? { skills: frozen.skills } : {}),
-      ...(frozen.planningAction ? { planningAction: frozen.planningAction } : {}),
       ...(frozen.imageIds.length ? { imageIds: frozen.imageIds } : {}),
     }
     const inlineBytes =
@@ -2917,7 +3033,6 @@ export function useConversation(
       let restoredImages: ConversationImage[] = [],
         restoredSkills: SkillSelection[] = []
       let restoredRoute: import('@pact/contracts').ConversationMessageRoute | undefined
-      let planningAction: ConversationSendInput['planningAction'] | undefined
       const chunks: string[] = []
       while (true) {
         if (owner.controller.signal.aborted)
@@ -2951,7 +3066,6 @@ export function useConversation(
           restoredImages = page.images ?? []
           restoredSkills = page.skills ?? []
           restoredRoute = page.route
-          planningAction = page.planningAction
           first = false
         } else if (JSON.stringify(restoredRoute) !== JSON.stringify(page.route)) {
           throw new Error('The returned message routing changed while loading.')
@@ -2983,7 +3097,6 @@ export function useConversation(
         text: chunks.join(''),
         revision: (draft.revision ?? 0) + 1,
         queueReturnOperationId: operationId,
-        planningAction,
         skills: restoredSkills,
         route: restoredRoute,
         images: restoredImages.map((image) => ({
@@ -3109,6 +3222,7 @@ export function useConversation(
       )
         return false
       if (
+        hasDecisionAnswers(draft?.decisionAnswers) ||
         draft?.images?.length ||
         draft?.text ||
         draft?.mention ||
@@ -3196,7 +3310,8 @@ export function useConversation(
           (latest?.revision ?? 0) !== (draft?.revision ?? 0) ||
           latest?.text ||
           latest?.mention ||
-          latest?.images?.length
+          latest?.images?.length ||
+          hasDecisionAnswers(latest?.decisionAnswers)
         )
           return false
         let restoredMention: ConversationComposerMention | undefined
@@ -3268,7 +3383,8 @@ export function useConversation(
           (value?.revision ?? 0) !== (draft?.revision ?? 0) ||
           value?.text ||
           value?.mention ||
-          value?.images?.length
+          value?.images?.length ||
+          hasDecisionAnswers(value?.decisionAnswers)
         )
           return false
         return putComposerDraft(sessionId, restoredDraft)
@@ -3302,11 +3418,20 @@ export function useConversation(
   const recovery =
     windowState?.view.sessionId === sessionId ? windowState?.view.rebuildInputRecovery : undefined
   useEffect(() => {
-    if (!recovery || composer || composerMention || composerImages.length || !visible) return
+    if (
+      !recovery ||
+      composer ||
+      composerMention ||
+      composerImages.length ||
+      hasDecisionAnswers(composerDraft?.decisionAnswers) ||
+      !visible
+    )
+      return
     if (draftsReadyRevision !== windowState?.view.commentsRevision) return
     void restoreReturnedInput(true)
   }, [
     recovery,
+    composerDraft?.decisionAnswers,
     composer,
     composerMention,
     composerImages.length,
@@ -3469,6 +3594,9 @@ export function useConversation(
     rebuildNativeContext,
     checkNativeContext,
     history: {
+      decisionDraft: composerDraft?.decisionAnswers,
+      setDecisionDraft,
+      clearDecisionDraft,
       queueActions: {
         pending: Boolean(currentOperations?.queueOperationId) || restoringInput,
         steer: () => performQueueAction('steer'),

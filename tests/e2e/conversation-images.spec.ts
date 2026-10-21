@@ -47,7 +47,6 @@ async function createImageSession(
           primaryAgentId: 'claude',
           agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
           maxDiscussionRounds: 3,
-          runningMessagePolicy: 'next_round',
           maxReviewCycles: 3,
           maxRepairAttempts: 3,
         },

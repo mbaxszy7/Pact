@@ -36,7 +36,6 @@ async function seed(fixture: RuntimeFixture) {
         primaryAgentId: 'claude',
         agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
         maxDiscussionRounds: 3,
-        runningMessagePolicy: 'next_round',
         maxReviewCycles: 2,
         maxRepairAttempts: 2,
       },

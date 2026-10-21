@@ -74,8 +74,6 @@ import type {
 } from '@pact/agent-runtime'
 import type { NormalizedAgentEvent } from '@pact/contracts'
 
-import { collaborationTaskSchema } from '@pact/contracts'
-
 import {
   CODEX_TURN_ACCEPT_TIMEOUT_MS,
   CODEX_THREAD_RPC_TIMEOUT_MS,
@@ -87,11 +85,7 @@ import {
 } from './codex-agent-adapter.js'
 import { CODEX_MAX_FRAME_BYTES } from './codex-app-server-connection.js'
 import { codexProcessEnvironment } from './codex-process-environment.js'
-import {
-  planAuthorization,
-  planEnvelope,
-  planRunInput,
-} from './collaboration-fixture.test-support.js'
+import { planRunInput } from './collaboration-fixture.test-support.js'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
 
 describe('owned Codex loopback environment', () => {
@@ -202,9 +196,8 @@ import { NATIVE_OWNER_WORKING_BYTES } from './native-working-memory.js'
 
 const nativeHomes: string[] = []
 
-it('preserves a 12 MiB root final carrier before parsing, submits the full plan once and displays only its natural message', async () => {
-  const source = planEnvelope('Plan evidence\n' + 'x'.repeat(12 * 1024 * 1024)),
-    serialized = JSON.stringify(source),
+it('preserves a 12 MiB native plan independently of natural text and ignores foreign roots', async () => {
+  const plan = 'Plan evidence\n' + 'x'.repeat(12 * 1024 * 1024),
     input = planRunInput('codex'),
     methods: string[] = [],
     recorded: string[] = [],
@@ -226,7 +219,7 @@ it('preserves a 12 MiB root final carrier before parsing, submits the full plan 
             id: 'foreign',
             type: 'agentMessage',
             phase: 'final_answer',
-            text: JSON.stringify(planEnvelope('Wrong plan')),
+            text: 'Wrong plan',
           },
         },
       })
@@ -235,7 +228,15 @@ it('preserves a 12 MiB root final carrier before parsing, submits the full plan 
         params: {
           threadId: 'large-thread',
           turnId: 'large-turn',
-          item: { id: 'root-final', type: 'agentMessage', phase: 'final_answer', text: serialized },
+          item: { id: 'root-plan', type: 'plan', text: plan },
+        },
+      })
+      notify({
+        method: 'item/completed',
+        params: {
+          threadId: 'large-thread',
+          turnId: 'large-turn',
+          item: { id: 'natural', type: 'agentMessage', text: 'Plan ready.' },
         },
       })
       notify({
@@ -250,48 +251,53 @@ it('preserves a 12 MiB root final carrier before parsing, submits the full plan 
       adapter,
       {
         ...input,
-        recordCollaborationCarrierText: (text) => {
-          expect(text).toBe(serialized)
-          recorded.push('raw')
-        },
-        recordCollaborationCarrier: (carrier) => {
-          expect(recorded).toEqual(['raw'])
-          expect(carrier).toEqual(source)
-          recorded.push('parsed')
+        recordWorkflowPlan: (value) => {
+          expect(value).toEqual({ nativeId: 'root-plan', text: plan })
+          recorded.push('plan')
         },
       },
       new AbortController().signal,
       (event) => events.push(event),
     )
-    const results = events.filter((event) => event.type === 'collaboration.result')
+    const results = events.filter((event) => event.type === 'collaboration.plan')
     expect(results).toHaveLength(1)
-    expect(results[0]).toMatchObject({ result: { plan: source.result.plan } })
+    expect(results[0]).toMatchObject({ nativeId: 'root-plan', text: plan })
     expect(
       events.filter((event) => event.type === 'text.completed').map((event) => event.text),
-    ).toEqual([source.answer])
+    ).toEqual(['Plan ready.'])
     expect(methods.filter((method) => method === 'turn/start')).toHaveLength(1)
     expect(adapter.diagnostics().pendingRequests).toBe(0)
-    expect(recorded).toEqual(['raw', 'parsed'])
+    expect(recorded).toEqual(['plan'])
   } finally {
     await adapter.dispose()
   }
 }, 10_000)
 
-it('recovers the Codex final report separately from natural message bytes without a Model Turn', async () => {
+it('rejects missing native model configuration before submitting a planning Turn', async () => {
+  const methods: string[] = []
+  const child = fakeCodexProcess((request, respond) => {
+    const id = Reflect.get(request, 'id'),
+      method = String(Reflect.get(request, 'method'))
+    methods.push(method)
+    if (method === 'initialize') respond({ id, result: {} })
+    else if (method === 'thread/start')
+      respond({ id, result: { thread: { id: 'no-model' }, model: null } })
+  })
+  const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child))
+  try {
+    await expect(collectRun(adapter, planRunInput('codex'))).rejects.toMatchObject({
+      kind: 'runtime_incompatible',
+    })
+    expect(methods).not.toContain('turn/start')
+  } finally {
+    await adapter.dispose()
+  }
+})
+
+it('recovers native plan and natural answer without a Model Turn', async () => {
   const methods: string[] = [],
-    report = {
-      submission: 'plan_submission',
-      inputResponses: [],
-      outcome: 'complete',
-      summary: 'Source checked.',
-      plan: 'Unique cold plan.',
-      todoDeltas: [],
-    },
-    envelope = {
-      version: 'pact-collaboration-envelope-v5',
-      answer: 'Natural argument.',
-      result: report,
-    }
+    plan = 'Unique cold plan.',
+    answer = 'Natural argument.'
   const child = fakeCodexProcess((request, respond) => {
     const id = Reflect.get(request, 'id'),
       method = String(Reflect.get(request, 'method'))
@@ -318,24 +324,23 @@ it('recovers the Codex final report separately from natural message bytes withou
           nextCursor: null,
         },
       })
-    else if (method === 'thread/items/list')
+    else if (method === 'thread/items/list') {
+      const cursor = Reflect.get(Reflect.get(request, 'params'), 'cursor')
       respond({
         id,
         result: {
           data: [
             {
               turnId: 'cold-turn',
-              item: {
-                id: 'root-final',
-                type: 'agentMessage',
-                phase: 'final',
-                text: JSON.stringify(envelope),
-              },
+              item: cursor
+                ? { id: 'root-final', type: 'agentMessage', phase: 'final', text: answer }
+                : { id: 'cold-plan', type: 'plan', text: plan },
             },
           ],
-          nextCursor: null,
+          nextCursor: cursor ? null : 'answer-page',
         },
       })
+    }
   })
   const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child))
   try {
@@ -348,7 +353,7 @@ it('recovers the Codex final report separately from natural message bytes withou
         nativeSessionId: 'cold-thread',
         nativeTurnId: 'cold-turn',
         bindingGeneration: 1,
-        answerFormat: 'collaboration_envelope_v5',
+        planSource: true,
         cwd: '/project',
         model: null,
         effort: null,
@@ -358,7 +363,11 @@ it('recovers the Codex final report separately from natural message bytes withou
     expect(result).toMatchObject({
       kind: 'ended',
       outcome: 'completed',
-      output: { text: envelope.answer, completeness: 'complete', submittedReport: report },
+      output: {
+        text: answer,
+        completeness: 'complete',
+        plan: { nativeId: 'cold-plan', text: plan },
+      },
     })
     expect(methods).not.toContain('turn/start')
     expect(methods).not.toContain('thread/resume')
@@ -623,53 +632,21 @@ describe('Codex native launch capabilities', () => {
         return false
       },
     )
-    const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child)),
-      sessionId = randomUUID(),
-      messageId = randomUUID(),
-      runId = randomUUID()
-    const workflow = collaborationTaskSchema.parse({
-      id: randomUUID(),
-      sessionId,
-      taskMessageId: messageId,
-      runId,
-      task: 'Make a plan.',
-      kind: 'plan',
-      revision: 0,
-      primary: 'codex',
-      drafter: 'codex',
-      implementer: 'claude',
-      reviewer: 'codex',
-      stage: 'draft',
-      actor: 'codex',
-      status: 'running',
-      planVersion: 0,
-      discussionRounds: 0,
-      discussionHalf: false,
-      reviewCycles: 0,
-      repairAttempts: 0,
-      rereview: false,
-      nextCycle: false,
-    })
-    const input: AgentRunInput = {
-      answerFormat: 'collaboration_envelope_v5',
-      runId,
-      sessionId,
-      cwd: '/project',
-      model: null,
-      effort: null,
-      promptEnvelope: {
-        version: 'pact-agent-prompt-v1',
-        sessionId,
-        message: { id: messageId, content: '/plan Make a plan.' },
-        comments: [],
-        collaboration: workflow,
-        collaborationAuthorization: planAuthorization(runId, workflow.id, 'codex'),
-      },
-    }
+    const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child))
+    const input = planRunInput('codex')
     try {
       const first: NormalizedAgentEvent[] = []
       await collectRun(adapter, input, new AbortController().signal, (event) => first.push(event))
-      expect(first.filter((event) => event.type === 'collaboration.result')).toHaveLength(1)
+      expect(first.filter((event) => event.type === 'collaboration.plan')).toHaveLength(0)
+      expect(first.filter((event) => event.type === 'text.completed')).toEqual([
+        expect.objectContaining({
+          text: JSON.stringify({
+            version: 'pact-collaboration-envelope-v5',
+            answer: 'Source checked.',
+            result: report,
+          }),
+        }),
+      ])
       expect(declinedPublications).toEqual([true])
       expect(policies[0]).toEqual({
         approvalPolicy: 'never',
@@ -679,6 +656,10 @@ describe('Codex native launch capabilities', () => {
       expect(turns[0]).toMatchObject({
         sandboxPolicy: { type: 'readOnly' },
         approvalPolicy: 'never',
+      })
+      expect(Reflect.get(turns[0]!, 'collaborationMode')).toEqual({
+        mode: 'plan',
+        settings: { model: 'gpt-test', reasoning_effort: 'medium', developer_instructions: null },
       })
       const firstTurn = turns[0],
         firstConfig = configs[0]
@@ -1324,6 +1305,8 @@ describe('Codex Agent lifecycle', () => {
             ? [
                 {
                   threadId: 'thread-1',
+                  model: 'gpt-test',
+                  reasoningEffort: 'medium',
                   approvalPolicy: 'on-request',
                   approvalsReviewer: 'user',
                   sandboxPolicy: nativeSandbox,
@@ -4121,6 +4104,8 @@ function fakeCodexProcess(
             ? {
                 ...message,
                 result: {
+                  model: 'gpt-test',
+                  reasoningEffort: 'medium',
                   approvalPolicy: 'on-request',
                   approvalsReviewer: 'user',
                   sandbox: { type: 'dangerFullAccess' },

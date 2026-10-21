@@ -1121,3 +1121,43 @@
     }
   }
 }
+
+@layer components {
+  .input-replacement {
+    position: relative;
+    min-width: 0;
+  }
+  .input-replacement[data-transitioning='true'] {
+    overflow: clip;
+  }
+  .input-replacement-pane {
+    position: absolute;
+    inset: 0 0 auto;
+    min-width: 0;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateY(6px);
+    transition:
+      opacity 140ms ease-out,
+      transform 220ms var(--ease-out-pact),
+      visibility 0s 220ms;
+  }
+  .input-replacement-pane[data-active='true'] {
+    position: relative;
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateY(0);
+    transition-delay: 0s;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .input-replacement-pane,
+    .input-replacement-pane[data-active='true'] {
+      transform: none;
+      transition:
+        opacity 60ms linear,
+        visibility 0s;
+    }
+  }
+}

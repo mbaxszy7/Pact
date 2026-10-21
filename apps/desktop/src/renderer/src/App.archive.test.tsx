@@ -110,7 +110,7 @@ function fixture(projectCount = 2) {
     settings: {
       primaryAgentId: 'claude',
       agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
-      runningMessagePolicy: 'next_round',
+
       maxDiscussionRounds: 3,
       maxReviewCycles: 3,
       maxRepairAttempts: 3,

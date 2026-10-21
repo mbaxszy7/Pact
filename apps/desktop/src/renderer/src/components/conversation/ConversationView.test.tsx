@@ -11,7 +11,7 @@ import type { AgentRun, ConversationPage, DesktopBridge, WorkspaceChangeSet } fr
 
 import { collaborationTaskSchema } from '@pact/contracts'
 
-import { collaborationFixture, reportPage } from './collaboration.test-helper'
+import { collaborationFixture, reportPage, markdownPage } from './collaboration.test-helper'
 import { composerBridgeFixture } from './composer.test-helper'
 import { windowFromPage } from './conversation-window'
 import { ConversationView } from './ConversationView'
@@ -62,6 +62,19 @@ vi.mock('@tanstack/react-virtual', async (importOriginal) => {
 })
 
 beforeEach(() => {
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  )
+  vi.stubGlobal('matchMedia', () => ({
+    matches: true,
+    addEventListener: vi.fn<() => void>(),
+    removeEventListener: vi.fn<() => void>(),
+  }))
   virtualState.interactive = false
   virtualState.instance = undefined
   Object.defineProperty(crypto, 'subtle', { configurable: true, value: webcrypto.subtle })
@@ -166,15 +179,18 @@ it.each(['no-output', 'structured-only', 'changes-only', 'answered-changes'] as 
     const { props, run } = recordingFixture()
     const user = props.snapshot!.messages[0]!
     const task = collaborationTaskSchema.parse({
+      protocol: 'native-workflow-v1',
+      owner: 'codex',
+      automation: 'paused',
+      inputSequence: 0,
+      handledInputSequence: 0,
       id: crypto.randomUUID(),
       sessionId: props.session.id,
       runId: run.id,
       taskMessageId: user.id,
       kind: 'build',
       revision: 1,
-      primary: 'codex',
-      drafter: 'codex',
-      implementer: 'codex',
+
       reviewer: 'claude',
       task: 'Implement cancellation.',
       stage: 'implement',
@@ -182,22 +198,11 @@ it.each(['no-output', 'structured-only', 'changes-only', 'answered-changes'] as 
       status: mode === 'no-output' ? 'failed' : 'waiting',
       planVersion: 0,
       discussionRounds: 0,
-      discussionHalf: false,
+
       reviewCycles: 0,
       repairAttempts: 0,
-      rereview: false,
-      nextCycle: false,
-      ...(mode === 'no-output'
-        ? { notice: 'Failed before output.' }
-        : {
-            result: {
-              submission: 'stage_result',
-              inputResponses: [],
-              outcome: 'complete',
-              summary: 'Structured work complete.',
-              todoDeltas: [],
-            },
-          }),
+
+      ...(mode === 'no-output' ? { notice: 'Failed before output.' } : {}),
     })
     run.collaboration = { taskId: task.id, kind: 'build', stage: 'implement' }
     run.nativeEffectsState = 'settled'
@@ -234,6 +239,7 @@ it.each(['no-output', 'structured-only', 'changes-only', 'answered-changes'] as 
           sessionId: props.session.id,
           view: {
             task,
+            availableActions: [mode === 'no-output' ? 'retry' : 'resume'],
             actionable: true,
             accepted: mode !== 'no-output',
             reportAvailable: mode !== 'no-output',
@@ -248,7 +254,7 @@ it.each(['no-output', 'structured-only', 'changes-only', 'answered-changes'] as 
     )
     expect(
       screen.getAllByRole('button', {
-        name: mode === 'no-output' ? 'Retry · Codex' : 'Review changes · Claude Code',
+        name: mode === 'no-output' ? 'Retry · Codex' : 'Continue collaboration',
       }),
     ).toHaveLength(1)
   },
@@ -263,40 +269,37 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
     const user = props.snapshot!.messages[0]!
     user.runId = run.id
     const task = collaborationTaskSchema.parse({
+      protocol: 'native-workflow-v1',
+      owner: 'codex',
+      automation: 'paused',
+      inputSequence: 0,
+      handledInputSequence: 0,
       id: crypto.randomUUID(),
       sessionId: props.session.id,
       runId: run.id,
       taskMessageId: user.id,
       kind: 'plan',
       revision: 1,
-      primary: 'codex',
-      drafter: 'codex',
-      implementer: 'claude',
+
       reviewer: 'claude',
       task: 'Inspect ownership',
-      stage: 'draft',
+      stage: 'plan',
       actor: 'codex',
       status: 'waiting',
-      plan: 'Exact frozen plan version',
       planVersion: 1,
-      planAuthor: 'codex',
-      planReference: { type: 'unchanged', version: 1, sourceRunId: run.id, sha256: 'a'.repeat(64) },
+
+      planReference: {
+        version: 1,
+        sourceRunId: run.id,
+        sourceMessageId: user.id,
+        document: { id: crypto.randomUUID(), sha256: 'a'.repeat(64), bytes: 25, chars: 25 },
+      },
       discussionRounds: 0,
-      discussionHalf: false,
+
       reviewCycles: 0,
       repairAttempts: 0,
-      rereview: false,
-      nextCycle: false,
-      result: {
-        submission: 'plan_submission',
-        outcome: 'complete',
-        summary: 'Plan drafted.',
-        plan: { type: 'unchanged', version: 1, sourceRunId: run.id, sha256: 'a'.repeat(64) },
-        todoDeltas: [],
-        inputResponses: [],
-      },
     })
-    run.collaboration = { taskId: task.id, kind: 'plan', stage: 'draft' }
+    run.collaboration = { taskId: task.id, kind: 'plan', stage: 'plan' }
     props.snapshot!.nativeContexts = []
     if (mode === 'answer')
       props.snapshot!.messages.push({
@@ -313,6 +316,9 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
         createdAt: run.createdAt,
         updatedAt: run.updatedAt,
       })
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(
+      new DOMRect(0, 0, 900, 600),
+    )
     const host = document.createElement('aside')
     document.body.append(host)
     props.planPanelHost = host
@@ -332,6 +338,17 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
       getConversation: vi
         .fn<DesktopBridge['getConversation']>()
         .mockImplementation(async (request) => {
+          if (request.scope === 'collaboration-markdown')
+            return { ok: true, value: markdownPage(task, 'Exact frozen plan version') }
+          if (request.scope === 'collaboration-quote')
+            return {
+              ok: true,
+              value: {
+                ...request,
+                text: 'Exact frozen plan version'.slice(request.offset, request.endOffset),
+                nextOffset: null,
+              },
+            }
           if (request.scope !== 'collaboration') throw new Error(`Unexpected ${request.scope}`)
           return {
             ok: true,
@@ -340,6 +357,7 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
               sessionId: props.session.id,
               view: {
                 task,
+                availableActions: [],
                 actionable: request.projection !== 'plan',
                 accepted: true,
                 reportAvailable: true,
@@ -379,22 +397,23 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
   },
 )
 
-it('finishes historical report navigation after the source page is ready without reopening a dismissed card', async () => {
+it('finishes historical report navigation after the source page is ready and preserves it across draft edits', async () => {
   window.getSelection()?.removeAllRanges()
   const { props, run } = recordingFixture()
-  const { task, planReference } = collaborationFixture()
+  const { task } = collaborationFixture()
   task.sessionId = props.session.id
   task.runId = run.id
   task.taskMessageId = run.userMessageId
   task.actor = 'claude'
-  task.result = {
-    submission: 'plan_review',
-    outcome: 'complete',
-    reviewedPlan: { ...planReference, sourceRunId: run.id },
+  task.stage = 'plan_review'
+  task.review = {
+    runId: run.id,
+    actor: 'claude',
+    stage: 'plan_review',
     verdict: 'accepted',
-    summary: 'The historical review conclusion is preserved.',
-    todoDeltas: [],
-    inputResponses: [],
+    inputSequence: 0,
+    planReference: task.planReference,
+    document: task.planReference?.document ?? task.reviewScopeRef!,
   }
   run.agentId = 'claude'
   run.nativeEffectsState = 'settled'
@@ -413,15 +432,18 @@ it('finishes historical report navigation after the source page is ready without
     endOffset: 21,
   }
   const read = vi.fn<DesktopBridge['getConversation']>(async (request) => {
+    if (request.scope === 'collaboration-markdown')
+      return {
+        ok: true,
+        value: markdownPage(task, 'The historical review conclusion is preserved.'),
+      }
     if (request.scope !== 'collaboration') throw new Error(`Unexpected ${request.scope}`)
     return { ok: true, value: reportPage(task, { actionable: false }) }
   })
   vi.stubGlobal('pact', { ...composerBridgeFixture(), getConversation: read })
   const view = render(<ConversationView {...props} />)
-  await screen.findByText(task.result.summary)
+  await screen.findByText('The historical review conclusion is preserved.')
   const summary = view.container.querySelector<HTMLElement>('[data-pact-report-key="summary"]')!
-  const header = screen.getByRole('button', { name: 'Review · v2' })
-  expect(header.getAttribute('aria-expanded')).toBe('true')
   expect(summary.dataset.pactReportRunId).toBe(run.id)
   expect(window.getSelection()?.toString()).toBe('')
   const sourceBefore = summary.querySelector('[data-pact-projection-start]')!.firstChild!
@@ -433,9 +455,7 @@ it('finishes historical report navigation after the source page is ready without
   expect(selected.startOffset).toBe(4)
   expect(selected.endOffset).toBe(21)
   expect(position).toHaveBeenCalledOnce()
-  fireEvent.click(header)
-  expect(header.getAttribute('aria-expanded')).toBe('false')
-  expect(screen.queryByText(task.result.summary)).toBeNull()
+  expect(screen.getByText('The historical review conclusion is preserved.')).toBeDefined()
   view.rerender(
     <ConversationView
       {...props}
@@ -443,8 +463,7 @@ it('finishes historical report navigation after the source page is ready without
       history={{ ...props.history, loadingPage: false }}
     />,
   )
-  expect(header.getAttribute('aria-expanded')).toBe('false')
-  expect(screen.queryByText(task.result.summary)).toBeNull()
+  expect(screen.getByText('The historical review conclusion is preserved.')).toBeDefined()
   expect(position).toHaveBeenCalledOnce()
   window.getSelection()?.removeAllRanges()
 })
@@ -463,19 +482,20 @@ it('cancels a superseded report reveal frame and applies only the latest navigat
   })
   vi.stubGlobal('cancelAnimationFrame', cancel)
   const { props, run } = recordingFixture()
-  const { task, planReference } = collaborationFixture()
+  const { task } = collaborationFixture()
   task.sessionId = props.session.id
   task.runId = run.id
   task.taskMessageId = run.userMessageId
   task.actor = 'claude'
-  task.result = {
-    submission: 'plan_review',
-    outcome: 'complete',
-    reviewedPlan: { ...planReference, sourceRunId: run.id },
+  task.stage = 'plan_review'
+  task.review = {
+    runId: run.id,
+    actor: 'claude',
+    stage: 'plan_review',
     verdict: 'accepted',
-    summary: 'The historical review conclusion is preserved.',
-    todoDeltas: [],
-    inputResponses: [],
+    inputSequence: 0,
+    planReference: task.planReference,
+    document: task.planReference?.document ?? task.reviewScopeRef!,
   }
   run.agentId = 'claude'
   run.nativeEffectsState = 'settled'
@@ -495,13 +515,18 @@ it('cancels a superseded report reveal frame and applies only the latest navigat
   }
   vi.stubGlobal('pact', {
     ...composerBridgeFixture(),
-    getConversation: vi.fn<DesktopBridge['getConversation']>().mockResolvedValue({
-      ok: true,
-      value: reportPage(task, { actionable: false }),
-    }),
+    getConversation: vi
+      .fn<DesktopBridge['getConversation']>()
+      .mockImplementation(async (request) => ({
+        ok: true,
+        value:
+          request.scope === 'collaboration-markdown'
+            ? markdownPage(task, 'The historical review conclusion is preserved.')
+            : reportPage(task, { actionable: false }),
+      })),
   })
   const view = render(<ConversationView {...props} />)
-  await screen.findByText(task.result.summary)
+  await screen.findByText('The historical review conclusion is preserved.')
   const position = vi.spyOn(virtualState.instance!, 'scrollToOffset')
   const readyHistory = { ...props.history, loadingPage: false }
   view.rerender(<ConversationView {...props} history={readyHistory} />)
@@ -525,6 +550,7 @@ it('cancels a superseded report reveal frame and applies only the latest navigat
       composer="A separate draft during navigation"
     />,
   )
+  await screen.findByText('The historical review conclusion is preserved.')
   await act(async () => {
     const readyFrames = [...frames]
     for (const [id, callback] of readyFrames) {
@@ -537,8 +563,6 @@ it('cancels a superseded report reveal frame and applies only the latest navigat
   expect(selected.startOffset).toBe(22)
   expect(selected.endOffset).toBe(32)
   expect(position).toHaveBeenCalledOnce()
-  const header = screen.getByRole('button', { name: 'Review · v2' })
-  fireEvent.click(header)
   view.rerender(
     <ConversationView
       {...props}
@@ -554,7 +578,6 @@ it('cancels a superseded report reveal frame and applies only the latest navigat
       callback(0)
     }
   })
-  expect(header.getAttribute('aria-expanded')).toBe('false')
   expect(position).toHaveBeenCalledOnce()
   window.getSelection()?.removeAllRanges()
 })
@@ -566,31 +589,26 @@ it('keeps a previously accepted code review waiting when a newer input is Receiv
   task.runId = run.id
   task.taskMessageId = run.userMessageId
   task.kind = 'review'
-  task.stage = 'review'
-  task.duty = 'code_review'
+  task.stage = 'code_review'
   task.actor = 'claude'
   task.status = 'waiting'
   task.planVersion = 0
   task.inputSequence = 2
-  task.processedWatermark = 1
-  task.reviewedInputWatermark = 1
+  task.handledInputSequence = 1
   task.reviewScopeRef = {
     id: crypto.randomUUID(),
     sha256: 'c'.repeat(64),
     bytes: 100,
     chars: 100,
   }
-  delete task.plan
   delete task.planReference
-  delete task.planAuthor
-  task.result = {
-    submission: 'code_review',
-    outcome: 'complete',
+  task.review = {
+    runId: run.id,
+    actor: 'claude',
+    stage: 'code_review',
     verdict: 'accepted',
-    reviewScopeRef: task.reviewScopeRef,
-    summary: 'The previous review found no remaining issues.',
-    todoDeltas: [],
-    inputResponses: [],
+    inputSequence: 1,
+    document: task.reviewScopeRef,
   }
   run.agentId = 'claude'
   run.nativeEffectsState = 'settled'
@@ -615,15 +633,10 @@ it('keeps a previously accepted code review waiting when a newer input is Receiv
   }
   vi.stubGlobal('pact', bridge)
   render(<ConversationView {...props} />)
-  fireEvent.click(await screen.findByRole('button', { name: 'Review' }))
-  expect(screen.getByText(task.result.summary)).toBeDefined()
-  expect(
-    screen.getByText('Review the new user feedback.').closest('output')?.textContent,
-  ).toContain('Received · Claude Code')
+  await screen.findByRole('region', { name: 'Pact collaboration result' })
+  expect(screen.queryByText('· Complete')).toBeNull()
   expect(screen.queryByText('Review complete')).toBeNull()
-  expect(
-    screen.getAllByRole('button', { name: 'Review current changes · read-only' }),
-  ).toHaveLength(1)
+  expect(screen.getAllByRole('button', { name: 'Continue collaboration' })).toHaveLength(1)
   expect(bridge.actOnCollaboration).not.toHaveBeenCalled()
   expect(task.status).toBe('waiting')
 })
@@ -631,40 +644,47 @@ it('keeps a previously accepted code review waiting when a newer input is Receiv
 it('reports plan availability only after the first complete plan has been submitted', async () => {
   const { props, run } = recordingFixture()
   run.status = 'running'
-  run.collaboration = { taskId: crypto.randomUUID(), kind: 'plan', stage: 'draft' }
+  run.collaboration = { taskId: crypto.randomUUID(), kind: 'plan', stage: 'plan' }
   delete run.workspaceChanges
   props.snapshot!.nativeContexts = []
   props.onPlanAvailable =
     vi.fn<NonNullable<ComponentProps<typeof ConversationView>['onPlanAvailable']>>()
   const task = collaborationTaskSchema.parse({
+    protocol: 'native-workflow-v1',
+    owner: 'codex',
+    automation: 'paused',
+    inputSequence: 0,
+    handledInputSequence: 0,
     id: run.collaboration.taskId,
     sessionId: props.session.id,
     runId: run.id,
     taskMessageId: run.userMessageId,
     kind: 'plan',
     revision: 1,
-    primary: 'codex',
-    drafter: 'codex',
-    implementer: 'claude',
+
     reviewer: 'claude',
     task: 'Draft ownership',
-    stage: 'draft',
+    stage: 'plan',
     actor: 'codex',
     status: 'running',
     planVersion: 0,
     discussionRounds: 0,
-    discussionHalf: false,
+
     reviewCycles: 0,
     repairAttempts: 0,
-    rereview: false,
-    nextCycle: false,
   })
   const read = vi.fn<DesktopBridge['getConversation']>().mockResolvedValue({
     ok: true,
     value: {
       scope: 'collaboration',
       sessionId: props.session.id,
-      view: { task, actionable: false, accepted: false, reportAvailable: false },
+      view: {
+        availableActions: [],
+        task,
+        actionable: false,
+        accepted: false,
+        reportAvailable: false,
+      },
     },
   })
   vi.stubGlobal('pact', { ...composerBridgeFixture(), getConversation: read })
@@ -673,7 +693,12 @@ it('reports plan availability only after the first complete plan has been submit
     expect(props.onPlanAvailable).toHaveBeenCalledWith(props.session.id, undefined),
   )
   expect(screen.queryByRole('button', { name: 'Open current plan' })).toBeNull()
-  task.plan = 'A submitted plan'
+  task.planReference = {
+    version: 1,
+    sourceRunId: run.id,
+    sourceMessageId: run.userMessageId,
+    document: { id: crypto.randomUUID(), sha256: 'a'.repeat(64), chars: 20, bytes: 20 },
+  }
   task.planVersion = 1
   task.status = 'waiting'
   run.status = 'completed'
@@ -686,6 +711,7 @@ it('reports plan availability only after the first complete plan has been submit
       sessionId: props.session.id,
       view: {
         task,
+        availableActions: [],
         actionable: true,
         accepted: true,
         reportAvailable: true,
@@ -712,7 +738,7 @@ it.each([
     const { props, run } = recordingFixture()
     delete run.workspaceChanges
     props.snapshot!.nativeContexts = []
-    run.collaboration = { taskId: crypto.randomUUID(), kind: 'plan', stage: 'discuss' }
+    run.collaboration = { taskId: crypto.randomUUID(), kind: 'plan', stage: 'plan_review' }
     const user = props.snapshot!.messages[0]!
     user.runId = run.id
     const visible = `@codex ${request}`
@@ -725,7 +751,13 @@ it.each([
         value: {
           scope: 'collaboration',
           sessionId: props.session.id,
-          view: { task: null, actionable: false, accepted: false, reportAvailable: false },
+          view: {
+            availableActions: [],
+            task: null,
+            actionable: false,
+            accepted: false,
+            reportAvailable: false,
+          },
         },
       }),
     })
@@ -817,16 +849,15 @@ it('preserves the visible row when an asynchronous offscreen card changes height
 })
 
 it.each([
-  { action: 'maintain_plan', actor: 'codex', inferred: false },
-  { action: 'review_plan', actor: 'claude', inferred: false },
-  { action: 'maintain_plan', actor: 'codex', inferred: true },
-  { action: 'review_plan', actor: 'claude', inferred: true },
+  { actor: 'codex', inferred: false },
+  { actor: 'claude', inferred: false },
+  { actor: 'codex', inferred: true },
+  { actor: 'claude', inferred: true },
 ] as const)(
-  'routes document-backed feedback through the single Send to $actor ($action, inferred: $inferred)',
-  async ({ action, actor, inferred }) => {
+  'routes document-backed feedback through the single Send to $actor (inferred: $inferred)',
+  async ({ actor, inferred }) => {
     const { task, run } = collaborationFixture()
-    delete task.plan
-    task.planDocument = {
+    task.planReference!.document = {
       id: crypto.randomUUID(),
       sha256: 'a'.repeat(64),
       bytes: 30000,
@@ -883,7 +914,6 @@ it.each([
         [],
         { type: 'agent', agentId: actor },
         [],
-        action,
       ),
     )
     expect(screen.queryByRole('button', { name: 'Review plan · Claude Code' })).toBeNull()
@@ -927,7 +957,7 @@ function fixture(): ComponentProps<typeof ConversationView> {
         primaryAgentId: 'codex',
         agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
         maxDiscussionRounds: 3,
-        runningMessagePolicy: 'next_round',
+
         maxReviewCycles: 3,
         maxRepairAttempts: 3,
       },

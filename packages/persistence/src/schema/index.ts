@@ -495,16 +495,7 @@ export const agentRuns = sqliteTable(
     }),
     collaborationKind: text('collaboration_kind', { enum: ['plan', 'build', 'review'] }),
     collaborationStage: text('collaboration_stage', {
-      enum: [
-        'draft',
-        'discuss',
-        'clarify',
-        'implement',
-        'supplement',
-        'review',
-        'respond',
-        'repair',
-      ],
+      enum: ['plan', 'plan_review', 'implement', 'code_review', 'respond', 'repair', 'reply'],
     }),
     id: text('id').primaryKey(),
     sessionId: text('session_id')
@@ -875,6 +866,7 @@ export const agentEventJournal = sqliteTable(
   },
   (table) => [
     primaryKey({ columns: [table.sessionId, table.sequence] }),
+    index('agent_event_journal_run_type_sequence').on(table.runId, table.eventType, table.sequence),
     index('agent_event_journal_reported_title')
       .on(table.sessionId)
       .where(
@@ -1040,6 +1032,39 @@ export const collaborationTasks = sqliteTable(
       .where(sql`${table.active} = 1`),
   ],
 )
+/** Native workflow turns bind small metadata to an immutable host-owned root. */
+export const workflowTurns = sqliteTable(
+  'workflow_turns',
+  {
+    runId: text('run_id')
+      .primaryKey()
+      .references(() => agentRuns.id, { onDelete: 'cascade' }),
+    taskId: text('task_id')
+      .notNull()
+      .references(() => collaborationTasks.id, { onDelete: 'cascade' }),
+    stage: text('stage', {
+      enum: ['plan', 'plan_review', 'implement', 'code_review', 'respond', 'repair', 'reply'],
+    }).notNull(),
+    actor: text('actor', { enum: ['claude', 'codex'] }).notNull(),
+    inputSequence: integer('input_sequence').notNull(),
+    authorizationJson: text('authorization_json').notNull(),
+    stateJson: text('state_json').notNull(),
+    planBodyId: text('plan_body_id').references(() => conversationBodyInputs.id),
+    planNativeId: text('plan_native_id'),
+    verdict: text('verdict', {
+      enum: ['accepted', 'changes_requested', 'needs_user', 'incomplete'],
+    }),
+    verdictConflict: integer('verdict_conflict', { mode: 'boolean' }).notNull().default(false),
+    reservation: text('reservation', {
+      enum: ['discussionRounds', 'reviewCycles', 'repairAttempts'],
+    }),
+    reportBodyId: text('report_body_id').references(() => conversationBodyInputs.id),
+    applied: integer('applied', { mode: 'boolean' }).notNull().default(false),
+    createdAt: text('created_at').notNull(),
+  },
+  (t) => [index('workflow_turns_task_created_idx').on(t.taskId, t.createdAt)],
+)
+
 export const collaborationTurns = sqliteTable(
   'collaboration_turns',
   {

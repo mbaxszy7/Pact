@@ -21,13 +21,13 @@ for (const actor of ['codex', 'claude'] as const)
       test.setTimeout(300_000)
       const ctx = await launchRealWorkspace(`real-required-plan-${actor}`)
       try {
-        await selectRealConfiguredEffort(ctx, [actor])
+        await selectRealConfiguredEffort(ctx, ['codex', 'claude'])
         await sendRealMessage(
           ctx,
-          '/plan Draft a small conceptual plan for documenting cancellation ownership. Scope: explain which owner cancels a pending request and releases its resources. Acceptance: document normal completion, cancellation and disposal in three concrete steps. This is planning only; do not inspect or modify files, run commands or delegate. The scope is fully specified.',
+          '/plan Draft a small conceptual plan for documenting cancellation ownership. Scope: explain which owner cancels a pending request and releases its resources. Acceptance: document normal completion, cancellation and disposal in three concrete steps. This is planning only; do not inspect or modify project files, run commands or delegate; the native plan document is permitted. The scope is fully specified.',
           actor,
         )
-        const snapshot = await waitForRealCompletion(ctx, 1).catch(async () => {
+        const snapshot = await waitForRealCompletion(ctx, 2).catch(async () => {
             const saved = await readRealConversation(ctx)
             let nativeErrors: unknown
             if (actor === 'codex' && saved.runs[0]?.nativeSessionId) {
@@ -62,16 +62,15 @@ for (const actor of ['codex', 'claude'] as const)
               ),
             )
           }),
-          run = snapshot.runs[0]!
+          run = snapshot.runs.find((candidate) => candidate.collaboration?.stage === 'plan')!
         expect(run).toMatchObject({
           agentId: actor,
           status: 'completed',
-          answerFormat: 'collaboration_envelope_v5',
         })
         const response = await ctx.page.evaluate(
-          async ({ sessionId, runId }) => {
+          async ({ sessionId }) => {
             const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
-            return bridge.getConversation({ scope: 'collaboration', sessionId, runId })
+            return bridge.getConversation({ scope: 'collaboration', sessionId })
           },
           { sessionId: ctx.sessionId, runId: run.id },
         )
@@ -80,11 +79,7 @@ for (const actor of ['codex', 'claude'] as const)
           throw new Error('The real plan result is unavailable.')
         const task = response.value.view.task!
         let sourceToolEvidence: unknown
-        if (
-          actor === 'codex' &&
-          !['waiting', 'questions'].includes(task.status) &&
-          run.nativeSessionId
-        ) {
+        if (actor === 'codex' && !['ready'].includes(task.status) && run.nativeSessionId) {
           const client = await ctx.fixture.openCodexClient()
           try {
             const native = await client.request('thread/turns/list', {
@@ -144,11 +139,11 @@ for (const actor of ['codex', 'claude'] as const)
           }
         }
         expect(
-          ['waiting', 'questions'],
+          ['ready'],
           JSON.stringify({
             status: task.status,
             notice: task.notice,
-            reportFailure: task.reportFailure,
+
             planVersion: task.planVersion,
             sourceToolEvidence,
             answer: ctx.fixture
@@ -158,8 +153,8 @@ for (const actor of ['codex', 'claude'] as const)
               .slice(0, 6000),
           }),
         ).toContain(task.status)
-        expect(task.reportFailure).toBeUndefined()
-        expect(task.planDocument).toBeDefined()
+        expect(task.automation).toBeDefined()
+        expect(task.planReference?.document).toBeDefined()
         const plan = await ctx.page.evaluate(
           async ({ sessionId, runId, document }) => {
             const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
@@ -184,26 +179,27 @@ for (const actor of ['codex', 'claude'] as const)
           {
             sessionId: ctx.sessionId,
             runId: task.planReference!.sourceRunId,
-            document: task.planDocument!,
+            document: task.planReference!.document,
           },
         )
         expect(plan.trim().length).toBeGreaterThan(0)
         expect(task.planVersion).toBe(1)
-        expect(task.planAuthor).toBe(actor)
+        expect(task.owner).toBe(actor)
         const card = ctx.page.getByRole('region', { name: 'Pact collaboration result' })
-        await expect(card).toHaveCount(1)
-        await ctx.page
-          .getByRole('navigation', { name: 'Task context' })
-          .getByRole('button', { name: 'Plan', exact: true })
-          .click()
-        const panel = ctx.page.getByRole('region', { name: 'Current plan', exact: true })
+        await expect(card).toHaveCount(2)
+        await ctx.page.getByRole('button', { name: 'Open plan', exact: true }).click()
+        const panel = ctx.page.getByRole('region', { name: /Current plan|Plan source/ })
         await expect(panel).toBeVisible()
         await expect(panel.locator('[data-pact-plan-run-id]')).toContainText(
           markdownVisibleProjection(plan).trim().slice(0, 40),
         )
         await expect(panel).toContainText('Select text to add a Comment')
         await expect(card.locator('[data-pact-plan-run-id]')).toHaveCount(0)
-        expect(snapshot.runs).toHaveLength(1)
+        expect(snapshot.runs).toHaveLength(2)
+        expect(
+          snapshot.runs.find((candidate) => candidate.collaboration?.stage === 'plan_review')
+            ?.agentId,
+        ).toBe(actor === 'codex' ? 'claude' : 'codex')
       } finally {
         await closeRealWorkspace(ctx)
       }

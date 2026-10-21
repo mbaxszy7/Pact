@@ -4,8 +4,6 @@ import type {
   AgentRun,
   CollaborationSession,
   CollaborationTask,
-  CollaborationTodo,
-  CollaborationTodoDelta,
   ConversationPage,
 } from '@pact/contracts'
 
@@ -13,7 +11,7 @@ import { collaborationTaskSchema } from '@pact/contracts'
 
 const timestamp = '2026-10-10T01:00:00.000Z'
 
-/** A settled v5 root Turn, with the host's current-plan reference kept separate from its report. */
+/** A settled native workflow Turn with an immutable current-plan reference. */
 export function collaborationFixture() {
   const sessionId = crypto.randomUUID()
   const run: AgentRun = {
@@ -33,46 +31,35 @@ export function collaborationFixture() {
     updatedAt: timestamp,
   }
   const planReference = {
-    type: 'unchanged' as const,
     version: 2,
     sourceRunId: run.id,
-    sha256: 'a'.repeat(64),
+    sourceMessageId: run.userMessageId,
+    document: { id: crypto.randomUUID(), sha256: 'a'.repeat(64), bytes: 100, chars: 100 },
   }
   const task = collaborationTaskSchema.parse({
+    protocol: 'native-workflow-v1',
     id: crypto.randomUUID(),
     sessionId,
     runId: run.id,
     taskMessageId: run.userMessageId,
     kind: 'plan',
     revision: 3,
-    primary: 'codex',
-    drafter: 'codex',
-    implementer: 'claude',
+    owner: 'codex',
     reviewer: 'claude',
     task: 'Improve cancellation ownership.',
-    stage: 'discuss',
+    stage: 'plan',
     actor: 'codex',
     status: 'waiting',
-    plan: 'The unique current plan is maintained in the context pane.',
+    automation: 'paused',
+    inputSequence: 0,
+    handledInputSequence: 0,
     planReference,
     planVersion: 2,
-    planAuthor: 'codex',
     discussionRounds: 1,
-    discussionHalf: false,
     reviewCycles: 0,
     repairAttempts: 0,
-    rereview: false,
-    nextCycle: false,
-    result: {
-      submission: 'plan_submission',
-      outcome: 'complete',
-      summary: 'Cancellation ownership clarified.',
-      plan: planReference,
-      todoDeltas: [],
-      inputResponses: [],
-    },
   })
-  run.collaboration = { taskId: task.id, kind: 'plan', stage: 'discuss' }
+  run.collaboration = { taskId: task.id, kind: 'plan', stage: 'plan', planVersion: 2 }
   const session: CollaborationSession = {
     id: sessionId,
     projectId: crypto.randomUUID(),
@@ -90,7 +77,6 @@ export function collaborationFixture() {
       maxDiscussionRounds: 6,
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
-      runningMessagePolicy: 'next_round' as const,
     },
   }
   const props = {
@@ -115,52 +101,47 @@ export function reportPage(
       actionable: true,
       accepted: true,
       reportAvailable: true,
-      feedbackCount: task.result?.todoDeltas.length ?? 0,
-      feedbackOffset: 0,
+      availableActions: ['resume'],
       documents: [],
       ...overrides,
     },
   }
 }
 
-export const todoDelta = (id: string): CollaborationTodoDelta => ({
-  todoId: id,
-  expectedRevision: 0,
-  operation: 'create',
-  kind: 'opinion',
-  title: `Finding ${id}`,
-  detail: `Impact for ${id}.`,
-  recommendation: `Resolve ${id}.`,
-  evidence: `Evidence for ${id}.`,
-  question: null,
-  resolutionKind: null,
-  reason: 'Review found an unresolved issue.',
-  mergeTargetId: null,
-  userSourceIds: [],
-  evidenceRefs: [],
-})
-
-export function todoFixture(
+export function markdownPage(
   task: CollaborationTask,
-  id: string,
-  overrides: Partial<CollaborationTodo> = {},
-): CollaborationTodo {
+  text: string,
+  source = task.review?.document ?? task.planReference!.document,
+): Extract<ConversationPage, { scope: 'collaboration-markdown' }> {
   return {
-    taskId: task.id,
-    id,
-    revision: 1,
-    kind: 'opinion',
-    status: 'open',
-    title: `Finding ${id}`,
-    author: 'claude',
-    answerResolver: null,
-    needsUserAnswer: false,
-    question: null,
-    resolutionKind: null,
-    resolutionReasonPreview: '',
-    document: { id: crypto.randomUUID(), sha256: 'b'.repeat(64), bytes: 1000, chars: 1000 },
-    sourceRunId: task.runId,
-    sourceMessageId: task.taskMessageId,
-    ...overrides,
+    scope: 'collaboration-markdown',
+    sessionId: task.sessionId,
+    document: source,
+    basis: 'markdown-visible-v2',
+    visibleStart: 0,
+    visibleEnd: text.length,
+    offset: 0,
+    previousOffset: null,
+    nextOffset: null,
+    tree: {
+      type: 'root',
+      children: [
+        {
+          type: 'element',
+          tagName: 'p',
+          children: [
+            {
+              type: 'element',
+              tagName: 'span',
+              properties: {
+                'data-pact-projection-start': 0,
+                'data-pact-projection-end': text.length,
+              },
+              children: [{ type: 'text', value: text }],
+            },
+          ],
+        },
+      ],
+    },
   }
 }

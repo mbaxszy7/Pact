@@ -10,7 +10,11 @@ import {
 } from '@pact/contracts'
 
 import { markdownProjectionRehypePlugin } from '../../../../shared/message-anchor-text'
-import { MessageSelectionSurface, type MessageTextSelection } from './MessageSelectionSurface'
+import {
+  MessageSelectionSurface,
+  type MessageTextSelection,
+  type DocumentSelectionAdapter,
+} from './MessageSelectionSurface'
 
 export interface ProjectFileTarget {
   path: string
@@ -30,6 +34,7 @@ interface MessageMarkdownProps {
   onOpenProjectFile: (target: ProjectFileTarget) => void
   messageId?: string | undefined
   onCreateComment?: ((selection: MessageTextSelection) => void) | undefined
+  documentSelection?: DocumentSelectionAdapter | undefined
 }
 
 export const MessageMarkdown = memo(function MessageMarkdown({
@@ -39,6 +44,7 @@ export const MessageMarkdown = memo(function MessageMarkdown({
   onOpenProjectFile,
   messageId,
   onCreateComment,
+  documentSelection,
 }: MessageMarkdownProps): React.JSX.Element {
   const openProjectFileRef = useRef(onOpenProjectFile)
   useLayoutEffect(() => {
@@ -106,7 +112,11 @@ export const MessageMarkdown = memo(function MessageMarkdown({
     [content, tree, markdownComponents, remarkPlugins, rehypePlugins],
   )
   return (
-    <MessageSelectionSurface messageId={messageId} onCreateComment={onCreateComment}>
+    <MessageSelectionSurface
+      messageId={messageId}
+      onCreateComment={onCreateComment}
+      documentSelection={documentSelection}
+    >
       {renderedMarkdown}
     </MessageSelectionSurface>
   )
@@ -125,9 +135,20 @@ function renderProjectionTree(
   key = 'root',
 ): React.ReactNode {
   if (node.type === 'text') return node.value ?? ''
-  const children = (node.children ?? []).map((child, index) =>
-    renderProjectionTree(child, components, `${key}:${index}`),
-  )
+  const children = (node.children ?? []).map((child, index) => {
+    const properties = child.properties
+    const identity =
+      properties?.['data-pact-projection-start'] !== undefined
+        ? `text:${String(properties['data-pact-projection-start'])}:${String(properties['data-pact-projection-end'])}`
+        : properties?.['data-pact-source-start'] !== undefined
+          ? `alias:${String(properties['data-pact-source-start'])}:${String(properties['data-pact-source-end'])}`
+          : properties?.['data-pact-fragment-start'] !== undefined
+            ? `fragment:${String(properties['data-pact-fragment-start'])}:${String(properties['data-pact-fragment-end'])}`
+            : properties?.['data-pact-node-id'] !== undefined
+              ? `node:${String(properties['data-pact-node-id'])}`
+              : `child:${index}`
+    return renderProjectionTree(child, components, `${key}:${identity}`)
+  })
   if (node.type === 'root') return children
   const tag = node.tagName ?? 'span'
   const props: Record<string, unknown> = { ...node.properties, key }

@@ -3,7 +3,11 @@ import { request as httpRequest, type ClientRequest } from 'node:http'
 import { setImmediate as immediate } from 'node:timers/promises'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { collaborationSourceReadSchema, type CollaborationSourceReadResult } from '@pact/contracts'
+import {
+  collaborationSourceReadSchema,
+  type CollaborationSourceReadResult,
+  type CollaborationTask,
+} from '@pact/contracts'
 
 import { planRunInput } from './collaboration-fixture.test-support.js'
 import { PactPeerToolServer } from './pact-peer-tool-server.js'
@@ -64,14 +68,7 @@ afterEach(async () => {
 })
 
 describe('PactPeerToolServer', () => {
-  it.each([
-    'todos',
-    'decisions',
-    'identities',
-    'required_inputs',
-    'handoff_sources',
-    'batch',
-  ] as const)(
+  it.each(['inputs', 'handoff_sources', 'batch'] as const)(
     'reads the frozen %s index when its request also carries a contextual document reference',
     async (source) => {
       const server = new PactPeerToolServer()
@@ -400,4 +397,307 @@ describe('PactPeerToolServer', () => {
     expect(response.result.isError).toBe(true)
     expect(response.result.structuredContent).toBeUndefined()
   })
+})
+
+function workflowTask(fields: Partial<CollaborationTask> = {}): CollaborationTask {
+  return { ...planRunInput('codex').promptEnvelope.collaboration!, ...fields }
+}
+async function workflowCall(url: string, name: string, args: unknown) {
+  return jsonRpcResult(
+    await fetch(url, {
+      method: 'POST',
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      }),
+    }).then((response) => response.json()),
+  ).result
+}
+const workflowQuestions = [
+  {
+    prompt: 'Which scope?',
+    selection: 'single' as const,
+    options: [{ label: 'Current' }, { label: 'All' }],
+  },
+]
+
+describe('workflow tool root capabilities', () => {
+  it.each(['plan_review', 'code_review'] as const)(
+    'authenticates %s against the host reviewer and rejects model-supplied authority',
+    async (stage) => {
+      const server = new PactPeerToolServer()
+      servers.push(server)
+      const url = await server.start(),
+        task = workflowTask({ stage, actor: 'claude' }),
+        receipt = server.beginTurn('codex', true, task)
+      const valid = { verdict: 'accepted' }
+      expect(await workflowCall(`${url}/${receipt}`, 'submit_review', valid)).toEqual({
+        isError: false,
+        structuredContent: {
+          pactReview: { verdict: 'accepted', receipt: server.capabilityReceipt },
+        },
+      })
+      for (const authority of [
+        { actor: 'claude' },
+        { stage },
+        { runId: task.runId },
+        { taskId: task.id },
+        { inputSequence: 0 },
+        { receipt },
+      ]) {
+        expect(server.acceptReview({ ...valid, ...authority }, receipt)).toBeUndefined()
+      }
+      expect(await workflowCall(url, 'submit_review', { ...valid, actor: 'claude' })).toEqual({
+        isError: true,
+        structuredContent: undefined,
+      })
+      expect(server.acceptReview(valid, randomUUID())).toBeUndefined()
+      const wrongActor = server.beginTurn('codex', false, { ...task, actor: 'codex' })
+      expect(server.acceptReview(valid, wrongActor)).toBeUndefined()
+      expect((await workflowCall(url, 'submit_review', valid)).isError).toBe(true)
+    },
+  )
+
+  it.each(['plan', 'implement', 'respond', 'repair', 'reply'] as const)(
+    'does not admit a review verdict from %s',
+    async (stage) => {
+      const server = new PactPeerToolServer()
+      servers.push(server)
+      const url = await server.start(),
+        receipt = server.beginTurn('codex', false, workflowTask({ stage, actor: 'claude' }))
+      expect(server.acceptReview({ verdict: 'accepted' }, receipt)).toBeUndefined()
+      expect((await workflowCall(url, 'submit_review', { verdict: 'accepted' })).isError).toBe(true)
+    },
+  )
+
+  it('validates bounded question content and requires questions exactly for needs_user', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start(),
+      receipt = server.beginTurn(
+        'codex',
+        false,
+        workflowTask({ stage: 'plan_review', actor: 'claude' }),
+      )
+    expect(
+      await workflowCall(url, 'submit_review', {
+        verdict: 'needs_user',
+        questions: workflowQuestions,
+      }),
+    ).toEqual({
+      isError: false,
+      structuredContent: {
+        pactReview: {
+          verdict: 'needs_user',
+          questions: workflowQuestions,
+          receipt: server.capabilityReceipt,
+        },
+      },
+    })
+    for (const invalid of [
+      { verdict: 'needs_user' },
+      { verdict: 'accepted', questions: workflowQuestions },
+      { verdict: 'needs_user', questions: [] },
+      {
+        verdict: 'needs_user',
+        questions: Array.from({ length: 4 }, () => ({ ...workflowQuestions[0] })),
+      },
+      { verdict: 'needs_user', questions: [{ ...workflowQuestions[0], prompt: 'x'.repeat(2049) }] },
+      {
+        verdict: 'needs_user',
+        questions: [{ ...workflowQuestions[0], options: [{ label: 'Only option' }] }],
+      },
+      { verdict: 'needs_user', questions: [{ ...workflowQuestions[0], id: 'q1' }] },
+    ])
+      expect(server.acceptReview(invalid, receipt)).toBeUndefined()
+  })
+
+  it('permits planner questions but never a planner claim that input was processed', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start(),
+      receipt = server.beginTurn('claude', false, workflowTask())
+    expect(server.acceptInputResult({ outcome: 'processed' }, receipt)).toBeUndefined()
+    expect((await workflowCall(url, 'submit_input_result', { outcome: 'processed' })).isError).toBe(
+      true,
+    )
+    expect(
+      await workflowCall(url, 'submit_input_result', {
+        outcome: 'needs_user',
+        questions: workflowQuestions,
+      }),
+    ).toEqual({
+      isError: false,
+      structuredContent: {
+        pactInputResult: {
+          outcome: 'needs_user',
+          questions: workflowQuestions,
+          receipt: server.capabilityReceipt,
+        },
+      },
+    })
+    expect(server.acceptInputResult({ outcome: 'needs_user' }, receipt)).toBeUndefined()
+    expect(
+      server.acceptInputResult(
+        { outcome: 'needs_user', questions: workflowQuestions, actor: 'codex' },
+        receipt,
+      ),
+    ).toBeUndefined()
+  })
+
+  it('requires host pending input and a reply stage for processed observations', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start(),
+      task = workflowTask({
+        kind: 'build',
+        stage: 'reply',
+        inputProcessing: { pending: { inputId: randomUUID(), inputSequence: 1 } },
+      })
+    const receipt = server.beginTurn('claude', false, task)
+    expect(await workflowCall(url, 'submit_input_result', { outcome: 'processed' })).toEqual({
+      isError: false,
+      structuredContent: {
+        pactInputResult: { outcome: 'processed', receipt: server.capabilityReceipt },
+      },
+    })
+    for (const invalid of [
+      { outcome: 'processed', questions: workflowQuestions },
+      { outcome: 'incomplete' },
+      { outcome: 'processed', runId: task.runId },
+    ])
+      expect(server.acceptInputResult(invalid, receipt)).toBeUndefined()
+    const noPending = server.beginTurn('claude', false, { ...task, inputProcessing: {} })
+    expect(server.acceptInputResult({ outcome: 'processed' }, noPending)).toBeUndefined()
+    const notReply = server.beginTurn('claude', false, { ...task, stage: 'implement' })
+    expect(server.acceptInputResult({ outcome: 'processed' }, notReply)).toBeUndefined()
+    expect((await workflowCall(url, 'submit_input_result', { outcome: 'processed' })).isError).toBe(
+      true,
+    )
+  })
+
+  it('preserves repeated and conflicting observations for the durable settlement owner instead of consuming a one-shot quota', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start()
+    const receipt = server.beginTurn(
+      'codex',
+      false,
+      workflowTask({ stage: 'plan_review', actor: 'claude' }),
+    )
+    const first = { verdict: 'accepted' },
+      conflict = { verdict: 'changes_requested' }
+    expect(server.acceptReview(first, receipt)).toEqual(first)
+    expect(server.acceptReview(first, receipt)).toEqual(first)
+    expect(server.acceptReview(conflict, receipt)).toEqual(conflict)
+    expect((await workflowCall(url, 'submit_review', conflict)).structuredContent).toEqual({
+      pactReview: { ...conflict, receipt: server.capabilityReceipt },
+    })
+    const reply = server.beginTurn(
+      'claude',
+      false,
+      workflowTask({
+        kind: 'build',
+        stage: 'reply',
+        inputProcessing: { pending: { inputId: randomUUID(), inputSequence: 1 } },
+      }),
+    )
+    expect(server.acceptInputResult({ outcome: 'processed' }, reply)).toEqual({
+      outcome: 'processed',
+    })
+    expect(server.acceptInputResult({ outcome: 'processed' }, reply)).toEqual({
+      outcome: 'processed',
+    })
+    expect(
+      server.acceptInputResult({ outcome: 'needs_user', questions: workflowQuestions }, reply),
+    ).toEqual({ outcome: 'needs_user', questions: workflowQuestions })
+  })
+
+  it('revokes review and input receipts at cancellation, retaining no authority in cached tool names', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start(),
+      first = server.beginTurn(
+        'codex',
+        false,
+        workflowTask({ stage: 'plan_review', actor: 'claude' }),
+      )
+    server.endTurn(first)
+    expect(server.acceptReview({ verdict: 'accepted' }, first)).toBeUndefined()
+    expect((await workflowCall(url, 'submit_review', { verdict: 'accepted' })).isError).toBe(true)
+    expect((await fetch(`${url}/${first}`, { method: 'POST', body: '{}' })).status).toBe(404)
+    const next = server.beginTurn('claude', false, workflowTask())
+    server.endTurn(first)
+    expect(
+      server.acceptInputResult({ outcome: 'needs_user', questions: workflowQuestions }, next),
+    ).toBeDefined()
+    server.endTurn(next)
+    expect(
+      server.acceptInputResult({ outcome: 'needs_user', questions: workflowQuestions }, next),
+    ).toBeUndefined()
+    expect(
+      (
+        await workflowCall(url, 'submit_input_result', {
+          outcome: 'needs_user',
+          questions: workflowQuestions,
+        })
+      ).isError,
+    ).toBe(true)
+  })
+
+  it.each(['submit_review', 'submit_input_result'] as const)(
+    'rejects delayed %s requests after root replacement',
+    async (name) => {
+      const server = new PactPeerToolServer()
+      servers.push(server)
+      const url = await server.start()
+      const task =
+        name === 'submit_review'
+          ? workflowTask({ stage: 'plan_review', actor: 'claude' })
+          : workflowTask()
+      const args =
+        name === 'submit_review'
+          ? { verdict: 'accepted' }
+          : { outcome: 'needs_user', questions: workflowQuestions }
+      server.beginTurn('claude', false, task)
+      const body = JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      })
+      const requests: ClientRequest[] = []
+      const replies = Array.from(
+        { length: 4 },
+        () =>
+          new Promise<unknown>((resolve, reject) => {
+            const request = httpRequest(
+              url,
+              { method: 'POST', headers: { 'content-length': Buffer.byteLength(body) } },
+              (response) => {
+                let text = ''
+                response.on('data', (chunk: Buffer) => {
+                  text += chunk.toString('utf8')
+                })
+                response.on('end', () => resolve(JSON.parse(text)))
+              },
+            )
+            request.on('error', reject)
+            request.write(body.slice(0, 8))
+            requests.push(request)
+          }),
+      )
+      await immediate()
+      await immediate()
+      expect((await fetch(url, { method: 'POST', body })).status).toBe(429)
+      const current = server.beginTurn('claude', false, task)
+      for (const request of requests) request.end(body.slice(8))
+      expect(
+        (await Promise.all(replies)).map((value) => jsonRpcResult(value).result.isError),
+      ).toEqual([true, true, true, true])
+      expect((await workflowCall(`${url}/${current}`, name, args)).isError).toBe(false)
+    },
+  )
 })

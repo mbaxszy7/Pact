@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-14T12:28:07.341Z",
+  "generatedAt": "2026-10-19T15:02:41.804742+00:00",
   "title": "Design System: Pact Desktop",
   "extensions": {
     "colorMeta": {
@@ -259,6 +259,11 @@
       {
         "name": "The Composer and Recovery Rule",
         "body": "Composer starts at least two lines high, with atomic inline Skill/route units, Comment/answer chips above and image controls below full-width body. Observed response replaces Send with Stop without auto-sending the next draft. Image modal uses directional navigation, bounded filmstrip, 180ms reduced-motion-aware transition and close focus return, without zoom controls. Recovery is one concise card showing affected Agents and their currently valid action.",
+        "section": "components"
+      },
+      {
+        "name": "Frozen task permission help",
+        "body": "Keep permission labels and layout unchanged. Existing tooltip and menu help distinguish the next-task selection from the active Run’s frozen choice and project read-only duties. Full access suppresses tool-approval cards without bypassing task or native policy; user questions remain independent. Published plans do not hide their ordinary author response.",
         "section": "components"
       }
     ],

@@ -12,17 +12,14 @@ export const messageCommentAnchorSchema = z
   .strictObject({
     type: z.literal('message'),
     messageId: z.string().uuid(),
-    // A bounded structured plan belongs to the source Run, not the ordinary answer body.
+    // A native plan artifact belongs to its original Run, independent of the answer body.
     plan: z
       .strictObject({ runId: z.string().uuid(), version: z.number().int().positive() })
       .optional(),
     report: z
       .strictObject({
         runId: z.string().uuid(),
-        target: z.discriminatedUnion('type', [
-          z.strictObject({ type: z.literal('summary') }),
-          z.strictObject({ type: z.literal('feedback'), id: z.string().min(1).max(80) }),
-        ]),
+        target: z.strictObject({ type: z.literal('summary') }),
       })
       .optional(),
     contentHash: z.string().regex(/^[a-f\d]{64}$/iu),
@@ -63,35 +60,36 @@ export const fileCommentAnchorSchema = z
   )
 export type FileCommentAnchor = z.infer<typeof fileCommentAnchorSchema>
 
-export const todoCommentAnchorSchema = z.strictObject({
-  type: z.literal('todo'),
-  taskId: z.string().uuid(),
-  todoId: z.string().min(1).max(80),
-  todoRevision: z.number().int().positive(),
-  quote: quoteSchema,
-  question: z
-    .strictObject({
-      id: z.string().min(1).max(80),
-      revision: z.number().int().positive(),
-      optionIndex: z.number().int().nonnegative().optional(),
-    })
-    .optional(),
-  selection: z
-    .strictObject({
-      contentHash: z.string().regex(/^[a-f\d]{64}$/iu),
-      textBasis: z.enum([MESSAGE_ANCHOR_TEXT_BASIS, 'plain-visible-v1']),
-      startOffset: z.number().int().nonnegative(),
-      endOffset: z.number().int().positive(),
-    })
-    .optional(),
+const creatableCommentAnchorSchema = z.discriminatedUnion('type', [
+  messageCommentAnchorSchema,
+  fileCommentAnchorSchema,
+])
+export const unavailableCommentAnchorSchema = z.strictObject({
+  type: z.literal('unavailable'),
+  quote: z.string().max(MAX_COMMENT_QUOTE_LENGTH),
+  reason: z.string().min(1).max(512),
 })
-export type TodoCommentAnchor = z.infer<typeof todoCommentAnchorSchema>
 export const commentAnchorSchema = z.discriminatedUnion('type', [
   messageCommentAnchorSchema,
   fileCommentAnchorSchema,
-  todoCommentAnchorSchema,
+  unavailableCommentAnchorSchema,
 ])
 export type CommentAnchor = z.infer<typeof commentAnchorSchema>
+
+/** Retired sources remain readable snapshots; this does not restore their capabilities. */
+export function storedCommentAnchor(value: unknown): CommentAnchor {
+  const current = commentAnchorSchema.safeParse(value)
+  if (current.success) return current.data
+  const quote =
+    value && typeof value === 'object' && 'quote' in value && typeof value.quote === 'string'
+      ? value.quote
+      : ''
+  return unavailableCommentAnchorSchema.parse({
+    type: 'unavailable',
+    quote,
+    reason: 'This saved source cannot be opened in this version. Its original record is preserved.',
+  })
+}
 
 export const anchoredCommentSchema = z.strictObject({
   id: z.string().uuid(),
@@ -114,12 +112,11 @@ export const commentDraftSaveInputSchema = z.discriminatedUnion('mode', [
     commentId: z.string().uuid(),
     expectedCommentsRevision: z.number().int().nonnegative(),
     body: commentBodySchema,
-    anchor: commentAnchorSchema,
+    anchor: creatableCommentAnchorSchema,
   }),
   z.strictObject({
     mode: z.literal('edit'),
     requestId: z.string().uuid().optional(),
-    anchor: todoCommentAnchorSchema.optional(),
     sessionId: z.string().uuid(),
     commentId: z.string().uuid(),
     expectedCommentsRevision: z.number().int().nonnegative(),
@@ -150,7 +147,7 @@ export const commentSourceResolutionSchema = z.discriminatedUnion('status', [
   z.strictObject({
     status: z.literal('unavailable'),
     commentId: z.string().uuid(),
-    quote: quoteSchema,
+    quote: z.string().max(MAX_COMMENT_QUOTE_LENGTH),
     reason: z.string().min(1),
   }),
 ])

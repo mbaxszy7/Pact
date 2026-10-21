@@ -509,9 +509,6 @@ async function changeSettingsFields(
     .getByRole('spinbutton', { name: 'Maximum discussion rounds', exact: true })
     .fill(String(settings.maxDiscussionRounds))
   await scope
-    .getByRole('combobox', { name: 'Messages sent during a run', exact: true })
-    .selectOption(settings.runningMessagePolicy)
-  await scope
     .getByRole('spinbutton', { name: 'Maximum review cycles', exact: true })
     .fill(String(settings.maxReviewCycles))
   await scope

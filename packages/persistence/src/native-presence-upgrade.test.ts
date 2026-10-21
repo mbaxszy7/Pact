@@ -76,7 +76,7 @@ it('upgrades the real 0060 schema through archive and native presence without lo
         primaryAgentId: 'codex',
         agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
         maxDiscussionRounds: 3,
-        runningMessagePolicy: 'next_round',
+
         maxReviewCycles: 3,
         maxRepairAttempts: 3,
       },

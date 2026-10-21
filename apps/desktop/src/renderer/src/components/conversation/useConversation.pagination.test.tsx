@@ -1150,3 +1150,115 @@ it('does not erase a new interrupted partial reply when an older around-page set
   })
   fixture.client.clear()
 })
+
+it('keeps stale decision answers and the ordinary draft across session navigation until explicitly merged', async () => {
+  const f = historyFixture()
+  try {
+    await waitFor(() => expect(f.result.current.snapshot).toBeDefined())
+    const decision = {
+      reference: {
+        taskId: crypto.randomUUID(),
+        runId: crypto.randomUUID(),
+        decisionInputSequence: 1,
+        expectedInputSequence: 1,
+      },
+      questions: [
+        {
+          id: 'q1',
+          prompt: 'Delivery?',
+          selection: 'single' as const,
+          options: [
+            { id: 'o1', label: 'Queue' },
+            { id: 'o2', label: 'Steer' },
+          ],
+        },
+      ],
+      answers: { q1: { optionIds: ['o1'], text: 'After review' } },
+    }
+    act(() => f.result.current.setComposer('Ordinary draft'))
+    act(() => expect(f.result.current.history.setDecisionDraft?.(decision)).toBe(true))
+    const changed = {
+      ...decision,
+      reference: { ...decision.reference, runId: crypto.randomUUID() },
+    }
+    act(() => expect(f.result.current.history.setDecisionDraft?.(changed)).toBe(false))
+    f.rerender({ selected: undefined })
+    f.rerender({ selected: f.page().sessionId })
+    await waitFor(() => expect(f.result.current.history.decisionDraft).toEqual(decision))
+    expect(f.result.current.composer).toBe('Ordinary draft')
+    act(() => expect(f.result.current.history.clearDecisionDraft?.(true)).toBe(true))
+    expect(f.result.current.history.decisionDraft).toBeUndefined()
+    expect(f.result.current.composer).toContain('Ordinary draft\n\nQuestion: Delivery?')
+    expect(f.result.current.composer).toContain('Selected: Queue')
+    expect(f.result.current.composer).toContain('After review')
+  } finally {
+    f.unmount()
+    f.client.clear()
+  }
+})
+
+it.each([true, false])(
+  'sends only decision answers and preserves the ordinary draft (acknowledged: %s)',
+  async (acknowledged) => {
+    const f = historyFixture()
+    try {
+      await waitFor(() => expect(f.result.current.snapshot).toBeDefined())
+      const decision = {
+        reference: {
+          taskId: crypto.randomUUID(),
+          runId: crypto.randomUUID(),
+          decisionInputSequence: 1,
+          expectedInputSequence: 1,
+        },
+        questions: [{ id: 'q1', prompt: 'Delivery?', selection: 'single' as const }],
+        answers: { q1: { optionIds: [], text: 'After review' } },
+      }
+      const send = vi.fn<DesktopBridge['sendConversationMessage']>().mockResolvedValue(
+        acknowledged
+          ? {
+              ok: true,
+              value: {
+                version: 'conversation-patch-v1',
+                sessionId: f.page().sessionId,
+                observation: { ...f.page().observation, sequence: 2 },
+                session: f.page().header.session,
+                messages: [],
+                activities: [],
+                runs: [],
+                activityStates: [],
+              },
+            }
+          : { ok: false, error: { code: 'CONFLICT', message: 'Request changed.' } },
+      )
+      window.pact.sendConversationMessage = send
+      act(() => f.result.current.setComposer('Unsent ordinary draft'))
+      act(() => expect(f.result.current.history.setDecisionDraft?.(decision)).toBe(true))
+      await act(async () =>
+        expect(
+          await f.result.current.send(
+            'Unsent ordinary draft',
+            [crypto.randomUUID()],
+            { type: 'agent', agentId: 'claude' },
+            [],
+            decision,
+          ),
+        ).toBe(acknowledged),
+      )
+      expect(send).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          replyToDecision: decision.reference,
+          content: 'Replies to your questions:\nQuestion: Delivery?\nMy answer: After review',
+          freezeDrafts: false,
+          commentIds: [],
+        }),
+      )
+      expect(send.mock.calls[0]?.[0]).not.toHaveProperty('route')
+      expect(send.mock.calls[0]?.[0]).not.toHaveProperty('imageIds')
+      expect(f.result.current.composer).toBe('Unsent ordinary draft')
+      expect(f.result.current.history.decisionDraft).toEqual(acknowledged ? undefined : decision)
+    } finally {
+      f.unmount()
+      f.client.clear()
+    }
+  },
+)

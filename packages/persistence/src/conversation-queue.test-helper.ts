@@ -14,7 +14,7 @@ const settings = {
   primaryAgentId: 'codex',
   agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
   maxDiscussionRounds: 6,
-  runningMessagePolicy: 'immediate_safe_point',
+
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
 } as const
@@ -72,23 +72,22 @@ export async function createQueueFixture(filePath = ':memory:', directoryPath = 
           sessionId,
           kind: 'plan',
           revision: 0,
-          primary: 'codex',
-          drafter: 'codex',
-          implementer: 'claude',
-          reviewer: 'codex',
+          protocol: 'native-workflow-v1',
+          owner: 'codex',
+          reviewer: 'claude',
+          automation: 'active',
+          inputSequence: 0,
+          handledInputSequence: 0,
           task: 'Review scope.',
           taskMessageId: clientMessageId,
-          stage: 'draft',
+          stage: 'plan',
           actor: 'codex',
           status: 'running',
           runId: clientMessageId,
           planVersion: 0,
           discussionRounds: 0,
-          discussionHalf: false,
           reviewCycles: 0,
           repairAttempts: 0,
-          rereview: false,
-          nextCycle: false,
         })
       : undefined
     const { run } = repo().beginRun({
@@ -223,7 +222,6 @@ export async function createQueueFixture(filePath = ':memory:', directoryPath = 
         ...proof(run),
         agentId: 'codex',
         requestId: run.id,
-        ...(run.answerFormat ? { answerFormat: run.answerFormat } : {}),
       },
     })
     repo().applyEvent(sessionId, run.id, {

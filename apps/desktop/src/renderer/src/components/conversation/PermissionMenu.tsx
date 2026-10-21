@@ -35,7 +35,7 @@ const modes = {
   },
   full: {
     label: 'Full access',
-    description: 'Broad access without routine approval prompts.',
+    description: 'No tool-approval prompts. Task and native policy limits still apply.',
     Icon: ShieldAlert,
   },
 }
@@ -44,7 +44,7 @@ function focusConfirmationCancel(button: HTMLButtonElement | null): void {
   button?.focus()
 }
 
-/** One next-task choice; the native runtime still owns every live approval. */
+/** One next-task choice, with the active Run's frozen scope described in existing help. */
 export function PermissionMenu({
   session,
   agent = session.settings.primaryAgentId,
@@ -94,6 +94,18 @@ export function PermissionMenu({
   const selected =
     session.settings.permissionModes?.[agent] ?? (agent === 'claude' ? 'ask' : 'native')
   const { label, Icon } = modes[selected]
+  const current =
+    run?.agentId === agent && (busy || ['starting', 'running', 'recovering'].includes(run.status))
+      ? run
+      : undefined
+  const currentMode = current
+    ? modes[current.permissionMode ?? (agent === 'claude' ? 'ask' : 'native')].label
+    : undefined
+  const readOnly =
+    current?.collaboration && !['implement', 'repair'].includes(current.collaboration.stage)
+  const currentScope = currentMode
+    ? `Current task: ${currentMode}.${readOnly ? ' Project changes are blocked during this planning or review task.' : ''}`
+    : ''
   const pending =
     run?.agentId === agent &&
     (busy || ['starting', 'running', 'recovering'].includes(run.status)) &&
@@ -143,8 +155,8 @@ export function PermissionMenu({
         type="button"
         popoverTarget={id}
         disabled={disabled || saving}
-        title="Permissions for the next task"
-        aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} permissions: ${label}`}
+        title={`Permissions for the next task: ${label}.${currentScope ? ` ${currentScope}` : ''}`}
+        aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} permissions for the next task: ${label}`}
         aria-haspopup="menu"
         aria-expanded={expanded}
         style={{ anchorName: anchor }}
@@ -220,8 +232,9 @@ export function PermissionMenu({
               Enable Full access for {agent === 'claude' ? 'Claude Code' : 'Codex'}?
             </p>
             <p className="mt-1.5 leading-relaxed text-secondary">
-              Allow files and network access beyond this project without routine approval. Native
-              policy still applies.
+              Allow files and network access beyond this project without tool-approval prompts. Task
+              limits and native policy still apply. Questions and implementation decisions still
+              need your response.
             </p>
             <p className="mt-1.5 leading-relaxed text-secondary">
               Only this Agent in this session, including restarts and rebuilds.
@@ -255,7 +268,7 @@ export function PermissionMenu({
                 Saving…
               </>
             ) : (
-              'Applies to the next task. Current work is unchanged.'
+              `Applies to the next task. ${currentScope || 'Current work is unchanged.'}`
             )}
           </p>
         )}
