@@ -584,7 +584,6 @@ function sharedPlanFixture(db: PactDatabase, index: number) {
       turnId,
       outcome: 'completed',
     })
-    repo.recordNativeEffects(runId, 'settled')
   }
   const admission = () => {
     const task = repo.collaboration(sessionId)!,
