@@ -506,6 +506,40 @@ export function collaborationAvailableActions(task: CollaborationTask): Collabor
   return collaborationNextStage(task) ? ['continue', 'pause'] : ['pause']
 }
 
+export interface CollaborationStageLimit {
+  stage: 'plan_review' | 'code_review' | 'repair'
+  used: number
+  maximum: number
+}
+
+/** The projection and actual reservation use the same stage allowance. */
+function collaborationStageLimit(
+  task: CollaborationTask,
+  stage: CollaborationStage | undefined,
+  limits: CollaborationLimits,
+): CollaborationStageLimit | undefined {
+  if (stage === 'plan_review' && task.discussionRounds >= limits.maxDiscussionRounds)
+    return { stage, used: task.discussionRounds, maximum: limits.maxDiscussionRounds }
+  if (stage === 'code_review' && task.reviewCycles >= limits.maxReviewCycles)
+    return { stage, used: task.reviewCycles, maximum: limits.maxReviewCycles }
+  if (
+    stage === 'repair' &&
+    (!task.pendingWork || task.pendingWork.repairReservationReleased) &&
+    task.repairAttempts >= limits.maxRepairAttempts
+  )
+    return { stage, used: task.repairAttempts, maximum: limits.maxRepairAttempts }
+  return undefined
+}
+
+export function collaborationContinuationLimit(
+  task: CollaborationTask,
+  limits: CollaborationLimits,
+): CollaborationStageLimit | undefined {
+  if (task.status === 'running' || task.status === 'complete' || collaborationInputGate(task))
+    return undefined
+  return collaborationStageLimit(task, collaborationNextStage(task), limits)
+}
+
 /** Reserve counters before dispatch; proven-unsent reservations alone may be released. */
 export function advanceCollaboration(
   task: CollaborationTask,
@@ -582,19 +616,22 @@ export function advanceCollaboration(
     }
   }
   if (!stage || stage === 'reply') throw new Error('This collaboration action is unavailable.')
+  const limit = collaborationStageLimit(next, stage, limits)
+  if (limit)
+    throw new Error(
+      {
+        plan_review: 'The Session discussion limit has been reached.',
+        code_review: 'The Session review limit has been reached.',
+        repair: 'The Session repair limit has been reached.',
+      }[limit.stage],
+    )
   if (stage === 'plan_review') {
-    if (next.discussionRounds >= limits.maxDiscussionRounds)
-      throw new Error('The Session discussion limit has been reached.')
     next.discussionRounds++
   }
   if (stage === 'code_review') {
-    if (next.reviewCycles >= limits.maxReviewCycles)
-      throw new Error('The Session review limit has been reached.')
     next.reviewCycles++
   }
   if (stage === 'repair' && (!task.pendingWork || task.pendingWork.repairReservationReleased)) {
-    if (next.repairAttempts >= limits.maxRepairAttempts)
-      throw new Error('The Session repair limit has been reached.')
     next.repairAttempts++
   }
   next.stage = stage

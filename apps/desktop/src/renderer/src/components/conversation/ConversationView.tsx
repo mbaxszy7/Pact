@@ -165,6 +165,7 @@ interface ConversationViewProps {
   schedulingState?: import('@pact/contracts').SchedulingState | undefined
   relayDecision?: RelayDecisionPresentation | undefined
   onOpenRelaySettings?: (() => void) | undefined
+  onOpenSessionSettings?: (() => void) | undefined
   visible: boolean
   session: CollaborationSession
   snapshot?: ConversationViewProjection | undefined
@@ -313,6 +314,7 @@ export function ConversationView({
   schedulingState,
   relayDecision,
   onOpenRelaySettings,
+  onOpenSessionSettings,
   session,
   snapshot,
   history,
@@ -3005,6 +3007,7 @@ export function ConversationView({
               latestRunId={latestRun?.id}
               disabled={disabled || responseInProgress}
               onOpenPlan={openRecordedPlan}
+              onOpenSessionSettings={onOpenSessionSettings}
               onOpenProjectFile={openProjectFile}
               onCreateReportComment={
                 recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
@@ -3069,6 +3072,7 @@ export function ConversationView({
               latestRunId={latestRun?.id}
               disabled={disabled || responseInProgress}
               onOpenPlan={openRecordedPlan}
+              onOpenSessionSettings={onOpenSessionSettings}
               onOpenProjectFile={openProjectFile}
               onCreateReportComment={
                 recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
@@ -3328,6 +3332,7 @@ export function ConversationView({
             latestRunId={latestRun?.id}
             disabled={disabled || responseInProgress}
             onOpenPlan={openRecordedPlan}
+            onOpenSessionSettings={onOpenSessionSettings}
             onOpenProjectFile={openProjectFile}
             onCreateReportComment={
               recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment

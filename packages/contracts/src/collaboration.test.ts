@@ -5,6 +5,7 @@ import {
   advanceCollaboration,
   bindCollaborationQuestions,
   collaborationAvailableActions,
+  collaborationContinuationLimit,
   collaborationDecisionQuestionsSchema,
   collaborationInputGate,
   collaborationInputProcessing,
@@ -77,6 +78,68 @@ function accepted(): CollaborationTask {
 }
 
 describe('native workflow authorization and progression', () => {
+  it.each(['plan_review', 'code_review', 'repair'] as const)(
+    'projects the same %s limit that prevents a new stage and preserves consumed counts',
+    (stage) => {
+      const current =
+        stage === 'plan_review'
+          ? task({
+              planReference: plan(),
+              planInputSequence: 0,
+              planVersion: 1,
+              discussionRounds: limits.maxDiscussionRounds,
+            })
+          : task({
+              kind: 'build',
+              nextStage: stage,
+              reviewCycles: limits.maxReviewCycles,
+              repairAttempts: limits.maxRepairAttempts,
+              ...(stage === 'repair'
+                ? {
+                    pendingWork: {
+                      stage: 'repair' as const,
+                      runId: randomUUID(),
+                      inputSequence: 0,
+                      repairReservationReleased: true,
+                    },
+                  }
+                : {}),
+            })
+      current.automation = 'paused'
+      current.pauseReason = 'limit'
+      const original = structuredClone(current)
+      expect(collaborationContinuationLimit(current, limits)).toMatchObject({ stage })
+      const resumed = advanceCollaboration(current, 'resume', limits)
+      expect(() => advanceCollaboration(resumed, 'continue', limits)).toThrow(/limit/)
+      const raised = {
+        ...limits,
+        ...(stage === 'plan_review'
+          ? { maxDiscussionRounds: limits.maxDiscussionRounds + 1 }
+          : stage === 'code_review'
+            ? { maxReviewCycles: limits.maxReviewCycles + 1 }
+            : { maxRepairAttempts: limits.maxRepairAttempts + 1 }),
+      }
+      expect(collaborationContinuationLimit(current, raised)).toBeUndefined()
+      expect(
+        advanceCollaboration(advanceCollaboration(current, 'resume', raised), 'continue', raised),
+      ).toMatchObject({ stage, status: 'running' })
+      expect(current).toEqual(original)
+    },
+  )
+  it('does not block an already reserved repair or active work at the repair limit', () => {
+    const current = task({
+      kind: 'build',
+      repairAttempts: limits.maxRepairAttempts,
+      automation: 'paused',
+      pauseReason: 'limit',
+      pendingWork: { stage: 'repair', runId: randomUUID(), inputSequence: 0 },
+    })
+    expect(collaborationContinuationLimit(current, limits)).toBeUndefined()
+    const resumed = advanceCollaboration(current, 'resume', limits)
+    const next = advanceCollaboration(resumed, 'continue', limits)
+    expect(next.repairAttempts).toBe(limits.maxRepairAttempts)
+    expect(collaborationContinuationLimit(next, limits)).toBeUndefined()
+  })
   it('keeps planning and review read-only until explicit execution', () => {
     expect(collaborationNextStage(task())).toBe('plan')
     const planned = task({ planReference: plan(), planInputSequence: 0, planVersion: 1 })

@@ -485,6 +485,7 @@ function WorkspaceContent({
               schedulingState={props.schedulingState}
               relayDecision={props.relayDecision}
               onOpenRelaySettings={() => props.onOpenSettings('decision-scheduling')}
+              onOpenSessionSettings={() => props.onOpenSessionSettings(selectedSession.id)}
               visible={props.conversationVisible}
               snapshot={props.conversation}
               history={props.conversationHistory}

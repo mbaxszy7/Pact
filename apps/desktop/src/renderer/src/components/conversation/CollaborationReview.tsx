@@ -11,7 +11,11 @@ import type {
   MessageCommentAnchor,
 } from '@pact/contracts'
 
-import { collaborationInputGate, collaborationInputProcessing } from '@pact/contracts'
+import {
+  collaborationContinuationLimit,
+  collaborationInputGate,
+  collaborationInputProcessing,
+} from '@pact/contracts'
 
 import type { ProjectFileTarget } from './MessageMarkdown'
 import type { MessageTextSelection } from './MessageSelectionSurface'
@@ -39,14 +43,14 @@ const agentName = (id: 'claude' | 'codex'): string => (id === 'claude' ? 'Claude
 const verdictLabel = {
   accepted: 'Accepted',
   changes_requested: 'Changes requested',
-  needs_user: 'Your decision needed',
+  needs_user: 'Waiting for your input',
   incomplete: 'Review incomplete',
 }
 const pauseLabel: Record<NonNullable<CollaborationTask['pauseReason']>, string> = {
-  user_message: 'Paused after your message',
+  user_message: 'Collaboration paused',
   user: 'Collaboration paused',
-  needs_user: 'Your decision needed',
-  restart: 'Paused after restart',
+  needs_user: 'Waiting for your input',
+  restart: 'Paused after reopening Pact',
   limit: 'Session limit reached',
   failure: 'Collaboration needs attention',
   stopped: 'Collaboration stopped',
@@ -69,6 +73,7 @@ export const CollaborationReview = memo(function CollaborationReview({
   onTaskChange,
   renderedMessageId,
   onOpenPlan,
+  onOpenSessionSettings,
 }: {
   session: CollaborationSession
   run: AgentRun
@@ -87,6 +92,7 @@ export const CollaborationReview = memo(function CollaborationReview({
   onTaskChange?: (() => void) | undefined
   renderedMessageId?: string | undefined
   onOpenPlan?: ((source: { runId: string; messageId: string; version: number }) => void) | undefined
+  onOpenSessionSettings?: (() => void) | undefined
 }) {
   const [view, setView] = useState<Extract<ConversationPage, { scope: 'collaboration' }>['view']>()
   const [loadedAt, setLoadedAt] = useState('')
@@ -96,6 +102,7 @@ export const CollaborationReview = memo(function CollaborationReview({
   const [busy, setBusy] = useState(false)
   const running = ['starting', 'running', 'recovering'].includes(run.status)
   const historical = run.id !== latestRunId
+  const reportVersion = `${run.updatedAt}:${session.settingsRevision}`
   const revealKey =
     revealReport?.runId === run.id
       ? `${revealReportRequestId ?? ''}:${revealReportOffset ?? ''}`
@@ -124,7 +131,7 @@ export const CollaborationReview = memo(function CollaborationReview({
         if (!current) return undefined
         if (response.ok && response.value.scope === 'collaboration') {
           setView(response.value.view)
-          setLoadedAt(run.updatedAt)
+          setLoadedAt(reportVersion)
           setReadError('')
         } else if (!response.ok) setReadError(response.error.message)
         return undefined
@@ -136,10 +143,10 @@ export const CollaborationReview = memo(function CollaborationReview({
       current = false
     }
     // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Explicit refresh after an action receipt or failed read.
-  }, [session.id, run.id, run.updatedAt, running, refresh])
+  }, [session.id, run.id, reportVersion, running, refresh])
   const task = view?.task
   const error = actionError || readError
-  const actionable = !historical && Boolean(view?.actionable) && loadedAt === run.updatedAt
+  const actionable = !historical && Boolean(view?.actionable) && loadedAt === reportVersion
   const act = async (action: CollaborationAction): Promise<void> => {
     if (
       !task ||
@@ -201,6 +208,47 @@ export const CollaborationReview = memo(function CollaborationReview({
   const review = task.review?.runId === run.id ? task.review : undefined
   const planSync = view?.planSync
   const inputState = collaborationInputProcessing(task)
+  const paused = actionable && task.status !== 'complete' && task.automation === 'paused'
+  const inputGate = collaborationInputGate(task)
+  const continuationLimit =
+    actionable && !planSync && !inputGate
+      ? collaborationContinuationLimit(task, session.settings)
+      : undefined
+  const nextStep = planSync || inputGate || continuationLimit ? undefined : view?.nextStep
+  const resumedLimit =
+    paused && task.pauseReason === 'limit' && !continuationLimit && !planSync && !inputGate
+  const limitName = continuationLimit
+    ? {
+        plan_review: { step: 'Plan review', setting: 'Plan reviews' },
+        code_review: { step: 'Code review', setting: 'Code reviews' },
+        repair: { step: 'Repair', setting: 'Repair attempts' },
+      }[continuationLimit.stage]
+    : undefined
+  const duplicateLimitNotice = [
+    'The Session discussion limit has been reached.',
+    'The Session review limit has been reached.',
+    'The Session repair limit has been reached.',
+  ].includes(task.notice ?? '')
+  const duplicateRestartNotice =
+    task.pauseReason === 'restart' &&
+    task.notice ===
+      'Application restarted. Check the original execution, then continue collaboration.' &&
+    run.status === 'completed' &&
+    run.nativeOutcome === 'completed' &&
+    run.nativeEffectsState === 'settled' &&
+    run.dispatchPhase === 'ended' &&
+    session.activity.state === 'idle' &&
+    !planSync &&
+    !inputGate
+  const readyToContinue =
+    stage === 'reply' &&
+    inputState.settled?.runId === run.id &&
+    paused &&
+    task.pauseReason === 'user_message' &&
+    !planSync &&
+    !inputGate &&
+    !continuationLimit &&
+    view?.availableActions?.includes('resume')
   const replyLabel = planSync
     ? 'Plan recovery required'
     : inputState.decision?.runId === run.id
@@ -208,7 +256,9 @@ export const CollaborationReview = memo(function CollaborationReview({
         ? 'Waiting for your answer'
         : 'Asked for your input'
       : inputState.settled?.runId === run.id
-        ? 'Answer processed'
+        ? readyToContinue
+          ? 'Ready to continue'
+          : 'Reply complete'
         : 'Reply to your message'
   const label =
     stage === 'plan'
@@ -222,9 +272,6 @@ export const CollaborationReview = memo(function CollaborationReview({
             : stage === 'respond'
               ? 'Review response'
               : replyLabel
-  const paused = actionable && task.status !== 'complete' && task.automation === 'paused'
-  const inputGate = collaborationInputGate(task)
-  const nextStep = planSync || inputGate ? undefined : view?.nextStep
   const actions = actionable
     ? (view?.availableActions ?? []).filter(
         (action): action is DisplayedCollaborationAction =>
@@ -233,6 +280,7 @@ export const CollaborationReview = memo(function CollaborationReview({
           action !== 'confirm_supplement' &&
           action !== 'continue' &&
           action !== 'pause' &&
+          (!continuationLimit || !['resume', 'retry'].includes(action)) &&
           (!inputGate || action === 'recover_plan'),
       )
     : []
@@ -302,23 +350,38 @@ export const CollaborationReview = memo(function CollaborationReview({
             ? ' Restore the saved response, then continue for independent review.'
             : ' Restore the saved plan, then continue for independent review.'}
         </p>
+      ) : continuationLimit && limitName ? (
+        <p className="mt-1 text-secondary">
+          {limitName.step} limit reached ({continuationLimit.used}/{continuationLimit.maximum}).
+          {' Increase '}
+          {limitName.setting} in Session settings to continue.
+        </p>
       ) : paused && !inputGate ? (
         <p className="mt-1 text-secondary">
-          {pauseLabel[task.pauseReason ?? 'user']}
-          {nextStep ? `. Next: ${nextStep}.` : '.'}
+          {readyToContinue || resumedLimit
+            ? nextStep
+              ? `Next: ${nextStep}.`
+              : 'Collaboration stays paused until you continue.'
+            : `${pauseLabel[task.pauseReason ?? 'user']}${nextStep ? `. Next: ${nextStep}.` : '.'}`}
         </p>
       ) : null}
       {actionable &&
       !planSync &&
       (!inputGate || inputGate === 'incomplete') &&
       task.status !== 'complete' &&
-      task.notice ? (
+      task.notice &&
+      !duplicateLimitNotice &&
+      !duplicateRestartNotice &&
+      // Retained tasks may contain this older, redundant confirmation; keep other notices.
+      (!readyToContinue ||
+        task.notice !==
+          'Your reply has been processed. Continue collaboration when you are ready.') ? (
         <p className="mt-1 whitespace-pre-wrap text-secondary">{task.notice}</p>
       ) : null}
       {actionable && view?.received?.state === 'blocked' ? (
         <p className="mt-1 text-secondary">Your message delivery needs attention.</p>
       ) : null}
-      {actions.length ? (
+      {actions.length || (continuationLimit && onOpenSessionSettings) ? (
         <div
           aria-label="Pact Proposal"
           className="pact-review-actions mt-2 flex flex-wrap items-center gap-1.5"
@@ -339,6 +402,16 @@ export const CollaborationReview = memo(function CollaborationReview({
               {busy ? (action === 'recover_plan' ? 'Restoring…' : 'Sending…') : actionLabel(action)}
             </button>
           ))}
+          {continuationLimit && onOpenSessionSettings ? (
+            <button
+              type="button"
+              disabled={disabled || busy}
+              onClick={onOpenSessionSettings}
+              className="min-h-8 rounded-control bg-surface-inverse px-3 py-1.5 text-caption font-medium text-inverse hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:opacity-45"
+            >
+              Session settings
+            </button>
+          ) : null}
         </div>
       ) : null}
       {error ? (

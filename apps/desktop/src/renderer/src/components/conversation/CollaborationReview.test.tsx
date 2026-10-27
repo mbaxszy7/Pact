@@ -202,6 +202,85 @@ function installRead(
   return bridge
 }
 
+it('opens Session settings instead of offering an ineffective Continue at the plan review limit', async () => {
+  const { props, task } = collaborationFixture()
+  task.discussionRounds = props.session.settings.maxDiscussionRounds
+  task.planInputSequence = task.inputSequence
+  task.pauseReason = 'limit'
+  task.notice = 'The Session discussion limit has been reached.'
+  const bridge = installRead(task)
+  bridge.getConversation.mockResolvedValue({
+    ok: true,
+    value: reportPage(task, { nextStep: 'Review the current plan with Claude Code' }),
+  })
+  const onOpenSessionSettings = vi.fn<() => void>()
+  render(<CollaborationReview {...props} onOpenSessionSettings={onOpenSessionSettings} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Session settings' }))
+  expect(onOpenSessionSettings).toHaveBeenCalledOnce()
+  expect(screen.queryByRole('button', { name: 'Continue collaboration' })).toBeNull()
+  expect(bridge.actOnCollaboration).not.toHaveBeenCalled()
+  expect(task.discussionRounds).toBe(props.session.settings.maxDiscussionRounds)
+})
+
+it('omits the generic restart reminder only for known settled work', async () => {
+  const { props, task } = collaborationFixture()
+  const notice = 'Application restarted. Check the original execution, then continue collaboration.'
+  task.pauseReason = 'restart'
+  task.notice = notice
+  installRead(task)
+  const view = render(<CollaborationReview {...props} />)
+  await screen.findByRole('button', { name: 'Continue collaboration' })
+  expect(screen.queryByText(notice)).toBeNull()
+  view.rerender(
+    <CollaborationReview {...props} run={{ ...props.run, nativeEffectsState: 'unknown' }} />,
+  )
+  expect(screen.getByText(notice).textContent).toBe(notice)
+})
+
+it('requires explicit Continue after updated Session limits and refreshes the same Run projection', async () => {
+  const { props, task } = collaborationFixture()
+  task.planInputSequence = task.inputSequence
+  task.discussionRounds = props.session.settings.maxDiscussionRounds
+  task.pauseReason = 'limit'
+  task.notice = 'The Session discussion limit has been reached.'
+  const bridge = installRead(task)
+  bridge.getConversation.mockResolvedValue({
+    ok: true,
+    value: reportPage(task, { nextStep: 'Review the current plan with Claude Code' }),
+  })
+  bridge.actOnCollaboration.mockResolvedValue({
+    ok: false,
+    error: { code: 'CONFLICT', message: 'A current action receipt is required.' },
+  })
+  const onOpenSessionSettings = vi.fn<() => void>()
+  const view = render(
+    <CollaborationReview {...props} onOpenSessionSettings={onOpenSessionSettings} />,
+  )
+  await screen.findByRole('button', { name: 'Session settings' })
+  view.rerender(
+    <CollaborationReview
+      {...props}
+      session={{
+        ...props.session,
+        settingsRevision: props.session.settingsRevision + 1,
+        settings: { ...props.session.settings, maxDiscussionRounds: task.discussionRounds + 1 },
+      }}
+      onOpenSessionSettings={onOpenSessionSettings}
+    />,
+  )
+  const resume = await screen.findByRole('button', { name: 'Continue collaboration' })
+  expect(bridge.getConversation).toHaveBeenCalledTimes(2)
+  expect(bridge.actOnCollaboration).not.toHaveBeenCalled()
+  expect(screen.queryByText(/limit.*reached/i)).toBeNull()
+  fireEvent.click(resume)
+  await waitFor(() =>
+    expect(bridge.actOnCollaboration).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ taskId: task.id, revision: task.revision, action: 'resume' }),
+    ),
+  )
+  expect(task.discussionRounds).toBe(props.session.settings.maxDiscussionRounds)
+})
+
 it('opens the exact current plan without duplicating it in chat or offering historical actions', async () => {
   const { props, task } = collaborationFixture()
   const bridge = installRead(task)
