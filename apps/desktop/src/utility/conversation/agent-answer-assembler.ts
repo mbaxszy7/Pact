@@ -1,5 +1,9 @@
 import { AgentExecutionError } from './agent-execution-error'
-import { NativeWorkingMemory } from './native-working-memory'
+import {
+  NativeWorkingMemory,
+  type NativeMemoryAllocator,
+  type NativeMemoryReservation,
+} from './native-working-memory'
 
 const MAX_ANSWER_ITEMS = 128
 const MAX_ANSWER_ITEM_ID_BYTES = 512
@@ -19,11 +23,12 @@ export class AgentAnswerAssembler {
   private encodedTextBytes = 0
   private nonemptyItems = 0
   private chars = 0
-  private readonly working = new NativeWorkingMemory().reserve(0)
+  private readonly working: NativeMemoryReservation
   private lastSnapshot: string | undefined
 
-  constructor(runId: string) {
+  constructor(runId: string, memory: NativeMemoryAllocator = new NativeWorkingMemory()) {
     this.outputId = `${runId}:assistant`
+    this.working = memory.reserve(0)
   }
 
   append(itemId: string, text: string): string {

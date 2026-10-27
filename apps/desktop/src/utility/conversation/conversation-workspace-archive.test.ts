@@ -66,6 +66,20 @@ function adapter(agentId: RuntimeAgentId) {
     readonly id = agentId
     readonly executorId = randomUUID()
     inspectNativeRebuild = native.inspect
+    beginNativeRebuildCheck(
+      input: AgentNativeContextRebuildInput,
+      source: AsyncIterable<NativeContextRebuildChunk>,
+      signal: AbortSignal,
+    ) {
+      const result = this.inspectNativeRebuild(input, source, signal)
+      return {
+        result,
+        physicalCompletion: result.then(
+          () => undefined,
+          () => undefined,
+        ),
+      }
+    }
 
     hasActiveBackgroundWork(runId?: string) {
       return [...native.runs.values()].some(

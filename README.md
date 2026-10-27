@@ -47,7 +47,8 @@ conversation. You choose who acts and when.
 - **Give the work a shared home.** Conversations, plans, comments, review findings and recorded file
   changes stay connected to the local project that produced them.
 - **Keep control of the next step.** Explicit routing, native permissions and user-approved handoffs
-  make collaboration deliberate. Pact's orchestrator does not add a third model.
+  make collaboration deliberate. Default orchestration is deterministic. Optional Relay uses a
+  separately selected model for bounded scheduling advice, with execution still owned by Pact.
 
 ### Local data. Native connections.
 
@@ -64,7 +65,7 @@ accounts, model access, usage limits and provider fees still apply.
 | From intent to result     | What you can do                                                                                                        |
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | **Two perspectives**      | Route to Claude, Codex or `@all`. Bring relevant conversation history across when changing agents.                     |
-| **Plan, build, review**   | Use `/plan`, `/build` and `/review` with versioned plans, shared Todos, review findings and explicit decisions.        |
+| **Plan, build, review**   | Use `/plan`, `/build` and `/review` with one versioned plan, natural review reports and explicit writing decisions.    |
 | **Point to what matters** | Send images and comments anchored to messages, plans or file selections alongside your prompt.                         |
 | **See what changed**      | Inspect recorded file changes and undo an eligible Changes card after conflict checks.                                 |
 | **Continue with context** | Continue native agent histories, fork a conversation at a completed answer, or explicitly recover a disrupted session. |
@@ -121,6 +122,13 @@ older or unrecognized versions retain their native speed configuration.
 Pact does not install or authenticate the CLIs for you. Keep provider configuration in the native
 tools. Pact checks readiness and discovers available models during setup, and explains when a native
 capability is unavailable.
+
+Relay defaults off. Decision requests use the selected native runtime and consume account usage or
+incur provider charges; they do not implement the task or answer native approvals. Current Codex
+decision admission requires exact Codex 0.163.0 on macOS and GPT-6 Luna. Claude and Windows decision
+execution remain unavailable without the required native isolation evidence. Automatic checks,
+confirmed-unsent resend and complete Relay acceptance are still pending; see the
+[current requirements and capability boundary](docs/product/requirements.md#automatic-limits-pause-and-continuation).
 
 ## Quality you can inspect
 

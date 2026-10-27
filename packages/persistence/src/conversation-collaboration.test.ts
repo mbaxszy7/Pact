@@ -12,6 +12,8 @@ import {
   collaborationTaskSchema,
   type CollaborationDocument,
   type ConversationSendInput,
+  type CollaborationTask,
+  type SchedulingHandoff,
 } from '@pact/contracts'
 
 import { PactDatabase } from './pact-database.js'
@@ -22,6 +24,9 @@ import {
   conversationBodyInputs,
   conversationImageAssets,
   conversationInputBatchMembers,
+  schedulingHandoffs,
+  schedulingEvaluations,
+  schedulingBudgetReservations,
 } from './schema/index.js'
 
 const databases: PactDatabase[] = [],
@@ -269,6 +274,528 @@ function readDocument(
   expect(hash(text)).toBe(source.sha256)
   return text
 }
+
+function admitHandoff(
+  f: Awaited<ReturnType<typeof fixture>>,
+  task: CollaborationTask,
+  handoff: SchedulingHandoff,
+) {
+  const next = advanceCollaboration(task, 'continue', settings)
+  return f.repo.beginRun({
+    sessionId: f.sessionId,
+    clientMessageId: randomUUID(),
+    content: `@${next.actor} Next stage.`,
+    commentIds: [],
+    expectedCommentsRevision: f.drafts().commentsRevision,
+    settingsRevision: f.db.sessionRepository.find(f.sessionId)!.settingsRevision,
+    agentId: next.actor,
+    model: null,
+    effort: null,
+    collaboration: next,
+    expectedCollaborationRevision: task.revision,
+    preserveDraftComments: true,
+    schedulingHandoff: handoff,
+  })
+}
+
+async function planSupplementOpportunity(f: Awaited<ReturnType<typeof fixture>>) {
+  f.repo.saveSchedulingSettings({
+    expectedRevision: 0,
+    enabled: true,
+    selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
+  })
+  f.finish()
+  for (let index = 0; index < 2; index++) {
+    const review = advance(f)
+    f.finish(review.id, { verdict: 'changes_requested' })
+    const revision = advance(f)
+    f.finish(revision.id, { plan: `Complete Plan revision ${index + 2}.` })
+  }
+}
+
+async function confirmedSupplement(
+  f: Awaited<ReturnType<typeof fixture>>,
+  kind: 'supplement_plan' | 'supplement_code_response',
+) {
+  const task = f.repo.collaboration(f.sessionId)!,
+    handoff = f.repo.workflowHandoff(task, kind === 'supplement_plan' ? task.reviewer : task.owner),
+    candidateId = `propose_${kind}`,
+    deadlineAt = Date.now() + 15_000
+  expect(f.repo.relaySupplementOpportunity(handoff)?.kind).toBe(kind)
+  const material = await f.repo.readRelayWorkflowDecisionSources(
+    handoff,
+    [
+      {
+        id: candidateId,
+        description: 'One exact read-only clarification and its fixed return review.',
+      },
+    ],
+    { signal: new AbortController().signal, deadlineAt },
+  )
+  const reserved = f.repo.reserveEvaluation({
+    handoff,
+    provider: 'codex',
+    model: 'gpt-6-luna',
+    configurationFingerprint: hash('config'),
+    deadlineAt,
+    inputSha256: material.inputSha256,
+  })
+  if (reserved.status !== 'reserved') throw Error('Expected the original model evaluation')
+  f.repo.dispatchEvaluation(reserved.evaluation.id)
+  f.repo.settleEvaluation(reserved.evaluation.id, {
+    outcome: 'completed',
+    physicalReleased: true,
+    selectedCandidateId: candidateId,
+  })
+  const card = f.repo.proposeRelayWorkflowAction({
+    handoff,
+    kind,
+    evaluationId: reserved.evaluation.id,
+    configurationGeneration: f.repo.schedulingConfigurationGeneration(),
+    inputSha256: material.inputSha256,
+    sourceFingerprint: material.sourceFingerprint,
+    deadlineAt,
+    reason: 'Clarify the complete frozen scope before returning to its fixed reviewer.',
+    sourceIds: material.sources.map((source) => source.id),
+  })
+  expect(f.repo.relayWorkflowUserGrants(handoff, material.snapshot)).toEqual({})
+  const accepted = f.repo.answerRelaySchedulingDecision({
+    reference: { sessionId: f.sessionId, decisionId: card.decisionId, revision: card.revision },
+    clientOperationId: randomUUID(),
+    answer: { kind: 'confirm' },
+  })
+  if (!('receiptId' in accepted) || !accepted.receiptId)
+    throw Error('Expected a concrete user grant')
+  return f.repo.preparedRelayWorkflowAction(accepted.receiptId)
+}
+
+function startConfirmedSupplement(
+  f: Awaited<ReturnType<typeof fixture>>,
+  prepared: ReturnType<Awaited<ReturnType<typeof fixture>>['repo']['preparedRelayWorkflowAction']>,
+) {
+  return f.repo.beginRun({
+    sessionId: f.sessionId,
+    clientMessageId: prepared.receipt.clientNonce,
+    content: 'Perform the exact approved read-only clarification.',
+    commentIds: [],
+    expectedCommentsRevision: f.drafts().commentsRevision,
+    agentId: prepared.next.actor,
+    settingsRevision: 1,
+    model: null,
+    effort: null,
+    preserveDraftComments: true,
+    expectedCollaborationRevision: prepared.task.revision,
+    collaboration: prepared.next,
+    schedulingHandoff: prepared.handoff,
+    collaborationActionReceiptId: prepared.receipt.id,
+  }).run
+}
+
+describe('Shared handoff receipts and persistent scheduling budgets', () => {
+  it('arbitrates different manual/default client receipts as one business Run and one original counter', async () => {
+    const f = await fixture()
+    f.finish()
+    const task = f.repo.collaboration(f.sessionId)!,
+      node = f.repo.workflowHandoff(task, task.reviewer)
+    const results = await Promise.all([0, 1, 2, 3].map(async () => admitHandoff(f, task, node)))
+    expect(results.filter((result) => result.created)).toHaveLength(1)
+    expect(new Set(results.map((result) => result.run.id)).size).toBe(1)
+    expect(f.repo.collaboration(f.sessionId)!.discussionRounds).toBe(1)
+    expect(f.db.drizzle.select().from(schedulingHandoffs).all()).toHaveLength(1)
+    expect(f.repo.handoffReceipt(node.id)?.runId).toBe(results[0]!.run.id)
+    f.finish(results[0]!.run.id, { verdict: 'changes_requested' })
+    const next = f.repo.collaboration(f.sessionId)!
+    expect(f.repo.workflowHandoff(next, next.owner).id).not.toBe(node.id)
+  })
+
+  it('keeps node/fact identity through configuration and pause changes, but rejects an old guard', async () => {
+    const f = await fixture()
+    f.finish()
+    const task = f.repo.collaboration(f.sessionId)!,
+      old = f.repo.workflowHandoff(task, task.reviewer)
+    f.db.sessionRepository.saveSettings(f.sessionId, {
+      ...settings,
+      agents: { ...settings.agents, claude: { model: 'explicit-model', effort: 'high' } },
+    })
+    const changed = f.repo.workflowHandoff(task, task.reviewer)
+    expect(changed.id).toBe(old.id)
+    expect(changed.factFingerprint).toBe(old.factFingerprint)
+    expect(changed.freshnessGuard).not.toEqual(old.freshnessGuard)
+    expect(() => admitHandoff(f, task, old)).toThrow('handoff facts changed')
+    f.repo.pauseCollaboration(f.sessionId)
+    const paused = f.repo.collaboration(f.sessionId)!
+    expect(f.repo.workflowHandoff(paused, paused.reviewer).id).toBe(old.id)
+    f.repo.setCollaborationState({
+      ...paused,
+      revision: paused.revision + 1,
+      automation: 'active',
+      pauseReason: undefined,
+    })
+    const resumed = f.repo.collaboration(f.sessionId)!
+    const result = admitHandoff(f, resumed, f.repo.workflowHandoff(resumed, resumed.reviewer))
+    expect(admitHandoff(f, task, old)).toMatchObject({ created: false, run: { id: result.run.id } })
+  })
+
+  it('gives a new priority input its own business event while retaining the task budget root', async () => {
+    const f = await fixture()
+    f.finish()
+    const task = f.repo.collaboration(f.sessionId)!,
+      previous = f.repo.workflowHandoff(task, task.reviewer)
+    const received = f.receive(),
+      updated = f.repo.collaboration(f.sessionId)!
+    const node = f.repo.workflowHandoff(updated, updated.owner, received.send.clientMessageId)
+    expect(node.id).not.toBe(previous.id)
+    expect(node.budgetSubjectId).toBe(previous.budgetSubjectId)
+    expect(() => admitHandoff(f, task, previous)).toThrow('handoff facts changed')
+    const result = f.materialize()
+    expect(f.repo.handoffReceipt(node.id)?.runId).toBe(result.run.id)
+    expect(f.repo.handoffReceipt(previous.id)).toBeUndefined()
+  })
+
+  it('deduplicates the same evaluation facts across model changes and retains physical capacity after logical failure', async () => {
+    const f = await fixture()
+    f.finish()
+    const task = f.repo.collaboration(f.sessionId)!,
+      node = f.repo.workflowHandoff(task, task.reviewer)
+    const reserved = f.repo.reserveEvaluation({
+      handoff: node,
+      provider: 'codex',
+      model: 'exact-codex-model',
+      configurationFingerprint: hash('config'),
+    })
+    if (reserved.status !== 'reserved') throw Error('Expected a reservation')
+    expect(f.repo.dispatchEvaluation(reserved.evaluation.id).created).toBe(true)
+    expect(f.repo.dispatchEvaluation(reserved.evaluation.id).created).toBe(false)
+    f.repo.settleEvaluation(reserved.evaluation.id, { outcome: 'failed', physicalReleased: false })
+    expect(() =>
+      f.repo.settleEvaluation(reserved.evaluation.id, {
+        outcome: 'not_sent',
+        physicalReleased: true,
+      }),
+    ).toThrow('cannot be refunded')
+    f.db.sessionRepository.saveSettings(f.sessionId, settings)
+    expect(
+      f.repo.reserveEvaluation({
+        handoff: f.repo.workflowHandoff(task, task.reviewer),
+        provider: 'claude',
+        model: 'another-explicit-model',
+        configurationFingerprint: hash('new-config'),
+      }).status,
+    ).toBe('duplicate')
+    const fault = f.repo.recoveryHandoff({ kind: 'run', id: f.first.run.id })
+    expect(
+      f.repo.reserveEvaluation({
+        handoff: fault,
+        provider: 'codex',
+        model: 'exact-codex-model',
+        configurationFingerprint: hash('config'),
+      }).status,
+    ).toBe('busy')
+    f.repo.settleEvaluation(reserved.evaluation.id, {
+      outcome: 'failed',
+      physicalReleased: true,
+      usage: { inputTokens: 12, outputTokens: 3 },
+    })
+    expect(f.repo.schedulingBudget(node.budgetSubjectId)?.evaluationCalls).toBe(1)
+    expect(
+      f.repo.reserveEvaluation({
+        handoff: fault,
+        provider: 'codex',
+        model: 'exact-codex-model',
+        configurationFingerprint: hash('config'),
+      }).status,
+    ).toBe('reserved')
+  })
+
+  it('rejects stale/expired invocation and preserves same-fact deduplication after a proven unsent evaluation', async () => {
+    const f = await fixture()
+    f.finish()
+    const task = f.repo.collaboration(f.sessionId)!,
+      node = f.repo.workflowHandoff(task, task.reviewer)
+    const reserved = f.repo.reserveEvaluation({
+      handoff: node,
+      provider: 'codex',
+      model: 'exact-model',
+      configurationFingerprint: hash('config'),
+    })
+    if (reserved.status !== 'reserved') throw Error('Expected a reservation')
+    f.db.drizzle
+      .update(schedulingEvaluations)
+      .set({ deadline: new Date(0).toISOString() })
+      .where(eq(schedulingEvaluations.id, reserved.evaluation.id))
+      .run()
+    expect(() => f.repo.dispatchEvaluation(reserved.evaluation.id)).toThrow('no longer eligible')
+    f.repo.settleEvaluation(reserved.evaluation.id, { outcome: 'not_sent', physicalReleased: true })
+    expect(
+      f.repo.reserveEvaluation({
+        handoff: node,
+        provider: 'codex',
+        model: 'exact-model',
+        configurationFingerprint: hash('config'),
+      }).status,
+    ).toBe('duplicate')
+    expect(f.repo.schedulingBudget(node.budgetSubjectId)?.evaluationCalls ?? 0).toBe(0)
+  })
+
+  it('records more than twelve actual evaluations on one task without a cumulative evaluation cap', async () => {
+    const f = await fixture()
+    f.finish()
+    for (let index = 0; index < 16; index++) {
+      const task = f.repo.collaboration(f.sessionId)!,
+        node = f.repo.workflowHandoff(task, task.reviewer)
+      const result = f.repo.reserveEvaluation({
+        handoff: node,
+        provider: 'codex',
+        model: 'exact-model',
+        configurationFingerprint: hash('config'),
+      })
+      if (result.status !== 'reserved')
+        throw Error(`Expected reservation ${index}: ${result.status}`)
+      f.repo.dispatchEvaluation(result.evaluation.id)
+      f.repo.settleEvaluation(result.evaluation.id, {
+        outcome: 'completed',
+        physicalReleased: true,
+      })
+      if (index < 15) {
+        f.receive(f.input(`New decision ${index}`))
+        const reply = f.materialize()
+        f.finish(reply.run.id, {
+          plan: `Complete revised plan ${index}`,
+        })
+      }
+    }
+    expect(f.repo.schedulingBudget(`task:${f.initial.id}`)?.evaluationCalls).toBe(16)
+  })
+
+  it('atomically retains task-wide extra Turn budgets across new Runs, revisions and restart', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'pact-scheduling-restart-'))
+    directories.push(directory)
+    const filePath = join(directory, 'pact.sqlite'),
+      f = await fixture(filePath)
+    await planSupplementOpportunity(f)
+    const prepared = await confirmedSupplement(f, 'supplement_plan'),
+      node = prepared.handoff
+    const supplement = startConfirmedSupplement(f, prepared),
+      reservations = f.db.drizzle.select().from(schedulingBudgetReservations).all()
+    expect(reservations).toHaveLength(1)
+    const extra = reservations[0]!
+    expect(extra).toMatchObject({
+      handoffId: node.id,
+      budget: 'extra_plan_turn',
+      state: 'reserved',
+      authorizationId: prepared.receipt.id,
+    })
+    expect(startConfirmedSupplement(f, prepared).id).toBe(supplement.id)
+    expect(f.db.drizzle.select().from(schedulingBudgetReservations).all()).toHaveLength(1)
+    f.repo.settleSchedulingBudget(extra.id, 'possibly_sent')
+    expect(() => f.repo.settleSchedulingBudget(extra.id, 'not_sent')).toThrow('cannot be refunded')
+    f.finish(supplement.id, { plan: 'The complete clarified Plan.' })
+    const returnReview = advance(f)
+    f.finish(returnReview.id, { verdict: 'changes_requested' })
+    const revisionAfterSupplement = advance(f)
+    f.finish(revisionAfterSupplement.id, {
+      plan: 'Complete revised Plan after the fixed return review.',
+    })
+    const exhaustedTask = f.repo.collaboration(f.sessionId)!,
+      exhaustedNode = f.repo.workflowHandoff(exhaustedTask, exhaustedTask.reviewer)
+    expect(f.repo.relayWorkflowSnapshot(exhaustedNode)?.node).toBe('owner_to_review')
+    expect(f.repo.relaySupplementOpportunity(exhaustedNode)).toBeUndefined()
+    expect(f.repo.schedulingBudget(node.budgetSubjectId)?.extraPlanTurns).toBe(1)
+    const finalPlanReview = advance(f)
+    f.finish(finalPlanReview.id, { verdict: 'accepted' })
+
+    // A new input and its real reply advance the revision, while the task root keeps its allowance.
+    f.receive(f.input('Preserve the clarified Plan while documenting the latest acceptance.'))
+    const reply = f.materialize()
+    f.finish(reply.run.id, { plan: 'Current complete Plan after the new priority input.' })
+    f.repo.setCollaborationState(
+      advanceCollaboration(f.repo.collaboration(f.sessionId)!, 'resume', settings),
+    )
+    const after = f.repo.collaboration(f.sessionId)!,
+      nextNode = f.repo.workflowHandoff(after, after.reviewer)
+    expect(nextNode.id).not.toBe(node.id)
+    expect(nextNode.budgetSubjectId).toBe(node.budgetSubjectId)
+    expect(f.repo.relayWorkflowSnapshot(nextNode)?.node).toBe('plan_to_review')
+    expect(f.repo.relaySupplementOpportunity(nextNode)).toBeUndefined()
+    expect(() =>
+      f.repo.reserveSchedulingBudget({
+        handoff: nextNode,
+        budget: 'extra_plan_turn',
+        authorizationId: randomUUID(),
+      }),
+    ).toThrow('no current, concrete single-use user grant')
+    expect(f.repo.schedulingBudget(node.budgetSubjectId)?.extraPlanTurns).toBe(1)
+    const acceptedReview = advance(f)
+    f.finish(acceptedReview.id, { verdict: 'accepted' })
+    const implementation = advance(f, 'execute')
+    f.finish(implementation.id, { answer: 'Implementation completed within the accepted scope.' })
+    const codeReview = advance(f)
+    f.finish(codeReview.id, { verdict: 'changes_requested' })
+    const response = advance(f, 'respond')
+    f.finish(response.id, { answer: 'Complete response to the first code review.' })
+    const secondCodeReview = advance(f)
+    f.finish(secondCodeReview.id, { verdict: 'changes_requested' })
+    const code = await confirmedSupplement(f, 'supplement_code_response')
+    expect(
+      f.repo.reserveSchedulingBudget({
+        handoff: code.handoff,
+        budget: 'extra_code_turn',
+        authorizationId: code.receipt.id,
+      }).status,
+    ).toBe('reserved')
+    expect(f.repo.schedulingBudget(node.budgetSubjectId)).toMatchObject({
+      extraPlanTurns: 1,
+      extraCodeTurns: 1,
+    })
+    databases.splice(databases.indexOf(f.db), 1)
+    f.db.close()
+    const reopened = await PactDatabase.open({
+      filePath,
+      migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
+    })
+    databases.push(reopened)
+    const repo = reopened.conversationRepository
+    repo.recoverCollaborationTasks()
+    const restored = repo.collaboration(f.sessionId)!
+    expect(restored.id).toBe(prepared.task.id)
+    expect(restored.automation).toBe('paused')
+    expect(repo.schedulingBudget(node.budgetSubjectId)).toMatchObject({
+      extraPlanTurns: 1,
+      extraCodeTurns: 1,
+    })
+    expect(
+      repo.relaySupplementOpportunity(repo.workflowHandoff(restored, restored.owner)),
+    ).toBeUndefined()
+  })
+
+  it('refunds only a proven unsent budget and never erases the deduplication receipt', async () => {
+    const f = await fixture()
+    await planSupplementOpportunity(f)
+    const prepared = await confirmedSupplement(f, 'supplement_plan'),
+      node = prepared.handoff
+    const extra = f.repo.reserveSchedulingBudget({
+      handoff: node,
+      budget: 'extra_plan_turn',
+      authorizationId: prepared.receipt.id,
+    })
+    if (extra.status !== 'reserved') throw Error('Expected reservation')
+    f.repo.settleSchedulingBudget(extra.reservation.id, 'not_sent')
+    expect(
+      f.repo.reserveSchedulingBudget({
+        handoff: node,
+        budget: 'extra_plan_turn',
+        authorizationId: prepared.receipt.id,
+      }),
+    ).toMatchObject({
+      status: 'duplicate',
+      reservation: { id: extra.reservation.id, state: 'not_sent' },
+    })
+    expect(f.repo.schedulingBudget(node.budgetSubjectId)?.extraPlanTurns).toBe(0)
+    expect(f.db.drizzle.select().from(schedulingBudgetReservations).all()).toHaveLength(1)
+  })
+
+  it('uses stable original fault budgets, accepts only new native facts and keeps Check separate from dispatch', async () => {
+    const f = await fixture()
+    const first = f.repo.recoveryHandoff({ kind: 'run', id: f.first.run.id })
+    const check = f.repo.reserveSchedulingBudget({ handoff: first, budget: 'automatic_check' })
+    if (check.status !== 'reserved') throw Error('Expected check reservation')
+    f.repo.settleSchedulingBudget(check.reservation.id, 'settled')
+    expect(
+      f.repo.reserveSchedulingBudget({ handoff: first, budget: 'automatic_check' }).status,
+    ).toBe('duplicate')
+    f.repo.recordDispatch(f.first.run.id, 'possibly_sent', 'native-fixture')
+    const second = f.repo.recoveryHandoff({ kind: 'run', id: f.first.run.id })
+    expect(second.id).not.toBe(first.id)
+    expect(second.budgetSubjectId).toBe(first.budgetSubjectId)
+    const again = f.repo.reserveSchedulingBudget({ handoff: second, budget: 'automatic_check' })
+    if (again.status !== 'reserved') throw Error('Expected second check reservation')
+    f.repo.settleSchedulingBudget(again.reservation.id, 'possibly_sent')
+    f.repo.recordDispatch(f.first.run.id, 'accepted', 'native-fixture')
+    const third = f.repo.recoveryHandoff({ kind: 'run', id: f.first.run.id })
+    expect(
+      f.repo.reserveSchedulingBudget({ handoff: third, budget: 'automatic_check' }).status,
+    ).toBe('exhausted')
+    expect(f.repo.schedulingBudget(first.budgetSubjectId)?.automaticChecks).toBe(2)
+    expect(f.db.drizzle.select().from(agentRuns).all()).toHaveLength(1)
+    expect(f.repo.findRun(f.first.run.id)?.dispatchPhase).toBe('accepted')
+  })
+
+  it('uses indexed bounded lookups with a representative retained history', async () => {
+    const f = await fixture()
+    f.finish()
+    const node = f.repo.workflowHandoff(f.repo.collaboration(f.sessionId)!, 'claude')
+    f.db.drizzle.transaction((transaction) => {
+      for (let index = 0; index < 1_000; index++) {
+        const id = hash(`historical-node-${index}`)
+        transaction
+          .insert(schedulingHandoffs)
+          .values({
+            id,
+            sessionId: f.sessionId,
+            budgetSubjectId: node.budgetSubjectId,
+            eventId: `historical-event-${index}`,
+            slot: 'workflow_next',
+            factFingerprint: hash(`fact-${index}`),
+            freshnessGuardJson: JSON.stringify(node.freshnessGuard),
+            createdAt: f.now,
+          })
+          .run()
+        transaction
+          .insert(schedulingEvaluations)
+          .values({
+            id: randomUUID(),
+            sessionId: f.sessionId,
+            handoffId: id,
+            budgetSubjectId: node.budgetSubjectId,
+            factFingerprint: hash(`fact-${index}`),
+            provider: 'codex',
+            model: 'fixture-model',
+            configurationFingerprint: hash('fixture-config'),
+            handoffJson: JSON.stringify(node),
+            active: false,
+            called: true,
+            outcome: 'completed',
+            createdAt: f.now,
+            deadline: f.now,
+          })
+          .run()
+        transaction
+          .insert(schedulingBudgetReservations)
+          .values({
+            id: randomUUID(),
+            sessionId: f.sessionId,
+            handoffId: id,
+            budgetSubjectId: node.budgetSubjectId,
+            faultSubjectId: `run:${randomUUID()}`,
+            factFingerprint: hash(`fact-${index}`),
+            budget: 'automatic_check',
+            state: 'settled',
+            createdAt: f.now,
+          })
+          .run()
+      }
+    })
+    const plans = [
+      f.db.drizzle.all<{ detail: string }>(
+        sql`EXPLAIN QUERY PLAN SELECT * FROM scheduling_handoffs WHERE id = ${node.id}`,
+      ),
+      f.db.drizzle.all<{ detail: string }>(
+        sql`EXPLAIN QUERY PLAN SELECT * FROM scheduling_evaluations WHERE budget_subject_id = ${node.budgetSubjectId} AND fact_fingerprint = ${node.factFingerprint}`,
+      ),
+      f.db.drizzle.all<{ detail: string }>(
+        sql`EXPLAIN QUERY PLAN SELECT id FROM scheduling_evaluations WHERE active = 1 LIMIT 1`,
+      ),
+      f.db.drizzle.all<{ detail: string }>(
+        sql`EXPLAIN QUERY PLAN SELECT * FROM scheduling_budget_reservations WHERE handoff_id = ${node.id} AND budget = 'automatic_check' AND replaces_reservation_id IS NULL`,
+      ),
+    ].map((plan) => plan.map((row) => row.detail).join('; '))
+    expect(plans[0]).toContain('USING INDEX sqlite_autoindex_scheduling_handoffs_1')
+    expect(plans[1]).toContain('USING INDEX scheduling_evaluations_fact')
+    expect(plans[2]).toContain('USING INDEX scheduling_evaluations_active_app')
+    expect(plans[3]).toContain('USING INDEX scheduling_budget_reservations_handoff')
+    expect(plans.every((plan) => plan.startsWith('SEARCH'))).toBe(true)
+  })
+})
 
 describe('Durable collaboration receipt and phase ownership', () => {
   it('ACKs a body without creating a placeholder User/Run and deduplicates before released temporary input resolution', async () => {
@@ -684,10 +1211,23 @@ function advance(
   action: 'continue' | 'execute' | 'repair' | 'respond' = 'continue',
 ) {
   const current = f.repo.collaboration(f.sessionId)!
-  const next = advanceCollaboration(current, action, settings)
+  const clientMessageId = randomUUID()
+  const prepared = ['execute', 'repair', 'respond'].includes(action)
+    ? f.repo.prepareCollaborationAction(
+        {
+          sessionId: f.sessionId,
+          taskId: current.id,
+          revision: current.revision,
+          clientMessageId,
+          action,
+        },
+        settings,
+      )
+    : undefined
+  const next = prepared?.next ?? advanceCollaboration(current, action, settings)
   return f.repo.beginRun({
     sessionId: f.sessionId,
-    clientMessageId: randomUUID(),
+    clientMessageId,
     content: 'Continue authorized work.',
     commentIds: [],
     expectedCommentsRevision: f.drafts().commentsRevision,
@@ -698,6 +1238,9 @@ function advance(
     preserveDraftComments: true,
     expectedCollaborationRevision: current.revision,
     collaboration: next,
+    ...(prepared
+      ? { schedulingHandoff: prepared.handoff, collaborationActionReceiptId: prepared.receipt.id }
+      : {}),
   }).run
 }
 
@@ -722,6 +1265,23 @@ it('binds native plan/review facts to their actual actor and exact version, then
     review: { actor: 'claude', verdict: 'accepted', planReference: planned.planReference },
   })
   expect(() => advance(f)).toThrow(/no next/)
+  const ready = f.repo.collaboration(f.sessionId)!
+  expect(() =>
+    f.repo.beginRun({
+      sessionId: f.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'An unreceipted implementation must not start.',
+      commentIds: [],
+      expectedCommentsRevision: f.drafts().commentsRevision,
+      agentId: ready.owner,
+      settingsRevision: 1,
+      model: null,
+      effort: null,
+      preserveDraftComments: true,
+      expectedCollaborationRevision: ready.revision,
+      collaboration: advanceCollaboration(ready, 'execute', settings),
+    }),
+  ).toThrow('original concrete user receipt')
   const work = advance(f, 'execute')
   expect(work.agentId).toBe('codex')
   f.finish(work.id, { answer: 'Implemented cancellation.' })
@@ -1250,4 +1810,111 @@ it('does not settle a recovered author reply over a newer received answer', asyn
   expect(f.repo.collaboration(f.sessionId)!.inputProcessing?.settled).toBeUndefined()
   expect(f.repo.readReceivedInput(f.sessionId)?.id).toBe(newer.send.clientMessageId)
   expect(f.repo.needsWorkflowPlanRecovery(reply.run.id)).toBe(false)
+})
+
+it('bounds the complete evaluation row before dispatch and preserves every previously observed physical identity', async () => {
+  const f = await fixture()
+  f.finish()
+  const task = f.repo.collaboration(f.sessionId)!,
+    node = f.repo.workflowHandoff(task, task.reviewer)
+  const reserved = f.repo.reserveEvaluation({
+    handoff: node,
+    provider: 'codex',
+    model: 'gpt-6-luna',
+    configurationFingerprint: hash('original'),
+  })
+  if (reserved.status !== 'reserved') throw Error('Expected evaluation')
+  const id = reserved.evaluation.id,
+    ownerId = randomUUID()
+  const witness = {
+    version: 1 as const,
+    platform: 'darwin' as const,
+    ownerId,
+    owner: { pid: 1, started: 'birth' },
+    root: { pid: 2, pgid: 2, started: 'birth' },
+    members: [
+      { pid: 2, pgid: 2, started: 'birth' },
+      { pid: 3, pgid: 2, started: 'birth' },
+    ],
+  }
+  f.repo.recordEvaluationPhysicalWitness(id, { witness, configurationFingerprint: hash('native') })
+  expect(() =>
+    f.repo.recordEvaluationPhysicalWitness(id, {
+      witness: { ...witness, members: witness.members.slice(0, 1) },
+      configurationFingerprint: hash('native'),
+    }),
+  ).toThrow('owner changed')
+  const before = f.db.drizzle.select().from(schedulingEvaluations).get()!
+  const quoted = '"'.repeat(64)
+  const large = {
+    ...witness,
+    owner: { pid: 1, started: quoted },
+    root: { pid: 2, pgid: 2, started: quoted },
+    members: Array.from({ length: 8 }, (_, i) => ({ pid: i + 2, pgid: 2, started: quoted })),
+  }
+  expect(Buffer.byteLength(JSON.stringify(large))).toBeLessThanOrEqual(2048)
+  // Use a fresh reservation: owner replacement has a separate, stronger rejection.
+  f.repo.settleEvaluation(id, { outcome: 'not_sent', physicalReleased: true })
+  const fault = f.repo.recoveryHandoff({ kind: 'run', id: f.first.run.id })
+  const other = f.repo.reserveEvaluation({
+    handoff: fault,
+    provider: 'codex',
+    model: 'gpt-6-luna',
+    configurationFingerprint: hash('other'),
+  })
+  if (other.status !== 'reserved') throw Error('Expected distinct evaluation')
+  expect(() =>
+    f.repo.recordEvaluationPhysicalWitness(other.evaluation.id, {
+      witness: large,
+      configurationFingerprint: hash('native'),
+    }),
+  ).toThrow('metadata capacity')
+  expect(
+    f.db.drizzle
+      .select()
+      .from(schedulingEvaluations)
+      .where(eq(schedulingEvaluations.id, other.evaluation.id))
+      .get(),
+  ).toMatchObject({ called: false, physicalWitnessJson: null })
+  expect(
+    f.db.drizzle.select().from(schedulingEvaluations).where(eq(schedulingEvaluations.id, id)).get()
+      ?.physicalWitnessJson,
+  ).toBe(before.physicalWitnessJson)
+  expect(f.repo.schedulingBudget(node.budgetSubjectId)).toBeUndefined()
+})
+
+it('keeps unknown old evaluations active without replay and reads the active owner through the bounded partial index', async () => {
+  const f = await fixture()
+  f.finish()
+  const task = f.repo.collaboration(f.sessionId)!,
+    node = f.repo.workflowHandoff(task, task.reviewer)
+  const reserved = f.repo.reserveEvaluation({
+    handoff: node,
+    provider: 'codex',
+    model: 'gpt-6-luna',
+    configurationFingerprint: hash('native'),
+  })
+  if (reserved.status !== 'reserved') throw Error('Expected evaluation')
+  f.repo.dispatchEvaluation(reserved.evaluation.id)
+  f.repo.recoverInterruptedRuns()
+  expect(f.repo.activeEvaluation()).toMatchObject({
+    id: reserved.evaluation.id,
+    sessionId: f.sessionId,
+    called: true,
+    physicalWitnessJson: null,
+  })
+  expect(
+    f.repo.reserveEvaluation({
+      handoff: node,
+      provider: 'codex',
+      model: 'gpt-6-luna',
+      configurationFingerprint: hash('new config'),
+    }).status,
+  ).toBe('duplicate')
+  const plan = f.db.drizzle.all(
+    sql`EXPLAIN QUERY PLAN SELECT id,session_id,called,outcome,physical_witness_json FROM scheduling_evaluations WHERE active=1 LIMIT 1`,
+  )
+  console.info('Active decision owner SQL plan', JSON.stringify(plan))
+  expect(JSON.stringify(plan)).toContain('scheduling_evaluations_active')
+  expect(f.repo.schedulingBudget(node.budgetSubjectId)?.evaluationCalls).toBe(1)
 })

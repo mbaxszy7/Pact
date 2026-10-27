@@ -14,11 +14,15 @@ import type {
   NativeForkFileResult,
   NativeForkAnswerResult,
   NativeForkHistoryReference,
+  NativeSeedVerificationResult,
+  NativeSessionExistenceResult,
 } from './native-fork-files'
 
+import { ClaudeAnswerAssembler } from './claude-answer-assembler'
 import {
   ClaudeNativePlan,
   claudePlanInputFingerprint,
+  claudePlanSubmissionFingerprint,
   type ClaudePlanBinding,
 } from './claude-native-plan'
 import { projectCollaborationAnswer } from './collaboration-answer'
@@ -108,9 +112,12 @@ function isInput(value: unknown): value is NativeForkFileInput {
   if (
     !isObject(value) ||
     !['claude', 'codex'].includes(String(value.provider)) ||
-    !['prepare', 'fork', 'inspect', 'read', 'read-answer'].includes(String(value.action))
+    !['prepare', 'fork', 'inspect', 'read', 'read-answer', 'verify-seed', 'exists'].includes(
+      String(value.action),
+    )
   )
     return false
+  if (value.action === 'exists' && value.provider !== 'claude') return false
   if (
     value.planHook !== undefined &&
     (value.action !== 'read-answer' ||
@@ -122,8 +129,48 @@ function isInput(value: unknown): value is NativeForkFileInput {
       !/^[a-f0-9]{64}$/u.test(value.planHook.inputFingerprint))
   )
     return false
+  if (
+    value.terminalPlanSubmission !== undefined &&
+    (value.provider !== 'claude' ||
+      value.action !== 'read-answer' ||
+      value.planHook !== undefined ||
+      value.includePlan === false ||
+      !isObject(value.terminalPlanSubmission) ||
+      typeof value.terminalPlanSubmission.id !== 'string' ||
+      !value.terminalPlanSubmission.id ||
+      value.terminalPlanSubmission.id.length > 1024 ||
+      typeof value.terminalPlanSubmission.promptId !== 'string' ||
+      !uuid.test(value.terminalPlanSubmission.promptId) ||
+      typeof value.terminalPlanSubmission.inputFingerprint !== 'string' ||
+      !/^[a-f0-9]{64}$/u.test(value.terminalPlanSubmission.inputFingerprint))
+  )
+    return false
   if (value.includePlan !== undefined && typeof value.includePlan !== 'boolean') return false
   if (value.planHook && value.includePlan === false) return false
+  if (value.action === 'verify-seed') {
+    if (
+      value.provider !== 'claude' ||
+      typeof value.rejectAdditionalWork !== 'boolean' ||
+      !Array.isArray(value.expectedSeed) ||
+      !value.expectedSeed.length ||
+      value.expectedSeed.length > 4096 ||
+      !value.expectedSeed.every(
+        (entry) =>
+          isObject(entry) &&
+          typeof entry.id === 'string' &&
+          uuid.test(entry.id) &&
+          typeof entry.hash === 'string' &&
+          /^[a-f0-9]{64}$/u.test(entry.hash) &&
+          Number.isSafeInteger(entry.images) &&
+          Number(entry.images) >= 0 &&
+          Number(entry.images) <= 4096,
+      ) ||
+      new Set(value.expectedSeed.map((entry) => entry.id)).size !== value.expectedSeed.length ||
+      Buffer.byteLength(JSON.stringify(value.expectedSeed)) > 1024 * 1024
+    )
+      return false
+  } else if (value.expectedSeed !== undefined || value.rejectAdditionalWork !== undefined)
+    return false
   for (const key of ['cwd', 'nativeSessionId'])
     if (typeof value[key] !== 'string' || !value[key].length || value[key].length > 4096)
       return false
@@ -429,12 +476,18 @@ function normalized(
 }
 async function claude(
   input: NativeForkFileInput,
-): Promise<NativeForkFileResult | NativeForkAnswerResult> {
+): Promise<
+  | NativeForkFileResult
+  | NativeForkAnswerResult
+  | NativeSeedVerificationResult
+  | NativeSessionExistenceResult
+> {
   const { forkSession, getSessionMessages } = await import('@anthropic-ai/claude-agent-sdk')
   if (!uuid.test(input.nativeSessionId)) throw new Error('Invalid Claude Native Session UUID.')
   const root = claudeRoot()
   // SDK asks its store for the exact sanitized project key, including its portable long-path hash.
   let projectDirectory: string | undefined
+  let sessionExists: boolean | undefined
   const load: SessionStore['load'] = async (key) => {
     if (key.subpath || !/^[a-z0-9-]+$/iu.test(key.projectKey) || !uuid.test(key.sessionId))
       throw new Error('Unsupported Native Session store key.')
@@ -450,6 +503,45 @@ async function claude(
     )
       throw new Error('The recorded Claude native Fork path changed.')
     const nativePath = join(projectDirectory, `${key.sessionId}.jsonl`)
+    if (input.action === 'exists') {
+      if (key.sessionId !== input.nativeSessionId)
+        throw new Error('The SDK selected another native Session store.')
+      try {
+        const canonicalRoot = await realpath(root),
+          canonicalProject = await realpath(projectDirectory),
+          canonicalPath = await realpath(nativePath)
+        if (
+          !inside(canonicalRoot, canonicalProject) ||
+          !inside(canonicalProject, canonicalPath) ||
+          canonicalProject !== join(canonicalRoot, key.projectKey) ||
+          canonicalPath !== join(canonicalProject, `${key.sessionId}.jsonl`)
+        )
+          throw new Error('Native transcript escaped its exact project store.')
+        const before = await lstat(nativePath, { bigint: true })
+        if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n)
+          throw new Error('Native transcript is linked or unsupported.')
+        const handle = await open(nativePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+        try {
+          if (
+            !stable(before, await handle.stat({ bigint: true })) ||
+            !stable(before, await lstat(nativePath, { bigint: true })) ||
+            (await realpath(nativePath)) !== canonicalPath ||
+            (await realpath(root)) !== canonicalRoot ||
+            (await realpath(projectDirectory)) !== canonicalProject
+          )
+            throw new Error('Native transcript identity changed during existence verification.')
+          sessionExists = true
+        } finally {
+          await handle.close()
+        }
+      } catch (error) {
+        if (error instanceof Error && Reflect.get(error, 'code') === 'ENOENT') sessionExists = false
+        else throw error
+      }
+      // Let the pinned SDK select its exact project key through our store.
+      // No transcript entries, custom title, or global index are loaded.
+      return []
+    }
     if (
       input.action === 'read-answer' &&
       ((input.storageRoot && (await realpath(root)) !== input.storageRoot) ||
@@ -528,11 +620,16 @@ async function claude(
     },
   }
   // Use the SDK's own chain selection; system messages keep compact boundaries intact.
-  await getSessionMessages(input.nativeSessionId, {
+  const selectedMessages = await getSessionMessages(input.nativeSessionId, {
     dir: input.cwd,
     includeSystemMessages: true,
     sessionStore: reading,
   })
+  if (input.action === 'exists') {
+    if (sessionExists === undefined)
+      throw new Error('The SDK did not identify the exact native Session store.')
+    return { nativeSessionId: input.nativeSessionId, exists: sessionExists }
+  }
   const raw = await records(
     join(projectDirectory!, `${input.nativeSessionId}.jsonl`),
     root,
@@ -542,6 +639,76 @@ async function claude(
   )
   if (hash(raw.entries) !== hash(sourceEntries))
     throw new Error('Native transcript changed between source reads.')
+  if (input.action === 'verify-seed') {
+    const expected = new Map(input.expectedSeed!.map((entry) => [entry.id, entry]))
+    const rawSeedIds = new Set<string>()
+    for (const entry of raw.entries) {
+      const id = entry.uuid
+      if (typeof id !== 'string' || !expected.has(id)) continue
+      if (rawSeedIds.has(id))
+        throw new Error('Native seed readback contained duplicate or foreign identities.')
+      rawSeedIds.add(id)
+    }
+    const seen = new Set<string>()
+    for (const message of selectedMessages) {
+      const receipt = expected.get(message.uuid)
+      if (!receipt) {
+        if (input.rejectAdditionalWork && message.type === 'user')
+          throw new Error(
+            'Additional native user work prevents an initialization-only confirmation.',
+          )
+        if (input.rejectAdditionalWork && message.type === 'assistant') {
+          const value = object(message.message).content
+          if (
+            !Array.isArray(value) ||
+            value.some(
+              (block) =>
+                !isObject(block) ||
+                block.type !== 'text' ||
+                block.text !== 'No response requested.',
+            )
+          )
+            throw new Error(
+              'Additional native assistant work prevents an initialization-only confirmation.',
+            )
+        }
+        continue
+      }
+      if (
+        seen.has(message.uuid) ||
+        message.session_id !== input.nativeSessionId ||
+        message.type !== 'user'
+      )
+        throw new Error('Native seed readback contained duplicate or foreign identities.')
+      const value = object(message.message).content
+      const content =
+        typeof value === 'string'
+          ? value
+          : Array.isArray(value)
+            ? value
+                .filter((block) => isObject(block) && block.type === 'text')
+                .map((block) => block.text)
+                .filter((text): text is string => typeof text === 'string')
+                .join('')
+            : ''
+      if (createHash('sha256').update(content).digest('hex') !== receipt.hash)
+        throw new Error('Native seed readback did not preserve the complete original content.')
+      const blocks = Array.isArray(value) ? value : []
+      const images = blocks.filter((block) => isObject(block) && block.type === 'image')
+      if (
+        images.length !== receipt.images ||
+        images.some(
+          (block) => nativeHistoryImageBytes({ type: 'user', message: { content: [block] } }) === 0,
+        ) ||
+        blocks.some((block) => !isObject(block) || !['text', 'image'].includes(String(block.type)))
+      )
+        throw new Error('Native seed image blocks do not match the complete manifest.')
+      seen.add(message.uuid)
+    }
+    if (seen.size !== expected.size)
+      throw new Error('Claude Code did not persist every full rebuild chunk.')
+    return { nativeSessionId: input.nativeSessionId, seedVerified: true }
+  }
   if (input.action === 'inspect') {
     const witness = input.witness
     if (!witness || witness.nativeSessionId !== input.nativeSessionId || !witness.idMap.length)
@@ -846,9 +1013,47 @@ async function claude(
       }
     }
     if (matches !== 1)
-      throw new Error('The exact live native plan operation is not available in the root history.')
+      throw Object.assign(
+        new Error('The exact live native plan operation is not available in the root history.'),
+        {
+          code: matches === 0 ? 'CLAUDE_PLAN_OPERATION_MISSING' : 'CLAUDE_PLAN_OPERATION_DUPLICATE',
+        },
+      )
   }
-  const answerItems = new Map<string, string>()
+  const submission = input.terminalPlanSubmission
+  let submissionLocated = false
+  if (submission) {
+    if (
+      !artifact ||
+      submission.promptId !== rootEntry.promptId ||
+      artifact.binding.promptId !== submission.promptId
+    )
+      throw new Error('The terminal plan submission has no matching authenticated prompt binding.')
+    let matches = 0
+    for (const entry of selected) {
+      if (
+        !belongsToRoot(entry) ||
+        entry.sessionId !== input.nativeSessionId ||
+        entry.type !== 'assistant' ||
+        entry.isCompactSummary
+      )
+        continue
+      const content = object(entry.message).content
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (!isObject(block) || block.type !== 'tool_use' || block.id !== submission.id) continue
+        matches++
+        if (
+          block.name !== 'ExitPlanMode' ||
+          claudePlanSubmissionFingerprint(block.input) !== submission.inputFingerprint
+        )
+          throw new Error('The terminal plan submission differs from its permission intent.')
+      }
+    }
+    if (matches !== 1)
+      throw new Error('The terminal plan submission identity is missing or duplicated.')
+  }
+  using answerItems = new ClaudeAnswerAssembler(input.nativeTurnId ?? input.nativeSessionId)
   for (const entry of selected) {
     if (
       !belongsToRoot(entry) ||
@@ -882,12 +1087,45 @@ async function claude(
       continue
     }
     if (typeof messageValue.id !== 'string') throw new Error('Incomplete native answer.')
-    let text = ''
+    let text = '',
+      textBlocks = 0
     for (const block of content) {
       if (!isObject(block)) throw new Error('Claude native content is incomplete.')
       if (block.type === 'text') {
         if (typeof block.text !== 'string') throw new Error('Claude native text is incomplete.')
         text += block.text
+        textBlocks++
+      } else if (
+        submissionLocated &&
+        block.type === 'tool_use' &&
+        block.name === 'AskUserQuestion'
+      ) {
+        throw new Error('A native clarification prevents terminal plan submission.')
+      } else if (submission && block.type === 'tool_use' && block.name === 'ExitPlanMode') {
+        if (!artifact || submissionLocated || block.id !== submission.id)
+          throw new Error('Another native submission invalidates the terminal plan intent.')
+        artifact.finish()
+        if (artifact.unavailable || artifact.hasPendingOperations || !artifact.completeText)
+          throw new Error('The terminal plan has incomplete or failed native operations.')
+        const intent = object(block.input)
+        if (
+          (intent.planFilePath !== undefined && intent.planFilePath !== artifact.binding.path) ||
+          (intent.plan !== undefined && intent.plan !== artifact.completeText)
+        )
+          throw new Error(
+            'The submitted native plan body or path differs from its authenticated source.',
+          )
+        artifact.noteSubmission(submission.id, block.input)
+        retainedId = submission.id
+        submissionLocated = true
+      } else if (
+        submissionLocated &&
+        artifact &&
+        block.type === 'tool_use' &&
+        ['Write', 'Edit'].includes(String(block.name)) &&
+        object(block.input).file_path === artifact.binding.path
+      ) {
+        throw new Error('A later native plan operation invalidates the terminal submission.')
       } else if (input.planHook && block.type === 'tool_use' && block.id === input.planHook.id) {
         hookLocated = true
       } else if (
@@ -912,13 +1150,28 @@ async function claude(
         if (!previous) operations.set(block.id, operation)
       }
     }
-    if (text) answerItems.set(messageValue.id, text)
+    if (typeof entry.uuid !== 'string') throw new Error('Incomplete native answer identity.')
+    answerItems.frame(messageValue.id, entry.uuid, textBlocks ? text : undefined, textBlocks)
   }
   if (!input.planHook) artifact?.finish()
   const plan = artifact?.plan
   const retainedPlan = retainedId ? artifact?.retained(retainedId) : undefined
-  const answer = projectCollaborationAnswer([...answerItems].map(([id, text]) => ({ id, text })))
+  answerItems.finalize()
+  const answer = answerItems.text
   if (input.action === 'read-answer') {
+    if (submission) {
+      if (!submissionLocated || artifact?.unavailable || (!plan && !retainedPlan))
+        throw new Error('The terminal native plan proof is incomplete.')
+      return {
+        nativeSessionId: input.nativeSessionId,
+        nativeTurnId: input.nativeTurnId!,
+        ...(plan ? { plan } : retainedPlan ? { retainedPlan } : {}),
+        ...(planBinding ? { planBinding } : {}),
+        terminalPlanSubmission: submission,
+        nativeStorageRoot: await realpath(root),
+        nativePath: join(await realpath(projectDirectory!), `${input.nativeSessionId}.jsonl`),
+      }
+    }
     if (input.planHook)
       return {
         nativeSessionId: input.nativeSessionId,

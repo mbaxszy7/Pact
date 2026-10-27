@@ -52,8 +52,8 @@ test(
     try {
       const originalSettings = await sessionSettings(ctx)
       expect(originalSettings.session.settings.agents).toEqual({
-        claude: { model: null, effort: null },
-        codex: { model: null, effort: null },
+        claude: { model: null, effort: null, speed: 'native' },
+        codex: { model: null, effort: null, speed: 'native' },
       })
       const originalDefault = await appDefaults(ctx)
       const configuredModels = ctx.fixture.readConfigurationModels()
@@ -85,6 +85,7 @@ test(
       expect((await sessionSettings(ctx)).session.settings.agents.codex).toEqual({
         model: null,
         effort: null,
+        speed: 'native',
       })
       const codexDefaultEvidence = await findNativeRecord(
         ctx,
@@ -134,6 +135,7 @@ test(
       expect((await sessionSettings(ctx)).session.settings.agents.claude).toEqual({
         model: null,
         effort: null,
+        speed: 'native',
       })
       const claudeDefaultEvidence = await findNativeRecord(
         ctx,
@@ -425,6 +427,7 @@ function selection(options: Selections, phase: 'first' | 'next'): AgentModelSele
   return {
     model: options.model,
     effort: phase === 'first' ? options.firstEffort : options.nextEffort,
+    speed: 'native',
   }
 }
 
@@ -506,13 +509,13 @@ async function changeSettingsFields(
       .selectOption(wanted.effort ?? '')
   }
   await scope
-    .getByRole('spinbutton', { name: 'Maximum discussion rounds', exact: true })
+    .getByRole('spinbutton', { name: 'Plan reviews', exact: true })
     .fill(String(settings.maxDiscussionRounds))
   await scope
-    .getByRole('spinbutton', { name: 'Maximum review cycles', exact: true })
+    .getByRole('spinbutton', { name: 'Code reviews', exact: true })
     .fill(String(settings.maxReviewCycles))
   await scope
-    .getByRole('spinbutton', { name: 'Repair attempts per task', exact: true })
+    .getByRole('spinbutton', { name: 'Repair attempts', exact: true })
     .fill(String(settings.maxRepairAttempts))
 }
 

@@ -20,6 +20,9 @@ import {
   collaborationTaskSchema,
   collaborationTurnAuthorizationSchema,
   collaborationDocumentSchema,
+  preparedInformationControlSchema,
+  handoffGuidanceSchema,
+  HANDOFF_GUIDANCE_BYTES,
   type CollaborationDocument,
   type CollaborationTurnAuthorization,
   nativeForkBoundarySchema,
@@ -562,6 +565,7 @@ export function commitFork(
     const memberIdentity = (id: string) => (id === '$body' ? id : identity('comment', id))
     const userIdentity = (id: string) => identity(commentSet.has(id) ? 'comment' : 'message', id)
     const structuredDocuments = new Set<string>()
+    const guidanceDocuments = new Set<string>()
     const registerDocument = (value: unknown, structured = false): void => {
       const parsed = collaborationDocumentSchema.safeParse(value)
       if (parsed.success && structured) structuredDocuments.add(parsed.data.id)
@@ -575,6 +579,8 @@ export function commitFork(
       const auth = historicalAuthorizations.get(turn.runId)!
       registerDocument(auth.reviewScopeRef, true)
       registerDocument(auth.sourceManifestRef, true)
+      registerDocument(auth.relayWorkRef, true)
+      if (auth.sourceManifestRef) guidanceDocuments.add(auth.sourceManifestRef.id)
     }
     for (const row of memberRows)
       if (row.anchorDocumentJson) registerDocument(JSON.parse(row.anchorDocumentJson), true)
@@ -631,8 +637,21 @@ export function commitFork(
         } catch {
           value = undefined
         }
-        // Unparseable structured sources remain exact evidence, never new valid metadata.
-        if (value !== undefined) text = JSON.stringify(remapMetadata(value))
+        // Unknown/invalid manifests remain evidence; they cannot add recursive references.
+        const guidance =
+          guidanceDocuments.has(ref.id) && old.bytes <= HANDOFF_GUIDANCE_BYTES
+            ? handoffGuidanceSchema.safeParse(value)
+            : undefined
+        if (guidanceDocuments.has(ref.id)) {
+          if (guidance?.success) {
+            const mapped = handoffGuidanceSchema.parse(remapMetadata(guidance.data))
+            if (mapped.version === 'handoff-guidance-v2') {
+              mapped.basis.task.id = identity('collaboration', mapped.basis.task.id)
+              mapped.basis.producerRunId = identity('run', mapped.basis.producerRunId)
+            }
+            text = JSON.stringify(handoffGuidanceSchema.parse(mapped))
+          }
+        } else if (value !== undefined) text = JSON.stringify(remapMetadata(value))
       }
       const sha256 =
         text === undefined ? ref.sha256 : createHash('sha256').update(text).digest('hex')
@@ -697,6 +716,8 @@ export function commitFork(
       const object: Record<string, unknown> = Object.fromEntries(Object.entries(value))
       const mapped: Record<string, unknown> = {}
       for (const [key, item] of Object.entries(object)) {
+        // A Fork carries historical source facts, never the parent's usable action grant.
+        if (key === 'userAuthority') continue
         if (item == null) {
           mapped[key] = item
           continue
@@ -716,9 +737,14 @@ export function commitFork(
         } else if (['taskId', 'sourceTaskId'].includes(key) && typeof item === 'string')
           mapped[key] = identity('collaboration', item)
         else if (
-          ['runId', 'sourceRunId', 'responseRunId', 'codeRunId', 'sourceChangeSetId'].includes(
-            key,
-          ) &&
+          [
+            'runId',
+            'sourceRunId',
+            'responseRunId',
+            'codeRunId',
+            'sourceChangeSetId',
+            'implementationRunId',
+          ].includes(key) &&
           typeof item === 'string'
         )
           mapped[key] = identity('run', item)
@@ -729,6 +755,7 @@ export function commitFork(
             'userMessageId',
             'taskMessageId',
             'latestUserMessageId',
+            'requestMessageId',
           ].includes(key) &&
           typeof item === 'string'
         )
@@ -1104,6 +1131,22 @@ export function commitFork(
       const body = row.bodyDocumentJson
         ? remapDocument(JSON.parse(row.bodyDocumentJson))
         : undefined
+      const information = row.dispatchInformationJson
+        ? preparedInformationControlSchema.parse(JSON.parse(row.dispatchInformationJson))
+        : undefined
+      const historicalInformation = information
+        ? preparedInformationControlSchema.parse({
+            version: 'prepared-information-v1',
+            decisionId: forkId(sessionId, 'historical-information', information.decisionId),
+            revision: 0,
+            preview: information.preview,
+            originalCommentIds: information.originalCommentIds.map((id) => identity('comment', id)),
+            draftCopies: [],
+            ...(information.answerDocument
+              ? { answerDocument: remapDocument(information.answerDocument) }
+              : {}),
+          })
+        : undefined
       database
         .insert(conversationInputBatches)
         .values({
@@ -1116,6 +1159,12 @@ export function commitFork(
           runId: row.runId ? identity('run', row.runId) : null,
           messageId: row.messageId ? identity('message', row.messageId) : null,
           inputId: null,
+          dispatchInformationJson: historicalInformation
+            ? JSON.stringify(historicalInformation)
+            : null,
+          userInformationDocumentJson: row.userInformationDocumentJson
+            ? JSON.stringify(remapDocument(JSON.parse(row.userInformationDocumentJson)))
+            : null,
           bodyDocumentJson: body ? JSON.stringify(body) : null,
         })
         .run()

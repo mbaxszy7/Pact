@@ -48,6 +48,10 @@ import {
 } from './components/runtime-preparation/RuntimePreparationView'
 import { AppearanceSettingsView } from './components/settings/appearance/AppearanceSettingsView'
 import {
+  DecisionSchedulingSettings,
+  useSchedulingSettings,
+} from './components/settings/scheduling/DecisionSchedulingSettings'
+import {
   DefaultSessionOnboardingView,
   DefaultSessionSettingsView,
 } from './components/settings/session/DefaultSessionSettingsView'
@@ -348,6 +352,17 @@ function App(): React.JSX.Element {
     !nativeQuitState &&
     !isRuntimePreparationOpen &&
     !showFirstUseDefaults
+  const schedulingSettings = useSchedulingSettings(
+    runtimePreparationQuery.data?.firstUse === false &&
+      documentVisible &&
+      !nativeAttentionOpen &&
+      !nativeQuitState &&
+      !isRuntimePreparationOpen &&
+      !showFirstUseDefaults &&
+      (settingsPage === 'decision-scheduling' || (!settingsPage && !creatingProjectId)),
+    selectedSessionId,
+    settingsPage === 'decision-scheduling',
+  )
   const conversation = useConversation(
     selectedSessionId,
     showWarning,
@@ -1539,6 +1554,7 @@ function App(): React.JSX.Element {
           sessionError={sessionWorkspace.error}
           updateAvailable={updates.state?.updateAvailable ?? false}
           settingsPage={settingsPage}
+          schedulingState={schedulingSettings.state}
           onOpenSettings={(page) => {
             beginUserSelection()
             setNativeAttentionOpen(false)
@@ -1579,6 +1595,10 @@ function App(): React.JSX.Element {
           onAddConversationImages={conversation.addComposerImages}
           onChooseConversationImages={conversation.chooseComposerImages}
           onRemoveConversationImage={conversation.removeComposerImage}
+          conversationComposerUserInformation={conversation.composerUserInformation}
+          onConversationComposerUserInformationChange={(value) =>
+            conversation.setComposerUserInformation(value)
+          }
           conversationComposerSkills={conversation.composerSkills}
           onConversationComposerSkillsChange={(values) => conversation.setComposerSkills(values)}
           conversationComposerMention={conversation.composerMention}
@@ -1718,7 +1738,9 @@ function App(): React.JSX.Element {
             )
           }
           settingsView={
-            settingsPage === 'updates' ? (
+            settingsPage === 'decision-scheduling' ? (
+              <DecisionSchedulingSettings state={schedulingSettings} />
+            ) : settingsPage === 'updates' ? (
               aboutUpdatesView
             ) : settingsPage === 'appearance' ? (
               <AppearanceSettingsView

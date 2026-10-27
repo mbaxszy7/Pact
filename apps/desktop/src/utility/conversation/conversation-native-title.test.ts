@@ -115,6 +115,16 @@ class NativeFixture {
       },
     }
   }
+  beginNativeStatusCheck(input: AgentNativeProbeInput) {
+    const result = this.probeNativeStatus(input)
+    return {
+      result,
+      physicalCompletion: result.then(
+        () => undefined,
+        () => undefined,
+      ),
+    }
+  }
   async setNativeTitle(input: AgentNativeTitleInput, signal: AbortSignal) {
     native.writes.push(input)
     native.naming += 1

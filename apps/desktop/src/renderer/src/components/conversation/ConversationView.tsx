@@ -38,6 +38,7 @@ import type {
   AnchoredComment,
   CollaborationSession,
   CollaborationTask,
+  RelayDecisionAnswer,
   ConversationPage,
   CommentAnchor,
   MessageCommentAnchor,
@@ -74,6 +75,9 @@ import type {
 } from './useConversation'
 
 import { MESSAGE_ANCHOR_TEXT_BASIS } from '../../../../shared/message-anchor-text'
+import { PreparedInputCard } from '../scheduling/PreparedInputCard'
+import { RelayDecisionCard, type RelayDecisionPresentation } from '../scheduling/RelayDecisionCard'
+import { RelayActivityIndicator } from '../settings/scheduling/RelayActivityIndicator'
 import { InputReplacement } from '../ui/InputReplacement'
 import { AgentActivityList } from './AgentActivityList'
 import { CollaborationQuestionCard } from './CollaborationQuestionCard'
@@ -120,6 +124,7 @@ import { SessionWarningCard } from './SessionWarningCard'
 import { SpeedMenu } from './SpeedMenu'
 import { sameDecision, hasDecisionAnswers, type DecisionReplyContext } from './useConversation'
 import { commentDraftSaveSucceeded } from './useConversation'
+import { UserInformationDraft } from './UserInformationDraft'
 import { useSkillComposer, type ComposerEdit } from './useSkillComposer'
 import { WorkspaceChangesCard, type WorkspaceChangesList } from './WorkspaceChangesCard'
 
@@ -157,11 +162,16 @@ interface ConversationViewProps {
   sessionSettingsSaving?: boolean | undefined
   onSaveSessionPermission?: ((input: SessionPermissionSaveInput) => Promise<boolean>) | undefined
   onSaveSessionSpeed?: ((input: SessionSpeedSaveInput) => Promise<boolean>) | undefined
+  schedulingState?: import('@pact/contracts').SchedulingState | undefined
+  relayDecision?: RelayDecisionPresentation | undefined
+  onOpenRelaySettings?: (() => void) | undefined
   visible: boolean
   session: CollaborationSession
   snapshot?: ConversationViewProjection | undefined
   history: ConversationHistoryControls
   composer: string
+  composerUserInformation?: import('@pact/contracts').UserInformationDeclaration | undefined
+  onComposerUserInformationChange?: ConversationFlow['setComposerUserInformation'] | undefined
   choosingImages?: boolean | undefined
   composerImages?: readonly DraftImage[] | undefined
   onAddComposerImages?: ConversationFlow['addComposerImages'] | undefined
@@ -300,11 +310,16 @@ export function ConversationView({
   onSaveSessionPermission,
   onSaveSessionSpeed,
   visible,
+  schedulingState,
+  relayDecision,
+  onOpenRelaySettings,
   session,
   snapshot,
   history,
   composer,
   composerImages = EMPTY_IMAGES,
+  composerUserInformation,
+  onComposerUserInformationChange,
   choosingImages = false,
   onAddComposerImages,
   onChooseComposerImages,
@@ -583,6 +598,7 @@ export function ConversationView({
   >(undefined)
   const focusAfterPageRef = useRef<'latest' | undefined>(undefined)
   const commentTextareaRef = useRef<HTMLTextAreaElement>(null)
+  const commentFocusRef = useRef<{ visible: boolean; cancel?: () => void }>({ visible })
   const messageRefs = useRef(new Map<string, HTMLElement>())
   const messagesRef = useRef(snapshot?.messages)
   // Completed Markdown can skip Composer/stream renders; its stable event
@@ -768,7 +784,159 @@ export function ConversationView({
   const nativeQuestions = nativeRequests.filter(
     ({ request }) => request.kind && request.kind !== 'approval',
   )
-  const inputTakeover = decisionTakeover || nativeQuestions.length > 0
+  const relayRequest =
+    snapshot?.relaySchedulingDecision?.sessionId === session.id &&
+    snapshot.relaySchedulingDecision.decisionId !== history.cancelledInformationDecisionId
+      ? snapshot.relaySchedulingDecision
+      : undefined
+  const relayIdentity = relayRequest
+    ? `${relayRequest.sessionId}:${relayRequest.decisionId}:${relayRequest.revision}`
+    : undefined
+  const [relayUi, setRelayUi] = useState<{
+    identity: string
+    value: string
+    status: RelayDecisionPresentation['status']
+    error?: string | undefined
+  }>()
+  const relayAnswerOwner = useRef<
+    { identity: string; input: RelayDecisionAnswer; pending: boolean } | undefined
+  >(undefined)
+  const relayUiRef = useRef(relayIdentity)
+  relayUiRef.current = relayIdentity
+  const readRelayReceipt = async (): Promise<void> => {
+    const owner = relayAnswerOwner.current
+    if (!owner || owner.pending || owner.identity !== relayUiRef.current) return
+    owner.pending = true
+    setRelayUi((current) =>
+      current?.identity === owner.identity ? { ...current, status: 'checking_receipt' } : current,
+    )
+    try {
+      const { reference, clientOperationId } = owner.input
+      const result = await window.pact.getRelayDecisionReceipt({
+        sessionId: reference.sessionId,
+        decisionId: reference.decisionId,
+        clientOperationId,
+      })
+      if (relayUiRef.current !== owner.identity) return
+      if (result.ok) {
+        history.retryRead()
+      } else
+        setRelayUi((current) =>
+          current?.identity === owner.identity
+            ? { ...current, status: 'receipt_unconfirmed', error: result.error.message }
+            : current,
+        )
+    } catch {
+      if (relayUiRef.current === owner.identity)
+        setRelayUi((current) =>
+          current?.identity === owner.identity
+            ? {
+                ...current,
+                status: 'receipt_unconfirmed',
+                error:
+                  'The scheduling decision is not confirmed. Check its receipt before another action.',
+              }
+            : current,
+        )
+    } finally {
+      owner.pending = false
+    }
+  }
+  const submitRelayAnswer = async (answer: RelayDecisionAnswer['answer']): Promise<void> => {
+    if (
+      answer.kind === 'cancel' &&
+      relayRequest?.request.category === 'necessary_information' &&
+      history.cancelPreparedInformation
+    ) {
+      await history.cancelPreparedInformation(relayRequest)
+      return
+    }
+    if (!relayRequest || !relayIdentity || relayAnswerOwner.current?.identity === relayIdentity)
+      return
+    const owner = {
+      identity: relayIdentity,
+      pending: true,
+      input: {
+        reference: {
+          sessionId: relayRequest.sessionId,
+          decisionId: relayRequest.decisionId,
+          revision: relayRequest.revision,
+        },
+        clientOperationId: crypto.randomUUID(),
+        answer,
+      },
+    }
+    relayAnswerOwner.current = owner
+    setRelayUi((current) => ({
+      identity: relayIdentity,
+      value: current?.identity === relayIdentity ? current.value : '',
+      status: 'submitting',
+    }))
+    try {
+      const result = await window.pact.answerRelayDecision(owner.input)
+      if (relayUiRef.current !== owner.identity) return
+      if (result.ok) history.retryRead()
+      else if (result.error.code === 'TIMEOUT' || result.error.code === 'UNCERTAIN') {
+        owner.pending = false
+        await readRelayReceipt()
+      } else {
+        relayAnswerOwner.current = undefined
+        setRelayUi((current) =>
+          current?.identity === owner.identity
+            ? { ...current, status: 'awaiting_confirmation', error: result.error.message }
+            : current,
+        )
+      }
+    } catch {
+      if (relayUiRef.current === owner.identity) {
+        owner.pending = false
+        await readRelayReceipt()
+      }
+    } finally {
+      owner.pending = false
+    }
+  }
+  const activeRelayUi = relayUi?.identity === relayIdentity ? relayUi : undefined
+  const productionRelayDecision: RelayDecisionPresentation | undefined = relayRequest
+    ? {
+        request: relayRequest,
+        status: activeRelayUi?.status ?? 'awaiting_confirmation',
+        answerValue: activeRelayUi?.value ?? '',
+        error: activeRelayUi?.error,
+        onChangeAnswer: (value) => {
+          if (relayIdentity)
+            setRelayUi({ identity: relayIdentity, value, status: 'awaiting_confirmation' })
+        },
+        onConfirm: (answer) => {
+          void submitRelayAnswer(answer)
+        },
+        onCheckReceipt: () => {
+          void readRelayReceipt()
+        },
+        onCancel: () => {
+          void submitRelayAnswer({ kind: 'cancel' })
+        },
+      }
+    : undefined
+  const cancellation = history.informationCancellation
+  const currentRelayDecision =
+    cancellation?.request.sessionId === session.id
+      ? {
+          ...cancellation,
+          cancelling: true,
+          answerValue: '',
+          onChangeAnswer: () => undefined,
+          onConfirm: () => undefined,
+          onCancel: () => undefined,
+          onCheckReceipt: () => {
+            void history.checkInformationCancellation?.()
+          },
+        }
+      : relayDecision?.request.sessionId === session.id
+        ? relayDecision
+        : productionRelayDecision
+  const inputTakeover =
+    decisionTakeover || nativeQuestions.length > 0 || Boolean(currentRelayDecision)
   const showDecisionNotice = Boolean(
     decisionSource &&
     !planRecovery &&
@@ -809,6 +977,29 @@ export function ConversationView({
       : undefined
 
   const sessionIssues = snapshot?.sessionIssues
+  const relayRebuild =
+    currentRelayDecision?.request.request.category === 'arrangement_change' &&
+    !decisionTakeover &&
+    !nativeRequests.length &&
+    !planRecovery
+      ? currentRelayDecision.request.request.operation
+      : undefined
+  const visibleSessionIssues =
+    sessionIssues && relayRebuild
+      ? {
+          ...sessionIssues,
+          agents: sessionIssues.agents.filter(
+            (issue) =>
+              !(
+                issue.agentId === relayRebuild.agentId &&
+                issue.generation === relayRebuild.expectedGeneration &&
+                (issue.nativeSessionId ?? null) === relayRebuild.expectedNativeSessionId &&
+                (issue.runId ?? null) === relayRebuild.expectedRunId &&
+                (issue.rebuildId ?? null) === relayRebuild.expectedRebuildId
+              ),
+          ),
+        }
+      : sessionIssues
   const inputGate = sessionIssues?.inputGate ?? 'read_only'
   const recoveryLocked = inputGate === 'read_only'
 
@@ -929,7 +1120,7 @@ export function ConversationView({
       composerImages.length ||
       commentEditor?.body.trim()),
   )
-  const activeCommentAnchor = commentEditor?.anchor
+  const commentDraftId = commentEditor?.draftId
   const defaultRecipient =
     unfinishedTask && !parseComposerCommandPrefix(composer, composerSkills).pact
       ? unfinishedTask.kind === 'review'
@@ -1871,15 +2062,63 @@ export function ConversationView({
     setRequestedResponseId(undefined)
     setRestorationMessageIds([])
   }, [requestedResponseId, visible, rows, mountedRowKeys, virtualizer])
-  useEffect(() => {
-    if (!activeCommentAnchor) return undefined
-    const frame = requestAnimationFrame(() => {
-      const textarea = commentTextareaRef.current
-      textarea?.focus()
-      textarea?.setSelectionRange(textarea.value.length, textarea.value.length)
+  useLayoutEffect(() => {
+    commentFocusRef.current.visible = visible
+    if (!visible) commentFocusRef.current.cancel?.()
+  }, [visible])
+  useLayoutEffect(() => {
+    const textarea = commentTextareaRef.current
+    if (
+      !commentDraftId ||
+      !commentFocusRef.current.visible ||
+      !textarea ||
+      document.activeElement === textarea
+    )
+      return undefined
+    const origin = document.activeElement
+    let active = true
+    let frame: number | undefined
+    const detach = (): void => {
+      document.removeEventListener('focusin', cancel, true)
+      window.removeEventListener('blur', cancel)
+      if (commentFocusRef.current.cancel === cancel) delete commentFocusRef.current.cancel
+    }
+    const cancel = (): void => {
+      active = false
+      detach()
+      if (frame !== undefined) cancelAnimationFrame(frame)
+      frame = undefined
+    }
+    // Capture ownership before paint. Any later focus transfer supersedes this request,
+    // including a transfer away and back to the original element.
+    commentFocusRef.current.cancel = cancel
+    document.addEventListener('focusin', cancel, true)
+    window.addEventListener('blur', cancel)
+    frame = requestAnimationFrame(() => {
+      if (!active) return
+      active = false
+      frame = undefined
+      detach()
+      if (
+        commentTextareaRef.current !== textarea ||
+        !commentFocusRef.current.visible ||
+        !textarea.isConnected ||
+        textarea.disabled ||
+        textarea.readOnly ||
+        document.activeElement !== origin ||
+        textarea.closest('[inert], [hidden], [aria-hidden="true"]')
+      )
+        return
+      for (let element: HTMLElement | null = textarea; element; element = element.parentElement) {
+        const style = getComputedStyle(element)
+        if (style.display === 'none' || style.visibility === 'hidden') return
+      }
+      textarea.focus()
+      if (document.activeElement === textarea)
+        textarea.setSelectionRange(textarea.value.length, textarea.value.length)
     })
-    return () => cancelAnimationFrame(frame)
-  }, [activeCommentAnchor, planPanelExpanded])
+    return cancel
+  }, [commentDraftId, planPanelExpanded])
   useEffect(() => {
     copyActiveRef.current = true
     return () => {
@@ -3128,6 +3367,7 @@ export function ConversationView({
     <section
       className="rounded-card border border-border bg-surface-raised p-3"
       aria-labelledby="comment-editor-title"
+      data-pact-comment-editor
     >
       <header className="flex items-start justify-between gap-group">
         <div className="flex min-w-0 items-start gap-2.5">
@@ -3632,11 +3872,11 @@ export function ConversationView({
         </div>
       </section>
 
-      <div className="shrink-0 px-section py-group">
-        <div className={`mx-auto flex ${CONVERSATION_WIDTH} flex-col gap-2`}>
-          {sessionIssues && sessionIssues.agents.length > 0 ? (
+      <div className="pact-conversation-input-dock shrink-0 px-section py-group">
+        <div className={`pact-input-dock-inner mx-auto flex ${CONVERSATION_WIDTH} flex-col gap-2`}>
+          {visibleSessionIssues && visibleSessionIssues.agents.length > 0 ? (
             <SessionWarningCard
-              value={sessionIssues}
+              value={visibleSessionIssues}
               enabled={agentActionsEnabled}
               onRetry={(issue) =>
                 issue.action === 'inspect_rebuild'
@@ -3669,7 +3909,7 @@ export function ConversationView({
               disabled={composerDisabled || sending || stopping}
               canSteer={!inputTakeover && canSteerQueuedInput}
               steerUnavailableReason={
-                inputTakeover ? 'Answer the current questions first.' : steerUnavailableReason
+                inputTakeover ? 'Resolve the current interaction first.' : steerUnavailableReason
               }
               respondingAgentId={respondingAgentId}
               onSteer={queueActions.steer}
@@ -3684,6 +3924,17 @@ export function ConversationView({
               }
             />
           ) : null}
+          <div className="relay-indicator-slot">
+            {onOpenRelaySettings ? (
+              <RelayActivityIndicator
+                state={schedulingState}
+                sessionId={session.id}
+                visible={visible && !nativePresentationSuspended}
+                waitingForUser={inputTakeover || nativeRequests.length > 0}
+                onOpenSettings={onOpenRelaySettings}
+              />
+            ) : null}
+          </div>
           <InputReplacement
             key={session.id}
             replacement={
@@ -3784,10 +4035,31 @@ export function ConversationView({
                         </section>
                       ),
                     }
-                  : undefined
+                  : currentRelayDecision && !planRecovery && nativeRequests.length === 0
+                    ? {
+                        key: `relay:${currentRelayDecision.request.decisionId}`,
+                        content: (
+                          <RelayDecisionCard
+                            decision={currentRelayDecision}
+                            visible={visible && !nativePresentationSuspended}
+                          />
+                        ),
+                      }
+                    : undefined
             }
           >
-            <div className="flex flex-col gap-2">
+            <div className="pact-ordinary-input-stack flex flex-col gap-2">
+              {snapshot?.preparedInputContinuation ? (
+                <PreparedInputCard
+                  key={`${session.id}:${snapshot.preparedInputContinuation.batchId}`}
+                  sessionId={session.id}
+                  input={snapshot.preparedInputContinuation}
+                  disabled={
+                    sending || stopping || nativeRequests.length > 0 || Boolean(planRecovery)
+                  }
+                  onChanged={() => history.retryRead()}
+                />
+              ) : null}
               {!planPanelExpanded ? commentEditorView : null}
               {skillComposer.warning ? (
                 <div
@@ -3824,7 +4096,7 @@ export function ConversationView({
                 </div>
               ) : null}
               <div
-                className={`relative flex flex-col gap-1.5 rounded-card border border-border bg-surface-raised p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus ${recoveryLocked ? 'opacity-60' : ''} ${imageDropActive ? 'outline-2 outline-focus outline-offset-4' : ''}`}
+                className={`pact-composer-box relative flex flex-col gap-1.5 rounded-card border border-border bg-surface-raised p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus ${recoveryLocked ? 'opacity-60' : ''} ${imageDropActive ? 'outline-2 outline-focus outline-offset-4' : ''}`}
                 onDragEnter={(event) => {
                   if (
                     !composerDisabled &&
@@ -3869,276 +4141,88 @@ export function ConversationView({
 
                 aria-disabled={recoveryLocked}
               >
-                <div
-                  ref={skillMenuRef}
-                  id={`skills-${session.id}`}
-                  role="listbox"
-                  aria-label="Native Skills"
-                  aria-hidden={!skillComposer.query}
-                  aria-busy={skillComposer.loading}
-                  inert={!skillComposer.query}
-                  data-open={Boolean(skillComposer.query)}
-                  className="pact-skill-menu absolute right-0 bottom-[calc(100%+8px)] left-0 z-30 min-h-32 max-h-80 overflow-y-auto rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
-                >
-                  {skillComposer.pactOptions.length > 0 ? (
-                    <>
-                      <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">
-                        Pact
-                      </p>
-                      {skillComposer.pactOptions.map((entry) => {
-                        const index = skillComposer.options.indexOf(entry)
-                        return (
+                <div className="pact-composer-editing flex min-h-16 w-full flex-col gap-1.5">
+                  {!planPanelExpanded ? commentDraftsView : null}
+                  {returnedInput ? (
+                    <div className="mb-2 flex flex-wrap items-center gap-2 px-2 text-caption text-secondary">
+                      <span>
+                        {history.restoringInput
+                          ? 'Restoring unsent message…'
+                          : returnedInput.state === 'installed' &&
+                              (composer || composerImages.length || draftComments.length)
+                            ? 'Unsent message restored'
+                            : 'Previous unsent message is available'}
+                      </span>
+                      <span>
+                        ·{' '}
+                        {returnedInput.route.type === 'all'
+                          ? `${returnedInput.route.firstAgentId === 'codex' ? 'Codex' : 'Claude Code'} → ${returnedInput.route.secondAgentId === 'codex' ? 'Codex' : 'Claude Code'}`
+                          : returnedInput.route.agentId === 'codex'
+                            ? 'Codex'
+                            : 'Claude Code'}
+                      </span>
+                      {returnedInput.state === 'pending' ||
+                      (!composer &&
+                        !composerImages.length &&
+                        !hasDecisionAnswers(history.decisionDraft)) ? (
+                        <>
                           <button
-                            key={entry.id}
-                            id={`skill-${entry.id}`}
                             type="button"
-                            role="option"
-                            aria-selected={index === skillComposer.active}
-                            className={`flex min-h-10 w-full items-center gap-2 rounded-control px-2.5 py-1.5 text-left text-caption ${index === skillComposer.active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
-                            onMouseEnter={() => skillComposer.setActive(index, false)}
-                            onMouseDown={(event) => event.preventDefault()}
-                            onClick={() => chooseSkill(entry)}
+                            className="rounded-control px-2 py-1 text-primary hover:bg-surface-muted disabled:opacity-40"
+                            disabled={Boolean(
+                              composer ||
+                              hasDecisionAnswers(history.decisionDraft) ||
+                              composerImages.length ||
+                              composerMention ||
+                              draftComments.some(
+                                (comment) => !returnedInput.commentIds.includes(comment.id),
+                              ) ||
+                              history.restoringInput ||
+                              history.draftsLoading,
+                            )}
+                            onClick={() => void history.restoreReturnedInput?.()}
                           >
-                            <BookOpen
-                              aria-hidden="true"
-                              className="size-4 shrink-0"
-                              strokeWidth={1.75}
-                            />
-                            <span className="min-w-0 flex-1">
-                              <span className="block font-medium text-primary">{entry.name}</span>
-                              <span className="block text-tertiary">{entry.description}</span>
-                            </span>
-                            <span className="text-tertiary">Pact</span>
+                            Restore to input
                           </button>
-                        )
-                      })}
-                    </>
-                  ) : null}
-                  {skillComposer.agents.map((agent) => (
-                    <Fragment key={agent}>
-                      <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">
-                        {agent === 'claude' ? 'Claude Code' : 'Codex'}
-                      </p>
-                      {skillComposer.visibleOptions
-                        .filter((entry) => entry.agentId === agent)
-                        .map((entry) => {
-                          const index = skillComposer.options.indexOf(entry)
-                          return (
-                            <button
-                              key={entry.id}
-                              id={`skill-${entry.id}`}
-                              type="button"
-                              role="option"
-                              aria-selected={index === skillComposer.active}
-                              className={`flex min-h-10 w-full items-center gap-2 rounded-control px-2.5 py-1.5 text-left text-caption ${index === skillComposer.active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
-                              onMouseEnter={() => skillComposer.setActive(index, false)}
-                              onMouseDown={(event) => event.preventDefault()}
-                              onClick={() => {
-                                chooseSkill(entry)
-                              }}
-                            >
-                              <span className="min-w-0 flex-1">
-                                <span className="block truncate font-medium text-primary">
-                                  /{entry.name}
-                                  {entry.argumentHint ? (
-                                    <span className="ml-2 font-normal text-tertiary">
-                                      {entry.argumentHint}
-                                    </span>
-                                  ) : null}
-                                </span>
-                                <span
-                                  className="block truncate text-tertiary"
-                                  title={entry.description}
-                                >
-                                  {entry.description}
-                                </span>
-                              </span>
-                              <span className="shrink-0 text-tertiary">
-                                {entry.source === 'native'
-                                  ? 'Native'
-                                  : entry.source[0]!.toUpperCase() + entry.source.slice(1)}
-                              </span>
-                            </button>
-                          )
-                        })}
-                      {skillComposer.errors[agent] ? (
-                        <p className="px-2.5 py-2 text-caption text-secondary">
-                          {skillComposer.errors[agent]}
-                        </p>
-                      ) : null}
-                      {!skillComposer.loading &&
-                      !skillComposer.errors[agent] &&
-                      !skillComposer.pages[agent]?.skills.length ? (
-                        <p className="px-2.5 py-2 text-caption text-tertiary">
-                          No matching Skills.
-                        </p>
-                      ) : null}
-                      {skillComposer.canPrevious(agent) || skillComposer.canMore(agent) ? (
-                        <div className="flex items-center justify-between gap-2 px-2.5 py-1">
-                          {skillComposer.canPrevious(agent) ? (
+                          {returnedInput.state === 'pending' ? (
                             <button
                               type="button"
-                              className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
-                              aria-label={`Previous ${agent === 'claude' ? 'Claude Code' : 'Codex'} Skills`}
-                              disabled={skillComposer.loading}
-                              onMouseDown={(event) => event.preventDefault()}
-                              onClick={() => {
-                                composerRef.current?.focus()
-                                void skillComposer.more(agent, true)
-                              }}
+                              className="rounded-control px-2 py-1 hover:bg-surface-muted disabled:opacity-40"
+                              disabled={Boolean(history.restoringInput)}
+                              onClick={() => void history.discardReturnedInput?.()}
                             >
-                              Previous Skills
-                            </button>
-                          ) : (
-                            <span />
-                          )}
-                          <span role="status" className="text-caption text-tertiary">
-                            {skillComposer.rangeLabel(agent)}
-                          </span>
-                          {skillComposer.canMore(agent) ? (
-                            <button
-                              type="button"
-                              className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
-                              aria-label={`More ${agent === 'claude' ? 'Claude Code' : 'Codex'} Skills`}
-                              disabled={skillComposer.loading}
-                              onMouseDown={(event) => event.preventDefault()}
-                              onClick={() => {
-                                composerRef.current?.focus()
-                                void skillComposer.more(agent)
-                              }}
-                            >
-                              More Skills
+                              Dismiss
                             </button>
                           ) : null}
-                        </div>
-                      ) : null}
-                    </Fragment>
-                  ))}
-                  {skillComposer.loading && skillComposer.options.length === 0 ? (
-                    <p
-                      role="status"
-                      className="flex items-center gap-2 px-2.5 py-2 text-caption text-tertiary"
-                    >
-                      <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-                      Loading native Skills…
-                    </p>
-                  ) : null}
-                </div>
-                {mentionListOpen ? (
-                  <div
-                    id={mentionListId}
-                    className="absolute right-0 bottom-[calc(100%+8px)] left-0 z-20 overflow-hidden rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
-                    role="listbox"
-                    aria-label="Message recipients"
-                  >
-                    {filteredMentionOptions.map((option, index) => {
-                      const Icon = option.icon
-                      const active = index === activeMentionIndex
-                      return (
-                        <button
-                          id={`${mentionListId}-${option.token.slice(1)}`}
-                          key={option.token}
-                          type="button"
-                          role="option"
-                          aria-selected={active}
-                          className={`flex min-h-9 w-full cursor-pointer items-center gap-2.5 rounded-control px-2.5 text-left text-caption ${active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted/70 hover:text-primary'}`}
-                          onMouseEnter={() => setActiveMentionIndex(index)}
-                          onMouseDown={(event) => event.preventDefault()}
-                          onClick={() => chooseMention(option)}
-                        >
-                          <Icon
-                            aria-hidden="true"
-                            className="size-3.5 shrink-0"
-                            strokeWidth={1.75}
-                          />
-                          <span className="min-w-0 flex-1">
-                            <span className="font-medium text-primary">{option.label}</span>
-                            <span className="ml-2 text-caption text-tertiary">
-                              {option.description}
-                            </span>
-                          </span>
-                          <span className="font-mono text-caption text-tertiary">
-                            {option.token}
-                          </span>
-                        </button>
-                      )
-                    })}
-                  </div>
-                ) : null}
-                {!planPanelExpanded ? commentDraftsView : null}
-                {returnedInput ? (
-                  <div className="mb-2 flex flex-wrap items-center gap-2 px-2 text-caption text-secondary">
-                    <span>
-                      {history.restoringInput
-                        ? 'Restoring unsent message…'
-                        : returnedInput.state === 'installed' &&
-                            (composer || composerImages.length || draftComments.length)
-                          ? 'Unsent message restored'
-                          : 'Previous unsent message is available'}
-                    </span>
-                    <span>
-                      ·{' '}
-                      {returnedInput.route.type === 'all'
-                        ? `${returnedInput.route.firstAgentId === 'codex' ? 'Codex' : 'Claude Code'} → ${returnedInput.route.secondAgentId === 'codex' ? 'Codex' : 'Claude Code'}`
-                        : returnedInput.route.agentId === 'codex'
-                          ? 'Codex'
-                          : 'Claude Code'}
-                    </span>
-                    {returnedInput.state === 'pending' ||
-                    (!composer &&
-                      !composerImages.length &&
-                      !hasDecisionAnswers(history.decisionDraft)) ? (
-                      <>
-                        <button
-                          type="button"
-                          className="rounded-control px-2 py-1 text-primary hover:bg-surface-muted disabled:opacity-40"
-                          disabled={Boolean(
-                            composer ||
-                            hasDecisionAnswers(history.decisionDraft) ||
+                          {returnedInput.state === 'pending' &&
+                          (composer ||
                             composerImages.length ||
                             composerMention ||
-                            draftComments.some(
-                              (comment) => !returnedInput.commentIds.includes(comment.id),
-                            ) ||
-                            history.restoringInput ||
-                            history.draftsLoading,
-                          )}
-                          onClick={() => void history.restoreReturnedInput?.()}
-                        >
-                          Restore to input
-                        </button>
-                        {returnedInput.state === 'pending' ? (
-                          <button
-                            type="button"
-                            className="rounded-control px-2 py-1 hover:bg-surface-muted disabled:opacity-40"
-                            disabled={Boolean(history.restoringInput)}
-                            onClick={() => void history.discardReturnedInput?.()}
-                          >
-                            Dismiss
-                          </button>
-                        ) : null}
-                        {returnedInput.state === 'pending' &&
-                        (composer ||
-                          composerImages.length ||
-                          composerMention ||
-                          draftComments.length) ? (
-                          <span>
-                            Keep your current draft. Sending it replaces the previous input.
-                          </span>
-                        ) : null}
-                      </>
-                    ) : null}
-                  </div>
-                ) : null}
-                <ConversationImages
-                  sessionId={session.id}
-                  images={composerImages}
-                  draft
-                  disabled={composerDisabled}
-                  onOpen={(image) => openImageGallery(composerImages, image)}
-                  onRemove={onRemoveComposerImage}
-                />
-                <div className="flex w-full flex-col gap-1">
+                            draftComments.length) ? (
+                            <span>
+                              Keep your current draft. Sending it replaces the previous input.
+                            </span>
+                          ) : null}
+                        </>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  <ConversationImages
+                    sessionId={session.id}
+                    images={composerImages}
+                    draft
+                    disabled={composerDisabled}
+                    onOpen={(image) => openImageGallery(composerImages, image)}
+                    onRemove={onRemoveComposerImage}
+                  />
+                  {onComposerUserInformationChange && composerUserInformation ? (
+                    <UserInformationDraft
+                      value={composerUserInformation}
+                      compact={Boolean(snapshot?.preparedInputContinuation)}
+                      disabled={composerDisabled}
+                      onChange={onComposerUserInformationChange}
+                    />
+                  ) : null}
                   <ComposerEditor
                     editorRef={composerRef}
                     value={editorValue}
@@ -4280,78 +4364,282 @@ export function ConversationView({
                       }
                     }}
                   />
-                  <div className="flex items-center justify-between">
-                    {onChooseComposerImages ? (
-                      <button
-                        type="button"
-                        className="grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary disabled:opacity-40"
-                        aria-label="Add images"
-                        title="Add images · paste or drop also works"
-                        disabled={composerDisabled || choosingImages}
-                        aria-busy={choosingImages}
-                        onClick={() => void onChooseComposerImages()}
-                      >
-                        {choosingImages ? (
-                          <LoaderCircle
-                            className="size-4 animate-spin"
-                            aria-hidden="true"
-                            strokeWidth={1.75}
-                          />
-                        ) : (
-                          <ImagePlus className="size-4" aria-hidden="true" strokeWidth={1.75} />
-                        )}
-                      </button>
+                </div>
+                <div className="pact-composer-send-row relative flex items-center justify-between">
+                  <div
+                    ref={skillMenuRef}
+                    id={`skills-${session.id}`}
+                    role="listbox"
+                    aria-label="Native Skills"
+                    aria-hidden={!skillComposer.query}
+                    aria-busy={skillComposer.loading}
+                    inert={!skillComposer.query}
+                    data-open={Boolean(skillComposer.query)}
+                    className="pact-skill-menu absolute right-0 bottom-[calc(100%+8px)] left-0 z-30 min-h-32 max-h-80 overflow-y-auto rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
+                  >
+                    {skillComposer.pactOptions.length > 0 ? (
+                      <>
+                        <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">
+                          Pact
+                        </p>
+                        {skillComposer.pactOptions.map((entry) => {
+                          const index = skillComposer.options.indexOf(entry)
+                          return (
+                            <button
+                              key={entry.id}
+                              id={`skill-${entry.id}`}
+                              type="button"
+                              role="option"
+                              aria-selected={index === skillComposer.active}
+                              className={`flex min-h-10 w-full items-center gap-2 rounded-control px-2.5 py-1.5 text-left text-caption ${index === skillComposer.active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
+                              onMouseEnter={() => skillComposer.setActive(index, false)}
+                              onMouseDown={(event) => event.preventDefault()}
+                              onClick={() => chooseSkill(entry)}
+                            >
+                              <BookOpen
+                                aria-hidden="true"
+                                className="size-4 shrink-0"
+                                strokeWidth={1.75}
+                              />
+                              <span className="min-w-0 flex-1">
+                                <span className="block font-medium text-primary">{entry.name}</span>
+                                <span className="block text-tertiary">{entry.description}</span>
+                              </span>
+                              <span className="text-tertiary">Pact</span>
+                            </button>
+                          )
+                        })}
+                      </>
                     ) : null}
-                    {sendWhileWorking ? (
-                      <button
-                        type="button"
-                        aria-label={`Stop ${respondingAgentId === 'claude' ? 'Claude Code' : 'Codex'} response`}
-                        title="Stop current response"
-                        disabled={stopping}
-                        onClick={() => void onStop()}
-                        className="ml-auto grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-40"
+                    {skillComposer.agents.map((agent) => (
+                      <Fragment key={agent}>
+                        <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">
+                          {agent === 'claude' ? 'Claude Code' : 'Codex'}
+                        </p>
+                        {skillComposer.visibleOptions
+                          .filter((entry) => entry.agentId === agent)
+                          .map((entry) => {
+                            const index = skillComposer.options.indexOf(entry)
+                            return (
+                              <button
+                                key={entry.id}
+                                id={`skill-${entry.id}`}
+                                type="button"
+                                role="option"
+                                aria-selected={index === skillComposer.active}
+                                className={`flex min-h-10 w-full items-center gap-2 rounded-control px-2.5 py-1.5 text-left text-caption ${index === skillComposer.active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
+                                onMouseEnter={() => skillComposer.setActive(index, false)}
+                                onMouseDown={(event) => event.preventDefault()}
+                                onClick={() => {
+                                  chooseSkill(entry)
+                                }}
+                              >
+                                <span className="min-w-0 flex-1">
+                                  <span className="block truncate font-medium text-primary">
+                                    /{entry.name}
+                                    {entry.argumentHint ? (
+                                      <span className="ml-2 font-normal text-tertiary">
+                                        {entry.argumentHint}
+                                      </span>
+                                    ) : null}
+                                  </span>
+                                  <span
+                                    className="block truncate text-tertiary"
+                                    title={entry.description}
+                                  >
+                                    {entry.description}
+                                  </span>
+                                </span>
+                                <span className="shrink-0 text-tertiary">
+                                  {entry.source === 'native'
+                                    ? 'Native'
+                                    : entry.source[0]!.toUpperCase() + entry.source.slice(1)}
+                                </span>
+                              </button>
+                            )
+                          })}
+                        {skillComposer.errors[agent] ? (
+                          <p className="px-2.5 py-2 text-caption text-secondary">
+                            {skillComposer.errors[agent]}
+                          </p>
+                        ) : null}
+                        {!skillComposer.loading &&
+                        !skillComposer.errors[agent] &&
+                        !skillComposer.pages[agent]?.skills.length ? (
+                          <p className="px-2.5 py-2 text-caption text-tertiary">
+                            No matching Skills.
+                          </p>
+                        ) : null}
+                        {skillComposer.canPrevious(agent) || skillComposer.canMore(agent) ? (
+                          <div className="flex items-center justify-between gap-2 px-2.5 py-1">
+                            {skillComposer.canPrevious(agent) ? (
+                              <button
+                                type="button"
+                                className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
+                                aria-label={`Previous ${agent === 'claude' ? 'Claude Code' : 'Codex'} Skills`}
+                                disabled={skillComposer.loading}
+                                onMouseDown={(event) => event.preventDefault()}
+                                onClick={() => {
+                                  composerRef.current?.focus()
+                                  void skillComposer.more(agent, true)
+                                }}
+                              >
+                                Previous Skills
+                              </button>
+                            ) : (
+                              <span />
+                            )}
+                            <span role="status" className="text-caption text-tertiary">
+                              {skillComposer.rangeLabel(agent)}
+                            </span>
+                            {skillComposer.canMore(agent) ? (
+                              <button
+                                type="button"
+                                className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
+                                aria-label={`More ${agent === 'claude' ? 'Claude Code' : 'Codex'} Skills`}
+                                disabled={skillComposer.loading}
+                                onMouseDown={(event) => event.preventDefault()}
+                                onClick={() => {
+                                  composerRef.current?.focus()
+                                  void skillComposer.more(agent)
+                                }}
+                              >
+                                More Skills
+                              </button>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </Fragment>
+                    ))}
+                    {skillComposer.loading && skillComposer.options.length === 0 ? (
+                      <p
+                        role="status"
+                        className="flex items-center gap-2 px-2.5 py-2 text-caption text-tertiary"
                       >
-                        <Square
-                          aria-hidden="true"
-                          className="size-3.5"
-                          fill="currentColor"
-                          strokeWidth={1.5}
-                        />
-                      </button>
+                        <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                        Loading native Skills…
+                      </p>
                     ) : null}
-                    <button
-                      className={`${sendWhileWorking ? '' : 'ml-auto '}grid size-9 shrink-0 cursor-pointer place-items-center rounded-control bg-surface-inverse text-inverse hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-40`}
-                      type="button"
-                      aria-label={composerActionLabel}
-                      title={composerActionLabel}
-                      disabled={
-                        stopComposerAction
-                          ? stopping
-                          : disabled ||
-                            (!composerContentReady &&
-                              draftComments.length === 0 &&
-                              composerImages.length === 0)
-                      }
-                      onClick={() => void (stopComposerAction ? onStop() : submit())}
+                  </div>
+                  {mentionListOpen ? (
+                    <div
+                      id={mentionListId}
+                      className="absolute right-0 bottom-[calc(100%+8px)] left-0 z-20 overflow-hidden rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
+                      role="listbox"
+                      aria-label="Message recipients"
                     >
-                      {stopping ? (
+                      {filteredMentionOptions.map((option, index) => {
+                        const Icon = option.icon
+                        const active = index === activeMentionIndex
+                        return (
+                          <button
+                            id={`${mentionListId}-${option.token.slice(1)}`}
+                            key={option.token}
+                            type="button"
+                            role="option"
+                            aria-selected={active}
+                            className={`flex min-h-9 w-full cursor-pointer items-center gap-2.5 rounded-control px-2.5 text-left text-caption ${active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted/70 hover:text-primary'}`}
+                            onMouseEnter={() => setActiveMentionIndex(index)}
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => chooseMention(option)}
+                          >
+                            <Icon
+                              aria-hidden="true"
+                              className="size-3.5 shrink-0"
+                              strokeWidth={1.75}
+                            />
+                            <span className="min-w-0 flex-1">
+                              <span className="font-medium text-primary">{option.label}</span>
+                              <span className="ml-2 text-caption text-tertiary">
+                                {option.description}
+                              </span>
+                            </span>
+                            <span className="font-mono text-caption text-tertiary">
+                              {option.token}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  ) : null}
+
+                  {onChooseComposerImages ? (
+                    <button
+                      type="button"
+                      className="grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary disabled:opacity-40"
+                      aria-label="Add images"
+                      title="Add images · paste or drop also works"
+                      disabled={composerDisabled || choosingImages}
+                      aria-busy={choosingImages}
+                      onClick={() => void onChooseComposerImages()}
+                    >
+                      {choosingImages ? (
                         <LoaderCircle
-                          aria-hidden="true"
                           className="size-4 animate-spin"
-                          strokeWidth={1.8}
-                        />
-                      ) : stopComposerAction ? (
-                        <Square
                           aria-hidden="true"
-                          className="size-3.5"
-                          fill="currentColor"
-                          strokeWidth={1.5}
+                          strokeWidth={1.75}
                         />
                       ) : (
-                        <ArrowUp aria-hidden="true" className="size-4" strokeWidth={1.9} />
+                        <ImagePlus className="size-4" aria-hidden="true" strokeWidth={1.75} />
                       )}
                     </button>
-                  </div>
+                  ) : null}
+                  {onComposerUserInformationChange && !composerUserInformation ? (
+                    <UserInformationDraft
+                      value={undefined}
+                      disabled={composerDisabled}
+                      onChange={onComposerUserInformationChange}
+                    />
+                  ) : null}
+                  {sendWhileWorking ? (
+                    <button
+                      type="button"
+                      aria-label={`Stop ${respondingAgentId === 'claude' ? 'Claude Code' : 'Codex'} response`}
+                      title="Stop current response"
+                      disabled={stopping}
+                      onClick={() => void onStop()}
+                      className="ml-auto grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-40"
+                    >
+                      <Square
+                        aria-hidden="true"
+                        className="size-3.5"
+                        fill="currentColor"
+                        strokeWidth={1.5}
+                      />
+                    </button>
+                  ) : null}
+                  <button
+                    className={`${sendWhileWorking ? '' : 'ml-auto '}grid size-9 shrink-0 cursor-pointer place-items-center rounded-control bg-surface-inverse text-inverse hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-40`}
+                    type="button"
+                    aria-label={composerActionLabel}
+                    title={composerActionLabel}
+                    disabled={
+                      stopComposerAction
+                        ? stopping
+                        : disabled ||
+                          (!composerContentReady &&
+                            draftComments.length === 0 &&
+                            composerImages.length === 0)
+                    }
+                    onClick={() => void (stopComposerAction ? onStop() : submit())}
+                  >
+                    {stopping ? (
+                      <LoaderCircle
+                        aria-hidden="true"
+                        className="size-4 animate-spin"
+                        strokeWidth={1.8}
+                      />
+                    ) : stopComposerAction ? (
+                      <Square
+                        aria-hidden="true"
+                        className="size-3.5"
+                        fill="currentColor"
+                        strokeWidth={1.5}
+                      />
+                    ) : (
+                      <ArrowUp aria-hidden="true" className="size-4" strokeWidth={1.9} />
+                    )}
+                  </button>
                 </div>
               </div>
               <div className="pact-composer-controls flex min-w-0 items-center gap-2">

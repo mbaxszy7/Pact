@@ -30,6 +30,11 @@ export type ReportTextSelection = MessageTextSelection & {
   textBasis?: 'markdown-visible-v2' | 'plain-visible-v1' | undefined
   contentHash?: string | undefined
 }
+type DisplayedCollaborationAction = Exclude<
+  CollaborationAction,
+  'request_plan_supplement' | 'request_code_supplement' | 'confirm_supplement'
+>
+
 const agentName = (id: 'claude' | 'codex'): string => (id === 'claude' ? 'Claude Code' : 'Codex')
 const verdictLabel = {
   accepted: 'Accepted',
@@ -144,6 +149,9 @@ export const CollaborationReview = memo(function CollaborationReview({
       !actionable
     )
       return
+    // Retired requests may still have durable gates; retain cancellation through the existing actions.
+    const decision = action === 'cancel_supplement' ? view?.relayDecision : undefined
+    if (action === 'cancel_supplement' && !decision) return
     setBusy(true)
     setActionError('')
     try {
@@ -153,6 +161,7 @@ export const CollaborationReview = memo(function CollaborationReview({
         revision: task.revision,
         clientMessageId: crypto.randomUUID(),
         action,
+        ...(decision ? { decision: { id: decision.id, revision: decision.revision } } : {}),
       })
       if (!response.ok)
         setActionError(
@@ -218,11 +227,16 @@ export const CollaborationReview = memo(function CollaborationReview({
   const nextStep = planSync || inputGate ? undefined : view?.nextStep
   const actions = actionable
     ? (view?.availableActions ?? []).filter(
-        (action) =>
-          action !== 'continue' && action !== 'pause' && (!inputGate || action === 'recover_plan'),
+        (action): action is DisplayedCollaborationAction =>
+          action !== 'request_plan_supplement' &&
+          action !== 'request_code_supplement' &&
+          action !== 'confirm_supplement' &&
+          action !== 'continue' &&
+          action !== 'pause' &&
+          (!inputGate || action === 'recover_plan'),
       )
     : []
-  const actionLabel = (action: CollaborationAction): string =>
+  const actionLabel = (action: DisplayedCollaborationAction): string =>
     ({
       execute: `Implement plan · ${agentName(task.owner)}`,
       respond: `Respond · ${agentName(task.owner)}`,
@@ -232,6 +246,7 @@ export const CollaborationReview = memo(function CollaborationReview({
       recover_plan: planSync?.kind === 'response' ? 'Restore plan response' : 'Restore saved plan',
       retry: `Retry · ${agentName(task.actor)}`,
       continue: 'Continue collaboration',
+      cancel_supplement: 'Cancel scheduling action',
     })[action]
   const reportDocument =
     view?.documents?.find((entry) => entry.key === 'report')?.source ??
@@ -242,6 +257,7 @@ export const CollaborationReview = memo(function CollaborationReview({
   return (
     <section
       aria-label="Pact collaboration result"
+      data-pact-collaboration-run-id={run.id}
       className="pact-review-card mt-2 mb-7 w-full min-w-0 max-w-[72ch] self-start text-caption"
     >
       <div className="flex min-h-7 flex-wrap items-center gap-x-2.5 gap-y-1 text-secondary">

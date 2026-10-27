@@ -13,6 +13,41 @@ import { isScriptEntry } from './script-entry.mjs'
 // Exact business cases, independent of a candidate's mutable tags or test outcome.
 export const realCases = [
   {
+    path: 'tests/e2e/relay-information-real.spec.ts',
+    title:
+      'real Claude completes a confirmed user value and an already-answered release note without repeated questions',
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'additional-regression',
+  },
+  ...['codex_luna', 'claude_haiku_5_5'].map((target) => ({
+    path: 'tests/e2e/relay-information-real.spec.ts',
+    title: `real Relay ${target} preserves necessary information through Cancel and a fresh Send without inventing user questions`,
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'additional-regression',
+  })),
+  ...['codex_luna', 'claude_haiku_5_5'].map((target) => ({
+    path: 'tests/e2e/relay-routing-benefit-real.spec.ts',
+    title: `real Relay ${target} saves one source-author route correction against the legal default`,
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'routing',
+  })),
+  ...['codex_luna', 'claude_haiku_5_5'].map((target) => ({
+    path: 'tests/e2e/relay-real-handoff.spec.ts',
+    title: `real Relay ${target} compares Off and On through the fixed native reviewer`,
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'collaboration',
+  })),
+  {
+    path: 'tests/e2e/relay-native-comparison.spec.ts',
+    title: 'real ordinary Pact Session completes one exact Codex Luna task',
+    tier: 'extended',
+    scenario: 'additional-regression',
+  },
+  {
     path: 'tests/e2e/real-stop.spec.ts',
     title:
       'real codex UI archive interrupts its foreground command before the delayed filesystem effect',

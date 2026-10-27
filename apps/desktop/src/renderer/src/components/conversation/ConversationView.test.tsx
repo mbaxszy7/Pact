@@ -5,6 +5,7 @@ import type { ComponentProps } from 'react'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 // oxlint-disable-next-line eslint/no-restricted-imports -- jsdom lacks browser SubtleCrypto; this test-only provider verifies the real source hash.
 import { webcrypto } from 'node:crypto'
+import { useState } from 'react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import type { AgentRun, ConversationPage, DesktopBridge, WorkspaceChangeSet } from '@pact/contracts'
@@ -105,6 +106,127 @@ afterEach(() => {
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
+
+it('does not reclaim Comment focus after the user moves to the Composer before its opening frame', async () => {
+  const frames = new Map<number, FrameRequestCallback>()
+  let frameId = 0
+  vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+    const id = ++frameId
+    frames.set(id, callback)
+    return id
+  })
+  vi.stubGlobal('cancelAnimationFrame', (id: number) => frames.delete(id))
+  const { props, run } = recordingFixture()
+  delete run.workspaceChanges
+  props.snapshot!.nativeContexts = []
+  function View() {
+    const [composer, setComposer] = useState('')
+    return <ConversationView {...props} composer={composer} onComposerChange={setComposer} />
+  }
+  const mounted = render(<View />)
+  const source = mounted.container.querySelector<HTMLElement>('[data-pact-message-content]')!
+  expect(focusProjectionRange(source, 0, 4, { scroll: false, highlight: false })).toBe(true)
+  fireEvent.keyUp(source)
+  fireEvent.click(await screen.findByRole('button', { name: 'Comment on selected text' }))
+  const comment = await screen.findByRole<HTMLTextAreaElement>('textbox', { name: 'Comment' })
+  fireEvent.change(comment, { target: { value: 'Keep this original Comment.' } })
+  const composer = screen.getByRole('combobox', { name: 'Message' })
+  act(() => {
+    comment.focus()
+    composer.focus()
+    const pending = [...frames.values()]
+    frames.clear()
+    for (const callback of pending) {
+      callback(0)
+    }
+  })
+  expect(document.activeElement).toBe(composer)
+  // Dispatch to the actual focused input; never refocus to conceal a pending focus transfer.
+  const input = new InputEvent('beforeinput', {
+    inputType: 'insertText',
+    data: '@codex',
+    bubbles: true,
+    cancelable: true,
+  })
+  Object.defineProperty(input, 'getTargetRanges', { value: () => [] })
+  fireEvent(document.activeElement!, input)
+  expect(composer.textContent).toBe('@codex')
+  expect(comment.value).toBe('Keep this original Comment.')
+  expect(screen.getByRole('option', { name: /Codex/u })).toBeDefined()
+})
+
+it.each(['opening', 'focus-return', 'window-blur', 'close', 'visible-return'] as const)(
+  'owns the pending Comment focus request through %s and preserves an existing selection',
+  async (mode) => {
+    const frames = new Map<number, FrameRequestCallback>()
+    let frameId = 0
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      const id = ++frameId
+      frames.set(id, callback)
+      return id
+    })
+    vi.stubGlobal('cancelAnimationFrame', (id: number) => frames.delete(id))
+    const { props, run } = recordingFixture()
+    delete run.workspaceChanges
+    props.snapshot!.nativeContexts = []
+    const mounted = render(<ConversationView {...props} />)
+    const source = mounted.container.querySelector<HTMLElement>('[data-pact-message-content]')!
+    source.tabIndex = -1
+    act(() => source.focus())
+    expect(focusProjectionRange(source, 0, 4, { scroll: false, highlight: false })).toBe(true)
+    fireEvent.keyUp(source)
+    fireEvent.click(await screen.findByRole('button', { name: 'Comment on selected text' }))
+    const comment = await screen.findByRole<HTMLTextAreaElement>('textbox', { name: 'Comment' })
+    fireEvent.change(comment, { target: { value: 'An unchanged Comment draft.' } })
+    const origin = document.activeElement
+    if (!(origin instanceof HTMLElement)) throw Error('Opening focus origin is unavailable')
+    const pending = [...frames.values()]
+    let expectedFocus: Element = origin
+    act(() => {
+      if (mode === 'focus-return') {
+        screen.getByRole('combobox', { name: 'Message' }).focus()
+        origin.focus()
+      }
+      if (mode === 'window-blur') window.dispatchEvent(new Event('blur'))
+    })
+    if (mode === 'visible-return') {
+      const composer = screen.getByRole('combobox', { name: 'Message' })
+      act(() => composer.focus())
+      expectedFocus = composer
+      mounted.rerender(<ConversationView {...props} visible={false} />)
+      mounted.rerender(<ConversationView {...props} visible />)
+      pending.push(...frames.values())
+    }
+    if (mode === 'close')
+      fireEvent.click(screen.getByRole('button', { name: 'Close Comment editor' }))
+    // Also exercise a callback already dequeued by the browser before cancellation.
+    act(() => {
+      frames.clear()
+      for (const callback of pending) callback(0)
+    })
+    const focusedAfterFrame = document.activeElement
+    let openingCaretAtEnd: boolean | undefined
+    let selectionPreserved: boolean | undefined
+    if (mode === 'opening') {
+      openingCaretAtEnd = comment.selectionStart === comment.value.length
+      comment.setSelectionRange(2, 7)
+      mounted.rerender(<ConversationView {...props} composer="An independent draft" />)
+      act(() => {
+        for (const callback of frames.values()) callback(0)
+        frames.clear()
+      })
+      selectionPreserved =
+        document.activeElement === comment &&
+        comment.selectionStart === 2 &&
+        comment.selectionEnd === 7
+    }
+    expect(comment.isConnected).toBe(mode !== 'close')
+    expect(focusedAfterFrame).toBe(mode === 'opening' ? comment : expectedFocus)
+    expect(openingCaretAtEnd).toBe(mode === 'opening' ? true : undefined)
+    expect(selectionPreserved).toBe(mode === 'opening' ? true : undefined)
+    expect(comment.value).toBe('An unchanged Comment draft.')
+  },
+)
 
 it('defers a completed Steer fold while reading history and resumes when scrolling back to latest', async () => {
   const { props, run } = recordingFixture()
@@ -413,6 +535,7 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
     fireEvent.click(await screen.findByRole('button', { name: 'Comment on selected text' }))
     const editor = await screen.findByRole('textbox', { name: 'Comment' })
     expect(host.contains(editor)).toBe(true)
+    await waitFor(() => expect(document.activeElement).toBe(editor))
     fireEvent.change(editor, { target: { value: 'Keep this plan detail.' } })
     fireEvent.click(screen.getByRole('button', { name: 'Restore plan panel' }))
     expect(props.onPlanPanelExpandedChange).toHaveBeenLastCalledWith(false)
@@ -421,10 +544,14 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
     const restoredEditor = screen.getByRole<HTMLTextAreaElement>('textbox', { name: 'Comment' })
     expect(container.contains(restoredEditor)).toBe(true)
     expect(restoredEditor.value).toBe('Keep this plan detail.')
+    await waitFor(() => expect(document.activeElement).toBe(restoredEditor))
     fireEvent.click(screen.getByRole('button', { name: 'Expand plan panel' }))
     rerender(<ConversationView {...props} planPanelExpanded />)
     expect(screen.getByRole<HTMLTextAreaElement>('textbox', { name: 'Comment' }).value).toBe(
       'Keep this plan detail.',
+    )
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole('textbox', { name: 'Comment' })),
     )
     fireEvent.click(screen.getByRole('button', { name: 'Add to comment' }))
     await waitFor(() =>
@@ -1683,3 +1810,81 @@ it.each([true, false])(
     )
   },
 )
+
+it('keeps cancellation receipt recovery visible after the host card disappears, then masks the settled stale card', async () => {
+  const props = fixture(),
+    declaration = {
+      version: 'user-information-v1' as const,
+      id: crypto.randomUUID(),
+      kind: 'user_supplied_value' as const,
+      question: 'Which launch date?',
+      input: 'text' as const,
+      options: [],
+      state: { status: 'unanswered' as const },
+    },
+    card: import('@pact/contracts').RelaySchedulingDecision = {
+      version: 'relay-decision-v2',
+      sessionId: props.session.id,
+      decisionId: crypto.randomUUID(),
+      revision: 0,
+      handoffId: 'a'.repeat(64),
+      title: 'One detail before sending',
+      reason: 'You reserved this detail.',
+      consequence: 'Cancel returns to your draft.',
+      sources: [{ id: 'input', label: 'Current request' }],
+      request: {
+        category: 'necessary_information',
+        consumer: {
+          kind: 'prepared_input_clarification',
+          batchId: crypto.randomUUID(),
+          clientMessageId: crypto.randomUUID(),
+          requestFingerprint: 'b'.repeat(64),
+          sourceFingerprint: 'c'.repeat(64),
+          defaultAgentId: 'codex',
+        },
+        field: {
+          fieldId: declaration.id,
+          prompt: declaration.question,
+          input: { kind: 'text', maxLength: 1024 },
+        },
+      },
+    }
+  props.composer = 'Keep the current draft'
+  props.composerUserInformation = declaration
+  props.snapshot!.relaySchedulingDecision = card
+  const cancel = vi
+      .fn<NonNullable<typeof props.history.cancelPreparedInformation>>()
+      .mockResolvedValue(false),
+    check = vi
+      .fn<NonNullable<typeof props.history.checkInformationCancellation>>()
+      .mockResolvedValue(false)
+  props.history.cancelPreparedInformation = cancel
+  props.history.checkInformationCancellation = check
+  const mounted = render(<ConversationView {...props} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel this scheduling action' }))
+  await waitFor(() => expect(cancel).toHaveBeenCalledExactlyOnceWith(card))
+  props.snapshot!.relaySchedulingDecision = null
+  props.history.informationCancellation = {
+    request: card,
+    status: 'receipt_unconfirmed',
+    error: 'Cancellation result not confirmed.',
+  }
+  mounted.rerender(<ConversationView {...props} />)
+  expect(screen.getByText('Cancellation pending', { exact: true })).toBeDefined()
+  expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull()
+  expect(screen.queryByRole('textbox', { name: declaration.question })).toBeNull()
+  expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Cancel requested' }).disabled).toBe(
+    true,
+  )
+  fireEvent.click(screen.getByRole('button', { name: 'Check decision' }))
+  expect(check).toHaveBeenCalledTimes(1)
+  expect(cancel).toHaveBeenCalledTimes(1)
+  props.history.informationCancellation = undefined
+  props.history.cancelledInformationDecisionId = card.decisionId
+  props.snapshot!.relaySchedulingDecision = card
+  mounted.rerender(<ConversationView {...props} />)
+  expect(screen.getByRole('button', { name: 'Send message' })).toBeDefined()
+  expect(screen.getByRole('combobox', { name: 'Message' }).textContent).toBe(props.composer)
+  expect(screen.queryByRole('button', { name: 'Cancel this scheduling action' })).toBeNull()
+  expect(props.onSend).not.toHaveBeenCalled()
+})

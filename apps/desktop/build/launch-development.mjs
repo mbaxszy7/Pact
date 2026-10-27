@@ -19,6 +19,7 @@ import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
 import identities from '../app-identities.json' with { type: 'json' }
+import { prepareWindowsOwnedProcessResource } from './windows-owned-process-resource.mjs'
 
 const require = createRequire(import.meta.url)
 const execute = promisify(execFile)
@@ -150,6 +151,8 @@ try {
     }
     process.env.ELECTRON_EXEC_PATH = await prepareMacRuntime(cancellation.signal)
   }
+  if (process.platform === 'win32')
+    await prepareWindowsOwnedProcessResource(process.arch, { signal: cancellation.signal })
   cancellation.signal.throwIfAborted()
   const vite = join(dirname(require.resolve('electron-vite/package.json')), 'bin/electron-vite.js')
   process.removeListener('SIGINT', interrupt)

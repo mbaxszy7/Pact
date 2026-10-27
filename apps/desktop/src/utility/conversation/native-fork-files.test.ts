@@ -10,7 +10,7 @@ import { afterAll, beforeAll, expect, it, vi } from 'vitest'
 import type { AgentNativeForkWitness } from '@pact/contracts'
 
 import { LogicalIpcWorkerTraffic } from '../../shared/logical-ipc-traffic'
-import { claudePlanInputFingerprint } from './claude-native-plan'
+import { claudePlanInputFingerprint, claudePlanSubmissionFingerprint } from './claude-native-plan'
 import {
   NativeForkFiles,
   type NativeForkFileInput,
@@ -597,6 +597,230 @@ it.each(['complete', 'failed', 'pending', 'foreign', 'unbound', 'hook', 'wrong_h
     }
   },
 )
+it.each([
+  'complete',
+  'retained',
+  'missing',
+  'duplicate',
+  'wrong_prompt',
+  'wrong_input',
+  'wrong_body',
+  'wrong_path',
+  'foreign',
+  'failed_write',
+  'pending_write',
+  'post_edit',
+  'post_failed_edit',
+  'post_pending_edit',
+  'later_exit',
+  'question',
+  'answered_question',
+  'termination_rejected',
+] as const)('authenticates the entire terminated native plan root: %s', async (mode) => {
+  const profile = join(directory, randomUUID()),
+    nativeSessionId = randomUUID(),
+    nativeTurnId = randomUUID(),
+    promptId = randomUUID()
+  const project = join(
+    profile,
+    'projects',
+    (await realpath(directory)).replace(/[^a-z0-9]/giu, '-'),
+  )
+  await mkdir(project, { recursive: true })
+  const path = join(profile, 'plan.md'),
+    text = 'An authenticated plan with a bounded cleanup path.'
+  // A newer file is deliberately unrelated; terminal authentication never opens it.
+  await writeFile(path, 'Forged disk-only plan')
+  const records: Record<string, unknown>[] = []
+  let parent: string | null = null
+  const append = (
+    type: string,
+    value: Record<string, unknown>,
+    uuid: string = randomUUID(),
+  ): void => {
+    records.push({ type, uuid, parentUuid: parent, ...value })
+    parent = uuid
+  }
+  const root = (id: string, prompt: string): void => {
+    append('user', { promptId: prompt, message: { role: 'user', content: 'Plan' } }, id)
+    append('attachment', {
+      attachment: { type: 'plan_mode', isSubAgent: false, planFilePath: path },
+    })
+  }
+  const call = (id: string, name: string, operationInput: unknown, foreign = false): void => {
+    append('assistant', {
+      ...(foreign ? { parentUuid: randomUUID() } : {}),
+      message: {
+        id: `message-${records.length}`,
+        role: 'assistant',
+        content: [{ type: 'tool_use', id, name, input: operationInput }],
+      },
+    })
+  }
+  const receipt = (id: string, response: unknown, failed = false): void => {
+    append('user', {
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: id, is_error: failed, content: 'ack' }],
+      },
+      toolUseResult: response,
+    })
+  }
+  const write = (): void => {
+    call('write-plan', 'Write', { file_path: path, content: text })
+    if (mode !== 'pending_write')
+      receipt(
+        'write-plan',
+        { filePath: path, content: text, userModified: false },
+        mode === 'failed_write',
+      )
+  }
+  if (mode === 'answered_question') {
+    root(nativeTurnId, promptId)
+    call('earlier-question', 'AskUserQuestion', { questions: [{ question: 'Which owner?' }] })
+    receipt('earlier-question', { answers: { 'Which owner?': 'The requester owner' } })
+    write()
+  } else if (mode === 'retained') {
+    root(randomUUID(), randomUUID())
+    write()
+    root(nativeTurnId, promptId)
+  } else {
+    root(nativeTurnId, promptId)
+    write()
+  }
+  const intent = {
+    plan: mode === 'wrong_body' ? 'Forged' : text,
+    planFilePath: mode === 'wrong_path' ? join(profile, 'other.md') : path,
+  }
+  if (mode !== 'missing') call('exit-plan', 'ExitPlanMode', intent, mode === 'foreign')
+  if (mode === 'duplicate') call('exit-plan', 'ExitPlanMode', intent)
+  if (mode.startsWith('post_')) {
+    call('later-edit', 'Edit', {
+      file_path: path,
+      old_string: text,
+      new_string: 'Changed after submission',
+    })
+    if (mode !== 'post_pending_edit')
+      receipt(
+        'later-edit',
+        {
+          filePath: path,
+          oldString: text,
+          newString: 'Changed after submission',
+          userModified: false,
+        },
+        mode === 'post_failed_edit',
+      )
+  }
+  if (mode === 'later_exit') call('another-exit', 'ExitPlanMode', intent)
+  if (mode === 'question') call('question', 'AskUserQuestion', { questions: [] })
+  await writeFile(
+    join(project, `${nativeSessionId}.jsonl`),
+    records
+      .map((record) =>
+        JSON.stringify({ ...record, cwd: directory, sessionId: nativeSessionId, timestamp }),
+      )
+      .join('\n') + '\n',
+  )
+  vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
+  try {
+    const submission = {
+      id: 'exit-plan',
+      promptId: mode === 'wrong_prompt' ? randomUUID() : promptId,
+      inputFingerprint: claudePlanSubmissionFingerprint(
+        mode === 'wrong_input' ? { ...intent, extra: true } : intent,
+      ),
+    }
+    const reading = files.readAnswer(
+      { cwd: directory, nativeSessionId, nativeTurnId, terminalPlanSubmission: submission },
+      new AbortController().signal,
+    )
+    let settled = false
+    const outcomePromise = reading.then(
+      (value) => {
+        settled = true
+        return { value, error: undefined }
+      },
+      (error: unknown) => {
+        settled = true
+        return { value: undefined, error }
+      },
+    )
+    let retainedOwner: { active: boolean; settled: boolean; live: number } | undefined
+    if (mode === 'termination_rejected') {
+      const worker = workerLocation.last!,
+        requested = Promise.withResolvers<void>()
+      const termination = vi.spyOn(worker, 'terminate').mockImplementation(() => {
+        requested.resolve()
+        return Promise.reject(new Error('Controlled terminal termination rejection'))
+      })
+      try {
+        await requested.promise
+        await Promise.resolve()
+        retainedOwner = { active: files.active, settled, live: workerLocation.live }
+      } finally {
+        termination.mockRestore()
+        await worker.terminate()
+      }
+    }
+    const outcome = await outcomePromise
+    expect(retainedOwner).toEqual(
+      mode === 'termination_rejected' ? { active: true, settled: false, live: 1 } : undefined,
+    )
+    const accepted = ['complete', 'retained', 'answered_question'].includes(mode)
+    expect(Boolean(outcome.error)).toBe(!accepted)
+    expect(outcome.value?.terminalPlanSubmission).toEqual(accepted ? submission : undefined)
+    expect(outcome.value?.planState).toBeUndefined()
+    expect(outcome.value?.planUnavailable).toBeUndefined()
+    expect(outcome.value?.plan).toEqual(
+      ['complete', 'answered_question'].includes(mode)
+        ? { nativeId: 'write-plan', text }
+        : undefined,
+    )
+    expect(outcome.value?.retainedPlan).toEqual(
+      mode === 'retained'
+        ? {
+            nativeId: 'exit-plan',
+            sha256: hash(text),
+            bytes: Buffer.byteLength(text),
+            chars: text.length,
+          }
+        : undefined,
+    )
+    expect(workerLocation.live).toBe(0)
+  } finally {
+    vi.unstubAllEnvs()
+  }
+})
+
+it('binds every ExitPlanMode JSON field without changing the live Write/Edit prefix fingerprint', () => {
+  const intent = {
+    plan: 'Body',
+    planFilePath: '/native/plan.md',
+    allowedPrompts: [{ tool: 'Bash', prompt: 'test' }],
+  }
+  expect(claudePlanSubmissionFingerprint(intent)).toBe(
+    claudePlanSubmissionFingerprint({
+      allowedPrompts: intent.allowedPrompts,
+      planFilePath: intent.planFilePath,
+      plan: intent.plan,
+    }),
+  )
+  for (const changed of [
+    { ...intent, plan: 'Other' },
+    { ...intent, planFilePath: '/other' },
+    { ...intent, extra: null },
+    { ...intent, allowedPrompts: [] },
+  ]) {
+    expect(claudePlanSubmissionFingerprint(changed)).not.toBe(
+      claudePlanSubmissionFingerprint(intent),
+    )
+  }
+  expect(claudePlanInputFingerprint('ExitPlanMode', intent)).toBe(
+    claudePlanInputFingerprint('ExitPlanMode', { ...intent, plan: 'Other' }),
+  )
+})
+
 const timestamp = '2026-10-04T00:00:00.000Z'
 const start = (turnId: string) => ({
   type: 'event_msg',
@@ -1241,6 +1465,7 @@ it('retains a rejected termination owner and shared reservation until the exact 
     expect(persistCandidate).not.toHaveBeenCalled()
     termination.mockRestore()
     await worker.terminate()
+    expect(owner.active).toBe(false)
     expect(workerLocation.live).toBe(0)
     additional = new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES)
     expect(retained.every((reservation) => reservation.bytes === NATIVE_OWNER_WORKING_BYTES)).toBe(
@@ -1356,3 +1581,79 @@ it('constructor failure retains no Worker or shared reservation and permits the 
     await owner.dispose()
   }
 }, 15_000)
+
+it.each([false, true])(
+  'cold Claude text grouping preserves both API blocks and only known consumed Steer inputs (%s)',
+  async (includeSteer) => {
+    const cwd = await realpath(directory),
+      profile = join(directory, randomUUID()),
+      nativeSessionId = randomUUID(),
+      root = randomUUID(),
+      first = randomUUID(),
+      second = randomUUID(),
+      steer = randomUUID(),
+      third = randomUUID(),
+      later = randomUUID(),
+      last = randomUUID(),
+      project = join(profile, 'projects', cwd.replace(/[^a-z0-9]/giu, '-')),
+      sourceTimestamp = new Date().toISOString()
+    await mkdir(project, { recursive: true })
+    const user = (uuid: string, parentUuid: string | null, content: string) => ({
+      type: 'user',
+      sessionId: nativeSessionId,
+      cwd,
+      timestamp: sourceTimestamp,
+      uuid,
+      parentUuid,
+      message: { role: 'user', content },
+    })
+    const assistant = (uuid: string, parentUuid: string, id: string, text: string) => ({
+      type: 'assistant',
+      sessionId: nativeSessionId,
+      cwd,
+      timestamp: sourceTimestamp,
+      uuid,
+      parentUuid,
+      message: { id, role: 'assistant', content: [{ type: 'text', text }] },
+    })
+    const entries = [
+      user(root, null, 'Original input'),
+      assistant(first, root, 'api-1', 'First.'),
+      assistant(second, first, 'api-1', ' Second.'),
+      user(steer, second, 'Consumed Steer input'),
+      assistant(third, steer, 'api-2', 'Final.'),
+      user(later, third, 'Unrelated later input'),
+      assistant(last, later, 'api-3', 'Must not borrow this later reply.'),
+    ]
+    const body =
+        entries
+          .map((entry) =>
+            JSON.stringify({
+              ...entry,
+              sessionId: nativeSessionId,
+              cwd,
+              timestamp: sourceTimestamp,
+            }),
+          )
+          .join('\n') + '\n',
+      path = join(project, nativeSessionId + '.jsonl')
+    await writeFile(path, body)
+    vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
+    try {
+      const answer = await files.readAnswer(
+        {
+          cwd,
+          nativeSessionId,
+          nativeTurnId: root,
+          ...(includeSteer ? { nativeInputIds: [root, steer] } : {}),
+        },
+        new AbortController().signal,
+      )
+      expect(answer.answer).toBe(includeSteer ? 'First. Second.\n\nFinal.' : 'First. Second.')
+      expect(await readFile(path, 'utf8')).toBe(body)
+      expect(workerLocation.live).toBe(0)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  },
+)

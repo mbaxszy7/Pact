@@ -48,6 +48,41 @@ export function claudePlanInputFingerprint(name: string, input: unknown): string
   ])
 }
 
+/** Full ExitPlanMode intent, distinct from the Write/Edit prefix identity. No body is retained. */
+export function claudePlanSubmissionFingerprint(input: unknown): string {
+  const hash = createHash('sha256').update('pact-claude-plan-submission-v1;')
+  let bytes = 0,
+    nodes = 0
+  const visit = (value: unknown, depth: number): void => {
+    if (++nodes > 10_000 || depth > 32)
+      throw new Error('Native plan submission input is too complex.')
+    if (typeof value === 'string') {
+      bytes += Buffer.byteLength(value)
+      if (bytes > 8 * 1024 * 1024)
+        throw new Error('Native plan submission exceeds the native text bound.')
+      hash.update(`string:${value.length}:`).update(value)
+    } else if (value === null) hash.update('null;')
+    else if (typeof value === 'boolean') hash.update(`boolean:${value};`)
+    else if (typeof value === 'number' && Number.isFinite(value)) hash.update(`number:${value};`)
+    else if (Array.isArray(value)) {
+      hash.update(`array:${value.length}:[`)
+      for (const item of value) visit(item, depth + 1)
+      hash.update(']')
+    } else if (isObject(value)) {
+      const keys = Object.keys(value).toSorted()
+      hash.update(`object:${keys.length}:{`)
+      for (const key of keys) {
+        visit(key, depth + 1)
+        visit(value[key], depth + 1)
+      }
+      hash.update('}')
+    } else throw new Error('Native plan submission is not a JSON value.')
+  }
+  if (!isObject(input)) throw new Error('Native plan submission must be an object.')
+  visit(input, 0)
+  return hash.digest('hex')
+}
+
 export function isClaudePlanState(value: unknown): value is ClaudePlanState {
   if (
     !isObject(value) ||

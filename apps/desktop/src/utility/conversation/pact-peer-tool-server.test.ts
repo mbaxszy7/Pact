@@ -68,6 +68,58 @@ afterEach(async () => {
 })
 
 describe('PactPeerToolServer', () => {
+  it('advertises flat source arguments and refuses a nested capability envelope before reading', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const target = await server.start(),
+      owner = { runId: randomUUID(), grant: randomUUID() },
+      batchId = randomUUID(),
+      reader = vi.fn<(raw: unknown) => CollaborationSourceReadResult>((raw) => {
+        const request = collaborationSourceReadSchema.parse(raw)
+        return { source: request.source, offset: request.offset, nextOffset: null, text: '{}' }
+      })
+    server.beginTurn('claude', false, undefined, false, reader, owner)
+    const response = await fetch(target, {
+      method: 'POST',
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    })
+    const listing: unknown = await response.json()
+    if (!listing || typeof listing !== 'object') throw new Error('Missing native tool metadata')
+    const result: unknown = Reflect.get(listing, 'result')
+    const tools: unknown =
+      result && typeof result === 'object' ? Reflect.get(result, 'tools') : null
+    if (!Array.isArray(tools)) throw new Error('Missing native tools')
+    const tool: unknown = tools.find(
+      (value: unknown) =>
+        value &&
+        typeof value === 'object' &&
+        Reflect.get(value, 'name') === 'read_collaboration_source',
+    )
+    if (!tool || typeof tool !== 'object') throw new Error('Missing native source tool')
+    const description: unknown = Reflect.get(tool, 'description')
+    const schema: unknown = Reflect.get(tool, 'inputSchema')
+    const properties: unknown =
+      schema && typeof schema === 'object' ? Reflect.get(schema, 'properties') : null
+    if (typeof description !== 'string' || !properties || typeof properties !== 'object')
+      throw new Error('Incomplete native source argument metadata')
+    for (const name of ['runId', 'grant', 'batchId', 'document', 'offset']) {
+      expect(Object.hasOwn(properties, name)).toBe(true)
+      expect(description).toContain(name)
+    }
+    expect(reader).not.toHaveBeenCalled()
+    const refused = await callSource(target, {
+      source: 'batch',
+      id: batchId,
+      sourceGrant: owner,
+      offset: 0,
+    })
+    expect(refused.value).toMatchObject({ result: { isError: true } })
+    expect(reader).not.toHaveBeenCalled()
+    const accepted = await callSource(target, { ...owner, source: 'batch', batchId, offset: 0 })
+    expect(accepted.value).toMatchObject({ result: { content: [{ type: 'text' }] } })
+    expect(reader).toHaveBeenCalledTimes(1)
+  })
+
   it.each(['inputs', 'handoff_sources', 'batch'] as const)(
     'reads the frozen %s index when its request also carries a contextual document reference',
     async (source) => {

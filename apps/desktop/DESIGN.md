@@ -295,6 +295,46 @@ During authorized automatic collaboration, show the responsible Agent and concis
 
 Image preview is a native modal with previous/next, directional keys, bounded filmstrip, close/Escape and trigger focus return. It fits content without zoom/Fit/100% controls. Its 180ms slide/fade honors reduced motion. Recovery uses one compact card for affected Agents, with currently valid action and specific reason rather than stacked warnings or repeated safety paragraphs.
 
+### Relay scheduling
+
+Relay Settings retains its heading and intelligent-orchestration subtitle, independent enable and
+indicator preferences, exact model choice, explicit usage notice and read-only Scheduling activity.
+The settings surface stays opaque in translucent windows. Activity shows time, Project/Session,
+reason and actual result, with no filter, details, navigation, copy, export, retry or clearing actions.
+
+Place the compact rectangular `Scheduling in background` indicator immediately above the current
+Composer's upper-left edge. Show it only for that Session's real evaluation/check activity while
+Relay and its indicator preference are on. Idle, other-Session activity, catalog probes, cleanup and
+waiting for user input do not imply active scheduling. Reserve the settings button's space; Hover
+and keyboard focus reveal it smoothly without moving the Composer or taking focus. Its accessible
+name is `Open decision & scheduling settings`.
+
+The indicator and Relay decision card share one soft highlight slowly travelling around the edge,
+using theme-derived lavender, peach and mint. Keep their interiors and text stable in both themes.
+Reduced motion uses a static colored edge; hidden/unmounted content stops its animation. This
+bounded edge treatment is the exception to the general product-gradient rule. Native approvals
+retain their existing styles and transcript position.
+
+Relay decisions replace the input through the existing InputReplacement. Use a clear `Relay decision`
+heading, a short concrete action or scheduling question, actual recipient/scope, concise reason and
+necessary consequence, source labels and an action-specific confirmation. Show `Cancel this
+scheduling action`. Only a genuine host-required scheduling field permits choices or text; ordinary
+business questions stay in the Agent's form. Do not display protocol IDs, grants or hashes.
+Native permission/question/OAuth interactions come first, existing collaboration/recovery next, then
+a freshly host-validated Relay request. Preserve ordinary drafts and attachments, unsubmitted answers,
+queue semantics and focus. Showing a card, hiding it or answering another interaction grants no Relay
+permission. Pending/uncertain confirmation uses its own receipt state and cannot become another Send.
+Turning off the indicator does not hide a necessary decision. Latest Relay visual acceptance remains
+pending; static CSS/build checks do not establish the visible effect.
+
+A scoped Repair request names one repair and its fixed reviewer; its confirmation says `Allow
+repair`, and Full access is stated when those are the current execution permissions. Never describe
+that writing authorization as a read-only turn. A Rebuild request says `Confirm rebuild`, retains
+warnings about old work continuing or earlier uncertain creation, and replaces only its matching
+recovery row. Cancel preserves the underlying recovery facts. Activity distinguishes a rebuilt native
+context from a completed business task, and displays historical model identity only for actual
+inference. Suggestions, acceptance and real execution results remain separate readable facts.
+
 ## Windows installer preview
 
 The first Windows x64 installer is a native NSIS Modern UI extension. Its visual design is pending
@@ -387,7 +427,7 @@ visual acceptance before formal verification.
 - **Don't** use whole-window opacity to implement translucency.
 - **Don't** draw Project-to-Session connector lines or show branch/Changes/path/count metadata by default.
 - **Don't** add a persistent `Sessions` label under an already expanded Project.
-- **Don't** use gradients, 3D illustration, giant typography, or 32px marketing-card radii in product UI.
+- **Don't** use gradients outside Relay's specified edge treatment, 3D illustration, giant typography, or 32px marketing-card radii in product UI.
 - **Don't** let wallpaper reduce Diff, terminal, permission, or body-text contrast.
 - **Don't** treat Agent color as the only provenance cue.
 - **Don't** draw one-off inline SVG icons when Lucide provides the control or state symbol.

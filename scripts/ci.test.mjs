@@ -26,6 +26,7 @@ void test('native CI preserves failed case reports and refuses missing execution
       JSON.stringify({
         private: true,
         type: 'module',
+        packageManager: 'pnpm@12.11.2',
         scripts: { 'test:native': 'node fixture.mjs' },
       }),
     )
@@ -410,4 +411,41 @@ void test('Playwright-worker admission reads only the explicit private Codex env
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+void test('the native owner admits only its fixed decision profile and fails closed before execution without its verified private CLI', async () => {
+  await assert.rejects(main(['native', 'unregistered-version']), /Unknown fixed native profile/u)
+  await assert.rejects(main(['native', 'decision-codex'], {}), /requires its pinned macOS CLI/u)
+  await assert.rejects(main(['native', 'decision-codex', '--grep=one']), /owns its reporter/u)
+  const safe = ciEnvironment({
+    PACT_NATIVE_CODEX_EXECUTABLE: '/legacy/codex',
+    PACT_NATIVE_DECISION_CODEX_EXECUTABLE: '/private/codex',
+    PACT_NATIVE_DECISION_CODEX_VERSION: '0.163.0',
+    OPENAI_API_KEY: 'synthetic-never-forwarded',
+  })
+  assert.equal(safe.PACT_NATIVE_CODEX_EXECUTABLE, '/legacy/codex')
+  assert.equal(safe.PACT_NATIVE_DECISION_CODEX_EXECUTABLE, '/private/codex')
+  assert.equal(safe.PACT_NATIVE_DECISION_CODEX_VERSION, '0.163.0')
+  assert.equal(safe.OPENAI_API_KEY, undefined)
+})
+
+void test('Claude and Windows owner admission cannot reuse another version or a non-Windows skip, while MSVC paths remain credential-free', async () => {
+  await assert.rejects(main(['native', 'decision-claude'], {}), /requires its pinned native CLI/u)
+  await assert.rejects(main(['native', 'decision-claude', '--grep=one'], {}), /owns its reporter/u)
+  if (process.platform !== 'win32')
+    await assert.rejects(main(['native', 'windows-owner'], {}), /requires a native Windows/u)
+  const safe = ciEnvironment({
+    PACT_NATIVE_DECISION_CLAUDE_EXECUTABLE: '/owned/claude',
+    PACT_NATIVE_DECISION_CLAUDE_VERSION: '2.1.272',
+    INCLUDE: '/owned/msvc/include',
+    LIB: '/owned/msvc/lib',
+    LIBPATH: '/owned/msvc/libpath',
+    VSCMD_ARG_TGT_ARCH: 'arm64',
+    ANTHROPIC_API_KEY: 'not-admitted',
+  })
+  assert.equal(safe.PACT_NATIVE_DECISION_CLAUDE_VERSION, '2.1.272')
+  assert.equal(safe.PACT_NATIVE_DECISION_CLAUDE_EXECUTABLE, '/owned/claude')
+  assert.equal(safe.VSCMD_ARG_TGT_ARCH, 'arm64')
+  assert.equal(safe.LIB, '/owned/msvc/lib')
+  assert.equal(safe.ANTHROPIC_API_KEY, undefined)
 })

@@ -1,6 +1,11 @@
 import { flipFuses, FuseV1Options, FuseVersion } from '@electron/fuses'
 
 import identities from '../app-identities.json' with { type: 'json' }
+import {
+  assertNoWindowsOwnedProcessResource,
+  inspectWindowsOwnedProcessResource,
+  windowsOwnedProcessSourceHash,
+} from './windows-owned-process-resource.mjs'
 
 // electron-builder's Arch enum uses 3 for arm64. Keep this local so the packaging hook does not
 // depend on electron-builder's internal utility package resolution.
@@ -46,6 +51,18 @@ export default async function afterPack(context) {
   const executablePath = isMac
     ? join(context.appOutDir, `${productFilename}.app`, 'Contents', 'MacOS', productFilename)
     : join(context.appOutDir, `${productFilename}.exe`)
+
+  const resources = isMac
+    ? join(context.appOutDir, `${productFilename}.app`, 'Contents/Resources')
+    : join(context.appOutDir, 'resources')
+  if (context.electronPlatformName === 'win32')
+    await inspectWindowsOwnedProcessResource(
+      join(resources, 'native'),
+      arch,
+      await windowsOwnedProcessSourceHash(),
+      { runIdentity: true },
+    )
+  else await assertNoWindowsOwnedProcessResource(resources)
 
   await flipFuses(executablePath, {
     version: FuseVersion.V1,

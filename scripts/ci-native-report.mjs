@@ -7,10 +7,28 @@ import {
   reportIdentityMarkdown,
   writeE2EReport,
 } from './e2e-report.mjs'
+import {
+  nativeProfile,
+  nativeProfileSupports,
+  windowsOwnerHostCases,
+  windowsOwnerNativeCases,
+} from './native-profiles.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
 /** Protocol fixtures have no model credentials. Raw errors and attachments never leave this owner. */
-export function nativeReport(raw, { completed, exitCode, identity = null } = {}) {
+export function nativeReport(
+  raw,
+  {
+    completed,
+    exitCode,
+    identity = null,
+    profile: name = 'legacy',
+    verifiedCodexVersion = null,
+    verifiedClaudeVersion = null,
+    requireIdentity = false,
+  } = {},
+) {
+  const profile = nativeProfile(name)
   const cases = []
   const names = new Set()
   let valid = Boolean(raw && typeof raw.success === 'boolean' && Array.isArray(raw.testResults))
@@ -52,6 +70,26 @@ export function nativeReport(raw, { completed, exitCode, identity = null } = {})
     }
   } else valid = false
   valid &&= Number.isSafeInteger(raw?.numTotalTests) && raw.numTotalTests === cases.length
+  if (profile.files) {
+    const files = Array.isArray(raw?.testResults)
+      ? raw.testResults.map((file) =>
+          typeof file?.name === 'string' ? file.name.replaceAll('\\', '/') : '',
+        )
+      : []
+    valid &&=
+      nativeProfileSupports(profile) &&
+      (!profile.codexVersion || verifiedCodexVersion === profile.codexVersion) &&
+      (!profile.claudeVersion || verifiedClaudeVersion === profile.claudeVersion) &&
+      (!requireIdentity || publicReportIdentity(identity)?.kind === 'ci') &&
+      files.length === profile.files.length &&
+      profile.files.every(
+        (expected) =>
+          files.filter((file) => file === expected || file.endsWith('/' + expected)).length === 1,
+      )
+    if (profile.cases)
+      valid &&=
+        cases.length === profile.cases.length && profile.cases.every((title) => names.has(title))
+  }
   const passed =
     valid &&
     completed === true &&
@@ -62,6 +100,24 @@ export function nativeReport(raw, { completed, exitCode, identity = null } = {})
   return {
     schemaVersion: 1,
     lane: 'native',
+    profile: profile.name,
+    requiredCodexVersion: profile.codexVersion,
+    verifiedCodexVersion:
+      verifiedCodexVersion === profile.codexVersion ? verifiedCodexVersion : null,
+    requiredClaudeVersion: profile.claudeVersion ?? null,
+    verifiedClaudeVersion:
+      profile.claudeVersion && verifiedClaudeVersion === profile.claudeVersion
+        ? verifiedClaudeVersion
+        : null,
+    ...(profile.name === 'windows-owner'
+      ? {
+          windowsOwnerEvidence: {
+            nativeRequired: windowsOwnerNativeCases.length,
+            hostSeamRequired: windowsOwnerHostCases.length,
+            nativeAcceptance: passed && process.platform === 'win32',
+          },
+        }
+      : {}),
     status: passed ? 'passed' : completed === true && valid ? 'failed' : 'blocked',
     executionCompleted: completed === true,
     exitCode: Number.isSafeInteger(exitCode) ? exitCode : null,
@@ -82,6 +138,13 @@ export function nativeReport(raw, { completed, exitCode, identity = null } = {})
       'Informational report; the required native command and platform job remain the merge gate.',
       'Unexecuted cases require investigation; none are represented as passing.',
       'Raw native errors, stdout, configuration and credentials are excluded.',
+      ...(profile.name === 'decision-claude'
+        ? [
+            'Owned loopback and synthetic catalog evidence does not establish real Haiku entitlement or benefit.',
+          ]
+        : profile.name === 'windows-owner'
+          ? ['Host OS-seam assertions do not establish Windows Job or installed-helper acceptance.']
+          : []),
     ],
   }
 }
@@ -92,6 +155,11 @@ export function nativeMarkdown(report) {
     '# Native CLI protocol report',
     '',
     `Result: **${report.status}** · ${report.platform}/${report.arch}.`,
+    report.requiredClaudeVersion
+      ? `Profile: ${report.profile}; required Claude ${report.requiredClaudeVersion}; verified ${report.verifiedClaudeVersion ?? 'not recorded'}.`
+      : report.profile === 'windows-owner'
+        ? `Profile: windows-owner; ${report.windowsOwnerEvidence.nativeRequired} native Windows and ${report.windowsOwnerEvidence.hostSeamRequired} host OS-seam cases required.`
+        : `Profile: ${report.profile}; required Codex ${report.requiredCodexVersion}; verified ${report.verifiedCodexVersion ?? 'not recorded'}.`,
     '',
   ]
   lines.push(reportIdentityMarkdown(report.identity), '')
@@ -118,6 +186,10 @@ export async function writeNativeReport({
   identityPath,
   summary,
   artifactName,
+  profile,
+  verifiedCodexVersion,
+  verifiedClaudeVersion,
+  requireIdentity,
 }) {
   let raw
   try {
@@ -126,14 +198,25 @@ export async function writeNativeReport({
     /* Missing or invalid execution must still leave a safe blocked report. */
   }
   const identity = identityPath ? await readCiReportIdentity(identityPath) : null
-  return writeE2EReport(nativeReport(raw, { completed, exitCode, identity }), {
-    directory,
-    workspace,
-    basename: 'native-summary',
-    markdown: nativeMarkdown,
-    summary,
-    artifactName,
-  })
+  return writeE2EReport(
+    nativeReport(raw, {
+      completed,
+      exitCode,
+      identity,
+      profile,
+      verifiedCodexVersion,
+      verifiedClaudeVersion,
+      requireIdentity,
+    }),
+    {
+      directory,
+      workspace,
+      basename: 'native-summary',
+      markdown: nativeMarkdown,
+      summary,
+      artifactName,
+    },
+  )
 }
 
 /** Setup/cancellation still leaves evidence; an existing execution report is never replaced. */
@@ -153,6 +236,7 @@ export async function ensureUnexecutedNativeReport(options) {
       existing.lane !== 'native' ||
       existing.platform !== process.platform ||
       existing.arch !== process.arch ||
+      (options.profile !== undefined && existing.profile !== nativeProfile(options.profile).name) ||
       !['passed', 'failed', 'blocked'].includes(existing.status) ||
       existing.reportFiles?.artifactName !== options.artifactName ||
       (options.identityPath &&
@@ -164,7 +248,7 @@ export async function ensureUnexecutedNativeReport(options) {
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error
   }
-  const report = nativeReport(undefined, { completed: false, identity })
+  const report = nativeReport(undefined, { completed: false, identity, profile: options.profile })
   report.limitations.push(
     'Native execution was unavailable; no case is reported as passing. Inspect setup and cancellation diagnostics.',
   )
@@ -185,6 +269,7 @@ if (isScriptEntry(import.meta.url))
     identityPath: process.env.PACT_CI_NATIVE_IDENTITY_FILE,
     artifactName: process.env.PACT_CI_NATIVE_ARTIFACT,
     summary: process.env.GITHUB_STEP_SUMMARY,
+    profile: process.env.PACT_CI_NATIVE_PROFILE,
   }).catch(() => {
     console.error('Native evidence could not be safely preserved.')
     process.exitCode = 1

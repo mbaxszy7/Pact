@@ -508,6 +508,21 @@ function journey(
           })),
         }
       : {}),
+    ...(file === 'default-session-settings.spec.ts' &&
+    title === 'saves first-use defaults and reopens the singleton from Settings'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 32,
+              reason:
+                'The accepted collaboration-limit terminology labels the same maxDiscussionRounds field Plan reviews. Preserve the exact saved value 4 after cold restart, Codex primary, repair attempts 3, unchanged-default save disabling and cursor obligations.',
+              replacementAssertions: [
+                "expect(window.getByRole('spinbutton', { name: 'Plan reviews' })).toHaveValue('4')",
+              ],
+            },
+          ],
+        }
+      : {}),
     ...(file === 'workspace-shell.spec.ts' && title.startsWith('resizes and collapses')
       ? {
           contractUpdates: [

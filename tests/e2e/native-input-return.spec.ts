@@ -43,7 +43,7 @@ async function seed(fixture: RuntimeFixture) {
   } finally {
     database.close()
   }
-  return sessionId
+  return { sessionId, projectId }
 }
 
 for (const keepNewDraft of [false, true]) {
@@ -55,7 +55,7 @@ for (const keepNewDraft of [false, true]) {
       const fixture = await createRuntimeFixture({ codexAppServer: 'writer_rejected_once' })
       let app: Awaited<ReturnType<typeof fixture.launch>> | undefined
       try {
-        const sessionId = await seed(fixture)
+        const { sessionId, projectId } = await seed(fixture)
         app = await fixture.launch()
         let page = await app.firstWindow()
         await page.getByRole('button', { name: 'Input return Session', exact: true }).click()
@@ -155,12 +155,19 @@ for (const keepNewDraft of [false, true]) {
         expect(restored.commentIds).not.toContain(comment)
         expect(restored.bodies).toEqual(['Retain this anchored instruction'])
         if (!keepNewDraft) {
-          const title = await page.evaluate(async (id) => {
-            const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
-            const settings = await bridge.getSessionSettings(id)
-            if (!settings.ok) throw new Error('Session unavailable')
-            return settings.value.session.title
-          }, sessionId)
+          // The catalog owns the title; opening Settings also probes native models,
+          // which is unrelated to returning the original input across restart.
+          const title = await page.evaluate(
+            async ({ projectId: projectKey, sessionId: sessionKey }) => {
+              const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+              const catalog = await bridge.getSessionCatalog(projectKey)
+              if (!catalog.ok) throw new Error(`Session catalog unavailable: ${catalog.error.code}`)
+              const session = catalog.value.sessions.find((entry) => entry.id === sessionKey)
+              if (!session) throw new Error('Restored Session missing from its catalog')
+              return session.title
+            },
+            { projectId, sessionId },
+          )
           await quitPact(app)
           app = await fixture.launch()
           page = await app.firstWindow()

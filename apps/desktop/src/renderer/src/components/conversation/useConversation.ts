@@ -24,6 +24,9 @@ import {
   NATIVE_PERMISSION_REQUESTS,
   NATIVE_PERMISSION_TIMEOUT_MS,
   nativeInputValuesSchema,
+  userInformationDeclarationSchema,
+  relaySchedulingDecisionSchema,
+  parseComposerCommandPrefix,
 } from '@pact/contracts'
 import { IMAGE_REFERENCE_ITEMS, type ConversationImage } from '@pact/contracts/images'
 
@@ -36,7 +39,7 @@ import {
   COMPOSER_DRAFT_BYTES,
   COMPOSER_DRAFT_ITEMS,
 } from './composer-capacity'
-import { releaseComposerRoute } from './composer-document'
+import { composerRouteIntent, releaseComposerRoute } from './composer-document'
 import {
   mergeActivityPage,
   mergeRunArtifactPage,
@@ -106,6 +109,18 @@ export interface ConversationHistoryControls {
   decisionDraft?: DecisionAnswerDraft | undefined
   setDecisionDraft?: ((draft: DecisionAnswerDraft) => boolean) | undefined
   clearDecisionDraft?: ((keepInMessage: boolean) => boolean) | undefined
+  informationCancellation?:
+    | {
+        request: import('@pact/contracts').RelaySchedulingDecision
+        status: 'submitting' | 'checking_receipt' | 'receipt_unconfirmed'
+        error?: string | undefined
+      }
+    | undefined
+  cancelledInformationDecisionId?: string | undefined
+  cancelPreparedInformation?:
+    | ((request: import('@pact/contracts').RelaySchedulingDecision) => Promise<boolean>)
+    | undefined
+  checkInformationCancellation?: (() => Promise<boolean>) | undefined
   collapseEarlierResponses?: ((runId: string) => Promise<void>) | undefined
   setSnapshotFoldGuard?: ((guard: (() => boolean) | undefined) => void) | undefined
   queueActions?: {
@@ -281,6 +296,10 @@ async function readSentComments(
 export interface ConversationFlow {
   snapshot: ConversationViewProjection | undefined
   composer: string
+  composerUserInformation: import('@pact/contracts').UserInformationDeclaration | undefined
+  setComposerUserInformation(
+    value: import('@pact/contracts').UserInformationDeclaration | undefined,
+  ): boolean
   choosingImages: boolean
   composerImages: readonly DraftImage[]
   addComposerImages(this: void, files: readonly File[]): Promise<void>
@@ -359,6 +378,7 @@ function liveNativeDraft(
 export type ConversationComposerMention = import('./composer-document').ComposerMention
 
 interface ConversationComposerDraft {
+  userInformation?: import('@pact/contracts').UserInformationDeclaration | undefined
   decisionAnswers?: DecisionAnswerDraft | undefined
   text: string
   images?: DraftImage[] | undefined
@@ -394,11 +414,13 @@ export const commentDraftSaveSucceeded = (value: CommentDraftSaveOutcome): value
 interface PendingSubmission {
   kind: 'message' | 'decision'
   replyToDecision?: ConversationSendInput['replyToDecision'] | undefined
+  userInformation?: import('@pact/contracts').UserInformationDeclaration | undefined
   sourceDocument: ConversationComposerDraft
   imageIds: string[]
   inputId?: string | undefined
   inputPreparation?: AbortController | undefined
   composerRevision?: number
+  routeIntent?: NonNullable<ConversationSendInput['routeIntent']>
   returnedInputOperationId?: string | undefined
   queueReturnOperationId?: string | undefined
   acknowledgementError?: string
@@ -421,6 +443,7 @@ interface ReturnedInputRead {
 
 function emptyComposerDraft(value: ConversationComposerDraft): boolean {
   return (
+    !value.userInformation &&
     !hasDecisionAnswers(value.decisionAnswers) &&
     !value.images?.length &&
     !value.text &&
@@ -439,7 +462,20 @@ export function shouldClearComposerAfterAck(
   return currentComposer === pending.composerSnapshot
 }
 
+const INFORMATION_CANCELLATION_ITEMS = 32
+
+interface InformationCancellation {
+  request: import('@pact/contracts').RelaySchedulingDecision
+  input: import('@pact/contracts').RelayDecisionAnswer
+  declaration?: import('@pact/contracts').UserInformationDeclaration | undefined
+  status: 'submitting' | 'checking_receipt' | 'receipt_unconfirmed'
+  busy: boolean
+  error?: string | undefined
+}
+
 interface SessionOperationState {
+  informationCancellation?: InformationCancellation | undefined
+  cancelledInformationDecisionId?: string | undefined
   choosingImages?: boolean | undefined
   sendingOperationId?: string | undefined
   stoppingOperationId?: string | undefined
@@ -459,6 +495,7 @@ export function useConversation(
   const [operationsBySession, setOperationsBySession] = useState<
     Record<string, SessionOperationState>
   >({})
+  const operationsBySessionRef = useRef<Record<string, SessionOperationState>>({})
   const [composerDraftsBySession, setComposerDraftsBySession] = useState<
     Record<string, ConversationComposerDraft>
   >({})
@@ -515,8 +552,11 @@ export function useConversation(
               skills: value.skills,
               imageIds: value.imageIds,
               route: value.route,
+              routeIntent: value.routeIntent,
+              composerRevision: value.composerRevision,
               commentIds: value.commentIds,
               replyToDecision: value.replyToDecision,
+              userInformation: value.userInformation,
             }),
           ).byteLength
         if (value.content !== value.sourceDocument.text) bytes += value.content.length * 2
@@ -542,9 +582,11 @@ export function useConversation(
               returnedInputOperationId: value.returnedInputOperationId,
               queueReturnOperationId: value.queueReturnOperationId,
               decisionAnswers: value.decisionAnswers,
+              userInformation: value.userInformation,
             }),
           ).byteLength
         if (value.decisionAnswers) bytes += JSON.stringify(value.decisionAnswers).length * 2
+        if (value.userInformation) bytes += JSON.stringify(value.userInformation).length * 2
         if (bytes > COMPOSER_DRAFT_BYTES || items > COMPOSER_DRAFT_ITEMS) break
       }
       if (textCandidate) {
@@ -552,6 +594,8 @@ export function useConversation(
         bytes += textCandidate.chars * 2 + 64 * 1024 + 1024
         const answers = drafts[textCandidate.sessionId]?.decisionAnswers
         if (answers) bytes += JSON.stringify(answers).length * 3
+        const declaration = JSON.stringify(drafts[textCandidate.sessionId]?.userInformation ?? null)
+        bytes += bodyTextEncoder.encode(declaration).byteLength + declaration.length * 2
       }
       const imageIdentities = new Set(
         [...documents].flatMap((value) =>
@@ -839,6 +883,7 @@ export function useConversation(
           )
             releaseDraftImage(ownerSessionId, entry.image.id)
       composerDraftsRef.current = {}
+      operationsBySessionRef.current = {}
       latestComposerDraft.current = undefined
       for (const [ownerSessionId, pending] of pendingBySessionRef.current) {
         pending.inputPreparation?.abort()
@@ -865,6 +910,43 @@ export function useConversation(
   const actionError = currentOperations?.error
   const composerDraft = sessionId ? composerDraftsBySession[sessionId] : undefined
   const composer = composerDraft?.text ?? ''
+  const composerUserInformation = composerDraft?.userInformation
+  const setComposerUserInformation = (
+    userInformation: import('@pact/contracts').UserInformationDeclaration | undefined,
+  ): boolean => {
+    if (!sessionId || returnOperation.current?.sessionId === sessionId) return false
+    if (
+      userInformation &&
+      bodyTextEncoder.encode(JSON.stringify(userInformation)).byteLength > 4096
+    ) {
+      onNotice('This information is too long. Your previous draft was kept.')
+      return false
+    }
+    const previous = composerDraftsRef.current[sessionId] ?? { text: '' }
+    return putComposerDraft(sessionId, {
+      ...previous,
+      // Each field edit gets a fresh identity, including a change back to earlier text.
+      userInformation: userInformation ? { ...userInformation } : undefined,
+      revision: (previous.revision ?? 0) + 1,
+    })
+  }
+  const clearCancelledInformation = (
+    ownerSessionId: string,
+    expected: import('@pact/contracts').UserInformationDeclaration,
+  ): boolean => {
+    const previous = composerDraftsRef.current[ownerSessionId]
+    if (
+      !previous ||
+      expected.state.status !== 'unanswered' ||
+      previous.userInformation !== expected
+    )
+      return false
+    return putComposerDraft(ownerSessionId, {
+      ...previous,
+      userInformation: undefined,
+      revision: (previous.revision ?? 0) + 1,
+    })
+  }
   const composerImages = composerDraft?.images ?? []
   const composerMention = composerDraft?.mention
   const composerSkills = composerDraft?.skills ?? []
@@ -1157,13 +1239,201 @@ export function useConversation(
       ownerSessionId: string,
       update: (current: SessionOperationState) => SessionOperationState,
     ): void => {
-      setOperationsBySession((current) => ({
-        ...current,
-        [ownerSessionId]: update(current[ownerSessionId] ?? {}),
-      }))
+      const current = operationsBySessionRef.current,
+        next = { ...current, [ownerSessionId]: update(current[ownerSessionId] ?? {}) }
+      operationsBySessionRef.current = next
+      setOperationsBySession(next)
     },
     [],
   )
+
+  const currentInformationCancellation = (owner: InformationCancellation) =>
+    operationsBySessionRef.current[owner.request.sessionId]?.informationCancellation?.input
+      .clientOperationId === owner.input.clientOperationId
+
+  const observeInformationCancellation = async (
+    owner: InformationCancellation,
+    invoke: () => Promise<
+      import('@pact/contracts').RpcResult<import('@pact/contracts').RelayDecisionReceipt>
+    >,
+    phase: 'cancel' | 'receipt',
+  ): Promise<boolean> => {
+    let result: Awaited<ReturnType<typeof invoke>>
+    try {
+      result = await invoke()
+    } catch {
+      result = {
+        ok: false,
+        error: {
+          code: 'UNCERTAIN',
+          message:
+            'The cancellation result is not confirmed. Check this decision before sending again.',
+        },
+      }
+    }
+    if (!currentInformationCancellation(owner)) return false
+    // This endpoint returns CONFLICT only before mutation; committed Cancel has its positive receipt.
+    if (!result.ok && phase === 'cancel' && result.error.code === 'CONFLICT') {
+      updateSessionOperations(owner.request.sessionId, (state) => ({
+        ...state,
+        informationCancellation: undefined,
+      }))
+      onErrorNotice(result.error.message)
+      void queryClient.invalidateQueries({
+        queryKey: conversationQueryKeys.session(owner.request.sessionId),
+        exact: true,
+      })
+      return false
+    }
+    if (
+      result.ok &&
+      result.value.disposition === 'cancelled' &&
+      result.value.sessionId === owner.request.sessionId &&
+      result.value.decisionId === owner.request.decisionId &&
+      result.value.clientOperationId === owner.input.clientOperationId &&
+      result.value.runId === null &&
+      result.value.rebuildId === null
+    ) {
+      if (owner.declaration) clearCancelledInformation(owner.request.sessionId, owner.declaration)
+      const consumer = owner.request.request
+      const pending = pendingBySessionRef.current.get(owner.request.sessionId)
+      const cancelledSubmission =
+        consumer.category === 'necessary_information' &&
+        pending?.clientMessageId === consumer.consumer.clientMessageId
+          ? pending
+          : undefined
+      if (cancelledSubmission) {
+        pendingBySessionRef.current.delete(owner.request.sessionId)
+        cancelledSubmission.inputPreparation?.abort()
+      }
+      updateSessionOperations(owner.request.sessionId, (state) => ({
+        ...state,
+        ...(cancelledSubmission
+          ? {
+              sendingOperationId:
+                state.sendingOperationId === cancelledSubmission.operationId
+                  ? undefined
+                  : state.sendingOperationId,
+              error:
+                state.error === cancelledSubmission.acknowledgementError ? undefined : state.error,
+            }
+          : {}),
+        informationCancellation: undefined,
+        cancelledInformationDecisionId: owner.request.decisionId,
+      }))
+      void queryClient.invalidateQueries({
+        queryKey: conversationQueryKeys.session(owner.request.sessionId),
+        exact: true,
+      })
+      return true
+    }
+    updateSessionOperations(owner.request.sessionId, (state) => ({
+      ...state,
+      informationCancellation: {
+        ...owner,
+        busy: false,
+        status: 'receipt_unconfirmed',
+        error: result.ok
+          ? 'The cancellation receipt does not match. Check this decision before sending again.'
+          : 'The cancellation result is not confirmed. Check this decision before sending again.',
+      },
+    }))
+    return false
+  }
+
+  const checkInformationCancellation = async (ownerSessionId = sessionId): Promise<boolean> => {
+    const owner = ownerSessionId
+      ? operationsBySessionRef.current[ownerSessionId]?.informationCancellation
+      : undefined
+    if (!owner || owner.busy) return false
+    updateSessionOperations(owner.request.sessionId, (state) => ({
+      ...state,
+      informationCancellation: {
+        ...owner,
+        busy: true,
+        status: 'checking_receipt',
+        error: undefined,
+      },
+    }))
+    return observeInformationCancellation(
+      owner,
+      () =>
+        window.pact.getRelayDecisionReceipt({
+          sessionId: owner.request.sessionId,
+          decisionId: owner.request.decisionId,
+          clientOperationId: owner.input.clientOperationId,
+        }),
+      'receipt',
+    )
+  }
+
+  const cancelPreparedInformation = async (
+    raw: import('@pact/contracts').RelaySchedulingDecision,
+  ): Promise<boolean> => {
+    const parsed = relaySchedulingDecisionSchema.safeParse(raw)
+    if (!parsed.success) return false
+    const request = parsed.data
+    if (request.sessionId !== sessionId || request.request.category !== 'necessary_information')
+      return false
+    const current = operationsBySessionRef.current[request.sessionId]
+    if (
+      current?.informationCancellation ||
+      current?.cancelledInformationDecisionId === request.decisionId
+    )
+      return false
+    // At most 32 pending operations: one 4 KiB card, one 4 KiB declaration and fixed metadata each.
+    if (
+      Object.values(operationsBySessionRef.current).filter((state) => state.informationCancellation)
+        .length >= INFORMATION_CANCELLATION_ITEMS
+    ) {
+      onNotice('Resolve a pending cancellation before cancelling another request.')
+      return false
+    }
+    const declaration = composerDraftsRef.current[request.sessionId]?.userInformation,
+      field = request.request.field,
+      expected =
+        declaration?.state.status === 'unanswered' &&
+        declaration.id === field.fieldId &&
+        declaration.question === field.prompt &&
+        declaration.input === field.input.kind &&
+        (field.input.kind === 'text' ||
+          JSON.stringify(declaration.options) === JSON.stringify(field.input.options))
+          ? declaration
+          : undefined,
+      owner: InformationCancellation = {
+        request,
+        declaration: expected,
+        busy: true,
+        status: 'submitting',
+        input: {
+          reference: {
+            sessionId: request.sessionId,
+            decisionId: request.decisionId,
+            revision: request.revision,
+          },
+          clientOperationId: crypto.randomUUID(),
+          answer: { kind: 'cancel' },
+        },
+      }
+    // Completed markers protect only mounted stale projections; other Session Views unmount.
+    const states = { ...operationsBySessionRef.current }
+    for (const [id, state] of Object.entries(states))
+      if (id !== request.sessionId && state.cancelledInformationDecisionId)
+        states[id] = { ...state, cancelledInformationDecisionId: undefined }
+    operationsBySessionRef.current = states
+    updateSessionOperations(request.sessionId, (state) => ({
+      ...state,
+      informationCancellation: owner,
+    }))
+    const confirmed = await observeInformationCancellation(
+      owner,
+      () => window.pact.answerRelayDecision(owner.input),
+      'cancel',
+    )
+    if (confirmed || !currentInformationCancellation(owner)) return confirmed
+    // Only receipt observation follows an uncertain answer; never repeat the mutation or poll.
+    return checkInformationCancellation(request.sessionId)
+  }
 
   const settleSubmission = useCallback(
     (ownerSessionId: string, clientMessageId: string): void => {
@@ -2372,7 +2642,13 @@ export function useConversation(
     skills?: SkillSelection[],
     decision?: DecisionReplyContext,
   ): Promise<boolean> => {
-    if (!sessionId || sending || returnOperation.current?.sessionId === sessionId) return false
+    if (
+      !sessionId ||
+      sending ||
+      returnOperation.current?.sessionId === sessionId ||
+      (!decision && operationsBySessionRef.current[sessionId]?.informationCancellation)
+    )
+      return false
     const original = composerSnapshot.trim()
     const draftAnswers = composerDraftsRef.current[sessionId]?.decisionAnswers
     if (
@@ -2393,6 +2669,31 @@ export function useConversation(
     const content = decision ? `**Replies to your questions**\n\n${answers}` : original
     const submissionSkills = decision ? undefined : skills
     const selectedRoute = decision ? undefined : route
+    const userInformation = decision
+      ? undefined
+      : composerDraftsRef.current[sessionId]?.userInformation
+    if (userInformation) {
+      const validation = userInformationDeclarationSchema.safeParse(userInformation)
+      const prefix = parseComposerCommandPrefix(content, submissionSkills)
+      if (
+        !validation.success ||
+        decision ||
+        (userInformation &&
+          (submissionSkills?.length ||
+            selectedRoute?.type === 'all' ||
+            prefix.pact ||
+            prefix.skills.length ||
+            prefix.error ||
+            composerDraftsRef.current[sessionId]?.returnedInputOperationId ||
+            composerDraftsRef.current[sessionId]?.queueReturnOperationId ||
+            composerDraftsRef.current[sessionId]?.images?.length))
+      ) {
+        onNotice(
+          'Complete the reserved information, or remove it before sending a command, workflow reply, queued message, Skill or image. Your draft was kept.',
+        )
+        return false
+      }
+    }
     const images = decision ? [] : (composerDraftsRef.current[sessionId]?.images ?? [])
     if (images.some((image) => image.status !== 'ready' || !image.image)) {
       onNotice('Wait for images to finish preparing, or remove an image that could not be added.')
@@ -2413,6 +2714,7 @@ export function useConversation(
       pending &&
       (JSON.stringify(pending.imageIds) !== JSON.stringify(imageIds) ||
         pending.content !== content ||
+        JSON.stringify(pending.userInformation) !== JSON.stringify(userInformation) ||
         JSON.stringify(pending.route) !== JSON.stringify(selectedRoute) ||
         JSON.stringify(pending.skills ?? []) !== JSON.stringify(submissionSkills ?? []) ||
         !sameDecision(pending.replyToDecision, decision?.reference))
@@ -2428,30 +2730,50 @@ export function useConversation(
     const preserved = pending
     const expectedCommentsRevision = preserved?.expectedCommentsRevision ?? currentRevision
     const submissionCommentIds = preserved?.commentIds ?? (decision ? [] : commentIds)
-    const submissionRoute = preserved?.route ?? selectedRoute
+    const submissionRoute = preserved ? preserved.route : selectedRoute
     const clientMessageId = preserved?.clientMessageId ?? crypto.randomUUID()
     const operationId = crypto.randomUUID()
-    const sourceDocument =
-      preserved?.sourceDocument ??
-      (latestComposerDraft.current?.sessionId === sessionId
+    const currentDocument =
+      latestComposerDraft.current?.sessionId === sessionId
         ? latestComposerDraft.current.draft
-        : (composerDraftsRef.current[sessionId] ?? { text: composerSnapshot }))
+        : composerDraftsRef.current[sessionId]
+    const sourceDocument = preserved?.sourceDocument ??
+      currentDocument ?? { text: composerSnapshot }
+    const returnedInputOperationId = decision
+      ? undefined
+      : preserved
+        ? preserved.returnedInputOperationId
+        : sourceDocument.returnedInputOperationId
+    const queueReturnOperationId = decision
+      ? undefined
+      : preserved
+        ? preserved.queueReturnOperationId
+        : sourceDocument.queueReturnOperationId
+    const routeIntent = preserved
+      ? (preserved.routeIntent ?? 'explicit')
+      : decision ||
+          returnedInputOperationId ||
+          queueReturnOperationId ||
+          selectedRoute?.type === 'agent' ||
+          selectedRoute?.type === 'all' ||
+          !currentDocument ||
+          currentDocument.text !== composerSnapshot
+        ? 'explicit'
+        : composerRouteIntent({ ...sourceDocument, skills: sourceDocument.skills ?? [] })
     const frozen: PendingSubmission = {
       kind: decision ? 'decision' : 'message',
+      userInformation: decision
+        ? undefined
+        : (preserved?.userInformation ?? sourceDocument.userInformation),
       sourceDocument,
       imageIds: preserved?.imageIds ?? imageIds,
       inputId: preserved?.inputId,
-      composerRevision:
-        (latestComposerDraft.current?.sessionId === sessionId
-          ? latestComposerDraft.current.draft
-          : composerDraftsBySession[sessionId]
-        )?.revision ?? 0,
-      returnedInputOperationId: decision
-        ? undefined
-        : composerDraftsBySession[sessionId]?.returnedInputOperationId,
-      queueReturnOperationId: decision
-        ? undefined
-        : (preserved?.queueReturnOperationId ?? sourceDocument.queueReturnOperationId),
+      composerRevision: preserved
+        ? (preserved.composerRevision ?? preserved.sourceDocument.revision ?? 0)
+        : (sourceDocument.revision ?? 0),
+      routeIntent,
+      returnedInputOperationId,
+      queueReturnOperationId,
       operationId,
       content,
       composerSnapshot,
@@ -2481,6 +2803,9 @@ export function useConversation(
         ? { queueReturnOperationId: frozen.queueReturnOperationId }
         : {}),
       expectedCommentsRevision,
+      routeIntent: frozen.routeIntent,
+      composerRevision: frozen.composerRevision,
+      ...(frozen.userInformation ? { userInformation: frozen.userInformation } : {}),
       ...(frozen.replyToDecision ? { replyToDecision: frozen.replyToDecision } : {}),
       commentIds: [],
       freezeDrafts: frozen.kind !== 'decision',
@@ -2638,7 +2963,12 @@ export function useConversation(
         !result.value.messages.some((item) => item.message.id === clientMessageId)
       )
         onInfoNotice("Your message is queued until the current Agent's work finishes.")
-      if (result.value.sessionId === sessionId) settleSubmission(sessionId, clientMessageId)
+      if (result.value.sessionId === sessionId) {
+        if (result.value.sendDisposition === 'held_for_information') {
+          if (pendingBySessionRef.current.get(sessionId)?.operationId === operationId)
+            pendingBySessionRef.current.delete(sessionId)
+        } else settleSubmission(sessionId, clientMessageId)
+      }
       cachePatch(result.value)
       return true
     } catch (error) {
@@ -3567,6 +3897,8 @@ export function useConversation(
   return {
     snapshot: visibleWindow?.view,
     composer,
+    composerUserInformation,
+    setComposerUserInformation,
     composerImages,
     choosingImages: Boolean(currentOperations?.choosingImages),
     addComposerImages,
@@ -3602,6 +3934,16 @@ export function useConversation(
       decisionDraft: composerDraft?.decisionAnswers,
       setDecisionDraft,
       clearDecisionDraft,
+      informationCancellation: currentOperations?.informationCancellation
+        ? {
+            request: currentOperations.informationCancellation.request,
+            status: currentOperations.informationCancellation.status,
+            error: currentOperations.informationCancellation.error,
+          }
+        : undefined,
+      cancelledInformationDecisionId: currentOperations?.cancelledInformationDecisionId,
+      cancelPreparedInformation,
+      checkInformationCancellation,
       queueActions: {
         pending: Boolean(currentOperations?.queueOperationId) || restoringInput,
         steer: () => performQueueAction('steer'),

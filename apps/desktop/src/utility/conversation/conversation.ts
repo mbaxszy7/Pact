@@ -61,6 +61,19 @@ import type {
   NativeSessionRow,
   NativeQuitOperationInput,
   NativeQuitPreparation,
+  DecisionInput,
+  DecisionEvaluationOutcome,
+  RelayDecisionMaterial,
+  HandoffGuidanceProposal,
+  WorkflowRelayCandidateId,
+  InputRoutingProposal,
+  SchedulingHandoff,
+  SchedulingState,
+  SchedulingStateInput,
+  SchedulingEligibility,
+  DecisionCapability,
+  DecisionPhysicalWitness,
+  SchedulingModelSelection,
 } from '@pact/contracts'
 import type {
   ConversationImage,
@@ -74,9 +87,13 @@ import type { HandoffBundle } from '@pact/persistence'
 import {
   serializeAgentPromptEnvelope,
   type AgentAdapter,
+  type AgentRunInput,
+  type AgentNativeCheckOperation,
+  type AgentNativeCheckContext,
   type AgentPromptEnvelope,
   type AgentNativeForkInput,
 } from '@pact/agent-runtime'
+import { conversationStreamTraceSchema, STREAM_TRACE_TTL_MS } from '@pact/contracts'
 import {
   COLLABORATION_PROTOCOL,
   collaborationTaskSchema,
@@ -85,10 +102,26 @@ import {
   collaborationInputGate,
   collaborationStageLabel,
   otherAgent,
-  collaborationSourceReadSchema,
   collaborationMarkdownPageSchema,
   type CollaborationTask,
   type CollaborationActionInput,
+  handoffGuidanceProposalSchema,
+  HANDOFF_GUIDANCE_VERSION,
+  decisionJsonBytes,
+  schedulingSettingsSchema,
+  schedulingStateSchema,
+  schedulingCheckPhysicalOwnerSchema,
+  schedulingStateInputSchema,
+  SCHEDULING_CAPABILITY_TTL_MS,
+  SCHEDULING_CAPABILITY_RESIDENT_BYTES,
+  DECISION_PHYSICAL_RECEIPT_ITEMS,
+  DECISION_CLEANUP_TARGET_MS,
+  relayDecisionAnswerSchema,
+  preparedInputContinueSchema,
+  relayDecisionReceiptReadSchema,
+  type RelayDecisionAnswer,
+  type RelayDecisionReceipt,
+  type RelayDecisionReceiptRead,
 } from '@pact/contracts'
 import {
   frozenSkillInvocationSchema,
@@ -135,6 +168,7 @@ import {
   HANDOFF_SAFETY_BYTES,
   HANDOFF_READ_DEADLINE_MS,
   RunOperationConflictError,
+  PreparedInformationConflictError,
   OversizedConversationEntityError,
   ProjectCatalogRepository,
   SessionRepository,
@@ -142,8 +176,11 @@ import {
   WorkspaceArchiveConflictError,
 } from '@pact/persistence'
 
+import type { DecisionRuntime } from './decision-runtime'
+
 import { recordDiagnostic } from '../../diagnostics/utility-log'
 import { LogicalIpcWorkerTraffic, observeWorkerTraffic } from '../../shared/logical-ipc-traffic'
+import { OwnedProcessGroup } from '../owned-process-group'
 import { ProjectFileReader } from '../project-file/project-file-reader'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation'
 import { WorkspaceChanges, WorkspaceChangeError } from '../workspace-changes/workspace-changes'
@@ -158,10 +195,21 @@ import {
 } from './agent-execution-error'
 import { AgentStreamBuffer } from './agent-stream-buffer'
 import { ClaudeAgentAdapter } from './claude-agent-adapter'
+import { ClaudeDecisionRuntime } from './claude-decision-runtime'
 import { CodexAgentAdapter } from './codex-agent-adapter'
+import { CodexDecisionRuntime, type DecisionInputLoader } from './codex-decision-runtime'
 import { ConversationImages } from './conversation-images'
+import { pathlessExecutionInput, restoreExecutionInput } from './execution-input'
+import { FrozenSourceReader } from './frozen-source-reader'
+import { encodeNativeJsonFrame } from './native-json-encoder'
 import { safeNativePermissionText } from './native-permission-wait'
-import { NativeWorkingMemory } from './native-working-memory'
+import { NativeWorkingMemory, type NativeMemoryAllocator } from './native-working-memory'
+import {
+  evaluateRelayPolicy,
+  relayWorkflowPolicyFacts,
+  type RelayPolicyAdmission,
+  type RelayAction,
+} from './relay-policy'
 import { presentSessionIssues } from './session-issues'
 
 const DELIVERY_RECONCILIATION_TIMEOUT_MS = 10_000
@@ -243,7 +291,55 @@ interface PreparingSend {
   task: Promise<RpcResult<ConversationPatch>>
 }
 
+interface DecisionInvocationOwner {
+  kind: 'evaluation'
+  operationId: string
+  runtime?: DecisionRuntime | undefined
+  sessionId: string
+  handoff: SchedulingHandoff | undefined
+  controller: AbortController
+  current: () => boolean
+  consulting: boolean
+  reserved?: boolean
+  settling?: boolean
+}
+
+interface DecisionProbeOwner {
+  kind: 'probe'
+  operationId: string
+  sessionId: string | null
+  key: string
+  controller: AbortController
+  current: () => boolean
+  runtime?: DecisionRuntime | undefined
+  task?: Promise<RpcResult<SchedulingState>> | undefined
+  reserved?: boolean
+  settling?: boolean
+}
+
+interface DecisionCapabilityObservation {
+  sessionId: string | null
+  scopeKey: string
+  configurationKey: string
+  generation: number
+  capability: DecisionCapability
+  expiresAt: string
+}
+
 interface SendOptions {
+  collaborationActionReceiptId?: string | undefined
+  preparedInput?: import('@pact/persistence').PreparedInputDispatch | undefined
+  inputRouting?: InputRoutingProposal | undefined
+  inputRoutingCurrent?: (() => boolean) | undefined
+  preparationDeadlineAt?: number | undefined
+  schedulingHandoff?: import('@pact/contracts').SchedulingHandoff | undefined
+  handoffGuidance?:
+    | {
+        proposal: HandoffGuidanceProposal
+        current: () => boolean
+        reservation: import('./native-working-memory').NativeMemoryReservation
+      }
+    | undefined
   imageOwnerKey?: string
 
   preserveDraftComments?: boolean
@@ -264,7 +360,16 @@ interface PreparingContinuation {
   completion?: Promise<void> | undefined
 }
 
+interface OwnedStreamTrace {
+  data: import('@pact/contracts').ConversationStreamTrace
+  startedAt: number
+  expiresAt: number
+  reservation: import('./native-working-memory').NativeMemoryReservation
+}
+
 interface NativeObservation {
+  sourceReader?: FrozenSourceReader | undefined
+  streamTrace?: OwnedStreamTrace | undefined
   generation: string
   adapter: AgentAdapter
   archiveBuffer?: AgentStreamBuffer
@@ -320,11 +425,16 @@ export class Conversation {
   private interestedSessionIds = new Set<string>()
   /** One finite receipt-check intent per interested Session; never rotated by message resync. */
   private readonly steerReceiptChecks = new Map<string, string>()
+  private lastSettledStreamTrace: OwnedStreamTrace | undefined
   private suppressedProgress = 0
   private publishedProgress = 0
   private readonly activeExecutions = new Map<string, ActiveExecution>()
   private readonly nativeRebuilds = new Map<string, ActiveNativeRebuild>()
   private readonly preparingSends = new Map<string, PreparingSend>()
+  private readonly collaborationActions = new Map<
+    string,
+    { request: string; task: Promise<RpcResult<ConversationPatch>> }
+  >()
   private readonly preparingContinuations = new Map<string, PreparingContinuation>()
   private readonly titleEnrichments = new Map<string, ActiveTitleEnrichment>()
   private readonly nativeTitleSyncs = new Map<string, ActiveNativeTitleSync>()
@@ -368,6 +478,12 @@ export class Conversation {
     {
       controller: AbortController
       task: Promise<RpcResult<ConversationPatch>>
+      physicalCompletion: Promise<void>
+      physicalOperations: Set<Promise<void>>
+      logicalTimeout: () => void
+      phase: 'checking' | 'cleanup_unconfirmed'
+      automaticAttemptId?: string | undefined
+      configurationGeneration?: number | undefined
       adapter?: AgentAdapter | undefined
       receiptSessionId?: string | undefined
     }
@@ -375,6 +491,9 @@ export class Conversation {
   private adapterSlotTail: Promise<void> = Promise.resolve()
   private pendingContinuationScheduled = false
   private pendingContinuationWakeAgain = false
+  private pendingContinuationImmediate: NodeJS.Immediate | undefined
+  private workflowCandidateCursor: { updatedAt: string; id: string } | undefined
+  private workflowCandidateRescan = false
   private readonly markdownPreparations = new Map<string, Promise<void>>()
   private markdownTail: Promise<void> = Promise.resolve()
   private markdownWorker: Worker | undefined
@@ -396,6 +515,12 @@ export class Conversation {
     }
   >()
   private disposal: Promise<void> | undefined
+  private decisionRuntime: DecisionInvocationOwner | DecisionProbeOwner | undefined
+  private decisionRecovery: Promise<void> | undefined
+  private decisionRecoveryOwner: { operationId: string; sessionId: string | null } | undefined
+  private hostDecisionCapability: DecisionCapabilityObservation | undefined
+  private contextDecisionCapability: DecisionCapabilityObservation | undefined
+  private schedulingListener: (() => void) | undefined
 
   constructor(
     private readonly conversations: ConversationRepository,
@@ -406,13 +531,923 @@ export class Conversation {
     private readonly workspaceChanges?: WorkspaceChanges,
     private readonly images?: ConversationImages,
     private readonly ipcTraffic?: LogicalIpcWorkerTraffic,
+    private readonly modelCatalogs?: import('../default-session-settings/default-session-settings').DefaultSessionSettings,
   ) {
     this.conversations.archives.recover(this.archiveOwnerId)
     this.conversations.expireNativePermissions()
     this.conversations.recoverInterruptedRuns()
     this.conversations.recoverCollaborationTasks()
     this.conversations.recoverForkIntents()
+    this.conversations.beginSchedulingRecoveryEpoch(randomUUID())
     this.schedulePendingRoutedContinuations()
+    void this.recoverDecisionReservation()
+  }
+
+  subscribeSchedulingChanges(listener: () => void): () => void {
+    if (this.schedulingListener) throw new Error('Scheduling already has its Utility subscriber.')
+    const unsubscribe = this.conversations.subscribeSchedulingChanges(listener)
+    this.schedulingListener = listener
+    return () => {
+      if (this.schedulingListener === listener) this.schedulingListener = undefined
+      unsubscribe()
+    }
+  }
+
+  getSchedulingSettings(): RpcResult<import('@pact/contracts').SchedulingSettings> {
+    const parsed = schedulingSettingsSchema.safeParse(this.conversations.schedulingSettings())
+    return parsed.success
+      ? { ok: true, value: parsed.data }
+      : {
+          ok: false,
+          error: { code: 'INTERNAL', message: 'Scheduling settings could not be confirmed.' },
+        }
+  }
+
+  private schedulingScope(sessionId: string | undefined) {
+    if (!sessionId) return { sessionId: null, cwd: undefined, key: 'host' }
+    const session = this.sessions.find(sessionId)
+    const project = session && this.projects.find(session.projectId)
+    if (!session || !project)
+      throw new RunOperationConflictError('The scheduling context is unavailable.')
+    return {
+      sessionId,
+      cwd: project.directoryPath,
+      key: JSON.stringify([sessionId, project.id, project.directoryPath]),
+    }
+  }
+
+  private schedulingObservation(
+    saved: DecisionCapabilityObservation | undefined,
+    scope: ReturnType<Conversation['schedulingScope']>,
+  ): SchedulingState['host'] {
+    if (!saved || saved.sessionId !== scope.sessionId)
+      return { status: 'unconfirmed', capability: null, expiresAt: null }
+    const stale =
+      saved.scopeKey !== scope.key ||
+      saved.generation !== this.conversations.schedulingConfigurationGeneration() ||
+      saved.configurationKey !== this.runtimePreparation.catalogIdentity(scope.cwd) ||
+      Date.parse(saved.expiresAt) <= Date.now()
+    return {
+      status: stale ? 'stale' : saved.capability.status,
+      capability: saved.capability,
+      expiresAt: saved.expiresAt,
+    }
+  }
+
+  private schedulingEligibility(
+    sessionId: string,
+    observation: SchedulingState['host'],
+  ): SchedulingEligibility {
+    const settings = this.conversations.schedulingSettings()
+    if (!settings.enabled) return 'disabled'
+    if (!settings.selection) return 'model_required'
+    const session = this.sessions.find(sessionId)
+    if (
+      !session ||
+      session.status === 'archived' ||
+      this.projects.find(session.projectId)?.archivedAt ||
+      this.conversations.archives.blocksSession(sessionId)
+    )
+      return 'archived'
+    if (this.pendingNativeInteractions(sessionId).length) return 'native_interaction'
+    const task = this.conversations.collaboration(sessionId)
+    if (task?.automation === 'paused') return 'paused'
+    if (
+      this.conversations.receivedCollaborationInput(sessionId) ||
+      this.conversations.hasPendingRoutedContinuation(sessionId) ||
+      (task && collaborationInputGate(task))
+    )
+      return 'input_pending'
+    if (this.conversations.nativeRecoveryBlocksInput(sessionId)) return 'recovery_required'
+    if (
+      this.hasSessionOperation(sessionId, true) ||
+      this.decisionRuntime ||
+      this.decisionRecovery ||
+      this.conversations.activeSchedulingRuntimeOwner()
+    )
+      return 'busy'
+    return observation.status === 'supported'
+      ? 'available'
+      : observation.status === 'unavailable'
+        ? 'unavailable'
+        : 'unconfirmed'
+  }
+
+  /** Pure projection: neither reading Settings nor the indicator starts native work. */
+  getSchedulingState(raw: SchedulingStateInput): RpcResult<SchedulingState> {
+    try {
+      const input = schedulingStateInputSchema.parse(raw)
+      const scope = this.schedulingScope(input.sessionId)
+      const observation = scope.sessionId
+        ? this.schedulingObservation(this.contextDecisionCapability, scope)
+        : null
+      const owner = this.conversations.activeSchedulingRuntimeOwner()
+      const live = this.decisionRuntime
+      const activity: SchedulingState['activity']['decision'] =
+        owner && owner.kind !== 'check'
+          ? {
+              status:
+                owner.phase === 'cleanup_unconfirmed' ||
+                live?.settling ||
+                !live ||
+                live.operationId !== owner.id
+                  ? 'cleanup_unconfirmed'
+                  : owner.kind === 'probe'
+                    ? 'inspecting'
+                    : 'evaluating',
+              operationId: owner.id,
+              sessionId: owner.sessionId,
+            }
+          : live?.settling && live.runtime
+            ? {
+                status: 'cleanup_unconfirmed',
+                operationId: live.operationId,
+                sessionId: live.sessionId,
+              }
+            : this.decisionRecoveryOwner
+              ? { status: 'cleanup_unconfirmed', ...this.decisionRecoveryOwner }
+              : { status: 'idle' }
+      const value = schedulingStateSchema.parse({
+        settings: this.conversations.schedulingSettings(),
+        configurationGeneration: this.conversations.schedulingConfigurationGeneration(),
+        host: this.schedulingObservation(
+          this.hostDecisionCapability,
+          this.schedulingScope(undefined),
+        ),
+        context:
+          scope.sessionId && observation
+            ? {
+                sessionId: scope.sessionId,
+                observation,
+                eligibility: this.schedulingEligibility(scope.sessionId, observation),
+              }
+            : null,
+        activity: {
+          decision: activity,
+          check:
+            owner?.kind === 'check' && owner.sessionId
+              ? {
+                  status:
+                    owner.phase !== 'cleanup_unconfirmed' &&
+                    [...this.nativeChecks.values()].find(
+                      (entry) => entry.automaticAttemptId === owner.id,
+                    )?.phase === 'checking'
+                      ? 'checking'
+                      : 'cleanup_unconfirmed',
+                  operationId: owner.id,
+                  sessionId: owner.sessionId,
+                }
+              : { status: 'idle' },
+        },
+      })
+      return { ok: true, value }
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    }
+  }
+
+  /** Explicit, zero-Turn refresh shares the exact physical owner used by evaluations. */
+  async refreshSchedulingState(raw: SchedulingStateInput): Promise<RpcResult<SchedulingState>> {
+    try {
+      const input = schedulingStateInputSchema.parse(raw)
+      if (this.disposed) return Conversation.shuttingDown()
+      if (this.nativeQuitSealed()) return Conversation.quitPrepared()
+      const scope = this.schedulingScope(input.sessionId)
+      const settings = this.conversations.schedulingSettings()
+      if (!settings.selection) return this.getSchedulingState(input)
+      const generation = this.conversations.schedulingConfigurationGeneration()
+      const configurationKey = this.runtimePreparation.catalogIdentity(scope.cwd)
+      const key = JSON.stringify([scope.key, generation, configurationKey, settings.selection])
+      const live = this.decisionRuntime
+      if (live?.kind === 'probe' && live.key === key && live.task) return live.task
+      if (live || this.conversations.activeSchedulingRuntimeOwner() || this.decisionRecovery) {
+        void this.recoverDecisionReservation()
+        return this.getSchedulingState(input)
+      }
+      const selection = settings.selection
+      const controller = new AbortController()
+      const current = () => {
+        if (
+          this.disposed ||
+          this.nativeQuitSealed() ||
+          controller.signal.aborted ||
+          this.conversations.schedulingConfigurationGeneration() !== generation ||
+          this.runtimePreparation.catalogIdentity(scope.cwd) !== configurationKey
+        )
+          return false
+        try {
+          if (this.schedulingScope(input.sessionId).key !== scope.key) return false
+          if (scope.sessionId) {
+            const session = this.sessions.find(scope.sessionId)
+            if (
+              !session ||
+              session.status === 'archived' ||
+              this.projects.find(session.projectId)?.archivedAt ||
+              this.conversations.archives.blocksSession(scope.sessionId)
+            )
+              return false
+          }
+          return true
+        } catch {
+          return false
+        }
+      }
+      if (!current()) return this.getSchedulingState(input)
+      const deadlineAt = Date.now() + 15_000
+      const operationId = randomUUID()
+      const owner: DecisionProbeOwner = {
+        kind: 'probe',
+        operationId,
+        sessionId: scope.sessionId,
+        key,
+        controller,
+        current,
+      }
+      this.decisionRuntime = owner
+      try {
+        if (
+          !this.conversations.reserveSchedulingProbe({
+            id: operationId,
+            sessionId: scope.sessionId,
+            provider: selection.provider,
+            model: selection.modelId,
+            configurationFingerprint: createHash('sha256').update(key).digest('hex'),
+            deadlineAt,
+          })
+        ) {
+          this.decisionRuntime = undefined
+          return this.getSchedulingState(input)
+        }
+        owner.reserved = true
+      } catch (error) {
+        if (this.decisionRuntime === owner) this.decisionRuntime = undefined
+        throw error
+      }
+      const task = Promise.resolve().then(async () => {
+        let capability: DecisionCapability | undefined
+        try {
+          if (!current()) {
+            capability = {
+              provider: selection.provider,
+              modelId: selection.modelId,
+              status: 'unavailable',
+              supported: false,
+              reason: 'cancelled',
+              configurationFingerprint: null,
+              checkedAt: new Date().toISOString(),
+              physicalReleased: true,
+            }
+          } else {
+            const runtime = this.createSchedulingRuntime(owner, selection, scope.cwd, deadlineAt, {
+              dispatch: () => {
+                throw new Error('A compatibility probe cannot dispatch a Turn.')
+              },
+              prepared: (facts) =>
+                this.conversations.recordSchedulingRuntimeWitness(operationId, facts),
+            })
+            owner.runtime = runtime
+            capability = await runtime.probeAdmission(controller.signal)
+          }
+          if (current()) {
+            const observation: DecisionCapabilityObservation = {
+              sessionId: scope.sessionId,
+              scopeKey: scope.key,
+              configurationKey,
+              generation,
+              capability,
+              expiresAt: new Date(Date.now() + SCHEDULING_CAPABILITY_TTL_MS).toISOString(),
+            }
+            const host = scope.sessionId ? this.hostDecisionCapability : observation
+            const context = scope.sessionId ? observation : this.contextDecisionCapability
+            if (
+              Buffer.byteLength(JSON.stringify([host, context])) <=
+              SCHEDULING_CAPABILITY_RESIDENT_BYTES
+            ) {
+              this.hostDecisionCapability = host
+              this.contextDecisionCapability = context
+            }
+          }
+        } catch {
+          // Even a thrown callback may have started a native process. Only settlement clears it.
+        }
+        owner.settling = true
+        const settle = async () => {
+          const released = owner.runtime
+            ? await owner.runtime.settlement().catch(() => false)
+            : true
+          this.conversations.settleSchedulingProbe(operationId, released)
+          if (released && this.decisionRuntime === owner) this.decisionRuntime = undefined
+          this.schedulingListener?.()
+        }
+        this.conversations.settleSchedulingProbe(operationId, false)
+        if (!owner.runtime || capability?.physicalReleased) await settle()
+        else void settle()
+        this.schedulingListener?.()
+        return this.getSchedulingState(input)
+      })
+      owner.task = task
+      return await task
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    }
+  }
+
+  /** Both providers retain the existing global owner through every native stage and cleanup. */
+  private createSchedulingRuntime(
+    owner: DecisionInvocationOwner | DecisionProbeOwner,
+    selection: SchedulingModelSelection,
+    cwd: string | undefined,
+    deadlineAt: number,
+    callbacks: {
+      dispatch: () => void
+      reserve?: NonNullable<ConstructorParameters<typeof CodexDecisionRuntime>[0]['reserve']>
+      prepared: (facts: {
+        nativeGeneration: number
+        witness: DecisionPhysicalWitness
+        configurationFingerprint: string
+      }) => void
+    },
+  ): DecisionRuntime {
+    const physicalPrepared = (facts: {
+      nativeGeneration: number
+      witness: DecisionPhysicalWitness
+    }) => {
+      if (!owner.reserved) throw new Error('Native work requires a durable scheduling owner.')
+      this.conversations.recordSchedulingRuntimeWitness(owner.operationId, facts)
+    }
+    const shared = {
+      executable: (signal: AbortSignal) =>
+        this.runtimePreparation.findRecoveryExecutable(selection.provider, signal),
+      ...(cwd ? { cwd } : {}),
+      current: owner.current,
+      deadlineAt,
+      dispatch: callbacks.dispatch,
+      ...(callbacks.reserve ? { reserve: callbacks.reserve } : {}),
+      retirePhysicalReceipts: (facts: {
+        memory: NativeMemoryAllocator
+        deadlineAt: number
+        signal?: AbortSignal | undefined
+      }) => this.retireSchedulingPhysicalReceipts(facts),
+      physicalCompletion: async (facts: {
+        memory: NativeMemoryAllocator
+        deadlineAt: number
+        nativeGeneration: number
+        witness: DecisionPhysicalWitness | null
+        outcome?: import('@pact/contracts').DecisionOutcome | undefined
+        usage?: import('@pact/contracts').SchedulingUsage | undefined
+      }) => {
+        if (!owner.reserved) return
+        owner.settling = true
+        this.conversations.completeSchedulingRuntimePhysical(owner.operationId, {
+          nativeGeneration: facts.nativeGeneration,
+          witness: facts.witness,
+          completed: facts.outcome?.kind === 'recommendation',
+          candidateId:
+            facts.outcome?.kind === 'recommendation'
+              ? facts.outcome.recommendation.candidateId
+              : null,
+          ...(facts.usage ? { usage: facts.usage } : {}),
+        })
+        this.schedulingListener?.()
+        // This lease stays held until every started receipt helper and file handle joins.
+        await this.retireSchedulingPhysicalReceipts(facts)
+      },
+    }
+    if (selection.provider === 'claude')
+      return new ClaudeDecisionRuntime({
+        ...shared,
+        modelId: selection.modelId,
+        ownerId: randomUUID(),
+        beginNativeStage: (facts) =>
+          this.conversations.beginSchedulingNativeStage(owner.operationId, facts),
+        physicalPrepared,
+        prepared: callbacks.prepared,
+      })
+    return new CodexDecisionRuntime({
+      ...shared,
+      beginNativeStage: (facts) =>
+        this.conversations.beginSchedulingNativeStage(owner.operationId, facts),
+      physicalPrepared,
+      prepared: callbacks.prepared,
+    })
+  }
+
+  private async retireSchedulingPhysicalReceipts(facts: {
+    memory: NativeMemoryAllocator
+    deadlineAt: number
+    signal?: AbortSignal | undefined
+  }): Promise<boolean> {
+    if (process.platform !== 'win32') return true
+    let cursor: string | undefined
+    for (let index = 0; index < DECISION_PHYSICAL_RECEIPT_ITEMS; index++) {
+      if (facts.signal?.aborted || Date.now() >= facts.deadlineAt) break
+      const receipt = this.conversations.claimSchedulingPhysicalReceipt(cursor)
+      if (!receipt) break
+      cursor = receipt.receiptId
+      // oxlint-disable-next-line no-await-in-loop -- One serial helper inside the existing decision lease and shared deadline.
+      const result = await OwnedProcessGroup.cleanupPhysicalReceipt(
+        receipt.witness,
+        undefined,
+        facts.memory,
+        {
+          deadlineAt: facts.deadlineAt,
+          ...(facts.signal ? { signal: facts.signal } : {}),
+        },
+      )
+      if (result === 'removed' || result === 'already_absent')
+        this.conversations.acknowledgeSchedulingPhysicalReceipt(
+          receipt.receiptId,
+          receipt.witnessJson,
+        )
+    }
+    return this.conversations.schedulingPhysicalReceiptCapacityAvailable()
+  }
+
+  /** The host supplies complete facts; the result cannot dispatch or authorize a business Turn. */
+  async evaluateDecision(
+    request:
+      | DecisionInput
+      | {
+          handoff: SchedulingHandoff
+          load: DecisionInputLoader
+          retainHandoff?: boolean
+        }
+      | { sessionId: string; prepare: DecisionInputLoader },
+    signal: AbortSignal,
+  ): Promise<DecisionEvaluationOutcome> {
+    const requestedHandoff = 'prepare' in request ? undefined : request.handoff
+    const requestedSessionId = 'prepare' in request ? request.sessionId : request.handoff.sessionId
+    const settings = this.conversations.schedulingSettings()
+    if (this.disposed || !settings.enabled || !settings.selection)
+      return { kind: 'unavailable', reason: 'disabled' }
+    if (this.decisionRuntime) return { kind: 'unavailable', reason: 'busy' }
+    const available = () => {
+      if (this.disposed || this.nativeQuitSealed()) return undefined
+      try {
+        if (this.conversations.archives.blocksSession(requestedSessionId)) return undefined
+        const session = this.sessions.find(requestedSessionId)
+        if (!session || session.status === 'archived') return undefined
+        const project = this.projects.find(session.projectId)
+        return project && !project.archivedAt ? { session, project } : undefined
+      } catch {
+        return undefined
+      }
+    }
+    const scope = available()
+    if (!scope) return { kind: 'unavailable', reason: 'stale' }
+    const { session, project } = scope
+    const configurationKey = this.runtimePreparation.catalogIdentity(project.directoryPath)
+    const configurationGeneration = this.conversations.schedulingConfigurationGeneration()
+    const selectionKey = JSON.stringify([settings.enabled, settings.selection])
+    if (signal.aborted || this.disposed) return { kind: 'unavailable', reason: 'cancelled' }
+    if (
+      !available() ||
+      this.conversations.schedulingConfigurationGeneration() !== configurationGeneration ||
+      this.runtimePreparation.catalogIdentity(project.directoryPath) !== configurationKey
+    )
+      return { kind: 'unavailable', reason: 'stale' }
+    if (this.decisionRuntime) return { kind: 'unavailable', reason: 'busy' }
+    let handoff = requestedHandoff
+    let evaluationId: string | undefined
+    let deadlineAt = 0
+    let configurationFingerprint = createHash('sha256')
+      .update(configurationKey + selectionKey)
+      .digest('hex')
+    const controller = new AbortController()
+    const invocationSignal = AbortSignal.any([signal, controller.signal])
+    const invocationDeadlineAt = Date.now() + 15_000
+    const current = () => {
+      const liveScope = available()
+      if (!liveScope) return false
+      const saved = this.conversations.schedulingSettings()
+      return (
+        liveScope.project.id === project.id &&
+        liveScope.project.directoryPath === project.directoryPath &&
+        !invocationSignal.aborted &&
+        JSON.stringify([saved.enabled, saved.selection]) === selectionKey &&
+        this.conversations.schedulingConfigurationGeneration() === configurationGeneration &&
+        this.runtimePreparation.catalogIdentity(project.directoryPath) === configurationKey &&
+        (!handoff || this.conversations.evaluationIsCurrent(handoff))
+      )
+    }
+    if (!current()) return { kind: 'unavailable', reason: 'stale' }
+    const existing = handoff && this.conversations.decisionEvaluationReceipt(handoff)
+    // This intent owns no native resource or source body. It only merges automatic wakes.
+    const owner: DecisionInvocationOwner = {
+      kind: 'evaluation',
+      operationId: randomUUID(),
+      sessionId: session.id,
+      handoff,
+      controller,
+      current,
+      consulting: true,
+    }
+    this.decisionRuntime = owner
+    if (existing) {
+      // Inspect the stored witness, never wait for its process to exit or replay its inference.
+      // An already absent owner must settle before returning the original duplicate receipt.
+      await this.waitForDecisionRecovery(invocationDeadlineAt, invocationSignal)
+      owner.consulting = 'load' in request && request.retainHandoff === true
+      if (!owner.consulting && this.decisionRuntime === owner) this.decisionRuntime = undefined
+      return { kind: 'unavailable', reason: 'duplicate' }
+    }
+    if (this.conversations.activeSchedulingRuntimeOwner() || this.decisionRecovery) {
+      void this.recoverDecisionReservation()
+      if (this.decisionRuntime === owner) this.decisionRuntime = undefined
+      return { kind: 'unavailable', reason: 'busy' }
+    }
+    // Retain the preflight checkpoint: Quit/Archive may linearize before resource admission.
+    await Promise.resolve()
+    if (!current() || Date.now() >= invocationDeadlineAt) {
+      if (this.decisionRuntime === owner) this.decisionRuntime = undefined
+      return {
+        kind: 'unavailable',
+        reason: Date.now() >= invocationDeadlineAt ? 'timeout' : 'stale',
+      }
+    }
+    const selection = settings.selection
+    let runtime: DecisionRuntime
+    try {
+      runtime = this.createSchedulingRuntime(
+        owner,
+        selection,
+        project.directoryPath,
+        invocationDeadlineAt,
+        {
+          reserve: (admitted, facts) => {
+            handoff = admitted.handoff
+            owner.handoff = handoff
+            deadlineAt = facts.deadlineAt
+            if (!current()) throw new Error('Decision invocation is no longer eligible.')
+            const reservation = this.conversations.reserveEvaluation({
+              handoff,
+              provider: selection.provider,
+              model: selection.modelId,
+              configurationFingerprint,
+              inputSha256: createHash('sha256').update(JSON.stringify(admitted)).digest('hex'),
+              deadlineAt,
+            })
+            if (reservation.status === 'reserved') {
+              evaluationId = reservation.evaluation.id
+              owner.operationId = evaluationId
+              owner.reserved = true
+              return 'reserved'
+            }
+            return reservation.status === 'duplicate' ? 'duplicate' : 'busy'
+          },
+          dispatch: () => {
+            if (
+              !evaluationId ||
+              !current() ||
+              !this.conversations.dispatchEvaluation(evaluationId).created
+            )
+              throw new Error('Decision invocation is no longer eligible.')
+          },
+          prepared: (facts) => {
+            if (!evaluationId) throw new Error('Decision invocation is unavailable.')
+            this.conversations.recordEvaluationPhysicalWitness(evaluationId, facts)
+            configurationFingerprint = facts.configurationFingerprint
+          },
+        },
+      )
+    } catch {
+      if (this.decisionRuntime === owner) this.decisionRuntime = undefined
+      return { kind: 'unavailable', reason: 'busy' }
+    }
+    owner.runtime = runtime
+    let outcome = await runtime.evaluateDecision(
+      async (context: Parameters<DecisionInputLoader>[0]) => {
+        context.signal.throwIfAborted()
+        if (!current()) throw new Error('Decision invocation is no longer eligible.')
+        const input =
+          'prepare' in request
+            ? await request.prepare(context)
+            : 'load' in request
+              ? await request.load(context)
+              : request
+        if (input.handoff.sessionId !== session.id)
+          throw new Error('Decision input belongs to another Session.')
+        handoff = input.handoff
+        owner.handoff = handoff
+        if (!current()) throw new Error('Decision invocation is no longer eligible.')
+        return input
+      },
+      invocationSignal,
+    )
+    owner.consulting = 'load' in request && request.retainHandoff === true
+    if (outcome.kind === 'recommendation' && !current())
+      outcome = { kind: 'unavailable', reason: 'stale' }
+    const terminal = runtime.invoked
+      ? outcome.kind === 'recommendation'
+        ? 'completed'
+        : 'failed'
+      : 'not_sent'
+    if (evaluationId)
+      this.conversations.settleEvaluation(evaluationId, {
+        outcome: terminal,
+        selectedCandidateId:
+          outcome.kind === 'recommendation' ? outcome.recommendation.candidateId : null,
+        physicalReleased: false,
+        ...(runtime.usage ? { usage: runtime.usage } : {}),
+      })
+    void runtime
+      .settlement()
+      .then((released) => {
+        if (evaluationId)
+          this.conversations.settleEvaluation(evaluationId, {
+            outcome: terminal,
+            selectedCandidateId:
+              outcome.kind === 'recommendation' ? outcome.recommendation.candidateId : null,
+            physicalReleased: released,
+            ...(runtime.usage ? { usage: runtime.usage } : {}),
+          })
+        if (released) {
+          owner.runtime = undefined
+          if (!owner.consulting && this.decisionRuntime === owner) this.decisionRuntime = undefined
+          const liveScope = available()
+          const unchanged =
+            liveScope?.project.directoryPath === project.directoryPath &&
+            this.conversations.schedulingConfigurationGeneration() === configurationGeneration &&
+            this.runtimePreparation.catalogIdentity(project.directoryPath) === configurationKey
+          if (
+            evaluationId &&
+            unchanged &&
+            (outcome.kind === 'recommendation' ||
+              !['cancelled', 'stale', 'busy', 'duplicate'].includes(outcome.reason))
+          ) {
+            const successful = outcome.kind === 'recommendation'
+            const capability: DecisionCapability = {
+              provider: selection.provider,
+              modelId: selection.modelId,
+              status: successful ? 'supported' : 'unavailable',
+              supported: successful,
+              reason: successful
+                ? 'supported'
+                : (runtime.diagnostics?.().failureReason ??
+                  (outcome.kind === 'unavailable' && outcome.reason === 'timeout'
+                    ? 'timeout'
+                    : 'unavailable')),
+              configurationFingerprint: successful ? configurationFingerprint : null,
+              checkedAt: new Date().toISOString(),
+              physicalReleased: true,
+            }
+            const observation: DecisionCapabilityObservation = {
+              sessionId: session.id,
+              scopeKey: this.schedulingScope(session.id).key,
+              configurationKey,
+              generation: configurationGeneration,
+              capability,
+              expiresAt: new Date(Date.now() + SCHEDULING_CAPABILITY_TTL_MS).toISOString(),
+            }
+            if (
+              Buffer.byteLength(JSON.stringify([this.hostDecisionCapability, observation])) <=
+              SCHEDULING_CAPABILITY_RESIDENT_BYTES
+            )
+              this.contextDecisionCapability = observation
+          }
+          this.schedulingListener?.()
+        }
+        return undefined
+      })
+      .catch(() => undefined)
+    if (outcome.kind !== 'recommendation') return outcome
+    if (!evaluationId || !deadlineAt || !handoff)
+      return { kind: 'unavailable', reason: 'invalid_output' }
+    return {
+      ...outcome,
+      evaluationReceipt: {
+        evaluationId,
+        handoffId: handoff.id,
+        configurationGeneration,
+        configurationFingerprint,
+        deadlineAt,
+      },
+    }
+  }
+
+  /** At most one current admission and one unreconciled durable owner; identical Sessions coalesce. */
+  private decisionSessionIds(): Set<string> {
+    const identities = new Set<string>()
+    if (this.decisionRuntime?.runtime && this.decisionRuntime.sessionId)
+      identities.add(this.decisionRuntime.sessionId)
+    if (this.decisionRecoveryOwner?.sessionId) identities.add(this.decisionRecoveryOwner.sessionId)
+    const saved = this.conversations.activeSchedulingRuntimeOwner()
+    if (saved?.sessionId) identities.add(saved.sessionId)
+    return identities
+  }
+
+  private recoverDecisionReservation(): Promise<void> {
+    if (this.decisionRecovery) return this.decisionRecovery
+    if (this.decisionRuntime?.runtime || this.disposed) return Promise.resolve()
+    const saved = this.conversations.activeSchedulingRuntimeOwner()
+    if (saved?.kind === 'check') return this.recoverSchedulingCheck(saved.id)
+    const hasReceipts =
+      process.platform === 'win32' && this.conversations.hasSchedulingPhysicalReceipts()
+    if (!saved?.physicalWitnessJson && !hasReceipts) return Promise.resolve()
+    const deadlineAt = Date.now() + DECISION_CLEANUP_TARGET_MS
+    const memory = new NativeWorkingMemory('decision')
+    const recoveryOwner = {
+      operationId: saved?.id ?? randomUUID(),
+      sessionId: saved?.sessionId ?? null,
+    }
+    this.decisionRecoveryOwner = recoveryOwner
+    const recovery = (async () => {
+      if (saved?.physicalWitnessJson) {
+        let witness: unknown
+        try {
+          witness = JSON.parse(saved.physicalWitnessJson)
+        } catch {
+          return
+        }
+        if (
+          await OwnedProcessGroup.provePhysicalRelease(witness, undefined, memory, { deadlineAt })
+        )
+          this.conversations.settleSchedulingOwnerAfterPhysicalProof(
+            saved.id,
+            saved.physicalWitnessJson,
+            saved.nativeGeneration,
+          )
+      }
+      await this.retireSchedulingPhysicalReceipts({ memory, deadlineAt })
+    })().catch(() => undefined)
+    this.decisionRecovery = recovery
+    void recovery.then(() => {
+      if (this.decisionRecovery === recovery) this.decisionRecovery = undefined
+      if (this.decisionRecoveryOwner === recoveryOwner) this.decisionRecoveryOwner = undefined
+      this.schedulingListener?.()
+      return undefined
+    })
+    return recovery
+  }
+
+  private recoverSchedulingCheck(id: string): Promise<void> {
+    const attempt = this.conversations.schedulingRecoveryAttempt(id)
+    if (
+      !attempt ||
+      attempt.utilityPid === process.pid ||
+      !Number.isSafeInteger(attempt.utilityPid) ||
+      attempt.utilityPid <= 0
+    )
+      return Promise.resolve()
+    const recovery = (async () => {
+      try {
+        process.kill(attempt.utilityPid, 0)
+        return
+      } catch (error) {
+        if (!error || typeof error !== 'object' || Reflect.get(error, 'code') !== 'ESRCH') return
+      }
+      const owner = schedulingCheckPhysicalOwnerSchema.safeParse(
+        JSON.parse(attempt.physicalOwnerJson),
+      )
+      if (!owner.success || owner.data.kind === 'inspection_pending') return
+      if (
+        owner.data.kind === 'inspection_group' &&
+        !(await OwnedProcessGroup.provePhysicalRelease(owner.data.witness))
+      )
+        return
+      this.conversations.settleSchedulingRecoveryCheck(id, {
+        ok: false,
+        physicalReleased: true,
+        retire: true,
+      })
+    })().catch(() => undefined)
+    this.decisionRecovery = recovery
+    void recovery.then(() => {
+      if (this.decisionRecovery === recovery) this.decisionRecovery = undefined
+      this.schedulingListener?.()
+      return undefined
+    })
+    return recovery
+  }
+
+  private async waitForDecisionRecovery(deadlineAt: number, signal: AbortSignal): Promise<void> {
+    const recovery = this.recoverDecisionReservation()
+    await new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(timer)
+        signal.removeEventListener('abort', finish)
+        resolve()
+      }
+      const timer = setTimeout(finish, Math.max(0, deadlineAt - Date.now()))
+      signal.addEventListener('abort', finish, { once: true })
+      void recovery.then(finish, finish)
+      if (signal.aborted) finish()
+    })
+  }
+
+  async saveSchedulingSettings(
+    input: import('@pact/contracts').SchedulingSettingsSave,
+  ): Promise<RpcResult<import('@pact/contracts').SchedulingSettings>> {
+    try {
+      if (input.selection) {
+        const identity = this.runtimePreparation.catalogIdentity(process.cwd())
+        if (!this.modelCatalogs || this.disposed || input.catalogIdentity !== identity)
+          throw new RunOperationConflictError(
+            'The native model configuration changed. Refresh models before selecting again.',
+          )
+        const catalogs = await this.modelCatalogs.loadModelCatalogs()
+        const selection = input.selection,
+          catalog = catalogs[selection.provider]
+        if (
+          this.disposed ||
+          this.runtimePreparation.catalogIdentity(process.cwd()) !== identity ||
+          catalog.status !== 'available' ||
+          !catalog.models.some((model) => (model.resolvedModel ?? model.id) === selection.modelId)
+        )
+          throw new RunOperationConflictError(
+            'This exact model is no longer available. Your saved selection is unchanged.',
+          )
+      }
+      const generation = this.conversations.schedulingConfigurationGeneration()
+      const saved = this.conversations.saveSchedulingSettings(input, (patch) => this.publish(patch))
+      if (this.conversations.schedulingConfigurationGeneration() !== generation) {
+        this.hostDecisionCapability = undefined
+        this.contextDecisionCapability = undefined
+        this.decisionRuntime?.controller.abort()
+        for (const check of this.nativeChecks.values())
+          if (check.automaticAttemptId) check.controller.abort()
+        void this.decisionRuntime?.runtime?.dispose()
+        this.schedulePendingRoutedContinuations()
+      }
+      return { ok: true, value: saved }
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    }
+  }
+
+  readSchedulingActivity(
+    input: import('@pact/contracts').SchedulingActivityRead,
+  ): RpcResult<import('@pact/contracts').SchedulingActivityPage> {
+    try {
+      return { ok: true, value: this.conversations.readSchedulingActivity(input) }
+    } catch {
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'Scheduling activity could not be loaded.' },
+      }
+    }
+  }
+
+  async refreshSchedulingModels(): Promise<RpcResult<import('@pact/contracts').SchedulingModels>> {
+    try {
+      if (!this.modelCatalogs || this.disposed) throw new Error('Model discovery is unavailable.')
+      const catalogIdentity = this.runtimePreparation.catalogIdentity(process.cwd())
+      const catalogs = await this.modelCatalogs.loadModelCatalogs()
+      if (
+        this.disposed ||
+        this.runtimePreparation.catalogIdentity(process.cwd()) !== catalogIdentity
+      )
+        throw new Error('Model discovery was cancelled or its configuration changed.')
+      const targets = ['codex_luna', 'claude_haiku_5_5'] as const
+      const savedSelection = this.conversations.schedulingSettings().selection
+      return {
+        ok: true,
+        value: {
+          catalogIdentity,
+          models: targets.map((target) => {
+            const provider = target === 'codex_luna' ? 'codex' : 'claude',
+              catalog = catalogs[provider]
+            const matches = catalog.models.filter((model) =>
+              target === 'codex_luna'
+                ? (model.resolvedModel ?? model.id) === 'gpt-6-luna'
+                : /^claude-haiku-5-5(?:-\d{8})?$/u.test(model.resolvedModel ?? model.id),
+            )
+            const match =
+              matches.find(
+                (model) =>
+                  savedSelection?.target === target &&
+                  savedSelection.provider === provider &&
+                  (model.resolvedModel ?? model.id) === savedSelection.modelId,
+              ) ??
+              matches.toSorted((left, right) =>
+                (left.resolvedModel ?? left.id).localeCompare(right.resolvedModel ?? right.id),
+              )[0]
+            return {
+              target,
+              status: match
+                ? 'found'
+                : catalog.status === 'available'
+                  ? 'not_found'
+                  : 'unconfirmed',
+              checkedAt: catalog.checkedAt,
+              selection: match
+                ? target === 'codex_luna'
+                  ? { target, provider: 'codex', modelId: 'gpt-6-luna' }
+                  : { target, provider: 'claude', modelId: match.resolvedModel ?? match.id }
+                : null,
+            }
+          }),
+        },
+      }
+    } catch {
+      return {
+        ok: false,
+        error: {
+          code: 'RUNTIME_UNAVAILABLE',
+          message: 'Model availability could not be confirmed. Your selection is unchanged.',
+        },
+      }
+    }
   }
 
   sessionTitleChanged(sessionId: string): void {
@@ -706,6 +1741,7 @@ export class Conversation {
     try {
       const rows = this.liveNativeRows()
       const identities = new Set([...rows.running, ...rows.attention].map((row) => row.sessionId))
+      for (const sessionId of this.decisionSessionIds()) identities.add(sessionId)
       for (const owner of this.preparingSends.values()) identities.add(owner.input.sessionId)
       for (const owner of this.preparingContinuations.values()) identities.add(owner.sessionId)
       for (const id of this.nativeRebuilds.keys()) identities.add(id)
@@ -725,6 +1761,11 @@ export class Conversation {
       const activeCount =
         identities.size +
         unsettled.count +
+        Number(
+          this.decisionRuntime?.sessionId === null ||
+            this.decisionRecoveryOwner?.sessionId === null ||
+            this.conversations.activeSchedulingRuntimeOwner()?.sessionId === null,
+        ) +
         Number(otherPreparationActive && identities.size === 0 && unsettled.count === 0)
       const listed = [...new Set([...identities, ...unsettled.sessionIds])]
         .slice(0, 5)
@@ -883,6 +1924,7 @@ export class Conversation {
         'Too many tasks changed at once. Nothing was stopped; try again.',
       )
     const unsupported =
+      [...this.decisionSessionIds()].some(belongs) ||
       [...this.nativeRebuilds.keys()].some(belongs) ||
       [...this.nativeForks.values()].some(
         (entry) =>
@@ -2019,8 +3061,17 @@ export class Conversation {
           input.sessionId,
           page.header.nativeContexts ?? [],
         )
+      if (page.scope === 'messages')
+        page.header.relaySchedulingDecision = this.projectRelaySchedulingDecision(
+          input.sessionId,
+          page.header.sessionIssues,
+        )
       if (page.scope === 'messages' && input.scope === 'messages')
         this.scheduleSteerReceiptCheck(page, input)
+      if (page.scope === 'messages')
+        page.header.preparedInputContinuation = this.conversations.preparedInputContinuation(
+          input.sessionId,
+        )
       return { ok: true, value: page }
     } catch (error) {
       return {
@@ -2032,8 +3083,229 @@ export class Conversation {
               : error instanceof OversizedConversationEntityError
                 ? 'VALIDATION'
                 : 'INTERNAL',
-          message: error instanceof Error ? error.message : 'Conversation history could not load.',
+          message:
+            error instanceof StaleConversationCursorError ||
+            error instanceof OversizedConversationEntityError
+              ? error.message
+              : 'Saved conversation history could not be read.',
         },
+      }
+    }
+  }
+
+  private projectRelaySchedulingDecision(sessionId: string, issues?: SessionIssues) {
+    if (this.conversations.discardStaleRelaySchedulingDecision(sessionId))
+      this.schedulePendingRoutedContinuations()
+    const task = this.conversations.collaboration(sessionId)
+    const card = this.conversations.relaySchedulingDecision(sessionId)
+    if (!card) return null
+    const recovery =
+      issues ??
+      this.sessionIssues(
+        sessionId,
+        (['codex', 'claude'] as const).flatMap((actor) => {
+          const context = this.conversations.nativeContext(sessionId, actor)
+          return context ? [context] : []
+        }),
+      )
+    const nativeRecovery =
+      card.request.category === 'arrangement_change' ? card.request.operation : undefined
+    const representedIssue = (issue: SessionIssues['agents'][number]): boolean =>
+      Boolean(
+        nativeRecovery &&
+        issue.action === 'rebuild' &&
+        issue.agentId === nativeRecovery.agentId &&
+        issue.generation === nativeRecovery.expectedGeneration &&
+        (issue.nativeSessionId ?? null) === nativeRecovery.expectedNativeSessionId &&
+        (issue.runId ?? null) === nativeRecovery.expectedRunId &&
+        (issue.rebuildId ?? null) === nativeRecovery.expectedRebuildId &&
+        issue.abandon === nativeRecovery.abandonOldWork,
+      )
+    if (
+      this.pendingNativeInteractions(sessionId).length ||
+      recovery.agents.some((issue) => !representedIssue(issue)) ||
+      (!nativeRecovery && this.conversations.nativeRecoveryBlocksInput(sessionId)) ||
+      (nativeRecovery &&
+        ([...this.nativeChecks.keys()].some((key) => key.startsWith(`${sessionId}:`)) ||
+          this.conversations.rebuildInputRecovery(sessionId))) ||
+      (task &&
+        (collaborationInputGate(task) || this.conversations.needsWorkflowPlanRecovery(task.runId)))
+    )
+      return null
+    return card
+  }
+
+  getRelayDecisionReceipt(raw: RelayDecisionReceiptRead): RpcResult<RelayDecisionReceipt> {
+    try {
+      const input = relayDecisionReceiptReadSchema.parse(raw)
+      const receipt = this.conversations.relayDecisionReceipt(input)
+      if (!receipt)
+        throw new RunOperationConflictError(
+          'This Relay answer has not been recorded. No action was repeated.',
+        )
+      return { ok: true, value: receipt }
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    }
+  }
+
+  async answerRelayDecision(raw: RelayDecisionAnswer): Promise<RpcResult<RelayDecisionReceipt>> {
+    let committedCancellation: RelayDecisionReceipt | undefined
+    let unusedReceiptId: string | undefined
+    let unusedPrepared: import('@pact/persistence').PreparedInputDispatch | undefined
+    try {
+      const input = relayDecisionAnswerSchema.parse(raw)
+      const sessionId = input.reference.sessionId
+      if (this.disposed) return Conversation.shuttingDown()
+      if (this.nativeQuitSealed()) return Conversation.quitPrepared()
+      if (this.conversations.archives.blocksSession(sessionId)) return Conversation.archiveBusy()
+      const existing = this.conversations.relayDecisionReceipt({
+        sessionId,
+        decisionId: input.reference.decisionId,
+        clientOperationId: input.clientOperationId,
+      })
+      const card = !existing ? this.projectRelaySchedulingDecision(sessionId) : null
+      // The Repository checks the original digest even for identical answer readback.
+      if (!existing && input.answer.kind !== 'cancel' && !card)
+        throw new RunOperationConflictError(
+          'Resolve the current native or collaboration interaction before confirming this scheduling action.',
+        )
+      if (
+        !existing &&
+        input.answer.kind !== 'cancel' &&
+        (card?.request.category === 'necessary_information' ||
+          (input.answer.kind === 'confirm' && card?.request.category === 'arrangement_change')) &&
+        (this.hasSessionOperation(sessionId) ||
+          this.operationCount() >= MAX_AGENT_OPERATIONS ||
+          this.permissions.size >= NATIVE_PERMISSION_REQUESTS)
+      )
+        return Conversation.capacityFailure()
+      const answer = this.conversations.answerRelaySchedulingDecision(input)
+      // Only the successful Repository call has checked the original request digest and committed.
+      if (
+        input.answer.kind === 'cancel' &&
+        answer.result.disposition === 'cancelled' &&
+        answer.result.sessionId === sessionId &&
+        answer.result.decisionId === input.reference.decisionId &&
+        answer.result.clientOperationId === input.clientOperationId &&
+        answer.result.runId === null &&
+        answer.result.rebuildId === null
+      )
+        committedCancellation = answer.result
+      this.publish(
+        this.conversations.metadataPatch(sessionId, {
+          draftsChanged: 'draftsChanged' in answer && answer.draftsChanged,
+        }),
+      )
+      if (answer.created && 'preparedInput' in answer && answer.preparedInput) {
+        unusedPrepared = answer.preparedInput.receipt
+        const sent = await this.enqueueSend(answer.preparedInput.input, {
+          preparedInput: unusedPrepared,
+        })
+        if (!sent.ok) return sent
+      }
+      if (answer.created && 'nativeRebuild' in answer && answer.nativeRebuild)
+        this.startNativeRebuildOperation(
+          sessionId,
+          answer.nativeRebuild.agentId,
+          answer.nativeRebuild.operationId,
+        )
+      if (answer.created && answer.receiptId) {
+        unusedReceiptId = answer.receiptId
+        const prepared = this.conversations.preparedRelayWorkflowAction(answer.receiptId)
+        const dispatched = await this.startWorkflowTurn(
+          prepared.task,
+          prepared.next,
+          input.clientOperationId,
+          undefined,
+          prepared.receipt.id,
+          prepared.handoff,
+        )
+        if (!dispatched.ok) return dispatched
+      }
+      this.schedulePendingRoutedContinuations()
+      return {
+        ok: true,
+        value:
+          this.conversations.relayDecisionReceipt({
+            sessionId,
+            decisionId: input.reference.decisionId,
+            clientOperationId: input.clientOperationId,
+          }) ?? answer.result,
+      }
+    } catch (error) {
+      if (committedCancellation) {
+        recordDiagnostic({
+          operation: 'ipc',
+          scope: 'request',
+          requestType: 'relay.decision.answer.request',
+          phase: 'failed',
+          level: 'warn',
+          sessionId: committedCancellation.sessionId,
+          operationId: committedCancellation.clientOperationId,
+          code: 'INTERNAL',
+          failureSource: 'classified_error',
+          runtimeBoundary: 'projection',
+          runtimeErrorType:
+            diagnosticEventSchema.shape.runtimeErrorType.safeParse(
+              error instanceof Error ? error.name : 'other',
+            ).data ?? 'other',
+        })
+        // Projection failure cannot undo this fact; receipt readback never repeats the action.
+        return { ok: true, value: committedCancellation }
+      }
+      return Conversation.sendFailure(error)
+    } finally {
+      if (unusedPrepared) {
+        const draftsChanged = this.conversations.cancelPreparedInputDispatch(
+          unusedPrepared,
+          'preparation_failed',
+        )
+        if (!this.disposed)
+          this.publish(
+            this.conversations.metadataPatch(unusedPrepared.sessionId, { draftsChanged }),
+          )
+      }
+      if (unusedReceiptId) {
+        const patch = this.conversations.releaseUnusedRelayWorkflowAction(unusedReceiptId, true)
+        if (patch && !this.disposed) this.publish(patch)
+      }
+    }
+  }
+
+  async continuePreparedInput(
+    raw: import('@pact/contracts').PreparedInputContinue,
+  ): Promise<RpcResult<ConversationPatch>> {
+    let claimed: import('@pact/persistence').PreparedInputDispatch | undefined
+    try {
+      const input = preparedInputContinueSchema.parse(raw),
+        old = this.conversations.readPreparedInputContinue(input)
+      if (old) return { ok: true, value: old }
+      if (this.disposed) return Conversation.shuttingDown()
+      if (this.nativeQuitSealed()) return Conversation.quitPrepared()
+      if (this.conversations.archives.blocksSession(input.sessionId))
+        return Conversation.archiveBusy()
+      if (
+        this.hasSessionOperation(input.sessionId) ||
+        this.pendingNativeInteractions(input.sessionId).length ||
+        this.operationCount() >= MAX_AGENT_OPERATIONS
+      )
+        return Conversation.capacityFailure()
+      const prepared = this.conversations.continuePreparedInput(input)
+      if (!prepared.created) return { ok: true, value: prepared.patch }
+      claimed = prepared.receipt
+      this.publish(this.conversations.metadataPatch(input.sessionId))
+      return await this.enqueueSend(prepared.input, { preparedInput: claimed })
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    } finally {
+      if (claimed) {
+        const draftsChanged = this.conversations.cancelPreparedInputDispatch(
+          claimed,
+          'preparation_failed',
+        )
+        if (!this.disposed)
+          this.publish(this.conversations.metadataPatch(claimed.sessionId, { draftsChanged }))
       }
     }
   }
@@ -2095,6 +3367,8 @@ export class Conversation {
   ): Promise<RpcResult<ConversationPatch>> {
     let releaseImages: (() => void) | undefined
     try {
+      const held = this.conversations.heldPreparedInputPatch(input)
+      if (held) return { ok: true, value: held }
       const savedTask = this.conversations.collaboration(input.sessionId)
       const task = savedTask?.status === 'complete' ? undefined : savedTask
       const preparing = this.preparingSends.has(input.clientMessageId)
@@ -2105,7 +3379,13 @@ export class Conversation {
         input,
         waitingForWork,
       )
-      if (received) return { ok: true, value: received }
+      if (received) {
+        if (input.userInformation)
+          throw new RunOperationConflictError(
+            'A queued message cannot acquire a user declaration. Your draft was kept.',
+          )
+        return { ok: true, value: received }
+      }
       const content = input.inputId
         ? this.conversations
             .resolveConversationInput(
@@ -2116,11 +3396,28 @@ export class Conversation {
             )
             .trim()
         : input.content
+      this.conversations.assertPreparedInputRequest({ ...input, content })
       const submitted = this.conversations.submittedRunReceipt({ ...input, content })
       if (submitted) {
         this.publish(submitted.patch)
         return { ok: true, value: submitted.patch }
       }
+      if (
+        input.userInformation &&
+        !preparing &&
+        (task ||
+          waitingForWork ||
+          input.returnedInputOperationId ||
+          input.queueReturnOperationId ||
+          input.replyToDecision ||
+          input.skills?.length ||
+          input.imageIds?.length ||
+          input.route?.type === 'all')
+      )
+        throw new RunOperationConflictError(
+          'Reserved information supports a new ordinary message only. Remove it before queueing, steering, replying to a workflow, using Skills, images or @all. Your draft was kept.',
+        )
+      this.conversations.assertRelayDecisionResolved(input.sessionId)
       this.conversations.assertDecisionInput({ ...input, content })
       if (this.conversations.receivedCollaborationInput(input.sessionId))
         throw new RunOperationConflictError(
@@ -2138,6 +3435,10 @@ export class Conversation {
         releaseImages = this.images.hold(input.imageIds)
       }
       const prefix = parseComposerCommandPrefix(content, input.skills)
+      if (input.userInformation && (prefix.pact || prefix.skills.length || prefix.error))
+        throw new RunOperationConflictError(
+          'Remove reserved information before sending a command. Your draft was kept.',
+        )
       if (!preparing && (task || waitingForWork)) {
         if (task && !prefix.pact && (input.route ?? prefix.route)?.type === 'all')
           throw new RunOperationConflictError('Finish or stop this Pact task before using @all.')
@@ -2220,9 +3521,9 @@ export class Conversation {
         this.schedulePendingRoutedContinuations()
         return { ok: true, value: patch }
       }
-      const { inputId, ...fields } = input
+      const { inputId } = input
       return await this.enqueueSend(
-        { ...fields, content },
+        { ...input, content },
         ownerKey ? { imageOwnerKey: ownerKey } : {},
       ).then((result) => {
         if (result.ok && inputId)
@@ -3085,10 +4386,26 @@ export class Conversation {
     input: ConversationSendInput,
     options: SendOptions,
   ): Promise<RpcResult<ConversationPatch>> {
+    if (!options.preparedInput) {
+      try {
+        const held = this.conversations.heldPreparedInputPatch(input)
+        if (held) return Promise.resolve({ ok: true, value: held })
+      } catch (error) {
+        return Promise.resolve(Conversation.sendFailure(error))
+      }
+    }
     if (this.disposed) return Promise.resolve(Conversation.shuttingDown())
     if (this.nativeQuitSealed()) return Promise.resolve(Conversation.quitPrepared())
     if (this.conversations.archives.blocksSession(input.sessionId))
       return Promise.resolve(Conversation.archiveBusy())
+    try {
+      this.conversations.assertRelayDecisionResolved(
+        input.sessionId,
+        options.collaborationActionReceiptId,
+      )
+    } catch (error) {
+      return Promise.resolve(Conversation.sendFailure(error))
+    }
     if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
       return Promise.resolve(Conversation.nativeRecoveryRequired())
     if (
@@ -3118,6 +4435,10 @@ export class Conversation {
         JSON.stringify(prior.imageIds ?? []) === JSON.stringify(input.imageIds ?? []) &&
         JSON.stringify(prior.skills ?? []) === JSON.stringify(input.skills ?? []) &&
         JSON.stringify(prior.route) === JSON.stringify(input.route) &&
+        prior.inputId === input.inputId &&
+        prior.routeIntent === input.routeIntent &&
+        prior.composerRevision === input.composerRevision &&
+        JSON.stringify(prior.userInformation) === JSON.stringify(input.userInformation) &&
         JSON.stringify(prior.replyToDecision) === JSON.stringify(input.replyToDecision) &&
         (prior.batchId ?? prior.clientMessageId) === (input.batchId ?? input.clientMessageId) &&
         (prior.freezeDrafts ?? !preparing.options.preserveDraftComments) ===
@@ -3158,7 +4479,7 @@ export class Conversation {
       return Promise.resolve(Conversation.capacityFailure())
 
     const controller = new AbortController()
-    const task = Promise.resolve().then(() => this.sendAdmitted(input, controller, options))
+    const task = Promise.resolve().then(() => this.sendWithInputRouting(input, controller, options))
     const entry: PreparingSend = { input, options, controller, task }
     this.preparingSends.set(input.clientMessageId, entry)
     this.workspaceChanges?.cancelUndoForNativeSession(input.sessionId)
@@ -3172,23 +4493,97 @@ export class Conversation {
     return task
   }
 
-  async actOnCollaboration(input: CollaborationActionInput): Promise<RpcResult<ConversationPatch>> {
+  actOnCollaboration(input: CollaborationActionInput): Promise<RpcResult<ConversationPatch>> {
+    if (
+      ['pause', 'request_plan_supplement', 'request_code_supplement', 'cancel_supplement'].includes(
+        input.action,
+      )
+    )
+      return this.actOnCollaborationAdmitted(input)
+    const request = JSON.stringify(input),
+      existing = this.collaborationActions.get(input.clientMessageId)
+    if (existing)
+      return existing.request === request
+        ? existing.task
+        : Promise.resolve(
+            Conversation.sendFailure(
+              new RunOperationConflictError('This action nonce belongs to a different request.'),
+            ),
+          )
+    if (this.collaborationActions.size >= MAX_AGENT_OPERATIONS)
+      return Promise.resolve(Conversation.capacityFailure())
+    const task = this.actOnCollaborationAdmitted(input).finally(() => {
+      this.collaborationActions.delete(input.clientMessageId)
+    })
+    this.collaborationActions.set(input.clientMessageId, { request, task })
+    return task
+  }
+
+  private async actOnCollaborationAdmitted(
+    input: CollaborationActionInput,
+  ): Promise<RpcResult<ConversationPatch>> {
+    if (this.disposed) return Conversation.shuttingDown()
     if (this.nativeQuitSealed()) return Conversation.quitPrepared()
     if (this.conversations.archives.blocksSession(input.sessionId))
       return Conversation.archiveBusy()
     try {
       const context = this.sessions.find(input.sessionId)
       const task = this.conversations.collaboration(input.sessionId)
-      if (!context || !task || task.id !== input.taskId || task.revision !== input.revision)
+      const prior = this.conversations.collaborationActionReceipt(input)
+      if (prior?.boundRunId)
+        return { ok: true, value: this.conversations.runPatch(prior.boundRunId) }
+      if (prior && prior.state !== 'available')
+        return { ok: true, value: this.conversations.metadataPatch(input.sessionId) }
+      if (
+        !context ||
+        !task ||
+        task.id !== input.taskId ||
+        (!prior && task.revision !== input.revision)
+      )
         throw new RunOperationConflictError('This collaboration action is no longer current.')
       if (task.status === 'complete')
         throw new RunOperationConflictError('This collaboration is already complete.')
+      if (
+        ['request_plan_supplement', 'request_code_supplement', 'confirm_supplement'].includes(
+          input.action,
+        )
+      )
+        throw new RunOperationConflictError(
+          'This manual Relay request was retired. Use the current scheduling decision or existing collaboration action.',
+        )
+      if (input.action === 'confirm_supplement' || input.action === 'cancel_supplement') {
+        if (
+          input.action === 'confirm_supplement' &&
+          this.pendingNativeInteractions(input.sessionId).length
+        )
+          return Conversation.capacityFailure()
+        const answer = this.conversations.answerRelaySupplement(input)
+        this.publish(answer.patch)
+        if (input.action === 'cancel_supplement') {
+          const decision = this.decisionRuntime
+          if (decision?.sessionId === input.sessionId) {
+            decision.controller.abort()
+            void decision.runtime?.dispose()
+          }
+          for (const preparing of this.preparingSends.values())
+            if (
+              preparing.input.sessionId === input.sessionId &&
+              ['supplement_plan', 'supplement_code_response'].includes(
+                preparing.options.handoffGuidance?.proposal.guidance.candidateId ?? '',
+              )
+            )
+              preparing.controller.abort()
+          return { ok: true, value: answer.patch }
+        }
+        throw new RunOperationConflictError('This legacy Relay grant cannot start new work.')
+      }
       if (input.action === 'pause') {
         const patch = this.conversations.pauseCollaboration(input.sessionId)
         this.abortPreparedWorkflow(input.sessionId)
         this.publish(patch)
         return { ok: true, value: patch }
       }
+      this.conversations.discardUnansweredRelaySchedulingDecision(input.sessionId)
       if (this.conversations.receivedCollaborationInput(input.sessionId))
         throw new RunOperationConflictError(
           'Your queued message will be answered before collaboration continues.',
@@ -3230,7 +4625,8 @@ export class Conversation {
         throw new RunOperationConflictError(
           'Restore the saved native plan before continuing collaboration.',
         )
-      if (input.action === 'resume') {
+      if (input.action === 'resume' && !task.pendingWork) {
+        this.conversations.assertRelayDecisionResolved(input.sessionId)
         if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
           return Conversation.nativeRecoveryRequired()
         const resumed = advanceCollaboration(task, 'resume', context.settings)
@@ -3241,47 +4637,368 @@ export class Conversation {
       }
       if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
         return Conversation.nativeRecoveryRequired()
-      const next = advanceCollaboration(task, input.action, context.settings)
-      return await this.startWorkflowTurn(task, next, input.clientMessageId)
+      const prepared = this.conversations.prepareCollaborationAction(input, context.settings)
+      if (prepared.receipt.boundRunId)
+        return { ok: true, value: this.conversations.runPatch(prepared.receipt.boundRunId) }
+      if (!prepared.task || !prepared.next || !prepared.handoff)
+        throw new RunOperationConflictError('The original action preparation is unavailable.')
+      let guidance: SendOptions['handoffGuidance']
+      let consultation: DecisionInvocationOwner | undefined
+      try {
+        guidance = await this.prepareWorkflowGuidance(
+          prepared.task,
+          prepared.next,
+          prepared.handoff,
+          prepared.receipt.id,
+        )
+        consultation =
+          this.decisionRuntime?.kind === 'evaluation' &&
+          this.decisionRuntime.handoff?.id === prepared.handoff.id
+            ? this.decisionRuntime
+            : undefined
+        const dispatched = this.startWorkflowTurn(
+          prepared.task,
+          prepared.next,
+          input.clientMessageId,
+          guidance,
+          prepared.receipt.id,
+          prepared.handoff,
+        )
+        guidance = undefined
+        this.releaseDecisionHandoff(consultation)
+        return await dispatched
+      } finally {
+        guidance?.reservation.release()
+        this.releaseDecisionHandoff(consultation)
+        this.conversations.cancelPreparedCollaborationAction(prepared.receipt.id)
+      }
     } catch (error) {
       return Conversation.sendFailure(error)
     }
   }
 
   private abortPreparedWorkflow(sessionId: string): void {
+    const decision = this.decisionRuntime
+    if (decision?.sessionId === sessionId) {
+      decision.controller.abort()
+      void decision.runtime?.dispose()
+    }
     for (const preparing of this.preparingSends.values())
       if (preparing.input.sessionId === sessionId && preparing.options.collaboration)
         preparing.controller.abort()
   }
 
-  private startWorkflowTurn(
+  private async startWorkflowTurn(
     task: CollaborationTask,
     next: CollaborationTask,
     clientMessageId: string = randomUUID(),
+    guidance?: SendOptions['handoffGuidance'],
+    collaborationActionReceiptId?: string,
+    schedulingHandoff?: SchedulingHandoff,
   ): Promise<RpcResult<ConversationPatch>> {
-    const drafts = this.conversations.readPage({ scope: 'drafts', sessionId: task.sessionId })
-    if (drafts.scope !== 'drafts')
-      return Promise.resolve(Conversation.sendFailure(new Error('Comment drafts are unavailable.')))
-    const content = `@${next.actor} ${collaborationStageLabel(next.stage)}.`
-    return this.enqueueSend(
-      {
-        sessionId: task.sessionId,
-        clientMessageId,
-        content,
-        route: { type: 'agent', agentId: next.actor },
-        expectedCommentsRevision: drafts.commentsRevision,
-        commentIds: [],
-        freezeDrafts: false,
-      },
-      {
-        preserveDraftComments: true,
-        collaboration: next,
-        expectedCollaborationRevision: task.revision,
-      },
+    const options: SendOptions = {
+      preserveDraftComments: true,
+      collaboration: next,
+      expectedCollaborationRevision: task.revision,
+      handoffGuidance: guidance,
+      collaborationActionReceiptId,
+    }
+    try {
+      options.schedulingHandoff =
+        schedulingHandoff ?? this.conversations.workflowHandoff(task, next.actor)
+      const drafts = this.conversations.readPage({ scope: 'drafts', sessionId: task.sessionId })
+      if (drafts.scope !== 'drafts')
+        return Conversation.sendFailure(new Error('Comment drafts are unavailable.'))
+      const content = `@${next.actor} ${collaborationStageLabel(next.stage)}.`
+      return await this.enqueueSend(
+        {
+          sessionId: task.sessionId,
+          clientMessageId,
+          content,
+          route: { type: 'agent', agentId: next.actor },
+          expectedCommentsRevision: drafts.commentsRevision,
+          commentIds: [],
+          freezeDrafts: false,
+        },
+        options,
+      )
+    } finally {
+      this.releaseHandoffGuidance(options)
+    }
+  }
+
+  private releaseHandoffGuidance(options: SendOptions): void {
+    options.handoffGuidance?.reservation.release()
+    options.handoffGuidance = undefined
+  }
+
+  private releaseDecisionHandoff(owner: DecisionInvocationOwner | undefined): void {
+    if (!owner || this.decisionRuntime !== owner) return
+    owner.consulting = false
+    if (!owner.runtime) this.decisionRuntime = undefined
+  }
+
+  private decisionRuntimeAdmission(sessionId: string): RelayPolicyAdmission['runtimeAdmission'] {
+    if (this.decisionRuntime || this.conversations.activeSchedulingRuntimeOwner()) return 'busy'
+    const scope = this.schedulingScope(sessionId)
+    const observation = this.contextDecisionCapability
+    if (
+      !observation ||
+      observation.sessionId !== sessionId ||
+      observation.scopeKey !== scope.key ||
+      observation.generation !== this.conversations.schedulingConfigurationGeneration() ||
+      observation.configurationKey !== this.runtimePreparation.catalogIdentity(scope.cwd)
     )
+      return 'may_attempt'
+    if (
+      [
+        'unsupported_platform',
+        'unsupported_provider',
+        'unsupported_network',
+        'unsupported_authentication',
+        'unsupported_protocol',
+        'project_authentication_differs',
+        'executable_unavailable',
+        'model_unavailable',
+        'model_metadata_invalid',
+        'model_effort_unavailable',
+      ].includes(observation.capability.reason)
+    )
+      return 'known_unavailable'
+    return observation.capability.status === 'unavailable' &&
+      Date.parse(observation.expiresAt) > Date.now()
+      ? 'cooldown'
+      : 'may_attempt'
+  }
+
+  private async prepareWorkflowGuidance(
+    task: CollaborationTask,
+    next: CollaborationTask | undefined,
+    handoff: SchedulingHandoff,
+    receiptId?: string,
+  ): Promise<SendOptions['handoffGuidance']> {
+    let material: Omit<RelayDecisionMaterial, 'input'> | undefined
+    let reservation: import('./native-working-memory').NativeMemoryReservation | undefined
+    try {
+      const preferences = this.conversations.schedulingSettings()
+      if (!preferences.enabled || !preferences.selection) return undefined
+      const runtimeAdmission = this.decisionRuntimeAdmission(task.sessionId)
+      if (
+        runtimeAdmission !== 'may_attempt' ||
+        !this.conversations.relayWorkflowWorthConsulting(handoff)
+      )
+        return undefined
+      const session = this.sessions.find(task.sessionId)
+      const project = session && this.projects.find(session.projectId)
+      if (!project) return undefined
+      const configurationKey = this.runtimePreparation.catalogIdentity(project.directoryPath)
+      const candidateId: WorkflowRelayCandidateId | undefined =
+        this.conversations.relayDecision(task.sessionId)?.state === 'available' && receiptId
+          ? this.conversations.relayDecision(task.sessionId)?.kind
+          : next?.stage === 'respond'
+            ? 'respond_to_code_review'
+            : next?.stage === 'repair'
+              ? 'repair_code'
+              : next?.stage === 'plan_review'
+                ? 'continue_plan_review'
+                : next?.stage === 'plan'
+                  ? 'continue_plan_revision'
+                  : next?.stage === 'code_review'
+                    ? 'continue_code_review'
+                    : undefined
+      const opportunity = receiptId
+        ? undefined
+        : this.conversations.relaySupplementOpportunity(handoff)
+      const repairOpportunity = receiptId
+        ? undefined
+        : this.conversations.relayRepairOpportunity(handoff)
+      if (!candidateId && !opportunity && !repairOpportunity) return undefined
+      const supplementary =
+        candidateId === 'supplement_plan' || candidateId === 'supplement_code_response'
+      const candidates = [
+        ...(candidateId === 'supplement_plan'
+          ? [
+              {
+                id: 'continue_plan_review',
+                description: `Continue the original Plan review with ${task.reviewer}, without adding a Turn.`,
+              },
+            ]
+          : []),
+        ...(candidateId && next
+          ? [
+              {
+                id: candidateId,
+                description: supplementary
+                  ? `Use the user's exact single-use grant for one read-only ${next.stage} Turn by ${task.owner}, followed by the mandatory ${task.reviewer} review. Do not change scope or roles.`
+                  : `Continue the already-authorized ${next.stage} with the fixed ${next.actor} actor; provide only source-grounded focus.`,
+              },
+            ]
+          : []),
+        ...(opportunity
+          ? [
+              {
+                id: `propose_${opportunity.kind}`,
+                description: `Propose one extra read-only turn by ${task.owner}, followed by the fixed ${task.reviewer} review, only if complete sources establish a concrete remaining gap that the normal next step cannot address. This candidate requests the user's specific authorization and grants no execution. Choose null or the existing next step when no extra turn is necessary.`,
+              },
+            ]
+          : []),
+        ...(repairOpportunity
+          ? [
+              {
+                id: 'propose_repair',
+                description: `Request one scoped repair by ${task.owner} under a new exact user grant, followed by the fixed ${task.reviewer} review. Propose this only when complete current review sources establish concrete work within the original task. It grants no execution and cannot expand scope or permissions. Prefer the original next step when no extra work is necessary.`,
+              },
+            ]
+          : []),
+      ]
+      const legalActions = supplementary
+        ? candidateId === 'supplement_plan'
+          ? [
+              {
+                action: 'continue_plan_review' as RelayAction,
+                actor: task.reviewer,
+                authorizationId: handoff.id,
+                authorizationCurrent: true,
+                businessBudgetAvailable: true,
+              },
+            ]
+          : []
+        : candidateId && next
+          ? [
+              {
+                action: candidateId,
+                actor: next.actor,
+                authorizationId: receiptId ?? handoff.id,
+                authorizationCurrent: true,
+                businessBudgetAvailable: true,
+              },
+            ]
+          : []
+      const outcome = await this.evaluateDecision(
+        {
+          handoff,
+          retainHandoff: true,
+          load: async (context) => {
+            const read = await this.conversations.readRelayWorkflowDecisionSources(
+              handoff,
+              candidates,
+              context,
+            )
+            const settings = this.conversations.schedulingSettings()
+            const facts = relayWorkflowPolicyFacts(read.snapshot, {
+              handoffId: handoff.id,
+              inputBytes: decisionJsonBytes(read.input),
+              legalActions,
+              supplementOpportunity: opportunity,
+              repairOpportunity,
+              ...this.conversations.relayWorkflowUserGrants(handoff, read.snapshot, receiptId),
+              continuation: this.conversations.relayWorkflowContinuation(read.snapshot) ?? null,
+              admission: {
+                enabled: settings.enabled,
+                modelSelected: settings.selection !== null,
+                runtimeAdmission,
+                evaluationResourcesAvailable: true,
+                factAlreadyEvaluated: Boolean(
+                  this.conversations.decisionEvaluationReceipt(handoff),
+                ),
+                pendingUserInput: Boolean(
+                  this.conversations.receivedCollaborationInput(task.sessionId) ||
+                  collaborationInputGate(read.snapshot.task),
+                ),
+                nativeInteraction: this.pendingNativeInteractions(task.sessionId).length > 0,
+                newTaskDispatchProtected: false,
+              },
+            })
+            const policy = facts && evaluateRelayPolicy(facts)
+            if (
+              !policy ||
+              policy.kind !== 'eligible' ||
+              !candidates.every((candidate) =>
+                policy.candidates.some((entry) => entry.id === candidate.id),
+              )
+            )
+              throw new RunOperationConflictError(
+                'This workflow node does not need a decision request.',
+              )
+            material = {
+              basis: read.basis,
+              sources: read.sources,
+              inputSha256: read.inputSha256,
+              sourceFingerprint: read.sourceFingerprint,
+            }
+            return read.input
+          },
+        },
+        new AbortController().signal,
+      )
+      if (
+        outcome.kind !== 'recommendation' ||
+        !candidates.some((candidate) => candidate.id === outcome.recommendation.candidateId) ||
+        outcome.recommendation.highlights.length === 0 ||
+        !material ||
+        material.basis.kind !== 'workflow'
+      )
+        return undefined
+      const chosenProposal =
+        repairOpportunity && outcome.recommendation.candidateId === 'propose_repair'
+          ? repairOpportunity
+          : opportunity && outcome.recommendation.candidateId === `propose_${opportunity.kind}`
+            ? opportunity
+            : undefined
+      if (chosenProposal) {
+        if (this.pendingNativeInteractions(task.sessionId).length) return undefined
+        const reason = outcome.recommendation.highlights[0]!
+        this.conversations.proposeRelayWorkflowAction({
+          handoff,
+          kind: chosenProposal.kind,
+          evaluationId: outcome.evaluationReceipt.evaluationId,
+          configurationGeneration: outcome.evaluationReceipt.configurationGeneration,
+          deadlineAt: outcome.evaluationReceipt.deadlineAt,
+          inputSha256: material.inputSha256,
+          sourceFingerprint: material.sourceFingerprint,
+          reason: reason.text,
+          sourceIds: reason.sourceIds,
+        })
+        this.publish(this.conversations.metadataPatch(task.sessionId))
+        return undefined
+      }
+      if (!next || !candidateId) return undefined
+      reservation = new NativeWorkingMemory().reserve(128 * 1024)
+      const { evaluationReceipt, recommendation } = outcome
+      const proposal = handoffGuidanceProposalSchema.parse({
+        guidance: {
+          version: HANDOFF_GUIDANCE_VERSION,
+          evaluationId: evaluationReceipt.evaluationId,
+          handoffId: evaluationReceipt.handoffId,
+          ...material,
+          ...recommendation,
+        },
+        configurationGeneration: evaluationReceipt.configurationGeneration,
+        configurationFingerprint: evaluationReceipt.configurationFingerprint,
+        deadlineAt: evaluationReceipt.deadlineAt,
+      })
+      const current = () =>
+        !this.disposed &&
+        !this.nativeQuitSealed() &&
+        this.conversations.schedulingConfigurationGeneration() ===
+          proposal.configurationGeneration &&
+        this.runtimePreparation.catalogIdentity(project.directoryPath) === configurationKey &&
+        this.conversations.evaluationIsCurrent(handoff) &&
+        Date.now() < proposal.deadlineAt
+      if (!current()) return undefined
+      const transferred = reservation
+      reservation = undefined
+      return { proposal, current, reservation: transferred }
+    } catch {
+      return undefined
+    } finally {
+      material = undefined
+      reservation?.release()
+    }
   }
 
   private async dispatchWorkflowContinuation(sessionId: string): Promise<void> {
+    this.conversations.discardStaleRelaySchedulingDecision(sessionId)
     if (
       this.disposed ||
       this.nativeQuitSealed() ||
@@ -3289,7 +5006,9 @@ export class Conversation {
       this.operationCount() >= MAX_AGENT_OPERATIONS ||
       this.conversations.receivedCollaborationInput(sessionId) ||
       this.conversations.nativeRecoveryBlocksInput(sessionId) ||
-      this.conversations.hasPendingRoutedContinuation(sessionId)
+      this.conversations.hasPendingRoutedContinuation(sessionId) ||
+      this.pendingNativeInteractions(sessionId).length > 0 ||
+      this.conversations.hasRelayDecision(sessionId)
     )
       return
     const task = this.conversations.collaboration(sessionId)
@@ -3314,7 +5033,19 @@ export class Conversation {
       )
       return
     }
-    if (!collaborationNextStage(task)) return
+    if (!collaborationNextStage(task)) {
+      if (!this.pendingNativeInteractions(sessionId).length) {
+        const handoff = this.conversations.workflowHandoff(task, task.owner)
+        await this.prepareWorkflowGuidance(task, undefined, handoff)
+        const consultation =
+          this.decisionRuntime?.kind === 'evaluation' &&
+          this.decisionRuntime.handoff?.id === handoff.id
+            ? this.decisionRuntime
+            : undefined
+        this.releaseDecisionHandoff(consultation)
+      }
+      return
+    }
     let next: CollaborationTask
     try {
       next = advanceCollaboration(task, 'continue', session.settings)
@@ -3333,7 +5064,57 @@ export class Conversation {
       )
       return
     }
-    const result = await this.startWorkflowTurn(task, next)
+    let guidance: SendOptions['handoffGuidance']
+    let consultation: DecisionInvocationOwner | undefined
+    const settings = this.conversations.schedulingSettings()
+    if (settings.enabled && settings.selection) {
+      const handoff = this.conversations.workflowHandoff(task, next.actor)
+      if (
+        this.decisionRuntime?.kind === 'evaluation' &&
+        this.decisionRuntime.consulting &&
+        this.decisionRuntime.current() &&
+        this.decisionRuntime.handoff?.id === handoff.id
+      )
+        return
+      guidance = await this.prepareWorkflowGuidance(task, next, handoff)
+      consultation =
+        this.decisionRuntime?.kind === 'evaluation' &&
+        this.decisionRuntime.handoff?.id === handoff.id
+          ? this.decisionRuntime
+          : undefined
+      if (this.disposed || this.nativeQuitSealed()) {
+        guidance?.reservation.release()
+        this.releaseDecisionHandoff(consultation)
+        return
+      }
+      if (this.conversations.hasRelayDecision(sessionId)) {
+        guidance?.reservation.release()
+        this.releaseDecisionHandoff(consultation)
+        return
+      }
+      if (!this.conversations.evaluationIsCurrent(handoff)) {
+        guidance?.reservation.release()
+        this.releaseDecisionHandoff(consultation)
+        this.schedulePendingRoutedContinuations()
+        return
+      }
+      if (
+        [...this.preparingSends.values()].some(
+          ({ options }) =>
+            options.schedulingHandoff?.id === handoff.id &&
+            options.schedulingHandoff.factFingerprint === handoff.factFingerprint,
+        )
+      ) {
+        // The original manual claim is preparing; its existing release path wakes automation.
+        guidance?.reservation.release()
+        this.releaseDecisionHandoff(consultation)
+        return
+      }
+    }
+    const preparation = this.startWorkflowTurn(task, next, undefined, guidance)
+    // enqueueSend has synchronously registered the original business preparation, or refused it.
+    this.releaseDecisionHandoff(consultation)
+    const result = await preparation
     if (!result.ok) {
       const current = this.conversations.collaboration(sessionId)
       if (current?.id !== task.id || current.revision !== task.revision) return
@@ -3816,6 +5597,260 @@ export class Conversation {
     })
   }
 
+  private async sendWithInputRouting(
+    input: ConversationSendInput,
+    controller: AbortController,
+    options: SendOptions,
+  ): Promise<RpcResult<ConversationPatch>> {
+    let receipt: import('@pact/persistence').PreparedInputDispatch | undefined =
+      options.preparedInput
+    let held = false
+    let handoff: SchedulingHandoff | undefined
+    try {
+      const session = this.sessions.find(input.sessionId)
+      const settings = this.conversations.schedulingSettings()
+      const admission = this.decisionRuntimeAdmission(input.sessionId)
+      if (
+        !receipt &&
+        session &&
+        settings.enabled &&
+        settings.selection &&
+        admission === 'may_attempt' &&
+        !options.collaboration &&
+        !options.receivedInputId &&
+        !options.sourceProposalId &&
+        !options.preserveDraftComments &&
+        !this.pendingNativeInteractions(input.sessionId).length &&
+        this.conversations.ordinaryInputWorthConsulting(input, session.settings.primaryAgentId)
+      ) {
+        const allowed = (['codex', 'claude'] as const).filter((actor) => {
+          const context = this.conversations.nativeContext(input.sessionId, actor)
+          return !context || context.continuationState === 'ready'
+        })
+        const scope = this.projects.find(session.projectId)
+        const configurationKey =
+          scope && this.runtimePreparation.catalogIdentity(scope.directoryPath)
+        let material: { inputSha256: string; sourceFingerprint: string } | undefined
+        const outcome = await this.evaluateDecision(
+          {
+            sessionId: input.sessionId,
+            prepare: async (context) => {
+              // Runtime owns the fixed lease and original deadline before any complete input freeze.
+              receipt = this.conversations.prepareInputDispatch(
+                input,
+                randomUUID(),
+                allowed,
+                context,
+              )
+              options.preparedInput = receipt
+              const frozen = receipt
+              handoff = this.conversations.preparedInputHandoff(receipt.batchId)
+              this.publish(
+                this.conversations.metadataPatch(input.sessionId, { draftsChanged: true }),
+              )
+              const routingCandidates = frozen.metadata.allowedAgentIds.map((actor) => ({
+                id: `route_${actor}`,
+                description: `Send the exact original input once to ${actor}, preserving its existing permissions and scope.`,
+              }))
+              const informationOpportunity =
+                this.conversations.preparedInformationOpportunity(frozen)
+              const candidates = [
+                ...routingCandidates,
+                ...(informationOpportunity
+                  ? [
+                      {
+                        id: 'clarify_prepared_input',
+                        description: `Collect the existing unanswered user-declared field ${informationOpportunity.fieldId}. Select only that exact fieldId; its question and choices are already frozen by the host.`,
+                      },
+                    ]
+                  : []),
+              ]
+              const read = await this.conversations.readPreparedInputDecisionSources(
+                frozen,
+                candidates,
+                context,
+              )
+              const policy = evaluateRelayPolicy({
+                node: 'send',
+                informationOpportunity: informationOpportunity
+                  ? {
+                      ...informationOpportunity,
+                      sourceId:
+                        read.sources.find(
+                          (source) =>
+                            source.kind === 'declaration' &&
+                            source.document?.id === informationOpportunity.document.id,
+                        )?.id ?? '',
+                    }
+                  : undefined,
+                ordinary: true,
+                handoffId: handoff.id,
+                budgetSubjectId: handoff.budgetSubjectId,
+                primary: frozen.metadata.defaultAgentId,
+                route: 'implicit',
+                inputSourceId: 's0',
+                referencedSourceIds: read.sources
+                  .filter((source) => source.actor !== null)
+                  .map((source) => source.id),
+                materials: {
+                  complete: true,
+                  inputBytes: decisionJsonBytes(read.input),
+                  sources: read.sources.map((source) => ({
+                    id: source.id,
+                    sha256: source.sha256,
+                    bytes: source.bytes,
+                    roles: source.roles,
+                    actor: source.actor,
+                    complete: true,
+                    settled: true,
+                    frozen: true,
+                  })),
+                },
+                legalActions: frozen.metadata.allowedAgentIds.map((actor) => ({
+                  action: 'route_send',
+                  actor,
+                  authorizationId: handoff!.id,
+                  authorizationCurrent: true,
+                  businessBudgetAvailable: true,
+                })),
+                admission: {
+                  enabled: settings.enabled,
+                  modelSelected: settings.selection !== null,
+                  runtimeAdmission: admission,
+                  evaluationResourcesAvailable: true,
+                  factAlreadyEvaluated: false,
+                  pendingUserInput: Boolean(
+                    this.conversations.receivedCollaborationInput(input.sessionId),
+                  ),
+                  nativeInteraction: this.pendingNativeInteractions(input.sessionId).length > 0,
+                  newTaskDispatchProtected: false,
+                },
+              })
+              if (
+                policy.kind !== 'eligible' ||
+                !policy.candidates.length ||
+                candidates.length !== policy.candidates.length ||
+                candidates.some(
+                  (candidate) => !policy.candidates.some((legal) => legal.id === candidate.id),
+                )
+              )
+                throw new RunOperationConflictError(
+                  'The frozen input does not need recipient advice.',
+                )
+              material = {
+                inputSha256: read.inputSha256,
+                sourceFingerprint: read.sourceFingerprint,
+              }
+              return read.input
+            },
+          },
+          controller.signal,
+        )
+        const selected =
+          outcome.kind === 'recommendation' ? outcome.recommendation.candidateId : undefined
+        recordDiagnostic({
+          operation: 'send',
+          phase: outcome.kind === 'recommendation' ? 'ready' : 'blocked',
+          level: 'info',
+          sessionId: input.sessionId,
+          inputAdviceResult:
+            outcome.kind === 'unavailable'
+              ? outcome.reason
+              : selected === null
+                ? 'no_advice'
+                : selected === 'clarify_prepared_input' ||
+                    selected === 'route_codex' ||
+                    selected === 'route_claude'
+                  ? selected
+                  : 'other_candidate',
+        })
+        if (
+          outcome.kind === 'recommendation' &&
+          material &&
+          (outcome.recommendation.candidateId === 'route_codex' ||
+            outcome.recommendation.candidateId === 'route_claude')
+        ) {
+          options.inputRouting = {
+            version: 'input-routing-v1',
+            ...material,
+            ...outcome.evaluationReceipt,
+            candidateId: outcome.recommendation.candidateId,
+          }
+          options.inputRoutingCurrent = () =>
+            Boolean(
+              scope &&
+              this.runtimePreparation.catalogIdentity(scope.directoryPath) === configurationKey,
+            )
+        }
+        if (
+          outcome.kind === 'recommendation' &&
+          material &&
+          receipt &&
+          outcome.recommendation.candidateId === 'clarify_prepared_input' &&
+          !controller.signal.aborted &&
+          !this.disposed &&
+          !this.pendingNativeInteractions(input.sessionId).length &&
+          scope &&
+          this.runtimePreparation.catalogIdentity(scope.directoryPath) === configurationKey
+        ) {
+          try {
+            this.conversations.proposePreparedInputInformation({
+              receipt,
+              original: input,
+              recommendation: outcome.recommendation,
+              evaluation: outcome.evaluationReceipt,
+              ...material,
+            })
+            held = true
+            const patch = {
+              ...this.conversations.metadataPatch(input.sessionId),
+              sendDisposition: 'held_for_information' as const,
+            }
+            this.publish(patch)
+            return { ok: true, value: patch }
+          } catch (error) {
+            // An inadmissible auxiliary question never adds a new obstacle to the original Send.
+            if (!(error instanceof RunOperationConflictError)) throw error
+            recordDiagnostic({
+              operation: 'send',
+              phase: 'blocked',
+              level: 'info',
+              sessionId: input.sessionId,
+              code: 'CONFLICT',
+              informationAdviceRefusal:
+                error instanceof PreparedInformationConflictError
+                  ? error.informationAdviceRefusal
+                  : 'host_validation',
+            })
+          }
+        }
+      }
+      if (this.disposed || controller.signal.aborted || this.nativeQuitSealed())
+        throw new RunOperationConflictError(
+          'This preparation ended without sending. Your draft is preserved.',
+        )
+      return await this.sendAdmitted(input, controller, options)
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    } finally {
+      if (
+        !held &&
+        receipt &&
+        this.conversations.cancelPreparedInputDispatch(
+          receipt,
+          controller.signal.aborted ? 'cancelled' : 'preparation_failed',
+        )
+      )
+        this.publish(this.conversations.metadataPatch(input.sessionId, { draftsChanged: true }))
+      if (
+        handoff &&
+        this.decisionRuntime?.kind === 'evaluation' &&
+        this.decisionRuntime.handoff?.id === handoff.id
+      )
+        this.releaseDecisionHandoff(this.decisionRuntime)
+    }
+  }
+
   private async sendAdmitted(
     input: ConversationSendInput,
     controller: AbortController,
@@ -3830,7 +5865,11 @@ export class Conversation {
     }
     controller.signal.addEventListener('abort', onAbort, { once: true })
     if (controller.signal.aborted) onAbort()
-    const timeout = setTimeout(() => controller.abort(), PREPARATION_TIMEOUT_MS)
+    options.preparationDeadlineAt ??= Date.now() + PREPARATION_TIMEOUT_MS
+    const timeout = setTimeout(
+      () => controller.abort(),
+      Math.max(0, options.preparationDeadlineAt - Date.now()),
+    )
     try {
       const context = await Promise.race([
         this.prepareSession(input.sessionId, controller.signal),
@@ -3880,6 +5919,17 @@ export class Conversation {
           input.returnedInputOperationId,
         )
         if (!input.route) route = original
+      }
+      if (options.preparedInput) {
+        if (options.inputRoutingCurrent && !options.inputRoutingCurrent())
+          options.inputRouting = undefined
+        route = {
+          type: 'primary',
+          agentId: this.conversations.preparedInputRecipient(
+            options.preparedInput,
+            options.inputRouting,
+          ),
+        }
       }
       const targets =
         route.type === 'all' ? [route.firstAgentId, route.secondAgentId] : [route.agentId]
@@ -4010,14 +6060,34 @@ export class Conversation {
         throw new RunOperationConflictError(
           'The native binding changed during message preparation.',
         )
+      if (options.handoffGuidance && !options.handoffGuidance.current())
+        this.releaseHandoffGuidance(options)
+      if (
+        options.preparedInput &&
+        options.inputRouting &&
+        (!options.inputRoutingCurrent?.() ||
+          this.conversations.preparedInputRecipient(options.preparedInput, options.inputRouting) !==
+            agentId)
+      ) {
+        options.inputRouting = undefined
+        // A stale recommendation returns to the frozen default within the same business deadline.
+        return await this.sendAdmitted(input, controller, options)
+      }
       const started = this.conversations.beginRun({
+        preparedInput: options.preparedInput,
+        inputRouting: options.inputRouting,
+
         ...(options.receivedInputId ? { receivedInputId: options.receivedInputId } : {}),
         ...(collaboration ? { collaboration } : {}),
+        schedulingHandoff: options.schedulingHandoff,
+        ...(options.handoffGuidance ? { handoffGuidance: options.handoffGuidance.proposal } : {}),
         expectedCollaborationRevision: options.expectedCollaborationRevision,
+        collaborationActionReceiptId: options.collaborationActionReceiptId,
         ...(skillInvocation ? { skillInvocation } : {}),
         sessionId: input.sessionId,
         clientMessageId: input.clientMessageId,
         content: input.content,
+        ...(input.userInformation ? { userInformation: input.userInformation } : {}),
         ...(input.replyToDecision ? { replyToDecision: input.replyToDecision } : {}),
         ...(input.imageIds?.length ? { imageIds: input.imageIds } : {}),
         ...(options.imageOwnerKey ? { imageOwnerKey: options.imageOwnerKey } : {}),
@@ -4054,7 +6124,11 @@ export class Conversation {
           ? { suggestedTitle: Conversation.localTitle(input.content) }
           : {}),
       })
+      this.releaseHandoffGuidance(options)
       prompt.inputBatchRef = this.conversations.inputBatchForRun(started.run.id) ?? undefined
+      const clarification = this.conversations.preparedAnswerForRun(started.run.id)
+      prompt.clarificationAnswer = clarification?.document
+      prompt.userClarification = clarification
       if (collaboration) {
         prompt.collaborationAuthorization =
           this.conversations.collaborationTurnAuthorization(started.run.id) ?? undefined
@@ -4078,6 +6152,7 @@ export class Conversation {
     } catch (error) {
       return Conversation.sendFailure(error)
     } finally {
+      this.releaseHandoffGuidance(options)
       clearTimeout(timeout)
       controller.signal.removeEventListener('abort', onAbort)
       const entry = this.preparingSends.get(input.clientMessageId)
@@ -4173,6 +6248,12 @@ export class Conversation {
   stop(input: ConversationStopInput): RpcResult<ConversationPatch> {
     if (this.disposed) return Conversation.shuttingDown()
     try {
+      this.conversations.cancelSchedulingRecoveryFaults(input.sessionId)
+      if (this.conversations.pausePreparedInputForStop(input.sessionId))
+        this.publish(this.conversations.metadataPatch(input.sessionId, { draftsChanged: true }))
+      for (const [key, check] of this.nativeChecks)
+        if (check.automaticAttemptId && key.startsWith(`${input.sessionId}:`))
+          check.controller.abort()
       if (this.conversations.receivedCollaborationInput(input.sessionId))
         this.publish(
           this.conversations.pauseConversationQueue(
@@ -4266,7 +6347,8 @@ export class Conversation {
       }
     const binding = this.conversations.nativeContext(sessionId, agentId)
     const receiptCheck = original && this.nativeChecks.get(`${sessionId}:${agentId}:${original.id}`)
-    if (receiptCheck?.receiptSessionId) return receiptCheck.task.then(() => this.retry(input))
+    if (receiptCheck?.receiptSessionId)
+      return receiptCheck.physicalCompletion.then(() => this.retry(input))
     if (
       original &&
       (!binding ||
@@ -4311,14 +6393,14 @@ export class Conversation {
   private async probeSteerInputs(
     run: AgentRun,
     adapter: AgentAdapter,
-    signal: AbortSignal,
+    controller: AbortController,
   ): Promise<void> {
     if (
       run.agentId !== 'codex' ||
       run.forkSourceRunId ||
       !run.nativeSessionId ||
       !run.nativeTurnId ||
-      !adapter.probeNativeInputs ||
+      !adapter.beginNativeInputsCheck ||
       this.nativeObservations.has(run.id)
     )
       return
@@ -4334,40 +6416,40 @@ export class Conversation {
       bindingGeneration: run.bindingGeneration ?? 1,
       executorId: run.executorId,
     }
-    const controller = new AbortController()
-    const readSignal = AbortSignal.any([signal, controller.signal])
-    const timer = setTimeout(() => controller.abort(), DELIVERY_RECONCILIATION_TIMEOUT_MS)
-    try {
-      await adapter.probeNativeInputs(
-        {
-          ...proof,
-          requestId: run.id,
-          agentId: run.agentId,
-          cwd: this.projects.find(this.sessions.find(run.sessionId)!.projectId)!.directoryPath,
-          model: run.model,
-          effort: run.effort,
-          unresolvedInputIds: ids,
-          recordConsumption: (id) => {
-            if (this.disposed || readSignal.aborted || !ids.includes(id)) return
-            this.publish(this.conversations.recordQueuedSteerConsumption(proof, id))
+    await this.runNativeCheck(
+      controller,
+      (checkContext, checkSignal) =>
+        adapter.beginNativeInputsCheck!(
+          {
+            ...proof,
+            requestId: run.id,
+            agentId: run.agentId,
+            cwd: this.projects.find(this.sessions.find(run.sessionId)!.projectId)!.directoryPath,
+            model: run.model,
+            effort: run.effort,
+            unresolvedInputIds: ids,
+            recordConsumption: (id) => {
+              if (this.disposed || checkSignal.aborted || !ids.includes(id)) return
+              this.publish(this.conversations.recordQueuedSteerConsumption(proof, id))
+            },
           },
-        },
-        readSignal,
-      )
-    } finally {
-      clearTimeout(timer)
-    }
+          checkSignal,
+          checkContext,
+        ),
+      true,
+    )
   }
 
   private inspectPreviousRun(
     run: AgentRun,
     receiptsOnly = false,
+    automaticAttemptId?: string,
   ): Promise<RpcResult<ConversationPatch>> {
     const key = `${run.sessionId}:${run.agentId}:${run.id}`
     const pending = this.nativeChecks.get(key)
     if (pending)
       return !receiptsOnly && pending.receiptSessionId
-        ? pending.task.then(() => this.inspectPreviousRun(run))
+        ? pending.physicalCompletion.then(() => this.inspectPreviousRun(run))
         : pending.task
     if (!run.nativeSessionId)
       return Promise.resolve({
@@ -4380,46 +6462,49 @@ export class Conversation {
       })
     if (
       this.hasSessionOperation(run.sessionId, false, undefined, true) ||
-      this.nativeChecks.size >= MAX_AGENT_OPERATIONS
+      this.operationCount() >= MAX_AGENT_OPERATIONS
     )
       return Promise.resolve(Conversation.capacityFailure())
     const controller = new AbortController()
-    const task = (async (): Promise<RpcResult<ConversationPatch>> => {
-      try {
-        const session = this.sessions.find(run.sessionId),
-          project = session && this.projects.find(session.projectId)
-        if (!session || !project) throw new Error('The project is unavailable.')
-        const executable = await this.runtimePreparation.findRecoveryExecutable(
-          run.agentId,
-          controller.signal,
-        )
-        if (!executable) throw new Error('The native executable is unavailable.')
-        const adapter = await this.adapterFor(
-          run.sessionId,
-          run.agentId,
-          executable,
-          controller.signal,
-          project.directoryPath,
-          (acquired) => {
-            const owner = this.nativeChecks.get(key)
-            if (owner?.controller !== controller || controller.signal.aborted)
-              throw new RunOperationConflictError('The native check is no longer current.')
-            owner.adapter = acquired
-            this.nativeMetadataChanged()
-          },
-        )
+    return this.startNativeCheck(
+      key,
+      controller,
+      async () => {
         try {
-          await this.probeSteerInputs(run, adapter, controller.signal)
-        } catch (error) {
-          if (receiptsOnly) throw error
-          // An unavailable input receipt must not suppress independent root inspection.
-        }
-        if (receiptsOnly)
-          return { ok: true, value: this.conversations.metadataPatch(run.sessionId) }
-        const evidence = await Conversation.withRecoveryDeadline(
-          controller,
-          async () =>
-            adapter.probeNativeStatus?.(
+          const session = this.sessions.find(run.sessionId),
+            project = session && this.projects.find(session.projectId)
+          if (!session || !project) throw new Error('The project is unavailable.')
+          const executable = await this.runtimePreparation.findRecoveryExecutable(
+            run.agentId,
+            controller.signal,
+          )
+          if (!executable) throw new Error('The native executable is unavailable.')
+          const adapter = await this.adapterFor(
+            run.sessionId,
+            run.agentId,
+            executable,
+            controller.signal,
+            project.directoryPath,
+            (acquired) => {
+              const owner = this.nativeChecks.get(key)
+              if (owner?.controller !== controller || controller.signal.aborted)
+                throw new RunOperationConflictError('The native check is no longer current.')
+              owner.adapter = acquired
+              this.nativeMetadataChanged()
+            },
+          )
+          try {
+            await this.probeSteerInputs(run, adapter, controller)
+          } catch (error) {
+            if (receiptsOnly || controller.signal.aborted) throw error
+            // An unavailable input receipt must not suppress independent root inspection.
+          }
+          if (receiptsOnly)
+            return { ok: true, value: this.conversations.metadataPatch(run.sessionId) }
+          const evidence = await this.runNativeCheck(controller, (checkContext, checkSignal) => {
+            if (!adapter.beginNativeStatusCheck)
+              throw new Error('The runtime cannot own a native check.')
+            return adapter.beginNativeStatusCheck(
               {
                 sessionId: run.sessionId,
                 agentId: run.agentId,
@@ -4435,77 +6520,69 @@ export class Conversation {
                 model: run.model,
                 effort: run.effort,
               },
-              controller.signal,
-            ),
-          undefined,
-        )
-        const archiveTail = this.nativeObservations.get(run.id)?.archiveTail
-        if (archiveTail) await archiveTail
-        if (!evidence || this.disposed || controller.signal.aborted)
-          throw new Error('The previous native result could not be checked.')
-        this.flushRunOutput(run)
-        this.publish(this.conversations.recordNativeEvidence(evidence))
-        if ('output' in evidence && evidence.output)
-          this.publish(
-            await this.conversations.recordNativeOutputComplete(
-              run.id,
-              evidence.output,
-              controller.signal,
-            ),
-          )
-        if (evidence.kind === 'ended') {
-          this.publish(this.conversations.settleKnownNativeEnding(run.id))
-          if (
-            evidence.outcome === 'completed' &&
-            evidence.output?.completeness === 'complete' &&
-            evidence.identity.nativeTurnId
-          )
-            this.reconcileOwnedCompletedCollaboration(run.id, {
-              nativeTurnId: evidence.identity.nativeTurnId,
-              source: evidence.source,
-              ...(evidence.identity.executorId ? { executorId: evidence.identity.executorId } : {}),
-            })
+              checkSignal,
+              checkContext,
+            )
+          })
+          const archiveTail = this.nativeObservations.get(run.id)?.archiveTail
+          if (archiveTail) await archiveTail
+          if (!evidence || this.disposed || controller.signal.aborted)
+            throw new Error('The previous native result could not be checked.')
+          this.flushRunOutput(run)
+          this.publish(this.conversations.recordNativeEvidence(evidence))
+          if ('output' in evidence && evidence.output)
+            this.publish(
+              await this.conversations.recordNativeOutputComplete(
+                run.id,
+                evidence.output,
+                controller.signal,
+              ),
+            )
+          if (evidence.kind === 'ended') {
+            this.publish(this.conversations.settleKnownNativeEnding(run.id))
+            if (
+              evidence.outcome === 'completed' &&
+              evidence.output?.completeness === 'complete' &&
+              evidence.identity.nativeTurnId
+            )
+              this.reconcileOwnedCompletedCollaboration(run.id, {
+                nativeTurnId: evidence.identity.nativeTurnId,
+                source: evidence.source,
+                ...(evidence.identity.executorId
+                  ? { executorId: evidence.identity.executorId }
+                  : {}),
+              })
+          }
+          return evidence.kind === 'ended'
+            ? { ok: true, value: this.conversations.contextPatch(run.sessionId) }
+            : {
+                ok: false,
+                error: {
+                  code: 'CONFLICT',
+                  message:
+                    'The previous native result was not confirmed. The current binding was not changed.',
+                },
+              }
+        } catch {
+          return {
+            ok: false,
+            error: {
+              code: 'CONFLICT',
+              message:
+                'The previous native result could not be checked. The current binding was not changed.',
+            },
+          }
         }
-        return evidence.kind === 'ended'
-          ? { ok: true, value: this.conversations.contextPatch(run.sessionId) }
-          : {
-              ok: false,
-              error: {
-                code: 'CONFLICT',
-                message:
-                  'The previous native result was not confirmed. The current binding was not changed.',
-              },
-            }
-      } catch {
-        return {
-          ok: false,
-          error: {
-            code: 'CONFLICT',
-            message:
-              'The previous native result could not be checked. The current binding was not changed.',
-          },
-        }
-      } finally {
-        const physicalOwner = this.nativeChecks.get(key)
-        if (physicalOwner?.controller === controller) physicalOwner.adapter = undefined
-        this.nativeChecks.delete(key)
-        this.nativeMetadataChanged()
-        this.schedulePendingRoutedContinuations()
-      }
-    })()
-    this.nativeChecks.set(key, {
-      controller,
-      task,
-      ...(receiptsOnly ? { receiptSessionId: run.sessionId } : {}),
-    })
-    this.nativeMetadataChanged()
-    return task
+      },
+      { ...(receiptsOnly ? { receiptSessionId: run.sessionId } : {}), automaticAttemptId },
+    )
   }
 
   private checkNativeBinding(
     sessionId: string,
     agentId: RuntimeAgentId,
     expectedRunId?: string,
+    automaticAttemptId?: string,
   ): Promise<RpcResult<ConversationPatch>> {
     const fork = this.conversations.forkOperation(sessionId)
     const forkBinding = this.conversations.nativeContext(sessionId, agentId)
@@ -4523,112 +6600,137 @@ export class Conversation {
     if (pending) return pending.task
     if (this.hasSessionOperation(sessionId, false, undefined, true))
       return Promise.resolve(Conversation.capacityFailure())
-    if (this.nativeChecks.size >= MAX_AGENT_OPERATIONS)
+    if (this.operationCount() >= MAX_AGENT_OPERATIONS)
       return Promise.resolve(Conversation.capacityFailure())
     const controller = new AbortController()
-    const task = (async (): Promise<RpcResult<ConversationPatch>> => {
-      const context = this.conversations.nativeContext(sessionId, agentId)
-      const candidate = context?.lastRunId
-        ? this.conversations.findRun(context.lastRunId)
-        : this.conversations.latestAgentRun(sessionId, agentId)
-      const run =
-        candidate?.bindingGeneration === context?.bindingGeneration &&
-        candidate?.nativeSessionId === context?.nativeSessionId
-          ? candidate
-          : undefined
-      if (expectedRunId && run?.id !== expectedRunId)
-        return {
-          ok: false,
-          error: {
-            code: 'CONFLICT',
-            message: 'The native plan source is no longer the current execution.',
-          },
-        }
-      if (!context)
-        return {
-          ok: false,
-          error: {
-            code: 'CONFLICT',
-            message:
-              'No native identity was confirmed. You can create a replacement without reexecuting the task.',
-          },
-        }
-      const generation = context.bindingGeneration ?? 1
-      this.publish(
-        this.conversations.setContinuation(sessionId, agentId, 'checking', undefined, generation),
-      )
-      try {
-        const session = this.sessions.find(sessionId)
-        const project = session && this.projects.find(session.projectId)
-        if (!session || !project) throw new Error('The Session project is unavailable.')
-        const executable = await this.runtimePreparation.findRecoveryExecutable(
-          agentId,
-          controller.signal,
-        )
-        if (executable === undefined)
-          throw new AgentExecutionError(
-            'runtime_incompatible',
-            'The native executable is unavailable. Restore the executable, then Retry.',
-            false,
-          )
-        const adapter = await this.adapterFor(
-          sessionId,
-          agentId,
-          executable,
-          controller.signal,
-          project.directoryPath,
-          (acquired) => {
-            const owner = this.nativeChecks.get(key)
-            if (owner?.controller !== controller || controller.signal.aborted)
-              throw new RunOperationConflictError('The native check is no longer current.')
-            owner.adapter = acquired
-            this.nativeMetadataChanged()
-          },
-        )
-        if (run) {
-          try {
-            await this.probeSteerInputs(run, adapter, controller.signal)
-          } catch {
-            // Receipt availability cannot change the separately checked root outcome.
+    let markLogicalTimeout: (() => void) | undefined
+    return this.startNativeCheck(
+      key,
+      controller,
+      async () => {
+        const context = this.conversations.nativeContext(sessionId, agentId)
+        const candidate = context?.lastRunId
+          ? this.conversations.findRun(context.lastRunId)
+          : this.conversations.latestAgentRun(sessionId, agentId)
+        const run =
+          candidate?.bindingGeneration === context?.bindingGeneration &&
+          candidate?.nativeSessionId === context?.nativeSessionId
+            ? candidate
+            : undefined
+        if (expectedRunId && run?.id !== expectedRunId)
+          return {
+            ok: false,
+            error: {
+              code: 'CONFLICT',
+              message: 'The native plan source is no longer the current execution.',
+            },
           }
-        }
-        const observeCheckedTitle = (nativeSessionId: string, logicalTitle?: string): void => {
+        if (!context)
+          return {
+            ok: false,
+            error: {
+              code: 'CONFLICT',
+              message:
+                'No native identity was confirmed. You can create a replacement without reexecuting the task.',
+            },
+          }
+        const generation = context.bindingGeneration ?? 1
+        markLogicalTimeout = () => {
           const current = this.conversations.nativeContext(sessionId, agentId)
           if (
             this.disposed ||
             controller.signal.aborted ||
-            this.adapters.get(key)?.adapter !== adapter ||
-            current?.nativeSessionId !== nativeSessionId ||
-            current.bindingGeneration !== generation
+            current?.bindingGeneration !== generation ||
+            current.nativeSessionId !== context.nativeSessionId
           )
             return
-          if (logicalTitle) {
-            // A late first title must follow the same save/priority guard as
-            // terminal enrichment before its Native name can be decorated.
-            if (!run || !this.conversations.ownsNativeControl(run.id)) return
+          const message =
+            'Native state check timed out. Cleanup remains pending. No task was reexecuted.'
+          this.publish(
+            this.conversations.setContinuation(
+              sessionId,
+              agentId,
+              'recovery_required',
+              message,
+              generation,
+              { kind: 'transient_transport', message, action: 'rebuild' },
+            ),
+          )
+        }
+        this.publish(
+          this.conversations.setContinuation(sessionId, agentId, 'checking', undefined, generation),
+        )
+        try {
+          const session = this.sessions.find(sessionId)
+          const project = session && this.projects.find(session.projectId)
+          if (!session || !project) throw new Error('The Session project is unavailable.')
+          const executable = await this.runtimePreparation.findRecoveryExecutable(
+            agentId,
+            controller.signal,
+          )
+          if (executable === undefined)
+            throw new AgentExecutionError(
+              'runtime_incompatible',
+              'The native executable is unavailable. Restore the executable, then Retry.',
+              false,
+            )
+          const adapter = await this.adapterFor(
+            sessionId,
+            agentId,
+            executable,
+            controller.signal,
+            project.directoryPath,
+            (acquired) => {
+              const owner = this.nativeChecks.get(key)
+              if (owner?.controller !== controller || controller.signal.aborted)
+                throw new RunOperationConflictError('The native check is no longer current.')
+              owner.adapter = acquired
+              this.nativeMetadataChanged()
+            },
+          )
+          if (run) {
             try {
-              this.publish(
-                this.conversations.applyEvent(sessionId, run.id, {
-                  agentId,
-                  type: 'session.title.updated',
-                  title: logicalTitle,
-                }),
-              )
-            } catch {
-              return // Title I/O cannot turn a reliable Native check into a failure.
+              await this.probeSteerInputs(run, adapter, controller)
+            } catch (error) {
+              if (controller.signal.aborted) throw error
+              // Receipt availability cannot change the separately checked root outcome.
             }
           }
-          this.observeNativeTitle(sessionId, adapter, nativeSessionId, generation)
-        }
-        if (!run) {
-          const initialized = this.conversations.confirmedNativeInitialization(sessionId, agentId)
-          if (!initialized || !adapter.probeNativeStatus)
-            throw new Error('There is no confirmed current initialization to check.')
-          const chunks = this.conversations.readNativeRebuildSource(initialized.rebuildId)
-          const evidence = await Conversation.withRecoveryDeadline(
-            controller,
-            () =>
-              adapter.probeNativeStatus!(
+          const observeCheckedTitle = (nativeSessionId: string, logicalTitle?: string): void => {
+            const current = this.conversations.nativeContext(sessionId, agentId)
+            if (
+              this.disposed ||
+              controller.signal.aborted ||
+              this.adapters.get(key)?.adapter !== adapter ||
+              current?.nativeSessionId !== nativeSessionId ||
+              current.bindingGeneration !== generation
+            )
+              return
+            if (logicalTitle) {
+              // A late first title must follow the same save/priority guard as
+              // terminal enrichment before its Native name can be decorated.
+              if (!run || !this.conversations.ownsNativeControl(run.id)) return
+              try {
+                this.publish(
+                  this.conversations.applyEvent(sessionId, run.id, {
+                    agentId,
+                    type: 'session.title.updated',
+                    title: logicalTitle,
+                  }),
+                )
+              } catch {
+                return // Title I/O cannot turn a reliable Native check into a failure.
+              }
+            }
+            this.observeNativeTitle(sessionId, adapter, nativeSessionId, generation)
+          }
+          if (!run) {
+            const initialized = this.conversations.confirmedNativeInitialization(sessionId, agentId)
+            if (!initialized || !adapter.beginNativeStatusCheck)
+              throw new Error('There is no confirmed current initialization to check.')
+            const chunks = this.conversations.readNativeRebuildSource(initialized.rebuildId)
+            const evidence = await this.runNativeCheck(controller, (checkContext, checkSignal) =>
+              adapter.beginNativeStatusCheck!(
                 {
                   target: 'initialized_binding',
                   resolveImage: (id, _signal) => this.resolveRebuildImage(sessionId, id),
@@ -4650,28 +6752,26 @@ export class Conversation {
                   })(),
                   observeNativeTitle: observeCheckedTitle,
                 },
-                controller.signal,
+                checkSignal,
+                checkContext,
               ),
-            undefined,
-          )
-          if (!evidence || controller.signal.aborted || this.disposed)
-            throw new Error('The initialized binding could not be checked.')
-          this.publish(this.conversations.recordNativeEvidence(evidence))
-          if (evidence.kind !== 'binding_ready')
-            throw new Error('Native initialization readback did not confirm this binding.')
-          this.scheduleNativeTitleSync(sessionId)
-          return { ok: true, value: this.conversations.contextPatch(sessionId) }
-        }
-        const evidence = await Conversation.withRecoveryDeadline(
-          controller,
-          async () => {
-            if (!adapter.probeNativeStatus)
+            )
+            if (!evidence || controller.signal.aborted || this.disposed)
+              throw new Error('The initialized binding could not be checked.')
+            this.publish(this.conversations.recordNativeEvidence(evidence))
+            if (evidence.kind !== 'binding_ready')
+              throw new Error('Native initialization readback did not confirm this binding.')
+            this.scheduleNativeTitleSync(sessionId)
+            return { ok: true, value: this.conversations.contextPatch(sessionId) }
+          }
+          const evidence = await this.runNativeCheck(controller, (checkContext, checkSignal) => {
+            if (!adapter.beginNativeStatusCheck)
               throw new AgentExecutionError(
                 'runtime_incompatible',
                 'The runtime cannot provide a safe native check. Update the runtime, then Retry.',
                 false,
               )
-            return adapter.probeNativeStatus(
+            return adapter.beginNativeStatusCheck(
               {
                 sessionId,
                 agentId,
@@ -4719,115 +6819,110 @@ export class Conversation {
                 effort: session.settings.agents[agentId].effort,
                 observeNativeTitle: observeCheckedTitle,
               },
-              controller.signal,
+              checkSignal,
+              checkContext,
             )
-          },
-          undefined,
-        )
-        if (!evidence || controller.signal.aborted)
-          throw new Error('The native check did not return evidence.')
-        const archiveTail = run && this.nativeObservations.get(run.id)?.archiveTail
-        if (archiveTail) await archiveTail
-        if (
-          this.disposed ||
-          controller.signal.aborted ||
-          this.conversations.nativeContext(sessionId, agentId)?.bindingGeneration !== generation
-        )
-          throw new RunOperationConflictError('The binding changed while checking.')
-        if (run) this.flushRunOutput(run)
-        this.publish(this.conversations.recordNativeEvidence(evidence))
-        if (run && 'output' in evidence && evidence.output) {
-          this.publish(
-            await this.conversations.recordNativeOutputComplete(
-              run.id,
-              evidence.output,
-              controller.signal,
-            ),
-          )
-        }
-        if (run && evidence.kind === 'ended') {
-          this.publish(this.conversations.settleKnownNativeEnding(run.id))
+          })
+          if (!evidence || controller.signal.aborted)
+            throw new Error('The native check did not return evidence.')
+          const archiveTail = run && this.nativeObservations.get(run.id)?.archiveTail
+          if (archiveTail) await archiveTail
           if (
-            evidence.outcome === 'completed' &&
-            evidence.output?.completeness === 'complete' &&
-            evidence.identity.nativeTurnId
+            this.disposed ||
+            controller.signal.aborted ||
+            this.conversations.nativeContext(sessionId, agentId)?.bindingGeneration !== generation
           )
-            this.reconcileOwnedCompletedCollaboration(run.id, {
-              nativeTurnId: evidence.identity.nativeTurnId,
-              source: evidence.source,
-              ...(evidence.identity.executorId ? { executorId: evidence.identity.executorId } : {}),
-            })
-        }
-        if (evidence.kind === 'no_evidence' || evidence.kind === 'missing')
+            throw new RunOperationConflictError('The binding changed while checking.')
+          if (run) this.flushRunOutput(run)
+          this.publish(this.conversations.recordNativeEvidence(evidence))
+          if (run && 'output' in evidence && evidence.output) {
+            this.publish(
+              await this.conversations.recordNativeOutputComplete(
+                run.id,
+                evidence.output,
+                controller.signal,
+              ),
+            )
+          }
+          if (run && evidence.kind === 'ended') {
+            this.publish(this.conversations.settleKnownNativeEnding(run.id))
+            if (
+              evidence.outcome === 'completed' &&
+              evidence.output?.completeness === 'complete' &&
+              evidence.identity.nativeTurnId
+            )
+              this.reconcileOwnedCompletedCollaboration(run.id, {
+                nativeTurnId: evidence.identity.nativeTurnId,
+                source: evidence.source,
+                ...(evidence.identity.executorId
+                  ? { executorId: evidence.identity.executorId }
+                  : {}),
+              })
+          }
+          if (evidence.kind === 'no_evidence' || evidence.kind === 'missing')
+            return {
+              ok: false,
+              error: {
+                code: 'NATIVE_CONTEXT_RECOVERY_REQUIRED',
+                message:
+                  evidence.kind === 'missing'
+                    ? 'The native session is unavailable. Rebuild it to continue.'
+                    : 'The native check did not confirm the Turn. You can retry or rebuild; no task was reexecuted.',
+              },
+            }
+          if (this.conversations.pendingNativeRebuild(sessionId, agentId))
+            this.publish(
+              this.conversations.setContinuation(
+                sessionId,
+                agentId,
+                'recovery_required',
+                'The candidate rebuild has not been confirmed. Check that creation or explicitly create another.',
+                generation,
+              ),
+            )
+          this.scheduleNativeTitleSync(sessionId)
+          return { ok: true, value: this.conversations.contextPatch(sessionId) }
+        } catch (error) {
+          if (this.disposed) return Conversation.shuttingDown()
+          const patch = this.conversations.setContinuation(
+            sessionId,
+            agentId,
+            'recovery_required',
+            safeNativePermissionText(
+              `Native state check failed: ${error instanceof Error ? error.message : 'No reliable response.'}`,
+              240,
+            ),
+            generation,
+            {
+              kind: classifyAgentError(error).kind,
+              message: safeNativePermissionText(
+                error instanceof Error ? error.message : 'No reliable native response.',
+                1024,
+              ),
+              action: [
+                'authentication_required',
+                'quota_or_rate_limit',
+                'permission_blocked',
+                'runtime_incompatible',
+                'response_too_large',
+              ].includes(classifyAgentError(error).kind)
+                ? 'retry'
+                : 'rebuild',
+            },
+          )
+          this.publish(patch)
           return {
             ok: false,
             error: {
               code: 'NATIVE_CONTEXT_RECOVERY_REQUIRED',
               message:
-                evidence.kind === 'missing'
-                  ? 'The native session is unavailable. Rebuild it to continue.'
-                  : 'The native check did not confirm the Turn. You can retry or rebuild; no task was reexecuted.',
+                'The native check did not provide reliable evidence. No task was reexecuted.',
             },
           }
-        if (this.conversations.pendingNativeRebuild(sessionId, agentId))
-          this.publish(
-            this.conversations.setContinuation(
-              sessionId,
-              agentId,
-              'recovery_required',
-              'The candidate rebuild has not been confirmed. Check that creation or explicitly create another.',
-              generation,
-            ),
-          )
-        this.scheduleNativeTitleSync(sessionId)
-        return { ok: true, value: this.conversations.contextPatch(sessionId) }
-      } catch (error) {
-        const patch = this.conversations.setContinuation(
-          sessionId,
-          agentId,
-          'recovery_required',
-          safeNativePermissionText(
-            `Native state check failed: ${error instanceof Error ? error.message : 'No reliable response.'}`,
-            240,
-          ),
-          generation,
-          {
-            kind: classifyAgentError(error).kind,
-            message: safeNativePermissionText(
-              error instanceof Error ? error.message : 'No reliable native response.',
-              1024,
-            ),
-            action: [
-              'authentication_required',
-              'quota_or_rate_limit',
-              'permission_blocked',
-              'runtime_incompatible',
-              'response_too_large',
-            ].includes(classifyAgentError(error).kind)
-              ? 'retry'
-              : 'rebuild',
-          },
-        )
-        this.publish(patch)
-        return {
-          ok: false,
-          error: {
-            code: 'NATIVE_CONTEXT_RECOVERY_REQUIRED',
-            message: 'The native check did not provide reliable evidence. No task was reexecuted.',
-          },
         }
-      }
-    })().finally(() => {
-      if (this.nativeChecks.get(key)?.controller === controller) {
-        this.nativeChecks.get(key)!.adapter = undefined
-        this.nativeChecks.delete(key)
-        this.nativeMetadataChanged()
-      }
-      this.schedulePendingRoutedContinuations()
-    })
-    this.nativeChecks.set(key, { controller, task })
-    this.nativeMetadataChanged()
-    return task
+      },
+      { automaticAttemptId, onLogicalTimeout: () => markLogicalTimeout?.() },
+    )
   }
 
   async rebuildNativeContext(
@@ -4985,34 +7080,42 @@ export class Conversation {
         abandon: input.abandon === true,
         ...(input.agentId === 'claude' ? { reservedNativeSessionId: randomUUID() } : {}),
       })
-      const rebuild: ActiveNativeRebuild = {
-        agentId: input.agentId,
-        rebuildId: input.clientOperationId,
-        abortController: new AbortController(),
-      }
-      this.nativeRebuilds.set(input.sessionId, rebuild)
-      this.workspaceChanges?.cancelUndoForNativeSession(input.sessionId)
       this.publish(patch)
-      rebuild.completion = this.runNativeContextRebuild(input.sessionId, rebuild).finally(() => {
-        if (this.nativeRebuilds.get(input.sessionId) === rebuild)
-          this.nativeRebuilds.delete(input.sessionId)
-        if (!this.disposed) this.publish(this.conversations.metadataPatch(input.sessionId))
-      })
+      this.startNativeRebuildOperation(input.sessionId, input.agentId, input.clientOperationId)
       return { ok: true, value: patch }
     } catch (error) {
       return Conversation.sendFailure(error)
     }
   }
 
+  private startNativeRebuildOperation(
+    sessionId: string,
+    agentId: RuntimeAgentId,
+    rebuildId: string,
+  ): void {
+    const rebuild: ActiveNativeRebuild = {
+      agentId,
+      rebuildId,
+      abortController: new AbortController(),
+    }
+    this.nativeRebuilds.set(sessionId, rebuild)
+    this.workspaceChanges?.cancelUndoForNativeSession(sessionId)
+    rebuild.completion = this.runNativeContextRebuild(sessionId, rebuild).finally(() => {
+      if (this.nativeRebuilds.get(sessionId) === rebuild) this.nativeRebuilds.delete(sessionId)
+      if (!this.disposed) this.publish(this.conversations.metadataPatch(sessionId))
+    })
+  }
+
   private checkNativeRebuild(
     sessionId: string,
     agentId: RuntimeAgentId,
     operation: NonNullable<ReturnType<ConversationRepository['nativeRebuildOperation']>>,
+    automaticAttemptId?: string,
   ): Promise<RpcResult<ConversationPatch>> {
     const key = `${sessionId}:${agentId}:rebuild`
     const pending = this.nativeChecks.get(key)
     if (pending) return pending.task
-    if (this.nativeChecks.size >= MAX_AGENT_OPERATIONS)
+    if (this.operationCount() >= MAX_AGENT_OPERATIONS)
       return Promise.resolve(Conversation.capacityFailure())
     if (this.hasSessionOperation(sessionId, false, undefined, true))
       return Promise.resolve(Conversation.archiveBusy())
@@ -5021,38 +7124,40 @@ export class Conversation {
       sessionId,
       agentId,
     )?.nativeSessionId
-    const task = (async (): Promise<RpcResult<ConversationPatch>> => {
-      try {
-        this.conversations.verifyRebuildReceipt(operation.id, sessionId, agentId)
-        const session = this.sessions.find(sessionId)
-        const project = session && this.projects.find(session.projectId)
-        if (!session || !project) throw new Error('The Session project is unavailable.')
-        const executable = await this.runtimePreparation.findRecoveryExecutable(
-          agentId,
-          controller.signal,
-        )
-        if (!executable) throw new Error('The native executable is unavailable.')
-        const adapter = await this.adapterFor(
-          sessionId,
-          agentId,
-          executable,
-          controller.signal,
-          project.directoryPath,
-          (acquired) => {
-            const owner = this.nativeChecks.get(key)
-            if (owner?.controller !== controller || controller.signal.aborted)
-              throw new RunOperationConflictError('The native check is no longer current.')
-            owner.adapter = acquired
-            this.nativeMetadataChanged()
-          },
-        )
-        const chunks = this.conversations.readNativeRebuildSource(operation.id)
+    return this.startNativeCheck(
+      key,
+      controller,
+      async () => {
+        try {
+          this.conversations.verifyRebuildReceipt(operation.id, sessionId, agentId)
+          const session = this.sessions.find(sessionId)
+          const project = session && this.projects.find(session.projectId)
+          if (!session || !project) throw new Error('The Session project is unavailable.')
+          const executable = await this.runtimePreparation.findRecoveryExecutable(
+            agentId,
+            controller.signal,
+          )
+          if (!executable) throw new Error('The native executable is unavailable.')
+          const adapter = await this.adapterFor(
+            sessionId,
+            agentId,
+            executable,
+            controller.signal,
+            project.directoryPath,
+            (acquired) => {
+              const owner = this.nativeChecks.get(key)
+              if (owner?.controller !== controller || controller.signal.aborted)
+                throw new RunOperationConflictError('The native check is no longer current.')
+              owner.adapter = acquired
+              this.nativeMetadataChanged()
+            },
+          )
+          const chunks = this.conversations.readNativeRebuildSource(operation.id)
 
-        const result = await Conversation.withRecoveryDeadline(
-          controller,
-          async () => {
-            if (!adapter.inspectNativeRebuild) return undefined
-            return adapter.inspectNativeRebuild(
+          const result = await this.runNativeCheck(controller, (checkContext, checkSignal) => {
+            if (!adapter.beginNativeRebuildCheck)
+              throw new Error('The runtime cannot own candidate inspection.')
+            return adapter.beginNativeRebuildCheck(
               {
                 rebuildId: operation.id,
                 sessionId,
@@ -5068,58 +7173,53 @@ export class Conversation {
               (async function* () {
                 yield* chunks
               })(),
-              controller.signal,
+              checkSignal,
+              checkContext,
             )
-          },
-          undefined,
-        )
-        if (this.disposed) throw new Error('Pact is shutting down.')
-        if (!result) {
-          this.publish(
-            this.conversations.recordNativeRebuildCheck(
-              sessionId,
-              agentId,
-              operation,
-              expectedNativeSessionId,
-            ),
-          )
-          return {
-            ok: false,
-            error: {
-              code: 'NATIVE_CONTEXT_RECOVERY_REQUIRED',
-              message: 'Pact couldn’t confirm the new session.',
-            },
+          })
+          if (controller.signal.aborted) throw new Error('The native check was interrupted.')
+          if (this.disposed) throw new Error('Pact is shutting down.')
+          if (!result) {
+            this.publish(
+              this.conversations.recordNativeRebuildCheck(
+                sessionId,
+                agentId,
+                operation,
+                expectedNativeSessionId,
+              ),
+            )
+            return {
+              ok: false,
+              error: {
+                code: 'NATIVE_CONTEXT_RECOVERY_REQUIRED',
+                message: 'Pact couldn’t confirm the new session.',
+              },
+            }
           }
+          const patch = this.conversations.completeNativeRebuild(
+            operation.id,
+            result.nativeSessionId,
+            adapter.executorId,
+            result.initializationWitness,
+          )
+          this.retireChangedSourceGrants(sessionId, agentId)
+          for (const interaction of this.permissions.values())
+            if (interaction.sessionId === sessionId && interaction.agentId === agentId)
+              interaction.visible = false
+          this.publish(patch)
+          this.scheduleNativeTitleSync(sessionId)
+          return { ok: true, value: patch }
+        } catch (error) {
+          return Conversation.sendFailure(error)
         }
-        const patch = this.conversations.completeNativeRebuild(
-          operation.id,
-          result.nativeSessionId,
-          adapter.executorId,
-          result.initializationWitness,
-        )
-        this.retireChangedSourceGrants(sessionId, agentId)
-        for (const interaction of this.permissions.values())
-          if (interaction.sessionId === sessionId && interaction.agentId === agentId)
-            interaction.visible = false
-        this.publish(patch)
-        this.scheduleNativeTitleSync(sessionId)
-        return { ok: true, value: patch }
-      } catch (error) {
-        return Conversation.sendFailure(error)
-      }
-    })().finally(() => {
-      if (this.nativeChecks.get(key)?.controller === controller) {
-        this.nativeChecks.get(key)!.adapter = undefined
-        this.nativeChecks.delete(key)
-        this.nativeMetadataChanged()
-      }
-      this.schedulePendingRoutedContinuations()
-      if (!this.disposed) this.recoveryResult(sessionId)
-    })
-    this.nativeChecks.set(key, { controller, task })
-    this.nativeMetadataChanged()
-    this.recoveryResult(sessionId)
-    return task
+      },
+      {
+        automaticAttemptId,
+        onPhysicalCompletion: () => {
+          if (!this.disposed) this.recoveryResult(sessionId)
+        },
+      },
+    )
   }
 
   private async runNativeContextRebuild(
@@ -5467,8 +7567,215 @@ export class Conversation {
     return { ok: true, value: { ready: true } }
   }
 
+  private createStreamTrace(run: AgentRun, owner: NativeObservation): OwnedStreamTrace | undefined {
+    try {
+      const reservation = owner.archiveMemory.reserve(8192)
+      const startedAt = performance.now()
+      return {
+        startedAt,
+        expiresAt: startedAt + STREAM_TRACE_TTL_MS,
+        reservation,
+        data: {
+          runId: run.id,
+          sessionId: run.sessionId,
+          generationSha256: createHash('sha256').update(owner.generation).digest('hex'),
+          capturedAfterMs: 0,
+          state: 'active',
+          nativeBound: false,
+          invalid: false,
+          outputFailed: false,
+          loop: {
+            text: 0,
+            reasoning: 0,
+            bytes: 0,
+            foreignThread: 0,
+            foreignTurn: 0,
+            missingIdentity: 0,
+            firstMs: null,
+            lastMs: null,
+          },
+          normalized: { text: 0, reasoning: 0, bytes: 0, current: 0, archived: 0, lastMs: null },
+          publication: { attempts: 0, suppressed: 0, published: 0, lastMs: null },
+          foregroundBuffer: null,
+          archiveBuffer: null,
+          transport: null,
+        },
+      }
+    } catch {
+      return undefined
+    }
+  }
+
+  private currentStreamTrace(owner: NativeObservation): OwnedStreamTrace | undefined {
+    const trace = owner.streamTrace
+    if (!trace) return undefined
+    if (
+      performance.now() >= trace.expiresAt ||
+      this.nativeObservations.get(trace.data.runId) !== owner
+    ) {
+      trace.reservation.release()
+      owner.streamTrace = undefined
+      return undefined
+    }
+    const elapsed = Math.floor(performance.now() - trace.startedAt)
+    if (!Number.isSafeInteger(elapsed) || elapsed < 0) trace.data.invalid = true
+    else trace.data.capturedAfterMs = elapsed
+    return trace
+  }
+
+  private bumpStreamTrace(
+    trace: OwnedStreamTrace,
+    group: Record<string, number | null>,
+    key: string,
+    amount = 1,
+  ): void {
+    if (trace.data.invalid) return
+    const value = group[key]
+    if (
+      typeof value !== 'number' ||
+      !Number.isSafeInteger(amount) ||
+      amount < 0 ||
+      !Number.isSafeInteger(value + amount)
+    ) {
+      trace.data.invalid = true
+      return
+    }
+    group[key] = value + amount
+  }
+
+  private observeNativeDelta(
+    owner: NativeObservation,
+    value: import('@pact/contracts').NativeLoopDeltaObservation,
+  ): void {
+    const trace = this.currentStreamTrace(owner)
+    if (!trace || trace.data.invalid) return
+    if (
+      !['text', 'reasoning'].includes(value.kind) ||
+      !Number.isSafeInteger(value.bytes) ||
+      value.bytes <= 0
+    ) {
+      trace.data.invalid = true
+      return
+    }
+    if (value.identity !== 'matched') {
+      const key = {
+        foreign_thread: 'foreignThread',
+        foreign_turn: 'foreignTurn',
+        missing_identity: 'missingIdentity',
+      }[value.identity]
+      this.bumpStreamTrace(trace, trace.data.loop, key)
+      return
+    }
+    this.bumpStreamTrace(trace, trace.data.loop, value.kind)
+    this.bumpStreamTrace(trace, trace.data.loop, 'bytes', value.bytes)
+    trace.data.loop.firstMs ??= trace.data.capturedAfterMs
+    trace.data.loop.lastMs = trace.data.capturedAfterMs
+  }
+
+  private observeNormalizedDelta(
+    owner: NativeObservation,
+    event: import('@pact/contracts').NormalizedAgentEvent,
+    archived: boolean,
+  ): void {
+    if (event.type !== 'text.delta' && event.type !== 'reasoning.summary.delta') return
+    if (!event.text.length) return
+    const trace = this.currentStreamTrace(owner)
+    if (!trace || trace.data.invalid) return
+    this.bumpStreamTrace(
+      trace,
+      trace.data.normalized,
+      event.type === 'text.delta' ? 'text' : 'reasoning',
+    )
+    this.bumpStreamTrace(
+      trace,
+      trace.data.normalized,
+      'bytes',
+      Buffer.byteLength(event.text, 'utf8'),
+    )
+    this.bumpStreamTrace(trace, trace.data.normalized, archived ? 'archived' : 'current')
+    trace.data.normalized.lastMs = trace.data.capturedAfterMs
+  }
+
+  private projectStreamTrace(
+    owner: NativeObservation,
+    foreground?: AgentStreamBuffer,
+  ): import('@pact/contracts').ConversationStreamTrace | undefined {
+    const trace = this.currentStreamTrace(owner)
+    if (!trace) return undefined
+    try {
+      const execution = this.activeExecutions.get(trace.data.sessionId)
+      const buffer =
+        foreground ?? (execution?.run.id === trace.data.runId ? execution.streamBuffer : undefined)
+      if (buffer) trace.data.foregroundBuffer = buffer.diagnostics()
+      if (owner.archiveBuffer) trace.data.archiveBuffer = owner.archiveBuffer.diagnostics()
+      trace.data.outputFailed = Boolean(owner.outputFailure)
+      const run = this.conversations.findRun(trace.data.runId)
+      trace.data.nativeBound = Boolean(run?.nativeSessionId && run.nativeTurnId)
+      if (
+        owner.adapter instanceof CodexAgentAdapter &&
+        typeof owner.adapter.diagnostics === 'function'
+      ) {
+        const facts = owner.adapter.diagnostics()
+        trace.data.transport = {
+          queuedMessages: facts.queuedMessages,
+          queuedInboundBytes: facts.queuedInboundBytes,
+          stdoutPaused: facts.stdoutPaused,
+          open: facts.open,
+        }
+      }
+      const parsed = conversationStreamTraceSchema.safeParse(trace.data)
+      if (!parsed.success) {
+        trace.reservation.release()
+        owner.streamTrace = undefined
+        return undefined
+      }
+      return parsed.data
+    } catch {
+      trace.reservation.release()
+      owner.streamTrace = undefined
+      return undefined
+    }
+  }
+
+  private retireStreamTrace(owner: NativeObservation, foreground?: AgentStreamBuffer): void {
+    const snapshot = this.projectStreamTrace(owner, foreground),
+      trace = owner.streamTrace
+    owner.streamTrace = undefined
+    if (!snapshot || !trace) return
+    try {
+      snapshot.state =
+        this.conversations.findRun(snapshot.runId)?.nativeEffectsState === 'settled'
+          ? 'settled'
+          : 'retired'
+      this.lastSettledStreamTrace?.reservation.release()
+      trace.data = snapshot
+      this.lastSettledStreamTrace = trace
+    } catch {
+      trace.reservation.release()
+    }
+  }
+
+  private streamTraceProjections(): import('@pact/contracts').ConversationStreamTrace[] {
+    const result: import('@pact/contracts').ConversationStreamTrace[] = []
+    for (const owner of this.nativeObservations.values()) this.currentStreamTrace(owner)
+    for (const execution of this.activeExecutions.values()) {
+      const owner = this.nativeObservations.get(execution.run.id)
+      const trace = owner && this.projectStreamTrace(owner, execution.streamBuffer)
+      if (trace) result.push(trace)
+    }
+    const last = this.lastSettledStreamTrace
+    if (last && performance.now() >= last.expiresAt) {
+      last.reservation.release()
+      this.lastSettledStreamTrace = undefined
+    } else if (last && !result.some((trace) => trace.runId === last.data.runId))
+      result.push(structuredClone(last.data))
+    return result
+  }
+
   diagnostics() {
     return {
+      interestedSessionIds: [...this.interestedSessionIds],
+      streamTraces: this.streamTraceProjections(),
       interestedSessions: this.interestedSessionIds.size,
       suppressedProgress: this.suppressedProgress,
       publishedProgress: this.publishedProgress,
@@ -5503,13 +7810,23 @@ export class Conversation {
 
   private async close(): Promise<void> {
     this.disposed = true
+    if (this.pendingContinuationImmediate) clearImmediate(this.pendingContinuationImmediate)
+    this.pendingContinuationImmediate = undefined
+    this.workflowCandidateCursor = undefined
+    this.workflowCandidateRescan = false
+    this.decisionRuntime?.controller.abort()
+    const decisionProbe =
+      this.decisionRuntime?.kind === 'probe' ? this.decisionRuntime.task : undefined
+    const decisionCleanup = this.decisionRuntime?.runtime?.dispose().catch(() => false)
+    this.hostDecisionCapability = undefined
+    this.contextDecisionCapability = undefined
     await this.markdownWorker?.terminate()
     await this.markdownTail
     const forkOwners = [...this.nativeForks.values()]
     const forkPreparations = [...this.forkPreparations.values()]
     for (const owner of forkOwners) owner.controller.abort()
-    for (const check of this.nativeChecks.values()) check.controller.abort()
-    this.nativeChecks.clear()
+    const nativeChecks = [...this.nativeChecks.values()]
+    for (const check of nativeChecks) check.controller.abort()
     this.interestedSessionIds.clear()
     this.steerReceiptChecks.clear()
     const executions = [...this.activeExecutions.values()]
@@ -5552,7 +7869,10 @@ export class Conversation {
     await this.adapterSlotTail
     const adapters = [...this.adapters.values()]
     this.adapters.clear()
-    for (const owner of this.nativeObservations.values()) owner.archiveController.abort()
+    for (const owner of this.nativeObservations.values()) {
+      owner.sourceReader?.retire()
+      owner.archiveController.abort()
+    }
     await Promise.allSettled(
       [...this.nativeObservations.values()].flatMap((owner) =>
         owner.archiveTail ? [owner.archiveTail] : [],
@@ -5565,13 +7885,24 @@ export class Conversation {
         flushed = false
       }
     }
+    for (const owner of this.nativeObservations.values()) {
+      owner.streamTrace?.reservation.release()
+      owner.streamTrace = undefined
+    }
+    this.lastSettledStreamTrace?.reservation.release()
+    this.lastSettledStreamTrace = undefined
     this.nativeObservations.clear()
     const cleanup = await Promise.allSettled([
+      ...(decisionCleanup ? [decisionCleanup] : []),
+      ...(decisionProbe ? [decisionProbe] : []),
+      ...(this.decisionRecovery ? [this.decisionRecovery] : []),
+      ...[...this.collaborationActions.values()].map((owner) => owner.task),
       ...adapters.map(async ({ adapter }) => {
         await adapter.dispose()
       }),
       ...forkOwners.flatMap((owner) => (owner.completion ? [owner.completion] : [])),
       ...forkPreparations.map((owner) => owner.task),
+      ...nativeChecks.map((owner) => owner.physicalCompletion),
       ...titleEnrichments.map(({ promise }) => promise),
       ...nativeTitleSyncs.map(({ promise }) => promise),
       ...executions.flatMap((execution) => (execution.completion ? [execution.completion] : [])),
@@ -5589,7 +7920,11 @@ export class Conversation {
     this.forkPreparations.clear()
     this.listeners.clear()
     await this.images?.dispose()
-    if (!flushed || cleanup.some((result) => result.status === 'rejected'))
+    if (
+      !flushed ||
+      (await decisionCleanup) === false ||
+      cleanup.some((result) => result.status === 'rejected')
+    )
       throw new Error(
         'Pact could not finish all output commits and resource cleanup before shutdown.',
       )
@@ -5833,21 +8168,23 @@ export class Conversation {
     }
   }
 
-  private schedulePendingRoutedContinuations(): void {
+  private schedulePendingRoutedContinuations(continueWorkflowScan = false): void {
     if (this.disposed) return
+    if (!continueWorkflowScan && this.workflowCandidateCursor) this.workflowCandidateRescan = true
     if (this.pendingContinuationScheduled) {
       this.pendingContinuationWakeAgain = true
       return
     }
     this.pendingContinuationScheduled = true
-    queueMicrotask(() => {
+    this.pendingContinuationImmediate = setImmediate(() => {
+      this.pendingContinuationImmediate = undefined
       void this.resumePendingRoutedContinuations()
         .catch(() => undefined)
         .finally(() => {
           this.pendingContinuationScheduled = false
           if (this.pendingContinuationWakeAgain) {
             this.pendingContinuationWakeAgain = false
-            this.schedulePendingRoutedContinuations()
+            this.schedulePendingRoutedContinuations(Boolean(this.workflowCandidateCursor))
           }
         })
     })
@@ -5975,6 +8312,30 @@ export class Conversation {
   }
 
   private async resumePendingRoutedContinuations(): Promise<void> {
+    for (const pending of this.conversations.pendingPreparedInformationDefaults()) {
+      if (this.disposed || this.operationCount() >= MAX_AGENT_OPERATIONS) break
+      if (this.hasSessionOperation(pending.sessionId)) continue
+      const prepared = this.conversations.takePreparedInformationDefault(pending.batchId)
+      if (!prepared || 'paused' in prepared) {
+        this.publish(
+          this.conversations.metadataPatch(pending.sessionId, {
+            draftsChanged: Boolean(prepared?.draftsChanged),
+          }),
+        )
+        continue
+      }
+      const sending = this.enqueueSend(prepared.input, { preparedInput: prepared.receipt })
+      void sending
+        .finally(() => {
+          const draftsChanged = this.conversations.cancelPreparedInputDispatch(
+            prepared.receipt,
+            'preparation_failed',
+          )
+          if (!this.disposed)
+            this.publish(this.conversations.metadataPatch(pending.sessionId, { draftsChanged }))
+        })
+        .catch(() => undefined)
+    }
     for (const pending of this.conversations.pendingCollaborationInputs()) {
       void this.dispatchReceivedInput(pending.sessionId).catch(() => {
         if (
@@ -5989,7 +8350,9 @@ export class Conversation {
           )
       })
     }
-    for (const pending of this.conversations.pendingWorkflowTasks())
+    if (!this.workflowCandidateCursor) this.workflowCandidateRescan = false
+    const workflowCandidates = this.conversations.pendingWorkflowTasks(this.workflowCandidateCursor)
+    for (const pending of workflowCandidates)
       void this.dispatchWorkflowContinuation(pending.sessionId).catch((error) => {
         const task = this.conversations.collaboration(pending.sessionId)
         if (!task || task.automation !== 'active') return
@@ -6006,6 +8369,23 @@ export class Conversation {
           }),
         )
       })
+    // Five metadata candidates are a page, not a limit on which Sessions may progress.
+    // The existing coalesced wake yields between pages; physical capacity remains authoritative.
+    if (
+      workflowCandidates.length === 5 &&
+      this.operationCount() < MAX_AGENT_OPERATIONS &&
+      !this.disposed
+    ) {
+      const last = workflowCandidates.at(-1)!
+      this.workflowCandidateCursor = { updatedAt: last.updatedAt, id: last.id }
+      this.pendingContinuationWakeAgain = true
+    } else {
+      this.workflowCandidateCursor = undefined
+      if (this.workflowCandidateRescan) {
+        this.workflowCandidateRescan = false
+        this.pendingContinuationWakeAgain = true
+      }
+    }
     for (const pending of this.conversations.pendingRoutedContinuations()) {
       if (
         this.disposed ||
@@ -6025,6 +8405,218 @@ export class Conversation {
       this.workspaceChanges?.cancelUndoForNativeSession(pending.sessionId)
       continuation.completion = this.preparePendingRoutedContinuation(pending, continuation)
     }
+    void this.resumeAutomaticRecovery().catch(() => undefined)
+  }
+
+  /** Consume changed fault facts once, including skipped/busy facts. There is no recovery queue. */
+  private async resumeAutomaticRecovery(): Promise<void> {
+    if (this.disposed || this.nativeQuitSealed()) return
+    for (;;) {
+      const candidates = this.conversations.takeSchedulingRecoveryFaults()
+      if (!candidates.length) return
+      for (const { fault, node } of candidates) {
+        try {
+          const settings = this.conversations.schedulingSettings()
+          if (
+            !settings.enabled ||
+            !settings.selection ||
+            this.decisionRuntime ||
+            this.decisionRecovery ||
+            this.conversations.activeSchedulingRuntimeOwner() ||
+            [...this.nativeChecks.keys()].some((key) => key.startsWith(`${node.sessionId}:`)) ||
+            this.operationCount() >= MAX_AGENT_OPERATIONS ||
+            this.hasSessionOperation(node.sessionId, false, undefined, true) ||
+            this.conversations.archives.blocksSession(node.sessionId) ||
+            this.pendingNativeInteractions(node.sessionId).length
+          )
+            continue
+          const session = this.sessions.find(node.sessionId),
+            task = this.conversations.collaboration(node.sessionId)
+          if (
+            !session ||
+            session.status === 'archived' ||
+            this.projects.find(session.projectId)?.archivedAt ||
+            (task?.automation === 'paused' && task.pauseReason !== 'failure')
+          )
+            continue
+          const run =
+              node.freshnessGuard.runId && this.conversations.findRun(node.freshnessGuard.runId),
+            binding = this.conversations.nativeContext(node.sessionId, fault.agentId)
+          if (
+            !run ||
+            run.forkSourceRunId ||
+            run.controlDisposition === 'abandoned' ||
+            !run.nativeSessionId ||
+            this.conversations.latestAgentRun(node.sessionId, fault.agentId)?.id !== run.id ||
+            (binding &&
+              (binding.bindingGeneration !== run.bindingGeneration ||
+                binding.nativeSessionId !== run.nativeSessionId)) ||
+            [
+              'user_stopped',
+              'authentication_required',
+              'quota_or_rate_limit',
+              'permission_blocked',
+              'runtime_incompatible',
+            ].includes(run.failureKind ?? '')
+          )
+            continue
+          if (
+            fault.faultKind === 'run' &&
+            run.dispatchPhase === 'ended' &&
+            this.conversations.hasCompleteResponse(run.id) &&
+            run.nativeEffectsState === 'settled'
+          )
+            continue
+          const generation = this.conversations.schedulingConfigurationGeneration()
+          let observation = this.schedulingObservation(
+            this.contextDecisionCapability,
+            this.schedulingScope(node.sessionId),
+          )
+          if (observation.status !== 'supported') {
+            if (this.decisionRuntimeAdmission(node.sessionId) !== 'may_attempt') continue
+            // A new Session or an expired observation needs zero-Turn native evidence.
+            // Use the existing probe owner once for this consumed fault, without a retry queue.
+            // oxlint-disable-next-line no-await-in-loop -- One fault uses the global probe lease; later busy facts are consumed without queuing.
+            const refreshed = await this.refreshSchedulingState({ sessionId: node.sessionId })
+            if (!refreshed.ok || !refreshed.value.context) continue
+            observation = refreshed.value.context.observation
+          }
+          if (
+            observation.status !== 'supported' ||
+            this.disposed ||
+            this.nativeQuitSealed() ||
+            this.conversations.schedulingConfigurationGeneration() !== generation ||
+            this.decisionRuntime ||
+            this.decisionRecovery ||
+            this.conversations.activeSchedulingRuntimeOwner() ||
+            this.hasSessionOperation(node.sessionId, false, undefined, true) ||
+            this.pendingNativeInteractions(node.sessionId).length ||
+            this.conversations.archives.blocksSession(node.sessionId)
+          )
+            continue
+          if (
+            fault.faultKind === 'run' &&
+            !run.reexecutedFromRunId &&
+            this.conversations.executionInput(run.id)?.proof &&
+            ['not_dispatched', 'settled'].includes(run.nativeEffectsState ?? '') &&
+            !this.hasSessionOperation(node.sessionId, true)
+          ) {
+            this.launchConfirmedUnsentReexecution(fault.id, node)
+            continue
+          }
+          if (
+            fault.faultKind === 'run' &&
+            ['not_sent', 'rejected'].includes(run.dispatchPhase ?? '')
+          )
+            continue
+          const rebuild =
+            fault.faultKind === 'rebuild'
+              ? this.conversations.nativeRebuildOperation(fault.faultId)
+              : undefined
+          if (
+            fault.faultKind === 'rebuild' &&
+            (!rebuild ||
+              rebuild.stage !== 'unconfirmed' ||
+              !rebuild.provisionalNativeSessionId ||
+              !rebuild.sourceHash)
+          )
+            continue
+          const attempt = this.conversations.reserveSchedulingRecoveryCheck(
+            fault.id,
+            node,
+            process.pid,
+          )
+          if (!attempt) continue
+          const checking =
+            fault.faultKind === 'rebuild'
+              ? this.checkNativeRebuild(node.sessionId, fault.agentId, rebuild!, attempt.id)
+              : fault.faultKind === 'queue'
+                ? this.inspectPreviousRun(run, true, attempt.id)
+                : this.checkNativeBinding(node.sessionId, fault.agentId, run.id, attempt.id)
+          if (
+            ![...this.nativeChecks.values()].some(
+              (entry) => entry.automaticAttemptId === attempt.id,
+            )
+          )
+            this.conversations.settleSchedulingRecoveryCheck(attempt.id, {
+              ok: false,
+              physicalReleased: true,
+            })
+          void checking.catch(() => undefined)
+        } catch {
+          // Unavailable/stale facts keep their original manual recovery path; no new card or retry.
+        }
+      }
+    }
+  }
+
+  private launchConfirmedUnsentReexecution(
+    faultId: string,
+    node: import('@pact/contracts').SchedulingHandoff,
+  ): void {
+    const original =
+      node.freshnessGuard.runId && this.conversations.findRun(node.freshnessGuard.runId)
+    if (!original) return
+    const saved = this.conversations.executionInput(original.id)
+    const cached = this.adapters.get(`${original.sessionId}:${original.agentId}`)
+    const settings = this.sessions.findSettingsRevision(
+      original.sessionId,
+      original.settingsRevision,
+    )
+    if (
+      !saved?.proof ||
+      !cached ||
+      cached.adapter.executorId !== saved.proof.executorId ||
+      !settings
+    )
+      return
+    const snapshot = this.conversations.frozenExecutionEnvelope(original.id)
+    const prompt = restoreExecutionInput(
+      snapshot,
+      (image) => {
+        if (!this.images)
+          throw new RunOperationConflictError('The original image source is unavailable.')
+        return this.images.resolve(original.sessionId, image)
+      },
+      this.conversations.skillInvocation(original.userMessageId),
+    )
+    const started = this.conversations.beginConfirmedUnsentReexecution({
+      operationId: randomUUID(),
+      faultId,
+      handoff: node,
+    })
+    if (!started.created) return
+    this.publish(started.patch)
+    void this.trackExecution(started.run, async (execution) => {
+      const prepared = await this.prepareSession(
+        original.sessionId,
+        execution.abortController.signal,
+      )
+      if (!prepared.ok)
+        throw new AgentExecutionError('runtime_incompatible', prepared.error.message, false)
+      if (
+        this.adapters.get(`${original.sessionId}:${original.agentId}`)?.adapter !==
+          cached.adapter ||
+        !this.conversations.canDispatchReexecution(started.run.id)
+      )
+        throw new NativeInputWithheldError()
+      await this.executeAttempts(
+        execution,
+        started.run,
+        prompt,
+        prepared.value.projectDirectory,
+        settings,
+        prepared.value.executablePaths,
+      )
+      if (this.conversations.findRun(started.run.id)?.status === 'completed')
+        await this.executeRoutedContinuation(
+          execution,
+          started.run.userMessageId,
+          prepared.value.projectDirectory,
+          settings,
+          prepared.value.executablePaths,
+        )
+    })
   }
 
   private async preparePendingRoutedContinuation(
@@ -6148,6 +8740,8 @@ export class Conversation {
               (!owner.archiveBuffer.flush() || !owner.archiveBuffer.dispose())
             )
               throw new Error('The late native output could not be committed.')
+            this.retireStreamTrace(owner, execution.streamBuffer)
+            owner.sourceReader?.retire()
             this.nativeObservations.delete(execution.run.id)
             if (this.conversations.findRun(execution.run.id)?.nativeEffectsState === 'pending')
               this.publish(
@@ -6291,6 +8885,7 @@ export class Conversation {
       archiveMemory: new NativeWorkingMemory(),
     }
     this.nativeObservations.set(run.id, owner)
+    owner.streamTrace = this.createStreamTrace(run, owner)
     const stillOwned = (): boolean =>
       !this.disposed && this.nativeObservations.get(run.id) === owner
     const ownsCurrentNativeRun = (): boolean =>
@@ -6306,7 +8901,7 @@ export class Conversation {
         ownsCurrentNativeRun()
           ? this.conversations.applyStreamBatch(run.sessionId, run.id, events)
           : this.conversations.applyArchivedBatch(run.sessionId, run.id, events),
-      (patch) => this.publish(patch, true),
+      (patch) => this.publish(patch, true, owner),
       (error) => {
         this.failRunOutput(run, error)
       },
@@ -6329,6 +8924,7 @@ export class Conversation {
         this.failRunOutput(run, error)
         return
       }
+      this.observeNormalizedDelta(owner, fact, true)
       const large =
         fact.type === 'text.completed' &&
         Buffer.byteLength(fact.text, 'utf8') > CONVERSATION_MARKDOWN_BYTES
@@ -6349,7 +8945,7 @@ export class Conversation {
         if (fact.type === 'text.delta' || fact.type === 'reasoning.summary.delta') {
           owner.archiveBuffer ??= new AgentStreamBuffer(
             (events) => this.conversations.applyArchivedBatch(run.sessionId, run.id, events),
-            (patch) => this.publish(patch, true),
+            (patch) => this.publish(patch, true, owner),
             (error) => {
               this.failRunOutput(run, error)
             },
@@ -6468,6 +9064,8 @@ export class Conversation {
       buffer.dispose()
       owner.archiveBuffer?.dispose()
       if (owner.outputFailure) this.workspaceChanges?.observeUncertainEffects(run.id)
+      this.retireStreamTrace(owner, buffer)
+      owner.sourceReader?.retire()
       this.nativeObservations.delete(run.id)
       void this.finalizeWorkspaceChanges(run.id).catch(() => undefined)
     }
@@ -6490,8 +9088,8 @@ export class Conversation {
       promptEnvelope.collaborationAuthorization = this.conversations.collaborationTurnAuthorization(
         run.id,
       )
-      promptEnvelope.inputBatchRef =
-        this.conversations.inputBatchForRun(run.id) ?? promptEnvelope.inputBatchRef
+      const originalInputBatch = this.conversations.inputBatchForRun(run.id)
+      promptEnvelope.inputBatchRef = originalInputBatch ?? promptEnvelope.inputBatchRef
       promptEnvelope.requiredInputScopeRef =
         promptEnvelope.collaborationAuthorization?.sourceManifestRef ?? undefined
       // Recovery and Handoff retain their original frozen source scope, but each
@@ -6502,6 +9100,33 @@ export class Conversation {
         promptEnvelope.handoffContext?.some((source) => source.inputBatchRef)
           ? { runId: run.id, grant: generation }
           : undefined
+      if (promptEnvelope.sourceGrant)
+        owner.sourceReader = new FrozenSourceReader(
+          promptEnvelope.sourceGrant,
+          run.sessionId,
+          this.conversations,
+          () => stillOwned() && !signal.aborted && this.ownsFrozenSourceRoot(run),
+          () => execution.promptEnvelope?.inputBatchRef?.id ?? promptEnvelope.inputBatchRef?.id,
+          (error) => {
+            recordDiagnostic({
+              operation: 'native_check',
+              phase: 'failed',
+              level: 'warn',
+              scope: 'run',
+              sessionId: run.sessionId,
+              runId: run.id,
+              agentId: run.agentId,
+              runtimeBoundary: 'source_read',
+              code: classifyAgentError(error).kind,
+              runtimeErrorType:
+                diagnosticEventSchema.shape.runtimeErrorType.safeParse(
+                  error instanceof Error ? error.name : 'other',
+                ).data ?? 'other',
+            })
+          },
+          signal,
+          originalInputBatch?.id,
+        )
       execution.promptEnvelope = promptEnvelope
       adapter.preflightPrompt?.({
         runId: run.id,
@@ -6528,8 +9153,71 @@ export class Conversation {
           signal,
         )
       promptEnvelope.targetAgentId = run.agentId
+      let recovery: AgentRunInput['recovery']
+      const schedulingSettings = this.conversations.schedulingSettings()
+      if (schedulingSettings.enabled && schedulingSettings.selection) {
+        let captureMemory: ReturnType<NativeWorkingMemory['reserve']> | undefined
+        try {
+          captureMemory = new NativeWorkingMemory().reserve(8 * 1024 * 1024 + 128 * 1024)
+          const captured = await this.conversations.captureExecutionInput({
+            runId: run.id,
+            nativeGeneration: generation,
+            requested: {
+              provider: run.agentId,
+              model: settings.agents[run.agentId].model,
+              effort: settings.agents[run.agentId].effort,
+              speed: run.speed ?? 'native',
+              permissionMode: run.permissionMode ?? 'native',
+            },
+            source: encodeNativeJsonFrame(pathlessExecutionInput(promptEnvelope), signal),
+            signal,
+          })
+          const original = run.reexecutedFromRunId
+            ? this.conversations.executionInput(run.reexecutedFromRunId)
+            : undefined
+          if (captured)
+            recovery = {
+              inputSha256: captured.inputSha256,
+              ...(original?.effective && original.proof
+                ? {
+                    expected: {
+                      settings: original.effective,
+                      executorId: original.proof.executorId,
+                      nativeSessionId: original.proof.nativeSessionId,
+                    },
+                    canDispatch: () =>
+                      currentControl() &&
+                      !signal.aborted &&
+                      !this.pendingNativeInteractions(run.sessionId).length &&
+                      this.conversations.canDispatchReexecution(run.id),
+                  }
+                : {}),
+              recordEffectiveSettings: (effective, identity) => {
+                if (stillOwned())
+                  this.conversations.recordEffectiveExecutionSettings(
+                    run.id,
+                    generation,
+                    effective,
+                    identity,
+                  )
+              },
+              recordConfirmedUnsent: (boundary, identity) => {
+                if (stillOwned())
+                  this.conversations.recordConfirmedUnsent(run.id, generation, boundary, identity)
+              },
+            }
+        } catch (error) {
+          if (signal.aborted || run.reexecutedFromRunId) throw error
+          // Optional capture failure cannot change the user's original Send.
+        } finally {
+          captureMemory?.release()
+        }
+      }
+      if (run.reexecutedFromRunId && (!recovery?.expected || !recovery.canDispatch?.()))
+        throw new NativeInputWithheldError()
       for await (const event of adapter.run(
         {
+          recovery,
           runId: run.id,
           sessionId: run.sessionId,
           permissionMode: run.permissionMode,
@@ -6595,6 +9283,9 @@ export class Conversation {
             if (phase === 'possibly_sent' || phase === 'accepted') execution.deliveryPossible = true
             if (stillOwned())
               this.publish(this.conversations.recordDispatch(run.id, phase, nativeId, executorId))
+          },
+          observeNativeDelta: (value) => {
+            if (stillOwned()) this.observeNativeDelta(owner, value)
           },
           recordNativeEvidence: (evidence) => {
             if (
@@ -6674,99 +9365,17 @@ export class Conversation {
             if (stillOwned()) this.failRunOutput(run, error)
           },
           recordArchivedEvent: archive,
-          readCollaborationSourcePart:
-            promptEnvelope.collaboration ||
-            promptEnvelope.inputBatchRef ||
-            promptEnvelope.handoffContext?.some((source) => source.inputBatchRef)
-              ? (raw) => {
-                  try {
-                    if (!stillOwned() || signal.aborted || !this.ownsFrozenSourceRoot(run))
-                      throw new Error('The source reader belongs to a retired Turn.')
-                    const input = collaborationSourceReadSchema.parse(raw)
-                    if (input.runId !== run.id || input.grant !== generation)
-                      throw new Error('This source capability does not belong to the current root.')
-                    if (input.source === 'document') {
-                      if (!input.document) throw new Error('Supply the frozen document reference.')
-                      const body = this.conversations.collaborationDocumentRow(
-                        run.sessionId,
-                        input.document,
-                      )
-                      if (!this.conversations.sourceDocumentAuthorized(run.id, input.document))
-                        throw new Error('The document is outside this Run authorization.')
-                      const page = this.conversations.readPage({
-                        scope: 'collaboration-text',
-                        sessionId: run.sessionId,
-                        runId: body.sourceRunId ?? run.id,
-                        document: input.document,
-                        offset: input.offset,
-                      })
-                      if (page.scope !== 'collaboration-text')
-                        throw new Error('The document source changed.')
-                      let text = page.text.slice(0, 4096)
-                      if (text.length < page.text.length && /[\uD800-\uDBFF]/u.test(text.at(-1)!))
-                        text = text.slice(0, -1)
-                      return {
-                        source: input.source,
-                        document: input.document,
-                        text,
-                        offset: input.offset,
-                        nextOffset:
-                          input.offset + text.length < input.document.chars
-                            ? input.offset + text.length
-                            : null,
-                      }
-                    }
-                    const after = input.offset - 1
-                    if (input.source === 'batch') {
-                      const batchId = input.batchId ?? promptEnvelope.inputBatchRef?.id
-                      if (!batchId) throw new Error('The frozen input Batch is unavailable.')
-                      const page = this.conversations.readFrozenInputBatch(run.id, batchId, after)
-                      return {
-                        source: input.source,
-                        offset: input.offset,
-                        text: JSON.stringify(page),
-                        nextOffset: page.hasMore ? page.nextOrdinal + 1 : null,
-                      }
-                    }
-                    if (input.source === 'inputs') {
-                      const page = this.conversations.readWorkflowInputs(run.id, input.offset)
-                      return {
-                        source: input.source,
-                        offset: input.offset,
-                        text: JSON.stringify(page),
-                        nextOffset: page.nextOffset,
-                      }
-                    }
-                    if (input.source === 'handoff_sources') {
-                      const page = this.conversations.readRunSources(run.id, input.offset)
-                      return {
-                        source: input.source,
-                        offset: input.offset,
-                        text: JSON.stringify(page),
-                        nextOffset: page.nextOffset,
-                      }
-                    }
-                    throw new Error('The frozen source kind is unavailable.')
-                  } catch (error) {
-                    recordDiagnostic({
-                      operation: 'native_check',
-                      phase: 'failed',
-                      level: 'warn',
-                      scope: 'run',
-                      sessionId: run.sessionId,
-                      runId: run.id,
-                      agentId: run.agentId,
-                      runtimeBoundary: 'source_read',
-                      code: classifyAgentError(error).kind,
-                      runtimeErrorType:
-                        diagnosticEventSchema.shape.runtimeErrorType.safeParse(
-                          error instanceof Error ? error.name : 'other',
-                        ).data ?? 'other',
-                    })
-                    throw error
-                  }
-                }
-              : undefined,
+          collaborationSourceReader: owner.sourceReader,
+          readCollaborationSourcePart: owner.sourceReader
+            ? (raw) => {
+                const {
+                  binding: _binding,
+                  nextRead: _nextRead,
+                  ...page
+                } = owner.sourceReader!.read(raw).page
+                return page
+              }
+            : undefined,
           recordWorkflowPlan: (plan) => {
             if (stillOwned()) this.conversations.recordWorkflowPlan(run.id, plan)
           },
@@ -6858,6 +9467,7 @@ export class Conversation {
           archive(fact)
           continue
         }
+        this.observeNormalizedDelta(owner, fact, false)
         if (owner.outputFailure) throw owner.outputFailure
         if (fact.type === 'session.title.updated') {
           if (reportedTitle) continue
@@ -6996,6 +9606,38 @@ export class Conversation {
       } else if (saved?.dispatchPhase === 'rejected' || saved?.dispatchPhase === 'not_sent') {
         this.publish(this.conversations.failRun(run.id, failure.kind, failure.message, false))
         const currentContext = this.conversations.nativeContext(run.sessionId, run.agentId)
+        const unsentProof = this.conversations.executionInput(run.id)?.proof
+        const confirmedUnsentBinding = Boolean(
+          unsentProof &&
+          currentContext &&
+          !saved.nativeTurnId &&
+          !saved.nativeOutcome &&
+          ['not_dispatched', 'settled'].includes(saved.nativeEffectsState ?? '') &&
+          currentContext.nativeSessionId === unsentProof.nativeSessionId &&
+          currentContext.bindingGeneration === unsentProof.bindingGeneration &&
+          currentContext.executorId === unsentProof.executorId &&
+          adapter.executorId === unsentProof.executorId &&
+          !adapter.hasActiveBackgroundWork?.(run.id) &&
+          !this.pendingNativeInteractions(run.sessionId).length &&
+          ![
+            'authentication_required',
+            'quota_or_rate_limit',
+            'permission_blocked',
+            'runtime_incompatible',
+            'context_resume_failed',
+            'native_session_occupied',
+          ].includes(failure.kind),
+        )
+        if (confirmedUnsentBinding)
+          this.publish(
+            this.conversations.setContinuation(
+              run.sessionId,
+              run.agentId,
+              'ready',
+              undefined,
+              run.bindingGeneration,
+            ),
+          )
         const capacityRefusedBeforeStartup =
           error instanceof NativeCapacityError &&
           saved.dispatchPhase === 'not_sent' &&
@@ -7012,20 +9654,21 @@ export class Conversation {
             ),
           )
         const unchangedReadyBinding =
-          context?.continuationState === 'ready' &&
-          currentContext?.continuationState === 'ready' &&
-          currentContext.nativeSessionId === context.nativeSessionId &&
-          currentContext.bindingGeneration === context.bindingGeneration &&
-          ((error instanceof PermissionModeRejectedError &&
-            (!adapter.hasActiveBackgroundWork?.() ||
-              // Claude's negative native ACK proves this gated request was
-              // refused; a preserved startup Hook is not this User Turn.
-              (run.agentId === 'claude' &&
-                saved.dispatchPhase === 'rejected' &&
-                !saved.nativeTurnId &&
-                !saved.nativeOutcome &&
-                !execution.deliveryPossible))) ||
-            capacityRefusedBeforeStartup)
+          confirmedUnsentBinding ||
+          (context?.continuationState === 'ready' &&
+            currentContext?.continuationState === 'ready' &&
+            currentContext.nativeSessionId === context.nativeSessionId &&
+            currentContext.bindingGeneration === context.bindingGeneration &&
+            ((error instanceof PermissionModeRejectedError &&
+              (!adapter.hasActiveBackgroundWork?.() ||
+                // Claude's negative native ACK proves this gated request was
+                // refused; a preserved startup Hook is not this User Turn.
+                (run.agentId === 'claude' &&
+                  saved.dispatchPhase === 'rejected' &&
+                  !saved.nativeTurnId &&
+                  !saved.nativeOutcome &&
+                  !execution.deliveryPossible))) ||
+              capacityRefusedBeforeStartup))
         if (
           error instanceof NativeThreadOccupiedError ||
           error instanceof NativeThreadArchivedError
@@ -7106,8 +9749,10 @@ export class Conversation {
         run?.sessionId === sessionId &&
         run.agentId === agentId &&
         !this.ownsFrozenSourceRoot(run)
-      )
+      ) {
+        owner.sourceReader?.retire()
         owner.adapter.retireSourceGrant?.({ runId, grant: owner.generation })
+      }
     }
   }
 
@@ -7140,21 +9785,231 @@ export class Conversation {
     if (patch) this.publish(patch)
   }
 
-  private static async withRecoveryDeadline<T>(
+  private startNativeCheck(
+    key: string,
     controller: AbortController,
-    operation: () => Promise<T>,
-    cancelled: T,
-  ): Promise<T> {
-    if (controller.signal.aborted) return cancelled
-    const interruption = Promise.withResolvers<T>()
-    const aborted = (): void => interruption.resolve(cancelled)
+    operation: () => Promise<RpcResult<ConversationPatch>>,
+    options: {
+      receiptSessionId?: string
+      onPhysicalCompletion?: () => void
+      automaticAttemptId?: string | undefined
+      onLogicalTimeout?: () => void
+    } = {},
+  ): Promise<RpcResult<ConversationPatch>> {
+    const physical = Promise.withResolvers<void>()
+    const interruption = Promise.withResolvers<RpcResult<ConversationPatch>>()
+    const aborted = (): void =>
+      interruption.resolve({
+        ok: false,
+        error: {
+          code: 'NATIVE_CONTEXT_RECOVERY_REQUIRED',
+          message: 'Native state could not be confirmed. No task was reexecuted.',
+        },
+      })
+    const owner: NonNullable<ReturnType<typeof this.nativeChecks.get>> = {
+      controller,
+      task: interruption.promise,
+      physicalCompletion: physical.promise,
+      physicalOperations: new Set(),
+      logicalTimeout: () => {
+        try {
+          options.onLogicalTimeout?.()
+        } catch {
+          // A failed recovery projection cannot disable the check's deadline.
+        } finally {
+          aborted()
+        }
+      },
+      phase: 'checking',
+      automaticAttemptId: options.automaticAttemptId,
+      configurationGeneration: options.automaticAttemptId
+        ? this.conversations.schedulingConfigurationGeneration()
+        : undefined,
+      ...(options.receiptSessionId ? { receiptSessionId: options.receiptSessionId } : {}),
+    }
+    this.nativeChecks.set(key, owner)
     controller.signal.addEventListener('abort', aborted, { once: true })
-    const timer = setTimeout(() => controller.abort(), DELIVERY_RECONCILIATION_TIMEOUT_MS)
+    const timer = options.automaticAttemptId
+      ? setTimeout(
+          () => controller.abort(),
+          Math.max(
+            0,
+            Date.parse(
+              this.conversations.schedulingRecoveryAttempt(options.automaticAttemptId)!.deadline,
+            ) - Date.now(),
+          ),
+        )
+      : undefined
+    let workSucceeded = false
+    const work = Promise.resolve()
+      .then(() => {
+        if (
+          options.automaticAttemptId &&
+          Date.now() >=
+            Date.parse(
+              this.conversations.schedulingRecoveryAttempt(options.automaticAttemptId)!.deadline,
+            )
+        )
+          controller.abort()
+        controller.signal.throwIfAborted()
+        if (options.automaticAttemptId)
+          this.conversations.startSchedulingRecoveryCheck(options.automaticAttemptId)
+        return operation()
+      })
+      .then((result) => {
+        workSucceeded = result.ok
+        return result
+      })
+    owner.task = Promise.race([work, interruption.promise])
+      .then((result) => {
+        if (options.automaticAttemptId)
+          this.conversations.settleSchedulingRecoveryCheck(options.automaticAttemptId, {
+            ok: result.ok,
+            physicalReleased: false,
+          })
+        return result
+      })
+      .finally(() => {
+        clearTimeout(timer)
+        controller.signal.removeEventListener('abort', aborted)
+        if (this.nativeChecks.get(key) === owner) {
+          owner.phase = 'cleanup_unconfirmed'
+          this.nativeMetadataChanged()
+        }
+      })
+    void work
+      .then(
+        () => undefined,
+        () => undefined,
+      )
+      .then(async () => {
+        await Promise.all(owner.physicalOperations)
+        if (options.automaticAttemptId)
+          this.conversations.settleSchedulingRecoveryCheck(options.automaticAttemptId, {
+            ok: workSucceeded,
+            physicalReleased: true,
+          })
+        if (this.nativeChecks.get(key) === owner) {
+          owner.adapter = undefined
+          this.nativeChecks.delete(key)
+          physical.resolve()
+          this.nativeMetadataChanged()
+          if (
+            options.automaticAttemptId &&
+            !this.disposed &&
+            owner.configurationGeneration === this.conversations.schedulingConfigurationGeneration()
+          ) {
+            const [sessionId, agentId] = key.split(':')
+            if (
+              sessionId &&
+              (agentId === 'codex' || agentId === 'claude') &&
+              !this.pendingNativeInteractions(sessionId).length &&
+              this.schedulingObservation(
+                this.contextDecisionCapability,
+                this.schedulingScope(sessionId),
+              ).status === 'supported' &&
+              this.conversations.proposeRelayNativeRecovery(
+                sessionId,
+                agentId,
+                this.conversations.schedulingRecoveryAttempt(options.automaticAttemptId)?.faultId,
+              )
+            )
+              this.publish(this.conversations.metadataPatch(sessionId))
+          }
+          this.schedulePendingRoutedContinuations()
+          options.onPhysicalCompletion?.()
+        }
+        physical.resolve()
+        return undefined
+      })
+      .catch(physical.reject)
+    // A rejected cleanup stays owned; disposal reports the failure instead of releasing its slot.
+    void physical.promise.catch(() => undefined)
+    this.nativeMetadataChanged()
+    return owner.task
+  }
+
+  private async runNativeCheck<T>(
+    controller: AbortController,
+    begin: (
+      context: AgentNativeCheckContext | undefined,
+      signal: AbortSignal,
+    ) => AgentNativeCheckOperation<T>,
+    receiptStage = false,
+  ): Promise<T> {
+    const owner = [...this.nativeChecks.values()].find((entry) => entry.controller === controller)
+    if (
+      owner?.automaticAttemptId &&
+      Date.now() >=
+        Date.parse(this.conversations.schedulingRecoveryAttempt(owner.automaticAttemptId)!.deadline)
+    )
+      controller.abort()
+    if (!owner || controller.signal.aborted)
+      throw new Error('The native check is no longer current.')
+    const child = owner.automaticAttemptId ? undefined : new AbortController()
+    const checkSignal = child
+      ? AbortSignal.any([controller.signal, child.signal])
+      : controller.signal
+    const interruption = Promise.withResolvers<never>(),
+      ownerInterruption = Promise.withResolvers<never>()
+    const interrupted = () => interruption.reject(new Error('The native check was interrupted.'))
+    const ownerAborted = () =>
+      ownerInterruption.reject(new Error('The native check owner was cancelled.'))
+    checkSignal.addEventListener('abort', interrupted, { once: true })
+    controller.signal.addEventListener('abort', ownerAborted, { once: true })
+    // Both rejections are also observed while the result/physical branch is awaiting its peer.
+    void interruption.promise.catch(() => undefined)
+    void ownerInterruption.promise.catch(() => undefined)
+    const timer = child
+      ? setTimeout(() => {
+          try {
+            if (!receiptStage) owner.logicalTimeout()
+          } finally {
+            child.abort()
+          }
+        }, DELIVERY_RECONCILIATION_TIMEOUT_MS)
+      : undefined
     try {
-      return await Promise.race([operation(), interruption.promise])
+      const operation = begin(
+        owner.automaticAttemptId
+          ? {
+              operationId: owner.automaticAttemptId,
+              recordPhysicalOwner: (physicalOwner) =>
+                this.conversations.recordSchedulingCheckPhysicalOwner(
+                  owner.automaticAttemptId!,
+                  physicalOwner,
+                ),
+            }
+          : undefined,
+        checkSignal,
+      )
+      owner.physicalOperations.add(operation.physicalCompletion)
+      void operation.physicalCompletion.then(
+        () => owner.physicalOperations.delete(operation.physicalCompletion),
+        () => undefined,
+      )
+      try {
+        const result = await Promise.race([
+          operation.result.then(
+            (value) => ({ ok: true as const, value }),
+            (error) => ({ ok: false as const, error }),
+          ),
+          interruption.promise,
+        ])
+        // Serial stages cannot overlap a still-owned RPC, reader, encoder, or cleanup.
+        await Promise.race([operation.physicalCompletion, interruption.promise])
+        controller.signal.throwIfAborted()
+        if (!result.ok) throw result.error
+        return result.value
+      } catch (error) {
+        if (child?.signal.aborted && !controller.signal.aborted)
+          await Promise.race([operation.physicalCompletion, ownerInterruption.promise])
+        throw error
+      }
     } finally {
       clearTimeout(timer)
-      controller.signal.removeEventListener('abort', aborted)
+      checkSignal.removeEventListener('abort', interrupted)
+      controller.signal.removeEventListener('abort', ownerAborted)
     }
   }
 
@@ -7319,7 +10174,7 @@ export class Conversation {
   }
 
   private static async markdownVisibleProjection(markdown: string): Promise<string> {
-    const projection = await import('../../shared/message-anchor-text')
+    const projection = await import('../../shared/message-anchor-text.js')
     return projection.markdownVisibleProjection(markdown)
   }
 
@@ -7508,14 +10363,40 @@ export class Conversation {
     active.abortController.abort()
   }
 
-  private publish(patch: ConversationPatch, progress = false): void {
-    if (!progress) this.nativeMetadataChanged()
+  private publish(
+    patch: ConversationPatch,
+    progress = false,
+    streamOwner?: NativeObservation,
+  ): void {
+    const streamTrace = progress && streamOwner ? this.currentStreamTrace(streamOwner) : undefined
+    if (streamTrace) this.bumpStreamTrace(streamTrace, streamTrace.data.publication, 'attempts')
+    const decision = this.decisionRuntime
+    if (!progress && decision?.sessionId === patch.sessionId && !decision.current()) {
+      decision.controller.abort()
+      void decision.runtime?.dispose()
+    }
+    if (!progress) {
+      this.conversations.refreshSchedulingRecoveryFacts(patch.sessionId)
+      if (!this.hasSessionOperation(patch.sessionId, false, undefined, true))
+        this.conversations.armSchedulingRecoveryFaults(patch.sessionId)
+      this.nativeMetadataChanged()
+      this.schedulePendingRoutedContinuations()
+    }
     if (!progress) patch.forkBlocked = this.forkBlocked(patch.sessionId)
     if (!progress)
       patch.sessionIssues = this.sessionIssues(patch.sessionId, patch.nativeContexts ?? [])
     // Interaction changes publish non-progress facts. Do not inflate every
     // high-frequency Delta or leak private details into the stream window.
     if (!progress) patch.pendingNativeInteractions = this.pendingNativeInteractions(patch.sessionId)
+    if (!progress)
+      patch.preparedInputContinuation = this.conversations.preparedInputContinuation(
+        patch.sessionId,
+      )
+    if (!progress)
+      patch.relaySchedulingDecision = this.projectRelaySchedulingDecision(
+        patch.sessionId,
+        patch.sessionIssues,
+      )
     if (!progress && Buffer.byteLength(JSON.stringify(patch)) > CONVERSATION_PATCH_BYTES) {
       // Recovery projection is mandatory; large durable bodies are read through existing pagination.
       const activityRunIds = [
@@ -7551,10 +10432,20 @@ export class Conversation {
     }
     if (!progress) this.activeExecutions.get(patch.sessionId)?.streamBuffer?.publishPending()
     if (progress && !this.interestedSessionIds.has(patch.sessionId)) {
+      if (streamTrace) {
+        this.bumpStreamTrace(streamTrace, streamTrace.data.publication, 'suppressed')
+        streamTrace.data.publication.lastMs = streamTrace.data.capturedAfterMs
+      }
       this.suppressedProgress += 1
       return
     }
-    if (progress) this.publishedProgress += 1
+    if (progress) {
+      if (streamTrace) {
+        this.bumpStreamTrace(streamTrace, streamTrace.data.publication, 'published')
+        streamTrace.data.publication.lastMs = streamTrace.data.capturedAfterMs
+      }
+      this.publishedProgress += 1
+    }
     for (const listener of this.listeners) listener(patch, progress)
   }
 

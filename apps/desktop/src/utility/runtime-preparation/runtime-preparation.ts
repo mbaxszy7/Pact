@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
 import { access } from 'node:fs/promises'
 import { delimiter, isAbsolute, join } from 'node:path'
@@ -27,7 +28,22 @@ interface ProbeCommandResult {
 }
 
 export class RuntimePreparation {
+  private configurationGeneration = 0
   constructor(private readonly repository: RuntimePreparationRepository) {}
+
+  catalogIdentity(workingDirectory?: string): string {
+    return createHash('sha256')
+      .update(
+        JSON.stringify([
+          workingDirectory,
+          this.configurationGeneration,
+          this.repository.readSelectedExecutablePath('claude'),
+          this.repository.readSelectedExecutablePath('codex'),
+          process.env.PATH,
+        ]),
+      )
+      .digest('hex')
+  }
 
   async findRecoveryExecutable(
     agentId: RuntimeAgentId,
@@ -68,6 +84,7 @@ export class RuntimePreparation {
       }
     }
     this.repository.saveSelectedExecutablePath(input.agentId, input.executablePath)
+    this.configurationGeneration += 1
     return this.inspectReadiness()
   }
 

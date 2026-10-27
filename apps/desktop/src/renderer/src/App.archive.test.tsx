@@ -145,6 +145,29 @@ function fixture(projectCount = 2) {
     projects: projects.filter((project) => !archivedProjects.has(project.id)),
   })
   const bridge = {
+    onSchedulingChanged: vi.fn<DesktopBridge['onSchedulingChanged']>(() => () => undefined),
+    getSchedulingState: vi.fn<DesktopBridge['getSchedulingState']>(async (input) => ({
+      ok: true,
+      value: {
+        settings: {
+          enabled: false,
+          selection: null,
+          showIndicator: true,
+          revision: 0,
+          updatedAt: timestamp,
+        },
+        configurationGeneration: 0,
+        host: { status: 'unconfirmed', capability: null, expiresAt: null },
+        context: input?.sessionId
+          ? {
+              sessionId: input.sessionId,
+              observation: { status: 'unconfirmed', capability: null, expiresAt: null },
+              eligibility: 'disabled',
+            }
+          : null,
+        activity: { decision: { status: 'idle' }, check: { status: 'idle' } },
+      },
+    })),
     getUpdateState: vi.fn<DesktopBridge['getUpdateState']>(async () => ({
       ok: true,
       value: {
@@ -286,6 +309,8 @@ function fixture(projectCount = 2) {
   } satisfies Pick<
     DesktopBridge,
     | 'getUpdateState'
+    | 'onSchedulingChanged'
+    | 'getSchedulingState'
     | 'onUpdateStateChanged'
     | 'onNativePresenceChanged'
     | 'getAppInfo'

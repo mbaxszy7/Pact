@@ -13,16 +13,20 @@ import type {
   NativeInitializationWitness,
   SessionPermissionMode,
   NormalizedAgentEvent,
+  RunEffectiveExecutionSettings,
 } from '@pact/contracts'
 
 import {
   type AgentAdapter,
+  type AgentNativeCheckOperation,
+  type AgentNativeCheckContext,
   type AgentNativeProbeInput,
   type AgentNativeInputProbeInput,
   type AgentNativeInitializedBindingProbeInput,
   type AgentNativeContextRebuildInput,
   type AgentNativeContextRebuildResult,
   type AgentRunInput,
+  type AgentSourceReadForm,
   type AgentSteerInput,
   type AgentSteerResult,
   type AgentTitleEnrichmentInput,
@@ -72,6 +76,7 @@ import {
   collaborationInputResultAllowed,
   frozenSourceInstructions,
 } from './collaboration-prompt'
+import { NativeCheckOperation } from './native-check-operation'
 import {
   codexFileChanges,
   nativeEffectsUncertain,
@@ -142,6 +147,7 @@ interface EarlyNativeFact {
 interface NativeBackground {
   input: AgentRunInput
   sourceGrant?: { runId: string; grant: string } | undefined
+  sourceReadForm?: AgentSourceReadForm
   /** Proven ancestry survives a child Turn ending: that child may have spawned grandchildren. */
   parents: Map<string, string>
   threads: Set<string>
@@ -589,6 +595,7 @@ export class CodexAgentAdapter implements AgentAdapter {
   private initialized = false
   // Protocol support belongs to this initialized actor, never to a saved Thread.
   private turnSpeedOverrideSupported = false
+  private nativeSourceContextSupported = false
   private running = false
   private disposed = false
   private readonly loadedThreadIds = new Set<string>()
@@ -601,6 +608,11 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.skillCatalogChanged = listener
   }
   private readonly peerToolServer = new PactPeerToolServer()
+  private withSourceCallable(instructions: string): string {
+    const name = `mcp__${this.peerServerName}__read_collaboration_source`
+    return `${instructions}\nFor permitted Source reads in this current native Root, the exact CodeMode callable is tools[${JSON.stringify(name)}]. Bind that exact function before using it; do not guess an unqualified name or reuse a callable from another Root. This binding does not require a tool call when the current task forbids tools.`
+  }
+
   private peerServerName = `pact_peer_${randomUUID().replaceAll('-', '')}`
   private readonly nativeBackground = new Set<NativeBackground>()
   // Current connection generation only; <=256 identities / 512 KiB each, cleared on replacement.
@@ -609,6 +621,7 @@ export class CodexAgentAdapter implements AgentAdapter {
   private idleTimer: ReturnType<typeof setTimeout> | undefined
   private uncertainTitleExecutor: string | undefined
   private readonly nativeForkFiles: NativeForkFiles
+  private readonly nativeCheck = new NativeCheckOperation(() => !this.disposed)
   // Pending actual Fork/startup owners count against the same eight-context ceiling.
   private readonly nativeForkOwners = new Map<string, CodexNativeForkOwner>()
 
@@ -618,7 +631,9 @@ export class CodexAgentAdapter implements AgentAdapter {
     private readonly nativeReadOptions: { storageRoot?: string } = {},
     private readonly ipcTraffic?: LogicalIpcWorkerTraffic,
   ) {
-    this.nativeForkFiles = new NativeForkFiles(ipcTraffic)
+    this.nativeForkFiles = new NativeForkFiles(ipcTraffic, (signal, physicalCompletion) =>
+      this.nativeCheck.observeRequest(signal, physicalCompletion),
+    )
   }
 
   retireSourceGrant(owner: { runId: string; grant: string }): void {
@@ -1309,7 +1324,26 @@ export class CodexAgentAdapter implements AgentAdapter {
     }
   }
 
-  async probeNativeInputs(input: AgentNativeInputProbeInput, signal: AbortSignal): Promise<void> {
+  probeNativeInputs(input: AgentNativeInputProbeInput, signal: AbortSignal): Promise<void> {
+    return this.beginNativeInputsCheck(input, signal).result
+  }
+
+  beginNativeInputsCheck(
+    input: AgentNativeInputProbeInput,
+    signal: AbortSignal,
+    context?: AgentNativeCheckContext,
+  ): AgentNativeCheckOperation<void> {
+    return this.beginNativeCheck(
+      signal,
+      (checkSignal) => this.readNativeInputs(input, checkSignal),
+      context,
+    )
+  }
+
+  private async readNativeInputs(
+    input: AgentNativeInputProbeInput,
+    signal: AbortSignal,
+  ): Promise<void> {
     if (
       !input.nativeTurnId ||
       input.unresolvedInputIds.length > 64 ||
@@ -1322,6 +1356,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.idleTimer = undefined
     try {
       const connection = await this.ensureConnection(input.cwd)
+      this.nativeCheck.recordPhysicalOwner(signal, { kind: 'shared_rpc' })
       await this.initializeConnection(connection, signal)
       await this.withNativeInspectionConnection(
         connection,
@@ -1357,7 +1392,23 @@ export class CodexAgentAdapter implements AgentAdapter {
     }
   }
 
-  async probeNativeStatus(
+  probeNativeStatus(input: AgentNativeProbeInput, signal: AbortSignal): Promise<NativeProbeResult> {
+    return this.beginNativeStatusCheck(input, signal).result
+  }
+
+  beginNativeStatusCheck(
+    input: AgentNativeProbeInput,
+    signal: AbortSignal,
+    context?: AgentNativeCheckContext,
+  ): AgentNativeCheckOperation<NativeProbeResult> {
+    return this.beginNativeCheck(
+      signal,
+      (checkSignal) => this.readNativeStatus(input, checkSignal),
+      context,
+    )
+  }
+
+  private async readNativeStatus(
     input: AgentNativeProbeInput,
     signal: AbortSignal,
   ): Promise<NativeProbeResult> {
@@ -1373,6 +1424,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.idleTimer = undefined
     try {
       const connection = await this.ensureConnection(input.cwd)
+      this.nativeCheck.recordPhysicalOwner(signal, { kind: 'shared_rpc' })
       await this.initializeConnection(connection, signal)
       const response = await connection.request(
         'thread/read',
@@ -2034,7 +2086,28 @@ export class CodexAgentAdapter implements AgentAdapter {
     }
   }
 
-  async inspectNativeRebuild(
+  inspectNativeRebuild(
+    input: AgentNativeContextRebuildInput,
+    source: AsyncIterable<NativeContextRebuildChunk>,
+    signal: AbortSignal,
+  ): Promise<AgentNativeContextRebuildResult | undefined> {
+    return this.beginNativeRebuildCheck(input, source, signal).result
+  }
+
+  beginNativeRebuildCheck(
+    input: AgentNativeContextRebuildInput,
+    source: AsyncIterable<NativeContextRebuildChunk>,
+    signal: AbortSignal,
+    context?: AgentNativeCheckContext,
+  ): AgentNativeCheckOperation<AgentNativeContextRebuildResult | undefined> {
+    return this.beginNativeCheck(
+      signal,
+      (checkSignal) => this.readNativeRebuild(input, source, checkSignal),
+      context,
+    )
+  }
+
+  private async readNativeRebuild(
     input: AgentNativeContextRebuildInput,
     source: AsyncIterable<NativeContextRebuildChunk>,
     signal: AbortSignal,
@@ -2050,6 +2123,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.idleTimer = undefined
     try {
       const connection = await this.ensureConnection(input.cwd)
+      this.nativeCheck.recordPhysicalOwner(signal, { kind: 'shared_rpc' })
       await this.initializeConnection(connection, signal)
       const initializationWitness = await this.verifyNativeSeed(
         connection,
@@ -2110,6 +2184,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.idleTimer = undefined
     try {
       const connection = await this.ensureConnection(input.cwd)
+      this.nativeCheck.recordPhysicalOwner(signal, { kind: 'shared_rpc' })
       await this.initializeConnection(connection, signal)
 
       const response = await connection.request(
@@ -2389,11 +2464,14 @@ export class CodexAgentAdapter implements AgentAdapter {
     const controller = new AbortController()
     const readSignal = AbortSignal.any([signal, controller.signal])
     const deadline = setTimeout(() => controller.abort(), 10_000)
+    this.nativeCheck.recordPhysicalOwner(signal, { kind: 'inspection_pending' })
     const owner: NonNullable<CodexAgentAdapter['nativeInspection']> = {
       controller,
       connection: undefined,
       task: Promise.resolve(undefined),
     }
+    const physical = Promise.withResolvers<void>()
+    this.nativeCheck.observeRequest(signal, physical.promise)
     this.nativeInspection = owner
     // Install the entire lifecycle task before invoking a possibly asynchronous factory.
     const task = Promise.resolve().then(async () => {
@@ -2425,6 +2503,15 @@ export class CodexAgentAdapter implements AgentAdapter {
             this.connection === live,
         )
         owner.connection = connection
+        const checkContext = this.nativeCheck.contextFor(signal)
+        if (checkContext && owned.physicalWitness) {
+          try {
+            const witness = await owned.physicalWitness(checkContext.operationId)
+            checkContext.recordPhysicalOwner({ kind: 'inspection_group', witness })
+          } catch {
+            // Missing/oversized identity proof stays pending across restart; normal close is still required.
+          }
+        }
         if (readSignal.aborted || this.disposed || this.connection !== live)
           throw new AgentExecutionError(
             'agent_process_crash',
@@ -2466,6 +2553,8 @@ export class CodexAgentAdapter implements AgentAdapter {
         // A failed physical close keeps this same inspection owner reserved.
         await owner.connection?.close(new Error('Read-only native history inspection finished.'))
         if (this.nativeInspection === owner) this.nativeInspection = undefined
+        this.nativeCheck.recordPhysicalOwner(signal, { kind: 'shared_rpc' })
+        physical.resolve()
       }
     })
     owner.task = task
@@ -2720,6 +2809,7 @@ export class CodexAgentAdapter implements AgentAdapter {
         ...(witness ? { witness } : {}),
       },
       signal,
+      (physicalCompletion) => this.nativeCheck.observeRequest(signal, physicalCompletion),
     )
     const after = await metadata()
     return after && Reflect.get(after, 'path') === path ? verified : undefined
@@ -2776,16 +2866,20 @@ export class CodexAgentAdapter implements AgentAdapter {
         threadId: input.nativeSessionId ?? 'x'.repeat(256),
         clientUserMessageId: input.runId,
         input: [
-          ...(input.promptEnvelope.collaboration || input.readCollaborationSourcePart
+          ...(input.promptEnvelope.collaboration ||
+          input.collaborationSourceReader ||
+          input.readCollaborationSourcePart
             ? [
                 {
                   type: 'text',
-                  text: input.promptEnvelope.collaboration
-                    ? collaborationInstructions(
-                        input.promptEnvelope.collaboration,
-                        input.promptEnvelope.collaborationAuthorization,
-                      )
-                    : frozenSourceInstructions,
+                  text: this.withSourceCallable(
+                    input.promptEnvelope.collaboration
+                      ? collaborationInstructions(
+                          input.promptEnvelope.collaboration,
+                          input.promptEnvelope.collaborationAuthorization,
+                        )
+                      : frozenSourceInstructions,
+                  ),
                 },
               ]
             : []),
@@ -2885,20 +2979,33 @@ export class CodexAgentAdapter implements AgentAdapter {
           expectedTurnId: input.nativeTurnId,
           clientUserMessageId: input.inputId,
           input: [
-            ...(workflow || owner.input.readCollaborationSourcePart
+            ...(workflow ||
+            owner.input.collaborationSourceReader ||
+            owner.input.readCollaborationSourcePart
               ? [
                   {
                     type: 'text',
-                    text: workflow
-                      ? collaborationInstructions(
-                          workflow,
-                          input.promptEnvelope.collaborationAuthorization,
-                        )
-                      : frozenSourceInstructions,
+                    text: this.withSourceCallable(
+                      workflow
+                        ? collaborationInstructions(
+                            workflow,
+                            input.promptEnvelope.collaborationAuthorization,
+                          )
+                        : frozenSourceInstructions,
+                    ),
                   },
                 ]
               : []),
-            ...codexPromptInput(input.promptEnvelope),
+            ...codexPromptInput(
+              input.promptEnvelope,
+              owner.input.collaborationSourceReader
+                ? (target) =>
+                    owner.input.collaborationSourceReader!.navigation(
+                      target,
+                      owner.sourceReadForm ?? 'legacy',
+                    )
+                : undefined,
+            ),
           ],
         },
         {
@@ -2965,11 +3072,14 @@ export class CodexAgentAdapter implements AgentAdapter {
       throw new NativeCapacityError(
         'The previous native root still owns its frozen sources. No new task was submitted.',
       )
+    const hasSourceReader = Boolean(
+      input.collaborationSourceReader || input.readCollaborationSourcePart,
+    )
     const sourceGrant = input.promptEnvelope.sourceGrant
       ? { ...input.promptEnvelope.sourceGrant }
       : undefined
     if (
-      input.readCollaborationSourcePart &&
+      hasSourceReader &&
       (!sourceGrant ||
         sourceGrant.runId !== input.runId ||
         (input.nativeGeneration && sourceGrant.grant !== input.nativeGeneration))
@@ -3009,6 +3119,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.terminalEvidence.delete(input.runId)
     this.admitEvidenceCache()
     let connection: CodexAppServerConnection | undefined
+    let recoveryConfiguration: { model: string; effort: string | null; policy: object } | undefined
     let threadId = input.nativeSessionId
     let turnId: string | undefined
     const delivery: {
@@ -3800,16 +3911,29 @@ export class CodexAgentAdapter implements AgentAdapter {
 
     try {
       connection = await this.ensureConnection(input.cwd)
+      const expectedRecovery = input.recovery?.expected
+      if (
+        expectedRecovery &&
+        (expectedRecovery.executorId !== connection.executorId ||
+          expectedRecovery.nativeSessionId !== input.nativeSessionId)
+      )
+        throw new NativeInputWithheldError(
+          'The original native executor or Session changed. The replacement input was withheld.',
+        )
       input.recordExecutor?.(connection.executorId)
       background.connection = connection
       this.nativeBackground.add(background)
       await this.initializeConnection(connection, signal)
+      background.sourceReadForm =
+        this.nativeSourceContextSupported && input.collaborationSourceReader?.readNativeRoot
+          ? 'nativeRoot'
+          : 'legacy'
       peerReceipt = this.peerToolServer.beginTurn(
         'claude',
         !workflow && input.peerAssistanceAllowed !== false,
         workflow,
         input.promptEnvelope.requestSessionTitle === true,
-        input.readCollaborationSourcePart
+        hasSourceReader
           ? (raw) => {
               if (
                 background.closed ||
@@ -3818,10 +3942,13 @@ export class CodexAgentAdapter implements AgentAdapter {
                 !connection?.isOpen
               )
                 throw new Error('This source reader belongs to a retired root Turn.')
-              return input.readCollaborationSourcePart!(raw)
+              return input.collaborationSourceReader
+                ? input.collaborationSourceReader.read(raw).page
+                : input.readCollaborationSourcePart!(raw)
             }
           : undefined,
         sourceGrant,
+        input.collaborationSourceReader,
       )
       // Loaded Threads ignore resume config: their installed capability URL must stay stable.
       const peerToolUrl = await this.peerToolServer.start()
@@ -4016,25 +4143,48 @@ export class CodexAgentAdapter implements AgentAdapter {
         threadId = resolvedThreadId
         background.primaryThreadId = threadId
         replayEarly()
+        let appliedPolicy: object
         try {
           if (
             input.nativeSessionId ||
             collaborationReadOnly(workflow, input.promptEnvelope.collaborationAuthorization)
           )
-            await this.applyPermissionSettings(
+            appliedPolicy = await this.applyPermissionSettings(
               connection,
               resolvedThreadId,
               phasePolicy,
               signal,
               message,
             )
-          else CodexAgentAdapter.confirmPermissionMode(message, input.permissionMode)
+          else {
+            CodexAgentAdapter.confirmPermissionMode(message, input.permissionMode)
+            appliedPolicy = CodexAgentAdapter.permissionReadback(message)
+          }
         } catch (error) {
           background.rootNotStarted = true
           input.recordDispatch?.('rejected', resolvedThreadId, connection.executorId)
           throw error
         }
         this.rememberThread(resolvedThreadId)
+        // Absent reasoningEffort is unknown. It must not become a known-null
+        // default merely because the display configuration accepts null.
+        const effectiveEffort = input.effort ?? resolvedEffort
+        if (
+          input.recovery &&
+          typeof resolvedModel === 'string' &&
+          resolvedModel.length > 0 &&
+          resolvedModel.length <= 160 &&
+          (effectiveEffort === null ||
+            (typeof effectiveEffort === 'string' &&
+              effectiveEffort.length > 0 &&
+              effectiveEffort.length <= 80)) &&
+          freezeNativeJsonFrame(appliedPolicy) <= 64 * 1024
+        )
+          recoveryConfiguration = {
+            model: resolvedModel,
+            effort: effectiveEffort,
+            policy: appliedPolicy,
+          }
         if (typeof resolvedModel === 'string' && resolvedModel) {
           const configuration = resolveCodexThreadConfiguration(input, {
             model: resolvedModel,
@@ -4084,26 +4234,85 @@ export class CodexAgentAdapter implements AgentAdapter {
         signal,
         acceptanceDeadline,
       )
-      const turnResponse = await connection.request(
+      let recoverySettings: RunEffectiveExecutionSettings | undefined
+      if (input.recovery && recoveryConfiguration && speed.serviceTier) {
+        const applied = {
+          model: recoveryConfiguration.model,
+          modelSelection: modeModel,
+          effort: input.effort ?? recoveryConfiguration.effort,
+          speed: speed.serviceTier === 'priority' ? ('fast' as const) : ('standard' as const),
+          policy: recoveryConfiguration.policy,
+          collaborationMode: collaborationPlanMode(
+            workflow,
+            input.promptEnvelope.collaborationAuthorization,
+          )
+            ? 'plan'
+            : 'default',
+        }
+        recoverySettings = {
+          version: 1,
+          provider: 'codex',
+          model: applied.model,
+          effort: { known: true, value: applied.effort },
+          speed: applied.speed,
+          permissionMode: input.permissionMode ?? 'native',
+          configurationSha256: createHash('sha256')
+            .update(
+              JSON.stringify(applied, (_key, value: unknown) =>
+                value && typeof value === 'object' && !Array.isArray(value)
+                  ? Object.fromEntries(
+                      Object.entries(value).toSorted(([a], [b]) => a.localeCompare(b)),
+                    )
+                  : value,
+              ),
+            )
+            .digest('hex'),
+          provenance: 'codex_thread_configuration',
+        }
+        input.recovery.recordEffectiveSettings(recoverySettings, {
+          executorId: connection.executorId,
+          nativeSessionId: threadId,
+        })
+      }
+      if (
+        input.recovery?.expected &&
+        (!recoverySettings ||
+          !isDeepStrictEqual(recoverySettings, input.recovery.expected.settings))
+      )
+        throw new NativeInputWithheldError(
+          'The native execution settings could not be confirmed unchanged. The replacement input was withheld.',
+        )
+      const rootOperation = connection.requestOwned(
         'turn/start',
         {
           threadId,
           clientUserMessageId: input.runId,
           input: [
-            ...(workflow || input.readCollaborationSourcePart
+            ...(workflow || input.collaborationSourceReader || input.readCollaborationSourcePart
               ? [
                   {
                     type: 'text',
-                    text: workflow
-                      ? collaborationInstructions(
-                          workflow,
-                          input.promptEnvelope.collaborationAuthorization,
-                        )
-                      : frozenSourceInstructions,
+                    text: this.withSourceCallable(
+                      workflow
+                        ? collaborationInstructions(
+                            workflow,
+                            input.promptEnvelope.collaborationAuthorization,
+                          )
+                        : frozenSourceInstructions,
+                    ),
                   },
                 ]
               : []),
-            ...codexPromptInput(input.promptEnvelope),
+            ...codexPromptInput(
+              input.promptEnvelope,
+              input.collaborationSourceReader
+                ? (target) =>
+                    input.collaborationSourceReader!.navigation(
+                      target,
+                      background.sourceReadForm ?? 'legacy',
+                    )
+                : undefined,
+            ),
           ],
           ...(workflow ? phasePolicy : {}),
           ...(input.model ? { model: input.model } : {}),
@@ -4123,6 +4332,18 @@ export class CodexAgentAdapter implements AgentAdapter {
         {
           timeoutMs: Math.max(1, acceptanceDeadline - Date.now()),
           signal,
+          canDispatch: input.recovery?.expected
+            ? () => {
+                if (input.recovery?.canDispatch?.() === true) return true
+                inputWithheldError = new NativeInputWithheldError(
+                  'The replacement authority changed before native input delivery.',
+                )
+                background.rootNotStarted = true
+                background.rootInputWithheld = true
+                input.recordDispatch?.('rejected', threadId, nativeConnection.executorId)
+                return false
+              }
+            : undefined,
           onDispatch: () => {
             try {
               input.recordDispatch?.('possibly_sent', threadId, nativeConnection.executorId)
@@ -4139,19 +4360,33 @@ export class CodexAgentAdapter implements AgentAdapter {
           },
         },
       )
+      if (input.recovery && rootOperation.requestId !== null) {
+        const recovery = input.recovery
+        const identity = { executorId: connection.executorId, nativeSessionId: threadId }
+        const requestId = rootOperation.requestId
+        // Only the actual writer's joined result proves that this exact root
+        // frame never reached stdin. RPC rejection/EOF/timeout is insufficient.
+        void rootOperation.physicalCompletion
+          .then((completion) => {
+            if (completion === 'not_sent') {
+              background.rootNotStarted = true
+              recovery.recordConfirmedUnsent(
+                { kind: 'codex_root_frame_not_written', requestId },
+                identity,
+              )
+              maybeSettle()
+            }
+            return undefined
+          })
+          .catch(() => undefined)
+      }
+      const turnResponse = await rootOperation.result
       const turnRpcError = Reflect.get(turnResponse, 'error')
       if (turnRpcError) {
         delivery.phase = 'before_dispatch'
         background.rootNotStarted = true
         input.recordDispatch?.('rejected', threadId, connection.executorId)
         throw classifyAgentError(new Error(JSON.stringify(turnRpcError)))
-      }
-      yield {
-        agentId: 'codex',
-        type: 'run.speed.resolved',
-        requested: input.speed ?? 'native',
-        ...(speed.serviceTier === 'default' ? { speed: 'standard' as const } : {}),
-        ...(speed.detail ? { detail: speed.detail } : {}),
       }
       const turnResult = Reflect.get(turnResponse, 'result')
       const turn =
@@ -4168,7 +4403,26 @@ export class CodexAgentAdapter implements AgentAdapter {
         )
       turnId = resolvedTurnId
       background.primaryTurnId = turnId
+      if (sourceGrant && background.sourceReadForm === 'nativeRoot')
+        this.peerToolServer.bindNativeSourceRoot(
+          sourceGrant,
+          { executorId: connection.executorId, threadId, turnId },
+          () =>
+            this.connection === nativeConnection &&
+            nativeConnection.isOpen &&
+            !this.disposed &&
+            !background.closed &&
+            !background.rootTerminal &&
+            !signal.aborted,
+        )
       delivery.phase = 'accepted'
+      yield {
+        agentId: 'codex',
+        type: 'run.speed.resolved',
+        requested: input.speed ?? 'native',
+        ...(speed.serviceTier === 'default' ? { speed: 'standard' as const } : {}),
+        ...(speed.detail ? { detail: speed.detail } : {}),
+      }
       input.recordDispatch?.('accepted', threadId, connection.executorId)
       input.recordNativeEvidence?.({
         kind: 'running',
@@ -4177,6 +4431,7 @@ export class CodexAgentAdapter implements AgentAdapter {
       })
       yield { agentId: 'codex', type: 'turn.started', turnId }
 
+      let streamObserver = input.observeNativeDelta
       while (delivery.phase !== 'terminal') {
         // The Adapter consumes only provider notifications; RPC responses are routed independently.
         // oxlint-disable-next-line no-await-in-loop
@@ -4184,6 +4439,32 @@ export class CodexAgentAdapter implements AgentAdapter {
         const method = Reflect.get(message, 'method')
         const params = Reflect.get(message, 'params')
         if (typeof method !== 'string' || !params || typeof params !== 'object') continue
+        if (
+          streamObserver &&
+          (method === 'item/agentMessage/delta' || method === 'item/reasoning/summaryTextDelta')
+        ) {
+          const delta = Reflect.get(params, 'delta')
+          if (typeof delta === 'string' && delta.length) {
+            const sourceThread = Reflect.get(params, 'threadId'),
+              sourceTurn = Reflect.get(params, 'turnId')
+            try {
+              streamObserver({
+                kind: method === 'item/agentMessage/delta' ? 'text' : 'reasoning',
+                identity:
+                  typeof sourceThread !== 'string' || typeof sourceTurn !== 'string' || !turnId
+                    ? 'missing_identity'
+                    : sourceThread !== threadId
+                      ? 'foreign_thread'
+                      : sourceTurn !== turnId
+                        ? 'foreign_turn'
+                        : 'matched',
+                bytes: Buffer.byteLength(delta, 'utf8'),
+              })
+            } catch {
+              streamObserver = undefined
+            }
+          }
+        }
         if (background.steering && background.steeringDone) {
           const item = Reflect.get(params, 'item')
           if (
@@ -4838,6 +5119,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     return (
       this.connection?.diagnostics() ?? {
         pendingRequests: 0,
+        pendingPhysicalRequests: 0,
         queuedMessages: 0,
         queuedInboundBytes: 0,
         queuedOutboundFrames: 0,
@@ -4860,6 +5142,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     }
     this.skillCatalogChanged = undefined
     this.disposed = true
+    this.nativeCheck.cancel()
     const reader = this.nativeInspection
     reader?.controller.abort()
     const probe = this.featureProbe
@@ -4903,17 +5186,35 @@ export class CodexAgentAdapter implements AgentAdapter {
           false,
         ),
       }
+    if (!failure) await attempt(() => this.nativeCheck.join())
     if (failure) throw failure.error
   }
 
   hasActiveBackgroundWork(runId?: string): boolean {
     return (
+      (!runId &&
+        (this.nativeCheck.active ||
+          this.nativeInspection !== undefined ||
+          this.nativeForkFiles.active)) ||
       [...this.nativeForkOwners].some(([id]) => !runId || id === runId) ||
       [...this.nativeBackground].some((background) => !runId || background.input.runId === runId) ||
       [...this.nativeRebuildReceipts].some(
         ([id, receipt]) => receipt.pending && (!runId || runId === id),
       )
     )
+  }
+
+  private beginNativeCheck<T>(
+    signal: AbortSignal,
+    operation: (signal: AbortSignal) => Promise<T>,
+    context?: AgentNativeCheckContext,
+  ): AgentNativeCheckOperation<T> {
+    const check = this.nativeCheck.begin(signal, operation, context)
+    void check.physicalCompletion.then(
+      () => this.scheduleIdleDisconnect(),
+      () => undefined,
+    )
+    return check
   }
 
   private rememberNativeRebuild(id: string, value: NativeRebuildReceipt): void {
@@ -5423,6 +5724,8 @@ export class CodexAgentAdapter implements AgentAdapter {
       owned.close,
       this.ipcTraffic,
       () => !this.disposed,
+      undefined,
+      (signal, physicalCompletion) => this.nativeCheck.observeRequest(signal, physicalCompletion),
     )
     connection.setSkillChangeListener(() => this.skillCatalogChanged?.())
     this.connection = connection
@@ -5431,6 +5734,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.processEnvironmentKey = environmentKey
     this.initialized = false
     this.turnSpeedOverrideSupported = false
+    this.nativeSourceContextSupported = false
     this.retiredNativeTurns.clear()
     this.retiredNativeChildren.clear()
     this.loadedThreadIds.clear()
@@ -5572,6 +5876,11 @@ export class CodexAgentAdapter implements AgentAdapter {
           Number(version[2]) > 159 ||
           (Number(version[2]) === 159 && Number(version[3]) >= 2)),
       )
+      // Only this observed Native generation proves immutable request-level Thread/Turn metadata.
+      // Unknown versions select legacy before dispatch; a refused new request is never retried.
+      this.nativeSourceContextSupported = Boolean(
+        version && version[1] === '0' && version[2] === '163' && version[3] === '0',
+      )
       this.initialized = true
     } catch (error) {
       // A cancelled acknowledgement cannot leave a half-initialized actor reusable.
@@ -5592,6 +5901,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.processEnvironmentKey = undefined
     this.initialized = false
     this.turnSpeedOverrideSupported = false
+    this.nativeSourceContextSupported = false
     this.loadedThreadIds.clear()
     this.loadedThreadConfigurations.clear()
     for (const receipt of this.nativeRebuildReceipts.values()) {
@@ -5781,6 +6091,9 @@ export class CodexAgentAdapter implements AgentAdapter {
   private async injectedProcess(cwd: string): Promise<{
     child: ChildProcessWithoutNullStreams
     close: (() => Promise<void>) | undefined
+    physicalWitness?: (
+      ownerId: string,
+    ) => Promise<import('@pact/contracts').DecisionPhysicalWitness>
   }> {
     const supplied = await this.processFactory!(cwd)
     return 'child' in supplied ? supplied : { child: supplied, close: undefined }
@@ -5790,7 +6103,11 @@ export class CodexAgentAdapter implements AgentAdapter {
     cwd: string,
     storageRoot?: string,
     env = codexProcessEnvironment(storageRoot),
-  ): Promise<{ child: ChildProcessWithoutNullStreams; close: () => Promise<void> }> {
+  ): Promise<{
+    child: ChildProcessWithoutNullStreams
+    close: () => Promise<void>
+    physicalWitness: (ownerId: string) => Promise<import('@pact/contracts').DecisionPhysicalWitness>
+  }> {
     const isWindowsCommand = process.platform === 'win32' && /\.cmd$/iu.test(this.executablePath)
     if (isWindowsCommand && /[&|<>^%!"\r\n]/u.test(this.executablePath)) {
       throw new AgentExecutionError('runtime_incompatible', 'Unsafe Codex executable path.', false)
@@ -5824,7 +6141,11 @@ export class CodexAgentAdapter implements AgentAdapter {
         : runtimeArgs,
       { cwd, env, windowsHide: true, windowsVerbatimArguments: isWindowsCommand },
     )
-    return { child, close: () => processGroup.close() }
+    return {
+      child,
+      close: () => processGroup.close(),
+      physicalWitness: (ownerId) => processGroup.physicalWitness(ownerId),
+    }
   }
 
   private discoverInterruptArgs(
@@ -6124,13 +6445,25 @@ export class CodexAgentAdapter implements AgentAdapter {
       )
   }
 
+  private static permissionReadback(message: object): object {
+    const result = Reflect.get(message, 'result')
+    const profile = Reflect.get(result, 'activePermissionProfile')
+    return {
+      approvalPolicy: Reflect.get(result, 'approvalPolicy'),
+      approvalsReviewer: Reflect.get(result, 'approvalsReviewer'),
+      sandboxPolicy: CodexAgentAdapter.normalizeSandboxPolicy(Reflect.get(result, 'sandbox')),
+      permissionProfile:
+        profile && typeof profile === 'object' ? (Reflect.get(profile, 'id') ?? null) : null,
+    }
+  }
+
   private async applyPermissionSettings(
     connection: CodexAppServerConnection,
     threadId: string,
     policy: object | undefined,
     signal: AbortSignal,
     resumed?: object,
-  ): Promise<void> {
+  ): Promise<object> {
     if (signal.aborted)
       throw new AgentExecutionError(
         'user_stopped',
@@ -6166,7 +6499,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     )
       // This fresh native readback already proves the requested policy is in
       // force. Codex does not emit a settings notification for a no-op update.
-      return
+      return CodexAgentAdapter.permissionReadback(resumed)
     const controller = new AbortController()
     const observedSignal = AbortSignal.any([signal, controller.signal])
     let settle!: (settings: object | undefined) => void
@@ -6205,6 +6538,15 @@ export class CodexAgentAdapter implements AgentAdapter {
             ? 'Codex did not return a permission confirmation before the check ended. No task was submitted; the original native session was kept.'
             : 'Codex returned permissions that did not match the requested policy. No task was submitted; the original native session was kept.',
         )
+      return {
+        approvalPolicy: Reflect.get(actual!, 'approvalPolicy'),
+        approvalsReviewer: Reflect.get(actual!, 'approvalsReviewer'),
+        sandboxPolicy: CodexAgentAdapter.normalizeSandboxPolicy(
+          Reflect.get(actual!, 'sandboxPolicy'),
+        ),
+        permissionProfile:
+          Reflect.get(Reflect.get(actual!, 'activePermissionProfile') ?? {}, 'id') ?? null,
+      }
     } finally {
       release?.()
       clearTimeout(deadline)

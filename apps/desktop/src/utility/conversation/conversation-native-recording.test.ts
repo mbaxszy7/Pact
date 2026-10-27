@@ -95,6 +95,20 @@ vi.mock('./codex-agent-adapter.js', () => ({
     readonly id = 'codex' as const
     readonly executorId = randomUUID()
     inspectNativeRebuild = native.inspect
+    beginNativeRebuildCheck(
+      input: AgentNativeContextRebuildInput,
+      source: AsyncIterable<NativeContextRebuildChunk>,
+      signal: AbortSignal,
+    ) {
+      const result = this.inspectNativeRebuild(input, source, signal)
+      return {
+        result,
+        physicalCompletion: result.then(
+          () => undefined,
+          () => undefined,
+        ),
+      }
+    }
     hasActiveBackgroundWork(runId?: string) {
       return runId
         ? native.background.has(runId)

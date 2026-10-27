@@ -7,7 +7,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./diagnostics": "./src/diagnostics.ts",
-    "./images": "./src/images.ts"
+    "./images": "./src/images.ts",
+    "./decision-physical-witness": "./src/decision-physical-witness.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json --composite false"

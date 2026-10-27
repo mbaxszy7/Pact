@@ -14,6 +14,7 @@ import type {
   SessionCatalogChange,
   ProjectNameChange,
   RpcResult,
+  SchedulingState,
 } from '@pact/contracts'
 
 import type { ComposerDocument } from '../conversation/composer-document'
@@ -25,6 +26,7 @@ import type {
   ConversationHistoryControls,
   ConversationFlow,
 } from '../conversation/useConversation'
+import type { RelayDecisionPresentation } from '../scheduling/RelayDecisionCard'
 import type { SessionCatalogCache } from './session-catalog-cache'
 
 import { nativeRecoveryTargets } from '../conversation/conversation-window'
@@ -76,6 +78,8 @@ interface WorkspaceViewProps {
   sessionError?: string | undefined
   updateAvailable?: boolean
   settingsPage: SettingsPage
+  schedulingState?: SchedulingState | undefined
+  relayDecision?: RelayDecisionPresentation | undefined
   settingsView?: ReactNode
   runtimeNotice?: ReactNode
   archiveNotice?: ReactNode
@@ -137,6 +141,12 @@ interface WorkspaceViewProps {
   onOpenSkillDocument: (skill: SkillSelection) => void
   skillDocumentPanel?: SkillDocumentPanelState | undefined
   onRetrySkillDocument: () => void
+  conversationComposerUserInformation?:
+    | import('@pact/contracts').UserInformationDeclaration
+    | undefined
+  onConversationComposerUserInformationChange?:
+    | import('../conversation/useConversation').ConversationFlow['setComposerUserInformation']
+    | undefined
   conversationComposerSkills: SkillSelection[]
   onConversationComposerSkillsChange: (skills: SkillSelection[]) => void
   onConversationComposerMentionChange: (value: ConversationComposerMention | undefined) => void
@@ -271,14 +281,18 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
       }
       workspaceHeader={
         selectedSession && !props.settingsPage && !creatingProject ? (
-          <SessionHeader
-            session={selectedSession}
-            projectName={selectedProject?.name}
-            saving={props.renamingSessionId === selectedSession.id}
-            onSave={(title) => props.onRenameSession(selectedSession.id, title)}
-            onOpenSettings={() => props.onOpenSessionSettings(selectedSession.id)}
-            settingsButtonRef={sessionSettingsFocusRef}
-          />
+          <div className="flex h-full min-w-0 items-center gap-group">
+            <div className="min-w-0 flex-1">
+              <SessionHeader
+                session={selectedSession}
+                projectName={selectedProject?.name}
+                saving={props.renamingSessionId === selectedSession.id}
+                onSave={(title) => props.onRenameSession(selectedSession.id, title)}
+                onOpenSettings={() => props.onOpenSessionSettings(selectedSession.id)}
+                settingsButtonRef={sessionSettingsFocusRef}
+              />
+            </div>
+          </div>
         ) : undefined
       }
       workspaceNotice={
@@ -446,7 +460,7 @@ function WorkspaceContent({
         ) : null}
         <div
           className="h-full"
-          style={{ visibility: props.settingsPage ? 'hidden' : 'visible' }}
+          style={{ opacity: props.settingsPage ? 0 : 1 }}
           inert={Boolean(props.settingsPage)}
         >
           <ConversationErrorBoundary key={selectedSession.id}>
@@ -468,6 +482,9 @@ function WorkspaceContent({
               onSaveSessionSpeed={props.onSaveSessionSpeed}
               sessionSettingsSaving={props.savingSessionSettings}
               session={selectedSession}
+              schedulingState={props.schedulingState}
+              relayDecision={props.relayDecision}
+              onOpenRelaySettings={() => props.onOpenSettings('decision-scheduling')}
               visible={props.conversationVisible}
               snapshot={props.conversation}
               history={props.conversationHistory}
@@ -480,6 +497,8 @@ function WorkspaceContent({
               onComposerChange={props.onConversationComposerChange}
               onComposerDocumentChange={props.onConversationComposerDocumentChange}
               onOpenSkillDocument={props.onOpenSkillDocument}
+              composerUserInformation={props.conversationComposerUserInformation}
+              onComposerUserInformationChange={props.onConversationComposerUserInformationChange}
               composerSkills={props.conversationComposerSkills}
               onComposerSkillsChange={props.onConversationComposerSkillsChange}
               composerMention={props.conversationComposerMention}

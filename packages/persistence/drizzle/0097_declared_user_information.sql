@@ -1,0 +1,1 @@
+ALTER TABLE `conversation_input_batches` ADD `user_information_document_json` text;

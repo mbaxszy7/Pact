@@ -20,6 +20,7 @@ export {
   HANDOFF_SAFETY_BYTES,
   HANDOFF_READ_DEADLINE_MS,
   RunOperationConflictError,
+  PreparedInformationConflictError,
   OversizedConversationEntityError,
   StaleConversationCursorError,
   type ConversationInputWrite,
@@ -28,8 +29,11 @@ export {
   type ImageAssetRecord,
   type BeginRunInput,
   type BeginRunResult,
+  type PreparedInputDispatch,
   type HandoffBundle,
   type HandoffSourceRef,
+  type RelayWorkflowSnapshot,
+  type RelayWorkflowTurnSource,
 } from './conversation-repository.js'
 export { ProjectCatalogRepository } from './project-catalog-repository.js'
 export { projectSessionIssues } from './session-issues.js'

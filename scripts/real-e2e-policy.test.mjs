@@ -79,7 +79,7 @@ await test('actual Playwright discovery is completely classified and core select
       .toSorted(compare),
   )
   assert.equal(core.size, 1)
-  assert.equal(listed.size - core.size, 62)
+  assert.equal(listed.size - core.size, 70)
   assert.deepEqual(
     realCases.filter((item) => item.tier === 'core').map((item) => item.title),
     ['real @all completes each Agent once and keeps ordered distinct response rows'],
@@ -98,7 +98,7 @@ await test('core success reports every deferred case without claiming a complete
     notRun: 0,
     notApplicable: 0,
   })
-  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 62)
+  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 70)
   assert(
     report.cases
       .filter((item) => item.tier === 'extended')
@@ -250,12 +250,14 @@ await test('missing, dual and incorrectly reassigned Playwright tier tags cannot
 await test('a macOS-only case is required on macOS and explicitly non-applicable on Windows', () => {
   const raw = fixture()
   const mac = realCases.find((item) => item.platforms)
-  const executed = raw.suites[0].specs.find((item) => item.title === mac.title).tests[0]
-  executed.results[0].status = 'skipped'
-  executed.status = 'skipped'
+  for (const item of realCases.filter((entry) => entry.platforms)) {
+    const executed = raw.suites[0].specs.find((spec) => spec.title === item.title).tests[0]
+    executed.results[0].status = 'skipped'
+    executed.status = 'skipped'
+  }
   const windows = evaluateRealReport(raw, { suite: 'full', platform: 'win32' })
   assert.equal(windows.gatePassed, true)
-  assert.equal(windows.tiers.extended.notApplicable, 1)
+  assert.equal(windows.tiers.extended.notApplicable, 8)
   assert.equal(windows.cases.find((item) => item.title === mac.title).status, 'not-applicable')
   assert.equal(realCaseRequired({ ...mac, project: 'real' }, 'full', 'win32'), false)
   assert.equal(realCaseRequired({ ...mac, project: 'real' }, 'full', 'darwin'), true)
@@ -337,7 +339,7 @@ await test('the reporting entry still lists all cases and fails when CI identity
       (error) => error.status === 1,
     )
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
-    assert.equal(report.cases.length, 63)
+    assert.equal(report.cases.length, 71)
     assert.equal(report.gatePassed, false)
     assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
   } finally {
@@ -369,7 +371,7 @@ await test('the actual CI reporting entry preserves exact source and run metadat
       },
     )
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
-    assert.equal(report.cases.length, 63)
+    assert.equal(report.cases.length, 71)
     assert.equal(report.gatePassed, true)
     assert.deepEqual(report.identity, reportIdentity)
     assert.equal(JSON.stringify(report).includes(privateCanary), false)
@@ -416,7 +418,7 @@ await test('CI report entry rejects local or null metadata while preserving ever
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json')))
     assert.equal(report.gatePassed, false)
     assert.equal(report.identity, null)
-    assert.equal(report.cases.length, 63)
+    assert.equal(report.cases.length, 71)
     assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
   }
 })

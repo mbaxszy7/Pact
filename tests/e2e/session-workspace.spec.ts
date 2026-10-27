@@ -32,9 +32,10 @@ test(
   async () => {
     test.setTimeout(120_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })
+    let app: ElectronApplication | undefined
 
     try {
-      let app = await fixture.launch()
+      app = await fixture.launch()
       let window = await app.firstWindow()
       await expect(window.getByRole('heading', { name: 'Start with a project' })).toBeVisible()
       await addProject(fixture, app, window, 'project-one')
@@ -94,7 +95,11 @@ test(
       await expect(window.getByRole('heading', { name: 'New session' })).toBeVisible()
       await expect(window.getByRole('button', { name: 'New session', exact: true })).toBeVisible()
     } finally {
-      await fixture.dispose()
+      try {
+        if (app) await quitPact(app)
+      } finally {
+        await fixture.dispose()
+      }
     }
   },
 )

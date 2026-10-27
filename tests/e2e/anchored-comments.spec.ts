@@ -1,4 +1,4 @@
-import { expect, type Page } from '@playwright/test'
+import { expect, type ElectronApplication, type Page } from '@playwright/test'
 import { createHash, randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 
@@ -15,10 +15,11 @@ test(
   async () => {
     test.setTimeout(120_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })
+    let app: ElectronApplication | undefined
 
     try {
       const seeded = await seedConversation(fixture)
-      let app = await fixture.launch()
+      app = await fixture.launch()
       let window = await app.firstWindow()
       await openSeededSession(window, seeded.sessionTitle)
       await selectAssistantPhrase(
@@ -45,7 +46,11 @@ test(
         'Please verify this boundary.',
       )
     } finally {
-      await fixture.dispose()
+      try {
+        if (app) await quitPact(app)
+      } finally {
+        await fixture.dispose()
+      }
     }
   },
 )
@@ -56,10 +61,11 @@ test(
   async () => {
     test.setTimeout(120_000)
     const fixture = await createRuntimeFixture({ mode: 'real' })
+    let app: ElectronApplication | undefined
 
     try {
       const seeded = await seedConversation(fixture, { draftComments: 10 })
-      let app = await fixture.launch()
+      app = await fixture.launch()
       let window = await app.firstWindow()
       await openSeededSession(window, seeded.sessionTitle)
       let drafts = window.getByLabel('Attached Comment drafts').locator(':scope > span')
@@ -92,7 +98,11 @@ test(
         'The eleventh Comment is retained.',
       )
     } finally {
-      await fixture.dispose()
+      try {
+        if (app) await quitPact(app)
+      } finally {
+        await fixture.dispose()
+      }
     }
   },
 )

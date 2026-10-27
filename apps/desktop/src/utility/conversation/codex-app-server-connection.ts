@@ -24,6 +24,7 @@ import {
   NativeWorkingMemory,
   NATIVE_OWNER_WORKING_BYTES,
   type NativeMemoryReservation,
+  type NativeMemoryAllocator,
 } from './native-working-memory'
 
 // Compatibility for bounded cold-read callers; actual framing uses shared working admission.
@@ -41,16 +42,52 @@ const CODEX_INLINE_ENCODING_MEMORY_BYTES = 256 * 1024
 // Raw fragments, concatenation, decode, Worker DTO and receiving structured clone.
 const CODEX_PARSE_WORKSPACE_MULTIPLIER = 8
 const CODEX_FRAME_WORKSPACE_BYTES = 4 * NATIVE_FRAME_WRITE_CHUNK_BYTES
+const DECISION_PARSE_WORKSPACE_BYTES = 3 * 1024 * 1024
+const DECISION_NATIVE_DTO_BYTES = 1024 * 1024
+
+/** Count structural allocation before JSON.parse; no shared parser Worker for auxiliary frames. */
+function decisionParseWorkspace(bytes: Buffer): number {
+  let quoted = false,
+    escaped = false
+  let held = CODEX_FRAME_WORKSPACE_BYTES + bytes.length * CODEX_PARSE_WORKSPACE_MULTIPLIER
+  for (const byte of bytes) {
+    if (quoted) {
+      if (escaped) escaped = false
+      else if (byte === 92) escaped = true
+      else if (byte === 34) quoted = false
+    } else if (byte === 34) {
+      quoted = true
+      held += 96
+    } else if (byte === 123 || byte === 91) held += 512
+    // Include array-index properties, descriptor/own-key counting workspace,
+    // slots and primitives as well as the parsed containers and strings.
+    else if (byte === 58 || byte === 44) held += 384
+  }
+  return held
+}
 
 interface PendingRequest {
   diagnostic: DiagnosticEvent
   startedAt: number
-  resolve: (message: object) => void
-  reject: (error: Error) => void
+  resolve: ((message: object) => void) | undefined
+  reject: ((error: Error) => void) | undefined
   timeout: ReturnType<typeof setTimeout> | undefined
   pauseCleanup?: (() => void) | undefined
   signal?: AbortSignal | undefined
   abort?: (() => void) | undefined
+  logicalSettled: boolean
+  dispatched: boolean
+  writeJoined: boolean
+  replied: boolean
+  physicalResolve: (result: CodexRequestPhysicalCompletion) => void
+}
+
+export type CodexRequestPhysicalCompletion = 'reply' | 'not_sent' | 'connection_closed'
+export interface CodexRequestOperation {
+  readonly requestId: number | null
+  result: Promise<object>
+  /** A logical timeout/abort cannot settle an already dispatched RPC's physical ownership. */
+  physicalCompletion: Promise<CodexRequestPhysicalCompletion>
 }
 
 interface QueuedNotification {
@@ -82,10 +119,12 @@ interface OutboundFrame {
   onDispatch?: (() => void) | undefined
   canDispatch?: (() => boolean) | undefined
   cancelBeforeWriteSignal?: AbortSignal | undefined
+  physicalResolve?: (() => void) | undefined
 }
 
 export interface CodexConnectionDiagnostics {
   pendingRequests: number
+  pendingPhysicalRequests: number
   queuedMessages: number
   queuedInboundBytes: number
   queuedOutboundFrames: number
@@ -97,7 +136,7 @@ export interface CodexConnectionDiagnostics {
 
 export class CodexAppServerConnection {
   readonly executorId = randomUUID()
-  private readonly memory = new NativeWorkingMemory()
+  private readonly memory: NativeMemoryAllocator
   private readonly inboundController = new AbortController()
   private frameReservation: NativeMemoryReservation | undefined
   private inboundProcessing = false
@@ -118,6 +157,12 @@ export class CodexAppServerConnection {
   private outboundHead = 0
   private notificationWaiter: NotificationWaiter | undefined
   private frameChunks: Buffer[] = []
+  private decisionFrame: Buffer | undefined
+  private decisionFrameReservation: NativeMemoryReservation | undefined
+  private receiveTask: Promise<void> | undefined
+  private parserCompletion: Promise<void> | undefined
+  private outboundWriteTask: Promise<void> | undefined
+  private readonly processClosed: Promise<void>
   private frameBytes = 0
   private queuedInboundBytes = 0
   private queuedOutboundBytes = 0
@@ -136,7 +181,7 @@ export class CodexAppServerConnection {
   private readonly receive = (chunk: Buffer): void => {
     this.inboundProcessing = true
     this.updateStdoutPause()
-    void this.receiveChunk(chunk)
+    const task = this.receiveChunk(chunk)
       .catch((error: unknown) => {
         void this.close(
           error instanceof Error ? error : new Error('Native frame read failed.'),
@@ -144,9 +189,13 @@ export class CodexAppServerConnection {
       })
       .finally(() => {
         this.inboundProcessing = false
-        if (this.observedCloseError) this.fail(this.observedCloseError, 'process_exit')
+        if (this.observedCloseError) {
+          this.fail(this.observedCloseError, 'process_exit')
+          void this.close(this.observedCloseError).catch(() => undefined)
+        }
         this.updateStdoutPause()
       })
+    this.receiveTask = task
   }
   private readonly receiveError = (chunk: Buffer): void => {
     const remaining = CODEX_STDERR_LIMIT_BYTES - this.stderrBytes
@@ -163,7 +212,10 @@ export class CodexAppServerConnection {
       true,
     )
     if (this.inboundProcessing) this.observedCloseError = error
-    else this.fail(error, 'process_exit')
+    else {
+      this.fail(error, 'process_exit')
+      void this.close(error).catch(() => undefined)
+    }
   }
   private readonly processExited = (code: number | null): void => this.recordExit(code)
 
@@ -173,7 +225,14 @@ export class CodexAppServerConnection {
     private readonly closeOwnedProcess?: () => Promise<void>,
     private readonly ipcTraffic?: LogicalIpcWorkerTraffic,
     private readonly isLifetimeCurrent?: () => boolean,
+    private readonly decisionMemory?: NativeMemoryAllocator,
+    private readonly observePhysicalOperation?: (
+      signal: AbortSignal | undefined,
+      physicalCompletion: Promise<unknown>,
+    ) => void,
   ) {
+    this.processClosed = new Promise((resolve) => child.once('close', () => resolve()))
+    this.memory = decisionMemory ?? new NativeWorkingMemory()
     recordDiagnostic({
       operation: 'process',
       scope: 'process',
@@ -205,7 +264,10 @@ export class CodexAppServerConnection {
 
   diagnostics(): CodexConnectionDiagnostics {
     return {
-      pendingRequests: this.pendingRequests.size,
+      pendingRequests: [...this.pendingRequests.values()].filter(
+        (request) => !request.logicalSettled,
+      ).length,
+      pendingPhysicalRequests: this.pendingRequests.size,
       queuedMessages: this.notificationQueue.length - this.notificationHead,
       queuedInboundBytes: this.queuedInboundBytes,
       queuedOutboundFrames: this.outboundQueue.length - this.outboundHead,
@@ -226,22 +288,48 @@ export class CodexAppServerConnection {
       canDispatch?: (() => boolean) | undefined
     },
   ): Promise<object> {
+    return this.requestOwned(method, params, options).result
+  }
+
+  requestOwned(
+    method: string,
+    params: object,
+    options: {
+      timeoutMs: number
+      signal?: AbortSignal | undefined
+      onDispatch?: (() => void) | undefined
+      canDispatch?: (() => boolean) | undefined
+    },
+  ): CodexRequestOperation {
     if (options.signal?.aborted) {
-      return Promise.reject(
-        new AgentExecutionError('agent_process_crash', 'Codex was interrupted.', false),
-      )
-    }
-    if (this.pendingRequests.size >= CODEX_PENDING_REQUEST_LIMIT) {
-      return Promise.reject(
-        new AgentExecutionError(
-          'protocol_error',
-          'Codex exceeded Pact’s pending request budget.',
-          false,
+      return {
+        requestId: null,
+        result: Promise.reject(
+          new AgentExecutionError('agent_process_crash', 'Codex was interrupted.', false),
         ),
-      )
+        physicalCompletion: Promise.resolve('not_sent'),
+      }
+    }
+    if (this.pendingRequests.size >= (this.decisionMemory ? 8 : CODEX_PENDING_REQUEST_LIMIT)) {
+      return {
+        requestId: null,
+        result: Promise.reject(
+          new AgentExecutionError(
+            'protocol_error',
+            'Codex exceeded Pact’s pending request budget.',
+            false,
+          ),
+        ),
+        physicalCompletion: Promise.resolve('not_sent'),
+      }
     }
     const id = this.nextRequestId
     this.nextRequestId += 1
+    let physicalResolve!: PendingRequest['physicalResolve']
+    const physicalCompletion = new Promise<CodexRequestPhysicalCompletion>((resolve) => {
+      physicalResolve = resolve
+    })
+    this.observePhysicalOperation?.(options.signal, physicalCompletion)
     const response = new Promise<object>((resolve, reject) => {
       const expired = (): void => {
         this.settleRequest(
@@ -272,6 +360,11 @@ export class CodexAppServerConnection {
         reject,
         timeout: undefined,
         signal: options.signal,
+        logicalSettled: false,
+        dispatched: false,
+        writeJoined: false,
+        replied: false,
+        physicalResolve,
       }
       const arm = (): void => {
         clearTimeout(pending.timeout)
@@ -296,13 +389,22 @@ export class CodexAppServerConnection {
       this.updateStdoutPause()
       recordDiagnostic(pending.diagnostic)
     })
-    void this.enqueue(
+    const writing = this.enqueue(
       { method, id, params },
-      { requestId: id, onDispatch: options.onDispatch, canDispatch: options.canDispatch },
-    ).catch((error: unknown) => {
+      {
+        requestId: id,
+        onDispatch: () => {
+          const pending = this.pendingRequests.get(id)
+          options.onDispatch?.()
+          if (pending) pending.dispatched = true
+        },
+        canDispatch: options.canDispatch,
+      },
+    )
+    void writing.catch((error: unknown) => {
       this.settleRequest(id, error instanceof Error ? error : new Error(String(error)))
     })
-    return response
+    return { requestId: id, result: response, physicalCompletion }
   }
 
   async notify(
@@ -449,9 +551,30 @@ export class CodexAppServerConnection {
 
   async close(error = new Error('Codex connection closed.')): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise
+    // oxlint-disable-next-line promise/no-promise-in-callback -- Publish completion before onClosed can reenter this method.
+    const completion = Promise.withResolvers<void>()
+    this.shutdownPromise = completion.promise
     if (!this.closed) this.fail(error)
-    this.shutdownPromise = this.shutdown()
-    return this.shutdownPromise
+    // oxlint-disable-next-line promise/no-promise-in-callback -- This method accepts an Error, not a callback.
+    void (async () => {
+      await this.shutdown()
+      await this.processClosed
+      await this.outboundWriteTask
+      await this.receiveTask
+      await this.parserCompletion
+      if (this.decisionMemory) {
+        // Native exit is not a decoder join. The fixed buffer remains charged
+        // until the last physical reader has stopped referring to it.
+        this.decisionFrame = undefined
+        this.decisionFrameReservation?.release()
+        this.decisionFrameReservation = undefined
+      }
+      for (const [id, pending] of this.pendingRequests) {
+        this.pendingRequests.delete(id)
+        pending.physicalResolve('connection_closed')
+      }
+    })().then(completion.resolve, completion.reject)
+    return completion.promise
   }
 
   private async receiveChunk(chunk: Buffer): Promise<void> {
@@ -473,14 +596,28 @@ export class CodexAppServerConnection {
             ).catch(() => undefined)
           }, 10_000)
         this.frameBytes += fragment.length
+        if (this.decisionMemory && this.frameBytes > 256 * 1024)
+          throw new AgentExecutionError(
+            'protocol_error',
+            'Decision native frame capacity is full.',
+            false,
+          )
         this.frameReservation ??= this.memory.reserve(CODEX_FRAME_WORKSPACE_BYTES)
         this.frameReservation.resize(
           CODEX_FRAME_WORKSPACE_BYTES + this.frameBytes * CODEX_PARSE_WORKSPACE_MULTIPLIER,
         )
-        this.frameChunks.push(fragment)
+        if (this.decisionMemory) {
+          if (!this.decisionFrame) {
+            this.decisionFrameReservation = this.memory.reserve(256 * 1024)
+            this.decisionFrame = Buffer.allocUnsafe(256 * 1024)
+          }
+          fragment.copy(this.decisionFrame, this.frameBytes - fragment.length)
+        } else this.frameChunks.push(fragment)
       }
       if (newline === -1) return
-      const frame = Buffer.concat(this.frameChunks, this.frameBytes)
+      const frame = this.decisionMemory
+        ? (this.decisionFrame?.subarray(0, this.frameBytes) ?? Buffer.alloc(0))
+        : Buffer.concat(this.frameChunks, this.frameBytes)
       this.frameChunks = []
       this.frameBytes = 0
       const reservation = this.frameReservation ?? this.memory.reserve(CODEX_FRAME_WORKSPACE_BYTES)
@@ -504,6 +641,7 @@ export class CodexAppServerConnection {
     reservation: NativeMemoryReservation,
   ): Promise<void> {
     let retained = false
+    let parserPhysical: Promise<void> | undefined
     try {
       const wireBytes = rawFrame.length + 1
       const frame = rawFrame.at(-1) === 0x0d ? rawFrame.subarray(0, -1) : rawFrame
@@ -511,13 +649,33 @@ export class CodexAppServerConnection {
       let message: unknown
       let heldBytes: number
       if (frame.length <= CODEX_INLINE_ENCODING_MEMORY_BYTES) {
+        if (this.decisionMemory) {
+          const workspace = decisionParseWorkspace(frame)
+          if (workspace > DECISION_PARSE_WORKSPACE_BYTES)
+            throw new AgentExecutionError(
+              'protocol_error',
+              'Decision native structure capacity is full.',
+              false,
+            )
+          reservation.resize(Math.max(reservation.bytes, workspace))
+        }
         message = JSON.parse(this.decoder.decode(frame))
         heldBytes = freezeNativeJsonFrame(message)
+        if (this.decisionMemory && heldBytes > DECISION_NATIVE_DTO_BYTES)
+          throw new AgentExecutionError(
+            'protocol_error',
+            'Decision native DTO capacity is full.',
+            false,
+          )
       } else {
         const parsed = await parseNativeJsonFrame(
           frame,
           this.inboundController.signal,
           this.ipcTraffic,
+          (completion) => {
+            parserPhysical = completion
+            this.parserCompletion = completion
+          },
         )
         message = parsed.message
         heldBytes = parsed.heldBytes
@@ -549,7 +707,11 @@ export class CodexAppServerConnection {
       this.notificationQueue.push({ message, bytes: wireBytes, reservation })
       retained = true
       this.queuedInboundBytes += wireBytes
-      if (this.notificationQueue.length - this.notificationHead > CODEX_QUEUE_MESSAGE_LIMIT)
+      if (
+        this.notificationQueue.length - this.notificationHead >
+          (this.decisionMemory ? 64 : CODEX_QUEUE_MESSAGE_LIMIT) ||
+        (this.decisionMemory && this.queuedInboundBytes > 512 * 1024)
+      )
         throw new AgentExecutionError(
           'protocol_error',
           'Native notification item capacity is full.',
@@ -559,7 +721,16 @@ export class CodexAppServerConnection {
       // Pause only when no request/control handler is waiting behind these notifications.
       this.updateStdoutPause()
     } finally {
-      if (!retained) reservation.release()
+      if (!retained) {
+        if (parserPhysical) {
+          const completion = parserPhysical
+          void completion.then(() => {
+            reservation.release()
+            if (this.parserCompletion === completion) this.parserCompletion = undefined
+            return undefined
+          })
+        } else reservation.release()
+      }
     }
   }
 
@@ -571,7 +742,12 @@ export class CodexAppServerConnection {
   ): void {
     const pending = this.pendingRequests.get(id)
     if (!pending) return
-    this.pendingRequests.delete(id)
+    if (message) pending.replied = true
+    if (pending.logicalSettled) {
+      this.completePhysicalRequest(id, pending)
+      return
+    }
+    pending.logicalSettled = true
     const rpcError = message && Reflect.get(message, 'error')
     const candidate =
       rpcError && typeof rpcError === 'object' ? Reflect.get(rpcError, 'code') : undefined
@@ -616,8 +792,34 @@ export class CodexAppServerConnection {
     pending.pauseCleanup?.()
     if (pending.signal && pending.abort) pending.signal.removeEventListener('abort', pending.abort)
     this.updateStdoutPause()
-    if (error) pending.reject(error)
-    else if (message) pending.resolve(message)
+    if (error) pending.reject?.(error)
+    else if (message) pending.resolve?.(message)
+    pending.resolve = undefined
+    pending.reject = undefined
+    pending.signal = undefined
+    pending.abort = undefined
+    pending.pauseCleanup = undefined
+    pending.timeout = undefined
+    this.completePhysicalRequest(id, pending)
+  }
+
+  private finishRequestWrite(id: number | undefined): void {
+    if (id === undefined) return
+    const pending = this.pendingRequests.get(id)
+    if (!pending) return
+    pending.writeJoined = true
+    // A write rejection settles the logical request in its Promise handler.
+    // Keep that record available until the handler has consumed the error.
+    if (pending.logicalSettled) this.completePhysicalRequest(id, pending)
+  }
+
+  private completePhysicalRequest(id: number, pending: PendingRequest): void {
+    if (!pending.logicalSettled || !pending.writeJoined || (!pending.replied && pending.dispatched))
+      return
+    if (this.pendingRequests.get(id) !== pending) return
+    this.pendingRequests.delete(id)
+    pending.physicalResolve(pending.replied ? 'reply' : 'not_sent')
+    this.updateStdoutPause()
   }
 
   private settleNotificationWaiter(error: Error): void {
@@ -668,24 +870,34 @@ export class CodexAppServerConnection {
     },
   ): Promise<void> {
     if (!this.isOpen) {
+      this.finishRequestWrite(options.requestId)
       return Promise.reject(this.closeError ?? new Error('Codex app-server is unavailable.'))
     }
     let heldBytes: number
     let bytes: Buffer | undefined
     let reservation: NativeMemoryReservation
+    let counting: NativeMemoryReservation | undefined
     try {
+      if (this.decisionMemory) counting = this.memory.reserve(64 * 1024)
       heldBytes = freezeNativeJsonFrame(message)
-      if (heldBytes <= CODEX_INLINE_ENCODING_MEMORY_BYTES) {
+      if (!this.decisionMemory && heldBytes <= CODEX_INLINE_ENCODING_MEMORY_BYTES) {
         bytes = Buffer.from(`${JSON.stringify(message)}\n`, 'utf8')
         heldBytes += bytes.length * 3
       }
       heldBytes += CODEX_FRAME_WORKSPACE_BYTES
       reservation = this.memory.reserve(heldBytes)
     } catch (error) {
+      this.finishRequestWrite(options.requestId)
       return Promise.reject(error)
+    } finally {
+      counting?.release()
     }
-    if (this.outboundQueue.length - this.outboundHead >= CODEX_QUEUE_MESSAGE_LIMIT) {
+    if (
+      this.outboundQueue.length - this.outboundHead >=
+      (this.decisionMemory ? 8 : CODEX_QUEUE_MESSAGE_LIMIT)
+    ) {
       reservation.release()
+      this.finishRequestWrite(options.requestId)
       return Promise.reject(
         new AgentExecutionError(
           'runtime_incompatible',
@@ -696,6 +908,9 @@ export class CodexAppServerConnection {
     }
     this.queuedOutboundBytes += heldBytes
     return new Promise((resolve, reject) => {
+      const physical = options.requestId === undefined ? Promise.withResolvers<void>() : undefined
+      if (physical)
+        this.observePhysicalOperation?.(options.cancelBeforeWriteSignal, physical.promise)
       this.outboundQueue.push({
         message,
         expiresAt: Date.now() + CODEX_OUTBOUND_DRAIN_TIMEOUT_MS,
@@ -706,6 +921,7 @@ export class CodexAppServerConnection {
         controller: new AbortController(),
         resolve,
         reject,
+        physicalResolve: physical?.resolve,
         ...options,
       })
       this.pumpOutbound()
@@ -724,7 +940,11 @@ export class CodexAppServerConnection {
       this.pumpOutbound()
       return
     }
-    if (frame.requestId !== undefined && !this.pendingRequests.has(frame.requestId)) {
+    if (
+      frame.requestId !== undefined &&
+      (!this.pendingRequests.has(frame.requestId) ||
+        this.pendingRequests.get(frame.requestId)?.logicalSettled)
+    ) {
       this.finishOutbound(frame, new Error('Codex request expired before dispatch.'))
       this.pumpOutbound()
       return
@@ -747,14 +967,16 @@ export class CodexAppServerConnection {
             }
           })()
         : encodeNativeJsonFrame(frame.message, physicalSignal)
-    void writeNativeFrame(this.child.stdin, source, {
+    const writing = writeNativeFrame(this.child.stdin, source, {
       signal: writeSignal,
       ...(signal ? { cancelBeforeWriteSignal: signal } : {}),
       onFirstWrite: () => frame.onDispatch?.(),
       canDispatch: () =>
         this.isOpen &&
         (this.isLifetimeCurrent?.() ?? true) &&
-        (frame.requestId === undefined || this.pendingRequests.has(frame.requestId)) &&
+        (frame.requestId === undefined ||
+          (this.pendingRequests.has(frame.requestId) &&
+            !this.pendingRequests.get(frame.requestId)?.logicalSettled)) &&
         (frame.canDispatch?.() ?? true),
       deadlineMs: Math.max(1, frame.expiresAt - Date.now()),
     }).then(
@@ -772,6 +994,7 @@ export class CodexAppServerConnection {
         return undefined
       },
     )
+    this.outboundWriteTask = writing
   }
 
   private releaseOutbound(frame: OutboundFrame): void {
@@ -784,6 +1007,8 @@ export class CodexAppServerConnection {
   private finishOutbound(frame: OutboundFrame, error?: Error): void {
     // A closed queue may already have rejected this frame, but its actual writer still owned the DTO.
     this.releaseOutbound(frame)
+    this.finishRequestWrite(frame.requestId)
+    frame.physicalResolve?.()
     if (this.activeOutboundFrame === frame) this.activeOutboundFrame = undefined
     if (this.outboundQueue[this.outboundHead] !== frame) return
     this.outboundQueue[this.outboundHead] = undefined
@@ -831,7 +1056,11 @@ export class CodexAppServerConnection {
     for (let index = this.outboundHead; index < this.outboundQueue.length; index += 1) {
       const frame = this.outboundQueue[index]
       if (frame) {
-        if (frame !== this.activeOutboundFrame) this.releaseOutbound(frame)
+        if (frame !== this.activeOutboundFrame) {
+          this.releaseOutbound(frame)
+          this.finishRequestWrite(frame.requestId)
+          frame.physicalResolve?.()
+        }
         frame.reject(error)
       }
     }

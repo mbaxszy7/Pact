@@ -26,7 +26,7 @@ const settings: DefaultSessionSettings = {
 test(
   '@all preserves ordered distinct Agent rows while the second response is pending',
   { tag: '@deterministic' },
-  async () => {
+  async ({ browserName: _browserName }, testInfo) => {
     const fixture = await createRuntimeFixture({
       codexAppServer: 'retry_progress',
       claudeConversation: 'complete',
@@ -65,6 +65,9 @@ test(
       expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(1)
       expect((await fixture.readClaudeFacts()).count).toBe(1)
       await expect(window.getByRole('combobox', { name: 'Message' })).toBeEnabled()
+    } catch (error) {
+      await fixture.captureUiFailure(testInfo).catch(() => undefined)
+      throw error
     } finally {
       await quitPact(app)
       await fixture.dispose()

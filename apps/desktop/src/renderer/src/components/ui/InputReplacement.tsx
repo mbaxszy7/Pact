@@ -25,7 +25,7 @@ export function InputReplacement({
   const active = Boolean(replacement)
   const mode = useRef(active)
   const modeKey = useRef(replacement?.key)
-  const measureCurrent = useRef<(() => void) | undefined>(undefined)
+  const measureCurrent = useRef<((interrupt?: boolean) => void) | undefined>(undefined)
 
   useLayoutEffect(() => {
     if (replacement) {
@@ -41,17 +41,17 @@ export function InputReplacement({
     const element = root.current
     if (!element) return undefined
     const media = window.matchMedia('(prefers-reduced-motion: reduce)')
-    const measure = (): void => {
+    const measure = (interrupt = false): void => {
       const panel = mode.current ? alternate.current : ordinary.current
-      if (!panel) return
-      const next = panel.getBoundingClientRect().height
-      if (height.current === next) return
+      if (!panel || (animation.current && !interrupt)) return
       const previous = animation.current ? element.getBoundingClientRect().height : height.current
-      height.current = next
       animation.current?.cancel()
       animation.current = undefined
       delete element.dataset.transitioning
-      if (previous === undefined || media.matches) return
+      // Measure natural layout after removing our own animated height constraint.
+      const next = panel.getBoundingClientRect().height
+      height.current = next
+      if (previous === undefined || media.matches || previous === next) return
       const transition = element.animate([{ height: `${previous}px` }, { height: `${next}px` }], {
         duration: 220,
         easing: 'cubic-bezier(0.16, 1, 0.3, 1)',
@@ -62,11 +62,12 @@ export function InputReplacement({
         if (animation.current === transition) {
           animation.current = undefined
           delete element.dataset.transitioning
+          measure()
         }
       }
     }
     measureCurrent.current = measure
-    const observer = new ResizeObserver(measure)
+    const observer = new ResizeObserver(() => measure())
     if (ordinary.current) observer.observe(ordinary.current)
     if (alternate.current) observer.observe(alternate.current)
     const reduce = (): void => {
@@ -104,7 +105,7 @@ export function InputReplacement({
     const previousKey = modeKey.current
     mode.current = active
     modeKey.current = replacement?.key
-    measureCurrent.current?.()
+    measureCurrent.current?.(previous !== active || previousKey !== replacement?.key)
     if (previous === active && previousKey === replacement?.key) return
     const owner = focusOwner.current
     if (
@@ -148,6 +149,7 @@ export function InputReplacement({
     >
       <div
         ref={ordinary}
+        data-input-panel="ordinary"
         className="input-replacement-pane"
         data-active={!active}
         inert={active}
@@ -160,6 +162,7 @@ export function InputReplacement({
       </div>
       <div
         ref={alternate}
+        data-input-panel="alternate"
         className="input-replacement-pane"
         data-active={active}
         inert={!active}

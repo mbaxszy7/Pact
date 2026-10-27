@@ -19,6 +19,10 @@ import { promisify } from 'node:util'
 
 import identities from '../apps/desktop/app-identities.json' with { type: 'json' }
 import {
+  inspectWindowsOwnedProcessResource,
+  validateWindowsOwnedProcessManifest,
+} from '../apps/desktop/build/windows-owned-process-resource.mjs'
+import {
   loadProviderConfiguration,
   prepareProviderEnvironment,
 } from '../tests/e2e/provider-environment.ts'
@@ -320,6 +324,7 @@ export async function readDistributionManifest(path) {
     )
       throw new Error('Distribution artifact metadata is invalid.')
   }
+  validateWindowsOwnedProcessManifest(manifest)
   return manifest
 }
 
@@ -347,7 +352,17 @@ export async function verifyApplication(application, manifest, installed) {
     }
     throw mismatch
   }
+  const windowsOwnedProcess = validateWindowsOwnedProcessManifest(manifest)
   const executable = resolveWithin(application, manifest.application.executable)
+  if (windowsOwnedProcess) {
+    const observed = await inspectWindowsOwnedProcessResource(
+      join(application, 'resources/native'),
+      manifest.arch,
+      windowsOwnedProcess.sourceSha256,
+    )
+    if (JSON.stringify(observed) !== JSON.stringify(windowsOwnedProcess))
+      throw new Error('Installed Windows helper differs from its exact distribution identity.')
+  }
   if (!(await pathExists(executable)))
     throw new Error('The explicit packaged executable is missing or not executable.')
   return executable

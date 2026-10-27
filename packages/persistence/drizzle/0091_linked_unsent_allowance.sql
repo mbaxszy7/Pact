@@ -1,0 +1,4 @@
+DROP INDEX `scheduling_budget_reservations_handoff`;--> statement-breakpoint
+ALTER TABLE `scheduling_budget_reservations` ADD `replaces_reservation_id` text REFERENCES scheduling_budget_reservations(id);--> statement-breakpoint
+CREATE UNIQUE INDEX `scheduling_budget_reservations_replacement` ON `scheduling_budget_reservations` (`replaces_reservation_id`) WHERE "scheduling_budget_reservations"."replaces_reservation_id" IS NOT NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX `scheduling_budget_reservations_handoff` ON `scheduling_budget_reservations` (`handoff_id`,`budget`) WHERE "scheduling_budget_reservations"."replaces_reservation_id" IS NULL;

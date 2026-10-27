@@ -5,8 +5,10 @@ import {
   collaborationDocumentSchema,
   collaborationInputBatchReferenceSchema,
 } from './collaboration-documents.js'
+import { schedulingHandoffSchema } from './scheduling.js'
 
 export * from './collaboration-documents.js'
+export * from './scheduling.js'
 
 const agent = z.enum(['claude', 'codex'])
 export const PACT_SKILLS = ['plan', 'build', 'review'] as const
@@ -192,6 +194,22 @@ export const collaborationTurnAuthorizationSchema = z.strictObject({
   inputBatchRef: collaborationInputBatchReferenceSchema.optional(),
   inputProcessing: collaborationInputProcessingSchema.optional(),
   sourceManifestRef: collaborationDocumentSchema.optional(),
+  relayWorkRef: collaborationDocumentSchema.optional(),
+  /** A host-verified user receipt; inherited workflow stage is never write authority. */
+  userAuthority: z
+    .strictObject({
+      receiptId: z.string().uuid(),
+      rootReceiptId: z.string().uuid(),
+      purpose: z.enum([
+        'action',
+        'write_continuation',
+        'supplement_plan',
+        'supplement_code_response',
+      ]),
+      returnStage: z.enum(['plan_review', 'code_review']).optional(),
+      returnActor: agent.optional(),
+    })
+    .optional(),
 })
 export type CollaborationTurnAuthorization = z.infer<typeof collaborationTurnAuthorizationSchema>
 
@@ -268,6 +286,10 @@ export const collaborationActionSchema = z.enum([
   'resume',
   'retry',
   'recover_plan',
+  'request_plan_supplement',
+  'request_code_supplement',
+  'confirm_supplement',
+  'cancel_supplement',
 ])
 export type CollaborationAction = z.infer<typeof collaborationActionSchema>
 export const collaborationActionInputSchema = z.strictObject({
@@ -276,8 +298,62 @@ export const collaborationActionInputSchema = z.strictObject({
   revision: z.number().int().nonnegative(),
   action: collaborationActionSchema,
   clientMessageId: z.string().uuid(),
+  decision: z
+    .strictObject({ id: z.string().uuid(), revision: z.number().int().nonnegative() })
+    .optional(),
 })
 export type CollaborationActionInput = z.infer<typeof collaborationActionInputSchema>
+
+/** Repository-proved arrangement and permission changes, originating in an explicit user request. */
+export const relayDecisionSchema = z.strictObject({
+  id: z.string().uuid(),
+  revision: z.number().int().nonnegative(),
+  taskId: z.string().uuid(),
+  afterRunId: z.string().uuid(),
+  kind: z.enum(['supplement_plan', 'supplement_code_response']),
+  state: z.enum(['requested', 'awaiting_answer', 'available']),
+  actor: agent,
+  returnActor: agent,
+  planReference: collaborationPlanReferenceSchema.optional(),
+  reviewRunId: z.string().uuid().optional(),
+  reviewDocument: collaborationDocumentSchema.optional(),
+  reviewScopeRef: collaborationDocumentSchema.optional(),
+})
+export type RelayDecision = z.infer<typeof relayDecisionSchema>
+
+/** Bounded durable proof references, produced and rechecked only by the existing host owner. */
+export const relayDecisionProofSchema = z.strictObject({
+  card: relayDecisionSchema,
+  request: z.strictObject({
+    taskRevision: z.number().int().nonnegative(),
+    inputSequence: z.number().int().nonnegative(),
+    configurationGeneration: z.number().int().nonnegative(),
+    wasRunning: z.boolean(),
+  }),
+  handoff: schedulingHandoffSchema.optional(),
+  sourceFingerprint: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/u)
+    .optional(),
+})
+
+export const collaborationActionBasisSchema = z.strictObject({
+  handoff: schedulingHandoffSchema,
+  taskId: z.string().uuid(),
+  inputSequence: z.number().int().nonnegative(),
+  stage: collaborationStageSchema,
+  actor: agent,
+  planReference: collaborationPlanReferenceSchema.nullable(),
+  review: collaborationReviewSchema.nullable(),
+  reviewScopeRef: collaborationDocumentSchema.nullable(),
+  previousRunId: z.string().uuid().nullable(),
+  actorBinding: z.strictObject({
+    generation: z.number().int().positive(),
+    nativeSessionId: z.string().max(1024).nullable(),
+    continuationState: z.string().max(128).nullable(),
+    permissions: z.string().regex(/^[a-f0-9]{64}$/u),
+  }),
+})
 export interface CollaborationLimits {
   maxDiscussionRounds: number
   maxReviewCycles: number
@@ -439,6 +515,15 @@ export function advanceCollaboration(
   if (task.status === 'complete') throw new Error('This collaboration is already complete.')
   if (action === 'recover_plan')
     throw new Error('Plan recovery checks the original source; it cannot advance collaboration.')
+  if (
+    [
+      'request_plan_supplement',
+      'request_code_supplement',
+      'confirm_supplement',
+      'cancel_supplement',
+    ].includes(action)
+  )
+    throw new Error('A supplement requires its current user decision receipt.')
   const next = structuredClone(task)
   if (action === 'pause') {
     next.automation = 'paused'
@@ -529,6 +614,7 @@ export const collaborationViewSchema = z
     accepted: z.boolean().default(false),
     actionable: z.boolean().default(false),
     availableActions: z.array(collaborationActionSchema).max(7).default([]),
+    relayDecision: relayDecisionSchema.optional(),
     nextStep: z.string().max(160).optional(),
     planSync: z
       .strictObject({

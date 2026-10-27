@@ -23,8 +23,8 @@ test(
         window.getByRole('heading', { name: 'Set your collaboration defaults' }),
       ).toBeVisible()
       await window.getByRole('radio', { name: 'Codex Set as Primary LLM' }).click()
-      await window.getByRole('spinbutton', { name: 'Maximum discussion rounds' }).fill('4')
-      await window.getByRole('spinbutton', { name: 'Repair attempts per task' }).fill('3')
+      await window.getByRole('spinbutton', { name: 'Plan reviews' }).fill('4')
+      await window.getByRole('spinbutton', { name: 'Repair attempts' }).fill('3')
       await window.getByRole('button', { name: 'Save and enter Pact' }).click()
 
       await expect(window.getByRole('heading', { name: 'Start with a project' })).toBeVisible()
@@ -37,9 +37,7 @@ test(
 
       await expect(window.getByRole('heading', { name: 'Default session settings' })).toBeVisible()
       await expect(window.getByRole('radio', { name: 'Codex Primary LLM' })).toBeChecked()
-      await expect(
-        window.getByRole('spinbutton', { name: 'Maximum discussion rounds' }),
-      ).toHaveValue('4')
+      await expect(window.getByRole('spinbutton', { name: 'Plan reviews' })).toHaveValue('4')
       await expect(window.getByRole('button', { name: 'Save defaults' })).toBeDisabled()
       await expect(window.getByRole('button', { name: 'Save defaults' })).toHaveCSS(
         'cursor',

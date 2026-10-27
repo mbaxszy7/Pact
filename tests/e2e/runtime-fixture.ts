@@ -27,7 +27,12 @@ import { codexProcessEnvironment } from '../../apps/desktop/src/utility/conversa
 import { OwnedProcessGroup } from '../../apps/desktop/src/utility/owned-process-group.js'
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { readCiProviderConfiguration } from '../../scripts/ci.mjs'
-import { NativeRpc, within } from '../native/native-harness.js'
+import {
+  createWindowsFixtureProcessScope,
+  NativeRpc,
+  within,
+  type WindowsFixtureProcessScope,
+} from '../native/native-harness.js'
 import {
   writeNativeTransportFault,
   type NativeTransportFault,
@@ -127,6 +132,7 @@ export interface RuntimeFixtureOptions {
     scope: string
     enabled: boolean
   }>
+  codexModels?: Array<{ id: string; displayName: string }>
   codexAppServer?:
     | 'complete'
     | 'complete_title_silent'
@@ -412,6 +418,7 @@ export async function createRuntimeFixture(
     if (
       mode === 'real' &&
       (options.codexAppServer ||
+        options.codexModels ||
         options.codexSkills ||
         options.claudeConversation ||
         options.claude ||
@@ -426,6 +433,13 @@ export async function createRuntimeFixture(
         Buffer.byteLength(JSON.stringify(options.codexSkills)) > 32 * 1024)
     )
       throw new Error('Synthetic Skills require one bounded protocol fixture catalog.')
+    if (
+      options.codexModels &&
+      (!options.codexAppServer ||
+        options.codexModels.length > 8 ||
+        Buffer.byteLength(JSON.stringify(options.codexModels)) > 16 * 1024)
+    )
+      throw new Error('Synthetic models require one bounded protocol fixture catalog.')
     // Missing credentials fail before creating an app, a CLI process or a Native Session.
     const configuration =
       mode === 'real'
@@ -440,6 +454,7 @@ export async function createRuntimeFixture(
     const apps = new Set<ElectronApplication>()
     const failedAppClosures = new Set<ElectronApplication>()
     const nativeClients = new Set<NativeRpc>()
+    let windowsProcessScope: WindowsFixtureProcessScope | undefined
     const launchOwners = new Set<WindowsLaunchOwner>()
     const unlaunchedOwners = new Set<WindowsLaunchOwner>()
     const commandLaunchOwners = new Set<WindowsLaunchOwner>()
@@ -691,6 +706,9 @@ export async function createRuntimeFixture(
         }
         if (releaseUnconfirmed)
           throw new Error(`${failures.join('; ')}; owned fixture retained at ${directory}`)
+        // Auxiliary product groups have already joined above. Residual durable
+        // receipts or a replaced directory retain the fixture instead of being erased.
+        await windowsProcessScope?.assertReceiptsRetired()
         await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 })
         ownedFixtures.delete(dispose)
         releaseFixtureSlot()
@@ -704,6 +722,8 @@ export async function createRuntimeFixture(
     try {
       if (creationCancelled) throw new Error('E2E fixture construction was cancelled')
       environment = await prepareProviderEnvironment(directory, configuration)
+      if (mode === 'real' && process.platform === 'win32')
+        windowsProcessScope = await createWindowsFixtureProcessScope(directory)
       if (creationCancelled) throw new Error('E2E fixture construction was cancelled')
       environment.env.NODE_ENV = 'test'
       environment.env.PACT_TEST_DB_FILE = databaseFile
@@ -719,6 +739,7 @@ export async function createRuntimeFixture(
             options.codexAppServer,
             options.codexSkills ?? [],
             options.sessionTitles,
+            options.codexModels,
           )
         : undefined
       const claudeSdkPath = options.claudeConversation
@@ -806,7 +827,10 @@ export async function createRuntimeFixture(
                 CODEX_INTERNAL_ORIGINATOR_OVERRIDE: originator,
               },
               {
-                group: new OwnedProcessGroup({ startupObservationMs: 2_000 }),
+                group: new OwnedProcessGroup({
+                  startupObservationMs: 2_000,
+                  ...(windowsProcessScope ? { windows: windowsProcessScope.configuration } : {}),
+                }),
                 onReleased: () => nativeClients.delete(client),
               },
             )
@@ -1230,7 +1254,7 @@ for (;;) {
     const count = facts.count + 1
     facts.count = count; writeFileSync(statePath, JSON.stringify(facts))
     await new Promise((resolve) => setTimeout(resolve, 1800))
-    if (sessionTitles && JSON.stringify(message.message.content).includes('Pact Session metadata:')) {
+    if (sessionTitles) {
       const own = sdkServers.find(name => name.startsWith('pact_peer'))
       const args = {title:'Title from the authorized Turn'}
       const metadataTool = 'mcp__'+own+'__publish_session_title'
@@ -1268,6 +1292,7 @@ async function writeCodexAppServer(
   scenario: NonNullable<RuntimeFixtureOptions['codexAppServer']>,
   skills: NonNullable<RuntimeFixtureOptions['codexSkills']>,
   sessionTitles = false,
+  models: NonNullable<RuntimeFixtureOptions['codexModels']> = [],
 ): Promise<string> {
   const path = join(directory, 'codex-app-server-fixture.mjs')
   const statePath = join(directory, 'codex-app-server-state.json')
@@ -1347,7 +1372,7 @@ for await (const line of lines) {
     send({id:request.id,result:{}})
     send({method:'turn/completed',params:{threadId:stop.threadId,turn:{id:stop.turnId,status:'interrupted'}}})
   }
-  else if (request.method === 'model/list') send({ id: request.id, result: { data: [] } })
+  else if (request.method === 'model/list') send({ id: request.id, result: { data: ${JSON.stringify(models)} } })
   else if (request.method === 'skills/list') send({ id: request.id, result: { data: [{ cwd: request.params.cwds?.[0] ?? process.cwd(), skills, errors: [] }] } })
   else if (request.method === 'config/read') send({ id: request.id, result: { config: { model: 'gpt-fixture', model_reasoning_effort: 'medium', approval_policy: 'on-request', approvals_reviewer: 'user', sandbox_mode: 'danger-full-access' } } })
   else if (request.method === 'thread/settings/update') {
@@ -1449,7 +1474,7 @@ for await (const line of lines) {
         send({ method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', id: 'fixture-message', text } } })
         send({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } })
       }
-      if (sessionTitles && request.params.input.some(item => item.type === 'text' && item.text.includes('Pact Session metadata:'))) {
+      if (sessionTitles) {
         const key = Object.keys(native(threadId).config).find(key=>key.startsWith('mcp_servers.pact_peer'))
         const args = {title:'Title from the authorized Turn'}
         const rpc = await fetch(native(threadId).config[key].url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:99,method:'tools/call',params:{name:'publish_session_title',arguments:args}}),signal:AbortSignal.timeout(5000)}).then(response=>response.json())

@@ -10,6 +10,8 @@ import {
   writeNativeReport,
   ensureUnexecutedNativeReport,
 } from './ci-native-report.mjs'
+import { reportRepository } from './e2e-report.mjs'
+import { nativeProfile, nativeProfileSupports, windowsOwnerHostCases } from './native-profiles.mjs'
 
 const fixture = (status = 'passed', success = status === 'passed') => ({
   success,
@@ -196,4 +198,142 @@ await test('native report recovery binds the same source and run instead of acce
     writeNativeReport({ ...options, directory: join(root, 'invalid') }),
     /identity/,
   )
+})
+
+await test('decision evidence requires every fixed file, the verified pin and every executed assertion, with CI source identity when required', async () => {
+  const { decisionNativeFiles } = await import('./native-profiles.mjs')
+  const raw = {
+    success: true,
+    numTotalTests: decisionNativeFiles.length,
+    testResults: decisionNativeFiles.map((name, index) => ({
+      name: '/owned/' + name,
+      assertionResults: [
+        { fullName: `Owned decision ${index}`, status: 'passed', duration: 1, failureMessages: [] },
+      ],
+    })),
+  }
+  const options = {
+    completed: true,
+    exitCode: 0,
+    profile: 'decision-codex',
+    verifiedCodexVersion: '0.163.0',
+  }
+  const supported = process.platform === 'darwin' && process.arch === 'arm64'
+  assert.equal(nativeReport(raw, options).status, supported ? 'passed' : 'blocked')
+  assert.notEqual(
+    nativeReport(raw, { ...options, verifiedCodexVersion: '0.159.2' }).status,
+    'passed',
+  )
+  assert.notEqual(nativeReport(raw, { ...options, verifiedCodexVersion: null }).status, 'passed')
+  assert.notEqual(nativeReport(raw, { ...options, requireIdentity: true }).status, 'passed')
+  const local = {
+    schemaVersion: 1,
+    kind: 'local',
+    repository: reportRepository,
+    sourceSha: 'a'.repeat(40),
+  }
+  assert.notEqual(
+    nativeReport(raw, { ...options, identity: local, requireIdentity: true }).status,
+    'passed',
+  )
+  const ci = {
+    ...local,
+    kind: 'ci',
+    runId: 1,
+    runAttempt: 1,
+    eventName: 'push',
+    ref: 'refs/heads/dev',
+  }
+  assert.equal(
+    nativeReport(raw, { ...options, identity: ci, requireIdentity: true }).status,
+    supported ? 'passed' : 'blocked',
+  )
+  const missing = {
+    ...raw,
+    numTotalTests: raw.numTotalTests - 1,
+    testResults: raw.testResults.slice(0, -1),
+  }
+  assert.notEqual(nativeReport(missing, options).status, 'passed')
+  const skipped = structuredClone(raw)
+  skipped.testResults[0].assertionResults[0].status = 'pending'
+  assert.notEqual(nativeReport(skipped, options).status, 'passed')
+  const wrong = structuredClone(raw)
+  wrong.testResults[0].name = '/owned/tests/native/not-the-required-file.test.ts'
+  assert.notEqual(nativeReport(wrong, options).status, 'passed')
+})
+
+function exactNativeFixture(name) {
+  const profile = nativeProfile(name)
+  return {
+    success: true,
+    numTotalTests: profile.cases.length,
+    testResults: [
+      {
+        name: '/owned/' + profile.files[0],
+        assertionResults: profile.cases.map((fullName) => ({
+          fullName,
+          status: 'passed',
+          duration: 1,
+        })),
+      },
+    ],
+  }
+}
+
+await test('Claude report rejects catalog-only, renamed, skipped and wrong-version substitutes for its six exact native obligations', () => {
+  const raw = exactNativeFixture('decision-claude')
+  const options = {
+    completed: true,
+    exitCode: 0,
+    profile: 'decision-claude',
+    verifiedClaudeVersion: '2.1.272',
+  }
+  const report = nativeReport(raw, options)
+  assert.equal(
+    report.status,
+    nativeProfileSupports(nativeProfile(options.profile)) ? 'passed' : 'blocked',
+  )
+  assert.equal(report.requiredClaudeVersion, '2.1.272')
+  assert.equal(report.requiredCodexVersion, null)
+  assert(nativeMarkdown(report).includes('required Claude 2.1.272'))
+  for (const verifiedClaudeVersion of [null, '2.1.286'])
+    assert.notEqual(nativeReport(raw, { ...options, verifiedClaudeVersion }).status, 'passed')
+  for (const defect of ['missing', 'renamed', 'skipped']) {
+    const changed = structuredClone(raw)
+    const cases = changed.testResults[0].assertionResults
+    if (defect === 'missing') {
+      cases.pop()
+      changed.numTotalTests--
+    }
+    if (defect === 'renamed') cases[0].fullName = 'Catalog found Haiku'
+    if (defect === 'skipped') cases[0].status = 'pending'
+    assert.notEqual(nativeReport(changed, options).status, 'passed')
+  }
+})
+
+await test('Windows ownership acceptance requires all thirteen real cases and five host seams on Windows, never skipped macOS observations', () => {
+  const raw = exactNativeFixture('windows-owner')
+  const options = { completed: true, exitCode: 0, profile: 'windows-owner' }
+  const report = nativeReport(raw, options)
+  const supported = nativeProfileSupports(nativeProfile(options.profile))
+  assert.equal(report.status, supported ? 'passed' : 'blocked')
+  assert.deepEqual(report.windowsOwnerEvidence, {
+    nativeRequired: 13,
+    hostSeamRequired: 5,
+    nativeAcceptance: supported,
+  })
+  const skipped = structuredClone(raw)
+  for (const item of skipped.testResults[0].assertionResults)
+    if (!windowsOwnerHostCases.includes(item.fullName)) item.status = 'pending'
+  assert.notEqual(nativeReport(skipped, options).status, 'passed')
+  assert.equal(nativeReport(skipped, options).windowsOwnerEvidence.nativeAcceptance, false)
+  const onlyHost = structuredClone(raw)
+  onlyHost.testResults[0].assertionResults = onlyHost.testResults[0].assertionResults.filter(
+    (item) => windowsOwnerHostCases.includes(item.fullName),
+  )
+  onlyHost.numTotalTests = 5
+  assert.notEqual(nativeReport(onlyHost, options).status, 'passed')
+  const noTitle = structuredClone(raw)
+  noTitle.testResults[0].assertionResults[0].fullName = 'Windows fixture'
+  assert.notEqual(nativeReport(noTitle, options).status, 'passed')
 })

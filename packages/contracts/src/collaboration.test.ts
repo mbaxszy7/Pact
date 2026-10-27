@@ -14,6 +14,9 @@ import {
   collaborationQuestionsSchema,
   collaborationReviewInputSchema,
   collaborationSourceReadSchema,
+  collaborationSourceNativeReadSchema,
+  collaborationSourceWireReadSchema,
+  collaborationSourceWireResultSchema,
   collaborationSourceReadResultSchema,
   collaborationTaskSchema,
   collaborationViewSchema,
@@ -387,4 +390,69 @@ it('allows a failed reply gate to clear only for its exact settled run and input
   const current = task({ stage: 'reply', status: 'failed', automation: 'paused', inputSequence: 2 })
   current.inputProcessing = { settled: { runId: current.runId, inputSequence: 2 } }
   expect(collaborationInputGate(current)).toBeUndefined()
+})
+
+it('native source selection is explicit and cannot carry model-supplied caller authority', () => {
+  const request = { context: 'native-root-v1', source: 'batch', batchId: randomUUID(), offset: 0 }
+  expect(collaborationSourceNativeReadSchema.safeParse(request).success).toBe(true)
+  expect(collaborationSourceWireReadSchema.safeParse(request).success).toBe(false)
+  for (const extra of [
+    { runId: randomUUID() },
+    { grant: randomUUID() },
+    { sourceReference: 'p1.private' },
+    { _meta: { threadId: 'forged' } },
+  ])
+    expect(collaborationSourceNativeReadSchema.safeParse({ ...request, ...extra }).success).toBe(
+      false,
+    )
+  expect(
+    collaborationSourceNativeReadSchema.safeParse({ ...request, source: undefined }).success,
+  ).toBe(false)
+  const page = {
+    source: 'batch',
+    text: '{}',
+    offset: 0,
+    nextOffset: null,
+    binding: {
+      submitted: 'nativeRoot',
+      callerRunId: randomUUID(),
+      grantSha256: 'a'.repeat(64),
+      referenceSha256: null,
+    },
+  }
+  expect(collaborationSourceWireResultSchema.safeParse(page).success).toBe(false)
+  const bound = {
+    ...page,
+    binding: { ...page.binding, nativeRoot: { threadId: 'thread', turnId: 'turn' } },
+  }
+  expect(collaborationSourceWireResultSchema.safeParse(bound).success).toBe(true)
+  expect(
+    collaborationSourceWireResultSchema.safeParse({
+      ...bound,
+      binding: { ...bound.binding, submitted: 'legacy' },
+    }).success,
+  ).toBe(false)
+})
+
+it('native root_batch is an exclusive transport-bound original-input selection', () => {
+  const request = { context: 'native-root-v1', source: 'root_batch', offset: 0 }
+  expect(collaborationSourceNativeReadSchema.parse(request)).toEqual(request)
+  expect(collaborationSourceWireReadSchema.safeParse(request).success).toBe(false)
+  expect(
+    collaborationSourceReadSchema.safeParse({
+      ...request,
+      runId: randomUUID(),
+      grant: randomUUID(),
+    }).success,
+  ).toBe(false)
+  for (const extra of [
+    { batchId: randomUUID() },
+    { document: { id: randomUUID(), sha256: 'a'.repeat(64), bytes: 1, chars: 1 } },
+    { runId: randomUUID() },
+    { grant: randomUUID() },
+    { sourceReference: 'p1.invalid' },
+  ])
+    expect(collaborationSourceNativeReadSchema.safeParse({ ...request, ...extra }).success).toBe(
+      false,
+    )
 })

@@ -74,8 +74,12 @@ test(
       const rows = await ctx.page
         .locator('[data-pact-row-key]')
         .evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-pact-row-key') ?? ''))
-      expect(rows.some((key) => key.endsWith(':codex'))).toBe(true)
-      expect(rows.some((key) => key.endsWith(':claude'))).toBe(true)
+      expect(rows.some((key) => key.startsWith('reply:') && key.split(':')[2] === 'codex')).toBe(
+        true,
+      )
+      expect(rows.some((key) => key.startsWith('reply:') && key.split(':')[2] === 'claude')).toBe(
+        true,
+      )
       expect(new Set(rows).size).toBe(rows.length)
       expect(await readFile(join(ctx.fixture.directory, 'routing-permission.txt'), 'utf8')).toBe(
         marker,

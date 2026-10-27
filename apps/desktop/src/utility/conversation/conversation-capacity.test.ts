@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm'
 import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -289,6 +290,51 @@ describe('App-wide Agent admission', () => {
     }
   })
 
+  it('fails unreadable saved history safely and reads repaired storage through the same owner', async () => {
+    const f = await fixture()
+    try {
+      const sessionId = f.sessionIds[0]!
+      const peer = f.db.conversationRepository.beginRun({
+        ...sendInput(sessionId),
+        content: 'Peer question',
+        agentId: 'claude',
+        settingsRevision: 1,
+        model: null,
+        effort: null,
+      })
+      for (const event of [
+        { agentId: 'claude', type: 'session.started', nativeSessionId: 'claude-native' },
+        { agentId: 'claude', type: 'turn.started', turnId: 'peer-turn' },
+        {
+          agentId: 'claude',
+          type: 'text.completed',
+          turnId: 'peer-turn',
+          outputId: 'peer-answer',
+          text: 'The complete saved peer answer.',
+        },
+        { agentId: 'claude', type: 'turn.completed', turnId: 'peer-turn', outcome: 'completed' },
+      ] as const)
+        f.db.conversationRepository.applyEvent(sessionId, peer.run.id, event)
+      const before = await f.conversation.load({ scope: 'messages', sessionId })
+      if (!before.ok || before.value.scope !== 'messages') throw new Error('Saved page unavailable')
+      const answer = before.value.messages.find((row) => row.message.role === 'assistant')
+      if (!answer) throw new Error('Saved answer unavailable')
+      f.db.drizzle.run(sql`UPDATE conversation_messages SET id=CAST(id AS BLOB)
+        WHERE id=${answer.message.id} AND session_id=${sessionId}`)
+      expect(await f.conversation.load({ scope: 'messages', sessionId })).toEqual({
+        ok: false,
+        error: { code: 'INTERNAL', message: 'Saved conversation history could not be read.' },
+      })
+      f.db.drizzle.run(sql`UPDATE conversation_messages SET id=CAST(id AS TEXT)
+        WHERE id=CAST(${answer.message.id} AS BLOB) AND session_id=${sessionId}`)
+      const repaired = await f.conversation.load({ scope: 'messages', sessionId })
+      expect(repaired).toEqual(before)
+    } finally {
+      await f.conversation.dispose()
+      f.db.close()
+    }
+  })
+
   it('reports an unreadable handoff separately from a size refusal', async () => {
     const f = await fixture()
     vi.spyOn(f.preparation, 'inspectReadiness').mockResolvedValue(ready)
@@ -525,4 +571,52 @@ describe('App-wide Agent admission', () => {
       f.db.close()
     }
   })
+})
+
+it('binds a declared field to the original Send while native preparation is still pending', async () => {
+  const f = await fixture(),
+    gate = Promise.withResolvers<RpcResult<RuntimePreparation>>()
+  const probe = vi.spyOn(f.preparation, 'inspectReadiness').mockImplementation(() => gate.promise)
+  const input: ConversationSendInput = {
+    ...sendInput(f.sessionIds[0]!),
+    userInformation: {
+      version: 'user-information-v1',
+      id: randomUUID(),
+      kind: 'user_supplied_value',
+      question: 'What launch date should be used?',
+      input: 'text',
+      options: [],
+      state: { status: 'unanswered' },
+    },
+  }
+  try {
+    const first = f.conversation.send(input)
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledTimes(1))
+    const same = f.conversation.send(structuredClone(input))
+    expect(
+      await f.conversation.send({
+        ...input,
+        userInformation: { ...input.userInformation!, question: 'A changed question' },
+      }),
+    ).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
+    expect(
+      await f.conversation.send({
+        ...input,
+        userInformation: {
+          ...input.userInformation!,
+          state: { status: 'answered', value: '2027-04-12' },
+        },
+      }),
+    ).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
+    gate.resolve(ready)
+    const [original, duplicate] = await Promise.all([first, same])
+    expect(original).toMatchObject({ ok: true })
+    expect(duplicate).toEqual(original)
+    expect(probe).toHaveBeenCalledTimes(1)
+    expect(f.db.conversationRepository.read(input.sessionId).runs).toHaveLength(1)
+  } finally {
+    gate.resolve(unavailable)
+    await f.conversation.dispose()
+    f.db.close()
+  }
 })
