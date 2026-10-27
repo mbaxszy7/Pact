@@ -321,12 +321,14 @@ export async function main(source = process.env, profileName = 'legacy') {
           ? join(directory, 'node_modules', '@anthropic-ai/claude-code', 'bin', 'claude.exe')
           : decisionCodex && nativeCodex
             ? nativeCodex.executable
-            : join(
-                directory,
-                'node_modules',
-                '.bin',
-                `codex${process.platform === 'win32' ? '.cmd' : ''}`,
-              )
+            : decisionCodex && process.platform === 'darwin'
+              ? join(directory, 'node_modules', '@openai', 'codex', 'bin', 'codex.js')
+              : join(
+                  directory,
+                  'node_modules',
+                  '.bin',
+                  `codex${process.platform === 'win32' ? '.cmd' : ''}`,
+                )
       // oxlint-disable-next-line eslint/no-await-in-loop -- Every selected installed executable is checked before any path is published.
       const info = await lstat(path)
       if (!info.isFile() && !info.isSymbolicLink())

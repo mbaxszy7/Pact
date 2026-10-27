@@ -102,6 +102,7 @@ vi.mock('./codex-decision-runtime.js', () => ({
     invoked = false
     usage = { inputTokens: 31, outputTokens: 7 }
     private work: Promise<DecisionOutcome> | undefined
+    private closeTask: Promise<boolean> | undefined
     private readonly controller = new AbortController()
     private readonly memory = new DecisionMemoryLease()
     constructor(
@@ -155,13 +156,27 @@ vi.mock('./codex-decision-runtime.js', () => ({
           return { kind: 'unavailable', reason: 'cancelled' }
         }
       })()
-      return this.work
+      return this.work.then(async (outcome) =>
+        outcome.kind === 'recommendation' && !(await this.settlement())
+          ? { kind: 'unavailable' as const, reason: 'runtime_unavailable' as const }
+          : outcome,
+      )
     }
-    async settlement() {
-      await this.work
-      await native.decisionPhysicalHold
-      this.memory.release()
-      return true
+    settlement() {
+      this.closeTask ??= (async () => {
+        const outcome = await this.work
+        await native.decisionPhysicalHold
+        await this.context.physicalCompletion?.({
+          memory: this.memory,
+          deadlineAt: Date.now() + 4_000,
+          nativeGeneration: 0,
+          witness: null,
+          ...(outcome ? { outcome, usage: this.usage } : {}),
+        })
+        this.memory.release()
+        return true
+      })().catch(() => false)
+      return this.closeTask
     }
     dispose() {
       this.controller.abort()

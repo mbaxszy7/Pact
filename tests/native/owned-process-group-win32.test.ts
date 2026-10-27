@@ -166,6 +166,7 @@ class Observer {
     this.child.stdin.write(`${command}\n`)
     const [text] = await response
     if (typeof text !== 'string' || text.length > 1024) throw Error('Observer frame bound')
+    if (command === 'kill' && text === '') return []
     return text.split(';').map((entry) => {
       const match = /^(\d+):(\d+):([01])$/u.exec(entry)
       if (!match) throw Error('Observer identity frame')
@@ -177,6 +178,38 @@ class Observer {
     await deadline(this.closed)
     this.lines.close()
   }
+}
+
+async function closeObservedUtility(
+  utility: ChildProcess,
+  closed: Promise<unknown>,
+  observer: Observer,
+  bodyErrors: readonly unknown[],
+) {
+  const cleanupErrors: unknown[] = []
+  try {
+    if (utility.exitCode === null && utility.signalCode === null) utility.kill()
+    await deadline(closed)
+  } catch (error) {
+    cleanupErrors.push(error)
+  }
+  try {
+    await observer.command('kill')
+  } catch (error) {
+    cleanupErrors.push(error)
+  } finally {
+    try {
+      await observer.close()
+    } catch (error) {
+      cleanupErrors.push(error)
+    }
+  }
+  if (cleanupErrors.length)
+    throw new AggregateError(
+      [...bodyErrors, ...cleanupErrors],
+      'Fixture Utility/Observer cleanup did not complete.',
+      { cause: bodyErrors.length ? bodyErrors[0] : cleanupErrors[0] },
+    )
 }
 
 function windows(receipts: string) {
@@ -829,9 +862,9 @@ describe.runIf(process.platform === 'win32')('Windows product OwnedProcessGroup'
     async (phase) => {
       const root = await scratch(),
         observer = await Observer.create()
-      const loader = createRequire(resolvePath('packages/persistence/package.json')).resolve(
-        'tsx/esm',
-      )
+      const loader = pathToFileURL(
+        createRequire(resolvePath('packages/persistence/package.json')).resolve('tsx/esm'),
+      ).href
       const module = pathToFileURL(
         resolvePath('apps/desktop/src/utility/owned-process-group.ts'),
       ).href
@@ -849,6 +882,7 @@ describe.runIf(process.platform === 'win32')('Windows product OwnedProcessGroup'
         shell: false,
       })
       utility.stderr?.resume()
+      const bodyErrors: unknown[] = []
       const closed = new Promise<void>((done) => utility.once('close', () => done()))
       try {
         const [message] = await deadline(once(utility, 'message'), 15_000)
@@ -906,11 +940,11 @@ describe.runIf(process.platform === 'win32')('Windows product OwnedProcessGroup'
           'removed',
         )
         expect(await readdir(receipts)).toEqual([])
+      } catch (error) {
+        bodyErrors.push(error)
+        throw error
       } finally {
-        utility.kill()
-        await deadline(closed)
-        await observer.command('kill')
-        await observer.close()
+        await closeObservedUtility(utility, closed, observer, bodyErrors)
       }
     },
   )
@@ -919,9 +953,9 @@ describe.runIf(process.platform === 'win32')('Windows product OwnedProcessGroup'
     const root = await scratch(),
       observer = await Observer.create(),
       receipts = join(root, 'receipts')
-    const loader = createRequire(resolvePath('packages/persistence/package.json')).resolve(
-      'tsx/esm',
-    )
+    const loader = pathToFileURL(
+      createRequire(resolvePath('packages/persistence/package.json')).resolve('tsx/esm'),
+    ).href
     const module = pathToFileURL(
       resolvePath('apps/desktop/src/utility/owned-process-group.ts'),
     ).href
@@ -977,6 +1011,7 @@ child.stderr.resume();
       shell: false,
     })
     utility.stderr?.resume()
+    const bodyErrors: unknown[] = []
     const closed = new Promise<number | null>((done) => utility.once('close', (code) => done(code)))
     try {
       const [message] = await deadline(once(utility, 'message'), 15_000)
@@ -1010,11 +1045,11 @@ child.stderr.resume();
       expect(await deadline(closed)).toBe(0)
       await emptyHandles(observer)
       expect(await OwnedProcessGroup.provePhysicalRelease(witness, windows(receipts))).toBe(false)
+    } catch (error) {
+      bodyErrors.push(error)
+      throw error
     } finally {
-      if (utility.exitCode === null && utility.signalCode === null) utility.kill()
-      await deadline(closed)
-      await observer.command('kill')
-      await observer.close()
+      await closeObservedUtility(utility, closed, observer, bodyErrors)
     }
   })
 })

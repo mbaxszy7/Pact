@@ -375,6 +375,7 @@ void test(
           '#!/usr/bin/env node\nprocess.stdout.write(' +
           JSON.stringify(`codex-cli ${version}\n`) +
           ')\n'
+        const shim = '#!/usr/bin/env node\nprocess.exit(9)\n'
         // This controlled installer never contacts a package registry or Provider.
         // It exercises main's real preparation, version process and publication boundary.
         // oxlint-disable-next-line eslint/no-await-in-loop -- The fixture installer is fully prepared before main starts it.
@@ -386,7 +387,9 @@ if (process.argv[2] !== 'install') process.exit(3);
 const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 if (JSON.stringify(manifest.dependencies) !== '{"@openai/codex":"0.163.0"}') process.exit(4);
 fs.mkdirSync('node_modules/.bin', {recursive:true});
-fs.writeFileSync('node_modules/.bin/codex', ${JSON.stringify(executable)}, {mode:0o700});
+fs.mkdirSync('node_modules/@openai/codex/bin', {recursive:true});
+fs.writeFileSync('node_modules/.bin/codex', ${JSON.stringify(shim)}, {mode:0o700});
+fs.writeFileSync('node_modules/@openai/codex/bin/codex.js', ${JSON.stringify(executable)}, {mode:0o700});
 fs.writeFileSync('pnpm-lock.yaml', ${JSON.stringify('owned-installation-fixture\n')});
 `,
           { mode: 0o700 },
@@ -410,7 +413,7 @@ fs.writeFileSync('pnpm-lock.yaml', ${JSON.stringify('owned-installation-fixture\
             // oxlint-disable-next-line eslint/no-await-in-loop -- Read the actual publication after all setup/version work joins.
             await readFile(environment, 'utf8'),
             legacy +
-              `PACT_NATIVE_DECISION_CODEX_EXECUTABLE=${join(directory, 'node_modules', '.bin', 'codex')}\n` +
+              `PACT_NATIVE_DECISION_CODEX_EXECUTABLE=${join(directory, 'node_modules', '@openai', 'codex', 'bin', 'codex.js')}\n` +
               'PACT_NATIVE_DECISION_CODEX_VERSION=0.163.0\n',
           )
         } else {

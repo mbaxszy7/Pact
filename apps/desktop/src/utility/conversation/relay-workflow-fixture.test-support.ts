@@ -254,52 +254,77 @@ export function workflowDecisionRuntime(state: WorkflowNativeState) {
     invoked = false
     usage = { inputTokens: 31, outputTokens: 7 }
     private work: Promise<DecisionOutcome> | undefined
+    private closeTask: Promise<boolean> | undefined
+    private readonly controller = new AbortController()
     private readonly memory = new DecisionMemoryLease()
     constructor(readonly context: ConstructorParameters<typeof CodexDecisionRuntime>[0]) {}
     evaluateDecision(load: DecisionInputLoader, signal: AbortSignal) {
+      const observed = AbortSignal.any([signal, this.controller.signal])
       this.work = (async (): Promise<DecisionOutcome> => {
-        const deadlineAt = this.context.deadlineAt ?? Date.now() + 15_000,
-          input = await load({ signal, deadlineAt })
-        const reserved = this.context.reserve!(input, { deadlineAt })
-        if (reserved !== 'reserved') return { kind: 'unavailable', reason: reserved }
-        signal.throwIfAborted()
-        this.context.dispatch()
-        this.invoked = true
-        state.decisions.push(input)
-        const requested = state.candidate,
-          candidateId =
-            requested === null
-              ? null
-              : (input.candidates.find((candidate) => candidate.id === requested)?.id ??
-                input.candidates[0]?.id ??
-                null)
-        return {
-          kind: 'recommendation',
-          recommendation: {
-            candidateId,
-            ...(candidateId === 'clarify_prepared_input' && state.information
-              ? { information: state.information }
-              : {}),
-            highlights:
-              candidateId && candidateId !== 'clarify_prepared_input'
-                ? [
-                    {
-                      text: 'Clarify the complete current scope once before fixed review.',
-                      sourceIds: [input.sources.at(-1)!.id],
-                    },
-                  ]
-                : [],
-          },
+        try {
+          const deadlineAt = this.context.deadlineAt ?? Date.now() + 15_000,
+            input = await load({ signal: observed, deadlineAt })
+          const reserved = this.context.reserve!(input, { deadlineAt })
+          if (reserved !== 'reserved') return { kind: 'unavailable', reason: reserved }
+          observed.throwIfAborted()
+          this.context.dispatch()
+          this.invoked = true
+          state.decisions.push(input)
+          const requested = state.candidate,
+            candidateId =
+              requested === null
+                ? null
+                : (input.candidates.find((candidate) => candidate.id === requested)?.id ??
+                  input.candidates[0]?.id ??
+                  null)
+          return {
+            kind: 'recommendation',
+            recommendation: {
+              candidateId,
+              ...(candidateId === 'clarify_prepared_input' && state.information
+                ? { information: state.information }
+                : {}),
+              highlights:
+                candidateId && candidateId !== 'clarify_prepared_input'
+                  ? [
+                      {
+                        text: 'Clarify the complete current scope once before fixed review.',
+                        sourceIds: [input.sources.at(-1)!.id],
+                      },
+                    ]
+                  : [],
+            },
+          }
+        } catch {
+          return {
+            kind: 'unavailable',
+            reason: observed.aborted ? 'cancelled' : 'runtime_unavailable',
+          }
         }
       })()
-      return this.work
+      return this.work.then(async (outcome) =>
+        outcome.kind === 'recommendation' && !(await this.settlement())
+          ? { kind: 'unavailable' as const, reason: 'runtime_unavailable' as const }
+          : outcome,
+      )
     }
-    async settlement() {
-      await this.work
-      this.memory.release()
-      return true
+    settlement() {
+      this.closeTask ??= (async () => {
+        const outcome = await this.work
+        await this.context.physicalCompletion?.({
+          memory: this.memory,
+          deadlineAt: Date.now() + 4_000,
+          nativeGeneration: 0,
+          witness: null,
+          ...(outcome ? { outcome, usage: this.usage } : {}),
+        })
+        this.memory.release()
+        return true
+      })().catch(() => false)
+      return this.closeTask
     }
-    async dispose() {
+    dispose() {
+      this.controller.abort()
       return this.settlement()
     }
   }

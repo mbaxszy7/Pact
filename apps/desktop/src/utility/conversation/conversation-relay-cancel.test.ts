@@ -16,7 +16,11 @@ import type { WorkflowSourceRead } from './relay-workflow-fixture.test-support.j
 import { Conversation } from './conversation.js'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
 import { decisionWorkingMemoryDiagnostics } from './native-working-memory.js'
-import { enableWorkflowRelay, workflowConversation } from './relay-workflow-fixture.test-support.js'
+import {
+  enableWorkflowRelay,
+  workflowConversation,
+  workflowDecisionRuntime as controlledDecisionRuntime,
+} from './relay-workflow-fixture.test-support.js'
 
 const native = vi.hoisted(() => ({
   inputs: [] as AgentRunInput[],
@@ -165,6 +169,7 @@ describe('Cancel an optional Relay advancement, then continue through the origin
     async (primary) => {
       const f = await fixture(primary),
         repo = f.db.conversationRepository
+      const physicalCompletion = vi.spyOn(repo, 'completeSchedulingRuntimePhysical')
       enableWorkflowRelay(f.db)
       native.reviews = [{ verdict: 'changes_requested' }, { verdict: 'changes_requested' }]
       native.candidate = 'propose_supplement_plan'
@@ -176,6 +181,10 @@ describe('Cancel an optional Relay advancement, then continue through the origin
           category: 'new_authorization',
           operation: { kind: 'supplement_plan' },
         }),
+      )
+      expect(physicalCompletion).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ completed: true, candidateId: 'propose_supplement_plan' }),
       )
       const state = await cancel(f)
       expect(native.inputs).toHaveLength(5)
@@ -504,3 +513,26 @@ it.each(['implement', 'repair'] as const)(
     })
   },
 )
+
+it('controlled decision cancellation releases its admitted lease after loader rejection', async () => {
+  const Runtime = controlledDecisionRuntime(native),
+    runtime = new Runtime({
+      executable: async () => process.execPath,
+      current: () => true,
+      dispatch: vi.fn<() => void>(),
+    }),
+    controller = new AbortController()
+  controller.abort()
+  try {
+    await expect(
+      runtime.evaluateDecision(async ({ signal }) => {
+        signal.throwIfAborted()
+        throw Error('Cancelled loader unexpectedly continued')
+      }, controller.signal),
+    ).resolves.toEqual({ kind: 'unavailable', reason: 'cancelled' })
+    await expect(runtime.settlement()).resolves.toBe(true)
+    expect(decisionWorkingMemoryDiagnostics().chargedBytes).toBe(0)
+  } finally {
+    await runtime.dispose().catch(() => undefined)
+  }
+})
