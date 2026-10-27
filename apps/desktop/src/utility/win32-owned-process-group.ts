@@ -329,6 +329,8 @@ function startHelper(
     env: options.env,
     windowsHide: true,
     shell: false,
+    // The run bridge must survive its owner to seal physical cleanup.
+    detached: mode === 'run',
     // The Node signal is deliberately not forwarded: killing the bridge loses proof.
     stdio:
       mode === 'run'

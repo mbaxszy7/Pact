@@ -13,6 +13,7 @@ import { randomUUID } from 'node:crypto'
 import { getEventListeners, once } from 'node:events'
 import {
   link,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -905,6 +906,7 @@ describe.runIf(process.platform === 'win32')('Windows product OwnedProcessGroup'
         utility.send('exit')
         await deadline(closed)
         await emptyHandles(observer)
+        expect((await lstat(join(receipts, `${witness.receipt.id}.receipt`))).size).toBe(256)
         expect(await OwnedProcessGroup.provePhysicalRelease(witness, windows(receipts))).toBe(true)
         expect(
           await OwnedProcessGroup.provePhysicalRelease(
