@@ -1139,14 +1139,22 @@ export class ConversationRepository {
         .select(publicRunColumns)
         .from(agentRuns)
         .where(
-          and(
-            eq(agentRuns.sessionId, sql.placeholder('sessionId')),
-            eq(agentRuns.agentId, sql.placeholder('agentId')),
-            isNull(agentRuns.forkSourceRunId),
+          eq(
+            agentRuns.id,
+            this.database
+              .select({ id: agentRuns.id })
+              .from(agentRuns)
+              .where(
+                and(
+                  eq(agentRuns.sessionId, sql.placeholder('sessionId')),
+                  eq(agentRuns.agentId, sql.placeholder('agentId')),
+                  isNull(agentRuns.forkSourceRunId),
+                ),
+              )
+              .orderBy(desc(agentRuns.createdAt), desc(sql`${agentRuns}.rowid`))
+              .limit(1),
           ),
-        )
-        .orderBy(desc(agentRuns.createdAt), desc(sql`${agentRuns}.rowid`))
-        .limit(1),
+        ),
     ),
     latestGenerationRun: lazyStatement(() =>
       this.database

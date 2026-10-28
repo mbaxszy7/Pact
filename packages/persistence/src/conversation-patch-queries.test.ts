@@ -175,3 +175,78 @@ it('reads current Session, generation, unread and queue facts across rollback an
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+it('projects the complete latest Agent Run after atomic identity selection without changing legacy filters', async () => {
+  const f = await createQueueFixture()
+  try {
+    const session = f.db.sessionRepository.find(f.sessionId)!
+    const otherSessionId = randomUUID()
+    f.db.sessionRepository.create(
+      {
+        id: otherSessionId,
+        projectId: session.projectId,
+        title: 'Other latest Run',
+        createdAt: session.createdAt,
+      },
+      session.settings,
+    )
+    const createdAt = '2026-10-01T00:00:00.000Z'
+    const insert = (
+      sessionId: string,
+      agentId: 'codex' | 'claude',
+      id = randomUUID(),
+      forkSourceRunId?: string,
+    ) => {
+      f.db.drizzle
+        .insert(agentRuns)
+        .values({
+          id,
+          sessionId,
+          agentId,
+          userMessageId: randomUUID(),
+          status: 'completed',
+          attemptCount: 1,
+          settingsRevision: 1,
+          createdAt,
+          updatedAt: createdAt,
+          ...(forkSourceRunId ? { forkSourceRunId } : {}),
+        })
+        .run()
+      return id
+    }
+    const first = insert(f.sessionId, 'codex', 'ffffffff-ffff-4fff-bfff-ffffffffffff')
+    const latest = insert(f.sessionId, 'codex', '00000000-0000-4000-8000-000000000001')
+    insert(f.sessionId, 'codex', randomUUID(), latest)
+    const peer = insert(f.sessionId, 'claude')
+    const other = insert(otherSessionId, 'codex')
+    const check = (sessionId: string, agentId: 'codex' | 'claude', id: string) =>
+      expect(f.repo.latestAgentRun(sessionId, agentId)).toEqual(f.repo.findRun(id))
+    check(f.sessionId, 'codex', latest)
+    check(f.sessionId, 'claude', peer)
+    check(otherSessionId, 'codex', other)
+    expect(f.repo.latestAgentRun(otherSessionId, 'claude')).toBeUndefined()
+    expect(f.repo.latestAgentRun(randomUUID(), 'codex')).toBeUndefined()
+    f.db.drizzle
+      .update(agentRuns)
+      .set({ controlDisposition: 'abandoned' })
+      .where(eq(agentRuns.id, latest))
+      .run()
+    // The no-generation legacy lookup includes abandoned rows; generation-aware callers differ.
+    check(f.sessionId, 'codex', latest)
+    f.db.drizzle
+      .update(agentRuns)
+      .set({ createdAt: '2026-10-02T00:00:00.000Z' })
+      .where(eq(agentRuns.id, first))
+      .run()
+    check(f.sessionId, 'codex', first)
+    f.db.drizzle
+      .update(agentRuns)
+      .set({ workspaceChangesJson: '{invalid' })
+      .where(eq(agentRuns.id, first))
+      .run()
+    expect(() => f.repo.findRun(first)).toThrow(SyntaxError)
+    expect(() => f.repo.latestAgentRun(f.sessionId, 'codex')).toThrow(SyntaxError)
+  } finally {
+    f.close()
+  }
+})
