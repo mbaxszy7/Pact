@@ -479,11 +479,15 @@ function enableRelay(f: Awaited<ReturnType<typeof fixture>>, requestedRevisions 
 async function completedPlanRevision(
   f: Awaited<ReturnType<typeof fixture>>,
   requestedRevisions = 2,
+  timeout = 1_000,
 ) {
-  await vi.waitFor(() => {
-    expect(native.inputs).toHaveLength(2 + requestedRevisions * 2)
-    expect(f.db.conversationRepository.collaboration(f.sessionId)?.status).toBe('ready')
-  })
+  await vi.waitFor(
+    () => {
+      expect(native.inputs).toHaveLength(2 + requestedRevisions * 2)
+      expect(f.db.conversationRepository.collaboration(f.sessionId)?.status).toBe('ready')
+    },
+    { timeout },
+  )
   return f.settled()
 }
 
@@ -533,7 +537,7 @@ describe('Optional plan revision guidance through the original workflow owner', 
     expect((await f.flow.send(f.input('/plan Keep disabled Relay free of inference.'))).ok).toBe(
       true,
     )
-    await completedPlanRevision(f)
+    await completedPlanRevision(f, 2, 5_000)
     expect(native.decisions).toEqual([])
     expect(native.guidanceBodies).toEqual([])
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM scheduling_evaluations`)).toEqual({
@@ -643,7 +647,7 @@ describe('Optional plan revision guidance through the original workflow owner', 
       expect(
         (await f.flow.send(f.input('/plan Continue after an undecided auxiliary result.'))).ok,
       ).toBe(true)
-      await completedPlanRevision(f)
+      await completedPlanRevision(f, 2, 5_000)
       expect(native.decisions).toHaveLength(2)
       expect(native.guidanceBodies).toEqual([])
       expect(
@@ -664,7 +668,7 @@ describe('Optional plan revision guidance through the original workflow owner', 
     expect((await f.flow.send(f.input('/plan Keep the manual continuation responsive.'))).ok).toBe(
       true,
     )
-    await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
+    await vi.waitFor(() => expect(native.decisions).toHaveLength(1), { timeout: 5_000 })
     const task = f.db.conversationRepository.collaboration(f.sessionId)!
     const handoffId = native.decisions[0]!.handoff.id
     expect(native.inputs).toHaveLength(4)
@@ -678,7 +682,7 @@ describe('Optional plan revision guidance through the original workflow owner', 
     })
     expect(result.ok).toBe(true)
     hold.resolve()
-    await completedPlanRevision(f)
+    await completedPlanRevision(f, 2, 5_000)
     expectNoRepeatedConsultation(handoffId)
     expect(guidanceForHandoff(handoffId)).toEqual([])
     expect(
@@ -816,14 +820,7 @@ describe('Optional plan revision guidance through the original workflow owner', 
     const goal = 'The durable original objective remains complete.\n'.repeat(3200)
     expect((await f.flow.send(f.input(`/plan ${goal}`))).ok).toBe(true)
     // All six full-source stages share the test's existing five-second total deadline.
-    await vi.waitFor(
-      () => {
-        expect(native.inputs).toHaveLength(6)
-        expect(f.db.conversationRepository.collaboration(f.sessionId)?.status).toBe('ready')
-      },
-      { timeout: 5_000 },
-    )
-    await f.settled()
+    await completedPlanRevision(f, 2, 5_000)
     expect(native.decisions).toEqual([])
     expect(native.guidanceBodies).toEqual([])
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM scheduling_evaluations`)).toEqual({

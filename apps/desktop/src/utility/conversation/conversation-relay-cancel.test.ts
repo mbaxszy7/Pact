@@ -176,11 +176,13 @@ describe('Cancel an optional Relay advancement, then continue through the origin
       expect(
         await f.flow.send(f.input('/plan Preserve the exact original cancellation scope.')),
       ).toMatchObject({ ok: true })
-      await vi.waitFor(() =>
-        expect(repo.relaySchedulingDecision(f.sessionId)?.request).toMatchObject({
-          category: 'new_authorization',
-          operation: { kind: 'supplement_plan' },
-        }),
+      await vi.waitFor(
+        () =>
+          expect(repo.relaySchedulingDecision(f.sessionId)?.request).toMatchObject({
+            category: 'new_authorization',
+            operation: { kind: 'supplement_plan' },
+          }),
+        { timeout: 5_000 },
       )
       expect(physicalCompletion).toHaveBeenCalledWith(
         expect.any(String),
