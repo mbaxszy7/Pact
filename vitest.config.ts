@@ -21,6 +21,7 @@ export default defineConfig({
       'tests/e2e/provider-environment.test.ts',
       'tests/e2e/native-transport-fault.test.ts',
       'tests/e2e/runtime-fixture-cleanup.test.ts',
+      'tests/e2e/native-process-owner.test.ts',
       'tests/e2e/runtime-fixture-admission.test.ts',
       'tests/e2e/windows-cli-launcher.test.ts',
       'tests/e2e/windows-process-observation.test.ts',

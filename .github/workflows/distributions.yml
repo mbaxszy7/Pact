@@ -710,6 +710,7 @@ jobs:
           --build-number "$GITHUB_RUN_NUMBER" --output "$RUNNER_TEMP/package"
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          PACT_WINDOWS_STARTUP_DIAGNOSTIC: '1'
       - name: Bind the clean installer manifest to its producing execution
         run: node scripts/ci-artifacts.mjs package-context "$RUNNER_TEMP/package"
       - id: upload

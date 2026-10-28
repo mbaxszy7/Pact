@@ -344,13 +344,16 @@ export class RuntimePreparation {
       )
       let killTimer: ReturnType<typeof setTimeout> | undefined
       let closeTimer: ReturnType<typeof setTimeout> | undefined
-      const capture = (chunk: Buffer): void => {
+      const capture = (chunk: Buffer, stdout: boolean): void => {
         const length = Math.min(chunk.length, MAX_CAPTURE_BYTES - outputBytes)
         if (length > 0) {
-          output += chunk.subarray(0, length).toString('utf8')
+          if (stdout) output += chunk.subarray(0, length).toString('utf8')
           outputBytes += length
         }
       }
+      // Diagnostics are drained under the same byte budget, never parsed as machine results.
+      const stdout = (chunk: Buffer): void => capture(chunk, true)
+      const stderr = (chunk: Buffer): void => capture(chunk, false)
       const finish = (exitCode: number | null): void => {
         if (settled) return
         settled = true
@@ -358,8 +361,8 @@ export class RuntimePreparation {
         clearTimeout(killTimer)
         clearTimeout(closeTimer)
         signal?.removeEventListener('abort', stop)
-        child.stdout.off('data', capture)
-        child.stderr.off('data', capture)
+        child.stdout.off('data', stdout)
+        child.stderr.off('data', stderr)
         child.stdout.destroy()
         child.stderr.destroy()
         resolve({ exitCode, output, timedOut, failedToStart })
@@ -377,8 +380,8 @@ export class RuntimePreparation {
         }, 750)
       }
       const timeout = setTimeout(stop, PROBE_TIMEOUT_MS)
-      child.stdout.on('data', capture)
-      child.stderr.on('data', capture)
+      child.stdout.on('data', stdout)
+      child.stderr.on('data', stderr)
       child.once('error', () => {
         failedToStart = true
         finish(null)

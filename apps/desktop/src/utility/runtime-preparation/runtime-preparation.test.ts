@@ -67,6 +67,28 @@ afterEach(async () => {
 })
 
 describe.skipIf(process.platform === 'win32')('Runtime preparation utility', () => {
+  it.each([
+    ['warning before version', 'startup warning', 'codex-cli 0.159.2', 'ready'],
+    ['version only in stderr', 'codex-cli 9.9.9', 'unknown CLI output', 'cannot_verify'],
+  ])('uses stdout as the version result: %s', async (_label, stderr, stdout, state) => {
+    const claude = await executable('claude', 0, 0)
+    const codex = await executable('codex', 0, 0)
+    await writeFile(
+      codex,
+      `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${stderr}' >&2; sleep 0.05; echo '${stdout}'; exit 0; fi\nif [ "$1" = "login" ] && [ "$2" = "status" ]; then exit 0; fi\nexit 2\n`,
+    )
+    const result = await new RuntimePreparation(repository({ claude, codex })).inspectReadiness()
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        agents: [
+          { agentId: 'claude', state: 'ready' },
+          { agentId: 'codex', state, version: stdout },
+        ],
+      },
+    })
+  })
+
   it('reports both independently ready without sending a model prompt', async () => {
     const [claude, codex] = await Promise.all([
       executable('claude', 0, 0),

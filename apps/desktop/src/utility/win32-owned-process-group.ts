@@ -305,6 +305,8 @@ class BridgeControl {
 type Helper = {
   process: ChildProcess
   control: BridgeControl | undefined
+  startup: Promise<void>
+  spawnError?: Error
   closed: Promise<void>
   spawned: boolean
   closedFact: boolean
@@ -324,6 +326,8 @@ function startHelper(
   facts: (frame: Buffer) => boolean,
   onFailure: () => void,
 ): Helper {
+  const startup = Promise.withResolvers<void>()
+  void startup.promise.catch(() => undefined)
   const child = spawn(config.windowsBridgeExecutable, [mode], {
     cwd: options.cwd,
     env: options.env,
@@ -342,6 +346,7 @@ function startHelper(
   // Its physical close still has to be joined before capacity can be returned.
   const result: Helper = {
     process: child,
+    startup: startup.promise,
     control: stream instanceof Duplex ? new BridgeControl(stream, facts, onFailure) : undefined,
     closed: new Promise((resolve) => child.once('close', () => resolve())),
     spawned: false,
@@ -349,13 +354,20 @@ function startHelper(
   }
   const spawned = () => {
     result.spawned = true
+    startup.resolve()
+  }
+  const failed = (error: Error) => {
+    if (!result.spawned && child.pid === undefined) result.spawnError = error
+    startup.reject(error)
+    onFailure()
   }
   child.once('spawn', spawned)
-  child.once('error', onFailure)
+  child.once('error', failed)
   child.once('close', () => {
     result.closedFact = true
+    if (!result.spawned) startup.reject(result.spawnError ?? failure())
     child.off('spawn', spawned)
-    child.off('error', onFailure)
+    child.off('error', failed)
     child.stdin?.off('error', ignoreHelperInputError)
     result.control?.dispose()
   })
@@ -480,6 +492,7 @@ export class WindowsOwnedProcess {
       this.reportFailure()
       this.requestStop()
       if (!this.helper || this.helper.closedFact) this.closeFacade()
+      else void this.helper.closed.then(() => this.closeFacade())
     })
   }
 
@@ -562,6 +575,8 @@ export class WindowsOwnedProcess {
       () => undefined,
     )
     this.helper = prepare
+    await within(prepare.startup, this.preparationDeadline)
+    this.checkStarting()
     const prepareControl = controlOf(prepare)
     const answer = prepareControl.expect(11)
     const request = baseRequest(
@@ -603,6 +618,8 @@ export class WindowsOwnedProcess {
     )
     this.helper = helper
     this.nativeWasStarted = true
+    await within(helper.startup, this.preparationDeadline)
+    this.checkStarting()
     const control = controlOf(helper)
     requirePipedChild(helper.process)
     this.input.pipe(helper.process.stdin)
@@ -672,7 +689,11 @@ export class WindowsOwnedProcess {
 
   private reportFailure(): void {
     if (this.startupError) return
-    this.startupError = failure()
+    const helper = this.helper
+    this.startupError =
+      helper && !helper.spawned && helper.process.pid === undefined && helper.spawnError
+        ? helper.spawnError
+        : failure()
     this.child.emit('error', this.startupError)
   }
 

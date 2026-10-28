@@ -159,6 +159,7 @@ export class NativeProcessOwner {
   private controlClosed = false
   private helperReleased = false
   private jobEmpty = false
+  private windowsUnadmitted = false
   private helperDiagnostic: HelperDiagnostic | undefined
   private groupFailure: string | undefined
 
@@ -181,13 +182,16 @@ export class NativeProcessOwner {
     root: string,
     deadlineAt: number,
     group?: OwnedProcessGroup,
+    preparedWindows?: WindowsLaunchOwner,
   ): Promise<NativeProcessOwner> {
     const remaining = Math.floor(deadlineAt - performance.now())
     if (remaining <= 0 || remaining > 50_000) throw new Error('Native fixture deadline is invalid')
+    // A prepared control owner also supplies the lifecycle test's OS boundary.
     const windows =
-      process.platform === 'win32'
+      preparedWindows ??
+      (process.platform === 'win32'
         ? await writeWindowsObservedLauncher(root, command, remaining)
-        : undefined
+        : undefined)
     try {
       const windowsProcessScope =
         windows && !group ? await createWindowsFixtureProcessScope(windows.directory) : undefined
@@ -283,13 +287,17 @@ export class NativeProcessOwner {
     const physical =
       this.group.released &&
       (!this.child || this.childClosed) &&
-      (!admitted || !this.windows || this.jobEmpty)
+      (!admitted || !this.windows || this.windowsUnadmitted || this.jobEmpty)
     return {
       admitted,
       spawnFailedBeforeStart: this.spawnFailedBeforeStart,
       childClosed: this.childClosed,
       groupReleased: this.group.released,
-      windowsJobEmpty: this.windows ? (admitted ? this.jobEmpty : null) : null,
+      windowsJobEmpty: this.windows
+        ? admitted && !this.windowsUnadmitted
+          ? this.jobEmpty
+          : null
+        : null,
       controlClosed: !this.windows || this.controlClosed,
       helperReleased: !this.windows || this.helperReleased,
       released: physical && (!this.windows || (this.controlClosed && this.helperReleased)),
@@ -408,7 +416,11 @@ export class NativeProcessOwner {
         if (
           !this.group.released ||
           (this.child &&
-            (!this.childClosed || (this.windows && !this.spawnFailedBeforeStart && !this.jobEmpty)))
+            (!this.childClosed ||
+              (this.windows &&
+                !this.spawnFailedBeforeStart &&
+                !this.windowsUnadmitted &&
+                !this.jobEmpty)))
         )
           throw new Error('Owned native physical release remains unconfirmed')
         return this.release()
@@ -427,6 +439,17 @@ export class NativeProcessOwner {
       }
     }
     if (this.windows && this.child && !this.childClosed) this.child.stdin.end()
+    if (this.windows && this.child && !this.spawnFailedBeforeStart && !this.jobEmpty) {
+      // Keep the observed helper alive until it supplies its own release fact.
+      // Cancellation also permanently prevents a late hello from receiving go.
+      this.windows.cancel()
+      this.windowsUnadmitted = !Object.hasOwn(this.windows.diagnostic().stages, 'go')
+      if (!this.windowsUnadmitted)
+        await attempt(async () => {
+          await within(this.windows!.empty, 5000, 'Owned Windows Job release deadline')
+          this.jobEmpty = true
+        })
+    }
     await attempt(async () => {
       try {
         await this.group.close()
@@ -441,13 +464,6 @@ export class NativeProcessOwner {
     if (this.closed)
       await attempt(() => within(this.closed!, 1500, 'Owned helper child close deadline'))
     if (this.windows) {
-      if (this.child && !this.spawnFailedBeforeStart && !this.jobEmpty) {
-        this.windows.cancel()
-        await attempt(async () => {
-          await within(this.windows!.empty, 5000, 'Owned Windows Job release deadline')
-          this.jobEmpty = true
-        })
-      }
       if (!this.controlClosed)
         await attempt(async () => {
           await this.windows!.disposeControl()
@@ -458,7 +474,9 @@ export class NativeProcessOwner {
       if (
         !this.helperReleased &&
         this.group.released &&
-        (!this.child || (this.childClosed && (this.spawnFailedBeforeStart || this.jobEmpty))) &&
+        (!this.child ||
+          (this.childClosed &&
+            (this.spawnFailedBeforeStart || this.windowsUnadmitted || this.jobEmpty))) &&
         this.controlClosed
       ) {
         let stage: HelperDiagnostic['stage'] = 'canonicalize'
