@@ -6,10 +6,10 @@ import { dirname, isAbsolute } from 'node:path'
 import {
   directoryFileOperationInputSchema,
   directoryFileOperationResultSchema,
-  WORKSPACE_FILE_BYTES,
   type DirectoryFileOperationInput,
   type DirectoryFileOperationResult,
-} from '@pact/contracts'
+} from '@pact/contracts/directory-file-operations'
+import { WORKSPACE_FILE_BYTES } from '@pact/contracts/workspace-changes'
 
 const COPY_BUFFER_BYTES = 64 * 1024
 type FailureCode = Extract<DirectoryFileOperationResult, { ok: false }>['code']

@@ -8,6 +8,8 @@
     ".": "./src/index.ts",
     "./diagnostics": "./src/diagnostics.ts",
     "./images": "./src/images.ts",
+    "./directory-file-operations": "./src/directory-file-operations.ts",
+    "./workspace-changes": "./src/workspace-changes.ts",
     "./decision-physical-witness": "./src/decision-physical-witness.ts"
   },
   "scripts": {
