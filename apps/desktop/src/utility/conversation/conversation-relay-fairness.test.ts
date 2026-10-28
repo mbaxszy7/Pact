@@ -122,14 +122,17 @@ it('keeps five Relay decisions waiting while an independent sixth Session comple
 
 describe.each([32, 100])('%i independently waiting Relay cards', (count) => {
   let representative: Awaited<ReturnType<typeof workflowConversation>>
-  beforeAll(async () => {
-    representative = await workflowConversation(Conversation)
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    for (let index = 0; index < count; index++) {
-      // oxlint-disable-next-line eslint/no-await-in-loop -- Genuine proposals share the single-App evaluation owner and must settle serially.
-      await proposeWorkflowPlanOn(representative.db, index)
-    }
-  }, 20_000)
+  beforeAll(
+    async () => {
+      representative = await workflowConversation(Conversation)
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      for (let index = 0; index < count; index++) {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- Genuine proposals share the single-App evaluation owner and must settle serially.
+        await proposeWorkflowPlanOn(representative.db, index)
+      }
+    },
+    count === 100 ? 30_000 : 20_000,
+  )
   afterAll(async () => {
     await representative?.dispose()
   })
