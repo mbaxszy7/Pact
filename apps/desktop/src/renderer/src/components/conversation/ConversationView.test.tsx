@@ -728,6 +728,8 @@ it('cancels a superseded report reveal frame and applies only the latest navigat
     />,
   )
   await screen.findByText('The historical review conclusion is preserved.')
+  // Rendering the text can precede the passive effect that schedules its reveal frame.
+  await waitFor(() => expect(frames.size).toBeGreaterThan(0))
   await act(async () => {
     const readyFrames = [...frames]
     for (const [id, callback] of readyFrames) {
