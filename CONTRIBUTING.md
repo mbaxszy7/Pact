@@ -29,6 +29,19 @@ Prompt or Developer PowerShell, with `cl.exe`, `link.exe`, `INCLUDE` and `LIB` c
 matching host and target. These build steps compile the owned-process helper; packaged applications
 use the bundled helper and never download or compile it at runtime.
 
+MSVC preparation uses the existing compiled Windows Job launcher and the system .NET Framework
+compiler to own the compiler's auxiliary processes. A successful compile requires its natural root
+exit, authenticated empty Job and closed launcher before validating or publishing the artifact.
+Packaged applications still use the native helper and do not acquire a .NET runtime dependency.
+Control files stay on the system temporary volume while compilation retains its own working
+directory. Preparation and execution share the original deadline; late preparation is reclaimed
+before its capacity is reused, and unconfirmed cleanup preserves its recovery files.
+The [compiler action owner](scripts/run-windows-compiler.mjs) admits one action per Node process
+with no queue. Native-helper builds use a 60-second absolute deadline and 256 KiB per output stream;
+the test observer uses 30 seconds and 64 KiB per stream. Preparation shares that deadline, startup
+uses at most 15 seconds, and failure cleanup has one fixed five-second window. Missing root,
+nonzero compilation, cancellation, protocol errors or unconfirmed release remain failures.
+
 Windows file-symlink boundary tests require permission to create symbolic links. Run them in a
 suitably privileged session, or manually enable
 [Developer Mode](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createsymboliclinkw)

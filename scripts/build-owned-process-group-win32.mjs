@@ -5,6 +5,8 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
+import { runWindowsCompiler, WindowsCompilerError } from './run-windows-compiler.mjs'
+
 const execute = promisify(execFile)
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const source = join(root, 'apps/desktop/native/owned-process-group-win32.cpp')
@@ -29,11 +31,11 @@ const sourceSha256 = createHash('sha256')
 const filename = `owned-process-group-win32-${arch}.exe`
 const compiled = join(temporary, filename)
 const destination = join(output, filename)
+let preserveTemporary = false
 try {
-  // The caller enters a Windows SDK developer environment. There is no shell,
-  // runtime compilation/download, .NET dependency, or product PATH lookup.
-  await execute(
-    'cl.exe',
+  // Build preparation owns MSVC's complete subtree. The shipped native helper
+  // remains self-contained and never compiles, downloads or requires .NET at runtime.
+  await runWindowsCompiler(
     [
       '/nologo',
       '/std:c++20',
@@ -54,7 +56,7 @@ try {
       '/NXCOMPAT',
       `/MACHINE:${arch === 'arm64' ? 'ARM64' : 'X64'}`,
     ],
-    { cwd: temporary, shell: false, windowsHide: true, timeout: 60_000, maxBuffer: 256 * 1024 },
+    { cwd: temporary, timeout: 60_000, maxBuffer: 256 * 1024 },
   )
   if ((await stat(compiled)).size > 16 * 1024 * 1024)
     throw Error('Native bridge artifact is oversized.')
@@ -100,6 +102,9 @@ try {
   await rename(compiled, destination)
   await writeFile(`${destination}.json`, `${JSON.stringify(metadata, null, 2)}\n`)
   process.stdout.write(`Built Windows ${arch} process ownership bridge (${bytes.length} bytes).\n`)
+} catch (error) {
+  preserveTemporary = error instanceof WindowsCompilerError && error.preserveWorkspace
+  throw error
 } finally {
-  await rm(temporary, { recursive: true, force: true })
+  if (!preserveTemporary) await rm(temporary, { recursive: true, force: true })
 }

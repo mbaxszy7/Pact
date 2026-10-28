@@ -4,7 +4,6 @@ import type { PathLike } from 'node:fs'
 import assert from 'node:assert/strict'
 import {
   ChildProcess,
-  execFile,
   spawn,
   type ChildProcessWithoutNullStreams,
   type SpawnOptions,
@@ -32,7 +31,6 @@ import { join, resolve as resolvePath } from 'node:path'
 import { createInterface } from 'node:readline'
 import { Duplex } from 'node:stream'
 import { pathToFileURL } from 'node:url'
-import { promisify } from 'node:util'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -50,8 +48,8 @@ import {
   decisionPhysicalWitnessSchema,
   type DecisionWindowsPhysicalWitness,
 } from '../../packages/contracts/src/decision-physical-witness.js'
+import { runWindowsCompiler, WindowsCompilerError } from '../../scripts/run-windows-compiler.mjs'
 
-const execute = promisify(execFile)
 const seam = vi.hoisted(() => ({
   spawn: undefined as (() => ChildProcess) | undefined,
   afterLstat: undefined as ((path: PathLike) => Promise<void>) | undefined,
@@ -84,6 +82,7 @@ vi.mock('node:fs/promises', async (original) => {
 let directory = '',
   observerExecutable = '',
   bridgeExecutable = ''
+let preserveDirectory = false
 
 // Independent test observer: it retains actual kernel process handles. No PID
 // lookup after admission, no product receipt interpretation, no process scan.
@@ -499,24 +498,28 @@ describe.runIf(process.platform === 'win32')('Windows product OwnedProcessGroup'
     const source = join(directory, 'observer.cpp')
     observerExecutable = join(directory, 'observer.exe')
     await writeFile(source, observerSource)
-    await execute(
-      'cl.exe',
-      [
-        '/nologo',
-        '/std:c++20',
-        '/O2',
-        '/MT',
-        '/W4',
-        '/WX',
-        `/Fo${join(directory, 'observer.obj')}`,
-        `/Fe${observerExecutable}`,
-        source,
-      ],
-      { cwd: directory, shell: false, windowsHide: true, timeout: 30_000, maxBuffer: 64 * 1024 },
-    )
+    try {
+      await runWindowsCompiler(
+        [
+          '/nologo',
+          '/std:c++20',
+          '/O2',
+          '/MT',
+          '/W4',
+          '/WX',
+          `/Fo${join(directory, 'observer.obj')}`,
+          `/Fe${observerExecutable}`,
+          source,
+        ],
+        { cwd: directory, timeout: 30_000, maxBuffer: 64 * 1024 },
+      )
+    } catch (error) {
+      preserveDirectory = error instanceof WindowsCompilerError && error.preserveWorkspace
+      throw error
+    }
   })
   afterAll(async () => {
-    if (directory) await rm(directory, { recursive: true, force: true })
+    if (directory && !preserveDirectory) await rm(directory, { recursive: true, force: true })
   })
 
   it('persists allocated and contained phases before the first native instruction and forwards the real root identity', async () => {
