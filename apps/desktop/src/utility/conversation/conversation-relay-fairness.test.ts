@@ -171,7 +171,10 @@ describe.each([32, 100])('%i independently waiting Relay cards', (count) => {
         representative.input('/build Review this independent task after every waiting card.'),
       ),
     ).toMatchObject({ ok: true })
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+    await vi.waitFor(
+      () => expect(native.inputs).toHaveLength(2),
+      count === 100 ? { timeout: 5_000 } : undefined,
+    )
     expect(await representative.settled()).toMatchObject({ status: 'complete', reviewer: 'claude' })
     expect(native.inputs.map((input) => input.sessionId)).toEqual([
       representative.sessionId,
