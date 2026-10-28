@@ -1081,6 +1081,53 @@ export class ConversationRepository {
   // At most fourteen immutable templates. Each prepares on first use and SQLite
   // finalizes it when this Repository's connection closes. All facts are reread.
   private readonly sourceQueries = {
+    session: lazyStatement(() =>
+      this.database
+        .select()
+        .from(sessions)
+        .where(eq(sessions.id, sql.placeholder('sessionId'))),
+    ),
+    latestEligibleRun: lazyStatement(() =>
+      this.database
+        .select(publicRunColumns)
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.sessionId, sql.placeholder('sessionId')),
+            ne(agentRuns.controlDisposition, 'abandoned'),
+            isNull(agentRuns.forkSourceRunId),
+            sql`NOT EXISTS (SELECT 1 FROM native_agent_contexts n WHERE n.session_id=${agentRuns.sessionId} AND n.agent_id=${agentRuns.agentId} AND n.binding_generation<>${agentRuns.bindingGeneration})`,
+          ),
+        )
+        .orderBy(desc(agentRuns.createdAt), desc(sql`rowid`))
+        .limit(1),
+    ),
+    latestCompleteVisibleSequence: lazyStatement(() =>
+      this.database
+        .select({ value: max(conversationMessages.sequence) })
+        .from(conversationMessages)
+        .where(
+          and(
+            eq(conversationMessages.sessionId, sql.placeholder('sessionId')),
+            eq(conversationMessages.role, 'assistant'),
+            eq(conversationMessages.state, 'complete'),
+            eq(conversationMessages.isVisible, true),
+          ),
+        ),
+    ),
+    activeReceivedInput: lazyStatement(() =>
+      this.database
+        .select()
+        .from(collaborationInputs)
+        .where(
+          and(
+            eq(collaborationInputs.sessionId, sql.placeholder('sessionId')),
+            inArray(collaborationInputs.state, ['accepted', 'blocked']),
+          ),
+        )
+        .orderBy(desc(collaborationInputs.createdAt))
+        .limit(1),
+    ),
     run: lazyStatement(() =>
       this.database
         .select(publicRunColumns)
@@ -6706,15 +6753,14 @@ export class ConversationRepository {
   }
 
   queueState(sessionId: string): ConversationQueueState {
-    const session = this.database
-      .select({
-        enabled: sessions.queueEnabled,
-        revision: sessions.queueRevision,
-        reason: sessions.queuePauseReason,
-      })
-      .from(sessions)
-      .where(eq(sessions.id, sessionId))
-      .get()
+    const stored = this.sourceQueries.session().get({ sessionId })
+    const session = stored
+      ? {
+          enabled: stored.queueEnabled,
+          revision: stored.queueRevision,
+          reason: stored.queuePauseReason,
+        }
+      : undefined
     if (!session) throw new RunOperationConflictError('The Session is unavailable.')
     const row = this.receivedCollaborationInput(sessionId)
     const returned = this.database
@@ -7958,6 +8004,7 @@ export class ConversationRepository {
   }
 
   receivedCollaborationInput(sessionId: string, includeCancelled = false) {
+    if (!includeCancelled) return this.sourceQueries.activeReceivedInput().get({ sessionId })
     return this.database
       .select()
       .from(collaborationInputs)
@@ -10325,36 +10372,15 @@ export class ConversationRepository {
       .get()
   }
 
-  private sessionProjection(sessionId: string): ConversationSnapshot['session'] {
-    const session = this.database.select().from(sessions).where(eq(sessions.id, sessionId)).get()
+  private sessionProjection(
+    sessionId: string,
+    latestRun: AgentRun | undefined,
+  ): ConversationSnapshot['session'] {
+    const session = this.sourceQueries.session().get({ sessionId })
     if (!session) throw new Error('Session does not exist.')
-    const latestRunRow = this.database
-      .select(publicRunColumns)
-      .from(agentRuns)
-      .where(
-        and(
-          eq(agentRuns.sessionId, sessionId),
-          ne(agentRuns.controlDisposition, 'abandoned'),
-          isNull(agentRuns.forkSourceRunId),
-          sql`NOT EXISTS (SELECT 1 FROM native_agent_contexts n WHERE n.session_id=${agentRuns.sessionId} AND n.agent_id=${agentRuns.agentId} AND n.binding_generation<>${agentRuns.bindingGeneration})`,
-        ),
-      )
-      .orderBy(desc(agentRuns.createdAt), desc(sql`rowid`))
-      .limit(1)
-      .get()
-    const latestRun = latestRunRow ? ConversationRepository.toRun(latestRunRow) : undefined
-    const latestCompleteAssistantSequence = this.database
-      .select({ value: max(conversationMessages.sequence) })
-      .from(conversationMessages)
-      .where(
-        and(
-          eq(conversationMessages.sessionId, sessionId),
-          eq(conversationMessages.role, 'assistant'),
-          eq(conversationMessages.state, 'complete'),
-          eq(conversationMessages.isVisible, true),
-        ),
-      )
-      .get()?.value
+    const latestCompleteAssistantSequence = this.sourceQueries
+      .latestCompleteVisibleSequence()
+      .get({ sessionId })?.value
     const title = projectSessionTitle(session.title, session.titleSource)
     return {
       id: session.id,
@@ -10484,20 +10510,9 @@ export class ConversationRepository {
   private createPatch(sessionId: string, input: PatchInput = {}): ConversationPatch {
     this.patchCount += 1
     const observation = this.nextObservation(sessionId)
-    const latestRunId = this.database
-      .select({ id: agentRuns.id })
-      .from(agentRuns)
-      .where(
-        and(
-          eq(agentRuns.sessionId, sessionId),
-          ne(agentRuns.controlDisposition, 'abandoned'),
-          isNull(agentRuns.forkSourceRunId),
-          sql`NOT EXISTS (SELECT 1 FROM native_agent_contexts n WHERE n.session_id=${agentRuns.sessionId} AND n.agent_id=${agentRuns.agentId} AND n.binding_generation<>${agentRuns.bindingGeneration})`,
-        ),
-      )
-      .orderBy(desc(agentRuns.createdAt), desc(sql`rowid`))
-      .limit(1)
-      .get()?.id
+    const latestRunRow = this.sourceQueries.latestEligibleRun().get({ sessionId })
+    const latestRun = latestRunRow ? ConversationRepository.toRun(latestRunRow) : undefined
+    const latestRunId = latestRun?.id
     const received = this.database
       .select({ id: collaborationInputs.id })
       .from(collaborationInputs)
@@ -10520,7 +10535,7 @@ export class ConversationRepository {
       ...(input.queuedInputIds?.length ? { queuedInputIds: input.queuedInputIds } : {}),
       sessionId,
       observation,
-      session: this.sessionProjection(sessionId),
+      session: this.sessionProjection(sessionId, latestRun),
       messages: input.messages ?? [],
       ...(input.removedMessageIds?.length ? { removedMessageIds: input.removedMessageIds } : {}),
       runs: input.runs ?? [],
