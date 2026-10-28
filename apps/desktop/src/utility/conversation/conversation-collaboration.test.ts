@@ -815,7 +815,15 @@ describe('Optional plan revision guidance through the original workflow owner', 
     enableRelay(f)
     const goal = 'The durable original objective remains complete.\n'.repeat(3200)
     expect((await f.flow.send(f.input(`/plan ${goal}`))).ok).toBe(true)
-    await completedPlanRevision(f)
+    // All six full-source stages share the test's existing five-second total deadline.
+    await vi.waitFor(
+      () => {
+        expect(native.inputs).toHaveLength(6)
+        expect(f.db.conversationRepository.collaboration(f.sessionId)?.status).toBe('ready')
+      },
+      { timeout: 5_000 },
+    )
+    await f.settled()
     expect(native.decisions).toEqual([])
     expect(native.guidanceBodies).toEqual([])
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM scheduling_evaluations`)).toEqual({
