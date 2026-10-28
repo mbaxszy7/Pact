@@ -15,10 +15,89 @@ import {
   disposeWindowsLauncherImage,
   windowsLauncherImageDiagnostic,
 } from '../tests/e2e/windows-cli-launcher.ts'
-import { runWindows, validateWindowsArgumentMode } from './run-e2e-windows.mjs'
+import {
+  runWindows,
+  validateWindowsArgumentMode,
+  windowsJobDiagnostic,
+} from './run-e2e-windows.mjs'
 import { run } from './run-e2e.mjs'
 
 const windowsOnly = { skip: process.platform !== 'win32', timeout: 20_000 }
+
+function diagnosticFixture() {
+  const members = Array.from({ length: 16 }, (_, index) => ({
+    pid: 4294967295 - index,
+    createdMs: Number.MAX_SAFE_INTEGER,
+    role: 'descendant',
+    image: 'crash-reporter',
+  }))
+  return {
+    version: 1,
+    root: {
+      pid: 4294967279,
+      exitCode: -2147483648,
+      elapsedMs: Number.MAX_SAFE_INTEGER,
+      natural: false,
+      active: 256,
+      members,
+      membersIncomplete: false,
+    },
+    stop: { reason: 'descendants-still-running', active: 256 },
+    afterTerminate: { phase: 'after-terminate', members, membersIncomplete: false },
+    errorCode: -2147483648,
+  }
+}
+
+await test('Windows runner failure facts fit the original control bound with adjacent frames', () => {
+  const diagnostic = diagnosticFixture()
+  assert.deepEqual(windowsJobDiagnostic(diagnostic), diagnostic)
+  const frames = [
+    { kind: 'stopping', reason: 'descendants-still-running' },
+    { kind: 'counts', active: 256 },
+    { kind: 'counts', active: 256 },
+    { kind: 'empty', active: 0, exitCode: -2147483648, diagnostic },
+  ]
+  assert(Buffer.byteLength(JSON.stringify(frames.at(-1))) <= 3584)
+  assert(Buffer.byteLength(frames.map((frame) => JSON.stringify(frame) + '\r\n').join('')) < 4096)
+})
+
+await test('Windows runner diagnostics withhold arbitrary strings and never mutate empty evidence', () => {
+  const diagnostic = diagnosticFixture()
+  diagnostic.path = 'private path'
+  diagnostic.root.argv = 'private argument'
+  diagnostic.root.members[0].command = 'private command'
+  const empty = { kind: 'empty', active: 0, exitCode: 7, diagnostic }
+  const snapshot = structuredClone(empty)
+  const result = windowsJobDiagnostic(empty.diagnostic)
+  assert(!JSON.stringify(result).includes('private'))
+  assert.deepEqual(empty, snapshot)
+  assert.equal(result.root.exitCode, -2147483648)
+  assert.equal(empty.exitCode, 7)
+})
+
+await test('missing malformed and oversized Windows diagnostics stay incomplete without throwing', () => {
+  const extraMembers = diagnosticFixture()
+  extraMembers.root.members.push(extraMembers.root.members[0])
+  const privateImage = diagnosticFixture()
+  privateImage.root.members[0].image = 'private executable name'
+  const invalidCode = diagnosticFixture()
+  invalidCode.root.exitCode = Number.MAX_SAFE_INTEGER
+  const invalidPhase = diagnosticFixture()
+  invalidPhase.afterTerminate.phase = 'before-stop'
+  for (const value of [
+    undefined,
+    null,
+    [],
+    {},
+    extraMembers,
+    privateImage,
+    invalidCode,
+    invalidPhase,
+  ])
+    assert.deepEqual(windowsJobDiagnostic(value), { incomplete: true })
+  const natural = { ...diagnosticFixture(), stop: null, afterTerminate: null, errorCode: null }
+  assert.equal(windowsJobDiagnostic(natural).stop, null)
+})
 
 await test(
   'a cold Windows Job starts and releases without a PowerShell compiler dependency',
