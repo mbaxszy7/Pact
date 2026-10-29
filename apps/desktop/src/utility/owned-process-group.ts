@@ -465,7 +465,10 @@ export class OwnedProcessGroup {
     try {
       process.kill(-root.pgid, signal)
     } catch (error) {
-      if (errorCode(error) !== 'ESRCH')
+      // Darwin can return EPERM while a group is exiting. It is not release:
+      // the original deadline still requires actual child close and group ESRCH.
+      const code = errorCode(error)
+      if (code !== 'ESRCH' && !(process.platform === 'darwin' && code === 'EPERM'))
         throw new Error('The owned owned group could not be stopped.', { cause: error })
     }
   }

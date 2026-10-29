@@ -339,6 +339,84 @@ describe('Owned physical process groups', () => {
     await expectReleased(fixture)
   })
 
+  it.skipIf(process.platform !== 'darwin').each([
+    { mode: 'natural-exit', childMode: 'eof', hideAbsence: false, released: true, minimumMs: 0 },
+    {
+      mode: 'denied-live',
+      childMode: 'normal',
+      hideAbsence: false,
+      released: false,
+      minimumMs: 3900,
+    },
+    {
+      mode: 'unconfirmed-absence',
+      childMode: 'eof',
+      hideAbsence: true,
+      released: false,
+      minimumMs: 3900,
+    },
+  ])('requires actual release after Darwin signal EPERM: $mode', async (scenario) => {
+    let fixture: Fixture
+    let releasedAtInput: boolean | undefined
+    const inputEntered = Promise.withResolvers<void>()
+    const allowInputClose = Promise.withResolvers<void>()
+    const closeInput = vi.fn<() => Promise<void>>(async () => {
+      releasedAtInput = fixture.owner.released
+      inputEntered.resolve()
+      await allowInputClose.promise
+      fixture.child.stdin.end()
+    })
+    fixture = await createFixture(scenario.childMode, { onCloseInput: closeInput })
+    await fixture.owner.observe()
+    const originalKill = process.kill.bind(process)
+    const signals: string[] = []
+    const denied = Object.assign(Error('Controlled owned-group permission result'), {
+      code: 'EPERM',
+    })
+    const kill = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      if (pid === -fixture.child.pid!) {
+        if (signal === 0 && scenario.hideAbsence) throw denied
+        if (signal === 'SIGTERM' || signal === 'SIGKILL') {
+          signals.push(signal)
+          throw denied
+        }
+      }
+      return originalKill(pid, signal)
+    })
+    try {
+      const began = performance.now()
+      const closing = fixture.owner.close().then(
+        () => ({ released: true, error: undefined }),
+        (error: unknown) => ({
+          released: false,
+          error: error instanceof Error ? error.message : 'other',
+        }),
+      )
+      await inputEntered.promise
+      expect(fixture.owner.released).toBe(false)
+      expect(originalKill(-fixture.child.pid!, 0)).toBe(true)
+      allowInputClose.resolve()
+      const result = await closing
+      expect(result).toEqual({
+        released: scenario.released,
+        error: scenario.released
+          ? undefined
+          : 'The owned process scope did not release before its deadline.',
+      })
+      expect(performance.now() - began).toBeGreaterThanOrEqual(scenario.minimumMs)
+      expect(fixture.owner.released).toBe(scenario.released)
+      expect(releasedAtInput).toBe(false)
+      expect(closeInput).toHaveBeenCalledOnce()
+      expect(signals[0]).toBe('SIGTERM')
+      expect(signals.length).toBeLessThanOrEqual(2)
+      kill.mockRestore()
+      expect(groupGone(fixture.child.pid!)).toBe(scenario.childMode === 'eof')
+    } finally {
+      allowInputClose.resolve()
+      kill.mockRestore()
+    }
+  })
+
   it.skipIf(process.platform === 'win32')(
     'waits for actual absence when a closed root leaves a previously unobserved helper',
     async () => {
