@@ -119,6 +119,96 @@ function record(f: Fixture, id: string, nativeGeneration: number) {
   return witness
 }
 
+describe('Windows tool-disabled native context', () => {
+  it('cannot authorize inference from a pre-launch allocation', async () => {
+    const f = await fixture(),
+      id = reserveEvaluation(f),
+      witness = windowsWitness()
+    expect(begin(f, id, 'native_context', 0, null)).toBe(1)
+    const allocated = decisionPhysicalWitnessSchema.parse({
+      version: witness.version,
+      platform: witness.platform,
+      ownerId: witness.ownerId,
+      generation: witness.generation,
+      protocolVersion: witness.protocolVersion,
+      phase: 'allocated',
+      owner: witness.owner,
+      receipt: witness.receipt,
+    })
+    f.repo.recordSchedulingRuntimeWitness(id, { nativeGeneration: 1, witness: allocated })
+    expect(() =>
+      f.repo.recordEvaluationPhysicalWitness(id, {
+        witness: allocated,
+        nativeGeneration: 1,
+        configurationFingerprint,
+      }),
+    ).toThrow(/inference stage/u)
+    f.repo.recordSchedulingRuntimeWitness(id, { nativeGeneration: 1, witness })
+    f.repo.recordEvaluationPhysicalWitness(id, {
+      nativeGeneration: 1,
+      witness,
+      configurationFingerprint,
+    })
+    expect(f.repo.dispatchEvaluation(id).created).toBe(true)
+  })
+
+  it('binds one inference generation to its Windows witness and closes the original admission', async () => {
+    const f = await fixture(),
+      id = reserveEvaluation(f)
+    expect(begin(f, id, 'native_context', 0, null)).toBe(1)
+    const witness = record(f, id, 1)
+    f.repo.recordEvaluationPhysicalWitness(id, {
+      witness,
+      nativeGeneration: 1,
+      configurationFingerprint,
+    })
+    expect(f.repo.dispatchEvaluation(id).created).toBe(true)
+    expect(() => begin(f, id, 'host_metadata', 1, witness)).toThrow(/stage order/u)
+    f.repo.completeSchedulingRuntimePhysical(id, {
+      nativeGeneration: 1,
+      witness,
+      completed: true,
+      candidateId: 'wait',
+    })
+    expect(f.repo.activeSchedulingRuntimeOwner()).toBeUndefined()
+  })
+
+  it('does not admit a tool-disabled context for Codex or a Darwin physical witness', async () => {
+    const f = await fixture(),
+      id = reserveEvaluation(f)
+    expect(begin(f, id, 'native_context', 0, null)).toBe(1)
+    const darwin = {
+      version: 1,
+      platform: 'darwin',
+      ownerId: randomUUID(),
+      owner: { pid: 5101, started: 'owned-owner' },
+      root: { pid: 5102, pgid: 5102, started: 'owned-root' },
+      members: [{ pid: 5102, pgid: 5102, started: 'owned-root' }],
+    }
+    expect(() =>
+      f.repo.recordSchedulingRuntimeWitness(id, {
+        nativeGeneration: 1,
+        witness: decisionPhysicalWitnessSchema.parse(darwin),
+      }),
+    ).toThrow(/Windows Claude/u)
+    f.repo.completeSchedulingRuntimePhysical(id, {
+      nativeGeneration: 1,
+      witness: null,
+      completed: false,
+      candidateId: null,
+    })
+    f.repo.saveSchedulingSettings({
+      expectedRevision: f.repo.schedulingSettings().revision,
+      selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
+    })
+    const probe = probeInput(null)
+    expect(
+      f.repo.reserveSchedulingProbe({ ...probe, provider: 'codex', model: 'gpt-6-luna' }),
+    ).toBe(true)
+    expect(() => begin(f, probe.id, 'native_context', 0, null)).toThrow(/initial native stage/u)
+  })
+})
+
 function receipts(db: PactDatabase) {
   return db.drizzle
     .select()

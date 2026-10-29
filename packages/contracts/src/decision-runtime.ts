@@ -16,6 +16,7 @@ export const DECISION_SCHEMA_DEPTH = 4
 export const DECISION_PHYSICAL_RECEIPT_ITEMS = 32
 export const DECISION_PHYSICAL_RECEIPT_BYTES = 64 * 1024
 export const decisionNativeStageSchema = z.enum([
+  'native_context',
   'host_metadata',
   'project_metadata',
   'guarded_context',

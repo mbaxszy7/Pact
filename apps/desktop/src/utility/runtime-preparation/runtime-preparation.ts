@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
-import { access } from 'node:fs/promises'
+import { access, opendir } from 'node:fs/promises'
 import { delimiter, isAbsolute, join } from 'node:path'
 
 import type {
@@ -19,6 +19,9 @@ import { recordDiagnostic } from '../../diagnostics/utility-log'
 
 const PROBE_TIMEOUT_MS = 4_000
 const MAX_CAPTURE_BYTES = 64 * 1024
+const INSTALLATION_DISCOVERY_MS = 1_000
+const INSTALLATION_DISCOVERY_ENTRIES = 128
+const INSTALLATION_DISCOVERY_BYTES = 64 * 1024
 
 interface ProbeCommandResult {
   exitCode: number | null
@@ -40,6 +43,7 @@ export class RuntimePreparation {
           this.repository.readSelectedExecutablePath('claude'),
           this.repository.readSelectedExecutablePath('codex'),
           process.env.PATH,
+          process.env.LOCALAPPDATA,
         ]),
       )
       .digest('hex')
@@ -55,7 +59,8 @@ export class RuntimePreparation {
     const executable =
       selected && (await this.isExecutable(selected))
         ? selected
-        : await this.findOnInheritedPath(agentId, 128)
+        : ((agentId === 'claude' ? await this.findWindowsDesktopClaude(signal) : undefined) ??
+          (await this.findOnInheritedPath(agentId, 128)))
     signal.throwIfAborted()
     return executable
   }
@@ -218,9 +223,82 @@ export class RuntimePreparation {
     if (selectedPath && (await this.isExecutable(selectedPath))) return selectedPath
     signal?.throwIfAborted()
     return (
+      (agentId === 'claude' ? await this.findWindowsDesktopClaude(signal) : undefined) ??
       (await this.findOnInheritedPath(agentId)) ??
       (await this.findWithPlatformLookup(agentId, signal))
     )
+  }
+
+  /** Desktop updates its native CLI separately from PATH installations. Never replace an explicit choice. */
+  private async findWindowsDesktopClaude(signal?: AbortSignal): Promise<string | undefined> {
+    const localAppData = process.env.LOCALAPPDATA
+    if (process.platform !== 'win32' || !localAppData || !isAbsolute(localAppData)) return undefined
+    const deadline = Date.now() + INSTALLATION_DISCOVERY_MS
+    let entries = 0,
+      bytes = 0
+    const check = (): void => {
+      signal?.throwIfAborted()
+      if (Date.now() >= deadline) throw new Error('Native installation discovery timed out.')
+    }
+    const directories = async (path: string, pattern: RegExp): Promise<string[]> => {
+      check()
+      let directory
+      try {
+        directory = await opendir(path, { bufferSize: 16 })
+      } catch (error) {
+        check()
+        if (
+          typeof error === 'object' &&
+          error !== null &&
+          'code' in error &&
+          error.code === 'ENOENT'
+        )
+          return []
+        throw error
+      }
+      const names: string[] = []
+      for await (const entry of directory) {
+        check()
+        bytes += Buffer.byteLength(entry.name)
+        if (++entries > INSTALLATION_DISCOVERY_ENTRIES || bytes > INSTALLATION_DISCOVERY_BYTES)
+          throw new Error('Native installation discovery exceeds its capacity.')
+        if (entry.isDirectory() && pattern.test(entry.name)) names.push(entry.name)
+      }
+      check()
+      return names
+    }
+    const root = join(localAppData, 'Claude-Data')
+    const installations: Array<{ path: string; version: number[] }> = []
+    for (const profile of await directories(root, /^claude_[a-z0-9]+$/u)) {
+      const runtimeRoot = join(root, profile, 'claude-code')
+      // oxlint-disable-next-line no-await-in-loop -- One bounded directory handle at a time.
+      for (const version of await directories(runtimeRoot, /^\d{1,5}\.\d{1,5}\.\d{1,5}$/u))
+        installations.push({
+          path: join(runtimeRoot, version),
+          version: version.split('.').map(Number),
+        })
+    }
+    installations.sort((left, right) => {
+      for (let component = 0; component < 3; component++) {
+        const difference = right.version[component]! - left.version[component]!
+        if (difference) return difference
+      }
+      return left.path.localeCompare(right.path)
+    })
+    for (const installation of installations) {
+      // oxlint-disable-next-line no-await-in-loop -- Newest completed installation wins within the same discovery budget.
+      const builds = await directories(installation.path, /^[a-f0-9]{12,64}$/u)
+      for (const build of builds.toSorted()) {
+        const executable = join(installation.path, build, 'claude.exe')
+        // oxlint-disable-next-line no-await-in-loop -- Do not speculate on executable startup or authentication during lookup.
+        if (await this.isExecutable(executable)) {
+          check()
+          return executable
+        }
+      }
+    }
+    check()
+    return undefined
   }
 
   // The inherited PATH is the cheapest lookup and preserves the environment used to launch Pact.

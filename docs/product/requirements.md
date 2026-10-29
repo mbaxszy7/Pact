@@ -84,6 +84,12 @@ Assess Claude Code and Codex independently through executable discovery or a sav
 
 Minimum supported CLI versions are Claude Code **2.1.272** and Codex **0.159.2**. Compare numeric version components, ignoring build metadata; a prerelease of the minimum release is not sufficient. An older version has an explicit Upgrade required warning, showing the detected version and required minimum with upgrade/recheck guidance. Unreadable versions remain unconfirmed, never Ready. Version compatibility is checked before authentication or native execution; Pact does not install or upgrade CLIs automatically.
 
+An existing manual executable choice takes precedence. Without one, Windows Claude discovery first
+uses the newest completed versioned native runtime installed by Claude Desktop, then inherited PATH
+and platform lookup. Readiness, model catalogs and native recovery use that same selection policy;
+automatic discovery never persists a manual override. Incomplete installations are not executable
+candidates, and bounded discovery failure is not permission to choose an older truncated result.
+
 **CLI Ready** means the selected CLI is discoverable, accepts an effective authentication method and can start its control/probe operation. It guarantees neither network, quota, model availability nor future Run success. Claude's accepted local API authentication is valid without a subscription login. GUI processes inherit only the environment available at launch; a later terminal export does not change an already running Pact.
 
 First-time users remain on Runtime Preparation until both CLIs are Ready, then must complete Default Session Settings. There is no hidden skip or fake-model validation. Saving defaults and completing setup is atomic.
@@ -536,7 +542,7 @@ selected native binary, writes outside owned temporary storage and network acces
 response guard. Hooks and MCP startup therefore cannot execute processes or contact services.
 Claude keeps its ordinary global configuration; it does not use a bare replacement home.
 
-The bounded guard binds the native destination, exact model and request. It permits only the required
+On macOS, the bounded guard binds the native destination, exact model and request. It permits only the required
 native metadata route during admission, then the single bound inference request. It rejects tools
 before forwarding and withholds all model output until the complete response is verified. Complete
 inherited input remains within 128 KiB and the native transport envelope within 256 KiB. Observable
@@ -552,10 +558,23 @@ A retained file descriptor verifies identity and content through physical
 completion; Pact never creates or repairs this identifier. This is a narrow trusted-native exception,
 not an operating-system guarantee that every native-home file is read-only.
 
-Windows has an owned Job implementation and packaged helper checks, but these do not establish the
-required decision isolation. It remains unavailable for decision execution. Missing native proof
-reports unavailable without changing the selected model. Platform and real-provider acceptance
-remain separate requirements.
+Windows Claude Relay uses a trusted native CLI in one fresh, tool-disabled context outside the
+Project, retaining the original native login. It uses fixed Relay instructions and the complete
+Pact-supplied business context, disables built-in tools, MCP, Hooks, Skills, plugins and other
+development customizations, and never resumes development history. Native organization policy remains
+trusted; if it prevents effective disablement, Relay refuses inference. Startup configuration runs
+under normal native permissions. Effective credential helpers remain unavailable even with cached
+account identity. This mode was checked with Claude Code 2.1.309.
+
+Windows trusts the installed CLI and its native authentication behavior. The CLI may maintain its
+normal authentication, cache and client state. Pact does not provide OS-level filesystem, ACL or
+network isolation for this process and does not insert the macOS response guard. Model output is
+untrusted: require the exact selected model, one normally completed bound turn, no tool-use blocks,
+matching assistant/result text and a valid admitted recommendation before adoption. The existing
+Windows Job owner provides cancellation, physical exit and durable receipt proof. One 15-second,
+16-MiB invocation reservation, bounded input/output and host freshness/authorization checks remain.
+Refresh performs no inference. Codex decision execution remains unavailable on Windows. Platform,
+packaged and real-provider acceptance remain separate requirements.
 
 Evaluation rows record only invocation/outcome/usage and bounded physical identity metadata below
 4 KiB, never complete inputs or unadopted suggestion bodies. Adopted guidance is separately sealed

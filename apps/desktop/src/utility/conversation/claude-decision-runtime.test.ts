@@ -962,7 +962,7 @@ it('uses the original host deadline and cancels without releasing a live loader'
   }
 })
 
-it.each(['win32', 'linux'] as const)(
+it.each(['linux'] as const)(
   'keeps unverified %s isolation unavailable before executable discovery or dispatch',
   async (platform) => {
     const source = await decisionFixture(),

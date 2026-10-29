@@ -15,6 +15,7 @@ import {
   type DecisionInput,
   type DecisionOutcome,
   type DecisionPhysicalWitness,
+  type DecisionNativeStage,
   type SchedulingUsage,
 } from '@pact/contracts'
 
@@ -77,7 +78,7 @@ const scalar = (value: unknown, limit = 4096): string | null => {
     throw Error('unsupported_protocol')
   return value
 }
-type NativeStage = 'host_metadata' | 'project_metadata' | 'guarded_context' | 'project_verification'
+type NativeStage = DecisionNativeStage
 type Guard = Awaited<ReturnType<typeof createClaudeDecisionResponseGuard>>
 type Authority = { fingerprint: string; destination: string; account: string; effective: string }
 
@@ -143,7 +144,7 @@ export interface ClaudeDecisionRuntimeContext {
 }
 
 /** One fixed JSONL buffer and one waiter; no SDK/readline, event queue or shared parser worker. */
-class ClaudeDecisionTransport {
+export class ClaudeDecisionTransport {
   private readonly frame = Buffer.allocUnsafe(FRAME_BYTES)
   private length = 0
   private bytes = 0
@@ -161,12 +162,14 @@ class ClaudeDecisionTransport {
   private protocolRefusal = 'none'
   private nativeSystem = 'none'
   private nativeTypes = { assistant: 0, system: 0, result: 0, command_lifecycle: 0, other: 0 }
+  private rateLimitFrames = 0
   diagnostics() {
     return {
       refusal: this.protocolRefusal,
       frames: { ...this.nativeTypes },
       system: this.nativeSystem,
       assistantFrames: this.assistantFrames,
+      rateLimitFrames: this.rateLimitFrames,
     }
   }
   private rejectProtocol(reason: string): never {
@@ -177,6 +180,11 @@ class ClaudeDecisionTransport {
   private assistantId: string | undefined
   private assistantFrames = 0
   private assistantBytes = 0
+  private assistantText = ''
+  private observedUsage: SchedulingUsage | undefined
+  get usage(): SchedulingUsage | undefined {
+    return this.observedUsage ? { ...this.observedUsage } : undefined
+  }
   private initSeen = false
   private resultSeen = false
   private commandId: string | undefined
@@ -192,6 +200,7 @@ class ClaudeDecisionTransport {
     private readonly signal: AbortSignal,
     private readonly sessionId: string,
     private readonly modelId: string,
+    private readonly nativeToolDisabled = false,
   ) {
     child.stdout.on('data', this.read)
     child.stderr.on('data', this.stderr)
@@ -257,6 +266,46 @@ class ClaudeDecisionTransport {
     }
   }
   private accept(value: Record<string, unknown>): void {
+    if (this.nativeToolDisabled && value.type === 'rate_limit_event') {
+      const fields = ['type', 'rate_limit_info', 'uuid', 'session_id']
+      if (
+        Object.keys(value).length !== fields.length ||
+        Object.keys(value).some((key) => !fields.includes(key)) ||
+        value.session_id !== this.sessionId ||
+        typeof value.uuid !== 'string' ||
+        !UUID.test(value.uuid)
+      )
+        this.rejectProtocol('unbound_rate_limit')
+      const info = record(value.rate_limit_info)
+      if (!['allowed', 'allowed_warning', 'rejected'].includes(String(info.status)))
+        this.rejectProtocol('rate_limit_status')
+      // Subscription windows vary by native version. This bounded metadata is
+      // discarded; it never becomes a result, permission or settings update.
+      if (Buffer.byteLength(JSON.stringify(info)) > 4 * 1024)
+        this.rejectProtocol('rate_limit_metadata')
+      this.rateLimitFrames++
+      return
+    }
+    if (
+      this.nativeToolDisabled &&
+      value.type === 'system' &&
+      (value.subtype === 'ui_invalidate' || value.subtype === 'session_title_changed')
+    ) {
+      const field = value.subtype === 'ui_invalidate' ? 'event' : 'title'
+      const allowed = ['type', 'subtype', field, 'uuid', 'session_id']
+      const payload = value[field]
+      if (
+        Object.keys(value).length !== allowed.length ||
+        Object.keys(value).some((key) => !allowed.includes(key)) ||
+        value.session_id !== this.sessionId ||
+        typeof value.uuid !== 'string' ||
+        !UUID.test(value.uuid) ||
+        typeof payload !== 'string' ||
+        Buffer.byteLength(payload) > (field === 'event' ? 128 : 640)
+      )
+        this.rejectProtocol('unbound_metadata')
+      return
+    }
     if (value.type === 'control_response') {
       const response = record(value.response),
         pending = this.pending
@@ -381,11 +430,32 @@ class ClaudeDecisionTransport {
           scalar(part.type === 'text' ? part.text : part.thinking, DECISION_OUTPUT_BYTES) ?? '',
         )
         if (bytes > DECISION_OUTPUT_BYTES) throw Error('unsupported_protocol')
+        if (this.nativeToolDisabled && part.type === 'text') this.assistantText += part.text
       }
       this.assistantId ??= scalar(message.id, 256) ?? undefined
       this.assistantBytes = bytes
       this.assistantSeen = true
     } else if (value.type === 'result') {
+      if (this.nativeToolDisabled && isRecord(value.usage)) {
+        const inputs = [
+          value.usage.input_tokens,
+          value.usage.cache_read_input_tokens ?? 0,
+          value.usage.cache_creation_input_tokens ?? 0,
+        ]
+        const output = value.usage.output_tokens
+        const usage: SchedulingUsage = {}
+        if (
+          inputs.every(
+            (count) => typeof count === 'number' && Number.isSafeInteger(count) && count >= 0,
+          )
+        ) {
+          const total = inputs.reduce<number>((sum, count) => sum + Number(count), 0)
+          if (Number.isSafeInteger(total)) usage.inputTokens = total
+        }
+        if (typeof output === 'number' && Number.isSafeInteger(output) && output >= 0)
+          usage.outputTokens = output
+        if (Object.keys(usage).length) this.observedUsage = usage
+      }
       const waiting = this.result
       if (!waiting || !this.initSeen) throw Error('unsupported_protocol')
       this.resultSeen = true
@@ -401,7 +471,8 @@ class ClaudeDecisionTransport {
         value.user_message_uuids[0] !== this.commandId ||
         !this.assistantSeen ||
         typeof value.result !== 'string' ||
-        Buffer.byteLength(value.result) > DECISION_OUTPUT_BYTES
+        Buffer.byteLength(value.result) > DECISION_OUTPUT_BYTES ||
+        (this.nativeToolDisabled && value.result !== this.assistantText)
       )
         waiting.reject(Error('unavailable'))
       else this.terminalResult = { result: value.result }
@@ -449,7 +520,7 @@ class ClaudeDecisionTransport {
     this.child.stdout.resume()
     this.child.stdin.end()
   }
-  async release(): Promise<void> {
+  async release(): Promise<boolean> {
     await this.closePromise
     this.signal.removeEventListener('abort', this.aborted)
     this.child.stdout.off('data', this.read)
@@ -459,13 +530,19 @@ class ClaudeDecisionTransport {
     this.child.stdin.off('error', this.aborted)
     this.child.off('error', this.aborted)
     this.terminalResult = undefined
+    this.assistantText = ''
     this.length = 0
     this.frame.fill(0)
+    return (
+      !this.failure &&
+      (!this.submitted || (this.lifecycle === 'completed' && this.resultSeen && this.assistantSeen))
+    )
   }
 }
 
 /** One disposable native invocation; owns all native stages, I/O, guard and physical settlement. */
 export class ClaudeDecisionRuntime implements DecisionRuntime {
+  private readonly nativeToolDisabled = process.platform === 'win32'
   private readonly memory = new DecisionMemoryLease()
   private readonly controller = new AbortController()
   private readonly admittedAt = Date.now()
@@ -526,7 +603,11 @@ export class ClaudeDecisionRuntime implements DecisionRuntime {
     return this.called
   }
   get usage() {
-    return this.guard?.usage ?? (this.observedUsage ? { ...this.observedUsage } : undefined)
+    return (
+      this.guard?.usage ??
+      this.transport?.usage ??
+      (this.observedUsage ? { ...this.observedUsage } : undefined)
+    )
   }
   diagnostics() {
     return {
@@ -664,6 +745,7 @@ export class ClaudeDecisionRuntime implements DecisionRuntime {
         signal,
         async () => {
           const authority = await this.prepare()
+          if (this.nativeToolDisabled) await this.closeStage(true)
           return authority.fingerprint
         },
         (reason) => {
@@ -710,29 +792,35 @@ export class ClaudeDecisionRuntime implements DecisionRuntime {
           const authority = await this.prepare()
           this.check()
           const prompt = decisionRuntimePrompt(input) + JSON.stringify(input)
-          this.guard!.bind({
-            modelId: this.context.modelId,
-            prompt,
-            current: async () => {
-              this.check()
-              await this.verifyExecutable()
-              this.check()
-              return true
-            },
-            dispatch: () => {
-              this.check()
-              if (this.called) throw Error('unavailable')
-              this.context.dispatch()
-              this.called = true
-            },
-          })
+          if (this.nativeToolDisabled) {
+            await this.verifyExecutable()
+            this.check()
+            this.context.dispatch()
+            this.called = true
+          } else
+            this.guard!.bind({
+              modelId: this.context.modelId,
+              prompt,
+              current: async () => {
+                this.check()
+                await this.verifyExecutable()
+                this.check()
+                return true
+              },
+              dispatch: () => {
+                this.check()
+                if (this.called) throw Error('unavailable')
+                this.context.dispatch()
+                this.called = true
+              },
+            })
           this.phase = 'inference'
           const result = await this.transport!.prompt(prompt)
           this.check()
           if (
             !this.called ||
-            this.guard!.facts.acceptedResponses !== 1 ||
-            result.result !== this.guard!.answer
+            (!this.nativeToolDisabled &&
+              (this.guard!.facts.acceptedResponses !== 1 || result.result !== this.guard!.answer))
           )
             throw Error('unavailable')
           const recommendation = parseDecisionRecommendation(
@@ -741,9 +829,12 @@ export class ClaudeDecisionRuntime implements DecisionRuntime {
           )
           if (!recommendation.success)
             return { kind: 'unavailable', reason: 'invalid_output' } as const
-          await this.closeStage()
-          const verified = await this.stage('project_verification', this.context.cwd, false)
-          if (verified.fingerprint !== authority.fingerprint) throw Error('stale')
+          if (this.nativeToolDisabled) await this.closeStage(true)
+          else {
+            await this.closeStage()
+            const verified = await this.stage('project_verification', this.context.cwd, false)
+            if (verified.fingerprint !== authority.fingerprint) throw Error('stale')
+          }
           await this.verifyExecutable()
           this.check()
           return { kind: 'recommendation', recommendation: recommendation.recommendation } as const
@@ -779,7 +870,8 @@ export class ClaudeDecisionRuntime implements DecisionRuntime {
   }
   private async prepare(): Promise<Authority> {
     this.check()
-    if (process.platform !== 'darwin') throw Error('unsupported_platform')
+    if (process.platform !== 'darwin' && process.platform !== 'win32')
+      throw Error('unsupported_platform')
     if (!MODEL.test(this.context.modelId)) throw Error('model_unavailable')
     if (
       !UUID.test(this.context.ownerId) ||
@@ -803,7 +895,19 @@ export class ClaudeDecisionRuntime implements DecisionRuntime {
       if (dirname(ancestor) === ancestor) break
     }
     await this.verifyExecutable()
-    const host = await this.stage('host_metadata', path, false)
+    const host = await this.stage(
+      this.nativeToolDisabled ? 'native_context' : 'host_metadata',
+      path,
+      false,
+    )
+    if (this.nativeToolDisabled) {
+      this.context.prepared({
+        nativeGeneration: this.generation,
+        witness: this.witness!,
+        configurationFingerprint: host.fingerprint,
+      })
+      return host
+    }
     await this.closeStage()
     if (this.context.cwd) {
       const project = await this.stage('project_metadata', this.context.cwd, false)
@@ -948,11 +1052,20 @@ export class ClaudeDecisionRuntime implements DecisionRuntime {
       '--mcp-config',
       '{"mcpServers":{}}',
       '--setting-sources',
-      stage === 'project_metadata' || stage === 'project_verification'
-        ? 'user,project,local'
-        : 'user',
+      this.nativeToolDisabled
+        ? ''
+        : stage === 'project_metadata' || stage === 'project_verification'
+          ? 'user,project,local'
+          : 'user',
       '--settings',
       JSON.stringify({ ...SETTINGS, env: localEnv }),
+      ...(this.nativeToolDisabled
+        ? [
+            '--safe-mode',
+            '--system-prompt',
+            'You provide scheduling advice to Pact. Use only the supplied business context. Never use tools. Return only the requested JSON. Advice grants no authority.',
+          ]
+        : []),
     ]
     this.group = new OwnedProcessGroup({
       signal: this.controller.signal,
@@ -968,11 +1081,9 @@ export class ClaudeDecisionRuntime implements DecisionRuntime {
         await this.context.physicalPrepared({ nativeGeneration: generation, witness })
       },
     })
-    const sandbox = decisionDarwinSandbox(
-      this.nativeExecutable!.path,
-      this.directory!.path,
-      this.guard?.port,
-    )
+    const sandbox = this.nativeToolDisabled
+      ? { command: this.nativeExecutable!.path, args: [] }
+      : decisionDarwinSandbox(this.nativeExecutable!.path, this.directory!.path, this.guard?.port)
     const child = this.group.spawn(sandbox.command, [...sandbox.args, ...args], {
       cwd,
       env,
@@ -983,6 +1094,7 @@ export class ClaudeDecisionRuntime implements DecisionRuntime {
       this.controller.signal,
       sessionId,
       this.context.modelId,
+      this.nativeToolDisabled,
     )
     const witness = await this.group.physicalWitness(this.context.ownerId)
     this.witness = witness
@@ -1109,7 +1221,8 @@ export class ClaudeDecisionRuntime implements DecisionRuntime {
       ].some((key) => mergedEnv[key])
     )
       throw Error('unsupported_network')
-    if (effective.apiKeyHelper && !account.identity) throw Error('unsupported_authentication')
+    if (effective.apiKeyHelper && (this.nativeToolDisabled || !account.identity))
+      throw Error('unsupported_authentication')
     const route = scalar(mergedEnv.ANTHROPIC_BASE_URL) ?? 'https://api.anthropic.com'
     if (guarded && route !== this.guard!.baseUrl) throw Error('unsupported_network')
     const destination = guarded ? originalDestination! : route
@@ -1133,6 +1246,7 @@ export class ClaudeDecisionRuntime implements DecisionRuntime {
     })
     return {
       fingerprint: fingerprint([
+        ...(this.nativeToolDisabled ? ['windows_native_tool_disabled_v1'] : []),
         account.hash,
         effectiveHash,
         destination,
@@ -1157,25 +1271,27 @@ export class ClaudeDecisionRuntime implements DecisionRuntime {
     )
       throw Error('unsupported_protocol')
   }
-  private async closeStage(): Promise<void> {
+  private async closeStage(validateProtocol = false): Promise<void> {
     this.phase = 'closing_stage'
-    this.observedUsage = this.guard?.usage ?? this.observedUsage
+    this.observedUsage = this.guard?.usage ?? this.transport?.usage ?? this.observedUsage
     this.guard?.stopForwarding()
     const results = await Promise.allSettled([this.group?.close()])
     // Closing joins decoders too; retain counters observed while cancellation was settling.
-    this.observedUsage = this.guard?.usage ?? this.observedUsage
+    this.observedUsage = this.guard?.usage ?? this.transport?.usage ?? this.observedUsage
     if (
       results.some((result) => result.status === 'rejected') ||
       (this.group && !this.group.released)
     )
       throw Error('cleanup_unconfirmed')
-    if (this.guard) this.observedTransport = this.transport?.diagnostics() ?? this.observedTransport
-    await this.transport?.release()
+    const protocolValid = await this.transport?.release()
+    if (this.guard || this.nativeToolDisabled)
+      this.observedTransport = this.transport?.diagnostics() ?? this.observedTransport
     await this.guard?.close()
     this.transport = undefined
     this.group = undefined
     this.guard = undefined
     this.previousPhysicalReleased = true
+    if (validateProtocol && protocolValid !== true) throw Error('unsupported_protocol')
   }
   private cleanup(): Promise<boolean> {
     this.cleanupTask ??= (async () => {

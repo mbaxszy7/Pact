@@ -46,6 +46,29 @@ async function prefix(path: string) {
     await file.close()
   }
 }
+async function windowsExecutable(path: string): Promise<boolean> {
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    const size = (await file.stat()).size
+    const header = Buffer.alloc(64),
+      pe = Buffer.alloc(24)
+    if (
+      (await file.read(header, 0, header.length, 0)).bytesRead !== header.length ||
+      header.toString('ascii', 0, 2) !== 'MZ'
+    )
+      return false
+    const offset = header.readUInt32LE(60)
+    return (
+      offset >= 64 &&
+      offset <= size - pe.length &&
+      (await file.read(pe, 0, pe.length, offset)).bytesRead === pe.length &&
+      pe.readUInt32LE(0) === 0x4550 &&
+      pe.readUInt16LE(4) === (process.arch === 'arm64' ? 0xaa64 : 0x8664)
+    )
+  } finally {
+    await file.close()
+  }
+}
 export async function resolveDecisionNativeExecutable(
   selected: string,
   provider: 'codex' | 'claude',
@@ -54,7 +77,9 @@ export async function resolveDecisionNativeExecutable(
   const original = await realpath(selected)
   const paths = [selected, original]
   let native = original
-  if (!macho(await prefix(native))) {
+  const windowsClaude = process.platform === 'win32' && provider === 'claude'
+  if (windowsClaude && !(await windowsExecutable(native))) throw Error('unsupported_protocol')
+  if (!windowsClaude && !macho(await prefix(native))) {
     if (provider !== 'codex') throw Error('unsupported_protocol')
     let launcher = original
     if (!launcher.endsWith('/bin/codex.js')) {

@@ -290,10 +290,14 @@ These profiles use owned loopback providers, not paid model inference.
 
 `pnpm test:native:claude-decision` separately verifies exact Claude Code 2.1.272 on macOS arm64,
 including global-instruction preservation, OS containment and complete response validation.
-Both decision execution profiles remain unavailable on Windows until equivalent containment is
-implemented and independently verified. CLI installation and Windows Job ownership are separate
-proofs; Windows CI preserves blocked decision evidence instead of reporting those cases passed.
-Original Windows native protocol and ownership obligations remain required.
+Those macOS containment profiles remain separate from Windows Claude's trusted, tool-disabled
+native mode. `pnpm test:native:claude-windows` exercises the real installed CLI against an owned
+loopback provider, including an enabled-tool positive control, Relay tool denial, one-generation
+SQLite provenance, invalid output and cancellation. It requires the existing source-matched Windows
+Job helper and a compatible CLI (checked with 2.1.309). `PACT_WINDOWS_CLAUDE_EXECUTABLE` explicitly
+selects another installed test executable; the test does not install a CLI or use paid inference.
+Native subscription inference requires a separate trusted-local real-provider check. Windows Codex
+decisions remain unavailable; original Windows native protocol and ownership obligations remain.
 
 Native workspace journeys use the ordinary Pact Quit action and confirm pending work before waiting
 for physical process exit. `tests/e2e/native-quit.ts` provides this bounded teardown; an Electron

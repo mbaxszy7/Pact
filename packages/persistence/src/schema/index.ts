@@ -1340,7 +1340,13 @@ export const schedulingRuntimeOwners = sqliteTable(
     physicalWitnessJson: text('physical_witness_json'),
     nativeGeneration: integer('native_generation').notNull().default(0),
     nativeStage: text('native_stage', {
-      enum: ['host_metadata', 'project_metadata', 'guarded_context', 'project_verification'],
+      enum: [
+        'host_metadata',
+        'project_metadata',
+        'guarded_context',
+        'project_verification',
+        'native_context',
+      ],
     }),
     active: integer('active', { mode: 'boolean' }).notNull().default(true),
     phase: text('phase', {

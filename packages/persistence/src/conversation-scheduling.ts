@@ -825,6 +825,11 @@ export function recordRuntimeWitness(
     .where(eq(schedulingRuntimeOwners.id, id))
     .get()
   if (!saved?.active) throw new RunOperationConflictError('The native reservation is unavailable.')
+  if (
+    saved.nativeStage === 'native_context' &&
+    (saved.provider !== 'claude' || witness.platform !== 'win32')
+  )
+    throw new RunOperationConflictError('The native context requires a Windows Claude owner.')
   if ((value.nativeGeneration ?? 0) !== saved.nativeGeneration)
     throw new RunOperationConflictError('The native witness belongs to an older physical stage.')
   if (value.configurationFingerprint && !/^[a-f0-9]{64}$/u.test(value.configurationFingerprint))
@@ -876,7 +881,7 @@ export function beginNativeStage(
     throw new RunOperationConflictError('The native stage is no longer eligible.')
   if (owner.nativeGeneration === 0) {
     if (
-      stage !== 'host_metadata' ||
+      (stage !== 'host_metadata' && !(stage === 'native_context' && owner.provider === 'claude')) ||
       owner.phase !== 'reserved' ||
       owner.nativeStage !== null ||
       owner.physicalWitnessJson !== null ||
@@ -984,7 +989,16 @@ export function recordEvaluationPhysicalWitness(
     .from(schedulingRuntimeOwners)
     .where(eq(schedulingRuntimeOwners.id, id))
     .get()
-  if (owner?.nativeGeneration && owner.nativeStage !== 'guarded_context')
+  if (
+    owner?.nativeGeneration &&
+    owner.nativeStage !== 'guarded_context' &&
+    !(
+      owner.nativeStage === 'native_context' &&
+      owner.provider === 'claude' &&
+      witness.platform === 'win32' &&
+      witness.phase === 'contained'
+    )
+  )
     throw new RunOperationConflictError(
       'Only the inference stage may record evaluation provenance.',
     )
