@@ -642,6 +642,14 @@ it
       let physicalPreparations = 0
       let physicalCompletions = 0
       let receiptRetirements = 0
+      let completionObservation:
+        | {
+            poolBytes: number | null
+            generation: number
+            platform: string | undefined
+            activeOwner: boolean
+          }
+        | undefined
       helperPost = () => {
         for (let index = 0; index < 4; index++)
           business.push(new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES))
@@ -682,11 +690,11 @@ it
           return f.repo.schedulingPhysicalReceiptCapacityAvailable()
         },
         physicalCompletion: async (facts) => {
-          expect(nativeWorkingMemoryCapacities().decision.chargedBytes).toBe(16 * 1024 * 1024)
-          expect(facts.nativeGeneration).toBe(
-            ['message', 'custom_api_key', 'missing_mime'].includes(kind) ? 3 : 2,
-          )
-          expect(facts.witness?.platform).toBe('darwin')
+          const completionFacts = {
+            poolBytes: nativeWorkingMemoryCapacities().decision.chargedBytes,
+            generation: facts.nativeGeneration,
+            platform: facts.witness?.platform,
+          }
           f.repo.completeSchedulingRuntimePhysical(evaluationId, {
             nativeGeneration: facts.nativeGeneration,
             witness: facts.witness,
@@ -697,7 +705,10 @@ it
                 : null,
             ...(facts.usage ? { usage: facts.usage } : {}),
           })
-          expect(f.repo.activeSchedulingRuntimeOwner()).toBeUndefined()
+          completionObservation = {
+            ...completionFacts,
+            activeOwner: f.repo.activeSchedulingRuntimeOwner() !== undefined,
+          }
           physicalCompletions++
         },
         dispatch: () => {
@@ -731,12 +742,31 @@ it
       })
       const cleanupBegan = performance.now()
       const physicalReleased = await runtime.settlement()
+      const cleanupElapsedMs = performance.now() - cleanupBegan
+      console.info(
+        'Native durable settlement',
+        JSON.stringify({
+          kind,
+          physicalReleased,
+          poolBytes: nativeWorkingMemoryCapacities().decision.chargedBytes,
+          diagnostics: runtime.diagnostics(),
+          completionObservation,
+        }),
+      )
       expect({ physicalPreparations, physicalCompletions, receiptRetirements }).toEqual({
         physicalPreparations: ['message', 'custom_api_key', 'missing_mime'].includes(kind) ? 3 : 2,
         physicalCompletions: 1,
         receiptRetirements: 1,
       })
-      expect(performance.now() - cleanupBegan).toBeLessThan(4000)
+      expect(cleanupElapsedMs).toBeLessThan(4000)
+      // Observe at the original callback boundary, but never let a test assertion
+      // interrupt the production owner's final lease release.
+      expect(completionObservation).toEqual({
+        poolBytes: 16 * 1024 * 1024,
+        generation: ['message', 'custom_api_key', 'missing_mime'].includes(kind) ? 3 : 2,
+        platform: 'darwin',
+        activeOwner: false,
+      })
       lateResponse?.end('late response must never reach native')
       business.splice(0).forEach((reservation) => reservation.release())
       f.repo.settleEvaluation(evaluationId, {

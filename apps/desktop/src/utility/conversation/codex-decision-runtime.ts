@@ -50,6 +50,57 @@ const CATALOG_PAGE_ITEMS = 25
 const CATALOG_PAGES = 8
 const CATALOG_BYTES = 256 * 1024
 
+function ownErrorField(value: unknown, key: string): unknown {
+  return value && typeof value === 'object'
+    ? Object.getOwnPropertyDescriptor(value, key)?.value
+    : undefined
+}
+
+/** Closed classifications only: native errors can contain private paths or output. */
+export function decisionCloseResult(result: PromiseSettledResult<unknown>) {
+  if (result.status === 'fulfilled') return { status: 'fulfilled' as const }
+  const reasons: Record<string, string> = {
+    'The owned process did not establish its owned group.': 'root_identity',
+    'The owned group lost its verified process identity.': 'anchor_lost',
+    'The owned group identity changed.': 'identity_changed',
+    'Process group identities could not be checked.': 'os_observation',
+    'Process group observation was invalid.': 'invalid_observation',
+    'Process group identity was invalid.': 'invalid_observation',
+    'Process group observation exceeded its limit.': 'capacity',
+    'Process group ownership exceeded its identity limit.': 'capacity',
+    'Process group release could not be confirmed.': 'release_observation',
+    'The owned owned group could not be stopped.': 'signal_failed',
+    'The owned process scope did not release before its deadline.': 'physical_cleanup_deadline',
+  }
+  try {
+    const error: unknown = result.reason
+    const message = ownErrorField(error, 'message')
+    const cause = ownErrorField(error, 'cause') ?? error
+    const code = ownErrorField(cause, 'code'),
+      signal = ownErrorField(cause, 'signal')
+    return {
+      status: 'rejected' as const,
+      reason:
+        typeof message === 'string' && Object.hasOwn(reasons, message)
+          ? reasons[message]!
+          : 'other',
+      code:
+        [
+          'ESRCH',
+          'EPERM',
+          'EACCES',
+          'ENOENT',
+          'ETIMEDOUT',
+          'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+        ].find((value) => value === code) ?? null,
+      killed: ownErrorField(cause, 'killed') === true,
+      signal: ['SIGTERM', 'SIGKILL', 'SIGABRT'].find((value) => value === signal) ?? null,
+    }
+  } catch {
+    return { status: 'rejected' as const, reason: 'other', code: null, killed: false, signal: null }
+  }
+}
+
 const DISABLED = [
   'hooks',
   'plugins',
@@ -120,6 +171,17 @@ export class CodexDecisionRuntime implements DecisionRuntime {
   private completionOutcome: DecisionOutcome | undefined
   private receiptRetirementUnconfirmed = false
   private refusalCode: number | undefined
+  private firstCloseFailure:
+    | {
+        boundary: 'stage' | 'final'
+        generation: number
+        phase: string
+        elapsedMs: number
+        connection: ReturnType<typeof decisionCloseResult>
+        group: ReturnType<typeof decisionCloseResult>
+        groupReleased: boolean | null
+      }
+    | undefined
 
   constructor(
     private readonly context: {
@@ -185,6 +247,9 @@ export class CodexDecisionRuntime implements DecisionRuntime {
       failure: this.failure,
       failureReason: this.failureReason,
       refusalCode: this.refusalCode,
+      firstCloseFailure: this.firstCloseFailure
+        ? structuredClone(this.firstCloseFailure)
+        : undefined,
       guard: this.guard?.facts,
       working: this.memory.diagnostics(),
     }
@@ -1114,13 +1179,32 @@ export class CodexDecisionRuntime implements DecisionRuntime {
   }
 
   private async closeNativeStage(): Promise<void> {
+    const began = performance.now()
     const results = await Promise.allSettled([this.connection?.close(), this.group?.close()])
-    if (results.some((x) => x.status === 'rejected') || (this.group && !this.group.released))
+    if (results.some((x) => x.status === 'rejected') || (this.group && !this.group.released)) {
+      this.recordCloseFailure('stage', began, results)
       throw Error('Unsupported native protocol')
+    }
     this.connection = undefined
     this.group = undefined
     if (this.installation && !(await this.installation.current()))
       throw Error('Native decision configuration changed')
+  }
+  private recordCloseFailure(
+    boundary: 'stage' | 'final',
+    began: number,
+    results: [PromiseSettledResult<unknown>, PromiseSettledResult<unknown>],
+  ): void {
+    // One fixed-size snapshot per invocation; later cleanup cannot erase the first cause.
+    this.firstCloseFailure ??= {
+      boundary,
+      generation: this.nativeGeneration,
+      phase: this.phase,
+      elapsedMs: Math.min(60_000, Math.max(0, Math.round(performance.now() - began))),
+      connection: decisionCloseResult(results[0]),
+      group: decisionCloseResult(results[1]),
+      groupReleased: this.group?.released ?? null,
+    }
   }
   private cleanup(): Promise<boolean> {
     if (this.closeTask) return this.closeTask
@@ -1129,13 +1213,20 @@ export class CodexDecisionRuntime implements DecisionRuntime {
     this.closeTask = (async () => {
       const cleanupDeadline = Date.now() + DECISION_CLEANUP_TARGET_MS
       this.guard?.stopForwarding()
+      const began = performance.now()
       const results = await Promise.allSettled([this.connection?.close(), this.group?.close()])
       if (
         this.receiptRetirementUnconfirmed ||
         results.some((result) => result.status === 'rejected') ||
         (this.group && !this.group.released)
-      )
+      ) {
+        if (
+          results.some((result) => result.status === 'rejected') ||
+          (this.group && !this.group.released)
+        )
+          this.recordCloseFailure('final', began, results)
         return false
+      }
       if (this.installation) {
         if (!(await this.installation.current().catch(() => false))) {
           this.completionOutcome = { kind: 'unavailable', reason: 'stale' }
