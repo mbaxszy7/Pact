@@ -115,6 +115,16 @@ class NativeFixture {
       },
     }
   }
+  beginNativeStatusCheck(input: AgentNativeProbeInput) {
+    const result = this.probeNativeStatus(input)
+    return {
+      result,
+      physicalCompletion: result.then(
+        () => undefined,
+        () => undefined,
+      ),
+    }
+  }
   async setNativeTitle(input: AgentNativeTitleInput, signal: AbortSignal) {
     native.writes.push(input)
     native.naming += 1
@@ -210,7 +220,7 @@ const settings: Settings = {
   primaryAgentId: 'codex',
   agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
   maxDiscussionRounds: 3,
-  runningMessagePolicy: 'next_round',
+
   maxReviewCycles: 2,
   maxRepairAttempts: 2,
 }

@@ -120,6 +120,22 @@ jobs:
           PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-evidence/darwin-arm64
           PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
           PACT_CI_NATIVE_ARTIFACT: native-e2e-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+      - name: Prepare the separate pinned Codex decision protocol profile
+        run: node scripts/ci-native.mjs decision-codex
+      - name: Actual Codex decision protocol and physical lifecycle cases
+        run: node scripts/ci.mjs native decision-codex
+        env:
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-decision-evidence/darwin-arm64
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
+          PACT_CI_NATIVE_ARTIFACT: native-decision-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+      - name: Prepare the separate pinned Claude decision protocol profile
+        run: node scripts/ci-native.mjs decision-claude
+      - name: Actual Claude decision protocol and production response guard cases
+        run: node scripts/ci.mjs native decision-claude
+        env:
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-claude-decision-evidence/darwin-arm64
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
+          PACT_CI_NATIVE_ARTIFACT: native-claude-decision-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
       - name: Preserve sanitized native case results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -128,6 +144,35 @@ jobs:
           path: |
             ${{ runner.temp }}/pact-native-evidence/darwin-arm64/native-summary.json
             ${{ runner.temp }}/pact-native-evidence/darwin-arm64/native-summary.md
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Preserve sanitized decision native case results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-decision-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-native-decision-evidence/darwin-arm64/native-summary.json
+            ${{ runner.temp }}/pact-native-decision-evidence/darwin-arm64/native-summary.md
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Preserve unavailable claude-decision execution as blocked evidence
+        if: always()
+        run: node scripts/ci-native-report.mjs
+        env:
+          PACT_CI_NATIVE_PROFILE: decision-claude
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-claude-decision-evidence/darwin-arm64
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
+          PACT_CI_NATIVE_ARTIFACT: native-claude-decision-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+      - name: Preserve sanitized claude-decision case results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-claude-decision-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-native-claude-decision-evidence/darwin-arm64/native-summary.json
+            ${{ runner.temp }}/pact-native-claude-decision-evidence/darwin-arm64/native-summary.md
           if-no-files-found: ignore
           retention-days: 14
 
@@ -275,6 +320,45 @@ jobs:
         with:
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
+      - name: Prepare the matching installed Windows SDK and MSVC tools
+        shell: pwsh
+        timeout-minutes: 2
+        env:
+          PACT_MSVC_ARCH: x64
+        run: &windows-msvc-environment |
+          $ErrorActionPreference = 'Stop'
+          $arch = $env:PACT_MSVC_ARCH
+          if ($arch -notin @('x64', 'arm64')) { throw 'Unsupported native MSVC target.' }
+          node --input-type=module -e 'if(process.platform!=="win32"||process.arch!==process.env.PACT_MSVC_ARCH)throw Error("Native MSVC runner architecture mismatch")'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $component = if ($arch -eq 'arm64') { 'Microsoft.VisualStudio.Component.VC.Tools.ARM64' } else { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) { throw 'The installed Visual Studio locator is unavailable.' }
+          $installation = @(& $vswhere -latest -products '*' -requires $component -property installationPath)
+          if ($LASTEXITCODE -ne 0 -or $installation.Count -ne 1 -or $installation[0].Length -gt 4096 -or $installation[0] -match '[\x00\r\n"]') { throw 'The required installed MSVC component could not be located.' }
+          $devCmd = Join-Path ($installation[0].Trim()) 'Common7\Tools\VsDevCmd.bat'
+          if (-not (Test-Path -LiteralPath $devCmd -PathType Leaf)) { throw 'The installed Visual Studio developer command is unavailable.' }
+          $command = 'call "{0}" -no_logo -arch={1} -host_arch={1} >nul && set PATH && set INCLUDE && set LIB && set LIBPATH && set VSCMD_ARG_TGT_ARCH' -f $devCmd, $arch
+          $lines = @(& $env:ComSpec /d /s /c $command)
+          if ($LASTEXITCODE -ne 0) { throw 'The matching native MSVC environment could not be initialized.' }
+          if ($lines.Count -gt 128 -or [Text.Encoding]::UTF8.GetByteCount(($lines -join "`n")) -gt 65536) { throw 'The MSVC environment exceeded its admission bound.' }
+          $selected = @{}
+          foreach ($line in $lines) {
+            if ($line -match '^(PATH|INCLUDE|LIB|LIBPATH|VSCMD_ARG_TGT_ARCH)=(.*)$') { $selected[$Matches[1].ToUpperInvariant()] = $Matches[2] }
+          }
+          foreach ($key in @('PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VSCMD_ARG_TGT_ARCH')) {
+            if (-not $selected.ContainsKey($key) -or [string]::IsNullOrWhiteSpace($selected[$key]) -or $selected[$key] -match '[\x00\r\n]') { throw 'A required MSVC environment field is missing or invalid.' }
+          }
+          if ($selected['VSCMD_ARG_TGT_ARCH'] -ne $arch) { throw 'MSVC selected a different target architecture.' }
+          $env:PATH = $selected['PATH']
+          $compiler = (Get-Command cl.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          if (-not $compiler.EndsWith("\Host$arch\$arch\cl.exe", [StringComparison]::OrdinalIgnoreCase)) { throw 'MSVC selected a different compiler host or target.' }
+          $compilerDirectory = Split-Path -Parent $compiler
+          if (-not (Test-Path -LiteralPath (Join-Path $compilerDirectory 'link.exe') -PathType Leaf)) { throw 'The matching MSVC linker is unavailable.' }
+          foreach ($key in @('INCLUDE', 'LIB', 'LIBPATH', 'VSCMD_ARG_TGT_ARCH')) {
+            Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value ("{0}={1}" -f $key, $selected[$key])
+          }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8 -Value $compilerDirectory
       - uses: ./.github/actions/setup
         with:
           native: 'true'
@@ -284,12 +368,24 @@ jobs:
           node scripts/e2e-report.mjs --ci-metadata "$RUNNER_TEMP/e2e-metadata.json"
       - name: Build native runtime dependencies
         run: node scripts/ci.mjs build
+      - name: Actual Windows product helper ownership and physical lifecycle cases
+        run: node scripts/ci.mjs native windows-owner
+        env:
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-windows-owner-evidence/win32-x64
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
+          PACT_CI_NATIVE_ARTIFACT: native-windows-owner-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
       - name: Actual native CLI protocol, configuration and lifecycle cases
         run: node scripts/ci.mjs native
         env:
           PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-evidence/win32-x64
           PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
           PACT_CI_NATIVE_ARTIFACT: native-e2e-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
+      - name: Verify decision isolation remains unavailable on Windows
+        run: >-
+          node --input-type=module -e
+          "import { nativeProfile, nativeProfileSupports } from './scripts/native-profiles.mjs';
+          for (const name of ['decision-codex', 'decision-claude'])
+          if (nativeProfileSupports(nativeProfile(name))) throw new Error('Unsafe decision platform admission');"
       - name: Preserve sanitized native case results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -298,6 +394,42 @@ jobs:
           path: |
             ${{ runner.temp }}/pact-native-evidence/win32-x64/native-summary.json
             ${{ runner.temp }}/pact-native-evidence/win32-x64/native-summary.md
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Preserve unavailable windows-owner execution as blocked evidence
+        if: always()
+        run: node scripts/ci-native-report.mjs
+        env:
+          PACT_CI_NATIVE_PROFILE: windows-owner
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-windows-owner-evidence/win32-x64
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
+          PACT_CI_NATIVE_ARTIFACT: native-windows-owner-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
+      - name: Preserve sanitized windows-owner case results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-windows-owner-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-native-windows-owner-evidence/win32-x64/native-summary.json
+            ${{ runner.temp }}/pact-native-windows-owner-evidence/win32-x64/native-summary.md
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Preserve unavailable claude-decision execution as blocked evidence
+        if: always()
+        run: node scripts/ci-native-report.mjs
+        env:
+          PACT_CI_NATIVE_PROFILE: decision-claude
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-claude-decision-evidence/win32-x64
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
+          PACT_CI_NATIVE_ARTIFACT: native-claude-decision-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
+      - name: Preserve sanitized claude-decision case results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-claude-decision-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-native-claude-decision-evidence/win32-x64/native-summary.json
+            ${{ runner.temp }}/pact-native-claude-decision-evidence/win32-x64/native-summary.md
           if-no-files-found: ignore
           retention-days: 14
 
@@ -316,6 +448,12 @@ jobs:
         with:
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
+      - name: Prepare the matching installed Windows SDK and MSVC tools
+        shell: pwsh
+        timeout-minutes: 2
+        env:
+          PACT_MSVC_ARCH: x64
+        run: *windows-msvc-environment
       - uses: ./.github/actions/setup
       - name: Build the exact native installer candidate
         run: >-
@@ -393,6 +531,12 @@ jobs:
         with:
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
+      - name: Prepare the matching installed Windows SDK and MSVC tools
+        shell: pwsh
+        timeout-minutes: 2
+        env:
+          PACT_MSVC_ARCH: x64
+        run: *windows-msvc-environment
       - uses: ./.github/actions/setup
         with:
           native: 'true'
@@ -401,6 +545,8 @@ jobs:
         run: |
           node --input-type=module -e 'if(process.platform!=="win32"||process.arch!=="x64")throw Error("Runner architecture mismatch")'
           node scripts/e2e-report.mjs --ci-metadata "$RUNNER_TEMP/e2e-metadata.json"
+      - name: Build the matching helper for source Electron execution
+        run: node scripts/build-owned-process-group-win32.mjs
       - name: Execute existing real core cases with isolated model configuration
         id: execute
         continue-on-error: true
@@ -450,6 +596,12 @@ jobs:
         with:
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
+      - name: Prepare the matching installed Windows SDK and MSVC tools
+        shell: pwsh
+        timeout-minutes: 2
+        env:
+          PACT_MSVC_ARCH: arm64
+        run: *windows-msvc-environment
       - uses: ./.github/actions/setup
         with:
           native: 'true'
@@ -459,12 +611,24 @@ jobs:
           node scripts/e2e-report.mjs --ci-metadata "$RUNNER_TEMP/e2e-metadata.json"
       - name: Build native runtime dependencies
         run: node scripts/ci.mjs build
+      - name: Actual Windows product helper ownership and physical lifecycle cases
+        run: node scripts/ci.mjs native windows-owner
+        env:
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-windows-owner-evidence/win32-arm64
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
+          PACT_CI_NATIVE_ARTIFACT: native-windows-owner-win32-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
       - name: Actual native CLI protocol, configuration and lifecycle cases
         run: node scripts/ci.mjs native
         env:
           PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-evidence/win32-arm64
           PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
           PACT_CI_NATIVE_ARTIFACT: native-e2e-win32-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+      - name: Verify decision isolation remains unavailable on Windows
+        run: >-
+          node --input-type=module -e
+          "import { nativeProfile, nativeProfileSupports } from './scripts/native-profiles.mjs';
+          for (const name of ['decision-codex', 'decision-claude'])
+          if (nativeProfileSupports(nativeProfile(name))) throw new Error('Unsafe decision platform admission');"
       - name: Preserve sanitized native case results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -473,6 +637,42 @@ jobs:
           path: |
             ${{ runner.temp }}/pact-native-evidence/win32-arm64/native-summary.json
             ${{ runner.temp }}/pact-native-evidence/win32-arm64/native-summary.md
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Preserve unavailable windows-owner execution as blocked evidence
+        if: always()
+        run: node scripts/ci-native-report.mjs
+        env:
+          PACT_CI_NATIVE_PROFILE: windows-owner
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-windows-owner-evidence/win32-arm64
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
+          PACT_CI_NATIVE_ARTIFACT: native-windows-owner-win32-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+      - name: Preserve sanitized windows-owner case results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-windows-owner-win32-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-native-windows-owner-evidence/win32-arm64/native-summary.json
+            ${{ runner.temp }}/pact-native-windows-owner-evidence/win32-arm64/native-summary.md
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Preserve unavailable claude-decision execution as blocked evidence
+        if: always()
+        run: node scripts/ci-native-report.mjs
+        env:
+          PACT_CI_NATIVE_PROFILE: decision-claude
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-claude-decision-evidence/win32-arm64
+          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
+          PACT_CI_NATIVE_ARTIFACT: native-claude-decision-win32-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+      - name: Preserve sanitized claude-decision case results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-claude-decision-win32-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pact-native-claude-decision-evidence/win32-arm64/native-summary.json
+            ${{ runner.temp }}/pact-native-claude-decision-evidence/win32-arm64/native-summary.md
           if-no-files-found: ignore
           retention-days: 14
 
@@ -496,6 +696,12 @@ jobs:
         with:
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
+      - name: Prepare the matching installed Windows SDK and MSVC tools
+        shell: pwsh
+        timeout-minutes: 2
+        env:
+          PACT_MSVC_ARCH: arm64
+        run: *windows-msvc-environment
       - uses: ./.github/actions/setup
       - name: Build the exact native installer candidate
         run: >-
@@ -504,6 +710,7 @@ jobs:
           --build-number "$GITHUB_RUN_NUMBER" --output "$RUNNER_TEMP/package"
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          PACT_WINDOWS_STARTUP_DIAGNOSTIC: '1'
       - name: Bind the clean installer manifest to its producing execution
         run: node scripts/ci-artifacts.mjs package-context "$RUNNER_TEMP/package"
       - id: upload
@@ -583,6 +790,12 @@ jobs:
         with:
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
+      - name: Prepare the matching installed Windows SDK and MSVC tools
+        shell: pwsh
+        timeout-minutes: 2
+        env:
+          PACT_MSVC_ARCH: arm64
+        run: *windows-msvc-environment
       - uses: ./.github/actions/setup
         with:
           native: 'true'
@@ -591,6 +804,8 @@ jobs:
         run: |
           node --input-type=module -e 'if(process.platform!=="win32"||process.arch!=="arm64")throw Error("Runner architecture mismatch")'
           node scripts/e2e-report.mjs --ci-metadata "$RUNNER_TEMP/e2e-metadata.json"
+      - name: Build the matching helper for source Electron execution
+        run: node scripts/build-owned-process-group-win32.mjs
       - name: Execute existing real core cases with isolated model configuration
         id: execute
         continue-on-error: true

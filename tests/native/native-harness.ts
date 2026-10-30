@@ -3,7 +3,18 @@ import type { Socket } from 'node:net'
 
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { access, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import {
+  access,
+  lstat,
+  mkdir,
+  mkdtemp,
+  opendir,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -23,7 +34,10 @@ import type {
   NativeProbeResult,
 } from '../../packages/contracts/src/index.js'
 
-import { OwnedProcessGroup } from '../../apps/desktop/src/utility/owned-process-group.js'
+import {
+  OwnedProcessGroup,
+  type WindowsOwnedProcessConfiguration,
+} from '../../apps/desktop/src/utility/owned-process-group.js'
 import {
   writeWindowsObservedLauncher,
   type WindowsLaunchOwner,
@@ -55,6 +69,82 @@ const groupFailureMessages = new Map([
 ])
 const execFileAsync = promisify(execFile)
 
+export interface WindowsFixtureProcessScope {
+  configuration: Readonly<WindowsOwnedProcessConfiguration>
+  /** Call only after the existing physical process/Job owners have released. */
+  assertReceiptsRetired: () => Promise<void>
+}
+
+/** Configuration and directory identity only; this never substitutes for native release proof. */
+export async function createWindowsFixtureProcessScope(
+  root: string,
+): Promise<WindowsFixtureProcessScope | undefined> {
+  if (process.platform !== 'win32') return undefined
+  if (!['x64', 'arm64'].includes(process.arch))
+    throw new Error('Windows process-owner fixtures require native x64 or arm64.')
+  const bridgePath = join(
+    desktopRoot,
+    'out/native',
+    `owned-process-group-win32-${process.arch}.exe`,
+  )
+  let windowsBridgeExecutable: string
+  try {
+    const binary = await lstat(bridgePath)
+    if (
+      !binary.isFile() ||
+      binary.isSymbolicLink() ||
+      binary.size < 88 ||
+      binary.size > 16 * 1024 * 1024
+    )
+      throw new Error('Invalid native helper')
+    windowsBridgeExecutable = await realpath(bridgePath)
+  } catch {
+    throw new Error(
+      'The real Windows product helper is unavailable. Build it with scripts/build-owned-process-group-win32.mjs before native fixtures.',
+    )
+  }
+  const canonicalRoot = await realpath(root)
+  const rootIdentity = await lstat(root, { bigint: true })
+  if (!rootIdentity.isDirectory() || rootIdentity.isSymbolicLink())
+    throw new Error('Windows fixture root must be an owned regular directory.')
+  const receiptDirectory = join(canonicalRoot, 'product-process-receipts')
+  // Each scope belongs to one newly-created fixture/observed-launcher root.
+  await mkdir(receiptDirectory, { mode: 0o700 })
+  const receiptIdentity = await lstat(receiptDirectory, { bigint: true })
+  const configuration = Object.freeze({ windowsBridgeExecutable, receiptDirectory })
+  return {
+    configuration,
+    async assertReceiptsRetired() {
+      const currentRoot = await lstat(root, { bigint: true })
+      const currentReceipt = await lstat(receiptDirectory, { bigint: true })
+      if (
+        !currentRoot.isDirectory() ||
+        currentRoot.isSymbolicLink() ||
+        currentRoot.dev !== rootIdentity.dev ||
+        currentRoot.ino !== rootIdentity.ino ||
+        (await realpath(root)) !== canonicalRoot ||
+        !currentReceipt.isDirectory() ||
+        currentReceipt.isSymbolicLink() ||
+        currentReceipt.dev !== receiptIdentity.dev ||
+        currentReceipt.ino !== receiptIdentity.ino ||
+        (await realpath(receiptDirectory)) !== receiptDirectory
+      )
+        throw new Error(
+          'Windows fixture cleanup is unconfirmed: directory identity changed; recovery data retained.',
+        )
+      const directory = await opendir(receiptDirectory)
+      try {
+        if (await directory.read())
+          throw new Error(
+            'Windows fixture cleanup is unconfirmed: receipts remain; recovery data retained.',
+          )
+      } finally {
+        await directory.close()
+      }
+    },
+  }
+}
+
 /** Fixture process ownership; production Adapter interfaces and policies remain unchanged. */
 export class NativeProcessOwner {
   readonly group: OwnedProcessGroup
@@ -69,6 +159,7 @@ export class NativeProcessOwner {
   private controlClosed = false
   private helperReleased = false
   private jobEmpty = false
+  private windowsUnadmitted = false
   private helperDiagnostic: HelperDiagnostic | undefined
   private groupFailure: string | undefined
 
@@ -77,8 +168,13 @@ export class NativeProcessOwner {
     readonly deadlineAt: number,
     private readonly windows: WindowsLaunchOwner | undefined,
     group?: OwnedProcessGroup,
+    private readonly windowsProcessScope?: WindowsFixtureProcessScope,
   ) {
-    this.group = group ?? new OwnedProcessGroup()
+    this.group =
+      group ??
+      (windowsProcessScope
+        ? new OwnedProcessGroup({ windows: windowsProcessScope.configuration })
+        : new OwnedProcessGroup())
   }
 
   static async prepare(
@@ -86,14 +182,35 @@ export class NativeProcessOwner {
     root: string,
     deadlineAt: number,
     group?: OwnedProcessGroup,
+    preparedWindows?: WindowsLaunchOwner,
   ): Promise<NativeProcessOwner> {
     const remaining = Math.floor(deadlineAt - performance.now())
     if (remaining <= 0 || remaining > 50_000) throw new Error('Native fixture deadline is invalid')
+    // A prepared control owner also supplies the lifecycle test's OS boundary.
     const windows =
-      process.platform === 'win32'
+      preparedWindows ??
+      (process.platform === 'win32'
         ? await writeWindowsObservedLauncher(root, command, remaining)
-        : undefined
-    return new NativeProcessOwner(command, deadlineAt, windows, group)
+        : undefined)
+    try {
+      const windowsProcessScope =
+        windows && !group ? await createWindowsFixtureProcessScope(windows.directory) : undefined
+      return new NativeProcessOwner(command, deadlineAt, windows, group, windowsProcessScope)
+    } catch (error) {
+      // No target was started. Reuse the existing owner to close the prepared
+      // observed launcher rather than leave its control server or helper behind.
+      const prepared = new NativeProcessOwner(command, deadlineAt, windows, group)
+      try {
+        await prepared.close()
+      } catch (cleanup) {
+        throw new AggregateError(
+          [error, cleanup],
+          'Windows fixture preparation cleanup is unconfirmed.',
+          { cause: cleanup },
+        )
+      }
+      throw error
+    }
   }
 
   start(args: readonly string[], options: SpawnOptions): ChildProcessWithoutNullStreams {
@@ -170,13 +287,17 @@ export class NativeProcessOwner {
     const physical =
       this.group.released &&
       (!this.child || this.childClosed) &&
-      (!admitted || !this.windows || this.jobEmpty)
+      (!admitted || !this.windows || this.windowsUnadmitted || this.jobEmpty)
     return {
       admitted,
       spawnFailedBeforeStart: this.spawnFailedBeforeStart,
       childClosed: this.childClosed,
       groupReleased: this.group.released,
-      windowsJobEmpty: this.windows ? (admitted ? this.jobEmpty : null) : null,
+      windowsJobEmpty: this.windows
+        ? admitted && !this.windowsUnadmitted
+          ? this.jobEmpty
+          : null
+        : null,
       controlClosed: !this.windows || this.controlClosed,
       helperReleased: !this.windows || this.helperReleased,
       released: physical && (!this.windows || (this.controlClosed && this.helperReleased)),
@@ -295,7 +416,11 @@ export class NativeProcessOwner {
         if (
           !this.group.released ||
           (this.child &&
-            (!this.childClosed || (this.windows && !this.spawnFailedBeforeStart && !this.jobEmpty)))
+            (!this.childClosed ||
+              (this.windows &&
+                !this.spawnFailedBeforeStart &&
+                !this.windowsUnadmitted &&
+                !this.jobEmpty)))
         )
           throw new Error('Owned native physical release remains unconfirmed')
         return this.release()
@@ -314,6 +439,17 @@ export class NativeProcessOwner {
       }
     }
     if (this.windows && this.child && !this.childClosed) this.child.stdin.end()
+    if (this.windows && this.child && !this.spawnFailedBeforeStart && !this.jobEmpty) {
+      // Keep the observed helper alive until it supplies its own release fact.
+      // Cancellation also permanently prevents a late hello from receiving go.
+      this.windows.cancel()
+      this.windowsUnadmitted = !Object.hasOwn(this.windows.diagnostic().stages, 'go')
+      if (!this.windowsUnadmitted)
+        await attempt(async () => {
+          await within(this.windows!.empty, 5000, 'Owned Windows Job release deadline')
+          this.jobEmpty = true
+        })
+    }
     await attempt(async () => {
       try {
         await this.group.close()
@@ -328,13 +464,6 @@ export class NativeProcessOwner {
     if (this.closed)
       await attempt(() => within(this.closed!, 1500, 'Owned helper child close deadline'))
     if (this.windows) {
-      if (this.child && !this.spawnFailedBeforeStart && !this.jobEmpty) {
-        this.windows.cancel()
-        await attempt(async () => {
-          await within(this.windows!.empty, 5000, 'Owned Windows Job release deadline')
-          this.jobEmpty = true
-        })
-      }
       if (!this.controlClosed)
         await attempt(async () => {
           await this.windows!.disposeControl()
@@ -345,7 +474,9 @@ export class NativeProcessOwner {
       if (
         !this.helperReleased &&
         this.group.released &&
-        (!this.child || (this.childClosed && (this.spawnFailedBeforeStart || this.jobEmpty))) &&
+        (!this.child ||
+          (this.childClosed &&
+            (this.spawnFailedBeforeStart || this.windowsUnadmitted || this.jobEmpty))) &&
         this.controlClosed
       ) {
         let stage: HelperDiagnostic['stage'] = 'canonicalize'
@@ -354,6 +485,7 @@ export class NativeProcessOwner {
           canonicalMatches = (await realpath(this.windows.directory)) === this.windows.directory
           stage = 'identity'
           if (!canonicalMatches) throw new Error('Unsafe Windows RPC cleanup target')
+          await this.windowsProcessScope?.assertReceiptsRetired()
           stage = 'remove'
           await rm(this.windows.directory, { recursive: true, force: true })
           this.helperReleased = true
@@ -620,6 +752,7 @@ export interface NativeAdapter {
   run: AgentAdapter['run']
   steer: NonNullable<AgentAdapter['steer']>
   probeNativeInputs: NonNullable<AgentAdapter['probeNativeInputs']>
+  beginNativeInputsCheck: NonNullable<AgentAdapter['beginNativeInputsCheck']>
   setNativeTitle?(
     input: AgentNativeTitleInput,
     signal: AbortSignal,

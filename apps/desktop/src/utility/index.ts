@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { realpath, rm } from 'node:fs/promises'
-import { basename, dirname, isAbsolute } from 'node:path'
+import { basename, dirname, isAbsolute, join } from 'node:path'
 import { monitorEventLoopDelay } from 'node:perf_hooks'
 
 import {
@@ -19,8 +19,12 @@ import { AppUpdates } from './app-updates/app-updates'
 import { handleAppearanceRequest } from './appearance/handler'
 import { Conversation } from './conversation/conversation'
 import { ConversationImages } from './conversation/conversation-images'
-import { nativeWorkingMemoryDiagnostics } from './conversation/native-working-memory'
+import {
+  nativeWorkingMemoryCapacities,
+  nativeWorkingMemoryDiagnostics,
+} from './conversation/native-working-memory'
 import { DefaultSessionSettings } from './default-session-settings/default-session-settings'
+import { configureOwnedProcessGroups } from './owned-process-group'
 import { ProjectCatalog } from './project-catalog/project-catalog'
 import { ProjectFileReader } from './project-file/project-file-reader'
 import { RuntimePreparation } from './runtime-preparation/runtime-preparation'
@@ -81,6 +85,7 @@ function performanceSnapshot(
     resourceHighWater,
     resourceCapacityExceeded,
     nativeMemory: nativeWorkingMemoryDiagnostics(),
+    nativeMemoryCapacities: nativeWorkingMemoryCapacities(),
   }
 }
 
@@ -89,6 +94,15 @@ async function bootstrap(
   runtimeMigrationsFolder: string,
   runtimeWorkspaceStorageRoot: string,
 ): Promise<void> {
+  if (process.platform === 'win32') {
+    const windowsBridgeExecutable = process.argv[7]
+    if (!windowsBridgeExecutable || !isAbsolute(windowsBridgeExecutable))
+      throw new Error('Windows native work requires its installed process owner.')
+    configureOwnedProcessGroups({
+      windowsBridgeExecutable,
+      receiptDirectory: join(runtimeWorkspaceStorageRoot, 'native-process-receipts'),
+    })
+  }
   recordDiagnostic({ operation: 'utility', phase: 'started' })
   const measurementRoot = process.env.PACT_E2E_ROOT
   const measurePerformance = Boolean(
@@ -159,7 +173,11 @@ async function bootstrap(
     runtimeDatabaseFile === ':memory:' ? undefined : workspaceOwner,
     images,
     workerTraffic,
+    defaultSessionSettings,
   )
+  const unsubscribeScheduling = conversation.subscribeSchedulingChanges(() => {
+    parentPort.postMessage(utilityEventSchema.parse({ type: 'scheduling.changed.event' }))
+  })
   conversation.subscribe((patch, progress) => {
     parentPort.postMessage(
       utilityEventSchema.parse({ type: 'conversation.patch.event', patch, progress }),
@@ -200,6 +218,62 @@ async function bootstrap(
     if (closing && request.data.type !== 'runtime.shutdown.request') return
 
     switch (request.data.type) {
+      case 'scheduling.state.get.request':
+      case 'scheduling.state.refresh.request': {
+        const input = request.data
+        runRequest(async () => {
+          const result =
+            input.type === 'scheduling.state.get.request'
+              ? conversationOwner.getSchedulingState(input.input)
+              : await conversationOwner.refreshSchedulingState(input.input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'scheduling.state.response',
+              requestId: input.requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+      case 'scheduling.settings.get.request':
+      case 'scheduling.settings.save.request': {
+        const input = request.data
+        runRequest(async () => {
+          const result =
+            input.type === 'scheduling.settings.get.request'
+              ? conversationOwner.getSchedulingSettings()
+              : await conversationOwner.saveSchedulingSettings(input.input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'scheduling.settings.response',
+              requestId: input.requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+      case 'scheduling.activity.read.request': {
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'scheduling.activity.response',
+            requestId: request.data.requestId,
+            result: conversationOwner.readSchedulingActivity(request.data.input),
+          }),
+        )
+        return
+      }
+      case 'scheduling.models.refresh.request': {
+        const requestId = request.data.requestId
+        runRequest(async () => {
+          const result = await conversationOwner.refreshSchedulingModels()
+          parentPort.postMessage(
+            utilityResponseSchema.parse({ type: 'scheduling.models.response', requestId, result }),
+          )
+        })
+        return
+      }
       case 'updates.check.request': {
         const requestId = request.data.requestId
         runRequest(async () => {
@@ -389,6 +463,7 @@ async function bootstrap(
         const requestId = request.data.requestId
         shutdown ??= (async () => {
           closing = true
+          unsubscribeScheduling()
           await appUpdates.dispose()
           projectCatalog.dispose()
           const drainRequests =
@@ -951,6 +1026,28 @@ async function bootstrap(
         return
       }
 
+      case 'conversation.prepared-input.continue.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = conversation
+            ? await conversation.continuePreparedInput(input)
+            : {
+                ok: false as const,
+                error: {
+                  code: 'RUNTIME_UNAVAILABLE' as const,
+                  message: 'Conversation runtime is unavailable.',
+                },
+              }
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'conversation.prepared-input.continue.response',
+              requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
       case 'conversation.send.request': {
         const { input, requestId, ownerKey } = request.data
         runRequest(async () => {
@@ -1034,6 +1131,31 @@ async function bootstrap(
         return
       }
 
+      case 'relay.decision.answer.request':
+      case 'relay.decision.receipt.request': {
+        const operation = request.data
+        runRequest(async () => {
+          const result = conversation
+            ? operation.type === 'relay.decision.answer.request'
+              ? await conversation.answerRelayDecision(operation.input)
+              : conversation.getRelayDecisionReceipt(operation.input)
+            : {
+                ok: false as const,
+                error: {
+                  code: 'RUNTIME_UNAVAILABLE' as const,
+                  message: 'Conversation runtime is unavailable.',
+                },
+              }
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'relay.decision.receipt.response',
+              requestId: operation.requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
       case 'collaboration.action.request': {
         const { input, requestId } = request.data
         runRequest(async () => {

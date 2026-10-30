@@ -42,7 +42,7 @@ test.describe('real business input return', { tag: '@real' }, () => {
           const sourceMarker = `SOURCE_${randomUUID()}`
           await sendRealMessage(
             ctx,
-            `Briefly acknowledge ${sourceMarker}. Do not use tools, read files or write files.`,
+            `Reply with the exact marker ${sourceMarker} and no other text. Do not use tools, read files or write files.`,
             'codex',
           )
           const source = await waitForRealCompletion(ctx, 1)
@@ -104,7 +104,6 @@ test.describe('real business input return', { tag: '@real' }, () => {
                 primaryAgentId: 'claude',
                 agents: current.value.session.settings.agents,
                 maxDiscussionRounds: current.value.session.settings.maxDiscussionRounds,
-                runningMessagePolicy: current.value.session.settings.runningMessagePolicy,
                 maxReviewCycles: current.value.session.settings.maxReviewCycles,
                 maxRepairAttempts: current.value.session.settings.maxRepairAttempts,
               },
@@ -139,7 +138,7 @@ test.describe('real business input return', { tag: '@real' }, () => {
           await selectRealSession(ctx, ctx.sessionId)
 
           const rejectedMarker = `RETURN_${randomUUID()}`
-          const rejectedBody = `Acknowledge ${rejectedMarker}. Do not use tools, read files or write files.`
+          const rejectedBody = `Reply with the exact marker ${rejectedMarker} and no other text. Do not use tools, read files or write files.`
           const rejectedInput = `@codex ${rejectedBody}`
           if (keepNewDraft) {
             await ctx.fixture.controlTransportFault('arm')

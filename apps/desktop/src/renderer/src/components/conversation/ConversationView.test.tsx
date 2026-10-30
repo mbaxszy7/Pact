@@ -5,13 +5,14 @@ import type { ComponentProps } from 'react'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 // oxlint-disable-next-line eslint/no-restricted-imports -- jsdom lacks browser SubtleCrypto; this test-only provider verifies the real source hash.
 import { webcrypto } from 'node:crypto'
+import { useState } from 'react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import type { AgentRun, ConversationPage, DesktopBridge, WorkspaceChangeSet } from '@pact/contracts'
 
 import { collaborationTaskSchema } from '@pact/contracts'
 
-import { collaborationFixture, reportPage } from './collaboration.test-helper'
+import { collaborationFixture, reportPage, markdownPage } from './collaboration.test-helper'
 import { composerBridgeFixture } from './composer.test-helper'
 import { windowFromPage } from './conversation-window'
 import { ConversationView } from './ConversationView'
@@ -62,6 +63,23 @@ vi.mock('@tanstack/react-virtual', async (importOriginal) => {
 })
 
 beforeEach(() => {
+  Object.defineProperty(HTMLElement.prototype, 'hidePopover', {
+    configurable: true,
+    value: vi.fn<() => void>(),
+  })
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  )
+  vi.stubGlobal('matchMedia', () => ({
+    matches: true,
+    addEventListener: vi.fn<() => void>(),
+    removeEventListener: vi.fn<() => void>(),
+  }))
   virtualState.interactive = false
   virtualState.instance = undefined
   Object.defineProperty(crypto, 'subtle', { configurable: true, value: webcrypto.subtle })
@@ -88,6 +106,127 @@ afterEach(() => {
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
+
+it('does not reclaim Comment focus after the user moves to the Composer before its opening frame', async () => {
+  const frames = new Map<number, FrameRequestCallback>()
+  let frameId = 0
+  vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+    const id = ++frameId
+    frames.set(id, callback)
+    return id
+  })
+  vi.stubGlobal('cancelAnimationFrame', (id: number) => frames.delete(id))
+  const { props, run } = recordingFixture()
+  delete run.workspaceChanges
+  props.snapshot!.nativeContexts = []
+  function View() {
+    const [composer, setComposer] = useState('')
+    return <ConversationView {...props} composer={composer} onComposerChange={setComposer} />
+  }
+  const mounted = render(<View />)
+  const source = mounted.container.querySelector<HTMLElement>('[data-pact-message-content]')!
+  expect(focusProjectionRange(source, 0, 4, { scroll: false, highlight: false })).toBe(true)
+  fireEvent.keyUp(source)
+  fireEvent.click(await screen.findByRole('button', { name: 'Comment on selected text' }))
+  const comment = await screen.findByRole<HTMLTextAreaElement>('textbox', { name: 'Comment' })
+  fireEvent.change(comment, { target: { value: 'Keep this original Comment.' } })
+  const composer = screen.getByRole('combobox', { name: 'Message' })
+  act(() => {
+    comment.focus()
+    composer.focus()
+    const pending = [...frames.values()]
+    frames.clear()
+    for (const callback of pending) {
+      callback(0)
+    }
+  })
+  expect(document.activeElement).toBe(composer)
+  // Dispatch to the actual focused input; never refocus to conceal a pending focus transfer.
+  const input = new InputEvent('beforeinput', {
+    inputType: 'insertText',
+    data: '@codex',
+    bubbles: true,
+    cancelable: true,
+  })
+  Object.defineProperty(input, 'getTargetRanges', { value: () => [] })
+  fireEvent(document.activeElement!, input)
+  expect(composer.textContent).toBe('@codex')
+  expect(comment.value).toBe('Keep this original Comment.')
+  expect(screen.getByRole('option', { name: /Codex/u })).toBeDefined()
+})
+
+it.each(['opening', 'focus-return', 'window-blur', 'close', 'visible-return'] as const)(
+  'owns the pending Comment focus request through %s and preserves an existing selection',
+  async (mode) => {
+    const frames = new Map<number, FrameRequestCallback>()
+    let frameId = 0
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      const id = ++frameId
+      frames.set(id, callback)
+      return id
+    })
+    vi.stubGlobal('cancelAnimationFrame', (id: number) => frames.delete(id))
+    const { props, run } = recordingFixture()
+    delete run.workspaceChanges
+    props.snapshot!.nativeContexts = []
+    const mounted = render(<ConversationView {...props} />)
+    const source = mounted.container.querySelector<HTMLElement>('[data-pact-message-content]')!
+    source.tabIndex = -1
+    act(() => source.focus())
+    expect(focusProjectionRange(source, 0, 4, { scroll: false, highlight: false })).toBe(true)
+    fireEvent.keyUp(source)
+    fireEvent.click(await screen.findByRole('button', { name: 'Comment on selected text' }))
+    const comment = await screen.findByRole<HTMLTextAreaElement>('textbox', { name: 'Comment' })
+    fireEvent.change(comment, { target: { value: 'An unchanged Comment draft.' } })
+    const origin = document.activeElement
+    if (!(origin instanceof HTMLElement)) throw Error('Opening focus origin is unavailable')
+    const pending = [...frames.values()]
+    let expectedFocus: Element = origin
+    act(() => {
+      if (mode === 'focus-return') {
+        screen.getByRole('combobox', { name: 'Message' }).focus()
+        origin.focus()
+      }
+      if (mode === 'window-blur') window.dispatchEvent(new Event('blur'))
+    })
+    if (mode === 'visible-return') {
+      const composer = screen.getByRole('combobox', { name: 'Message' })
+      act(() => composer.focus())
+      expectedFocus = composer
+      mounted.rerender(<ConversationView {...props} visible={false} />)
+      mounted.rerender(<ConversationView {...props} visible />)
+      pending.push(...frames.values())
+    }
+    if (mode === 'close')
+      fireEvent.click(screen.getByRole('button', { name: 'Close Comment editor' }))
+    // Also exercise a callback already dequeued by the browser before cancellation.
+    act(() => {
+      frames.clear()
+      for (const callback of pending) callback(0)
+    })
+    const focusedAfterFrame = document.activeElement
+    let openingCaretAtEnd: boolean | undefined
+    let selectionPreserved: boolean | undefined
+    if (mode === 'opening') {
+      openingCaretAtEnd = comment.selectionStart === comment.value.length
+      comment.setSelectionRange(2, 7)
+      mounted.rerender(<ConversationView {...props} composer="An independent draft" />)
+      act(() => {
+        for (const callback of frames.values()) callback(0)
+        frames.clear()
+      })
+      selectionPreserved =
+        document.activeElement === comment &&
+        comment.selectionStart === 2 &&
+        comment.selectionEnd === 7
+    }
+    expect(comment.isConnected).toBe(mode !== 'close')
+    expect(focusedAfterFrame).toBe(mode === 'opening' ? comment : expectedFocus)
+    expect(openingCaretAtEnd).toBe(mode === 'opening' ? true : undefined)
+    expect(selectionPreserved).toBe(mode === 'opening' ? true : undefined)
+    expect(comment.value).toBe('An unchanged Comment draft.')
+  },
+)
 
 it('defers a completed Steer fold while reading history and resumes when scrolling back to latest', async () => {
   const { props, run } = recordingFixture()
@@ -166,15 +305,18 @@ it.each(['no-output', 'structured-only', 'changes-only', 'answered-changes'] as 
     const { props, run } = recordingFixture()
     const user = props.snapshot!.messages[0]!
     const task = collaborationTaskSchema.parse({
+      protocol: 'native-workflow-v1',
+      owner: 'codex',
+      automation: 'paused',
+      inputSequence: 0,
+      handledInputSequence: 0,
       id: crypto.randomUUID(),
       sessionId: props.session.id,
       runId: run.id,
       taskMessageId: user.id,
       kind: 'build',
       revision: 1,
-      primary: 'codex',
-      drafter: 'codex',
-      implementer: 'codex',
+
       reviewer: 'claude',
       task: 'Implement cancellation.',
       stage: 'implement',
@@ -182,22 +324,11 @@ it.each(['no-output', 'structured-only', 'changes-only', 'answered-changes'] as 
       status: mode === 'no-output' ? 'failed' : 'waiting',
       planVersion: 0,
       discussionRounds: 0,
-      discussionHalf: false,
+
       reviewCycles: 0,
       repairAttempts: 0,
-      rereview: false,
-      nextCycle: false,
-      ...(mode === 'no-output'
-        ? { notice: 'Failed before output.' }
-        : {
-            result: {
-              submission: 'stage_result',
-              inputResponses: [],
-              outcome: 'complete',
-              summary: 'Structured work complete.',
-              todoDeltas: [],
-            },
-          }),
+
+      ...(mode === 'no-output' ? { notice: 'Failed before output.' } : {}),
     })
     run.collaboration = { taskId: task.id, kind: 'build', stage: 'implement' }
     run.nativeEffectsState = 'settled'
@@ -234,6 +365,7 @@ it.each(['no-output', 'structured-only', 'changes-only', 'answered-changes'] as 
           sessionId: props.session.id,
           view: {
             task,
+            availableActions: [mode === 'no-output' ? 'retry' : 'resume'],
             actionable: true,
             accepted: mode !== 'no-output',
             reportAvailable: mode !== 'no-output',
@@ -248,7 +380,7 @@ it.each(['no-output', 'structured-only', 'changes-only', 'answered-changes'] as 
     )
     expect(
       screen.getAllByRole('button', {
-        name: mode === 'no-output' ? 'Retry · Codex' : 'Review changes · Claude Code',
+        name: mode === 'no-output' ? 'Retry · Codex' : 'Continue collaboration',
       }),
     ).toHaveLength(1)
   },
@@ -263,40 +395,37 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
     const user = props.snapshot!.messages[0]!
     user.runId = run.id
     const task = collaborationTaskSchema.parse({
+      protocol: 'native-workflow-v1',
+      owner: 'codex',
+      automation: 'paused',
+      inputSequence: 0,
+      handledInputSequence: 0,
       id: crypto.randomUUID(),
       sessionId: props.session.id,
       runId: run.id,
       taskMessageId: user.id,
       kind: 'plan',
       revision: 1,
-      primary: 'codex',
-      drafter: 'codex',
-      implementer: 'claude',
+
       reviewer: 'claude',
       task: 'Inspect ownership',
-      stage: 'draft',
+      stage: 'plan',
       actor: 'codex',
       status: 'waiting',
-      plan: 'Exact frozen plan version',
       planVersion: 1,
-      planAuthor: 'codex',
-      planReference: { type: 'unchanged', version: 1, sourceRunId: run.id, sha256: 'a'.repeat(64) },
+
+      planReference: {
+        version: 1,
+        sourceRunId: run.id,
+        sourceMessageId: user.id,
+        document: { id: crypto.randomUUID(), sha256: 'a'.repeat(64), bytes: 25, chars: 25 },
+      },
       discussionRounds: 0,
-      discussionHalf: false,
+
       reviewCycles: 0,
       repairAttempts: 0,
-      rereview: false,
-      nextCycle: false,
-      result: {
-        submission: 'plan_submission',
-        outcome: 'complete',
-        summary: 'Plan drafted.',
-        plan: { type: 'unchanged', version: 1, sourceRunId: run.id, sha256: 'a'.repeat(64) },
-        todoDeltas: [],
-        inputResponses: [],
-      },
     })
-    run.collaboration = { taskId: task.id, kind: 'plan', stage: 'draft' }
+    run.collaboration = { taskId: task.id, kind: 'plan', stage: 'plan' }
     props.snapshot!.nativeContexts = []
     if (mode === 'answer')
       props.snapshot!.messages.push({
@@ -313,12 +442,16 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
         createdAt: run.createdAt,
         updatedAt: run.updatedAt,
       })
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(
+      new DOMRect(0, 0, 900, 600),
+    )
     const host = document.createElement('aside')
     document.body.append(host)
     props.planPanelHost = host
     props.onPlanAvailable =
       vi.fn<NonNullable<ComponentProps<typeof ConversationView>['onPlanAvailable']>>()
     props.onClosePlan = vi.fn<() => void>()
+    props.onPlanPanelExpandedChange = vi.fn<(expanded: boolean) => void>()
     if (mode === 'historical-source')
       props.messageNavigation = {
         navigationId: crypto.randomUUID(),
@@ -332,6 +465,17 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
       getConversation: vi
         .fn<DesktopBridge['getConversation']>()
         .mockImplementation(async (request) => {
+          if (request.scope === 'collaboration-markdown')
+            return { ok: true, value: markdownPage(task, 'Exact frozen plan version') }
+          if (request.scope === 'collaboration-quote')
+            return {
+              ok: true,
+              value: {
+                ...request,
+                text: 'Exact frozen plan version'.slice(request.offset, request.endOffset),
+                nextOffset: null,
+              },
+            }
           if (request.scope !== 'collaboration') throw new Error(`Unexpected ${request.scope}`)
           return {
             ok: true,
@@ -340,6 +484,7 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
               sessionId: props.session.id,
               view: {
                 task,
+                availableActions: [],
                 actionable: request.projection !== 'plan',
                 accepted: true,
                 reportAvailable: true,
@@ -371,6 +516,56 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
     rerender(<ConversationView {...props} composer="A new draft" />)
     expect(host.querySelector('[data-pact-projection-start]')!.firstChild).toBe(text)
     expect(window.getSelection()?.toString()).toBe('Exact')
+    fireEvent.click(screen.getByRole('button', { name: 'Expand plan panel' }))
+    expect(props.onPlanPanelExpandedChange).toHaveBeenLastCalledWith(true)
+    rerender(<ConversationView {...props} planPanelExpanded />)
+    expect(host.querySelector('[data-pact-projection-start]')!.firstChild).toBe(text)
+    const planContent = host.querySelector<HTMLElement>('[data-pact-plan-run-id]')!
+    expect(focusProjectionRange(planContent, 0, 5, { scroll: false, highlight: false })).toBe(true)
+    // jsdom has no browser caret movement; move to the selected word boundary.
+    Object.defineProperty(window.getSelection()!, 'modify', {
+      configurable: true,
+      value: () => window.getSelection()!.collapse(text, 5),
+    })
+    fireEvent.keyDown(screen.getByRole('textbox', { name: 'Plan text' }), {
+      key: 'ArrowRight',
+      shiftKey: true,
+      ctrlKey: true,
+    })
+    fireEvent.click(await screen.findByRole('button', { name: 'Comment on selected text' }))
+    const editor = await screen.findByRole('textbox', { name: 'Comment' })
+    expect(host.contains(editor)).toBe(true)
+    await waitFor(() => expect(document.activeElement).toBe(editor))
+    fireEvent.change(editor, { target: { value: 'Keep this plan detail.' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Restore plan panel' }))
+    expect(props.onPlanPanelExpandedChange).toHaveBeenLastCalledWith(false)
+    rerender(<ConversationView {...props} planPanelExpanded={false} />)
+    expect(host.querySelector('[data-pact-projection-start]')!.firstChild).toBe(text)
+    const restoredEditor = screen.getByRole<HTMLTextAreaElement>('textbox', { name: 'Comment' })
+    expect(container.contains(restoredEditor)).toBe(true)
+    expect(restoredEditor.value).toBe('Keep this plan detail.')
+    await waitFor(() => expect(document.activeElement).toBe(restoredEditor))
+    fireEvent.click(screen.getByRole('button', { name: 'Expand plan panel' }))
+    rerender(<ConversationView {...props} planPanelExpanded />)
+    expect(screen.getByRole<HTMLTextAreaElement>('textbox', { name: 'Comment' }).value).toBe(
+      'Keep this plan detail.',
+    )
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole('textbox', { name: 'Comment' })),
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Add to comment' }))
+    await waitFor(() =>
+      expect(props.onSaveCommentDraft).toHaveBeenCalledWith(
+        expect.objectContaining({
+          mode: 'create',
+          body: 'Keep this plan detail.',
+          anchor: expect.objectContaining({
+            quote: 'Exact',
+            plan: { runId: run.id, version: 1 },
+          }),
+        }),
+      ),
+    )
     fireEvent.click(screen.getByRole('button', { name: 'Close context panel' }))
     expect(props.onClosePlan).toHaveBeenCalledOnce()
     unmount()
@@ -379,22 +574,23 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
   },
 )
 
-it('finishes historical report navigation after the source page is ready without reopening a dismissed card', async () => {
+it('finishes historical report navigation after the source page is ready and preserves it across draft edits', async () => {
   window.getSelection()?.removeAllRanges()
   const { props, run } = recordingFixture()
-  const { task, planReference } = collaborationFixture()
+  const { task } = collaborationFixture()
   task.sessionId = props.session.id
   task.runId = run.id
   task.taskMessageId = run.userMessageId
   task.actor = 'claude'
-  task.result = {
-    submission: 'plan_review',
-    outcome: 'complete',
-    reviewedPlan: { ...planReference, sourceRunId: run.id },
+  task.stage = 'plan_review'
+  task.review = {
+    runId: run.id,
+    actor: 'claude',
+    stage: 'plan_review',
     verdict: 'accepted',
-    summary: 'The historical review conclusion is preserved.',
-    todoDeltas: [],
-    inputResponses: [],
+    inputSequence: 0,
+    planReference: task.planReference,
+    document: task.planReference?.document ?? task.reviewScopeRef!,
   }
   run.agentId = 'claude'
   run.nativeEffectsState = 'settled'
@@ -413,15 +609,18 @@ it('finishes historical report navigation after the source page is ready without
     endOffset: 21,
   }
   const read = vi.fn<DesktopBridge['getConversation']>(async (request) => {
+    if (request.scope === 'collaboration-markdown')
+      return {
+        ok: true,
+        value: markdownPage(task, 'The historical review conclusion is preserved.'),
+      }
     if (request.scope !== 'collaboration') throw new Error(`Unexpected ${request.scope}`)
     return { ok: true, value: reportPage(task, { actionable: false }) }
   })
   vi.stubGlobal('pact', { ...composerBridgeFixture(), getConversation: read })
   const view = render(<ConversationView {...props} />)
-  await screen.findByText(task.result.summary)
+  await screen.findByText('The historical review conclusion is preserved.')
   const summary = view.container.querySelector<HTMLElement>('[data-pact-report-key="summary"]')!
-  const header = screen.getByRole('button', { name: 'Review · v2' })
-  expect(header.getAttribute('aria-expanded')).toBe('true')
   expect(summary.dataset.pactReportRunId).toBe(run.id)
   expect(window.getSelection()?.toString()).toBe('')
   const sourceBefore = summary.querySelector('[data-pact-projection-start]')!.firstChild!
@@ -433,9 +632,7 @@ it('finishes historical report navigation after the source page is ready without
   expect(selected.startOffset).toBe(4)
   expect(selected.endOffset).toBe(21)
   expect(position).toHaveBeenCalledOnce()
-  fireEvent.click(header)
-  expect(header.getAttribute('aria-expanded')).toBe('false')
-  expect(screen.queryByText(task.result.summary)).toBeNull()
+  expect(screen.getByText('The historical review conclusion is preserved.')).toBeDefined()
   view.rerender(
     <ConversationView
       {...props}
@@ -443,8 +640,7 @@ it('finishes historical report navigation after the source page is ready without
       history={{ ...props.history, loadingPage: false }}
     />,
   )
-  expect(header.getAttribute('aria-expanded')).toBe('false')
-  expect(screen.queryByText(task.result.summary)).toBeNull()
+  expect(screen.getByText('The historical review conclusion is preserved.')).toBeDefined()
   expect(position).toHaveBeenCalledOnce()
   window.getSelection()?.removeAllRanges()
 })
@@ -463,19 +659,20 @@ it('cancels a superseded report reveal frame and applies only the latest navigat
   })
   vi.stubGlobal('cancelAnimationFrame', cancel)
   const { props, run } = recordingFixture()
-  const { task, planReference } = collaborationFixture()
+  const { task } = collaborationFixture()
   task.sessionId = props.session.id
   task.runId = run.id
   task.taskMessageId = run.userMessageId
   task.actor = 'claude'
-  task.result = {
-    submission: 'plan_review',
-    outcome: 'complete',
-    reviewedPlan: { ...planReference, sourceRunId: run.id },
+  task.stage = 'plan_review'
+  task.review = {
+    runId: run.id,
+    actor: 'claude',
+    stage: 'plan_review',
     verdict: 'accepted',
-    summary: 'The historical review conclusion is preserved.',
-    todoDeltas: [],
-    inputResponses: [],
+    inputSequence: 0,
+    planReference: task.planReference,
+    document: task.planReference?.document ?? task.reviewScopeRef!,
   }
   run.agentId = 'claude'
   run.nativeEffectsState = 'settled'
@@ -495,13 +692,18 @@ it('cancels a superseded report reveal frame and applies only the latest navigat
   }
   vi.stubGlobal('pact', {
     ...composerBridgeFixture(),
-    getConversation: vi.fn<DesktopBridge['getConversation']>().mockResolvedValue({
-      ok: true,
-      value: reportPage(task, { actionable: false }),
-    }),
+    getConversation: vi
+      .fn<DesktopBridge['getConversation']>()
+      .mockImplementation(async (request) => ({
+        ok: true,
+        value:
+          request.scope === 'collaboration-markdown'
+            ? markdownPage(task, 'The historical review conclusion is preserved.')
+            : reportPage(task, { actionable: false }),
+      })),
   })
   const view = render(<ConversationView {...props} />)
-  await screen.findByText(task.result.summary)
+  await screen.findByText('The historical review conclusion is preserved.')
   const position = vi.spyOn(virtualState.instance!, 'scrollToOffset')
   const readyHistory = { ...props.history, loadingPage: false }
   view.rerender(<ConversationView {...props} history={readyHistory} />)
@@ -525,6 +727,9 @@ it('cancels a superseded report reveal frame and applies only the latest navigat
       composer="A separate draft during navigation"
     />,
   )
+  await screen.findByText('The historical review conclusion is preserved.')
+  // Rendering the text can precede the passive effect that schedules its reveal frame.
+  await waitFor(() => expect(frames.size).toBeGreaterThan(0))
   await act(async () => {
     const readyFrames = [...frames]
     for (const [id, callback] of readyFrames) {
@@ -537,8 +742,6 @@ it('cancels a superseded report reveal frame and applies only the latest navigat
   expect(selected.startOffset).toBe(22)
   expect(selected.endOffset).toBe(32)
   expect(position).toHaveBeenCalledOnce()
-  const header = screen.getByRole('button', { name: 'Review · v2' })
-  fireEvent.click(header)
   view.rerender(
     <ConversationView
       {...props}
@@ -554,7 +757,6 @@ it('cancels a superseded report reveal frame and applies only the latest navigat
       callback(0)
     }
   })
-  expect(header.getAttribute('aria-expanded')).toBe('false')
   expect(position).toHaveBeenCalledOnce()
   window.getSelection()?.removeAllRanges()
 })
@@ -566,31 +768,26 @@ it('keeps a previously accepted code review waiting when a newer input is Receiv
   task.runId = run.id
   task.taskMessageId = run.userMessageId
   task.kind = 'review'
-  task.stage = 'review'
-  task.duty = 'code_review'
+  task.stage = 'code_review'
   task.actor = 'claude'
   task.status = 'waiting'
   task.planVersion = 0
   task.inputSequence = 2
-  task.processedWatermark = 1
-  task.reviewedInputWatermark = 1
+  task.handledInputSequence = 1
   task.reviewScopeRef = {
     id: crypto.randomUUID(),
     sha256: 'c'.repeat(64),
     bytes: 100,
     chars: 100,
   }
-  delete task.plan
   delete task.planReference
-  delete task.planAuthor
-  task.result = {
-    submission: 'code_review',
-    outcome: 'complete',
+  task.review = {
+    runId: run.id,
+    actor: 'claude',
+    stage: 'code_review',
     verdict: 'accepted',
-    reviewScopeRef: task.reviewScopeRef,
-    summary: 'The previous review found no remaining issues.',
-    todoDeltas: [],
-    inputResponses: [],
+    inputSequence: 1,
+    document: task.reviewScopeRef,
   }
   run.agentId = 'claude'
   run.nativeEffectsState = 'settled'
@@ -615,15 +812,10 @@ it('keeps a previously accepted code review waiting when a newer input is Receiv
   }
   vi.stubGlobal('pact', bridge)
   render(<ConversationView {...props} />)
-  fireEvent.click(await screen.findByRole('button', { name: 'Review' }))
-  expect(screen.getByText(task.result.summary)).toBeDefined()
-  expect(
-    screen.getByText('Review the new user feedback.').closest('output')?.textContent,
-  ).toContain('Received · Claude Code')
+  await screen.findByRole('region', { name: 'Pact collaboration result' })
+  expect(screen.queryByText('· Complete')).toBeNull()
   expect(screen.queryByText('Review complete')).toBeNull()
-  expect(
-    screen.getAllByRole('button', { name: 'Review current changes · read-only' }),
-  ).toHaveLength(1)
+  expect(screen.getAllByRole('button', { name: 'Continue collaboration' })).toHaveLength(1)
   expect(bridge.actOnCollaboration).not.toHaveBeenCalled()
   expect(task.status).toBe('waiting')
 })
@@ -631,40 +823,47 @@ it('keeps a previously accepted code review waiting when a newer input is Receiv
 it('reports plan availability only after the first complete plan has been submitted', async () => {
   const { props, run } = recordingFixture()
   run.status = 'running'
-  run.collaboration = { taskId: crypto.randomUUID(), kind: 'plan', stage: 'draft' }
+  run.collaboration = { taskId: crypto.randomUUID(), kind: 'plan', stage: 'plan' }
   delete run.workspaceChanges
   props.snapshot!.nativeContexts = []
   props.onPlanAvailable =
     vi.fn<NonNullable<ComponentProps<typeof ConversationView>['onPlanAvailable']>>()
   const task = collaborationTaskSchema.parse({
+    protocol: 'native-workflow-v1',
+    owner: 'codex',
+    automation: 'paused',
+    inputSequence: 0,
+    handledInputSequence: 0,
     id: run.collaboration.taskId,
     sessionId: props.session.id,
     runId: run.id,
     taskMessageId: run.userMessageId,
     kind: 'plan',
     revision: 1,
-    primary: 'codex',
-    drafter: 'codex',
-    implementer: 'claude',
+
     reviewer: 'claude',
     task: 'Draft ownership',
-    stage: 'draft',
+    stage: 'plan',
     actor: 'codex',
     status: 'running',
     planVersion: 0,
     discussionRounds: 0,
-    discussionHalf: false,
+
     reviewCycles: 0,
     repairAttempts: 0,
-    rereview: false,
-    nextCycle: false,
   })
   const read = vi.fn<DesktopBridge['getConversation']>().mockResolvedValue({
     ok: true,
     value: {
       scope: 'collaboration',
       sessionId: props.session.id,
-      view: { task, actionable: false, accepted: false, reportAvailable: false },
+      view: {
+        availableActions: [],
+        task,
+        actionable: false,
+        accepted: false,
+        reportAvailable: false,
+      },
     },
   })
   vi.stubGlobal('pact', { ...composerBridgeFixture(), getConversation: read })
@@ -673,7 +872,12 @@ it('reports plan availability only after the first complete plan has been submit
     expect(props.onPlanAvailable).toHaveBeenCalledWith(props.session.id, undefined),
   )
   expect(screen.queryByRole('button', { name: 'Open current plan' })).toBeNull()
-  task.plan = 'A submitted plan'
+  task.planReference = {
+    version: 1,
+    sourceRunId: run.id,
+    sourceMessageId: run.userMessageId,
+    document: { id: crypto.randomUUID(), sha256: 'a'.repeat(64), chars: 20, bytes: 20 },
+  }
   task.planVersion = 1
   task.status = 'waiting'
   run.status = 'completed'
@@ -686,6 +890,7 @@ it('reports plan availability only after the first complete plan has been submit
       sessionId: props.session.id,
       view: {
         task,
+        availableActions: [],
         actionable: true,
         accepted: true,
         reportAvailable: true,
@@ -712,7 +917,7 @@ it.each([
     const { props, run } = recordingFixture()
     delete run.workspaceChanges
     props.snapshot!.nativeContexts = []
-    run.collaboration = { taskId: crypto.randomUUID(), kind: 'plan', stage: 'discuss' }
+    run.collaboration = { taskId: crypto.randomUUID(), kind: 'plan', stage: 'plan_review' }
     const user = props.snapshot!.messages[0]!
     user.runId = run.id
     const visible = `@codex ${request}`
@@ -725,7 +930,13 @@ it.each([
         value: {
           scope: 'collaboration',
           sessionId: props.session.id,
-          view: { task: null, actionable: false, accepted: false, reportAvailable: false },
+          view: {
+            availableActions: [],
+            task: null,
+            actionable: false,
+            accepted: false,
+            reportAvailable: false,
+          },
         },
       }),
     })
@@ -817,16 +1028,15 @@ it('preserves the visible row when an asynchronous offscreen card changes height
 })
 
 it.each([
-  { action: 'maintain_plan', actor: 'codex', inferred: false },
-  { action: 'review_plan', actor: 'claude', inferred: false },
-  { action: 'maintain_plan', actor: 'codex', inferred: true },
-  { action: 'review_plan', actor: 'claude', inferred: true },
+  { actor: 'codex', inferred: false },
+  { actor: 'claude', inferred: false },
+  { actor: 'codex', inferred: true },
+  { actor: 'claude', inferred: true },
 ] as const)(
-  'routes document-backed feedback through the single Send to $actor ($action, inferred: $inferred)',
-  async ({ action, actor, inferred }) => {
+  'routes document-backed feedback through the single Send to $actor (inferred: $inferred)',
+  async ({ actor, inferred }) => {
     const { task, run } = collaborationFixture()
-    delete task.plan
-    task.planDocument = {
+    task.planReference!.document = {
       id: crypto.randomUUID(),
       sha256: 'a'.repeat(64),
       bytes: 30000,
@@ -883,7 +1093,6 @@ it.each([
         [],
         { type: 'agent', agentId: actor },
         [],
-        action,
       ),
     )
     expect(screen.queryByRole('button', { name: 'Review plan · Claude Code' })).toBeNull()
@@ -927,7 +1136,7 @@ function fixture(): ComponentProps<typeof ConversationView> {
         primaryAgentId: 'codex',
         agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
         maxDiscussionRounds: 3,
-        runningMessagePolicy: 'next_round',
+
         maxReviewCycles: 3,
         maxRepairAttempts: 3,
       },
@@ -1391,3 +1600,292 @@ it.each(['read_only', 'send_blocked', 'open'] as const)(
     expect(screen.queryByRole('button', { name: 'Reexecute…' })).toBeNull()
   },
 )
+
+it.each(['accept', 'cancel'] as const)(
+  'replaces the composer with a native question and restores its draft after %s',
+  async (action) => {
+    const props = fixture()
+    props.composer = 'Keep this ordinary draft'
+    const request = {
+      id: crypto.randomUUID(),
+      operationId: crypto.randomUUID(),
+      kind: 'questions' as const,
+      title: 'Sort notes',
+      detail: '',
+      createdAt: new Date().toISOString(),
+    }
+    props.snapshot!.pendingNativeInteractions = [
+      { agentId: 'claude', bindingGeneration: 1, request },
+    ]
+    props.nativeInputDrafts = {
+      [request.id]: {
+        operationId: request.operationId,
+        agentId: 'claude',
+        expiresAt: Date.now() + 60000,
+        values: { order: 'recent' },
+        page: 0,
+      },
+    }
+    const read = vi.fn<DesktopBridge['readNativeInput']>().mockResolvedValue({
+      ok: true,
+      value: {
+        kind: 'questions',
+        title: 'Sort notes',
+        message: '',
+        fields: [
+          {
+            id: 'order',
+            type: 'select',
+            label: 'Sort order',
+            required: true,
+            options: [
+              { value: 'recent', label: 'Recently edited' },
+              { value: 'title', label: 'Title order' },
+            ],
+            allowOther: true,
+          },
+        ],
+      },
+    })
+    vi.stubGlobal('pact', { ...composerBridgeFixture(), readNativeInput: read })
+    const mounted = render(<ConversationView {...props} />)
+    await screen.findByRole('radio', { name: 'Recently edited' })
+    expect(read).toHaveBeenCalledExactlyOnceWith({
+      operationId: request.operationId,
+      requestId: request.id,
+    })
+    expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull()
+    expect(screen.queryByText('Your message draft is kept while you answer.')).toBeNull()
+    fireEvent.click(
+      screen.getByRole('button', { name: action === 'accept' ? 'Submit answers' : 'Cancel' }),
+    )
+    await waitFor(() =>
+      expect(props.onRespondNativeInput).toHaveBeenCalledExactlyOnceWith({
+        operationId: request.operationId,
+        requestId: request.id,
+        action,
+        ...(action === 'accept' ? { values: { order: 'recent' } } : {}),
+      }),
+    )
+    expect(props.onSend).not.toHaveBeenCalled()
+    expect(props.onStop).not.toHaveBeenCalled()
+    expect(props.onComposerChange).not.toHaveBeenCalled()
+    mounted.rerender(
+      <ConversationView
+        {...props}
+        snapshot={{ ...props.snapshot!, pendingNativeInteractions: [] }}
+      />,
+    )
+    expect(screen.getByRole('combobox', { name: 'Message' }).textContent).toBe(props.composer)
+    expect(screen.queryByRole('region', { name: 'Claude Code native input' })).toBeNull()
+  },
+)
+
+it('keeps native input cancellation available when details fail and retries the same identity', async () => {
+  const props = fixture()
+  const request = {
+    id: crypto.randomUUID(),
+    operationId: crypto.randomUUID(),
+    kind: 'questions' as const,
+    title: 'Unavailable question',
+    detail: '',
+    createdAt: new Date().toISOString(),
+  }
+  props.snapshot!.pendingNativeInteractions = [{ agentId: 'codex', bindingGeneration: 1, request }]
+  const read = vi.fn<DesktopBridge['readNativeInput']>().mockResolvedValue({
+    ok: false,
+    error: { code: 'CONTEXT_UNAVAILABLE', message: 'Request unavailable' },
+  })
+  vi.stubGlobal('pact', { ...composerBridgeFixture(), readNativeInput: read })
+  render(<ConversationView {...props} />)
+  await screen.findByRole('alert')
+  expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Submit answers' }).disabled).toBe(
+    true,
+  )
+  expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+  await waitFor(() => expect(read).toHaveBeenCalledTimes(2))
+  expect(read.mock.calls[1]?.[0]).toEqual({
+    operationId: request.operationId,
+    requestId: request.id,
+  })
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+  await waitFor(() =>
+    expect(props.onRespondNativeInput).toHaveBeenCalledWith({
+      operationId: request.operationId,
+      requestId: request.id,
+      action: 'cancel',
+    }),
+  )
+})
+
+it.each([false, true])(
+  'prioritizes plan recovery over stale question or processing without clearing drafts (pending: %s)',
+  async (pending) => {
+    const props = fixture()
+    const { task, run } = collaborationFixture()
+    task.sessionId = props.session.id
+    run.sessionId = props.session.id
+    task.inputProcessing = {
+      decision: {
+        runId: run.id,
+        inputSequence: 0,
+        actor: 'codex',
+        questions: [{ id: 'q1', prompt: 'Preserve boundaries?', selection: 'single' }],
+      },
+      ...(pending ? { pending: { inputId: crypto.randomUUID(), inputSequence: 1 } } : {}),
+    }
+    if (pending) task.inputSequence = 1
+    props.composer = 'Ordinary unsent draft'
+    props.history.clearDecisionDraft = vi
+      .fn<NonNullable<typeof props.history.clearDecisionDraft>>()
+      .mockReturnValue(true)
+    props.history.decisionDraft = {
+      reference: {
+        taskId: task.id,
+        runId: run.id,
+        decisionInputSequence: 0,
+        expectedInputSequence: task.inputSequence,
+      },
+      questions: task.inputProcessing.decision!.questions!,
+      answers: { q1: { optionIds: [], text: 'Keep boundaries' } },
+    }
+    props.snapshot!.runs = [run]
+    props.history.window!.latestRun = run
+    const read = vi.fn<DesktopBridge['getConversation']>().mockResolvedValue({
+      ok: true,
+      value: reportPage(task, {
+        planSync: { state: 'recovery_required', kind: 'plan', runId: run.id, retainedVersion: 2 },
+        availableActions: [],
+      }),
+    })
+    vi.stubGlobal('pact', { ...composerBridgeFixture(), getConversation: read })
+    render(<ConversationView {...props} />)
+    await screen.findByRole('region', { name: 'Plan recovery required' })
+    expect(screen.queryByText('Preserve boundaries?')).toBeNull()
+    expect(screen.queryByRole('region', { name: 'Answer progress' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Send answers' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull()
+    expect(props.history.clearDecisionDraft).not.toHaveBeenCalled()
+    expect(props.onComposerChange).not.toHaveBeenCalled()
+    expect(props.onSend).not.toHaveBeenCalled()
+  },
+)
+
+it.each([true, false])(
+  'labels decision replies with their actual Codex recipient despite a Claude primary (route recorded: %s)',
+  async (recorded) => {
+    const { props, run } = recordingFixture()
+    props.session.settings.primaryAgentId = 'claude'
+    run.collaboration = { taskId: crypto.randomUUID(), kind: 'plan', stage: 'reply' }
+    delete run.workspaceChanges
+    props.snapshot!.nativeContexts = []
+    const message = props.snapshot!.messages[0]!
+    message.runId = run.id
+    message.content =
+      '**Replies to your questions**\n\n**1. Preserve rules?**\n\n**Your answer:**\n\nYes.'
+    if (recorded) message.route = { type: 'agent', agentId: 'codex' }
+    vi.stubGlobal('pact', {
+      ...composerBridgeFixture(),
+      getConversation: vi.fn<DesktopBridge['getConversation']>().mockResolvedValue({
+        ok: true,
+        value: {
+          scope: 'collaboration',
+          sessionId: props.session.id,
+          view: {
+            task: null,
+            actionable: false,
+            accepted: false,
+            reportAvailable: false,
+            availableActions: [],
+          },
+        },
+      }),
+    })
+    render(<ConversationView {...props} />)
+    expect(await screen.findByText('@codex')).toBeDefined()
+    expect(screen.queryByText('@claude')).toBeNull()
+    expect(screen.getByText('Replies to your questions').closest('strong')).not.toBeNull()
+    expect(screen.getByText('1. Preserve rules?').closest('p')).not.toBe(
+      screen.getByText('Your answer:').closest('p'),
+    )
+  },
+)
+
+it('keeps cancellation receipt recovery visible after the host card disappears, then masks the settled stale card', async () => {
+  const props = fixture(),
+    declaration = {
+      version: 'user-information-v1' as const,
+      id: crypto.randomUUID(),
+      kind: 'user_supplied_value' as const,
+      question: 'Which launch date?',
+      input: 'text' as const,
+      options: [],
+      state: { status: 'unanswered' as const },
+    },
+    card: import('@pact/contracts').RelaySchedulingDecision = {
+      version: 'relay-decision-v2',
+      sessionId: props.session.id,
+      decisionId: crypto.randomUUID(),
+      revision: 0,
+      handoffId: 'a'.repeat(64),
+      title: 'One detail before sending',
+      reason: 'You reserved this detail.',
+      consequence: 'Cancel returns to your draft.',
+      sources: [{ id: 'input', label: 'Current request' }],
+      request: {
+        category: 'necessary_information',
+        consumer: {
+          kind: 'prepared_input_clarification',
+          batchId: crypto.randomUUID(),
+          clientMessageId: crypto.randomUUID(),
+          requestFingerprint: 'b'.repeat(64),
+          sourceFingerprint: 'c'.repeat(64),
+          defaultAgentId: 'codex',
+        },
+        field: {
+          fieldId: declaration.id,
+          prompt: declaration.question,
+          input: { kind: 'text', maxLength: 1024 },
+        },
+      },
+    }
+  props.composer = 'Keep the current draft'
+  props.snapshot!.relaySchedulingDecision = card
+  const cancel = vi
+      .fn<NonNullable<typeof props.history.cancelPreparedInformation>>()
+      .mockResolvedValue(false),
+    check = vi
+      .fn<NonNullable<typeof props.history.checkInformationCancellation>>()
+      .mockResolvedValue(false)
+  props.history.cancelPreparedInformation = cancel
+  props.history.checkInformationCancellation = check
+  const mounted = render(<ConversationView {...props} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel this scheduling action' }))
+  await waitFor(() => expect(cancel).toHaveBeenCalledExactlyOnceWith(card))
+  props.snapshot!.relaySchedulingDecision = null
+  props.history.informationCancellation = {
+    request: card,
+    status: 'receipt_unconfirmed',
+    error: 'Cancellation result not confirmed.',
+  }
+  mounted.rerender(<ConversationView {...props} />)
+  expect(screen.getByText('Cancellation pending', { exact: true })).toBeDefined()
+  expect(screen.queryByRole('button', { name: 'Send message' })).toBeNull()
+  expect(screen.queryByRole('textbox', { name: declaration.question })).toBeNull()
+  expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Cancel requested' }).disabled).toBe(
+    true,
+  )
+  fireEvent.click(screen.getByRole('button', { name: 'Check decision' }))
+  expect(check).toHaveBeenCalledTimes(1)
+  expect(cancel).toHaveBeenCalledTimes(1)
+  props.history.informationCancellation = undefined
+  props.history.cancelledInformationDecisionId = card.decisionId
+  props.snapshot!.relaySchedulingDecision = card
+  mounted.rerender(<ConversationView {...props} />)
+  expect(screen.getByRole('button', { name: 'Send message' })).toBeDefined()
+  expect(screen.getByRole('combobox', { name: 'Message' }).textContent).toBe(props.composer)
+  expect(screen.queryByRole('button', { name: 'Cancel this scheduling action' })).toBeNull()
+  expect(props.onSend).not.toHaveBeenCalled()
+})

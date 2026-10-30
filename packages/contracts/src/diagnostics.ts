@@ -30,6 +30,8 @@ export const diagnosticRequestTypeSchema = z.enum([
   'native-quit.prepare.request',
   'native-quit.cancel.request',
   'collaboration.action.request',
+  'relay.decision.answer.request',
+  'relay.decision.receipt.request',
   'session.fork.request',
   'conversation.interests.request',
   'runtime.shutdown.request',
@@ -43,6 +45,12 @@ export const diagnosticRequestTypeSchema = z.enum([
   'runtime-preparation.get.request',
   'runtime-preparation.path.update.request',
   'default-session-settings.get.request',
+  'scheduling.settings.get.request',
+  'scheduling.state.get.request',
+  'scheduling.state.refresh.request',
+  'scheduling.settings.save.request',
+  'scheduling.models.refresh.request',
+  'scheduling.activity.read.request',
   'default-session-settings.save.request',
   'project-catalog.get.request',
   'project-context.read.request',
@@ -70,6 +78,7 @@ export const diagnosticRequestTypeSchema = z.enum([
   'skill-document.cancel.request',
   'skills.cancel.request',
   'conversation.send.request',
+  'conversation.prepared-input.continue.request',
   'conversation.queue.steer.request',
   'conversation.queue.return.request',
   'conversation.queue.remove.request',
@@ -123,7 +132,121 @@ export const diagnosticFailureSourceSchema = z.enum([
 export type DiagnosticFailureSource = z.infer<typeof diagnosticFailureSourceSchema>
 
 const boundedCount = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
+export const sourceReadStageSchema = z.enum([
+  'entry_owner',
+  'request_parse',
+  'native_root',
+  'native_current',
+  'reader_current',
+  'original_capture',
+  'repository_scope',
+  'page_read',
+  'navigation',
+  'page_validation',
+  'cursor',
+  'page_budget',
+  'unknown',
+])
+const sourceCheckSchema = z.enum(['passed', 'rejected', 'not_checked'])
+export const sourceReadDiagnosticSchema = z.strictObject({
+  version: z.literal('source-read-failure-v1'),
+  form: z.enum(['nativeRoot', 'sourceReference', 'legacy', 'unknown']),
+  source: z.enum([
+    'document',
+    'batch',
+    'root_batch',
+    'root_document',
+    'inputs',
+    'handoff_sources',
+    'unknown',
+  ]),
+  offset: boundedCount.nullable(),
+  nativeCallSha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/u)
+    .nullable(),
+  requestSha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/u)
+    .nullable(),
+  entryOwner: sourceCheckSchema,
+  rootBinding: sourceCheckSchema,
+  currentBeforeRead: sourceCheckSchema,
+  readerEntered: z.boolean().nullable(),
+  stage: sourceReadStageSchema,
+})
+export type SourceReadDiagnostic = z.infer<typeof sourceReadDiagnosticSchema>
+export type SourceReadStage = z.infer<typeof sourceReadStageSchema>
+
+/** Canonical, domain-separated input for diagnostics only; never grants source authority. */
+export function sourceReadCallIdentity(
+  threadId: unknown,
+  turnId: unknown,
+  callId: unknown,
+): string | undefined {
+  if (
+    ![threadId, turnId, callId].every(
+      (value) => typeof value === 'string' && value.length > 0 && value.length <= 1024,
+    )
+  )
+    return undefined
+  return `pact-source-read-call-v1\0${JSON.stringify([threadId, turnId, callId])}`
+}
+
 export const diagnosticEventSchema = z.strictObject({
+  inputAdviceResult: z
+    .enum([
+      'clarify_prepared_input',
+      'route_codex',
+      'route_claude',
+      'no_advice',
+      'other_candidate',
+      'disabled',
+      'busy',
+      'duplicate',
+      'invalid_input',
+      'invalid_output',
+      'cancelled',
+      'timeout',
+      'stale',
+      'runtime_unavailable',
+    ])
+    .optional(),
+  informationAdviceRefusal: z
+    .enum(['missing_field', 'unavailable_field', 'field_mismatch', 'host_validation'])
+    .optional(),
+  sourceRead: sourceReadDiagnosticSchema.optional(),
+  planStage: z.enum(['capture', 'submission']).optional(),
+  planReason: z
+    .enum([
+      'captured',
+      'submitted',
+      'retained',
+      'hook_prompt_missing',
+      'hook_prompt_mismatch',
+      'history_binding_missing',
+      'history_lookup_failed',
+      'plan_capture_failed',
+      'submission_hook_unverified',
+      'plan_pending',
+      'plan_unavailable',
+      'plan_missing',
+      'retained_basis_mismatch',
+    ])
+    .optional(),
+  planCapture: z
+    .strictObject({
+      code: z.enum([
+        'hook_prompt_missing',
+        'hook_prompt_mismatch',
+        'history_binding_missing',
+        'history_lookup_failed',
+        'plan_capture_failed',
+      ]),
+      tool: z.enum(['Write', 'Edit', 'ExitPlanMode']),
+      phase: z.enum(['begin', 'success', 'failure']),
+    })
+    .optional(),
   settingsCatalogPhase: z
     .enum([
       'admission',
@@ -201,6 +324,7 @@ export const diagnosticEventSchema = z.strictObject({
     'send',
     'stop',
     'native_check',
+    'claude_plan',
     'native_rebuild',
     'fork',
     'undo',

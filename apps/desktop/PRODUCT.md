@@ -20,16 +20,16 @@ Pact is a shared dual-agent coding workspace. It makes the current task, receivi
 
 ## Positioning
 
-The user controls routing and subsequent Agent work. Ordinary messages stay lightweight; explicit `/plan`, `/build` and `/review` share a versioned plan, Todo ledger and click-authorized workflow. Pact's orchestration is deterministic, not a third model.
+The user controls routing, writing authorization and continuation. Ordinary messages stay lightweight; explicit `/plan`, `/build` and `/review` use native planning, complete natural reports and bounded automatic handoffs between a fixed owner and independent reviewer. Default orchestration is deterministic. Optional Relay uses a separately selected model for scheduling advice; Pact retains execution, source, authorization and recovery ownership.
 
 Forward execution preserves native tools and user permissions. Recorded Changes support guarded whole-round Undo where evidence is reliable. Pact does not provide a hard filesystem Writer Lease against external editors/native tools or full Session/workspace Checkpoints.
 
 ## Operating Context
 
 - A resizable desktop workspace with Project/Session navigation, shared Transcript/Composer and a contextual right pane.
-- The contextual pane presents the sole current Plan, shared Todos, files, historical Changes and Session settings. It can be closed/reopened without making a second full plan in Chat.
-- The Composer combines text, route, native Skill selections, static images and persistent Comment/answer drafts in one Send.
-- Every Proposal authorizes one target root Turn when clicked. A native result, review acceptance and temporary dispatch readiness are separate facts.
+- The contextual pane presents the sole current Plan, files, historical Changes and Session settings. It can be closed/reopened without making a second full plan in Chat.
+- The Composer combines text, route, native Skill selections, static images and persistent Comment drafts in one Send. Native question answers use their live forms.
+- Implement plan and each new Repair explicitly authorize their displayed writing scope. Continue collaboration resumes the already authorized workflow after rechecking current facts. Native completion, independent review acceptance and dispatch readiness remain separate facts.
 - Preserve deliberate reading position, selection and focus while streaming, expanding details, paging, navigating Comments or loading historical sources.
 - Native approvals, questions, MCP forms and OAuth keep their own actual lifecycle. Recovery retains readable history and existing drafts.
 
@@ -38,12 +38,16 @@ Forward execution preserves native tools and user permissions. Recorded Changes 
 - Projects, history, managed images and diagnostics are local. Native Agents/tools can communicate with the services configured by the user; local-first does not imply offline execution.
 - Claude Code and Codex are the only built-in Agents, with independent native configuration, credentials, Skills, MCP, Plugins and context.
 - Primary/Secondary provide defaults; explicit user task routing can choose either Agent without a permanent role change.
+- A Plan owner maintains the native plan and is its default implementer; the other Agent reviews exact versions. Necessary questions may precede a plan. Accepted plans require an explicit Implement action.
+- Build automatically proceeds to independent code review. Direct Review stays read-only; Respond and Repair are explicit and automatically return to the reviewer. Session settings count each plan review, each code review and each new repair separately.
+- Sending workflow feedback immediately pauses later automatic work and prioritizes a reply after current native work settles. The reply stays paused until Continue collaboration; answering a native form resumes its root without clearing that pause. Restart also pauses the chain and reconciles unknown work before continuation.
 - `@all` runs Primary then Secondary, excluding the current Primary answer from Secondary's input; the boundary does not isolate shared Project files.
 - Default Session settings are mandatory during onboarding and copied into each new Session. Runs freeze their own settings and permission revision.
 - The Renderer is browser-only and uses the typed DesktopBridge. It cannot import native/filesystem/persistence/runtime APIs.
-- Current recovery is explicit inspection or user-confirmed Rebuild; unknown delivery never causes blind replay. Fork uses both providers' genuine native boundary histories.
+- Recovery retains manual inspection and user-confirmed Rebuild. Optional Relay adds bounded readback and one independently recorded replacement only with exact positive-unsent evidence; unknown delivery never causes blind replay. Fork uses both providers' genuine native boundary histories.
 - Composer supports one complete queued input per Session and explicit native Steer where the current CLI supports its lifecycle; complete recovery and unknown-delivery facts remain authoritative. Steer preserves full output snapshots in one Run, collapses Work Log in the final answer on completion and collapses earlier responses after normal settled completion without changing Comment sources or canonical native history. Full audit export, unlimited history, complete capability management and automatic Checkpoints remain future scopes.
 - Agent provenance, workflow state, Diff meaning, warnings and consequential actions never depend on color alone.
+- Relay performs scheduling, not task implementation or ordinary Agent questioning. Its necessary decisions replace the current Composer after higher-priority native/workflow interactions. A Rebuild decision replaces only its exact duplicate recovery notice. Repair advice needs a concrete writing grant plus applicable extra and original business allowances. The current-Session indicator and Relay card share the moving pastel border; native cards retain their appearance. Visual and complete runtime acceptance remain separate obligations.
 - macOS and Windows share functional requirements; each platform's actual native effects and release verification must be established separately.
 
 ## Brand Commitments
@@ -66,7 +70,8 @@ Forward execution preserves native tools and user permissions. Recorded Changes 
 
 - Make receiving Agent, authority, current state and next available action visible.
 - Retain original sources and user decisions rather than relying on transcript summaries.
-- A settled answer is not automatically an accepted plan, resolved input or verified code change.
+- A settled answer is not automatically an accepted plan, handled later input or verified code change.
+- Implementation and review reports state confirmed checks with their evidence and label unknown results Unverified in the user's language. Author-reported results remain distinct from independent checks; existing reports carry these limits without a separate execution-proof system.
 - Keep native capabilities and credentials inside their provider boundaries.
 - Preserve drafts, recoverable facts and unknown outcomes through failure/restart; never fabricate success to simplify a screen.
 - Bound UI work and disclose more progressively without silently hiding required opinions or user input.

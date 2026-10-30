@@ -3,15 +3,23 @@ import { Worker } from 'node:worker_threads'
 
 import type { AgentNativeForkBoundary, AgentNativeForkWitness } from '@pact/agent-runtime'
 
-import { ipcTrafficMeasurementSchema } from '@pact/contracts'
 import {
-  collaborationResultSchema,
-  type CollaborationResult,
-  type CollaborationAnswerFormat,
+  collaborationRetainedPlanSchema,
+  type CollaborationRetainedPlan,
+  ipcTrafficMeasurementSchema,
+} from '@pact/contracts'
+import {
+  collaborationReviewObservationSchema,
+  type CollaborationReviewObservation,
 } from '@pact/contracts'
 
 import { LogicalIpcWorkerTraffic, observeWorkerTraffic } from '../../shared/logical-ipc-traffic'
 import { AgentExecutionError } from './agent-execution-error'
+import {
+  isClaudePlanState,
+  type ClaudePlanBinding,
+  type ClaudePlanState,
+} from './claude-native-plan'
 import { NativeWorkingMemory, NATIVE_OWNER_WORKING_BYTES } from './native-working-memory'
 
 function digest(hash: unknown): boolean {
@@ -80,7 +88,14 @@ function result(value: unknown): NativeForkFileResult {
 
 export interface NativeForkFileInput {
   provider: 'claude' | 'codex'
-  action: 'prepare' | 'fork' | 'inspect' | 'read' | 'read-answer'
+  action: 'prepare' | 'fork' | 'inspect' | 'read' | 'read-answer' | 'verify-seed' | 'exists'
+  expectedSeed?: Array<{ id: string; hash: string; images: number }>
+  rejectAdditionalWork?: boolean
+  /** Exact live Hook cutoff; the prefix excludes this operation. */
+  planHook?: { id: string; inputFingerprint: string }
+  /** One full-root proof after native termination; never a live prefix. */
+  terminalPlanSubmission?: { id: string; promptId: string; inputFingerprint: string }
+  includePlan?: boolean
   lastDispatchedPhase?: 'fork' | 'initialize'
   cwd: string
   nativeSessionId: string
@@ -88,7 +103,6 @@ export interface NativeForkFileInput {
   /** Private exact ordered provider input identities, including the root. */
   nativeInputIds?: readonly string[]
   responseHash?: string
-  answerFormat?: CollaborationAnswerFormat
   source?: AgentNativeForkBoundary
   witness?: AgentNativeForkWitness
   storageRoot?: string
@@ -124,9 +138,25 @@ export interface NativeForkAnswerResult {
   nativeSessionId: string
   nativeTurnId: string
   answer?: string
-  submittedReport?: CollaborationResult
+  plan?: { nativeId: string; text: string }
+  planBinding?: ClaudePlanBinding
+  planState?: ClaudePlanState
+  terminalPlanSubmission?: NonNullable<NativeForkFileInput['terminalPlanSubmission']>
+  retainedPlan?: CollaborationRetainedPlan
+  planUnavailable?: true
+  reviewResult?: CollaborationReviewObservation
   nativeStorageRoot: string
   nativePath: string
+}
+
+export interface NativeSeedVerificationResult {
+  nativeSessionId: string
+  seedVerified: true
+}
+
+export interface NativeSessionExistenceResult {
+  nativeSessionId: string
+  exists: boolean
 }
 
 function isAnswerResult(value: unknown): value is NativeForkAnswerResult {
@@ -139,8 +169,39 @@ function isAnswerResult(value: unknown): value is NativeForkAnswerResult {
       (path) => typeof path === 'string' && path.length > 0 && path.length <= 4096,
     ) ||
     (value.answer !== undefined && typeof value.answer !== 'string') ||
-    (value.submittedReport !== undefined &&
-      !collaborationResultSchema.safeParse(value.submittedReport).success)
+    (value.plan !== undefined &&
+      (!isObject(value.plan) ||
+        typeof value.plan.nativeId !== 'string' ||
+        !value.plan.nativeId ||
+        value.plan.nativeId.length > 1024 ||
+        typeof value.plan.text !== 'string')) ||
+    (value.retainedPlan !== undefined &&
+      !collaborationRetainedPlanSchema.safeParse(value.retainedPlan).success) ||
+    (value.terminalPlanSubmission !== undefined &&
+      (!isObject(value.terminalPlanSubmission) ||
+        typeof value.terminalPlanSubmission.id !== 'string' ||
+        !value.terminalPlanSubmission.id ||
+        value.terminalPlanSubmission.id.length > 1024 ||
+        typeof value.terminalPlanSubmission.promptId !== 'string' ||
+        !/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/iu.test(
+          value.terminalPlanSubmission.promptId,
+        ) ||
+        !digest(value.terminalPlanSubmission.inputFingerprint) ||
+        value.planState !== undefined ||
+        value.planUnavailable !== undefined ||
+        (value.plan === undefined) === (value.retainedPlan === undefined))) ||
+    (value.planState !== undefined && !isClaudePlanState(value.planState)) ||
+    (value.planUnavailable !== undefined && value.planUnavailable !== true) ||
+    (value.planBinding !== undefined &&
+      (!isObject(value.planBinding) ||
+        typeof value.planBinding.promptId !== 'string' ||
+        !value.planBinding.promptId ||
+        value.planBinding.promptId.length > 1024 ||
+        typeof value.planBinding.path !== 'string' ||
+        !value.planBinding.path ||
+        value.planBinding.path.length > 4096)) ||
+    (value.reviewResult !== undefined &&
+      !collaborationReviewObservationSchema.safeParse(value.reviewResult).success)
   )
     return false
   return true
@@ -156,7 +217,17 @@ export class NativeForkFiles {
   private worker: Worker | undefined
   private terminateWorker: (() => Promise<void>) | undefined
 
-  constructor(private readonly ipcTraffic?: LogicalIpcWorkerTraffic) {}
+  constructor(
+    private readonly ipcTraffic?: LogicalIpcWorkerTraffic,
+    private readonly observePhysicalOperation?: (
+      signal: AbortSignal,
+      completion: Promise<void>,
+    ) => void,
+  ) {}
+
+  get active(): boolean {
+    return this.worker !== undefined
+  }
 
   async execute(
     input: NativeForkFileInput,
@@ -167,15 +238,26 @@ export class NativeForkFiles {
       signal: AbortSignal,
     ) => Promise<NativeForkHistoryReference>,
   ): Promise<NativeForkFileResult> {
-    if (input.action === 'read-answer')
-      throw new Error('Native collaboration answers must use the readAnswer interface.')
+    if (
+      input.action === 'read-answer' ||
+      input.action === 'verify-seed' ||
+      input.action === 'exists'
+    )
+      throw new Error('Native answers and seeds must use their typed readback interfaces.')
     return this.run(input, signal, result, candidate, resolveReference)
   }
 
   async readAnswer(
     input: Pick<
       NativeForkFileInput,
-      'cwd' | 'nativeSessionId' | 'nativeInputIds' | 'storageRoot' | 'path' | 'answerFormat'
+      | 'cwd'
+      | 'nativeSessionId'
+      | 'nativeInputIds'
+      | 'storageRoot'
+      | 'path'
+      | 'planHook'
+      | 'terminalPlanSubmission'
+      | 'includePlan'
     > & {
       nativeTurnId: string
     },
@@ -195,7 +277,68 @@ export class NativeForkFiles {
       answer.nativeTurnId !== input.nativeTurnId
     )
       throw new Error('Native collaboration answer belongs to another Session or root input.')
+    if (
+      input.terminalPlanSubmission &&
+      (answer.terminalPlanSubmission?.id !== input.terminalPlanSubmission.id ||
+        answer.terminalPlanSubmission.promptId !== input.terminalPlanSubmission.promptId ||
+        answer.terminalPlanSubmission.inputFingerprint !==
+          input.terminalPlanSubmission.inputFingerprint)
+    )
+      throw new Error('The terminal plan proof does not match the exact permission intent.')
     return answer
+  }
+
+  async verifySeed(
+    input: Pick<NativeForkFileInput, 'cwd' | 'nativeSessionId'> & {
+      expected: ReadonlyMap<string, { hash: string; images: number }>
+      rejectAdditionalWork: boolean
+    },
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.run(
+      {
+        provider: 'claude',
+        action: 'verify-seed',
+        cwd: input.cwd,
+        nativeSessionId: input.nativeSessionId,
+        expectedSeed: [...input.expected].map(([id, value]) => ({
+          id,
+          hash: value.hash,
+          images: value.images,
+        })),
+        rejectAdditionalWork: input.rejectAdditionalWork,
+      },
+      signal,
+      (value): NativeSeedVerificationResult => {
+        if (
+          !isObject(value) ||
+          value.nativeSessionId !== input.nativeSessionId ||
+          value.seedVerified !== true
+        )
+          throw new Error('The native seed verification belongs to another Session.')
+        return { nativeSessionId: input.nativeSessionId, seedVerified: true }
+      },
+    )
+  }
+
+  async exists(
+    input: Pick<NativeForkFileInput, 'cwd' | 'nativeSessionId'>,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const existence = await this.run(
+      { ...input, provider: 'claude', action: 'exists' },
+      signal,
+      (value): NativeSessionExistenceResult => {
+        if (
+          !isObject(value) ||
+          value.nativeSessionId !== input.nativeSessionId ||
+          typeof value.exists !== 'boolean'
+        )
+          throw new Error('The native existence verification belongs to another Session.')
+        return { nativeSessionId: input.nativeSessionId, exists: value.exists }
+      },
+    )
+    return existence.exists
   }
 
   private async run<T>(
@@ -248,6 +391,8 @@ export class NativeForkFiles {
     let timer: ReturnType<typeof setTimeout> | undefined
     let abort: (() => void) | undefined
     let physicallySettled = false
+    const physical = Promise.withResolvers<void>()
+    this.observePhysicalOperation?.(signal, physical.promise)
     let termination: Promise<void> | undefined
     const settlePhysical = (): void => {
       if (physicallySettled) return
@@ -257,6 +402,7 @@ export class NativeForkFiles {
         this.worker = undefined
         this.terminateWorker = undefined
       }
+      physical.resolve()
     }
     const terminate = (): Promise<void> => {
       if (physicallySettled) return Promise.resolve()
@@ -397,7 +543,14 @@ export class NativeForkFiles {
       references.abort()
       clearTimeout(timer)
       if (abort) signal.removeEventListener('abort', abort)
-      await terminate()
+      try {
+        await terminate()
+      } catch (error) {
+        // Only this admitted terminal read joins its exact physical owner. Busy requests never queue.
+        if (input.terminalPlanSubmission) await physical.promise
+        // oxlint-disable-next-line no-unsafe-finally -- A failed physical termination must override a logical success; its exact Worker has now exited.
+        throw error
+      }
     }
   }
 

@@ -180,6 +180,7 @@ export function ImageGallery({
       ref={dialog}
       className="pact-image-gallery bg-surface text-primary"
       aria-label="Image preview"
+      closedby="any"
       onCancel={(event) => {
         event.preventDefault()
         onClose()

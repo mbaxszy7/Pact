@@ -1,4 +1,4 @@
-import { eq, sql } from 'drizzle-orm'
+import { eq } from 'drizzle-orm'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -7,8 +7,6 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   skillArguments,
-  collaborationEnvelopeSchema,
-  type CollaborationResult,
   type ConversationPageMessage,
   type FrozenSkillInvocation,
 } from '@pact/contracts'
@@ -20,9 +18,6 @@ import {
 } from './conversation-queue.test-helper.js'
 import {
   anchoredComments,
-  collaborationInputs,
-  conversationBodyInputs,
-  conversationInputBatches,
   conversationInputBatchMembers,
   conversationQueueOperations,
 } from './schema/index.js'
@@ -83,8 +78,16 @@ describe('queued workflow classification through the sealed body', () => {
     expect(received.metadata.workflowCommand).toBe(true)
     expect(received.taskId).toBeNull()
     expect(value.repo.queueState(value.sessionId).input?.workflowCommand).toBe(true)
-    expect(() => value.prepare(root, request)).toThrow(/cannot be steered/)
-    expect(value.repo.collaboration(value.sessionId)).toEqual(task)
+    expect(() => value.prepare(root, request)).toThrow(/answered in the next Turn/)
+    expect(value.repo.collaboration(value.sessionId)).toEqual({
+      ...task,
+      automation: 'paused',
+      pauseReason: 'user_message',
+      revision: task.revision + 1,
+      latestUserMessageId: request.inputId,
+      inputProcessing: { pending: { inputId: request.inputId, inputSequence: task.inputSequence } },
+      notice: 'Automatic collaboration is paused. Your message will be answered next.',
+    })
     expect(value.repo.queueState(value.sessionId).input?.state).toBe('queued')
   })
 
@@ -104,7 +107,7 @@ describe('queued workflow classification through the sealed body', () => {
     expect(received.metadata.workflowCommand).toBe(false)
     expect(received.metadata.skills).toEqual([selection])
     expect(received.taskId).toBe(root.collaboration?.taskId)
-    expect(value.prepare(root, request).created).toBe(true)
+    expect(() => value.prepare(root, request)).toThrow(/answered in the next Turn/)
   })
 
   it('rejects malformed mixed commands before reserving the queue or freezing Comments', async () => {
@@ -230,138 +233,21 @@ describe('queued Return claims and durable Comment ownership', () => {
 })
 
 describe('Steer receipts against the original native execution', () => {
-  it.each([
-    { phase: 'possibly_sent', legacyAlias: false },
-    { phase: 'unknown', legacyAlias: false },
-    { phase: 'unknown', legacyAlias: true },
-  ] as const)(
-    'accepts independent final nonce proof for $phase delivery (legacy root UUID alias: $legacyAlias)',
-    async ({ phase, legacyAlias }) => {
-      const value = await fixture(),
-        root = value.root(true)
-      value.comment(root, 'Preserve this frozen observation')
-      let request = value.queue(root, 'Apply this supplemental requirement')
-      const grant = value.prepare(root, request)
-      value.repo.markQueuedSteerPossiblySent(request.operationId)
-      if (phase === 'unknown') value.repo.markQueuedSteerUnknown(request.operationId)
-      const received = value.repo.readReceivedInput(value.sessionId)!,
-        bodyBefore = value.db.drizzle
-          .select()
-          .from(conversationBodyInputs)
-          .where(eq(conversationBodyInputs.id, received.inputId))
-          .get()!,
-        frozen = frozenComments(value)
-      if (legacyAlias) {
-        // Reproduce only the durable identity mapping of a pre-guard legacy intent.
-        // Its sealed bytes, digest, Batch/member identities, nonce and Run stay intact.
-        value.db.drizzle.transaction((transaction) => {
-          transaction.run(sql`PRAGMA defer_foreign_keys = ON`)
-          transaction
-            .update(collaborationInputs)
-            .set({ id: root.id })
-            .where(eq(collaborationInputs.id, request.inputId))
-            .run()
-          transaction
-            .update(conversationQueueOperations)
-            .set({ inputId: root.id })
-            .where(eq(conversationQueueOperations.id, request.operationId))
-            .run()
-          transaction
-            .update(conversationInputBatches)
-            .set({ clientMessageId: root.id })
-            .where(eq(conversationInputBatches.clientMessageId, request.inputId))
-            .run()
-          transaction
-            .update(conversationBodyInputs)
-            .set({ clientMessageId: root.id, pendingReceiptId: root.id })
-            .where(eq(conversationBodyInputs.id, received.inputId))
-            .run()
-          transaction
-            .update(anchoredComments)
-            .set({ pendingReceiptId: root.id })
-            .where(eq(anchoredComments.pendingReceiptId, request.inputId))
-            .run()
-        })
-        request = { ...request, inputId: root.id }
-        value.repo.recordQueuedSteerConsumption(value.proof(root), request.inputId)
-      }
-      const auth = value.repo.collaborationTurnAuthorization(root.id)!,
-        inputResponses: CollaborationResult['inputResponses'] = []
-      let offset = 0
-      for (;;) {
-        const page = value.repo.readRequiredInputMembers(root.id, offset, grant.inputRevision)
-        inputResponses.push(
-          ...page.items.map((item) => ({
-            batchId: item.batchId,
-            memberId: item.memberId,
-            disposition: 'resolved' as const,
-            reason: 'Applied the complete frozen requirement to the submitted plan.',
-            todoId: null,
-          })),
-        )
-        if (page.nextOffset === null) break
-        offset = page.nextOffset
-      }
-      const result: CollaborationResult = {
-        submission: auth.duty,
-        outcome: 'complete',
-        summary: 'The plan includes the supplemental requirement and frozen observation.',
-        plan: 'Scope and acceptance include the complete supplemental requirement.',
-        todoDeltas: [],
-        inputRevision: grant.inputRevision,
-        resultNonce: grant.resultNonce,
-        inputResponses,
-      }
-      const carrier = collaborationEnvelopeSchema.parse({
-        version: 'pact-collaboration-envelope-v5',
-        answer: 'Full final response.',
-        result,
-      })
-      expect(inputResponses).toHaveLength(3)
-      expect(operation(value, request.operationId).state).toBe(phase)
-      value.repo.recordCollaborationCarrierText(root.id, JSON.stringify(carrier))
-      const proofPatch = value.repo.recordCollaborationCarrier(root.id, carrier)
-      expect(proofPatch?.resync).toMatchObject({ messages: true, drafts: true })
-      expect(operation(value, request.operationId).state).toBe('consumed')
-      value.repo.recordCollaborationResult(root.id, carrier.result)
-      value.finish(root)
-      value.repo.recordNativeEffects(root.id, 'settled')
-      expect(value.repo.queueState(value.sessionId).input).toBeNull()
-      expect(value.repo.unresolvedSteerInputs(root.id)).toEqual([])
-      expect(value.repo.collaboration(value.sessionId)).toMatchObject({
-        id: root.collaboration!.taskId,
-        runId: root.id,
-        status: 'waiting',
-        planVersion: 1,
-      })
-      expect(value.repo.collaborationReportSource(value.sessionId, root.id)).toMatchObject(result)
-      expect(
-        value.repo
-          .readRequiredInputMembers(root.id, 0, grant.inputRevision)
-          .items.every((member) => member.state === 'resolved'),
-      ).toBe(true)
-      expect(value.repo.message(request.inputId, value.sessionId)?.content).toBe(received.content)
-      expect(
-        value.db.drizzle
-          .select()
-          .from(conversationBodyInputs)
-          .where(eq(conversationBodyInputs.id, received.inputId))
-          .get(),
-      ).toMatchObject({
-        hash: bodyBefore.hash,
-        chars: bodyBefore.chars,
-        bytes: bodyBefore.bytes,
-        sealed: true,
-      })
-      expect(
-        frozenComments(value).members.map(({ bodySha256, anchorJson }) => ({
-          bodySha256,
-          anchorJson,
-        })),
-      ).toEqual(frozen.members.map(({ bodySha256, anchorJson }) => ({ bodySha256, anchorJson })))
-      expect(value.repo.findRun(root.id)?.outputSnapshots?.settled).toBe(true)
-    },
-  )
+  it('keeps workflow feedback queued for the next reply instead of native Steer', async () => {
+    const value = await fixture(),
+      root = value.root(true)
+    value.comment(root, 'Preserve this observation')
+    const request = value.queue(root, 'Use the complete supplemental requirement')
+    const frozen = frozenComments(value)
+    expect(() => value.prepare(root, request)).toThrow(/answered in the next Turn/)
+    expect(value.repo.queueState(value.sessionId).input?.state).toBe('queued')
+    expect(value.repo.readReceivedInput(value.sessionId)?.content).toBe(
+      'Use the complete supplemental requirement',
+    )
+    expect(frozen.members).toHaveLength(1)
+    expect(value.repo.unresolvedSteerInputs(root.id)).toEqual([])
+    expect(value.page().messages.some(({ message }) => message.id === request.inputId)).toBe(false)
+  })
 
   it('recovers an undispatched reservation as paused without materializing or retrying it', async () => {
     const value = await fixture(true),

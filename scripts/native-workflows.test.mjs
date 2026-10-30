@@ -521,3 +521,219 @@ void test('delivery and publication consume exact accepted IDs in separate non-e
   assert.match(release.jobs.version_pr.if, /needs\.publish\.result == 'success'/u)
   assert.doesNotMatch(JSON.stringify(release), /release_created/u)
 })
+
+void test('the required macOS native job runs the separate pinned decision profile after legacy and preserves independent strict evidence', () => {
+  const steps = distribution.jobs.native_mac.steps
+  const legacy = steps.findIndex((step) => step.run === 'node scripts/ci.mjs native')
+  const prepare = steps.findIndex(
+    (step) => step.run === 'node scripts/ci-native.mjs decision-codex',
+  )
+  const decision = steps.findIndex(
+    (step) => step.run === 'node scripts/ci.mjs native decision-codex',
+  )
+  assert(legacy >= 0 && prepare > legacy && decision > prepare)
+  assert.equal(
+    steps[decision].env.PACT_CI_NATIVE_IDENTITY_FILE,
+    steps[legacy].env.PACT_CI_NATIVE_IDENTITY_FILE,
+  )
+  assert.notEqual(
+    steps[decision].env.PACT_CI_NATIVE_REPORT_DIR,
+    steps[legacy].env.PACT_CI_NATIVE_REPORT_DIR,
+  )
+  assert.notEqual(
+    steps[decision].env.PACT_CI_NATIVE_ARTIFACT,
+    steps[legacy].env.PACT_CI_NATIVE_ARTIFACT,
+  )
+  const preserved = steps.find(
+    (step) => step.with?.name === steps[decision].env.PACT_CI_NATIVE_ARTIFACT,
+  )
+  assert.equal(preserved?.if, 'always()')
+  assert.match(preserved.with.path, /native-summary\.json/u)
+  for (const suffix of ['win', 'win_arm64'])
+    assert.doesNotMatch(
+      commands(distribution.jobs[`native_${suffix}`]),
+      /node scripts\/ci(?:-native)?\.mjs (?:native )?decision-codex/u,
+    )
+  assert(distribution.jobs.complete.needs.includes('native_mac'))
+})
+
+void test('Windows source jobs share installed native MSVC admission without downloading tools or exporting the whole environment', () => {
+  let procedure
+  for (const [suffix, arch] of [
+    ['win', 'x64'],
+    ['win_arm64', 'arm64'],
+  ]) {
+    for (const responsibility of ['native', 'package', 'real']) {
+      const steps = distribution.jobs[`${responsibility}_${suffix}`].steps
+      const prepare = steps.findIndex((step) => step.env?.PACT_MSVC_ARCH === arch)
+      const setupAt = steps.findIndex((step) => step.uses === './.github/actions/setup')
+      assert(prepare >= 0 && prepare < setupAt)
+      const step = steps[prepare]
+      assert.equal(step.shell, 'pwsh')
+      assert.equal(step['timeout-minutes'], 2)
+      assert.equal(step['continue-on-error'], undefined)
+      procedure ??= step.run
+      assert.equal(step.run, procedure)
+      assert.match(step.run, /process\.arch!==process\.env\.PACT_MSVC_ARCH/u)
+      assert.match(step.run, /Microsoft\.VisualStudio\.Component\.VC\.Tools\.ARM64/u)
+      assert.match(step.run, /Microsoft\.VisualStudio\.Component\.VC\.Tools\.x86\.x64/u)
+      assert.match(step.run, /-requires \$component -property installationPath/u)
+      assert.match(step.run, /-arch=\{1\} -host_arch=\{1\}/u)
+      assert.match(step.run, /VSCMD_ARG_TGT_ARCH'\] -ne \$arch/u)
+      assert(step.run.includes('\\Host$arch\\$arch\\cl.exe'))
+      assert.match(step.run, /\$lines\.Count -gt 128/u)
+      assert.match(step.run, /-gt 65536/u)
+      assert.match(step.run, /GITHUB_PATH.*\$compilerDirectory/u)
+      assert.doesNotMatch(
+        step.run,
+        /Invoke-WebRequest|DownloadFile|winget|choco|msiexec|setx\s|reg add/iu,
+      )
+      assert.doesNotMatch(step.run, /&& set(?:\s*'|\s*$)/mu)
+      const exported =
+        /foreach \(\$key in @\(([^)]+)\)\) \{\s*Add-Content -LiteralPath \$env:GITHUB_ENV/u.exec(
+          step.run,
+        )
+      assert(exported)
+      assert.deepEqual(
+        [...exported[1].matchAll(/'([^']+)'/gu)].map((match) => match[1]),
+        ['INCLUDE', 'LIB', 'LIBPATH', 'VSCMD_ARG_TGT_ARCH'],
+      )
+      assert.doesNotMatch(JSON.stringify(step), /secrets\.|pact-provider-ci/u)
+    }
+    assert.equal(
+      distribution.jobs[`smoke_${suffix}`].steps.some((step) => step.env?.PACT_MSVC_ARCH),
+      false,
+    )
+  }
+  for (const name of ['native_mac', 'package_mac', 'real_mac', 'smoke_mac'])
+    assert.equal(
+      distribution.jobs[name].steps.some((step) => step.env?.PACT_MSVC_ARCH),
+      false,
+    )
+})
+
+function assertProfileEvidence(steps, execution, profile) {
+  const command = steps[execution]
+  assert.equal(command['continue-on-error'], undefined)
+  assert.equal(command.if, undefined)
+  const fallback = steps.find(
+    (step) =>
+      step.run === 'node scripts/ci-native-report.mjs' &&
+      step.env?.PACT_CI_NATIVE_PROFILE === profile,
+  )
+  assert.equal(fallback?.if, 'always()')
+  for (const key of [
+    'PACT_CI_NATIVE_REPORT_DIR',
+    'PACT_CI_NATIVE_IDENTITY_FILE',
+    'PACT_CI_NATIVE_ARTIFACT',
+  ])
+    assert.equal(fallback.env[key], command.env[key])
+  const artifact = steps.find((step) => step.with?.name === command.env.PACT_CI_NATIVE_ARTIFACT)
+  assert.equal(artifact?.if, 'always()')
+  assert.equal(artifact.with['retention-days'], 14)
+  assert.deepEqual(artifact.with.path.trim().split('\n'), [
+    `${command.env.PACT_CI_NATIVE_REPORT_DIR}/native-summary.json`,
+    `${command.env.PACT_CI_NATIVE_REPORT_DIR}/native-summary.md`,
+  ])
+  assert.doesNotMatch(JSON.stringify(command), /secrets\.|--grep|--testNamePattern|--reporter/u)
+}
+
+void test('macOS requires the pinned Claude profile while Windows preserves blocked decision evidence and denies execution', () => {
+  for (const suffix of ['mac', 'win', 'win_arm64']) {
+    const job = distribution.jobs[`native_${suffix}`]
+    const steps = job.steps
+    const legacy = steps.findIndex((step) => step.run === 'node scripts/ci.mjs native')
+    const prepare = steps.findIndex(
+      (step) => step.run === 'node scripts/ci-native.mjs decision-claude',
+    )
+    const execute = steps.findIndex(
+      (step) => step.run === 'node scripts/ci.mjs native decision-claude',
+    )
+    assert(legacy >= 0)
+    if (suffix !== 'mac') {
+      assert.equal(prepare, -1)
+      assert.equal(execute, -1)
+      const guard = steps.find(
+        (step) => step.name === 'Verify decision isolation remains unavailable on Windows',
+      )
+      assert.match(guard.run, /nativeProfileSupports/u)
+      assert.match(guard.run, /decision-codex/u)
+      assert.match(guard.run, /decision-claude/u)
+      assert.match(guard.run, /throw new Error/u)
+      const blocked = steps.find(
+        (step) =>
+          step.run === 'node scripts/ci-native-report.mjs' &&
+          step.env?.PACT_CI_NATIVE_PROFILE === 'decision-claude',
+      )
+      assert.equal(blocked.if, 'always()')
+      assert.equal(
+        blocked.env.PACT_CI_NATIVE_IDENTITY_FILE,
+        steps[legacy].env.PACT_CI_NATIVE_IDENTITY_FILE,
+      )
+      assert.notEqual(
+        blocked.env.PACT_CI_NATIVE_REPORT_DIR,
+        steps[legacy].env.PACT_CI_NATIVE_REPORT_DIR,
+      )
+      const uploaded = steps.find((step) => step.with?.name === blocked.env.PACT_CI_NATIVE_ARTIFACT)
+      assert.equal(uploaded.if, 'always()')
+      assert.match(uploaded.with.path, /native-summary\.json/u)
+      assert.equal(job.environment, undefined)
+      assert.doesNotMatch(JSON.stringify(job), /secrets\.PACT_(CLAUDE|CODEX)_/u)
+      assert(distribution.jobs.complete.needs.includes(`native_${suffix}`))
+      continue
+    }
+    assert(prepare > legacy && execute > prepare)
+    if (suffix === 'mac')
+      assert(
+        prepare >
+          steps.findIndex((step) => step.run === 'node scripts/ci.mjs native decision-codex'),
+      )
+    assert.equal(
+      steps[execute].env.PACT_CI_NATIVE_IDENTITY_FILE,
+      steps[legacy].env.PACT_CI_NATIVE_IDENTITY_FILE,
+    )
+    assert.notEqual(
+      steps[execute].env.PACT_CI_NATIVE_REPORT_DIR,
+      steps[legacy].env.PACT_CI_NATIVE_REPORT_DIR,
+    )
+    assert.notEqual(
+      steps[execute].env.PACT_CI_NATIVE_ARTIFACT,
+      steps[legacy].env.PACT_CI_NATIVE_ARTIFACT,
+    )
+    assertProfileEvidence(steps, execute, 'decision-claude')
+    assert.equal(job.environment, undefined)
+    assert.doesNotMatch(JSON.stringify(job), /secrets\.PACT_(CLAUDE|CODEX)_/u)
+    assert(distribution.jobs.complete.needs.includes(`native_${suffix}`))
+  }
+})
+
+void test('Windows owner acceptance builds before legacy protocols and real source runners prepare their own helper without compiling installed smoke', () => {
+  for (const suffix of ['win', 'win_arm64']) {
+    const steps = distribution.jobs[`native_${suffix}`].steps
+    const build = steps.findIndex((step) => step.run === 'node scripts/ci.mjs build')
+    const owner = steps.findIndex((step) => step.run === 'node scripts/ci.mjs native windows-owner')
+    const legacy = steps.findIndex((step) => step.run === 'node scripts/ci.mjs native')
+    assert(build >= 0 && owner > build && owner < legacy)
+    assertProfileEvidence(steps, owner, 'windows-owner')
+    assert.notEqual(
+      steps[owner].env.PACT_CI_NATIVE_REPORT_DIR,
+      steps[legacy].env.PACT_CI_NATIVE_REPORT_DIR,
+    )
+    const real = distribution.jobs[`real_${suffix}`]
+    const helper = real.steps.findIndex(
+      (step) => step.run === 'node scripts/build-owned-process-group-win32.mjs',
+    )
+    const execute = real.steps.findIndex((step) => step.id === 'execute')
+    assert(helper >= 0 && helper < execute)
+    assert.equal(real.if, 'inputs.real_allowed')
+    assert.equal(real.steps[helper].env, undefined)
+    assert.doesNotMatch(
+      commands(distribution.jobs[`smoke_${suffix}`]),
+      /build-owned-process-group|windows-owner|cl\.exe/u,
+    )
+  }
+  assert.doesNotMatch(
+    commands(distribution.jobs.native_mac),
+    /native windows-owner|build-owned-process-group/u,
+  )
+})

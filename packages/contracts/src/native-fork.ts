@@ -8,7 +8,6 @@ const hash = z.string().regex(/^[a-f\d]{64}$/u)
 
 /** Private Utility/Adapter facts. Raw native transcripts never cross DesktopBridge. */
 export const nativeForkBoundarySchema = z.strictObject({
-  answerFormat: z.enum(['collaboration_envelope_v5']).optional(),
   nativeSessionId: nativeId,
   nativeCutId: nativeId,
   nativeTurnId: nativeId,
@@ -27,7 +26,6 @@ export const nativeForkWitnessSchema = z
     sourceNativeSessionId: nativeId,
     nativeSessionId: nativeId,
     sourceCutId: nativeId,
-    answerFormat: z.enum(['collaboration_envelope_v5']).optional(),
     sourcePrefixHash: hash,
     candidatePrefixHash: hash,
     candidatePrefixRecords: z.number().int().positive().max(NATIVE_FORK_RECORDS).optional(),

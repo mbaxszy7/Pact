@@ -1,0 +1,1 @@
+ALTER TABLE `agent_runs` ADD `automatic_recovery_revoked` integer DEFAULT false NOT NULL;

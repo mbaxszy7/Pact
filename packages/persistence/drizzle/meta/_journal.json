@@ -505,6 +505,188 @@
       "when": 1792337889331,
       "tag": "0071_app_update_checks",
       "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "6",
+      "when": 1792392348869,
+      "tag": "0072_lush_galactus",
+      "breakpoints": true
+    },
+    {
+      "idx": 73,
+      "version": "6",
+      "when": 1792394111713,
+      "tag": "0073_bizarre_demogoblin",
+      "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "6",
+      "when": 1792410407823,
+      "tag": "0074_happy_franklin_richards",
+      "breakpoints": true
+    },
+    {
+      "idx": 75,
+      "version": "6",
+      "when": 1792645444664,
+      "tag": "0075_durable_handoff_receipts",
+      "breakpoints": true
+    },
+    {
+      "idx": 76,
+      "version": "6",
+      "when": 1792646515840,
+      "tag": "0076_global_scheduling_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 77,
+      "version": "6",
+      "when": 1792746723095,
+      "tag": "0077_decision_runtime_ownership",
+      "breakpoints": true
+    },
+    {
+      "idx": 78,
+      "version": "6",
+      "when": 1792777409135,
+      "tag": "0078_unified_scheduling_runtime_owner",
+      "breakpoints": true
+    },
+    {
+      "idx": 79,
+      "version": "6",
+      "when": 1792780331277,
+      "tag": "0079_relay_workflow_source_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 80,
+      "version": "6",
+      "when": 1792782920626,
+      "tag": "0080_serial_decision_native_stages",
+      "breakpoints": true
+    },
+    {
+      "idx": 81,
+      "version": "6",
+      "when": 1792784837064,
+      "tag": "0081_closed_native_receipt_retirement",
+      "breakpoints": true
+    },
+    {
+      "idx": 82,
+      "version": "6",
+      "when": 1792788651305,
+      "tag": "0082_prepared_input_dispatch",
+      "breakpoints": true
+    },
+    {
+      "idx": 83,
+      "version": "6",
+      "when": 1792793379314,
+      "tag": "0083_concrete_collaboration_authority",
+      "breakpoints": true
+    },
+    {
+      "idx": 84,
+      "version": "6",
+      "when": 1792798888334,
+      "tag": "0084_supplement_return_obligation",
+      "breakpoints": true
+    },
+    {
+      "idx": 85,
+      "version": "6",
+      "when": 1792815796906,
+      "tag": "0085_relay_scheduling_decisions",
+      "breakpoints": true
+    },
+    {
+      "idx": 86,
+      "version": "6",
+      "when": 1792824987836,
+      "tag": "0086_relay_recovery_attempts",
+      "breakpoints": true
+    },
+    {
+      "idx": 87,
+      "version": "6",
+      "when": 1792826666803,
+      "tag": "0087_relay_activity_projection",
+      "breakpoints": true
+    },
+    {
+      "idx": 88,
+      "version": "6",
+      "when": 1792827762109,
+      "tag": "0088_confirmed_unsent_reexecution",
+      "breakpoints": true
+    },
+    {
+      "idx": 89,
+      "version": "6",
+      "when": 1792827820457,
+      "tag": "0089_execution_receipt_identity",
+      "breakpoints": true
+    },
+    {
+      "idx": 90,
+      "version": "6",
+      "when": 1792827966240,
+      "tag": "0090_revoke_automatic_recovery",
+      "breakpoints": true
+    },
+    {
+      "idx": 91,
+      "version": "6",
+      "when": 1792828182259,
+      "tag": "0091_linked_unsent_allowance",
+      "breakpoints": true
+    },
+    {
+      "idx": 92,
+      "version": "6",
+      "when": 1792829485983,
+      "tag": "0092_native_recovery_decision_matter",
+      "breakpoints": true
+    },
+    {
+      "idx": 93,
+      "version": "6",
+      "when": 1792829706009,
+      "tag": "0093_relay_rebuild_activity",
+      "breakpoints": true
+    },
+    {
+      "idx": 94,
+      "version": "6",
+      "when": 1792832619132,
+      "tag": "0094_confirmed_reexecution_dispatch_guard",
+      "breakpoints": true
+    },
+    {
+      "idx": 95,
+      "version": "6",
+      "when": 1792843983775,
+      "tag": "0095_pending_workflow_scan",
+      "breakpoints": true
+    },
+    {
+      "idx": 96,
+      "version": "6",
+      "when": 1792875317032,
+      "tag": "0096_prepared_input_information",
+      "breakpoints": true
+    },
+    {
+      "idx": 97,
+      "version": "6",
+      "when": 1792896392181,
+      "tag": "0097_declared_user_information",
+      "breakpoints": true
     }
   ]
 }

@@ -1179,7 +1179,7 @@ it('real Codex Steer incorporates the exact client UUID in its original Turn and
     const cold = new bundle.CodexAgentAdapter(codexExecutable, factory, { storageRoot: owned.home })
     adapters.push(cold)
     const coldConsumed: string[] = []
-    await cold.probeNativeInputs(
+    const coldCheck = cold.beginNativeInputsCheck(
       {
         agentId: 'codex',
         requestId: runId,
@@ -1195,6 +1195,8 @@ it('real Codex Steer incorporates the exact client UUID in its original Turn and
       },
       controller.signal,
     )
+    await coldCheck.result
+    await coldCheck.physicalCompletion
     expect(coldConsumed).toEqual([inputId])
     expect(cold.hasActiveBackgroundWork()).toBe(false)
     expect(hash(await boundedNativeText(thread.path, owned.home))).toBe(sourceHash)

@@ -95,6 +95,20 @@ vi.mock('./codex-agent-adapter.js', () => ({
     readonly id = 'codex' as const
     readonly executorId = randomUUID()
     inspectNativeRebuild = native.inspect
+    beginNativeRebuildCheck(
+      input: AgentNativeContextRebuildInput,
+      source: AsyncIterable<NativeContextRebuildChunk>,
+      signal: AbortSignal,
+    ) {
+      const result = this.inspectNativeRebuild(input, source, signal)
+      return {
+        result,
+        physicalCompletion: result.then(
+          () => undefined,
+          () => undefined,
+        ),
+      }
+    }
     hasActiveBackgroundWork(runId?: string) {
       return runId
         ? native.background.has(runId)
@@ -143,7 +157,7 @@ const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
   agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
   maxDiscussionRounds: 3,
-  runningMessagePolicy: 'next_round',
+
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
 }

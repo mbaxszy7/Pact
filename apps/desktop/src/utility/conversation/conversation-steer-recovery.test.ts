@@ -20,6 +20,7 @@ import type {
   SkillBinding,
 } from '@pact/contracts'
 
+import { collaborationSourceWireReadSchema } from '@pact/contracts'
 import { PactDatabase } from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
@@ -128,6 +129,26 @@ vi.mock('./codex-agent-adapter.js', () => ({
     readonly executorId = randomUUID()
     probeNativeInputs = native.receipts
     probeNativeStatus = native.status
+    beginNativeInputsCheck(input: AgentNativeInputProbeInput, signal: AbortSignal) {
+      const result = this.probeNativeInputs(input, signal)
+      return {
+        result,
+        physicalCompletion: result.then(
+          () => undefined,
+          () => undefined,
+        ),
+      }
+    }
+    beginNativeStatusCheck(input: AgentNativeProbeInput, signal: AbortSignal) {
+      const result = this.probeNativeStatus(input, signal)
+      return {
+        result,
+        physicalCompletion: result.then(
+          () => undefined,
+          () => undefined,
+        ),
+      }
+    }
     steer = native.steer
     async discoverSkills() {
       return native.skills
@@ -166,7 +187,7 @@ const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
   agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
   maxDiscussionRounds: 3,
-  runningMessagePolicy: 'next_round',
+
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
 }
@@ -861,6 +882,71 @@ it('receipt timeout waits for physical cleanup and does not abort the independen
   }
 })
 
+it('a root check timeout exposes Rebuild while retaining the unresolved physical check', async () => {
+  const f = await fixture()
+  const physical = deferred()
+  native.receipts.mockResolvedValue(undefined)
+  native.status.mockImplementation(async (input) => {
+    await physical.promise
+    return noRootEvidence(input)
+  })
+  try {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const retry = f.flow.retry({ runId: f.saved!.runId })
+    await vi.waitFor(() => expect(native.status).toHaveBeenCalledTimes(1))
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect((await retry).ok).toBe(false)
+    const page = await f.load()
+    expect(page.header.sessionIssues).toMatchObject({
+      inputGate: 'read_only',
+      agents: [expect.objectContaining({ agentId: 'codex', action: 'rebuild' })],
+    })
+    expect((await f.flow.retry({ runId: f.saved!.runId })).ok).toBe(false)
+    expect(native.status).toHaveBeenCalledTimes(1)
+    expect(native.runCalls).toBe(0)
+  } finally {
+    physical.resolve()
+    vi.useRealTimers()
+    await f.dispose()
+  }
+})
+
+it('a failed timeout projection cannot prevent logical failure or native cancellation', async () => {
+  const f = await fixture()
+  const physical = deferred()
+  let checkSignal: AbortSignal | undefined
+  native.receipts.mockResolvedValue(undefined)
+  native.status.mockImplementation(async (input, signal) => {
+    checkSignal = signal
+    await physical.promise
+    return noRootEvidence(input)
+  })
+  const original = f.db.conversationRepository.setContinuation.bind(f.db.conversationRepository)
+  const projection = vi
+    .spyOn(f.db.conversationRepository, 'setContinuation')
+    .mockImplementation((...args) => {
+      if (args[3]?.startsWith('Native state check timed out.'))
+        throw Error('Controlled projection failure')
+      return original(...args)
+    })
+  try {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const retry = f.flow.retry({ runId: f.saved!.runId })
+    await vi.waitFor(() => expect(native.status).toHaveBeenCalledTimes(1))
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect((await retry).ok).toBe(false)
+    expect(checkSignal?.aborted).toBe(true)
+    expect((await f.flow.retry({ runId: f.saved!.runId })).ok).toBe(false)
+    expect(native.status).toHaveBeenCalledTimes(1)
+    expect(native.runCalls).toBe(0)
+  } finally {
+    physical.resolve()
+    projection.mockRestore()
+    vi.useRealTimers()
+    await f.dispose()
+  }
+})
+
 it('a cold exact receipt restores frozen Skill metadata without catalog discovery and survives reopen', async () => {
   const f = await fixture(true, true)
   native.receipts.mockImplementation(async (input) => {
@@ -1004,6 +1090,181 @@ it('a retained original observer accepts a late exact receipt after foreground c
     })
     expect(native.steer).toHaveBeenCalledTimes(1)
     expect(native.runCalls).toBe(1)
+  } finally {
+    await f.dispose()
+  }
+})
+
+it('observes exact-run progress without changing suppression, retirement or late-callback ownership', async () => {
+  const f = await fixture(false)
+  native.finishMode = 'seal_body_after_terminal'
+  try {
+    const first = await f.send()
+    const initialInput = native.inputs.get(first)!
+    initialInput.observeNativeDelta?.({ kind: 'text', identity: 'matched', bytes: 15 })
+    await vi.waitFor(() => expect(f.flow.diagnostics().suppressedProgress).toBeGreaterThan(0))
+    const live = f.flow.diagnostics().streamTraces.find((trace) => trace.runId === first)!
+    const sourceGrant = initialInput.promptEnvelope.sourceGrant
+    if (!sourceGrant) throw new Error('Actual root source grant is unavailable')
+    const grant = sourceGrant.grant
+    expect(grant).toBeTruthy()
+    expect(live.generationSha256).toMatch(/^[a-f0-9]{64}$/u)
+    expect(JSON.stringify(f.flow.diagnostics().streamTraces)).not.toContain(grant)
+    expect(live).toMatchObject({
+      runId: first,
+      nativeBound: true,
+      invalid: false,
+      loop: { text: 1, bytes: 15 },
+      normalized: { text: 1, current: 1, archived: 0 },
+      publication: { suppressed: 1, published: 0 },
+    })
+    expect(f.flow.diagnostics().interestedSessionIds).toEqual([])
+    native.finishes.get(first)!()
+    await vi.waitFor(() => expect(f.flow.diagnostics().activeExecutions).toBe(0))
+    const settled = structuredClone(
+      f.flow.diagnostics().streamTraces.find((trace) => trace.runId === first)!,
+    )
+    expect(settled.state).toBe('settled')
+    const drafts = f.db.conversationRepository.readPage({ scope: 'drafts', sessionId: f.sessionId })
+    if (drafts.scope !== 'drafts') throw new Error('Fixture drafts unavailable')
+    native.finishMode = 'seal_body_after_terminal'
+    const second = await f.send({ expectedCommentsRevision: drafts.commentsRevision })
+    initialInput.observeNativeDelta?.({ kind: 'text', identity: 'matched', bytes: 999 })
+    expect(f.flow.diagnostics().streamTraces.find((trace) => trace.runId === first)).toEqual(
+      settled,
+    )
+    expect(
+      f.flow.diagnostics().streamTraces.find((trace) => trace.runId === second)?.loop.text,
+    ).toBe(0)
+    native.inputs.get(second)!.observeNativeDelta?.({ kind: 'text', identity: 'matched', bytes: 7 })
+    native.finishes.get(second)!()
+    await vi.waitFor(() => expect(f.flow.diagnostics().activeExecutions).toBe(0))
+    expect(f.flow.diagnostics().streamTraces.map((trace) => trace.runId)).toEqual([second])
+    expect(native.runCalls).toBe(2)
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(performance.now() + 600_001)
+    try {
+      expect(f.flow.diagnostics().streamTraces).toEqual([])
+    } finally {
+      clock.mockRestore()
+    }
+  } finally {
+    await f.dispose()
+  }
+})
+
+it.each(['accepted', 'consumed'] as const)(
+  'keeps prepared Steer reading unauthorized until the exact %s receipt',
+  async (ending) => {
+    const f = await fixture(false)
+    let preparedError: string | null = null
+    native.steer.mockImplementation(async (input) => {
+      const root = native.inputs.get(input.runId)!,
+        reader = root.collaborationSourceReader!
+      const batch = input.promptEnvelope.inputBatchRef!
+      let read: import('@pact/contracts').CollaborationSourceWireRead
+      try {
+        read = collaborationSourceWireReadSchema.parse(
+          reader.navigation({ source: 'batch', batchId: batch.id }, 'legacy'),
+        )
+      } catch (error) {
+        preparedError = error instanceof Error ? error.message : 'unknown'
+        throw error
+      }
+      expect(() => reader.read(read)).toThrow(/authorization/u)
+      input.recordDispatch('possibly_sent')
+      expect(() => reader.read(read)).toThrow(/authorization/u)
+      const run = f.db.conversationRepository.findRun(input.runId)!
+      if (ending === 'accepted') input.recordDispatch('accepted')
+      else
+        root.recordInputConsumption?.(input.inputId, {
+          nativeSessionId: run.nativeSessionId!,
+          nativeTurnId: run.nativeTurnId!,
+          executorId: run.executorId!,
+        })
+      const page = reader.read(read).page
+      expect(page.source).toBe('batch')
+      const index: { bodyRead: import('@pact/contracts').CollaborationSourceWireRead } = JSON.parse(
+        page.text,
+      )
+      expect(reader.read(index.bodyRead).page.text).toBe('Keep this exact supplemental input.')
+      input.recordDispatch('accepted')
+      return { status: 'accepted' }
+    })
+    try {
+      const runId = await f.send(),
+        request = f.queue(runId, 'Keep this exact supplemental input.')
+      const result = await f.flow.steerQueuedConversationMessage(request)
+      expect({ accepted: result.ok, preparedError }).toEqual({
+        accepted: true,
+        preparedError: null,
+      })
+      expect(native.runCalls).toBe(1)
+    } finally {
+      await f.dispose()
+    }
+  },
+)
+
+it('the native original-Batch selector retains B0 through Steer B1 and retires before R1 B2', async () => {
+  const f = await fixture(false)
+  native.finishMode = 'seal_body_after_terminal'
+  native.steer.mockImplementation(async (input) => {
+    input.recordDispatch('possibly_sent')
+    const original = native.inputs.get(input.runId)!,
+      run = f.db.conversationRepository.findRun(input.runId)!
+    original.recordInputConsumption?.(input.inputId, {
+      nativeSessionId: run.nativeSessionId!,
+      nativeTurnId: run.nativeTurnId!,
+      executorId: run.executorId!,
+    })
+    input.recordDispatch('accepted')
+    return { status: 'accepted' }
+  })
+  try {
+    const r0 = await f.send(),
+      repo = f.db.conversationRepository,
+      input = native.inputs.get(r0)!,
+      reader = input.collaborationSourceReader!,
+      b0 = repo.inputBatchForRun(r0)!,
+      run = repo.findRun(r0)!,
+      root = { threadId: run.nativeSessionId!, turnId: run.nativeTurnId! },
+      request = { context: 'native-root-v1', source: 'root_batch', offset: 0 }
+    expect(reader.navigation({ source: 'batch', batchId: b0.id }, 'nativeRoot')).toEqual(request)
+    expect(JSON.parse(reader.readNativeRoot!(request, root).page.text).batch.id).toBe(b0.id)
+    const queued = f.queue(r0, 'Supplement B1')
+    expect((await f.flow.steerQueuedConversationMessage(queued)).ok).toBe(true)
+    const b1 = native.steer.mock.calls[0]![0].promptEnvelope.inputBatchRef!
+    expect(b1.id).not.toBe(b0.id)
+    expect(repo.inputBatchForRun(r0)).toEqual(b0)
+    expect(JSON.parse(reader.readNativeRoot!(request, root).page.text).batch.id).toBe(b0.id)
+    const explicit = reader.navigation({ source: 'batch', batchId: b1.id }, 'nativeRoot')
+    expect(explicit).toMatchObject({ context: 'native-root-v1', source: 'batch', batchId: b1.id })
+    expect(JSON.parse(reader.readNativeRoot!(explicit, root).page.text).batch.id).toBe(b1.id)
+    expect(() => reader.readNativeRoot!({ ...explicit, batchId: randomUUID() }, root)).toThrow(
+      /Batch|Run|retired Turn/u,
+    )
+    native.finishes.get(r0)!()
+    await vi.waitFor(() => expect(repo.findRun(r0)?.nativeEffectsState).toBe('settled'))
+    const drafts = repo.readPage({ scope: 'drafts', sessionId: f.sessionId })
+    if (drafts.scope !== 'drafts') throw Error('Missing drafts')
+    const r1 = await f.send({
+        content: 'New original B2',
+        expectedCommentsRevision: drafts.commentsRevision,
+      }),
+      next = native.inputs.get(r1)!,
+      b2 = repo.inputBatchForRun(r1)!,
+      nextRun = repo.findRun(r1)!
+    expect(() => reader.readNativeRoot!(request, root)).toThrow(/Batch|Run|retired Turn/u)
+    expect(
+      JSON.parse(
+        next.collaborationSourceReader!.readNativeRoot!(request, {
+          threadId: nextRun.nativeSessionId!,
+          turnId: nextRun.nativeTurnId!,
+        }).page.text,
+      ).batch.id,
+    ).toBe(b2.id)
+    expect(b2.id).not.toBe(b0.id)
+    expect(b2.id).not.toBe(b1.id)
   } finally {
     await f.dispose()
   }

@@ -138,7 +138,6 @@ test(
               primaryAgentId: settings.primaryAgentId,
               agents: settings.agents,
               maxDiscussionRounds: 5,
-              runningMessagePolicy: settings.runningMessagePolicy,
               maxReviewCycles: settings.maxReviewCycles,
               maxRepairAttempts: settings.maxRepairAttempts,
             },
@@ -280,7 +279,11 @@ test(
         window.getByRole('button', { name: 'Rename Project Project 999', exact: true }),
       ).toHaveCount(0)
       await expect(navigation.getByText('Project 999', { exact: true })).toHaveCount(0)
-      await window.getByRole('button', { name: 'Undo', exact: true }).click()
+      const archiveNotice = window.getByRole('region', { name: 'Archive results', exact: true })
+      await archiveNotice.getByRole('button', { name: 'View', exact: true }).click()
+      await archiveNotice
+        .getByRole('button', { name: 'Undo archive of Project 999', exact: true })
+        .click()
       await expect(
         window.getByRole('button', { name: 'Rename Project Project 999', exact: true }),
       ).toBeVisible()

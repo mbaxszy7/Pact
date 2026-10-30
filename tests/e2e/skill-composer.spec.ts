@@ -54,7 +54,6 @@ async function prepare() {
           primaryAgentId: 'codex',
           agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
           maxDiscussionRounds: 3,
-          runningMessagePolicy: 'next_round',
           maxReviewCycles: 3,
           maxRepairAttempts: 3,
         },

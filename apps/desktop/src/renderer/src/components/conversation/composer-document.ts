@@ -39,6 +39,28 @@ export function releaseComposerRoute(route: ComposerRoute | undefined): Composer
       : route
 }
 
+/** Preserve the user's original routing facts before a default Primary is resolved. */
+export function composerRouteIntent(
+  value: Pick<
+    ComposerDocument,
+    'text' | 'skills' | 'mention' | 'route' | 'returnedInputOperationId'
+  > & {
+    queueReturnOperationId?: string | undefined
+  },
+): NonNullable<ConversationSendInput['routeIntent']> {
+  if (
+    value.route ||
+    value.mention ||
+    value.returnedInputOperationId ||
+    value.queueReturnOperationId
+  )
+    return 'explicit'
+  const prefix = parseComposerCommandPrefix(value.text, value.skills)
+  return prefix.error || prefix.pact || prefix.route || prefix.skills.length || value.skills.length
+    ? 'explicit'
+    : 'implicit'
+}
+
 /** One edit transforms all canonical range facts together, never the displayed chip text. */
 export function replaceComposerDocument(
   value: ComposerDocument,

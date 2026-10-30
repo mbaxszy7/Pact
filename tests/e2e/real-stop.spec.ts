@@ -124,6 +124,21 @@ for (const agentId of ['codex', 'claude'] as const) {
             const current = (await readRealConversation(ctx)).runs.find(
               (run) => run.id === originalRun.id,
             )
+            console.info(
+              '[pact-stop-composer-boundary]',
+              JSON.stringify({
+                agentId,
+                focused: state.focused,
+                editable: state.editable,
+                expanded: state.expanded,
+                caretInside: state.caretInside,
+                anchorOffset: state.anchorOffset,
+                collapsed: state.collapsed,
+                textLength: state.text?.length ?? 0,
+                status: current?.status,
+                dispatchPhase: current?.dispatchPhase,
+              }),
+            )
             await test.info().attach('stop-draft-preparation-boundary', {
               body: ctx.fixture.redactDiagnostic(
                 JSON.stringify({
@@ -398,6 +413,7 @@ for (const agentId of ['codex', 'claude'] as const) {
       { tag: ['@real', '@real-extended'] },
       async () => {
         test.setTimeout(600_000)
+        const caseDeadline = Date.now() + test.info().timeout
         const ctx = await launchRealWorkspace(`real-${action}-command-${agentId}`)
         const marker = authMarker('FOREGROUND_STOP')
         const filename = `stop-command-${marker}.mjs`
@@ -461,12 +477,62 @@ for (const agentId of ['codex', 'claude'] as const) {
             'The actual command must still be executing when UI Stop is clicked',
           ).toBeGreaterThan(3_000)
           expect(await fileExists(finishedPath)).toBe(false)
+          // Native can start the process before emitting commandExecution. Wait
+          // for its real committed Activity, within this same live command's
+          // deadline; the original full-snapshot assertion below remains required.
+          const activityDeadline = Math.min(caseDeadline, ready.finishDueAt - 3_000)
+          const activityTimeout = activityDeadline - Date.now()
+          if (activityTimeout <= 0)
+            throw new Error('No live command time remains for authoritative Activity observation')
+          const observer = ReadonlyFixtureDatabase.open(ctx.fixture)
+          try {
+            await expect
+              .poll(
+                () => {
+                  const activity = observer.drizzle.query.agentRunActivities
+                    .findFirst({
+                      where: (fields, { and, eq, sql }) =>
+                        and(
+                          eq(fields.sessionId, ctx.sessionId),
+                          eq(fields.agentId, agentId),
+                          eq(fields.kind, 'tool'),
+                          agentId === 'claude'
+                            ? eq(fields.toolName, 'Bash')
+                            : sql`instr(${fields.title} || coalesce(${fields.detail}, ''), ${filename}) > 0`,
+                        ),
+                      columns: { id: true },
+                    })
+                    .sync()
+                  return Date.now() < activityDeadline && Boolean(activity)
+                },
+                { timeout: activityTimeout, intervals: [10, 25, 50] },
+              )
+              .toBe(true)
+          } finally {
+            observer.close()
+          }
           const running = await readRealConversation(ctx)
           const run = running.runs[0]
           if (running.runs.length !== 1 || !run?.nativeSessionId)
             throw new Error('Actual foreground Native task is unavailable')
           runId = run.id
           expect(run).toMatchObject({ agentId, status: 'running', dispatchPhase: 'accepted' })
+          console.info(
+            '[pact-stop-activity-boundary]',
+            JSON.stringify({
+              agentId,
+              activityCount: running.activities.length,
+              observations: running.activities.slice(0, 8).map((activity) => ({
+                kind: activity.kind,
+                tool: ['command', 'Bash'].includes(activity.toolName ?? '')
+                  ? activity.toolName
+                  : 'other',
+                detailChars: activity.detail?.length ?? 0,
+                titleHasFilename: activity.title.includes(filename),
+                detailHasFilename: activity.detail?.includes(filename) ?? false,
+              })),
+            }),
+          )
           expect(
             running.activities.some(
               (activity) =>
@@ -486,7 +552,6 @@ for (const agentId of ['codex', 'claude'] as const) {
               firstPidExitAt = Date.now()
             if (Date.now() >= observationDeadline) clearInterval(pidObserver)
           }, 25)
-          stopStartedAt = Date.now()
           if (action === 'archive') {
             const archive = ctx.page
               .locator(`[data-session-menu="${ctx.sessionId}"]`)
@@ -499,6 +564,10 @@ for (const agentId of ['codex', 'claude'] as const) {
             })
             await expect(confirmation).toBeVisible()
             archivedTitle = await confirmation.locator('.pact-archive-target').innerText()
+            expect(isProcessAlive(physical.pid)).toBe(true)
+            expect(await fileExists(finishedPath)).toBe(false)
+            expect(physical.finishDueAt - Date.now()).toBeGreaterThan(3_000)
+            stopStartedAt = Date.now()
             await confirmation
               .getByRole('button', { name: 'Stop and archive', exact: true })
               .click()
@@ -532,7 +601,13 @@ for (const agentId of ['codex', 'claude'] as const) {
             } finally {
               database.close()
             }
-          } else await clickStop(ctx, agentId)
+          } else {
+            expect(isProcessAlive(physical.pid)).toBe(true)
+            expect(await fileExists(finishedPath)).toBe(false)
+            expect(physical.finishDueAt - Date.now()).toBeGreaterThan(3_000)
+            stopStartedAt = Date.now()
+            await clickStop(ctx, agentId)
+          }
           stopReturnedAt = Date.now()
           // Native terminal evidence is independent of Pact's immediate Stopped
           // projection. This case also observes the exact script PID naturally

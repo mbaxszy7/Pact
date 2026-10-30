@@ -47,6 +47,7 @@ interface CollectedEditorState {
 export class DefaultSessionSettings {
   private readonly operations = new Set<CatalogOperation>()
   private readonly probes = new Set<OwnedProcessGroup>()
+  private readonly catalogReads = new Map<string, Promise<CollectedEditorState>>()
   private disposed = false
   private disposal: Promise<void> | undefined
   constructor(
@@ -142,7 +143,30 @@ export class DefaultSessionSettings {
     }
   }
 
-  private async collectEditorState(workingDirectory: string): Promise<CollectedEditorState> {
+  async loadModelCatalogs(): Promise<DefaultSessionSettingsEditorState['modelCatalogs']> {
+    return (await this.collectEditorState(process.cwd())).editorState.modelCatalogs
+  }
+
+  private collectEditorState(workingDirectory: string): Promise<CollectedEditorState> {
+    const key = this.runtimePreparation.catalogIdentity(workingDirectory)
+    const existing = this.catalogReads.get(key)
+    if (existing) return existing
+    if (this.catalogReads.size >= 4)
+      return Promise.reject(new Error('Catalog capacity is unavailable.'))
+    const task = this.collectEditorStateOnce(workingDirectory).then((result) => {
+      if (this.runtimePreparation.catalogIdentity(workingDirectory) !== key)
+        throw new Error('The native model catalog configuration changed during discovery.')
+      return result
+    })
+    this.catalogReads.set(key, task)
+    const release = (): void => {
+      if (this.catalogReads.get(key) === task) this.catalogReads.delete(key)
+    }
+    void task.then(release, release)
+    return task
+  }
+
+  private async collectEditorStateOnce(workingDirectory: string): Promise<CollectedEditorState> {
     if (this.disposed || this.operations.size >= 4) {
       const error = new Error('The settings catalog capacity is unavailable.')
       DefaultSessionSettings.recordFailure(
@@ -362,6 +386,8 @@ export class DefaultSessionSettings {
         },
       })
       const models = await DefaultSessionSettings.withTimeout(session.supportedModels(), timeoutMs)
+      if (models.length > 200 || Buffer.byteLength(JSON.stringify(models)) > 256 * 1024)
+        throw new Error('The Claude model catalog exceeds its discovery capacity.')
       return {
         agentId: 'claude',
         status: 'available',
@@ -414,6 +440,9 @@ export class DefaultSessionSettings {
         runningChild.stdin.write(`${JSON.stringify(message)}\n`)
       }
 
+      let requestId = 1
+      const collected: CodexModel[] = []
+      const cursors = new Set<string>()
       const models = await DefaultSessionSettings.withTimeout(
         new Promise<CodexModel[]>((resolve, reject) => {
           runningChild.once('error', reject)
@@ -442,12 +471,49 @@ export class DefaultSessionSettings {
                 return
               }
               send({ method: 'initialized', params: {} })
-              send({ method: 'model/list', id: 1, params: { limit: 100, includeHidden: false } })
+              send({
+                method: 'model/list',
+                id: requestId,
+                params: { limit: 25, includeHidden: false },
+              })
               return
             }
 
-            const listed = DefaultSessionSettings.parseCodexModelListResponse(message)
-            if (listed) resolve(listed)
+            const listed = DefaultSessionSettings.parseCodexModelListResponse(message, requestId)
+            if (listed) {
+              collected.push(...listed)
+              if (
+                collected.length > 200 ||
+                Buffer.byteLength(JSON.stringify(collected)) > 256 * 1024
+              ) {
+                reject(new Error('The Codex model catalog exceeds its discovery capacity.'))
+                return
+              }
+              const result: unknown =
+                typeof message === 'object' && message ? Reflect.get(message, 'result') : undefined
+              const cursor: unknown =
+                result && typeof result === 'object' ? Reflect.get(result, 'nextCursor') : undefined
+              if (cursor === null || cursor === undefined) {
+                resolve(collected)
+                return
+              }
+              if (
+                typeof cursor !== 'string' ||
+                cursor.length > 1024 ||
+                cursors.has(cursor) ||
+                cursors.size >= 8
+              ) {
+                reject(new Error('The Codex model cursor is invalid.'))
+                return
+              }
+              cursors.add(cursor)
+              requestId += 1
+              send({
+                method: 'model/list',
+                id: requestId,
+                params: { limit: 25, includeHidden: false, cursor },
+              })
+            }
           })
           send({
             method: 'initialize',
@@ -537,8 +603,15 @@ export class DefaultSessionSettings {
     return option
   }
 
-  private static parseCodexModelListResponse(message: unknown): CodexModel[] | undefined {
-    if (typeof message !== 'object' || message === null || Reflect.get(message, 'id') !== 1) {
+  private static parseCodexModelListResponse(
+    message: unknown,
+    requestId = 1,
+  ): CodexModel[] | undefined {
+    if (
+      typeof message !== 'object' ||
+      message === null ||
+      Reflect.get(message, 'id') !== requestId
+    ) {
       return undefined
     }
     const result = Reflect.get(message, 'result')

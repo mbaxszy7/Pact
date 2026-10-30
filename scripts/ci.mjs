@@ -16,6 +16,7 @@ import { resolve, join, isAbsolute } from 'node:path'
 
 import { loadProviderConfiguration } from '../tests/e2e/provider-environment.ts'
 import { writeNativeReport } from './ci-native-report.mjs'
+import { nativeProfile, nativeProfileSupports } from './native-profiles.mjs'
 import { requireRealScope } from './real-e2e-policy.mjs'
 import { run, runNaturally as runCiE2EJob } from './run-e2e.mjs'
 import { isScriptEntry } from './script-entry.mjs'
@@ -40,6 +41,10 @@ const systemKeys = [
   'TMPDIR',
   'LANG',
   'LC_ALL',
+  'INCLUDE',
+  'LIB',
+  'LIBPATH',
+  'VSCMD_ARG_TGT_ARCH',
   'TERM',
   'CI',
   'GITHUB_ACTIONS',
@@ -53,6 +58,10 @@ const systemKeys = [
   'PACT_NATIVE_CLAUDE_EXECUTABLE',
   'PACT_NATIVE_CODEX_EXECUTABLE',
   'PACT_NATIVE_CODEX_PACKAGE_ROOT',
+  'PACT_NATIVE_DECISION_CODEX_EXECUTABLE',
+  'PACT_NATIVE_DECISION_CODEX_VERSION',
+  'PACT_NATIVE_DECISION_CLAUDE_EXECUTABLE',
+  'PACT_NATIVE_DECISION_CLAUDE_VERSION',
   'PACT_GITLEAKS_EXECUTABLE',
 ]
 
@@ -399,7 +408,37 @@ export async function main(args = process.argv.slice(2), source = process.env) {
       await appendFile(source.GITHUB_OUTPUT, `${lane}_execution_completed=true\n`)
     if (code !== 0) throw new Error('Required Electron E2E lane failed')
   } else if (lane === 'native') {
-    if (forwarded.length) throw new Error('Reported native execution owns its reporter arguments')
+    if (forwarded.length > 1)
+      throw new Error('Reported native execution owns its reporter arguments')
+    const profile = nativeProfile(forwarded[0])
+    if (profile.name === 'decision-codex') {
+      const executable = env.PACT_NATIVE_DECISION_CODEX_EXECUTABLE
+      if (
+        process.platform !== 'darwin' ||
+        process.arch !== 'arm64' ||
+        typeof executable !== 'string' ||
+        !isAbsolute(executable) ||
+        /[\r\n\0]/u.test(executable) ||
+        env.PACT_NATIVE_DECISION_CODEX_VERSION !== profile.codexVersion
+      )
+        throw new Error('The fixed decision native profile requires its pinned macOS CLI')
+      env.PACT_NATIVE_CODEX_EXECUTABLE = executable
+    }
+    if (profile.name === 'decision-claude') {
+      const executable = env.PACT_NATIVE_DECISION_CLAUDE_EXECUTABLE
+      if (
+        !nativeProfileSupports(profile) ||
+        typeof executable !== 'string' ||
+        !isAbsolute(executable) ||
+        Buffer.byteLength(executable) > 4096 ||
+        /[\r\n\0]/u.test(executable) ||
+        env.PACT_NATIVE_DECISION_CLAUDE_VERSION !== profile.claudeVersion
+      )
+        throw new Error('The fixed Claude decision native profile requires its pinned native CLI')
+      env.PACT_NATIVE_CLAUDE_EXECUTABLE = executable
+    }
+    if (profile.name === 'windows-owner' && !nativeProfileSupports(profile))
+      throw new Error('The Windows owner profile requires a native Windows x64 or arm64 runner')
     const temporaryReport = !source.PACT_CI_NATIVE_REPORT_DIR
     const directory =
       source.PACT_CI_NATIVE_REPORT_DIR ?? (await mkdtemp(join(tmpdir(), 'pact-native-report-')))
@@ -421,7 +460,7 @@ export async function main(args = process.argv.slice(2), source = process.env) {
       reportPreserved = false
     try {
       code = await runCiE2EJob(
-        ['test:native', '--reporter=verbose', '--reporter=json', '--outputFile', rawPath],
+        [profile.command, '--reporter=verbose', '--reporter=json', '--outputFile', rawPath],
         20 * 60_000,
         {
           cwd: workspace,
@@ -445,6 +484,12 @@ export async function main(args = process.argv.slice(2), source = process.env) {
         identityPath: source.PACT_CI_NATIVE_IDENTITY_FILE,
         artifactName: source.PACT_CI_NATIVE_ARTIFACT,
         summary: source.GITHUB_STEP_SUMMARY,
+        profile: profile.name,
+        verifiedCodexVersion:
+          profile.name === 'decision-codex' ? env.PACT_NATIVE_DECISION_CODEX_VERSION : null,
+        verifiedClaudeVersion:
+          profile.name === 'decision-claude' ? env.PACT_NATIVE_DECISION_CLAUDE_VERSION : null,
+        requireIdentity: profile.name !== 'legacy' && source.GITHUB_ACTIONS === 'true',
       })
       reportPreserved = true
       console.info('Safe native E2E report:', join(written.directory, 'native-summary.md'))

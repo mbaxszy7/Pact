@@ -275,7 +275,7 @@ function DefaultSettingsSummary({
         <SummaryItem
           className="px-panel py-group"
           label="Limits"
-          value={`${settings.maxDiscussionRounds} discussion · ${settings.maxReviewCycles} review · ${settings.maxRepairAttempts} repair`}
+          value={`${settings.maxDiscussionRounds} plan reviews · ${settings.maxReviewCycles} code reviews · ${settings.maxRepairAttempts} repairs`}
         />
       </div>
     </section>

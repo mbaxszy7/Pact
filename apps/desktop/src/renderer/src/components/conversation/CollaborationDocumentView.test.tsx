@@ -27,6 +27,7 @@ afterEach(() => {
   window.getSelection()?.removeAllRanges()
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
+  Reflect.deleteProperty(document, 'caretRangeFromPoint')
 })
 
 it.each(['markdown-visible-v2', 'plain-visible-v1'] as const)(
@@ -125,6 +126,192 @@ it('ignores a completed read for an evicted document source', async () => {
   expect(screen.getByText('New document')).toBeDefined()
 })
 
+it.each([
+  { edge: 'top', y: 131, start: 0, end: 33 },
+  { edge: 'bottom', y: 499, start: 45, end: 78 },
+])('keeps the exact caret inside the $edge auto-scroll band', async ({ y, start, end }) => {
+  const harness = continuousFixture('0123456789'.repeat(100))
+  await harness.ready()
+  harness.down(start, y)
+  harness.move(end, y)
+  await harness.frame()
+  harness.up()
+  fireEvent.click(await screen.findByRole('button', { name: 'Comment on selected text' }))
+  expect(harness.comment).toHaveBeenCalledWith(
+    expect.objectContaining({
+      startOffset: start,
+      endOffset: end,
+      quote: harness.text.slice(start, end),
+    }),
+  )
+  harness.dispose()
+})
+
+it.each([
+  { edge: 'top boundary', y: 129, start: 78, caret: 45, expectedStart: 0, expectedEnd: 78 },
+  { edge: 'below viewport', y: 510, start: 45, caret: 78, expectedStart: 45, expectedEnd: 1000 },
+])(
+  'retains resident-edge snapping at the $edge',
+  async ({ y, start, caret, expectedStart, expectedEnd }) => {
+    const harness = continuousFixture('0123456789'.repeat(100))
+    await harness.ready()
+    harness.down(start, 300)
+    harness.move(caret, y)
+    await harness.frame()
+    harness.up()
+    fireEvent.click(await screen.findByRole('button', { name: 'Comment on selected text' }))
+    expect(harness.comment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        startOffset: expectedStart,
+        endOffset: expectedEnd,
+        quote: harness.text.slice(expectedStart, expectedEnd),
+      }),
+    )
+    harness.dispose()
+  },
+)
+
+it.each(['next', 'previous'] as const)(
+  'keeps an exact four-page Comment after real %s page eviction',
+  async (direction) => {
+    const forward = direction === 'next'
+    const harness = continuousFixture('0123456789'.repeat(1900), forward ? 0 : 8192)
+    await harness.ready()
+    const initial = projectionSpans(harness.root)
+    const evicted = forward ? initial[0]! : initial.at(-1)!
+    const start = forward ? 100 : 16484
+    const end = forward ? 16484 : 100
+    harness.down(start, 300)
+    // Outside the viewport must still cover the resident edge before its page is evicted.
+    harness.move(forward ? 12000 : 8300, forward ? 510 : 120)
+    await harness.frame()
+    await waitFor(() =>
+      expect(projectionSpans(harness.root)[0]?.dataset.pactProjectionStart).toBe('4096'),
+    )
+    expect(evicted.isConnected).toBe(false)
+    expect(projectionSpans(harness.root)).toHaveLength(3)
+    harness.move(forward ? 16000 : 4200, forward ? 510 : 120)
+    await harness.frame()
+    await waitFor(() =>
+      expect(projectionSpans(harness.root)[0]?.dataset.pactProjectionStart).toBe(
+        forward ? '8192' : '0',
+      ),
+    )
+    expect(projectionSpans(harness.root)).toHaveLength(3)
+    harness.move(end, 300)
+    await harness.frame()
+    harness.up()
+    fireEvent.click(await screen.findByRole('button', { name: 'Comment on selected text' }))
+    expect(harness.comment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        startOffset: 100,
+        endOffset: 16484,
+        quote: harness.text.slice(100, 16484),
+      }),
+    )
+    expect(harness.peakReads()).toBe(1)
+    expect(
+      harness.fixture.read.mock.calls.filter(
+        ([request]) => request.scope === 'collaboration-quote',
+      ),
+    ).toHaveLength(4)
+    harness.dispose()
+  },
+)
+
+const pointer = (target: Element | Document, type: string, y: number) => {
+  fireEvent(target, new MouseEvent(type, { bubbles: true, button: 0, clientX: 100, clientY: y }))
+}
+
+function continuousFixture(text: string, aroundOffset = 0) {
+  const fixture = documentFixture(text)
+  const root = document.createElement('div')
+  document.body.append(root)
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(
+    new DOMRect(0, 129, 900, 372),
+  )
+  Object.defineProperty(root, 'clientHeight', { value: 372 })
+  Object.defineProperty(root, 'scrollHeight', { value: 372 })
+  // Model a viewport at either scroll boundary; actual projection/window movement remains real.
+  Object.defineProperty(root, 'scrollTop', { get: () => 0, set: () => undefined })
+  const frames = new Map<number, FrameRequestCallback>()
+  let nextFrame = 0
+  vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+    frames.set(++nextFrame, callback)
+    return nextFrame
+  })
+  vi.stubGlobal('cancelAnimationFrame', (id: number) => frames.delete(id))
+  let offset = 0
+  Object.defineProperty(document, 'caretRangeFromPoint', {
+    configurable: true,
+    value: () => {
+      const span = projectionSpans(root).find(
+        (entry) =>
+          Number(entry.dataset.pactProjectionStart) <= offset &&
+          Number(entry.dataset.pactProjectionEnd) >= offset,
+      )
+      if (!span?.firstChild) return null
+      const range = document.createRange()
+      range.setStart(span.firstChild, offset - Number(span.dataset.pactProjectionStart))
+      range.collapse(true)
+      return range
+    },
+  })
+  let active = 0,
+    peak = 0
+  vi.stubGlobal('pact', {
+    getConversation: async (request: Request) => {
+      active++
+      peak = Math.max(peak, active)
+      try {
+        return await fixture.read(request)
+      } finally {
+        active--
+      }
+    },
+  })
+  const comment = vi.fn<(selection: unknown) => void>()
+  const view = render(
+    <CollaborationDocumentView
+      {...fixture.props}
+      aroundOffset={aroundOffset}
+      continuous={{ viewport: { current: root } }}
+      onCreateComment={comment}
+    />,
+    { container: root },
+  )
+  return {
+    text,
+    fixture,
+    root,
+    comment,
+    peakReads: () => peak,
+    ready: () =>
+      waitFor(() => expect(projectionSpans(root)).toHaveLength(Math.min(3, fixture.pages.length))),
+    down: (value: number, y: number) => {
+      offset = value
+      pointer(screen.getByRole('textbox', { name: 'Plan text' }), 'pointerdown', y)
+    },
+    move: (value: number, y: number) => {
+      offset = value
+      pointer(document, 'pointermove', y)
+    },
+    up: () => pointer(document, 'pointerup', 300),
+    frame: async () => {
+      await act(async () => {
+        const pending = [...frames.values()]
+        frames.clear()
+        pending.forEach((callback) => callback(0))
+      })
+    },
+    dispose: () => {
+      view.unmount()
+      root.remove()
+      Reflect.deleteProperty(document, 'caretRangeFromPoint')
+    },
+  }
+}
+
 function projectionSpans(container: HTMLElement) {
   return [...container.querySelectorAll<HTMLElement>('[data-pact-projection-start]')]
 }
@@ -189,6 +376,17 @@ function documentFixture(text: string, basis: Page['basis'] = 'markdown-visible-
         : null,
   }))
   const read = vi.fn<DesktopBridge['getConversation']>(async (request: Request) => {
+    if (request.scope === 'collaboration-quote') {
+      const end = Math.min(request.endOffset, request.offset + 4096)
+      return {
+        ok: true,
+        value: {
+          ...request,
+          text: text.slice(request.offset, end),
+          nextOffset: end < request.endOffset ? end : null,
+        },
+      }
+    }
     if (request.scope !== 'collaboration-markdown') throw new Error(`Unexpected ${request.scope}`)
     const index =
       request.aroundOffset !== undefined

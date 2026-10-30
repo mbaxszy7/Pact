@@ -3,7 +3,14 @@ import { randomUUID } from 'node:crypto'
 
 import type { RpcResult } from '@pact/contracts'
 
-import { collaborationActionInputSchema } from '@pact/contracts'
+import {
+  collaborationActionInputSchema,
+  relayDecisionAnswerSchema,
+  preparedInputContinueSchema,
+  relayDecisionReceiptReadSchema,
+  relayDecisionReceiptSchema,
+  rpcResultSchema,
+} from '@pact/contracts'
 import {
   imageWriteInputSchema,
   imageReadInputSchema,
@@ -40,6 +47,24 @@ export function registerConversationIpcHandlers(
   trust: RendererTrust,
   utilityClient: UtilityProcessClient,
 ): () => void {
+  ipcMain.handle(IPC_CHANNELS.preparedInputContinue, async (event, raw: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    return rpcResultSchema(conversationPatchSchema).parse(
+      await utilityClient.continuePreparedConversationInput(preparedInputContinueSchema.parse(raw)),
+    )
+  })
+  ipcMain.handle(IPC_CHANNELS.relayDecisionAnswer, async (event, raw: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    return rpcResultSchema(relayDecisionReceiptSchema).parse(
+      await utilityClient.answerRelayDecision(relayDecisionAnswerSchema.parse(raw)),
+    )
+  })
+  ipcMain.handle(IPC_CHANNELS.relayDecisionReceiptRead, async (event, raw: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    return rpcResultSchema(relayDecisionReceiptSchema).parse(
+      await utilityClient.getRelayDecisionReceipt(relayDecisionReceiptReadSchema.parse(raw)),
+    )
+  })
   // Each trusted renderer document owns only its unsubmitted input parts.
   // A new UUID on navigation/restart prevents recycled WebContents IDs from taking ownership.
   const inputOwners = new Map<WebContents, { key: string; release: () => void }>()
@@ -497,6 +522,9 @@ export function registerConversationIpcHandlers(
     ipcMain.removeHandler(IPC_CHANNELS.resumeConversationQueue)
     ipcMain.removeHandler(IPC_CHANNELS.setConversationQueueEnabled)
     ipcMain.removeHandler(IPC_CHANNELS.conversationStop)
+    ipcMain.removeHandler(IPC_CHANNELS.relayDecisionAnswer)
+    ipcMain.removeHandler(IPC_CHANNELS.preparedInputContinue)
+    ipcMain.removeHandler(IPC_CHANNELS.relayDecisionReceiptRead)
     ipcMain.removeHandler(IPC_CHANNELS.peerProposalAccept)
     ipcMain.removeHandler(IPC_CHANNELS.peerProposalDismiss)
     ipcMain.removeHandler(IPC_CHANNELS.conversationRetry)

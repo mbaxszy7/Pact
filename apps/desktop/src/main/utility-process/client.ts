@@ -1,4 +1,4 @@
-import { utilityProcess, type UtilityProcess } from 'electron'
+import { app, utilityProcess, type UtilityProcess } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import { dirname, isAbsolute, join } from 'node:path'
@@ -64,6 +64,13 @@ import type {
   WorkspaceChangesPage,
   WorkspaceChangesReadInput,
   WorkspaceChangesUndoInput,
+  SchedulingSettings,
+  SchedulingSettingsSave,
+  SchedulingState,
+  SchedulingStateInput,
+  SchedulingModels,
+  SchedulingActivityRead,
+  SchedulingActivityPage,
 } from '@pact/contracts'
 
 import {
@@ -110,6 +117,10 @@ import { DirectoryFileOperations } from './directory-file-operations'
 const REQUEST_TIMEOUT_MS = 2_000
 const STARTUP_TIMEOUT_MS = 10_000
 const RUNTIME_PREPARATION_TIMEOUT_MS = 12_000
+// Send composes optional 15s advice with existing 10s preparation and 2s transport margin.
+const CONVERSATION_SEND_TIMEOUT_MS = 15_000 + RUNTIME_PREPARATION_TIMEOUT_MS
+// A sealed input may first use the existing bounded 10s complete body read.
+const CONVERSATION_SEND_BODY_READ_MS = 10_000
 const DEFAULT_SESSION_SETTINGS_TIMEOUT_MS = 25_000
 const WORKSPACE_OPERATION_TIMEOUT_MS = 5_000
 const WORKSPACE_FILE_READ_TIMEOUT_MS = 15_000
@@ -144,6 +155,13 @@ export type NativeQuitPreparationAttempt =
   | { kind: 'attempted'; result: RpcResult<NativeQuitPreparation> }
 
 export interface UtilityProcessClient {
+  getSchedulingState(input: SchedulingStateInput): Promise<RpcResult<SchedulingState>>
+  refreshSchedulingState(input: SchedulingStateInput): Promise<RpcResult<SchedulingState>>
+  getSchedulingSettings(): Promise<RpcResult<SchedulingSettings>>
+  saveSchedulingSettings(input: SchedulingSettingsSave): Promise<RpcResult<SchedulingSettings>>
+  refreshSchedulingModels(): Promise<RpcResult<SchedulingModels>>
+  readSchedulingActivity(input: SchedulingActivityRead): Promise<RpcResult<SchedulingActivityPage>>
+  subscribeSchedulingChanges(listener: () => void): () => void
   getNativePresence(): Promise<RpcResult<NativePresenceSnapshot>>
   readNativeAttention(input: NativeAttentionReadInput): Promise<RpcResult<NativeAttentionPage>>
   resolveNativeSession(input: NativeSessionResolveInput): Promise<RpcResult<SessionCatalogChange>>
@@ -225,6 +243,15 @@ export interface UtilityProcessClient {
   actOnCollaboration(
     input: import('@pact/contracts').CollaborationActionInput,
   ): Promise<RpcResult<ConversationPatch>>
+  answerRelayDecision(
+    input: import('@pact/contracts').RelayDecisionAnswer,
+  ): Promise<RpcResult<import('@pact/contracts').RelayDecisionReceipt>>
+  continuePreparedConversationInput(
+    input: import('@pact/contracts').PreparedInputContinue,
+  ): Promise<RpcResult<ConversationPatch>>
+  getRelayDecisionReceipt(
+    input: import('@pact/contracts').RelayDecisionReceiptRead,
+  ): Promise<RpcResult<import('@pact/contracts').RelayDecisionReceipt>>
   getConversation(input: ConversationGetInput): Promise<RpcResult<ConversationPage>>
   writeConversationImage(
     input: import('@pact/contracts').ImageWriteInput,
@@ -355,6 +382,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     (patch: ConversationPatch, progress: boolean) => void
   >()
   private readonly nativePresenceListeners = new Set<(version: NativePresenceVersion) => void>()
+  private readonly schedulingListeners = new Set<() => void>()
   private readonly nativeQuitRecentListeners = new Set<
     (version: NativePresenceVersion, sessions: NativeSessionRow[]) => void
   >()
@@ -508,6 +536,13 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         options.simulateAppearanceWriteFailure ? '1' : '0',
         options.workspaceStorageRoot ?? '',
         options.diagnostics ? JSON.stringify(options.diagnostics.identity) : '',
+        process.platform === 'win32'
+          ? join(
+              app.isPackaged ? process.resourcesPath : dirname(__dirname),
+              'native',
+              `owned-process-group-win32-${process.arch}.exe`,
+            )
+          : '',
       ],
       { serviceName: 'Pact Utility Process' },
     )
@@ -753,6 +788,100 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         DEFAULT_SESSION_SETTINGS_TIMEOUT_MS,
       ),
     )
+  }
+
+  subscribeSchedulingChanges(listener: () => void): () => void {
+    if (this.schedulingListeners.size >= 1)
+      throw new Error('Scheduling already has its Main subscriber.')
+    this.schedulingListeners.add(listener)
+    return () => {
+      this.schedulingListeners.delete(listener)
+    }
+  }
+
+  async getSchedulingState(input: SchedulingStateInput): Promise<RpcResult<SchedulingState>> {
+    const result = await this.request(
+      { type: 'scheduling.state.get.request', input },
+      'scheduling.state.response',
+      5_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'scheduling.state.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected scheduling state response.' } }
+  }
+
+  async refreshSchedulingState(input: SchedulingStateInput): Promise<RpcResult<SchedulingState>> {
+    const result = await this.request(
+      { type: 'scheduling.state.refresh.request', input },
+      'scheduling.state.response',
+      20_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'scheduling.state.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected scheduling state response.' } }
+  }
+
+  async getSchedulingSettings(): Promise<RpcResult<SchedulingSettings>> {
+    const result = await this.request(
+      { type: 'scheduling.settings.get.request' },
+      'scheduling.settings.response',
+      5_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'scheduling.settings.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error: { code: 'INTERNAL', message: 'Unexpected scheduling settings response.' },
+        }
+  }
+
+  async saveSchedulingSettings(
+    input: SchedulingSettingsSave,
+  ): Promise<RpcResult<SchedulingSettings>> {
+    const result = await this.request(
+      { type: 'scheduling.settings.save.request', input },
+      'scheduling.settings.response',
+      input.selection ? DEFAULT_SESSION_SETTINGS_TIMEOUT_MS : 5_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'scheduling.settings.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error: { code: 'INTERNAL', message: 'Unexpected scheduling settings response.' },
+        }
+  }
+
+  async refreshSchedulingModels(): Promise<RpcResult<SchedulingModels>> {
+    const result = await this.request(
+      { type: 'scheduling.models.refresh.request' },
+      'scheduling.models.response',
+      DEFAULT_SESSION_SETTINGS_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'scheduling.models.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected scheduling model response.' } }
+  }
+
+  async readSchedulingActivity(
+    input: SchedulingActivityRead,
+  ): Promise<RpcResult<SchedulingActivityPage>> {
+    const result = await this.request(
+      { type: 'scheduling.activity.read.request', input },
+      'scheduling.activity.response',
+      5_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'scheduling.activity.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error: { code: 'INTERNAL', message: 'Unexpected scheduling activity response.' },
+        }
   }
 
   async saveDefaultSessionSettings(
@@ -1074,6 +1203,64 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         }
   }
 
+  async answerRelayDecision(
+    input: import('@pact/contracts').RelayDecisionAnswer,
+  ): Promise<RpcResult<import('@pact/contracts').RelayDecisionReceipt>> {
+    const result = await this.request(
+      { type: 'relay.decision.answer.request', input },
+      'relay.decision.receipt.response',
+      CONVERSATION_SEND_TIMEOUT_MS,
+    )
+    return result.kind === 'response' && result.response.type === 'relay.decision.receipt.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error:
+            result.kind === 'response'
+              ? { code: 'INTERNAL', message: 'Unexpected Relay receipt response.' }
+              : result.error,
+        }
+  }
+
+  async continuePreparedConversationInput(
+    input: import('@pact/contracts').PreparedInputContinue,
+  ): Promise<RpcResult<ConversationPatch>> {
+    const result = await this.request(
+      { type: 'conversation.prepared-input.continue.request', input },
+      'conversation.prepared-input.continue.response',
+      CONVERSATION_SEND_TIMEOUT_MS,
+    )
+    return result.kind === 'response' &&
+      result.response.type === 'conversation.prepared-input.continue.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error:
+            result.kind === 'response'
+              ? { code: 'INTERNAL', message: 'Unexpected saved input response.' }
+              : result.error,
+        }
+  }
+
+  async getRelayDecisionReceipt(
+    input: import('@pact/contracts').RelayDecisionReceiptRead,
+  ): Promise<RpcResult<import('@pact/contracts').RelayDecisionReceipt>> {
+    const result = await this.request(
+      { type: 'relay.decision.receipt.request', input },
+      'relay.decision.receipt.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    return result.kind === 'response' && result.response.type === 'relay.decision.receipt.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error:
+            result.kind === 'response'
+              ? { code: 'INTERNAL', message: 'Unexpected Relay receipt response.' }
+              : result.error,
+        }
+  }
+
   async actOnCollaboration(
     input: import('@pact/contracts').CollaborationActionInput,
   ): Promise<RpcResult<ConversationPatch>> {
@@ -1081,7 +1268,17 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       await this.request(
         { type: 'collaboration.action.request', input },
         'conversation.patch.response',
-        WORKSPACE_OPERATION_TIMEOUT_MS,
+        [
+          'continue',
+          'execute',
+          'respond',
+          'repair',
+          'resume',
+          'retry',
+          'confirm_supplement',
+        ].includes(input.action)
+          ? CONVERSATION_SEND_TIMEOUT_MS
+          : WORKSPACE_OPERATION_TIMEOUT_MS,
       ),
     )
   }
@@ -1174,7 +1371,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       await this.request(
         { type: 'conversation.send.request', input, ...(ownerKey ? { ownerKey } : {}) },
         'conversation.patch.response',
-        RUNTIME_PREPARATION_TIMEOUT_MS,
+        CONVERSATION_SEND_TIMEOUT_MS + (input.inputId ? CONVERSATION_SEND_BODY_READ_MS : 0),
       ),
     )
   }
@@ -1857,6 +2054,9 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       }
       if (event.data.type === 'native-presence.changed.event') {
         for (const listener of this.nativePresenceListeners) listener(event.data.version)
+      }
+      if (event.data.type === 'scheduling.changed.event') {
+        for (const listener of this.schedulingListeners) listener()
       }
       if (event.data.type === 'conversation.patch.event') {
         for (const listener of this.conversationListeners)

@@ -1,3 +1,5 @@
+import { conversationStreamTraceSchema } from './conversation-stream-diagnostics.js'
+export * from './conversation-stream-diagnostics.js'
 import {
   updateStoredStateSchema,
   updatePreferencesInputSchema,
@@ -6,6 +8,9 @@ import {
   type UpdateState,
   type UpdatePreferencesInput,
 } from './app-updates.js'
+import { agentSpeedSchema, sessionPermissionModeSchema } from './execution-settings.js'
+export * from './execution-settings.js'
+export * from './execution-envelope.js'
 export * from './app-updates.js'
 import {
   collaborationViewSchema,
@@ -13,10 +18,47 @@ import {
   collaborationMarkdownNodeSchema,
   collaborationMarkdownTreeWithinBudget,
   collaborationActionInputSchema,
-  collaborationResultSchema,
+  collaborationStageSchema,
+  collaborationReviewVerdictSchema,
+  collaborationRetainedPlanSchema,
+  collaborationInputOutcomeSchema,
+  collaborationReviewObservationSchema,
+  collaborationInputObservationSchema,
 } from './collaboration.js'
 export * from './collaboration.js'
-export * from './collaboration-todos.js'
+export * from './scheduling-settings.js'
+export * from './relay-decisions.js'
+export * from './prepared-input.js'
+import {
+  preparedInputContinueSchema,
+  preparedInputContinuationSchema,
+  userInformationDeclarationSchema,
+  type PreparedInputContinue,
+} from './prepared-input.js'
+import {
+  relaySchedulingDecisionSchema,
+  relayDecisionAnswerSchema,
+  relayDecisionReceiptReadSchema,
+  relayDecisionReceiptSchema,
+} from './relay-decisions.js'
+export * from './decision-runtime.js'
+export * from './plan-revision-guidance.js'
+import {
+  schedulingSettingsSchema,
+  schedulingSettingsSaveSchema,
+  schedulingStateSchema,
+  schedulingStateInputSchema,
+  schedulingModelsSchema,
+  schedulingActivityReadSchema,
+  schedulingActivityPageSchema,
+  type SchedulingSettings,
+  type SchedulingSettingsSave,
+  type SchedulingState,
+  type SchedulingStateInput,
+  type SchedulingModels,
+  type SchedulingActivityRead,
+  type SchedulingActivityPage,
+} from './scheduling-settings.js'
 export * from './workspace-archive.js'
 export * from './native-presence.js'
 import {
@@ -120,8 +162,8 @@ export {
   MAX_COMMENT_QUOTE_LENGTH,
   MESSAGE_ANCHOR_TEXT_BASIS,
   messageCommentAnchorSchema,
-  todoCommentAnchorSchema,
-  type TodoCommentAnchor,
+  storedCommentAnchor,
+  unavailableCommentAnchorSchema,
   type AnchoredComment,
   type CommentAnchor,
   type CommentDraftRemoveInput,
@@ -184,6 +226,13 @@ export const IPC_CHANNELS = {
   runtimePreparationGet: 'pact:runtime-preparation:get',
   runtimeExecutableChoose: 'pact:runtime-preparation:choose-executable',
   defaultSessionSettingsGet: 'pact:default-session-settings:get',
+  schedulingSettingsGet: 'pact:scheduling:settings:get',
+  schedulingSettingsSave: 'pact:scheduling:settings:save',
+  schedulingStateGet: 'pact:scheduling:state:get',
+  schedulingStateRefresh: 'pact:scheduling:state:refresh',
+  schedulingModelsRefresh: 'pact:scheduling:models:refresh',
+  schedulingActivityRead: 'pact:scheduling:activity:read',
+  schedulingChanged: 'pact:scheduling:changed',
   defaultSessionSettingsSave: 'pact:default-session-settings:save',
   projectCatalogGet: 'pact:project-catalog:get',
   projectCatalogChooseAndAdd: 'pact:project-catalog:choose-and-add',
@@ -204,6 +253,9 @@ export const IPC_CHANNELS = {
   sessionPermissionSave: 'pact:session-permission:save',
   sessionSpeedSave: 'pact:session-speed:save',
   collaborationAction: 'pact:collaboration:action',
+  preparedInputContinue: 'pact:conversation:prepared-input:continue',
+  relayDecisionAnswer: 'pact:relay:decision:answer',
+  relayDecisionReceiptRead: 'pact:relay:decision:receipt',
   conversationGet: 'pact:conversation:get',
   skillCatalogRead: 'pact:skills:read',
   skillCatalogCancel: 'pact:skills:cancel',
@@ -578,6 +630,30 @@ export const nativeMemoryDiagnosticsSchema = z
   })
 export type NativeMemoryDiagnostics = z.infer<typeof nativeMemoryDiagnosticsSchema>
 
+export const nativeMemoryCapacitiesSchema = z
+  .strictObject({
+    businessLimitBytes: z.literal(512 * 1024 * 1024),
+    decisionLimitBytes: z.literal(16 * 1024 * 1024),
+    combinedLimitBytes: z.literal(528 * 1024 * 1024),
+    chargedBytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(528 * 1024 * 1024),
+    business: nativeMemoryDiagnosticsSchema,
+    decision: nativeMemoryDiagnosticsSchema,
+  })
+  .refine(
+    (value) =>
+      value.business.chargedBytes !== null &&
+      value.decision.chargedBytes !== null &&
+      value.decision.chargedBytes <= value.decisionLimitBytes &&
+      (value.decision.highWaterBytes === null ||
+        value.decision.highWaterBytes <= value.decisionLimitBytes) &&
+      value.chargedBytes === value.business.chargedBytes + value.decision.chargedBytes,
+  )
+export type NativeMemoryCapacities = z.infer<typeof nativeMemoryCapacitiesSchema>
+
 export const runtimeHealthSchema = z.object({
   ipcTraffic: ipcTrafficSchema.optional(),
   performance: z
@@ -590,6 +666,7 @@ export const runtimeHealthSchema = z.object({
       resourceHighWater: z.number().int().nonnegative(),
       resourceCapacityExceeded: z.boolean(),
       nativeMemory: nativeMemoryDiagnosticsSchema.optional(),
+      nativeMemoryCapacities: nativeMemoryCapacitiesSchema.optional(),
       sqlite: z.strictObject({
         operations: z.number().int().nonnegative(),
         transactions: z.number().int().nonnegative(),
@@ -642,6 +719,8 @@ export const runtimeHealthSchema = z.object({
   conversation: z
     .strictObject({
       interestedSessions: z.number().int().nonnegative().max(CONVERSATION_INTEREST_ITEMS),
+      interestedSessionIds: z.array(z.string().uuid()).max(CONVERSATION_INTEREST_ITEMS).optional(),
+      streamTraces: z.array(conversationStreamTraceSchema).max(6).optional(),
       suppressedProgress: z.number().int().nonnegative(),
       publishedProgress: z.number().int().nonnegative(),
       activeExecutions: z.number().int().nonnegative(),
@@ -653,6 +732,19 @@ export const runtimeHealthSchema = z.object({
       adapterSlots: z.number().int().nonnegative().optional(),
       completeReads: z.number().int().nonnegative(),
     })
+    .refine(
+      (value) =>
+        !value.interestedSessionIds ||
+        (new Set(value.interestedSessionIds).size === value.interestedSessionIds.length &&
+          value.interestedSessionIds.length === value.interestedSessions),
+      'Interest diagnostics must describe the actual unique membership.',
+    )
+    .refine(
+      (value) =>
+        !value.streamTraces ||
+        new Set(value.streamTraces.map((trace) => trace.runId)).size === value.streamTraces.length,
+      'Stream diagnostics must have unique Run identities.',
+    )
     .optional(),
   status: z.literal('ready'),
   database: z.literal('ready'),
@@ -665,9 +757,15 @@ export type RuntimeHealth = z.infer<typeof runtimeHealthSchema>
 export const runtimeAgentIdSchema = z.enum(['claude', 'codex'])
 export type RuntimeAgentId = z.infer<typeof runtimeAgentIdSchema>
 
+export const RUNTIME_MINIMUM_VERSIONS = {
+  claude: '2.1.272',
+  codex: '0.159.2',
+} as const satisfies Record<RuntimeAgentId, string>
+
 export const runtimeReadinessStateSchema = z.enum([
   'ready',
   'missing',
+  'unsupported_version',
   'authentication_required',
   'startup_failed',
   'cannot_verify',
@@ -696,9 +794,6 @@ export const runtimeExecutablePathUpdateSchema = z.strictObject({
 })
 export type RuntimeExecutablePathUpdate = z.infer<typeof runtimeExecutablePathUpdateSchema>
 
-export const agentSpeedSchema = z.enum(['native', 'standard', 'fast'])
-export type AgentSpeed = z.infer<typeof agentSpeedSchema>
-
 export const agentModelSelectionSchema = z
   .strictObject({
     model: z.string().min(1).nullable(),
@@ -719,14 +814,11 @@ export const defaultSessionSettingsSchema = z.strictObject({
     codex: agentModelSelectionSchema,
   }),
   maxDiscussionRounds: z.number().int().min(1).max(20),
-  runningMessagePolicy: z.enum(['immediate_safe_point', 'next_round']),
   maxReviewCycles: z.number().int().min(1).max(10),
   maxRepairAttempts: z.number().int().min(1).max(10),
 })
 export type DefaultSessionSettings = z.infer<typeof defaultSessionSettingsSchema>
 
-export const sessionPermissionModeSchema = z.enum(['native', 'ask', 'auto', 'full'])
-export type SessionPermissionMode = z.infer<typeof sessionPermissionModeSchema>
 export const sessionSettingsSchema = defaultSessionSettingsSchema.extend({
   permissionModes: z
     .strictObject({
@@ -1224,7 +1316,6 @@ export const nativeContinuationStateSchema = z.enum([
 export type NativeContinuationState = z.infer<typeof nativeContinuationStateSchema>
 
 export const nativeEvidenceIdentitySchema = z.strictObject({
-  answerFormat: z.enum(['collaboration_envelope_v5']).optional(),
   sessionId: z.string().uuid(),
   agentId: runtimeAgentIdSchema,
   runId: z.string().uuid().optional(),
@@ -1250,12 +1341,37 @@ export const nativeInitializationWitnessSchema = z.strictObject({
 })
 export type NativeInitializationWitness = z.infer<typeof nativeInitializationWitnessSchema>
 
-const nativeRecoveredOutputSchema = z.strictObject({
-  outputId: z.string().min(1).max(1024),
-  text: z.string(),
-  completeness: z.enum(['complete', 'partial']),
-  submittedReport: collaborationResultSchema.optional(),
-})
+const nativeRecoveredOutputSchema = z
+  .strictObject({
+    outputId: z.string().min(1).max(1024),
+    text: z.string(),
+    completeness: z.enum(['complete', 'partial']),
+    plan: z.strictObject({ nativeId: z.string().min(1).max(1024), text: z.string() }).optional(),
+    planUnavailable: z.literal(true).optional(),
+    retainedPlan: collaborationRetainedPlanSchema.optional(),
+    reviewVerdict: collaborationReviewVerdictSchema.optional(),
+    reviewResult: collaborationReviewObservationSchema.optional(),
+    inputResult: collaborationInputObservationSchema.optional(),
+    inputOutcome: collaborationInputOutcomeSchema.optional(),
+  })
+  .refine(
+    (value) =>
+      Number(Boolean(value.plan)) +
+        Number(Boolean(value.retainedPlan)) +
+        Number(Boolean(value.planUnavailable)) <=
+      1,
+    'Native plan observations conflict.',
+  )
+  .refine(
+    (value) =>
+      (!value.reviewResult ||
+        !value.reviewVerdict ||
+        value.reviewResult.verdict === value.reviewVerdict) &&
+      (!value.inputResult ||
+        !value.inputOutcome ||
+        value.inputResult.outcome === value.inputOutcome),
+    'Native workflow observations conflict.',
+  )
 export type NativeRecoveredOutput = z.infer<typeof nativeRecoveredOutputSchema>
 export const nativeProbeResultSchema = z.discriminatedUnion('kind', [
   z.strictObject({
@@ -1276,6 +1392,7 @@ export const nativeProbeResultSchema = z.discriminatedUnion('kind', [
     identity: nativeEvidenceIdentitySchema,
     source: z.enum(['live_terminal', 'stored_terminal']),
     outcome: z.enum(['completed', 'failed', 'interrupted']).optional(),
+    planUnavailable: z.literal(true).optional(),
     output: nativeRecoveredOutputSchema.optional(),
   }),
   z.strictObject({
@@ -1336,21 +1453,12 @@ export const agentRunSchema = z.strictObject({
       settled: z.boolean(),
     })
     .optional(),
-  answerFormat: z.enum(['collaboration_envelope_v5']).optional(),
   collaboration: z
     .strictObject({
       taskId: z.string().uuid(),
       kind: z.enum(['plan', 'build', 'review']),
-      stage: z.enum([
-        'draft',
-        'discuss',
-        'clarify',
-        'implement',
-        'supplement',
-        'review',
-        'respond',
-        'repair',
-      ]),
+      stage: collaborationStageSchema,
+      planVersion: z.number().int().positive().optional(),
     })
     .optional(),
   forkSourceRunId: z.string().uuid().optional(),
@@ -1552,6 +1660,8 @@ export const conversationQueueEnabledInputSchema = z.strictObject({
 export type ConversationQueueEnabledInput = z.infer<typeof conversationQueueEnabledInputSchema>
 
 export const conversationSnapshotSchema = z.strictObject({
+  preparedInputContinuation: preparedInputContinuationSchema.nullable().optional(),
+  relaySchedulingDecision: relaySchedulingDecisionSchema.nullable().optional(),
   observation: z.strictObject({
     incarnation: z.string().uuid(),
     sequence: z.number().int().positive(),
@@ -1613,6 +1723,24 @@ const conversationPageBaseInputSchema = z.strictObject({
   sessionId: z.string().uuid(),
 })
 export const conversationGetInputSchema = z.discriminatedUnion('scope', [
+  conversationPageBaseInputSchema
+    .extend({
+      scope: z.literal('collaboration-quote'),
+      runId: z.string().uuid(),
+      document: collaborationDocumentSchema,
+      basis: z.enum(['markdown-visible-v2', 'plain-visible-v1']),
+      startOffset: z.number().int().nonnegative(),
+      endOffset: z.number().int().nonnegative(),
+      offset: z.number().int().nonnegative(),
+    })
+    .refine(
+      (value) =>
+        value.endOffset > value.startOffset &&
+        value.endOffset - value.startOffset <= 20_000 &&
+        value.offset >= value.startOffset &&
+        value.offset < value.endOffset,
+      'Invalid document selection range.',
+    ),
   conversationPageBaseInputSchema.extend({
     scope: z.literal('collaboration-markdown'),
     basis: z.enum(['markdown-visible-v2', 'plain-visible-v1']).optional(),
@@ -1630,15 +1758,14 @@ export const conversationGetInputSchema = z.discriminatedUnion('scope', [
   conversationPageBaseInputSchema.extend({
     scope: z.literal('collaboration'),
     runId: z.string().uuid().optional(),
-    projection: z.enum(['current', 'report', 'plan', 'todos']).optional(),
-    taskId: z.string().uuid().optional(),
-    ledgerRevision: z.number().int().nonnegative().optional(),
-    todoStatus: z.enum(['active', 'done', 'all', 'source']).optional(),
-    todoOffset: z.number().int().nonnegative().optional(),
-    todoId: z.string().min(1).max(80).optional(),
-    todoRevision: z.number().int().positive().optional(),
-    feedbackOffset: z.number().int().nonnegative().optional(),
-    feedbackId: z.string().min(1).max(80).optional(),
+    projection: z.enum(['current', 'report', 'plan']).optional(),
+  }),
+  conversationPageBaseInputSchema.extend({
+    scope: z.literal('prepared-input'),
+    batchId: z.string().uuid(),
+    revision: z.number().int().nonnegative(),
+    sourceId: z.string().uuid().optional(),
+    offset: z.number().int().nonnegative(),
   }),
   conversationPageBaseInputSchema.extend({
     scope: z.literal('queued-input'),
@@ -1735,6 +1862,8 @@ const conversationPageActivitySchema = z.discriminatedUnion('kind', [
 export type ConversationPageActivity = z.infer<typeof conversationPageActivitySchema>
 
 const conversationPageHeaderSchema = z.strictObject({
+  preparedInputContinuation: preparedInputContinuationSchema.nullable().optional(),
+  relaySchedulingDecision: relaySchedulingDecisionSchema.nullable().optional(),
   queue: conversationQueueStateSchema.optional(),
   receivedInputIds: z.array(z.string().uuid()).max(1).optional(),
   session: conversationSnapshotSchema.shape.session,
@@ -1755,6 +1884,31 @@ const conversationPageHeaderSchema = z.strictObject({
 
 export const conversationPageSchema = z
   .discriminatedUnion('scope', [
+    z
+      .strictObject({
+        scope: z.literal('collaboration-quote'),
+        sessionId: z.string().uuid(),
+        document: collaborationDocumentSchema,
+        basis: z.enum(['markdown-visible-v2', 'plain-visible-v1']),
+        startOffset: z.number().int().nonnegative(),
+        endOffset: z.number().int().nonnegative(),
+        offset: z.number().int().nonnegative(),
+        text: z.string().min(1).max(4096),
+        nextOffset: z.number().int().nonnegative().nullable(),
+      })
+      .refine(
+        (value) =>
+          value.endOffset > value.startOffset &&
+          value.endOffset - value.startOffset <= 20_000 &&
+          value.offset >= value.startOffset &&
+          value.offset + value.text.length <= value.endOffset &&
+          value.nextOffset ===
+            (value.offset + value.text.length < value.endOffset
+              ? value.offset + value.text.length
+              : null) &&
+          new TextEncoder().encode(JSON.stringify(value)).byteLength <= 48 * 1024,
+        'Invalid document selection page.',
+      ),
     z
       .strictObject({
         scope: z.literal('collaboration-markdown'),
@@ -1794,6 +1948,34 @@ export const conversationPageSchema = z
       sessionId: z.string().uuid(),
       view: collaborationViewSchema,
     }),
+    z
+      .strictObject({
+        scope: z.literal('prepared-input'),
+        sessionId: z.string().uuid(),
+        batchId: z.string().uuid(),
+        revision: z.number().int().nonnegative(),
+        body: collaborationDocumentSchema,
+        offset: z.number().int().nonnegative(),
+        text: z.string().max(4096),
+        nextOffset: z.number().int().nonnegative().nullable(),
+        sourceId: z.string().uuid(),
+        declaredInformation: userInformationDeclarationSchema.optional(),
+        sources: z
+          .array(
+            z.strictObject({
+              sourceId: z.string().uuid(),
+              label: z.string().max(96),
+              sha256: z.string().regex(/^[a-f0-9]{64}$/u),
+              bytes: z.number().int().nonnegative(),
+              chars: z.number().int().nonnegative(),
+            }),
+          )
+          .max(13),
+      })
+      .refine(
+        (v) => new TextEncoder().encode(JSON.stringify(v)).byteLength <= 48 * 1024,
+        'The prepared input page exceeds its byte budget.',
+      ),
     z.strictObject({
       scope: z.literal('queued-input'),
       source: z.enum(['queued', 'returned']),
@@ -1810,7 +1992,6 @@ export const conversationPageSchema = z
       skills: skillSelectionsSchema.optional(),
       route: conversationMessageRouteSchema,
       batchId: z.string().uuid().optional(),
-      planningAction: z.enum(['maintain_plan', 'review_plan']).optional(),
     }),
     z.strictObject({
       scope: z.literal('rebuild-input'),
@@ -1990,6 +2171,9 @@ export const conversationPatchSchema = z
       .optional(),
     sessionId: z.string().uuid(),
     observation: conversationObservationSchema,
+    sendDisposition: z.literal('held_for_information').optional(),
+    preparedInputContinuation: preparedInputContinuationSchema.nullable().optional(),
+    relaySchedulingDecision: relaySchedulingDecisionSchema.nullable().optional(),
     session: conversationSnapshotSchema.shape.session,
     messages: z.array(conversationMessageChangeSchema).max(4),
     removedMessageIds: z.array(z.string().uuid()).max(4).optional(),
@@ -2096,11 +2280,22 @@ export const conversationSendInputSchema = z
     clientMessageId: z.string().uuid(),
     returnedInputOperationId: z.string().uuid().optional(),
     queueReturnOperationId: z.string().uuid().optional(),
+    /** The Composer preserves whether the user chose a recipient explicitly. */
+    routeIntent: z.enum(['implicit', 'explicit']).optional(),
+    composerRevision: z.number().int().nonnegative().optional(),
+    userInformation: userInformationDeclarationSchema.optional(),
+    replyToDecision: z
+      .strictObject({
+        taskId: z.string().uuid(),
+        runId: z.string().uuid(),
+        decisionInputSequence: z.number().int().nonnegative(),
+        expectedInputSequence: z.number().int().nonnegative(),
+      })
+      .optional(),
     inputId: z.string().uuid().optional(),
     imageIds: z.array(z.string().uuid()).max(128).optional(),
     skills: skillSelectionsSchema.optional(),
     content: z.string().trim(),
-    planningAction: z.enum(['maintain_plan', 'review_plan']).optional(),
     batchId: z.string().uuid().optional(),
     freezeDrafts: z.boolean().optional(),
     expectedCommentsRevision: z.number().int().nonnegative(),
@@ -2114,6 +2309,12 @@ export const conversationSendInputSchema = z
       .optional(),
   })
   .superRefine((input, context) => {
+    if (input.routeIntent === 'implicit' && input.route && input.route.type !== 'primary')
+      context.addIssue({
+        code: 'custom',
+        message: 'Implicit routing must retain the original Primary intent.',
+        path: ['routeIntent'],
+      })
     if (
       !input.content &&
       !input.inputId &&
@@ -2149,7 +2350,7 @@ export const collaborationReceivedMetadataSchema = z.strictObject({
   imageIds: conversationSendInputSchema.shape.imageIds.default([]),
   commentIds: conversationSendInputSchema.shape.commentIds,
   route: conversationSendInputSchema.shape.route,
-  planningAction: conversationSendInputSchema.shape.planningAction,
+  replyToDecision: conversationSendInputSchema.shape.replyToDecision,
   batchId: conversationSendInputSchema.shape.batchId,
   freezeDrafts: conversationSendInputSchema.shape.freezeDrafts,
 })
@@ -2358,6 +2559,49 @@ export const appearanceSnapshotSchema = z.object({
 export type AppearanceSnapshot = z.infer<typeof appearanceSnapshotSchema>
 
 export const utilityRequestSchema = z.discriminatedUnion('type', [
+  z.strictObject({
+    type: z.literal('conversation.prepared-input.continue.request'),
+    requestId: z.string().uuid(),
+    input: preparedInputContinueSchema,
+  }),
+  z.strictObject({
+    type: z.literal('relay.decision.answer.request'),
+    requestId: z.string().uuid(),
+    input: relayDecisionAnswerSchema,
+  }),
+  z.strictObject({
+    type: z.literal('relay.decision.receipt.request'),
+    requestId: z.string().uuid(),
+    input: relayDecisionReceiptReadSchema,
+  }),
+  z.strictObject({
+    type: z.literal('scheduling.state.get.request'),
+    requestId: z.string().uuid(),
+    input: schedulingStateInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('scheduling.state.refresh.request'),
+    requestId: z.string().uuid(),
+    input: schedulingStateInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('scheduling.settings.get.request'),
+    requestId: z.string().uuid(),
+  }),
+  z.strictObject({
+    type: z.literal('scheduling.settings.save.request'),
+    requestId: z.string().uuid(),
+    input: schedulingSettingsSaveSchema,
+  }),
+  z.strictObject({
+    type: z.literal('scheduling.models.refresh.request'),
+    requestId: z.string().uuid(),
+  }),
+  z.strictObject({
+    type: z.literal('scheduling.activity.read.request'),
+    requestId: z.string().uuid(),
+    input: schedulingActivityReadSchema,
+  }),
   z.strictObject({ type: z.literal('updates.get.request'), requestId: z.string().uuid() }),
   z.strictObject({ type: z.literal('updates.check.request'), requestId: z.string().uuid() }),
   z.strictObject({
@@ -2725,6 +2969,36 @@ export type UtilityRequest = z.infer<typeof utilityRequestSchema>
 
 export const utilityResponseSchema = z.discriminatedUnion('type', [
   z.strictObject({
+    type: z.literal('conversation.prepared-input.continue.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(conversationPatchSchema),
+  }),
+  z.strictObject({
+    type: z.literal('relay.decision.receipt.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(relayDecisionReceiptSchema),
+  }),
+  z.strictObject({
+    type: z.literal('scheduling.state.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(schedulingStateSchema),
+  }),
+  z.strictObject({
+    type: z.literal('scheduling.settings.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(schedulingSettingsSchema),
+  }),
+  z.strictObject({
+    type: z.literal('scheduling.models.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(schedulingModelsSchema),
+  }),
+  z.strictObject({
+    type: z.literal('scheduling.activity.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(schedulingActivityPageSchema),
+  }),
+  z.strictObject({
     type: z.literal('updates.state.response'),
     requestId: z.string().uuid(),
     result: rpcResultSchema(updateStoredStateSchema),
@@ -2961,6 +3235,7 @@ export const runtimeStartupFailureAckSchema = z.strictObject({
 })
 
 export const utilityEventSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('scheduling.changed.event') }),
   z.strictObject({ type: z.literal('runtime.ready.event') }),
   z.strictObject({
     type: z.literal('native-presence.quit-recent.event'),
@@ -2981,6 +3256,16 @@ export const utilityEventSchema = z.discriminatedUnion('type', [
 export type UtilityEvent = z.infer<typeof utilityEventSchema>
 
 export interface DesktopBridge {
+  continuePreparedConversationInput(
+    input: PreparedInputContinue,
+  ): Promise<RpcResult<ConversationPatch>>
+  getSchedulingState(input: SchedulingStateInput): Promise<RpcResult<SchedulingState>>
+  refreshSchedulingState(input: SchedulingStateInput): Promise<RpcResult<SchedulingState>>
+  getSchedulingSettings(): Promise<RpcResult<SchedulingSettings>>
+  saveSchedulingSettings(input: SchedulingSettingsSave): Promise<RpcResult<SchedulingSettings>>
+  refreshSchedulingModels(): Promise<RpcResult<SchedulingModels>>
+  readSchedulingActivity(input: SchedulingActivityRead): Promise<RpcResult<SchedulingActivityPage>>
+  onSchedulingChanged(listener: () => void): () => void
   getUpdateState(): Promise<RpcResult<UpdateState>>
   checkForUpdates(): Promise<RpcResult<UpdateState>>
   setUpdatePreferences(input: UpdatePreferencesInput): Promise<RpcResult<UpdateState>>
@@ -3070,6 +3355,12 @@ export interface DesktopBridge {
   actOnCollaboration(
     input: import('./collaboration.js').CollaborationActionInput,
   ): Promise<RpcResult<ConversationPatch>>
+  answerRelayDecision(
+    input: import('./relay-decisions.js').RelayDecisionAnswer,
+  ): Promise<RpcResult<import('./relay-decisions.js').RelayDecisionReceipt>>
+  getRelayDecisionReceipt(
+    input: import('./relay-decisions.js').RelayDecisionReceiptRead,
+  ): Promise<RpcResult<import('./relay-decisions.js').RelayDecisionReceipt>>
   getConversation(input: ConversationGetInput): Promise<RpcResult<ConversationPage>>
   setConversationInterest(
     sessionId: string | null,
@@ -3127,3 +3418,6 @@ export interface DesktopBridge {
   resetAppearanceSettings(input: AppearanceSettingsReset): Promise<RpcResult<AppearanceSnapshot>>
   onAppearanceSettingsChanged(listener: (snapshot: AppearanceSnapshot) => void): () => void
 }
+
+export * from './handoff-guidance.js'
+export * from './scheduling-recovery.js'

@@ -146,7 +146,7 @@ The palette uses daylight blue and midnight navy as environmental fields, with p
 ### Tertiary
 
 - **Ready Green** (`#16883f` / `#5ee58a`): healthy and running states.
-- **Warning Ochre** (`#946200` / `#e6b84a`): recoverable risk and pending decisions.
+- **Warning Ochre** (`#946200` / `#e6b84a`): recoverable operational risk. Routine collaboration decisions use neutral surfaces.
 - **Danger Red** (`#b42318` / `#ff8a80`): failed, blocked, destructive, and irreversible actions.
 
 ### Neutral
@@ -259,6 +259,8 @@ Messages and self-contained Artifacts earn a colored surface. Navigation groups,
 
 Agent settings align Model and Effort, stacking in compact panels. Speed belongs in Composer: each Agent groups independent Permission and Speed buttons with a divider and the Project folder/branch surface treatment. Speed always shows its label and Native, Standard or Fast value. All dropdown arrows stay neutral; Full access warning color applies only to its icon and label. Speed opens its own upward popover with checked choices, descriptions and a Next run / This Session footer. Selection saves immediately; keyboard navigation, Escape and visibility/focus recovery follow existing Composer menus. Requested speed and native fallback remain distinct. Run headers show Native speed when a requested override was not applied and no effective speed was reported. Put the explanation behind a neutral info icon with a hover and keyboard-focus tooltip; keep long diagnostic prose out of the header. App defaults, Session settings and creation customization contain no Speed field.
 
+Permission controls keep their existing layout and labels. Their tooltip and existing menu footer distinguish the next-task selection from the active Run's frozen choice and any project read-only duty. Full access does not display tool-approval cards; native-policy refusals do not become approvals, and questions/forms and plan implementation decisions retain their own interaction.
+
 Fields use a dense local surface so their value remains stable over any native backdrop. Focus increases border contrast and adds the Iris focus outline. Disabled and error states retain readable values and recovery copy.
 
 The Project name editor stays in its row: a 32px focused input group with 28px Check/X controls on the right, an Iris-tinted Save action and neutral Cancel. Select the current name on entry; Enter saves, Escape cancels, and blur keeps the draft. A failed save keeps the input and shows a local error; saving is visibly busy and cannot repeat. Names are trimmed, nonempty, single-line and limited to 120 UTF-16 units. The shell has no application fullscreen button or dedicated fullscreen Bridge.
@@ -271,7 +273,7 @@ Project ownership is expressed by disclosure, indentation, and grouping. Do not 
 
 User messages are right-aligned on lavender. Claude and Codex messages are left-aligned on peach and mint. Speaker labels remain visible, and ordinary messages avoid avatars that could be mistaken for account UI. Flow steps and runtime states may appear inline inside the responsible Agent message; global workflow timelines and `Plan approved` banners are not persistent Chat chrome.
 
-The Composer is a stable dense surface at least two lines high. Native Skills and the selected route are atomic inline units; attached Comments and answers are removable source chips above the input. Images show thumbnails, filename and state, with Add image below full-width text. Send becomes Stop during a response. Enter queues one message, Shift+Enter inserts a newline; a disabled queue retains Enter as newline. Unsubmitted drafts never auto-send.
+The Composer is a stable dense surface at least two lines high. Native Skills and the selected route are atomic inline units; attached Comments are removable source chips above the input; native question answers stay in their live forms. Images show thumbnails, filename and state, with Add image below full-width text. Agent permissions, Speed, Project folder and branch stay on one row below the input. Project context shrinks first; labels truncate as space decreases while icons and dropdown controls remain visible. Full values remain available through accessible names, tooltips and menus. Send becomes Stop during a response. Enter queues one message, Shift+Enter inserts a newline; a disabled queue retains Enter as newline. Unsubmitted drafts never auto-send.
 
 One compact raised message strip sits immediately above Composer, with a queue icon, recipient, readable preview and Steer, Remove and More actions. When the responding Agent differs from the queued recipient, an info icon beside disabled Steer explains both Agents on hover or keyboard focus. The menu contains Edit message and Disable queue; paused delivery offers Resume queue. State/reason and attachment counts wrap beneath the preview without displacing actions at narrow widths. Unknown or active delivery locks destructive/duplicate actions and offers Check status for its original Run. After a confirmed Rebuild retires that Run, Remove becomes available with copy explaining that only the Pact queue is cleared and delivery remains unconfirmed; Edit, Steer and Resume remain locked. An empty disabled queue still exposes Enable queue. Use the existing Composer popover treatment, keyboard menu navigation, Escape/focus return and both themes. Edit removes the item and returns its full content to the normal Composer, overwriting its draft; no Save/Cancel edit mode is introduced. A return receipt needing recovery uses a quiet Restore returned message action outside the queue.
 
@@ -283,13 +285,55 @@ Composer permission, Project-folder and branch popovers share one presentation: 
 
 The right panel is contextual, resizable and closable. Diff uses dedicated add/remove tokens in both themes and becomes nearly opaque under translucency. Documents preserve comfortable prose measure; Comments retain a visible anchor without obscuring code.
 
-The current full plan is read only in Context's Plan tab. Transcript uses compact opaque version/review cards: title, total feedback count and one disclosure on a single header. Historical cards start closed; necessary Proposal, Resume and errors stay visible outside folded content. Do not duplicate the complete plan in Chat or add another nested Feedback disclosure.
+The current full plan is read only in Context's Plan tab. Plan headers expose Expand/Restore beside Close. The Plan pane resizes within the available workspace without a percentage cap or document-width ceiling. In-app expansion keeps the same document, scroll position, Conversation owner and Comment state mounted; its Comment editor and attached drafts remain usable inside the expanded pane. Restoring returns them to the Composer without sending or discarding drafts. Chat preserves complete natural replies and review reports, with a compact footer for the native plan version, review state and next action. Avoid a second full plan or a separate structured-feedback disclosure. A native plan with no ordinary answer still has its compact source/footer and opens the saved plan document. Current Implement, Respond, Repair, Continue collaboration and failure actions remain visible independently of historical folding. Proposal actions do not include a Pause collaboration button.
 
-Context's Todos tab shows Pending and Done with ordinary unboxed rows. One short state label distinguishes Open, Awaiting review and Done. A tick is status, not a user-editable checkbox; an accessible info control explains a Done disposition. Detail progressively reveals issue, impact, suggestion, evidence and handling. Questions/Comments use Add to comment/Cancel; all sending occurs through the Composer, without To selector or per-Todo Send. Recommendation is a separate label, never a submitted answer.
+The context pane contains Plan, files, Changes and Session settings; findings and author responses live in natural review reports. Native question, form and browser-authorization cards use the same InputReplacement location as workflow decisions, taking priority while their native operation is waiting. Their scrollable content keeps submission and cancellation reachable. Do not add a separate draft-retention caption or Stop row beneath the native card. Ordinary draft state stays mounted and inert until the native request clears, then the workflow decision or ordinary Composer resumes. Tool-approval cards retain their transcript placement. Native question forms present actual provider choices and free input, preserve keyboard/focus/cancellation behavior, and do not create shared task rows or persistent answer chips. Recommendations remain labels rather than submitted answers.
 
-Historical sources show then-state and known current state without changing counts or exposing an answer entry for an old question. Navigation waits for body readiness before alignment, restores exact source focus, and does not reset reading position on refresh. Internal UUIDs, hashes, JSON fields and transport instructions do not belong in visible product prose.
+Historical plans and reports retain their exact source/version; unsupported old anchors show their saved quote and an unavailable reason without reopening removed workflow UI. Navigation waits for body readiness before alignment, restores exact source focus, and does not reset reading position on refresh. Internal UUIDs, hashes, JSON fields and transport instructions do not belong in visible product prose.
+
+During authorized automatic collaboration, show the responsible Agent and concise current step. User Send immediately pauses later handoffs; the current root normally finishes, then the priority reply remains paused. When a completed reply requires a user decision, its question card replaces the ordinary Composer. Show each explicit prompt, unselected choices when supplied, and a labelled free-answer field; do not infer questions from report prose. Send answers submits only the card answers to the verified requesting Agent. Sent replies show the frozen @recipient beside You, a separate reply heading, and numbered question blocks with selected answers on their own lines. Stop interrupts the current response and pauses collaboration while preserving sent answers and ordinary drafts. Keep the ordinary message draft, images, Comments, Skills, route and returned-input receipts intact and unsent. The reusable InputReplacement component owns the shared input location, a 220ms height transition with a 140ms fade, focus handoff and inert inactive panels. Reduced motion removes height/movement and keeps a brief opacity cue. Its two panels, one ResizeObserver, one animation and one exit-retention timer are disposed on unmount. Processing keeps a compact answer status in this location with Stop and existing recovery/queue controls; ordinary message input returns only after the decision gate clears. Failed or uncertain work retains recovery and never silently opens a new-message path. When the current plan requires recovery, replace an existing decision form with a neutral Plan recovery required state. Keep its answers and ordinary drafts intact, and use the existing Proposal recovery action. Do not show question or answer-processing copy for this recovery state. Older requests retain an expandable original-text entry and a free-answer field inside the card. Result footers distinguish requests for input, processed replies and ordinary review responses using that Run's stored facts. Use a neutral muted surface, a thin neutral border and a monochrome conversation icon; routine input requests are not operational warnings. Successful Send dismisses this prompt immediately; failed Send preserves it. Queue/progress/recovery use their existing surfaces. Only a new decision request shows the prompt again. Hide Continue and the next-review suggestion until the reply is confirmed processed; then show Continue collaboration with its computed next step. Keep Stop separate from pausing future work. At Session limits, show the specific exhausted allowance and retain the plan/report rather than implying failure erased it. Native form answers continue the existing root while any independent automation pause remains visible. Restart preserves a paused continuation and the original unknown-work recovery action; no hidden automatic peer restart or generic approval banner is introduced.
 
 Image preview is a native modal with previous/next, directional keys, bounded filmstrip, close/Escape and trigger focus return. It fits content without zoom/Fit/100% controls. Its 180ms slide/fade honors reduced motion. Recovery uses one compact card for affected Agents, with currently valid action and specific reason rather than stacked warnings or repeated safety paragraphs.
+
+### Relay scheduling
+
+Relay Settings retains its heading and intelligent-orchestration subtitle, independent enable and
+indicator preferences, exact model choice, explicit usage notice and read-only Scheduling activity.
+The settings surface stays opaque in translucent windows. Activity shows time, Project/Session,
+reason and actual result, with no filter, details, navigation, copy, export, retry or clearing actions.
+
+Place the compact rectangular `Scheduling in background` indicator immediately above the current
+Composer's upper-left edge. Show it only for that Session's real evaluation/check activity while
+Relay and its indicator preference are on. Idle, other-Session activity, catalog probes, cleanup and
+waiting for user input do not imply active scheduling. Reserve the settings button's space; Hover
+and keyboard focus reveal it smoothly without moving the Composer or taking focus. Its accessible
+name is `Open decision & scheduling settings`.
+
+The indicator and Relay decision card share one soft highlight slowly travelling around the edge,
+using theme-derived lavender, peach and mint. Keep their interiors and text stable in both themes.
+Reduced motion uses a static colored edge; hidden/unmounted content stops its animation. This
+bounded edge treatment is the exception to the general product-gradient rule. Native approvals
+retain their existing styles and transcript position.
+
+Relay decisions replace the input through the existing InputReplacement. Use a clear `Relay decision`
+heading, a short concrete action or scheduling question, actual recipient/scope, concise reason and
+necessary consequence, source labels and an action-specific confirmation. Show `Cancel this
+scheduling action`. Only a genuine host-required scheduling field permits choices or text; ordinary
+business questions stay in the Agent's form. Do not display protocol IDs, grants or hashes.
+Native permission/question/OAuth interactions come first, existing collaboration/recovery next, then
+a freshly host-validated Relay request. Preserve ordinary drafts and attachments, unsubmitted answers,
+queue semantics and focus. Showing a card, hiding it or answering another interaction grants no Relay
+permission. Pending/uncertain confirmation uses its own receipt state and cannot become another Send.
+Turning off the indicator does not hide a necessary decision. Latest Relay visual acceptance remains
+pending; static CSS/build checks do not establish the visible effect.
+
+A scoped Repair request names one repair and its fixed reviewer; its confirmation says `Allow
+repair`, and Full access is stated when those are the current execution permissions. Never describe
+that writing authorization as a read-only turn. A Rebuild request says `Confirm rebuild`, retains
+warnings about old work continuing or earlier uncertain creation, and replaces only its matching
+recovery row. Cancel preserves the underlying recovery facts. Activity distinguishes a rebuilt native
+context from a completed business task, and displays historical model identity only for actual
+inference. Suggestions, acceptance and real execution results remain separate readable facts.
 
 ## Windows installer preview
 
@@ -383,7 +427,7 @@ visual acceptance before formal verification.
 - **Don't** use whole-window opacity to implement translucency.
 - **Don't** draw Project-to-Session connector lines or show branch/Changes/path/count metadata by default.
 - **Don't** add a persistent `Sessions` label under an already expanded Project.
-- **Don't** use gradients, 3D illustration, giant typography, or 32px marketing-card radii in product UI.
+- **Don't** use gradients outside Relay's specified edge treatment, 3D illustration, giant typography, or 32px marketing-card radii in product UI.
 - **Don't** let wallpaper reduce Diff, terminal, permission, or body-text contrast.
 - **Don't** treat Agent color as the only provenance cue.
 - **Don't** draw one-off inline SVG icons when Lucide provides the control or state symbol.

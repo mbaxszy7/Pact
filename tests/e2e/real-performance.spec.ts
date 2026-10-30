@@ -11,6 +11,7 @@ import {
   CONVERSATION_PAGE_BYTES,
   CONVERSATION_PATCH_BYTES,
 } from '../../packages/contracts/src/index.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import {
   addRealSession,
   closeRealWorkspace,
@@ -30,6 +31,24 @@ const observationItems = 64
 const observationBytes = 1024 * 1024
 const backgroundBytes = 8 * 1024
 type StreamPhase = 'foreground' | 'background' | 'settings' | 'minimized' | 'background-completion'
+type RuntimeStreamFrame = {
+  anchor: boolean
+  phase: StreamPhase
+  pid: number
+  checkedAt: string
+  conversation: NonNullable<RuntimeHealth['conversation']>
+}
+const runtimeCaptures = new WeakMap<
+  RealWorkspace,
+  {
+    phase: StreamPhase
+    frames: RuntimeStreamFrame[]
+    bytes: number
+    dropped: number
+    deadlineAt: number
+    anchorNext: boolean
+  }
+>()
 interface PhaseCounters {
   patches: number
   bytes: number
@@ -230,6 +249,7 @@ test(
   { tag: ['@real', '@real-extended'] },
   async () => {
     test.setTimeout(caseDeadlineMs)
+    const diagnosticDeadline = Date.now() + caseDeadlineMs
     const ctx = await launchRealWorkspace('real-stream-interest')
     try {
       const readingId = await addRealSession(ctx, 'Reading Session')
@@ -331,6 +351,63 @@ test(
       expect(completed.runs[0]?.nativeTurnId).toBeTruthy()
       expect(completed.messages.filter((message) => message.role === 'user')).toHaveLength(1)
       const native = await findNativeRecord(ctx, 'codex', completed.runs[0]!.nativeSessionId!)
+      const parityInput = {
+          nativeSessionId: completed.runs[0]!.nativeSessionId!,
+          nativeTurnId: completed.runs[0]!.nativeTurnId!,
+          text: completedAnswer.content,
+          markers: [`${marker}_BEGIN`, `${marker}_END`],
+        },
+        t0 = {
+          literalMatch: native.containsLiteralText(completedAnswer.content),
+          ...native.answerParity(parityInput),
+        },
+        parityObservations = [t0]
+      const t0Evidence = JSON.stringify({ runId: started.runId, observation: t0 })
+      if (Buffer.byteLength(t0Evidence) > 64 * 1024)
+        throw Error('Native answer t0 diagnostics exceed 64 KiB')
+      await test.info().attach('native-answer-parity-t0', {
+        body: t0Evidence,
+        contentType: 'application/json',
+      })
+      const laterReadFailures: Array<{
+        delayMs: number
+        reason: 'unavailable' | 'diagnostic_budget'
+      }> = []
+      if (!t0.literalMatch) {
+        for (const delay of [100, 500]) {
+          if (Date.now() + delay >= diagnosticDeadline) break
+          // oxlint-disable-next-line no-await-in-loop -- Two read-only observations never extend the original case deadline or change t0's assertion.
+          await new Promise<void>((done) => setTimeout(done, delay))
+          try {
+            // oxlint-disable-next-line no-await-in-loop -- Each bounded diagnostic snapshot is closed before the next observation.
+            const later = await findNativeRecord(ctx, 'codex', parityInput.nativeSessionId)
+            const laterObservation = {
+              literalMatch: later.containsLiteralText(completedAnswer.content),
+              ...later.answerParity(parityInput),
+            }
+            if (
+              Buffer.byteLength(JSON.stringify([...parityObservations, laterObservation])) <
+              60 * 1024
+            )
+              parityObservations.push(laterObservation)
+            else laterReadFailures.push({ delayMs: delay, reason: 'diagnostic_budget' })
+          } catch {
+            // Later file changes cannot replace or invalidate the captured t0 gate.
+            laterReadFailures.push({ delayMs: delay, reason: 'unavailable' })
+          }
+        }
+      }
+      const parityEvidence = JSON.stringify({
+        runId: started.runId,
+        observations: parityObservations,
+        laterReadFailures,
+      })
+      if (Buffer.byteLength(parityEvidence) > 64 * 1024)
+        throw Error('Native answer parity diagnostics exceed 64 KiB')
+      console.info('[pact-native-answer-parity]', parityEvidence)
+      await test
+        .info()
+        .attach('native-answer-parity', { body: parityEvidence, contentType: 'application/json' })
       expect(
         native.containsText(completedAnswer.content),
         'Pact must retain the complete authentic Native answer, including its exact markers.',
@@ -339,6 +416,14 @@ test(
       expect(completedAnswer.content).toContain(`${marker}_END`)
       const expectedHash = createHash('sha256').update(completedAnswer.content).digest('hex')
       const expectedBytes = Buffer.byteLength(completedAnswer.content)
+      expect(t0.file.snapshotStable).toBe(true)
+      expect(t0.completeProjection).toBe(true)
+      expect(t0.exactMatch).toBe(true)
+      expect(t0.native).toEqual({
+        chars: completedAnswer.content.length,
+        bytes: expectedBytes,
+        sha256: expectedHash,
+      })
       expect(expectedBytes).toBeGreaterThan(1500)
       await expect.poll(() => unread(ctx)).toBe(true)
       const captured = await observation(ctx)
@@ -403,13 +488,41 @@ test(
 )
 
 async function health(ctx: RealWorkspace): Promise<NonNullable<RuntimeHealth['conversation']>> {
-  return ctx.page.evaluate(async () => {
+  const observed = await ctx.page.evaluate(async () => {
     const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
     const result = await bridge.getRuntimeHealth()
     if (!result.ok || !result.value.conversation)
       throw new Error('Actual runtime counters are unavailable')
-    return result.value.conversation
+    return {
+      pid: result.value.pid,
+      checkedAt: result.value.checkedAt,
+      conversation: result.value.conversation,
+    }
   })
+  const capture = runtimeCaptures.get(ctx)
+  if (capture && Date.now() <= capture.deadlineAt) {
+    const frame = {
+        anchor: capture.frames.length === 0 || capture.anchorNext,
+        phase: capture.phase,
+        ...observed,
+      },
+      bytes = Buffer.byteLength(JSON.stringify(frame))
+    capture.anchorNext = false
+    while (
+      capture.frames.length > 1 &&
+      (capture.frames.length >= 64 || capture.bytes + bytes > 60 * 1024)
+    ) {
+      const index = capture.frames.findIndex((entry) => !entry.anchor)
+      if (index < 0) break
+      capture.bytes -= Buffer.byteLength(JSON.stringify(capture.frames.splice(index, 1)[0]))
+      capture.dropped++
+    }
+    if (capture.frames.length < 64 && capture.bytes + bytes <= 60 * 1024) {
+      capture.frames.push(frame)
+      capture.bytes += bytes
+    } else capture.dropped++
+  }
+  return observed.conversation
 }
 
 function answer(snapshot: ConversationSnapshot) {
@@ -421,6 +534,14 @@ function answer(snapshot: ConversationSnapshot) {
 }
 
 async function installObservation(ctx: RealWorkspace): Promise<void> {
+  runtimeCaptures.set(ctx, {
+    phase: 'foreground',
+    frames: [],
+    bytes: 0,
+    dropped: 0,
+    deadlineAt: Date.now() + caseDeadlineMs,
+    anchorNext: false,
+  })
   await ctx.page.evaluate(
     ({ key, sessionId, maxItems, maxBytes, maxPatchBytes, ttl }) => {
       if (Reflect.get(globalThis, key))
@@ -542,6 +663,8 @@ async function observation(ctx: RealWorkspace): Promise<StreamObservation> {
 }
 
 async function setPhase(ctx: RealWorkspace, phase: StreamPhase): Promise<void> {
+  const capture = runtimeCaptures.get(ctx)
+  if (capture) capture.phase = phase
   await ctx.page.evaluate(
     ({ key, nextPhase }) => {
       const state: StreamObservation | undefined = Reflect.get(globalThis, key)
@@ -567,6 +690,8 @@ async function observeSuppression(
 ): Promise<void> {
   await expect.poll(async () => (await health(ctx)).interestedSessions).toBe(interestedSessions)
   await setPhase(ctx, phase)
+  const capture = runtimeCaptures.get(ctx)
+  if (capture) capture.anchorNext = true
   const before = await health(ctx)
   expect(
     before.activeExecutions,
@@ -587,6 +712,68 @@ async function observeSuppression(
 }
 
 async function disposeObservation(ctx: RealWorkspace): Promise<void> {
+  const capture = runtimeCaptures.get(ctx)
+  runtimeCaptures.delete(ctx)
+  if (capture) {
+    let database: ReadonlyFixtureDatabase | undefined
+    let roots: unknown = { status: 'unavailable' }
+    let closeUnavailable = false
+    try {
+      database = ReadonlyFixtureDatabase.open(ctx.fixture)
+      const observedRoots = database.drizzle.query.agentRuns
+        .findMany({
+          where: (fields, { eq }) => eq(fields.sessionId, ctx.sessionId),
+          columns: {
+            id: true,
+            status: true,
+            dispatchPhase: true,
+            nativeOutcome: true,
+            nativeEffectsState: true,
+            nativeSessionId: true,
+            nativeTurnId: true,
+            bindingGeneration: true,
+          },
+          limit: 2,
+        })
+        .sync()
+      roots = observedRoots.map(({ nativeSessionId, nativeTurnId, bindingGeneration, ...facts }) =>
+        Object.assign(facts, {
+          nativeIdentitySha256:
+            nativeSessionId && nativeTurnId
+              ? createHash('sha256')
+                  .update(JSON.stringify({ nativeSessionId, nativeTurnId, bindingGeneration }))
+                  .digest('hex')
+              : null,
+        }),
+      )
+    } catch {
+      // Already captured owner boundaries remain useful when the database is unavailable.
+    } finally {
+      try {
+        database?.close()
+      } catch {
+        closeUnavailable = true
+      }
+    }
+    try {
+      const body = JSON.stringify({
+        source:
+          'Existing owners; loop counts are downstream of Connection listeners, not stdout counts.',
+        frames: capture.frames,
+        dropped: capture.dropped,
+        roots,
+        closeUnavailable,
+      })
+      if (Buffer.byteLength(body) > 64 * 1024) throw new Error('Stream diagnostic attachment bound')
+      await test.info().attach('real-stream-owner-boundaries', {
+        body: Buffer.from(body),
+        contentType: 'application/json',
+      })
+    } catch {
+      console.info('[pact-real-stream-diagnostic]', JSON.stringify({ status: 'unavailable' }))
+    }
+  }
+
   if (ctx.page.isClosed()) return
   await ctx.page.evaluate((key) => {
     const dispose: (() => void) | undefined = Reflect.get(globalThis, `${key}Dispose`)

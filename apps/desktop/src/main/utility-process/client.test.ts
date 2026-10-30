@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { conversationSendInputSchema, utilityResponseSchema } from '@pact/contracts'
+
 const harness = vi.hoisted(() => {
   type Listener = (...args: unknown[]) => void
   class FakeUtilityProcess {
@@ -89,6 +91,142 @@ const startOptions = {
   databaseFile: ':memory:',
   migrationsFolder: '/tmp/pact-migrations',
 }
+
+describe('Relay RPC deadlines without automatic resend', () => {
+  it.each([
+    {
+      name: 'settings read',
+      deadline: 5_000,
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.getSchedulingSettings(),
+    },
+    {
+      name: 'intent save',
+      deadline: 5_000,
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.saveSchedulingSettings({ expectedRevision: 0, enabled: true }),
+    },
+    {
+      name: 'activity read',
+      deadline: 5_000,
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.readSchedulingActivity({}),
+    },
+    {
+      name: 'catalog refresh',
+      deadline: 25_000,
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.refreshSchedulingModels(),
+    },
+    {
+      name: 'model selection',
+      deadline: 25_000,
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.saveSchedulingSettings({
+          expectedRevision: 0,
+          selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
+          catalogIdentity: 'a'.repeat(64),
+        }),
+    },
+  ])(
+    'retains $deadline ms for $name and sends once on uncertain delivery',
+    async ({ deadline, invoke }) => {
+      vi.useFakeTimers()
+      const client = createUtilityProcessClient()
+      client.start(startOptions)
+      const child = harness.children.at(-1)!
+      child.emit('message', { type: 'runtime.ready.event' })
+      let settled = false
+      const operation = invoke(client).then((result) => {
+        settled = true
+        return result
+      })
+      await vi.advanceTimersByTimeAsync(deadline - 1)
+      expect(settled).toBe(false)
+      expect(child.posted).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(await operation).toMatchObject({ ok: false, error: { code: 'TIMEOUT' } })
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(child.posted).toHaveLength(1)
+      client.dispose()
+    },
+  )
+})
+
+it.each([
+  { body: false, responseAt: 23_000 },
+  { body: true, responseAt: 33_000 },
+])(
+  'keeps Send pending through 12 seconds and accepts its correlated response at $responseAt ms (sealed body: $body)',
+  async ({ body, responseAt }) => {
+    vi.useFakeTimers()
+    const client = createUtilityProcessClient()
+    let operation: ReturnType<typeof client.sendConversationMessage> | undefined
+    try {
+      client.start(startOptions)
+      const child = harness.children.at(-1)!
+      child.emit('message', { type: 'runtime.ready.event' })
+      const sessionId = crypto.randomUUID()
+      const input = conversationSendInputSchema.parse({
+        sessionId,
+        clientMessageId: crypto.randomUUID(),
+        ...(body
+          ? { inputId: crypto.randomUUID(), content: '' }
+          : { content: 'Send after bounded Relay advice and normal business preparation.' }),
+        expectedCommentsRevision: 1,
+        commentIds: [crypto.randomUUID()],
+        routeIntent: 'implicit',
+        composerRevision: 1,
+      })
+      const startedAt = Date.now()
+      let completion: unknown
+      operation = client.sendConversationMessage(input).then((result) => {
+        completion = { afterMs: Date.now() - startedAt, result }
+        return result
+      })
+      const expected = {
+        ok: true,
+        value: {
+          version: 'conversation-patch-v1',
+          sessionId,
+          observation: { incarnation: crypto.randomUUID(), sequence: 1 },
+          session: {
+            id: sessionId,
+            title: 'Delayed Send',
+            titleSource: 'user',
+            status: 'idle',
+            activity: { state: 'idle' },
+            hasUnread: false,
+            updatedAt: new Date().toISOString(),
+          },
+          messages: [],
+          runs: [],
+          activities: [],
+          activityStates: [],
+        },
+      }
+      const response = utilityResponseSchema.parse({
+        type: 'conversation.patch.response',
+        requestId: postedRequest(child).requestId,
+        result: expected,
+      })
+      await vi.advanceTimersByTimeAsync(11_999)
+      expect(completion).toBeUndefined()
+      await vi.advanceTimersByTimeAsync(1)
+      expect.soft(completion, 'Send must remain pending at 12 seconds').toBeUndefined()
+      // Preserve the independent body-read, advice and business preparation bounds.
+      await vi.advanceTimersByTimeAsync(responseAt - 12_000)
+      child.emit('message', response)
+      await expect(operation).resolves.toEqual(expected)
+      expect(child.posted).toHaveLength(1)
+    } finally {
+      client.dispose()
+      await operation
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  },
+)
 
 afterEach(() => {
   // Simulated children always deliver physical exit before a test releases the transport fixture.

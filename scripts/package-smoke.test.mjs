@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { copyFile, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -19,6 +20,49 @@ import {
   readDistributionManifest,
 } from './package-smoke.mjs'
 import { run } from './run-e2e.mjs'
+
+const helperDigest = (bytes) => createHash('sha256').update(bytes).digest('hex')
+function helperPayload(arch) {
+  // A process-seam fixture, never an executable Windows/installed acceptance claim.
+  const pe = Buffer.alloc(128)
+  pe.write('MZ')
+  pe.writeUInt32LE(64, 60)
+  pe.writeUInt32LE(0x4550, 64)
+  pe.writeUInt16LE(arch === 'arm64' ? 0xaa64 : 0x8664, 68)
+  const metadata = JSON.stringify({
+    version: 1,
+    platform: 'win32',
+    architecture: arch,
+    protocolVersion: 1,
+    sourceSha256: 'c'.repeat(64),
+    executableSha256: helperDigest(pe),
+    executableBytes: pe.length,
+  })
+  const path = `resources/native/owned-process-group-win32-${arch}.exe`
+  const record = {
+    architecture: arch,
+    protocolVersion: 1,
+    sourceSha256: 'c'.repeat(64),
+    executable: { path, sha256: helperDigest(pe), bytes: pe.length },
+    identity: {
+      path: `${path}.json`,
+      sha256: helperDigest(metadata),
+      bytes: Buffer.byteLength(metadata),
+    },
+  }
+  return {
+    pe,
+    metadata,
+    record,
+    entries: [record.executable, record.identity].map((entry) => ({
+      path: entry.path,
+      sha256: entry.sha256,
+      bytes: entry.bytes,
+      type: 'file',
+      mode: 0,
+    })),
+  }
+}
 
 await test('manifest admission preserves local Production identity and rejects mixed profile/channel names', async (context) => {
   const root = await mkdtemp(join(tmpdir(), 'pact-local-manifest-'))
@@ -42,6 +86,11 @@ await test('manifest admission preserves local Production identity and rejects m
       entries: [],
     },
     artifacts: [],
+  }
+  if (process.platform === 'win32') {
+    const helper = helperPayload(process.arch)
+    manifest.windowsOwnedProcess = helper.record
+    manifest.application.entries = helper.entries
   }
   await writeFile(path, JSON.stringify(manifest))
   assert.equal((await readDistributionManifest(path)).productName, manifest.productName)
@@ -162,10 +211,16 @@ async function nsisFixture(context, behavior = {}) {
   const installerIcon = await readFile(new URL('../apps/desktop/build/icon.ico', import.meta.url))
   await writeFile(join(payload, 'uninstallerIcon.ico'), installerIcon)
   await writeFile(artifact, 'synthetic installer bytes', { mode: 0o700 })
+  const helper = helperPayload(process.arch)
+  await mkdir(join(payload, 'resources/native'), { recursive: true })
+  await writeFile(join(payload, helper.record.executable.path), helper.pe)
+  await writeFile(join(payload, helper.record.identity.path), helper.metadata)
   const content = await applicationContent(payload, 'win32')
   const manifest = {
     productName: 'Pact Dev',
     platform: 'win32',
+    arch: process.arch,
+    windowsOwnedProcess: helper.record,
     application: {
       executable: 'Pact Dev.exe',
       contentSha256: content.sha256,
@@ -213,6 +268,15 @@ async function nsisFixture(context, behavior = {}) {
       await writeFile(
         join(owned, 'installed', 'uninstallerIcon.ico'),
         behavior.corruptIcon ? 'changed installed icon' : installerIcon,
+      )
+      await mkdir(join(owned, 'installed/resources/native'), { recursive: true })
+      await copyFile(
+        join(payload, helper.record.executable.path),
+        join(owned, 'installed', helper.record.executable.path),
+      )
+      await copyFile(
+        join(payload, helper.record.identity.path),
+        join(owned, 'installed', helper.record.identity.path),
       )
       if (!behavior.installUnconfirmed)
         options.onState({ kind: 'settled', groupGone: true, ownedProcessCount: 0 })
@@ -1082,11 +1146,14 @@ await test('a parsed manifest contributes only validated distribution identity t
         path: 'unpacked',
         executable: 'Pact',
         contentSha256: 'b'.repeat(64),
-        entries: [],
+        entries: process.platform === 'win32' ? helperPayload(process.arch).entries : [],
         secret,
       },
       artifacts: [],
       extensions: secret,
+      ...(process.platform === 'win32'
+        ? { windowsOwnedProcess: helperPayload(process.arch).record }
+        : {}),
     }),
   )
   await assert.rejects(
@@ -1104,4 +1171,34 @@ await test('a parsed manifest contributes only validated distribution identity t
   assert.equal(report.cleanupVerified, true)
   assert.equal(text.includes(secret) || text.includes(directory), false)
   assert.equal(calls.length, 0)
+})
+
+await test('installed payload inspection rejects a helper source identity that differs from the exact content manifest', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-installed-helper-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const helper = helperPayload('x64')
+  await mkdir(join(root, 'resources/native'), { recursive: true })
+  await writeFile(join(root, 'Pact.exe'), 'synthetic application', { mode: 0o700 })
+  await writeFile(join(root, helper.record.executable.path), helper.pe)
+  await writeFile(join(root, helper.record.identity.path), helper.metadata)
+  const content = await applicationContent(root, 'win32')
+  const manifest = {
+    platform: 'win32',
+    arch: 'x64',
+    windowsOwnedProcess: helper.record,
+    application: {
+      executable: 'Pact.exe',
+      contentSha256: content.sha256,
+      entries: content.entries,
+    },
+  }
+  assert.equal(await verifyApplication(root, manifest, false), join(root, 'Pact.exe'))
+  await assert.rejects(
+    verifyApplication(
+      root,
+      { ...manifest, windowsOwnedProcess: { ...helper.record, sourceSha256: 'd'.repeat(64) } },
+      false,
+    ),
+    /target\/source\/protocol/u,
+  )
 })

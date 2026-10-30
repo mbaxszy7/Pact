@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { mkdir, mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -19,6 +20,8 @@ import {
 } from './real-e2e-policy.mjs'
 
 const workspace = fileURLToPath(new URL('..', import.meta.url))
+const require = createRequire(import.meta.url)
+const playwrightCli = require.resolve('@playwright/test/cli')
 const compare = (left, right) => left.localeCompare(right)
 const key = (item) => JSON.stringify([item.path, item.title])
 function fixture(suite = 'full') {
@@ -44,12 +47,11 @@ function fixture(suite = 'full') {
     errors: [],
   }
 }
-const first = (report, tier) =>
-  report.suites[0].specs.find(
-    (spec) =>
-      realCases.find((item) => key(item) === JSON.stringify([spec.file, spec.title]))?.tier ===
-      tier,
-  ).tests[0]
+const first = (report, tier, platform = process.platform) =>
+  report.suites[0].specs.find((spec) => {
+    const item = realCases.find((entry) => key(entry) === JSON.stringify([spec.file, spec.title]))
+    return item?.tier === tier && (!item.platforms || item.platforms.includes(platform))
+  }).tests[0]
 const fail = (result, status = 'failed') => {
   result.status = 'unexpected'
   result.results[0].status = status
@@ -59,8 +61,8 @@ await test('actual Playwright discovery is completely classified and core select
   const discover = (args) =>
     JSON.parse(
       execFileSync(
-        'pnpm',
-        ['exec', 'playwright', 'test', '--project=real', '--list', '--reporter=json', ...args],
+        process.execPath,
+        [playwrightCli, 'test', '--project=real', '--list', '--reporter=json', ...args],
         { cwd: workspace, encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 },
       ),
     )
@@ -76,7 +78,7 @@ await test('actual Playwright discovery is completely classified and core select
       .toSorted(compare),
   )
   assert.equal(core.size, 1)
-  assert.equal(listed.size - core.size, 62)
+  assert.equal(listed.size - core.size, 70)
   assert.deepEqual(
     realCases.filter((item) => item.tier === 'core').map((item) => item.title),
     ['real @all completes each Agent once and keeps ordered distinct response rows'],
@@ -95,7 +97,7 @@ await test('core success reports every deferred case without claiming a complete
     notRun: 0,
     notApplicable: 0,
   })
-  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 62)
+  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 70)
   assert(
     report.cases
       .filter((item) => item.tier === 'extended')
@@ -107,14 +109,19 @@ await test('core success reports every deferred case without claiming a complete
 })
 
 await test('extended failure remains reported while core passes; explicitly selected full gate fails', () => {
-  const raw = fixture()
-  fail(first(raw, 'extended'))
-  const pr = evaluateRealReport(raw, { suite: 'full', gate: 'core' })
-  assert.equal(pr.gatePassed, true)
-  assert.equal(pr.fullSuitePassed, false)
-  assert.equal(pr.tiers.extended.failed, 1)
-  assert.equal(evaluateRealReport(raw, { suite: 'full', gate: 'full' }).gatePassed, false)
-  assert.equal(evaluateRealReport(fixture(), { suite: 'full' }).fullSuitePassed, true)
+  for (const platform of ['darwin', 'win32']) {
+    const raw = fixture()
+    fail(first(raw, 'extended', platform))
+    const pr = evaluateRealReport(raw, { suite: 'full', gate: 'core', platform })
+    assert.equal(pr.gatePassed, true)
+    assert.equal(pr.fullSuitePassed, false)
+    assert.equal(pr.tiers.extended.failed, 1)
+    assert.equal(
+      evaluateRealReport(raw, { suite: 'full', gate: 'full', platform }).gatePassed,
+      false,
+    )
+    assert.equal(evaluateRealReport(fixture(), { suite: 'full', platform }).fullSuitePassed, true)
+  }
 })
 
 for (const status of ['failed', 'timedOut', 'interrupted', 'skipped'])
@@ -184,7 +191,7 @@ await test('immutable coverage keeps all assertions while requiring only selecte
   const directory = await mkdtemp(join(tmpdir(), 'pact-real-policy-coverage-'))
   try {
     const listed = JSON.parse(
-      execFileSync('pnpm', ['exec', 'playwright', 'test', '--list', '--reporter=json'], {
+      execFileSync(process.execPath, [playwrightCli, 'test', '--list', '--reporter=json'], {
         cwd: workspace,
         encoding: 'utf8',
         timeout: 30000,
@@ -247,12 +254,14 @@ await test('missing, dual and incorrectly reassigned Playwright tier tags cannot
 await test('a macOS-only case is required on macOS and explicitly non-applicable on Windows', () => {
   const raw = fixture()
   const mac = realCases.find((item) => item.platforms)
-  const executed = raw.suites[0].specs.find((item) => item.title === mac.title).tests[0]
-  executed.results[0].status = 'skipped'
-  executed.status = 'skipped'
+  for (const item of realCases.filter((entry) => entry.platforms)) {
+    const executed = raw.suites[0].specs.find((spec) => spec.title === item.title).tests[0]
+    executed.results[0].status = 'skipped'
+    executed.status = 'skipped'
+  }
   const windows = evaluateRealReport(raw, { suite: 'full', platform: 'win32' })
   assert.equal(windows.gatePassed, true)
-  assert.equal(windows.tiers.extended.notApplicable, 1)
+  assert.equal(windows.tiers.extended.notApplicable, 8)
   assert.equal(windows.cases.find((item) => item.title === mac.title).status, 'not-applicable')
   assert.equal(realCaseRequired({ ...mac, project: 'real' }, 'full', 'win32'), false)
   assert.equal(realCaseRequired({ ...mac, project: 'real' }, 'full', 'darwin'), true)
@@ -334,7 +343,7 @@ await test('the reporting entry still lists all cases and fails when CI identity
       (error) => error.status === 1,
     )
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
-    assert.equal(report.cases.length, 63)
+    assert.equal(report.cases.length, 71)
     assert.equal(report.gatePassed, false)
     assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
   } finally {
@@ -366,7 +375,7 @@ await test('the actual CI reporting entry preserves exact source and run metadat
       },
     )
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
-    assert.equal(report.cases.length, 63)
+    assert.equal(report.cases.length, 71)
     assert.equal(report.gatePassed, true)
     assert.deepEqual(report.identity, reportIdentity)
     assert.equal(JSON.stringify(report).includes(privateCanary), false)
@@ -413,7 +422,7 @@ await test('CI report entry rejects local or null metadata while preserving ever
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json')))
     assert.equal(report.gatePassed, false)
     assert.equal(report.identity, null)
-    assert.equal(report.cases.length, 63)
+    assert.equal(report.cases.length, 71)
     assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
   }
 })

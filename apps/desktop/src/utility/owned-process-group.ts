@@ -1,6 +1,26 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 
+import type { DecisionPhysicalWitness } from '@pact/contracts'
 import type { DiagnosticEvent } from '@pact/contracts/diagnostics'
+
+import type { NativeMemoryAllocator } from './conversation/native-working-memory'
+
+import {
+  cleanupWindowsPhysicalReceipt,
+  proveWindowsPhysicalRelease,
+  WindowsOwnedProcess,
+  type PhysicalReceiptOperation,
+  type PhysicalReceiptRetirementResult,
+  type WindowsOwnedProcessConfiguration,
+  type WindowsOwnedProcessOptions,
+} from './win32-owned-process-group'
+
+export { configureOwnedProcessGroups } from './win32-owned-process-group'
+export type {
+  PhysicalReceiptOperation,
+  PhysicalReceiptRetirementResult,
+  WindowsOwnedProcessConfiguration,
+} from './win32-owned-process-group'
 
 type IdentityDiagnostic = NonNullable<DiagnosticEvent['settingsCatalogIdentity']>
 type IdentityCapture = Pick<
@@ -53,7 +73,7 @@ function readProcesses(): Promise<Map<number, Identity>> {
         maxBuffer: 256 * 1024,
         encoding: 'utf8',
         shell: false,
-        env: { PATH: process.env.PATH, LC_ALL: 'C' },
+        env: { PATH: process.env.PATH, LC_ALL: 'C', TZ: 'UTC' },
       },
       (error, output) => {
         if (error) {
@@ -111,16 +131,17 @@ const observeZero = (pid: number | undefined): IdentityDiagnostic['pidZero'] => 
   }
 }
 
-/** One child and its private POSIX group. The caller decides when work may be stopped. */
+/** One native root and its OS containment. The caller owns business admission. */
 export class OwnedProcessGroup {
   private child: ChildProcessWithoutNullStreams | undefined
+  private windows: WindowsOwnedProcess | undefined
+  private readonly windowsOptions: WindowsOwnedProcessOptions
   private root: Promise<Identity> | undefined
   private readonly identities = new Map<number, Identity>()
   private closing = false
   private cleanup: Promise<void> | undefined
   private childClosed = false
   private readonly ignoreChildError = (): void => undefined
-  private readonly ignoreInputError = (): void => undefined
   private didRelease = false
   private readonly signal: AbortSignal | undefined
   private readonly onCloseInput: (() => void | Promise<void>) | undefined
@@ -128,18 +149,22 @@ export class OwnedProcessGroup {
   private startupDeadline = 0
   private startupTimer: ReturnType<typeof setTimeout> | undefined
   private startupObservation: Promise<void> | undefined
+  private closingDeadline: number | undefined
+  private inputCloseTask: Promise<void> | undefined
+  private signalObservation: Promise<void> | undefined
   private readonly abort = (): void => {
     void this.close().catch(() => undefined)
   }
 
   constructor(
-    options: {
+    options: WindowsOwnedProcessOptions & {
       signal?: AbortSignal | undefined
       onCloseInput?: (() => void | Promise<void>) | undefined
       startupObservationMs?: number | undefined
     } = {},
   ) {
     this.signal = options.signal
+    this.windowsOptions = Object.freeze({ ...options })
     this.onCloseInput = options.onCloseInput
     this.startupObservationMs = options.startupObservationMs ?? 0
     if (
@@ -159,12 +184,23 @@ export class OwnedProcessGroup {
   spawn(command: string, args: string[], options: Options = {}): ChildProcessWithoutNullStreams {
     if (this.closing || this.child || this.signal?.aborted || options.signal?.aborted)
       throw new Error('This owned process scope cannot start another child.')
+    if (process.platform === 'win32') {
+      this.windows = new WindowsOwnedProcess(command, args, options, this.windowsOptions)
+      this.child = this.windows.child
+      this.child.once('close', () => {
+        this.childClosed = true
+      })
+      return this.child
+    }
     const child = spawn(command, args, {
       ...options,
-      detached: process.platform !== 'win32',
+      detached: true,
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: false,
     })
+    // JS cannot start another observation during synchronous spawn. Any read already
+    // in flight at this boundary may include a pre-group birth row, even if it looks valid.
+    const observationAtSpawn = processTableRead
     this.child = child
     // The SDK owns protocol interpretation; this owner retains no stderr content.
     child.once('close', () => {
@@ -172,23 +208,25 @@ export class OwnedProcessGroup {
       clearTimeout(this.startupTimer)
       this.startupTimer = undefined
       child.off('error', this.ignoreChildError)
-      if (process.platform === 'win32') child.stdin.off('error', this.ignoreInputError)
     })
     child.once('error', this.ignoreChildError)
-    if (process.platform === 'win32') child.stdin.on('error', this.ignoreInputError)
-    this.root =
-      process.platform === 'win32' || !child.pid
-        ? Promise.resolve({
-            pid: child.pid ?? 0,
-            ppid: process.pid,
-            pgid: child.pid ?? 0,
-            started: '',
-            state: '',
-          })
-        : readProcesses().then(async (initialRows) => {
-            // Another scope's in-flight observation can predate this spawn.
+    this.root = !child.pid
+      ? Promise.resolve({
+          pid: child.pid ?? 0,
+          ppid: process.pid,
+          pgid: child.pid ?? 0,
+          started: '',
+          state: '',
+        })
+      : (() => {
+          const firstObservation = readProcesses()
+          return firstObservation.then(async (initialRows) => {
+            this.assertClosingDeadline()
+            // Replace an earlier epoch regardless of its contents. A fresh failed row
+            // is final: this is a birth-freshness fence, never a failed-identity retry.
             const rows =
-              initialRows.has(child.pid!) || this.childClosed ? initialRows : await readProcesses()
+              firstObservation === observationAtSpawn ? await readProcesses() : initialRows
+            this.assertClosingDeadline()
             const root = rows.get(child.pid!)
             if (!root || root.ppid !== process.pid || root.pgid !== child.pid)
               throw new OwnedProcessIdentityError({
@@ -207,9 +245,10 @@ export class OwnedProcessGroup {
             this.remember(rows, root)
             return root
           })
+        })()
     // A failed observation remains visible to close(), without an unhandled rejection.
     void this.root.catch(() => undefined)
-    if (process.platform !== 'win32' && this.startupObservationMs) {
+    if (this.startupObservationMs) {
       this.startupDeadline = Date.now() + this.startupObservationMs
       void this.root.then(
         () => this.observeStartup(),
@@ -220,6 +259,7 @@ export class OwnedProcessGroup {
   }
 
   close(): Promise<void> {
+    this.closingDeadline ??= Date.now() + CLEANUP_MS
     this.closing = true
     clearTimeout(this.startupTimer)
     this.startupTimer = undefined
@@ -232,10 +272,101 @@ export class OwnedProcessGroup {
     if (this.closing) throw new Error('The owned process group is already closing.')
     if (!this.child || process.platform === 'win32' || !this.child.pid) return
     const root = await this.root!
+    this.assertClosingDeadline()
     if (this.groupGone(root.pgid)) return
     const rows = await readProcesses()
     if ([...rows.values()].some((row) => row.pgid === root.pgid && !/^[ZX]/u.test(row.state)))
       this.remember(rows, root)
+  }
+
+  /** Durable identity evidence before inference, never a PID-only permission to signal. */
+  async physicalWitness(ownerId: string): Promise<DecisionPhysicalWitness> {
+    if (this.windows && !this.closing) return this.windows.physicalWitness(ownerId)
+    if (process.platform !== 'darwin' || !this.root || this.closing)
+      throw Error('Physical witness unavailable')
+    const { decisionPhysicalWitnessSchema } =
+      await import('@pact/contracts/decision-physical-witness')
+    await this.observe()
+    const root = await this.root
+    this.assertClosingDeadline()
+    const rows = await readProcesses(),
+      owner = rows.get(process.pid)
+    if (!owner || !same(root, rows.get(root.pid))) throw Error('Physical witness unavailable')
+    this.remember(rows, root)
+    return decisionPhysicalWitnessSchema.parse({
+      version: 1,
+      platform: 'darwin',
+      ownerId,
+      owner: { pid: owner.pid, started: owner.started },
+      root: { pid: root.pid, pgid: root.pgid, started: root.started },
+      members: [...this.identities.values()].map((member) => ({
+        pid: member.pid,
+        pgid: member.pgid,
+        started: member.started,
+      })),
+    })
+  }
+
+  /** Read-only restart proof. Both the old Utility and every owned native identity must be gone. */
+  static async provePhysicalRelease(
+    value: unknown,
+    windows?: WindowsOwnedProcessConfiguration,
+    memory?: NativeMemoryAllocator,
+    operation?: PhysicalReceiptOperation,
+  ): Promise<boolean> {
+    const { decisionPhysicalWitnessSchema } =
+      await import('@pact/contracts/decision-physical-witness')
+    const parsed = decisionPhysicalWitnessSchema.safeParse(value)
+    if (!parsed.success) return false
+    if (parsed.data.platform === 'win32')
+      return process.platform === 'win32'
+        ? proveWindowsPhysicalRelease(parsed.data, windows, memory, operation).catch(() => false)
+        : false
+    if (process.platform !== 'darwin') return false
+    const witness = parsed.data,
+      rows = await readProcesses()
+    // A changed/reused PID is not proof that this owner's other work released.
+    // Require actual absence; no credentials, files, signals or retries are involved.
+    try {
+      process.kill(witness.owner.pid, 0)
+      return false
+    } catch (error) {
+      if (errorCode(error) !== 'ESRCH') return false
+    }
+    const alive = (known: { pid: number; started: string }) => {
+      const current = rows.get(known.pid)
+      return current?.started === known.started && !/^[ZX]/u.test(current.state)
+    }
+    if (alive(witness.owner) || witness.members.some(alive)) return false
+    // ESRCH for the whole private group is stronger than an exited owner/PID.
+    // EPERM, a reused/nonempty group or any other uncertainty retains admission.
+    try {
+      process.kill(-witness.root.pgid, 0)
+      return false
+    } catch (error) {
+      return errorCode(error) === 'ESRCH'
+    }
+  }
+
+  /** The Repository must first commit a retiring intent for this exact witness
+   * from a physically closed generation. Unknown owners are ineligible. A result
+   * is withheld until all helper/I/O/handles join; already_absent acknowledges
+   * only the validated owned path, never process release. */
+  static async cleanupPhysicalReceipt(
+    value: unknown,
+    windows?: WindowsOwnedProcessConfiguration,
+    memory?: NativeMemoryAllocator,
+    operation?: PhysicalReceiptOperation,
+  ): Promise<PhysicalReceiptRetirementResult> {
+    const { decisionPhysicalWitnessSchema } =
+      await import('@pact/contracts/decision-physical-witness')
+    const parsed = decisionPhysicalWitnessSchema.safeParse(value)
+    if (!parsed.success || parsed.data.platform !== 'win32') return 'unconfirmed'
+    return process.platform === 'win32'
+      ? cleanupWindowsPhysicalReceipt(parsed.data, windows, memory, operation).catch(
+          () => 'unconfirmed' as const,
+        )
+      : 'unconfirmed'
   }
 
   private observeStartup(): void {
@@ -246,6 +377,7 @@ export class OwnedProcessGroup {
       this.startupTimer = undefined
       const observation = (async () => {
         const root = await this.root!
+        this.assertClosingDeadline()
         const rows = await readProcesses()
         this.remember(rows, root)
       })()
@@ -274,6 +406,7 @@ export class OwnedProcessGroup {
   }
 
   private remember(rows: Map<number, Identity>, root: Identity): void {
+    this.assertClosingDeadline()
     if (!this.hasLiveAnchor(rows, root))
       throw new Error('The owned group lost its verified process identity.')
     const leader = rows.get(root.pgid)
@@ -310,9 +443,15 @@ export class OwnedProcessGroup {
     }
   }
 
-  private async signalGroup(root: Identity, signal: NodeJS.Signals): Promise<void> {
+  private async signalGroup(
+    root: Identity,
+    signal: NodeJS.Signals,
+    deadline: number,
+  ): Promise<void> {
+    this.assertDeadline(deadline)
     if (this.groupGone(root.pgid)) return
     const rows = await readProcesses()
+    this.assertDeadline(deadline)
     const leader = rows.get(root.pgid)
     if (leader && !sameIdentity(root, leader)) throw new Error('The owned group identity changed.')
     if (![...rows.values()].some((row) => row.pgid === root.pgid && !/^[ZX]/u.test(row.state)))
@@ -322,18 +461,30 @@ export class OwnedProcessGroup {
     if (this.childClosed && !this.hasLiveAnchor(rows, root)) return
     this.remember(rows, root)
     // Signalling uses only a private group with a currently verified original identity.
+    this.assertDeadline(deadline)
     try {
       process.kill(-root.pgid, signal)
     } catch (error) {
-      if (errorCode(error) !== 'ESRCH')
+      // Darwin can return EPERM while a group is exiting. It is not release:
+      // the original deadline still requires actual child close and group ESRCH.
+      const code = errorCode(error)
+      if (code !== 'ESRCH' && !(process.platform === 'darwin' && code === 'EPERM'))
         throw new Error('The owned owned group could not be stopped.', { cause: error })
     }
   }
 
   private async release(): Promise<void> {
-    const deadline = Date.now() + CLEANUP_MS
+    const deadline = this.closingDeadline!
     let closeInput: Promise<void> | undefined
     try {
+      if (this.windows) {
+        closeInput = this.startClosingInput()
+        void closeInput.catch(() => undefined)
+        await this.windows.close(deadline)
+        await this.withDeadline(closeInput, deadline)
+        this.didRelease = this.windows.released
+        return
+      }
       const child = this.child
       if (this.startupObservation)
         await this.withDeadline(
@@ -348,7 +499,7 @@ export class OwnedProcessGroup {
       }
       let root: Identity
       try {
-        root = await this.root!
+        root = await this.withDeadline(this.root!, deadline)
       } catch (error) {
         if (error instanceof OwnedProcessIdentityError) {
           try {
@@ -364,10 +515,7 @@ export class OwnedProcessGroup {
         }
         // A short-lived child can be reaped before its birth observation.
         // Physical absence permits settlement without any group signal.
-        if (
-          this.childClosed &&
-          (process.platform === 'win32' || !child.pid || this.groupGone(child.pid))
-        ) {
+        if (this.childClosed && (!child.pid || this.groupGone(child.pid))) {
           closeInput = this.startClosingInput()
           await this.withDeadline(closeInput, deadline)
           this.didRelease = true
@@ -375,37 +523,23 @@ export class OwnedProcessGroup {
         }
         throw error
       }
-      if (process.platform === 'win32') {
-        // Preserve the existing Windows capability; this proves only this child,
-        // not Windows tree release, which requires its OS-specific verification.
-        // Let native relays observe real EOF/close before forcibly closing their Job.
-        if (!this.childClosed && !child.stdin.destroyed && !child.stdin.writableEnded)
-          child.stdin.end()
-      } else if (root.pid > 0) await this.signalGroup(root, 'SIGTERM')
+      if (root.pid > 0) await this.signalBeforeDeadline(root, 'SIGTERM', deadline)
       closeInput = this.startClosingInput()
       void closeInput.catch(() => undefined)
       const killAt = Date.now() + TERM_GRACE_MS
-      const forceAt = killAt + (process.platform === 'win32' ? TERM_GRACE_MS : 0)
-      let terminated = process.platform !== 'win32'
       let killed = false
       while (Date.now() < deadline) {
-        const gone = process.platform === 'win32' || root.pid === 0 || this.groupGone(root.pgid)
+        const gone = root.pid === 0 || this.groupGone(root.pgid)
         if (this.childClosed && gone) {
           // oxlint-disable-next-line no-await-in-loop -- Physical release is the gate for this one scope's input cleanup.
           await this.withDeadline(closeInput, deadline)
           this.didRelease = true
           return
         }
-        if (!terminated && Date.now() >= killAt) {
-          if (!this.childClosed) child.kill('SIGTERM')
-          terminated = true
-        }
-        if (!killed && Date.now() >= forceAt) {
-          if (process.platform === 'win32') {
-            if (!this.childClosed) child.kill('SIGKILL')
-          } else if (!gone) {
+        if (!killed && Date.now() >= killAt) {
+          if (!gone) {
             // oxlint-disable-next-line no-await-in-loop -- Revalidate the same owned group before the single KILL escalation.
-            await this.signalGroup(root, 'SIGKILL')
+            await this.signalBeforeDeadline(root, 'SIGKILL', deadline)
           }
           killed = true
         }
@@ -425,23 +559,50 @@ export class OwnedProcessGroup {
   }
 
   private startClosingInput(): Promise<void> {
-    return process.platform === 'win32'
-      ? Promise.resolve().then(() => this.onCloseInput?.())
-      : Promise.resolve(this.onCloseInput?.())
+    this.inputCloseTask ??= Promise.resolve().then(() => this.onCloseInput?.())
+    void this.inputCloseTask.catch(() => undefined)
+    return this.inputCloseTask
   }
 
-  private async withDeadline(work: Promise<void>, deadline: number): Promise<void> {
+  private signalBeforeDeadline(
+    root: Identity,
+    signal: NodeJS.Signals,
+    deadline: number,
+  ): Promise<void> {
+    const task = this.signalGroup(root, signal, deadline)
+    this.signalObservation = task
+    const settled = (): void => {
+      if (this.signalObservation === task) this.signalObservation = undefined
+    }
+    void task.then(settled, settled)
+    return this.withDeadline(task, deadline)
+  }
+
+  private assertClosingDeadline(): void {
+    if (this.closingDeadline !== undefined) this.assertDeadline(this.closingDeadline)
+  }
+
+  private assertDeadline(deadline: number): void {
+    if (Date.now() >= deadline)
+      throw new Error('The owned process scope did not release before its deadline.')
+  }
+
+  private async withDeadline<T>(work: Promise<T>, deadline: number): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined
+    void work.catch(() => undefined)
     try {
-      await Promise.race([
+      this.assertDeadline(deadline)
+      const result = await Promise.race([
         work,
         new Promise<never>((_, reject) => {
           timer = setTimeout(
-            () => reject(new Error('Process input cleanup did not settle.')),
+            () => reject(new Error('The owned process scope did not release before its deadline.')),
             Math.max(1, deadline - Date.now()),
           )
         }),
       ])
+      this.assertDeadline(deadline)
+      return result
     } finally {
       clearTimeout(timer)
     }
