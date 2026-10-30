@@ -47,12 +47,11 @@ function fixture(suite = 'full') {
     errors: [],
   }
 }
-const first = (report, tier) =>
-  report.suites[0].specs.find(
-    (spec) =>
-      realCases.find((item) => key(item) === JSON.stringify([spec.file, spec.title]))?.tier ===
-      tier,
-  ).tests[0]
+const first = (report, tier, platform = process.platform) =>
+  report.suites[0].specs.find((spec) => {
+    const item = realCases.find((entry) => key(entry) === JSON.stringify([spec.file, spec.title]))
+    return item?.tier === tier && (!item.platforms || item.platforms.includes(platform))
+  }).tests[0]
 const fail = (result, status = 'failed') => {
   result.status = 'unexpected'
   result.results[0].status = status
@@ -110,14 +109,19 @@ await test('core success reports every deferred case without claiming a complete
 })
 
 await test('extended failure remains reported while core passes; explicitly selected full gate fails', () => {
-  const raw = fixture()
-  fail(first(raw, 'extended'))
-  const pr = evaluateRealReport(raw, { suite: 'full', gate: 'core' })
-  assert.equal(pr.gatePassed, true)
-  assert.equal(pr.fullSuitePassed, false)
-  assert.equal(pr.tiers.extended.failed, 1)
-  assert.equal(evaluateRealReport(raw, { suite: 'full', gate: 'full' }).gatePassed, false)
-  assert.equal(evaluateRealReport(fixture(), { suite: 'full' }).fullSuitePassed, true)
+  for (const platform of ['darwin', 'win32']) {
+    const raw = fixture()
+    fail(first(raw, 'extended', platform))
+    const pr = evaluateRealReport(raw, { suite: 'full', gate: 'core', platform })
+    assert.equal(pr.gatePassed, true)
+    assert.equal(pr.fullSuitePassed, false)
+    assert.equal(pr.tiers.extended.failed, 1)
+    assert.equal(
+      evaluateRealReport(raw, { suite: 'full', gate: 'full', platform }).gatePassed,
+      false,
+    )
+    assert.equal(evaluateRealReport(fixture(), { suite: 'full', platform }).fullSuitePassed, true)
+  }
 })
 
 for (const status of ['failed', 'timedOut', 'interrupted', 'skipped'])

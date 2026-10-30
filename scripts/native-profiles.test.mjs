@@ -41,15 +41,17 @@ await test('the old native contract retains its pin while the fixed decision inv
   )
 })
 await test('both native configs consume one inventory and never permit a platform skip to satisfy the decision profile', async () => {
-  const legacy = await readFile(new URL('../vitest.native.config.ts', import.meta.url), 'utf8')
+  const { default: legacy } = await import('../vitest.native.config.ts')
   const decision = await readFile(
     new URL('../vitest.native-decision.config.ts', import.meta.url),
     'utf8',
   )
-  assert.match(
-    legacy,
-    /exclude:\s*\[\.\.\.decisionNativeFiles, \.\.\.claudeDecisionNativeFiles, \.\.\.windowsOwnerNativeFiles\]/u,
-  )
+  assert.deepEqual(legacy.test.exclude, [
+    ...decisionNativeFiles,
+    ...claudeDecisionNativeFiles,
+    ...windowsOwnerNativeFiles,
+    'tests/native/claude-decision-windows.test.ts',
+  ])
   assert.match(decision, /include:\s*\[\.\.\.decisionNativeFiles\]/u)
   assert.match(decision, /!nativeProfileSupports\(nativeProfile\('decision-codex'\)\)/u)
   assert.match(decision, /throw new Error/u)
