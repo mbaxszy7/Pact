@@ -672,7 +672,7 @@ const actionLabels: Record<NonNullable<SchedulingActivityRow['action']>, string>
   reply: 'User-input response',
   route_codex: 'Route to Codex',
   route_claude: 'Route to Claude Code',
-  clarify_prepared_input: 'Clarify a user-reserved detail',
+  clarify_prepared_input: 'Request missing information',
   supplement_plan: 'Extra read-only Plan clarification',
   supplement_code_response: 'Extra read-only code-review response',
   native_check: 'Native session check',

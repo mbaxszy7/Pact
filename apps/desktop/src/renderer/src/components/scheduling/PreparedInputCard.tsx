@@ -203,7 +203,7 @@ export function PreparedInputCard({
               </label>
               {page?.declaredInformation ? (
                 <div className="text-caption text-primary">
-                  <p className="font-medium">Reserved information</p>
+                  <p className="font-medium">Saved information</p>
                   <p>{page.declaredInformation.question}</p>
                   {page.declaredInformation.options.length ? (
                     <ul className="list-inside list-disc">

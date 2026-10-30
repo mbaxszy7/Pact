@@ -141,12 +141,6 @@ interface WorkspaceViewProps {
   onOpenSkillDocument: (skill: SkillSelection) => void
   skillDocumentPanel?: SkillDocumentPanelState | undefined
   onRetrySkillDocument: () => void
-  conversationComposerUserInformation?:
-    | import('@pact/contracts').UserInformationDeclaration
-    | undefined
-  onConversationComposerUserInformationChange?:
-    | import('../conversation/useConversation').ConversationFlow['setComposerUserInformation']
-    | undefined
   conversationComposerSkills: SkillSelection[]
   onConversationComposerSkillsChange: (skills: SkillSelection[]) => void
   onConversationComposerMentionChange: (value: ConversationComposerMention | undefined) => void
@@ -498,8 +492,6 @@ function WorkspaceContent({
               onComposerChange={props.onConversationComposerChange}
               onComposerDocumentChange={props.onConversationComposerDocumentChange}
               onOpenSkillDocument={props.onOpenSkillDocument}
-              composerUserInformation={props.conversationComposerUserInformation}
-              onComposerUserInformationChange={props.onConversationComposerUserInformationChange}
               composerSkills={props.conversationComposerSkills}
               onComposerSkillsChange={props.onConversationComposerSkillsChange}
               composerMention={props.conversationComposerMention}

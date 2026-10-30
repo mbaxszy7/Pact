@@ -124,7 +124,6 @@ import { SessionWarningCard } from './SessionWarningCard'
 import { SpeedMenu } from './SpeedMenu'
 import { sameDecision, hasDecisionAnswers, type DecisionReplyContext } from './useConversation'
 import { commentDraftSaveSucceeded } from './useConversation'
-import { UserInformationDraft } from './UserInformationDraft'
 import { useSkillComposer, type ComposerEdit } from './useSkillComposer'
 import { WorkspaceChangesCard, type WorkspaceChangesList } from './WorkspaceChangesCard'
 
@@ -171,8 +170,6 @@ interface ConversationViewProps {
   snapshot?: ConversationViewProjection | undefined
   history: ConversationHistoryControls
   composer: string
-  composerUserInformation?: import('@pact/contracts').UserInformationDeclaration | undefined
-  onComposerUserInformationChange?: ConversationFlow['setComposerUserInformation'] | undefined
   choosingImages?: boolean | undefined
   composerImages?: readonly DraftImage[] | undefined
   onAddComposerImages?: ConversationFlow['addComposerImages'] | undefined
@@ -320,8 +317,6 @@ export function ConversationView({
   history,
   composer,
   composerImages = EMPTY_IMAGES,
-  composerUserInformation,
-  onComposerUserInformationChange,
   choosingImages = false,
   onAddComposerImages,
   onChooseComposerImages,
@@ -4220,14 +4215,6 @@ export function ConversationView({
                     onOpen={(image) => openImageGallery(composerImages, image)}
                     onRemove={onRemoveComposerImage}
                   />
-                  {onComposerUserInformationChange && composerUserInformation ? (
-                    <UserInformationDraft
-                      value={composerUserInformation}
-                      compact={Boolean(snapshot?.preparedInputContinuation)}
-                      disabled={composerDisabled}
-                      onChange={onComposerUserInformationChange}
-                    />
-                  ) : null}
                   <ComposerEditor
                     editorRef={composerRef}
                     value={editorValue}
@@ -4588,13 +4575,6 @@ export function ConversationView({
                         <ImagePlus className="size-4" aria-hidden="true" strokeWidth={1.75} />
                       )}
                     </button>
-                  ) : null}
-                  {onComposerUserInformationChange && !composerUserInformation ? (
-                    <UserInformationDraft
-                      value={undefined}
-                      disabled={composerDisabled}
-                      onChange={onComposerUserInformationChange}
-                    />
                   ) : null}
                   {sendWhileWorking ? (
                     <button

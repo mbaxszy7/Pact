@@ -1595,10 +1595,6 @@ function App(): React.JSX.Element {
           onAddConversationImages={conversation.addComposerImages}
           onChooseConversationImages={conversation.chooseComposerImages}
           onRemoveConversationImage={conversation.removeComposerImage}
-          conversationComposerUserInformation={conversation.composerUserInformation}
-          onConversationComposerUserInformationChange={(value) =>
-            conversation.setComposerUserInformation(value)
-          }
           conversationComposerSkills={conversation.composerSkills}
           onConversationComposerSkillsChange={(values) => conversation.setComposerSkills(values)}
           conversationComposerMention={conversation.composerMention}

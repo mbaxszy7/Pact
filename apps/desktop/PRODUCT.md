@@ -28,7 +28,7 @@ Forward execution preserves native tools and user permissions. Recorded Changes 
 
 - A resizable desktop workspace with Project/Session navigation, shared Transcript/Composer and a contextual right pane.
 - The contextual pane presents the sole current Plan, files, historical Changes and Session settings. It can be closed/reopened without making a second full plan in Chat.
-- The Composer combines text, route, native Skill selections, static images and persistent Comment drafts in one Send. An optional reserved-detail declaration belongs to a new ordinary Send: the user supplies its question, choices and missing/supplied state; Relay may collect that exact field at an existing qualified node, otherwise the original Agent reads it. Unsupported input paths retain the draft and explain the refusal. Native question answers use their live forms.
+- The Composer combines text, route, native Skill selections, static images and persistent Comment drafts in one Send. Native question answers use their live forms.
 - Implement plan and each new Repair explicitly authorize their displayed writing scope. Continue collaboration resumes the already authorized workflow after rechecking current facts. Native completion, independent review acceptance and dispatch readiness remain separate facts.
 - Preserve deliberate reading position, selection and focus while streaming, expanding details, paging, navigating Comments or loading historical sources.
 - Native approvals, questions, MCP forms and OAuth keep their own actual lifecycle. Recovery retains readable history and existing drafts.

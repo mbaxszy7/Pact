@@ -255,3 +255,61 @@ test(
     }
   },
 )
+
+test(
+  'asks for missing information without a manual Composer setup',
+  { tag: '@deterministic' },
+  async ({ runtimeOwnership: _owned }, testInfo) => {
+    const fixture = await createRuntimeFixture({ codexAppServer: 'native_question' })
+    let app: Awaited<ReturnType<typeof fixture.launch>> | undefined
+    try {
+      await seed(fixture)
+      app = await fixture.launch()
+      const page = await app.firstWindow()
+      await page.getByRole('button', { name: 'Input return Session', exact: true }).click()
+      const composer = page.getByRole('combobox', { name: 'Message', exact: true })
+      await expect(composer).toBeVisible()
+      await page.screenshot({ path: testInfo.outputPath('composer.png') })
+      await expect(page.getByRole('button', { name: 'Reserve a detail', exact: true })).toHaveCount(
+        0,
+      )
+      await expect(
+        page.getByRole('textbox', { name: 'Question to ask me', exact: true }),
+      ).toHaveCount(0)
+      const appearance = await page.evaluate(async () => {
+        const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+        const current = await bridge.getAppearanceSettings()
+        if (!current.ok) return current
+        return bridge.updateAppearanceSettings({
+          expectedRevision: current.value.requested.revision,
+          theme: 'dark',
+        })
+      })
+      expect(appearance.ok).toBe(true)
+      await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+      await page.screenshot({
+        path: testInfo.outputPath('composer-dark.png'),
+        animations: 'disabled',
+      })
+      await composer.fill('@codex Ask for a cancellation scope')
+      await composer.press('Enter')
+      await expect(page.getByText('Codex needs your input', { exact: true })).toBeVisible()
+      await expect(composer).toHaveCount(0)
+      await expect(page.locator('.input-replacement[data-transitioning="true"]')).toHaveCount(0)
+      await page.screenshot({ path: testInfo.outputPath('question.png') })
+      await page.getByRole('radio', { name: /Current request/ }).check()
+      await page.getByRole('button', { name: 'Submit answers', exact: true }).click()
+      await expect(page.getByText('Bounded lifecycle response.', { exact: true })).toBeVisible()
+      await expect(page.getByText('Codex needs your input', { exact: true })).toHaveCount(0)
+      await expect(composer).toBeVisible()
+      await expect(page.getByRole('button', { name: 'Reserve a detail', exact: true })).toHaveCount(
+        0,
+      )
+      expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(1)
+      await page.screenshot({ path: testInfo.outputPath('continued.png') })
+    } finally {
+      if (app) await quitPact(app)
+      await fixture.dispose()
+    }
+  },
+)

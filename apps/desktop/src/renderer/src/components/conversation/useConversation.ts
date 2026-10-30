@@ -296,6 +296,7 @@ async function readSentComments(
 export interface ConversationFlow {
   snapshot: ConversationViewProjection | undefined
   composer: string
+  /** Legacy draft metadata remains available to in-flight receipts, without a Composer control. */
   composerUserInformation: import('@pact/contracts').UserInformationDeclaration | undefined
   setComposerUserInformation(
     value: import('@pact/contracts').UserInformationDeclaration | undefined,
@@ -2688,9 +2689,7 @@ export function useConversation(
             composerDraftsRef.current[sessionId]?.queueReturnOperationId ||
             composerDraftsRef.current[sessionId]?.images?.length))
       ) {
-        onNotice(
-          'Complete the reserved information, or remove it before sending a command, workflow reply, queued message, Skill or image. Your draft was kept.',
-        )
+        onNotice('This saved input cannot be sent in this context. Your draft was kept.')
         return false
       }
     }

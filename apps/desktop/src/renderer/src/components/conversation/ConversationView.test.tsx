@@ -1852,7 +1852,6 @@ it('keeps cancellation receipt recovery visible after the host card disappears, 
       },
     }
   props.composer = 'Keep the current draft'
-  props.composerUserInformation = declaration
   props.snapshot!.relaySchedulingDecision = card
   const cancel = vi
       .fn<NonNullable<typeof props.history.cancelPreparedInformation>>()

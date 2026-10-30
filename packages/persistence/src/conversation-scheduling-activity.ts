@@ -94,7 +94,7 @@ function suggestionFor(candidate: string | null): string | null {
     propose_supplement_code_response: 'Request one read-only code-review response.',
     route_codex: 'Route the input to Codex.',
     route_claude: 'Route the input to Claude Code.',
-    clarify_prepared_input: 'Ask for one explicitly user-reserved detail.',
+    clarify_prepared_input: 'Ask for missing information.',
   }
   return candidate ? (labels[candidate] ?? null) : null
 }

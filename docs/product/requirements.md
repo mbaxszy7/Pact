@@ -394,17 +394,13 @@ scheduling information unavailable through existing authorized investigation. Th
 actual operation, source basis, missing authority, versions and duplicate interactions; a model's
 uncertainty or technical disagreement alone cannot open a card. Task requirements and technical
 questions remain with the original Agent. The strict contract represents all three categories;
-native recovery has a deterministic arrangement-change consumer. Qualified implicit ordinary Send
-may collect one explicitly declared user-owned value or choice. The optional Composer declaration
-contains the user's exact question, choices and supplied/unanswered state. It is a separate immutable
-Batch source; ordinary prose, Comments, quoted material and model claims cannot create a missing field.
-Only the host-admitted field may be selected, with its original question and choices. Undeclared
-business questions stay with the original Agent. This declaration currently supports a new ordinary
-Send only; unsupported queue, Steer, returned-input, workflow, command, Skill and image paths refuse
-before acceptance and keep the draft. It does not expand the existing consultation trigger. Answers are separate immutable user
-sources. Cancel terminates this unsent request and returns to the current Composer with editable
-Comment copies; it offers no Continue for that request. Withdraw only its unchanged unanswered
-declaration, retaining newer draft edits. The next explicit Send sends the current draft under a
+native recovery has a deterministic arrangement-change consumer. Users send their task directly;
+the Composer has no manual question, choice or supplied-state configuration. Necessary task questions
+use the existing native forms or workflow decision replies. Confirmed answers remain bound to the
+same original request and follow its owner's existing continuation rules. Frozen information and answer sources remain
+readable for saved requests and recovery. Cancel terminates an unsent information request and returns
+to the current Composer with editable Comment copies; it offers no Continue for that request and
+retains newer draft edits. The next explicit Send sends the current draft under a
 new message identity. Stop, restart and preparation failure retain their existing explicit Continue
 with current execution settings and original frozen sources. An unconfirmed Cancel retains one
 receipt-check entry in its Session, including after switching Sessions. Until its matching receipt
