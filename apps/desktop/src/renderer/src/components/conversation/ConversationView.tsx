@@ -570,6 +570,9 @@ export function ConversationView({
       initialId: image.id,
     })
   const skillMenuRef = useRef<HTMLDivElement>(null)
+  const skillPopoverOpen = useRef(false)
+  const composerBoxRef = useRef<HTMLDivElement>(null)
+  const skillMenuAnchor = `--pact-skills-${useId().replaceAll(':', '')}`
   const [mentionQuery, setMentionQuery] = useState<MentionQuery | undefined>()
   const [activeMentionIndex, setActiveMentionIndex] = useState(0)
   const copyRequestGenerationRef = useRef(0)
@@ -1048,6 +1051,33 @@ export function ConversationView({
   const activeSkillId = skillComposer.query
     ? skillComposer.options[skillComposer.active]?.id
     : undefined
+  const skillMenuOpen =
+    Boolean(skillComposer.query) && visible && !composerDisabled && !inputTakeover
+  useLayoutEffect(() => {
+    const menu = skillMenuRef.current
+    const box = composerBoxRef.current
+    if (!menu || !box) return undefined
+    if (!skillMenuOpen) {
+      if (skillPopoverOpen.current) menu.hidePopover()
+      return undefined
+    }
+    const fit = (): void => {
+      menu.style.setProperty(
+        '--pact-skill-menu-available-height',
+        `${Math.max(0, box.getBoundingClientRect().top - 16)}px`,
+      )
+    }
+    fit()
+    menu.showPopover()
+    const observer = new ResizeObserver(fit)
+    observer.observe(box)
+    window.addEventListener('resize', fit)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', fit)
+      if (skillPopoverOpen.current) menu.hidePopover()
+    }
+  }, [skillMenuOpen, session.id])
   useLayoutEffect(() => {
     if (activeSkillId && skillComposer.revealActive)
       skillMenuRef.current?.querySelector<HTMLElement>(`#skill-${activeSkillId}`)?.scrollIntoView({
@@ -4096,6 +4126,8 @@ export function ConversationView({
                 </div>
               ) : null}
               <div
+                ref={composerBoxRef}
+                style={{ anchorName: skillMenuAnchor }}
                 className={`pact-composer-box relative flex flex-col gap-1.5 rounded-card border border-border bg-surface-raised p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus ${recoveryLocked ? 'opacity-60' : ''} ${imageDropActive ? 'outline-2 outline-focus outline-offset-4' : ''}`}
                 onDragEnter={(event) => {
                   if (
@@ -4360,14 +4392,20 @@ export function ConversationView({
                 <div className="pact-composer-send-row relative flex items-center justify-between">
                   <div
                     ref={skillMenuRef}
+                    popover="auto"
+                    style={{ positionAnchor: skillMenuAnchor }}
+                    onBeforeToggle={(event) => {
+                      skillPopoverOpen.current = event.newState === 'open'
+                      if (event.newState === 'closed' && skillComposer.query) skillComposer.close()
+                    }}
                     id={`skills-${session.id}`}
                     role="listbox"
                     aria-label="Native Skills"
-                    aria-hidden={!skillComposer.query}
+                    aria-hidden={!skillMenuOpen}
                     aria-busy={skillComposer.loading}
-                    inert={!skillComposer.query}
-                    data-open={Boolean(skillComposer.query)}
-                    className="pact-skill-menu absolute right-0 bottom-[calc(100%+8px)] left-0 z-30 min-h-32 max-h-80 overflow-y-auto rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
+                    inert={!skillMenuOpen}
+                    data-open={skillMenuOpen}
+                    className="pact-skill-menu overflow-y-auto rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
                   >
                     {skillComposer.pactOptions.length > 0 ? (
                       <>

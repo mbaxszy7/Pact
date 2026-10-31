@@ -145,42 +145,39 @@
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
-  /* Preserve the input-anchored surface across filtering; only open/close changes its motion. */
+  /* Reserve catalog space before native results arrive so Pact click targets stay fixed. */
   .pact-skill-menu {
     display: none;
+    position: fixed;
+    inset: auto;
+    left: anchor(left);
+    bottom: anchor(top);
+    width: anchor-size(width);
+    height: 20rem;
+    max-height: var(--pact-skill-menu-available-height, 20rem);
+    margin: 0 0 8px;
     opacity: 0;
-    transform: translateY(4px);
     transition:
       opacity 100ms ease-out,
-      transform 100ms cubic-bezier(0.16, 1, 0.3, 1),
       display 100ms allow-discrete;
   }
 
   .pact-skill-menu[data-open='true'] {
     display: block;
     opacity: 1;
-    transform: none;
     transition-duration: 160ms;
   }
 
   @starting-style {
     .pact-skill-menu[data-open='true'] {
       opacity: 0;
-      transform: translateY(4px);
     }
   }
 
   @media (prefers-reduced-motion: reduce) {
     .pact-skill-menu,
     .pact-skill-menu[data-open='true'] {
-      transform: none;
       transition-duration: 60ms;
-    }
-
-    @starting-style {
-      .pact-skill-menu[data-open='true'] {
-        transform: none;
-      }
     }
   }
 

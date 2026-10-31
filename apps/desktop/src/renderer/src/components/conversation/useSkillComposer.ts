@@ -79,6 +79,7 @@ export function useSkillComposer(input: {
   disabled: boolean
 }) {
   const [queryState, setQuery] = useState<Query>()
+  const dismissedQuery = useRef<Query | undefined>(undefined)
   const query = queryState?.sessionId === input.session.id ? queryState : undefined
   const [pages, setPages] = useState<Partial<Record<Agent, Page>>>({})
   const [errors, setErrors] = useState<Partial<Record<Agent, string>>>({})
@@ -336,7 +337,19 @@ export function useSkillComposer(input: {
   }, [key, open])
 
   const update = (value: string, cursor: number, selections: SkillSelection[]): void => {
-    setQuery(queryAt(input.session.id, value, cursor, selections))
+    const next = queryAt(input.session.id, value, cursor, selections)
+    const dismissed = dismissedQuery.current
+    if (
+      next &&
+      dismissed &&
+      next.sessionId === dismissed.sessionId &&
+      next.start === dismissed.start &&
+      next.end === dismissed.end &&
+      next.text === dismissed.text
+    )
+      return
+    dismissedQuery.current = undefined
+    setQuery(next)
     setActiveIndex(0)
     setRevealActive(true)
     setOptionStarts({})
@@ -450,6 +463,7 @@ export function useSkillComposer(input: {
     canPrevious,
     rangeLabel,
     close: () => {
+      dismissedQuery.current = query
       setQuery(undefined)
       void window.pact.cancelSkillCatalog(input.session.id).catch(() => undefined)
     },

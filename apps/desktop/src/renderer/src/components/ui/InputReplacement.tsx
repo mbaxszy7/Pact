@@ -51,6 +51,9 @@ export function InputReplacement({
       // Measure natural layout after removing our own animated height constraint.
       const next = panel.getBoundingClientRect().height
       height.current = next
+      // Typing and validation resize the ordinary editor naturally. Clipping is
+      // reserved for an actual surface replacement, never its focus outline.
+      if (!interrupt && !mode.current) return
       if (previous === undefined || media.matches || previous === next) return
       const transition = element.animate([{ height: `${previous}px` }, { height: `${next}px` }], {
         duration: 220,

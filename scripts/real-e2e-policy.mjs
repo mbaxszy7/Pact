@@ -13,6 +13,19 @@ import { isScriptEntry } from './script-entry.mjs'
 // Exact business cases, independent of a candidate's mutable tags or test outcome.
 export const realCases = [
   {
+    path: 'tests/e2e/skill-composer.spec.ts',
+    title:
+      'real Skill menu stays outside the Composer, dismisses, and preserves Pact command badges',
+    tier: 'extended',
+    scenario: 'additional-regression',
+  },
+  {
+    path: 'tests/e2e/skill-composer.spec.ts',
+    title: 'real Skill menu keeps Plan at its original click position while native catalogs load',
+    tier: 'extended',
+    scenario: 'additional-regression',
+  },
+  {
     path: 'tests/e2e/relay-information-real.spec.ts',
     title:
       'real Claude completes a confirmed user value and an already-answered release note without repeated questions',

@@ -319,6 +319,8 @@ Current durable Comments distinguish Draft/Sent. Automatic Comment resolve/wont-
 
 Pact commands are structured App actions, distinct from installed native Skills and native slash controls. Same-name Skills remain selectable by source. Commands quoted in prose, code or history do not start work. A workflow entry authorizes its bounded automatic handoffs; implementation and each new repair keep their own explicit write authorization.
 
+The Composer displays completed Pact commands as icon-and-`pact:<command>` badges. Copying and sending preserve the original `/plan`, `/build` or `/review` text; these badges never create native Skill selections or change workflow authority.
+
 | Entry              | Initial work                                                                                              | Fixed owner and reviewer                                                                                  |
 | ------------------ | --------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | `/plan [task]`     | Native planning and necessary clarification, followed by automatic independent review and author revision | Selected Agent, otherwise Primary, owns the plan and is the default implementer. The other Agent reviews. |

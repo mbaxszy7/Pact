@@ -78,7 +78,7 @@ await test('actual Playwright discovery is completely classified and core select
       .toSorted(compare),
   )
   assert.equal(core.size, 1)
-  assert.equal(listed.size - core.size, 70)
+  assert.equal(listed.size - core.size, 72)
   assert.deepEqual(
     realCases.filter((item) => item.tier === 'core').map((item) => item.title),
     ['real @all completes each Agent once and keeps ordered distinct response rows'],
@@ -97,7 +97,7 @@ await test('core success reports every deferred case without claiming a complete
     notRun: 0,
     notApplicable: 0,
   })
-  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 70)
+  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 72)
   assert(
     report.cases
       .filter((item) => item.tier === 'extended')
@@ -343,7 +343,7 @@ await test('the reporting entry still lists all cases and fails when CI identity
       (error) => error.status === 1,
     )
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
-    assert.equal(report.cases.length, 71)
+    assert.equal(report.cases.length, 73)
     assert.equal(report.gatePassed, false)
     assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
   } finally {
@@ -375,7 +375,7 @@ await test('the actual CI reporting entry preserves exact source and run metadat
       },
     )
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
-    assert.equal(report.cases.length, 71)
+    assert.equal(report.cases.length, 73)
     assert.equal(report.gatePassed, true)
     assert.deepEqual(report.identity, reportIdentity)
     assert.equal(JSON.stringify(report).includes(privateCanary), false)
@@ -422,7 +422,7 @@ await test('CI report entry rejects local or null metadata while preserving ever
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json')))
     assert.equal(report.gatePassed, false)
     assert.equal(report.identity, null)
-    assert.equal(report.cases.length, 71)
+    assert.equal(report.cases.length, 73)
     assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
   }
 })
