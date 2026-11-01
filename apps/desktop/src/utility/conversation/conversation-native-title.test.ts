@@ -272,7 +272,11 @@ async function fixture() {
     new DefaultSessionSettings(preparation, db.defaultSessionSettingsRepository),
     (id) => flow.sessionTitleChanged(id),
   )
-  const send = async (agentId: 'codex' | 'claude' = 'codex', targetSessionId = sessionId) => {
+  const send = async (
+    agentId: 'codex' | 'claude' = 'codex',
+    targetSessionId = sessionId,
+    content = 'Hello',
+  ) => {
     const drafts = db.conversationRepository.readPage({
       scope: 'drafts',
       sessionId: targetSessionId,
@@ -281,7 +285,7 @@ async function fixture() {
     const result = await flow.send({
       sessionId: targetSessionId,
       clientMessageId: randomUUID(),
-      content: 'Hello',
+      content,
       expectedCommentsRevision: drafts.commentsRevision,
       commentIds: [],
       route: { type: 'agent', agentId },
@@ -303,6 +307,27 @@ async function fixture() {
 }
 
 describe('Conversation Native display title ownership', () => {
+  it.each([
+    [
+      '你帮我评估一下目前 relay 的功能以及更合适的实现方案',
+      '你帮我评估一下目前 relay 的功能以及更合适的实现方案',
+    ],
+    [
+      'Review the current relay implementation and explain the remaining design tradeoffs clearly',
+      'Review the current relay implementation and explain the remaining design tradeoffs clearly',
+    ],
+    ['界'.repeat(150), '界'.repeat(120)],
+    ['x'.repeat(118) + '👩‍💻', 'x'.repeat(118)],
+    ['x'.repeat(118) + '😀', 'x'.repeat(118) + '😀'],
+  ])('preserves the full local title within its existing limit: %s', async (content, expected) => {
+    native.enrichTitle = undefined
+    const f = await fixture()
+    await f.send('codex', f.sessionId, content)
+    expect(f.title()).toBe(expected)
+    expect(f.title().length).toBeLessThanOrEqual(120)
+    expect(f.db.sessionRepository.find(f.sessionId)?.titleSource).toBe('local')
+  })
+
   it('adopts same-Turn metadata without a Native name and retains it through stale native readback and resume', async () => {
     native.enrichTitle = undefined
     native.reportedTitle = 'Metadata from the first task'

@@ -136,6 +136,8 @@ One Project may have multiple Sessions. Each owns transcript, settings, separate
 
 `New session` is immediate; a local first-message title is fallback. An Agent/native title can arrive within the existing authorized root Turn, without a hidden title-model Turn. User rename always wins. Only successful, current, correctly attributed root/generation evidence can be adopted; foreign/child/failed/expired/duplicate results cannot rename. A Fork preserves its inherited title semantics.
 
+Local fallback titles retain normalized first-message text within the existing 120 UTF-16-unit title limit without splitting a grapheme or appending a display ellipsis. Header and navigation labels ellipsize only when their rendered width is insufficient and expose the complete saved title on hover. Renaming edits the saved text, never a shortened display label.
+
 After adopting a native title into Pact, Codex's display name may become `[Pact] Project name · Session title`. Save user renames locally before one-way native synchronization. Failure does not block chat/rename; the next normal connection can reconcile. Never change an old generation, unconfirmed candidate or unrelated client's thread. The prefix is not part of Pact's own title. Users may intentionally open the native thread in another client; Pact does not hide it or migrate authentication to prevent this.
 
 Activity projects actual Run/interaction/recovery facts, independent of collaboration phase/verdict. Normal completion returns Idle; Waiting means an actual required question/approval. Completed, failed, interrupted, unknown-delivery and abandoned remain distinct. Unread follows durable completed-message sequence and recorded reading position, not transient deltas/title changes.

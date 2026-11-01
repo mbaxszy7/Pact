@@ -10539,14 +10539,16 @@ export class Conversation {
       .replace(/\s+/gu, ' ')
       .trim()
     if (!plain) return 'New session'
-    const characters = Array.from(
-      new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(plain),
-      ({ segment }) => segment,
-    )
-    const containsCjk = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(plain)
-    if (containsCjk) return characters.length > 20 ? `${characters.slice(0, 20).join('')}…` : plain
-    const words = plain.split(' ').slice(0, 8).join(' ')
-    return words.length > 60 ? `${words.slice(0, 59).trimEnd()}…` : words
+    // Persist title text, not a display-width preview. Keep the existing rename
+    // limit in UTF-16 units without splitting an emoji or combining sequence.
+    let title = ''
+    for (const { segment } of new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(
+      plain,
+    )) {
+      if (title.length + segment.length > 120) break
+      title += segment
+    }
+    return title.trimEnd() || 'New session'
   }
 
   private static peerActionCopy(kind: PeerRequestKind, source: string): string {

@@ -89,7 +89,9 @@ function EditableSessionTitle({
         data-titlebar-interactive
         className="group/title flex min-w-0 max-w-full items-center gap-1.5"
       >
-        <h1 className="truncate text-body font-medium text-primary">{session.title}</h1>
+        <h1 className="truncate text-body font-medium text-primary" title={session.title}>
+          {session.title}
+        </h1>
         <button
           className="grid size-7 shrink-0 place-items-center rounded-control text-tertiary opacity-0 transition-opacity duration-150 hover:bg-surface-muted hover:text-primary focus-visible:opacity-100 group-hover/title:opacity-100 group-focus-within/title:opacity-100"
           type="button"

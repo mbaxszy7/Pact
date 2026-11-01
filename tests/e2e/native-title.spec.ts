@@ -7,6 +7,93 @@ import { quitPact } from './native-quit.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture } from './runtime-fixture.js'
 
+test(
+  'keeps complete local titles in the header, navigation and rename editor',
+  { tag: '@deterministic' },
+  async () => {
+    const fixture = await createRuntimeFixture({ codexAppServer: 'complete' })
+    const directory = await fixture.createProjectDirectory('complete-local-title')
+    const db = await PactDatabase.open({
+      filePath: fixture.databaseFile,
+      migrationsFolder: resolve(import.meta.dirname, '../../packages/persistence/drizzle'),
+    })
+    const projectId = randomUUID()
+    const sessionId = randomUUID()
+    const createdAt = new Date().toISOString()
+    const title = '你帮我评估一下目前 relay 的功能以及更合适的实现方案'
+    try {
+      db.projectCatalogRepository.add({
+        id: projectId,
+        name: 'Complete titles',
+        directoryPath: directory,
+        kind: 'directory',
+        createdAt,
+      })
+      db.sessionRepository.create(
+        { id: sessionId, projectId, title: 'New session', createdAt },
+        {
+          primaryAgentId: 'codex',
+          agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+          maxDiscussionRounds: 3,
+          maxReviewCycles: 2,
+          maxRepairAttempts: 2,
+        },
+      )
+    } finally {
+      db.close()
+    }
+    const app = await fixture.launch()
+    try {
+      await app.evaluate(({ BrowserWindow }) =>
+        BrowserWindow.getAllWindows()[0]!.setSize(1796, 1013),
+      )
+      const page = await app.firstWindow()
+      await page.getByRole('button', { name: 'New session', exact: true }).click()
+      await page.getByRole('combobox', { name: 'Message' }).fill(title)
+      await page.getByRole('button', { name: 'Send message', exact: true }).click()
+      const heading = page.getByRole('heading', { name: title, exact: true })
+      await expect(heading).toBeVisible()
+      await expect(
+        page.getByRole('button', { name: 'Copy Codex message', exact: true }),
+      ).toBeVisible()
+      expect(await heading.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(
+        true,
+      )
+      const navigation = page.getByRole('button', { name: title, exact: true })
+      await expect(navigation).toBeVisible()
+      await expect(navigation.locator('span[title]')).toHaveAttribute('title', title)
+      const divider = await page.getByRole('separator', { name: 'Resize navigation' }).boundingBox()
+      expect(divider).not.toBeNull()
+      const dividerY = divider!.y + divider!.height / 2
+      await page.mouse.move(divider!.x + divider!.width / 2, dividerY)
+      await page.mouse.down()
+      await page.mouse.move(divider!.x + 400, dividerY, { steps: 5 })
+      await page.mouse.up()
+      await expect
+        .poll(() =>
+          navigation
+            .locator('span[title]')
+            .evaluate((element) => element.scrollWidth <= element.clientWidth),
+        )
+        .toBe(true)
+      await heading.hover()
+      await page.getByRole('button', { name: 'Rename Session', exact: true }).click()
+      const editor = page.getByRole('textbox', { name: 'Session title', exact: true })
+      await expect(editor).toHaveValue(title)
+      expect(await editor.evaluate((element) => getComputedStyle(element).textOverflow)).toBe(
+        'clip',
+      )
+      await page.screenshot({ path: test.info().outputPath('complete-title-edit.png') })
+      await editor.press('Escape')
+      await expect(heading).toBeVisible()
+      await page.screenshot({ path: test.info().outputPath('complete-title-display.png') })
+    } finally {
+      await quitPact(app)
+      await fixture.dispose()
+    }
+  },
+)
+
 for (const command of ['ordinary', '/plan', '/build', '/review'] as const)
   test(
     `same authorized ${command} Turn publishes metadata without a Native name`,
