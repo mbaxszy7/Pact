@@ -22,6 +22,8 @@ const settings = {
 export async function planRevisionFixture(
   options: {
     filePath?: string
+    owner?: 'codex' | 'claude'
+    nativeSessionId?: string
     task?: string
     plan?: string
     replyPlan?: string
@@ -32,6 +34,10 @@ export async function planRevisionFixture(
     inputs?: string[]
   } = {},
 ) {
+  const planOwner = options.owner ?? 'codex'
+  const selectedSettings = { ...settings, primaryAgentId: planOwner }
+  const nativeSessionId = (agent: 'codex' | 'claude') =>
+    agent === planOwner && options.nativeSessionId ? options.nativeSessionId : `fixture-${agent}`
   const db = await PactDatabase.open({
     filePath: options.filePath ?? ':memory:',
     migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
@@ -50,7 +56,7 @@ export async function planRevisionFixture(
   })
   db.sessionRepository.create(
     { id: sessionId, projectId, title: 'Plan revision', createdAt: now },
-    settings,
+    selectedSettings,
   )
   const initial = collaborationTaskSchema.parse({
     id: randomUUID(),
@@ -58,15 +64,15 @@ export async function planRevisionFixture(
     kind: 'plan',
     revision: 0,
     protocol: 'native-workflow-v1',
-    owner: 'codex',
-    reviewer: 'claude',
+    owner: planOwner,
+    reviewer: planOwner === 'codex' ? 'claude' : 'codex',
     automation: 'active',
     inputSequence: 0,
     handledInputSequence: 0,
     task: options.task ?? 'Review cancellation.',
     taskMessageId: messageId,
     stage: 'plan',
-    actor: 'codex',
+    actor: planOwner,
     status: 'running',
     runId: messageId,
     planVersion: 0,
@@ -80,7 +86,7 @@ export async function planRevisionFixture(
     content: `/plan ${initial.task}`,
     expectedCommentsRevision: 0,
     commentIds: [],
-    agentId: 'codex',
+    agentId: planOwner,
     settingsRevision: 1,
     model: null,
     effort: null,
@@ -94,7 +100,7 @@ export async function planRevisionFixture(
     repo.applyEvent(sessionId, runId, {
       type: 'session.started',
       agentId: run.agentId,
-      nativeSessionId: `fixture-${run.agentId}`,
+      nativeSessionId: nativeSessionId(run.agentId),
     })
     repo.applyEvent(sessionId, runId, {
       type: 'turn.started',
@@ -120,7 +126,7 @@ export async function planRevisionFixture(
         agentId: run.agentId,
         requestId: runId,
         runId,
-        nativeSessionId: `fixture-${run.agentId}`,
+        nativeSessionId: nativeSessionId(run.agentId),
         nativeTurnId: `turn-${runId}`,
         bindingGeneration: run.bindingGeneration ?? 1,
       },
@@ -136,7 +142,7 @@ export async function planRevisionFixture(
   }
   const admission = (proposal?: PlanRevisionGuidanceProposal, clientMessageId = randomUUID()) => {
     const task = repo.collaboration(sessionId)!,
-      next = advanceCollaboration(task, 'continue', settings)
+      next = advanceCollaboration(task, 'continue', selectedSettings)
     const drafts = repo.readPage({ scope: 'drafts', sessionId })
     if (drafts.scope !== 'drafts') throw Error('Missing drafts')
     return {
@@ -233,7 +239,7 @@ export async function planRevisionFixture(
       expectedCommentsRevision: drafts.commentsRevision,
       route: { type: 'primary' as const },
     }
-    repo.receiveCollaborationInput(send, body.inputId, 'codex', 'immediate_safe_point', owner)
+    repo.receiveCollaborationInput(send, body.inputId, planOwner, 'immediate_safe_point', owner)
     const received = repo.readReceivedInput(sessionId)!,
       task = repo.collaboration(sessionId)!
     const next = repo.workflowReply(task, received.actor)
@@ -256,7 +262,7 @@ export async function planRevisionFixture(
     })
     finish(reply.run.id, { plan: options.replyPlan ?? options.plan ?? 'Scope and acceptance.' })
     repo.setCollaborationState(
-      advanceCollaboration(repo.collaboration(sessionId)!, 'resume', settings),
+      advanceCollaboration(repo.collaboration(sessionId)!, 'resume', selectedSettings),
     )
   }
   const reviewRun = repo.beginRun(admission()).run

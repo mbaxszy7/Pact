@@ -2346,6 +2346,7 @@ export type ConversationSendInput = z.infer<typeof conversationSendInputSchema>
 export const collaborationReceivedMetadataSchema = z.strictObject({
   steerSkillInvocation: collaborationDocumentSchema.optional(),
   workflowCommand: z.boolean().default(false),
+  rolePolicy: z.literal('split-stages-v1').optional(),
   skills: skillSelectionsSchema.default([]),
   imageIds: conversationSendInputSchema.shape.imageIds.default([]),
   commentIds: conversationSendInputSchema.shape.commentIds,

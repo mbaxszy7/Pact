@@ -91,6 +91,7 @@ import {
   collaborationNextStage,
   collaborationPlanMode,
   collaborationActor,
+  otherAgent,
   collaborationStageLabel,
   collaborationRequiresPlan,
   collaborationPlanAccepted,
@@ -5090,7 +5091,11 @@ export class ConversationRepository {
       const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
       const frozen = this.decodedCollaboration(turn.stateJson)
       const planner = collaborationPlanMode(frozen, auth)
-      if (!planner || auth.actor !== frozen.owner || run.agentId !== auth.actor)
+      if (
+        !planner ||
+        auth.actor !== collaborationActor(frozen, 'plan') ||
+        run.agentId !== auth.actor
+      )
         throw new RunOperationConflictError(
           'Only the current plan author can submit a native plan.',
         )
@@ -5136,11 +5141,18 @@ export class ConversationRepository {
       const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson)),
         frozen = this.decodedCollaboration(turn.stateJson)
       if (
-        auth.actor !== frozen.owner ||
+        auth.actor !== collaborationActor(frozen, 'plan') ||
         run.agentId !== auth.actor ||
         !collaborationPlanMode(frozen, auth)
       )
         throw new RunOperationConflictError('This root does not own a plan response.')
+      // Cold native readers may return legacy candidates. They cannot demote
+      // or invalidate the host's already persisted final confirmation.
+      const prior = this.workflowPlanRetention(runId, turn.planNativeId)
+      if (prior) {
+        if (!retained.confirmation || isDeepStrictEqual(prior, retained)) return
+        throw new RunOperationConflictError('A confirmed plan retention cannot be replaced.')
+      }
       const basis = auth.planReference?.document
       if (
         !basis ||
@@ -5165,8 +5177,6 @@ export class ConversationRepository {
         throw new RunOperationConflictError(
           'A root with a new plan artifact cannot retain the prior version.',
         )
-      const prior = this.workflowPlanRetention(runId, turn.planNativeId)
-      if (prior && isDeepStrictEqual(prior, retained)) return
       this.database
         .update(workflowTurns)
         .set({ planNativeId: retained.nativeId })
@@ -5197,7 +5207,7 @@ export class ConversationRepository {
       const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
       const frozen = this.decodedCollaboration(turn.stateJson)
       if (
-        auth.actor !== frozen.owner ||
+        auth.actor !== collaborationActor(frozen, 'plan') ||
         run.agentId !== auth.actor ||
         !collaborationPlanMode(frozen, auth)
       )
@@ -5302,7 +5312,9 @@ export class ConversationRepository {
       .get()
     if (row?.type !== 'workflow.plan_retained') return undefined
     const retained = collaborationRetainedPlanSchema.parse(JSON.parse(row.payload))
-    return retained.nativeId === nativeId ? retained : undefined
+    return retained.nativeId === nativeId && retained.confirmation === 'native_root_settled_v1'
+      ? retained
+      : undefined
   }
 
   private workflowPlanHasUnansweredInput(runId: string): boolean {
@@ -5362,7 +5374,7 @@ export class ConversationRepository {
     const retained = this.workflowPlanRetention(runId, turn.planNativeId)
     return (
       planner &&
-      auth.actor === task.owner &&
+      auth.actor === collaborationActor(task, 'plan') &&
       auth.inputSequence === task.inputSequence &&
       !this.workflowPlanHasUnansweredInput(runId) &&
       (Boolean(turn.planBodyId || retained) || this.workflowPlanCaptureFailed(runId))
@@ -5381,7 +5393,7 @@ export class ConversationRepository {
     if (
       task.runId !== run.id ||
       task.id !== auth.taskId ||
-      task.owner !== auth.actor ||
+      collaborationActor(task, 'plan') !== auth.actor ||
       run.agentId !== auth.actor ||
       task.inputSequence !== auth.inputSequence ||
       task.planVersion !== (auth.planReference?.version ?? 0) ||
@@ -5745,7 +5757,11 @@ export class ConversationRepository {
         .get()
       if (!run || run.forkSourceRunId || !turn || run.controlDisposition === 'abandoned') return
       const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
-      if (!['plan_review', 'code_review'].includes(auth.stage) || auth.actor !== run.agentId)
+      if (
+        !['plan_review', 'code_review'].includes(auth.stage) ||
+        auth.actor !== run.agentId ||
+        auth.actor !== collaborationActor(this.decodedCollaboration(turn.stateJson), auth.stage)
+      )
         throw new RunOperationConflictError('This Turn does not own an independent review.')
       const parsed = collaborationReviewObservationSchema.parse(result)
       const old = this.workflowReviewResult(runId)
@@ -6148,7 +6164,7 @@ export class ConversationRepository {
     task: CollaborationTask,
     reference?: import('@pact/contracts').ConversationSendInput['replyToDecision'],
   ): RuntimeAgentId {
-    if (!reference) return task.kind === 'review' ? task.reviewer : task.owner
+    if (!reference) return collaborationActor(task, 'reply')
     const decision = collaborationInputProcessing(task).decision
     const run = this.findRun(reference.runId)
     const authorization = this.collaborationTurnAuthorization(reference.runId)
@@ -6852,6 +6868,7 @@ export class ConversationRepository {
     ownerKey: string,
     anchorRunId: string,
     waitingForWork = true,
+    rolePolicy?: CollaborationTask['rolePolicy'],
   ): ConversationPatch {
     const run = this.findRun(anchorRunId)
     if (!run || run.sessionId !== input.sessionId)
@@ -6865,6 +6882,7 @@ export class ConversationRepository {
         ownerKey,
         waitingForWork,
         anchorRunId,
+        rolePolicy,
       )
       this.database
         .update(collaborationInputs)
@@ -8143,6 +8161,7 @@ export class ConversationRepository {
     ownerKey: string,
     waitingForWork = false,
     anchorRunId?: string,
+    rolePolicy?: CollaborationTask['rolePolicy'],
   ): ConversationPatch {
     return this.database.transaction(() => {
       assertSessionAvailable(this.database, input.sessionId)
@@ -8216,6 +8235,40 @@ export class ConversationRepository {
       const prefix = parseComposerCommandPrefix(source.text, input.skills)
       if (prefix.error) throw new RunOperationConflictError(prefix.error)
       const workflowCommand = Boolean(prefix.pact)
+      if (rolePolicy) {
+        const settings = this.database
+          .select()
+          .from(sessionSettingsRevisions)
+          .where(
+            and(
+              eq(sessionSettingsRevisions.sessionId, input.sessionId),
+              eq(sessionSettingsRevisions.revision, session.settingsRevision),
+            ),
+          )
+          .get()
+        const requestedRoute = input.route ?? prefix.route
+        if (
+          requestedRoute?.type === 'all' ||
+          (requestedRoute?.type === 'agent' && requestedRoute.agentId !== actor) ||
+          !prefix.pact ||
+          !settings ||
+          actor !==
+            collaborationActor(
+              {
+                kind: prefix.pact,
+                owner: settings.primaryAgentId,
+                reviewer: otherAgent(settings.primaryAgentId),
+                rolePolicy,
+              },
+              prefix.pact === 'plan'
+                ? 'plan'
+                : prefix.pact === 'build'
+                  ? 'implement'
+                  : 'code_review',
+            )
+        )
+          throw new RunOperationConflictError('The queued workflow role changed before receipt.')
+      }
       const savedTask = this.collaboration(input.sessionId)
       const candidate = savedTask?.status === 'complete' ? undefined : savedTask
       const anchor = anchorRunId ? this.findRun(anchorRunId) : undefined
@@ -8230,6 +8283,7 @@ export class ConversationRepository {
         )
       const metadata = JSON.stringify({
         workflowCommand,
+        ...(rolePolicy ? { rolePolicy } : {}),
         skills: input.skills ?? [],
         imageIds: images.map((v) => v.id),
         commentIds: [],
@@ -9070,10 +9124,130 @@ export class ConversationRepository {
         .run()
   }
 
+  /** Explicit maintenance operation for an accepted plan with no code authority to transfer. */
+  adoptSplitStageRoles(input: {
+    sessionId: string
+    taskId: string
+    revision: number
+    settingsRevision: number
+    operationId: string
+  }): ConversationPatch {
+    return this.database.transaction(() => {
+      assertSessionAvailable(this.database, input.sessionId)
+      const task = this.collaboration(input.sessionId)
+      if (!task || task.id !== input.taskId)
+        throw new RunOperationConflictError(
+          'The requested collaboration task is no longer current.',
+        )
+      if (task.rolePolicy === 'split-stages-v1') return this.metadataPatch(input.sessionId)
+      const session = this.database
+        .select()
+        .from(sessions)
+        .where(eq(sessions.id, input.sessionId))
+        .get()
+      const settings = this.database
+        .select()
+        .from(sessionSettingsRevisions)
+        .where(
+          and(
+            eq(sessionSettingsRevisions.sessionId, input.sessionId),
+            eq(sessionSettingsRevisions.revision, input.settingsRevision),
+          ),
+        )
+        .get()
+      const run = this.findRun(task.runId)
+      const live = this.database
+        .select({ id: agentRuns.id })
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.sessionId, input.sessionId),
+            inArray(agentRuns.status, [...activeRunStatuses]),
+          ),
+        )
+        .limit(1)
+        .get()
+      const unsafeTaskRun = this.database
+        .select({ id: agentRuns.id })
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.collaborationTaskId, task.id),
+            or(
+              inArray(agentRuns.collaborationStage, ['implement', 'repair']),
+              isNull(agentRuns.nativeEffectsState),
+              ne(agentRuns.nativeEffectsState, 'settled'),
+            ),
+          ),
+        )
+        .limit(1)
+        .get()
+      const authority = this.database
+        .select({ id: collaborationActionReceipts.id })
+        .from(collaborationActionReceipts)
+        .where(eq(collaborationActionReceipts.taskId, task.id))
+        .limit(1)
+        .get()
+      if (
+        !/^[a-f0-9-]{36}$/u.test(input.operationId) ||
+        !session ||
+        session.settingsRevision !== input.settingsRevision ||
+        !settings ||
+        task.revision !== input.revision ||
+        task.kind !== 'plan' ||
+        task.status !== 'ready' ||
+        task.owner !== settings.primaryAgentId ||
+        task.reviewer !== otherAgent(settings.primaryAgentId) ||
+        !collaborationPlanAccepted(task) ||
+        task.codeRunId ||
+        task.pendingWork ||
+        collaborationInputGate(task) ||
+        this.receivedCollaborationInput(input.sessionId) ||
+        this.nativeRecoveryBlocksInput(input.sessionId) ||
+        this.activeRelayDecisionRow(input.sessionId) ||
+        live ||
+        unsafeTaskRun ||
+        authority ||
+        !run ||
+        run.nativeOutcome !== 'completed' ||
+        run.dispatchPhase !== 'ended' ||
+        !this.hasCompleteResponse(run.id)
+      )
+        throw new RunOperationConflictError(
+          'Only a settled accepted plan without existing code authority can adopt split stage roles.',
+        )
+      this.collaborationDocumentRow(input.sessionId, task.planReference!.document)
+      const next = { ...task, rolePolicy: 'split-stages-v1' as const, revision: task.revision + 1 }
+      if (next.actor !== collaborationActor(next, next.stage))
+        throw new RunOperationConflictError(
+          'The completed stage does not match the requested responsibilities.',
+        )
+      this.saveCollaboration(next)
+      this.nativeFact(task.runId, 'workflow.role_policy_adopted', {
+        operationId: input.operationId,
+        taskId: task.id,
+        previousRevision: task.revision,
+        revision: next.revision,
+        settingsRevision: input.settingsRevision,
+        rolePolicy: next.rolePolicy,
+        owner: next.owner,
+        reviewer: next.reviewer,
+      })
+      return this.metadataPatch(input.sessionId)
+    })
+  }
+
   setCollaborationState(task: CollaborationTask): ConversationPatch {
     return this.database.transaction(() => {
       const current = this.collaboration(task.sessionId)
-      if (!current || current.id !== task.id || current.revision + 1 !== task.revision)
+      if (
+        !current ||
+        current.id !== task.id ||
+        current.revision + 1 !== task.revision ||
+        current.owner !== task.owner ||
+        current.reviewer !== task.reviewer ||
+        current.rolePolicy !== task.rolePolicy
+      )
         throw new RunOperationConflictError('The collaboration changed before this action.')
       if (current.automation === 'paused' && task.automation === 'active') {
         const pending = this.pendingSupplementReview(current)
@@ -10771,6 +10945,7 @@ export class ConversationRepository {
     return {
       handoff,
       taskId: task.id,
+      ...(task.rolePolicy ? { rolePolicy: task.rolePolicy } : {}),
       inputSequence: task.inputSequence,
       stage: next.stage,
       actor: next.actor,
@@ -10813,7 +10988,10 @@ export class ConversationRepository {
   ): string {
     return scheduling.fingerprint({
       action: this.actionReceiptBasis(task, this.relayWorkflowActionNext(task, kind), handoff),
-      returnBinding: this.workflowHandoff(task, task.reviewer).freshnessGuard,
+      returnBinding: this.workflowHandoff(
+        task,
+        collaborationActor(task, kind === 'supplement_plan' ? 'plan_review' : 'code_review'),
+      ).freshnessGuard,
     })
   }
 
@@ -10849,8 +11027,11 @@ export class ConversationRepository {
       kind,
       taskId: snapshot.task.id,
       afterRunId: snapshot.task.runId,
-      actor: snapshot.task.owner,
-      returnActor: snapshot.task.reviewer,
+      actor: collaborationActor(snapshot.task, kind === 'supplement_plan' ? 'plan' : 'respond'),
+      returnActor: collaborationActor(
+        snapshot.task,
+        kind === 'supplement_plan' ? 'plan_review' : 'code_review',
+      ),
       inputSequence: snapshot.task.inputSequence,
       sourceFingerprint: snapshot.sourceFingerprint,
       budgetAvailable: true as const,
@@ -11174,15 +11355,21 @@ export class ConversationRepository {
         kind: input.kind,
         taskId: snapshot.task.id,
         afterRunId: snapshot.task.runId,
-        actor: snapshot.task.owner,
-        returnActor: snapshot.task.reviewer,
+        actor: collaborationActor(
+          snapshot.task,
+          input.kind === 'supplement_plan' ? 'plan' : 'implement',
+        ),
+        returnActor: collaborationActor(
+          snapshot.task,
+          input.kind === 'supplement_plan' ? 'plan_review' : 'code_review',
+        ),
         scopeFingerprint: snapshot.sourceFingerprint,
       }
       const repairPermission =
         input.kind === 'repair'
           ? this.runSettingsAt(
               snapshot.task.sessionId,
-              snapshot.task.owner,
+              collaborationActor(snapshot.task, 'repair'),
               input.handoff.freshnessGuard.settingsRevision,
             ).permissionMode
           : undefined
@@ -11995,7 +12182,7 @@ export class ConversationRepository {
     return collaborationTaskSchema.parse({
       ...task,
       stage: kind === 'supplement_plan' ? 'plan' : 'respond',
-      actor: task.owner,
+      actor: collaborationActor(task, kind === 'supplement_plan' ? 'plan' : 'respond'),
       status: 'running',
       automation: 'active',
       pauseReason: undefined,
@@ -12030,7 +12217,7 @@ export class ConversationRepository {
         input.action === 'request_plan_supplement' ? 'supplement_plan' : 'supplement_code_response'
       const originalHandoff = this.workflowHandoff(
         task,
-        kind === 'supplement_plan' ? task.reviewer : task.owner,
+        collaborationActor(task, kind === 'supplement_plan' ? 'plan_review' : 'respond'),
       )
       if (
         this.database
@@ -12050,7 +12237,8 @@ export class ConversationRepository {
       if (
         (kind === 'supplement_plan' &&
           (task.stage !== 'plan' ||
-            task.actor !== task.owner ||
+            task.actor !==
+              collaborationActor(task, kind === 'supplement_plan' ? 'plan' : 'respond') ||
             !['running', 'waiting'].includes(task.status) ||
             task.review?.stage !== 'plan_review' ||
             task.review.verdict !== 'changes_requested')) ||
@@ -12078,8 +12266,11 @@ export class ConversationRepository {
         afterRunId: task.runId,
         kind,
         state: 'requested',
-        actor: task.owner,
-        returnActor: task.reviewer,
+        actor: collaborationActor(task, kind === 'supplement_plan' ? 'plan' : 'respond'),
+        returnActor: collaborationActor(
+          task,
+          kind === 'supplement_plan' ? 'plan_review' : 'code_review',
+        ),
       })
       this.database
         .insert(relayDecisions)
@@ -12113,7 +12304,7 @@ export class ConversationRepository {
           clientNonce: input.clientMessageId,
           requestDigest: scheduling.fingerprint(input),
           action: input.action,
-          actor: task.owner,
+          actor: collaborationActor(task, kind === 'supplement_plan' ? 'plan' : 'respond'),
           handoffId: scheduling.fingerprint({ request: id }),
           decisionId: id,
           rootReceiptId: receiptId,
@@ -12168,7 +12359,7 @@ export class ConversationRepository {
         )
       const handoff = this.workflowHandoff(
         task,
-        gate.kind === 'supplement_plan' ? task.reviewer : task.owner,
+        collaborationActor(task, gate.kind === 'supplement_plan' ? 'plan_review' : 'respond'),
       )
       const snapshot = this.relayWorkflowSnapshot(handoff, gate.id)
       if (
@@ -12282,7 +12473,7 @@ export class ConversationRepository {
             clientNonce: input.clientMessageId,
             requestDigest: scheduling.fingerprint(input),
             action: input.action,
-            actor: task.owner,
+            actor: collaborationActor(task, gate.kind === 'supplement_plan' ? 'plan' : 'respond'),
             decisionId: gate.id,
             handoffId: scheduling.fingerprint({ cancel: gate.id, nonce: input.clientMessageId }),
             rootReceiptId: id,
@@ -12328,7 +12519,7 @@ export class ConversationRepository {
       this.saveCollaboration(task)
       const handoff = this.workflowHandoff(
         task,
-        gate.kind === 'supplement_plan' ? task.reviewer : task.owner,
+        collaborationActor(task, gate.kind === 'supplement_plan' ? 'plan_review' : 'respond'),
       )
       const next = this.supplementNext(task, gate.kind)
       const receipt = this.database
@@ -12340,7 +12531,7 @@ export class ConversationRepository {
           clientNonce: input.clientMessageId,
           requestDigest: scheduling.fingerprint(input),
           action: gate.kind,
-          actor: task.owner,
+          actor: collaborationActor(task, gate.kind === 'supplement_plan' ? 'plan' : 'respond'),
           handoffId: handoff.id,
           decisionId: gate.id,
           rootReceiptId: id,
@@ -12514,7 +12705,7 @@ export class ConversationRepository {
       receipt.boundRunId !== task.runId ||
       receipt.taskId !== task.id ||
       receipt.rootReceiptId !== authority.rootReceiptId ||
-      receipt.actor !== task.owner
+      receipt.actor !== collaborationActor(task, 'implement')
     )
       return undefined
     const basis = collaborationActionBasisSchema.parse(JSON.parse(receipt.basisJson))
@@ -12547,7 +12738,7 @@ export class ConversationRepository {
       authorizationId: authority.rootReceiptId,
       originalRunId: prior.id,
       taskId: task.id,
-      actor: task.owner,
+      actor: collaborationActor(task, 'implement'),
       scopeId,
       stage: auth.stage,
       authorizationCurrent: true as const,
@@ -12580,7 +12771,11 @@ export class ConversationRepository {
       receipt.taskId !== snapshot.task.id ||
       receipt.sessionId !== handoff.sessionId ||
       receipt.handoffId !== handoff.id ||
-      receipt.actor !== snapshot.task.owner
+      receipt.actor !==
+        collaborationActor(
+          snapshot.task,
+          receipt.action === 'supplement_plan' ? 'plan' : 'implement',
+        )
     )
       return {}
     const task = snapshot.task
@@ -12590,7 +12785,7 @@ export class ConversationRepository {
         : undefined
     const stage =
       kind === 'supplement_plan' ? 'plan' : receipt.action === 'repair' ? 'repair' : 'respond'
-    const next = { ...task, actor: task.owner, stage } as CollaborationTask
+    const next = { ...task, actor: collaborationActor(task, stage), stage } as CollaborationTask
     if (receipt.basisJson !== this.authorityJson(this.actionReceiptBasis(task, next, handoff)))
       return {}
     const common = {
@@ -12599,7 +12794,7 @@ export class ConversationRepository {
       taskId: task.id,
       budgetSubjectId: handoff.budgetSubjectId,
       handoffId: handoff.id,
-      actor: task.owner,
+      actor: collaborationActor(task, stage),
       inputSequence: task.inputSequence,
       state: 'available' as const,
       authorizationCurrent: true as const,
@@ -12624,7 +12819,7 @@ export class ConversationRepository {
           reviewSourceId: snapshot.reviews[0].sourceId,
           scope: 'read_only_plan_supplement' as const,
           returnStage: 'plan_review' as const,
-          returnActor: task.reviewer,
+          returnActor: collaborationActor(task, 'plan_review'),
           remainingPlanTurns: 1 - (budget?.extraPlanTurns ?? 0),
         },
       }
@@ -12641,7 +12836,7 @@ export class ConversationRepository {
           ...extra,
           scope: 'read_only_code_response' as const,
           returnStage: 'code_review' as const,
-          returnActor: task.reviewer,
+          returnActor: collaborationActor(task, 'code_review'),
           returnReviewBudgetAvailable: this.supplementAvailable(task, kind),
           remainingCodeTurns: 1 - (budget?.extraCodeTurns ?? 0),
         },
@@ -12726,17 +12921,18 @@ export class ConversationRepository {
       auth.taskId !== task.id ||
       turn.taskId !== task.id ||
       !['implement', 'repair'].includes(auth.stage) ||
-      auth.actor !== task.owner ||
+      auth.actor !== collaborationActor(task, 'implement') ||
       turn.stage !== auth.stage ||
       turn.actor !== auth.actor ||
       turn.inputSequence !== auth.inputSequence ||
       run.collaboration?.taskId !== task.id ||
       run.collaboration.stage !== auth.stage ||
-      run.agentId !== task.owner ||
+      run.agentId !== collaborationActor(task, 'implement') ||
       frozen.id !== task.id ||
       frozen.sessionId !== task.sessionId ||
       frozen.owner !== task.owner ||
       frozen.reviewer !== task.reviewer ||
+      frozen.rolePolicy !== task.rolePolicy ||
       frozen.kind !== task.kind ||
       frozen.taskMessageId !== task.taskMessageId ||
       !frozen.taskDocument ||
@@ -12833,7 +13029,7 @@ export class ConversationRepository {
       batch.runId !== inputOwnerRunId ||
       batch.sessionId !== task.sessionId ||
       batch.messageId !== run.userMessageId ||
-      batch.actor !== task.owner ||
+      batch.actor !== collaborationActor(task, 'implement') ||
       batch.memberCount !== auth.inputBatchRef?.memberCount ||
       batch.commentsRevision !== auth.inputBatchRef?.revision ||
       !batch.bodyDocumentJson ||
@@ -12856,12 +13052,12 @@ export class ConversationRepository {
         (auth.stage === 'implement' && frozen.kind === 'build') ||
         (auth.stage === 'implement' &&
           frozen.review?.stage === 'plan_review' &&
-          frozen.review.actor === frozen.reviewer &&
+          frozen.review.actor === collaborationActor(frozen, 'plan_review') &&
           frozen.review.verdict === 'accepted' &&
           samePlanContent(frozen.review.planReference, auth.planReference)) ||
         (auth.stage === 'repair' &&
           frozen.review?.stage === 'code_review' &&
-          frozen.review.actor === frozen.reviewer &&
+          frozen.review.actor === collaborationActor(frozen, 'code_review') &&
           frozen.review.verdict === 'changes_requested' &&
           isDeepStrictEqual(frozen.review.scopeRef, auth.reviewScopeRef))
       )
@@ -12960,7 +13156,7 @@ export class ConversationRepository {
           clientNonce: source.run.id,
           requestDigest: scheduling.fingerprint(basis),
           action: 'legacy_write',
-          actor: task.owner,
+          actor: collaborationActor(task, 'implement'),
           handoffId: scheduling.fingerprint(basis),
           rootReceiptId: id,
           basisJson: this.authorityJson(basis),
@@ -12988,7 +13184,7 @@ export class ConversationRepository {
       !receipt ||
       receipt.taskId !== task.id ||
       receipt.sessionId !== task.sessionId ||
-      receipt.actor !== task.owner ||
+      receipt.actor !== collaborationActor(task, 'implement') ||
       !receipt.boundRunId ||
       receipt.rootReceiptId !== receipt.id ||
       !['build', 'execute', 'repair', 'legacy_write'].includes(receipt.action) ||
@@ -13329,7 +13525,7 @@ export class ConversationRepository {
             contentSha256: createHash('sha256').update(input.content).digest('hex'),
           }),
           action: 'build',
-          actor: next.owner,
+          actor: collaborationActor(next, 'implement'),
           handoffId: scheduling.fingerprint({
             taskId: next.id,
             initialBuild: input.clientMessageId,
@@ -13486,7 +13682,8 @@ export class ConversationRepository {
         accepted.data.card.request.operation.taskId === current.id &&
         accepted.data.card.request.operation.afterRunId === current.runId &&
         accepted.data.card.request.operation.actor === next.actor &&
-        accepted.data.card.request.operation.returnActor === current.reviewer &&
+        accepted.data.card.request.operation.returnActor ===
+          collaborationActor(current, next.stage === 'plan' ? 'plan_review' : 'code_review') &&
         accepted.data.operationFingerprint ===
           scheduling.fingerprint(accepted.data.card.request.operation) &&
         accepted.data.configurationGeneration === this.schedulingConfigurationGeneration() &&
@@ -13571,7 +13768,10 @@ export class ConversationRepository {
                 supplement === 'supplement_plan'
                   ? ('plan_review' as const)
                   : ('code_review' as const),
-              returnActor: current.reviewer,
+              returnActor: collaborationActor(
+                current,
+                next.stage === 'plan' ? 'plan_review' : 'code_review',
+              ),
             }
           : {}),
       },
@@ -13699,7 +13899,7 @@ export class ConversationRepository {
       authority.rootReceiptId !== receipt.rootReceiptId ||
       authority.purpose !== receipt.action ||
       authority.returnStage !== stage ||
-      authority.returnActor !== task.reviewer ||
+      authority.returnActor !== collaborationActor(task, stage) ||
       !['supplement_plan', 'supplement_code_response'].includes(receipt.action)
     )
       throw new RunOperationConflictError(
@@ -14001,6 +14201,9 @@ export class ConversationRepository {
     const binding = this.nativeContext(task.sessionId, actor)
     const facts = {
       taskId: task.id,
+      ...(task.rolePolicy
+        ? { rolePolicy: task.rolePolicy, owner: task.owner, reviewer: task.reviewer }
+        : {}),
       runId: task.runId,
       stage: task.stage,
       inputSequence: task.inputSequence,
@@ -14575,7 +14778,7 @@ export class ConversationRepository {
             messageId: task.planReference.sourceMessageId,
             planVersion: task.planReference.version,
           },
-          task.owner,
+          collaborationActor(task, 'plan'),
         )
       : null
     const addTurn = (turn: typeof producer, role: RelaySourceRole) => {
@@ -14594,7 +14797,7 @@ export class ConversationRepository {
           plan.document,
           'plan',
           { messageId: plan.sourceMessageId, planVersion: plan.version },
-          task.owner,
+          collaborationActor(task, 'plan'),
         )
       }
       return turn.source
@@ -14919,7 +15122,7 @@ export class ConversationRepository {
       node.slot !== 'workflow_next' ||
       node.budgetRoot.kind !== 'task' ||
       node.budgetRoot.id !== task.id ||
-      node.freshnessGuard.agentId !== task.owner ||
+      node.freshnessGuard.agentId !== collaborationActor(task, 'plan') ||
       !plan ||
       !task.taskDocument ||
       task.planInputSequence !== task.inputSequence ||
@@ -14927,13 +15130,13 @@ export class ConversationRepository {
       !review ||
       review.stage !== 'plan_review' ||
       review.verdict !== 'changes_requested' ||
-      review.actor !== task.reviewer ||
+      review.actor !== collaborationActor(task, 'plan_review') ||
       review.runId !== task.runId ||
       review.inputSequence !== task.inputSequence ||
       !isDeepStrictEqual(review.planReference, plan) ||
       !planRun ||
       planRun.sessionId !== task.sessionId ||
-      planRun.agentId !== task.owner ||
+      planRun.agentId !== collaborationActor(task, 'plan') ||
       planRun.status !== 'completed' ||
       planRun.forkSourceRunId ||
       planRun.controlDisposition === 'abandoned' ||
@@ -16263,6 +16466,7 @@ export class ConversationRepository {
           before.stage !== task.stage ||
           before.owner !== task.owner ||
           before.reviewer !== task.reviewer ||
+          before.rolePolicy !== task.rolePolicy ||
           !isDeepStrictEqual(before.planReference, task.planReference) ||
           !isDeepStrictEqual(before.review, task.review)
         )
@@ -16944,6 +17148,46 @@ export class ConversationRepository {
         if (input.collaboration) {
           const task = collaborationTaskSchema.parse({ ...input.collaboration, runId })
           const current = this.collaboration(input.sessionId)
+          if (
+            task.rolePolicy &&
+            task.stage !== 'reply' &&
+            (task.actor !== collaborationActor(task, task.stage) || input.agentId !== task.actor)
+          )
+            throw new RunOperationConflictError(
+              'The Run does not match its frozen stage responsibility.',
+            )
+          if (task.rolePolicy && current?.id !== task.id) {
+            const queued = input.receivedInputId
+              ? this.readReceivedInput(input.sessionId)
+              : undefined
+            const settings = transaction
+              .select()
+              .from(sessionSettingsRevisions)
+              .where(
+                and(
+                  eq(sessionSettingsRevisions.sessionId, input.sessionId),
+                  eq(sessionSettingsRevisions.revision, input.settingsRevision),
+                ),
+              )
+              .get()
+            const primary = queued?.metadata.rolePolicy
+              ? task.kind === 'build'
+                ? otherAgent(queued.actor)
+                : queued.actor
+              : settings?.primaryAgentId
+            if (
+              !primary ||
+              task.owner !== primary ||
+              task.reviewer !== otherAgent(primary) ||
+              (queued &&
+                (queued.id !== input.receivedInputId ||
+                  queued.metadata.rolePolicy !== task.rolePolicy ||
+                  queued.actor !== input.agentId))
+            )
+              throw new RunOperationConflictError(
+                'The new task does not match its accepted Primary responsibility.',
+              )
+          }
           const resuming = input.collaborationActionReceiptId
             ? transaction
                 .select()
@@ -16964,6 +17208,9 @@ export class ConversationRepository {
               current.revision !== input.expectedCollaborationRevision ||
               task.revision !== current.revision + 1 ||
               task.inputSequence !== current.inputSequence ||
+              task.owner !== current.owner ||
+              task.reviewer !== current.reviewer ||
+              task.rolePolicy !== current.rolePolicy ||
               current.status === 'running' ||
               (task.stage !== 'reply' &&
                 ((current.automation !== 'active' && !explicitResume) ||

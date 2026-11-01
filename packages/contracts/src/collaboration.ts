@@ -117,8 +117,13 @@ export const collaborationRetainedPlanSchema = z.strictObject({
   sha256: z.string().regex(/^[a-f0-9]{64}$/u),
   bytes: z.number().int().positive(),
   chars: z.number().int().positive(),
+  /** Only the host may attest a completed root and drained observation lifecycle. */
+  confirmation: z.literal('native_root_settled_v1').optional(),
 })
 export type CollaborationRetainedPlan = z.infer<typeof collaborationRetainedPlanSchema>
+
+/** The host binds the current frozen plan; a model cannot choose its identity or version. */
+export const collaborationPlanRetentionInputSchema = z.strictObject({})
 
 export const collaborationPlanReferenceSchema = z.strictObject({
   version: z.number().int().positive(),
@@ -213,54 +218,60 @@ export const collaborationTurnAuthorizationSchema = z.strictObject({
 })
 export type CollaborationTurnAuthorization = z.infer<typeof collaborationTurnAuthorizationSchema>
 
-export const collaborationTaskSchema = z.strictObject({
-  protocol: z.literal(COLLABORATION_PROTOCOL),
-  id: z.string().uuid(),
-  sessionId: z.string().uuid(),
-  kind: pactSkillSchema,
-  revision: z.number().int().nonnegative(),
-  owner: agent,
-  reviewer: agent,
-  task: z.string(),
-  taskDocument: collaborationDocumentSchema.optional(),
-  taskMessageId: z.string().uuid(),
-  latestUserMessageId: z.string().uuid().optional(),
-  stage: collaborationStageSchema,
-  actor: agent,
-  status: z.enum(['running', 'waiting', 'questions', 'ready', 'complete', 'failed']),
-  /** Pausing automation never suppresses settlement of the current native root. */
-  automation: z.enum(['active', 'paused']),
-  pauseReason: z
-    .enum(['user_message', 'user', 'needs_user', 'restart', 'limit', 'failure', 'stopped'])
-    .optional(),
-  runId: z.string().uuid(),
-  sourceMessageId: z.string().uuid().optional(),
-  authorization: collaborationTurnAuthorizationSchema.optional(),
-  inputSequence: z.number().int().nonnegative(),
-  handledInputSequence: z.number().int().nonnegative(),
-  inputProcessing: collaborationInputProcessingSchema.optional(),
-  planVersion: z.number().int().nonnegative(),
-  planReference: collaborationPlanReferenceSchema.optional(),
-  planInputSequence: z.number().int().nonnegative().optional(),
-  review: collaborationReviewSchema.optional(),
-  reviewScopeRef: collaborationDocumentSchema.optional(),
-  codeRunId: z.string().uuid().optional(),
-  /** Only an already-authorized unfinished write may be resumed without a new Repair action. */
-  pendingWork: z
-    .strictObject({
-      stage: z.enum(['implement', 'repair']),
-      runId: z.string().uuid(),
-      inputSequence: z.number().int().nonnegative(),
-      planReference: collaborationPlanReferenceSchema.optional(),
-      repairReservationReleased: z.boolean().optional(),
-    })
-    .optional(),
-  nextStage: collaborationWorkStageSchema.optional(),
-  discussionRounds: z.number().int().nonnegative(),
-  reviewCycles: z.number().int().nonnegative(),
-  repairAttempts: z.number().int().nonnegative(),
-  notice: z.string().max(512).optional(),
-})
+export const collaborationTaskSchema = z
+  .strictObject({
+    protocol: z.literal(COLLABORATION_PROTOCOL),
+    id: z.string().uuid(),
+    sessionId: z.string().uuid(),
+    kind: pactSkillSchema,
+    revision: z.number().int().nonnegative(),
+    /** With split stages these are the frozen Primary and Secondary identities. */
+    owner: agent,
+    reviewer: agent,
+    rolePolicy: z.literal('split-stages-v1').optional(),
+    task: z.string(),
+    taskDocument: collaborationDocumentSchema.optional(),
+    taskMessageId: z.string().uuid(),
+    latestUserMessageId: z.string().uuid().optional(),
+    stage: collaborationStageSchema,
+    actor: agent,
+    status: z.enum(['running', 'waiting', 'questions', 'ready', 'complete', 'failed']),
+    /** Pausing automation never suppresses settlement of the current native root. */
+    automation: z.enum(['active', 'paused']),
+    pauseReason: z
+      .enum(['user_message', 'user', 'needs_user', 'restart', 'limit', 'failure', 'stopped'])
+      .optional(),
+    runId: z.string().uuid(),
+    sourceMessageId: z.string().uuid().optional(),
+    authorization: collaborationTurnAuthorizationSchema.optional(),
+    inputSequence: z.number().int().nonnegative(),
+    handledInputSequence: z.number().int().nonnegative(),
+    inputProcessing: collaborationInputProcessingSchema.optional(),
+    planVersion: z.number().int().nonnegative(),
+    planReference: collaborationPlanReferenceSchema.optional(),
+    planInputSequence: z.number().int().nonnegative().optional(),
+    review: collaborationReviewSchema.optional(),
+    reviewScopeRef: collaborationDocumentSchema.optional(),
+    codeRunId: z.string().uuid().optional(),
+    /** Only an already-authorized unfinished write may be resumed without a new Repair action. */
+    pendingWork: z
+      .strictObject({
+        stage: z.enum(['implement', 'repair']),
+        runId: z.string().uuid(),
+        inputSequence: z.number().int().nonnegative(),
+        planReference: collaborationPlanReferenceSchema.optional(),
+        repairReservationReleased: z.boolean().optional(),
+      })
+      .optional(),
+    nextStage: collaborationWorkStageSchema.optional(),
+    discussionRounds: z.number().int().nonnegative(),
+    reviewCycles: z.number().int().nonnegative(),
+    repairAttempts: z.number().int().nonnegative(),
+    notice: z.string().max(512).optional(),
+  })
+  .refine((task) => !task.rolePolicy || task.owner !== task.reviewer, {
+    message: 'Split collaboration stages require two distinct Agents.',
+  })
 export type CollaborationTask = z.infer<typeof collaborationTaskSchema>
 
 /** Only the frozen owner may publish or retain a native plan for this root. */
@@ -272,8 +283,27 @@ export function collaborationPlanMode(
   const actor = authorization?.actor ?? task?.actor
   return Boolean(
     task &&
-    actor === task.owner &&
+    actor === collaborationActor(task, 'plan') &&
     (stage === 'plan' || (stage === 'reply' && task.kind === 'plan' && !task.codeRunId)),
+  )
+}
+
+/** Shared by both providers; only a frozen owner with an existing plan may retain it. */
+export function collaborationPlanRetentionAllowed(
+  task: CollaborationTask | undefined,
+  authorization: CollaborationTurnAuthorization | undefined = task?.authorization,
+): boolean {
+  return Boolean(
+    task &&
+    authorization &&
+    authorization.taskId === task.id &&
+    authorization.taskRevision === task.revision &&
+    authorization.runId === task.runId &&
+    authorization.actor === task.actor &&
+    authorization.stage === task.stage &&
+    authorization.inputSequence === task.inputSequence &&
+    collaborationPlanMode(task, authorization) &&
+    authorization.planReference,
   )
 }
 
@@ -339,6 +369,7 @@ export const relayDecisionProofSchema = z.strictObject({
 
 export const collaborationActionBasisSchema = z.strictObject({
   handoff: schedulingHandoffSchema,
+  rolePolicy: z.literal('split-stages-v1').optional(),
   taskId: z.string().uuid(),
   inputSequence: z.number().int().nonnegative(),
   stage: collaborationStageSchema,
@@ -384,7 +415,7 @@ export function collaborationPlanAccepted(task: CollaborationTask): boolean {
     plan &&
     task.planInputSequence === task.inputSequence &&
     review?.stage === 'plan_review' &&
-    review.actor === task.reviewer &&
+    review.actor === collaborationActor(task, 'plan_review') &&
     review.verdict === 'accepted' &&
     review.inputSequence === task.inputSequence &&
     review.planReference?.version === plan.version &&
@@ -467,7 +498,19 @@ export function collaborationNextStage(task: CollaborationTask): CollaborationSt
   return task.nextStage
 }
 
-export function collaborationActor(task: CollaborationTask, stage: CollaborationStage) {
+/** The one role resolver for both frozen legacy tasks and split-stage tasks. */
+export function collaborationActor(
+  task: Pick<CollaborationTask, 'owner' | 'reviewer' | 'rolePolicy' | 'kind' | 'codeRunId'>,
+  stage: CollaborationStage,
+) {
+  if (task.rolePolicy === 'split-stages-v1') {
+    if (stage === 'plan' || stage === 'code_review') return task.owner
+    if (stage === 'reply')
+      return task.kind === 'review' || (task.kind === 'plan' && !task.codeRunId)
+        ? task.owner
+        : task.reviewer
+    return task.reviewer
+  }
   return stage === 'plan_review' || stage === 'code_review'
     ? task.reviewer
     : stage === 'reply' && task.kind === 'review'

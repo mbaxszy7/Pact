@@ -344,3 +344,46 @@ it('omits Pause while preserving the authorized next action and revision receipt
     ),
   )
 })
+
+it.each([
+  { primary: 'codex', secondary: 'claude', label: 'Claude Code' },
+  { primary: 'claude', secondary: 'codex', label: 'Codex' },
+] as const)(
+  'labels all writing actions with Secondary when Primary is $primary',
+  async ({ primary, secondary, label }) => {
+    const { props, task, planReference } = collaborationFixture()
+    Object.assign(task, {
+      owner: primary,
+      reviewer: secondary,
+      rolePolicy: 'split-stages-v1',
+      stage: 'plan_review',
+      actor: secondary,
+      status: 'ready',
+      automation: 'active',
+      planInputSequence: 0,
+      review: {
+        runId: props.run.id,
+        actor: secondary,
+        stage: 'plan_review',
+        verdict: 'accepted',
+        inputSequence: 0,
+        planReference,
+        document: planReference.document,
+      },
+    })
+    const bridge = installRead(task)
+    bridge.getConversation.mockResolvedValue({
+      ok: true,
+      value: reportPage(task, { availableActions: ['execute', 'respond', 'repair'] }),
+    })
+    render(<CollaborationReview {...props} />)
+    expect(await screen.findByRole('button', { name: `Implement plan · ${label}` })).toBeDefined()
+    expect(screen.getByRole('button', { name: `Respond · ${label}` })).toBeDefined()
+    expect(screen.getByRole('button', { name: `Repair · ${label}` })).toBeDefined()
+    expect(
+      screen.queryByRole('button', {
+        name: `Implement plan · ${primary === 'codex' ? 'Codex' : 'Claude Code'}`,
+      }),
+    ).toBeNull()
+  },
+)

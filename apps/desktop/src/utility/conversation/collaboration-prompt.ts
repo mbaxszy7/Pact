@@ -2,6 +2,8 @@ import {
   COLLABORATION_DISPLAY_TEXT_RULES,
   collaborationInputProcessing,
   collaborationPlanMode,
+  collaborationActor,
+  collaborationPlanRetentionAllowed,
   type CollaborationTask,
   type CollaborationTurnAuthorization,
 } from '@pact/contracts'
@@ -40,7 +42,13 @@ export { collaborationPlanMode } from '@pact/contracts'
 export const collaborationReviewMode = (
   task: CollaborationTask | undefined,
   authorization?: CollaborationTurnAuthorization,
-): boolean => ['plan_review', 'code_review'].includes(authorization?.stage ?? task?.stage ?? '')
+): boolean =>
+  Boolean(
+    task &&
+    ['plan_review', 'code_review'].includes(authorization?.stage ?? task.stage) &&
+    (authorization?.actor ?? task.actor) ===
+      collaborationActor(task, authorization?.stage ?? task.stage),
+  )
 
 export const collaborationInputResultRequired = (
   task: CollaborationTask | undefined,
@@ -97,7 +105,7 @@ export function collaborationInstructions(
       'Prioritize the latest user message. Answer or clarify it within this turn’s authority. Automatic collaboration stays paused after the reply; the user continues it explicitly. A reply does not authorize implementation or repair.',
   }[stage]
   return [
-    `Pact ${task.kind}. Current responsibility: ${stage}. The plan author and default implementer is ${task.owner}; the independent reviewer is ${task.reviewer}. Keep those roles fixed for this task.`,
+    `Pact ${task.kind}. Current responsibility: ${stage}. Plan author: ${collaborationActor(task, 'plan')}; plan reviewer: ${collaborationActor(task, 'plan_review')}; implementer: ${collaborationActor(task, 'implement')}; code reviewer: ${collaborationActor(task, 'code_review')}. Keep these stage responsibilities fixed for this task.`,
     ...sourceAuthority,
     ...(authorization?.userAuthority?.purpose === 'supplement_plan' ||
     authorization?.userAuthority?.purpose === 'supplement_code_response'
@@ -120,7 +128,10 @@ export function collaborationInstructions(
       : 'Only this implementation or repair turn permits project edits within its explicit scope.',
     duty,
     collaborationPlanMode(task, authorization) && (authorization?.actor ?? task.actor) === 'codex'
-      ? 'When the plan is decision complete and no necessary user choice remains, publish the complete official plan in the Codex native <proposed_plan> block, with each opening and closing tag on its own line and Markdown between them. This is the native plan publication mechanism for this turn; no separate plan-submission tool is required. update_plan is only a progress checklist and does not publish the official plan. Publish at most one complete plan in this turn, then end without implementing it.'
+      ? 'When a first or changed plan is decision complete and no necessary user choice remains, publish the complete official plan in the Codex native <proposed_plan> block, with each opening and closing tag on its own line and Markdown between them. This is the native plan publication mechanism for this turn; no separate plan-submission tool is required. update_plan is only a progress checklist and does not publish the official plan. Publish at most one complete plan in this turn, then end without implementing it. If the frozen official plan needs no change, use the explicit retention operation described below instead.'
+      : undefined,
+    collaborationPlanRetentionAllowed(task, authorization)
+      ? 'If the existing official plan remains correct after handling the supplied input, call retain_current_plan with an empty object in this root. This explicitly retains the frozen plan and its original version/source; ordinary prose saying that the plan is unchanged is not a submission. Do not call it after changing or starting to change the plan, while a plan operation is unresolved, or while a required user choice remains. If the plan needs changes, submit the complete updated plan through the native mechanism instead. This operation does not approve implementation or replace the independent reviewer.'
       : undefined,
     stage === 'reply'
       ? collaborationInputResultRequired(task, authorization)
@@ -166,6 +177,7 @@ export function collaborationToolAllowed(name: string, ownServer: string): boole
       'publish_session_title',
       'submit_review',
       'submit_input_result',
+      'retain_current_plan',
     ].some((tool) => name === `mcp__${ownServer}__${tool}`)
   )
 }

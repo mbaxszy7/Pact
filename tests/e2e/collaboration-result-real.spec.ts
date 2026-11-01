@@ -1,9 +1,12 @@
 import { expect } from '@playwright/test'
 import { createHash } from 'node:crypto'
+import { open, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { markdownVisibleProjection } from '../../apps/desktop/src/shared/message-anchor-text.js'
+import { diagnosticRecordSchema } from '../../packages/contracts/src/diagnostics.js'
 import {
   collaborationTaskSchema,
   collaborationPlanSettlementSchema,
@@ -21,9 +24,264 @@ import {
   sendRealMessage,
   type RealWorkspace,
   readRealConversation,
+  restartRealWorkspace,
 } from './real-harness.js'
 import { findNativeRecord } from './real-native-evidence.js'
 import { test } from './runtime-fixture.js'
+
+for (const owner of ['codex', 'claude'] as const)
+  test(
+    `real ${owner} retains an unchanged plan and settles its reply without implementation authority`,
+    { tag: ['@real', '@real-extended'] },
+    async () => {
+      test.setTimeout(300_000)
+      const deadline = Date.now() + 300_000
+      const ctx = await launchRealWorkspace(`real-retain-plan-${owner}`)
+      const readView = () =>
+        ctx.page.evaluate(async (sessionId) => {
+          const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+          const result = await bridge.getConversation({ scope: 'collaboration', sessionId })
+          if (!result.ok || result.value.scope !== 'collaboration')
+            throw new Error('Collaboration view unavailable')
+          return result.value.view
+        }, ctx.sessionId)
+      try {
+        await selectRealConfiguredEffort(ctx, ['codex', 'claude'], owner)
+        await sendRealMessage(
+          ctx,
+          '/plan Draft a concise conceptual plan for documenting cancellation ownership. Fixed requirements: one requester owns the request handle and cancellation authority; scope disposal delegates cancellation to that same owner. The executor releases work-local resources before its terminal acknowledgement, then the requester releases its handle exactly once. Normal completion needs no cancellation. Repeated cancellation/disposal is idempotent and awaits the same terminal cleanup. Acceptance: three concrete steps covering normal completion, cancellation, and disposal, naming each resource owner and release condition. All choices are specified. Do not inspect or modify project files, run commands, or delegate. The native plan document is permitted. Publish the complete official plan through the native plan mechanism.',
+          owner,
+        )
+        await expect
+          .poll(
+            async () => {
+              const view = await readView()
+              if (view.task?.status === 'failed')
+                throw new Error('Initial real plan or review did not settle')
+              return view.accepted && view.task?.status === 'ready'
+            },
+            { timeout: Math.max(1, deadline - Date.now()), intervals: [250, 500, 1000] },
+          )
+          .toBe(true)
+        const initial = (await readView()).task!
+        expect(initial.owner).toBe(owner)
+        expect(initial.reviewer).toBe(owner === 'codex' ? 'claude' : 'codex')
+        const originalPlan = initial.planReference!
+        const originalText = await readRequiredPlanSource(ctx, originalPlan)
+        const initialRuns = (await readRealConversation(ctx)).runs.length
+        await sendRealMessage(
+          ctx,
+          'Recheck the existing accepted plan against my unchanged requirements: cancellation and repeated disposal use the same owner and terminal cleanup. There is no new requirement or choice. If the current plan already covers these requirements, briefly confirm why it remains correct and call retain_current_plan with an empty object in this root. Preserve the existing official plan exactly: do not rewrite or republish it, do not use ExitPlanMode as a substitute for this explicit retention operation, and do not implement or delegate.',
+          owner,
+        )
+        await expect
+          .poll(
+            async () => {
+              const view = await readView()
+              if (view.task?.status === 'failed')
+                throw new Error('Real unchanged-plan reply lacks authenticated retention')
+              return (
+                view.task?.inputProcessing?.settled?.inputSequence === initial.inputSequence + 1 &&
+                !view.task.inputProcessing.pending &&
+                view.task.automation === 'paused'
+              )
+            },
+            { timeout: Math.max(1, deadline - Date.now()), intervals: [250, 500, 1000] },
+          )
+          .toBe(true)
+        const retained = await readView()
+        expect(retained.task?.planReference).toEqual(originalPlan)
+        expect(retained.task?.planVersion).toBe(initial.planVersion)
+        expect(retained.task?.planInputSequence).toBe(initial.inputSequence + 1)
+        expect(retained.task?.review).toEqual(initial.review)
+        expect(retained.task?.pauseReason).toBe('user_message')
+        expect(retained.accepted).toBe(false)
+        expect(retained.availableActions).toContain('resume')
+        expect(retained.availableActions).not.toContain('execute')
+        expect(await readRequiredPlanSource(ctx, retained.task!.planReference!)).toBe(originalText)
+        const snapshot = await readRealConversation(ctx)
+        expect(snapshot.runs).toHaveLength(initialRuns + 1)
+        const reply = snapshot.runs.find((run) => run.id === retained.task!.runId)!
+        expect(reply).toMatchObject({
+          agentId: owner,
+          status: 'completed',
+          nativeOutcome: 'completed',
+          nativeEffectsState: 'settled',
+          collaboration: { stage: 'reply' },
+        })
+        const database = ReadonlyFixtureDatabase.open(ctx.fixture)
+        try {
+          const facts = database.drizzle.query.agentEventJournal
+            .findMany({
+              where: (fields, { and, eq }) =>
+                and(eq(fields.runId, reply.id), eq(fields.eventType, 'workflow.plan_settled')),
+              columns: { payload: true },
+              limit: 2,
+            })
+            .sync()
+          expect(facts).toHaveLength(1)
+          const confirmations = database.drizzle.query.agentEventJournal
+            .findMany({
+              where: (fields, { and, eq }) =>
+                and(eq(fields.runId, reply.id), eq(fields.eventType, 'workflow.plan_retained')),
+              columns: { payload: true },
+              limit: 2,
+            })
+            .sync()
+          expect(confirmations).toHaveLength(1)
+          expect(JSON.parse(confirmations[0]!.payload)).toMatchObject({
+            confirmation: 'native_root_settled_v1',
+            sha256: originalPlan.document.sha256,
+            bytes: originalPlan.document.bytes,
+            chars: originalPlan.document.chars,
+          })
+          expect(
+            collaborationPlanSettlementSchema.parse(JSON.parse(facts[0]!.payload)),
+          ).toMatchObject({
+            kind: 'retained',
+            planReference: originalPlan,
+            inputSequence: initial.inputSequence + 1,
+          })
+        } finally {
+          database.close()
+        }
+        await restartRealWorkspace(ctx)
+        const cold = await readView()
+        expect(cold.task?.planReference).toEqual(originalPlan)
+        expect(cold.task?.inputProcessing).toEqual(retained.task?.inputProcessing)
+        expect(cold.task?.automation).toBe('paused')
+        expect((await readRealConversation(ctx)).runs).toHaveLength(initialRuns + 1)
+        await ctx.page.getByRole('button', { name: 'Continue collaboration', exact: true }).click()
+        await expect
+          .poll(
+            async () => {
+              const view = await readView()
+              if (view.task?.status === 'failed')
+                throw new Error('Current-input independent review failed')
+              return view.accepted && view.task?.review?.inputSequence === initial.inputSequence + 1
+            },
+            { timeout: Math.max(1, deadline - Date.now()), intervals: [250, 500, 1000] },
+          )
+          .toBe(true)
+        const reviewed = await readView()
+        expect(reviewed.task?.review?.actor).toBe(initial.reviewer)
+        expect(reviewed.task?.planReference).toEqual(originalPlan)
+        expect(reviewed.availableActions).toContain('execute')
+        expect(
+          (await readRealConversation(ctx)).runs.some((run) =>
+            ['implement', 'repair'].includes(run.collaboration?.stage ?? ''),
+          ),
+        ).toBe(false)
+      } catch (error) {
+        const view = await readView().catch(() => undefined)
+        const snapshot = await readRealConversation(ctx).catch(() => undefined)
+        const lastRun = snapshot?.runs.find((run) => run.id === view?.task?.runId)
+        const counts: Array<{ type: string; count: number }> = []
+        if (lastRun) {
+          const database = ReadonlyFixtureDatabase.open(ctx.fixture)
+          try {
+            const rows = database.drizzle.query.agentEventJournal
+              .findMany({
+                where: (fields, { eq }) => eq(fields.runId, lastRun.id),
+                columns: { eventType: true },
+                limit: 1024,
+              })
+              .sync()
+            for (const type of new Set(rows.map((row) => row.eventType)))
+              counts.push({ type, count: rows.filter((row) => row.eventType === type).length })
+          } finally {
+            database.close()
+          }
+        }
+        const planDiagnostics: object[] = []
+        const log = await open(
+          join(dirname(ctx.fixture.databaseFile), 'logs/development/pact-0.jsonl'),
+          'r',
+        ).catch(() => undefined)
+        if (log) {
+          try {
+            const size = (await log.stat()).size
+            if (size <= 1024 * 1024) {
+              const bytes = Buffer.alloc(size)
+              const read = await log.read(bytes, 0, size, 0)
+              for (const line of bytes.subarray(0, read.bytesRead).toString('utf8').split('\n')) {
+                if (!line) continue
+                try {
+                  const parsed = diagnosticRecordSchema.safeParse(JSON.parse(line))
+                  if (
+                    parsed.success &&
+                    parsed.data.runId === lastRun?.id &&
+                    parsed.data.operation === 'claude_plan' &&
+                    planDiagnostics.length < 64
+                  )
+                    planDiagnostics.push({
+                      stage: parsed.data.planStage,
+                      reason: parsed.data.planReason,
+                      capture: parsed.data.planCapture,
+                    })
+                } catch {
+                  /* Only complete validated diagnostic records are evidence. */
+                }
+              }
+            }
+          } finally {
+            await log.close()
+          }
+        }
+        let tools: Record<string, number> | undefined
+        if (lastRun?.nativeSessionId) {
+          const native = await findNativeRecord(ctx, owner, lastRun.nativeSessionId).catch(
+            () => undefined,
+          )
+          if (native) {
+            tools = {}
+            for (const name of native.toolNames) {
+              const allowed = [
+                'retain_current_plan',
+                'submit_input_result',
+                'submit_review',
+                'Write',
+                'Edit',
+                'ExitPlanMode',
+                'AskUserQuestion',
+              ]
+              const key =
+                allowed.find((value) => name === value || name.endsWith(`__${value}`)) ?? 'other'
+              tools[key] = (tools[key] ?? 0) + 1
+            }
+          }
+        }
+        const diagnostic = {
+          owner,
+          task: view?.task && {
+            status: view.task.status,
+            stage: view.task.stage,
+            planVersion: view.task.planVersion,
+            inputSequence: view.task.inputSequence,
+            planInputSequence: view.task.planInputSequence,
+            pending: Boolean(view.task.inputProcessing?.pending),
+          },
+          run: lastRun && {
+            status: lastRun.status,
+            outcome: lastRun.nativeOutcome,
+            effects: lastRun.nativeEffectsState,
+            failureKind: lastRun.failureKind,
+          },
+          counts,
+          planDiagnostics,
+          tools,
+        }
+        const encoded = JSON.stringify(diagnostic)
+        if (Buffer.byteLength(encoded) <= 64 * 1024) {
+          await writeFile(test.info().outputPath('retention-failure-scalars.json'), encoded)
+          console.log(`[pact-retention] ${encoded}`)
+        }
+        throw error
+      } finally {
+        await closeRealWorkspace(ctx)
+      }
+    },
+  )
 
 /** The exact immutable source must remain complete, including the first author's v1. */
 async function readRequiredPlanSource(

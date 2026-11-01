@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest'
 
 import {
   advanceCollaboration,
+  collaborationActor,
+  collaborationActionBasisSchema,
   bindCollaborationQuestions,
   collaborationAvailableActions,
   collaborationContinuationLimit,
@@ -12,6 +14,8 @@ import {
   collaborationInputResultSchema,
   collaborationNextStage,
   collaborationPlanAccepted,
+  collaborationPlanRetentionAllowed,
+  collaborationPlanRetentionInputSchema,
   collaborationQuestionsSchema,
   collaborationReviewInputSchema,
   collaborationSourceReadSchema,
@@ -32,6 +36,71 @@ const plan = () => ({
   sourceRunId: randomUUID(),
   sourceMessageId: randomUUID(),
   document: document(),
+})
+
+it.each(['codex', 'claude'] as const)(
+  'only the frozen %s owner may retain an existing plan',
+  (owner) => {
+    const current = task({
+      owner,
+      actor: owner,
+      reviewer: owner === 'codex' ? 'claude' : 'codex',
+      stage: 'reply',
+      planReference: plan(),
+      planVersion: 1,
+    })
+    current.authorization = {
+      runId: current.runId,
+      taskId: current.id,
+      taskRevision: current.revision,
+      stage: 'reply',
+      actor: owner,
+      inputSequence: current.inputSequence,
+      planReference: current.planReference,
+    }
+    expect(collaborationPlanRetentionAllowed(current)).toBe(true)
+    expect(collaborationPlanRetentionAllowed({ ...current, authorization: undefined })).toBe(false)
+    expect(
+      collaborationPlanRetentionAllowed(current, {
+        ...current.authorization,
+        planReference: undefined,
+      }),
+    ).toBe(false)
+    expect(
+      collaborationPlanRetentionAllowed(current, {
+        ...current.authorization,
+        actor: current.reviewer,
+      }),
+    ).toBe(false)
+    expect(
+      collaborationPlanRetentionAllowed(current, {
+        ...current.authorization,
+        inputSequence: current.inputSequence + 1,
+      }),
+    ).toBe(false)
+    expect(
+      collaborationPlanRetentionAllowed(current, { ...current.authorization, runId: randomUUID() }),
+    ).toBe(false)
+    expect(
+      collaborationPlanRetentionAllowed(
+        { ...current, stage: 'code_review' },
+        { ...current.authorization, stage: 'code_review' },
+      ),
+    ).toBe(false)
+  },
+)
+
+it('retention accepts only an empty intent and no model-selected plan identity', () => {
+  expect(collaborationPlanRetentionInputSchema.safeParse({}).success).toBe(true)
+  for (const value of [
+    null,
+    [],
+    { planId: randomUUID() },
+    { version: 1 },
+    { sha256: 'a'.repeat(64) },
+    { processed: true },
+  ])
+    expect(collaborationPlanRetentionInputSchema.safeParse(value).success).toBe(false)
 })
 function task(fields: Partial<CollaborationTask> = {}): CollaborationTask {
   return collaborationTaskSchema.parse({
@@ -518,4 +587,95 @@ it('native root_batch is an exclusive transport-bound original-input selection',
     expect(collaborationSourceNativeReadSchema.safeParse({ ...request, ...extra }).success).toBe(
       false,
     )
+})
+
+it.each(['codex', 'claude'] as const)(
+  'freezes split stage roles independently of provider: %s Primary',
+  (primary) => {
+    const secondary = primary === 'codex' ? 'claude' : 'codex'
+    const current = task({
+      owner: primary,
+      reviewer: secondary,
+      actor: primary,
+      rolePolicy: 'split-stages-v1',
+    })
+    const stages = ['plan', 'plan_review', 'implement', 'code_review', 'respond', 'repair'] as const
+    expect(stages.map((stage) => collaborationActor(current, stage))).toEqual([
+      primary,
+      secondary,
+      secondary,
+      primary,
+      secondary,
+      secondary,
+    ])
+    const legacy = { ...current, rolePolicy: undefined }
+    expect(stages.map((stage) => collaborationActor(legacy, stage))).toEqual([
+      primary,
+      secondary,
+      primary,
+      secondary,
+      primary,
+      primary,
+    ])
+    const ready: CollaborationTask = {
+      ...accepted(),
+      owner: primary,
+      reviewer: secondary,
+      rolePolicy: 'split-stages-v1' as const,
+    }
+    ready.review = { ...ready.review!, actor: secondary }
+    expect(advanceCollaboration(ready, 'execute', limits).actor).toBe(secondary)
+    expect(
+      collaborationPlanAccepted({ ...ready, review: { ...ready.review, actor: primary } }),
+    ).toBe(false)
+    expect(collaborationTaskSchema.safeParse({ ...current, reviewer: primary }).success).toBe(false)
+  },
+)
+
+it('preserves legacy action bases and validates only the supported split role marker', () => {
+  const current = task()
+  const basis = {
+    handoff: {
+      id: 'a'.repeat(64),
+      sessionId: current.sessionId,
+      budgetRoot: { kind: 'task', id: current.id },
+      budgetSubjectId: `task:${current.id}`,
+      eventId: current.runId,
+      slot: 'workflow_next',
+      factFingerprint: 'b'.repeat(64),
+      freshnessGuard: {
+        taskRevision: 0,
+        settingsRevision: 1,
+        inputSequence: 0,
+        runId: current.runId,
+        bindingGeneration: 1,
+        agentId: 'claude',
+        stateFingerprint: 'c'.repeat(64),
+      },
+    },
+    taskId: current.id,
+    inputSequence: 0,
+    stage: 'implement',
+    actor: 'claude',
+    planReference: null,
+    review: null,
+    reviewScopeRef: null,
+    previousRunId: null,
+    actorBinding: {
+      generation: 1,
+      nativeSessionId: null,
+      continuationState: null,
+      permissions: 'd'.repeat(64),
+    },
+  }
+  expect(collaborationActionBasisSchema.parse(basis)).toEqual(basis)
+  expect(collaborationActionBasisSchema.parse({ ...basis, rolePolicy: 'split-stages-v1' })).toEqual(
+    { ...basis, rolePolicy: 'split-stages-v1' },
+  )
+  expect(
+    collaborationActionBasisSchema.safeParse({ ...basis, rolePolicy: 'unverified' }).success,
+  ).toBe(false)
+  expect(collaborationActionBasisSchema.safeParse({ ...basis, implementer: 'codex' }).success).toBe(
+    false,
+  )
 })

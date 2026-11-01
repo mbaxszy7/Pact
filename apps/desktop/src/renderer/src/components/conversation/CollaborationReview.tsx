@@ -13,6 +13,7 @@ import type {
 
 import {
   collaborationContinuationLimit,
+  collaborationActor,
   collaborationInputGate,
   collaborationInputProcessing,
 } from '@pact/contracts'
@@ -286,9 +287,9 @@ export const CollaborationReview = memo(function CollaborationReview({
     : []
   const actionLabel = (action: DisplayedCollaborationAction): string =>
     ({
-      execute: `Implement plan · ${agentName(task.owner)}`,
-      respond: `Respond · ${agentName(task.owner)}`,
-      repair: `Repair · ${agentName(task.owner)}`,
+      execute: `Implement plan · ${agentName(collaborationActor(task, 'implement'))}`,
+      respond: `Respond · ${agentName(collaborationActor(task, 'respond'))}`,
+      repair: `Repair · ${agentName(collaborationActor(task, 'repair'))}`,
       pause: 'Pause collaboration',
       resume: 'Continue collaboration',
       recover_plan: planSync?.kind === 'response' ? 'Restore plan response' : 'Restore saved plan',

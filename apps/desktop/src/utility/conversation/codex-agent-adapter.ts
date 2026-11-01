@@ -8,6 +8,7 @@ import type {
   NativeContextRebuildChunk,
   CollaborationReviewObservation,
   CollaborationInputObservation,
+  CollaborationRetainedPlan,
   NativeEvidenceIdentity,
   NativeProbeResult,
   NativeInitializationWitness,
@@ -37,7 +38,7 @@ import {
   type AgentNativeForkInspection,
   type AgentNativeForkWitness,
 } from '@pact/agent-runtime'
-import { nativeCodexSkillListSchema } from '@pact/contracts'
+import { nativeCodexSkillListSchema, collaborationPlanRetentionAllowed } from '@pact/contracts'
 import {
   nativePermissionRequestSchema,
   peerRequestToolInputSchema,
@@ -3180,6 +3181,8 @@ export class CodexAgentAdapter implements AgentAdapter {
     const answer = new AgentAnswerAssembler(input.runId)
     const planMemory = new NativeWorkingMemory().reserve(0)
     let submittedPlan: { nativeId: string; text: string } | undefined
+    let retainedPlan: CollaborationRetainedPlan | undefined
+    let planOperationObserved = false
     let reviewResult: CollaborationReviewObservation | undefined
     let inputResult: CollaborationInputObservation | undefined
     let projectionFailure: unknown
@@ -3207,6 +3210,48 @@ export class CodexAgentAdapter implements AgentAdapter {
         input.recordWorkflowPlan?.(submittedPlan)
       })
     }
+    const observePlanOperation = (): void => {
+      if (!collaborationPlanMode(workflow, input.promptEnvelope.collaborationAuthorization)) return
+      planOperationObserved = true
+      const terminal = this.terminalEvidence.get(input.runId)
+      if (terminal?.output?.retainedPlan) {
+        const { retainedPlan: _retired, ...output } = terminal.output
+        this.terminalEvidence.set(input.runId, { ...terminal, output })
+      }
+      if (retainedPlan) {
+        retainedPlan = undefined
+        try {
+          input.recordWorkflowPlanUnavailable?.()
+        } catch {
+          // The in-memory intent is already invalid. A metadata failure cannot
+          // change the native outcome or make this intent eligible for settlement.
+        }
+      }
+    }
+    const captureRetainedPlan = (nativeId: unknown): void => {
+      const authorization = input.promptEnvelope.collaborationAuthorization
+      if (
+        signal.aborted ||
+        background.cancellationPending ||
+        planOperationObserved ||
+        submittedPlan ||
+        retainedPlan ||
+        inputResult ||
+        background.interactions.size ||
+        !collaborationPlanRetentionAllowed(workflow, authorization) ||
+        !authorization?.planReference ||
+        typeof nativeId !== 'string' ||
+        !nativeId ||
+        nativeId.length > 1024
+      )
+        return
+      const { sha256, bytes, chars } = authorization.planReference.document
+      const candidate = { nativeId, sha256, bytes, chars }
+      projectOutput(() => {
+        planMemory.resize(4096 + Buffer.byteLength(JSON.stringify(candidate)) * 6)
+        retainedPlan = candidate
+      })
+    }
     const captureReview = (verdict: CollaborationReviewObservation): void => {
       if (!collaborationReviewMode(workflow, input.promptEnvelope.collaborationAuthorization))
         return
@@ -3231,11 +3276,48 @@ export class CodexAgentAdapter implements AgentAdapter {
       })
     }
     background.release = () => {
+      const terminal = this.terminalEvidence.get(input.runId)
+      if (
+        retainedPlan &&
+        !planOperationObserved &&
+        !submittedPlan &&
+        !inputResult &&
+        !projectionFailure &&
+        !signal.aborted &&
+        background.rootTerminal &&
+        !background.unknown &&
+        !background.untrackedWork &&
+        !background.cancellationPending &&
+        !background.threads.size &&
+        !background.operations.size &&
+        !background.spawns.size &&
+        !background.interactions.size &&
+        !background.recordings.size &&
+        !background.early.length &&
+        terminal?.kind === 'ended' &&
+        terminal.outcome === 'completed' &&
+        terminal.output &&
+        input.recordWorkflowPlanRetained
+      ) {
+        const confirmed = { ...retainedPlan, confirmation: 'native_root_settled_v1' as const }
+        try {
+          input.recordWorkflowPlanRetained(confirmed)
+          this.terminalEvidence.set(input.runId, {
+            ...terminal,
+            output: { ...terminal.output, retainedPlan: confirmed },
+          })
+          this.admitEvidenceCache()
+        } catch {
+          // A missing final confirmation leaves workflow input pending. Native
+          // completion, answer content and actual effects remain independent.
+        }
+      }
       if (sourceGrant) this.peerToolServer.retireSourceReader(sourceGrant)
       releaseNativeRequests?.()
       releaseApprovalMetadata?.()
       answer.dispose()
       submittedPlan = undefined
+      retainedPlan = undefined
       planMemory.release()
     }
     const reasoningSummaryStates = new Map<string, { pendingPrefix: string; emitted: boolean }>()
@@ -3550,6 +3632,15 @@ export class CodexAgentAdapter implements AgentAdapter {
       }
       if (observed.has(event)) return !root || background.foregroundReleased
       observed.add(event)
+      if (
+        root &&
+        ownedTurn &&
+        (eventMethod === 'item/started' || eventMethod === 'item/completed')
+      ) {
+        const item = Reflect.get(eventParams, 'item')
+        if (item && typeof item === 'object' && Reflect.get(item, 'type') === 'plan')
+          observePlanOperation()
+      }
       if (root && ownedTurn && !background.rootTerminal && eventMethod === 'item/completed') {
         const item = Reflect.get(eventParams, 'item')
         if (item && typeof item === 'object') {
@@ -3572,7 +3663,9 @@ export class CodexAgentAdapter implements AgentAdapter {
           } else if (
             Reflect.get(item, 'type') === 'mcpToolCall' &&
             Reflect.get(item, 'server') === this.peerServerName &&
-            ['submit_review', 'submit_input_result'].includes(String(Reflect.get(item, 'tool'))) &&
+            ['submit_review', 'submit_input_result', 'retain_current_plan'].includes(
+              String(Reflect.get(item, 'tool')),
+            ) &&
             Reflect.get(item, 'status') === 'completed' &&
             Reflect.get(item, 'error') === null
           ) {
@@ -3582,9 +3675,17 @@ export class CodexAgentAdapter implements AgentAdapter {
                 ? Reflect.get(result, 'structuredContent')
                 : undefined
             const inputResultCall = Reflect.get(item, 'tool') === 'submit_input_result'
+            const retentionCall = Reflect.get(item, 'tool') === 'retain_current_plan'
             const receipt =
               structured && typeof structured === 'object'
-                ? Reflect.get(structured, inputResultCall ? 'pactInputResult' : 'pactReview')
+                ? Reflect.get(
+                    structured,
+                    retentionCall
+                      ? 'pactPlanRetention'
+                      : inputResultCall
+                        ? 'pactInputResult'
+                        : 'pactReview',
+                  )
                 : undefined
             if (
               receipt &&
@@ -3592,7 +3693,19 @@ export class CodexAgentAdapter implements AgentAdapter {
               Reflect.get(receipt, 'receipt') === this.peerToolServer.capabilityReceipt &&
               peerReceipt
             ) {
-              if (inputResultCall) {
+              if (retentionCall) {
+                if (
+                  result &&
+                  typeof result === 'object' &&
+                  Reflect.get(result, 'isError') !== true &&
+                  Reflect.get(receipt, 'accepted') === true &&
+                  this.peerToolServer.acceptPlanRetention(
+                    Reflect.get(item, 'arguments'),
+                    peerReceipt,
+                  )
+                )
+                  captureRetainedPlan(Reflect.get(item, 'id'))
+              } else if (inputResultCall) {
                 const outcome = this.peerToolServer.acceptInputResult(
                   Reflect.get(item, 'arguments'),
                   peerReceipt,
@@ -3949,6 +4062,15 @@ export class CodexAgentAdapter implements AgentAdapter {
           : undefined,
         sourceGrant,
         input.collaborationSourceReader,
+        input.promptEnvelope.collaborationAuthorization,
+        () =>
+          !signal.aborted &&
+          !background.rootTerminal &&
+          !background.closed &&
+          !background.cancellationPending &&
+          !planOperationObserved &&
+          !inputResult &&
+          background.interactions.size === 0,
       )
       // Loaded Threads ignore resume config: their installed capability URL must stay stable.
       const peerToolUrl = await this.peerToolServer.start()
@@ -4560,9 +4682,12 @@ export class CodexAgentAdapter implements AgentAdapter {
             CodexAgentAdapter.isPeerTool(item, this.peerServerName) ||
             (Reflect.get(item, 'type') === 'mcpToolCall' &&
               Reflect.get(item, 'server') === this.peerServerName &&
-              ['publish_session_title', 'submit_review', 'submit_input_result'].includes(
-                String(Reflect.get(item, 'tool')),
-              ))
+              [
+                'publish_session_title',
+                'submit_review',
+                'submit_input_result',
+                'retain_current_plan',
+              ].includes(String(Reflect.get(item, 'tool'))))
           )
             continue
           const activity = CodexAgentAdapter.describeTool(item, input.cwd, false)
@@ -4693,7 +4818,9 @@ export class CodexAgentAdapter implements AgentAdapter {
             Reflect.get(item, 'type') === 'plan' ||
             (Reflect.get(item, 'type') === 'mcpToolCall' &&
               Reflect.get(item, 'server') === this.peerServerName &&
-              ['submit_review', 'submit_input_result'].includes(String(Reflect.get(item, 'tool'))))
+              ['submit_review', 'submit_input_result', 'retain_current_plan'].includes(
+                String(Reflect.get(item, 'tool')),
+              ))
           ) {
             // Root plan/review metadata was captured by the owned native observer.
           } else if (CodexAgentAdapter.isPeerTool(item, this.peerServerName)) {
@@ -6734,6 +6861,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     answer: Pick<AgentAnswerAssembler, 'outputId' | 'text'>,
     metadata?: {
       plan?: { nativeId: string; text: string } | undefined
+      retainedPlan?: CollaborationRetainedPlan | undefined
       reviewResult?: CollaborationReviewObservation | undefined
       inputResult?: CollaborationInputObservation | undefined
     },
@@ -6743,13 +6871,14 @@ export class CodexAgentAdapter implements AgentAdapter {
       identity: this.runIdentity(input, nativeSessionId, nativeTurnId),
       source: 'live_terminal',
       outcome,
-      ...(answer.text || metadata?.plan || metadata?.reviewResult
+      ...(answer.text || metadata?.plan || metadata?.retainedPlan || metadata?.reviewResult
         ? {
             output: {
               outputId: answer.outputId,
               text: answer.text,
               completeness: outcome === 'completed' ? ('complete' as const) : ('partial' as const),
               ...(metadata?.plan ? { plan: metadata.plan } : {}),
+              ...(metadata?.retainedPlan ? { retainedPlan: metadata.retainedPlan } : {}),
               ...(metadata?.reviewResult ? { reviewResult: metadata.reviewResult } : {}),
               ...(metadata?.inputResult ? { inputResult: metadata.inputResult } : {}),
             },

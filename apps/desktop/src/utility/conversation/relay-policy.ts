@@ -5,7 +5,12 @@ import type {
 } from '@pact/contracts'
 import type { RelayWorkflowSnapshot, RelayWorkflowTurnSource } from '@pact/persistence'
 
-import { DECISION_CANDIDATES, DECISION_INPUT_BYTES, DECISION_SOURCES } from '@pact/contracts'
+import {
+  collaborationActor,
+  DECISION_CANDIDATES,
+  DECISION_INPUT_BYTES,
+  DECISION_SOURCES,
+} from '@pact/contracts'
 
 export type RelaySourceRole =
   | 'task'
@@ -444,12 +449,15 @@ export function relayWorkflowPolicyFacts(
     snapshot.node === 'plan_to_review' ||
     snapshot.node === 'plan_review_to_owner' ||
     snapshot.node === 'owner_to_review'
+  const planner = collaborationActor(task, 'plan')
+  const owner = collaborationActor(task, planning ? 'plan' : 'implement')
+  const reviewer = collaborationActor(task, planning ? 'plan_review' : 'code_review')
   const planSource = snapshot.planSourceId ? sources.get(snapshot.planSourceId) : undefined
   if (
     basis.plan
       ? !planSource ||
         !planSource.roles.includes('plan') ||
-        snapshot.sourceActors[planSource.id] !== task.owner ||
+        snapshot.sourceActors[planSource.id] !== planner ||
         !sameDocument(planSource.document, basis.plan.document)
       : snapshot.planSourceId !== null ||
         snapshot.sources.some((source) => source.roles.includes('plan'))
@@ -491,7 +499,7 @@ export function relayWorkflowPolicyFacts(
     snapshot.reviews.some(
       (review, index) =>
         !turnValid(review, 'review') ||
-        review.actor !== task.reviewer ||
+        review.actor !== reviewer ||
         review.stage !== (planning ? 'plan_review' : 'code_review') ||
         review.verdict === null ||
         (planning && !digestValid(review.planSha256 ?? '')) ||
@@ -500,7 +508,7 @@ export function relayWorkflowPolicyFacts(
     snapshot.responses.some(
       (response) =>
         !turnValid(response, 'owner_response') ||
-        response.actor !== task.owner ||
+        response.actor !== owner ||
         (planning
           ? response.stage !== 'plan'
           : response.stage !== 'respond' && response.stage !== 'repair') ||
@@ -514,8 +522,8 @@ export function relayWorkflowPolicyFacts(
     budgetSubjectId: `task:${task.id}`,
     task: {
       taskId: task.id,
-      owner: task.owner,
-      reviewer: task.reviewer,
+      owner: owner,
+      reviewer: reviewer,
       inputSequence: task.inputSequence,
     },
     admission: options.admission,
@@ -542,7 +550,7 @@ export function relayWorkflowPolicyFacts(
       ? {
           sourceId: planSource.id,
           sha256: basis.plan.document.sha256,
-          actor: task.owner,
+          actor: planner,
           inputSequence: task.planInputSequence,
         }
       : undefined
@@ -550,7 +558,7 @@ export function relayWorkflowPolicyFacts(
     case 'plan_to_review': {
       if (
         !plan ||
-        producer.actor !== task.owner ||
+        producer.actor !== owner ||
         (producer.stage !== 'plan' &&
           !(producer.stage === 'reply' && task.kind === 'plan' && !task.codeRunId))
       )
@@ -587,7 +595,7 @@ export function relayWorkflowPolicyFacts(
     }
     case 'plan_review_to_owner': {
       const review = relayPlanReview(producer)
-      if (!plan || !review || producer.actor !== task.reviewer || producer.stage !== 'plan_review')
+      if (!plan || !review || producer.actor !== reviewer || producer.stage !== 'plan_review')
         return undefined
       return {
         ...common,
@@ -605,7 +613,7 @@ export function relayWorkflowPolicyFacts(
         !plan ||
         !ownerResponse ||
         !previousReview ||
-        producer.actor !== task.owner ||
+        producer.actor !== owner ||
         producer.stage !== 'plan'
       )
         return undefined
@@ -625,7 +633,7 @@ export function relayWorkflowPolicyFacts(
     }
     case 'execution_to_review': {
       if (
-        producer.actor !== task.owner ||
+        producer.actor !== owner ||
         (producer.stage !== 'implement' && producer.stage !== 'repair')
       )
         return undefined
@@ -641,7 +649,7 @@ export function relayWorkflowPolicyFacts(
     }
     case 'code_review_to_next': {
       const review = relayCodeReview(producer)
-      if (!review || producer.actor !== task.reviewer || producer.stage !== 'code_review')
+      if (!review || producer.actor !== reviewer || producer.stage !== 'code_review')
         return undefined
       return {
         ...common,

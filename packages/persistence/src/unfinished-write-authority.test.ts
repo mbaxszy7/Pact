@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { advanceCollaboration, collaborationTaskSchema } from '@pact/contracts'
 
 import { PactDatabase } from './pact-database.js'
-import { agentRuns, workflowTurns } from './schema/index.js'
+import { agentRuns, workflowTurns, collaborationTasks } from './schema/index.js'
 import historical from './unfinished-write-0074.test-fixture.json' with { type: 'json' }
 
 const migrationsFolder = resolve(import.meta.dirname, '../drizzle')
@@ -506,6 +506,27 @@ describe('the original explicit unfinished write authority', () => {
     },
   )
 
+  it('refuses public role or policy changes while preserving an unfinished write', async () => {
+    const f = await fresh('repair'),
+      task = f.repo.collaboration(f.sessionId)!
+    expect(() =>
+      f.repo.setCollaborationState({
+        ...task,
+        revision: task.revision + 1,
+        owner: task.reviewer,
+        reviewer: task.owner,
+      }),
+    ).toThrow(/collaboration changed/u)
+    expect(() =>
+      f.repo.setCollaborationState({
+        ...task,
+        revision: task.revision + 1,
+        rolePolicy: 'split-stages-v1',
+      }),
+    ).toThrow(/collaboration changed/u)
+    expect(f.repo.collaboration(f.sessionId)).toEqual(task)
+  })
+
   it.each(['scope', 'owner', 'unsettled'] as const)(
     'rejects the %s negative control without granting a broader continuation',
     async (change) => {
@@ -518,12 +539,19 @@ describe('the original explicit unfinished write authority', () => {
           reviewScopeRef: task.taskDocument!,
         })
       if (change === 'owner')
-        f.repo.setCollaborationState({
-          ...task,
-          revision: task.revision + 1,
-          owner: task.reviewer,
-          reviewer: task.owner,
-        })
+        // Persisted-authority corruption must still be rejected even though the public state setter now refuses role changes.
+        f.db.drizzle
+          .update(collaborationTasks)
+          .set({
+            stateJson: JSON.stringify({
+              ...task,
+              revision: task.revision + 1,
+              owner: task.reviewer,
+              reviewer: task.owner,
+            }),
+          })
+          .where(eq(collaborationTasks.id, task.id))
+          .run()
       if (change === 'unsettled') f.repo.recordNativeEffects(f.write.id, 'unknown')
       expect(() => resume(f)).toThrow(/original write authorization|native recovery/u)
       expect(f.repo.findRun(f.write.id)?.dispatchPhase).toBe('ended')

@@ -145,6 +145,25 @@ function isInput(value: unknown): value is NativeForkFileInput {
       !/^[a-f0-9]{64}$/u.test(value.terminalPlanSubmission.inputFingerprint))
   )
     return false
+  if (
+    value.terminalPlanRetention !== undefined &&
+    (value.provider !== 'claude' ||
+      value.action !== 'read-answer' ||
+      value.planHook !== undefined ||
+      value.terminalPlanSubmission !== undefined ||
+      !isObject(value.terminalPlanRetention) ||
+      typeof value.terminalPlanRetention.id !== 'string' ||
+      !value.terminalPlanRetention.id ||
+      value.terminalPlanRetention.id.length > 1024 ||
+      typeof value.terminalPlanRetention.promptId !== 'string' ||
+      !uuid.test(value.terminalPlanRetention.promptId) ||
+      typeof value.terminalPlanRetention.toolName !== 'string' ||
+      !/^mcp__.+__retain_current_plan$/u.test(value.terminalPlanRetention.toolName) ||
+      value.terminalPlanRetention.toolName.length > 1024 ||
+      typeof value.terminalPlanRetention.inputFingerprint !== 'string' ||
+      !/^[a-f0-9]{64}$/u.test(value.terminalPlanRetention.inputFingerprint))
+  )
+    return false
   if (value.includePlan !== undefined && typeof value.includePlan !== 'boolean') return false
   if (value.planHook && value.includePlan === false) return false
   if (value.action === 'verify-seed') {
@@ -874,6 +893,95 @@ async function claude(
     return belongs
   }
   const rootEntry = main[start]!
+  if (input.terminalPlanRetention) {
+    const intent = input.terminalPlanRetention
+    if (
+      rootEntry.promptId !== intent.promptId ||
+      intent.inputFingerprint !== claudePlanInputFingerprint(intent.toolName, {})
+    )
+      throw new Error('The terminal retention intent has another prompt or input.')
+    // This proof depends only on the exact current root, never ancestral plan text.
+    const identities = new Set<string>()
+    for (const entry of main.slice(start, next)) {
+      if (typeof entry.uuid !== 'string' || identities.has(entry.uuid))
+        throw new Error('The terminal retention root has missing or duplicate identities.')
+      identities.add(entry.uuid)
+    }
+    const rawStart = sourceEntries.indexOf(rootEntry)
+    const rawEnd = next < main.length ? sourceEntries.indexOf(main[next]!) : sourceEntries.length
+    // Sidechain operations cannot authenticate a root intent or hide a conflicting plan write.
+    for (let index = rawStart + 1; index < rawEnd; index++) {
+      const entry = sourceEntries[index]!
+      if (!isObject(entry.message) || !Array.isArray(entry.message.content)) continue
+      for (const block of entry.message.content) {
+        if (!isObject(block)) continue
+        if (block.type === 'tool_use' && ['Write', 'Edit'].includes(String(block.name)))
+          throw new Error('A current-root operation conflicts with unchanged plan retention.')
+        const retentionOperation =
+          (block.type === 'tool_use' &&
+            (block.id === intent.id || String(block.name).endsWith('__retain_current_plan'))) ||
+          (block.type === 'tool_result' && block.tool_use_id === intent.id)
+        if (
+          retentionOperation &&
+          (entry.isSidechain ||
+            entry.agentId ||
+            entry.parent_tool_use_id ||
+            entry.sessionId !== input.nativeSessionId ||
+            !belongsToRoot(entry))
+        )
+          throw new Error('A retention operation is not from the authenticated root actor.')
+      }
+    }
+    let uses = 0,
+      results = 0
+    for (const entry of selected) {
+      if (entry.isCompactSummary) throw new Error('The terminal retention root is compacted.')
+      if (!belongsToRoot(entry) || entry.sessionId !== input.nativeSessionId)
+        throw new Error('The terminal retention root ancestry is incomplete.')
+      if (entry.type !== 'assistant' && entry.type !== 'user') continue
+      const content = object(entry.message).content
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (!isObject(block)) throw new Error('The terminal retention content is incomplete.')
+        if (entry.type === 'assistant' && block.type === 'tool_use') {
+          if (['Write', 'Edit', 'ExitPlanMode', 'AskUserQuestion'].includes(String(block.name)))
+            throw new Error('A current-root operation conflicts with unchanged plan retention.')
+          if (block.id === intent.id || String(block.name).endsWith('__retain_current_plan')) {
+            uses++
+            if (
+              block.id !== intent.id ||
+              block.name !== intent.toolName ||
+              !isObject(block.input) ||
+              Object.keys(block.input).length !== 0 ||
+              claudePlanInputFingerprint(block.name, block.input) !== intent.inputFingerprint
+            )
+              throw new Error('The terminal retention operation differs from its host intent.')
+          }
+        } else if (
+          entry.type === 'user' &&
+          block.type === 'tool_result' &&
+          block.tool_use_id === intent.id
+        ) {
+          if (
+            uses !== 1 ||
+            block.is_error === true ||
+            (block.is_error !== undefined && block.is_error !== false)
+          )
+            throw new Error('The terminal retention result is unsuccessful or out of order.')
+          results++
+        }
+      }
+    }
+    if (uses !== 1 || results !== 1)
+      throw new Error('The terminal retention operation or result is missing or duplicated.')
+    return {
+      nativeSessionId: input.nativeSessionId,
+      nativeTurnId: input.nativeTurnId!,
+      terminalPlanRetention: intent,
+      nativeStorageRoot: await realpath(root),
+      nativePath: join(await realpath(projectDirectory!), `${input.nativeSessionId}.jsonl`),
+    }
+  }
   const sourceWorkingBytes =
     (raw.rawBytes - raw.imageBytes) * 4 + raw.imageBytes * 2 + raw.rawRecords * 512
   const reservePlan = (bytes: number): void => {

@@ -97,7 +97,12 @@ it('keeps five Relay decisions waiting while an independent sixth Session comple
   ).toMatchObject({ ok: true })
   await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
   const complete = await f.settled()
-  expect(complete).toMatchObject({ kind: 'build', status: 'complete', reviewer: 'claude' })
+  expect(complete).toMatchObject({
+    kind: 'build',
+    status: 'complete',
+    rolePolicy: 'split-stages-v1',
+    review: { actor: 'codex', stage: 'code_review' },
+  })
   expect(
     native.inputs.map((input) => ({
       sessionId: input.sessionId,
@@ -105,8 +110,8 @@ it('keeps five Relay decisions waiting while an independent sixth Session comple
       actor: input.promptEnvelope.collaboration?.actor,
     })),
   ).toEqual([
-    { sessionId: f.sessionId, stage: 'implement', actor: 'codex' },
-    { sessionId: f.sessionId, stage: 'code_review', actor: 'claude' },
+    { sessionId: f.sessionId, stage: 'implement', actor: 'claude' },
+    { sessionId: f.sessionId, stage: 'code_review', actor: 'codex' },
   ])
   for (const { sessionId, card } of cards) {
     expect(repo.relaySchedulingDecision(sessionId)).toEqual(card)

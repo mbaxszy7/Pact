@@ -63,6 +63,7 @@ import {
   WORKSPACE_CHANGE_FILES,
   WORKSPACE_OPERATION_TIMEOUT_MS,
   collaborationInputGate,
+  collaborationActor,
   collaborationInputProcessing,
 } from '@pact/contracts'
 
@@ -2728,7 +2729,7 @@ export function ConversationView({
             runId: requested.runId,
             messageId: source.messageId,
             version: requested.version,
-            author: task.owner,
+            author: collaborationActor(task, 'plan'),
             content: '',
             document: task.planReference.document,
             sessionId: requested.sessionId,
@@ -3608,7 +3609,7 @@ export function ConversationView({
                         runId: currentPlan.source.runId,
                         messageId: currentPlan.source.messageId,
                         version: planningTask.planVersion,
-                        author: planningTask.owner,
+                        author: collaborationActor(planningTask, 'plan'),
                         content: '',
                         document: planningTask.planReference.document,
                         sessionId: session.id,

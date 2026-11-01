@@ -93,6 +93,7 @@ describe('Plan revision advice persistence', () => {
       plan = f.repo.collaboration(f.sessionId)!.planReference!.document
     f.repo.recordWorkflowPlanRetained(response.id, {
       nativeId: `retained-${response.id}`,
+      confirmation: 'native_root_settled_v1',
       sha256: plan.sha256,
       bytes: plan.bytes,
       chars: plan.chars,
@@ -121,6 +122,7 @@ describe('Plan revision advice persistence', () => {
       if (outcome === 'retained')
         f.repo.recordWorkflowPlanRetained(response.id, {
           nativeId: `retained-${response.id}`,
+          confirmation: 'native_root_settled_v1',
           sha256: plan.sha256,
           bytes: plan.bytes,
           chars: plan.chars,

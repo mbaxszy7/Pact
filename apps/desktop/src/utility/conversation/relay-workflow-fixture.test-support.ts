@@ -190,17 +190,8 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
           })
         } else if (
           phase.stage === 'reply' &&
-          collaborationPlanMode(phase, input.promptEnvelope.collaborationAuthorization)
-        ) {
-          const document = phase.planReference?.document
-          if (!document) throw Error('Missing retained original plan')
-          input.recordWorkflowPlanRetained?.({
-            nativeId: `retained-${input.runId}`,
-            sha256: document.sha256,
-            bytes: document.bytes,
-            chars: document.chars,
-          })
-        } else if (phase.stage === 'reply')
+          !collaborationPlanMode(phase, input.promptEnvelope.collaborationAuthorization)
+        )
           input.recordWorkflowInputResult?.({ outcome: 'processed' })
         else if (phase.stage === 'plan_review' || phase.stage === 'code_review')
           input.recordWorkflowReview?.(state.reviews.shift() ?? { verdict: 'accepted' })
@@ -217,6 +208,21 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
         agentId,
         turnId: input.runId,
         outcome: interrupted ? 'interrupted' : 'completed',
+      }
+      if (
+        !interrupted &&
+        phase?.stage === 'reply' &&
+        collaborationPlanMode(phase, input.promptEnvelope.collaborationAuthorization)
+      ) {
+        const document = phase.planReference?.document
+        if (!document) throw Error('Missing retained original plan')
+        input.recordWorkflowPlanRetained?.({
+          nativeId: `retained-${input.runId}`,
+          confirmation: 'native_root_settled_v1',
+          sha256: document.sha256,
+          bytes: document.bytes,
+          chars: document.chars,
+        })
       }
       input.reportNativeEffects?.({
         runId: input.runId,

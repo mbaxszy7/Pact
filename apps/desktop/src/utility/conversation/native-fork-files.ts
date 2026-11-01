@@ -95,6 +95,13 @@ export interface NativeForkFileInput {
   planHook?: { id: string; inputFingerprint: string }
   /** One full-root proof after native termination; never a live prefix. */
   terminalPlanSubmission?: { id: string; promptId: string; inputFingerprint: string }
+  /** Exact successful host-tool intent, authenticated only after root drain. */
+  terminalPlanRetention?: {
+    id: string
+    promptId: string
+    toolName: string
+    inputFingerprint: string
+  }
   includePlan?: boolean
   lastDispatchedPhase?: 'fork' | 'initialize'
   cwd: string
@@ -142,6 +149,7 @@ export interface NativeForkAnswerResult {
   planBinding?: ClaudePlanBinding
   planState?: ClaudePlanState
   terminalPlanSubmission?: NonNullable<NativeForkFileInput['terminalPlanSubmission']>
+  terminalPlanRetention?: NonNullable<NativeForkFileInput['terminalPlanRetention']>
   retainedPlan?: CollaborationRetainedPlan
   planUnavailable?: true
   reviewResult?: CollaborationReviewObservation
@@ -190,6 +198,24 @@ function isAnswerResult(value: unknown): value is NativeForkAnswerResult {
         value.planState !== undefined ||
         value.planUnavailable !== undefined ||
         (value.plan === undefined) === (value.retainedPlan === undefined))) ||
+    (value.terminalPlanRetention !== undefined &&
+      (!isObject(value.terminalPlanRetention) ||
+        typeof value.terminalPlanRetention.id !== 'string' ||
+        !value.terminalPlanRetention.id ||
+        value.terminalPlanRetention.id.length > 1024 ||
+        typeof value.terminalPlanRetention.promptId !== 'string' ||
+        !/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/iu.test(
+          value.terminalPlanRetention.promptId,
+        ) ||
+        typeof value.terminalPlanRetention.toolName !== 'string' ||
+        !/^mcp__.+__retain_current_plan$/u.test(value.terminalPlanRetention.toolName) ||
+        value.terminalPlanRetention.toolName.length > 1024 ||
+        !digest(value.terminalPlanRetention.inputFingerprint) ||
+        value.plan !== undefined ||
+        value.retainedPlan !== undefined ||
+        value.planState !== undefined ||
+        value.planUnavailable !== undefined ||
+        value.terminalPlanSubmission !== undefined)) ||
     (value.planState !== undefined && !isClaudePlanState(value.planState)) ||
     (value.planUnavailable !== undefined && value.planUnavailable !== true) ||
     (value.planBinding !== undefined &&
@@ -257,6 +283,7 @@ export class NativeForkFiles {
       | 'path'
       | 'planHook'
       | 'terminalPlanSubmission'
+      | 'terminalPlanRetention'
       | 'includePlan'
     > & {
       nativeTurnId: string
@@ -285,6 +312,16 @@ export class NativeForkFiles {
           input.terminalPlanSubmission.inputFingerprint)
     )
       throw new Error('The terminal plan proof does not match the exact permission intent.')
+    if (
+      input.terminalPlanRetention &&
+      (!answer.terminalPlanRetention ||
+        ['id', 'promptId', 'toolName', 'inputFingerprint'].some(
+          (key) =>
+            Reflect.get(answer.terminalPlanRetention!, key) !==
+            Reflect.get(input.terminalPlanRetention!, key),
+        ))
+    )
+      throw new Error('The terminal retention proof differs from its exact host-tool intent.')
     return answer
   }
 
@@ -547,7 +584,7 @@ export class NativeForkFiles {
         await terminate()
       } catch (error) {
         // Only this admitted terminal read joins its exact physical owner. Busy requests never queue.
-        if (input.terminalPlanSubmission) await physical.promise
+        if (input.terminalPlanSubmission || input.terminalPlanRetention) await physical.promise
         // oxlint-disable-next-line no-unsafe-finally -- A failed physical termination must override a logical success; its exact Worker has now exited.
         throw error
       }

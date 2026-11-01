@@ -72,8 +72,13 @@ import type {
   AgentRunInput,
   AgentSteerInput,
 } from '@pact/agent-runtime'
-import type { NormalizedAgentEvent } from '@pact/contracts'
+import type {
+  NormalizedAgentEvent,
+  NativeProbeResult,
+  CollaborationRetainedPlan,
+} from '@pact/contracts'
 
+import { planRevisionFixture } from '../../../../../packages/persistence/src/plan-revision-guidance.test-support.js'
 import {
   CODEX_TURN_ACCEPT_TIMEOUT_MS,
   CODEX_THREAD_RPC_TIMEOUT_MS,
@@ -195,6 +200,464 @@ afterAll(async () => {
 import { NATIVE_OWNER_WORKING_BYTES } from './native-working-memory.js'
 
 const nativeHomes: string[] = []
+
+it.each([
+  'valid',
+  'duplicate',
+  'held-hook',
+  'save-failure',
+  'foreign-root',
+  'wrong-receipt',
+  'failed-tool',
+  'failed-result',
+  'nonempty-input',
+  'plan-before',
+  'plan-after',
+  'pending-plan-after',
+  'plain-text',
+  'interrupted',
+] as const)(
+  'authenticates Codex frozen-plan retention at the native tool boundary: %s',
+  async (mode) => {
+    const input = planRunInput('codex')
+    const workflow = input.promptEnvelope.collaboration!
+    const authorization = input.promptEnvelope.collaborationAuthorization!
+    const reference = {
+      version: 2,
+      sourceRunId: randomUUID(),
+      sourceMessageId: randomUUID(),
+      document: { id: randomUUID(), sha256: 'a'.repeat(64), bytes: 4, chars: 4 },
+    }
+    workflow.stage = authorization.stage = 'reply'
+    workflow.inputSequence = authorization.inputSequence = 1
+    workflow.planReference = authorization.planReference = reference
+    workflow.planVersion = 2
+    const retained: CollaborationRetainedPlan[] = []
+    const evidence: NativeProbeResult[] = []
+    let invalidated = 0,
+      peerUrl = '',
+      peerServer = ''
+    let completeHook: (() => void) | undefined
+    const effects: string[] = []
+    const order: string[] = []
+    const protocol = Promise.withResolvers<void>()
+    const child = fakeCodexProcess((request, respond, notify) => {
+      const id = Reflect.get(request, 'id'),
+        method = Reflect.get(request, 'method')
+      if (method === 'initialize') respond({ id, result: {} })
+      else if (method === 'thread/start') {
+        const config = Reflect.get(Reflect.get(request, 'params'), 'config') as object
+        const [key, value] = Object.entries(config).find(([name]) =>
+          name.startsWith('mcp_servers.'),
+        )!
+        peerServer = key.slice('mcp_servers.'.length)
+        peerUrl = Reflect.get(value, 'url') as string
+        respond({ id, result: { thread: { id: 'retention-thread' } } })
+      } else if (method === 'turn/start') {
+        respond({ id, result: { turn: { id: 'retention-turn' } } })
+        const emit = (
+          item: object,
+          eventMethod = 'item/completed',
+          threadId = 'retention-thread',
+        ) => notify({ method: eventMethod, params: { threadId, turnId: 'retention-turn', item } })
+        void (async () => {
+          try {
+            if (mode === 'plan-before') emit({ id: 'new-plan', type: 'plan', text: 'Changed plan' })
+            if (mode !== 'plain-text') {
+              const args = mode === 'nonempty-input' ? { version: 2 } : {}
+              const rpc = (await fetch(peerUrl, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', connection: 'close' },
+                body: JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: 1,
+                  method: 'tools/call',
+                  params: { name: 'retain_current_plan', arguments: args },
+                }),
+              }).then((response) => response.json())) as object
+              const result = Reflect.get(rpc, 'result') as object
+              if (mode === 'wrong-receipt')
+                Reflect.set(
+                  Reflect.get(Reflect.get(result, 'structuredContent'), 'pactPlanRetention'),
+                  'receipt',
+                  'foreign-receipt',
+                )
+              if (mode === 'failed-result') Reflect.set(result, 'isError', true)
+              const item = {
+                id: 'retain-call',
+                type: 'mcpToolCall',
+                server: peerServer,
+                tool: 'retain_current_plan',
+                arguments: args,
+                status: mode === 'failed-tool' ? 'failed' : 'completed',
+                result,
+                error: mode === 'failed-tool' ? { message: 'failed' } : null,
+              }
+              emit(
+                item,
+                'item/completed',
+                mode === 'foreign-root' ? 'other-thread' : 'retention-thread',
+              )
+              if (mode === 'duplicate') emit(item)
+              if (mode === 'plan-after' || mode === 'pending-plan-after') {
+                emit({ id: 'new-plan', type: 'plan', text: '' }, 'item/started')
+                if (mode === 'plan-after')
+                  emit({ id: 'new-plan', type: 'plan', text: 'Changed plan' })
+              }
+            }
+            emit({ id: 'answer', type: 'agentMessage', text: 'The current plan is unchanged.' })
+            if (mode === 'held-hook') {
+              const hook = (hookMethod: string, status: string) =>
+                notify({
+                  method: hookMethod,
+                  params: {
+                    threadId: 'retention-thread',
+                    turnId: 'retention-turn',
+                    run: { id: 'retention-hook', status },
+                  },
+                })
+              hook('hook/started', 'running')
+              completeHook = () => hook('hook/completed', 'completed')
+            }
+            protocol.resolve()
+          } catch (error) {
+            protocol.reject(error)
+          } finally {
+            notify({
+              method: 'turn/completed',
+              params: {
+                threadId: 'retention-thread',
+                turn: {
+                  id: 'retention-turn',
+                  status: mode === 'interrupted' ? 'interrupted' : 'completed',
+                },
+              },
+            })
+          }
+        })()
+      }
+    })
+    const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child))
+    try {
+      await collectRun(adapter, {
+        ...input,
+        recordWorkflowPlanRetained: (candidate) => {
+          if (mode === 'save-failure') throw new Error('Final confirmation write failed')
+          order.push('confirmed')
+          retained.push(candidate)
+        },
+        reportNativeEffects: (report) => {
+          effects.push(report.state)
+          if (report.state === 'settled') order.push('settled')
+        },
+        recordWorkflowPlanUnavailable: () => {
+          invalidated++
+        },
+        recordNativeEvidence: (value) => evidence.push(value),
+      })
+      await protocol.promise
+      const held =
+        mode === 'held-hook'
+          ? {
+              retained: [...retained],
+              effectsSettled: effects.includes('settled'),
+              active: adapter.hasActiveBackgroundWork(),
+            }
+          : undefined
+      expect(held).toEqual(
+        mode === 'held-hook' ? { retained: [], effectsSettled: false, active: true } : undefined,
+      )
+      completeHook?.()
+      await vi.waitFor(() => expect(adapter.hasActiveBackgroundWork()).toBe(false))
+      const captured = ['valid', 'duplicate', 'held-hook'].includes(mode)
+      expect(retained).toEqual(
+        captured
+          ? [
+              {
+                nativeId: 'retain-call',
+                confirmation: 'native_root_settled_v1',
+                sha256: reference.document.sha256,
+                bytes: 4,
+                chars: 4,
+              },
+            ]
+          : [],
+      )
+      expect(order).toEqual(captured ? ['confirmed', 'settled'] : ['settled'])
+      const terminal = evidence.findLast((value) => value.kind === 'ended')
+      expect(terminal?.kind === 'ended' ? terminal.output?.retainedPlan : undefined).toEqual(
+        undefined,
+      )
+      expect(invalidated).toBe(mode === 'plan-after' || mode === 'pending-plan-after' ? 1 : 0)
+      expect(adapter.diagnostics().pendingRequests).toBe(0)
+    } finally {
+      await adapter.dispose()
+    }
+  },
+)
+
+it('does not settle an early retention after its invalidation write fails with an already sealed answer', async () => {
+  const f = await planRevisionFixture()
+  const clientMessageId = randomUUID(),
+    bodyOwner = randomUUID()
+  const drafts = f.repo.readPage({ scope: 'drafts', sessionId: f.sessionId })
+  if (drafts.scope !== 'drafts') throw new Error('Missing drafts')
+  const content = 'Recheck the unchanged current plan.'
+  const body = f.repo.writeConversationInput(
+    { type: 'begin', sessionId: f.sessionId, clientMessageId },
+    bodyOwner,
+  )
+  f.repo.writeConversationInput(
+    { type: 'append', sessionId: f.sessionId, inputId: body.inputId, offset: 0, text: content },
+    bodyOwner,
+  )
+  f.repo.writeConversationInput(
+    { type: 'seal', sessionId: f.sessionId, inputId: body.inputId },
+    bodyOwner,
+  )
+  f.repo.receiveCollaborationInput(
+    {
+      sessionId: f.sessionId,
+      clientMessageId,
+      content,
+      commentIds: [],
+      expectedCommentsRevision: drafts.commentsRevision,
+    },
+    body.inputId,
+    'codex',
+    'immediate_safe_point',
+    bodyOwner,
+  )
+  const received = f.repo.readReceivedInput(f.sessionId)!,
+    task = f.repo.collaboration(f.sessionId)!
+  const next = f.repo.workflowReply(task, 'codex')
+  next.latestUserMessageId = received.id
+  const admitted = f.repo.beginRun({
+    sessionId: f.sessionId,
+    clientMessageId: received.id,
+    content: received.content,
+    commentIds: [],
+    expectedCommentsRevision: drafts.commentsRevision,
+    agentId: 'codex',
+    settingsRevision: 1,
+    model: null,
+    effort: null,
+    preserveDraftComments: true,
+    receivedInputId: received.id,
+    expectedCollaborationRevision: task.revision,
+    collaboration: next,
+  })
+  const run = admitted.run
+  const frozen = f.repo.collaborationPromptState(f.repo.collaboration(f.sessionId)!)
+  const authorization = f.repo.collaborationTurnAuthorization(run.id)!
+  let url = '',
+    server = '',
+    outputFailed = false,
+    invalidations = 0,
+    retainedCandidates = 0
+  const done = Promise.withResolvers<void>()
+  let earlyRetainedCandidates: number | undefined
+  const waitForAnswer = () =>
+    vi.waitFor(() =>
+      expect(
+        f.repo
+          .read(f.sessionId)
+          .messages.some(
+            (message) =>
+              message.runId === run.id &&
+              message.role === 'assistant' &&
+              message.state === 'complete',
+          ),
+      ).toBe(true),
+    )
+  const waitForInvalidation = () => vi.waitFor(() => expect(invalidations).toBeGreaterThan(0))
+
+  const child = fakeCodexProcess(
+    (request, respond, notify) => {
+      const id = Reflect.get(request, 'id'),
+        method = Reflect.get(request, 'method')
+      if (method === 'initialize') respond({ id, result: {} })
+      else if (method === 'turn/start') {
+        respond({ id, result: { turn: { id: `turn-${run.id}` } } })
+        const emit = (item: object, methodName = 'item/completed') =>
+          notify({
+            method: methodName,
+            params: { threadId: 'fixture-codex', turnId: `turn-${run.id}`, item },
+          })
+        void (async () => {
+          try {
+            emit({
+              id: 'sealed-answer',
+              type: 'agentMessage',
+              text: 'The plan still meets the requirements.',
+            })
+            const rpc = (await fetch(url, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', connection: 'close' },
+              body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'tools/call',
+                params: { name: 'retain_current_plan', arguments: {} },
+              }),
+            }).then((response) => response.json())) as object
+            emit({
+              id: 'retention',
+              type: 'mcpToolCall',
+              server,
+              tool: 'retain_current_plan',
+              arguments: {},
+              status: 'completed',
+              result: Reflect.get(rpc, 'result'),
+              error: null,
+            })
+            notify({
+              method: 'hook/started',
+              params: {
+                threadId: 'fixture-codex',
+                turnId: `turn-${run.id}`,
+                run: { id: 'held-hook', status: 'running' },
+              },
+            })
+            notify({
+              method: 'turn/completed',
+              params: {
+                threadId: 'fixture-codex',
+                turn: { id: `turn-${run.id}`, status: 'completed' },
+              },
+            })
+            await waitForAnswer()
+            earlyRetainedCandidates = retainedCandidates
+            emit({ id: 'later-plan', type: 'plan', text: '' }, 'item/started')
+            await waitForInvalidation()
+            notify({
+              method: 'hook/completed',
+              params: {
+                threadId: 'fixture-codex',
+                turnId: `turn-${run.id}`,
+                run: { id: 'held-hook', status: 'completed' },
+              },
+            })
+            done.resolve()
+          } catch (error) {
+            done.reject(error)
+          } finally {
+            notify({
+              method: 'turn/completed',
+              params: {
+                threadId: 'fixture-codex',
+                turn: { id: `turn-${run.id}`, status: 'completed' },
+              },
+            })
+          }
+        })()
+      }
+    },
+    (request, respond) => {
+      if (Reflect.get(request, 'method') !== 'thread/resume') return false
+      const config = Reflect.get(Reflect.get(request, 'params'), 'config') as object
+      const [key, value] = Object.entries(config).find(([name]) => name.startsWith('mcp_servers.'))!
+      server = key.slice('mcp_servers.'.length)
+      url = Reflect.get(value, 'url') as string
+      respond({
+        id: Reflect.get(request, 'id'),
+        result: { thread: { id: 'fixture-codex' }, model: 'gpt-test', reasoningEffort: 'medium' },
+      })
+      return true
+    },
+  )
+  const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child))
+  try {
+    const outcome = collectRun(
+      adapter,
+      {
+        sessionId: f.sessionId,
+        runId: run.id,
+        cwd: '/fixture',
+        nativeSessionId: 'fixture-codex',
+        bindingGeneration: run.bindingGeneration ?? 1,
+        promptEnvelope: {
+          version: 'pact-agent-prompt-v1',
+          sessionId: f.sessionId,
+          message: { id: run.userMessageId, content },
+          comments: [],
+          collaboration: frozen,
+          collaborationAuthorization: authorization,
+        },
+        recordExecutor: (id) => {
+          f.repo.recordExecutor(run.id, id)
+        },
+        recordDispatch: (phase, nativeSessionId, executorId) => {
+          f.repo.recordDispatch(run.id, phase, nativeSessionId, executorId)
+        },
+        recordWorkflowPlanRetained: (plan) => {
+          f.repo.recordWorkflowPlanRetained(run.id, plan)
+          retainedCandidates++
+        },
+        recordWorkflowPlanUnavailable: () => {
+          invalidations++
+          throw new Error('Unavailable candidate write failed')
+        },
+        recordOutputFailure: () => {
+          outputFailed = true
+          f.repo.recordOutputFailure(run.id, {
+            kind: 'protocol_error',
+            message: 'Plan invalidation failed.',
+          })
+        },
+        recordNativeEvidence: (evidence) => {
+          const metadata =
+            evidence.kind === 'ended'
+              ? {
+                  kind: evidence.kind,
+                  source: evidence.source,
+                  identity: evidence.identity,
+                  outcome: evidence.outcome,
+                  ...(evidence.planUnavailable || evidence.output?.planUnavailable
+                    ? { planUnavailable: true as const }
+                    : {}),
+                }
+              : evidence
+          f.repo.recordNativeEvidence(metadata, 'retry')
+          if (!outputFailed && evidence.kind === 'ended' && evidence.output?.retainedPlan)
+            f.repo.recordNativeEvidence(evidence, 'retry')
+        },
+        reportNativeEffects: (report) => {
+          f.repo.recordNativeEffects(run.id, report.state, report.reason)
+          if (report.state === 'settled') f.repo.reconcileCompletedCollaboration(run.id)
+        },
+      },
+      new AbortController().signal,
+      (event) => {
+        if (!outputFailed) f.repo.applyEvent(f.sessionId, run.id, event)
+      },
+    ).catch(() => undefined)
+    await outcome
+    await done.promise
+    await vi.waitFor(() => expect(adapter.hasActiveBackgroundWork()).toBe(false))
+    f.repo.settleKnownNativeEnding(run.id)
+    f.repo.reconcileCompletedCollaboration(run.id)
+    expect(outputFailed).toBe(false)
+    expect(retainedCandidates).toBe(0)
+    expect(earlyRetainedCandidates).toBe(0)
+    const current = f.repo.collaboration(f.sessionId)!
+    const savedRun = f.repo.findRun(run.id)!
+    expect(savedRun.nativeOutcome).toBe('completed')
+    expect(savedRun.nativeEffectsState).toBe('settled')
+    expect(
+      f.repo
+        .read(f.sessionId)
+        .messages.find((message) => message.runId === run.id && message.role === 'assistant')
+        ?.state,
+    ).toBe('complete')
+    expect(current.inputProcessing?.pending).toBeDefined()
+    expect(current.planInputSequence).toBe(task.planInputSequence)
+    expect(f.repo.workflowPlanSettled(run.id)).toBe(false)
+  } finally {
+    await adapter.dispose()
+    f.db.close()
+  }
+})
 
 it('preserves a 12 MiB native plan independently of natural text and ignores foreign roots', async () => {
   const plan = 'Plan evidence\n' + 'x'.repeat(12 * 1024 * 1024),

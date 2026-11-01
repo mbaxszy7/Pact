@@ -97,6 +97,7 @@ import { conversationStreamTraceSchema, STREAM_TRACE_TTL_MS } from '@pact/contra
 import {
   COLLABORATION_PROTOCOL,
   collaborationTaskSchema,
+  collaborationActor,
   advanceCollaboration,
   collaborationNextStage,
   collaborationInputGate,
@@ -350,6 +351,7 @@ interface SendOptions {
   receivedInputId?: string | undefined
   receivedComments?: AnchoredComment[] | undefined
   queuedRoute?: ConversationMessageRoute | undefined
+  queuedRolePolicy?: CollaborationTask['rolePolicy'] | undefined
 }
 
 interface PreparingContinuation {
@@ -3446,12 +3448,31 @@ export class Conversation {
         if (!session || session.status === 'archived')
           throw new RunOperationConflictError('The Session is unavailable.')
         const requestedRoute = input.route ?? prefix.route
-        const actor =
+        let actor =
           requestedRoute?.type === 'agent'
             ? requestedRoute.agentId
             : task && !prefix.pact
               ? this.conversations.collaborationReplyActor(task, input.replyToDecision)
               : session.settings.primaryAgentId
+        if (prefix.pact) {
+          const primary = session.settings.primaryAgentId
+          actor = collaborationActor(
+            {
+              kind: prefix.pact,
+              owner: primary,
+              reviewer: otherAgent(primary),
+              rolePolicy: 'split-stages-v1',
+            },
+            prefix.pact === 'plan' ? 'plan' : prefix.pact === 'build' ? 'implement' : 'code_review',
+          )
+          if (
+            requestedRoute?.type === 'all' ||
+            (requestedRoute?.type === 'agent' && requestedRoute.agentId !== actor)
+          )
+            throw new RunOperationConflictError(
+              `This Pact ${prefix.pact} stage belongs to ${actor}. Remove the conflicting Agent recipient; your draft is preserved.`,
+            )
+        }
         const bodyOwner = ownerKey ?? 'pact-received-input'
         let retainedId = input.inputId
         if (!retainedId) {
@@ -3506,6 +3527,7 @@ export class Conversation {
           bodyOwner,
           anchor.id,
           waitingForWork,
+          prefix.pact ? 'split-stages-v1' : undefined,
         )
         this.publish(patch)
         if (task) {
@@ -4595,7 +4617,11 @@ export class Conversation {
         const settled = this.conversations.reconcileCompletedCollaboration(task.runId)
         if (settled) this.publish(settled)
         if (!this.conversations.workflowPlanSettled(task.runId)) {
-          const checked = await this.checkNativeBinding(input.sessionId, task.owner, task.runId)
+          const checked = await this.checkNativeBinding(
+            input.sessionId,
+            collaborationActor(task, 'plan'),
+            task.runId,
+          )
           if (!checked.ok) return checked
         }
         const recovered = this.conversations.collaboration(input.sessionId)
@@ -4820,7 +4846,7 @@ export class Conversation {
           ? [
               {
                 id: 'continue_plan_review',
-                description: `Continue the original Plan review with ${task.reviewer}, without adding a Turn.`,
+                description: `Continue the original Plan review with ${collaborationActor(task, 'plan_review')}, without adding a Turn.`,
               },
             ]
           : []),
@@ -4829,7 +4855,7 @@ export class Conversation {
               {
                 id: candidateId,
                 description: supplementary
-                  ? `Use the user's exact single-use grant for one read-only ${next.stage} Turn by ${task.owner}, followed by the mandatory ${task.reviewer} review. Do not change scope or roles.`
+                  ? `Use the user's exact single-use grant for one read-only ${next.stage} Turn by ${next.actor}, followed by the mandatory ${collaborationActor(task, next.stage === 'plan' ? 'plan_review' : 'code_review')} review. Do not change scope or roles.`
                   : `Continue the already-authorized ${next.stage} with the fixed ${next.actor} actor; provide only source-grounded focus.`,
               },
             ]
@@ -4838,7 +4864,7 @@ export class Conversation {
           ? [
               {
                 id: `propose_${opportunity.kind}`,
-                description: `Propose one extra read-only turn by ${task.owner}, followed by the fixed ${task.reviewer} review, only if complete sources establish a concrete remaining gap that the normal next step cannot address. This candidate requests the user's specific authorization and grants no execution. Choose null or the existing next step when no extra turn is necessary.`,
+                description: `Propose one extra read-only turn by ${opportunity.actor}, followed by the fixed ${opportunity.returnActor} review, only if complete sources establish a concrete remaining gap that the normal next step cannot address. This candidate requests the user's specific authorization and grants no execution. Choose null or the existing next step when no extra turn is necessary.`,
               },
             ]
           : []),
@@ -4846,7 +4872,7 @@ export class Conversation {
           ? [
               {
                 id: 'propose_repair',
-                description: `Request one scoped repair by ${task.owner} under a new exact user grant, followed by the fixed ${task.reviewer} review. Propose this only when complete current review sources establish concrete work within the original task. It grants no execution and cannot expand scope or permissions. Prefer the original next step when no extra work is necessary.`,
+                description: `Request one scoped repair by ${collaborationActor(task, 'repair')} under a new exact user grant, followed by the fixed ${collaborationActor(task, 'code_review')} review. Propose this only when complete current review sources establish concrete work within the original task. It grants no execution and cannot expand scope or permissions. Prefer the original next step when no extra work is necessary.`,
               },
             ]
           : []),
@@ -4856,7 +4882,7 @@ export class Conversation {
           ? [
               {
                 action: 'continue_plan_review' as RelayAction,
-                actor: task.reviewer,
+                actor: collaborationActor(task, 'plan_review'),
                 authorizationId: handoff.id,
                 authorizationCurrent: true,
                 businessBudgetAvailable: true,
@@ -5035,7 +5061,10 @@ export class Conversation {
     }
     if (!collaborationNextStage(task)) {
       if (!this.pendingNativeInteractions(sessionId).length) {
-        const handoff = this.conversations.workflowHandoff(task, task.owner)
+        const handoff = this.conversations.workflowHandoff(
+          task,
+          collaborationActor(task, task.stage === 'code_review' ? 'respond' : 'plan'),
+        )
         await this.prepareWorkflowGuidance(task, undefined, handoff)
         const consultation =
           this.decisionRuntime?.kind === 'evaluation' &&
@@ -5931,6 +5960,35 @@ export class Conversation {
           ),
         }
       }
+      const entryRolePolicy = options.receivedInputId ? options.queuedRolePolicy : 'split-stages-v1'
+      const entryPrimary =
+        options.receivedInputId && entryRolePolicy && route.type !== 'all'
+          ? commandPrefix.pact === 'build'
+            ? otherAgent(route.agentId)
+            : route.agentId
+          : primaryAgentId
+      if (!options.collaboration && commandPrefix.pact && entryRolePolicy) {
+        const stage =
+          commandPrefix.pact === 'plan'
+            ? 'plan'
+            : commandPrefix.pact === 'build'
+              ? 'implement'
+              : 'code_review'
+        const entryActor = collaborationActor(
+          {
+            kind: commandPrefix.pact,
+            owner: entryPrimary,
+            reviewer: otherAgent(entryPrimary),
+            rolePolicy: entryRolePolicy,
+          },
+          stage,
+        )
+        if (route.type === 'all' || (route.type === 'agent' && route.agentId !== entryActor))
+          throw new RunOperationConflictError(
+            `This Pact ${commandPrefix.pact} stage belongs to ${entryActor}. Remove the conflicting Agent recipient; your draft is preserved.`,
+          )
+        route = { ...route, agentId: entryActor }
+      }
       const targets =
         route.type === 'all' ? [route.firstAgentId, route.secondAgentId] : [route.agentId]
       const agentId = targets[0]!
@@ -5980,7 +6038,11 @@ export class Conversation {
         const task =
           input.content.slice(commandPrefix.argumentsStart).trim() ||
           'Use the explicit conversation context if it establishes the task. Otherwise ask at most three material questions before proceeding. No implementation scope is authorized until clarified.'
-        const owner = kind === 'review' ? otherAgent(agentId) : agentId
+        const owner = entryRolePolicy
+          ? entryPrimary
+          : kind === 'review'
+            ? otherAgent(agentId)
+            : agentId
         collaboration = collaborationTaskSchema.parse({
           protocol: COLLABORATION_PROTOCOL,
           id: randomUUID(),
@@ -5988,7 +6050,12 @@ export class Conversation {
           kind,
           revision: 0,
           owner,
-          reviewer: kind === 'review' ? agentId : otherAgent(owner),
+          reviewer: entryRolePolicy
+            ? otherAgent(owner)
+            : kind === 'review'
+              ? agentId
+              : otherAgent(owner),
+          ...(entryRolePolicy ? { rolePolicy: entryRolePolicy } : {}),
           task,
           taskMessageId: input.clientMessageId,
           stage: kind === 'plan' ? 'plan' : kind === 'build' ? 'implement' : 'code_review',
@@ -8298,6 +8365,7 @@ export class Conversation {
       },
       {
         ...(next ? { collaboration: next, expectedCollaborationRevision: task!.revision } : {}),
+        queuedRolePolicy: input.metadata.rolePolicy,
         queuedRoute:
           input.metadata.route?.type === 'all'
             ? { type: 'all', firstAgentId: input.actor, secondAgentId: otherAgent(input.actor) }

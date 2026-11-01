@@ -12,12 +12,16 @@ import {
   collaborationSourceNativeProofSchema,
   COLLABORATION_PAGE_BYTES,
   collaborationReviewInputSchema,
+  collaborationActor,
   collaborationInputResultSchema,
+  collaborationPlanRetentionInputSchema,
+  collaborationPlanRetentionAllowed,
   type CollaborationInputObservation,
   type CollaborationSourceReadResult,
   type CollaborationReviewObservation,
   sessionTitleInputSchema,
   type CollaborationTask,
+  type CollaborationTurnAuthorization,
   sourceReadDiagnosticSchema,
   sourceReadCallIdentity,
   type SourceReadDiagnostic,
@@ -82,6 +86,8 @@ export class PactPeerToolServer {
   private peerAllowed = false
   private titleAllowed = false
   private titleAccepted = false
+  private planRetentionAllowed = false
+  private planRetentionCurrent: (() => boolean) | undefined
 
   acceptSessionTitle(input: unknown, receipt: string): string | undefined {
     if (!this.titleAllowed || this.titleAccepted || this.turn?.receipt !== receipt) return undefined
@@ -99,6 +105,8 @@ export class PactPeerToolServer {
     sourceReader?: (input: unknown) => CollaborationSourceReadResult,
     sourceGrant?: { runId: string; grant: string },
     frozenReader?: AgentCollaborationSourceReader,
+    authorization?: CollaborationTurnAuthorization,
+    planRetentionCurrent?: () => boolean,
   ): string {
     if (this.sourceGrant) throw new Error('A previous native root still owns its source grant.')
     if ((sourceReader || frozenReader) && !sourceGrant)
@@ -109,6 +117,11 @@ export class PactPeerToolServer {
         : undefined
     this.peerAllowed = allowed && !collaboration
     this.collaboration = collaboration
+    this.planRetentionAllowed = collaborationPlanRetentionAllowed(
+      collaboration,
+      authorization ?? collaboration?.authorization,
+    )
+    this.planRetentionCurrent = planRetentionCurrent
     this.titleAllowed = requestSessionTitle
     this.titleAccepted = false
     this.turn = new PeerAssistanceTurn(expectedTarget, this.peerAllowed)
@@ -154,6 +167,8 @@ export class PactPeerToolServer {
     if (this.turn?.receipt !== receipt) return
     this.turn = undefined
     this.collaboration = undefined
+    this.planRetentionAllowed = false
+    this.planRetentionCurrent = undefined
     this.peerAllowed = false
     this.titleAllowed = false
     this.titleAccepted = false
@@ -169,7 +184,8 @@ export class PactPeerToolServer {
     if (
       this.turn?.receipt !== turnReceipt ||
       !this.collaboration ||
-      this.collaboration.actor !== this.collaboration.reviewer ||
+      this.collaboration.actor !==
+        collaborationActor(this.collaboration, this.collaboration.stage) ||
       !['plan_review', 'code_review'].includes(this.collaboration.stage)
     )
       return undefined
@@ -188,6 +204,16 @@ export class PactPeerToolServer {
       (!collaborationPlanMode(this.collaboration) || parsed.data.outcome === 'needs_user')
       ? parsed.data
       : undefined
+  }
+
+  /** Validation only: the Adapter must prove this call completed in its native root. */
+  acceptPlanRetention(input: unknown, turnReceipt: string): boolean {
+    return (
+      this.turn?.receipt === turnReceipt &&
+      this.planRetentionAllowed &&
+      (this.planRetentionCurrent?.() ?? true) &&
+      collaborationPlanRetentionInputSchema.safeParse(input).success
+    )
   }
 
   async start(): Promise<string> {
@@ -447,6 +473,18 @@ export class PactPeerToolServer {
             // Loaded native Threads cache this catalog. The current Turn validates every capability.
             tools: [
               {
+                name: 'retain_current_plan',
+                description:
+                  'Explicitly retain the frozen official plan after handling the current input without changing the plan. Pass an empty object. Only the current planning owner with an existing plan can use this; finish the root normally afterward. This does not approve implementation or replace independent review.',
+                inputSchema: collaborationPlanRetentionInputSchema.toJSONSchema(),
+                annotations: {
+                  readOnlyHint: true,
+                  destructiveHint: false,
+                  idempotentHint: true,
+                  openWorldHint: false,
+                },
+              },
+              {
                 name: 'submit_input_result',
                 description:
                   'Report processed only when this reply has fully handled the supplied user input and no required user choice remains; otherwise report needs_user with up to three explicit questions and optional choices. Planners may only report needs_user questions. This cannot approve implementation, repair, or code.',
@@ -669,6 +707,31 @@ export class PactPeerToolServer {
               structuredContent: {
                 pactSessionTitle: { accepted, receipt: this.capabilityReceipt },
               },
+            },
+          }
+        }
+        if (name === 'retain_current_plan') {
+          const accepted = Boolean(turn && this.acceptPlanRetention(args, turn.receipt))
+          return {
+            jsonrpc: '2.0',
+            id: request.id,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: accepted
+                    ? 'Retention intent validated. Finish this root normally; Pact will verify the native result and settle the current input. This is not implementation approval.'
+                    : 'No frozen current plan may be retained by this root.',
+                },
+              ],
+              isError: !accepted,
+              ...(accepted
+                ? {
+                    structuredContent: {
+                      pactPlanRetention: { accepted: true, receipt: this.capabilityReceipt },
+                    },
+                  }
+                : {}),
             },
           }
         }

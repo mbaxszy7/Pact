@@ -209,7 +209,7 @@ describe('Cancel an optional Relay advancement, then continue through the origin
       ).toMatchObject({ purpose: 'action' })
       expect(native.inputs[7]!.promptEnvelope.collaboration).toMatchObject({
         stage: 'code_review',
-        actor: state.task.reviewer,
+        actor: primary,
       })
       expect(await f.flow.answerRelayDecision(state.request)).toEqual(state.result)
       expect(native.inputs).toHaveLength(8)
@@ -273,7 +273,7 @@ describe('Cancel an optional Relay advancement, then continue through the origin
       expect(native.inputs).toHaveLength(6)
       expect(native.inputs[4]!.promptEnvelope.collaboration).toMatchObject({
         stage: action,
-        actor: primary,
+        actor: primary === 'codex' ? 'claude' : 'codex',
         reviewScopeRef: state.task.reviewScopeRef,
       })
       expect(
@@ -284,7 +284,7 @@ describe('Cancel an optional Relay advancement, then continue through the origin
       ).toBeUndefined()
       expect(native.inputs[5]!.promptEnvelope.collaboration).toMatchObject({
         stage: 'code_review',
-        actor: state.task.reviewer,
+        actor: primary,
       })
       expect(
         native.decisions.filter(

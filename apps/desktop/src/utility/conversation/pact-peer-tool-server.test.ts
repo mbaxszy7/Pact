@@ -68,6 +68,59 @@ afterEach(async () => {
 })
 
 describe('PactPeerToolServer', () => {
+  it.each(['codex', 'claude'] as const)(
+    'validates an empty retention intent for a frozen %s owner without settling it',
+    async (owner) => {
+      const server = new PactPeerToolServer()
+      servers.push(server)
+      const current = planRunInput(owner).promptEnvelope.collaboration!
+      current.planReference = {
+        version: 2,
+        sourceRunId: randomUUID(),
+        sourceMessageId: randomUUID(),
+        document: { id: randomUUID(), sha256: 'a'.repeat(64), bytes: 4, chars: 4 },
+      }
+      current.authorization = { ...current.authorization!, planReference: current.planReference }
+      let unchanged = true
+      const receipt = server.beginTurn(
+        'claude',
+        false,
+        current,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        current.authorization,
+        () => unchanged,
+      )
+      const target = await server.start()
+      const call = async (args: unknown) =>
+        jsonRpcResult(
+          await fetch(target, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'tools/call',
+              params: { name: 'retain_current_plan', arguments: args },
+            }),
+          }).then((response) => response.json()),
+        )
+      const accepted = await call({})
+      expect(accepted.result.isError).toBe(false)
+      expect(accepted.result.structuredContent).toEqual({
+        pactPlanRetention: { accepted: true, receipt: server.capabilityReceipt },
+      })
+      expect((await call({ planId: current.planReference.document.id })).result.isError).toBe(true)
+      expect(server.acceptPlanRetention({}, randomUUID())).toBe(false)
+      unchanged = false
+      expect((await call({})).result.isError).toBe(true)
+      server.endTurn(receipt)
+      expect(server.acceptPlanRetention({}, receipt)).toBe(false)
+      expect((await call({})).result.isError).toBe(true)
+    },
+  )
   it('advertises flat source arguments and refuses a nested capability envelope before reading', async () => {
     const server = new PactPeerToolServer()
     servers.push(server)
@@ -476,6 +529,40 @@ const workflowQuestions = [
 ]
 
 describe('workflow tool root capabilities', () => {
+  it.each([
+    { primary: 'codex', stage: 'plan_review', reviewer: 'claude' },
+    { primary: 'codex', stage: 'code_review', reviewer: 'codex' },
+    { primary: 'claude', stage: 'plan_review', reviewer: 'codex' },
+    { primary: 'claude', stage: 'code_review', reviewer: 'claude' },
+  ] as const)(
+    'authenticates split $stage by $reviewer for Primary $primary',
+    async ({ primary, stage, reviewer }) => {
+      const server = new PactPeerToolServer()
+      servers.push(server)
+      const url = await server.start()
+      const task = workflowTask({
+        rolePolicy: 'split-stages-v1',
+        owner: primary,
+        reviewer: primary === 'codex' ? 'claude' : 'codex',
+        stage,
+        actor: reviewer,
+      })
+      const receipt = server.beginTurn(reviewer === 'codex' ? 'claude' : 'codex', true, task)
+      expect(server.acceptReview({ verdict: 'accepted' }, receipt)).toEqual({ verdict: 'accepted' })
+      expect(
+        await workflowCall(`${url}/${receipt}`, 'submit_review', { verdict: 'accepted' }),
+      ).toMatchObject({ isError: false })
+      const foreign = server.beginTurn(reviewer, true, {
+        ...task,
+        actor: reviewer === 'codex' ? 'claude' : 'codex',
+      })
+      expect(server.acceptReview({ verdict: 'accepted' }, foreign)).toBeUndefined()
+      expect(
+        await workflowCall(`${url}/${foreign}`, 'submit_review', { verdict: 'accepted' }),
+      ).toMatchObject({ isError: true })
+    },
+  )
+
   it.each(['plan_review', 'code_review'] as const)(
     'authenticates %s against the host reviewer and rejects model-supplied authority',
     async (stage) => {

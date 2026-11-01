@@ -44,6 +44,7 @@ import type {
 import { collaborationSourceWireResultSchema } from '@pact/contracts'
 import { PactDatabase } from '@pact/persistence'
 
+import { planRevisionFixture } from '../../../../../packages/persistence/src/plan-revision-guidance.test-support.js'
 import { NativeCapacityError } from './agent-execution-error'
 import { CLAUDE_TITLE_TIMEOUT_MS, ClaudeAgentAdapter } from './claude-agent-adapter.js'
 import { planRunInput } from './collaboration-fixture.test-support.js'
@@ -213,7 +214,7 @@ describe('Claude plan submission diagnostics', () => {
         valid: 'submitted to Pact',
         missing_prompt: 'hook_prompt_missing',
         wrong_prompt: 'hook_prompt_mismatch',
-        missing_history: 'history_lookup_failed',
+        missing_history: 'history_operation_missing',
         pending: 'plan_pending',
         binding_missing: 'history_binding_missing',
         receipt_unavailable: 'plan_unavailable',
@@ -295,9 +296,550 @@ describe('Claude plan submission diagnostics', () => {
   })
 })
 
+describe('Claude explicit unchanged plan retention', () => {
+  it.each([
+    'valid',
+    'late_native_call',
+    'missing_post',
+    'duplicate_native',
+    'duplicate_sdk',
+    'cancel',
+    'wrong_prompt',
+    'foreign_root',
+    'child',
+    'missing_hook',
+    'missing_native_call',
+    'extra_native_args',
+    'error_result',
+    'missing_root_tool',
+  ] as const)(
+    'requires the owned Hook, native prefix and successful root result: %s',
+    async (mode) => {
+      const f = await nativeRetentionFixture()
+      try {
+        const id = 'retain-plan'
+        if (mode !== 'missing_native_call' && mode !== 'late_native_call')
+          await f.nativeCall(id, mode === 'extra_native_args' ? { planVersion: 2 } : {})
+        if (mode !== 'missing_hook')
+          await f.pre(
+            id,
+            mode === 'wrong_prompt'
+              ? { prompt_id: randomUUID() }
+              : mode === 'foreign_root'
+                ? { session_id: randomUUID() }
+                : mode === 'child'
+                  ? { agent_id: 'child' }
+                  : {},
+          )
+        if (mode !== 'missing_root_tool')
+          f.assistant(id, {}, mode === 'child' ? 'parent-tool' : null)
+        const invoked = await f.invoke()
+        expect(invoked.isError).not.toBe(true)
+        if (mode !== 'missing_post') await f.post(id)
+        if (mode === 'late_native_call' || mode === 'duplicate_native') await f.nativeCall(id)
+        if (mode === 'duplicate_sdk') f.assistant(id)
+        expect(f.record).not.toHaveBeenCalled()
+        await f.result(id, mode === 'error_result', mode === 'child' ? 'parent-tool' : null)
+        if (mode === 'cancel') f.cancel()
+        await f.end()
+        expect(f.record.mock.calls).toEqual(
+          ['valid', 'late_native_call'].includes(mode)
+            ? [
+                [
+                  {
+                    nativeId: id,
+                    confirmation: 'native_root_settled_v1',
+                    sha256: f.basis.document.sha256,
+                    bytes: f.basis.document.bytes,
+                    chars: f.basis.document.chars,
+                  },
+                ],
+              ]
+            : [],
+        )
+        expect(
+          f.evidence.mock.calls.some(
+            ([value]) =>
+              value.kind === 'ended' &&
+              value.outcome === 'completed' &&
+              value.output?.retainedPlan?.nativeId === id,
+          ),
+        ).toBe(['valid', 'late_native_call'].includes(mode))
+      } finally {
+        await f.dispose()
+      }
+    },
+  )
+
+  it.each([
+    'pending',
+    'failed',
+    'identical-write',
+    'pending-edit',
+    'failed-edit',
+    'identical-edit',
+  ] as const)(
+    'refuses retention when the real current native prefix includes %s plan work',
+    async (mode) => {
+      const f = await nativeRetentionFixture()
+      try {
+        const edit = mode.endsWith('-edit')
+        const operation = edit
+          ? { file_path: f.path, old_string: f.text, new_string: f.text }
+          : { file_path: f.path, content: f.text }
+        await f.append({
+          type: 'assistant',
+          message: {
+            id: 'current-write',
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'current-write',
+                name: edit ? 'Edit' : 'Write',
+                input: operation,
+              },
+            ],
+          },
+        })
+        if (!mode.startsWith('pending'))
+          await f.append({
+            type: 'user',
+            message: {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'current-write',
+                  is_error: mode.startsWith('failed'),
+                  content: 'Write outcome',
+                },
+              ],
+            },
+            toolUseResult: edit
+              ? {
+                  filePath: f.path,
+                  oldString: f.text,
+                  newString: f.text,
+                  replaceAll: false,
+                  originalFile: f.text,
+                  userModified: false,
+                }
+              : { filePath: f.path, content: f.text, userModified: false },
+          })
+        await f.nativeCall('retain-plan')
+        await f.pre('retain-plan')
+        f.assistant('retain-plan')
+        await f.invoke()
+        await f.post('retain-plan')
+        await f.result('retain-plan')
+        await f.finish()
+        expect(f.record).not.toHaveBeenCalled()
+        expect(f.unavailable).toHaveBeenCalled()
+      } finally {
+        await f.dispose()
+      }
+    },
+  )
+
+  it('invalidates candidate retention on a later write and cannot clear that fact with another retain call', async () => {
+    const f = await nativeRetentionFixture()
+    try {
+      await f.nativeCall('retain-plan')
+      await f.pre('retain-plan')
+      f.assistant('retain-plan')
+      await f.invoke()
+      await f.post('retain-plan')
+      await f.result('retain-plan')
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(f.record).not.toHaveBeenCalled()
+      await f.pre('later-write', {
+        tool_name: 'Write',
+        tool_input: { file_path: f.path, content: 'Changed' },
+      })
+      expect(f.unavailable).toHaveBeenCalled()
+      expect(await f.invoke()).toMatchObject({ isError: true })
+      await f.finish()
+      expect(f.record).not.toHaveBeenCalled()
+      const ended = f.evidence.mock.calls.flatMap(([value]) =>
+        value.kind === 'ended' ? [value] : [],
+      )
+      expect(ended.at(-1)?.output?.retainedPlan).toBeUndefined()
+    } finally {
+      await f.dispose()
+    }
+  })
+
+  it.each(['write-hook', 'error-tool-result'] as const)(
+    'fails closed if retaining-plan invalidation cannot be persisted after %s',
+    async (trigger) => {
+      const f = await nativeRetentionFixture()
+      try {
+        await f.nativeCall('retain-plan')
+        await f.pre('retain-plan')
+        f.assistant('retain-plan')
+        await f.invoke()
+        await f.post('retain-plan')
+        await f.result('retain-plan')
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        expect(f.record).not.toHaveBeenCalled()
+        f.unavailable.mockImplementation(() => {
+          throw new Error('Fixture persistence rejected plan invalidation.')
+        })
+        if (trigger === 'write-hook') {
+          await f
+            .pre('later-write', {
+              tool_name: 'Write',
+              tool_input: { file_path: f.path, content: 'Changed after retention' },
+            })
+            .catch(() => undefined)
+        } else await f.result('retain-plan', true)
+        await f.end()
+        const ended = f.evidence.mock.calls.flatMap(([value]) =>
+          value.kind === 'ended' ? [value] : [],
+        )
+        expect({
+          retainedCandidates: f.record.mock.calls.length,
+          invalidationAttempts: f.unavailable.mock.calls.length > 0,
+          outputFailures: f.outputFailure.mock.calls.length,
+          usableRetainedTerminal: Boolean(ended.at(-1)?.output?.retainedPlan),
+        }).toEqual({
+          retainedCandidates: 0,
+          invalidationAttempts: true,
+          outputFailures: 0,
+          usableRetainedTerminal: false,
+        })
+        expect(ended.at(-1)).toMatchObject({
+          outcome: 'completed',
+          output: {
+            text: 'The existing plan remains appropriate.',
+            completeness: 'complete',
+          },
+        })
+        expect(f.report).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'settled' }))
+      } finally {
+        await f.dispose()
+      }
+    },
+  )
+
+  it.each(['Write', 'Edit'] as const)(
+    'cannot retain after a failed %s before plan-state initialization',
+    async (toolName) => {
+      const f = await nativeRetentionFixture()
+      try {
+        await f.pre('unverified-write', {
+          tool_name: toolName,
+          tool_input: {
+            file_path: f.path,
+            content: 'Different',
+            old_string: f.text,
+            new_string: 'Different',
+          },
+        })
+        await f.nativeCall('retain-plan')
+        expect(await f.pre('retain-plan')).toMatchObject({
+          hookSpecificOutput: { permissionDecision: 'deny' },
+        })
+        expect(await f.invoke()).toMatchObject({ isError: true })
+        f.assistant('retain-plan')
+        await f.post('retain-plan')
+        await f.result('retain-plan')
+        await f.finish()
+        expect(f.record).not.toHaveBeenCalled()
+        expect(f.unavailable).toHaveBeenCalled()
+      } finally {
+        await f.dispose()
+      }
+    },
+  )
+
+  it('joins a started source authentication before releasing terminal work', async () => {
+    const f = await nativeRetentionFixture()
+    const gate = Promise.withResolvers<void>(),
+      started = Promise.withResolvers<void>()
+    // oxlint-disable-next-line typescript/unbound-method -- Called with the actual NativeForkFiles receiver below.
+    const read = NativeForkFiles.prototype.readAnswer
+    const inspect = vi
+      .spyOn(NativeForkFiles.prototype, 'readAnswer')
+      .mockImplementation(async function (this: NativeForkFiles, input, signal) {
+        if (input.terminalPlanRetention?.id === 'retain-plan') {
+          started.resolve()
+          await gate.promise
+        }
+        return read.call(this, input, signal)
+      })
+    try {
+      await f.nativeCall('retain-plan')
+      await f.pre('retain-plan')
+      f.assistant('retain-plan')
+      await f.invoke()
+      await f.post('retain-plan')
+      await f.result('retain-plan')
+      const ending = f.finish()
+      await started.promise
+      await vi.waitFor(() =>
+        expect(
+          f.evidence.mock.calls.some(
+            ([value]) => value.kind === 'ended' && value.outcome === 'completed',
+          ),
+        ).toBe(true),
+      )
+      expect(f.record).not.toHaveBeenCalled()
+      expect(f.report.mock.calls.some(([value]) => value.state === 'settled')).toBe(false)
+      gate.resolve()
+      await ending
+      await vi.waitFor(() => expect(f.record).toHaveBeenCalledOnce())
+      expect(
+        f.evidence.mock.calls.some(
+          ([value]) =>
+            value.kind === 'ended' && value.output?.retainedPlan?.nativeId === 'retain-plan',
+        ),
+      ).toBe(true)
+    } finally {
+      gate.resolve()
+      inspect.mockRestore()
+      await f.dispose()
+    }
+  })
+
+  it('does not cache final retention when its durable callback fails', async () => {
+    const f = await nativeRetentionFixture()
+    try {
+      await f.pre('retain-plan')
+      f.assistant('retain-plan')
+      await f.invoke()
+      await f.post('retain-plan')
+      await f.nativeCall('retain-plan')
+      await f.result('retain-plan')
+      f.record.mockImplementation(() => {
+        throw new Error('Controlled retained persistence failure')
+      })
+      await f.end()
+      expect(f.record).toHaveBeenCalledOnce()
+      expect(f.outputFailure).not.toHaveBeenCalled()
+      expect(f.report).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'settled' }))
+      const ended = f.evidence.mock.calls.flatMap(([value]) =>
+        value.kind === 'ended' ? [value] : [],
+      )
+      expect(ended.at(-1)).toMatchObject({
+        outcome: 'completed',
+        output: { text: 'The existing plan remains appropriate.', completeness: 'complete' },
+      })
+      expect(ended.every((value) => !value.output?.retainedPlan)).toBe(true)
+    } finally {
+      await f.dispose()
+    }
+  })
+
+  it('does not accept prose or model-selected identities as retention', async () => {
+    const f = await nativeRetentionFixture()
+    try {
+      expect(await f.invoke({ planVersion: 2 })).toMatchObject({ isError: true })
+      await f.finish()
+      expect(f.record).not.toHaveBeenCalled()
+    } finally {
+      await f.dispose()
+    }
+  })
+})
+
+it.each([false, true])(
+  'settles a new plan after retained intent only with intact publication: late invalidation failure=%s',
+  async (lateInvalidation) => {
+    const nativeSessionId = randomUUID()
+    const db = await planRevisionFixture({ owner: 'claude', nativeSessionId })
+    const repo = db.repo,
+      sessionId = db.sessionId
+    const clientMessageId = randomUUID(),
+      bodyOwner = randomUUID()
+    const drafts = repo.readPage({ scope: 'drafts', sessionId })
+    if (drafts.scope !== 'drafts') throw new Error('Missing drafts')
+    const content = 'Recheck the current plan.'
+    const body = repo.writeConversationInput(
+      { type: 'begin', sessionId, clientMessageId },
+      bodyOwner,
+    )
+    repo.writeConversationInput(
+      { type: 'append', sessionId, inputId: body.inputId, offset: 0, text: content },
+      bodyOwner,
+    )
+    repo.writeConversationInput({ type: 'seal', sessionId, inputId: body.inputId }, bodyOwner)
+    repo.receiveCollaborationInput(
+      {
+        sessionId,
+        clientMessageId,
+        content,
+        commentIds: [],
+        expectedCommentsRevision: drafts.commentsRevision,
+      },
+      body.inputId,
+      'claude',
+      'immediate_safe_point',
+      bodyOwner,
+    )
+    const received = repo.readReceivedInput(sessionId)!,
+      task = repo.collaboration(sessionId)!
+    const next = repo.workflowReply(task, 'claude')
+    next.latestUserMessageId = received.id
+    const { run } = repo.beginRun({
+      sessionId,
+      clientMessageId: received.id,
+      content: received.content,
+      commentIds: [],
+      expectedCommentsRevision: drafts.commentsRevision,
+      agentId: 'claude',
+      settingsRevision: 1,
+      model: null,
+      effort: null,
+      preserveDraftComments: true,
+      receivedInputId: received.id,
+      expectedCollaborationRevision: task.revision,
+      collaboration: next,
+    })
+    let rejectInvalidation = false
+    const capturedPlans: string[] = []
+    const f = await nativeRetentionFixture(
+      {
+        sessionId,
+        runId: run.id,
+        nativeSessionId,
+        bindingGeneration: run.bindingGeneration ?? 1,
+        promptEnvelope: {
+          version: 'pact-agent-prompt-v1',
+          sessionId,
+          message: { id: run.userMessageId, content },
+          comments: [],
+          collaboration: repo.collaborationPromptState(repo.collaboration(sessionId)!),
+          collaborationAuthorization: repo.collaborationTurnAuthorization(run.id)!,
+        },
+        recordExecutor: (id) => {
+          repo.recordExecutor(run.id, id)
+        },
+        recordDispatch: (phase, id, executor) => {
+          repo.recordDispatch(run.id, phase, id, executor)
+        },
+        recordWorkflowPlan: (plan) => {
+          capturedPlans.push(plan.text)
+          repo.recordWorkflowPlan(run.id, plan)
+        },
+        recordWorkflowPlanRetained: (plan) => repo.recordWorkflowPlanRetained(run.id, plan),
+        recordWorkflowPlanUnavailable: () => {
+          if (rejectInvalidation) throw new Error('Controlled late plan invalidation failure')
+          repo.recordWorkflowPlanUnavailable(run.id)
+        },
+        recordOutputFailure: () =>
+          repo.recordOutputFailure(run.id, {
+            kind: 'protocol_error',
+            message: 'Plan capture failed',
+          }),
+        recordNativeEvidence: (evidence) => {
+          repo.recordNativeEvidence(evidence, 'retry')
+        },
+        reportNativeEffects: (report) => {
+          repo.recordNativeEffects(run.id, report.state, report.reason)
+          if (report.state === 'settled') repo.reconcileCompletedCollaboration(run.id)
+        },
+      },
+      (event) => {
+        repo.applyEvent(sessionId, run.id, event)
+      },
+    )
+    try {
+      await f.nativeCall('retain-plan')
+      await f.pre('retain-plan')
+      f.assistant('retain-plan')
+      await f.invoke()
+      await f.post('retain-plan')
+      await f.result('retain-plan')
+      const writeInput = { file_path: f.path, content: 'New complete plan after reconsideration.' }
+      await f.append({
+        type: 'assistant',
+        message: {
+          id: 'write-message',
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'write-plan', name: 'Write', input: writeInput }],
+        },
+      })
+      await f.pre('write-plan', { tool_name: 'Write', tool_input: writeInput })
+      await f.post('write-plan', {
+        tool_name: 'Write',
+        tool_input: writeInput,
+        tool_response: { filePath: f.path, content: writeInput.content, userModified: false },
+      })
+      await f.pre('exit-plan', { tool_name: 'ExitPlanMode', tool_input: {} })
+      await f.options.canUseTool!(
+        'ExitPlanMode',
+        {},
+        {
+          signal: new AbortController().signal,
+          toolUseID: 'exit-plan',
+          requestId: 'exit-permission',
+        },
+      )
+      expect(capturedPlans).toContain(writeInput.content)
+      f.complete()
+      await vi.waitFor(() =>
+        expect(
+          repo
+            .read(sessionId)
+            .messages.some(
+              (message) =>
+                message.runId === run.id &&
+                message.role === 'assistant' &&
+                message.state === 'complete',
+            ),
+        ).toBe(true),
+      )
+      expect(repo.workflowPlanSettled(run.id)).toBe(false)
+      const ending = f.evidence.mock.calls
+        .map(([value]) => value)
+        .findLast((value) => value.kind === 'ended' && value.output)
+      expect(ending?.kind === 'ended' ? ending.output?.plan?.text : undefined).toBe(
+        writeInput.content,
+      )
+      if (lateInvalidation) {
+        rejectInvalidation = true
+        await f
+          .pre('late-write', {
+            tool_name: 'Write',
+            tool_input: { file_path: f.path, content: 'Unfinished late change' },
+          })
+          .catch(() => undefined)
+      }
+      await f.end()
+      repo.settleKnownNativeEnding(run.id)
+      repo.reconcileCompletedCollaboration(run.id)
+      expect(f.record).not.toHaveBeenCalled()
+      expect(repo.workflowPlanSettled(run.id)).toBe(!lateInvalidation)
+      expect(Boolean(repo.collaboration(sessionId)!.inputProcessing?.pending)).toBe(
+        lateInvalidation,
+      )
+      expect(repo.findRun(run.id)?.nativeEffectsState).toBe(
+        lateInvalidation ? 'unknown' : 'settled',
+      )
+      expect(repo.findRun(run.id)?.nativeOutcome).toBe('completed')
+      expect(
+        repo
+          .read(sessionId)
+          .messages.find((message) => message.runId === run.id && message.role === 'assistant')
+          ?.state,
+      ).toBe('complete')
+    } finally {
+      await f.dispose()
+      db.db.close()
+    }
+  },
+)
+
 describe('Claude terminated plan authentication', () => {
   it.each([
     'valid',
+    'live_submitted',
+    'live_pending_write',
+    'live_failed_write',
+    'retained',
+    'retained_live',
     'no_permission',
     'changed_permission',
     'changed_hook',
@@ -309,7 +851,7 @@ describe('Claude terminated plan authentication', () => {
     'live_changed_permission',
     'retained_recording_failure',
   ] as const)(
-    'joins one terminal read only for the exact missing-operation permission intent: %s',
+    'joins one terminal read for the exact permission intent after actor and reader drain: %s',
     async (mode) => {
       const directory = await mkdtemp(join(tmpdir(), 'pact-terminal-plan-')),
         cwd = await realpath(directory)
@@ -345,7 +887,7 @@ describe('Claude terminated plan authentication', () => {
       await append(
         'user',
         { promptId, message: { role: 'user', content: 'Plan' } },
-        mode === 'retained_recording_failure' ? randomUUID() : input.runId,
+        mode.startsWith('retained') ? randomUUID() : input.runId,
       )
       await append('attachment', {
         attachment: { type: 'plan_mode', isSubAgent: false, planFilePath: path },
@@ -371,7 +913,7 @@ describe('Claude terminated plan authentication', () => {
         },
         toolUseResult: { filePath: path, content: text, userModified: false },
       })
-      if (mode === 'retained_recording_failure') {
+      if (mode.startsWith('retained')) {
         const basis = {
           version: 1,
           sourceRunId: randomUUID(),
@@ -405,14 +947,23 @@ describe('Claude terminated plan authentication', () => {
         availablePlan = undefined
       })
       const retain = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlanRetained']>>(() => {
-        throw new Error('Controlled retained source storage failure')
+        if (mode === 'retained_recording_failure')
+          throw new Error('Controlled retained source storage failure')
       })
       const sourceFailure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
       const settled = Promise.withResolvers<void>()
       const reports = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>((report) => {
         if (report.state !== 'pending') settled.resolve()
       })
-      const reads = vi.spyOn(NativeForkFiles.prototype, 'readAnswer')
+      // oxlint-disable-next-line typescript/unbound-method -- Forward the real method with its original instance through call(this).
+      const readAnswer = NativeForkFiles.prototype.readAnswer
+      const reads = vi
+        .spyOn(NativeForkFiles.prototype, 'readAnswer')
+        .mockImplementation(function (this: NativeForkFiles, request, signal) {
+          if (mode === 'live_submitted' && request.terminalPlanSubmission)
+            return Promise.reject(new Error('Terminal history temporarily unavailable'))
+          return readAnswer.call(this, request, signal)
+        })
       const f = cancellationFixture(
         undefined,
         {
@@ -441,7 +992,7 @@ describe('Claude terminated plan authentication', () => {
         }
         const options = { signal: f.options().abortController!.signal }
         const pre = f.options().hooks!.PreToolUse![0]!.hooks[0]!
-        if (mode === 'live_changed_permission') {
+        if (mode.startsWith('live_')) {
           const writeHook = {
             ...hook,
             tool_name: 'Write',
@@ -459,9 +1010,17 @@ describe('Claude terminated plan authentication', () => {
             options,
           )
         }
-        // The live Hook arrives before this exact Exit is persisted. Write+ack already exist.
+        if (mode === 'retained_live')
+          await append('assistant', {
+            message: {
+              id: 'exit',
+              role: 'assistant',
+              content: [{ type: 'tool_use', id: 'exit-plan', name: 'ExitPlanMode', input: intent }],
+            },
+          })
+        // The ordinary live Hook precedes persistence; retained_live covers the already-readable prefix.
         await pre(hook, 'exit-plan', options)
-        expect(plan).toHaveBeenCalledTimes(mode === 'live_changed_permission' ? 1 : 0)
+        expect(plan).toHaveBeenCalledTimes(mode.startsWith('live_') ? 1 : 0)
         if (mode === 'changed_hook')
           await pre({ ...hook, tool_input: { ...intent, plan: 'Changed' } }, 'exit-plan', options)
         const decisions: Array<string | undefined> = []
@@ -479,7 +1038,8 @@ describe('Claude terminated plan authentication', () => {
           }
         }
         expect(decisions).toEqual(mode === 'no_permission' ? [] : ['deny', 'deny', 'deny'])
-        if (mode !== 'missing_terminal')
+        expect(retain).not.toHaveBeenCalled()
+        if (mode !== 'missing_terminal' && mode !== 'retained_live')
           await append('assistant', {
             message: {
               id: 'exit',
@@ -487,6 +1047,46 @@ describe('Claude terminated plan authentication', () => {
               content: [{ type: 'tool_use', id: 'exit-plan', name: 'ExitPlanMode', input: intent }],
             },
           })
+        if (mode === 'live_pending_write' || mode === 'live_failed_write') {
+          const lateInput = { file_path: path, content: 'Later plan edit' }
+          await append('assistant', {
+            message: {
+              role: 'assistant',
+              content: [{ type: 'tool_use', id: 'late-write', name: 'Write', input: lateInput }],
+            },
+          })
+          const lateHook = {
+            ...hook,
+            tool_name: 'Write',
+            tool_use_id: 'late-write',
+            tool_input: lateInput,
+          }
+          await pre(lateHook, 'late-write', options)
+          if (mode === 'live_failed_write') {
+            await append('user', {
+              message: {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: 'late-write',
+                    is_error: true,
+                    content: 'Failed',
+                  },
+                ],
+              },
+            })
+            await f.options().hooks!.PostToolUseFailure![0]!.hooks[0]!(
+              {
+                ...lateHook,
+                hook_event_name: 'PostToolUseFailure',
+                error: 'Failed',
+              },
+              'late-write',
+              options,
+            )
+          }
+        }
         if (mode === 'question')
           await pre(
             {
@@ -513,36 +1113,65 @@ describe('Claude terminated plan authentication', () => {
         })
         // EOF without actor close is insufficient; actor close and drain race into one owner.
         await f.outcome
-        expect(plan).toHaveBeenCalledTimes(mode === 'live_changed_permission' ? 1 : 0)
-        expect(availablePlan).toBeUndefined()
+        expect(plan).toHaveBeenCalledTimes(
+          mode.startsWith('live_') ? (mode === 'live_changed_permission' ? 1 : 4) : 0,
+        )
+        expect(availablePlan).toEqual(
+          mode === 'live_submitted' ? { nativeId: 'write-plan', text } : undefined,
+        )
+        expect(retain).not.toHaveBeenCalled()
         f.child.emit('close', 0, null)
         f.child.emit('close', 0, null)
         await settled.promise
         expect(reports).toHaveBeenLastCalledWith(
           expect.objectContaining({
-            state: mode === 'retained_recording_failure' ? 'unknown' : 'settled',
+            state: 'settled',
           }),
         )
         const terminalReads = reads.mock.calls.filter(([request]) => request.terminalPlanSubmission)
         expect(terminalReads).toHaveLength(
-          ['valid', 'wrong_prompt', 'missing_terminal', 'retained_recording_failure'].includes(mode)
+          [
+            'valid',
+            'retained',
+            'retained_live',
+            'wrong_prompt',
+            'missing_terminal',
+            'retained_recording_failure',
+          ].includes(mode)
             ? 1
             : 0,
         )
         expect(plan.mock.calls).toEqual(
-          ['valid', 'live_changed_permission'].includes(mode)
-            ? [[{ nativeId: 'write-plan', text }]]
-            : [],
+          mode.startsWith('live_') && mode !== 'live_changed_permission'
+            ? Array.from({ length: 4 }, () => [{ nativeId: 'write-plan', text }])
+            : ['valid', 'live_changed_permission'].includes(mode)
+              ? [[{ nativeId: 'write-plan', text }]]
+              : [],
         )
         expect(
           mode !== 'valid' ||
             reports.mock.invocationCallOrder.at(-1)! > plan.mock.invocationCallOrder[0]!,
         ).toBe(true)
         expect(availablePlan).toEqual(
-          mode === 'valid' ? { nativeId: 'write-plan', text } : undefined,
+          ['valid', 'live_submitted'].includes(mode) ? { nativeId: 'write-plan', text } : undefined,
         )
-        expect(retain).toHaveBeenCalledTimes(mode === 'retained_recording_failure' ? 1 : 0)
-        expect(sourceFailure).toHaveBeenCalledTimes(mode === 'retained_recording_failure' ? 1 : 0)
+        expect(retain).toHaveBeenCalledTimes(mode.startsWith('retained') ? 1 : 0)
+        expect(retain.mock.calls[0]?.[0]).toEqual(
+          mode.startsWith('retained')
+            ? {
+                nativeId: 'exit-plan',
+                confirmation: 'native_root_settled_v1',
+                sha256: createHash('sha256').update(text).digest('hex'),
+                bytes: Buffer.byteLength(text),
+                chars: text.length,
+              }
+            : undefined,
+        )
+        expect(
+          !mode.startsWith('retained') ||
+            reports.mock.invocationCallOrder.at(-1)! > retain.mock.invocationCallOrder[0]!,
+        ).toBe(true)
+        expect(sourceFailure).not.toHaveBeenCalled()
         const status =
           mode === 'valid'
             ? await f.adapter.probeNativeStatus(
@@ -2669,6 +3298,339 @@ function cancellationFixture(
       child.emit('close', 0, null)
       await outcome
       await adapter.dispose()
+    },
+  }
+}
+
+async function nativeRetentionFixture(
+  overrides: Partial<AgentRunInput> = {},
+  onEvent?: (event: import('@pact/contracts').NormalizedAgentEvent) => void,
+) {
+  const directory = await mkdtemp(join(tmpdir(), 'pact-claude-retain-'))
+  const cwd = await realpath(directory),
+    profile = join(cwd, 'profile')
+  const project = join(profile, 'projects', cwd.replace(/[^a-z0-9]/giu, '-'))
+  await mkdir(project, { recursive: true })
+  vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
+  const input = { ...planRunInput('claude'), cwd, nativeSessionId: randomUUID() }
+  const text = 'An existing complete plan.\nKeep the original owner and acceptance.'
+  const basis = {
+    version: 2,
+    sourceRunId: randomUUID(),
+    sourceMessageId: randomUUID(),
+    document: {
+      id: randomUUID(),
+      sha256: createHash('sha256').update(text).digest('hex'),
+      bytes: Buffer.byteLength(text),
+      chars: text.length,
+    },
+  }
+  const auth = input.promptEnvelope.collaborationAuthorization!
+  auth.stage = 'reply'
+  auth.inputSequence = 1
+  auth.planReference = basis
+  auth.inputProcessing = { pending: { inputId: input.promptEnvelope.message.id, inputSequence: 1 } }
+  Object.assign(input.promptEnvelope.collaboration!, {
+    stage: 'reply',
+    inputSequence: 1,
+    planVersion: 2,
+    planReference: basis,
+    inputProcessing: auth.inputProcessing,
+    authorization: auth,
+  })
+  Object.assign(input, overrides)
+  const promptId = randomUUID(),
+    path = join(profile, 'plans', 'retained.md')
+  const transcript = join(project, `${input.nativeSessionId}.jsonl`)
+  let parent: string | null = null
+  const append = async (record: Record<string, unknown>) => {
+    const uuid = typeof record.uuid === 'string' ? record.uuid : randomUUID()
+    await appendFile(
+      transcript,
+      JSON.stringify({
+        ...record,
+        uuid,
+        parentUuid: parent,
+        cwd,
+        sessionId: input.nativeSessionId,
+        timestamp: new Date().toISOString(),
+      }) + '\n',
+    )
+    parent = uuid
+  }
+  await append({
+    type: 'user',
+    uuid: input.runId,
+    promptId,
+    message: {
+      role: 'user',
+      content: 'Consider the supplementary review and retain this plan if no change is needed.',
+    },
+  })
+  await append({
+    type: 'attachment',
+    attachment: { type: 'plan_mode', isSubAgent: false, planFilePath: path },
+  })
+  const child = Object.assign(new EventEmitter(), {
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    pid: 12346,
+    killed: false,
+    exitCode: null,
+    kill: vi.fn(),
+  })
+  child.on('error', () => undefined)
+  const controller = new AbortController(),
+    ready = Promise.withResolvers<void>()
+  const messages: SDKMessage[] = []
+  let closed = false,
+    wake: (() => void) | undefined,
+    captured: Parameters<typeof sdkQuery>[0] | undefined
+  const record = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlanRetained']>>(
+    overrides.recordWorkflowPlanRetained,
+  )
+  const unavailable = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlanUnavailable']>>(
+    overrides.recordWorkflowPlanUnavailable,
+  )
+  const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>(
+    overrides.recordNativeEvidence,
+  )
+  const outputFailure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>(
+    overrides.recordOutputFailure,
+  )
+  const report = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>(
+    overrides.reportNativeEffects,
+  )
+  const query = ((request: Parameters<typeof sdkQuery>[0]) => {
+    captured = request
+    request.options!.spawnClaudeCodeProcess!({
+      command: '/fake/claude',
+      args: [],
+      env: {},
+      signal: request.options!.abortController!.signal,
+    })
+    return {
+      async *[Symbol.asyncIterator]() {
+        try {
+          const source = request.prompt as AsyncIterable<SDKUserMessage>
+          const first = await source[Symbol.asyncIterator]().next()
+          if (first.done) return
+          yield {
+            type: 'user',
+            uuid: input.runId,
+            user_message_uuid: input.runId,
+            session_id: input.nativeSessionId,
+            parent_tool_use_id: null,
+            message: { role: 'user', content: 'accepted' },
+          } as SDKMessage
+          ready.resolve()
+          for (;;) {
+            if (closed && !messages.length) break
+            const message = messages.shift()
+            if (message) yield message
+            else
+              // oxlint-disable-next-line no-await-in-loop -- One owned native stream is consumed in order.
+              await new Promise<void>((resolve) => {
+                wake = resolve
+              })
+          }
+        } finally {
+          child.emit('close', 0, null)
+        }
+      },
+      initializationResult: async () => ({
+        current_permission_mode: request.options?.permissionMode,
+      }),
+      setPermissionMode: vi.fn(async () => undefined),
+      interrupt: vi.fn(async () => undefined),
+      close: vi.fn(),
+      return: vi.fn(async () => ({ done: true, value: undefined })),
+    }
+  }) as unknown as typeof sdkQuery
+  const adapter = new ClaudeAgentAdapter('/fake/claude', {
+    query,
+    getSessionInfo: vi.fn() as never,
+    spawn: (() => child) as never,
+  })
+  const outcome = (async () => {
+    for await (const event of adapter.run(
+      {
+        ...input,
+        recordWorkflowPlanRetained: record,
+        recordWorkflowPlanUnavailable: unavailable,
+        recordNativeEvidence: evidence,
+        recordOutputFailure: outputFailure,
+        reportNativeEffects: report,
+      },
+      controller.signal,
+    ))
+      onEvent?.(event)
+  })().catch((error: unknown) => error)
+  await ready.promise
+  const options = captured!.options!
+  const serverName = Object.keys(options.mcpServers!)[0]!
+  const server = options.mcpServers![serverName]!
+  if (server.type !== 'sdk') throw Error('Expected real SDK MCP server')
+  const replies: object[] = []
+  const transport: Parameters<typeof server.instance.connect>[0] = {
+    start: async () => undefined,
+    close: async () => undefined,
+    send: async (message) => {
+      replies.push(message)
+      expect(replies.length).toBeLessThanOrEqual(128)
+    },
+  }
+  await server.instance.connect(transport)
+  let requestId = 0
+  const exchange = async (method: string, params: Record<string, unknown>) => {
+    const id = ++requestId
+    transport.onmessage?.({ jsonrpc: '2.0', id, method, params })
+    await vi.waitFor(() =>
+      expect(replies.some((reply) => Reflect.get(reply, 'id') === id)).toBe(true),
+    )
+    return Reflect.get(
+      replies.find((reply) => Reflect.get(reply, 'id') === id)!,
+      'result',
+    ) as Record<string, unknown>
+  }
+  await exchange('initialize', {
+    protocolVersion: '2025-06-18',
+    capabilities: {},
+    clientInfo: { name: 'retention-boundary', version: '1' },
+  })
+  transport.onmessage?.({ jsonrpc: '2.0', method: 'notifications/initialized' })
+  const name = `mcp__${serverName}__retain_current_plan`
+  const hook = (id: string, extra: object = {}) => ({
+    session_id: input.nativeSessionId,
+    transcript_path: transcript,
+    cwd,
+    prompt_id: promptId,
+    tool_use_id: id,
+    tool_name: name,
+    tool_input: {},
+    ...extra,
+  })
+  const push = (message: SDKMessage) => {
+    messages.push(message)
+    wake?.()
+    wake = undefined
+  }
+  const assistant = (id: string, args: unknown = {}, parentTool: string | null = null) =>
+    push({
+      type: 'assistant',
+      uuid: randomUUID(),
+      session_id: input.nativeSessionId,
+      parent_tool_use_id: parentTool,
+      message: {
+        id: `assistant-${id}`,
+        role: 'assistant',
+        content: [{ type: 'tool_use', id, name, input: args }],
+      },
+    } as SDKMessage)
+  const result = async (id: string, error = false, parentTool: string | null = null) => {
+    const message = {
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: id,
+          is_error: error,
+          content: error ? 'Rejected' : 'Retention intent validated',
+        },
+      ],
+    }
+    await append({ type: 'user', message, ...(parentTool ? { isSidechain: true } : {}) })
+    push({
+      type: 'user',
+      uuid: randomUUID(),
+      session_id: input.nativeSessionId,
+      parent_tool_use_id: parentTool,
+      message,
+    } as SDKMessage)
+  }
+  const pre = (id: string, extra: object = {}) =>
+    options.hooks!.PreToolUse![0]!.hooks[0]!(
+      { ...hook(id, extra), hook_event_name: 'PreToolUse' },
+      id,
+      { signal: controller.signal },
+    )
+  const post = (id: string, extra: object = {}) =>
+    options.hooks!.PostToolUse![0]!.hooks[0]!(
+      { tool_response: {}, ...hook(id, extra), hook_event_name: 'PostToolUse' },
+      id,
+      { signal: controller.signal },
+    )
+  const nativeCall = (id: string, args: unknown = {}) =>
+    append({
+      type: 'assistant',
+      message: {
+        id: `native-${id}`,
+        role: 'assistant',
+        content: [{ type: 'tool_use', id, name, input: args }],
+      },
+    })
+  let resultSent = false
+  const complete = () => {
+    if (resultSent) return
+    resultSent = true
+    push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      session_id: input.nativeSessionId,
+      user_message_uuid: input.runId,
+      result: 'The existing plan remains appropriate.',
+    } as SDKMessage)
+  }
+  const end = async () => {
+    complete()
+    closed = true
+    wake?.()
+    wake = undefined
+    const completed = await outcome
+    await vi.waitFor(() => expect(adapter.hasActiveBackgroundWork(input.runId)).toBe(false))
+    return completed
+  }
+  const finish = async () => {
+    expect(await end()).toBeUndefined()
+  }
+  return {
+    input,
+    cancel: () => controller.abort(),
+    basis,
+    text,
+    path,
+    promptId,
+    append,
+    hook,
+    pre,
+    post,
+    nativeCall,
+    assistant,
+    result,
+    record,
+    unavailable,
+    evidence,
+    outputFailure,
+    report,
+    options,
+    adapter,
+    finish,
+    end,
+    complete,
+    invoke: (args: unknown = {}) =>
+      exchange('tools/call', { name: 'retain_current_plan', arguments: args }),
+    dispose: async () => {
+      controller.abort()
+      closed = true
+      wake?.()
+      wake = undefined
+      child.emit('close', 0, null)
+      await outcome
+      await server.instance.close()
+      await adapter.dispose()
+      await rm(directory, { recursive: true, force: true })
     },
   }
 }

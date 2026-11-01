@@ -7,6 +7,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   advanceCollaboration,
+  collaborationActor,
+  collaborationActionBasisSchema,
   CONVERSATION_PATCH_BYTES,
   conversationPatchSchema,
   collaborationTaskSchema,
@@ -27,6 +29,9 @@ import {
   schedulingHandoffs,
   schedulingEvaluations,
   schedulingBudgetReservations,
+  workflowTurns,
+  collaborationActionReceipts,
+  agentEventJournal,
 } from './schema/index.js'
 
 const databases: PactDatabase[] = [],
@@ -44,7 +49,11 @@ const settings = {
   maxRepairAttempts: 3,
 } as const
 const hash = (text: string) => createHash('sha256').update(text).digest('hex')
-async function fixture(filePath = ':memory:', onOpened?: () => void) {
+async function fixture(
+  filePath = ':memory:',
+  onOpened?: () => void,
+  roles: { primary: 'codex' | 'claude'; split?: boolean } = { primary: 'codex' },
+) {
   const db = await PactDatabase.open({
     filePath,
     migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
@@ -66,7 +75,7 @@ async function fixture(filePath = ':memory:', onOpened?: () => void) {
   })
   db.sessionRepository.create(
     { id: sessionId, projectId, title: 'Collaboration', createdAt: now },
-    settings,
+    { ...settings, primaryAgentId: roles.primary },
   )
   const initial = collaborationTaskSchema.parse({
     id: randomUUID(),
@@ -74,15 +83,16 @@ async function fixture(filePath = ':memory:', onOpened?: () => void) {
     kind: 'plan',
     revision: 0,
     protocol: 'native-workflow-v1',
-    owner: 'codex',
-    reviewer: 'claude',
+    owner: roles.primary,
+    reviewer: roles.primary === 'codex' ? 'claude' : 'codex',
+    ...(roles.split ? { rolePolicy: 'split-stages-v1' } : {}),
     automation: 'active',
     inputSequence: 0,
     handledInputSequence: 0,
     task: 'Review cancellation.',
     taskMessageId: messageId,
     stage: 'plan',
-    actor: 'codex',
+    actor: roles.primary,
     status: 'running',
     runId: messageId,
     planVersion: 0,
@@ -96,7 +106,7 @@ async function fixture(filePath = ':memory:', onOpened?: () => void) {
     content: '/plan Review cancellation.',
     expectedCommentsRevision: 0,
     commentIds: [],
-    agentId: 'codex',
+    agentId: roles.primary,
     settingsRevision: 1,
     model: null,
     effort: null,
@@ -109,8 +119,10 @@ async function fixture(filePath = ':memory:', onOpened?: () => void) {
       verdict?: 'accepted' | 'changes_requested' | 'needs_user' | 'incomplete'
       questions?: import('@pact/contracts').CollaborationQuestions
       inputOutcome?: 'processed' | 'needs_user' | 'incomplete'
+      outcome?: 'completed' | 'interrupted'
       answer?: string
     } = { plan: 'Scope and acceptance.' },
+    settleEffects = true,
   ) => {
     const run = repo.findRun(runId)!
     repo.applyEvent(sessionId, runId, {
@@ -145,7 +157,7 @@ async function fixture(filePath = ':memory:', onOpened?: () => void) {
     repo.recordNativeEvidence({
       kind: 'ended',
       source: 'stored_terminal',
-      outcome: 'completed',
+      outcome: result.outcome ?? 'completed',
       identity: {
         sessionId,
         agentId: run.agentId,
@@ -156,14 +168,14 @@ async function fixture(filePath = ':memory:', onOpened?: () => void) {
         bindingGeneration: run.bindingGeneration ?? 1,
       },
     })
-    repo.recordNativeEffects(runId, 'settled')
+    if (settleEffects) repo.recordNativeEffects(runId, 'settled')
     repo.applyEvent(sessionId, runId, {
       type: 'turn.completed',
       agentId: run.agentId,
       turnId: `turn-${runId}`,
-      outcome: 'completed',
+      outcome: result.outcome ?? 'completed',
     })
-    repo.recordNativeEffects(runId, 'settled')
+    if (settleEffects) repo.recordNativeEffects(runId, 'settled')
   }
   const drafts = () => {
     const value = repo.readPage({ scope: 'drafts', sessionId })
@@ -318,7 +330,10 @@ async function confirmedSupplement(
   kind: 'supplement_plan' | 'supplement_code_response',
 ) {
   const task = f.repo.collaboration(f.sessionId)!,
-    handoff = f.repo.workflowHandoff(task, kind === 'supplement_plan' ? task.reviewer : task.owner),
+    handoff = f.repo.workflowHandoff(
+      task,
+      collaborationActor(task, kind === 'supplement_plan' ? 'plan_review' : 'respond'),
+    ),
     candidateId = `propose_${kind}`,
     deadlineAt = Date.now() + 15_000
   expect(f.repo.relaySupplementOpportunity(handoff)?.kind).toBe(kind)
@@ -1515,6 +1530,7 @@ it.each(['identical', 'changed', 'retained'] as const)(
     if (kind === 'retained')
       f.repo.recordWorkflowPlanRetained(reply.run.id, {
         nativeId: 'retained-source',
+        confirmation: 'native_root_settled_v1',
         sha256: original.document.sha256,
         bytes: original.document.bytes,
         chars: original.document.chars,
@@ -1537,6 +1553,67 @@ it.each(['identical', 'changed', 'retained'] as const)(
     expect(current.planReference?.sourceRunId).toBe(
       kind === 'retained' ? original.sourceRunId : reply.run.id,
     )
+  },
+)
+
+it.each(['confirmed', 'legacy', 'missing'] as const)(
+  'cold reply settlement requires a final retention confirmation: %s',
+  async (mode) => {
+    const directory = await mkdtemp(join(tmpdir(), 'pact-retained-plan-cold-'))
+    directories.push(directory)
+    const filePath = join(directory, 'pact.sqlite')
+    const f = await fixture(filePath)
+    f.finish()
+    const reference = f.repo.collaboration(f.sessionId)!.planReference!
+    const review = advance(f)
+    f.finish(review.id, { verdict: 'accepted' })
+    f.receive()
+    const reply = f.materialize()
+    const hasCandidate = mode === 'confirmed'
+    if (mode !== 'missing')
+      f.repo.recordWorkflowPlanRetained(reply.run.id, {
+        nativeId: 'authenticated-retention',
+        ...(hasCandidate ? { confirmation: 'native_root_settled_v1' as const } : {}),
+        sha256: reference.document.sha256,
+        bytes: reference.document.bytes,
+        chars: reference.document.chars,
+      })
+    if (hasCandidate) {
+      f.repo.recordWorkflowPlanRetained(reply.run.id, {
+        nativeId: 'stale-cold-candidate',
+        sha256: 'f'.repeat(64),
+        bytes: 1,
+        chars: 1,
+      })
+    }
+    f.finish(reply.run.id, { answer: 'The frozen plan remains appropriate.' }, false)
+    expect(f.repo.collaboration(f.sessionId)!.inputProcessing?.pending).toBeDefined()
+    f.db.close()
+    databases.splice(databases.indexOf(f.db), 1)
+    const cold = await PactDatabase.open({
+      filePath,
+      migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
+    })
+    databases.push(cold)
+    const repo = cold.conversationRepository
+    repo.recoverCollaborationTasks()
+    // A saved native ending alone cannot establish that effects have finished.
+    expect(repo.collaboration(f.sessionId)!.inputProcessing?.pending).toBeDefined()
+    repo.recordNativeEffects(reply.run.id, 'settled')
+    repo.reconcileCompletedCollaboration(reply.run.id)
+    const settled = repo.collaboration(f.sessionId)!
+    expect(settled.planReference).toEqual(reference)
+    expect(settled.automation).toBe('paused')
+    expect(settled.inputProcessing?.pending === undefined).toBe(hasCandidate)
+    expect(settled.planInputSequence).toBe(hasCandidate ? 2 : 1)
+    expect(settled.review?.inputSequence).toBe(1)
+    expect(repo.read(f.sessionId).runs).toHaveLength(3)
+    repo.reconcileCompletedCollaboration(reply.run.id)
+    expect(repo.collaboration(f.sessionId)).toEqual(settled)
+    const facts = cold.drizzle.get<{ count: number }>(
+      sql`select count(*) as count from agent_event_journal where run_id=${reply.run.id} and event_type='workflow.plan_settled'`,
+    )
+    expect(facts?.count).toBe(hasCandidate ? 1 : 0)
   },
 )
 
@@ -1918,3 +1995,428 @@ it('keeps unknown old evaluations active without replay and reads the active own
   expect(JSON.stringify(plan)).toContain('scheduling_evaluations_active')
   expect(f.repo.schedulingBudget(node.budgetSubjectId)?.evaluationCalls).toBe(1)
 })
+
+describe('Split collaboration stage responsibilities', () => {
+  it.each(['codex', 'claude'] as const)(
+    'binds planning, both reviews, implementation and repair to the frozen %s Primary',
+    async (primary) => {
+      const secondary = primary === 'codex' ? 'claude' : 'codex'
+      const f = await fixture(':memory:', undefined, { primary, split: true })
+      expect(f.first.run.agentId).toBe(primary)
+      f.finish()
+      const plan = f.repo.collaboration(f.sessionId)!.planReference!
+      const refuseSelfReview = () => {
+        const current = f.repo.collaboration(f.sessionId)!
+        const next = advanceCollaboration(current, 'continue', settings)
+        const wrong = next.actor === 'codex' ? 'claude' : 'codex'
+        const runs = f.repo.read(f.sessionId).runs.length
+        expect(() =>
+          f.repo.beginRun({
+            sessionId: f.sessionId,
+            clientMessageId: randomUUID(),
+            content: 'Wrong reviewer',
+            commentIds: [],
+            expectedCommentsRevision: f.drafts().commentsRevision,
+            agentId: wrong,
+            settingsRevision: 1,
+            model: null,
+            effort: null,
+            preserveDraftComments: true,
+            expectedCollaborationRevision: current.revision,
+            collaboration: { ...next, actor: wrong },
+          }),
+        ).toThrow(/frozen stage responsibility/)
+        expect(f.repo.read(f.sessionId).runs).toHaveLength(runs)
+      }
+      refuseSelfReview()
+      const planReview = advance(f)
+      expect(planReview.agentId).toBe(secondary)
+      expect(() => f.repo.recordWorkflowReview(f.first.run.id, { verdict: 'accepted' })).toThrow(
+        /independent review/,
+      )
+      expect(() =>
+        f.repo.recordWorkflowPlan(planReview.id, { nativeId: 'foreign', text: 'Wrong author' }),
+      ).toThrow(/plan author/)
+      f.finish(planReview.id, { verdict: 'accepted' })
+      const implementation = advance(f, 'execute')
+      expect(implementation.agentId).toBe(secondary)
+      const writeAuth = f.repo.collaborationTurnAuthorization(implementation.id)!
+      const receipt = f.db.drizzle
+        .select()
+        .from(collaborationActionReceipts)
+        .where(eq(collaborationActionReceipts.id, writeAuth.userAuthority!.receiptId))
+        .get()!
+      expect(receipt.actor).toBe(secondary)
+      expect(collaborationActionBasisSchema.parse(JSON.parse(receipt.basisJson))).toMatchObject({
+        rolePolicy: 'split-stages-v1',
+        actor: secondary,
+        stage: 'implement',
+        planReference: plan,
+      })
+      expect(() => f.repo.recordWorkflowReview(implementation.id, { verdict: 'accepted' })).toThrow(
+        /independent review/,
+      )
+      f.finish(implementation.id, { answer: 'Implemented exact scope.' })
+      refuseSelfReview()
+      const firstCodeReview = advance(f)
+      expect(firstCodeReview.agentId).toBe(primary)
+      f.finish(firstCodeReview.id, { verdict: 'changes_requested' })
+      const response = advance(f, 'respond')
+      expect(response.agentId).toBe(secondary)
+      f.finish(response.id, { answer: 'Answered the precise code review.' })
+      const secondCodeReview = advance(f)
+      expect(secondCodeReview.agentId).toBe(primary)
+      f.finish(secondCodeReview.id, { verdict: 'changes_requested' })
+      const repair = advance(f, 'repair')
+      expect(repair.agentId).toBe(secondary)
+      f.finish(repair.id, { answer: 'Repaired the explicitly authorized scope.' })
+      const finalCodeReview = advance(f)
+      expect(finalCodeReview.agentId).toBe(primary)
+      f.finish(finalCodeReview.id, { verdict: 'accepted' })
+      expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+        rolePolicy: 'split-stages-v1',
+        status: 'complete',
+        owner: primary,
+        reviewer: secondary,
+        planReference: plan,
+        review: { actor: primary, stage: 'code_review', verdict: 'accepted' },
+      })
+      expect(
+        f.db.drizzle
+          .select()
+          .from(collaborationActionReceipts)
+          .all()
+          .map((row) => row.actor),
+      ).toEqual([secondary, secondary, secondary])
+    },
+  )
+
+  it.each(['codex', 'claude'] as const)(
+    'retains the original four legacy duties when %s is the historical owner',
+    async (primary) => {
+      const secondary = primary === 'codex' ? 'claude' : 'codex'
+      const f = await fixture(':memory:', undefined, { primary })
+      f.finish()
+      const planReview = advance(f)
+      expect(planReview.agentId).toBe(secondary)
+      f.finish(planReview.id, { verdict: 'accepted' })
+      const implementation = advance(f, 'execute')
+      expect(implementation.agentId).toBe(primary)
+      const auth = f.repo.collaborationTurnAuthorization(implementation.id)!
+      const receipt = f.db.drizzle
+        .select()
+        .from(collaborationActionReceipts)
+        .where(eq(collaborationActionReceipts.id, auth.userAuthority!.receiptId))
+        .get()!
+      expect(JSON.parse(receipt.basisJson)).not.toHaveProperty('rolePolicy')
+      f.finish(implementation.id, { answer: 'Legacy owner completed authorized implementation.' })
+      const codeReview = advance(f)
+      expect(codeReview.agentId).toBe(secondary)
+      f.finish(codeReview.id, { verdict: 'accepted' })
+      expect(f.repo.collaboration(f.sessionId)?.rolePolicy).toBeUndefined()
+    },
+  )
+
+  it.each(['codex', 'claude'] as const)(
+    'round-trips split %s plan and code supplement grants through strict action bases',
+    async (primary) => {
+      const secondary = primary === 'codex' ? 'claude' : 'codex'
+      const f = await fixture(':memory:', undefined, { primary, split: true })
+      await planSupplementOpportunity(f)
+      const planSupplement = await confirmedSupplement(f, 'supplement_plan')
+      expect(planSupplement.next.actor).toBe(primary)
+      expect(
+        collaborationActionBasisSchema.parse(JSON.parse(planSupplement.receipt.basisJson)),
+      ).toMatchObject({
+        rolePolicy: 'split-stages-v1',
+        actor: primary,
+        stage: 'plan',
+      })
+      const extraPlan = startConfirmedSupplement(f, planSupplement)
+      f.finish(extraPlan.id, { plan: 'Complete clarified plan without changing responsibilities.' })
+      const planReview = advance(f)
+      expect(planReview.agentId).toBe(secondary)
+      f.finish(planReview.id, { verdict: 'accepted' })
+      const implementation = advance(f, 'execute')
+      f.finish(implementation.id, { answer: 'Implemented complete plan.' })
+      const codeReview = advance(f)
+      f.finish(codeReview.id, { verdict: 'changes_requested' })
+      const response = advance(f, 'respond')
+      f.finish(response.id, { answer: 'Response within current scope.' })
+      const repeatedReview = advance(f)
+      f.finish(repeatedReview.id, { verdict: 'changes_requested' })
+      const codeSupplement = await confirmedSupplement(f, 'supplement_code_response')
+      expect(codeSupplement.next.actor).toBe(secondary)
+      expect(
+        collaborationActionBasisSchema.parse(JSON.parse(codeSupplement.receipt.basisJson)),
+      ).toMatchObject({
+        rolePolicy: 'split-stages-v1',
+        actor: secondary,
+        stage: 'respond',
+      })
+      const extraCode = startConfirmedSupplement(f, codeSupplement)
+      const auth = f.repo.collaborationTurnAuthorization(extraCode.id)!
+      expect(auth.userAuthority).toMatchObject({
+        purpose: 'supplement_code_response',
+        returnStage: 'code_review',
+        returnActor: primary,
+      })
+      f.finish(extraCode.id, { answer: 'Clarified code evidence.' })
+      const finalReview = advance(f)
+      expect(finalReview.agentId).toBe(primary)
+      f.finish(finalReview.id, { verdict: 'accepted' })
+      expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete')
+    },
+  )
+})
+
+describe('Explicit adoption of split roles for a ready plan', () => {
+  it.each(['codex', 'claude'] as const)(
+    'adopts %s Primary once without rewriting plan, review, frozen history or existing bindings, including restart',
+    async (primary) => {
+      const directory = await mkdtemp(join(tmpdir(), 'pact-split-adoption-'))
+      directories.push(directory)
+      const filePath = join(directory, 'pact.sqlite')
+      const f = await fixture(filePath, undefined, { primary })
+      f.finish()
+      const reviewed = advance(f)
+      f.finish(reviewed.id, { verdict: 'accepted' })
+      const before = f.repo.collaboration(f.sessionId)!
+      const snapshot = () => ({
+        turns: f.db.drizzle.select().from(workflowTurns).all(),
+        receipts: f.db.drizzle.select().from(collaborationActionReceipts).all(),
+        runIds: f.repo.read(f.sessionId).runs.map((run) => run.id),
+        bindings: (['codex', 'claude'] as const).map((agent) =>
+          f.repo.nativeContext(f.sessionId, agent),
+        ),
+      })
+      const frozen = snapshot()
+      const request = {
+        sessionId: f.sessionId,
+        taskId: before.id,
+        revision: before.revision,
+        settingsRevision: 1,
+        operationId: randomUUID(),
+      }
+      const oldHandoff = f.repo.workflowHandoff(before, before.owner)
+      f.repo.adoptSplitStageRoles(request)
+      const adopted = f.repo.collaboration(f.sessionId)!
+      expect(adopted).toEqual({
+        ...before,
+        rolePolicy: 'split-stages-v1',
+        revision: before.revision + 1,
+      })
+      expect(snapshot()).toEqual(frozen)
+      expect(f.repo.workflowHandoff(adopted, adopted.reviewer).factFingerprint).not.toBe(
+        oldHandoff.factFingerprint,
+      )
+      f.repo.adoptSplitStageRoles(request)
+      expect(f.repo.collaboration(f.sessionId)).toEqual(adopted)
+      expect(
+        f.db.drizzle
+          .select()
+          .from(agentEventJournal)
+          .where(eq(agentEventJournal.eventType, 'workflow.role_policy_adopted'))
+          .all(),
+      ).toHaveLength(1)
+      expect(() =>
+        f.repo.setCollaborationState({
+          ...adopted,
+          rolePolicy: undefined,
+          revision: adopted.revision + 1,
+        }),
+      ).toThrow(/collaboration changed/)
+      f.db.close()
+      databases.splice(databases.indexOf(f.db), 1)
+      const cold = await PactDatabase.open({
+        filePath,
+        migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
+      })
+      databases.push(cold)
+      cold.conversationRepository.recoverCollaborationTasks()
+      const restored = cold.conversationRepository.collaboration(f.sessionId)!
+      expect(restored.rolePolicy).toBe('split-stages-v1')
+      expect(restored.planReference).toEqual(before.planReference)
+      expect(restored.review).toEqual(before.review)
+      expect(restored.authorization).toEqual(before.authorization)
+      expect(collaborationActor(restored, 'implement')).toBe(
+        primary === 'codex' ? 'claude' : 'codex',
+      )
+      expect(cold.drizzle.select().from(workflowTurns).all()).toEqual(frozen.turns)
+      expect(cold.conversationRepository.read(f.sessionId).runs.map((run) => run.id)).toEqual(
+        frozen.runIds,
+      )
+    },
+  )
+
+  it.each(['revision', 'settings', 'primary', 'input', 'effects', 'authority', 'write'] as const)(
+    'refuses adoption after %s changes without mutating the task or its audit history',
+    async (change) => {
+      const f = await fixture()
+      f.finish()
+      const review = advance(f)
+      f.finish(review.id, { verdict: 'accepted' })
+      const original = f.repo.collaboration(f.sessionId)!
+      if (change === 'settings' || change === 'primary') {
+        const saved = f.db.sessionRepository.find(f.sessionId)!.settings
+        f.db.sessionRepository.saveSettings(f.sessionId, {
+          ...saved,
+          primaryAgentId: change === 'primary' ? 'claude' : 'codex',
+        })
+      } else if (change === 'input') f.receive()
+      else if (change === 'effects') f.repo.recordNativeEffects(review.id, 'unknown')
+      else if (change === 'authority')
+        f.repo.prepareCollaborationAction(
+          {
+            sessionId: f.sessionId,
+            taskId: original.id,
+            revision: original.revision,
+            clientMessageId: randomUUID(),
+            action: 'execute',
+          },
+          settings,
+        )
+      else if (change === 'write') advance(f, 'execute')
+      const before = f.repo.collaboration(f.sessionId)!
+      const turns = f.db.drizzle.select().from(workflowTurns).all()
+      const runCount = f.repo.read(f.sessionId).runs.length
+      expect(() =>
+        f.repo.adoptSplitStageRoles({
+          sessionId: f.sessionId,
+          taskId: before.id,
+          revision: before.revision - (change === 'revision' ? 1 : 0),
+          settingsRevision: change === 'primary' ? 2 : 1,
+          operationId: randomUUID(),
+        }),
+      ).toThrow(/Only a settled accepted plan/)
+      expect(f.repo.collaboration(f.sessionId)).toEqual(before)
+      expect(f.db.drizzle.select().from(workflowTurns).all()).toEqual(turns)
+      expect(f.repo.read(f.sessionId).runs).toHaveLength(runCount)
+      expect(
+        f.db.drizzle
+          .select()
+          .from(agentEventJournal)
+          .where(eq(agentEventJournal.eventType, 'workflow.role_policy_adopted'))
+          .all(),
+      ).toHaveLength(0)
+    },
+  )
+})
+
+it.each([
+  { primary: 'codex', split: false },
+  { primary: 'claude', split: false },
+  { primary: 'codex', split: true },
+  { primary: 'claude', split: true },
+] as const)(
+  'continues the exact original $primary write after restart and Primary changes; split=$split',
+  async ({ primary, split }) => {
+    const directory = await mkdtemp(join(tmpdir(), 'pact-role-continuation-'))
+    directories.push(directory)
+    const filePath = join(directory, 'pact.sqlite')
+    const f = await fixture(filePath, undefined, { primary, split })
+    const secondary = primary === 'codex' ? 'claude' : 'codex'
+    const implementer = split ? secondary : primary
+    f.finish()
+    const review = advance(f)
+    f.finish(review.id, { verdict: 'accepted' })
+    const write = advance(f, 'execute')
+    const originalAuth = f.repo.collaborationTurnAuthorization(write.id)!
+    const rootReceipt = f.db.drizzle
+      .select()
+      .from(collaborationActionReceipts)
+      .where(eq(collaborationActionReceipts.id, originalAuth.userAuthority!.rootReceiptId))
+      .get()!
+    f.finish(write.id, {
+      outcome: 'interrupted',
+      answer: 'Unfinished authorized work; source retained.',
+    })
+    const interrupted = f.repo.collaboration(f.sessionId)!
+    expect(interrupted.pendingWork).toMatchObject({ stage: 'implement', runId: write.id })
+    const frozenTurn = f.db.drizzle
+      .select()
+      .from(workflowTurns)
+      .where(eq(workflowTurns.runId, write.id))
+      .get()!
+    f.db.sessionRepository.saveSettings(f.sessionId, {
+      ...f.db.sessionRepository.find(f.sessionId)!.settings,
+      primaryAgentId: secondary,
+    })
+    f.db.close()
+    databases.splice(databases.indexOf(f.db), 1)
+    const db = await PactDatabase.open({
+      filePath,
+      migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
+    })
+    databases.push(db)
+    const repo = db.conversationRepository
+    repo.recoverCollaborationTasks()
+    const current = repo.collaboration(f.sessionId)!
+    expect(current.rolePolicy).toBe(split ? 'split-stages-v1' : undefined)
+    expect(current.pendingWork).toEqual(interrupted.pendingWork)
+    const prepared = repo.prepareCollaborationAction(
+      {
+        sessionId: f.sessionId,
+        taskId: current.id,
+        revision: current.revision,
+        clientMessageId: randomUUID(),
+        action: 'resume',
+      },
+      settings,
+    )
+    if (!prepared.next || !prepared.task || !prepared.handoff)
+      throw new Error('Missing concrete continuation')
+    expect(prepared.next.actor).toBe(implementer)
+    const basis = collaborationActionBasisSchema.parse(JSON.parse(prepared.receipt.basisJson))
+    expect(basis.actor).toBe(implementer)
+    expect(basis.rolePolicy).toBe(split ? 'split-stages-v1' : undefined)
+    const admission = {
+      sessionId: f.sessionId,
+      clientMessageId: prepared.receipt.clientNonce,
+      content: 'Continue only the original unfinished scope.',
+      commentIds: [],
+      expectedCommentsRevision: 0,
+      agentId: prepared.next.actor,
+      settingsRevision: 2,
+      model: null,
+      effort: null,
+      preserveDraftComments: true,
+      expectedCollaborationRevision: prepared.task.revision,
+      collaboration: prepared.next,
+      schedulingHandoff: prepared.handoff,
+      collaborationActionReceiptId: prepared.receipt.id,
+    }
+    const continued = repo.beginRun(admission)
+    const auth = repo.collaborationTurnAuthorization(continued.run.id)!
+    expect(continued.run.agentId).toBe(implementer)
+    expect(auth.userAuthority).toMatchObject({
+      rootReceiptId: originalAuth.userAuthority!.rootReceiptId,
+      purpose: 'write_continuation',
+    })
+    expect(repo.collaboration(f.sessionId)?.repairAttempts).toBe(interrupted.repairAttempts)
+    expect(
+      db.drizzle.select().from(workflowTurns).where(eq(workflowTurns.runId, write.id)).get(),
+    ).toEqual(frozenTurn)
+    const savedRoot = db.drizzle
+      .select()
+      .from(collaborationActionReceipts)
+      .where(eq(collaborationActionReceipts.id, rootReceipt.id))
+      .get()!
+    expect({
+      actor: savedRoot.actor,
+      rootReceiptId: savedRoot.rootReceiptId,
+      basisJson: savedRoot.basisJson,
+    }).toEqual({
+      actor: rootReceipt.actor,
+      rootReceiptId: rootReceipt.rootReceiptId,
+      basisJson: rootReceipt.basisJson,
+    })
+    const batch = repo.readFrozenInputBatch(continued.run.id, originalAuth.inputBatchRef!.id)
+    expect(batch.batch).toMatchObject(originalAuth.inputBatchRef!)
+    expect(repo.sourceDocumentAuthorized(continued.run.id, batch.body!)).toBe(true)
+    expect(repo.beginRun(admission)).toMatchObject({
+      created: false,
+      run: { id: continued.run.id },
+    })
+  },
+)

@@ -999,7 +999,7 @@ async function repairDecisionFlow(primary: RuntimeAgentId, candidate: 'propose_r
 
 describe('Grounded Repair decisions through the existing Conversation owner', () => {
   it.each(['codex', 'claude'] as const)(
-    'requires a fresh user grant before the %s owner repairs, then returns once to the fixed reviewer',
+    'requires a fresh Secondary repair grant and returns to Primary code review when Primary is %s',
     async (primary) => {
       const f = await repairDecisionFlow(primary, 'propose_repair'),
         repo = f.db.conversationRepository,
@@ -1019,8 +1019,8 @@ describe('Grounded Repair decisions through the existing Conversation owner', ()
         category: 'new_authorization',
         operation: {
           kind: 'repair',
-          actor: primary,
-          returnActor: primary === 'codex' ? 'claude' : 'codex',
+          actor: primary === 'codex' ? 'claude' : 'codex',
+          returnActor: primary,
           afterRunId: before.runId,
         },
       })
@@ -1076,7 +1076,7 @@ describe('Grounded Repair decisions through the existing Conversation owner', ()
         fixedReview = native.inputs[5]!
       expect(repair.promptEnvelope.collaboration).toMatchObject({
         stage: 'repair',
-        actor: primary,
+        actor: primary === 'codex' ? 'claude' : 'codex',
         reviewScopeRef: before.reviewScopeRef,
       })
       expect(repair.promptEnvelope.collaborationAuthorization?.userAuthority).toMatchObject({
@@ -1091,7 +1091,7 @@ describe('Grounded Repair decisions through the existing Conversation owner', ()
       ).toBe(false)
       expect(fixedReview.promptEnvelope.collaboration).toMatchObject({
         stage: 'code_review',
-        actor: before.reviewer,
+        actor: primary,
       })
       expect(
         collaborationReadOnly(
@@ -1200,6 +1200,185 @@ describe('Grounded Repair decisions through the existing Conversation owner', ()
 })
 
 describe('Native workflow admission and durable dispatch', () => {
+  it.each(['codex', 'claude'] as const)(
+    'dispatches a legacy queued build with its original %s actor after Primary changes',
+    async (primary) => {
+      const f = await fixture(primary),
+        hold = Promise.withResolvers<void>()
+      native.hold = hold.promise
+      try {
+        expect(await f.flow.send(f.input('Finish the original request.'))).toMatchObject({
+          ok: true,
+        })
+        await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+        const request = f.input('/build Preserve the already accepted legacy scope.'),
+          owner = randomUUID()
+        const body = f.db.conversationRepository.writeConversationInput(
+          { type: 'begin', sessionId: f.sessionId, clientMessageId: request.clientMessageId },
+          owner,
+        )
+        f.db.conversationRepository.writeConversationInput(
+          {
+            type: 'append',
+            sessionId: f.sessionId,
+            inputId: body.inputId,
+            offset: 0,
+            text: request.content,
+          },
+          owner,
+        )
+        f.db.conversationRepository.writeConversationInput(
+          { type: 'seal', sessionId: f.sessionId, inputId: body.inputId },
+          owner,
+        )
+        f.db.conversationRepository.receiveQueuedInput(
+          request,
+          body.inputId,
+          primary,
+          owner,
+          native.inputs[0]!.runId,
+        )
+        expect(
+          f.db.conversationRepository.readReceivedInput(f.sessionId)?.metadata.rolePolicy,
+        ).toBeUndefined()
+        f.db.sessionRepository.saveSettings(f.sessionId, {
+          ...f.db.sessionRepository.find(f.sessionId)!.settings,
+          primaryAgentId: primary === 'codex' ? 'claude' : 'codex',
+        })
+        native.hold = undefined
+        hold.resolve()
+        await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+        const task = await f.settled()
+        expect(task.rolePolicy).toBeUndefined()
+        expect(task.owner).toBe(primary)
+        expect(f.db.conversationRepository.findRun(native.inputs[1]!.runId)?.agentId).toBe(primary)
+        expect(f.db.conversationRepository.findRun(native.inputs[2]!.runId)?.agentId).toBe(
+          primary === 'codex' ? 'claude' : 'codex',
+        )
+      } finally {
+        native.hold = undefined
+        hold.resolve()
+      }
+    },
+  )
+
+  it.each([
+    {
+      primary: 'codex',
+      kind: 'plan',
+      first: 'codex',
+      stages: ['plan', 'plan_review'],
+      actors: ['codex', 'claude'],
+    },
+    {
+      primary: 'claude',
+      kind: 'plan',
+      first: 'claude',
+      stages: ['plan', 'plan_review'],
+      actors: ['claude', 'codex'],
+    },
+    {
+      primary: 'codex',
+      kind: 'build',
+      first: 'claude',
+      stages: ['implement', 'code_review'],
+      actors: ['claude', 'codex'],
+    },
+    {
+      primary: 'claude',
+      kind: 'build',
+      first: 'codex',
+      stages: ['implement', 'code_review'],
+      actors: ['codex', 'claude'],
+    },
+    {
+      primary: 'codex',
+      kind: 'review',
+      first: 'codex',
+      stages: ['code_review'],
+      actors: ['codex'],
+    },
+    {
+      primary: 'claude',
+      kind: 'review',
+      first: 'claude',
+      stages: ['code_review'],
+      actors: ['claude'],
+    },
+  ] as const)(
+    'admits only the assigned /$kind recipient when Primary is $primary',
+    async ({ primary, kind, first, stages, actors }) => {
+      const f = await fixture(primary)
+      const wrong = first === 'codex' ? 'claude' : 'codex'
+      expect(await f.flow.send(f.input(`@${wrong} /${kind} Verify cancellation`))).toMatchObject({
+        ok: false,
+        error: { code: 'CONFLICT' },
+      })
+      expect(
+        await f.flow.send({
+          ...f.input(`/${kind} Verify cancellation`),
+          route: { type: 'agent', agentId: wrong },
+        }),
+      ).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
+      expect(native.inputs).toHaveLength(0)
+      expect(f.db.conversationRepository.read(f.sessionId).runs).toHaveLength(0)
+      expect(await f.flow.send(f.input(`@${first} /${kind} Verify cancellation`))).toMatchObject({
+        ok: true,
+      })
+      const task = await f.settled()
+      expect(task).toMatchObject({ owner: primary, rolePolicy: 'split-stages-v1' })
+      expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual(
+        stages,
+      )
+      expect(
+        native.inputs.map((input) => f.db.conversationRepository.findRun(input.runId)?.agentId),
+      ).toEqual(actors)
+    },
+  )
+
+  it.each([
+    { primary: 'codex', kind: 'plan', actor: 'codex', count: 2 },
+    { primary: 'claude', kind: 'plan', actor: 'claude', count: 2 },
+    { primary: 'codex', kind: 'build', actor: 'claude', count: 2 },
+    { primary: 'claude', kind: 'build', actor: 'codex', count: 2 },
+    { primary: 'codex', kind: 'review', actor: 'codex', count: 1 },
+    { primary: 'claude', kind: 'review', actor: 'claude', count: 1 },
+  ] as const)(
+    'preserves accepted queued /$kind roles after Primary $primary changes',
+    async ({ primary, kind, actor, count }) => {
+      const f = await fixture(primary),
+        hold = Promise.withResolvers<void>()
+      native.hold = hold.promise
+      try {
+        expect(await f.flow.send(f.input('Finish the current ordinary request.'))).toMatchObject({
+          ok: true,
+        })
+        await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+        expect(
+          await f.flow.send(f.input(`/${kind} Verify the queued cancellation scope.`)),
+        ).toMatchObject({ ok: true })
+        expect(f.db.conversationRepository.readReceivedInput(f.sessionId)).toMatchObject({
+          actor,
+          metadata: { rolePolicy: 'split-stages-v1', workflowCommand: true },
+        })
+        f.db.sessionRepository.saveSettings(f.sessionId, {
+          ...f.db.sessionRepository.find(f.sessionId)!.settings,
+          primaryAgentId: primary === 'codex' ? 'claude' : 'codex',
+        })
+        native.hold = undefined
+        hold.resolve()
+        await vi.waitFor(() => expect(native.inputs).toHaveLength(count + 1))
+        const task = await f.settled()
+        expect(task).toMatchObject({ owner: primary, rolePolicy: 'split-stages-v1' })
+        expect(f.db.conversationRepository.findRun(native.inputs[1]!.runId)?.agentId).toBe(actor)
+        expect(f.db.conversationRepository.readReceivedInput(f.sessionId)).toBeUndefined()
+      } finally {
+        native.hold = undefined
+        hold.resolve()
+      }
+    },
+  )
+
   it('rereads current source ownership and document facts across rollback and Stop', async () => {
     const f = await fixture('codex', false, true)
     native.next = { plan: 'Authoritative source.\n'.repeat(700) }
@@ -1279,13 +1458,14 @@ describe('Native workflow admission and durable dispatch', () => {
   })
 
   it.each(['codex', 'claude'] as const)(
-    'automatically reviews %s plans but requires explicit execution by their owner',
+    'plans with Primary %s, reviews with Secondary, then explicitly implements with Secondary and reviews code with Primary',
     async (primary) => {
       const f = await fixture(primary, true)
       expect((await f.flow.send(f.input('/plan Implement cancellation'))).ok).toBe(true)
       expect(await f.settled()).toMatchObject({
         status: 'ready',
         owner: primary,
+        rolePolicy: 'split-stages-v1',
         stage: 'plan_review',
       })
       expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
@@ -1310,8 +1490,8 @@ describe('Native workflow admission and durable dispatch', () => {
       expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.actor)).toEqual([
         primary,
         primary === 'codex' ? 'claude' : 'codex',
-        primary,
         primary === 'codex' ? 'claude' : 'codex',
+        primary,
       ])
       expect(collaborationReadOnly(native.inputs[2]!.promptEnvelope.collaboration)).toBe(false)
     },

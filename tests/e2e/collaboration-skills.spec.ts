@@ -87,13 +87,25 @@ async function prepare(
 }
 
 for (const primary of ['codex', 'claude'] as const)
-  test(`@deterministic native plan from ${primary} is independently reviewed before explicit owner implementation and repair`, async () => {
+  test(`@deterministic native plan from ${primary} is independently reviewed before explicit Secondary implementation and repair`, async () => {
     const f = await prepare(primary)
     try {
-      await f.send('/plan Build reliable cancellation')
-      const owner = primary === 'codex' ? 'Codex' : 'Claude Code'
+      const secondary = primary === 'codex' ? 'claude' : 'codex'
+      await f.send(`@${secondary} /plan Conflicting plan recipient.`)
       await expect(
-        f.page.getByRole('button', { name: `Implement plan · ${owner}`, exact: true }),
+        f.page.getByText(
+          `This Pact plan stage belongs to ${primary}. Remove the conflicting Agent recipient; your draft is preserved.`,
+          { exact: true },
+        ),
+      ).toBeVisible()
+      await expect(f.page.getByRole('combobox', { name: 'Message', exact: true })).toContainText(
+        'Conflicting plan recipient.',
+      )
+      expect(await f.counts()).toEqual({ codex: 0, claude: 0 })
+      await f.send('/plan Build reliable cancellation')
+      const implementer = primary === 'codex' ? 'Claude Code' : 'Codex'
+      await expect(
+        f.page.getByRole('button', { name: `Implement plan · ${implementer}`, exact: true }),
       ).toBeEnabled()
       await expect(
         f.page.getByRole('button', { name: 'Pause collaboration', exact: true }),
@@ -110,9 +122,11 @@ for (const primary of ['codex', 'claude'] as const)
       )
       await closeContextOverlay(f.page)
       await writeFile(join(f.directory, '.pact-data/dev/pact.sqlite'), 'App state changed')
-      await f.page.getByRole('button', { name: `Implement plan · ${owner}`, exact: true }).click()
+      await f.page
+        .getByRole('button', { name: `Implement plan · ${implementer}`, exact: true })
+        .click()
       await expect(
-        f.page.getByRole('button', { name: `Repair · ${owner}`, exact: true }),
+        f.page.getByRole('button', { name: `Repair · ${implementer}`, exact: true }),
       ).toBeEnabled()
       expect(await f.counts()).toEqual({ codex: 2, claude: 2 })
       const reviewed = await current(f.page, f.sessionId)
@@ -122,7 +136,7 @@ for (const primary of ['codex', 'claude'] as const)
         repairAttempts: 0,
       })
       await writeFile(join(f.directory, 'later-change.txt'), 'A real source change')
-      await f.page.getByRole('button', { name: `Repair · ${owner}`, exact: true }).click()
+      await f.page.getByRole('button', { name: `Repair · ${implementer}`, exact: true }).click()
       await expect.poll(async () => (await current(f.page, f.sessionId))?.status).toBe('complete')
       expect(await current(f.page, f.sessionId)).toMatchObject({
         repairAttempts: 1,
@@ -133,7 +147,9 @@ for (const primary of ['codex', 'claude'] as const)
         f.page.getByRole('region', { name: 'Pact collaboration result' }).last(),
       ).toContainText('Complete')
     } catch (error) {
-      const codex = await f.fixture.readCodexFacts(),
+      const codex = await f.fixture
+          .readCodexFacts()
+          .catch(() => ({ fixtureError: 'No native Codex invocation was recorded' })),
         claude = await f.fixture.readClaudeFacts().catch(() => ({ fixtureError: undefined }))
       throw Error(
         `${String(error)}; native fixture: ${codex.fixtureError ?? ''}; ${claude.fixtureError ?? ''}`,
@@ -146,7 +162,7 @@ for (const primary of ['codex', 'claude'] as const)
   })
 
 test('@deterministic structured question answers stay bound to the requesting actor and resume only on explicit continuation', async () => {
-  const f = await prepare('codex', { width: 1000, height: 720 })
+  const f = await prepare('claude', { width: 1000, height: 720 })
   try {
     await f.send('@claude /plan unclear cancellation requirement')
     const card = f.page.getByRole('region', { name: 'Collaboration questions', exact: true })
@@ -177,7 +193,7 @@ test('@deterministic structured question answers stay bound to the requesting ac
     await closeContextOverlay(f.page)
     await f.page.getByRole('button', { name: 'Continue collaboration', exact: true }).click()
     await expect(
-      f.page.getByRole('button', { name: 'Implement plan · Claude Code', exact: true }),
+      f.page.getByRole('button', { name: 'Implement plan · Codex', exact: true }),
     ).toBeEnabled()
     expect(await f.counts()).toEqual({ codex: 1, claude: 2 })
   } catch (error) {
@@ -202,8 +218,9 @@ test('@deterministic direct Review remains read-only until explicit repair and i
     ).toBeEnabled()
     const task = await current(f.page, f.sessionId)
     expect(task).toMatchObject({
-      owner: 'claude',
-      reviewer: 'codex',
+      owner: 'codex',
+      reviewer: 'claude',
+      rolePolicy: 'split-stages-v1',
       stage: 'code_review',
       review: { verdict: 'changes_requested' },
       repairAttempts: 0,
@@ -237,7 +254,7 @@ test('@deterministic cold restart preserves the accepted native plan and pauses 
   try {
     await f.send('/plan Preserve native plan through restart')
     await expect(
-      f.page.getByRole('button', { name: 'Implement plan · Codex', exact: true }),
+      f.page.getByRole('button', { name: 'Implement plan · Claude Code', exact: true }),
     ).toBeEnabled()
     const before = await current(f.page, f.sessionId)
     await quitPact(app)
@@ -308,7 +325,7 @@ for (const primary of ['codex', 'claude'] as const) {
       await f.page.getByRole('button', { name: 'Continue collaboration', exact: true }).click()
       await expect(
         f.page.getByRole('button', {
-          name: `Implement plan · ${primary === 'codex' ? 'Codex' : 'Claude Code'}`,
+          name: `Implement plan · ${primary === 'codex' ? 'Claude Code' : 'Codex'}`,
           exact: true,
         }),
       ).toBeEnabled()
@@ -371,7 +388,7 @@ for (const width of [1440, 1000])
     try {
       await f.send('/plan Build reliable cancellation')
       await expect(
-        f.page.getByRole('button', { name: 'Implement plan · Codex', exact: true }),
+        f.page.getByRole('button', { name: 'Implement plan · Claude Code', exact: true }),
       ).toBeEnabled()
       await closeContextOverlay(f.page)
       const composer = f.page.getByRole('combobox', { name: 'Message', exact: true })

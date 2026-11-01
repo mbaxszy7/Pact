@@ -12,6 +12,18 @@ import { isScriptEntry } from './script-entry.mjs'
 
 // Exact business cases, independent of a candidate's mutable tags or test outcome.
 export const realCases = [
+  ...['codex', 'claude'].map((primary) => ({
+    path: 'tests/e2e/collaboration-stage-roles-real.spec.ts',
+    title: `real Primary ${primary} plans and reviews code while Secondary reviews the plan and implements`,
+    tier: 'extended',
+    scenario: 'collaboration',
+  })),
+  ...['codex', 'claude'].map((owner) => ({
+    path: 'tests/e2e/collaboration-result-real.spec.ts',
+    title: `real ${owner} retains an unchanged plan and settles its reply without implementation authority`,
+    tier: 'extended',
+    scenario: 'collaboration',
+  })),
   {
     path: 'tests/e2e/skill-composer.spec.ts',
     title:

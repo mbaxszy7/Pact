@@ -37,6 +37,8 @@ export interface ClaudePlanState {
 }
 
 export function claudePlanInputFingerprint(name: string, input: unknown): string {
+  if (name.endsWith('__retain_current_plan'))
+    return fingerprint([name, claudePlanSubmissionFingerprint(input)])
   const value = object(input)
   return fingerprint([
     name,

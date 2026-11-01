@@ -598,6 +598,138 @@ it.each(['complete', 'failed', 'pending', 'foreign', 'unbound', 'hook', 'wrong_h
   },
 )
 it.each([
+  'valid',
+  'late_write',
+  'late_edit',
+  'failed_write',
+  'pending_write',
+  'wrong_prompt',
+  'wrong_name',
+  'extra_args',
+  'missing_result',
+  'failed_result',
+  'duplicate_call',
+  'duplicate_result',
+  'foreign_root',
+  'child',
+  'different_retain',
+  'child_duplicate',
+  'child_write',
+] as const)(
+  'authenticates host retention from the entire current root without ancestor body: %s',
+  async (mode) => {
+    const profile = join(directory, randomUUID()),
+      nativeSessionId = randomUUID(),
+      nativeTurnId = randomUUID(),
+      promptId = randomUUID(),
+      toolName = 'mcp__owned__retain_current_plan'
+    const project = join(
+      profile,
+      'projects',
+      (await realpath(directory)).replace(/[^a-z0-9]/giu, '-'),
+    )
+    await mkdir(project, { recursive: true })
+    const records: Record<string, unknown>[] = []
+    let parent: string | null = null
+    const append = (record: Record<string, unknown>) => {
+      const id = typeof record.uuid === 'string' ? record.uuid : randomUUID()
+      records.push({
+        uuid: id,
+        parentUuid: parent,
+        ...record,
+        sessionId: nativeSessionId,
+        cwd: directory,
+        timestamp,
+      })
+      parent = id
+    }
+    append({
+      type: 'user',
+      uuid: nativeTurnId,
+      promptId,
+      message: { role: 'user', content: 'Keep the frozen plan' },
+    })
+    const call = (id: string, name: string, toolInput: unknown, extra: object = {}) =>
+      append({
+        type: 'assistant',
+        ...extra,
+        message: {
+          id: randomUUID(),
+          role: 'assistant',
+          content: [{ type: 'tool_use', id, name, input: toolInput }],
+        },
+      })
+    const result = (id: string, failed = false) =>
+      append({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: id, is_error: failed, content: 'ack' }],
+        },
+      })
+    if (mode === 'pending_write' || mode === 'failed_write') {
+      call('write', 'Write', { file_path: '/native/current.md', content: 'Unchanged' })
+      if (mode === 'failed_write') result('write', true)
+    }
+    call(
+      'retain',
+      mode === 'wrong_name' ? 'mcp__foreign__retain_current_plan' : toolName,
+      mode === 'extra_args' ? { planVersion: 2 } : {},
+      mode === 'foreign_root'
+        ? { parentUuid: randomUUID() }
+        : mode === 'child'
+          ? { isSidechain: true }
+          : {},
+    )
+    if (mode === 'duplicate_call') call('retain', toolName, {})
+    if (mode !== 'missing_result') result('retain', mode === 'failed_result')
+    if (mode === 'duplicate_result') result('retain')
+    if (mode === 'child_duplicate') call('retain', toolName, {}, { isSidechain: true })
+    if (mode === 'child_write')
+      call(
+        'child-write',
+        'Write',
+        { file_path: '/native/current.md', content: 'Changed' },
+        { isSidechain: true },
+      )
+    if (mode === 'different_retain') call('other', toolName, {})
+    if (mode === 'late_write' || mode === 'late_edit')
+      call('late', mode === 'late_write' ? 'Write' : 'Edit', {
+        file_path: '/native/current.md',
+        content: 'Later',
+      })
+    await writeFile(
+      join(project, `${nativeSessionId}.jsonl`),
+      records.map((record) => JSON.stringify(record)).join('\n') + '\n',
+    )
+    vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
+    try {
+      const intent = {
+        id: 'retain',
+        promptId: mode === 'wrong_prompt' ? randomUUID() : promptId,
+        toolName,
+        inputFingerprint: claudePlanInputFingerprint(toolName, {}),
+      }
+      const reading = files.readAnswer(
+        { cwd: directory, nativeSessionId, nativeTurnId, terminalPlanRetention: intent },
+        new AbortController().signal,
+      )
+      const outcome = await reading.then(
+        (value) => ({ value, error: undefined }),
+        (error: unknown) => ({ value: undefined, error }),
+      )
+      expect(Boolean(outcome.error)).toBe(mode !== 'valid')
+      expect(outcome.value?.terminalPlanRetention).toEqual(mode === 'valid' ? intent : undefined)
+      expect(outcome.value?.plan).toBeUndefined()
+      expect(outcome.value?.retainedPlan).toBeUndefined()
+      expect(outcome.value?.planState).toBeUndefined()
+      expect(workerLocation.live).toBe(0)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  },
+)
+it.each([
   'complete',
   'retained',
   'missing',

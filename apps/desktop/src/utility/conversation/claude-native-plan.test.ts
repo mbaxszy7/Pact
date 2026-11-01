@@ -1,7 +1,11 @@
 import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 
-import { ClaudeNativePlan, isClaudePlanState } from './claude-native-plan'
+import {
+  ClaudeNativePlan,
+  claudePlanInputFingerprint,
+  isClaudePlanState,
+} from './claude-native-plan'
 
 const binding = { promptId: 'root-prompt', path: '/native/plans/current.md' }
 const write = (plan: ClaudeNativePlan, id: string, text: string) =>
@@ -26,6 +30,24 @@ const edit = (plan: ClaudeNativePlan, id: string, before: string, after: string,
   )
 
 describe('Acknowledged Claude native plan operations', () => {
+  it('fingerprints the exact host retention tool and empty input', () => {
+    const toolName = 'mcp__pact_owned__retain_current_plan'
+    expect(claudePlanInputFingerprint(toolName, {})).not.toBe(
+      claudePlanInputFingerprint(toolName, { planVersion: 2 }),
+    )
+  })
+
+  it.each(['pending', 'failed', 'identical-write'] as const)(
+    'does not retain a native plan after a current-root %s operation',
+    (mode) => {
+      const plan = new ClaudeNativePlan(binding, undefined, 'Frozen plan')
+      plan.begin('Write', 'write', { file_path: binding.path, content: 'Frozen plan' })
+      if (mode === 'failed') plan.reject('write')
+      if (mode === 'identical-write') write(plan, 'write', 'Frozen plan')
+      plan.noteSubmission('retain', {})
+      expect(plan.retained('retain')).toBeUndefined()
+    },
+  )
   it('requires an exact bound path and matching native acknowledgement before publishing', () => {
     const plan = new ClaudeNativePlan(binding)
     expect(
