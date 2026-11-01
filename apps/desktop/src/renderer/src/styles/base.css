@@ -145,16 +145,16 @@
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
-  /* Reserve catalog space before native results arrive so Pact click targets stay fixed. */
-  .pact-skill-menu {
+  /* Both autocomplete menus anchor above the complete Composer in the top layer. */
+  .pact-skill-menu,
+  .pact-mention-menu {
     display: none;
     position: fixed;
     inset: auto;
     left: anchor(left);
     bottom: anchor(top);
     width: anchor-size(width);
-    height: 20rem;
-    max-height: var(--pact-skill-menu-available-height, 20rem);
+    max-height: var(--pact-composer-menu-available-height, 20rem);
     margin: 0 0 8px;
     opacity: 0;
     transition:
@@ -162,21 +162,30 @@
       display 100ms allow-discrete;
   }
 
-  .pact-skill-menu[data-open='true'] {
+  /* Native catalog arrival must not move existing Pact command targets. */
+  .pact-skill-menu {
+    height: 20rem;
+  }
+
+  .pact-skill-menu[data-open='true'],
+  .pact-mention-menu[data-open='true'] {
     display: block;
     opacity: 1;
     transition-duration: 160ms;
   }
 
   @starting-style {
-    .pact-skill-menu[data-open='true'] {
+    .pact-skill-menu[data-open='true'],
+    .pact-mention-menu[data-open='true'] {
       opacity: 0;
     }
   }
 
   @media (prefers-reduced-motion: reduce) {
     .pact-skill-menu,
-    .pact-skill-menu[data-open='true'] {
+    .pact-mention-menu,
+    .pact-skill-menu[data-open='true'],
+    .pact-mention-menu[data-open='true'] {
       transition-duration: 60ms;
     }
   }

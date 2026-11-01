@@ -2,7 +2,7 @@ import type { Virtualizer } from '@tanstack/react-virtual'
 import type { ComponentProps } from 'react'
 
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 // oxlint-disable-next-line eslint/no-restricted-imports -- jsdom lacks browser SubtleCrypto; this test-only provider verifies the real source hash.
 import { webcrypto } from 'node:crypto'
 import { useState } from 'react'
@@ -63,6 +63,13 @@ vi.mock('@tanstack/react-virtual', async (importOriginal) => {
 })
 
 beforeEach(() => {
+  Object.defineProperty(HTMLElement.prototype, 'showPopover', {
+    configurable: true,
+    value: vi.fn<(this: HTMLElement) => void>(function (this: HTMLElement) {
+      // jsdom keeps the popover UA display:none rule without a native top layer.
+      this.style.display = 'block'
+    }),
+  })
   Object.defineProperty(HTMLElement.prototype, 'hidePopover', {
     configurable: true,
     value: vi.fn<() => void>(),
@@ -1803,9 +1810,10 @@ it.each([true, false])(
         },
       }),
     })
-    render(<ConversationView {...props} />)
-    expect(await screen.findByText('@codex')).toBeDefined()
-    expect(screen.queryByText('@claude')).toBeNull()
+    const view = render(<ConversationView {...props} />)
+    const userReply = view.container.querySelector<HTMLElement>('[data-pact-speaker="user"]')!
+    expect(await within(userReply).findByText('@codex')).toBeDefined()
+    expect(within(userReply).queryByText('@claude')).toBeNull()
     expect(screen.getByText('Replies to your questions').closest('strong')).not.toBeNull()
     expect(screen.getByText('1. Preserve rules?').closest('p')).not.toBe(
       screen.getByText('Your answer:').closest('p'),

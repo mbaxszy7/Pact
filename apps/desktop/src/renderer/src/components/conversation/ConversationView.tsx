@@ -571,8 +571,11 @@ export function ConversationView({
     })
   const skillMenuRef = useRef<HTMLDivElement>(null)
   const skillPopoverOpen = useRef(false)
+  const mentionMenuRef = useRef<HTMLDivElement>(null)
+  const mentionPopoverOpen = useRef(false)
+  const dismissedMention = useRef<MentionQuery | undefined>(undefined)
   const composerBoxRef = useRef<HTMLDivElement>(null)
-  const skillMenuAnchor = `--pact-skills-${useId().replaceAll(':', '')}`
+  const composerMenuAnchor = `--pact-composer-menu-${useId().replaceAll(':', '')}`
   const [mentionQuery, setMentionQuery] = useState<MentionQuery | undefined>()
   const [activeMentionIndex, setActiveMentionIndex] = useState(0)
   const copyRequestGenerationRef = useRef(0)
@@ -1053,38 +1056,6 @@ export function ConversationView({
     : undefined
   const skillMenuOpen =
     Boolean(skillComposer.query) && visible && !composerDisabled && !inputTakeover
-  useLayoutEffect(() => {
-    const menu = skillMenuRef.current
-    const box = composerBoxRef.current
-    if (!menu || !box) return undefined
-    if (!skillMenuOpen) {
-      if (skillPopoverOpen.current) menu.hidePopover()
-      return undefined
-    }
-    const fit = (): void => {
-      menu.style.setProperty(
-        '--pact-skill-menu-available-height',
-        `${Math.max(0, box.getBoundingClientRect().top - 16)}px`,
-      )
-    }
-    fit()
-    menu.showPopover()
-    const observer = new ResizeObserver(fit)
-    observer.observe(box)
-    window.addEventListener('resize', fit)
-    return () => {
-      observer.disconnect()
-      window.removeEventListener('resize', fit)
-      if (skillPopoverOpen.current) menu.hidePopover()
-    }
-  }, [skillMenuOpen, session.id])
-  useLayoutEffect(() => {
-    if (activeSkillId && skillComposer.revealActive)
-      skillMenuRef.current?.querySelector<HTMLElement>(`#skill-${activeSkillId}`)?.scrollIntoView({
-        block: 'nearest',
-        behavior: 'instant',
-      })
-  }, [activeSkillId, skillComposer.revealActive])
   const returnedInput = history.window?.view.rebuildInputRecovery
   const queue = snapshot?.queue
   const queueEnabled = queue?.enabled ?? true
@@ -1161,18 +1132,53 @@ export function ConversationView({
       (!unfinishedTask || option.token !== '@all'),
   )
   const mentionListOpen = Boolean(
-    mentionQuery && filteredMentionOptions.length > 0 && !composerDisabled,
+    mentionQuery &&
+    filteredMentionOptions.length > 0 &&
+    visible &&
+    !composerDisabled &&
+    !inputTakeover,
   )
   const mentionListId = `message-recipients-${session.id}`
   const activeMentionId = mentionListOpen
     ? `${mentionListId}-${filteredMentionOptions[activeMentionIndex]?.token.slice(1) ?? 'none'}`
     : undefined
+  const composerMenuKind = skillMenuOpen ? 'skill' : mentionListOpen ? 'mention' : undefined
+  useLayoutEffect(() => {
+    const menu = composerMenuKind === 'skill' ? skillMenuRef.current : mentionMenuRef.current
+    const open = composerMenuKind === 'skill' ? skillPopoverOpen : mentionPopoverOpen
+    const box = composerBoxRef.current
+    if (!composerMenuKind || !menu || !box) return undefined
+    const fit = (): void => {
+      menu.style.setProperty(
+        '--pact-composer-menu-available-height',
+        `${Math.max(0, box.getBoundingClientRect().top - 16)}px`,
+      )
+    }
+    fit()
+    menu.showPopover()
+    const observer = new ResizeObserver(fit)
+    observer.observe(box)
+    window.addEventListener('resize', fit)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', fit)
+      if (open.current && menu.isConnected) menu.hidePopover()
+    }
+  }, [composerMenuKind, session.id])
+  useLayoutEffect(() => {
+    if (activeSkillId && skillComposer.revealActive)
+      skillMenuRef.current?.querySelector<HTMLElement>(`#skill-${activeSkillId}`)?.scrollIntoView({
+        block: 'nearest',
+        behavior: 'instant',
+      })
+  }, [activeSkillId, skillComposer.revealActive])
   const scrollVersion = `${snapshot?.messages.at(-1)?.id ?? ''}:${snapshot?.messages.length ?? 0}:${snapshot?.activities.length ?? 0}:${snapshot?.runs.length ?? 0}:${loading}`
   const residentMessages = snapshot?.messages
   const navigationMessage = messageNavigation
     ? residentMessages?.find((message) => message.id === messageNavigation.messageId)
     : undefined
   useEffect(() => {
+    dismissedMention.current = undefined
     setMentionQuery(undefined)
     setActiveMentionIndex(0)
   }, [session.id])
@@ -2273,6 +2279,24 @@ export function ConversationView({
     }),
     [composer, composerSkills, composerMention, composerRoute, composerReturnedInputOperationId],
   )
+  const dismissMentionMenu = (): void => {
+    dismissedMention.current = mentionQuery
+    setMentionQuery(undefined)
+  }
+  const updateMentionQuery = (text: string, cursor: number): void => {
+    const next = mentionQueryAt(text, cursor)
+    const dismissed = dismissedMention.current
+    if (
+      next &&
+      dismissed &&
+      next.start === dismissed.start &&
+      next.end === dismissed.end &&
+      next.query === dismissed.query
+    )
+      return
+    dismissedMention.current = undefined
+    setMentionQuery(next)
+  }
   const acceptComposerDocument = (
     document: ComposerDocument,
     cursor: number,
@@ -2291,14 +2315,14 @@ export function ConversationView({
       return true
     }
     skillComposer.update(document.text, cursor, document.skills)
-    setMentionQuery(mentionQueryAt(document.text, cursor))
+    updateMentionQuery(document.text, cursor)
     setActiveMentionIndex(0)
     return true
   }
   const cursorChanged = (cursor: number): void => {
     const current = composerRef.current?.document() ?? editorValue
     skillComposer.update(current.text, cursor, current.skills)
-    setMentionQuery(mentionQueryAt(current.text, cursor))
+    updateMentionQuery(current.text, cursor)
     setActiveMentionIndex(0)
   }
   const documentAfterEdits = (edits: ComposerEdit[]): ComposerDocument | undefined => {
@@ -4127,7 +4151,7 @@ export function ConversationView({
               ) : null}
               <div
                 ref={composerBoxRef}
-                style={{ anchorName: skillMenuAnchor }}
+                style={{ anchorName: composerMenuAnchor }}
                 className={`pact-composer-box relative flex flex-col gap-1.5 rounded-card border border-border bg-surface-raised p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus ${recoveryLocked ? 'opacity-60' : ''} ${imageDropActive ? 'outline-2 outline-focus outline-offset-4' : ''}`}
                 onDragEnter={(event) => {
                   if (
@@ -4377,7 +4401,7 @@ export function ConversationView({
                         }
                         if (event.key === 'Escape') {
                           event.preventDefault()
-                          setMentionQuery(undefined)
+                          dismissMentionMenu()
                           return
                         }
                       }
@@ -4393,7 +4417,7 @@ export function ConversationView({
                   <div
                     ref={skillMenuRef}
                     popover="auto"
-                    style={{ positionAnchor: skillMenuAnchor }}
+                    style={{ positionAnchor: composerMenuAnchor }}
                     onBeforeToggle={(event) => {
                       skillPopoverOpen.current = event.newState === 'open'
                       if (event.newState === 'closed' && skillComposer.query) skillComposer.close()
@@ -4551,47 +4575,55 @@ export function ConversationView({
                       </p>
                     ) : null}
                   </div>
-                  {mentionListOpen ? (
-                    <div
-                      id={mentionListId}
-                      className="absolute right-0 bottom-[calc(100%+8px)] left-0 z-20 overflow-hidden rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
-                      role="listbox"
-                      aria-label="Message recipients"
-                    >
-                      {filteredMentionOptions.map((option, index) => {
-                        const Icon = option.icon
-                        const active = index === activeMentionIndex
-                        return (
-                          <button
-                            id={`${mentionListId}-${option.token.slice(1)}`}
-                            key={option.token}
-                            type="button"
-                            role="option"
-                            aria-selected={active}
-                            className={`flex min-h-9 w-full cursor-pointer items-center gap-2.5 rounded-control px-2.5 text-left text-caption ${active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted/70 hover:text-primary'}`}
-                            onMouseEnter={() => setActiveMentionIndex(index)}
-                            onMouseDown={(event) => event.preventDefault()}
-                            onClick={() => chooseMention(option)}
-                          >
-                            <Icon
-                              aria-hidden="true"
-                              className="size-3.5 shrink-0"
-                              strokeWidth={1.75}
-                            />
-                            <span className="min-w-0 flex-1">
-                              <span className="font-medium text-primary">{option.label}</span>
-                              <span className="ml-2 text-caption text-tertiary">
-                                {option.description}
-                              </span>
+                  <div
+                    ref={mentionMenuRef}
+                    id={mentionListId}
+                    popover="auto"
+                    style={{ positionAnchor: composerMenuAnchor }}
+                    data-open={mentionListOpen}
+                    aria-hidden={!mentionListOpen}
+                    inert={!mentionListOpen}
+                    onBeforeToggle={(event) => {
+                      mentionPopoverOpen.current = event.newState === 'open'
+                      if (event.newState === 'closed' && mentionQuery) dismissMentionMenu()
+                    }}
+                    className="pact-mention-menu overflow-y-auto rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
+                    role="listbox"
+                    aria-label="Message recipients"
+                  >
+                    {filteredMentionOptions.map((option, index) => {
+                      const Icon = option.icon
+                      const active = index === activeMentionIndex
+                      return (
+                        <button
+                          id={`${mentionListId}-${option.token.slice(1)}`}
+                          key={option.token}
+                          type="button"
+                          role="option"
+                          aria-selected={active}
+                          className={`flex min-h-9 w-full cursor-pointer items-center gap-2.5 rounded-control px-2.5 text-left text-caption ${active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted/70 hover:text-primary'}`}
+                          onMouseEnter={() => setActiveMentionIndex(index)}
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={() => chooseMention(option)}
+                        >
+                          <Icon
+                            aria-hidden="true"
+                            className="size-3.5 shrink-0"
+                            strokeWidth={1.75}
+                          />
+                          <span className="min-w-0 flex-1">
+                            <span className="font-medium text-primary">{option.label}</span>
+                            <span className="ml-2 text-caption text-tertiary">
+                              {option.description}
                             </span>
-                            <span className="font-mono text-caption text-tertiary">
-                              {option.token}
-                            </span>
-                          </button>
-                        )
-                      })}
-                    </div>
-                  ) : null}
+                          </span>
+                          <span className="font-mono text-caption text-tertiary">
+                            {option.token}
+                          </span>
+                        </button>
+                      )
+                    })}
+                  </div>
 
                   {onChooseComposerImages ? (
                     <button
