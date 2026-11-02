@@ -610,6 +610,11 @@ Selection uses PATH or `PACT_NATIVE_CODEX_EXECUTABLE` / `PACT_NATIVE_CLAUDE_EXEC
 Codex 0.159.2, Claude Code 2.1.272, and the pinned desktop SDK; other versions/platforms need their own
 results. It builds actual production Adapters/Workers into a temporary fixture.
 
+The generated Codex loopback configuration disables optional plugins, so protocol fixtures do not
+start external marketplace downloads or leave their Git children behind after native EOF. The writer
+lifecycle case verifies that no marketplace-sync lock is created and retains its original natural
+exit, takeover and physical cleanup obligations. Real-provider configuration is unchanged.
+
 Claude initializes copied candidates with zero model input, tests effort precedence and null/default
 inheritance, and verifies exact source bytes, candidate identity, initialization manifests, and cold
 readiness. Codex creates genuine two-Turn loopback history, forks an older prefix and then the branch,

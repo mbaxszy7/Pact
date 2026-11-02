@@ -2017,9 +2017,11 @@ export class LoopbackProvider {
     this.url = `http://127.0.0.1:${address.port}`
   }
   async configureCodex(home: string): Promise<void> {
+    // Protocol fixtures use only the loopback Provider, without optional plugin downloads.
+    // Native marketplace sync can otherwise outlive its root through network/Git children.
     await writeFile(
       join(home, 'config.toml'),
-      `model = "gpt-5.4"\nmodel_provider = "pact_native_loopback"\nmodel_reasoning_effort = "high"\n[model_providers.pact_native_loopback]\nname = "Pact Native Loopback"\nbase_url = "${this.url}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nenv_key = "PACT_NATIVE_TOKEN"\nrequest_max_retries = 0\nstream_max_retries = 0\nstream_idle_timeout_ms = 10000\n`,
+      `model = "gpt-5.4"\nmodel_provider = "pact_native_loopback"\nmodel_reasoning_effort = "high"\n[features]\nplugins = false\n[model_providers.pact_native_loopback]\nname = "Pact Native Loopback"\nbase_url = "${this.url}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nenv_key = "PACT_NATIVE_TOKEN"\nrequest_max_retries = 0\nstream_max_retries = 0\nstream_idle_timeout_ms = 10000\n`,
     )
   }
   async close(): Promise<void> {

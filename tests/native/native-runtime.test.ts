@@ -1792,6 +1792,10 @@ it('real Codex read-only Desktop client does not own a writer; competing live id
       }),
     ).thread
     await writeTurn(creator, thread.id, 'NATIVE_WRITER_INPUT')
+    // The loopback protocol fixture must not start an external plugin marketplace sync.
+    await expect(lstat(join(owned.home, '.tmp/plugins.sync.lock'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
     await creator.close()
     const desktop = await NativeRpc.create(
       codexExecutable,
