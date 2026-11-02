@@ -51,6 +51,7 @@ await test('both native configs consume one inventory and never permit a platfor
     ...claudeDecisionNativeFiles,
     ...windowsOwnerNativeFiles,
     'tests/native/claude-decision-windows.test.ts',
+    'tests/native/codex-decision-windows.test.ts',
   ])
   assert.match(decision, /include:\s*\[\.\.\.decisionNativeFiles\]/u)
   assert.match(decision, /!nativeProfileSupports\(nativeProfile\('decision-codex'\)\)/u)

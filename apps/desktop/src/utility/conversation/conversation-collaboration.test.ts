@@ -92,6 +92,7 @@ const native = vi.hoisted(() => ({
     largestReply: number
   }>,
   decisions: [] as DecisionInput[],
+  decisionStarted: undefined as ((input: DecisionInput) => void) | undefined,
   decisionHold: undefined as Promise<void> | undefined,
   decisionCandidate: undefined as string | null | undefined,
   decisionFailure: undefined as 'timeout' | 'invalid_output' | undefined,
@@ -125,6 +126,7 @@ vi.mock('./codex-decision-runtime.js', () => ({
           this.context.dispatch()
           this.invoked = true
           native.decisions.push(input)
+          native.decisionStarted?.(input)
           if (native.decisionHold)
             await Promise.race([
               native.decisionHold,
@@ -346,6 +348,7 @@ afterEach(async () => {
   native.fail = false
   native.sources = []
   native.decisions = []
+  native.decisionStarted = undefined
   native.decisionHold = undefined
   native.decisionCandidate = undefined
   native.decisionFailure = undefined
@@ -976,32 +979,40 @@ describe('Optional plan revision guidance through the original workflow owner', 
     enableRelay(f)
     const hold = Promise.withResolvers<void>()
     native.decisionHold = hold.promise
-    expect((await f.flow.send(f.input('/plan Retain semantic configuration generation.'))).ok).toBe(
-      true,
-    )
-    await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
-    const handoffId = native.decisions[0]!.handoff.id
-    const repository = f.db.conversationRepository
-    let settings = repository.schedulingSettings()
-    settings = repository.saveSchedulingSettings({
-      expectedRevision: settings.revision,
-      enabled: false,
-    })
-    repository.saveSchedulingSettings({ expectedRevision: settings.revision, enabled: true })
-    hold.resolve()
-    await completedPlanRevision(f)
-    expectNoRepeatedConsultation(handoffId)
-    expect(guidanceForHandoff(handoffId)).toEqual([])
-    expect(
-      native.inputs[4]!.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
-    ).toBeUndefined()
-    expect(
-      f.db.drizzle.get(
-        sql`SELECT count(*) AS count FROM scheduling_evaluations WHERE handoff_id = ${handoffId}`,
-      ),
-    ).toEqual({
-      count: 1,
-    })
+    const decisionStarted = Promise.withResolvers<DecisionInput>()
+    native.decisionStarted = decisionStarted.resolve
+    try {
+      expect(
+        (await f.flow.send(f.input('/plan Retain semantic configuration generation.'))).ok,
+      ).toBe(true)
+      // Observe the consultation itself; preceding workflow Turns share the test's deadline.
+      const decision = await decisionStarted.promise
+      expect(native.decisions).toHaveLength(1)
+      const handoffId = decision.handoff.id
+      const repository = f.db.conversationRepository
+      let settings = repository.schedulingSettings()
+      settings = repository.saveSchedulingSettings({
+        expectedRevision: settings.revision,
+        enabled: false,
+      })
+      repository.saveSchedulingSettings({ expectedRevision: settings.revision, enabled: true })
+      hold.resolve()
+      await completedPlanRevision(f)
+      expectNoRepeatedConsultation(handoffId)
+      expect(guidanceForHandoff(handoffId)).toEqual([])
+      expect(
+        native.inputs[4]!.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
+      ).toBeUndefined()
+      expect(
+        f.db.drizzle.get(
+          sql`SELECT count(*) AS count FROM scheduling_evaluations WHERE handoff_id = ${handoffId}`,
+        ),
+      ).toEqual({
+        count: 1,
+      })
+    } finally {
+      hold.resolve()
+    }
   })
 })
 
