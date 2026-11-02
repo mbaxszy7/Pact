@@ -496,7 +496,10 @@ export class Conversation {
   private pendingContinuationImmediate: NodeJS.Immediate | undefined
   private workflowCandidateCursor: { updatedAt: string; id: string } | undefined
   private workflowCandidateRescan = false
-  private readonly markdownPreparations = new Map<string, Promise<void>>()
+  private readonly markdownPreparations = new Map<
+    string,
+    { id: string; deadline: number; task: Promise<void> }
+  >()
   private markdownTail: Promise<void> = Promise.resolve()
   private markdownWorker: Worker | undefined
   private disposed = false
@@ -2926,7 +2929,7 @@ export class Conversation {
     if (row.sourceRunId !== runId) throw new Error('The source Run changed.')
     if (row.projectionPages !== null || row.projectionBasis === 'plain-visible-v1') return
     const existing = this.markdownPreparations.get(source.id)
-    if (existing) return existing
+    if (existing) return existing.task
     if (this.disposed || this.markdownPreparations.size >= 32)
       throw new Error('Document processing is busy. Try reading again.')
     const expires = Date.now() + 30_000
@@ -3036,13 +3039,46 @@ export class Conversation {
         this.conversations.usePlainCollaborationProjection(sessionId, source)
       } else throw error
     })
-    this.markdownPreparations.set(source.id, task)
+    const preparation = { id: randomUUID(), deadline: expires, task }
+    this.markdownPreparations.set(source.id, preparation)
     this.markdownTail = task.catch(() => undefined)
+    let status: 'ready' | 'failed' = 'failed'
     try {
       await task
+      status = 'ready'
     } finally {
-      if (this.markdownPreparations.get(source.id) === task)
+      if (this.markdownPreparations.get(source.id) === preparation)
         this.markdownPreparations.delete(source.id)
+      if (!this.disposed) {
+        // Derived document readiness has no authority to wake native work or Relay.
+        const metadata = this.conversations.metadataPatch(sessionId)
+        const patch = conversationPatchSchema.parse({
+          version: metadata.version,
+          sessionId,
+          observation: metadata.observation,
+          session: metadata.session,
+          messages: [],
+          runs: [],
+          activities: [],
+          activityStates: [],
+          documentProjection: {
+            runId,
+            document: source,
+            preparationId: preparation.id,
+            status,
+            ...(status === 'failed'
+              ? { message: 'The plan could not be prepared. Try again.' }
+              : {}),
+          },
+        })
+        for (const listener of this.listeners) {
+          try {
+            listener(patch, false)
+          } catch {
+            // Notification delivery cannot invalidate durable pages. Readers can query this receipt.
+          }
+        }
+      }
     }
   }
 
@@ -3052,8 +3088,30 @@ export class Conversation {
       return { ok: false, error: { code: 'VALIDATION', message: 'Session is unavailable.' } }
     }
     try {
-      if (input.scope === 'collaboration-markdown' && input.basis !== 'plain-visible-v1')
-        await this.prepareMarkdown(input.sessionId, input.runId, input.document)
+      if (input.scope === 'collaboration-markdown' && input.basis !== 'plain-visible-v1') {
+        const row = this.conversations.collaborationDocumentRow(input.sessionId, input.document)
+        if (row.sourceRunId !== input.runId) throw new Error('The source Run changed.')
+        if (row.projectionPages === null && row.projectionBasis !== 'plain-visible-v1') {
+          if (!input.preparationId)
+            void this.prepareMarkdown(input.sessionId, input.runId, input.document).catch(
+              () => undefined,
+            )
+          const preparation = this.markdownPreparations.get(input.document.id)
+          if (!preparation || (input.preparationId && preparation.id !== input.preparationId))
+            throw new Error('Document preparation is unavailable. Try again.')
+          return {
+            ok: true,
+            value: {
+              scope: 'collaboration-markdown-pending',
+              sessionId: input.sessionId,
+              runId: input.runId,
+              document: input.document,
+              preparationId: preparation.id,
+              deadline: preparation.deadline,
+            },
+          }
+        }
+      }
       const page = this.conversations.readPage(input)
       if (page.scope === 'messages')
         page.header.pendingNativeInteractions = this.pendingNativeInteractions(input.sessionId)

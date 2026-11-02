@@ -195,11 +195,6 @@ export function CurrentPlanPanel({
                 }
               />
             )}
-            {onCreatePlanComment ? (
-              <p className="mt-section text-caption text-secondary">
-                Select text to add a Comment.
-              </p>
-            ) : null}
           </div>
         ) : loading ? (
           <div aria-busy="true" aria-label="Loading current plan" className="space-y-group">

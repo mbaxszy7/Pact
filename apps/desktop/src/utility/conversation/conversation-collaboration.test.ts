@@ -2295,3 +2295,43 @@ describe('Ordinary input routing through the original Send owner', () => {
     expect(native.decisions).toHaveLength(1)
   })
 })
+
+it('prepares a cold plan outside page RPCs and publishes readiness without dispatching work', async () => {
+  const f = await fixture()
+  expect((await f.flow.send(f.input('/plan Read the original plan.'))).ok).toBe(true)
+  const task = await f.settled()
+  const reference = task.planReference!
+  const input = {
+    scope: 'collaboration-markdown' as const,
+    sessionId: f.sessionId,
+    runId: reference.sourceRunId,
+    document: reference.document,
+    offset: 0,
+  }
+  const beforeRuns = native.inputs.length
+  const events: NonNullable<import('@pact/contracts').ConversationPatch['documentProjection']>[] =
+    []
+  const brokenListener = f.flow.subscribe((patch) => {
+    if (patch.documentProjection) throw Error('Closed viewer')
+  })
+  const unsubscribe = f.flow.subscribe((patch) => {
+    if (patch.documentProjection) events.push(patch.documentProjection)
+  })
+  try {
+    const pending = await f.flow.load(input)
+    expect(pending.ok && pending.value.scope).toBe('collaboration-markdown-pending')
+    if (!pending.ok || pending.value.scope !== 'collaboration-markdown-pending')
+      throw Error('Expected preparation')
+    const duplicate = await f.flow.load({ ...input, preparationId: pending.value.preparationId })
+    expect(duplicate).toEqual(pending)
+    await vi.waitFor(() => expect(events).toHaveLength(1), { timeout: 15_000 })
+    expect(events[0]).toMatchObject({ preparationId: pending.value.preparationId, status: 'ready' })
+    const page = await f.flow.load({ ...input, preparationId: pending.value.preparationId })
+    expect(page.ok && page.value.scope).toBe('collaboration-markdown')
+    expect(native.inputs).toHaveLength(beforeRuns)
+    expect(f.db.conversationRepository.collaboration(f.sessionId)).toEqual(task)
+  } finally {
+    brokenListener()
+    unsubscribe()
+  }
+})

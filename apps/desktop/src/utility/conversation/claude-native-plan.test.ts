@@ -1,8 +1,11 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
+
+import { nativeProbeResultSchema } from '@pact/contracts'
 
 import {
   ClaudeNativePlan,
+  ClaudePlanPublication,
   claudePlanInputFingerprint,
   isClaudePlanState,
 } from './claude-native-plan'
@@ -173,4 +176,39 @@ describe('Acknowledged Claude native plan operations', () => {
     expect(() => write(denied, 'write', text)).toThrow('Reservation exhausted')
     expect(denied.plan).toBeUndefined()
   })
+})
+
+it('replaces cached plan observations atomically across invalidation and recovery', () => {
+  const publication = new ClaudePlanPublication()
+  const identity = {
+    sessionId: randomUUID(),
+    agentId: 'claude',
+    requestId: randomUUID(),
+    nativeSessionId: randomUUID(),
+    bindingGeneration: 1,
+  }
+  let output = { outputId: 'answer', text: 'Original answer', completeness: 'complete' as const }
+  const verify = () =>
+    expect(
+      nativeProbeResultSchema.safeParse({
+        kind: 'ended',
+        source: 'stored_terminal',
+        outcome: 'completed',
+        identity,
+        output,
+      }).success,
+    ).toBe(true)
+  publication.publish({ nativeId: 'write', text: 'Plan' })
+  output = publication.project(output)
+  verify()
+  publication.invalidate(true)
+  output = publication.project(output)
+  verify()
+  expect(output).not.toHaveProperty('plan')
+  expect(output).toHaveProperty('planUnavailable', true)
+  publication.publish({ nativeId: 'write', text: 'Plan' })
+  output = publication.project(output)
+  verify()
+  expect(output).not.toHaveProperty('planUnavailable')
+  expect(output.text).toBe('Original answer')
 })

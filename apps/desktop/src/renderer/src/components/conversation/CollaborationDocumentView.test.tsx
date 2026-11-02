@@ -3,7 +3,12 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
-import type { CollaborationDocument, ConversationPage, DesktopBridge } from '@pact/contracts'
+import type {
+  CollaborationDocument,
+  ConversationPage,
+  ConversationPatch,
+  DesktopBridge,
+} from '@pact/contracts'
 
 import { markdownProjectionPages } from '../../../../shared/message-anchor-text'
 import { CollaborationDocumentView } from './CollaborationDocumentView'
@@ -116,7 +121,7 @@ it('ignores a completed read for an evicted document source', async () => {
       return pending
     return next.read(request)
   })
-  vi.stubGlobal('pact', { getConversation: read })
+  vi.stubGlobal('pact', { getConversation: read, onConversationChanged: () => () => {} })
   const view = render(<CollaborationDocumentView {...old.props} />)
   await waitFor(() => expect(read).toHaveBeenCalledTimes(1))
   view.rerender(<CollaborationDocumentView {...next.props} />)
@@ -260,6 +265,7 @@ function continuousFixture(text: string, aroundOffset = 0) {
   let active = 0,
     peak = 0
   vi.stubGlobal('pact', {
+    onConversationChanged: () => () => {},
     getConversation: async (request: Request) => {
       active++
       peak = Math.max(peak, active)
@@ -396,7 +402,7 @@ function documentFixture(text: string, basis: Page['basis'] = 'markdown-visible-
           : request.offset
     return { ok: true, value: pages[index]! }
   })
-  vi.stubGlobal('pact', { getConversation: read })
+  vi.stubGlobal('pact', { getConversation: read, onConversationChanged: () => () => {} })
   return {
     props: {
       sessionId,
@@ -411,3 +417,154 @@ function documentFixture(text: string, basis: Page['basis'] = 'markdown-visible-
 }
 
 const pagesOffset = (index: number) => index * 4096
+
+it.each([true, false])(
+  'loads a cold document when readiness arrives before the pending receipt: %s',
+  async (early) => {
+    const fixture = documentFixture('The original plan is complete.')
+    const preparationId = crypto.randomUUID()
+    let listener!: (patch: Pick<ConversationPatch, 'sessionId' | 'documentProjection'>) => void
+    const unsubscribe = vi.fn<() => void>()
+    const patch: Pick<ConversationPatch, 'sessionId' | 'documentProjection'> = {
+      sessionId: fixture.props.sessionId,
+      documentProjection: {
+        runId: fixture.props.runId,
+        document: fixture.props.source,
+        preparationId,
+        status: 'ready',
+      },
+    }
+    fixture.read.mockImplementationOnce(async () => {
+      if (early) listener(patch)
+      return {
+        ok: true,
+        value: {
+          scope: 'collaboration-markdown-pending',
+          sessionId: fixture.props.sessionId,
+          runId: fixture.props.runId,
+          document: fixture.props.source,
+          preparationId,
+          deadline: Date.now() + 30_000,
+        },
+      }
+    })
+    vi.stubGlobal('pact', {
+      getConversation: fixture.read,
+      onConversationChanged: (value: typeof listener) => {
+        listener = value
+        return unsubscribe
+      },
+    })
+    const view = render(<CollaborationDocumentView {...fixture.props} />)
+    await waitFor(() => expect(fixture.read).toHaveBeenCalled())
+    if (!early) act(() => listener(patch))
+    await screen.findByText('The original plan is complete.')
+    expect(fixture.read).toHaveBeenCalledTimes(2)
+    expect(fixture.read.mock.calls[1]?.[0]).toMatchObject({ preparationId })
+    view.unmount()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+  },
+)
+
+it('removes the readiness subscription when a pending document closes', async () => {
+  const fixture = documentFixture('Preserved source')
+  const unsubscribe = vi.fn<() => void>()
+  fixture.read.mockResolvedValueOnce({
+    ok: true,
+    value: {
+      scope: 'collaboration-markdown-pending',
+      sessionId: fixture.props.sessionId,
+      runId: fixture.props.runId,
+      document: fixture.props.source,
+      preparationId: crypto.randomUUID(),
+      deadline: Date.now() + 30_000,
+    },
+  })
+  vi.stubGlobal('pact', { getConversation: fixture.read, onConversationChanged: () => unsubscribe })
+  const view = render(<CollaborationDocumentView {...fixture.props} />)
+  await waitFor(() => expect(fixture.read).toHaveBeenCalledTimes(1))
+  view.unmount()
+  await waitFor(() => expect(unsubscribe).toHaveBeenCalledTimes(1))
+  expect(fixture.read).toHaveBeenCalledTimes(1)
+})
+
+it('does not carry the previous document coordinate basis into a new source', async () => {
+  const first = documentFixture('First source', 'plain-visible-v1')
+  const second = documentFixture('Second source', 'markdown-visible-v2')
+  const read = vi.fn<DesktopBridge['getConversation']>((input) =>
+    'document' in input && input.document.id === first.props.source.id
+      ? first.read(input)
+      : second.read(input),
+  )
+  vi.stubGlobal('pact', { getConversation: read, onConversationChanged: () => () => {} })
+  const root = document.createElement('div')
+  document.body.append(root)
+  const continuous = { viewport: { current: root } }
+  const view = render(<CollaborationDocumentView {...first.props} continuous={continuous} />, {
+    container: root,
+  })
+  try {
+    await screen.findByText('First source')
+    view.rerender(<CollaborationDocumentView {...second.props} continuous={continuous} />)
+    await waitFor(() => expect(second.read).toHaveBeenCalled())
+    expect(second.read.mock.calls[0]?.[0]).not.toHaveProperty('basis')
+    await screen.findByText('Second source')
+  } finally {
+    view.unmount()
+    root.remove()
+  }
+})
+
+it('retires a pending retry when switching to another document', async () => {
+  const first = documentFixture('First source')
+  const second = documentFixture('Second source')
+  first.read
+    .mockResolvedValueOnce({
+      ok: false,
+      error: { code: 'TIMEOUT', message: 'Initial read failed.' },
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      value: {
+        scope: 'collaboration-markdown-pending',
+        sessionId: first.props.sessionId,
+        runId: first.props.runId,
+        document: first.props.source,
+        preparationId: crypto.randomUUID(),
+        deadline: Date.now() + 30_000,
+      },
+    })
+  const read = vi.fn<DesktopBridge['getConversation']>((input) =>
+    'document' in input && input.document.id === first.props.source.id
+      ? first.read(input)
+      : second.read(input),
+  )
+  const unsubscribers: Array<ReturnType<typeof vi.fn<() => void>>> = []
+  vi.stubGlobal('pact', {
+    getConversation: read,
+    onConversationChanged: () => {
+      const unsubscribe = vi.fn<() => void>()
+      unsubscribers.push(unsubscribe)
+      return unsubscribe
+    },
+  })
+  const root = document.createElement('div')
+  document.body.append(root)
+  const continuous = { viewport: { current: root } }
+  const view = render(<CollaborationDocumentView {...first.props} continuous={continuous} />, {
+    container: root,
+  })
+  try {
+    await screen.findByText('Initial read failed.')
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }))
+    await waitFor(() => expect(first.read).toHaveBeenCalledTimes(2))
+    view.rerender(<CollaborationDocumentView {...second.props} continuous={continuous} />)
+    await waitFor(() => expect(second.read).toHaveBeenCalled())
+    await screen.findByText('Second source')
+    expect(unsubscribers[1]).toHaveBeenCalledOnce()
+    expect(first.read).toHaveBeenCalledTimes(2)
+  } finally {
+    view.unmount()
+    root.remove()
+  }
+})

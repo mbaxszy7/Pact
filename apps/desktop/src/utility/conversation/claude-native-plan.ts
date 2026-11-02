@@ -2,6 +2,60 @@ import { createHash } from 'node:crypto'
 
 import type { CollaborationRetainedPlan } from '@pact/contracts'
 
+type PlanPublication =
+  | { kind: 'pending' | 'unavailable' }
+  | { kind: 'empty' }
+  | { kind: 'published'; plan: { nativeId: string; text: string } }
+  | { kind: 'retained'; plan: CollaborationRetainedPlan }
+
+/** One root's publication state. Wire projections never merge mutually exclusive observations. */
+export class ClaudePlanPublication {
+  private state: PlanPublication = { kind: 'empty' }
+
+  get plan() {
+    return this.state.kind === 'published' ? this.state.plan : undefined
+  }
+
+  get retained() {
+    return this.state.kind === 'retained' ? this.state.plan : undefined
+  }
+
+  get unavailable() {
+    return this.state.kind === 'pending' || this.state.kind === 'unavailable'
+  }
+
+  publish(plan: { nativeId: string; text: string }): void {
+    this.state = { kind: 'published', plan }
+  }
+
+  retain(plan: CollaborationRetainedPlan): void {
+    this.state = { kind: 'retained', plan }
+  }
+
+  invalidate(pending = false): void {
+    this.state = { kind: pending ? 'pending' : 'unavailable' }
+  }
+
+  project<
+    T extends {
+      outputId: string
+      text: string
+      completeness: 'complete' | 'partial'
+      plan?: unknown
+      retainedPlan?: unknown
+      planUnavailable?: true | undefined
+    },
+  >(output: T) {
+    const { plan: _plan, retainedPlan: _retained, planUnavailable: _unavailable, ...body } = output
+    return {
+      ...body,
+      ...(this.plan ? { plan: this.plan } : {}),
+      ...(this.retained ? { retainedPlan: this.retained } : {}),
+      ...(this.unavailable ? { planUnavailable: true as const } : {}),
+    }
+  }
+}
+
 export interface ClaudePlanBinding {
   promptId: string
   path: string

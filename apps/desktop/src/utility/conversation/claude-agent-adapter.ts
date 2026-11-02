@@ -77,6 +77,7 @@ import {
 import { ClaudeAnswerAssembler } from './claude-answer-assembler'
 import {
   ClaudeNativePlan,
+  ClaudePlanPublication,
   claudePlanInputFingerprint,
   claudePlanSubmissionFingerprint,
 } from './claude-native-plan'
@@ -1707,9 +1708,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     const planMemory = new NativeWorkingMemory().reserve(0)
     const metadataMemory = new NativeWorkingMemory().reserve(0)
     const planProofMemory = new NativeWorkingMemory().reserve(0)
-    let submittedPlan: { nativeId: string; text: string } | undefined
-    let planUnavailable = false
-    let retainedPlan: CollaborationRetainedPlan | undefined
+    const planPublication = new ClaudePlanPublication()
     let nativePlan: ClaudeNativePlan | undefined
     let planBindingTask: Promise<ClaudeNativePlan | undefined> | undefined
     let planBindingReads = 0
@@ -2083,7 +2082,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             terminalKnown ||
             signal.aborted ||
             retentionBlocked ||
-            submittedPlan ||
+            planPublication.plan ||
             inputResult ||
             permissionWait.waiting
           )
@@ -2159,44 +2158,40 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       // receipts even when a later body/carrier cannot be retained.
       if (!foregroundReleased && !deferForegroundFailure) throw projectionFailure
     }
+    const refreshCachedPlan = (): void => {
+      const known = this.nativeEvidence.get(input.runId)
+      if (known?.kind !== 'ended') return
+      const { planUnavailable: _unavailable, ...terminal } = known
+      this.nativeEvidence.set(input.runId, {
+        ...terminal,
+        ...(planPublication.unavailable ? { planUnavailable: true as const } : {}),
+        ...(known.output ? { output: planPublication.project(known.output) } : {}),
+      })
+    }
     const capturePlan = (plan: { nativeId: string; text: string }): void => {
       try {
         retentionBlocked = true
         planMemory.resize(4096 + Buffer.byteLength(plan.text) * 4 + plan.text.length * 2)
-        submittedPlan = plan
-        retainedPlan = undefined
         input.recordWorkflowPlan?.(plan)
+        planPublication.publish(plan)
+        refreshCachedPlan()
         logPlan('capture', 'captured')
         planCaptureFailure = undefined
       } catch (error) {
+        planPublication.invalidate()
+        refreshCachedPlan()
         failProjection(error)
       }
     }
-    const captureUnavailable = (retentionOnly = false): void => {
-      const invalidatesSubmittedPlan = Boolean(submittedPlan)
-      submittedPlan = undefined
-      retainedPlan = undefined
-      const notify = !planUnavailable
-      planUnavailable = true
-      // Invalidate memory and the terminal cache before crossing a fallible storage callback.
-      const known = this.nativeEvidence.get(input.runId)
-      if (known?.kind === 'ended') {
-        const output = known.output
-          ? { ...known.output, planUnavailable: true as const }
-          : undefined
-        if (output) delete output.retainedPlan
-        this.nativeEvidence.set(input.runId, {
-          ...known,
-          planUnavailable: true,
-          ...(output ? { output } : {}),
-        })
-      }
+    const captureUnavailable = (retentionOnly = false, pending = false): void => {
+      const invalidatesSubmittedPlan = Boolean(planPublication.plan)
+      const notify = !planPublication.unavailable
+      planPublication.invalidate(pending)
+      refreshCachedPlan()
       if (notify) {
         try {
           input.recordWorkflowPlanUnavailable?.()
         } catch (error) {
-          // Retention never persisted an early candidate; missing final metadata
-          // is sufficient to block settlement without failing the answer stream.
           if (!retentionOnly || invalidatesSubmittedPlan) failProjection(error)
         }
       }
@@ -2204,12 +2199,12 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     const blockRetention = (): void => {
       retentionBlocked = true
       for (const call of retentionCalls.values()) call.invalid = true
-      if (retentionCalls.size || retainedPlan) captureUnavailable(true)
+      if (retentionCalls.size || planPublication.retained) captureUnavailable(true)
     }
     const invalidateRetentionForQuestion = (): void => {
       retentionBlocked = true
       for (const call of retentionCalls.values()) call.invalid = true
-      if (retentionCalls.size || retainedPlan) captureUnavailable(true)
+      if (retentionCalls.size || planPublication.retained) captureUnavailable(true)
     }
     const nativePlanForHook = async (
       hook: {
@@ -2431,9 +2426,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           if (artifact.unavailable) captureUnavailable()
           return
         }
-        submittedPlan = undefined
-        retainedPlan = undefined
-        if (phase === 'begin') captureUnavailable()
+        if (phase === 'begin') captureUnavailable(false, true)
         if (phase === 'failure') artifact.reject(hook.tool_use_id)
         else if (phase === 'success')
           artifact.acknowledge(
@@ -2445,7 +2438,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         if (signal.aborted) return
         if (artifact.unavailable) captureUnavailable()
         else if (phase === 'success' && artifact.plan) {
-          planUnavailable = false
           capturePlan(artifact.plan)
         }
       } catch (error) {
@@ -2480,7 +2472,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         kind: 'ended',
         source: 'live_terminal',
         outcome,
-        ...(planUnavailable ? { planUnavailable: true as const } : {}),
+        ...(planPublication.unavailable ? { planUnavailable: true as const } : {}),
       })
     }
     let inputReservation: NativeMemoryReservation | undefined
@@ -2763,7 +2755,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         const eligible = (): boolean =>
           Boolean(
             nativePlanning &&
-            !submittedPlan &&
+            !planPublication.plan &&
             intent &&
             !intent.invalid &&
             intent.permissionMatched &&
@@ -2778,26 +2770,22 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           if (!input.recordWorkflowPlanRetained)
             throw new Error('The retained plan has no durable recorder.')
           input.recordWorkflowPlanRetained(confirmed)
-          retainedPlan = confirmed
-          planUnavailable = false
+          planPublication.retain(confirmed)
           planCaptureFailure = undefined
           logPlan('submission', 'retained')
+          refreshCachedPlan()
           const known = this.nativeEvidence.get(input.runId)
           if (known?.kind === 'ended' && known.outcome === 'completed') {
-            const ending = {
+            this.recordEvidence(input, resolvedSessionId, {
               ...known,
-              output: {
-                ...(known.output ?? {
+              output: planPublication.project(
+                known.output ?? {
                   outputId: input.runId,
                   text: '',
                   completeness: 'complete' as const,
-                }),
-                retainedPlan: confirmed,
-              },
-            }
-            delete ending.planUnavailable
-            delete ending.output.planUnavailable
-            this.recordEvidence(input, resolvedSessionId, ending)
+                },
+              ),
+            })
           }
         }
         const calls = [...retentionCalls]
@@ -2807,7 +2795,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             nativeRetention &&
             retention &&
             !retentionBlocked &&
-            !submittedPlan &&
+            !planPublication.plan &&
             !retention[1].invalid &&
             retention[1].preObserved &&
             retention[1].postObserved &&
@@ -2846,7 +2834,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           } catch {
             captureUnavailable(true)
           }
-        } else if (retentionCalls.size && !submittedPlan) {
+        } else if (retentionCalls.size && !planPublication.plan) {
           captureUnavailable(true)
         }
         if (intent && eligible() && planBindingReads < 64) {
@@ -2872,7 +2860,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 basis = authorization?.planReference?.document
               if (proof.plan) {
                 projectingTerminalPlan = true
-                planUnavailable = false
                 capturePlan(proof.plan)
                 logPlan('submission', 'submitted')
               } else if (
@@ -2884,18 +2871,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
               ) {
                 retainingTerminalPlan = true
                 commitRetained(retained)
-              }
-              if (!planUnavailable && !projectionFailure) {
-                const known = this.nativeEvidence.get(input.runId)
-                if (known?.kind === 'ended' && known.outcome === 'completed') {
-                  const ending = { ...known }
-                  delete ending.planUnavailable
-                  if (ending.output?.planUnavailable) {
-                    ending.output = { ...ending.output }
-                    delete ending.output.planUnavailable
-                  }
-                  this.nativeEvidence.set(input.runId, ending)
-                }
               }
               if (projectionFailure) {
                 terminalPlanProjectionFailed = true
@@ -2915,9 +2890,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             try {
               captureUnavailable(retainingTerminalPlan)
             } catch (storageError) {
-              submittedPlan = undefined
-              retainedPlan = undefined
-              planUnavailable = true
+              planPublication.invalidate()
+              refreshCachedPlan()
               terminalPlanProjectionFailed = true
               projectionFailure = classifyAgentError(storageError)
             }
@@ -3344,7 +3318,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 call.observed = true
                 if (!collaborationPlanRetentionInputSchema.safeParse(block.input).success)
                   call.invalid = true
-                if (call.invalid && retainedPlan?.nativeId === block.id) captureUnavailable()
+                if (call.invalid && planPublication.retained?.nativeId === block.id)
+                  captureUnavailable()
                 continue
               }
               if (block.name === titleToolName && input.promptEnvelope.requestSessionTitle) {
@@ -3474,7 +3449,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                   retention.invalid = true
                 else if (retention.succeeded) retention.invalid = true
                 else retention.succeeded = true
-                if (retention.invalid && retainedPlan?.nativeId === block.tool_use_id)
+                if (retention.invalid && planPublication.retained?.nativeId === block.tool_use_id)
                   captureUnavailable()
                 continue
               }
@@ -3670,7 +3645,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             kind: 'ended',
             source: 'live_terminal',
             outcome,
-            ...(answer.text || (outcome === 'completed' && (submittedPlan || reviewResult))
+            ...(answer.text || (outcome === 'completed' && (planPublication.plan || reviewResult))
               ? {
                   output: {
                     outputId: answer.outputId,
@@ -3706,7 +3681,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 text: resultText,
               }
           }
-          finalText = answer.finalize() ?? (submittedPlan && !answer.text ? '' : undefined)
+          finalText = answer.finalize() ?? (planPublication.plan && !answer.text ? '' : undefined)
         } catch (error) {
           failProjection(error)
           return
@@ -3715,16 +3690,18 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           kind: 'ended',
           source: 'live_terminal',
           outcome,
-          ...(planUnavailable ? { planUnavailable: true as const } : {}),
-          ...(answer.text || (outcome === 'completed' && (submittedPlan || reviewResult))
+          ...(planPublication.unavailable ? { planUnavailable: true as const } : {}),
+          ...(answer.text || (outcome === 'completed' && (planPublication.plan || reviewResult))
             ? {
                 output: {
                   outputId: answer.outputId,
                   text: answer.text,
                   completeness:
                     outcome === 'completed' ? ('complete' as const) : ('partial' as const),
-                  ...(outcome === 'completed' && submittedPlan ? { plan: submittedPlan } : {}),
-                  ...(planUnavailable ? { planUnavailable: true as const } : {}),
+                  ...(outcome === 'completed' && planPublication.plan
+                    ? { plan: planPublication.plan }
+                    : {}),
+                  ...(planPublication.unavailable ? { planUnavailable: true as const } : {}),
                   ...(outcome === 'completed' && reviewResult ? { reviewResult } : {}),
                   ...(outcome === 'completed' && inputResult ? { inputResult } : {}),
                 },
@@ -3740,12 +3717,12 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             text: finalText,
           }
         if (outcome === 'completed') {
-          if (submittedPlan)
+          if (planPublication.plan)
             yield {
               agentId: 'claude',
               type: 'collaboration.plan',
               turnId: input.runId,
-              ...submittedPlan,
+              ...planPublication.plan,
             }
           if (reviewResult)
             yield {
@@ -4093,7 +4070,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                     ) {
                       const call = retentionCalls.get(hook.tool_use_id)
                       if (call) call.invalid = true
-                      if (retainedPlan?.nativeId === hook.tool_use_id) captureUnavailable()
+                      if (planPublication.retained?.nativeId === hook.tool_use_id)
+                        captureUnavailable()
                       return {}
                     }
                     if (

@@ -173,7 +173,7 @@ describe('Windows tool-disabled native context', () => {
     expect(f.repo.activeSchedulingRuntimeOwner()).toBeUndefined()
   })
 
-  it('does not admit a tool-disabled context for Codex or a Darwin physical witness', async () => {
+  it('admits Windows Codex native context while rejecting Darwin witnesses', async () => {
     const f = await fixture(),
       id = reserveEvaluation(f)
     expect(begin(f, id, 'native_context', 0, null)).toBe(1)
@@ -190,7 +190,7 @@ describe('Windows tool-disabled native context', () => {
         nativeGeneration: 1,
         witness: decisionPhysicalWitnessSchema.parse(darwin),
       }),
-    ).toThrow(/Windows Claude/u)
+    ).toThrow(/Windows owner/u)
     f.repo.completeSchedulingRuntimePhysical(id, {
       nativeGeneration: 1,
       witness: null,
@@ -205,7 +205,10 @@ describe('Windows tool-disabled native context', () => {
     expect(
       f.repo.reserveSchedulingProbe({ ...probe, provider: 'codex', model: 'gpt-6-luna' }),
     ).toBe(true)
-    expect(() => begin(f, probe.id, 'native_context', 0, null)).toThrow(/initial native stage/u)
+    expect(begin(f, probe.id, 'native_context', 0, null)).toBe(1)
+    const codexWitness = record(f, probe.id, 1)
+    expect(codexWitness.platform).toBe('win32')
+    f.repo.settleSchedulingProbe(probe.id, true)
   })
 })
 

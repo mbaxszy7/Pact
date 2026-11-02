@@ -464,6 +464,7 @@ rl.on('line', (line) => {
   if (request.method === 'account/read') result = { requiresOpenaiAuth: true, account: { type: 'chatgpt', email: changed && mutation === 'account' ? 'changed@example.test' : 'owned@example.test', planType: 'plus' }, workspaceRouting: { chatgptAccountId: 'owned-account', backendOrigin: 'https://chatgpt.com', accountRoutingOverride: 'NO_CONSTRAINT' } };
   if (request.method === 'model/list') result = { data: [${JSON.stringify(exactNativeModel)}], nextCursor: null };
   if (request.method === 'thread/start') result = { cwd: params.cwd, model: params.model, modelProvider: params.modelProvider, thread: { id: 'owned-thread', cwd: params.cwd, ephemeral: true }, sandbox: { type: 'readOnly', networkAccess: false } };
+  if (request.method === 'turn/start') result = { turn: { id: 'owned-turn', status: 'inProgress' } };
   emit({ id: request.id, result });
   if (request.method === 'turn/start') {
     const timer = setInterval(() => {
@@ -472,7 +473,7 @@ rl.on('line', (line) => {
       changed = true;
       if (mutation === 'executable_identity') fs.appendFileSync(__filename, '\\n// changed owned executable\\n');
       emit({ method: 'item/completed', params: { threadId: 'owned-thread', turnId: 'owned-turn', item: { type: 'agentMessage', text: '{"candidateId":"wait","highlights":[]}' } } });
-      emit({ method: 'turn/completed', params: { threadId: 'owned-thread', turnId: 'owned-turn', turn: { status: 'completed' } } });
+      emit({ method: 'turn/completed', params: { threadId: 'owned-thread', turnId: 'owned-turn', turn: { id: 'owned-turn', status: 'completed' } } });
     }, 2);
   }
 });

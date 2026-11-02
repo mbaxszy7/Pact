@@ -463,6 +463,9 @@ export function registerConversationIpcHandlers(
       const routed = interested
         ? payload
         : {
+            ...(payload.documentProjection
+              ? { documentProjection: payload.documentProjection }
+              : {}),
             version: payload.version,
             sessionId: payload.sessionId,
             observation: payload.observation,

@@ -52,7 +52,9 @@ const hash = (text: string) => createHash('sha256').update(text).digest('hex')
 async function fixture(
   filePath = ':memory:',
   onOpened?: () => void,
-  roles: { primary: 'codex' | 'claude'; split?: boolean } = { primary: 'codex' },
+  roles: { primary: 'codex' | 'claude'; split?: boolean; inputSequence?: number } = {
+    primary: 'codex',
+  },
 ) {
   const db = await PactDatabase.open({
     filePath,
@@ -87,7 +89,7 @@ async function fixture(
     reviewer: roles.primary === 'codex' ? 'claude' : 'codex',
     ...(roles.split ? { rolePolicy: 'split-stages-v1' } : {}),
     automation: 'active',
-    inputSequence: 0,
+    inputSequence: roles.inputSequence ?? 0,
     handledInputSequence: 0,
     task: 'Review cancellation.',
     taskMessageId: messageId,
@@ -2420,3 +2422,33 @@ it.each([
     })
   },
 )
+
+it('settles the original plan after a completed root was applied as a projection failure', async () => {
+  const f = await fixture(undefined, undefined, { primary: 'claude', inputSequence: 1 })
+  const runId = f.first.run.id
+  f.repo.recordNativeEffects(runId, 'pending')
+  f.finish(runId, { answer: 'The plan is saved.' }, false)
+  f.repo.finishCollaboration(runId, false, 'Native plan observations conflict.')
+  expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+    handledInputSequence: 0,
+    automation: 'paused',
+  })
+  expect(
+    f.db.drizzle.select().from(workflowTurns).where(eq(workflowTurns.runId, runId)).get()?.applied,
+  ).toBe(true)
+  f.repo.recordWorkflowPlan(runId, { nativeId: 'saved-plan', text: 'Verified original plan.' })
+  f.repo.reconcileCompletedCollaboration(runId)
+  expect(f.repo.collaboration(f.sessionId)?.planVersion).toBe(0)
+  f.repo.recordNativeEffects(runId, 'settled')
+  f.repo.reconcileCompletedCollaboration(runId)
+  const settled = f.repo.collaboration(f.sessionId)!
+  expect(settled).toMatchObject({
+    handledInputSequence: 1,
+    planVersion: 1,
+    automation: 'paused',
+    nextStage: 'plan_review',
+  })
+  expect(f.repo.read(f.sessionId).runs).toHaveLength(1)
+  f.repo.reconcileCompletedCollaboration(runId)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(settled)
+})

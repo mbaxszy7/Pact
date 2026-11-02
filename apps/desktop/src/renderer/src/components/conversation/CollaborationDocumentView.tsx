@@ -13,6 +13,8 @@ import type {
   CollaborationDocument,
   CollaborationMarkdownNode,
   ConversationPage,
+  ConversationPatch,
+  ConversationGetInput,
 } from '@pact/contracts'
 
 import type {
@@ -29,6 +31,74 @@ import {
 import { MessageMarkdown, type ProjectFileTarget } from './MessageMarkdown'
 
 type Page = Extract<ConversationPage, { scope: 'collaboration-markdown' }>
+
+type DocumentRequest = Extract<ConversationGetInput, { scope: 'collaboration-markdown' }>
+
+/** Subscribe before admission: a fast compiler may finish before the pending reply arrives. */
+async function readDocumentPage(
+  input: DocumentRequest,
+  signal: AbortSignal,
+  request: typeof window.pact.getConversation = (value) => window.pact.getConversation(value),
+): Promise<Page> {
+  let terminal: NonNullable<ConversationPatch['documentProjection']> | undefined
+  let preparationId: string | undefined
+  let wake!: () => void
+  const finished = new Promise<void>((resolve) => {
+    wake = resolve
+  })
+  const unsubscribe = window.pact.onConversationChanged((patch) => {
+    const event = patch.documentProjection
+    if (
+      patch.sessionId !== input.sessionId ||
+      event?.runId !== input.runId ||
+      event.document.id !== input.document.id ||
+      event.document.sha256 !== input.document.sha256 ||
+      (preparationId && event.preparationId !== preparationId)
+    )
+      return
+    terminal = event
+    if (preparationId) wake()
+  })
+  let timer: ReturnType<typeof setTimeout> | undefined
+  signal.addEventListener('abort', wake, { once: true })
+  try {
+    signal.throwIfAborted()
+    let response = await request(input)
+    signal.throwIfAborted()
+    if (response.ok && response.value.scope === 'collaboration-markdown-pending') {
+      const pending = response.value
+      if (
+        pending.sessionId !== input.sessionId ||
+        pending.runId !== input.runId ||
+        pending.document.id !== input.document.id ||
+        pending.document.sha256 !== input.document.sha256
+      )
+        throw new Error('The document source changed.')
+      preparationId = pending.preparationId
+      if (terminal?.preparationId !== preparationId) {
+        terminal = undefined
+        timer = setTimeout(wake, Math.max(0, Math.min(30_000, pending.deadline - Date.now())))
+        await finished
+      }
+      signal.throwIfAborted()
+      if (terminal?.status === 'failed')
+        throw new Error(terminal.message ?? 'Plan could not be loaded.')
+      // One receipt read also handles a lost notification. It cannot start another compilation.
+      response = await request({ ...input, preparationId })
+      signal.throwIfAborted()
+    }
+    if (!response.ok) throw new Error(response.error.message)
+    if (response.value.scope !== 'collaboration-markdown')
+      throw new Error('The plan is still being prepared. Try again.')
+    if (input.basis && response.value.basis !== input.basis)
+      throw new Error('The requested document view is unavailable.')
+    return response.value
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    signal.removeEventListener('abort', wake)
+    unsubscribe()
+  }
+}
 
 /** Plain-source cursors can overlap after an aroundOffset read. Keep each character once. */
 function clipPlainPage(page: Page, start: number, end: number): Page {
@@ -118,13 +188,13 @@ type ReadJob = { owner: object; run: () => Promise<void>; reject: (error: Error)
 
 // Lifetime exceeds mounted Plan panels: a closing panel cannot release an unsettled RPC.
 const documentReads = { busy: false, desired: undefined as ReadJob | undefined }
-async function drainDocumentReads(): Promise<void> {
-  if (documentReads.busy) return
-  documentReads.busy = true
+async function drainDocumentReads(queue = documentReads): Promise<void> {
+  if (queue.busy) return
+  queue.busy = true
   try {
-    while (documentReads.desired) {
-      const next = documentReads.desired
-      documentReads.desired = undefined
+    while (queue.desired) {
+      const next = queue.desired
+      queue.desired = undefined
       try {
         // oxlint-disable-next-line no-await-in-loop -- One physical document RPC slot.
         await next.run()
@@ -133,13 +203,13 @@ async function drainDocumentReads(): Promise<void> {
       }
     }
   } finally {
-    documentReads.busy = false
+    queue.busy = false
   }
 }
-function cancelPendingRead(owner: object): void {
-  if (documentReads.desired?.owner !== owner) return
-  documentReads.desired.reject(new Error('Document request cancelled.'))
-  documentReads.desired = undefined
+function cancelPendingRead(owner: object, queue = documentReads): void {
+  if (queue.desired?.owner !== owner) return
+  queue.desired.reject(new Error('Document request cancelled.'))
+  queue.desired = undefined
 }
 
 /** The Plan's one physical read slot also verifies logical selections. */
@@ -171,6 +241,7 @@ function ContinuousDocumentView({
       | { revision: number; resolve: () => void; anchor?: { offset: number; top: number } }
       | undefined,
   })
+  const movements = useRef({ busy: false, desired: undefined as ReadJob | undefined })
   const expectedScroll = useRef<number | undefined>(undefined)
   const scrollPosition = useRef(0)
   const scrollViewport = useCallback(
@@ -206,19 +277,25 @@ function ContinuousDocumentView({
   useEffect(() => {
     const current = owner.current
     current.active = true
+    const movementQueue = movements.current
     return () => {
       current.active = false
       cancelPendingRead(current)
+      cancelPendingRead(current, movementQueue)
       current.commit?.resolve()
       current.commit = undefined
     }
   }, [])
 
   // One replaceable intent. An obsolete RPC retains its physical slot until it settles.
-  const schedule = (operation: () => Promise<void>, signal?: AbortSignal): Promise<void> => {
+  const schedule = <T,>(
+    operation: () => Promise<T>,
+    signal?: AbortSignal,
+    queue = documentReads,
+  ): Promise<T> => {
     const current = owner.current
-    return new Promise<void>((resolve, reject) => {
-      documentReads.desired?.reject(new Error('Document request replaced.'))
+    return new Promise<T>((resolve, reject) => {
+      queue.desired?.reject(new Error('Document request replaced.'))
       const requestedKey = sourceKey
       const job: ReadJob = {
         owner: current,
@@ -226,35 +303,42 @@ function ContinuousDocumentView({
         run: async () => {
           if (!current.active || current.key !== requestedKey || signal?.aborted)
             throw new Error('Document request cancelled.')
-          await operation()
+          const value = await operation()
           if (!current.active || current.key !== requestedKey || signal?.aborted)
             throw new Error('Document request cancelled.')
-          resolve()
+          resolve(value)
         },
       }
-      documentReads.desired = job
-      void drainDocumentReads()
+      queue.desired = job
+      void drainDocumentReads(queue)
     })
   }
   const checkCurrent = (signal?: AbortSignal): void => {
     if (!owner.current.active || owner.current.key !== sourceKey || signal?.aborted)
       throw new Error('Document request cancelled.')
   }
-  const readPage = async (offset: number, around?: number, signal?: AbortSignal): Promise<Page> => {
+  const readPage = async (
+    offset: number,
+    around?: number,
+    signal?: AbortSignal,
+    selectedBasis = basis ??
+      (owner.current.state.key === sourceKey ? owner.current.state.pages[0]?.basis : undefined),
+  ): Promise<Page> => {
     checkCurrent(signal)
-    const reply = await window.pact.getConversation({
-      scope: 'collaboration-markdown',
-      sessionId,
-      runId,
-      document: source,
-      offset,
-      ...(basis ? { basis } : {}),
-      ...(around !== undefined ? { aroundOffset: around } : {}),
-    })
+    const page = await readDocumentPage(
+      {
+        scope: 'collaboration-markdown',
+        sessionId,
+        runId,
+        document: source,
+        offset,
+        ...(selectedBasis ? { basis: selectedBasis } : {}),
+        ...(around !== undefined ? { aroundOffset: around } : {}),
+      },
+      signal ?? new AbortController().signal,
+      (request) => schedule(() => window.pact.getConversation(request), signal),
+    )
     checkCurrent(signal)
-    if (!reply.ok || reply.value.scope !== 'collaboration-markdown')
-      throw new Error(reply.ok ? 'Document unavailable.' : reply.error.message)
-    const page = reply.value
     if (
       page.sessionId !== sessionId ||
       page.document.id !== source.id ||
@@ -297,27 +381,32 @@ function ContinuousDocumentView({
     const pages = [page]
     for (let index = 1; index < 3 && page.nextOffset !== null; index++) {
       // oxlint-disable-next-line no-await-in-loop -- The prior cursor is authoritative.
-      page = await readPage(page.nextOffset, undefined, signal)
+      page = await readPage(page.nextOffset, undefined, signal, page.basis)
       pages.push(page)
     }
     await commit(pages, false, signal)
   }
   const moveViewport: DocumentSelectionAdapter['moveViewport'] = async (target, signal) => {
     try {
-      await schedule(async () => {
-        if (typeof target === 'number') {
+      await schedule(
+        async () => {
+          if (typeof target === 'number') {
+            const pages = owner.current.state.pages
+            if (pages.some((page) => page.visibleStart <= target && page.visibleEnd > target))
+              return
+            await loadWindow(target, signal)
+            return
+          }
           const pages = owner.current.state.pages
-          if (pages.some((page) => page.visibleStart <= target && page.visibleEnd > target)) return
-          await loadWindow(target, signal)
-          return
-        }
-        const pages = owner.current.state.pages
-        const edge = target === 'previous' ? pages[0] : pages.at(-1)
-        const offset = target === 'previous' ? edge?.previousOffset : edge?.nextOffset
-        if (offset === null || offset === undefined) return
-        const page = await readPage(offset, undefined, signal)
-        await commit(extendProjectionWindow(pages, page, target), true, signal)
-      }, signal)
+          const edge = target === 'previous' ? pages[0] : pages.at(-1)
+          const offset = target === 'previous' ? edge?.previousOffset : edge?.nextOffset
+          if (offset === null || offset === undefined) return
+          const page = await readPage(offset, undefined, signal)
+          await commit(extendProjectionWindow(pages, page, target), true, signal)
+        },
+        signal,
+        movements.current,
+      )
       failedMove.current = undefined
     } catch (error) {
       if (!signal.aborted && owner.current.active && owner.current.key === sourceKey) {
@@ -382,16 +471,21 @@ function ContinuousDocumentView({
     failedMove.current = undefined
     cancelPendingRead(current)
     const controller = new AbortController()
-    setState({ key: sourceKey, revision: ++current.revision, pages: [] })
-    void schedule(() => loadWindow(aroundOffset, controller.signal), controller.signal).catch(
-      (error: unknown) => {
-        if (controller.signal.aborted || current.key !== sourceKey) return
-        setState((old) => ({
-          ...old,
-          error: error instanceof Error ? error.message : 'Document unavailable.',
-        }))
-      },
-    )
+    current.commit?.resolve()
+    current.commit = undefined
+    current.state = { key: sourceKey, revision: ++current.revision, pages: [] }
+    setState(current.state)
+    void schedule(
+      () => loadWindow(aroundOffset, controller.signal),
+      controller.signal,
+      movements.current,
+    ).catch((error: unknown) => {
+      if (controller.signal.aborted || current.key !== sourceKey) return
+      setState((old) => ({
+        ...old,
+        error: error instanceof Error ? error.message : 'Document unavailable.',
+      }))
+    })
     return () => {
       controller.abort()
     }
@@ -399,20 +493,25 @@ function ContinuousDocumentView({
     // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceKey])
 
-  const [retry, setRetry] = useState(0)
+  const [retry, setRetry] = useState<{ key: string; sequence: number }>()
   useEffect(() => {
-    if (!retry) return undefined
+    if (!retry || retry.key !== sourceKey) return undefined
     const controller = new AbortController()
     const pending =
       failedMove.current === undefined
-        ? schedule(() => loadWindow(aroundOffset, controller.signal), controller.signal)
+        ? schedule(
+            () => loadWindow(aroundOffset, controller.signal),
+            controller.signal,
+            movements.current,
+          )
         : moveViewport(failedMove.current, controller.signal)
     void pending.catch((error: unknown) => {
-      if (!controller.signal.aborted) setState((old) => ({ ...old, error: String(error) }))
+      if (!controller.signal.aborted && owner.current.key === sourceKey)
+        setState((old) => (old.key === sourceKey ? { ...old, error: String(error) } : old))
     })
     return () => controller.abort()
     // oxlint-disable-next-line react-hooks/exhaustive-deps
-  }, [retry])
+  }, [retry, sourceKey])
   const movement = useRef(moveViewport)
   useLayoutEffect(() => {
     movement.current = moveViewport
@@ -561,7 +660,9 @@ function ContinuousDocumentView({
           <button
             type="button"
             className="mt-2 underline"
-            onClick={() => setRetry((value) => value + 1)}
+            onClick={() =>
+              setRetry((value) => ({ key: sourceKey, sequence: (value?.sequence ?? 0) + 1 }))
+            }
           >
             Try again
           </button>
@@ -608,27 +709,29 @@ function PagedDocumentView({
   const key = `${sessionId}:${runId}:${source.id}:${source.sha256}:${offset}:${aroundOffset ?? ''}:${basis ?? ''}:${retry}`
   useEffect(() => {
     let current = true
+    const controller = new AbortController()
     const read = async () => {
       const pages: Page[] = []
       let next = Math.max(0, offset)
       try {
         for (let i = 0; i < 3; i++) {
           // oxlint-disable-next-line no-await-in-loop -- Next page is fenced by the immutable prior response.
-          const response = await window.pact.getConversation({
-            scope: 'collaboration-markdown',
-            ...(basis ? { basis } : {}),
-            sessionId,
-            runId,
-            document: source,
-            offset: next,
-            ...(i === 0 && offset === -1 && aroundOffset !== undefined ? { aroundOffset } : {}),
-          })
+          const page = await readDocumentPage(
+            {
+              scope: 'collaboration-markdown',
+              ...((basis ?? pages[0]?.basis) ? { basis: basis ?? pages[0]!.basis } : {}),
+              sessionId,
+              runId,
+              document: source,
+              offset: next,
+              ...(i === 0 && offset === -1 && aroundOffset !== undefined ? { aroundOffset } : {}),
+            },
+            controller.signal,
+          )
           if (!current) return
-          if (!response.ok || response.value.scope !== 'collaboration-markdown')
-            throw new Error(response.ok ? 'Document unavailable.' : response.error.message)
-          pages.push(response.value)
-          if (response.value.nextOffset === null) break
-          next = response.value.nextOffset
+          pages.push(page)
+          if (page.nextOffset === null) break
+          next = page.nextOffset
         }
         if (current) setState({ key, pages })
       } catch (error) {
@@ -643,6 +746,7 @@ function PagedDocumentView({
     void read()
     return () => {
       current = false
+      controller.abort()
     }
     // Source hash is the immutable identity; object/callback churn must not re-read the document.
     // oxlint-disable-next-line react-hooks/exhaustive-deps

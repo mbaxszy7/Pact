@@ -100,7 +100,13 @@ export const CollaborationReview = memo(function CollaborationReview({
   const [refresh, setRefresh] = useState(0)
   const [readError, setReadError] = useState('')
   const [actionError, setActionError] = useState('')
+  const failedAction = useRef<{ taskId: string; revision: number } | undefined>(undefined)
   const [busy, setBusy] = useState(false)
+  const [refreshing, setRefreshing] = useState(true)
+  const refreshStatus = (): void => {
+    setRefreshing(true)
+    setRefresh((value) => value + 1)
+  }
   const running = ['starting', 'running', 'recovering'].includes(run.status)
   const historical = run.id !== latestRunId
   const reportVersion = `${run.updatedAt}:${session.settingsRevision}`
@@ -134,11 +140,24 @@ export const CollaborationReview = memo(function CollaborationReview({
           setView(response.value.view)
           setLoadedAt(reportVersion)
           setReadError('')
+          const next = response.value.view.task
+          if (
+            next &&
+            failedAction.current &&
+            (next.id !== failedAction.current.taskId ||
+              (next.revision !== failedAction.current.revision && next.status !== 'failed'))
+          ) {
+            setActionError('')
+            failedAction.current = undefined
+          }
         } else if (!response.ok) setReadError(response.error.message)
         return undefined
       })
       .catch(() => {
         if (current) setReadError('The collaboration result could not be loaded. Try again.')
+      })
+      .finally(() => {
+        if (current) setRefreshing(false)
       })
     return () => {
       current = false
@@ -161,7 +180,8 @@ export const CollaborationReview = memo(function CollaborationReview({
     const decision = action === 'cancel_supplement' ? view?.relayDecision : undefined
     if (action === 'cancel_supplement' && !decision) return
     setBusy(true)
-    setActionError('')
+    if (action !== 'recover_plan') setActionError('')
+    failedAction.current = { taskId: task.id, revision: task.revision }
     try {
       const response = await window.pact.actOnCollaboration({
         sessionId: session.id,
@@ -177,11 +197,11 @@ export const CollaborationReview = memo(function CollaborationReview({
             ? 'This action could not start. Refresh and try again.'
             : response.error.message,
         )
-      setRefresh((value) => value + 1)
+      refreshStatus()
       onTaskChange?.()
     } catch {
       setActionError('The action receipt is unavailable. Refresh before trying again.')
-      setRefresh((value) => value + 1)
+      refreshStatus()
       onTaskChange?.()
     } finally {
       setBusy(false)
@@ -192,11 +212,7 @@ export const CollaborationReview = memo(function CollaborationReview({
     return error ? (
       <p role="alert" className="mt-2 text-caption text-status-danger-foreground">
         {error}{' '}
-        <button
-          type="button"
-          className="underline"
-          onClick={() => setRefresh((value) => value + 1)}
-        >
+        <button type="button" className="underline" onClick={() => refreshStatus()}>
           Retry read
         </button>
       </p>
@@ -282,7 +298,8 @@ export const CollaborationReview = memo(function CollaborationReview({
           action !== 'continue' &&
           action !== 'pause' &&
           (!continuationLimit || !['resume', 'retry'].includes(action)) &&
-          (!inputGate || action === 'recover_plan'),
+          (!inputGate || action === 'recover_plan') &&
+          !(action === 'recover_plan' && actionError),
       )
     : []
   const actionLabel = (action: DisplayedCollaborationAction): string =>
@@ -339,17 +356,17 @@ export const CollaborationReview = memo(function CollaborationReview({
           onCreateComment={onCreateReportComment}
         />
       ) : null}
-      {planSync ? (
+      {planSync && !actionError ? (
         <p className="mt-1 text-secondary">
           {planSync.kind === 'response'
             ? 'The response for the existing plan needs recovery before review.'
-            : 'The Agent finished, but its latest plan has not been synced to Pact.'}
+            : 'Restore the saved plan to continue to independent review.'}
           {planSync.retainedVersion > 0
             ? ` Version ${planSync.retainedVersion} is still preserved.`
             : ''}
           {planSync.kind === 'response'
             ? ' Restore the saved response, then continue for independent review.'
-            : ' Restore the saved plan, then continue for independent review.'}
+            : ''}
         </p>
       ) : continuationLimit && limitName ? (
         <p className="mt-1 text-secondary">
@@ -357,7 +374,7 @@ export const CollaborationReview = memo(function CollaborationReview({
           {' Increase '}
           {limitName.setting} in Session settings to continue.
         </p>
-      ) : paused && !inputGate ? (
+      ) : paused && !inputGate && !actionError ? (
         <p className="mt-1 text-secondary">
           {readyToContinue || resumedLimit
             ? nextStep
@@ -416,19 +433,25 @@ export const CollaborationReview = memo(function CollaborationReview({
         </div>
       ) : null}
       {error ? (
-        <p role="alert" className="mt-2 flex items-start gap-2 text-status-danger-foreground">
-          <AlertCircle aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" strokeWidth={1.75} />
+        <div
+          role="alert"
+          className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-status-danger-foreground"
+        >
+          <AlertCircle aria-hidden="true" className="size-3.5 shrink-0" strokeWidth={1.75} />
           <span>
-            {error}{' '}
-            <button
-              type="button"
-              className="underline"
-              onClick={() => setRefresh((value) => value + 1)}
-            >
-              Refresh
-            </button>
+            {planSync && actionError ? "Couldn't restore the plan. Your plan is saved." : error}
           </span>
-        </p>
+          <button
+            type="button"
+            disabled={
+              busy || refreshing || (Boolean(planSync && actionError) && (disabled || !actionable))
+            }
+            className="min-h-8 rounded-control px-2 text-caption font-medium text-primary underline underline-offset-2 hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
+            onClick={() => (planSync && actionError ? void act('recover_plan') : refreshStatus())}
+          >
+            {busy ? 'Restoring…' : refreshing ? 'Checking…' : 'Retry'}
+          </button>
+        </div>
       ) : null}
     </section>
   )

@@ -77,9 +77,36 @@ export async function resolveDecisionNativeExecutable(
   const original = await realpath(selected)
   const paths = [selected, original]
   let native = original
-  const windowsClaude = process.platform === 'win32' && provider === 'claude'
-  if (windowsClaude && !(await windowsExecutable(native))) throw Error('unsupported_protocol')
-  if (!windowsClaude && !macho(await prefix(native))) {
+  const windows = process.platform === 'win32'
+  if (windows && !(await windowsExecutable(native))) {
+    if (provider !== 'codex') throw Error('unsupported_protocol')
+    const normalized = original.replaceAll('\\', '/')
+    let launcher: string
+    if (normalized.endsWith('/bin/codex.js')) launcher = original
+    else {
+      const shim = new TextDecoder('utf-8', { fatal: true }).decode(await bounded(original, 16384))
+      if (
+        !/codex\.(?:cmd|ps1)$/iu.test(original) ||
+        !shim.replaceAll('\\', '/').includes('node_modules/@openai/codex/bin/codex.js')
+      )
+        throw Error('unsupported_protocol')
+      launcher = await realpath(join(dirname(original), 'node_modules/@openai/codex/bin/codex.js'))
+    }
+    const packagePath = join(dirname(dirname(launcher)), 'package.json')
+    const metadata = JSON.parse((await bounded(packagePath, 16384)).toString('utf8'))
+    if (metadata.name !== '@openai/codex' || metadata.version !== '0.161.0')
+      throw Error('unsupported_protocol')
+    const arch = process.arch === 'arm64' ? 'arm64' : process.arch === 'x64' ? 'x64' : null
+    if (!arch) throw Error('unsupported_platform')
+    const platformRoot = dirname(
+      createRequire(launcher).resolve(`@openai/codex-win32-${arch}/package.json`),
+    )
+    const target = arch === 'arm64' ? 'aarch64-pc-windows-msvc' : 'x86_64-pc-windows-msvc'
+    native = await realpath(join(platformRoot, 'vendor', target, 'bin', 'codex.exe'))
+    paths.push(launcher, packagePath, native)
+    if (!(await windowsExecutable(native))) throw Error('unsupported_protocol')
+  }
+  if (!windows && !macho(await prefix(native))) {
     if (provider !== 'codex') throw Error('unsupported_protocol')
     let launcher = original
     if (!launcher.endsWith('/bin/codex.js')) {

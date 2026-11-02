@@ -264,18 +264,19 @@ raw exception or credentials. Debug logging does not backfill earlier events.
 
 ### Evidence and commands
 
-| Lane                  | Command                                                          | Prerequisites and evidence                                                              |
-| --------------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| Unit                  | `pnpm test`                                                      | Vitest; public, isolated fixtures, no paid models                                       |
-| Infrastructure        | `pnpm test:infra`                                                | Node tests for publication, baseline integrity, coverage, runners, and packaged harness |
-| UI                    | `pnpm test:e2e:ui`                                               | Real Electron UI with fixture data; no provider credentials                             |
-| Deterministic         | `pnpm test:e2e:deterministic`                                    | Electron plus controlled protocols/fixed loads; not real model evidence                 |
-| Real provider         | `pnpm test:e2e:real`                                             | Installed/authenticated CLIs and private configuration; paid model requests             |
-| Core real provider    | `pnpm test:e2e:real:core`                                        | The `@real-core` business cases; the same actual CLIs and isolated configuration        |
-| Complete E2E          | `pnpm test:e2e`                                                  | All three Electron lanes; private configuration admitted before the sole build          |
-| Native protocol       | `pnpm test:native`                                               | Actual CLI/SDK storage and protocol against isolated loopback providers; no paid models |
-| Packaged smoke        | Manifest-based commands below                                    | Actual installation/extraction, private data, seed and cold verification                |
-| Packaged visible core | `node scripts/package-smoke.mjs --manifest MANIFEST --real-core` | Trusted local real-provider configuration; manual actual business observations required |
+| Lane                  | Command                                                          | Prerequisites and evidence                                                                |
+| --------------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Unit                  | `pnpm test`                                                      | Vitest; public, isolated fixtures, no paid models                                         |
+| Infrastructure        | `pnpm test:infra`                                                | Node tests for publication, baseline integrity, coverage, runners, and packaged harness   |
+| UI                    | `pnpm test:e2e:ui`                                               | Real Electron UI with fixture data; no provider credentials                               |
+| Deterministic         | `pnpm test:e2e:deterministic`                                    | Electron plus controlled protocols/fixed loads; not real model evidence                   |
+| Real provider         | `pnpm test:e2e:real`                                             | Installed/authenticated CLIs and private configuration; paid model requests               |
+| Core real provider    | `pnpm test:e2e:real:core`                                        | The `@real-core` business cases; the same actual CLIs and isolated configuration          |
+| Complete E2E          | `pnpm test:e2e`                                                  | All three Electron lanes; private configuration admitted before the sole build            |
+| Windows Codex Relay   | `pnpm test:native:codex-windows`                                 | Windows, Codex 0.161.0 and the native Job helper; owned loopback provider, no paid models |
+| Native protocol       | `pnpm test:native`                                               | Actual CLI/SDK storage and protocol against isolated loopback providers; no paid models   |
+| Packaged smoke        | Manifest-based commands below                                    | Actual installation/extraction, private data, seed and cold verification                  |
+| Packaged visible core | `node scripts/package-smoke.mjs --manifest MANIFEST --real-core` | Trusted local real-provider configuration; manual actual business observations required   |
 
 Electron runners build the selected lane, use one Playwright worker, zero retries, and a two-hour
 total deadline with a five-minute build budget. Forward file names and `--grep` after `--`; do not

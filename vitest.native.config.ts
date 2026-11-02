@@ -17,6 +17,7 @@ export default defineConfig({
       ...claudeDecisionNativeFiles,
       ...windowsOwnerNativeFiles,
       'tests/native/claude-decision-windows.test.ts',
+      'tests/native/codex-decision-windows.test.ts',
     ],
     reporters: ['verbose'],
     fileParallelism: false,

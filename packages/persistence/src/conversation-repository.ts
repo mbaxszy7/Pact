@@ -5442,6 +5442,8 @@ export class ConversationRepository {
       )
         return false
     }
+    // Advancement is a result of the same authenticated settlement for live and recovered turns.
+    task.handledInputSequence = Math.max(task.handledInputSequence, auth.inputSequence)
     task.planInputSequence = auth.inputSequence
     task.sourceMessageId = run.responseMessageId ?? run.userMessageId
     this.nativeFact(
@@ -5498,7 +5500,7 @@ export class ConversationRepository {
       task.runId !== runId ||
       task.stage !== auth.stage ||
       !collaborationPlanMode(frozen, auth) ||
-      task.handledInputSequence !== auth.inputSequence
+      task.inputSequence !== auth.inputSequence
     )
       return
     if (

@@ -1748,6 +1748,7 @@ export const conversationGetInputSchema = z.discriminatedUnion('scope', [
     document: collaborationDocumentSchema,
     offset: z.number().int().nonnegative(),
     aroundOffset: z.number().int().nonnegative().optional(),
+    preparationId: z.string().uuid().optional(),
   }),
   conversationPageBaseInputSchema.extend({
     scope: z.literal('collaboration-text'),
@@ -1909,6 +1910,14 @@ export const conversationPageSchema = z
           new TextEncoder().encode(JSON.stringify(value)).byteLength <= 48 * 1024,
         'Invalid document selection page.',
       ),
+    z.strictObject({
+      scope: z.literal('collaboration-markdown-pending'),
+      sessionId: z.string().uuid(),
+      runId: z.string().uuid(),
+      document: collaborationDocumentSchema,
+      preparationId: z.string().uuid(),
+      deadline: z.number().int().positive(),
+    }),
     z
       .strictObject({
         scope: z.literal('collaboration-markdown'),
@@ -2163,6 +2172,15 @@ export type ConversationActivityChange = z.infer<typeof conversationActivityChan
 
 export const conversationPatchSchema = z
   .strictObject({
+    documentProjection: z
+      .strictObject({
+        runId: z.string().uuid(),
+        document: collaborationDocumentSchema,
+        preparationId: z.string().uuid(),
+        status: z.enum(['ready', 'failed']),
+        message: z.string().max(512).optional(),
+      })
+      .optional(),
     version: z.literal('conversation-patch-v1'),
     runContexts: z.array(conversationRunContextSchema).max(1).optional(),
     queue: conversationQueueStateSchema.optional(),

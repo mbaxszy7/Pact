@@ -10,6 +10,7 @@ import {
   DECISION_OUTPUT_BYTES,
   DECISION_CLEANUP_TARGET_MS,
   parseDecisionRecommendation,
+  schedulingUsageSchema,
   validateDecisionInput,
   type DecisionInput,
   type DecisionOutcome,
@@ -101,6 +102,7 @@ export function decisionCloseResult(result: PromiseSettledResult<unknown>) {
   }
 }
 
+const WINDOWS_DISABLED = ['code_mode', 'code_mode_host', 'memories', 'goals']
 const DISABLED = [
   'hooks',
   'plugins',
@@ -121,7 +123,19 @@ const object = (value: unknown): Record<string, unknown> => {
   if (!isRecord(value)) throw Error('Invalid native metadata')
   return value
 }
-const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
+// Native configuration maps have no ordering guarantee across readbacks.
+const hash = (value: unknown) =>
+  createHash('sha256')
+    .update(
+      JSON.stringify(value, (_key, item: unknown) =>
+        isRecord(item)
+          ? Object.fromEntries(
+              Object.entries(item).toSorted(([left], [right]) => left.localeCompare(right)),
+            )
+          : item,
+      ),
+    )
+    .digest('hex')
 type Authority = {
   fingerprint: string
   accountId: string | null
@@ -135,6 +149,7 @@ function isDecisionInputLoader(value: unknown): value is DecisionInputLoader {
 
 /** One invocation. It has no business Adapter, Run dispatch or fallback authority. */
 export class CodexDecisionRuntime implements DecisionRuntime {
+  private readonly nativeToolDisabled = process.platform === 'win32'
   private readonly memory = new DecisionMemoryLease()
   private readonly nativeOwnerId = randomUUID()
   private readonly controller = new AbortController()
@@ -157,6 +172,7 @@ export class CodexDecisionRuntime implements DecisionRuntime {
   private directory: { path: string; dev: number; ino: number } | undefined
   private started = false
   private called = false
+  private nativeUsage: SchedulingUsage | undefined
   private physical: Promise<boolean> | undefined
   private closeTask: Promise<boolean> | undefined
   private logicallySettled = false
@@ -238,7 +254,7 @@ export class CodexDecisionRuntime implements DecisionRuntime {
     return this.called
   }
   get usage() {
-    return this.guard?.usage
+    return this.guard?.usage ?? this.nativeUsage
   }
   diagnostics() {
     return {
@@ -584,7 +600,7 @@ export class CodexDecisionRuntime implements DecisionRuntime {
       provider: name,
       definition,
       mcp: hash(config.mcp_servers ?? {}),
-      mcpNames: Object.keys(object(config.mcp_servers ?? {})),
+      mcpNames: Object.keys(object(config.mcp_servers ?? {})).toSorted(),
       base,
       chatgptBase,
       credentialStore: config.cli_auth_credentials_store ?? null,
@@ -770,7 +786,238 @@ export class CodexDecisionRuntime implements DecisionRuntime {
     throw Error('Native catalog capacity')
   }
 
-  private async prepareNative() {
+  /** Trusted Windows CLI, native login, one context. No macOS sandbox or proxy is implied. */
+  private async windowsConfiguration() {
+    const config = object(
+      (await this.rpc('config/read', { cwd: this.directory!.path, includeLayers: false })).config,
+    )
+    const features = object(config.features ?? {})
+    if ([...DISABLED, ...WINDOWS_DISABLED].some((feature) => features[feature] !== false))
+      throw Error('Unsupported native protocol')
+    const provider = this.provider(config)
+    if (provider.mcpNames.length > 128) throw Error('Native catalog capacity')
+    const listing = await this.rpc('skills/list', {
+      cwds: [this.directory!.path],
+      forceReload: true,
+    })
+    if (!Array.isArray(listing.data) || listing.data.length !== 1)
+      throw Error('Unsupported native protocol')
+    const entry = object(listing.data[0])
+    if (
+      !Array.isArray(entry.skills) ||
+      entry.skills.length > 128 ||
+      (Array.isArray(entry.errors) && entry.errors.length)
+    )
+      throw Error('Native catalog capacity')
+    const skills = entry.skills
+      .map((item) => {
+        const path = object(item).path
+        if (typeof path !== 'string' || !path || path.length > 4096)
+          throw Error('Unsupported native protocol')
+        return { path, enabled: false }
+      })
+      .toSorted((left, right) => left.path.localeCompare(right.path))
+    const account = await this.rpc('account/read', { refreshToken: false })
+    const identity = object(account.account)
+    if (
+      account.requiresOpenaiAuth !== true ||
+      !['chatgpt', 'apiKey'].includes(String(identity.type))
+    )
+      throw Error('Unsupported native authentication')
+    const controls = {
+      mcp_servers: Object.fromEntries(provider.mcpNames.map((name) => [name, { enabled: false }])),
+      'skills.config': skills,
+    }
+    if (Buffer.byteLength(JSON.stringify(controls)) > 64 * 1024)
+      throw Error('Native catalog capacity')
+    return {
+      fingerprint: hash([provider, features, skills, identity, account.workspaceRouting]),
+      provider: provider.provider,
+      controls,
+    }
+  }
+
+  private async prepareWindowsNative() {
+    this.checkDeadline()
+    const env = this.context.environment ?? process.env
+    assertDecisionEnvironment(env)
+    const executable = await this.resolveExecutable()
+    this.nativeExecutable = await resolveDecisionNativeExecutable(executable, 'codex')
+    const directory = await realpath(await mkdtemp(join(tmpdir(), 'pact-decision-')))
+    const identity = await lstat(directory)
+    this.directory = { path: directory, dev: identity.dev, ino: identity.ino }
+    if (this.context.retirePhysicalReceipts) {
+      const released = await this.context
+        .retirePhysicalReceipts({
+          memory: this.memory,
+          deadlineAt: Math.min(this.deadlineAt, Date.now() + DECISION_CLEANUP_TARGET_MS),
+          signal: this.controller.signal,
+        })
+        .catch((error: unknown) => {
+          this.receiptRetirementUnconfirmed = true
+          throw error
+        })
+      if (!released) throw Error('Decision receipt capacity unavailable')
+    }
+    this.nativeGeneration =
+      this.context.beginNativeStage?.({
+        expectedGeneration: 0,
+        stage: 'native_context',
+        previousWitness: null,
+        previousPhysicalReleased: true,
+      }) ?? 1
+    if (this.nativeGeneration !== 1) throw Error('Unsupported native protocol')
+    this.group = new OwnedProcessGroup({
+      signal: this.controller.signal,
+      ownerId: this.nativeOwnerId,
+      memory: this.memory,
+      deadlineAt: this.deadlineAt,
+      ...(this.context.physicalPrepared
+        ? {
+            physicalPrepared: async (witness: DecisionPhysicalWitness) => {
+              this.witness = witness
+              await this.context.physicalPrepared!({
+                witness,
+                nativeGeneration: this.nativeGeneration,
+              })
+            },
+          }
+        : {}),
+    })
+    const child = this.group.spawn(
+      this.nativeExecutable.path,
+      [
+        'app-server',
+        ...[...DISABLED, ...WINDOWS_DISABLED].flatMap((feature) => ['--disable', feature]),
+        '-c',
+        'project_doc_max_bytes=0',
+        '-c',
+        'web_search="disabled"',
+      ],
+      { cwd: directory, env: codexProcessEnvironment(undefined, env) },
+    )
+    child.stderr.on('data', () => {})
+    this.connection = new CodexAppServerConnection(
+      child,
+      undefined,
+      () => this.group!.close(),
+      undefined,
+      () => this.context.current() && !this.controller.signal.aborted,
+      this.memory,
+    )
+    this.connection.subscribeServerRequests(() => {
+      this.controller.abort()
+      return true
+    })
+    const witness = await this.group.physicalWitness(this.nativeOwnerId)
+    this.witness = witness
+    await this.context.physicalPrepared?.({ witness, nativeGeneration: this.nativeGeneration })
+    if (this.probing)
+      this.context.probePrepared?.({ witness, nativeGeneration: this.nativeGeneration })
+    const initialized = await this.rpc('initialize', {
+      clientInfo: { name: 'pact', title: 'Pact Relay', version: '0.0.0' },
+      capabilities: { experimentalApi: true },
+    })
+    const version =
+      typeof initialized.userAgent === 'string'
+        ? /\/(0\.\d+\.\d+)(?:\s|$)/u.exec(initialized.userAgent)?.[1]
+        : undefined
+    if (initialized.platformOs !== 'windows' || version !== '0.161.0')
+      throw Error('Unsupported native protocol')
+    await this.connection.notify('initialized', {}, { signal: this.controller.signal })
+    const configuration = await this.windowsConfiguration()
+    const modelFingerprint = await this.exactModel()
+    const configurationFingerprint = hash({
+      configuration: configuration.fingerprint,
+      modelFingerprint,
+      executable: this.nativeExecutable.fingerprint,
+      version,
+      platform: 'win32',
+      model: MODEL,
+      effort: EFFORT,
+    })
+    return { configuration, directory, configurationFingerprint }
+  }
+
+  private async runWindows(input: DecisionInput): Promise<DecisionOutcome> {
+    const prepared = await this.prepareWindowsNative()
+    const { configuration, directory, configurationFingerprint } = prepared
+    const started = await this.rpc('thread/start', {
+      cwd: directory,
+      ephemeral: true,
+      model: MODEL,
+      modelProvider: configuration.provider,
+      approvalPolicy: 'never',
+      sandbox: 'read-only',
+      allowProviderModelFallback: false,
+      environments: [],
+      dynamicTools: [],
+      selectedCapabilityRoots: [],
+      experimentalRawEvents: true,
+      baseInstructions: 'Provide bounded decision advice using only supplied facts.',
+      developerInstructions: 'Return only the requested scheduling recommendation JSON.',
+      config: {
+        ...configuration.controls,
+      },
+    })
+    const thread = object(started.thread)
+    if (
+      started.model !== MODEL ||
+      started.modelProvider !== configuration.provider ||
+      started.cwd !== directory ||
+      thread.cwd !== directory ||
+      thread.ephemeral !== true ||
+      typeof thread.id !== 'string' ||
+      object(started.sandbox).type !== 'readOnly'
+    )
+      throw Error('Native decision configuration changed')
+    if (
+      !this.context.current() ||
+      !(await this.nativeExecutable!.current()) ||
+      (await this.windowsConfiguration()).fingerprint !== configuration.fingerprint
+    )
+      throw Error('Native decision configuration changed')
+    this.context.prepared?.({
+      witness: this.witness!,
+      configurationFingerprint,
+      nativeGeneration: this.nativeGeneration,
+    })
+    this.checkDeadline()
+    if (!this.context.current()) throw Error('Obsolete decision dispatch')
+    this.context.dispatch()
+    this.called = true
+    const admitted = await this.rpc('turn/start', {
+      threadId: thread.id,
+      model: MODEL,
+      effort: EFFORT,
+      environments: [],
+      input: [
+        {
+          type: 'text',
+          text: decisionRuntimePrompt(input) + JSON.stringify(input),
+          text_elements: [],
+        },
+      ],
+    })
+    const turnId = object(admitted.turn).id
+    if (typeof turnId !== 'string' || !turnId || turnId.length > 1024)
+      throw Error('Foreign native decision turn')
+    return this.readRecommendation(
+      thread.id,
+      turnId,
+      input,
+      async () =>
+        this.context.current() &&
+        (await this.nativeExecutable!.current()) &&
+        (await this.windowsConfiguration()).fingerprint === configuration.fingerprint,
+    )
+  }
+
+  private prepareNative(): Promise<{ configurationFingerprint: string }> {
+    return this.nativeToolDisabled ? this.prepareWindowsNative() : this.prepareGuardedNative()
+  }
+
+  private async prepareGuardedNative() {
     this.checkDeadline()
     const env = this.context.environment ?? process.env
     assertDecisionEnvironment(env)
@@ -1026,13 +1273,14 @@ export class CodexDecisionRuntime implements DecisionRuntime {
   }
 
   private async run(input: DecisionInput): Promise<DecisionOutcome> {
+    if (this.nativeToolDisabled) return this.runWindows(input)
     const {
       nativeAuthority,
       directory,
       executableCurrent,
       configurationFingerprint,
       verifyOriginal,
-    } = await this.prepareNative()
+    } = await this.prepareGuardedNative()
     const connection = this.connection
     if (!connection) throw Error('Native connection unavailable')
     const providerId = `pact_decision_${randomUUID().replaceAll('-', '')}`
@@ -1112,14 +1360,37 @@ export class CodexDecisionRuntime implements DecisionRuntime {
         this.called = true
       },
     })
-    await this.rpc('turn/start', {
+    const admitted = await this.rpc('turn/start', {
       threadId,
       model: MODEL,
       effort: EFFORT,
       input: [{ type: 'text', text: prompt, text_elements: [] }],
       environments: [],
     })
-    let answer: string | undefined, turnId: string | undefined
+    const turnId = object(admitted.turn).id
+    if (typeof turnId !== 'string' || !turnId || turnId.length > 1024)
+      throw Error('Foreign native decision turn')
+    return this.readRecommendation(threadId, turnId, input, async () => {
+      if (
+        !(await executableCurrent()) ||
+        hash(await this.authority()) !== hash(nativeAuthority) ||
+        !this.context.current()
+      )
+        return false
+      await verifyOriginal()
+      return true
+    })
+  }
+
+  private async readRecommendation(
+    threadId: string,
+    turnId: string,
+    input: DecisionInput,
+    verify: () => Promise<boolean>,
+  ): Promise<DecisionOutcome> {
+    const connection = this.connection
+    if (!connection) throw Error('Native connection unavailable')
+    let answer: string | undefined
     for (;;) {
       this.controller.signal.throwIfAborted()
       const event = await connection.nextNotification(
@@ -1130,11 +1401,35 @@ export class CodexDecisionRuntime implements DecisionRuntime {
         params = object(Reflect.get(event, 'params') ?? {})
       if (params.threadId !== undefined && params.threadId !== threadId)
         throw Error('Foreign native decision event')
-      if (typeof params.turnId === 'string') {
-        if (turnId && params.turnId !== turnId) throw Error('Foreign native decision turn')
-        turnId = params.turnId
+      if (params.turnId !== undefined && params.turnId !== turnId)
+        throw Error('Foreign native decision turn')
+      if (
+        ['turn/started', 'turn/completed'].includes(String(method)) &&
+        (params.threadId !== threadId || object(params.turn).id !== turnId)
+      )
+        throw Error('Foreign native decision turn')
+      if (
+        ['item/started', 'item/completed', 'rawResponseItem/completed'].includes(String(method)) &&
+        (params.threadId !== threadId || params.turnId !== turnId)
+      )
+        throw Error('Foreign native decision turn')
+      if (this.nativeToolDisabled && method === 'thread/tokenUsage/updated') {
+        const usage = object(object(params.tokenUsage).total)
+        this.nativeUsage = schedulingUsageSchema.parse({
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+        })
       }
       const item = params.item === undefined ? undefined : object(params.item)
+      if (
+        this.nativeToolDisabled &&
+        item &&
+        ((['item/started', 'item/completed'].includes(String(method)) &&
+          !['userMessage', 'agentMessage', 'reasoning'].includes(String(item.type))) ||
+          (method === 'rawResponseItem/completed' &&
+            !['message', 'reasoning'].includes(String(item.type))))
+      )
+        throw Error('Unexpected native tool execution')
       if (
         method === 'item/started' &&
         item &&
@@ -1165,13 +1460,7 @@ export class CodexDecisionRuntime implements DecisionRuntime {
           throw Error('Decision did not complete')
         const parsed = parseDecisionRecommendation(answer, input)
         if (!parsed.success) return { kind: 'unavailable', reason: 'invalid_output' }
-        if (
-          !(await executableCurrent()) ||
-          hash(await this.authority()) !== hash(nativeAuthority) ||
-          !this.context.current()
-        )
-          return { kind: 'unavailable', reason: 'stale' }
-        await verifyOriginal()
+        if (!(await verify())) return { kind: 'unavailable', reason: 'stale' }
         this.checkDeadline()
         return { kind: 'recommendation', recommendation: parsed.recommendation }
       }

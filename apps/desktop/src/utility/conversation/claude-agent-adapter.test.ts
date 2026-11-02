@@ -3669,7 +3669,7 @@ function rebuildInput() {
     sessionId: 'session-1',
     nativeSessionId: '3b222d47-fd99-48b9-9b6e-c23428710e41',
     sourceHash: 'a'.repeat(64),
-    cwd: '/project',
+    cwd: resolveSourceFixturePath('/project'),
     model: null,
     effort: null,
   }
@@ -3682,7 +3682,7 @@ function initializedInput() {
     sessionId: 'session-1',
     bindingGeneration: 2,
     nativeSessionId: rebuildInput().nativeSessionId,
-    cwd: '/project',
+    cwd: resolveSourceFixturePath('/project'),
     model: null,
     effort: null,
     confirmedInitialization: {
@@ -3697,7 +3697,7 @@ async function bootstrapFixture(
 ) {
   const profile = await mkdtemp(join(tmpdir(), 'pact-claude-seed-test-'))
   bootstrapDirectories.push(profile)
-  const project = join(profile, 'projects', '-project'),
+  const project = join(profile, 'projects', rebuildInput().cwd.replace(/[^a-z0-9]/giu, '-')),
     path = join(project, rebuildInput().nativeSessionId + '.jsonl')
   await mkdir(project, { recursive: true })
   vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
@@ -3711,7 +3711,7 @@ async function bootstrapFixture(
       request.options.spawnClaudeCodeProcess({
         command: '/fake/claude',
         args: [],
-        cwd: '/project',
+        cwd: rebuildInput().cwd,
         env: {},
       })
       return {
@@ -3723,7 +3723,7 @@ async function bootstrapFixture(
               : prompts.map((message, index) => ({
                   ...message,
                   sessionId: rebuildInput().nativeSessionId,
-                  cwd: '/project',
+                  cwd: rebuildInput().cwd,
                   parentUuid: index ? prompts[index - 1]!.uuid : null,
                   timestamp: new Date().toISOString(),
                   message: {
@@ -3805,7 +3805,7 @@ async function bootstrapFixture(
           uuid: randomUUID(),
           parentUuid: prompts.at(-1)!.uuid,
           sessionId: rebuildInput().nativeSessionId,
-          cwd: '/project',
+          cwd: rebuildInput().cwd,
           timestamp: new Date().toISOString(),
           message: {
             role: kind === 'user' ? 'user' : 'assistant',

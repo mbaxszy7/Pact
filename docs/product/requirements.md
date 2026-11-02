@@ -560,13 +560,15 @@ A retained file descriptor verifies identity and content through physical
 completion; Pact never creates or repairs this identifier. This is a narrow trusted-native exception,
 not an operating-system guarantee that every native-home file is read-only.
 
-Windows Claude Relay uses a trusted native CLI in one fresh, tool-disabled context outside the
+Windows Relay uses a trusted native Claude Code or Codex CLI in one fresh, tool-disabled context outside the
 Project, retaining the original native login. It uses fixed Relay instructions and the complete
 Pact-supplied business context, disables built-in tools, MCP, Hooks, Skills, plugins and other
 development customizations, and never resumes development history. Native organization policy remains
 trusted; if it prevents effective disablement, Relay refuses inference. Startup configuration runs
 under normal native permissions. Effective credential helpers remain unavailable even with cached
-account identity. This mode was checked with Claude Code 2.1.309.
+account identity. This mode was checked with Claude Code 2.1.309 and Codex 0.161.0. Codex uses an ephemeral
+native thread, empty environment and capability selections, disabled feature switches, and explicit
+MCP and Skill overrides. Native login and cache directories remain native-owned.
 
 Windows trusts the installed CLI and its native authentication behavior. The CLI may maintain its
 normal authentication, cache and client state. Pact does not provide OS-level filesystem, ACL or
@@ -575,7 +577,8 @@ untrusted: require the exact selected model, one normally completed bound turn, 
 matching assistant/result text and a valid admitted recommendation before adoption. The existing
 Windows Job owner provides cancellation, physical exit and durable receipt proof. One 15-second,
 16-MiB invocation reservation, bounded input/output and host freshness/authorization checks remain.
-Refresh performs no inference. Codex decision execution remains unavailable on Windows. Platform,
+Refresh performs no inference. The same Relay model selections are available on Windows and macOS;
+compatibility checks still verify the installed native protocol. Platform,
 packaged and real-provider acceptance remain separate requirements.
 
 Evaluation rows record only invocation/outcome/usage and bounded physical identity metadata below
