@@ -1122,9 +1122,7 @@ export function ConversationView({
   const commentDraftId = commentEditor?.draftId
   const defaultRecipient =
     unfinishedTask && !parseComposerCommandPrefix(composer, composerSkills).pact
-      ? unfinishedTask.kind === 'review'
-        ? unfinishedTask.reviewer
-        : unfinishedTask.owner
+      ? collaborationActor(unfinishedTask, 'reply')
       : session.settings.primaryAgentId
   const primaryName = session.settings.primaryAgentId === 'claude' ? 'Claude Code' : 'Codex'
   const filteredMentionOptions = mentionOptions.filter(
@@ -3957,28 +3955,6 @@ export function ConversationView({
               }
             />
           ) : null}
-          {queue && queueActions ? (
-            <QueueMessageBar
-              queue={queue}
-              pending={queueActions.pending}
-              disabled={composerDisabled || sending || stopping}
-              canSteer={!inputTakeover && canSteerQueuedInput}
-              steerUnavailableReason={
-                inputTakeover ? 'Resolve the current interaction first.' : steerUnavailableReason
-              }
-              respondingAgentId={respondingAgentId}
-              onSteer={queueActions.steer}
-              onRemove={queueActions.remove}
-              onEdit={inputTakeover ? undefined : () => returnQueueMessageToComposer(false)}
-              onResume={queueActions.resume}
-              onSetEnabled={queueActions.setEnabled}
-              onCheckStatus={
-                queuedInput?.state === 'unknown' && queuedInput.delivery
-                  ? queueActions.checkStatus
-                  : undefined
-              }
-            />
-          ) : null}
           <div className="relay-indicator-slot">
             {onOpenRelaySettings ? (
               <RelayActivityIndicator
@@ -3990,490 +3966,480 @@ export function ConversationView({
               />
             ) : null}
           </div>
-          <InputReplacement
-            key={session.id}
-            replacement={
-              nativeQuestions.length
-                ? {
-                    key: `native:${nativeQuestions.map(({ request }) => `${request.operationId}:${request.id}`).join(':')}`,
-                    content: (
-                      <div className="max-h-[min(60vh,36rem)] space-y-2 overflow-auto">
-                        {nativeQuestions.map(({ agentId, request }) => (
-                          <NativeInputCard
-                            key={`${request.operationId}:${request.id}`}
-                            request={request}
-                            agentId={agentId}
-                            onRespond={onRespondNativeInput}
-                            draft={nativeInputDrafts[request.id]}
-                            onDraftChange={onNativeInputDraftChange}
-                          />
-                        ))}
-                      </div>
-                    ),
-                  }
-                : decisionTakeover && decisionSource
+          <div className="pact-queued-input flex min-h-0 flex-col">
+            {queue && queueActions ? (
+              <QueueMessageBar
+                queue={queue}
+                pending={queueActions.pending}
+                disabled={composerDisabled || sending || stopping}
+                canSteer={!inputTakeover && canSteerQueuedInput}
+                steerUnavailableReason={
+                  inputTakeover ? 'Resolve the current interaction first.' : steerUnavailableReason
+                }
+                respondingAgentId={respondingAgentId}
+                onSteer={queueActions.steer}
+                onRemove={queueActions.remove}
+                onEdit={inputTakeover ? undefined : () => returnQueueMessageToComposer(false)}
+                onResume={queueActions.resume}
+                onSetEnabled={queueActions.setEnabled}
+                onCheckStatus={
+                  queuedInput?.state === 'unknown' && queuedInput.delivery
+                    ? queueActions.checkStatus
+                    : undefined
+                }
+              />
+            ) : null}
+            <InputReplacement
+              key={session.id}
+              replacement={
+                nativeQuestions.length
                   ? {
-                      key: planRecovery
-                        ? `recovery:${planRecovery.runId}`
-                        : decisionReply
-                          ? `question:${decisionKey}`
-                          : `processing:${decisionKey}`,
-                      content: planRecovery ? (
-                        <section
-                          aria-label="Plan recovery required"
-                          className="rounded-control border border-border bg-surface-muted px-group py-panel text-caption"
-                        >
-                          <p className="font-medium text-primary">Plan recovery required</p>
-                          <p className="mt-1 text-secondary">
-                            Restore the saved plan using the recovery action above. Your previous
-                            answers and message draft are kept.
-                          </p>
-                        </section>
-                      ) : decisionReply ? (
-                        <div className="space-y-2">
-                          {inputGateState === 'incomplete' ? (
-                            <p role="status" className="px-group text-caption text-secondary">
-                              {incompleteCanAnswer
-                                ? 'Your previous reply was not confirmed. You can send a follow-up answer.'
-                                : 'Your previous reply needs recovery before another answer can be sent.'}
-                            </p>
-                          ) : null}
-                          <CollaborationQuestionCard
-                            key={decisionKey}
-                            sessionId={session.id}
-                            runId={decisionSource.runId}
-                            messageId={decisionMessageId}
-                            actor={
-                              decisionSource.actor ?? runsById.get(decisionSource.runId)?.agentId
-                            }
-                            decision={decisionReply}
-                            draft={history.decisionDraft}
-                            onDraftChange={history.setDecisionDraft}
-                            onClearDraft={history.clearDecisionDraft}
-                            onSubmit={() => void submitAnswers()}
-                            canSubmit={decisionAnswersReady}
-                            disabled={questionDisabled}
-                            onOpenProjectFile={openProjectFile}
-                          />
+                      key: `native:${nativeQuestions.map(({ request }) => `${request.operationId}:${request.id}`).join(':')}`,
+                      content: (
+                        <div className="max-h-[min(60vh,36rem)] space-y-2 overflow-auto">
+                          {nativeQuestions.map(({ agentId, request }) => (
+                            <NativeInputCard
+                              key={`${request.operationId}:${request.id}`}
+                              request={request}
+                              agentId={agentId}
+                              onRespond={onRespondNativeInput}
+                              draft={nativeInputDrafts[request.id]}
+                              onDraftChange={onNativeInputDraftChange}
+                            />
+                          ))}
                         </div>
-                      ) : (
-                        <section
-                          aria-label="Answer progress"
-                          className="flex items-center gap-group rounded-control border border-border bg-surface-muted px-group py-panel text-caption"
-                        >
-                          <LoaderCircle
-                            aria-hidden="true"
-                            className="size-4 shrink-0 animate-spin text-secondary motion-reduce:animate-none"
-                          />
-                          <div className="min-w-0 flex-1">
-                            <p className="font-medium text-primary">
-                              {inputGateState === 'queued'
-                                ? 'Answers queued'
-                                : responseInProgress
-                                  ? 'Processing your answers'
-                                  : 'Answers sent'}
-                            </p>
-                            <p className="mt-1 text-secondary">
-                              Your message draft is kept until these questions are resolved.
-                            </p>
-                          </div>
-                          {responseInProgress ? (
-                            <button
-                              type="button"
-                              disabled={stopping}
-                              onClick={() => void onStop()}
-                              className="min-h-8 rounded-control px-3 font-medium text-primary hover:bg-surface-raised focus-visible:outline-2 focus-visible:outline-focus"
-                            >
-                              {stopping ? 'Stopping…' : 'Stop'}
-                            </button>
-                          ) : null}
-                        </section>
                       ),
                     }
-                  : currentRelayDecision && !planRecovery && nativeRequests.length === 0
+                  : decisionTakeover && decisionSource
                     ? {
-                        key: `relay:${currentRelayDecision.request.decisionId}`,
-                        content: (
-                          <RelayDecisionCard
-                            decision={currentRelayDecision}
-                            visible={visible && !nativePresentationSuspended}
-                          />
+                        key: planRecovery
+                          ? `recovery:${planRecovery.runId}`
+                          : decisionReply
+                            ? `question:${decisionKey}`
+                            : `processing:${decisionKey}`,
+                        content: planRecovery ? (
+                          <section
+                            aria-label="Plan recovery required"
+                            className="rounded-control border border-border bg-surface-muted px-group py-panel text-caption"
+                          >
+                            <p className="font-medium text-primary">Plan recovery required</p>
+                            <p className="mt-1 text-secondary">
+                              Restore the saved plan using the recovery action above. Your previous
+                              answers and message draft are kept.
+                            </p>
+                          </section>
+                        ) : decisionReply ? (
+                          <div className="space-y-2">
+                            {inputGateState === 'incomplete' ? (
+                              <p role="status" className="px-group text-caption text-secondary">
+                                {incompleteCanAnswer
+                                  ? 'Your previous reply was not confirmed. You can send a follow-up answer.'
+                                  : 'Your previous reply needs recovery before another answer can be sent.'}
+                              </p>
+                            ) : null}
+                            <CollaborationQuestionCard
+                              key={decisionKey}
+                              sessionId={session.id}
+                              runId={decisionSource.runId}
+                              messageId={decisionMessageId}
+                              actor={
+                                decisionSource.actor ?? runsById.get(decisionSource.runId)?.agentId
+                              }
+                              decision={decisionReply}
+                              draft={history.decisionDraft}
+                              onDraftChange={history.setDecisionDraft}
+                              onClearDraft={history.clearDecisionDraft}
+                              onSubmit={() => void submitAnswers()}
+                              canSubmit={decisionAnswersReady}
+                              disabled={questionDisabled}
+                              onOpenProjectFile={openProjectFile}
+                            />
+                          </div>
+                        ) : (
+                          <section
+                            aria-label="Answer progress"
+                            className="flex items-center gap-group rounded-control border border-border bg-surface-muted px-group py-panel text-caption"
+                          >
+                            <LoaderCircle
+                              aria-hidden="true"
+                              className="size-4 shrink-0 animate-spin text-secondary motion-reduce:animate-none"
+                            />
+                            <div className="min-w-0 flex-1">
+                              <p className="font-medium text-primary">
+                                {inputGateState === 'queued'
+                                  ? 'Answers queued'
+                                  : responseInProgress
+                                    ? 'Processing your answers'
+                                    : 'Answers sent'}
+                              </p>
+                              <p className="mt-1 text-secondary">
+                                Your message draft is kept until these questions are resolved.
+                              </p>
+                            </div>
+                            {responseInProgress ? (
+                              <button
+                                type="button"
+                                disabled={stopping}
+                                onClick={() => void onStop()}
+                                className="min-h-8 rounded-control px-3 font-medium text-primary hover:bg-surface-raised focus-visible:outline-2 focus-visible:outline-focus"
+                              >
+                                {stopping ? 'Stopping…' : 'Stop'}
+                              </button>
+                            ) : null}
+                          </section>
                         ),
                       }
-                    : undefined
-            }
-          >
-            <div className="pact-ordinary-input-stack flex flex-col gap-2">
-              {snapshot?.preparedInputContinuation ? (
-                <PreparedInputCard
-                  key={`${session.id}:${snapshot.preparedInputContinuation.batchId}`}
-                  sessionId={session.id}
-                  input={snapshot.preparedInputContinuation}
-                  disabled={
-                    sending || stopping || nativeRequests.length > 0 || Boolean(planRecovery)
-                  }
-                  onChanged={() => history.retryRead()}
-                />
-              ) : null}
-              {!planPanelExpanded ? commentEditorView : null}
-              {skillComposer.warning ? (
-                <div
-                  id={`skill-warning-${session.id}`}
-                  role="alert"
-                  className="flex items-start gap-2 rounded-control border border-status-danger/30 bg-status-danger-muted px-3 py-2 text-caption text-status-danger-foreground"
-                >
-                  <TriangleAlert
-                    aria-hidden="true"
-                    className="mt-0.5 size-3.5 shrink-0"
-                    strokeWidth={1.75}
+                    : currentRelayDecision && !planRecovery && nativeRequests.length === 0
+                      ? {
+                          key: `relay:${currentRelayDecision.request.decisionId}`,
+                          content: (
+                            <RelayDecisionCard
+                              decision={currentRelayDecision}
+                              visible={visible && !nativePresentationSuspended}
+                            />
+                          ),
+                        }
+                      : undefined
+              }
+            >
+              <div className="pact-ordinary-input-stack flex flex-col gap-2">
+                {snapshot?.preparedInputContinuation ? (
+                  <PreparedInputCard
+                    key={`${session.id}:${snapshot.preparedInputContinuation.batchId}`}
+                    sessionId={session.id}
+                    input={snapshot.preparedInputContinuation}
+                    disabled={
+                      sending || stopping || nativeRequests.length > 0 || Boolean(planRecovery)
+                    }
+                    onChanged={() => history.retryRead()}
                   />
-                  <span>{skillComposer.warning}</span>
-                </div>
-              ) : null}
-              {queue?.returnedInput &&
-              queueActions &&
-              (composerReturnedInputOperationId !== queue.returnedInput.operationId ||
-                (!composer && !composerImages.length && !draftComments.length)) ? (
-                <div
-                  className="flex min-h-8 flex-wrap items-center gap-2 px-2 text-caption text-secondary"
-                  role="status"
-                >
-                  <span>Returned message available</span>
-                  <button
-                    type="button"
-                    className="min-h-7 rounded-control px-2 font-medium text-primary hover:bg-surface-muted disabled:opacity-40"
-                    disabled={composerDisabled || sending || stopping || queueActions.pending}
-                    title="Replace the current draft with the returned message"
-                    onClick={() => void returnQueueMessageToComposer(true)}
+                ) : null}
+                {!planPanelExpanded ? commentEditorView : null}
+                {skillComposer.warning ? (
+                  <div
+                    id={`skill-warning-${session.id}`}
+                    role="alert"
+                    className="flex items-start gap-2 rounded-control border border-status-danger/30 bg-status-danger-muted px-3 py-2 text-caption text-status-danger-foreground"
                   >
-                    {history.restoringInput ? 'Restoring message…' : 'Restore returned message'}
-                  </button>
-                </div>
-              ) : null}
-              <div
-                ref={composerBoxRef}
-                style={{ anchorName: composerMenuAnchor }}
-                className={`pact-composer-box relative flex flex-col gap-1.5 rounded-card border border-border bg-surface-raised p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus ${recoveryLocked ? 'opacity-60' : ''} ${imageDropActive ? 'outline-2 outline-focus outline-offset-4' : ''}`}
-                onDragEnter={(event) => {
-                  if (
-                    !composerDisabled &&
-                    !inputTakeover &&
-                    event.dataTransfer.types.includes('Files')
-                  ) {
-                    event.preventDefault()
-                    setImageDropActive(true)
-                  }
-                }}
-                onDragOver={(event) => {
-                  if (
-                    !composerDisabled &&
-                    !inputTakeover &&
-                    event.dataTransfer.types.includes('Files')
-                  ) {
-                    event.preventDefault()
-                    event.dataTransfer.dropEffect = 'copy'
-                  }
-                }}
-                onDragLeave={(event) => {
-                  if (
-                    !event.currentTarget.contains(
-                      event.relatedTarget instanceof Node ? event.relatedTarget : null,
+                    <TriangleAlert
+                      aria-hidden="true"
+                      className="mt-0.5 size-3.5 shrink-0"
+                      strokeWidth={1.75}
+                    />
+                    <span>{skillComposer.warning}</span>
+                  </div>
+                ) : null}
+                {queue?.returnedInput &&
+                queueActions &&
+                (composerReturnedInputOperationId !== queue.returnedInput.operationId ||
+                  (!composer && !composerImages.length && !draftComments.length)) ? (
+                  <div
+                    className="flex min-h-8 flex-wrap items-center gap-2 px-2 text-caption text-secondary"
+                    role="status"
+                  >
+                    <span>Returned message available</span>
+                    <button
+                      type="button"
+                      className="min-h-7 rounded-control px-2 font-medium text-primary hover:bg-surface-muted disabled:opacity-40"
+                      disabled={composerDisabled || sending || stopping || queueActions.pending}
+                      title="Replace the current draft with the returned message"
+                      onClick={() => void returnQueueMessageToComposer(true)}
+                    >
+                      {history.restoringInput ? 'Restoring message…' : 'Restore returned message'}
+                    </button>
+                  </div>
+                ) : null}
+                <div
+                  ref={composerBoxRef}
+                  style={{ anchorName: composerMenuAnchor }}
+                  className={`pact-composer-box relative flex flex-col gap-1.5 rounded-card border border-border bg-surface-raised p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus ${recoveryLocked ? 'opacity-60' : ''} ${imageDropActive ? 'outline-2 outline-focus outline-offset-4' : ''}`}
+                  onDragEnter={(event) => {
+                    if (
+                      !composerDisabled &&
+                      !inputTakeover &&
+                      event.dataTransfer.types.includes('Files')
+                    ) {
+                      event.preventDefault()
+                      setImageDropActive(true)
+                    }
+                  }}
+                  onDragOver={(event) => {
+                    if (
+                      !composerDisabled &&
+                      !inputTakeover &&
+                      event.dataTransfer.types.includes('Files')
+                    ) {
+                      event.preventDefault()
+                      event.dataTransfer.dropEffect = 'copy'
+                    }
+                  }}
+                  onDragLeave={(event) => {
+                    if (
+                      !event.currentTarget.contains(
+                        event.relatedTarget instanceof Node ? event.relatedTarget : null,
+                      )
                     )
-                  )
+                      setImageDropActive(false)
+                  }}
+                  onDropCapture={(event) => {
                     setImageDropActive(false)
-                }}
-                onDropCapture={(event) => {
-                  setImageDropActive(false)
-                  if (
-                    event.dataTransfer.files.length &&
-                    onAddComposerImages &&
-                    !composerDisabled &&
-                    !inputTakeover
-                  ) {
-                    event.preventDefault()
-                    event.stopPropagation()
-                    void onAddComposerImages([...event.dataTransfer.files])
-                  }
-                }}
+                    if (
+                      event.dataTransfer.files.length &&
+                      onAddComposerImages &&
+                      !composerDisabled &&
+                      !inputTakeover
+                    ) {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      void onAddComposerImages([...event.dataTransfer.files])
+                    }
+                  }}
 
-                aria-disabled={recoveryLocked}
-              >
-                <div className="pact-composer-editing flex min-h-16 w-full flex-col gap-1.5">
-                  {!planPanelExpanded ? commentDraftsView : null}
-                  {returnedInput ? (
-                    <div className="mb-2 flex flex-wrap items-center gap-2 px-2 text-caption text-secondary">
-                      <span>
-                        {history.restoringInput
-                          ? 'Restoring unsent message…'
-                          : returnedInput.state === 'installed' &&
-                              (composer || composerImages.length || draftComments.length)
-                            ? 'Unsent message restored'
-                            : 'Previous unsent message is available'}
-                      </span>
-                      <span>
-                        ·{' '}
-                        {returnedInput.route.type === 'all'
-                          ? `${returnedInput.route.firstAgentId === 'codex' ? 'Codex' : 'Claude Code'} → ${returnedInput.route.secondAgentId === 'codex' ? 'Codex' : 'Claude Code'}`
-                          : returnedInput.route.agentId === 'codex'
-                            ? 'Codex'
-                            : 'Claude Code'}
-                      </span>
-                      {returnedInput.state === 'pending' ||
-                      (!composer &&
-                        !composerImages.length &&
-                        !hasDecisionAnswers(history.decisionDraft)) ? (
-                        <>
-                          <button
-                            type="button"
-                            className="rounded-control px-2 py-1 text-primary hover:bg-surface-muted disabled:opacity-40"
-                            disabled={Boolean(
-                              composer ||
-                              hasDecisionAnswers(history.decisionDraft) ||
+                  aria-disabled={recoveryLocked}
+                >
+                  <div className="pact-composer-editing flex min-h-16 w-full flex-col gap-1.5">
+                    {!planPanelExpanded ? commentDraftsView : null}
+                    {returnedInput ? (
+                      <div className="mb-2 flex flex-wrap items-center gap-2 px-2 text-caption text-secondary">
+                        <span>
+                          {history.restoringInput
+                            ? 'Restoring unsent message…'
+                            : returnedInput.state === 'installed' &&
+                                (composer || composerImages.length || draftComments.length)
+                              ? 'Unsent message restored'
+                              : 'Previous unsent message is available'}
+                        </span>
+                        <span>
+                          ·{' '}
+                          {returnedInput.route.type === 'all'
+                            ? `${returnedInput.route.firstAgentId === 'codex' ? 'Codex' : 'Claude Code'} → ${returnedInput.route.secondAgentId === 'codex' ? 'Codex' : 'Claude Code'}`
+                            : returnedInput.route.agentId === 'codex'
+                              ? 'Codex'
+                              : 'Claude Code'}
+                        </span>
+                        {returnedInput.state === 'pending' ||
+                        (!composer &&
+                          !composerImages.length &&
+                          !hasDecisionAnswers(history.decisionDraft)) ? (
+                          <>
+                            <button
+                              type="button"
+                              className="rounded-control px-2 py-1 text-primary hover:bg-surface-muted disabled:opacity-40"
+                              disabled={Boolean(
+                                composer ||
+                                hasDecisionAnswers(history.decisionDraft) ||
+                                composerImages.length ||
+                                composerMention ||
+                                draftComments.some(
+                                  (comment) => !returnedInput.commentIds.includes(comment.id),
+                                ) ||
+                                history.restoringInput ||
+                                history.draftsLoading,
+                              )}
+                              onClick={() => void history.restoreReturnedInput?.()}
+                            >
+                              Restore to input
+                            </button>
+                            {returnedInput.state === 'pending' ? (
+                              <button
+                                type="button"
+                                className="rounded-control px-2 py-1 hover:bg-surface-muted disabled:opacity-40"
+                                disabled={Boolean(history.restoringInput)}
+                                onClick={() => void history.discardReturnedInput?.()}
+                              >
+                                Dismiss
+                              </button>
+                            ) : null}
+                            {returnedInput.state === 'pending' &&
+                            (composer ||
                               composerImages.length ||
                               composerMention ||
-                              draftComments.some(
-                                (comment) => !returnedInput.commentIds.includes(comment.id),
-                              ) ||
-                              history.restoringInput ||
-                              history.draftsLoading,
-                            )}
-                            onClick={() => void history.restoreReturnedInput?.()}
-                          >
-                            Restore to input
-                          </button>
-                          {returnedInput.state === 'pending' ? (
-                            <button
-                              type="button"
-                              className="rounded-control px-2 py-1 hover:bg-surface-muted disabled:opacity-40"
-                              disabled={Boolean(history.restoringInput)}
-                              onClick={() => void history.discardReturnedInput?.()}
-                            >
-                              Dismiss
-                            </button>
-                          ) : null}
-                          {returnedInput.state === 'pending' &&
-                          (composer ||
-                            composerImages.length ||
-                            composerMention ||
-                            draftComments.length) ? (
-                            <span>
-                              Keep your current draft. Sending it replaces the previous input.
-                            </span>
-                          ) : null}
-                        </>
-                      ) : null}
-                    </div>
-                  ) : null}
-                  <ConversationImages
-                    sessionId={session.id}
-                    images={composerImages}
-                    draft
-                    disabled={composerDisabled}
-                    onOpen={(image) => openImageGallery(composerImages, image)}
-                    onRemove={onRemoveComposerImage}
-                  />
-                  <ComposerEditor
-                    editorRef={composerRef}
-                    value={editorValue}
-                    onChange={acceptComposerDocument}
-                    admitEdit={history.admitComposerEdit}
-                    onCursor={cursorChanged}
-                    onSkillOpen={(skill) => onOpenSkillDocument?.(skill)}
-                    onNotice={onNotice}
-                    onImages={
-                      onAddComposerImages ? (files) => void onAddComposerImages(files) : undefined
-                    }
-                    expanded={mentionListOpen || Boolean(skillComposer.query)}
-                    controls={
-                      skillComposer.query
-                        ? `skills-${session.id}`
-                        : mentionListOpen
-                          ? mentionListId
-                          : undefined
-                    }
-                    describedBy={skillComposer.warning ? `skill-warning-${session.id}` : undefined}
-                    activeDescendant={
-                      skillComposer.query && skillComposer.options[skillComposer.active]
-                        ? `skill-${skillComposer.options[skillComposer.active]!.id}`
-                        : activeMentionId
-                    }
-                    placeholder={
-                      history.draftError
-                        ? 'Comments unavailable'
-                        : history.draftsLoading
-                          ? 'Loading saved comments…'
-                          : agentActionsEnabled
-                            ? 'What should we tackle next?'
-                            : 'Agent actions are paused'
-                    }
-                    disabled={composerDisabled || inputTakeover}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
-                        event.preventDefault()
-                        void submit()
-                        return
+                              draftComments.length) ? (
+                              <span>
+                                Keep your current draft. Sending it replaces the previous input.
+                              </span>
+                            ) : null}
+                          </>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    <ConversationImages
+                      sessionId={session.id}
+                      images={composerImages}
+                      draft
+                      disabled={composerDisabled}
+                      onOpen={(image) => openImageGallery(composerImages, image)}
+                      onRemove={onRemoveComposerImage}
+                    />
+                    <ComposerEditor
+                      editorRef={composerRef}
+                      value={editorValue}
+                      onChange={acceptComposerDocument}
+                      admitEdit={history.admitComposerEdit}
+                      onCursor={cursorChanged}
+                      onSkillOpen={(skill) => onOpenSkillDocument?.(skill)}
+                      onNotice={onNotice}
+                      onImages={
+                        onAddComposerImages ? (files) => void onAddComposerImages(files) : undefined
                       }
-                      const editingDocument = composerRef.current?.document() ?? editorValue
-                      const selectedMention = editingDocument.mention
-                      const range = composerRef.current?.selection() ?? { start: 0, end: 0 }
-                      if (skillComposer.query) {
-                        if (event.key === 'Escape') {
+                      expanded={mentionListOpen || Boolean(skillComposer.query)}
+                      controls={
+                        skillComposer.query
+                          ? `skills-${session.id}`
+                          : mentionListOpen
+                            ? mentionListId
+                            : undefined
+                      }
+                      describedBy={
+                        skillComposer.warning ? `skill-warning-${session.id}` : undefined
+                      }
+                      activeDescendant={
+                        skillComposer.query && skillComposer.options[skillComposer.active]
+                          ? `skill-${skillComposer.options[skillComposer.active]!.id}`
+                          : activeMentionId
+                      }
+                      placeholder={
+                        history.draftError
+                          ? 'Comments unavailable'
+                          : history.draftsLoading
+                            ? 'Loading saved comments…'
+                            : agentActionsEnabled
+                              ? 'What should we tackle next?'
+                              : 'Agent actions are paused'
+                      }
+                      disabled={composerDisabled || inputTakeover}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
                           event.preventDefault()
-                          skillComposer.close()
+                          void submit()
                           return
                         }
-                        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-                          event.preventDefault()
-                          const next = skillComposer.active + (event.key === 'ArrowDown' ? 1 : -1)
-                          const current = skillComposer.options[skillComposer.active]
-                          if (
-                            event.key === 'ArrowUp' &&
-                            current &&
-                            current.agentId !== 'pact' &&
-                            (skillComposer.pages[current.agentId]?.startOffset ?? 0) > 0 &&
-                            skillComposer.options[next]?.agentId !== current.agentId
-                          ) {
-                            void skillComposer.more(current.agentId, true)
+                        const editingDocument = composerRef.current?.document() ?? editorValue
+                        const selectedMention = editingDocument.mention
+                        const range = composerRef.current?.selection() ?? { start: 0, end: 0 }
+                        if (skillComposer.query) {
+                          if (event.key === 'Escape') {
+                            event.preventDefault()
+                            skillComposer.close()
                             return
                           }
-                          if (
-                            event.key === 'ArrowDown' &&
-                            current &&
-                            current.agentId !== 'pact' &&
-                            skillComposer.pages[current.agentId]?.nextOffset != null &&
-                            skillComposer.options[next]?.agentId !== current.agentId
-                          )
-                            void skillComposer.more(current.agentId)
-                          else if (next >= skillComposer.options.length && skillComposer.hasMore)
-                            void skillComposer.more()
-                          else
-                            skillComposer.setActive(
-                              Math.max(0, Math.min(skillComposer.options.length - 1, next)),
+                          if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                            event.preventDefault()
+                            const next = skillComposer.active + (event.key === 'ArrowDown' ? 1 : -1)
+                            const current = skillComposer.options[skillComposer.active]
+                            if (
+                              event.key === 'ArrowUp' &&
+                              current &&
+                              current.agentId !== 'pact' &&
+                              (skillComposer.pages[current.agentId]?.startOffset ?? 0) > 0 &&
+                              skillComposer.options[next]?.agentId !== current.agentId
+                            ) {
+                              void skillComposer.more(current.agentId, true)
+                              return
+                            }
+                            if (
+                              event.key === 'ArrowDown' &&
+                              current &&
+                              current.agentId !== 'pact' &&
+                              skillComposer.pages[current.agentId]?.nextOffset != null &&
+                              skillComposer.options[next]?.agentId !== current.agentId
                             )
-                          return
-                        }
-                        if ((event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) {
-                          // Keep keyboard intent in the Composer while a filtered page is arriving.
-                          event.preventDefault()
-                          const entry = skillComposer.options[skillComposer.active]
-                          if (entry) {
-                            chooseSkill(entry)
+                              void skillComposer.more(current.agentId)
+                            else if (next >= skillComposer.options.length && skillComposer.hasMore)
+                              void skillComposer.more()
+                            else
+                              skillComposer.setActive(
+                                Math.max(0, Math.min(skillComposer.options.length - 1, next)),
+                              )
+                            return
                           }
-                          return
+                          if ((event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) {
+                            // Keep keyboard intent in the Composer while a filtered page is arriving.
+                            event.preventDefault()
+                            const entry = skillComposer.options[skillComposer.active]
+                            if (entry) {
+                              chooseSkill(entry)
+                            }
+                            return
+                          }
                         }
-                      }
-                      if (
-                        selectedMention &&
-                        range.start === range.end &&
-                        ((event.key === 'Backspace' && range.start === selectedMention.end) ||
-                          (event.key === 'Delete' && range.start === selectedMention.start))
-                      ) {
-                        event.preventDefault()
-                        const trailingSpace =
-                          editingDocument.text[selectedMention.end] === ' ' ? 1 : 0
-                        const next = `${editingDocument.text.slice(0, selectedMention.start)}${editingDocument.text.slice(selectedMention.end + trailingSpace)}`
-                        const cursor = selectedMention.start
-                        updateComposer(next, cursor, [
-                          {
-                            start: selectedMention.start,
-                            end: selectedMention.end + trailingSpace,
-                            text: '',
-                          },
-                        ])
-                        setMentionQuery(undefined)
-                        return
-                      }
-                      if (mentionQuery && filteredMentionOptions.length > 0) {
-                        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                        if (
+                          selectedMention &&
+                          range.start === range.end &&
+                          ((event.key === 'Backspace' && range.start === selectedMention.end) ||
+                            (event.key === 'Delete' && range.start === selectedMention.start))
+                        ) {
                           event.preventDefault()
-                          const direction = event.key === 'ArrowDown' ? 1 : -1
-                          setActiveMentionIndex(
-                            (index) =>
-                              (index + direction + filteredMentionOptions.length) %
-                              filteredMentionOptions.length,
-                          )
+                          const trailingSpace =
+                            editingDocument.text[selectedMention.end] === ' ' ? 1 : 0
+                          const next = `${editingDocument.text.slice(0, selectedMention.start)}${editingDocument.text.slice(selectedMention.end + trailingSpace)}`
+                          const cursor = selectedMention.start
+                          updateComposer(next, cursor, [
+                            {
+                              start: selectedMention.start,
+                              end: selectedMention.end + trailingSpace,
+                              text: '',
+                            },
+                          ])
+                          setMentionQuery(undefined)
                           return
                         }
-                        if ((event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) {
+                        if (mentionQuery && filteredMentionOptions.length > 0) {
+                          if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                            event.preventDefault()
+                            const direction = event.key === 'ArrowDown' ? 1 : -1
+                            setActiveMentionIndex(
+                              (index) =>
+                                (index + direction + filteredMentionOptions.length) %
+                                filteredMentionOptions.length,
+                            )
+                            return
+                          }
+                          if ((event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) {
+                            event.preventDefault()
+                            const option = filteredMentionOptions[activeMentionIndex]
+                            if (option) chooseMention(option)
+                            return
+                          }
+                          if (event.key === 'Escape') {
+                            event.preventDefault()
+                            dismissMentionMenu()
+                            return
+                          }
+                        }
+                        if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+                          if (responseInProgress && !queueEnabled && !unfinishedTask) return
                           event.preventDefault()
-                          const option = filteredMentionOptions[activeMentionIndex]
-                          if (option) chooseMention(option)
-                          return
+                          void submit()
                         }
-                        if (event.key === 'Escape') {
-                          event.preventDefault()
-                          dismissMentionMenu()
-                          return
-                        }
-                      }
-                      if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
-                        if (responseInProgress && !queueEnabled && !unfinishedTask) return
-                        event.preventDefault()
-                        void submit()
-                      }
-                    }}
-                  />
-                </div>
-                <div className="pact-composer-send-row relative flex items-center justify-between">
-                  <div
-                    ref={skillMenuRef}
-                    popover="auto"
-                    style={{ positionAnchor: composerMenuAnchor }}
-                    onBeforeToggle={(event) => {
-                      skillPopoverOpen.current = event.newState === 'open'
-                      if (event.newState === 'closed' && skillComposer.query) skillComposer.close()
-                    }}
-                    id={`skills-${session.id}`}
-                    role="listbox"
-                    aria-label="Native Skills"
-                    aria-hidden={!skillMenuOpen}
-                    aria-busy={skillComposer.loading}
-                    inert={!skillMenuOpen}
-                    data-open={skillMenuOpen}
-                    className="pact-skill-menu overflow-y-auto rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
-                  >
-                    {skillComposer.pactOptions.length > 0 ? (
-                      <>
-                        <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">
-                          Pact
-                        </p>
-                        {skillComposer.pactOptions.map((entry) => {
-                          const index = skillComposer.options.indexOf(entry)
-                          return (
-                            <button
-                              key={entry.id}
-                              id={`skill-${entry.id}`}
-                              type="button"
-                              role="option"
-                              aria-selected={index === skillComposer.active}
-                              className={`flex min-h-10 w-full items-center gap-2 rounded-control px-2.5 py-1.5 text-left text-caption ${index === skillComposer.active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
-                              onMouseEnter={() => skillComposer.setActive(index, false)}
-                              onMouseDown={(event) => event.preventDefault()}
-                              onClick={() => chooseSkill(entry)}
-                            >
-                              <BookOpen
-                                aria-hidden="true"
-                                className="size-4 shrink-0"
-                                strokeWidth={1.75}
-                              />
-                              <span className="min-w-0 flex-1">
-                                <span className="block font-medium text-primary">{entry.name}</span>
-                                <span className="block text-tertiary">{entry.description}</span>
-                              </span>
-                              <span className="text-tertiary">Pact</span>
-                            </button>
-                          )
-                        })}
-                      </>
-                    ) : null}
-                    {skillComposer.agents.map((agent) => (
-                      <Fragment key={agent}>
-                        <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">
-                          {agent === 'claude' ? 'Claude Code' : 'Codex'}
-                        </p>
-                        {skillComposer.visibleOptions
-                          .filter((entry) => entry.agentId === agent)
-                          .map((entry) => {
+                      }}
+                    />
+                  </div>
+                  <div className="pact-composer-send-row relative flex items-center justify-between">
+                    <div
+                      ref={skillMenuRef}
+                      popover="auto"
+                      style={{ positionAnchor: composerMenuAnchor }}
+                      onBeforeToggle={(event) => {
+                        skillPopoverOpen.current = event.newState === 'open'
+                        if (event.newState === 'closed' && skillComposer.query)
+                          skillComposer.close()
+                      }}
+                      id={`skills-${session.id}`}
+                      role="listbox"
+                      aria-label="Native Skills"
+                      aria-hidden={!skillMenuOpen}
+                      aria-busy={skillComposer.loading}
+                      inert={!skillMenuOpen}
+                      data-open={skillMenuOpen}
+                      className="pact-skill-menu overflow-y-auto rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
+                    >
+                      {skillComposer.pactOptions.length > 0 ? (
+                        <>
+                          <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">
+                            Pact
+                          </p>
+                          {skillComposer.pactOptions.map((entry) => {
                             const index = skillComposer.options.indexOf(entry)
                             return (
                               <button
@@ -4485,284 +4451,323 @@ export function ConversationView({
                                 className={`flex min-h-10 w-full items-center gap-2 rounded-control px-2.5 py-1.5 text-left text-caption ${index === skillComposer.active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
                                 onMouseEnter={() => skillComposer.setActive(index, false)}
                                 onMouseDown={(event) => event.preventDefault()}
-                                onClick={() => {
-                                  chooseSkill(entry)
-                                }}
+                                onClick={() => chooseSkill(entry)}
                               >
+                                <BookOpen
+                                  aria-hidden="true"
+                                  className="size-4 shrink-0"
+                                  strokeWidth={1.75}
+                                />
                                 <span className="min-w-0 flex-1">
-                                  <span className="block truncate font-medium text-primary">
-                                    /{entry.name}
-                                    {entry.argumentHint ? (
-                                      <span className="ml-2 font-normal text-tertiary">
-                                        {entry.argumentHint}
-                                      </span>
-                                    ) : null}
+                                  <span className="block font-medium text-primary">
+                                    {entry.name}
                                   </span>
-                                  <span
-                                    className="block truncate text-tertiary"
-                                    title={entry.description}
-                                  >
-                                    {entry.description}
-                                  </span>
+                                  <span className="block text-tertiary">{entry.description}</span>
                                 </span>
-                                <span className="shrink-0 text-tertiary">
-                                  {entry.source === 'native'
-                                    ? 'Native'
-                                    : entry.source[0]!.toUpperCase() + entry.source.slice(1)}
-                                </span>
+                                <span className="text-tertiary">Pact</span>
                               </button>
                             )
                           })}
-                        {skillComposer.errors[agent] ? (
-                          <p className="px-2.5 py-2 text-caption text-secondary">
-                            {skillComposer.errors[agent]}
+                        </>
+                      ) : null}
+                      {skillComposer.agents.map((agent) => (
+                        <Fragment key={agent}>
+                          <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">
+                            {agent === 'claude' ? 'Claude Code' : 'Codex'}
                           </p>
-                        ) : null}
-                        {!skillComposer.loading &&
-                        !skillComposer.errors[agent] &&
-                        !skillComposer.pages[agent]?.skills.length ? (
-                          <p className="px-2.5 py-2 text-caption text-tertiary">
-                            No matching Skills.
-                          </p>
-                        ) : null}
-                        {skillComposer.canPrevious(agent) || skillComposer.canMore(agent) ? (
-                          <div className="flex items-center justify-between gap-2 px-2.5 py-1">
-                            {skillComposer.canPrevious(agent) ? (
-                              <button
-                                type="button"
-                                className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
-                                aria-label={`Previous ${agent === 'claude' ? 'Claude Code' : 'Codex'} Skills`}
-                                disabled={skillComposer.loading}
-                                onMouseDown={(event) => event.preventDefault()}
-                                onClick={() => {
-                                  composerRef.current?.focus()
-                                  void skillComposer.more(agent, true)
-                                }}
-                              >
-                                Previous Skills
-                              </button>
-                            ) : (
-                              <span />
-                            )}
-                            <span role="status" className="text-caption text-tertiary">
-                              {skillComposer.rangeLabel(agent)}
-                            </span>
-                            {skillComposer.canMore(agent) ? (
-                              <button
-                                type="button"
-                                className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
-                                aria-label={`More ${agent === 'claude' ? 'Claude Code' : 'Codex'} Skills`}
-                                disabled={skillComposer.loading}
-                                onMouseDown={(event) => event.preventDefault()}
-                                onClick={() => {
-                                  composerRef.current?.focus()
-                                  void skillComposer.more(agent)
-                                }}
-                              >
-                                More Skills
-                              </button>
-                            ) : null}
-                          </div>
-                        ) : null}
-                      </Fragment>
-                    ))}
-                    {skillComposer.loading && skillComposer.options.length === 0 ? (
-                      <p
-                        role="status"
-                        className="flex items-center gap-2 px-2.5 py-2 text-caption text-tertiary"
-                      >
-                        <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-                        Loading native Skills…
-                      </p>
-                    ) : null}
-                  </div>
-                  <div
-                    ref={mentionMenuRef}
-                    id={mentionListId}
-                    popover="auto"
-                    style={{ positionAnchor: composerMenuAnchor }}
-                    data-open={mentionListOpen}
-                    aria-hidden={!mentionListOpen}
-                    inert={!mentionListOpen}
-                    onBeforeToggle={(event) => {
-                      mentionPopoverOpen.current = event.newState === 'open'
-                      if (event.newState === 'closed' && mentionQuery) dismissMentionMenu()
-                    }}
-                    className="pact-mention-menu overflow-y-auto rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
-                    role="listbox"
-                    aria-label="Message recipients"
-                  >
-                    {filteredMentionOptions.map((option, index) => {
-                      const Icon = option.icon
-                      const active = index === activeMentionIndex
-                      return (
-                        <button
-                          id={`${mentionListId}-${option.token.slice(1)}`}
-                          key={option.token}
-                          type="button"
-                          role="option"
-                          aria-selected={active}
-                          className={`flex min-h-9 w-full cursor-pointer items-center gap-2.5 rounded-control px-2.5 text-left text-caption ${active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted/70 hover:text-primary'}`}
-                          onMouseEnter={() => setActiveMentionIndex(index)}
-                          onMouseDown={(event) => event.preventDefault()}
-                          onClick={() => chooseMention(option)}
+                          {skillComposer.visibleOptions
+                            .filter((entry) => entry.agentId === agent)
+                            .map((entry) => {
+                              const index = skillComposer.options.indexOf(entry)
+                              return (
+                                <button
+                                  key={entry.id}
+                                  id={`skill-${entry.id}`}
+                                  type="button"
+                                  role="option"
+                                  aria-selected={index === skillComposer.active}
+                                  className={`flex min-h-10 w-full items-center gap-2 rounded-control px-2.5 py-1.5 text-left text-caption ${index === skillComposer.active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
+                                  onMouseEnter={() => skillComposer.setActive(index, false)}
+                                  onMouseDown={(event) => event.preventDefault()}
+                                  onClick={() => {
+                                    chooseSkill(entry)
+                                  }}
+                                >
+                                  <span className="min-w-0 flex-1">
+                                    <span className="block truncate font-medium text-primary">
+                                      /{entry.name}
+                                      {entry.argumentHint ? (
+                                        <span className="ml-2 font-normal text-tertiary">
+                                          {entry.argumentHint}
+                                        </span>
+                                      ) : null}
+                                    </span>
+                                    <span
+                                      className="block truncate text-tertiary"
+                                      title={entry.description}
+                                    >
+                                      {entry.description}
+                                    </span>
+                                  </span>
+                                  <span className="shrink-0 text-tertiary">
+                                    {entry.source === 'native'
+                                      ? 'Native'
+                                      : entry.source[0]!.toUpperCase() + entry.source.slice(1)}
+                                  </span>
+                                </button>
+                              )
+                            })}
+                          {skillComposer.errors[agent] ? (
+                            <p className="px-2.5 py-2 text-caption text-secondary">
+                              {skillComposer.errors[agent]}
+                            </p>
+                          ) : null}
+                          {!skillComposer.loading &&
+                          !skillComposer.errors[agent] &&
+                          !skillComposer.pages[agent]?.skills.length ? (
+                            <p className="px-2.5 py-2 text-caption text-tertiary">
+                              No matching Skills.
+                            </p>
+                          ) : null}
+                          {skillComposer.canPrevious(agent) || skillComposer.canMore(agent) ? (
+                            <div className="flex items-center justify-between gap-2 px-2.5 py-1">
+                              {skillComposer.canPrevious(agent) ? (
+                                <button
+                                  type="button"
+                                  className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
+                                  aria-label={`Previous ${agent === 'claude' ? 'Claude Code' : 'Codex'} Skills`}
+                                  disabled={skillComposer.loading}
+                                  onMouseDown={(event) => event.preventDefault()}
+                                  onClick={() => {
+                                    composerRef.current?.focus()
+                                    void skillComposer.more(agent, true)
+                                  }}
+                                >
+                                  Previous Skills
+                                </button>
+                              ) : (
+                                <span />
+                              )}
+                              <span role="status" className="text-caption text-tertiary">
+                                {skillComposer.rangeLabel(agent)}
+                              </span>
+                              {skillComposer.canMore(agent) ? (
+                                <button
+                                  type="button"
+                                  className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
+                                  aria-label={`More ${agent === 'claude' ? 'Claude Code' : 'Codex'} Skills`}
+                                  disabled={skillComposer.loading}
+                                  onMouseDown={(event) => event.preventDefault()}
+                                  onClick={() => {
+                                    composerRef.current?.focus()
+                                    void skillComposer.more(agent)
+                                  }}
+                                >
+                                  More Skills
+                                </button>
+                              ) : null}
+                            </div>
+                          ) : null}
+                        </Fragment>
+                      ))}
+                      {skillComposer.loading && skillComposer.options.length === 0 ? (
+                        <p
+                          role="status"
+                          className="flex items-center gap-2 px-2.5 py-2 text-caption text-tertiary"
                         >
-                          <Icon
+                          <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                          Loading native Skills…
+                        </p>
+                      ) : null}
+                    </div>
+                    <div
+                      ref={mentionMenuRef}
+                      id={mentionListId}
+                      popover="auto"
+                      style={{ positionAnchor: composerMenuAnchor }}
+                      data-open={mentionListOpen}
+                      aria-hidden={!mentionListOpen}
+                      inert={!mentionListOpen}
+                      onBeforeToggle={(event) => {
+                        mentionPopoverOpen.current = event.newState === 'open'
+                        if (event.newState === 'closed' && mentionQuery) dismissMentionMenu()
+                      }}
+                      className="pact-mention-menu overflow-y-auto rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
+                      role="listbox"
+                      aria-label="Message recipients"
+                    >
+                      {filteredMentionOptions.map((option, index) => {
+                        const Icon = option.icon
+                        const active = index === activeMentionIndex
+                        return (
+                          <button
+                            id={`${mentionListId}-${option.token.slice(1)}`}
+                            key={option.token}
+                            type="button"
+                            role="option"
+                            aria-selected={active}
+                            className={`flex min-h-9 w-full cursor-pointer items-center gap-2.5 rounded-control px-2.5 text-left text-caption ${active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted/70 hover:text-primary'}`}
+                            onMouseEnter={() => setActiveMentionIndex(index)}
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => chooseMention(option)}
+                          >
+                            <Icon
+                              aria-hidden="true"
+                              className="size-3.5 shrink-0"
+                              strokeWidth={1.75}
+                            />
+                            <span className="min-w-0 flex-1">
+                              <span className="font-medium text-primary">{option.label}</span>
+                              <span className="ml-2 text-caption text-tertiary">
+                                {option.description}
+                              </span>
+                            </span>
+                            <span className="font-mono text-caption text-tertiary">
+                              {option.token}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+
+                    {onChooseComposerImages ? (
+                      <button
+                        type="button"
+                        className="grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary disabled:opacity-40"
+                        aria-label="Add images"
+                        title="Add images · paste or drop also works"
+                        disabled={composerDisabled || choosingImages}
+                        aria-busy={choosingImages}
+                        onClick={() => void onChooseComposerImages()}
+                      >
+                        {choosingImages ? (
+                          <LoaderCircle
+                            className="size-4 animate-spin"
                             aria-hidden="true"
-                            className="size-3.5 shrink-0"
                             strokeWidth={1.75}
                           />
-                          <span className="min-w-0 flex-1">
-                            <span className="font-medium text-primary">{option.label}</span>
-                            <span className="ml-2 text-caption text-tertiary">
-                              {option.description}
-                            </span>
-                          </span>
-                          <span className="font-mono text-caption text-tertiary">
-                            {option.token}
-                          </span>
-                        </button>
-                      )
-                    })}
-                  </div>
-
-                  {onChooseComposerImages ? (
-                    <button
-                      type="button"
-                      className="grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary disabled:opacity-40"
-                      aria-label="Add images"
-                      title="Add images · paste or drop also works"
-                      disabled={composerDisabled || choosingImages}
-                      aria-busy={choosingImages}
-                      onClick={() => void onChooseComposerImages()}
-                    >
-                      {choosingImages ? (
-                        <LoaderCircle
-                          className="size-4 animate-spin"
+                        ) : (
+                          <ImagePlus className="size-4" aria-hidden="true" strokeWidth={1.75} />
+                        )}
+                      </button>
+                    ) : null}
+                    {sendWhileWorking ? (
+                      <button
+                        type="button"
+                        aria-label={`Stop ${respondingAgentId === 'claude' ? 'Claude Code' : 'Codex'} response`}
+                        title="Stop current response"
+                        disabled={stopping}
+                        onClick={() => void onStop()}
+                        className="ml-auto grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-40"
+                      >
+                        <Square
                           aria-hidden="true"
-                          strokeWidth={1.75}
+                          className="size-3.5"
+                          fill="currentColor"
+                          strokeWidth={1.5}
+                        />
+                      </button>
+                    ) : null}
+                    <button
+                      className={`${sendWhileWorking ? '' : 'ml-auto '}grid size-9 shrink-0 cursor-pointer place-items-center rounded-control bg-surface-inverse text-inverse hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-40`}
+                      type="button"
+                      aria-label={composerActionLabel}
+                      title={composerActionLabel}
+                      disabled={
+                        stopComposerAction
+                          ? stopping
+                          : disabled ||
+                            (!composerContentReady &&
+                              draftComments.length === 0 &&
+                              composerImages.length === 0)
+                      }
+                      onClick={() => void (stopComposerAction ? onStop() : submit())}
+                    >
+                      {stopping ? (
+                        <LoaderCircle
+                          aria-hidden="true"
+                          className="size-4 animate-spin"
+                          strokeWidth={1.8}
+                        />
+                      ) : stopComposerAction ? (
+                        <Square
+                          aria-hidden="true"
+                          className="size-3.5"
+                          fill="currentColor"
+                          strokeWidth={1.5}
                         />
                       ) : (
-                        <ImagePlus className="size-4" aria-hidden="true" strokeWidth={1.75} />
+                        <ArrowUp aria-hidden="true" className="size-4" strokeWidth={1.9} />
                       )}
                     </button>
-                  ) : null}
-                  {sendWhileWorking ? (
-                    <button
-                      type="button"
-                      aria-label={`Stop ${respondingAgentId === 'claude' ? 'Claude Code' : 'Codex'} response`}
-                      title="Stop current response"
-                      disabled={stopping}
-                      onClick={() => void onStop()}
-                      className="ml-auto grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-40"
-                    >
-                      <Square
-                        aria-hidden="true"
-                        className="size-3.5"
-                        fill="currentColor"
-                        strokeWidth={1.5}
-                      />
-                    </button>
-                  ) : null}
-                  <button
-                    className={`${sendWhileWorking ? '' : 'ml-auto '}grid size-9 shrink-0 cursor-pointer place-items-center rounded-control bg-surface-inverse text-inverse hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-40`}
-                    type="button"
-                    aria-label={composerActionLabel}
-                    title={composerActionLabel}
-                    disabled={
-                      stopComposerAction
-                        ? stopping
-                        : disabled ||
-                          (!composerContentReady &&
-                            draftComments.length === 0 &&
-                            composerImages.length === 0)
-                    }
-                    onClick={() => void (stopComposerAction ? onStop() : submit())}
-                  >
-                    {stopping ? (
-                      <LoaderCircle
-                        aria-hidden="true"
-                        className="size-4 animate-spin"
-                        strokeWidth={1.8}
-                      />
-                    ) : stopComposerAction ? (
-                      <Square
-                        aria-hidden="true"
-                        className="size-3.5"
-                        fill="currentColor"
-                        strokeWidth={1.5}
-                      />
-                    ) : (
-                      <ArrowUp aria-hidden="true" className="size-4" strokeWidth={1.9} />
-                    )}
-                  </button>
+                  </div>
                 </div>
-              </div>
-              <div className="pact-composer-controls flex min-w-0 items-center gap-2">
-                {onSaveSessionPermission ? (
-                  <>
-                    {(['claude', 'codex'] as const).map((agent) => (
-                      <div
-                        key={`${session.id}-${agent}`}
-                        role="group"
-                        aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} settings`}
-                        className="pact-agent-controls text-caption"
-                      >
-                        <PermissionMenu
-                          session={session}
-                          agent={agent}
-                          run={activeRun ?? latestRun}
-                          busy={responseInProgress}
-                          disabled={sessionSettingsSaving}
-                          visible={visible && !nativePresentationSuspended && !inputTakeover}
-                          onSave={onSaveSessionPermission}
-                          onNotice={onNotice}
-                        />
-                        {onSaveSessionSpeed ? (
-                          <>
-                            <span className="pact-agent-divider" aria-hidden="true" />
-                            <SpeedMenu
-                              session={session}
-                              agent={agent}
-                              run={activeRun ?? latestRun}
-                              busy={responseInProgress}
-                              disabled={sessionSettingsSaving}
-                              visible={visible && !nativePresentationSuspended && !inputTakeover}
-                              onSave={onSaveSessionSpeed}
-                              onNotice={onNotice}
-                            />
-                          </>
-                        ) : null}
-                      </div>
-                    ))}
-                  </>
-                ) : null}
-                <ProjectContextMenu
-                  key={`${session.id}-${session.projectId}`}
-                  projectId={session.projectId}
-                  platform={platform}
-                  visible={visible && !inputTakeover}
-                  refreshKey={`${latestRun?.id ?? ''}:${latestRun?.status ?? ''}`}
-                  onNotice={onNotice}
-                />
-              </div>
-              {history.draftError && snapshot ? (
-                <p
-                  className="flex items-center gap-2 px-2 text-caption text-secondary"
-                  role="alert"
-                >
-                  Couldn’t load comments.
-                  <button
-                    className="min-h-8 font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
-                    type="button"
-                    onClick={() => history.retryDrafts()}
+                <div className="pact-composer-controls flex min-w-0 items-center gap-2">
+                  {onSaveSessionPermission ? (
+                    <>
+                      {(['claude', 'codex'] as const).map((agent) => (
+                        <div
+                          key={`${session.id}-${agent}`}
+                          role="group"
+                          aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} settings`}
+                          className="pact-agent-controls text-caption"
+                        >
+                          <PermissionMenu
+                            session={session}
+                            agent={agent}
+                            run={activeRun ?? latestRun}
+                            busy={responseInProgress}
+                            disabled={sessionSettingsSaving}
+                            visible={visible && !nativePresentationSuspended && !inputTakeover}
+                            onSave={onSaveSessionPermission}
+                            onNotice={onNotice}
+                          />
+                          {onSaveSessionSpeed ? (
+                            <>
+                              <span className="pact-agent-divider" aria-hidden="true" />
+                              <SpeedMenu
+                                session={session}
+                                agent={agent}
+                                run={activeRun ?? latestRun}
+                                busy={responseInProgress}
+                                disabled={sessionSettingsSaving}
+                                visible={visible && !nativePresentationSuspended && !inputTakeover}
+                                onSave={onSaveSessionSpeed}
+                                onNotice={onNotice}
+                              />
+                            </>
+                          ) : null}
+                        </div>
+                      ))}
+                    </>
+                  ) : null}
+                  <ProjectContextMenu
+                    key={`${session.id}-${session.projectId}`}
+                    projectId={session.projectId}
+                    platform={platform}
+                    visible={visible && !inputTakeover}
+                    refreshKey={`${latestRun?.id ?? ''}:${latestRun?.status ?? ''}`}
+                    onNotice={onNotice}
+                  />
+                </div>
+                {history.draftError && snapshot ? (
+                  <p
+                    className="flex items-center gap-2 px-2 text-caption text-secondary"
+                    role="alert"
                   >
-                    Retry
-                  </button>
-                </p>
-              ) : null}
-            </div>
-          </InputReplacement>
+                    Couldn’t load comments.
+                    <button
+                      className="min-h-8 font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
+                      type="button"
+                      onClick={() => history.retryDrafts()}
+                    >
+                      Retry
+                    </button>
+                  </p>
+                ) : null}
+              </div>
+            </InputReplacement>
+          </div>
         </div>
       </div>
       {forkPoint?.sourceSessionId === session.id && onForkSessionCreated ? (

@@ -64,6 +64,10 @@
   padding: 0 0 7px 2px;
 }
 
+.relay-indicator-slot:empty {
+  display: none;
+}
+
 .relay-input-indicator {
   display: inline-flex;
   height: 28px;
@@ -294,6 +298,7 @@
   )
   :is(
     .pact-input-dock-inner,
+    .pact-queued-input,
     .input-replacement,
     .input-replacement-pane[data-input-panel='ordinary'][data-active='true'],
     .pact-ordinary-input-stack
@@ -307,7 +312,8 @@
     .input-replacement-pane[data-input-panel='ordinary'][data-active='true'] .prepared-input-card
   )
   :is(
-    .pact-input-dock-inner > :not(.input-replacement),
+    .pact-input-dock-inner > :not(.pact-queued-input),
+    .pact-queued-input > :not(.input-replacement),
     .pact-composer-send-row,
     .pact-composer-controls
   ) {

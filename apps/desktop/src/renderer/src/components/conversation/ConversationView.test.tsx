@@ -1106,6 +1106,49 @@ it.each([
   },
 )
 
+it.each([
+  { kind: 'review', rolePolicy: 'split-stages-v1', codeStarted: false, actor: 'claude' },
+  { kind: 'plan', rolePolicy: 'split-stages-v1', codeStarted: false, actor: 'claude' },
+  { kind: 'plan', rolePolicy: 'split-stages-v1', codeStarted: true, actor: 'codex' },
+  { kind: 'build', rolePolicy: 'split-stages-v1', codeStarted: true, actor: 'codex' },
+  { kind: 'review', rolePolicy: undefined, codeStarted: false, actor: 'codex' },
+  { kind: 'build', rolePolicy: undefined, codeStarted: true, actor: 'claude' },
+] as const)(
+  'routes unmentioned $kind feedback to $actor (policy: $rolePolicy, code started: $codeStarted)',
+  async ({ kind, rolePolicy, codeStarted, actor }) => {
+    const { task, run } = collaborationFixture()
+    task.kind = kind
+    task.rolePolicy = rolePolicy
+    task.owner = 'claude'
+    task.reviewer = 'codex'
+    if (codeStarted) task.codeRunId = run.id
+    const props = fixture()
+    props.session.id = task.sessionId
+    props.session.settings.primaryAgentId = 'claude'
+    props.snapshot!.sessionId = task.sessionId
+    props.composer = 'Please use the relevant skills to read this information.'
+    props.onPlanAvailable = vi.fn<NonNullable<typeof props.onPlanAvailable>>()
+    vi.stubGlobal('pact', {
+      ...composerBridgeFixture(),
+      getConversation: vi.fn<DesktopBridge['getConversation']>().mockResolvedValue({
+        ok: true,
+        value: reportPage(task, { planSource: { runId: run.id, messageId: run.userMessageId } }),
+      }),
+    })
+    render(<ConversationView {...props} />)
+    await waitFor(() => expect(props.onPlanAvailable).toHaveBeenCalledWith(task.sessionId, task.id))
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    await waitFor(() =>
+      expect(props.onSend).toHaveBeenCalledWith(
+        props.composer,
+        [],
+        { type: 'agent', agentId: actor },
+        [],
+      ),
+    )
+  },
+)
+
 function fixture(): ComponentProps<typeof ConversationView> {
   const sessionId = crypto.randomUUID()
   const timestamp = new Date().toISOString()

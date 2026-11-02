@@ -605,7 +605,7 @@ describe('Relay surface', () => {
     expect(
       screen.getByRole('radio', { name: 'Haiku 5.5 · Claude Code' }).hasAttribute('disabled'),
     ).toBe(true)
-    expect(screen.getByText('Choose a model to use Relay.')).toBeDefined()
+    expect(screen.queryByText('Choose a model to use Relay.')).toBeNull()
     expect(screen.getByText('No activity yet.')).toBeDefined()
     expect(
       screen.getAllByRole('button').map((button) => button.getAttribute('aria-label')),

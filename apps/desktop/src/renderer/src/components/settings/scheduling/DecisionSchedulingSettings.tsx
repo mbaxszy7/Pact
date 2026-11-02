@@ -4,7 +4,6 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type {
   SchedulingSettings,
   SchedulingState,
-  DecisionCapabilityReason,
   SchedulingSettingsSave,
   SchedulingModels,
   SchedulingActivityRow,
@@ -20,8 +19,6 @@ import {
   SCHEDULING_ACTIVITY_RESIDENT_ITEMS,
   SCHEDULING_ACTIVITY_RESIDENT_BYTES,
 } from '@pact/contracts'
-
-import { relayActivity } from './RelayActivityIndicator'
 
 type ReadIntent = 'latest' | 'older' | 'newer'
 const bytes = (rows: SchedulingActivityRow[]) =>
@@ -531,72 +528,6 @@ const reasonLabels: Record<SchedulingActivityRow['reason'], string> = {
   native_rebuild: 'Native context rebuild',
   confirmed_resend: 'Confirmed-unsent resend',
 }
-const capabilityReasons: Record<DecisionCapabilityReason, string> = {
-  supported: 'Native compatibility confirmed.',
-  busy: 'The native runtime is busy. Refresh models when it finishes.',
-  timeout: 'The compatibility check timed out. Refresh models to try again.',
-  cancelled: 'The compatibility check was cancelled. Refresh models to try again.',
-  stale: 'Native configuration changed. Refresh models to check compatibility again.',
-  unsupported_platform: 'This platform does not support Relay decisions.',
-  unsupported_provider: 'This provider does not support Relay decisions.',
-  unsupported_network: 'The current network configuration is not supported for Relay.',
-  unsupported_authentication: 'The current sign-in method is not supported for Relay.',
-  unsupported_protocol: 'The installed native runtime does not support Relay decisions.',
-  project_authentication_differs: 'This Project uses a different native sign-in configuration.',
-  executable_unavailable: 'The native runtime could not be found.',
-  model_unavailable: 'The selected model is unavailable in the native runtime.',
-  model_metadata_invalid: 'The native runtime could not confirm the selected model.',
-  model_effort_unavailable: 'The selected model does not support the required reasoning setting.',
-  catalog_limit: 'The model list exceeded the discovery limit. Compatibility is unconfirmed.',
-  unavailable: 'Native compatibility could not be confirmed. Refresh models to try again.',
-  cleanup_unconfirmed: 'Background resources are still being released.',
-}
-
-function relayStatus(state: SchedulingState | undefined, checking: boolean): string {
-  if (state) {
-    const activity = relayActivity(state)
-    if (activity) return activity.description
-  }
-  if (checking) return 'Checking native compatibility…'
-  if (!state) return 'Reading Relay status…'
-  if (!state.settings.selection) return 'Choose a model to use Relay.'
-  const context = state.context
-  if (context) {
-    switch (context.eligibility) {
-      case 'disabled':
-        return 'Relay is off.'
-      case 'model_required':
-        return 'Choose a model to use Relay.'
-      case 'busy':
-        return 'This Session is busy. Relay is unavailable while it runs.'
-      case 'archived':
-        return 'Relay is unavailable for this archived Session.'
-      case 'paused':
-        return 'Collaboration is paused in this Session.'
-      case 'input_pending':
-        return 'This Session is waiting for user input.'
-      case 'native_interaction':
-        return 'Complete the native interaction before Relay can continue.'
-      case 'recovery_required':
-        return 'This Session needs recovery before Relay can continue.'
-    }
-  }
-  const observation = context?.observation ?? state.host
-  if (observation.status === 'stale')
-    return 'The compatibility check has expired. Refresh models to check again.'
-  if (observation.status === 'unconfirmed')
-    return context
-      ? 'Compatibility for this Session has not been checked. Refresh models to check.'
-      : 'Native compatibility has not been checked. Refresh models to check.'
-  if (observation.status === 'unavailable')
-    return capabilityReasons[observation.capability?.reason ?? 'unavailable']
-  if (context?.eligibility === 'unavailable') return 'Relay is unavailable for this Session.'
-  if (context?.eligibility === 'unconfirmed')
-    return 'Eligibility for this Session is unconfirmed. Refresh models to check.'
-  return context
-    ? 'Compatible for this Session. Relay can assist eligible workflow handoffs.'
-    : 'Host compatibility confirmed. Open a Session to check its eligibility.'
-}
 function resultLabel(row: SchedulingActivityRow): string {
   const check =
     row.reason === 'native_check' || row.reason === 'queue_check' || row.reason === 'rebuild_check'
@@ -1017,9 +948,6 @@ export function DecisionSchedulingSettings({
               <p className="relay-usage text-caption leading-relaxed text-secondary">
                 {SCHEDULING_USAGE_NOTICE}
               </p>
-              <output className="mt-2 block text-caption leading-relaxed text-secondary">
-                {relayStatus(state.state, state.refreshingState)}
-              </output>
               <section className="relay-section relay-preference" aria-label="Indicator preference">
                 <RelaySwitch
                   checked={settings.showIndicator}
