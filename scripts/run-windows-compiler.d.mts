@@ -20,3 +20,9 @@ export function runWindowsCompiler(
     signal?: AbortSignal
   },
 ): Promise<{ stdout: string; stderr: string }>
+
+export function runWindowsCompilerSetup(
+  executable: string,
+  args: string[],
+  options: Parameters<typeof runWindowsCompiler>[1],
+): Promise<{ stdout: string; stderr: string }>

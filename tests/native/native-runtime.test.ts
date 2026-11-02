@@ -15,6 +15,7 @@ import type {
   NormalizedAgentEvent,
 } from '../../packages/contracts/src/index.js'
 
+import { planRunInput } from '../../apps/desktop/src/utility/conversation/collaboration-fixture.test-support.js'
 import {
   actualSdk,
   boundedNativeText,
@@ -891,6 +892,60 @@ it.each([{ longCwd: false }, { longCwd: true }])(
     }
   },
 )
+
+it('real Claude receives bare Pact /plan through the production Adapter without native command interception', async () => {
+  const owned = await ownedRoot(),
+    adapters: NativeAdapter[] = []
+  const provider = new LoopbackProvider(['NATIVE_PACT_PLAN_RECEIVED'], {
+    mode: 'claude-live',
+    beforeResponse: async () => undefined,
+  })
+  const controller = new AbortController(),
+    deadlineAt = performance.now() + 45_000
+  const deadline = setTimeout(() => controller.abort(), 45_000)
+  const previousConfig = process.env.CLAUDE_CONFIG_DIR,
+    sdk = actualSdk()
+  const input = planRunInput('claude')
+  input.cwd = owned.cwd
+  input.model = 'sonnet'
+  input.effort = 'low'
+  input.permissionMode = 'ask'
+  const original = '/plan Inspect cancellation ownership. No tools.'
+  input.promptEnvelope.message.content = original
+  const events: NormalizedAgentEvent[] = []
+  try {
+    await provider.start()
+    await owned.processes.prepare(claudeExecutable, 4, deadlineAt)
+    process.env.CLAUDE_CONFIG_DIR = owned.home
+    const env = { ...isolatedEnv(owned.root, owned.home), ANTHROPIC_BASE_URL: provider.url }
+    const adapter = new bundle.ClaudeAgentAdapter(claudeExecutable, {
+      getSessionInfo: sdk.getSessionInfo,
+      query: (request: SdkQueryInput) => {
+        expect(request.options.permissionMode).toBe('plan')
+        return sdk.query({ ...request, options: { ...request.options, env } })
+      },
+      spawn: (command: string, args: string[], options: Parameters<typeof spawn>[2]) =>
+        owned.processes.spawn(command, args, options ?? {}),
+    })
+    adapters.push(adapter)
+    for await (const event of adapter.run(input, controller.signal)) events.push(event)
+    expect(provider.errors).toEqual([])
+    expect(provider.requests.filter((request) => request.method === 'POST')).toHaveLength(1)
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'text.completed', text: 'NATIVE_PACT_PLAN_RECEIVED' }),
+    )
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'turn.completed', outcome: 'completed' }),
+    )
+    expect(input.promptEnvelope.message.content).toBe(original)
+  } finally {
+    controller.abort()
+    clearTimeout(deadline)
+    if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previousConfig
+    await finishFixture(owned, { adapters, provider })
+  }
+})
 
 it('real Claude Steer sends next-priority input and consumes only its matching native UUID', async () => {
   const owned = await ownedRoot(),

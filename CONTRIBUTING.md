@@ -23,11 +23,16 @@ Keep pnpm's isolated dependency layout and exact lockfile. Do not switch to hois
 hand-edit links, or introduce another package manager. Native runtime dependencies belong in
 `apps/desktop/package.json` and must be rebuilt for Electron. Use Oxlint and Oxfmt only.
 
-Windows development and packaging also require the MSVC compiler/linker and Windows SDK for the
-chosen architecture. Run `pnpm dev` and local packaging from the matching MSVC Developer Command
-Prompt or Developer PowerShell, with `cl.exe`, `link.exe`, `INCLUDE` and `LIB` configured for the
-matching host and target. These build steps compile the owned-process helper; packaged applications
-use the bundled helper and never download or compile it at runtime.
+Windows development and packaging also require Visual Studio Build Tools with the MSVC C++ tools
+and Windows SDK for the chosen architecture. `pnpm dev` works from ordinary PowerShell: the local
+development launcher opts into `--auto-msvc`, using Visual Studio Installer's `vswhere.exe` and
+Developer PowerShell to load the matching compiler environment automatically. An existing matching
+MSVC developer environment is reused. Setup changes only the build's child environment, shares
+the original 60-second build deadline and uses the same Job owner and cleanup policy as compilation.
+Missing tools produce an installation hint. CI and packaging retain their existing preconfigured
+MSVC environment and do not opt into automatic setup. Run local packaging from the matching MSVC
+Developer Command Prompt or Developer PowerShell. These build steps compile the owned-process helper;
+packaged applications use the bundled helper and never download or compile it at runtime.
 
 MSVC preparation uses the existing compiled Windows Job launcher and the system .NET Framework
 compiler to own the compiler's auxiliary processes. A successful compile requires its natural root

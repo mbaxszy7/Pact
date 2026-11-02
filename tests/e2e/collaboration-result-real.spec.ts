@@ -47,11 +47,10 @@ for (const owner of ['codex', 'claude'] as const)
         }, ctx.sessionId)
       try {
         await selectRealConfiguredEffort(ctx, ['codex', 'claude'], owner)
-        await sendRealMessage(
-          ctx,
-          '/plan Draft a concise conceptual plan for documenting cancellation ownership. Fixed requirements: one requester owns the request handle and cancellation authority; scope disposal delegates cancellation to that same owner. The executor releases work-local resources before its terminal acknowledgement, then the requester releases its handle exactly once. Normal completion needs no cancellation. Repeated cancellation/disposal is idempotent and awaits the same terminal cleanup. Acceptance: three concrete steps covering normal completion, cancellation, and disposal, naming each resource owner and release condition. All choices are specified. Do not inspect or modify project files, run commands, or delegate. The native plan document is permitted. Publish the complete official plan through the native plan mechanism.',
-          owner,
-        )
+        const initialRequest =
+          '/plan Draft a concise conceptual plan for documenting cancellation ownership. Fixed requirements: one requester owns the request handle and cancellation authority; scope disposal delegates cancellation to that same owner. The executor releases work-local resources before its terminal acknowledgement, then the requester releases its handle exactly once. Normal completion needs no cancellation. Repeated cancellation/disposal is idempotent and awaits the same terminal cleanup. Acceptance: three concrete steps covering normal completion, cancellation, and disposal, naming each resource owner and release condition. All choices are specified. Do not inspect or modify project files, run commands, or delegate. The native plan document is permitted. Publish the complete official plan through the native plan mechanism.'
+        // Exercise default Primary routing: an @claude prefix masks native /plan interception.
+        await sendRealMessage(ctx, initialRequest, 'primary')
         await expect
           .poll(
             async () => {
@@ -68,7 +67,14 @@ for (const owner of ['codex', 'claude'] as const)
         expect(initial.reviewer).toBe(owner === 'codex' ? 'claude' : 'codex')
         const originalPlan = initial.planReference!
         const originalText = await readRequiredPlanSource(ctx, originalPlan)
-        const initialRuns = (await readRealConversation(ctx)).runs.length
+        const initialConversation = await readRealConversation(ctx)
+        expect(
+          initialConversation.messages.find((message) => message.role === 'user')?.content,
+        ).toBe(initialRequest)
+        expect(
+          initialConversation.runs.find((run) => run.collaboration?.stage === 'plan')?.agentId,
+        ).toBe(owner)
+        const initialRuns = initialConversation.runs.length
         await sendRealMessage(
           ctx,
           'Recheck the existing accepted plan against my unchanged requirements: cancellation and repeated disposal use the same owner and terminal cleanup. There is no new requirement or choice. If the current plan already covers these requirements, briefly confirm why it remains correct and call retain_current_plan with an empty object in this root. Preserve the existing official plan exactly: do not rewrite or republish it, do not use ExitPlanMode as a substitute for this explicit retention operation, and do not implement or delegate.',

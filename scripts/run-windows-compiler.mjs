@@ -51,6 +51,16 @@ const defaultHost = {
   remove: removeWindowsRpcLauncherSync,
 }
 
+/** Compiler environment setup uses the same admission, Job, deadline and release policy. */
+export function runWindowsCompilerSetup(executable, args, options) {
+  if (typeof executable !== 'string' || !isAbsolute(executable) || executable.includes('\0'))
+    throw new WindowsCompilerError('invalid-setup-executable', true, false)
+  return runWindowsCompiler(args, options, {
+    ...defaultHost,
+    resolveCompiler: async () => executable,
+  })
+}
+
 /** One compile action, no queue. Its Job also owns compiler services after cl.exe exits. */
 export async function runWindowsCompiler(args, options, host = defaultHost) {
   if (active) throw new WindowsCompilerError('capacity-unavailable', false, false)

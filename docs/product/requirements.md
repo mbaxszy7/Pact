@@ -323,6 +323,8 @@ Pact commands are structured App actions, distinct from installed native Skills 
 
 The Composer displays completed Pact commands as icon-and-`pact:<command>` badges. Copying and sending preserve the original `/plan`, `/build` or `/review` text; these badges never create native Skill selections or change workflow authority.
 
+Pact workflow commands reach Claude as request text, not native slash-command invocations, including bare `/plan` routed to Claude as Primary. Native serialization adds a request heading without changing saved Messages or frozen sources; the Adapter selects native Plan mode. Ordinary native commands and Skill requests retain their existing serialization.
+
 | Entry              | Initial work                                                                                              | Fixed owner and reviewer                                                              |
 | ------------------ | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | `/plan [task]`     | Native planning and necessary clarification, followed by automatic independent review and author revision | Primary authors the plan and reviews code. Secondary reviews the plan and implements. |

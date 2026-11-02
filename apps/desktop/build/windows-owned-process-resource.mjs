@@ -148,18 +148,25 @@ export async function inspectWindowsOwnedProcessResource(
 }
 
 /** One preparation entry for development and every electron-builder target. Never called at runtime. */
-export async function prepareWindowsOwnedProcessResource(arch, { signal } = {}) {
+export async function prepareWindowsOwnedProcessResource(arch, { signal, autoMsvc = false } = {}) {
   if (process.platform !== 'win32' || process.arch !== arch)
     throw new Error('Build the Windows helper on a matching native Windows SDK/MSVC host.')
   windowsOwnedProcessFilename(arch)
-  await execute(process.execPath, [join(root, 'scripts/build-owned-process-group-win32.mjs')], {
-    cwd: root,
-    shell: false,
-    windowsHide: true,
-    signal,
-    timeout: 70_000,
-    maxBuffer: 256 * 1024,
-  })
+  await execute(
+    process.execPath,
+    [
+      join(root, 'scripts/build-owned-process-group-win32.mjs'),
+      ...(autoMsvc ? ['--auto-msvc'] : []),
+    ],
+    {
+      cwd: root,
+      shell: false,
+      windowsHide: true,
+      signal,
+      timeout: 70_000,
+      maxBuffer: 256 * 1024,
+    },
+  )
   return inspectWindowsOwnedProcessResource(
     join(desktop, 'out/native'),
     arch,

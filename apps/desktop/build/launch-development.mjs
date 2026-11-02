@@ -152,7 +152,10 @@ try {
     process.env.ELECTRON_EXEC_PATH = await prepareMacRuntime(cancellation.signal)
   }
   if (process.platform === 'win32')
-    await prepareWindowsOwnedProcessResource(process.arch, { signal: cancellation.signal })
+    await prepareWindowsOwnedProcessResource(process.arch, {
+      signal: cancellation.signal,
+      autoMsvc: true,
+    })
   cancellation.signal.throwIfAborted()
   const vite = join(dirname(require.resolve('electron-vite/package.json')), 'bin/electron-vite.js')
   process.removeListener('SIGINT', interrupt)

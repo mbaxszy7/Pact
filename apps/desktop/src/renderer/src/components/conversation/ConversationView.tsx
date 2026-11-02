@@ -3295,7 +3295,7 @@ export function ConversationView({
                 ) : !commentOnly ? (
                   <MessageMarkdown
                     content={visibleContent}
-                    skills={message.role === 'user' ? message.skills : undefined}
+                    skills={message.role === 'user' ? (message.skills ?? []) : undefined}
                     onOpenProjectFile={openProjectFile}
                     messageId={message.id}
                     onCreateComment={

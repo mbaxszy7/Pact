@@ -126,7 +126,10 @@ export async function claudePromptContent(
   signal?: AbortSignal,
   navigate?: AgentSourceNavigation,
 ) {
-  const text = serializeAgentPromptEnvelope(envelope, navigate)
+  const serialized = serializeAgentPromptEnvelope(envelope, navigate)
+  // Pact already owns workflow commands and the Adapter selects native Plan mode.
+  // Keep the original request as text, not a headless Claude slash-command invocation.
+  const text = envelope.collaboration ? `Pact user request:\n${serialized}` : serialized
   const groups = agentPromptImageGroups(envelope)
   if (!groups.length) return text
   const blocks: Array<{ type: 'text'; text: string } | NativeImageBlock> = [{ type: 'text', text }]

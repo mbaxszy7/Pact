@@ -38,6 +38,7 @@ import {
   collaborationReadOnly,
 } from './collaboration-prompt.js'
 import { Conversation } from './conversation.js'
+import { claudePromptContent } from './native-image-content.js'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
 import { DecisionMemoryLease, decisionWorkingMemoryDiagnostics } from './native-working-memory.js'
 const markdownWorker = vi.hoisted(() => ({ path: '' }))
@@ -458,6 +459,39 @@ async function fixture(
   }
   return { db, flow, sessionId, input, settled, act, drafts, preparation }
 }
+
+it('routes bare /plan to default Claude and preserves the exact user message through native serialization', async () => {
+  const f = await fixture('claude')
+  const original = '/plan 保留用户原文\nInspect cancellation ownership.'
+  const input = f.input(original)
+  expect((await f.flow.send(input)).ok).toBe(true)
+  await f.settled()
+  const planner = native.inputs[0]!
+  expect(planner.promptEnvelope.collaboration).toMatchObject({
+    kind: 'plan',
+    stage: 'plan',
+    actor: 'claude',
+    owner: 'claude',
+  })
+  expect(planner.promptEnvelope.message.content).toBe(original)
+  const content = await claudePromptContent(planner.promptEnvelope)
+  expect(typeof content).toBe('string')
+  expect(content).not.toMatch(/^\s*\/plan(?:\s|$)/u)
+  expect(content).toContain(original)
+  expect(
+    f.db.conversationRepository.internalMessage(input.clientMessageId, f.sessionId),
+  ).toMatchObject({
+    content: original,
+    role: 'user',
+  })
+  expect(native.sources).toContainEqual(
+    expect.objectContaining({
+      runId: planner.runId,
+      chars: original.length,
+      sha256: createHash('sha256').update(original).digest('hex'),
+    }),
+  )
+})
 
 function enableRelay(f: Awaited<ReturnType<typeof fixture>>, requestedRevisions = 2) {
   const repository = f.db.conversationRepository

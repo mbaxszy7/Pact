@@ -4,9 +4,82 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { markdownVisibleProjection } from '../../../../shared/message-anchor-text'
+import { selectedTextRange } from './message-selection'
 import { MessageMarkdown, type ProjectFileTarget } from './MessageMarkdown'
 
 afterEach(cleanup)
+
+describe('MessageMarkdown Pact badges', () => {
+  it.each(['plan', 'review', 'build'])(
+    'decorates /%s while preserving original text and comment coordinates',
+    (command) => {
+      const content = `@codex /${command} Inspect this change.`
+      const { container, rerender } = render(
+        <MessageMarkdown content={content} skills={[]} onOpenProjectFile={() => undefined} />,
+      )
+      const badge = screen.getByTitle(`Pact · ${command}`)
+      expect(badge.textContent).toBe(`/${command}`)
+      const range = document.createRange()
+      range.selectNodeContents(badge)
+      const selection = window.getSelection()!
+      selection.removeAllRanges()
+      selection.addRange(range)
+      expect(selectedTextRange(container, selection)).toEqual({
+        startOffset: 7,
+        endOffset: 8 + command.length,
+        quote: `/${command}`,
+      })
+      expect(
+        [...container.querySelectorAll('[data-pact-projection-start]')]
+          .map((span) => span.textContent)
+          .join(''),
+      ).toBe(markdownVisibleProjection(content))
+
+      rerender(
+        <MessageMarkdown content={content} skills={[]} onOpenProjectFile={() => undefined} />,
+      )
+      expect(screen.getByTitle(`Pact · ${command}`)).toBe(badge)
+      expect(selection.toString()).toBe(`/${command}`)
+      selection.removeAllRanges()
+    },
+  )
+
+  it('decorates a completed command without trailing whitespace', () => {
+    render(<MessageMarkdown content="/review" skills={[]} onOpenProjectFile={() => undefined} />)
+    expect(screen.getByTitle('Pact · review').textContent).toBe('/review')
+  })
+
+  it.each([
+    'Use /plan in a message.',
+    '`/plan` example',
+    '```text\n/plan\n```',
+    '> /plan quoted',
+    '/plan /review conflicting commands',
+    '@all /plan conflicting route',
+  ])('does not decorate ordinary Markdown or invalid prefixes: %s', (content) => {
+    const { container } = render(
+      <MessageMarkdown content={content} skills={[]} onOpenProjectFile={() => undefined} />,
+    )
+    expect(container.querySelector('[data-pact-command]')).toBeNull()
+  })
+
+  it('keeps assistant content and same-named native Skills distinct from Pact commands', () => {
+    const content = '/plan inspect'
+    const { container, rerender } = render(
+      <MessageMarkdown content={content} onOpenProjectFile={() => undefined} />,
+    )
+    expect(container.querySelector('[data-pact-command]')).toBeNull()
+    rerender(
+      <MessageMarkdown
+        content={content}
+        skills={[{ id: 'a'.repeat(64), agentId: 'codex', name: 'plan', start: 0, end: 5 }]}
+        onOpenProjectFile={() => undefined}
+      />,
+    )
+    expect(screen.getByTitle('Skill · plan').textContent).toBe('/plan')
+    expect(container.querySelector('[data-pact-command]')).toBeNull()
+  })
+})
 
 describe('MessageMarkdown anchor projection', () => {
   it('keeps completed text stable across parent updates and renders changed content', () => {

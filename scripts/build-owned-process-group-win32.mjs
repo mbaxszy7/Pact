@@ -6,14 +6,19 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
 import { runWindowsCompiler, WindowsCompilerError } from './run-windows-compiler.mjs'
+import { prepareWindowsMsvcEnvironment } from './windows-msvc-environment.mjs'
 
 const execute = promisify(execFile)
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const source = join(root, 'apps/desktop/native/owned-process-group-win32.cpp')
 const arch = process.arch
 const options = process.argv.slice(2)
+const autoMsvc = options[0] === '--auto-msvc'
+if (autoMsvc) options.shift()
 if (options.length !== 0 && (options.length !== 2 || options[0] !== '--output-directory'))
-  throw Error('Usage: node scripts/build-owned-process-group-win32.mjs [--output-directory PATH]')
+  throw Error(
+    'Usage: node scripts/build-owned-process-group-win32.mjs [--auto-msvc] [--output-directory PATH]',
+  )
 if (process.platform !== 'win32' || !['x64', 'arm64'].includes(arch))
   throw Error('The owned-process bridge requires a native Windows x64 or arm64 SDK/MSVC host.')
 if (
@@ -33,6 +38,13 @@ const compiled = join(temporary, filename)
 const destination = join(output, filename)
 let preserveTemporary = false
 try {
+  const compilerOptions = { cwd: temporary, timeout: 60_000, maxBuffer: 256 * 1024 }
+  // Only the local development launcher opts in. CI and packaging keep their configured SDK.
+  if (autoMsvc) {
+    const deadlineAt = performance.now() + compilerOptions.timeout
+    compilerOptions.env = await prepareWindowsMsvcEnvironment(arch, { deadlineAt })
+    compilerOptions.timeout = Math.floor(deadlineAt - performance.now())
+  }
   // Build preparation owns MSVC's complete subtree. The shipped native helper
   // remains self-contained and never compiles, downloads or requires .NET at runtime.
   await runWindowsCompiler(
@@ -56,7 +68,7 @@ try {
       '/NXCOMPAT',
       `/MACHINE:${arch === 'arm64' ? 'ARM64' : 'X64'}`,
     ],
-    { cwd: temporary, timeout: 60_000, maxBuffer: 256 * 1024 },
+    compilerOptions,
   )
   if ((await stat(compiled)).size > 16 * 1024 * 1024)
     throw Error('Native bridge artifact is oversized.')

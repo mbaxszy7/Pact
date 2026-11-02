@@ -70,11 +70,17 @@ export const MessageMarkdown = memo(function MessageMarkdown({
           )
           .map(([name, start, end]) => ({ name, start, end }))
       : []
+    const prefix = parseComposerCommandPrefix(decorationContent, selected)
     const ranges: SkillRange[] = []
-    for (const entry of [
-      ...parseComposerCommandPrefix(decorationContent, selected).skills,
-      ...selected,
-    ]) {
+    if (prefix.pact && !prefix.error) {
+      const leading = decorationContent.slice(0, prefix.argumentsStart)
+      const command = /(?:^|\s)\/(plan|review|build)(?=\s|$)/u.exec(leading)
+      if (command?.[1] === prefix.pact) {
+        const start = command.index + command[0].lastIndexOf('/')
+        ranges.push({ name: prefix.pact, start, end: start + prefix.pact.length + 1, pact: true })
+      }
+    }
+    for (const entry of [...prefix.skills, ...selected]) {
       if (
         decorationContent.slice(entry.start, entry.end) !== `/${entry.name}` ||
         ranges.some((range) => range.start === entry.start && range.end === entry.end)
@@ -207,15 +213,20 @@ function createMarkdownComponents(
         parts.push(
           <span
             key={`skill-${start}`}
-            title={`Skill · ${entry.name}`}
-            className="relative mx-0.5 inline-flex max-w-full items-baseline gap-1.5 rounded-control border border-border/60 bg-surface-raised/50 px-2 py-0.5 align-baseline text-caption font-medium leading-normal text-primary"
+            title={`${entry.pact ? 'Pact' : 'Skill'} · ${entry.name}`}
+            data-pact-command={entry.pact ? entry.name : undefined}
+            className={`relative mx-0.5 inline-flex max-w-full items-baseline gap-1.5 rounded-control border border-border/60 ${entry.pact ? 'bg-surface-muted' : 'bg-surface-raised/50'} px-2 py-0.5 align-baseline text-caption font-medium leading-normal text-primary`}
           >
             <BookOpen
               aria-hidden="true"
               className="size-3.5 shrink-0 self-center"
               strokeWidth={1.75}
             />
-            <span className="min-w-0 break-all">
+            <span
+              className={
+                entry.pact ? "min-w-0 break-all before:content-['pact:']" : 'min-w-0 break-all'
+              }
+            >
               <span
                 aria-hidden="true"
                 className="text-[0px]"
@@ -325,6 +336,7 @@ interface SkillRange {
   name: string
   start: number
   end: number
+  pact?: boolean
 }
 
 function safeMarkdownUrl(url: string): string {
