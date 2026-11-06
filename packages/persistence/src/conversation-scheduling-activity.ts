@@ -92,6 +92,7 @@ function suggestionFor(candidate: string | null): string | null {
     propose_supplement_plan: 'Request one read-only Plan clarification.',
     supplement_code_response: 'Add one read-only code-review response.',
     propose_supplement_code_response: 'Request one read-only code-review response.',
+    propose_reassign_roles: 'Request a future code-role change.',
     route_codex: 'Route the input to Codex.',
     route_claude: 'Route the input to Claude Code.',
     clarify_prepared_input: 'Ask for missing information.',
@@ -285,7 +286,11 @@ function recordNativeDecisionActivity(
   decision: typeof relayDecisions.$inferSelect,
   proof: RelayNativeRecoveryProof,
 ): void {
-  if (proof.card.request.category !== 'arrangement_change') return
+  if (
+    proof.card.request.category !== 'arrangement_change' ||
+    proof.card.request.operation.kind !== 'rebuild_native_context'
+  )
+    return
   const request = proof.card.request.operation
   const originFaultId = proof.originFaultId
   const fault = originFaultId
@@ -483,8 +488,12 @@ export function recordRelayDecisionActivity(db: PactDrizzleDatabase, decisionId:
     !decision.active
   )
     return
-  const action =
-    proof.data.card.request.category === 'new_authorization'
+  const reassign =
+    proof.data.card.request.category === 'arrangement_change' &&
+    proof.data.card.request.operation.kind === 'reassign_roles'
+  const action = reassign
+    ? ('reassign_roles' as const)
+    : proof.data.card.request.category === 'new_authorization'
       ? proof.data.card.request.operation.kind
       : proof.data.card.request.category === 'necessary_information'
         ? 'clarify_prepared_input'
@@ -497,7 +506,10 @@ export function recordRelayDecisionActivity(db: PactDrizzleDatabase, decisionId:
     actionResult: awaiting
       ? null
       : accepted
-        ? 'reserved'
+        ? // The metadata role change is complete on confirm; no future Run may overwrite it.
+          reassign
+          ? 'completed'
+          : 'reserved'
         : decision.state === 'cancelled'
           ? 'cancelled'
           : 'not_sent',
@@ -575,6 +587,9 @@ export function recordHandoffActivity(db: PactDrizzleDatabase, handoffId: string
     .from(schedulingActivity)
     .where(eq(schedulingActivity.evaluationId, evaluation.id))
     .get()
+  // A later explicit Implement shares the same handoff; it must not rewrite the confirmed
+  // role-change outcome as execution activity.
+  if (previous?.action === 'reassign_roles') return
   const handoff = db
     .select({ action: schedulingHandoffs.action })
     .from(schedulingHandoffs)
@@ -684,7 +699,12 @@ export function recordBusinessActivity(
         unresolved: sql<boolean>`${unresolvedAction(result) ? 1 : 0} OR EXISTS(SELECT 1 FROM scheduling_evaluations e WHERE e.id=${schedulingActivity.evaluationId} AND e.active=1)`,
         activityAt: new Date().toISOString(),
       })
-      .where(eq(schedulingActivity.handoffId, handoff.id))
+      .where(
+        and(
+          eq(schedulingActivity.handoffId, handoff.id),
+          sql`(${schedulingActivity.action} IS NULL OR ${schedulingActivity.action} <> 'reassign_roles')`,
+        ),
+      )
       .run()
   const batch = db
     .select({ information: conversationInputBatches.dispatchInformationJson })

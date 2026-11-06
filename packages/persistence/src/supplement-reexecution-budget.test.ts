@@ -12,6 +12,10 @@ import {
   reacquireUnsentExtraTurnBudget,
   reserveBudget,
 } from './conversation-scheduling.js'
+import {
+  configureDecisionFixtureCredential,
+  decisionHttpOwnerFixture,
+} from './decision-fixture.test-support.js'
 import { planRevisionFixture } from './plan-revision-guidance.test-support.js'
 import {
   agentRuns,
@@ -94,8 +98,11 @@ async function originalSupplement(kind: 'supplement_plan' | 'repair' = 'suppleme
     f.finish(response.id, { plan: 'The current complete Plan before the extra clarification.' })
   }
   const task = f.repo.collaboration(f.sessionId)!,
-    originalHandoff = f.repo.workflowHandoff(task, task.owner),
-    deadlineAt = Date.now() + 15_000
+    owner = decisionHttpOwnerFixture()
+  configureDecisionFixtureCredential(f.repo)
+  const originalHandoff = f.repo.workflowHandoff(task, task.owner),
+    deadlineAt = Date.now() + 15_000,
+    configurationFingerprint = f.repo.schedulingConfigurationFingerprint()
   const material = await f.repo.readRelayWorkflowDecisionSources(
     originalHandoff,
     [
@@ -111,31 +118,29 @@ async function originalSupplement(kind: 'supplement_plan' | 'repair' = 'suppleme
   )
   const evaluation = f.repo.reserveEvaluation({
     handoff: originalHandoff,
-    provider: 'codex',
-    model: 'gpt-6-luna',
-    configurationFingerprint: 'a'.repeat(64),
+    configurationFingerprint,
     inputSha256: material.inputSha256,
     deadlineAt,
+    httpOwner: owner,
   })
   if (evaluation.status !== 'reserved') throw Error('Missing evaluation')
-  f.repo.dispatchEvaluation(evaluation.evaluation.id)
+  f.repo.dispatchEvaluation(evaluation.evaluation.id, owner)
   f.repo.settleEvaluation(evaluation.evaluation.id, {
     outcome: 'completed',
     physicalReleased: true,
     selectedCandidateId: kind === 'repair' ? 'propose_repair' : 'propose_supplement_plan',
+    httpOwner: owner,
+    remoteOutcome: 'responded',
   })
   const card = f.repo.proposeRelayWorkflowAction({
     handoff: originalHandoff,
     kind,
     evaluationId: evaluation.evaluation.id,
     configurationGeneration: f.repo.schedulingConfigurationGeneration(),
+    configurationFingerprint,
     inputSha256: material.inputSha256,
     sourceFingerprint: material.sourceFingerprint,
     deadlineAt,
-    reason:
-      kind === 'repair'
-        ? 'Repair only the exact cancellation defect reported by the complete fixed review.'
-        : 'Clarify the original cancellation evidence in one read-only Turn.',
     sourceIds: [material.sources[0]!.id],
   })
   const answer = f.repo.answerRelaySchedulingDecision({

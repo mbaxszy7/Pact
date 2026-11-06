@@ -1,6 +1,7 @@
 import { z } from 'zod'
 
 import { collaborationDocumentSchema } from './collaboration-documents.js'
+import { taskStageRolesSchema } from './collaboration.js'
 import { schedulingHandoffSchema } from './scheduling.js'
 
 export const RELAY_DECISION_BYTES = 4 * 1024
@@ -38,6 +39,34 @@ export const relayRebuildOperationSchema = z.strictObject({
 export const relayRepairOperationSchema = relaySupplementOperationSchema.extend({
   kind: z.literal('repair'),
 })
+export const relayReassignRolesOperationSchema = z
+  .strictObject({
+    kind: z.literal('reassign_roles'),
+    taskId: uuid,
+    afterRunId: uuid,
+    expectedTaskRevision: z.number().int().nonnegative(),
+    expectedRoleRevision: z.number().int().nonnegative(),
+    previousRoles: taskStageRolesSchema,
+    proposedRoles: taskStageRolesSchema,
+    futureStages: z.tuple([
+      z.literal('implement'),
+      z.literal('respond'),
+      z.literal('repair'),
+      z.literal('code_review'),
+    ]),
+    scopeFingerprint: digest,
+  })
+  .refine(
+    (op) =>
+      op.expectedRoleRevision === op.previousRoles.revision &&
+      op.proposedRoles.revision === op.previousRoles.revision + 1 &&
+      op.proposedRoles.planAuthor === op.previousRoles.planAuthor &&
+      op.proposedRoles.planReviewer === op.previousRoles.planReviewer &&
+      op.proposedRoles.codeAuthor === op.previousRoles.codeReviewer &&
+      op.proposedRoles.codeReviewer === op.previousRoles.codeAuthor,
+    'Only the future code responsibilities may be swapped at the next role revision.',
+  )
+export type RelayReassignRolesOperation = z.infer<typeof relayReassignRolesOperationSchema>
 const schedulingFieldSchema = z.strictObject({
   fieldId: uuid,
   prompt: z
@@ -84,7 +113,10 @@ export const relaySchedulingDecisionSchema = relayDecisionReferenceSchema
     request: z.discriminatedUnion('category', [
       z.strictObject({
         category: z.literal('arrangement_change'),
-        operation: relayRebuildOperationSchema,
+        operation: z.discriminatedUnion('kind', [
+          relayRebuildOperationSchema,
+          relayReassignRolesOperationSchema,
+        ]),
       }),
       z.strictObject({
         category: z.literal('new_authorization'),
@@ -202,7 +234,9 @@ export const relayNativeRecoveryProofSchema = z
   .strictObject({
     version: z.literal('relay-native-recovery-proof-v1'),
     card: relaySchedulingDecisionSchema.refine(
-      (card) => card.request.category === 'arrangement_change',
+      (card) =>
+        card.request.category === 'arrangement_change' &&
+        card.request.operation.kind === 'rebuild_native_context',
     ),
     configurationGeneration: z.number().int().nonnegative(),
     utilityEpoch: uuid,
@@ -225,5 +259,12 @@ export const relayDecisionReceiptSchema = z.strictObject({
   disposition: z.enum(['confirmed', 'cancelled', 'discarded']),
   runId: uuid.nullable(),
   rebuildId: uuid.nullable(),
+  roleChange: z
+    .strictObject({
+      taskId: uuid,
+      taskRevision: z.number().int().nonnegative(),
+      stageRoles: taskStageRolesSchema,
+    })
+    .optional(),
 })
 export type RelayDecisionReceipt = z.infer<typeof relayDecisionReceiptSchema>

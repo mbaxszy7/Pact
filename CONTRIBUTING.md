@@ -264,46 +264,58 @@ raw exception or credentials. Debug logging does not backfill earlier events.
 
 ### Evidence and commands
 
-| Lane                  | Command                                                          | Prerequisites and evidence                                                                |
-| --------------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| Unit                  | `pnpm test`                                                      | Vitest; public, isolated fixtures, no paid models                                         |
-| Infrastructure        | `pnpm test:infra`                                                | Node tests for publication, baseline integrity, coverage, runners, and packaged harness   |
-| UI                    | `pnpm test:e2e:ui`                                               | Real Electron UI with fixture data; no provider credentials                               |
-| Deterministic         | `pnpm test:e2e:deterministic`                                    | Electron plus controlled protocols/fixed loads; not real model evidence                   |
-| Real provider         | `pnpm test:e2e:real`                                             | Installed/authenticated CLIs and private configuration; paid model requests               |
-| Core real provider    | `pnpm test:e2e:real:core`                                        | The `@real-core` business cases; the same actual CLIs and isolated configuration          |
-| Complete E2E          | `pnpm test:e2e`                                                  | All three Electron lanes; private configuration admitted before the sole build            |
-| Windows Codex Relay   | `pnpm test:native:codex-windows`                                 | Windows, Codex 0.161.0 and the native Job helper; owned loopback provider, no paid models |
-| Native protocol       | `pnpm test:native`                                               | Actual CLI/SDK storage and protocol against isolated loopback providers; no paid models   |
-| Packaged smoke        | Manifest-based commands below                                    | Actual installation/extraction, private data, seed and cold verification                  |
-| Packaged visible core | `node scripts/package-smoke.mjs --manifest MANIFEST --real-core` | Trusted local real-provider configuration; manual actual business observations required   |
+| Lane                  | Command                                                          | Prerequisites and evidence                                                                 |
+| --------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Unit                  | `pnpm test`                                                      | Vitest; public, isolated fixtures, no paid models                                          |
+| Infrastructure        | `pnpm test:infra`                                                | Node tests for publication, baseline integrity, coverage, runners, and packaged harness    |
+| UI                    | `pnpm test:e2e:ui`                                               | Real Electron UI with fixture data; no provider credentials                                |
+| Deterministic         | `pnpm test:e2e:deterministic`                                    | Electron plus controlled protocols/fixed loads; not real model evidence                    |
+| Real provider         | `pnpm test:e2e:real`                                             | Installed/authenticated CLIs and private configuration; paid model requests                |
+| Core real provider    | `pnpm test:e2e:real:core`                                        | The `@real-core` business cases; the same actual CLIs and isolated configuration           |
+| Complete E2E          | `pnpm test:e2e`                                                  | All three Electron lanes; private configuration admitted before the sole build             |
+| Codex execution       | `pnpm test:native:execution`                                     | macOS arm64, Codex 0.163.0; owned reexecution, inline-provider and historical-owner proofs |
+| Native protocol       | `pnpm test:native`                                               | Actual CLI/SDK storage and protocol against isolated loopback providers; no paid models    |
+| Packaged smoke        | Manifest-based commands below                                    | Actual installation/extraction, private data, seed and cold verification                   |
+| Packaged visible core | `node scripts/package-smoke.mjs --manifest MANIFEST --real-core` | Trusted local real-provider configuration; manual actual business observations required    |
 
 Electron runners build the selected lane, use one Playwright worker, zero retries, and a two-hour
 total deadline with a five-minute build budget. Forward file names and `--grep` after `--`; do not
 override the project's lane with a second `--project`. UI/native changes follow the visual-first
 acceptance order in [change discipline above](#change-discipline).
 
-Native protocol CI keeps two fixed profiles. `pnpm test:native` retains the original Codex 0.159.2
-and Claude Code 2.1.272 cases on each supported platform. `pnpm test:native:decision` contains
-exactly the five standalone decision-runtime files and requires macOS arm64 with Codex 0.163.0.
-The required `native_mac` job runs both sequentially; neither skipped cases nor missing profile
-files can satisfy its report gate. `node scripts/ci-native.mjs decision-codex` installs the second
+`pnpm test:native` retains the original Codex 0.159.2 and Claude Code 2.1.272 business-execution
+cases on each supported platform. `pnpm test:native:execution` preserves four exact cases across
+three files: two genuine Codex reexecution boundaries, thread-local provider configuration and
+historical native-owner recovery. It requires macOS arm64 with Codex 0.163.0. The required
+`native_mac` job runs both sequentially; skipped cases, missing files or a changed case inventory
+cannot satisfy the execution report gate. `node scripts/ci-native.mjs execution-codex` installs the second
 CLI through a separate private pnpm project, generates a lockfile, installs frozen and verifies
 its version. It publishes a separate executable namespace without replacing the legacy CLI or
-changing native homes. `node scripts/ci.mjs native decision-codex` selects that pinned executable
+changing native homes. `node scripts/ci.mjs native execution-codex` selects that pinned executable
 and writes a separate sanitized, source-bound report through the existing native evidence owner.
 These profiles use owned loopback providers, not paid model inference.
 
-`pnpm test:native:claude-decision` separately verifies exact Claude Code 2.1.272 on macOS arm64,
-including global-instruction preservation, OS containment and complete response validation.
-Those macOS containment profiles remain separate from Windows Claude's trusted, tool-disabled
-native mode. `pnpm test:native:claude-windows` exercises the real installed CLI against an owned
-loopback provider, including an enabled-tool positive control, Relay tool denial, one-generation
-SQLite provenance, invalid output and cancellation. It requires the existing source-matched Windows
-Job helper and a compatible CLI (checked with 2.1.309). `PACT_WINDOWS_CLAUDE_EXECUTABLE` explicitly
-selects another installed test executable; the test does not install a CLI or use paid inference.
-Native subscription inference requires a separate trusted-local real-provider check. Windows Codex
-decisions remain unavailable; original Windows native protocol and ownership obligations remain.
+Relay decision selection uses the direct Decisions runtime. Its unit and deterministic fixtures
+exercise the HTTP protocol, credential ownership and durable selection receipts without paid
+requests. Synthetic credential UI checks run against a real private macOS
+keychain under an isolated fixture HOME; they need local `clang` and the
+installed Node's N-API headers, fail rather than prompt for Keychain
+interaction, and never reuse the host credential stores. Native
+decision-engine profiles and their response-guard tests are retired; historical
+physical recovery and business execution obligations remain. The separate
+`pnpm test:native:windows-owner` profile retains its native Windows Job and host-seam obligations.
+Actual OpenAI inference requires explicit authorization and separate API credentials; protocol
+fixtures do not establish decision quality or provider availability.
+For authorized real Relay cases, provide `OPENAI_API_KEY` in the private file
+`tests/e2e/env/codex/.env`, or set `PACT_E2E_RELAY_API_KEY_FILE` to its absolute path.
+The real-fixture bootstrap reads at most 8 KiB only inside Electron Main, uses the normal named
+credential-save interface, verifies the receipt and joins Pact Quit before database seeding.
+Its read/save phase has a 15 s deadline. Subsequent cold launches use the fixture's own encrypted
+store; macOS uses the existing noninteractive private keychain. Plaintext never crosses the
+Playwright transport, enters business-agent environment variables, or appears in test evidence.
+The source file is read-only. Missing or invalid credentials fail setup without a plaintext fallback.
+The reviewed case titles retain their historical identifiers; every Relay decision now uses
+OpenAI Decisions, while Codex and Claude Code remain the real business executors.
 
 Native workspace journeys use the ordinary Pact Quit action and confirm pending work before waiting
 for physical process exit. `tests/e2e/native-quit.ts` provides this bounded teardown; an Electron
@@ -339,10 +351,14 @@ physical release, original titles and the immutable baseline remain unchanged.
 
 The approved information-business acceptance additionally requires the final actual answer to use
 the confirmed user value, fulfill the short release-note request and ask no further question for
-that supplied field. Source/lifecycle success alone is insufficient. Preserve both existing Codex
-business cases and their original checks; a Claude business case exercises the confirmed-answer and
-already-answered arms with Codex source history. Keep complete bounded final text for independent review. These
-test-only outcome checks do not create a production semantic gate, model judge or automatic retry.
+that supplied field. Source/lifecycle success alone is insufficient. The approved phase-specific
+information contract allows Off/Cancel to ask only for the missing value without reading drafting
+material first. Any actual tool call still needs the original audit; zero-tool questions require a
+complete matching native answer. Unread sources are reported as unverified. Writing and supplied-answer
+arms retain complete authenticated source reads. Preserve the existing cases, immutable baseline,
+permission, cancellation, fresh-input and lifecycle checks; a Claude business case exercises the
+confirmed-answer and already-answered arms with Codex source history. Keep complete bounded final text
+for independent review. These test-only checks create no production semantic gate, model judge or retry.
 
 Automatic CI requires the existing `@real-core` business case on Windows x64/arm64 and macOS arm64:
 `real @all completes each Agent once and keeps ordered distinct response rows`. It launches the
@@ -434,6 +450,11 @@ dispatch never publishes a formal release. A successful preflight does not estab
 protected-main publication. Ordinary branch and PR validation needs no readiness switches.
 
 Local production uses the same entry point with `--profile production-local --channel stable`; its name and existing data directories remain separate from both CI channels. Local `dist:mac`, `dist:win`, and `package:dir:local` select this profile. Smoke commands require the exact generated manifest.
+
+On macOS, add `--relay-credentials` to smoke for synthetic save, replacement, reveal and removal
+through the packaged DesktopBridge. Three cold launches verify retained and removed credentials.
+The owner creates a private Keychain; the bundled guard prevents prompts. Unconfirmed cleanup
+retains recovery data. No model calls or host credentials are used.
 
 For an isolated Windows arm64 local package, use the native toolchain and a new output directory.
 Running through pnpm supplies its exact native executable entry to Windows command supervision:

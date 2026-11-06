@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  DECISION_HTTP_OWNER_BYTES,
   DECISION_INPUT_BYTES,
   DECISION_OUTPUT_BYTES,
+  decisionHttpOwnerSchema,
+  decisionRemoteOutcomeSchema,
   decisionInputSchema,
   decisionRecommendationSchema,
+  decisionSelectionSchema,
   parseDecisionRecommendation,
   decisionJsonBytes,
   validateDecisionInput,
@@ -170,6 +174,52 @@ describe('Decision runtime contracts', () => {
     ).toBe(false)
   })
 
+  it('admits the typed host field binding only on the admitted information candidate', () => {
+    const fieldId = '00000000-0000-4000-8000-00000000000a'
+    const bound = input()
+    bound.candidates.push({
+      id: 'clarify_prepared_input',
+      description: 'Ask the declared user field.',
+      information: { fieldId },
+    })
+    expect(decisionInputSchema.safeParse(bound).success).toBe(true)
+    expect(validateDecisionInput(bound)).toEqual({ success: true, input: bound })
+    const legacy = input()
+    expect(decisionInputSchema.safeParse(legacy).success).toBe(true)
+    expect(validateDecisionInput(legacy)).toEqual({ success: true, input: legacy })
+    const misplaced = input()
+    misplaced.candidates[0]!.information = { fieldId }
+    expect(decisionInputSchema.safeParse(misplaced).success).toBe(false)
+    expect(validateDecisionInput(misplaced)).toEqual({ success: false })
+    const untyped = input()
+    untyped.candidates.push({
+      id: 'clarify_prepared_input',
+      description: 'Ask the declared user field.',
+      information: { fieldId: 'not-a-field' },
+    })
+    expect(decisionInputSchema.safeParse(untyped).success).toBe(false)
+  })
+
+  it('keeps the selection contract free of generated text and misplaced bindings', () => {
+    const fieldId = '00000000-0000-4000-8000-00000000000a'
+    for (const value of [
+      { candidateId: 'review' },
+      { candidateId: null },
+      { candidateId: 'clarify_prepared_input', information: { fieldId } },
+    ])
+      expect(decisionSelectionSchema.safeParse(value).success).toBe(true)
+    for (const value of [
+      { candidateId: 'clarify_prepared_input' },
+      { candidateId: 'review', information: { fieldId } },
+      { candidateId: null, information: { fieldId } },
+      { candidateId: 'review', highlights: [] },
+      { candidateId: 'review', explanation: 'generated explanation' },
+      { candidateId: 'review', runId: '00000000-0000-4000-8000-000000000003' },
+      { candidateId: 'clarify_prepared_input', information: { fieldId: 'invented' } },
+    ])
+      expect(decisionSelectionSchema.safeParse(value).success).toBe(false)
+  })
+
   it('refuses oversized, nested, malformed and excessive output rather than attempting a repair', () => {
     const source = input()
     expect(parseDecisionRecommendation(' '.repeat(DECISION_OUTPUT_BYTES + 1), source)).toEqual({
@@ -194,5 +244,39 @@ describe('Decision runtime contracts', () => {
         highlights: [{ text: '🙂'.repeat(2048), sourceIds: ['plan:1'] }],
       }).success,
     ).toBe(false)
+  })
+
+  it('admits only one bounded HTTP request owner identity', () => {
+    const owner = {
+      version: 1,
+      kind: 'http',
+      utilityEpoch: '00000000-0000-4000-8000-000000000001',
+      utilityPid: 4101,
+      requestId: '00000000-0000-4000-8000-000000000002',
+    }
+    expect(decisionHttpOwnerSchema.safeParse(owner).success).toBe(true)
+    expect(
+      new TextEncoder().encode(JSON.stringify(decisionHttpOwnerSchema.parse(owner))).length,
+    ).toBeLessThanOrEqual(DECISION_HTTP_OWNER_BYTES)
+    for (const value of [
+      { ...owner, credential: 'injected' },
+      { ...owner, url: 'https://owned.invalid' },
+      { ...owner, version: 2 },
+      { ...owner, kind: 'native' },
+      { ...owner, utilityEpoch: 'not-an-epoch' },
+      { ...owner, requestId: 'not-a-request' },
+      { ...owner, utilityPid: 0 },
+      { ...owner, utilityPid: -1 },
+      { ...owner, utilityPid: 2_147_483_648 },
+      { ...owner, utilityPid: 4101.5 },
+    ])
+      expect(decisionHttpOwnerSchema.safeParse(value).success).toBe(false)
+  })
+
+  it('bounds the remote outcome vocabulary to observed delivery states', () => {
+    for (const value of ['not_sent', 'unknown', 'responded'])
+      expect(decisionRemoteOutcomeSchema.safeParse(value).success).toBe(true)
+    for (const value of ['', 'sent', 'delivered', 0, null, {}])
+      expect(decisionRemoteOutcomeSchema.safeParse(value).success).toBe(false)
   })
 })

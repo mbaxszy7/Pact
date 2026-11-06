@@ -22,6 +22,26 @@ import {
 import { run } from './run-e2e.mjs'
 
 const helperDigest = (bytes) => createHash('sha256').update(bytes).digest('hex')
+
+await test('credential cleanup failure cannot certify an otherwise released package fixture', () => {
+  const report = packageSmokeFailureReport({
+    phase: 'cleanup',
+    cleanupFailed: true,
+    cleanupFailureStage: 'credential-store',
+    processes: [],
+    installationCleanupVerified: true,
+    providerCopiesCleanupVerified: true,
+    privateRootCleanupVerified: true,
+    credentialStoreCleanupVerified: false,
+    recoveryPreserved: true,
+  })
+  assert.equal(report.cleanupVerified, false)
+  assert.equal(report.credentialStoreCleanupVerified, false)
+  assert.equal(report.cleanupFailureStage, 'credential-store')
+  assert.equal(report.failureCode, 'CLEANUP_UNCONFIRMED')
+  assert.equal(report.recoveryPreserved, true)
+})
+
 function helperPayload(arch) {
   // A process-seam fixture, never an executable Windows/installed acceptance claim.
   const pe = Buffer.alloc(128)

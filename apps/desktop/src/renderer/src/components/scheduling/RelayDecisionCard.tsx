@@ -41,9 +41,11 @@ export function RelayDecisionCard({
     ? 'Continue scheduling'
     : operation?.kind === 'rebuild_native_context'
       ? 'Confirm rebuild'
-      : operation?.kind === 'repair'
-        ? 'Allow repair'
-        : 'Allow one read-only turn'
+      : operation?.kind === 'reassign_roles'
+        ? 'Use suggested roles'
+        : operation?.kind === 'repair'
+          ? 'Allow repair'
+          : 'Allow one read-only turn'
   const answer: RelayDecisionAnswer['answer'] | undefined = !field
     ? { kind: 'confirm' }
     : field.input.kind === 'single'
@@ -72,20 +74,24 @@ export function RelayDecisionCard({
         <p className="relay-action-target">
           {operation?.kind === 'rebuild_native_context'
             ? `${operation.agentId === 'codex' ? 'Codex' : 'Claude Code'} · Current session`
-            : operation
-              ? `${operation.actor === 'codex' ? 'Codex' : 'Claude Code'} · ${operation.kind === 'repair' ? 'One repair' : 'One read-only turn'}, then ${operation.returnActor === 'codex' ? 'Codex' : 'Claude Code'} reviews`
-              : 'Scheduling information'}
+            : operation?.kind === 'reassign_roles'
+              ? `Current: ${operation.previousRoles.codeAuthor === 'codex' ? 'Codex' : 'Claude Code'} implements · ${operation.previousRoles.codeReviewer === 'codex' ? 'Codex' : 'Claude Code'} reviews`
+              : operation
+                ? `${operation.actor === 'codex' ? 'Codex' : 'Claude Code'} · ${operation.kind === 'repair' ? 'One repair' : 'One read-only turn'}, then ${operation.returnActor === 'codex' ? 'Codex' : 'Claude Code'} reviews`
+                : 'Scheduling information'}
         </p>
         <p className="relay-action-explanation">
           {decision.cancelling
             ? 'Check this decision to confirm the cancellation before sending again.'
             : request.reason}
         </p>
-        <p className="relay-action-explanation">
-          {decision.cancelling
-            ? 'This check does not send your draft. Your current draft and Comments are kept.'
-            : request.consequence}
-        </p>
+        {operation?.kind !== 'reassign_roles' || decision.cancelling ? (
+          <p className="relay-action-explanation">
+            {decision.cancelling
+              ? 'This check does not send your draft. Your current draft and Comments are kept.'
+              : request.consequence}
+          </p>
+        ) : null}
         {field && !decision.cancelling ? (
           <div className="relay-scheduling-field">
             <label htmlFor={`${titleId}-field`}>{field.prompt}</label>
@@ -114,9 +120,11 @@ export function RelayDecisionCard({
             )}
           </div>
         ) : null}
-        <p className="relay-action-source">
-          Source: {request.sources.map((source) => source.label).join(' · ')}
-        </p>
+        {operation?.kind !== 'reassign_roles' ? (
+          <p className="relay-action-source">
+            Source: {request.sources.map((source) => source.label).join(' · ')}
+          </p>
+        ) : null}
       </div>
       {decision.error ? (
         <p role="alert" className="relay-decision-error">
@@ -134,7 +142,9 @@ export function RelayDecisionCard({
             ? decision.status === 'submitting'
               ? 'Cancelling…'
               : 'Cancel requested'
-            : 'Cancel this scheduling action'}
+            : operation?.kind === 'reassign_roles'
+              ? 'Keep current roles'
+              : 'Cancel this scheduling action'}
         </button>
         <button
           className="relay-submit"

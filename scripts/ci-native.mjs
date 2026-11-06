@@ -68,7 +68,7 @@ export async function windowsCodexEntry(directory, arch, profileName = 'legacy')
   if (!environmentFilePath(directory) || !['x64', 'arm64'].includes(arch))
     throw new Error('Invalid Windows Codex package selection')
   const profile = nativeProfile(profileName)
-  if (profile.name !== 'legacy' && profile.name !== 'decision-codex')
+  if (profile.name !== 'legacy' && profile.name !== 'execution-codex')
     throw new Error('The fixed native profile does not select a Codex package')
   const version = profile.codexVersion
   const root = await realpath(directory)
@@ -248,14 +248,12 @@ export async function main(source = process.env, profileName = 'legacy') {
   }
   try {
     const profile = nativeProfile(profileName)
-    const decisionCodex = profile.name === 'decision-codex'
-    const decisionClaude = profile.name === 'decision-claude'
-    const decision = decisionCodex || decisionClaude
+    const executionCodex = profile.name === 'execution-codex'
     if (!nativeProfileSetupSupports(profile))
       throw new Error('The fixed native profile does not support this native runner.')
     // The Windows owner profile builds its product helper through its command, without model CLIs.
     if (profile.name === 'windows-owner') return
-    const agents = decisionCodex ? ['codex'] : decisionClaude ? ['claude'] : ['claude', 'codex']
+    const agents = executionCodex ? ['codex'] : ['claude', 'codex']
     if (!source.RUNNER_TEMP || !isAbsolute(source.RUNNER_TEMP))
       throw new Error('Native CI requires the runner-owned temporary directory')
     if (!environmentFilePath(source.GITHUB_ENV))
@@ -270,11 +268,9 @@ export async function main(source = process.env, profileName = 'legacy') {
       join(directory, 'package.json'),
       JSON.stringify({
         private: true,
-        dependencies: decisionCodex
+        dependencies: executionCodex
           ? { '@openai/codex': profile.codexVersion }
-          : decisionClaude
-            ? { '@anthropic-ai/claude-code': profile.claudeVersion }
-            : { '@openai/codex': profile.codexVersion, '@anthropic-ai/claude-code': '2.1.272' },
+          : { '@openai/codex': profile.codexVersion, '@anthropic-ai/claude-code': '2.1.272' },
       }) + '\n',
       { flag: 'wx', mode: 0o600 },
     )
@@ -319,9 +315,9 @@ export async function main(source = process.env, profileName = 'legacy') {
       const path =
         agent === 'claude'
           ? join(directory, 'node_modules', '@anthropic-ai/claude-code', 'bin', 'claude.exe')
-          : decisionCodex && nativeCodex
+          : executionCodex && nativeCodex
             ? nativeCodex.executable
-            : decisionCodex && process.platform === 'darwin'
+            : executionCodex && process.platform === 'darwin'
               ? join(directory, 'node_modules', '@openai', 'codex', 'bin', 'codex.js')
               : join(
                   directory,
@@ -335,10 +331,10 @@ export async function main(source = process.env, profileName = 'legacy') {
         throw new Error('Pinned native CLI executable is missing')
       if (/[\r\n\0]/u.test(path))
         throw new Error('Native CLI path cannot enter an Actions environment file')
-      if (decision) {
+      if (executionCodex) {
         stage = 'native-version-validation'
         let versionOutput = ''
-        // oxlint-disable-next-line no-await-in-loop -- Verify the one decision CLI before publishing its private path.
+        // oxlint-disable-next-line no-await-in-loop -- Verify the pinned execution CLI before publishing its private path.
         const code = await run(['--version'], 10_000, {
           executable: path,
           cwd: directory,
@@ -349,13 +345,13 @@ export async function main(source = process.env, profileName = 'legacy') {
               throw new Error('Native version output overflow')
           },
         })
-        const version = agent === 'codex' ? profile.codexVersion : profile.claudeVersion
-        const expected = agent === 'codex' ? `codex-cli ${version}` : `${version} (Claude Code)`
+        const version = profile.codexVersion
+        const expected = `codex-cli ${version}`
         if (code !== 0 || versionOutput.trim() !== expected)
-          throw new Error('Pinned decision CLI version mismatch')
+          throw new Error('Pinned execution CLI version mismatch')
         lines.push(
-          `PACT_NATIVE_DECISION_${agent.toUpperCase()}_EXECUTABLE=${path}`,
-          `PACT_NATIVE_DECISION_${agent.toUpperCase()}_VERSION=${version}`,
+          `PACT_NATIVE_EXECUTION_CODEX_EXECUTABLE=${path}`,
+          `PACT_NATIVE_EXECUTION_CODEX_VERSION=${version}`,
         )
         continue
       }
@@ -366,7 +362,7 @@ export async function main(source = process.env, profileName = 'legacy') {
           }`,
         )
     }
-    if (nativeCodex && !decisionCodex)
+    if (nativeCodex && !executionCodex)
       lines.push(`PACT_NATIVE_CODEX_PACKAGE_ROOT=${nativeCodex.packageRoot}`)
     stage = 'actions-environment-publication'
     await appendFile(source.GITHUB_ENV, lines.join('\n') + '\n')

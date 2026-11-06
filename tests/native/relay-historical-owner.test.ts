@@ -13,10 +13,12 @@ import { Conversation } from '../../apps/desktop/src/utility/conversation/conver
 import { OwnedProcessGroup } from '../../apps/desktop/src/utility/owned-process-group.js'
 import { ProjectFileReader } from '../../apps/desktop/src/utility/project-file/project-file-reader.js'
 import { RuntimePreparation } from '../../apps/desktop/src/utility/runtime-preparation/runtime-preparation.js'
+import { runDirectoryWorker } from '../../apps/desktop/src/utility/workspace-changes/directory-worker.test-support.js'
 import { decisionPhysicalWitnessSchema } from '../../packages/contracts/src/decision-runtime.js'
 import {
   decisionFixture,
   decisionEvaluationFacts,
+  seedHistoricalDecisionEvaluation,
 } from '../../packages/persistence/src/decision-fixture.test-support.js'
 import { PactDatabase } from '../../packages/persistence/src/pact-database.js'
 
@@ -73,24 +75,7 @@ it.runIf(process.platform === 'darwin')(
       process.env.TZ = 'Asia/Shanghai'
       expect(await OwnedProcessGroup.provePhysicalRelease(witness)).toBe(false)
       f = await decisionFixture(join(directory, 'pact.sqlite'))
-      const reservation = f.repo.reserveEvaluation({
-        handoff: f.input.handoff,
-        provider: 'codex',
-        model: 'gpt-6-luna',
-        configurationFingerprint: 'a'.repeat(64),
-      })
-      if (reservation.status !== 'reserved') throw Error('Owned receipt unavailable')
-      const id = reservation.evaluation.id
-      f.repo.recordEvaluationPhysicalWitness(id, {
-        witness,
-        configurationFingerprint: 'b'.repeat(64),
-      })
-      f.repo.dispatchEvaluation(id)
-      f.repo.settleEvaluation(id, {
-        outcome: 'failed',
-        physicalReleased: false,
-        usage: { inputTokens: 17, outputTokens: 5 },
-      })
+      const id = seedHistoricalDecisionEvaluation(f.db, f.input, witness)
       const before = decisionEvaluationFacts(f.db)
       expect(Buffer.byteLength(JSON.stringify(before))).toBeLessThan(4096)
       owner.send('exit')
@@ -106,7 +91,11 @@ it.runIf(process.platform === 'darwin')(
         f.db.sessionRepository,
         f.db.projectCatalogRepository,
         new RuntimePreparation(f.db.runtimePreparationRepository),
-        new ProjectFileReader(f.db.sessionRepository, f.db.projectCatalogRepository),
+        new ProjectFileReader(
+          f.db.sessionRepository,
+          f.db.projectCatalogRepository,
+          runDirectoryWorker,
+        ),
       )
       expect(flow.prepareNativeQuit({ operationId: randomUUID() })).toMatchObject({
         ok: true,
@@ -154,14 +143,10 @@ it.runIf(process.platform === 'darwin')(
         usage_json: '{"inputTokens":17,"outputTokens":5}',
       })
       expect(f.repo.schedulingBudget(f.input.handoff.budgetSubjectId)?.evaluationCalls).toBe(1)
-      expect(
-        f.repo.reserveEvaluation({
-          handoff: f.input.handoff,
-          provider: 'codex',
-          model: 'gpt-6-luna',
-          configurationFingerprint: 'c'.repeat(64),
-        }).status,
-      ).toBe('duplicate')
+      expect(await flow.evaluateDecision(f.input, new AbortController().signal)).toEqual({
+        kind: 'unavailable',
+        reason: 'duplicate',
+      })
       await new Promise<void>((resolve) => setImmediate(resolve))
       const ready = flow.prepareWorkspaceArchive({
         operationId: randomUUID(),

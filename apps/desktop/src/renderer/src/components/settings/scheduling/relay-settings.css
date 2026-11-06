@@ -16,6 +16,10 @@
   padding-bottom: 1.5rem;
 }
 
+.relay-header p {
+  text-wrap: pretty;
+}
+
 .relay-header + .relay-toggle {
   margin-top: 1.5rem;
 }
@@ -93,93 +97,116 @@
   margin-top: 1.5rem;
 }
 
-.relay-refresh:focus-visible {
-  outline-offset: -2px;
+.relay-key-controls {
+  margin-top: 0.5rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
 }
 
-.relay-refresh {
-  display: grid;
+/* The wrapper owns the field's sizing so the eye button can sit inside its edge. */
+.relay-key-field {
+  position: relative;
+  min-width: 12rem;
+  flex: 1 1 14rem;
+}
+
+.relay-key-field input {
+  width: 100%;
+  min-width: 0;
+  height: 2.25rem;
+  border: 1px solid var(--pact-border);
+  border-radius: var(--radius-control);
+  background: var(--pact-surface-raised);
+  padding-inline: 0.75rem;
+  padding-inline-end: 2.75rem;
+  color: var(--pact-text-primary);
+  font-size: 0.875rem;
+}
+
+.relay-key-field input::placeholder {
+  color: var(--pact-text-primary);
+  opacity: 1;
+}
+
+.relay-key-eye {
+  position: absolute;
+  inset-inline-end: 0.125rem;
+  top: 50%;
+  transform: translateY(-50%);
   width: 2rem;
   height: 2rem;
-  flex: 0 0 auto;
-  place-items: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
   border-radius: var(--radius-control);
+  background: transparent;
   color: var(--pact-text-secondary);
   cursor: pointer;
 }
 
-.relay-refresh:hover:not(:disabled) {
+.relay-key-eye:hover:not(:disabled) {
   background: var(--pact-surface-muted);
+  color: var(--pact-text-primary);
 }
 
-.relay-refresh:disabled {
+.relay-key-eye:focus-visible {
+  outline: 2px solid var(--pact-focus);
+  outline-offset: -1px;
+}
+
+.relay-key-eye:disabled {
+  color: var(--pact-text-tertiary);
+  opacity: 0.6;
   cursor: default;
-  opacity: 0.45;
 }
 
-.relay-models {
-  margin-top: 0.5rem;
-  overflow: hidden;
-  border: 1px solid var(--pact-border);
-  border-radius: var(--radius-control);
-  background: var(--pact-surface-raised);
+.relay-key-controls input:focus-visible {
+  outline: 2px solid var(--pact-focus);
+  outline-offset: -1px;
 }
 
-.relay-model-row {
+.relay-key-controls input:disabled {
+  cursor: default;
+  color: var(--pact-text-tertiary);
+  opacity: 0.6;
+}
+
+.relay-key-actions {
+  margin-top: 0.75rem;
   display: flex;
-  min-height: 3rem;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.75rem;
-  padding: 0.75rem;
+}
+
+.relay-key-secondary {
+  display: inline-flex;
+  height: 2rem;
+  align-items: center;
+  border: 1px solid var(--pact-border);
+  border-radius: var(--radius-control);
+  padding-inline: 0.75rem;
   color: var(--pact-text-primary);
   cursor: pointer;
+  font-size: 0.8125rem;
+  font-weight: 500;
 }
 
-.relay-model-row:first-child {
-  border-radius: calc(var(--radius-control) - 1px) calc(var(--radius-control) - 1px) 0 0;
-}
-
-.relay-model-row:last-child {
-  border-radius: 0 0 calc(var(--radius-control) - 1px) calc(var(--radius-control) - 1px);
-}
-
-.relay-model-row + .relay-model-row {
-  border-top: 1px solid var(--pact-border);
-}
-
-.relay-model-row:hover:not([data-disabled='true']) {
+.relay-key-secondary:hover:not(:disabled) {
   background: var(--pact-surface-muted);
 }
 
-.relay-model-row[data-selected='true']:not([data-disabled='true']) {
-  background: color-mix(in srgb, var(--pact-focus) 6%, var(--pact-surface-raised));
-}
-
-.relay-model-row:has(input:focus-visible) {
+.relay-key-secondary:focus-visible {
   outline: 2px solid var(--pact-focus);
-  outline-offset: -2px;
+  outline-offset: -1px;
 }
 
-.relay-model-row[data-disabled='true'] {
-  color: var(--pact-text-tertiary);
-  cursor: not-allowed;
-  opacity: 0.48;
-}
-
-.relay-model-mark {
-  display: grid;
-  width: 1rem;
-  height: 1rem;
-  flex: 0 0 auto;
-  place-items: center;
-  border: 1px solid var(--pact-border-strong);
-  border-radius: 9999px;
-}
-
-.relay-model-row[data-selected='true'] .relay-model-mark {
-  border-color: var(--pact-focus);
-  background: var(--pact-focus);
-  color: var(--pact-text-inverse);
+.relay-key-secondary:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .relay-usage {
@@ -190,6 +217,19 @@
 .relay-toggle[data-compact='true'] {
   gap: 0.75rem;
   min-height: 2.25rem;
+}
+
+.relay-activity-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  column-gap: 1rem;
+  row-gap: 0.25rem;
+}
+
+.relay-activity-summary > :last-child {
+  flex: 0 0 auto;
 }
 
 .relay-activity-list {
@@ -242,32 +282,10 @@
     background: HighlightText;
   }
 
-  .relay-model-mark {
-    forced-color-adjust: none;
-    border-color: ButtonText;
-    background: Canvas;
-  }
-
-  .relay-model-row[data-selected='true'] .relay-model-mark {
-    border-color: Highlight;
-    background: Highlight;
-    color: HighlightText;
-  }
-
-  .relay-model-row[data-disabled='true'] {
-    color: GrayText;
-    opacity: 1;
-  }
-
-  .relay-model-row[data-disabled='true'] .relay-model-mark {
-    border-color: GrayText;
-    background: Canvas;
-    color: GrayText;
-  }
-
   .relay-toggle:focus-visible .relay-switch-track,
-  .relay-refresh:focus-visible,
-  .relay-model-row:has(input:focus-visible) {
+  .relay-key-controls input:focus-visible,
+  .relay-key-eye:focus-visible,
+  .relay-key-secondary:focus-visible {
     outline-color: Highlight;
   }
 }

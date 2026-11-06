@@ -368,13 +368,17 @@ function contextPanel(
       />
     )
   if (props.workspaceChangesPanel) {
+    const state = props.workspaceChangesPanel
     return (
       <WorkspaceChangesPanel
-        key={`${props.workspaceChangesPanel.sessionId}:${props.workspaceChangesPanel.changeSetId}:${props.workspaceChangesPanel.path}`}
-        state={props.workspaceChangesPanel}
+        key={`${state.sessionId}:${state.changeSetId}`}
+        state={state}
         expanded={props.projectFilePanelExpanded}
         onClose={() => props.onSessionSettingsOpenChange(false)}
         onExpandedChange={props.onProjectFilePanelExpandedChange}
+        onSelectFile={(path) =>
+          props.onOpenWorkspaceChanges(state.changeSetId, path, undefined, state.revision)
+        }
       />
     )
   }

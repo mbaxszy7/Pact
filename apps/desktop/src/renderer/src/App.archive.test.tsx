@@ -16,6 +16,8 @@ import type {
   WorkspaceArchiveReceipt,
 } from '@pact/contracts'
 
+import { OPENAI_DECISION_MODEL } from '@pact/contracts'
+
 import type { WorkspaceView } from './components/workspace/WorkspaceView'
 
 import App from './App'
@@ -151,17 +153,18 @@ function fixture(projectCount = 2) {
       value: {
         settings: {
           enabled: false,
-          selection: null,
+          provider: 'openai',
+          model: OPENAI_DECISION_MODEL,
+          credential: { configured: false, revision: 0 },
           showIndicator: true,
           revision: 0,
           updatedAt: timestamp,
         },
         configurationGeneration: 0,
-        host: { status: 'unconfirmed', capability: null, expiresAt: null },
+        connection: { status: 'unconfirmed', checkedAt: null, expiresAt: null },
         context: input?.sessionId
           ? {
               sessionId: input.sessionId,
-              observation: { status: 'unconfirmed', capability: null, expiresAt: null },
               eligibility: 'disabled',
             }
           : null,

@@ -161,6 +161,10 @@ export function decisionJsonBytes(root: unknown, limit = DECISION_INPUT_BYTES): 
   }
 }
 
+/** Select an existing host-admitted user field; the model cannot create its question. */
+export const decisionInformationSchema = z.strictObject({ fieldId: z.string().uuid() })
+export type DecisionInformation = z.infer<typeof decisionInformationSchema>
+
 /** Complete source text is admitted or refused together; these bounds never shorten it. */
 export const decisionInputSchema = z
   .strictObject({
@@ -172,6 +176,7 @@ export const decisionInputSchema = z
         z.strictObject({
           id,
           description: z.string().min(1).max(DECISION_INPUT_BYTES),
+          information: decisionInformationSchema.optional(),
         }),
       )
       .min(1)
@@ -197,6 +202,15 @@ export const decisionInputSchema = z
       new Set(value.sources.map((source) => source.id)).size !== value.sources.length
     )
       context.addIssue({ code: 'custom', message: 'Decision identities must be unique.' })
+    if (
+      value.candidates.some(
+        (candidate) => candidate.information && candidate.id !== 'clarify_prepared_input',
+      )
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Only the admitted information candidate carries a host field binding.',
+      })
   })
 export type DecisionInput = z.infer<typeof decisionInputSchema>
 
@@ -208,10 +222,6 @@ export function validateDecisionInput(
   const parsed = decisionInputSchema.safeParse(value)
   return parsed.success ? { success: true, input: parsed.data } : { success: false }
 }
-
-/** Select an existing host-admitted user field; the model cannot create its question. */
-export const decisionInformationSchema = z.strictObject({ fieldId: z.string().uuid() })
-export type DecisionInformation = z.infer<typeof decisionInformationSchema>
 
 /** A candidate ID is only a suggestion. It never carries a Run, operation or authorization. */
 export const decisionRecommendationSchema = z
@@ -273,6 +283,63 @@ export type DecisionOutcome =
         | 'stale'
         | 'runtime_unavailable'
     }
+
+export const OPENAI_DECISION_MODEL = 'gpt-6-luna'
+/** A selection is only a host-admitted candidate ID plus its bound field, never model text. */
+export const decisionSelectionSchema = z
+  .strictObject({
+    candidateId: id.nullable(),
+    information: decisionInformationSchema.optional(),
+  })
+  .refine(
+    (value) =>
+      (value.candidateId === 'clarify_prepared_input') === (value.information !== undefined),
+    'Only the admitted information candidate carries a host field binding.',
+  )
+export type DecisionSelection = z.infer<typeof decisionSelectionSchema>
+export type DecisionSelectionOutcome =
+  | { kind: 'selection'; selection: DecisionSelection }
+  | {
+      kind: 'unavailable'
+      reason:
+        | 'disabled'
+        | 'busy'
+        | 'duplicate'
+        | 'invalid_input'
+        | 'invalid_output'
+        | 'cancelled'
+        | 'timeout'
+        | 'stale'
+        | 'runtime_unavailable'
+    }
+
+export type DecisionEvaluationReceipt = {
+  evaluationId: string
+  handoffId: string
+  configurationGeneration: number
+  configurationFingerprint: string
+  deadlineAt: number
+}
+
+/** Host result only; the wire selection schema does not accept receipt identities. */
+export type DecisionEvaluationOutcome =
+  | Extract<DecisionSelectionOutcome, { kind: 'unavailable' }>
+  | (Extract<DecisionSelectionOutcome, { kind: 'selection' }> & {
+      evaluationReceipt: DecisionEvaluationReceipt
+    })
+
+export const DECISION_HTTP_OWNER_BYTES = 512
+/** Identifies Utility's HTTP request, not a native child witness. No URL, key or raw body. */
+export const decisionHttpOwnerSchema = z.strictObject({
+  version: z.literal(1),
+  kind: z.literal('http'),
+  utilityEpoch: z.string().uuid(),
+  utilityPid: z.number().int().positive().max(2_147_483_647),
+  requestId: z.string().uuid(),
+})
+export type DecisionHttpOwner = z.infer<typeof decisionHttpOwnerSchema>
+export const decisionRemoteOutcomeSchema = z.enum(['not_sent', 'unknown', 'responded'])
+export type DecisionRemoteOutcome = z.infer<typeof decisionRemoteOutcomeSchema>
 
 export {
   decisionPhysicalWitnessSchema,

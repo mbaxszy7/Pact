@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { realpath, stat } from 'node:fs/promises'
 import { basename, isAbsolute, join } from 'node:path'
 import { setImmediate as yieldImmediate } from 'node:timers/promises'
+import { isDeepStrictEqual } from 'node:util'
 import { Worker } from 'node:worker_threads'
 
 import type {
@@ -64,16 +65,12 @@ import type {
   DecisionInput,
   DecisionEvaluationOutcome,
   RelayDecisionMaterial,
-  HandoffGuidanceProposal,
-  WorkflowRelayCandidateId,
   InputRoutingProposal,
   SchedulingHandoff,
   SchedulingState,
   SchedulingStateInput,
   SchedulingEligibility,
-  DecisionCapability,
-  DecisionPhysicalWitness,
-  SchedulingModelSelection,
+  DecisionHttpOwner,
 } from '@pact/contracts'
 import type {
   ConversationImage,
@@ -98,6 +95,9 @@ import {
   COLLABORATION_PROTOCOL,
   collaborationTaskSchema,
   collaborationActor,
+  collaborationInitialStage,
+  defaultTaskStageRoles,
+  initialTaskRoleCandidateIdSchema,
   advanceCollaboration,
   collaborationNextStage,
   collaborationInputGate,
@@ -106,15 +106,15 @@ import {
   collaborationMarkdownPageSchema,
   type CollaborationTask,
   type CollaborationActionInput,
-  handoffGuidanceProposalSchema,
-  HANDOFF_GUIDANCE_VERSION,
   decisionJsonBytes,
+  decisionHttpOwnerSchema,
+  relayCredentialWriteSchema,
+  DECISION_HTTP_OWNER_BYTES,
   schedulingSettingsSchema,
   schedulingStateSchema,
   schedulingCheckPhysicalOwnerSchema,
   schedulingStateInputSchema,
   SCHEDULING_CAPABILITY_TTL_MS,
-  SCHEDULING_CAPABILITY_RESIDENT_BYTES,
   DECISION_PHYSICAL_RECEIPT_ITEMS,
   DECISION_CLEANUP_TARGET_MS,
   relayDecisionAnswerSchema,
@@ -196,21 +196,16 @@ import {
 } from './agent-execution-error'
 import { AgentStreamBuffer } from './agent-stream-buffer'
 import { ClaudeAgentAdapter } from './claude-agent-adapter'
-import { ClaudeDecisionRuntime } from './claude-decision-runtime'
 import { CodexAgentAdapter } from './codex-agent-adapter'
-import { CodexDecisionRuntime, type DecisionInputLoader } from './codex-decision-runtime'
 import { ConversationImages } from './conversation-images'
+import { type DecisionInputLoader } from './decision-runtime'
 import { pathlessExecutionInput, restoreExecutionInput } from './execution-input'
 import { FrozenSourceReader } from './frozen-source-reader'
 import { encodeNativeJsonFrame } from './native-json-encoder'
 import { safeNativePermissionText } from './native-permission-wait'
 import { NativeWorkingMemory, type NativeMemoryAllocator } from './native-working-memory'
-import {
-  evaluateRelayPolicy,
-  relayWorkflowPolicyFacts,
-  type RelayPolicyAdmission,
-  type RelayAction,
-} from './relay-policy'
+import { OpenAIDecisionRuntime } from './openai-decision-runtime'
+import { evaluateRelayPolicy, type RelayPolicyAdmission } from './relay-policy'
 import { presentSessionIssues } from './session-issues'
 
 const DELIVERY_RECONCILIATION_TIMEOUT_MS = 10_000
@@ -305,42 +300,15 @@ interface DecisionInvocationOwner {
   settling?: boolean
 }
 
-interface DecisionProbeOwner {
-  kind: 'probe'
-  operationId: string
-  sessionId: string | null
-  key: string
-  controller: AbortController
-  current: () => boolean
-  runtime?: DecisionRuntime | undefined
-  task?: Promise<RpcResult<SchedulingState>> | undefined
-  reserved?: boolean
-  settling?: boolean
-}
-
-interface DecisionCapabilityObservation {
-  sessionId: string | null
-  scopeKey: string
-  configurationKey: string
-  generation: number
-  capability: DecisionCapability
-  expiresAt: string
-}
-
 interface SendOptions {
   collaborationActionReceiptId?: string | undefined
   preparedInput?: import('@pact/persistence').PreparedInputDispatch | undefined
   inputRouting?: InputRoutingProposal | undefined
-  inputRoutingCurrent?: (() => boolean) | undefined
+  initialTaskRoles?: import('@pact/contracts').InitialTaskRolesProposal | undefined
+  initialRolesConsidered?: boolean
+  preparedSelectionCurrent?: (() => boolean) | undefined
   preparationDeadlineAt?: number | undefined
   schedulingHandoff?: import('@pact/contracts').SchedulingHandoff | undefined
-  handoffGuidance?:
-    | {
-        proposal: HandoffGuidanceProposal
-        current: () => boolean
-        reservation: import('./native-working-memory').NativeMemoryReservation
-      }
-    | undefined
   imageOwnerKey?: string
 
   preserveDraftComments?: boolean
@@ -520,11 +488,13 @@ export class Conversation {
     }
   >()
   private disposal: Promise<void> | undefined
-  private decisionRuntime: DecisionInvocationOwner | DecisionProbeOwner | undefined
+  private decisionRuntime: DecisionInvocationOwner | undefined
   private decisionRecovery: Promise<void> | undefined
   private decisionRecoveryOwner: { operationId: string; sessionId: string | null } | undefined
-  private hostDecisionCapability: DecisionCapabilityObservation | undefined
-  private contextDecisionCapability: DecisionCapabilityObservation | undefined
+  private readonly utilityEpoch = randomUUID()
+  private decisionConnection:
+    | (import('@pact/contracts').DecisionConnection & { generation: number })
+    | undefined
   private schedulingListener: (() => void) | undefined
 
   constructor(
@@ -536,14 +506,17 @@ export class Conversation {
     private readonly workspaceChanges?: WorkspaceChanges,
     private readonly images?: ConversationImages,
     private readonly ipcTraffic?: LogicalIpcWorkerTraffic,
-    private readonly modelCatalogs?: import('../default-session-settings/default-session-settings').DefaultSessionSettings,
+    private readonly loadDecisionCredential?: (context: {
+      signal: AbortSignal
+      deadlineAt: number
+    }) => Promise<string | null> | string | null,
   ) {
     this.conversations.archives.recover(this.archiveOwnerId)
     this.conversations.expireNativePermissions()
     this.conversations.recoverInterruptedRuns()
     this.conversations.recoverCollaborationTasks()
     this.conversations.recoverForkIntents()
-    this.conversations.beginSchedulingRecoveryEpoch(randomUUID())
+    this.conversations.beginSchedulingRecoveryEpoch(this.utilityEpoch)
     this.schedulePendingRoutedContinuations()
     void this.recoverDecisionReservation()
   }
@@ -581,31 +554,23 @@ export class Conversation {
     }
   }
 
-  private schedulingObservation(
-    saved: DecisionCapabilityObservation | undefined,
-    scope: ReturnType<Conversation['schedulingScope']>,
-  ): SchedulingState['host'] {
-    if (!saved || saved.sessionId !== scope.sessionId)
-      return { status: 'unconfirmed', capability: null, expiresAt: null }
+  private schedulingConnection(): SchedulingState['connection'] {
+    const saved = this.decisionConnection
+    if (!saved?.expiresAt) return { status: 'unconfirmed', checkedAt: null, expiresAt: null }
     const stale =
-      saved.scopeKey !== scope.key ||
-      saved.generation !== this.conversations.schedulingConfigurationGeneration() ||
-      saved.configurationKey !== this.runtimePreparation.catalogIdentity(scope.cwd) ||
-      Date.parse(saved.expiresAt) <= Date.now()
+      Date.parse(saved.expiresAt) <= Date.now() ||
+      saved.generation !== this.conversations.schedulingConfigurationGeneration()
     return {
-      status: stale ? 'stale' : saved.capability.status,
-      capability: saved.capability,
+      status: stale ? 'stale' : saved.status,
+      checkedAt: saved.checkedAt,
       expiresAt: saved.expiresAt,
     }
   }
 
-  private schedulingEligibility(
-    sessionId: string,
-    observation: SchedulingState['host'],
-  ): SchedulingEligibility {
+  private schedulingEligibility(sessionId: string): SchedulingEligibility {
     const settings = this.conversations.schedulingSettings()
     if (!settings.enabled) return 'disabled'
-    if (!settings.selection) return 'model_required'
+    if (!settings.credential.configured) return 'key_required'
     const session = this.sessions.find(sessionId)
     if (
       !session ||
@@ -631,21 +596,19 @@ export class Conversation {
       this.conversations.activeSchedulingRuntimeOwner()
     )
       return 'busy'
-    return observation.status === 'supported'
+    const connection = this.schedulingConnection()
+    return connection.status === 'available'
       ? 'available'
-      : observation.status === 'unavailable'
+      : connection.status === 'unavailable'
         ? 'unavailable'
         : 'unconfirmed'
   }
 
-  /** Pure projection: neither reading Settings nor the indicator starts native work. */
+  /** Pure projection: neither reading Settings nor the indicator starts provider work. */
   getSchedulingState(raw: SchedulingStateInput): RpcResult<SchedulingState> {
     try {
       const input = schedulingStateInputSchema.parse(raw)
       const scope = this.schedulingScope(input.sessionId)
-      const observation = scope.sessionId
-        ? this.schedulingObservation(this.contextDecisionCapability, scope)
-        : null
       const owner = this.conversations.activeSchedulingRuntimeOwner()
       const live = this.decisionRuntime
       const activity: SchedulingState['activity']['decision'] =
@@ -657,9 +620,7 @@ export class Conversation {
                 !live ||
                 live.operationId !== owner.id
                   ? 'cleanup_unconfirmed'
-                  : owner.kind === 'probe'
-                    ? 'inspecting'
-                    : 'evaluating',
+                  : 'evaluating',
               operationId: owner.id,
               sessionId: owner.sessionId,
             }
@@ -675,18 +636,13 @@ export class Conversation {
       const value = schedulingStateSchema.parse({
         settings: this.conversations.schedulingSettings(),
         configurationGeneration: this.conversations.schedulingConfigurationGeneration(),
-        host: this.schedulingObservation(
-          this.hostDecisionCapability,
-          this.schedulingScope(undefined),
-        ),
-        context:
-          scope.sessionId && observation
-            ? {
-                sessionId: scope.sessionId,
-                observation,
-                eligibility: this.schedulingEligibility(scope.sessionId, observation),
-              }
-            : null,
+        connection: this.schedulingConnection(),
+        context: scope.sessionId
+          ? {
+              sessionId: scope.sessionId,
+              eligibility: this.schedulingEligibility(scope.sessionId),
+            }
+          : null,
         activity: {
           decision: activity,
           check:
@@ -709,232 +665,6 @@ export class Conversation {
     } catch (error) {
       return Conversation.sendFailure(error)
     }
-  }
-
-  /** Explicit, zero-Turn refresh shares the exact physical owner used by evaluations. */
-  async refreshSchedulingState(raw: SchedulingStateInput): Promise<RpcResult<SchedulingState>> {
-    try {
-      const input = schedulingStateInputSchema.parse(raw)
-      if (this.disposed) return Conversation.shuttingDown()
-      if (this.nativeQuitSealed()) return Conversation.quitPrepared()
-      const scope = this.schedulingScope(input.sessionId)
-      const settings = this.conversations.schedulingSettings()
-      if (!settings.selection) return this.getSchedulingState(input)
-      const generation = this.conversations.schedulingConfigurationGeneration()
-      const configurationKey = this.runtimePreparation.catalogIdentity(scope.cwd)
-      const key = JSON.stringify([scope.key, generation, configurationKey, settings.selection])
-      const live = this.decisionRuntime
-      if (live?.kind === 'probe' && live.key === key && live.task) return live.task
-      if (live || this.conversations.activeSchedulingRuntimeOwner() || this.decisionRecovery) {
-        void this.recoverDecisionReservation()
-        return this.getSchedulingState(input)
-      }
-      const selection = settings.selection
-      const controller = new AbortController()
-      const current = () => {
-        if (
-          this.disposed ||
-          this.nativeQuitSealed() ||
-          controller.signal.aborted ||
-          this.conversations.schedulingConfigurationGeneration() !== generation ||
-          this.runtimePreparation.catalogIdentity(scope.cwd) !== configurationKey
-        )
-          return false
-        try {
-          if (this.schedulingScope(input.sessionId).key !== scope.key) return false
-          if (scope.sessionId) {
-            const session = this.sessions.find(scope.sessionId)
-            if (
-              !session ||
-              session.status === 'archived' ||
-              this.projects.find(session.projectId)?.archivedAt ||
-              this.conversations.archives.blocksSession(scope.sessionId)
-            )
-              return false
-          }
-          return true
-        } catch {
-          return false
-        }
-      }
-      if (!current()) return this.getSchedulingState(input)
-      const deadlineAt = Date.now() + 15_000
-      const operationId = randomUUID()
-      const owner: DecisionProbeOwner = {
-        kind: 'probe',
-        operationId,
-        sessionId: scope.sessionId,
-        key,
-        controller,
-        current,
-      }
-      this.decisionRuntime = owner
-      try {
-        if (
-          !this.conversations.reserveSchedulingProbe({
-            id: operationId,
-            sessionId: scope.sessionId,
-            provider: selection.provider,
-            model: selection.modelId,
-            configurationFingerprint: createHash('sha256').update(key).digest('hex'),
-            deadlineAt,
-          })
-        ) {
-          this.decisionRuntime = undefined
-          return this.getSchedulingState(input)
-        }
-        owner.reserved = true
-      } catch (error) {
-        if (this.decisionRuntime === owner) this.decisionRuntime = undefined
-        throw error
-      }
-      const task = Promise.resolve().then(async () => {
-        let capability: DecisionCapability | undefined
-        try {
-          if (!current()) {
-            capability = {
-              provider: selection.provider,
-              modelId: selection.modelId,
-              status: 'unavailable',
-              supported: false,
-              reason: 'cancelled',
-              configurationFingerprint: null,
-              checkedAt: new Date().toISOString(),
-              physicalReleased: true,
-            }
-          } else {
-            const runtime = this.createSchedulingRuntime(owner, selection, scope.cwd, deadlineAt, {
-              dispatch: () => {
-                throw new Error('A compatibility probe cannot dispatch a Turn.')
-              },
-              prepared: (facts) =>
-                this.conversations.recordSchedulingRuntimeWitness(operationId, facts),
-            })
-            owner.runtime = runtime
-            capability = await runtime.probeAdmission(controller.signal)
-          }
-          if (current()) {
-            const observation: DecisionCapabilityObservation = {
-              sessionId: scope.sessionId,
-              scopeKey: scope.key,
-              configurationKey,
-              generation,
-              capability,
-              expiresAt: new Date(Date.now() + SCHEDULING_CAPABILITY_TTL_MS).toISOString(),
-            }
-            const host = scope.sessionId ? this.hostDecisionCapability : observation
-            const context = scope.sessionId ? observation : this.contextDecisionCapability
-            if (
-              Buffer.byteLength(JSON.stringify([host, context])) <=
-              SCHEDULING_CAPABILITY_RESIDENT_BYTES
-            ) {
-              this.hostDecisionCapability = host
-              this.contextDecisionCapability = context
-            }
-          }
-        } catch {
-          // Even a thrown callback may have started a native process. Only settlement clears it.
-        }
-        owner.settling = true
-        const settle = async () => {
-          const released = owner.runtime
-            ? await owner.runtime.settlement().catch(() => false)
-            : true
-          this.conversations.settleSchedulingProbe(operationId, released)
-          if (released && this.decisionRuntime === owner) this.decisionRuntime = undefined
-          this.schedulingListener?.()
-        }
-        this.conversations.settleSchedulingProbe(operationId, false)
-        if (!owner.runtime || capability?.physicalReleased) await settle()
-        else void settle()
-        this.schedulingListener?.()
-        return this.getSchedulingState(input)
-      })
-      owner.task = task
-      return await task
-    } catch (error) {
-      return Conversation.sendFailure(error)
-    }
-  }
-
-  /** Both providers retain the existing global owner through every native stage and cleanup. */
-  private createSchedulingRuntime(
-    owner: DecisionInvocationOwner | DecisionProbeOwner,
-    selection: SchedulingModelSelection,
-    cwd: string | undefined,
-    deadlineAt: number,
-    callbacks: {
-      dispatch: () => void
-      reserve?: NonNullable<ConstructorParameters<typeof CodexDecisionRuntime>[0]['reserve']>
-      prepared: (facts: {
-        nativeGeneration: number
-        witness: DecisionPhysicalWitness
-        configurationFingerprint: string
-      }) => void
-    },
-  ): DecisionRuntime {
-    const physicalPrepared = (facts: {
-      nativeGeneration: number
-      witness: DecisionPhysicalWitness
-    }) => {
-      if (!owner.reserved) throw new Error('Native work requires a durable scheduling owner.')
-      this.conversations.recordSchedulingRuntimeWitness(owner.operationId, facts)
-    }
-    const shared = {
-      executable: (signal: AbortSignal) =>
-        this.runtimePreparation.findRecoveryExecutable(selection.provider, signal),
-      ...(cwd ? { cwd } : {}),
-      current: owner.current,
-      deadlineAt,
-      dispatch: callbacks.dispatch,
-      ...(callbacks.reserve ? { reserve: callbacks.reserve } : {}),
-      retirePhysicalReceipts: (facts: {
-        memory: NativeMemoryAllocator
-        deadlineAt: number
-        signal?: AbortSignal | undefined
-      }) => this.retireSchedulingPhysicalReceipts(facts),
-      physicalCompletion: async (facts: {
-        memory: NativeMemoryAllocator
-        deadlineAt: number
-        nativeGeneration: number
-        witness: DecisionPhysicalWitness | null
-        outcome?: import('@pact/contracts').DecisionOutcome | undefined
-        usage?: import('@pact/contracts').SchedulingUsage | undefined
-      }) => {
-        if (!owner.reserved) return
-        owner.settling = true
-        this.conversations.completeSchedulingRuntimePhysical(owner.operationId, {
-          nativeGeneration: facts.nativeGeneration,
-          witness: facts.witness,
-          completed: facts.outcome?.kind === 'recommendation',
-          candidateId:
-            facts.outcome?.kind === 'recommendation'
-              ? facts.outcome.recommendation.candidateId
-              : null,
-          ...(facts.usage ? { usage: facts.usage } : {}),
-        })
-        this.schedulingListener?.()
-        // This lease stays held until every started receipt helper and file handle joins.
-        await this.retireSchedulingPhysicalReceipts(facts)
-      },
-    }
-    if (selection.provider === 'claude')
-      return new ClaudeDecisionRuntime({
-        ...shared,
-        modelId: selection.modelId,
-        ownerId: randomUUID(),
-        beginNativeStage: (facts) =>
-          this.conversations.beginSchedulingNativeStage(owner.operationId, facts),
-        physicalPrepared,
-        prepared: callbacks.prepared,
-      })
-    return new CodexDecisionRuntime({
-      ...shared,
-      beginNativeStage: (facts) =>
-        this.conversations.beginSchedulingNativeStage(owner.operationId, facts),
-      physicalPrepared,
-      prepared: callbacks.prepared,
-    })
   }
 
   private async retireSchedulingPhysicalReceipts(facts: {
@@ -983,7 +713,7 @@ export class Conversation {
     const requestedHandoff = 'prepare' in request ? undefined : request.handoff
     const requestedSessionId = 'prepare' in request ? request.sessionId : request.handoff.sessionId
     const settings = this.conversations.schedulingSettings()
-    if (this.disposed || !settings.enabled || !settings.selection)
+    if (this.disposed || !settings.enabled || !settings.credential.configured)
       return { kind: 'unavailable', reason: 'disabled' }
     if (this.decisionRuntime) return { kind: 'unavailable', reason: 'busy' }
     const available = () => {
@@ -1001,23 +731,19 @@ export class Conversation {
     const scope = available()
     if (!scope) return { kind: 'unavailable', reason: 'stale' }
     const { session, project } = scope
-    const configurationKey = this.runtimePreparation.catalogIdentity(project.directoryPath)
     const configurationGeneration = this.conversations.schedulingConfigurationGeneration()
-    const selectionKey = JSON.stringify([settings.enabled, settings.selection])
+    const credentialRevision = settings.credential.revision
     if (signal.aborted || this.disposed) return { kind: 'unavailable', reason: 'cancelled' }
     if (
       !available() ||
-      this.conversations.schedulingConfigurationGeneration() !== configurationGeneration ||
-      this.runtimePreparation.catalogIdentity(project.directoryPath) !== configurationKey
+      this.conversations.schedulingConfigurationGeneration() !== configurationGeneration
     )
       return { kind: 'unavailable', reason: 'stale' }
     if (this.decisionRuntime) return { kind: 'unavailable', reason: 'busy' }
     let handoff = requestedHandoff
     let evaluationId: string | undefined
     let deadlineAt = 0
-    let configurationFingerprint = createHash('sha256')
-      .update(configurationKey + selectionKey)
-      .digest('hex')
+    const configurationFingerprint = this.conversations.schedulingConfigurationFingerprint()
     const controller = new AbortController()
     const invocationSignal = AbortSignal.any([signal, controller.signal])
     const invocationDeadlineAt = Date.now() + 15_000
@@ -1029,9 +755,11 @@ export class Conversation {
         liveScope.project.id === project.id &&
         liveScope.project.directoryPath === project.directoryPath &&
         !invocationSignal.aborted &&
-        JSON.stringify([saved.enabled, saved.selection]) === selectionKey &&
+        saved.enabled &&
+        saved.credential.configured &&
+        saved.credential.revision === credentialRevision &&
         this.conversations.schedulingConfigurationGeneration() === configurationGeneration &&
-        this.runtimePreparation.catalogIdentity(project.directoryPath) === configurationKey &&
+        this.pendingNativeInteractions(session.id).length === 0 &&
         (!handoff || this.conversations.evaluationIsCurrent(handoff))
       )
     }
@@ -1049,7 +777,7 @@ export class Conversation {
     }
     this.decisionRuntime = owner
     if (existing) {
-      // Inspect the stored witness, never wait for its process to exit or replay its inference.
+      // Inspect the stored owner, never wait for its process to exit or replay its inference.
       // An already absent owner must settle before returning the original duplicate receipt.
       await this.waitForDecisionRecovery(invocationDeadlineAt, invocationSignal)
       owner.consulting = 'load' in request && request.retainHandoff === true
@@ -1070,51 +798,53 @@ export class Conversation {
         reason: Date.now() >= invocationDeadlineAt ? 'timeout' : 'stale',
       }
     }
-    const selection = settings.selection
+    const httpOwner: DecisionHttpOwner = {
+      version: 1,
+      kind: 'http',
+      utilityEpoch: this.utilityEpoch,
+      utilityPid: process.pid,
+      requestId: owner.operationId,
+    }
     let runtime: DecisionRuntime
     try {
-      runtime = this.createSchedulingRuntime(
-        owner,
-        selection,
-        project.directoryPath,
-        invocationDeadlineAt,
-        {
-          reserve: (admitted, facts) => {
-            handoff = admitted.handoff
-            owner.handoff = handoff
-            deadlineAt = facts.deadlineAt
-            if (!current()) throw new Error('Decision invocation is no longer eligible.')
-            const reservation = this.conversations.reserveEvaluation({
-              handoff,
-              provider: selection.provider,
-              model: selection.modelId,
-              configurationFingerprint,
-              inputSha256: createHash('sha256').update(JSON.stringify(admitted)).digest('hex'),
-              deadlineAt,
-            })
-            if (reservation.status === 'reserved') {
-              evaluationId = reservation.evaluation.id
-              owner.operationId = evaluationId
-              owner.reserved = true
-              return 'reserved'
-            }
-            return reservation.status === 'duplicate' ? 'duplicate' : 'busy'
-          },
-          dispatch: () => {
-            if (
-              !evaluationId ||
-              !current() ||
-              !this.conversations.dispatchEvaluation(evaluationId).created
-            )
-              throw new Error('Decision invocation is no longer eligible.')
-          },
-          prepared: (facts) => {
-            if (!evaluationId) throw new Error('Decision invocation is unavailable.')
-            this.conversations.recordEvaluationPhysicalWitness(evaluationId, facts)
-            configurationFingerprint = facts.configurationFingerprint
-          },
+      runtime = new OpenAIDecisionRuntime({
+        deadlineAt: invocationDeadlineAt,
+        current,
+        credential: (facts) =>
+          this.loadDecisionCredential
+            ? this.loadDecisionCredential({
+                signal: facts.signal,
+                deadlineAt: facts.deadlineAt,
+              })
+            : null,
+        reserve: (admitted, facts) => {
+          handoff = admitted.handoff
+          owner.handoff = handoff
+          deadlineAt = facts.deadlineAt
+          if (!current()) throw new Error('Decision invocation is no longer eligible.')
+          const reservation = this.conversations.reserveEvaluation({
+            handoff,
+            configurationFingerprint,
+            inputSha256: createHash('sha256').update(JSON.stringify(admitted)).digest('hex'),
+            deadlineAt,
+            httpOwner,
+          })
+          if (reservation.status === 'reserved') {
+            evaluationId = reservation.evaluation.id
+            owner.reserved = true
+            return 'reserved'
+          }
+          return reservation.status === 'duplicate' ? 'duplicate' : 'busy'
         },
-      )
+        dispatch: () => {
+          if (
+            !evaluationId ||
+            !current() ||
+            !this.conversations.dispatchEvaluation(evaluationId, httpOwner).created
+          )
+            throw new Error('Decision invocation is no longer eligible.')
+        },
+      })
     } catch {
       if (this.decisionRuntime === owner) this.decisionRuntime = undefined
       return { kind: 'unavailable', reason: 'busy' }
@@ -1140,20 +870,22 @@ export class Conversation {
       invocationSignal,
     )
     owner.consulting = 'load' in request && request.retainHandoff === true
-    if (outcome.kind === 'recommendation' && !current())
+    if (outcome.kind === 'selection' && !current())
       outcome = { kind: 'unavailable', reason: 'stale' }
+    const diagnostics = runtime.diagnostics()
     const terminal = runtime.invoked
-      ? outcome.kind === 'recommendation'
+      ? outcome.kind === 'selection'
         ? 'completed'
         : 'failed'
       : 'not_sent'
     if (evaluationId)
       this.conversations.settleEvaluation(evaluationId, {
         outcome: terminal,
-        selectedCandidateId:
-          outcome.kind === 'recommendation' ? outcome.recommendation.candidateId : null,
+        selectedCandidateId: outcome.kind === 'selection' ? outcome.selection.candidateId : null,
         physicalReleased: false,
         ...(runtime.usage ? { usage: runtime.usage } : {}),
+        httpOwner,
+        remoteOutcome: diagnostics.remoteOutcome,
       })
     void runtime
       .settlement()
@@ -1162,9 +894,11 @@ export class Conversation {
           this.conversations.settleEvaluation(evaluationId, {
             outcome: terminal,
             selectedCandidateId:
-              outcome.kind === 'recommendation' ? outcome.recommendation.candidateId : null,
+              outcome.kind === 'selection' ? outcome.selection.candidateId : null,
             physicalReleased: released,
             ...(runtime.usage ? { usage: runtime.usage } : {}),
+            httpOwner,
+            remoteOutcome: runtime.diagnostics().remoteOutcome,
           })
         if (released) {
           owner.runtime = undefined
@@ -1172,50 +906,27 @@ export class Conversation {
           const liveScope = available()
           const unchanged =
             liveScope?.project.directoryPath === project.directoryPath &&
-            this.conversations.schedulingConfigurationGeneration() === configurationGeneration &&
-            this.runtimePreparation.catalogIdentity(project.directoryPath) === configurationKey
+            this.conversations.schedulingConfigurationGeneration() === configurationGeneration
           if (
             evaluationId &&
             unchanged &&
-            (outcome.kind === 'recommendation' ||
+            (outcome.kind === 'selection' ||
               !['cancelled', 'stale', 'busy', 'duplicate'].includes(outcome.reason))
           ) {
-            const successful = outcome.kind === 'recommendation'
-            const capability: DecisionCapability = {
-              provider: selection.provider,
-              modelId: selection.modelId,
-              status: successful ? 'supported' : 'unavailable',
-              supported: successful,
-              reason: successful
-                ? 'supported'
-                : (runtime.diagnostics?.().failureReason ??
-                  (outcome.kind === 'unavailable' && outcome.reason === 'timeout'
-                    ? 'timeout'
-                    : 'unavailable')),
-              configurationFingerprint: successful ? configurationFingerprint : null,
+            // Only a genuine provider attempt updates the app-wide connection observation.
+            this.decisionConnection = {
+              status: outcome.kind === 'selection' ? 'available' : 'unavailable',
               checkedAt: new Date().toISOString(),
-              physicalReleased: true,
-            }
-            const observation: DecisionCapabilityObservation = {
-              sessionId: session.id,
-              scopeKey: this.schedulingScope(session.id).key,
-              configurationKey,
-              generation: configurationGeneration,
-              capability,
               expiresAt: new Date(Date.now() + SCHEDULING_CAPABILITY_TTL_MS).toISOString(),
+              generation: configurationGeneration,
             }
-            if (
-              Buffer.byteLength(JSON.stringify([this.hostDecisionCapability, observation])) <=
-              SCHEDULING_CAPABILITY_RESIDENT_BYTES
-            )
-              this.contextDecisionCapability = observation
           }
           this.schedulingListener?.()
         }
         return undefined
       })
       .catch(() => undefined)
-    if (outcome.kind !== 'recommendation') return outcome
+    if (outcome.kind !== 'selection') return outcome
     if (!evaluationId || !deadlineAt || !handoff)
       return { kind: 'unavailable', reason: 'invalid_output' }
     return {
@@ -1246,6 +957,7 @@ export class Conversation {
     if (this.decisionRuntime?.runtime || this.disposed) return Promise.resolve()
     const saved = this.conversations.activeSchedulingRuntimeOwner()
     if (saved?.kind === 'check') return this.recoverSchedulingCheck(saved.id)
+    if (saved?.provider === 'openai') return this.recoverSchedulingHttpOwner(saved)
     const hasReceipts =
       process.platform === 'win32' && this.conversations.hasSchedulingPhysicalReceipts()
     if (!saved?.physicalWitnessJson && !hasReceipts) return Promise.resolve()
@@ -1274,6 +986,54 @@ export class Conversation {
           )
       }
       await this.retireSchedulingPhysicalReceipts({ memory, deadlineAt })
+    })().catch(() => undefined)
+    this.decisionRecovery = recovery
+    void recovery.then(() => {
+      if (this.decisionRecovery === recovery) this.decisionRecovery = undefined
+      if (this.decisionRecoveryOwner === recoveryOwner) this.decisionRecoveryOwner = undefined
+      this.schedulingListener?.()
+      return undefined
+    })
+    return recovery
+  }
+
+  /**
+   * An HTTP owner has no native witness. Only a positive OS absence proof for its
+   * stored Utility PID authorizes release; live, reused or unverifiable PIDs retain it.
+   */
+  private recoverSchedulingHttpOwner(saved: {
+    id: string
+    kind: string
+    sessionId: string | null
+    httpOwnerJson: string | null
+  }): Promise<void> {
+    const raw = saved.httpOwnerJson
+    if (!raw || Buffer.byteLength(raw) > DECISION_HTTP_OWNER_BYTES) return Promise.resolve()
+    let parsed: ReturnType<typeof decisionHttpOwnerSchema.safeParse>
+    try {
+      parsed = decisionHttpOwnerSchema.safeParse(JSON.parse(raw))
+    } catch {
+      return Promise.resolve()
+    }
+    if (!parsed.success || saved.kind !== 'evaluation' || parsed.data.requestId !== saved.id)
+      return Promise.resolve()
+    // A stored same-PID owner stays unresolved: rebuilding Conversation is not Utility exit.
+    if (parsed.data.utilityPid === process.pid) return Promise.resolve()
+    const ownerJson = raw,
+      proof = parsed.data,
+      id = saved.id
+    const recoveryOwner = { operationId: saved.id, sessionId: saved.sessionId ?? null }
+    this.decisionRecoveryOwner = recoveryOwner
+    const recovery = (async () => {
+      let absent = false
+      try {
+        process.kill(proof.utilityPid, 0)
+      } catch (error) {
+        absent =
+          typeof error === 'object' && error !== null && Reflect.get(error, 'code') === 'ESRCH'
+      }
+      if (!absent) return
+      this.conversations.settleSchedulingHttpOwnerAfterExit(id, ownerJson)
     })().catch(() => undefined)
     this.decisionRecovery = recovery
     void recovery.then(() => {
@@ -1344,30 +1104,11 @@ export class Conversation {
     input: import('@pact/contracts').SchedulingSettingsSave,
   ): Promise<RpcResult<import('@pact/contracts').SchedulingSettings>> {
     try {
-      if (input.selection) {
-        const identity = this.runtimePreparation.catalogIdentity(process.cwd())
-        if (!this.modelCatalogs || this.disposed || input.catalogIdentity !== identity)
-          throw new RunOperationConflictError(
-            'The native model configuration changed. Refresh models before selecting again.',
-          )
-        const catalogs = await this.modelCatalogs.loadModelCatalogs()
-        const selection = input.selection,
-          catalog = catalogs[selection.provider]
-        if (
-          this.disposed ||
-          this.runtimePreparation.catalogIdentity(process.cwd()) !== identity ||
-          catalog.status !== 'available' ||
-          !catalog.models.some((model) => (model.resolvedModel ?? model.id) === selection.modelId)
-        )
-          throw new RunOperationConflictError(
-            'This exact model is no longer available. Your saved selection is unchanged.',
-          )
-      }
+      if (this.disposed) throw new Error('The scheduling owner is no longer available.')
       const generation = this.conversations.schedulingConfigurationGeneration()
       const saved = this.conversations.saveSchedulingSettings(input, (patch) => this.publish(patch))
       if (this.conversations.schedulingConfigurationGeneration() !== generation) {
-        this.hostDecisionCapability = undefined
-        this.contextDecisionCapability = undefined
+        this.decisionConnection = undefined
         this.decisionRuntime?.controller.abort()
         for (const check of this.nativeChecks.values())
           if (check.automaticAttemptId) check.controller.abort()
@@ -1380,6 +1121,87 @@ export class Conversation {
     }
   }
 
+  /** Credential mutation owner: same config-generation lifecycle as saveSchedulingSettings. */
+  async writeRelayCredential(
+    input: import('@pact/contracts').RelayCredentialWrite,
+  ): Promise<
+    import('@pact/contracts').RpcResult<import('@pact/contracts').RelayCredentialReceipt>
+  > {
+    let generation: number | undefined
+    let deadlineAt = 0
+    try {
+      if (this.disposed)
+        return {
+          ok: false,
+          error: {
+            code: 'RUNTIME_UNAVAILABLE',
+            message: 'The scheduling owner is no longer available.',
+          },
+        }
+      const parsed = relayCredentialWriteSchema.safeParse(input)
+      if (!parsed.success)
+        return {
+          ok: false,
+          error: { code: 'VALIDATION', message: 'The credential request is invalid.' },
+        }
+      deadlineAt = parsed.data.deadlineAt
+      if (deadlineAt <= Date.now())
+        return {
+          ok: false,
+          error: {
+            code: 'RUNTIME_UNAVAILABLE',
+            message: 'Secure credential storage is unavailable.',
+          },
+        }
+      generation = this.conversations.schedulingConfigurationGeneration()
+      const receipt = this.conversations.writeRelayCredential(parsed.data, (patch) =>
+        this.publish(patch),
+      )
+      return { ok: true, value: receipt }
+    } catch {
+      // An unacknowledged outcome may still have committed; retained nonce + receipt
+      // readback is the status check, never another implicit mutation.
+      return {
+        ok: false,
+        error: {
+          code: 'UNCERTAIN',
+          message: 'The key change could not be confirmed. Check its status.',
+        },
+      }
+    } finally {
+      if (generation !== undefined) {
+        // A notification can fail after commit. That cannot leave the old key's
+        // invocation running or authorize an automatic retry of the mutation.
+        let changed = true
+        try {
+          changed = this.conversations.schedulingConfigurationGeneration() !== generation
+        } catch {
+          // An unreadable configuration cannot prove the old invocation is still current.
+        }
+        if (changed) {
+          this.decisionConnection = undefined
+          this.decisionRuntime?.controller.abort()
+          for (const check of this.nativeChecks.values())
+            if (check.automaticAttemptId) check.controller.abort()
+          const cleanup = this.decisionRuntime?.runtime?.dispose().catch(() => false)
+          this.schedulePendingRoutedContinuations()
+          if (cleanup) {
+            let timer: ReturnType<typeof setTimeout> | undefined
+            await Promise.race([
+              cleanup,
+              new Promise<boolean>((resolve) => {
+                timer = setTimeout(() => resolve(false), Math.max(0, deadlineAt - Date.now()))
+                timer.unref?.()
+              }),
+            ]).finally(() => clearTimeout(timer))
+            // The response confirms the durable credential receipt only. The runtime
+            // retains any unjoined physical owner through its existing settlement path.
+          }
+        }
+      }
+    }
+  }
+
   readSchedulingActivity(
     input: import('@pact/contracts').SchedulingActivityRead,
   ): RpcResult<import('@pact/contracts').SchedulingActivityPage> {
@@ -1389,68 +1211,6 @@ export class Conversation {
       return {
         ok: false,
         error: { code: 'INTERNAL', message: 'Scheduling activity could not be loaded.' },
-      }
-    }
-  }
-
-  async refreshSchedulingModels(): Promise<RpcResult<import('@pact/contracts').SchedulingModels>> {
-    try {
-      if (!this.modelCatalogs || this.disposed) throw new Error('Model discovery is unavailable.')
-      const catalogIdentity = this.runtimePreparation.catalogIdentity(process.cwd())
-      const catalogs = await this.modelCatalogs.loadModelCatalogs()
-      if (
-        this.disposed ||
-        this.runtimePreparation.catalogIdentity(process.cwd()) !== catalogIdentity
-      )
-        throw new Error('Model discovery was cancelled or its configuration changed.')
-      const targets = ['codex_luna', 'claude_haiku_5_5'] as const
-      const savedSelection = this.conversations.schedulingSettings().selection
-      return {
-        ok: true,
-        value: {
-          catalogIdentity,
-          models: targets.map((target) => {
-            const provider = target === 'codex_luna' ? 'codex' : 'claude',
-              catalog = catalogs[provider]
-            const matches = catalog.models.filter((model) =>
-              target === 'codex_luna'
-                ? (model.resolvedModel ?? model.id) === 'gpt-6-luna'
-                : /^claude-haiku-5-5(?:-\d{8})?$/u.test(model.resolvedModel ?? model.id),
-            )
-            const match =
-              matches.find(
-                (model) =>
-                  savedSelection?.target === target &&
-                  savedSelection.provider === provider &&
-                  (model.resolvedModel ?? model.id) === savedSelection.modelId,
-              ) ??
-              matches.toSorted((left, right) =>
-                (left.resolvedModel ?? left.id).localeCompare(right.resolvedModel ?? right.id),
-              )[0]
-            return {
-              target,
-              status: match
-                ? 'found'
-                : catalog.status === 'available'
-                  ? 'not_found'
-                  : 'unconfirmed',
-              checkedAt: catalog.checkedAt,
-              selection: match
-                ? target === 'codex_luna'
-                  ? { target, provider: 'codex', modelId: 'gpt-6-luna' }
-                  : { target, provider: 'claude', modelId: match.resolvedModel ?? match.id }
-                : null,
-            }
-          }),
-        },
-      }
-    } catch {
-      return {
-        ok: false,
-        error: {
-          code: 'RUNTIME_UNAVAILABLE',
-          message: 'Model availability could not be confirmed. Your selection is unchanged.',
-        },
       }
     }
   }
@@ -3169,7 +2929,10 @@ export class Conversation {
         }),
       )
     const nativeRecovery =
-      card.request.category === 'arrangement_change' ? card.request.operation : undefined
+      card.request.category === 'arrangement_change' &&
+      card.request.operation.kind === 'rebuild_native_context'
+        ? card.request.operation
+        : undefined
     const representedIssue = (issue: SessionIssues['agents'][number]): boolean =>
       Boolean(
         nativeRecovery &&
@@ -3277,7 +3040,6 @@ export class Conversation {
           prepared.task,
           prepared.next,
           input.clientOperationId,
-          undefined,
           prepared.receipt.id,
           prepared.handoff,
         )
@@ -4645,14 +4407,6 @@ export class Conversation {
             decision.controller.abort()
             void decision.runtime?.dispose()
           }
-          for (const preparing of this.preparingSends.values())
-            if (
-              preparing.input.sessionId === input.sessionId &&
-              ['supplement_plan', 'supplement_code_response'].includes(
-                preparing.options.handoffGuidance?.proposal.guidance.candidateId ?? '',
-              )
-            )
-              preparing.controller.abort()
           return { ok: true, value: answer.patch }
         }
         throw new RunOperationConflictError('This legacy Relay grant cannot start new work.')
@@ -4726,15 +4480,9 @@ export class Conversation {
         return { ok: true, value: this.conversations.runPatch(prepared.receipt.boundRunId) }
       if (!prepared.task || !prepared.next || !prepared.handoff)
         throw new RunOperationConflictError('The original action preparation is unavailable.')
-      let guidance: SendOptions['handoffGuidance']
       let consultation: DecisionInvocationOwner | undefined
       try {
-        guidance = await this.prepareWorkflowGuidance(
-          prepared.task,
-          prepared.next,
-          prepared.handoff,
-          prepared.receipt.id,
-        )
+        await this.consultWorkflowAlternatives(prepared.task, prepared.handoff)
         consultation =
           this.decisionRuntime?.kind === 'evaluation' &&
           this.decisionRuntime.handoff?.id === prepared.handoff.id
@@ -4744,15 +4492,12 @@ export class Conversation {
           prepared.task,
           prepared.next,
           input.clientMessageId,
-          guidance,
           prepared.receipt.id,
           prepared.handoff,
         )
-        guidance = undefined
         this.releaseDecisionHandoff(consultation)
         return await dispatched
       } finally {
-        guidance?.reservation.release()
         this.releaseDecisionHandoff(consultation)
         this.conversations.cancelPreparedCollaborationAction(prepared.receipt.id)
       }
@@ -4776,7 +4521,6 @@ export class Conversation {
     task: CollaborationTask,
     next: CollaborationTask,
     clientMessageId: string = randomUUID(),
-    guidance?: SendOptions['handoffGuidance'],
     collaborationActionReceiptId?: string,
     schedulingHandoff?: SchedulingHandoff,
   ): Promise<RpcResult<ConversationPatch>> {
@@ -4784,7 +4528,6 @@ export class Conversation {
       preserveDraftComments: true,
       collaboration: next,
       expectedCollaborationRevision: task.revision,
-      handoffGuidance: guidance,
       collaborationActionReceiptId,
     }
     try {
@@ -4807,13 +4550,8 @@ export class Conversation {
         options,
       )
     } finally {
-      this.releaseHandoffGuidance(options)
+      options.schedulingHandoff = undefined
     }
-  }
-
-  private releaseHandoffGuidance(options: SendOptions): void {
-    options.handoffGuidance?.reservation.release()
-    options.handoffGuidance = undefined
   }
 
   private releaseDecisionHandoff(owner: DecisionInvocationOwner | undefined): void {
@@ -4822,142 +4560,110 @@ export class Conversation {
     if (!owner.runtime) this.decisionRuntime = undefined
   }
 
-  private decisionRuntimeAdmission(sessionId: string): RelayPolicyAdmission['runtimeAdmission'] {
+  private decisionRuntimeAdmission(): RelayPolicyAdmission['runtimeAdmission'] {
     if (this.decisionRuntime || this.conversations.activeSchedulingRuntimeOwner()) return 'busy'
-    const scope = this.schedulingScope(sessionId)
-    const observation = this.contextDecisionCapability
-    if (
-      !observation ||
-      observation.sessionId !== sessionId ||
-      observation.scopeKey !== scope.key ||
-      observation.generation !== this.conversations.schedulingConfigurationGeneration() ||
-      observation.configurationKey !== this.runtimePreparation.catalogIdentity(scope.cwd)
-    )
-      return 'may_attempt'
-    if (
-      [
-        'unsupported_platform',
-        'unsupported_provider',
-        'unsupported_network',
-        'unsupported_authentication',
-        'unsupported_protocol',
-        'project_authentication_differs',
-        'executable_unavailable',
-        'model_unavailable',
-        'model_metadata_invalid',
-        'model_effort_unavailable',
-      ].includes(observation.capability.reason)
-    )
-      return 'known_unavailable'
-    return observation.capability.status === 'unavailable' &&
-      Date.parse(observation.expiresAt) > Date.now()
-      ? 'cooldown'
-      : 'may_attempt'
+    if (!this.conversations.schedulingSettings().credential.configured) return 'known_unavailable'
+    return 'may_attempt'
   }
 
-  private async prepareWorkflowGuidance(
+  /** Advisory-only initial-role consult: a choice is an ID only; the host metadata supplies roles. */
+  private async consultInitialTaskRoles(
+    input: ConversationSendInput,
+    prepared: PreparedSession,
+    controller: AbortController,
+    options: SendOptions,
+  ): Promise<void> {
+    const settings = this.conversations.schedulingSettings()
+    if (!settings.enabled || !settings.credential.configured) return
+    if (this.decisionRuntimeAdmission() !== 'may_attempt') return
+    const opportunity = this.conversations.initialTaskRoleOpportunity(input, ['codex', 'claude'])
+    if (!opportunity) return
+    const configurationKey = this.runtimePreparation.catalogIdentity(prepared.projectDirectory)
+    let material: { inputSha256: string; sourceFingerprint: string } | undefined
+    const outcome = await this.evaluateDecision(
+      {
+        sessionId: input.sessionId,
+        prepare: async (decisionContext) => {
+          const receipt = this.conversations.prepareInputDispatch(
+            input,
+            randomUUID(),
+            ['codex', 'claude'],
+            decisionContext,
+            'task_roles',
+          )
+          options.preparedInput = receipt
+          this.publish(this.conversations.metadataPatch(input.sessionId, { draftsChanged: true }))
+          const frozen = receipt.metadata.taskRoles!
+          const candidates = frozen.candidates.map((candidate) => ({
+            id: candidate.id,
+            description: `Assign ${candidate.roles.planAuthor} to author plans and ${candidate.roles.planReviewer} to review plans; assign ${candidate.roles.codeAuthor} to implement, respond and repair, and ${candidate.roles.codeReviewer} to review code. Keep the original scope and permissions; implementation after planning and every new repair still require their existing user authorization.`,
+          }))
+          const read = await this.conversations.readPreparedInputDecisionSources(
+            receipt,
+            candidates,
+            decisionContext,
+          )
+          material = {
+            inputSha256: read.inputSha256,
+            sourceFingerprint: read.sourceFingerprint,
+          }
+          return read.input
+        },
+      },
+      controller.signal,
+    )
+    if (outcome.kind === 'selection' && material) {
+      const candidateId = outcome.selection.candidateId
+      if (
+        candidateId === null ||
+        opportunity.candidates.some((candidate) => candidate.id === candidateId)
+      ) {
+        if (candidateId !== null)
+          options.initialTaskRoles = {
+            version: 'initial-task-roles-v1',
+            ...material,
+            ...outcome.evaluationReceipt,
+            candidateId: initialTaskRoleCandidateIdSchema.parse(candidateId),
+          }
+        options.preparedSelectionCurrent = () =>
+          this.runtimePreparation.catalogIdentity(prepared.projectDirectory) === configurationKey
+      }
+    }
+  }
+
+  /** Advisory-only consult: proposals never execute; false keeps the lawful default step. */
+  private async consultWorkflowAlternatives(
     task: CollaborationTask,
-    next: CollaborationTask | undefined,
     handoff: SchedulingHandoff,
-    receiptId?: string,
-  ): Promise<SendOptions['handoffGuidance']> {
+  ): Promise<void> {
     let material: Omit<RelayDecisionMaterial, 'input'> | undefined
-    let reservation: import('./native-working-memory').NativeMemoryReservation | undefined
     try {
       const preferences = this.conversations.schedulingSettings()
-      if (!preferences.enabled || !preferences.selection) return undefined
-      const runtimeAdmission = this.decisionRuntimeAdmission(task.sessionId)
-      if (
-        runtimeAdmission !== 'may_attempt' ||
-        !this.conversations.relayWorkflowWorthConsulting(handoff)
-      )
-        return undefined
+      if (!preferences.enabled || !preferences.credential.configured) return
+      const runtimeAdmission = this.decisionRuntimeAdmission()
+      if (runtimeAdmission !== 'may_attempt') return
       const session = this.sessions.find(task.sessionId)
       const project = session && this.projects.find(session.projectId)
-      if (!project) return undefined
-      const configurationKey = this.runtimePreparation.catalogIdentity(project.directoryPath)
-      const candidateId: WorkflowRelayCandidateId | undefined =
-        this.conversations.relayDecision(task.sessionId)?.state === 'available' && receiptId
-          ? this.conversations.relayDecision(task.sessionId)?.kind
-          : next?.stage === 'respond'
-            ? 'respond_to_code_review'
-            : next?.stage === 'repair'
-              ? 'repair_code'
-              : next?.stage === 'plan_review'
-                ? 'continue_plan_review'
-                : next?.stage === 'plan'
-                  ? 'continue_plan_revision'
-                  : next?.stage === 'code_review'
-                    ? 'continue_code_review'
-                    : undefined
-      const opportunity = receiptId
-        ? undefined
-        : this.conversations.relaySupplementOpportunity(handoff)
-      const repairOpportunity = receiptId
-        ? undefined
-        : this.conversations.relayRepairOpportunity(handoff)
-      if (!candidateId && !opportunity && !repairOpportunity) return undefined
-      const supplementary =
-        candidateId === 'supplement_plan' || candidateId === 'supplement_code_response'
-      const candidates = [
-        ...(candidateId === 'supplement_plan'
-          ? [
-              {
-                id: 'continue_plan_review',
-                description: `Continue the original Plan review with ${collaborationActor(task, 'plan_review')}, without adding a Turn.`,
-              },
-            ]
-          : []),
-        ...(candidateId && next
-          ? [
-              {
-                id: candidateId,
-                description: supplementary
-                  ? `Use the user's exact single-use grant for one read-only ${next.stage} Turn by ${next.actor}, followed by the mandatory ${collaborationActor(task, next.stage === 'plan' ? 'plan_review' : 'code_review')} review. Do not change scope or roles.`
-                  : `Continue the already-authorized ${next.stage} with the fixed ${next.actor} actor; provide only source-grounded focus.`,
-              },
-            ]
-          : []),
-        ...(opportunity
-          ? [
-              {
-                id: `propose_${opportunity.kind}`,
-                description: `Propose one extra read-only turn by ${opportunity.actor}, followed by the fixed ${opportunity.returnActor} review, only if complete sources establish a concrete remaining gap that the normal next step cannot address. This candidate requests the user's specific authorization and grants no execution. Choose null or the existing next step when no extra turn is necessary.`,
-              },
-            ]
-          : []),
-        ...(repairOpportunity
-          ? [
-              {
+      if (!project) return
+      const current = this.conversations.relayWorkflowAlternatives(handoff)
+      if (!current?.alternatives.length) return
+      const { alternatives } = current
+      const candidates = alternatives.map((entry) =>
+        entry.kind === 'reassign_roles'
+          ? {
+              id: 'propose_reassign_roles',
+              description: `Propose swapping future code responsibilities: ${entry.operation.proposedRoles.codeAuthor} implements, responds and repairs; ${entry.operation.proposedRoles.codeReviewer} reviews code. Propose only when the complete accepted Plan and review establish a clear benefit over the current assignment. Preserve the Plan authors, accepted artifacts, original scope and permissions. The user must confirm the role change; this does not start work or grant writing. Choose false when the current assignment remains suitable.`,
+            }
+          : entry.kind === 'repair'
+            ? {
                 id: 'propose_repair',
-                description: `Request one scoped repair by ${collaborationActor(task, 'repair')} under a new exact user grant, followed by the fixed ${collaborationActor(task, 'code_review')} review. Propose this only when complete current review sources establish concrete work within the original task. It grants no execution and cannot expand scope or permissions. Prefer the original next step when no extra work is necessary.`,
+                description: `Request one scoped repair by ${collaborationActor(task, 'repair')} under a new exact user grant, followed by the fixed ${collaborationActor(task, 'code_review')} review. Propose this only when complete current review sources establish concrete work within the original task. It grants no execution and cannot expand scope or permissions. Return false when no extra work is necessary.`,
+              }
+            : {
+                id: `propose_${entry.kind}`,
+                description: `Propose one extra read-only turn by ${entry.actor}, followed by the fixed ${entry.returnActor} review, only if complete sources establish a concrete remaining gap that the normal next step cannot address. This candidate requests the user's specific authorization and grants no execution. Choose false when no extra turn is necessary.`,
               },
-            ]
-          : []),
-      ]
-      const legalActions = supplementary
-        ? candidateId === 'supplement_plan'
-          ? [
-              {
-                action: 'continue_plan_review' as RelayAction,
-                actor: collaborationActor(task, 'plan_review'),
-                authorizationId: handoff.id,
-                authorizationCurrent: true,
-                businessBudgetAvailable: true,
-              },
-            ]
-          : []
-        : candidateId && next
-          ? [
-              {
-                action: candidateId,
-                actor: next.actor,
-                authorizationId: receiptId ?? handoff.id,
-                authorizationCurrent: true,
-                businessBudgetAvailable: true,
-              },
-            ]
-          : []
+      )
       const outcome = await this.evaluateDecision(
         {
           handoff,
@@ -4968,38 +4674,15 @@ export class Conversation {
               candidates,
               context,
             )
-            const settings = this.conversations.schedulingSettings()
-            const facts = relayWorkflowPolicyFacts(read.snapshot, {
-              handoffId: handoff.id,
-              inputBytes: decisionJsonBytes(read.input),
-              legalActions,
-              supplementOpportunity: opportunity,
-              repairOpportunity,
-              ...this.conversations.relayWorkflowUserGrants(handoff, read.snapshot, receiptId),
-              continuation: this.conversations.relayWorkflowContinuation(read.snapshot) ?? null,
-              admission: {
-                enabled: settings.enabled,
-                modelSelected: settings.selection !== null,
-                runtimeAdmission,
-                evaluationResourcesAvailable: true,
-                factAlreadyEvaluated: Boolean(
-                  this.conversations.decisionEvaluationReceipt(handoff),
-                ),
-                pendingUserInput: Boolean(
-                  this.conversations.receivedCollaborationInput(task.sessionId) ||
-                  collaborationInputGate(read.snapshot.task),
-                ),
-                nativeInteraction: this.pendingNativeInteractions(task.sessionId).length > 0,
-                newTaskDispatchProtected: false,
-              },
-            })
-            const policy = facts && evaluateRelayPolicy(facts)
+            const fresh = this.conversations.relayWorkflowAlternatives(handoff)
             if (
-              !policy ||
-              policy.kind !== 'eligible' ||
-              !candidates.every((candidate) =>
-                policy.candidates.some((entry) => entry.id === candidate.id),
-              )
+              !fresh ||
+              read.sourceFingerprint !== current.snapshot.sourceFingerprint ||
+              fresh.snapshot.sourceFingerprint !== read.sourceFingerprint ||
+              !isDeepStrictEqual(fresh.alternatives, alternatives) ||
+              this.conversations.receivedCollaborationInput(task.sessionId) ||
+              collaborationInputGate(read.snapshot.task) ||
+              this.pendingNativeInteractions(task.sessionId).length > 0
             )
               throw new RunOperationConflictError(
                 'This workflow node does not need a decision request.',
@@ -5015,69 +4698,36 @@ export class Conversation {
         },
         new AbortController().signal,
       )
-      if (
-        outcome.kind !== 'recommendation' ||
-        !candidates.some((candidate) => candidate.id === outcome.recommendation.candidateId) ||
-        outcome.recommendation.highlights.length === 0 ||
-        !material ||
-        material.basis.kind !== 'workflow'
+      if (outcome.kind !== 'selection' || !material || material.basis.kind !== 'workflow') return
+      const chosenProposal = alternatives.find(
+        (entry) => `propose_${entry.kind}` === outcome.selection.candidateId,
       )
-        return undefined
-      const chosenProposal =
-        repairOpportunity && outcome.recommendation.candidateId === 'propose_repair'
-          ? repairOpportunity
-          : opportunity && outcome.recommendation.candidateId === `propose_${opportunity.kind}`
-            ? opportunity
-            : undefined
-      if (chosenProposal) {
-        if (this.pendingNativeInteractions(task.sessionId).length) return undefined
-        const reason = outcome.recommendation.highlights[0]!
-        this.conversations.proposeRelayWorkflowAction({
-          handoff,
-          kind: chosenProposal.kind,
-          evaluationId: outcome.evaluationReceipt.evaluationId,
-          configurationGeneration: outcome.evaluationReceipt.configurationGeneration,
-          deadlineAt: outcome.evaluationReceipt.deadlineAt,
-          inputSha256: material.inputSha256,
-          sourceFingerprint: material.sourceFingerprint,
-          reason: reason.text,
-          sourceIds: reason.sourceIds,
-        })
-        this.publish(this.conversations.metadataPatch(task.sessionId))
-        return undefined
-      }
-      if (!next || !candidateId) return undefined
-      reservation = new NativeWorkingMemory().reserve(128 * 1024)
-      const { evaluationReceipt, recommendation } = outcome
-      const proposal = handoffGuidanceProposalSchema.parse({
-        guidance: {
-          version: HANDOFF_GUIDANCE_VERSION,
-          evaluationId: evaluationReceipt.evaluationId,
-          handoffId: evaluationReceipt.handoffId,
-          ...material,
-          ...recommendation,
-        },
-        configurationGeneration: evaluationReceipt.configurationGeneration,
-        configurationFingerprint: evaluationReceipt.configurationFingerprint,
-        deadlineAt: evaluationReceipt.deadlineAt,
+      if (!chosenProposal || this.pendingNativeInteractions(task.sessionId).length) return
+      // Host evidence only: prefer review, owner response and plan roles from the evaluated snapshot.
+      const sourceIds = material.sources
+        .filter((source) =>
+          (['review', 'owner_response', 'plan'] as const).some((role) =>
+            source.roles.includes(role),
+          ),
+        )
+        .map((source) => source.id)
+      if (!sourceIds.length) return
+      this.conversations.proposeRelayWorkflowAction({
+        handoff,
+        kind: chosenProposal.kind,
+        evaluationId: outcome.evaluationReceipt.evaluationId,
+        configurationGeneration: outcome.evaluationReceipt.configurationGeneration,
+        configurationFingerprint: outcome.evaluationReceipt.configurationFingerprint,
+        deadlineAt: outcome.evaluationReceipt.deadlineAt,
+        inputSha256: material.inputSha256,
+        sourceFingerprint: material.sourceFingerprint,
+        sourceIds,
       })
-      const current = () =>
-        !this.disposed &&
-        !this.nativeQuitSealed() &&
-        this.conversations.schedulingConfigurationGeneration() ===
-          proposal.configurationGeneration &&
-        this.runtimePreparation.catalogIdentity(project.directoryPath) === configurationKey &&
-        this.conversations.evaluationIsCurrent(handoff) &&
-        Date.now() < proposal.deadlineAt
-      if (!current()) return undefined
-      const transferred = reservation
-      reservation = undefined
-      return { proposal, current, reservation: transferred }
+      this.publish(this.conversations.metadataPatch(task.sessionId))
     } catch {
-      return undefined
+      // Advisory consultation never blocks the lawful default step.
     } finally {
       material = undefined
-      reservation?.release()
     }
   }
 
@@ -5102,9 +4752,20 @@ export class Conversation {
       !session ||
       session.status === 'archived' ||
       task.automation !== 'active' ||
-      task.status !== 'waiting'
+      (task.status !== 'waiting' && task.status !== 'ready')
     )
       return
+    if (task.status === 'ready') {
+      const handoff = this.conversations.workflowHandoff(
+        task,
+        collaborationActor(task, 'implement'),
+      )
+      await this.consultWorkflowAlternatives(task, handoff)
+      const owner = this.decisionRuntime
+      if (owner?.kind === 'evaluation' && owner.handoff?.id === handoff.id)
+        this.releaseDecisionHandoff(owner)
+      return
+    }
     if (collaborationInputGate(task)) {
       this.publish(
         this.conversations.setCollaborationState({
@@ -5123,7 +4784,7 @@ export class Conversation {
           task,
           collaborationActor(task, task.stage === 'code_review' ? 'respond' : 'plan'),
         )
-        await this.prepareWorkflowGuidance(task, undefined, handoff)
+        await this.consultWorkflowAlternatives(task, handoff)
         const consultation =
           this.decisionRuntime?.kind === 'evaluation' &&
           this.decisionRuntime.handoff?.id === handoff.id
@@ -5151,10 +4812,9 @@ export class Conversation {
       )
       return
     }
-    let guidance: SendOptions['handoffGuidance']
     let consultation: DecisionInvocationOwner | undefined
     const settings = this.conversations.schedulingSettings()
-    if (settings.enabled && settings.selection) {
+    if (settings.enabled && settings.credential.configured) {
       const handoff = this.conversations.workflowHandoff(task, next.actor)
       if (
         this.decisionRuntime?.kind === 'evaluation' &&
@@ -5163,24 +4823,21 @@ export class Conversation {
         this.decisionRuntime.handoff?.id === handoff.id
       )
         return
-      guidance = await this.prepareWorkflowGuidance(task, next, handoff)
+      await this.consultWorkflowAlternatives(task, handoff)
       consultation =
         this.decisionRuntime?.kind === 'evaluation' &&
         this.decisionRuntime.handoff?.id === handoff.id
           ? this.decisionRuntime
           : undefined
       if (this.disposed || this.nativeQuitSealed()) {
-        guidance?.reservation.release()
         this.releaseDecisionHandoff(consultation)
         return
       }
       if (this.conversations.hasRelayDecision(sessionId)) {
-        guidance?.reservation.release()
         this.releaseDecisionHandoff(consultation)
         return
       }
       if (!this.conversations.evaluationIsCurrent(handoff)) {
-        guidance?.reservation.release()
         this.releaseDecisionHandoff(consultation)
         this.schedulePendingRoutedContinuations()
         return
@@ -5193,12 +4850,11 @@ export class Conversation {
         )
       ) {
         // The original manual claim is preparing; its existing release path wakes automation.
-        guidance?.reservation.release()
         this.releaseDecisionHandoff(consultation)
         return
       }
     }
-    const preparation = this.startWorkflowTurn(task, next, undefined, guidance)
+    const preparation = this.startWorkflowTurn(task, next)
     // enqueueSend has synchronously registered the original business preparation, or refused it.
     this.releaseDecisionHandoff(consultation)
     const result = await preparation
@@ -5696,12 +5352,12 @@ export class Conversation {
     try {
       const session = this.sessions.find(input.sessionId)
       const settings = this.conversations.schedulingSettings()
-      const admission = this.decisionRuntimeAdmission(input.sessionId)
+      const admission = this.decisionRuntimeAdmission()
       if (
         !receipt &&
         session &&
         settings.enabled &&
-        settings.selection &&
+        settings.credential.configured &&
         admission === 'may_attempt' &&
         !options.collaboration &&
         !options.receivedInputId &&
@@ -5747,11 +5403,14 @@ export class Conversation {
                   ? [
                       {
                         id: 'clarify_prepared_input',
+                        information: { fieldId: informationOpportunity.fieldId },
                         description: `Collect the existing unanswered user-declared field ${informationOpportunity.fieldId}. Select only that exact fieldId; its question and choices are already frozen by the host.`,
                       },
                     ]
                   : []),
               ]
+              if (routingCandidates.length < 2 && !informationOpportunity)
+                throw new RunOperationConflictError('This input has no alternative recipient.')
               const read = await this.conversations.readPreparedInputDecisionSources(
                 frozen,
                 candidates,
@@ -5802,7 +5461,7 @@ export class Conversation {
                 })),
                 admission: {
                   enabled: settings.enabled,
-                  modelSelected: settings.selection !== null,
+                  keyConfigured: settings.credential.configured,
                   runtimeAdmission: admission,
                   evaluationResourcesAvailable: true,
                   factAlreadyEvaluated: false,
@@ -5833,11 +5492,10 @@ export class Conversation {
           },
           controller.signal,
         )
-        const selected =
-          outcome.kind === 'recommendation' ? outcome.recommendation.candidateId : undefined
+        const selected = outcome.kind === 'selection' ? outcome.selection.candidateId : undefined
         recordDiagnostic({
           operation: 'send',
-          phase: outcome.kind === 'recommendation' ? 'ready' : 'blocked',
+          phase: outcome.kind === 'selection' ? 'ready' : 'blocked',
           level: 'info',
           sessionId: input.sessionId,
           inputAdviceResult:
@@ -5852,28 +5510,28 @@ export class Conversation {
                   : 'other_candidate',
         })
         if (
-          outcome.kind === 'recommendation' &&
+          outcome.kind === 'selection' &&
           material &&
-          (outcome.recommendation.candidateId === 'route_codex' ||
-            outcome.recommendation.candidateId === 'route_claude')
+          (outcome.selection.candidateId === 'route_codex' ||
+            outcome.selection.candidateId === 'route_claude')
         ) {
           options.inputRouting = {
             version: 'input-routing-v1',
             ...material,
             ...outcome.evaluationReceipt,
-            candidateId: outcome.recommendation.candidateId,
+            candidateId: outcome.selection.candidateId,
           }
-          options.inputRoutingCurrent = () =>
+          options.preparedSelectionCurrent = () =>
             Boolean(
               scope &&
               this.runtimePreparation.catalogIdentity(scope.directoryPath) === configurationKey,
             )
         }
         if (
-          outcome.kind === 'recommendation' &&
+          outcome.kind === 'selection' &&
           material &&
           receipt &&
-          outcome.recommendation.candidateId === 'clarify_prepared_input' &&
+          outcome.selection.candidateId === 'clarify_prepared_input' &&
           !controller.signal.aborted &&
           !this.disposed &&
           !this.pendingNativeInteractions(input.sessionId).length &&
@@ -5884,7 +5542,7 @@ export class Conversation {
             this.conversations.proposePreparedInputInformation({
               receipt,
               original: input,
-              recommendation: outcome.recommendation,
+              selection: outcome.selection,
               evaluation: outcome.evaluationReceipt,
               ...material,
             })
@@ -5920,6 +5578,7 @@ export class Conversation {
     } catch (error) {
       return Conversation.sendFailure(error)
     } finally {
+      receipt ??= options.preparedInput
       if (
         !held &&
         receipt &&
@@ -5980,6 +5639,25 @@ export class Conversation {
         throw new RunOperationConflictError(
           'Handle or cancel the received input before starting a new Pact task.',
         )
+      if (
+        !options.initialRolesConsidered &&
+        !options.preparedInput &&
+        !options.collaboration &&
+        !options.receivedInputId &&
+        !options.queuedRoute &&
+        !options.sourceProposalId &&
+        !options.preserveDraftComments &&
+        commandPrefix.pact &&
+        !input.returnedInputOperationId &&
+        !input.queueReturnOperationId &&
+        !input.replyToDecision &&
+        !input.imageIds?.length &&
+        !input.skills?.length &&
+        !this.pendingNativeInteractions(input.sessionId).length
+      ) {
+        options.initialRolesConsidered = true
+        await this.consultInitialTaskRoles(input, context.value, controller, options)
+      }
       const requestedRoute = input.route ?? commandPrefix.route
       const primaryAgentId = context.value.session.settings.primaryAgentId
       const secondaryAgentId: RuntimeAgentId = primaryAgentId === 'claude' ? 'codex' : 'claude'
@@ -6008,36 +5686,44 @@ export class Conversation {
         if (!input.route) route = original
       }
       if (options.preparedInput) {
-        if (options.inputRoutingCurrent && !options.inputRoutingCurrent())
+        if (options.preparedSelectionCurrent && !options.preparedSelectionCurrent()) {
           options.inputRouting = undefined
+          options.initialTaskRoles = undefined
+        }
         route = {
           type: 'primary',
           agentId: this.conversations.preparedInputRecipient(
             options.preparedInput,
-            options.inputRouting,
+            options.initialTaskRoles ?? options.inputRouting,
           ),
         }
       }
       const entryRolePolicy = options.receivedInputId ? options.queuedRolePolicy : 'split-stages-v1'
+      const taskRoles = options.preparedInput?.metadata.taskRoles
       const entryPrimary =
-        options.receivedInputId && entryRolePolicy && route.type !== 'all'
+        taskRoles?.primaryAgentId ??
+        (options.receivedInputId && entryRolePolicy && route.type !== 'all'
           ? commandPrefix.pact === 'build'
             ? otherAgent(route.agentId)
             : route.agentId
-          : primaryAgentId
+          : primaryAgentId)
+      const entryStageRoles = taskRoles
+        ? this.conversations.preparedInitialTaskRoles(
+            options.preparedInput!,
+            options.initialTaskRoles,
+          )
+        : entryRolePolicy
+          ? defaultTaskStageRoles(entryPrimary)
+          : undefined
       if (!options.collaboration && commandPrefix.pact && entryRolePolicy) {
-        const stage =
-          commandPrefix.pact === 'plan'
-            ? 'plan'
-            : commandPrefix.pact === 'build'
-              ? 'implement'
-              : 'code_review'
+        const stage = collaborationInitialStage(commandPrefix.pact)
         const entryActor = collaborationActor(
           {
             kind: commandPrefix.pact,
             owner: entryPrimary,
             reviewer: otherAgent(entryPrimary),
             rolePolicy: entryRolePolicy,
+            ...(entryStageRoles ? { stageRoles: entryStageRoles } : {}),
           },
           stage,
         )
@@ -6113,6 +5799,7 @@ export class Conversation {
             : kind === 'review'
               ? agentId
               : otherAgent(owner),
+          ...(entryStageRoles ? { stageRoles: entryStageRoles } : {}),
           ...(entryRolePolicy ? { rolePolicy: entryRolePolicy } : {}),
           task,
           taskMessageId: input.clientMessageId,
@@ -6185,27 +5872,36 @@ export class Conversation {
         throw new RunOperationConflictError(
           'The native binding changed during message preparation.',
         )
-      if (options.handoffGuidance && !options.handoffGuidance.current())
-        this.releaseHandoffGuidance(options)
       if (
         options.preparedInput &&
-        options.inputRouting &&
-        (!options.inputRoutingCurrent?.() ||
-          this.conversations.preparedInputRecipient(options.preparedInput, options.inputRouting) !==
-            agentId)
+        (options.inputRouting || options.initialTaskRoles) &&
+        (!options.preparedSelectionCurrent?.() ||
+          this.conversations.preparedInputRecipient(
+            options.preparedInput,
+            options.initialTaskRoles ?? options.inputRouting,
+          ) !== agentId ||
+          (options.initialTaskRoles &&
+            !isDeepStrictEqual(
+              this.conversations.preparedInitialTaskRoles(
+                options.preparedInput,
+                options.initialTaskRoles,
+              ),
+              collaboration?.stageRoles,
+            )))
       ) {
         options.inputRouting = undefined
+        options.initialTaskRoles = undefined
         // A stale recommendation returns to the frozen default within the same business deadline.
         return await this.sendAdmitted(input, controller, options)
       }
       const started = this.conversations.beginRun({
         preparedInput: options.preparedInput,
         inputRouting: options.inputRouting,
+        initialTaskRoles: options.initialTaskRoles,
 
         ...(options.receivedInputId ? { receivedInputId: options.receivedInputId } : {}),
         ...(collaboration ? { collaboration } : {}),
         schedulingHandoff: options.schedulingHandoff,
-        ...(options.handoffGuidance ? { handoffGuidance: options.handoffGuidance.proposal } : {}),
         expectedCollaborationRevision: options.expectedCollaborationRevision,
         collaborationActionReceiptId: options.collaborationActionReceiptId,
         ...(skillInvocation ? { skillInvocation } : {}),
@@ -6249,7 +5945,6 @@ export class Conversation {
           ? { suggestedTitle: Conversation.localTitle(input.content) }
           : {}),
       })
-      this.releaseHandoffGuidance(options)
       prompt.inputBatchRef = this.conversations.inputBatchForRun(started.run.id) ?? undefined
       const clarification = this.conversations.preparedAnswerForRun(started.run.id)
       prompt.clarificationAnswer = clarification?.document
@@ -6277,7 +5972,6 @@ export class Conversation {
     } catch (error) {
       return Conversation.sendFailure(error)
     } finally {
-      this.releaseHandoffGuidance(options)
       clearTimeout(timeout)
       controller.signal.removeEventListener('abort', onAbort)
       const entry = this.preparingSends.get(input.clientMessageId)
@@ -7940,11 +7634,8 @@ export class Conversation {
     this.workflowCandidateCursor = undefined
     this.workflowCandidateRescan = false
     this.decisionRuntime?.controller.abort()
-    const decisionProbe =
-      this.decisionRuntime?.kind === 'probe' ? this.decisionRuntime.task : undefined
     const decisionCleanup = this.decisionRuntime?.runtime?.dispose().catch(() => false)
-    this.hostDecisionCapability = undefined
-    this.contextDecisionCapability = undefined
+    this.decisionConnection = undefined
     await this.markdownWorker?.terminate()
     await this.markdownTail
     const forkOwners = [...this.nativeForks.values()]
@@ -8019,7 +7710,7 @@ export class Conversation {
     this.nativeObservations.clear()
     const cleanup = await Promise.allSettled([
       ...(decisionCleanup ? [decisionCleanup] : []),
-      ...(decisionProbe ? [decisionProbe] : []),
+
       ...(this.decisionRecovery ? [this.decisionRecovery] : []),
       ...[...this.collaborationActions.values()].map((owner) => owner.task),
       ...adapters.map(async ({ adapter }) => {
@@ -8545,7 +8236,6 @@ export class Conversation {
           const settings = this.conversations.schedulingSettings()
           if (
             !settings.enabled ||
-            !settings.selection ||
             this.decisionRuntime ||
             this.decisionRecovery ||
             this.conversations.activeSchedulingRuntimeOwner() ||
@@ -8594,21 +8284,8 @@ export class Conversation {
           )
             continue
           const generation = this.conversations.schedulingConfigurationGeneration()
-          let observation = this.schedulingObservation(
-            this.contextDecisionCapability,
-            this.schedulingScope(node.sessionId),
-          )
-          if (observation.status !== 'supported') {
-            if (this.decisionRuntimeAdmission(node.sessionId) !== 'may_attempt') continue
-            // A new Session or an expired observation needs zero-Turn native evidence.
-            // Use the existing probe owner once for this consumed fault, without a retry queue.
-            // oxlint-disable-next-line no-await-in-loop -- One fault uses the global probe lease; later busy facts are consumed without queuing.
-            const refreshed = await this.refreshSchedulingState({ sessionId: node.sessionId })
-            if (!refreshed.ok || !refreshed.value.context) continue
-            observation = refreshed.value.context.observation
-          }
           if (
-            observation.status !== 'supported' ||
+            !this.conversations.schedulingSettings().enabled ||
             this.disposed ||
             this.nativeQuitSealed() ||
             this.conversations.schedulingConfigurationGeneration() !== generation ||
@@ -9281,7 +8958,7 @@ export class Conversation {
       promptEnvelope.targetAgentId = run.agentId
       let recovery: AgentRunInput['recovery']
       const schedulingSettings = this.conversations.schedulingSettings()
-      if (schedulingSettings.enabled && schedulingSettings.selection) {
+      if (schedulingSettings.enabled) {
         let captureMemory: ReturnType<NativeWorkingMemory['reserve']> | undefined
         try {
           captureMemory = new NativeWorkingMemory().reserve(8 * 1024 * 1024 + 128 * 1024)
@@ -10030,10 +9707,7 @@ export class Conversation {
               sessionId &&
               (agentId === 'codex' || agentId === 'claude') &&
               !this.pendingNativeInteractions(sessionId).length &&
-              this.schedulingObservation(
-                this.contextDecisionCapability,
-                this.schedulingScope(sessionId),
-              ).status === 'supported' &&
+              this.conversations.schedulingSettings().credential.configured &&
               this.conversations.proposeRelayNativeRecovery(
                 sessionId,
                 agentId,

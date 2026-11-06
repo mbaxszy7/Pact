@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { defaultTaskStageRoles } from './collaboration.js'
 import {
   RELAY_DECISION_BYTES,
   relayAnswerMatchesDecision,
@@ -86,6 +87,87 @@ describe('Relay scheduling decision v2 public contracts', () => {
         },
       }).success,
     ).toBe(true)
+  })
+
+  it('admits a typed code-role change only under arrangement_change and rejects malformed operations', () => {
+    const decision = card()
+    const previousRoles = defaultTaskStageRoles('codex')
+    const proposedRoles = {
+      ...previousRoles,
+      revision: previousRoles.revision + 1,
+      codeAuthor: previousRoles.codeReviewer,
+      codeReviewer: previousRoles.codeAuthor,
+    }
+    const operation = {
+      kind: 'reassign_roles' as const,
+      taskId: randomUUID(),
+      afterRunId: randomUUID(),
+      expectedTaskRevision: 2,
+      expectedRoleRevision: previousRoles.revision,
+      previousRoles,
+      proposedRoles,
+      futureStages: ['implement', 'respond', 'repair', 'code_review'] as const,
+      scopeFingerprint: 'a'.repeat(64),
+    }
+    expect(
+      relaySchedulingDecisionSchema.safeParse({
+        ...decision,
+        request: { category: 'arrangement_change', operation },
+      }).success,
+    ).toBe(true)
+    expect(
+      relaySchedulingDecisionSchema.safeParse({
+        ...decision,
+        request: { category: 'new_authorization', operation },
+      }).success,
+    ).toBe(false)
+    for (const value of [
+      {
+        ...operation,
+        proposedRoles: {
+          ...proposedRoles,
+          planAuthor: previousRoles.planReviewer,
+          planReviewer: previousRoles.planAuthor,
+        },
+      },
+      {
+        ...operation,
+        proposedRoles: {
+          ...previousRoles,
+          revision: previousRoles.revision + 1,
+        },
+      },
+      { ...operation, proposedRoles: { ...proposedRoles, codeAuthor: previousRoles.codeAuthor } },
+      { ...operation, proposedRoles: { ...proposedRoles, codeReviewer: proposedRoles.codeAuthor } },
+      { ...operation, expectedRoleRevision: previousRoles.revision + 1 },
+      { ...operation, proposedRoles: { ...proposedRoles, revision: previousRoles.revision + 2 } },
+      { ...operation, permission: 'write' },
+      { ...operation, command: 'execute arbitrary text' },
+      { ...operation, futureStages: ['implement', 'respond'] },
+    ])
+      expect(
+        relaySchedulingDecisionSchema.safeParse({
+          ...decision,
+          request: { category: 'arrangement_change', operation: value },
+        }).success,
+      ).toBe(false)
+    const roleDecision = relaySchedulingDecisionSchema.parse({
+      ...decision,
+      request: { category: 'arrangement_change', operation },
+    })
+    expect(relayAnswerMatchesDecision(roleDecision, answer(roleDecision))).toBe(true)
+    expect(
+      relayAnswerMatchesDecision(roleDecision, {
+        ...answer(roleDecision),
+        answer: { kind: 'cancel' },
+      }),
+    ).toBe(true)
+    expect(
+      relayAnswerMatchesDecision(roleDecision, {
+        ...answer(roleDecision),
+        answer: { kind: 'text', fieldId: randomUUID(), text: 'yes' },
+      }),
+    ).toBe(false)
   })
 
   it('requires the exact Session, decision and revision even when a confirmation is otherwise valid', () => {

@@ -1,14 +1,34 @@
+import { and, asc, eq, gt, lte, ne, sql } from 'drizzle-orm'
 import { createHash, randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 
 import {
   advanceCollaboration,
+  collaborationDocumentSchema,
   collaborationTaskSchema,
+  collaborationTurnAuthorizationSchema,
+  commentAnchorSchema,
+  handoffGuidanceSchema,
+  planRevisionGuidanceSchema,
   type CollaborationDocument,
-  type PlanRevisionGuidanceProposal,
+  type HandoffGuidance,
+  type PlanRevisionGuidance,
+  type PlanRevisionGuidanceSource,
+  type SchedulingHandoff,
+  type TaskStageRoles,
 } from '@pact/contracts'
 
 import { PactDatabase } from './pact-database.js'
+import {
+  collaborationTasks,
+  conversationBodyInputs,
+  conversationInputBatchMembers,
+  conversationInputBatches,
+  conversationRunSourceRefs,
+  schedulingBudgetCounters,
+  schedulingEvaluations,
+  workflowTurns,
+} from './schema/index.js'
 
 const settings = {
   primaryAgentId: 'codex',
@@ -32,6 +52,8 @@ export async function planRevisionFixture(
     fileComments?: boolean
     planComments?: boolean
     inputs?: string[]
+    rolePolicy?: 'split-stages-v1'
+    stageRoles?: TaskStageRoles
   } = {},
 ) {
   const planOwner = options.owner ?? 'codex'
@@ -79,6 +101,8 @@ export async function planRevisionFixture(
     discussionRounds: 0,
     reviewCycles: 0,
     repairAttempts: 0,
+    ...(options.rolePolicy ? { rolePolicy: options.rolePolicy } : {}),
+    ...(options.stageRoles ? { stageRoles: options.stageRoles } : {}),
   })
   const first = repo.beginRun({
     sessionId,
@@ -140,7 +164,7 @@ export async function planRevisionFixture(
     })
     repo.recordNativeEffects(runId, 'settled')
   }
-  const admission = (proposal?: PlanRevisionGuidanceProposal, clientMessageId = randomUUID()) => {
+  const admission = (clientMessageId = randomUUID()) => {
     const task = repo.collaboration(sessionId)!,
       next = advanceCollaboration(task, 'continue', selectedSettings)
     const drafts = repo.readPage({ scope: 'drafts', sessionId })
@@ -159,7 +183,6 @@ export async function planRevisionFixture(
       expectedCollaborationRevision: task.revision,
       collaboration: next,
       schedulingHandoff: repo.workflowHandoff(task, next.actor),
-      ...(proposal ? { planRevisionGuidance: proposal } : {}),
     }
   }
   finish(first.run.id, { plan: options.plan ?? 'Scope and acceptance.' })
@@ -273,7 +296,6 @@ export async function planRevisionFixture(
   repo.saveSchedulingSettings({
     expectedRevision: 0,
     enabled: true,
-    selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
   })
   const task = repo.collaboration(sessionId)!,
     handoff = repo.workflowHandoff(task, task.owner)
@@ -309,4 +331,294 @@ export async function planRevisionFixture(
     admission,
     readDocument,
   }
+}
+
+type Fixture = Awaited<ReturnType<typeof planRevisionFixture>>
+type HistoricalGrant = {
+  document: CollaborationDocument
+  messageId: string
+  sourceRunId: string
+  revision: number
+}
+
+/** Seed an already-frozen pre-cutover record; never invoke the retired adoption path. */
+export function seedHistoricalGuidance(
+  f: Pick<Fixture, 'db' | 'repo' | 'sessionId' | 'readDocument'>,
+  runId: string,
+  handoff: SchedulingHandoff,
+  value: HandoffGuidance,
+  grants: readonly HistoricalGrant[] = [],
+): CollaborationDocument {
+  const guidance = handoffGuidanceSchema.parse(value)
+  const run = f.repo.findRun(runId)
+  const auth = f.repo.collaborationTurnAuthorization(runId)
+  if (
+    !run ||
+    !auth ||
+    auth.sourceManifestRef ||
+    f.repo.handoffReceipt(handoff.id)?.runId !== runId ||
+    guidance.handoffId !== handoff.id
+  )
+    throw Error('Historical guidance requires the exact receiving Run and handoff')
+  const text = JSON.stringify(guidance)
+  const owner = randomUUID()
+  const { inputId } = f.repo.writeConversationInput(
+    { type: 'begin', sessionId: f.sessionId, clientMessageId: randomUUID() },
+    owner,
+  )
+  for (let offset = 0; offset < text.length;) {
+    let end = Math.min(text.length, offset + 2048)
+    const last = text.charCodeAt(end - 1)
+    if (end < text.length && last >= 0xd800 && last <= 0xdbff) end--
+    f.repo.writeConversationInput(
+      { type: 'append', sessionId: f.sessionId, inputId, offset, text: text.slice(offset, end) },
+      owner,
+    )
+    offset = end
+  }
+  f.repo.writeConversationInput({ type: 'seal', sessionId: f.sessionId, inputId }, owner)
+  const row = f.db.drizzle
+    .select()
+    .from(conversationBodyInputs)
+    .where(eq(conversationBodyInputs.id, inputId))
+    .get()
+  if (
+    !row?.sealed ||
+    row.hash !== createHash('sha256').update(text).digest('hex') ||
+    row.bytes !== Buffer.byteLength(text) ||
+    row.chars !== text.length
+  )
+    throw Error('The complete historical manifest was not sealed')
+  const document = collaborationDocumentSchema.parse({
+    id: inputId,
+    sha256: row.hash,
+    bytes: row.bytes,
+    chars: row.chars,
+  })
+  const authorization = collaborationTurnAuthorizationSchema.parse({
+    ...auth,
+    sourceManifestRef: document,
+  })
+  const authorizationJson = JSON.stringify(authorization)
+  const createdAt = run.createdAt
+  f.db.drizzle.transaction((tx) => {
+    tx.update(conversationBodyInputs)
+      .set({
+        purpose: 'collaboration',
+        sourceRunId: runId,
+        projectionBasis: null,
+        projectionPages: null,
+      })
+      .where(eq(conversationBodyInputs.id, inputId))
+      .run()
+    tx.update(workflowTurns)
+      .set({
+        authorizationJson,
+        stateJson: sql`json_set(${workflowTurns.stateJson}, '$.authorization', json(${authorizationJson}))`,
+      })
+      .where(eq(workflowTurns.runId, runId))
+      .run()
+    tx.update(collaborationTasks)
+      .set({
+        stateJson: sql`json_set(${collaborationTasks.stateJson}, '$.authorization', json(${authorizationJson}))`,
+      })
+      .where(
+        and(
+          eq(collaborationTasks.id, auth.taskId),
+          sql`json_extract(${collaborationTasks.stateJson}, '$.runId') = ${runId}`,
+        ),
+      )
+      .run()
+    // The historical evaluation is already closed. There is no active native runtime owner,
+    // physical absence assertion, dispatch call, or new model response in this fixture.
+    tx.insert(schedulingEvaluations)
+      .values({
+        id: guidance.evaluationId,
+        sessionId: f.sessionId,
+        handoffId: handoff.id,
+        budgetSubjectId: handoff.budgetSubjectId,
+        factFingerprint: handoff.factFingerprint,
+        provider: 'codex',
+        model: 'gpt-6-luna',
+        configurationFingerprint: 'a'.repeat(64),
+        inputSha256: guidance.inputSha256,
+        selectedCandidateId: guidance.candidateId,
+        handoffJson: JSON.stringify(handoff),
+        active: false,
+        called: true,
+        outcome: 'completed',
+        createdAt,
+        deadline: new Date(Date.parse(createdAt) + 15000).toISOString(),
+        settledAt: createdAt,
+      })
+      .run()
+    tx.insert(schedulingBudgetCounters)
+      .values({
+        subjectId: handoff.budgetSubjectId,
+        sessionId: f.sessionId,
+        evaluationCalls: 1,
+      })
+      .onConflictDoUpdate({
+        target: schedulingBudgetCounters.subjectId,
+        set: { evaluationCalls: sql`${schedulingBudgetCounters.evaluationCalls} + 1` },
+      })
+      .run()
+    // Grants come ONLY from the previously verified host snapshot, not the manifest contents.
+    // This intentionally allows negative fixtures with an ungranted source in a corrupt manifest.
+    for (const grant of grants) {
+      const previous = tx
+        .select()
+        .from(conversationRunSourceRefs)
+        .where(
+          and(
+            eq(conversationRunSourceRefs.runId, runId),
+            eq(conversationRunSourceRefs.sourceMessageId, grant.messageId),
+          ),
+        )
+        .get()
+      if (previous && previous.sourceRevision !== grant.revision)
+        throw Error('Historical grant revisions disagree')
+      const documents: Array<{ key: string; source: CollaborationDocument }> = previous
+        ? JSON.parse(previous.documentsJson)
+        : []
+      const same = documents.find((entry) => entry.source.id === grant.document.id)
+      if (same && JSON.stringify(same.source) !== JSON.stringify(grant.document))
+        throw Error('Historical grant documents disagree')
+      if (!same) documents.push({ key: `relay_${grant.document.id}`, source: grant.document })
+      const documentsJson = JSON.stringify(documents)
+      // Match the existing private HANDOFF_SOURCE_IDS_BYTES budget; do not export a new API.
+      if (Buffer.byteLength(documentsJson) > 512 * 1024)
+        throw Error('Historical source grant exceeds its metadata budget')
+      tx.insert(conversationRunSourceRefs)
+        .values({
+          runId,
+          sourceMessageId: grant.messageId,
+          sourceRevision: grant.revision,
+          batchId: previous?.batchId ?? null,
+          documentsJson,
+        })
+        .onConflictDoUpdate({
+          target: [conversationRunSourceRefs.runId, conversationRunSourceRefs.sourceMessageId],
+          set: { documentsJson },
+        })
+        .run()
+    }
+  })
+  return document
+}
+
+/** V1 history fixture for the existing original-message Comment scenarios. */
+export function historicalPlanGuidance(f: Fixture): PlanRevisionGuidance {
+  const task = f.repo.collaboration(f.sessionId)!
+  if (!task.taskDocument || !task.planReference || !task.review?.document)
+    throw Error('Missing the complete historical Plan/review')
+  const sources: PlanRevisionGuidanceSource[] = []
+  const add = (
+    document: CollaborationDocument,
+    role: PlanRevisionGuidanceSource['roles'][number],
+    provenance: Pick<
+      PlanRevisionGuidanceSource,
+      'messageId' | 'memberId' | 'inputBatchRef' | 'inputSequence' | 'planVersion'
+    > = {},
+  ) => {
+    const prior = sources.find(
+      (entry) =>
+        entry.document.id === document.id &&
+        (!provenance.memberId || entry.memberId === provenance.memberId) &&
+        (!provenance.messageId || entry.messageId === provenance.messageId),
+    )
+    if (prior) {
+      if (JSON.stringify(prior.document) !== JSON.stringify(document))
+        throw Error('Historical source identity changed')
+      if (!prior.roles.includes(role)) prior.roles.push(role)
+      return
+    }
+    const carrier = f.repo.collaborationDocumentRow(f.sessionId, document)
+    sources.push({
+      id: `s${sources.length}`,
+      roles: [role],
+      document,
+      evaluatedSha256: document.sha256,
+      ...(carrier.sourceRunId ? { sourceRunId: carrier.sourceRunId } : {}),
+      ...provenance,
+    })
+  }
+  add(task.taskDocument, 'task', { messageId: task.taskMessageId })
+  const batches = f.db.drizzle
+    .select()
+    .from(conversationInputBatches)
+    .where(
+      and(
+        eq(conversationInputBatches.taskId, task.id),
+        gt(conversationInputBatches.sequence, 0),
+        lte(conversationInputBatches.sequence, task.inputSequence),
+        ne(conversationInputBatches.bodyState, 'withdrawn'),
+      ),
+    )
+    .orderBy(asc(conversationInputBatches.sequence))
+    .all()
+  for (const batch of batches) {
+    if (!batch.messageId || !batch.bodyDocumentJson) throw Error('Incomplete historical input')
+    const provenance = {
+      messageId: batch.messageId,
+      inputSequence: batch.sequence,
+      inputBatchRef: {
+        id: batch.id,
+        revision: batch.commentsRevision,
+        memberCount: batch.memberCount,
+      },
+    }
+    add(collaborationDocumentSchema.parse(JSON.parse(batch.bodyDocumentJson)), 'input', provenance)
+    const members = f.db.drizzle
+      .select()
+      .from(conversationInputBatchMembers)
+      .where(eq(conversationInputBatchMembers.batchId, batch.id))
+      .orderBy(asc(conversationInputBatchMembers.ordinal))
+      .all()
+    if (members.length !== batch.memberCount) throw Error('Incomplete historical Comments')
+    for (const [ordinal, member] of members.entries()) {
+      if (member.ordinal !== ordinal || !member.bodyDocumentJson || !member.anchorDocumentJson)
+        throw Error('Incomplete historical Comment bodies')
+      const body = collaborationDocumentSchema.parse(JSON.parse(member.bodyDocumentJson))
+      const anchorDocument = collaborationDocumentSchema.parse(
+        JSON.parse(member.anchorDocumentJson),
+      )
+      if (body.sha256 !== member.bodySha256) throw Error('Historical Comment digest changed')
+      const anchor = commentAnchorSchema.parse(JSON.parse(f.readDocument(anchorDocument)))
+      if (
+        anchor.type !== 'message' ||
+        anchor.messageId !== task.taskMessageId ||
+        anchor.contentHash !== task.taskDocument.sha256 ||
+        anchor.plan
+      )
+        throw Error('This fixture supports only the original immutable message anchor')
+      const memberProvenance = { ...provenance, memberId: member.memberId }
+      add(body, 'comment', memberProvenance)
+      add(anchorDocument, 'anchor', memberProvenance)
+      add(task.taskDocument, 'anchor_target', { ...memberProvenance, messageId: anchor.messageId })
+    }
+  }
+  add(task.planReference.document, 'plan', {
+    messageId: task.planReference.sourceMessageId,
+    planVersion: task.planReference.version,
+  })
+  add(task.review.document, 'review', {
+    messageId: f.repo.findRun(task.review.runId)!.responseMessageId!,
+    planVersion: task.planReference.version,
+  })
+  const review = sources.find((source) => source.roles.includes('review'))!
+  return planRevisionGuidanceSchema.parse({
+    version: 'plan-revision-guidance-v1',
+    evaluationId: randomUUID(),
+    handoffId: f.handoff.id,
+    // Opaque historical receipt identities, never presented as a new model invocation hash.
+    inputSha256: 'b'.repeat(64),
+    sourceFingerprint: 'c'.repeat(64),
+    taskId: task.id,
+    inputSequence: task.inputSequence,
+    planVersion: task.planReference.version,
+    candidateId: 'continue_plan_revision',
+    sources,
+    highlights: [{ text: 'Keep the cancellation boundary explicit.', sourceIds: [review.id] }],
+  })
 }

@@ -1,22 +1,14 @@
 /** Fixed protocol inventories; no caller-selected version or fallback CLI. */
-export const decisionNativeFiles = Object.freeze([
-  'tests/native/codex-decision-runtime.test.ts',
-  'tests/native/decision-inline-provider.test.ts',
-  'tests/native/decision-physical-witness.test.ts',
-  'tests/native/decision-response-guard.test.ts',
-  'tests/native/decision-response-upgrade.test.ts',
+export const codexExecutionNativeFiles = Object.freeze([
+  'tests/native/codex-reexecution.test.ts',
+  'tests/native/codex-inline-provider.test.ts',
+  'tests/native/relay-historical-owner.test.ts',
 ])
-
-export const claudeDecisionNativeFiles = Object.freeze([
-  'tests/native/claude-decision-runtime.test.ts',
-])
-export const claudeDecisionNativeCases = Object.freeze([
-  'Claude decision inspects the actual catalog without substituting Haiku 4.5 or dispatching inference',
-  'Claude decision completes one actual native text turn through the production guard with owned synthetic catalog and global instructions',
-  'Claude decision preserves same-message thinking and text frames through the production guard',
-  'Claude production guard blocks a preauthorized native Bash response after a positive two-request tool canary',
-  'Claude production guard preserves native helper refresh for one complete 401 with identical semantic input',
-  'Claude production runtime rejects executable credential helpers without upstream requests or native mutations',
+export const codexExecutionNativeCases = Object.freeze([
+  'real Codex preserves one executor and exact frozen settings across one physically unsent replacement of an existing Session',
+  'real Codex withholds a fresh unmaterialized Thread replacement after native resume rejection without a second executor or model call',
+  'resolves a thread-local provider without writing the original owned config',
+  'keeps a live old owner and an orphaned native group occupied, then recovers only exact stored identity after actual process release without replay',
 ])
 export const windowsOwnerNativeFiles = Object.freeze([
   'tests/native/owned-process-group-win32.test.ts',
@@ -53,14 +45,13 @@ export const windowsOwnerNativeCases = Object.freeze(
 
 export function nativeProfileSupports(profile, platform = process.platform, arch = process.arch) {
   if (profile.name === 'legacy') return true
-  if (profile.name === 'decision-codex') return platform === 'darwin' && arch === 'arm64'
+  if (profile.name === 'execution-codex') return platform === 'darwin' && arch === 'arm64'
   if (profile.name === 'windows-owner')
     return platform === 'win32' && ['x64', 'arm64'].includes(arch)
-  return profile.name === 'decision-claude' && platform === 'darwin' && arch === 'arm64'
+  return false
 }
 
-/** Installing an exact CLI is separate from admitting its native test inventory.
- * Windows decision execution remains closed until its platform cases are implemented. */
+/** CLI setup does not admit the macOS process-group evidence inventory on Windows. */
 export function nativeProfileSetupSupports(
   profile,
   platform = process.platform,
@@ -68,9 +59,7 @@ export function nativeProfileSetupSupports(
 ) {
   return (
     nativeProfileSupports(profile, platform, arch) ||
-    (['decision-codex', 'decision-claude'].includes(profile.name) &&
-      platform === 'win32' &&
-      ['x64', 'arm64'].includes(arch))
+    (profile.name === 'execution-codex' && platform === 'win32' && ['x64', 'arm64'].includes(arch))
   )
 }
 
@@ -83,23 +72,14 @@ export function nativeProfile(name = 'legacy') {
       directory: 'pact-native-cli',
       files: null,
     }
-  if (name === 'decision-codex')
+  if (name === 'execution-codex')
     return {
       name,
-      command: 'test:native:decision',
+      command: 'test:native:execution',
       codexVersion: '0.163.0',
-      directory: 'pact-decision-native-cli',
-      files: decisionNativeFiles,
-    }
-  if (name === 'decision-claude')
-    return {
-      name,
-      command: 'test:native:claude-decision',
-      codexVersion: null,
-      claudeVersion: '2.1.272',
-      directory: 'pact-claude-decision-native-cli',
-      files: claudeDecisionNativeFiles,
-      cases: claudeDecisionNativeCases,
+      directory: 'pact-codex-execution-cli',
+      files: codexExecutionNativeFiles,
+      cases: codexExecutionNativeCases,
     }
   if (name === 'windows-owner')
     return {

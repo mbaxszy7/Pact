@@ -1,15 +1,20 @@
 import { sql } from 'drizzle-orm'
+import { randomUUID } from 'node:crypto'
+import { mkdir } from 'node:fs/promises'
+import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import type { AgentRunInput } from '@pact/agent-runtime'
 import type { CollaborationReviewObservation, DecisionInput } from '@pact/contracts'
 
+import type { DecisionInputLoader } from './decision-runtime.js'
 import type { WorkflowSourceRead } from './relay-workflow-fixture.test-support.js'
 
 import { Conversation } from './conversation.js'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
 import { decisionWorkingMemoryDiagnostics } from './native-working-memory.js'
 import {
+  enableWorkflowRelay,
   proposeWorkflowPlanOn,
   workflowConversation,
 } from './relay-workflow-fixture.test-support.js'
@@ -23,6 +28,7 @@ const native = vi.hoisted(() => ({
   loseObservation: false,
   rebuilds: [] as string[],
   sourceReads: [] as WorkflowSourceRead[],
+  failNextDecision: false,
   workerPath: '',
 }))
 vi.mock('./codex-agent-adapter.js', async () => {
@@ -33,9 +39,20 @@ vi.mock('./claude-agent-adapter.js', async () => {
   const { workflowAdapter } = await import('./relay-workflow-fixture.test-support.js')
   return { ClaudeAgentAdapter: workflowAdapter('claude', native) }
 })
-vi.mock('./codex-decision-runtime.js', async () => {
+vi.mock('./openai-decision-runtime.js', async () => {
   const { workflowDecisionRuntime } = await import('./relay-workflow-fixture.test-support.js')
-  return { CodexDecisionRuntime: workflowDecisionRuntime(native) }
+  return {
+    OpenAIDecisionRuntime: class extends workflowDecisionRuntime(native) {
+      override async evaluateDecision(load: DecisionInputLoader, signal: AbortSignal) {
+        const outcome = await super.evaluateDecision(load, signal)
+        if (native.failNextDecision && this.invoked) {
+          native.failNextDecision = false
+          return { kind: 'unavailable' as const, reason: 'runtime_unavailable' as const }
+        }
+        return outcome
+      }
+    },
+  }
 })
 vi.mock('node:worker_threads', async (original) => {
   const actual = await original<typeof import('node:worker_threads')>()
@@ -73,6 +90,7 @@ afterEach(async () => {
   native.loseObservation = false
   native.rebuilds = []
   native.sourceReads = []
+  native.failNextDecision = false
   vi.restoreAllMocks()
 })
 async function fixture(primary: 'codex' | 'claude' = 'codex') {
@@ -80,6 +98,82 @@ async function fixture(primary: 'codex' | 'claude' = 'codex') {
   owned.push(f)
   return f
 }
+
+it.each(['same_project', 'other_project'] as const)(
+  'consults another Session in %s immediately after a settled provider failure',
+  async (scope) => {
+    const f = await fixture()
+    enableWorkflowRelay(f.db)
+    native.failNextDecision = true
+    expect(
+      await f.flow.send({
+        ...f.input('/build Complete the original scope.'),
+        routeIntent: 'implicit',
+        composerRevision: 0,
+      }),
+    ).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(f.flow.diagnostics().activeExecutions).toBe(0))
+    const state = f.flow.getSchedulingState({})
+    expect(state).toMatchObject({ ok: true, value: { connection: { status: 'unavailable' } } })
+    if (!state.ok) throw Error('Missing provider observation')
+    expect(Date.parse(state.value.connection.expiresAt!)).toBeGreaterThan(Date.now())
+    expect(native.decisions).toHaveLength(1)
+
+    let projectId = f.db.sessionRepository.find(f.sessionId)!.projectId
+    if (scope === 'other_project') {
+      const directoryPath = join(
+        f.db.projectCatalogRepository.find(projectId)!.directoryPath,
+        'other',
+      )
+      await mkdir(directoryPath)
+      projectId = randomUUID()
+      f.db.projectCatalogRepository.add({
+        id: projectId,
+        name: 'Independent project',
+        directoryPath,
+        kind: 'directory',
+        createdAt: new Date().toISOString(),
+      })
+    }
+    const sessionId = randomUUID()
+    f.db.sessionRepository.create(
+      {
+        id: sessionId,
+        projectId,
+        title: 'Independent session',
+        createdAt: new Date().toISOString(),
+      },
+      {
+        primaryAgentId: 'codex',
+        agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+        maxDiscussionRounds: 6,
+        maxReviewCycles: 3,
+        maxRepairAttempts: 3,
+      },
+    )
+    native.candidate = 'roles_codex_codex'
+    expect(
+      await f.flow.send({
+        sessionId,
+        clientMessageId: randomUUID(),
+        content: '/build Complete this independent original scope.',
+        commentIds: [],
+        expectedCommentsRevision: 0,
+        routeIntent: 'implicit',
+        composerRevision: 0,
+      }),
+    ).toMatchObject({ ok: true })
+    expect(native.decisions.map((input) => input.handoff.sessionId)).toEqual([
+      f.sessionId,
+      sessionId,
+    ])
+    await vi.waitFor(() => expect(f.flow.diagnostics().activeExecutions).toBe(0))
+    expect(
+      native.inputs.find((input) => input.sessionId === sessionId)?.promptEnvelope.collaboration
+        ?.actor,
+    ).toBe('codex')
+  },
+)
 
 it('keeps five Relay decisions waiting while an independent sixth Session completes its fixed review', async () => {
   const f = await fixture(),
@@ -165,7 +259,7 @@ describe.each([32, 100])('%i independently waiting Relay cards', (count) => {
       EXPLAIN QUERY PLAN SELECT session_id,id,updated_at FROM collaboration_tasks
       WHERE active=1 AND json_extract(state_json,'$.protocol')='native-workflow-v1'
         AND json_extract(state_json,'$.automation')='active'
-        AND json_extract(state_json,'$.status')='waiting'
+        AND json_extract(state_json,'$.status') IN ('waiting','ready')
         AND (updated_at,id)>(${first!.updatedAt},${first!.id})
       ORDER BY updated_at,id LIMIT 5`)
     const details = queryPlan.map((row) => row.detail).join('\n')

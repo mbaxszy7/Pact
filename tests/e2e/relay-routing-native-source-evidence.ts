@@ -1008,7 +1008,24 @@ export function inspectRoutingSourceRecords(records: unknown[], expected: Expect
       | undefined,
     ledgerValid = true,
     rootMatched = false,
+    nonMessageOperationObserved = false,
     failedLeafCount = 0
+  const operationKinds: Array<{ record: string; kind: string }> = []
+  let omittedOperationObservations = 0
+  const observeOperation = (
+    record: 'response_item' | 'event_msg' | 'native_item',
+    value: unknown,
+  ) => {
+    nonMessageOperationObserved = true
+    // Protocol discriminators only: never retain message, command, argument or error content.
+    const kind =
+      typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/u.test(value)
+        ? value
+        : 'invalid_discriminator'
+    if (operationKinds.some((entry) => entry.record === record && entry.kind === kind)) return
+    if (operationKinds.length < 8) operationKinds.push({ record, kind })
+    else omittedOperationObservations++
+  }
   // The existing Native snapshot owns the complete file/records and execScripts.
   // This additional workspace borrows one input, retains only proof metadata,
   // and releases its parsed AST before the next record. No script text is exported.
@@ -1028,7 +1045,7 @@ export function inspectRoutingSourceRecords(records: unknown[], expected: Expect
     processHeapUsedAfterParseHighWater: 0,
   }
   const chargeWrapperMetadata = () => {
-    // Only bounded hashes/counters/flags are copied; identities borrow snapshot strings.
+    // Bounded hashes/counters/flags/protocol kinds are copied; identities borrow snapshot strings.
     const limit = 64 * 1024
     let size = 0
     const count = (value: unknown): void => {
@@ -1060,7 +1077,7 @@ export function inspectRoutingSourceRecords(records: unknown[], expected: Expect
     }
     // Map entries are visited one at a time. In particular, a long untrusted call ID
     // is counted before any encoded copy is allocated, rather than stringified first.
-    count({ wrappers, wrapperDiagnostics, identities: wrapperIds })
+    count({ wrappers, wrapperDiagnostics, identities: wrapperIds, operationKinds })
     if (size > limit) throw Error('Source script proof metadata exceeds 64 KiB')
     scriptAudit.proofMetadataHighWaterBytes = Math.max(
       scriptAudit.proofMetadataHighWaterBytes,
@@ -1494,6 +1511,50 @@ export function inspectRoutingSourceRecords(records: unknown[], expected: Expect
         )
           add({ id: item['id'], name: item['name'], input: item['input'] })
     const payload = record['payload']
+    // Zero-reader admission is only an observation of ordinary text and its lifecycle.
+    // Unknown operation shapes cannot become proof that no tool was invoked.
+    if (
+      record['type'] === 'response_item' &&
+      (!object(payload) ||
+        (payload['type'] !== 'reasoning' &&
+          !(
+            payload['type'] === 'message' &&
+            ['user', 'assistant', 'system', 'developer'].includes(String(payload['role']))
+          )))
+    )
+      observeOperation('response_item', object(payload) ? payload['type'] : undefined)
+    if (record['type'] === 'event_msg' && !object(payload)) observeOperation('event_msg', undefined)
+    if (record['type'] === 'event_msg' && object(payload)) {
+      const kind = payload['type'],
+        item = payload['item']
+      if (kind === 'thread_settings_applied') {
+        // The native protocol records host-applied thread configuration separately from tools.
+        if (
+          expected.nativeSessionId === undefined ||
+          payload['thread_id'] !== expected.nativeSessionId ||
+          !object(payload['thread_settings'])
+        )
+          observeOperation('event_msg', kind)
+      } else if (kind === 'item_started' || kind === 'item_completed') {
+        if (
+          !object(item) ||
+          !['Reasoning', 'AgentMessage', 'UserMessage'].includes(String(item['type']))
+        )
+          observeOperation('native_item', object(item) ? item['type'] : undefined)
+      } else if (
+        ![
+          'task_started',
+          'task_complete',
+          'token_count',
+          'user_message',
+          'agent_message',
+          'agent_reasoning',
+          'agent_reasoning_raw_content',
+          'agent_reasoning_section_break',
+        ].includes(String(kind))
+      )
+        observeOperation('event_msg', kind)
+    }
     if (openWrapper && record['type'] === 'event_msg' && object(payload)) {
       const kind = payload['type'],
         item = payload['item']
@@ -2276,10 +2337,20 @@ export function inspectRoutingSourceRecords(records: unknown[], expected: Expect
       bytes,
     }
   })
+  // This admits observed tool absence, not source consumption or native completion.
+  // A question-only caller additionally verifies its complete native answer projection.
+  const noToolCallsObserved =
+    rootMatched &&
+    !nonMessageOperationObserved &&
+    calls.size === 0 &&
+    outputs.size === 0 &&
+    outerIds.size === 0 &&
+    readers.size === 0 &&
+    wrappers.length === 0
   const allToolsAllowed =
     calls.size === allowed.length &&
     ledgerValid &&
-    readers.size === 1 &&
+    (readers.size === 1 || noToolCallsObserved) &&
     sourceRejections.length === 0 &&
     (wrappers.length === 0 ||
       (rootMatched &&
@@ -2322,6 +2393,9 @@ export function inspectRoutingSourceRecords(records: unknown[], expected: Expect
         sourceCalls: allowed.length,
         sourceReaders: readers.size,
         nativeInputObserved: rootMatched,
+        nonMessageOperationObserved,
+        operationKinds,
+        omittedOperationObservations,
         openWrapper: openWrapper !== undefined,
         nonSourceCalls: [...calls.values()]
           .filter((call) => !isRoutingSourceTool(call.name))

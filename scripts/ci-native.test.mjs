@@ -77,17 +77,17 @@ for (const arch of ['x64', 'arm64']) {
       await rm(root, { recursive: true, force: true })
     }
   })
-  void test(`admits only exact decision 0.163.0 ${arch} wrapper, alias and PE while retaining legacy 0.159.2`, async () => {
-    const root = await mkdtemp(join(tmpdir(), 'pact-ci-decision-entry-'))
+  void test(`admits only exact execution 0.163.0 ${arch} wrapper, alias and PE while retaining legacy 0.159.2`, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-ci-execution-entry-'))
     try {
       const entry = await installedCodex(await realpath(root), arch, '0.163.0')
-      assert.deepEqual(await windowsCodexEntry(root, arch, 'decision-codex'), {
+      assert.deepEqual(await windowsCodexEntry(root, arch, 'execution-codex'), {
         executable: entry.executable,
         packageRoot: entry.packageRoot,
       })
       await assert.rejects(windowsCodexEntry(root, arch), /wrapper identity mismatch/)
       await assert.rejects(windowsCodexEntry(root, arch, '0.163.0'), /Unknown fixed native profile/)
-      for (const profile of ['decision-claude', 'windows-owner'])
+      for (const profile of ['windows-owner'])
         // oxlint-disable-next-line eslint/no-await-in-loop -- Each non-Codex profile is refused before filesystem admission.
         await assert.rejects(
           windowsCodexEntry(root, arch, profile),
@@ -99,7 +99,7 @@ for (const arch of ['x64', 'arm64']) {
         `npm:@openai/codex@0.159.2-win32-${arch}`
       await writeFile(wrapper, JSON.stringify(metadata))
       await assert.rejects(
-        windowsCodexEntry(root, arch, 'decision-codex'),
+        windowsCodexEntry(root, arch, 'execution-codex'),
         /wrapper identity mismatch/,
       )
       await installedCodex(await realpath(root), arch, '0.163.0')
@@ -108,12 +108,12 @@ for (const arch of ['x64', 'arm64']) {
       nativeMetadata.version = `0.159.2-win32-${arch}`
       await writeFile(binary, JSON.stringify(nativeMetadata))
       await assert.rejects(
-        windowsCodexEntry(root, arch, 'decision-codex'),
+        windowsCodexEntry(root, arch, 'execution-codex'),
         /native package identity mismatch/,
       )
       await installedCodex(await realpath(root), arch)
       await assert.rejects(
-        windowsCodexEntry(root, arch, 'decision-codex'),
+        windowsCodexEntry(root, arch, 'execution-codex'),
         /wrapper identity mismatch/,
       )
       assert.deepEqual(await windowsCodexEntry(root, arch), {
@@ -348,11 +348,11 @@ void test('fixed decision setup refuses unknown profiles and preserves an existi
     const source = { ...process.env, RUNNER_TEMP: root, GITHUB_ENV: join(root, 'actions.env') }
     await assert.rejects(main(source, '0.164.0'), /Pinned native CLI setup failed/u)
     assert.equal((await readdir(root)).length, 0)
-    await mkdir(join(root, 'pact-decision-native-cli'))
-    await writeFile(join(root, 'pact-decision-native-cli', 'keep'), 'owned-original')
-    await assert.rejects(main(source, 'decision-codex'), /Pinned native CLI setup failed/u)
+    await mkdir(join(root, 'pact-codex-execution-cli'))
+    await writeFile(join(root, 'pact-codex-execution-cli', 'keep'), 'owned-original')
+    await assert.rejects(main(source, 'execution-codex'), /Pinned native CLI setup failed/u)
     assert.equal(
-      await readFile(join(root, 'pact-decision-native-cli', 'keep'), 'utf8'),
+      await readFile(join(root, 'pact-codex-execution-cli', 'keep'), 'utf8'),
       'owned-original',
     )
   } finally {
@@ -406,19 +406,19 @@ fs.writeFileSync('pnpm-lock.yaml', ${JSON.stringify('owned-installation-fixture\
         }
         if (version === '0.163.0') {
           // oxlint-disable-next-line eslint/no-await-in-loop -- No next installation starts before the real setup process settles.
-          await main(source, 'decision-codex')
+          await main(source, 'execution-codex')
           // oxlint-disable-next-line eslint/no-await-in-loop -- Match the canonical installation selected by main.
-          const directory = await realpath(join(root, 'pact-decision-native-cli'))
+          const directory = await realpath(join(root, 'pact-codex-execution-cli'))
           assert.equal(
             // oxlint-disable-next-line eslint/no-await-in-loop -- Read the actual publication after all setup/version work joins.
             await readFile(environment, 'utf8'),
             legacy +
-              `PACT_NATIVE_DECISION_CODEX_EXECUTABLE=${join(directory, 'node_modules', '@openai', 'codex', 'bin', 'codex.js')}\n` +
-              'PACT_NATIVE_DECISION_CODEX_VERSION=0.163.0\n',
+              `PACT_NATIVE_EXECUTION_CODEX_EXECUTABLE=${join(directory, 'node_modules', '@openai', 'codex', 'bin', 'codex.js')}\n` +
+              'PACT_NATIVE_EXECUTION_CODEX_VERSION=0.163.0\n',
           )
         } else {
           // oxlint-disable-next-line eslint/no-await-in-loop -- A mismatched version must complete with no environment mutation.
-          await assert.rejects(main(source, 'decision-codex'), (error) => {
+          await assert.rejects(main(source, 'execution-codex'), (error) => {
             assert.equal(nativeSetupFailureFacts(error).stage, 'native-version-validation')
             return true
           })
@@ -432,23 +432,3 @@ fs.writeFileSync('pnpm-lock.yaml', ${JSON.stringify('owned-installation-fixture\
     }
   },
 )
-
-void test('Claude decision setup owns a distinct fixed installation and never replaces an existing directory', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'pact-claude-decision-setup-'))
-  try {
-    const directory = join(root, 'pact-claude-decision-native-cli')
-    await mkdir(directory)
-    await writeFile(join(directory, 'keep'), 'owned-original')
-    await assert.rejects(
-      main(
-        { ...process.env, RUNNER_TEMP: root, GITHUB_ENV: join(root, 'actions.env') },
-        'decision-claude',
-      ),
-      /Pinned native CLI setup failed/u,
-    )
-    assert.equal(await readFile(join(directory, 'keep'), 'utf8'), 'owned-original')
-    assert.deepEqual(await readdir(root), ['pact-claude-decision-native-cli'])
-  } finally {
-    await rm(root, { recursive: true, force: true })
-  }
-})

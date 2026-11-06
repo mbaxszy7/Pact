@@ -12,12 +12,18 @@ import {
   CONVERSATION_PATCH_BYTES,
   conversationPatchSchema,
   collaborationTaskSchema,
+  decisionInputSchema,
   type CollaborationDocument,
   type ConversationSendInput,
   type CollaborationTask,
   type SchedulingHandoff,
 } from '@pact/contracts'
 
+import {
+  configureDecisionFixtureCredential,
+  decisionHttpOwnerFixture,
+  seedHistoricalDecisionEvaluation,
+} from './decision-fixture.test-support.js'
 import { PactDatabase } from './pact-database.js'
 import {
   agentRuns,
@@ -28,6 +34,7 @@ import {
   conversationInputBatchMembers,
   schedulingHandoffs,
   schedulingEvaluations,
+  schedulingRuntimeOwners,
   schedulingBudgetReservations,
   workflowTurns,
   collaborationActionReceipts,
@@ -49,6 +56,35 @@ const settings = {
   maxRepairAttempts: 3,
 } as const
 const hash = (text: string) => createHash('sha256').update(text).digest('hex')
+
+function ensureDecisionFixture(f: Awaited<ReturnType<typeof fixture>>) {
+  const current = f.repo.schedulingSettings()
+  if (!current.enabled)
+    f.repo.saveSchedulingSettings({ expectedRevision: current.revision, enabled: true })
+  if (!f.repo.schedulingSettings().credential.configured) configureDecisionFixtureCredential(f.repo)
+}
+
+function evaluationInput(handoff: SchedulingHandoff) {
+  const text = JSON.stringify(handoff)
+  return decisionInputSchema.parse({
+    version: 1,
+    handoff,
+    objective: 'Check the supplied scheduling fact.',
+    candidates: [{ id: 'wait', description: 'Keep the current workflow.' }],
+    sources: [{ id: 'handoff', digest: hash(text), text }],
+  })
+}
+
+function evaluationArgs(f: Awaited<ReturnType<typeof fixture>>, handoff: SchedulingHandoff) {
+  const input = evaluationInput(handoff)
+  return {
+    handoff,
+    configurationFingerprint: f.repo.schedulingConfigurationFingerprint(),
+    inputSha256: hash(JSON.stringify(input)),
+    deadlineAt: Date.now() + 15_000,
+    httpOwner: decisionHttpOwnerFixture(),
+  }
+}
 async function fixture(
   filePath = ':memory:',
   onOpened?: () => void,
@@ -313,11 +349,7 @@ function admitHandoff(
 }
 
 async function planSupplementOpportunity(f: Awaited<ReturnType<typeof fixture>>) {
-  f.repo.saveSchedulingSettings({
-    expectedRevision: 0,
-    enabled: true,
-    selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
-  })
+  ensureDecisionFixture(f)
   f.finish()
   for (let index = 0; index < 2; index++) {
     const review = advance(f)
@@ -331,6 +363,9 @@ async function confirmedSupplement(
   f: Awaited<ReturnType<typeof fixture>>,
   kind: 'supplement_plan' | 'supplement_code_response',
 ) {
+  ensureDecisionFixture(f)
+  const owner = decisionHttpOwnerFixture(),
+    configurationFingerprint = f.repo.schedulingConfigurationFingerprint()
   const task = f.repo.collaboration(f.sessionId)!,
     handoff = f.repo.workflowHandoff(
       task,
@@ -338,7 +373,9 @@ async function confirmedSupplement(
     ),
     candidateId = `propose_${kind}`,
     deadlineAt = Date.now() + 15_000
-  expect(f.repo.relaySupplementOpportunity(handoff)?.kind).toBe(kind)
+  expect(
+    f.repo.relayWorkflowAlternatives(handoff)?.alternatives.find((e) => e.kind === kind)?.kind,
+  ).toBe(kind)
   const material = await f.repo.readRelayWorkflowDecisionSources(
     handoff,
     [
@@ -351,31 +388,38 @@ async function confirmedSupplement(
   )
   const reserved = f.repo.reserveEvaluation({
     handoff,
-    provider: 'codex',
-    model: 'gpt-6-luna',
-    configurationFingerprint: hash('config'),
+    configurationFingerprint,
     deadlineAt,
     inputSha256: material.inputSha256,
+    httpOwner: owner,
   })
   if (reserved.status !== 'reserved') throw Error('Expected the original model evaluation')
-  f.repo.dispatchEvaluation(reserved.evaluation.id)
+  f.repo.dispatchEvaluation(reserved.evaluation.id, owner)
   f.repo.settleEvaluation(reserved.evaluation.id, {
     outcome: 'completed',
     physicalReleased: true,
     selectedCandidateId: candidateId,
+    httpOwner: owner,
+    remoteOutcome: 'responded',
   })
   const card = f.repo.proposeRelayWorkflowAction({
     handoff,
     kind,
     evaluationId: reserved.evaluation.id,
     configurationGeneration: f.repo.schedulingConfigurationGeneration(),
+    configurationFingerprint,
     inputSha256: material.inputSha256,
     sourceFingerprint: material.sourceFingerprint,
     deadlineAt,
-    reason: 'Clarify the complete frozen scope before returning to its fixed reviewer.',
     sourceIds: material.sources.map((source) => source.id),
   })
-  expect(f.repo.relayWorkflowUserGrants(handoff, material.snapshot)).toEqual({})
+  expect(
+    f.db.drizzle
+      .select()
+      .from(collaborationActionReceipts)
+      .where(eq(collaborationActionReceipts.handoffId, handoff.id))
+      .all(),
+  ).toEqual([])
   const accepted = f.repo.answerRelaySchedulingDecision({
     reference: { sessionId: f.sessionId, decisionId: card.decisionId, revision: card.revision },
     clientOperationId: randomUUID(),
@@ -469,109 +513,99 @@ describe('Shared handoff receipts and persistent scheduling budgets', () => {
     expect(f.repo.handoffReceipt(previous.id)).toBeUndefined()
   })
 
-  it('deduplicates the same evaluation facts across model changes and retains physical capacity after logical failure', async () => {
+  it('deduplicates the same evaluation facts across credential changes and retains physical capacity after logical failure', async () => {
     const f = await fixture()
+    ensureDecisionFixture(f)
     f.finish()
     const task = f.repo.collaboration(f.sessionId)!,
       node = f.repo.workflowHandoff(task, task.reviewer)
-    const reserved = f.repo.reserveEvaluation({
-      handoff: node,
-      provider: 'codex',
-      model: 'exact-codex-model',
-      configurationFingerprint: hash('config'),
-    })
+    const args = evaluationArgs(f, node),
+      owner = args.httpOwner
+    const reserved = f.repo.reserveEvaluation(args)
     if (reserved.status !== 'reserved') throw Error('Expected a reservation')
-    expect(f.repo.dispatchEvaluation(reserved.evaluation.id).created).toBe(true)
-    expect(f.repo.dispatchEvaluation(reserved.evaluation.id).created).toBe(false)
-    f.repo.settleEvaluation(reserved.evaluation.id, { outcome: 'failed', physicalReleased: false })
+    expect(f.repo.dispatchEvaluation(reserved.evaluation.id, owner).created).toBe(true)
+    expect(f.repo.dispatchEvaluation(reserved.evaluation.id, owner).created).toBe(false)
+    f.repo.settleEvaluation(reserved.evaluation.id, {
+      outcome: 'failed',
+      physicalReleased: false,
+      httpOwner: owner,
+      remoteOutcome: 'unknown',
+    })
     expect(() =>
       f.repo.settleEvaluation(reserved.evaluation.id, {
         outcome: 'not_sent',
         physicalReleased: true,
+        httpOwner: owner,
+        remoteOutcome: 'unknown',
       }),
     ).toThrow('cannot be refunded')
-    f.db.sessionRepository.saveSettings(f.sessionId, settings)
+    configureDecisionFixtureCredential(f.repo)
     expect(
-      f.repo.reserveEvaluation({
-        handoff: f.repo.workflowHandoff(task, task.reviewer),
-        provider: 'claude',
-        model: 'another-explicit-model',
-        configurationFingerprint: hash('new-config'),
-      }).status,
+      f.repo.reserveEvaluation(evaluationArgs(f, f.repo.workflowHandoff(task, task.reviewer)))
+        .status,
     ).toBe('duplicate')
     const fault = f.repo.recoveryHandoff({ kind: 'run', id: f.first.run.id })
-    expect(
-      f.repo.reserveEvaluation({
-        handoff: fault,
-        provider: 'codex',
-        model: 'exact-codex-model',
-        configurationFingerprint: hash('config'),
-      }).status,
-    ).toBe('busy')
+    expect(f.repo.reserveEvaluation(evaluationArgs(f, fault)).status).toBe('busy')
     f.repo.settleEvaluation(reserved.evaluation.id, {
       outcome: 'failed',
       physicalReleased: true,
       usage: { inputTokens: 12, outputTokens: 3 },
+      httpOwner: owner,
+      remoteOutcome: 'unknown',
     })
     expect(f.repo.schedulingBudget(node.budgetSubjectId)?.evaluationCalls).toBe(1)
-    expect(
-      f.repo.reserveEvaluation({
-        handoff: fault,
-        provider: 'codex',
-        model: 'exact-codex-model',
-        configurationFingerprint: hash('config'),
-      }).status,
-    ).toBe('reserved')
+    expect(f.repo.reserveEvaluation(evaluationArgs(f, fault)).status).toBe('reserved')
   })
 
   it('rejects stale/expired invocation and preserves same-fact deduplication after a proven unsent evaluation', async () => {
     const f = await fixture()
+    ensureDecisionFixture(f)
     f.finish()
     const task = f.repo.collaboration(f.sessionId)!,
       node = f.repo.workflowHandoff(task, task.reviewer)
-    const reserved = f.repo.reserveEvaluation({
-      handoff: node,
-      provider: 'codex',
-      model: 'exact-model',
-      configurationFingerprint: hash('config'),
-    })
+    const args = evaluationArgs(f, node)
+    const reserved = f.repo.reserveEvaluation(args)
     if (reserved.status !== 'reserved') throw Error('Expected a reservation')
     f.db.drizzle
       .update(schedulingEvaluations)
       .set({ deadline: new Date(0).toISOString() })
       .where(eq(schedulingEvaluations.id, reserved.evaluation.id))
       .run()
-    expect(() => f.repo.dispatchEvaluation(reserved.evaluation.id)).toThrow('no longer eligible')
-    f.repo.settleEvaluation(reserved.evaluation.id, { outcome: 'not_sent', physicalReleased: true })
-    expect(
-      f.repo.reserveEvaluation({
-        handoff: node,
-        provider: 'codex',
-        model: 'exact-model',
-        configurationFingerprint: hash('config'),
-      }).status,
-    ).toBe('duplicate')
+    f.db.drizzle
+      .update(schedulingRuntimeOwners)
+      .set({ deadline: new Date(0).toISOString() })
+      .where(eq(schedulingRuntimeOwners.id, reserved.evaluation.id))
+      .run()
+    expect(() => f.repo.dispatchEvaluation(reserved.evaluation.id, args.httpOwner)).toThrow(
+      'no longer eligible',
+    )
+    f.repo.settleEvaluation(reserved.evaluation.id, {
+      outcome: 'not_sent',
+      physicalReleased: true,
+      httpOwner: args.httpOwner,
+      remoteOutcome: 'not_sent',
+    })
+    expect(f.repo.reserveEvaluation(evaluationArgs(f, node)).status).toBe('duplicate')
     expect(f.repo.schedulingBudget(node.budgetSubjectId)?.evaluationCalls ?? 0).toBe(0)
   })
 
   it('records more than twelve actual evaluations on one task without a cumulative evaluation cap', async () => {
     const f = await fixture()
+    ensureDecisionFixture(f)
     f.finish()
     for (let index = 0; index < 16; index++) {
       const task = f.repo.collaboration(f.sessionId)!,
         node = f.repo.workflowHandoff(task, task.reviewer)
-      const result = f.repo.reserveEvaluation({
-        handoff: node,
-        provider: 'codex',
-        model: 'exact-model',
-        configurationFingerprint: hash('config'),
-      })
+      const args = evaluationArgs(f, node)
+      const result = f.repo.reserveEvaluation(args)
       if (result.status !== 'reserved')
         throw Error(`Expected reservation ${index}: ${result.status}`)
-      f.repo.dispatchEvaluation(result.evaluation.id)
+      f.repo.dispatchEvaluation(result.evaluation.id, args.httpOwner)
       f.repo.settleEvaluation(result.evaluation.id, {
         outcome: 'completed',
         physicalReleased: true,
+        httpOwner: args.httpOwner,
+        remoteOutcome: 'responded',
       })
       if (index < 15) {
         f.receive(f.input(`New decision ${index}`))
@@ -616,7 +650,7 @@ describe('Shared handoff receipts and persistent scheduling budgets', () => {
     const exhaustedTask = f.repo.collaboration(f.sessionId)!,
       exhaustedNode = f.repo.workflowHandoff(exhaustedTask, exhaustedTask.reviewer)
     expect(f.repo.relayWorkflowSnapshot(exhaustedNode)?.node).toBe('owner_to_review')
-    expect(f.repo.relaySupplementOpportunity(exhaustedNode)).toBeUndefined()
+    expect(f.repo.relayWorkflowAlternatives(exhaustedNode)).toBeUndefined()
     expect(f.repo.schedulingBudget(node.budgetSubjectId)?.extraPlanTurns).toBe(1)
     const finalPlanReview = advance(f)
     f.finish(finalPlanReview.id, { verdict: 'accepted' })
@@ -633,7 +667,7 @@ describe('Shared handoff receipts and persistent scheduling budgets', () => {
     expect(nextNode.id).not.toBe(node.id)
     expect(nextNode.budgetSubjectId).toBe(node.budgetSubjectId)
     expect(f.repo.relayWorkflowSnapshot(nextNode)?.node).toBe('plan_to_review')
-    expect(f.repo.relaySupplementOpportunity(nextNode)).toBeUndefined()
+    expect(f.repo.relayWorkflowAlternatives(nextNode)).toBeUndefined()
     expect(() =>
       f.repo.reserveSchedulingBudget({
         handoff: nextNode,
@@ -681,7 +715,7 @@ describe('Shared handoff receipts and persistent scheduling budgets', () => {
       extraCodeTurns: 1,
     })
     expect(
-      repo.relaySupplementOpportunity(repo.workflowHandoff(restored, restored.owner)),
+      repo.relayWorkflowAlternatives(repo.workflowHandoff(restored, restored.owner)),
     ).toBeUndefined()
   })
 
@@ -1891,105 +1925,21 @@ it('does not settle a recovered author reply over a newer received answer', asyn
   expect(f.repo.needsWorkflowPlanRecovery(reply.run.id)).toBe(false)
 })
 
-it('bounds the complete evaluation row before dispatch and preserves every previously observed physical identity', async () => {
-  const f = await fixture()
-  f.finish()
-  const task = f.repo.collaboration(f.sessionId)!,
-    node = f.repo.workflowHandoff(task, task.reviewer)
-  const reserved = f.repo.reserveEvaluation({
-    handoff: node,
-    provider: 'codex',
-    model: 'gpt-6-luna',
-    configurationFingerprint: hash('original'),
-  })
-  if (reserved.status !== 'reserved') throw Error('Expected evaluation')
-  const id = reserved.evaluation.id,
-    ownerId = randomUUID()
-  const witness = {
-    version: 1 as const,
-    platform: 'darwin' as const,
-    ownerId,
-    owner: { pid: 1, started: 'birth' },
-    root: { pid: 2, pgid: 2, started: 'birth' },
-    members: [
-      { pid: 2, pgid: 2, started: 'birth' },
-      { pid: 3, pgid: 2, started: 'birth' },
-    ],
-  }
-  f.repo.recordEvaluationPhysicalWitness(id, { witness, configurationFingerprint: hash('native') })
-  expect(() =>
-    f.repo.recordEvaluationPhysicalWitness(id, {
-      witness: { ...witness, members: witness.members.slice(0, 1) },
-      configurationFingerprint: hash('native'),
-    }),
-  ).toThrow('owner changed')
-  const before = f.db.drizzle.select().from(schedulingEvaluations).get()!
-  const quoted = '"'.repeat(64)
-  const large = {
-    ...witness,
-    owner: { pid: 1, started: quoted },
-    root: { pid: 2, pgid: 2, started: quoted },
-    members: Array.from({ length: 8 }, (_, i) => ({ pid: i + 2, pgid: 2, started: quoted })),
-  }
-  expect(Buffer.byteLength(JSON.stringify(large))).toBeLessThanOrEqual(2048)
-  // Use a fresh reservation: owner replacement has a separate, stronger rejection.
-  f.repo.settleEvaluation(id, { outcome: 'not_sent', physicalReleased: true })
-  const fault = f.repo.recoveryHandoff({ kind: 'run', id: f.first.run.id })
-  const other = f.repo.reserveEvaluation({
-    handoff: fault,
-    provider: 'codex',
-    model: 'gpt-6-luna',
-    configurationFingerprint: hash('other'),
-  })
-  if (other.status !== 'reserved') throw Error('Expected distinct evaluation')
-  expect(() =>
-    f.repo.recordEvaluationPhysicalWitness(other.evaluation.id, {
-      witness: large,
-      configurationFingerprint: hash('native'),
-    }),
-  ).toThrow('metadata capacity')
-  expect(
-    f.db.drizzle
-      .select()
-      .from(schedulingEvaluations)
-      .where(eq(schedulingEvaluations.id, other.evaluation.id))
-      .get(),
-  ).toMatchObject({ called: false, physicalWitnessJson: null })
-  expect(
-    f.db.drizzle.select().from(schedulingEvaluations).where(eq(schedulingEvaluations.id, id)).get()
-      ?.physicalWitnessJson,
-  ).toBe(before.physicalWitnessJson)
-  expect(f.repo.schedulingBudget(node.budgetSubjectId)).toBeUndefined()
-})
-
 it('keeps unknown old evaluations active without replay and reads the active owner through the bounded partial index', async () => {
   const f = await fixture()
+  ensureDecisionFixture(f)
   f.finish()
   const task = f.repo.collaboration(f.sessionId)!,
     node = f.repo.workflowHandoff(task, task.reviewer)
-  const reserved = f.repo.reserveEvaluation({
-    handoff: node,
-    provider: 'codex',
-    model: 'gpt-6-luna',
-    configurationFingerprint: hash('native'),
-  })
-  if (reserved.status !== 'reserved') throw Error('Expected evaluation')
-  f.repo.dispatchEvaluation(reserved.evaluation.id)
+  const id = seedHistoricalDecisionEvaluation(f.db, evaluationInput(node), null)
   f.repo.recoverInterruptedRuns()
   expect(f.repo.activeEvaluation()).toMatchObject({
-    id: reserved.evaluation.id,
+    id,
     sessionId: f.sessionId,
     called: true,
     physicalWitnessJson: null,
   })
-  expect(
-    f.repo.reserveEvaluation({
-      handoff: node,
-      provider: 'codex',
-      model: 'gpt-6-luna',
-      configurationFingerprint: hash('new config'),
-    }).status,
-  ).toBe('duplicate')
+  expect(f.repo.reserveEvaluation(evaluationArgs(f, node)).status).toBe('duplicate')
   const plan = f.db.drizzle.all(
     sql`EXPLAIN QUERY PLAN SELECT id,session_id,called,outcome,physical_witness_json FROM scheduling_evaluations WHERE active=1 LIMIT 1`,
   )

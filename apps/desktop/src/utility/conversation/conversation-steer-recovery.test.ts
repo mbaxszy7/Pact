@@ -25,6 +25,7 @@ import { PactDatabase } from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { Conversation } from './conversation.js'
 
 const native = vi.hoisted(() => ({
@@ -385,7 +386,7 @@ async function fixture(
       db.sessionRepository,
       db.projectCatalogRepository,
       preparation,
-      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
     )
   }
   let flow = createFlow()

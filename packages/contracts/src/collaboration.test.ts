@@ -24,6 +24,12 @@ import {
   collaborationSourceWireResultSchema,
   collaborationSourceReadResultSchema,
   collaborationTaskSchema,
+  defaultTaskStageRoles,
+  initialTaskRoleCandidates,
+  initialTaskRoleCandidateSchema,
+  initialTaskRoleCandidateIdSchema,
+  taskStageRolesSchema,
+  collaborationInitialStage,
   collaborationViewSchema,
   collaborationMarkdownPageSchema,
   type CollaborationTask,
@@ -678,4 +684,106 @@ it('preserves legacy action bases and validates only the supported split role ma
   expect(collaborationActionBasisSchema.safeParse({ ...basis, implementer: 'codex' }).success).toBe(
     false,
   )
+})
+
+describe('explicit initial stage roles', () => {
+  it.each([
+    ['plan', 'planAuthor'],
+    ['plan_review', 'planReviewer'],
+    ['implement', 'codeAuthor'],
+    ['respond', 'codeAuthor'],
+    ['repair', 'codeAuthor'],
+    ['code_review', 'codeReviewer'],
+  ] as const)('resolves %s through the selected %s role', (stage, role) => {
+    const roles = {
+      version: 'task-stage-roles-v1' as const,
+      revision: 0 as const,
+      planAuthor: 'claude' as const,
+      planReviewer: 'codex' as const,
+      codeAuthor: 'claude' as const,
+      codeReviewer: 'codex' as const,
+    }
+    const assigned = task({
+      rolePolicy: 'split-stages-v1',
+      owner: 'codex',
+      reviewer: 'claude',
+      stageRoles: roles,
+    })
+    expect(collaborationActor(assigned, stage)).toBe(roles[role])
+  })
+
+  it.each([
+    { kind: 'plan' as const, codeRunId: undefined, expected: 'claude' },
+    { kind: 'plan' as const, codeRunId: randomUUID(), expected: 'codex' },
+    { kind: 'build' as const, codeRunId: randomUUID(), expected: 'codex' },
+    { kind: 'review' as const, codeRunId: randomUUID(), expected: 'claude' },
+  ])(
+    'resolves reply through the correct role for kind=$kind with codeRunId=$codeRunId',
+    ({ kind, codeRunId, expected }) => {
+      const roles = {
+        version: 'task-stage-roles-v1' as const,
+        revision: 0 as const,
+        planAuthor: 'claude' as const,
+        planReviewer: 'codex' as const,
+        codeAuthor: 'codex' as const,
+        codeReviewer: 'claude' as const,
+      }
+      const assigned = task({
+        kind,
+        rolePolicy: 'split-stages-v1',
+        owner: 'codex',
+        reviewer: 'claude',
+        stageRoles: roles,
+        codeRunId,
+      })
+      expect(collaborationActor(assigned, 'reply')).toBe(expected)
+    },
+  )
+
+  it('rejects same-author reviewer, unknown actors, extra fields and unbound roles', () => {
+    const valid = defaultTaskStageRoles('codex')
+    expect(taskStageRolesSchema.safeParse(valid).success).toBe(true)
+    for (const value of [
+      { ...valid, planReviewer: valid.planAuthor },
+      { ...valid, codeAuthor: 'gpt' },
+      { ...valid, extra: 'field' },
+      { ...valid, revision: -1 },
+      { ...valid, revision: 0.5 },
+      { ...valid, revision: Number.MAX_SAFE_INTEGER + 1 },
+      { ...valid, permission: 'write' },
+    ])
+      expect(taskStageRolesSchema.safeParse(value).success).toBe(false)
+    expect(taskStageRolesSchema.safeParse({ ...valid, revision: 1 }).success).toBe(true)
+    const assigned = task({ rolePolicy: 'split-stages-v1', stageRoles: valid })
+    expect(collaborationTaskSchema.safeParse(assigned).success).toBe(true)
+    expect(collaborationTaskSchema.safeParse({ ...assigned, rolePolicy: undefined }).success).toBe(
+      false,
+    )
+    expect(collaborationTaskSchema.safeParse({ ...assigned, stageRoles: undefined }).success).toBe(
+      true,
+    )
+  })
+
+  it('freezes revision-0 metadata and emits only non-default candidates', () => {
+    const planCandidates = initialTaskRoleCandidates('plan', 'codex')
+    expect(planCandidates).toHaveLength(3)
+    for (const candidate of planCandidates) {
+      expect(initialTaskRoleCandidateSchema.parse(candidate)).toEqual(candidate)
+      expect(candidate.roles).not.toEqual(defaultTaskStageRoles('codex'))
+      expect(candidate.id).toBe(`roles_${candidate.roles.planAuthor}_${candidate.roles.codeAuthor}`)
+      expect(
+        initialTaskRoleCandidateSchema.safeParse({
+          ...candidate,
+          roles: { ...candidate.roles, revision: 1 },
+        }).success,
+      ).toBe(false)
+    }
+    expect(initialTaskRoleCandidates('build', 'codex')).toHaveLength(1)
+    expect(initialTaskRoleCandidates('review', 'claude')).toHaveLength(1)
+    expect(initialTaskRoleCandidateIdSchema.safeParse('roles_codex_codex').success).toBe(true)
+    expect(initialTaskRoleCandidateIdSchema.safeParse('route_codex').success).toBe(false)
+    expect(collaborationInitialStage('plan')).toBe('plan')
+    expect(collaborationInitialStage('build')).toBe('implement')
+    expect(collaborationInitialStage('review')).toBe('code_review')
+  })
 })

@@ -1,18 +1,20 @@
 import { describe, expect, it } from 'vitest'
 
+import { defaultTaskStageRoles, initialTaskRoleCandidates } from './collaboration.js'
 import {
   DECISION_HIGHLIGHT_BYTES,
   HANDOFF_GUIDANCE_BYTES,
   HANDOFF_GUIDANCE_VERSION,
-  handoffGuidanceProposalSchema,
   handoffGuidanceSchema,
+  initialTaskRolesProposalSchema,
+  inputRoutingProposalSchema,
+  preparedInputMetadataSchema,
   handoffGuidanceV2Schema,
   planRevisionGuidanceSchema,
   relayBasisV2Schema,
   relaySourceRoleSchema,
   relaySourceSchema,
   workflowRelayCandidateIdSchema,
-  type HandoffGuidanceProposal,
   type HandoffGuidanceV2,
   type PlanRevisionGuidance,
   type RelaySource,
@@ -58,15 +60,6 @@ function guidance(withPlan = false): HandoffGuidanceV2 {
       ...(withPlan ? [source(2, ['plan'])] : []),
     ],
     highlights: [{ text: 'Check the complete execution evidence.', sourceIds: ['s0', 's1'] }],
-  }
-}
-
-function proposal(): HandoffGuidanceProposal {
-  return {
-    guidance: guidance(true),
-    configurationGeneration: 0,
-    configurationFingerprint: 'f'.repeat(64),
-    deadlineAt: Number.MAX_SAFE_INTEGER,
   }
 }
 
@@ -132,9 +125,6 @@ describe('Handoff guidance versioned contracts', () => {
     expect(JSON.stringify(handoffGuidanceSchema.parse(JSON.parse(serialized)))).toBe(serialized)
     expect(handoffGuidanceSchema.parse(value)).toEqual(planRevisionGuidanceSchema.parse(value))
     expect(handoffGuidanceV2Schema.safeParse(value).success).toBe(false)
-    expect(
-      handoffGuidanceProposalSchema.safeParse({ ...proposal(), guidance: value }).success,
-    ).toBe(false)
     expect(planRevisionGuidanceSchema.safeParse(guidance()).success).toBe(false)
   })
 
@@ -255,22 +245,22 @@ describe('Handoff guidance versioned contracts', () => {
     ).toBe(true)
   })
 
-  it('rejects authority and other unknown fields throughout the proposal', () => {
-    const value = proposal()
-    const original = value.guidance.sources[0]!
+  it('rejects authority and other unknown fields throughout historical guidance', () => {
+    const value = guidance(true)
+    const original = value.sources[0]!
     for (const guidanceFields of [
       { runId: uuid() },
       { command: 'implement' },
-      { basis: { ...value.guidance.basis, grant: uuid() } },
+      { basis: { ...value.basis, grant: uuid() } },
       {
-        basis: { ...value.guidance.basis, plan: { ...value.guidance.basis.plan, approved: true } },
+        basis: { ...value.basis, plan: { ...value.basis.plan, approved: true } },
       },
-      { sources: [{ ...original, sourceMessageId: uuid() }, ...value.guidance.sources.slice(1)] },
-      { sources: [{ ...original, grant: uuid() }, ...value.guidance.sources.slice(1)] },
+      { sources: [{ ...original, sourceMessageId: uuid() }, ...value.sources.slice(1)] },
+      { sources: [{ ...original, grant: uuid() }, ...value.sources.slice(1)] },
       {
         sources: [
           { ...original, document: { ...original.document, body: 'hidden' } },
-          ...value.guidance.sources.slice(1),
+          ...value.sources.slice(1),
         ],
       },
       {
@@ -279,18 +269,12 @@ describe('Handoff guidance versioned contracts', () => {
             ...original,
             inputBatchRef: { id: uuid(), revision: 0, memberCount: 1, grant: uuid() },
           },
-          ...value.guidance.sources.slice(1),
+          ...value.sources.slice(1),
         ],
       },
       { highlights: [{ text: 'Unknown permission', sourceIds: ['s0'], approved: true }] },
     ])
-      expect(
-        handoffGuidanceProposalSchema.safeParse({
-          ...value,
-          guidance: { ...value.guidance, ...guidanceFields },
-        }).success,
-      ).toBe(false)
-    expect(handoffGuidanceProposalSchema.safeParse({ ...value, runId: uuid() }).success).toBe(false)
+      expect(handoffGuidanceV2Schema.safeParse({ ...value, ...guidanceFields }).success).toBe(false)
   })
 
   it('counts the complete escaped UTF-8 highlights at the exact 8 KiB boundary', () => {
@@ -320,31 +304,76 @@ describe('Handoff guidance versioned contracts', () => {
       expect(handoffGuidanceV2Schema.safeParse(value).success).toBe(false)
     },
   )
+})
 
-  it('bounds the complete proposal separately from its otherwise valid nested guidance', () => {
-    const value = proposal()
-    value.guidance.sources = fullSources()
-    padHighlightToBytes(value, value.guidance.highlights[0]!, HANDOFF_GUIDANCE_BYTES)
-    expect(bytes(value.guidance.highlights)).toBeLessThanOrEqual(DECISION_HIGHLIGHT_BYTES)
-    expect(handoffGuidanceProposalSchema.safeParse(value).success).toBe(true)
-    value.guidance.highlights[0]!.text += 'x'
-    expect(bytes(value)).toBe(HANDOFF_GUIDANCE_BYTES + 1)
-    expect(handoffGuidanceV2Schema.safeParse(value.guidance).success).toBe(true)
-    expect(handoffGuidanceProposalSchema.safeParse(value).success).toBe(false)
+describe('initial task role proof and prepared metadata', () => {
+  it('accepts a versioned role proof and rejects routing candidates or loose fields', () => {
+    const proof = {
+      version: 'initial-task-roles-v1' as const,
+      evaluationId: uuid(90),
+      handoffId: 'a'.repeat(64),
+      inputSha256: 'b'.repeat(64),
+      sourceFingerprint: 'c'.repeat(64),
+      candidateId: 'roles_claude_claude' as const,
+      configurationGeneration: 0,
+      configurationFingerprint: 'd'.repeat(64),
+      deadlineAt: 1,
+    }
+    expect(initialTaskRolesProposalSchema.parse(proof)).toEqual(proof)
+    for (const value of [
+      { ...proof, version: 'input-routing-v1' },
+      { ...proof, candidateId: 'route_codex' },
+      { ...proof, candidateId: 'roles_gpt_codex' },
+      { ...proof, roles: {} },
+      { ...proof, permission: 'write' },
+      { ...proof, extra: 1 },
+    ])
+      expect(initialTaskRolesProposalSchema.safeParse(value).success).toBe(false)
+    // The same proof under the ordinary schema must not produce a routing authority.
+    expect(inputRoutingProposalSchema.safeParse(proof).success).toBe(false)
   })
 
-  it('requires finite nonnegative safe integer freshness scalars', () => {
-    const value = proposal()
-    for (const fields of [
-      { configurationGeneration: -1 },
-      { configurationGeneration: 0.5 },
-      { configurationGeneration: Number.MAX_SAFE_INTEGER + 1 },
-      { configurationFingerprint: 'unknown' },
-      { deadlineAt: -1 },
-      { deadlineAt: 0.5 },
-      { deadlineAt: Number.MAX_SAFE_INTEGER + 1 },
-      { deadlineAt: Number.POSITIVE_INFINITY },
+  it('validates taskRoles metadata strictly and keeps it absent for ordinary purpose', () => {
+    const metadata = {
+      version: 'prepared-input-v1' as const,
+      ownerId: uuid(91),
+      requestFingerprint: 'e'.repeat(64),
+      inputId: null,
+      routeSpecified: false,
+      defaultAgentId: 'codex' as const,
+      allowedAgentIds: ['claude' as const, 'codex' as const],
+      routeIntent: 'implicit' as const,
+      composerRevision: 0,
+      settingsRevision: 1,
+      sourceFingerprint: 'f'.repeat(64),
+    }
+    expect(preparedInputMetadataSchema.parse(metadata)).toEqual(metadata)
+    const roles = {
+      kind: 'plan' as const,
+      primaryAgentId: 'codex' as const,
+      defaults: defaultTaskStageRoles('codex'),
+      candidates: initialTaskRoleCandidates('plan', 'codex'),
+    }
+    expect(preparedInputMetadataSchema.parse({ ...metadata, taskRoles: roles })).toEqual({
+      ...metadata,
+      taskRoles: roles,
+    })
+    for (const value of [
+      { ...roles, candidates: [] },
+      { ...roles, candidates: [...roles.candidates, ...roles.candidates] },
+      { ...roles, defaults: { ...roles.defaults, planReviewer: roles.defaults.planAuthor } },
+      { ...roles, defaults: { ...roles.defaults, revision: 1 } },
+      {
+        ...roles,
+        candidates: [
+          { ...roles.candidates[0]!, roles: { ...roles.candidates[0]!.roles, revision: 1 } },
+        ],
+      },
+      { ...roles, permission: 'write' },
+      { ...roles, note: 'instructions' },
     ])
-      expect(handoffGuidanceProposalSchema.safeParse({ ...value, ...fields }).success).toBe(false)
+      expect(preparedInputMetadataSchema.safeParse({ ...metadata, taskRoles: value }).success).toBe(
+        false,
+      )
   })
 })

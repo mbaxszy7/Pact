@@ -15,23 +15,28 @@ import type {
   RuntimeAgentId,
   MessageCommentAnchor,
   DecisionInput,
-  DecisionOutcome,
+  DecisionRemoteOutcome,
+  DecisionSelectionOutcome,
 } from '@pact/contracts'
 
 import {
+  OPENAI_DECISION_MODEL,
   advanceCollaboration,
   collaborationAvailableActions,
   handoffGuidanceSchema,
+  initialTaskRoleCandidates,
 } from '@pact/contracts'
 import { PactDatabase } from '@pact/persistence'
 
 import {
+  collaborationActionReceipts,
   conversationBodyInputs,
   nativeAgentContexts,
 } from '../../../../../packages/persistence/src/schema/index.js'
 import { markdownVisibleProjection } from '../../shared/message-anchor-text.js'
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import {
   collaborationInputResultRequired,
   collaborationPlanMode,
@@ -99,32 +104,42 @@ const native = vi.hoisted(() => ({
   decisionPhysicalHold: undefined as Promise<void> | undefined,
   guidanceBodies: [] as string[],
 }))
-vi.mock('./codex-decision-runtime.js', () => ({
-  CodexDecisionRuntime: class {
+vi.mock('./openai-decision-runtime.js', () => ({
+  OpenAIDecisionRuntime: class {
+    readonly provider = 'openai'
+    readonly modelId = OPENAI_DECISION_MODEL
     invoked = false
     usage = { inputTokens: 31, outputTokens: 7 }
-    private work: Promise<DecisionOutcome> | undefined
+    private remoteOutcome: DecisionRemoteOutcome = 'not_sent'
+    private work: Promise<DecisionSelectionOutcome> | undefined
     private closeTask: Promise<boolean> | undefined
     private readonly controller = new AbortController()
     private readonly memory = new DecisionMemoryLease()
     constructor(
       readonly context: ConstructorParameters<
-        typeof import('./codex-decision-runtime').CodexDecisionRuntime
+        typeof import('./openai-decision-runtime.js').OpenAIDecisionRuntime
       >[0],
     ) {}
     evaluateDecision(
-      value: import('./codex-decision-runtime').DecisionInputLoader,
+      value: import('./decision-runtime.js').DecisionInputLoader,
       signal: AbortSignal,
     ) {
       const observed = AbortSignal.any([signal, this.controller.signal])
-      this.work = (async (): Promise<DecisionOutcome> => {
+      this.work = (async (): Promise<DecisionSelectionOutcome> => {
         try {
-          const deadlineAt = this.context.deadlineAt ?? Date.now() + 15_000
+          const deadlineAt = this.context.deadlineAt
           const input = await value({ signal: observed, deadlineAt })
-          const reserved = this.context.reserve!(input, { deadlineAt })
+          const reserved = this.context.reserve(input, { deadlineAt })
           if (reserved !== 'reserved') return { kind: 'unavailable', reason: reserved }
+          observed.throwIfAborted()
+          if (!this.context.current()) return { kind: 'unavailable', reason: 'stale' }
+          if (!(await this.context.credential({ signal: observed, deadlineAt })))
+            return { kind: 'unavailable', reason: 'runtime_unavailable' }
+          observed.throwIfAborted()
+          if (!this.context.current()) return { kind: 'unavailable', reason: 'stale' }
           this.context.dispatch()
           this.invoked = true
+          this.remoteOutcome = 'unknown'
           native.decisions.push(input)
           native.decisionStarted?.(input)
           if (native.decisionHold)
@@ -136,46 +151,43 @@ vi.mock('./codex-decision-runtime.js', () => ({
               }),
             ])
           observed.throwIfAborted()
+          if (!this.context.current()) return { kind: 'unavailable', reason: 'stale' }
           if (native.decisionFailure) return { kind: 'unavailable', reason: native.decisionFailure }
+          const roleChoice = input.candidates.some(
+            (candidate) => candidate.id === 'propose_reassign_roles',
+          )
           const candidateId =
-            native.decisionCandidate === undefined
-              ? (input.candidates[0]?.id ?? null)
-              : native.decisionCandidate
-          return {
-            kind: 'recommendation',
-            recommendation: {
-              candidateId,
-              highlights: candidateId
-                ? [
-                    {
-                      text: 'Address the complete review findings.',
-                      sourceIds: [input.sources.at(-1)!.id],
-                    },
-                  ]
-                : [],
-            },
-          }
+            roleChoice && native.decisionCandidate !== 'propose_reassign_roles'
+              ? null
+              : native.decisionCandidate === undefined
+                ? input.handoff.slot === 'workflow_next'
+                  ? null
+                  : (input.candidates[0]?.id ?? null)
+                : native.decisionCandidate
+          if (candidateId !== null && !input.candidates.some((c) => c.id === candidateId))
+            return { kind: 'unavailable', reason: 'invalid_output' }
+          this.remoteOutcome = 'responded'
+          return { kind: 'selection', selection: { candidateId } }
         } catch {
-          return { kind: 'unavailable', reason: 'cancelled' }
+          return {
+            kind: 'unavailable',
+            reason: observed.aborted ? 'cancelled' : 'runtime_unavailable',
+          }
         }
       })()
       return this.work.then(async (outcome) =>
-        outcome.kind === 'recommendation' && !(await this.settlement())
+        outcome.kind === 'selection' && !(await this.settlement())
           ? { kind: 'unavailable' as const, reason: 'runtime_unavailable' as const }
           : outcome,
       )
     }
+    diagnostics() {
+      return { remoteOutcome: this.remoteOutcome, working: this.memory.diagnostics() }
+    }
     settlement() {
       this.closeTask ??= (async () => {
-        const outcome = await this.work
+        await this.work
         await native.decisionPhysicalHold
-        await this.context.physicalCompletion?.({
-          memory: this.memory,
-          deadlineAt: Date.now() + 4_000,
-          nativeGeneration: 0,
-          witness: null,
-          ...(outcome ? { outcome, usage: this.usage } : {}),
-        })
         this.memory.release()
         return true
       })().catch(() => false)
@@ -416,7 +428,11 @@ async function fixture(
     db.sessionRepository,
     db.projectCatalogRepository,
     preparation,
-    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
+    undefined,
+    undefined,
+    undefined,
+    () => 'OWNED_COLLABORATION_CREDENTIAL',
   )
   owners.push({ db, flow, directory })
   const input = (content: string): ConversationSendInput => {
@@ -496,13 +512,24 @@ it('routes bare /plan to default Claude and preserves the exact user message thr
   )
 })
 
-function enableRelay(f: Awaited<ReturnType<typeof fixture>>, requestedRevisions = 2) {
+function enableRelaySettings(f: Awaited<ReturnType<typeof fixture>>) {
   const repository = f.db.conversationRepository
   repository.saveSchedulingSettings({
     expectedRevision: repository.schedulingSettings().revision,
     enabled: true,
-    selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
   })
+  const credential = repository.writeRelayCredential({
+    operation: 'save',
+    nonce: randomUUID(),
+    expectedRevision: repository.readRelayCredential().revision,
+    deadlineAt: Date.now() + 5000,
+    ciphertext: Buffer.from('owned collaboration ciphertext').toString('base64'),
+  })
+  if (!credential.configured) throw Error('Owned collaboration ciphertext must be saved')
+}
+
+function enableRelay(f: Awaited<ReturnType<typeof fixture>>, requestedRevisions = 2) {
+  enableRelaySettings(f)
   native.reviews = Array.from({ length: requestedRevisions }, () => ({
     verdict: 'changes_requested' as const,
   }))
@@ -528,40 +555,19 @@ async function completedPlanRevision(
   return f.settled()
 }
 
-function guidanceForHandoff(handoffId: string) {
-  return native.guidanceBodies
-    .map((body) => handoffGuidanceSchema.parse(JSON.parse(body)))
-    .filter((guidance) => guidance.handoffId === handoffId)
-}
-
 function decisionsForProducer(runId: string) {
   return native.decisions.filter((decision) => decision.handoff.freshnessGuard.runId === runId)
 }
 
 function expectNoRepeatedConsultation(handoffId: string) {
-  expect(native.decisions.filter((decision) => decision.handoff.id === handoffId)).toHaveLength(1)
-  expect(new Set(native.decisions.map((decision) => decision.handoff.id)).size).toBe(
-    native.decisions.length,
-  )
-  const later = native.decisions.filter((decision) => decision.handoff.id !== handoffId)
-  expect(
-    later.map((decision) => ({
-      producer: decision.handoff.freshnessGuard.runId,
-      candidates: decision.candidates.map((candidate) => candidate.id),
-    })),
-  ).toEqual(
-    later.length === 0
-      ? []
-      : [
-          {
-            producer: native.inputs[4]?.runId,
-            candidates: ['continue_plan_review', 'propose_supplement_plan'],
-          },
-        ],
-  )
+  const forHandoff = native.decisions.filter((decision) => decision.handoff.id === handoffId)
+  expect(forHandoff).toHaveLength(1)
+  expect(forHandoff[0]!.candidates.map((candidate) => candidate.id)).toEqual([
+    'propose_supplement_plan',
+  ])
 }
 
-describe('Optional plan revision guidance through the original workflow owner', () => {
+describe('Decisions choices through the original workflow owner', () => {
   it('keeps repeated revisions on the original workflow while Relay is disabled', async () => {
     const f = await fixture()
     enableRelay(f)
@@ -582,47 +588,65 @@ describe('Optional plan revision guidance through the original workflow owner', 
     })
   })
 
-  it('follows a simple first changes_requested review without inference while Relay is enabled', async () => {
+  it('consults once at the first owner response and keeps the default on a null selection', async () => {
     const f = await fixture()
     enableRelay(f, 1)
     expect((await f.flow.send(f.input('/plan Preserve the complete original goal.'))).ok).toBe(true)
     await completedPlanRevision(f, 1)
+    await vi.waitFor(() => expect(native.decisions).toHaveLength(2))
     expect(f.flow.getSchedulingSettings()).toMatchObject({
       ok: true,
-      value: { enabled: true, selection: { target: 'codex_luna' } },
+      value: {
+        enabled: true,
+        provider: 'openai',
+        model: OPENAI_DECISION_MODEL,
+        credential: { configured: true },
+      },
     })
-    expect(native.decisions).toEqual([])
+    expect(native.decisions).toHaveLength(2)
+    expect(native.decisions[0]!.candidates.map((candidate) => candidate.id)).toEqual([
+      'propose_supplement_plan',
+    ])
+    expect(native.decisions[1]!.candidates.map((candidate) => candidate.id)).toEqual([
+      'propose_reassign_roles',
+    ])
     expect(native.guidanceBodies).toEqual([])
+    expect(f.db.conversationRepository.relaySchedulingDecision(f.sessionId)).toBeNull()
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM scheduling_evaluations`)).toEqual({
-      count: 0,
+      count: 2,
     })
   })
 
-  it('consults the second completed review once and adopts focus at each eligible handoff without an extra business Turn', async () => {
+  it('consults only a real alternative and keeps the complete default workflow without generated focus', async () => {
     const f = await fixture()
     enableRelay(f)
-    expect(f.flow.getSchedulingSettings()).toMatchObject({ ok: true, value: { enabled: true } })
+    expect(f.flow.getSchedulingSettings()).toMatchObject({
+      ok: true,
+      value: {
+        enabled: true,
+        provider: 'openai',
+        model: OPENAI_DECISION_MODEL,
+        credential: { configured: true },
+      },
+    })
     const consultation = Promise.withResolvers<void>()
     native.decisionHold = consultation.promise
     const goal = 'Keep the complete original goal and final acceptance.\n'.repeat(120)
     expect((await f.flow.send(f.input(`/plan ${goal}`))).ok).toBe(true)
     await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
-    expect(native.inputs).toHaveLength(4)
+    // The owner->review handoff holds the first real consult at the third input.
+    expect(native.inputs).toHaveLength(3)
+    expect(decisionsForProducer(native.inputs[0]!.runId)).toEqual([])
     expect(decisionsForProducer(native.inputs[1]!.runId)).toEqual([])
-    const reviewDecisions = decisionsForProducer(native.inputs[3]!.runId)
+    const reviewDecisions = decisionsForProducer(native.inputs[2]!.runId)
     expect(reviewDecisions).toHaveLength(1)
     expect(reviewDecisions[0]!.candidates.map((candidate) => candidate.id)).toEqual([
-      'continue_plan_revision',
+      'propose_supplement_plan',
     ])
     consultation.resolve()
     const task = await completedPlanRevision(f)
     expect(native.decisions).toHaveLength(2)
-    const rereviewDecisions = decisionsForProducer(native.inputs[4]!.runId)
-    expect(rereviewDecisions).toHaveLength(1)
-    expect(rereviewDecisions[0]!.candidates.map((candidate) => candidate.id)).toEqual([
-      'continue_plan_review',
-      'propose_supplement_plan',
-    ])
+    expect(native.inputs).toHaveLength(6)
     expect(
       f.db.drizzle.get(
         sql`SELECT count(*) AS count FROM collaboration_action_receipts WHERE action='supplement_plan'`,
@@ -648,26 +672,9 @@ describe('Optional plan revision guidance through the original workflow owner', 
       'codex',
       'claude',
     ])
-    expect(native.guidanceBodies).toHaveLength(2)
-    const [guidance] = guidanceForHandoff(reviewDecisions[0]!.handoff.id)
-    const revision = native.inputs[4]!
-    expect(guidance).toMatchObject({
-      version: 'handoff-guidance-v2',
-      basis: {
-        task: { id: task.id },
-        plan: { version: 2 },
-        producerRunId: native.inputs[3]!.runId,
-      },
-      candidateId: 'continue_plan_revision',
-    })
-    expect(guidanceForHandoff(rereviewDecisions[0]!.handoff.id)).toHaveLength(1)
-    expect(
-      native.inputs[2]!.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
-    ).toBeUndefined()
-    expect(revision.promptEnvelope.collaborationAuthorization?.sourceManifestRef).toBeDefined()
-    expect(
-      native.inputs[5]!.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
-    ).toBeDefined()
+    expect(native.guidanceBodies).toEqual([])
+    for (const input of native.inputs)
+      expect(input.promptEnvelope.collaborationAuthorization?.sourceManifestRef).toBeUndefined()
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM scheduling_evaluations`)).toEqual({
       count: 2,
     })
@@ -685,19 +692,27 @@ describe('Optional plan revision guidance through the original workflow owner', 
         (await f.flow.send(f.input('/plan Continue after an undecided auxiliary result.'))).ok,
       ).toBe(true)
       await completedPlanRevision(f, 2, 5_000)
-      expect(native.decisions).toHaveLength(2)
-      expect(native.guidanceBodies).toEqual([])
+      // Abstention and failure both preserve the default and permit distinct later handoffs.
+      const expectedConsults = 3
+      await vi.waitFor(() => expect(native.decisions).toHaveLength(expectedConsults))
+      expect(new Set(native.decisions.map((input) => input.handoff.id)).size).toBe(expectedConsults)
       expect(
-        native.inputs[4]!.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
-      ).toBeUndefined()
-      expect(f.db.drizzle.all(sql`SELECT called,outcome FROM scheduling_evaluations`)).toEqual([
-        { called: 1, outcome: 'completed' },
-        { called: 1, outcome: 'completed' },
-      ])
+        native.decisions.filter((input) => input.candidates[0]?.id === 'propose_reassign_roles'),
+      ).toHaveLength(1)
+      expect(native.guidanceBodies).toEqual([])
+      for (const input of native.inputs)
+        expect(input.promptEnvelope.collaborationAuthorization?.sourceManifestRef).toBeUndefined()
+      expect(f.db.drizzle.all(sql`SELECT called,outcome FROM scheduling_evaluations`)).toEqual(
+        // The fixture abstains from role reassignment even when its earlier choices are invalid.
+        (candidate === null
+          ? ['completed', 'completed', 'completed']
+          : ['failed', 'failed', 'completed']
+        ).map((outcome) => ({ called: 1, outcome })),
+      )
     },
   )
 
-  it('lets manual Continue claim the same handoff while consultation is pending and discards late focus', async () => {
+  it('lets manual Continue claim the same handoff while consultation is pending and discards late advice', async () => {
     const f = await fixture()
     enableRelay(f)
     const hold = Promise.withResolvers<void>()
@@ -708,8 +723,8 @@ describe('Optional plan revision guidance through the original workflow owner', 
     await vi.waitFor(() => expect(native.decisions).toHaveLength(1), { timeout: 5_000 })
     const task = f.db.conversationRepository.collaboration(f.sessionId)!
     const handoffId = native.decisions[0]!.handoff.id
-    expect(native.inputs).toHaveLength(4)
-    expect(native.decisions[0]!.handoff.freshnessGuard.runId).toBe(native.inputs[3]!.runId)
+    expect(native.inputs).toHaveLength(3)
+    expect(native.decisions[0]!.handoff.freshnessGuard.runId).toBe(native.inputs[2]!.runId)
     const result = await f.flow.actOnCollaboration({
       sessionId: f.sessionId,
       taskId: task.id,
@@ -721,13 +736,13 @@ describe('Optional plan revision guidance through the original workflow owner', 
     hold.resolve()
     await completedPlanRevision(f, 2, 5_000)
     expectNoRepeatedConsultation(handoffId)
-    expect(guidanceForHandoff(handoffId)).toEqual([])
+    expect(native.guidanceBodies).toEqual([])
     expect(
-      native.inputs[4]!.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
+      native.inputs[3]!.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
     ).toBeUndefined()
     expect(
       f.db.drizzle.get(sql`SELECT run_id FROM scheduling_handoffs WHERE id = ${handoffId}`),
-    ).toEqual({ run_id: native.inputs[4]!.runId })
+    ).toEqual({ run_id: native.inputs[3]!.runId })
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM agent_runs`)).toEqual({ count: 6 })
     expect(
       f.db.drizzle.get(
@@ -747,12 +762,12 @@ describe('Optional plan revision guidance through the original workflow owner', 
     await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
     await new Promise<void>((done) => setTimeout(done, 30))
     const handoffId = native.decisions[0]!.handoff.id
-    expect(native.inputs).toHaveLength(4)
+    expect(native.inputs).toHaveLength(3)
     expect(native.decisions).toHaveLength(1)
     hold.resolve()
     await completedPlanRevision(f)
     expectNoRepeatedConsultation(handoffId)
-    expect(guidanceForHandoff(handoffId)).toHaveLength(1)
+    expect(native.guidanceBodies).toEqual([])
   })
 
   it.each(['succeeds', 'fails', 'is cancelled'] as const)(
@@ -805,7 +820,7 @@ describe('Optional plan revision guidance through the original workflow owner', 
           revision: task.revision,
           automation: 'active',
         })
-        expect(native.inputs).toHaveLength(4)
+        expect(native.inputs).toHaveLength(3)
         const cancellation =
           outcome === 'is cancelled' ? f.flow.stop({ sessionId: f.sessionId }) : undefined
         expect(cancellation?.ok ?? true).toBe(true)
@@ -821,20 +836,20 @@ describe('Optional plan revision guidance through the original workflow owner', 
         )
         expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual(
           outcome === 'is cancelled'
-            ? ['plan', 'plan_review', 'plan', 'plan_review']
+            ? ['plan', 'plan_review', 'plan']
             : ['plan', 'plan_review', 'plan', 'plan_review', 'plan', 'plan_review'],
         )
         expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM agent_runs`)).toEqual({
-          count: outcome === 'is cancelled' ? 4 : 6,
+          count: outcome === 'is cancelled' ? 3 : 6,
         })
         expectNoRepeatedConsultation(handoffId)
-        expect(guidanceForHandoff(handoffId)).toEqual([])
+        expect(native.guidanceBodies).toEqual([])
         expect(
-          native.inputs[4]?.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
+          native.inputs[3]?.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
         ).toBeUndefined()
         expect(
           f.db.drizzle.get(sql`SELECT run_id FROM scheduling_handoffs WHERE id = ${handoffId}`),
-        ).toEqual({ run_id: native.inputs[4]?.runId ?? null })
+        ).toEqual({ run_id: native.inputs[3]?.runId ?? null })
         expect(
           f.db.drizzle.get(
             sql`SELECT count(*) AS count FROM scheduling_evaluations WHERE handoff_id = ${handoffId}`,
@@ -870,7 +885,7 @@ describe('Optional plan revision guidance through the original workflow owner', 
     ).toBe(true)
   })
 
-  it('keeps processed-decision source grants bound to their receiving review and skips later unauthorized revisions', async () => {
+  it('keeps the frozen Comment target with its original recipient without new manifest grants', async () => {
     const f = await fixture()
     const oldPlan = 'Frozen original v1 Plan.'
     native.next = { plan: oldPlan }
@@ -919,27 +934,30 @@ describe('Optional plan revision guidance through the original workflow owner', 
         original.document,
       ),
     ).toBe(false)
-    expect(native.decisions).toHaveLength(1)
-    expect(native.decisions[0]!.handoff.eventId).toBe(native.inputs[2]!.runId)
-    expect(native.decisions[0]!.candidates.map((candidate) => candidate.id)).toEqual([
-      'continue_plan_review',
-    ])
-    expect(native.guidanceBodies).toHaveLength(1)
-    const adopted = handoffGuidanceSchema.parse(JSON.parse(native.guidanceBodies[0]!))
-    expect(adopted.version).toBe('handoff-guidance-v2')
-    if (adopted.version !== 'handoff-guidance-v2') throw Error('Expected v2 workflow evidence.')
-    expect(adopted.basis.producerRunId).toBe(native.inputs[2]!.runId)
+    // The sole processed-input handoff has no real alternative; no consult runs at all.
+    expect(native.decisions).toHaveLength(0)
+    expect(native.guidanceBodies).toEqual([])
+    // The frozen v1 remains authorized only for its original recipient, not the later review.
+    expect(
+      f.db.conversationRepository.sourceDocumentAuthorized(
+        native.inputs[2]!.runId,
+        original.document,
+      ),
+    ).toBe(true)
     expect(
       f.db.conversationRepository.sourceDocumentAuthorized(
         native.inputs[3]!.runId,
         original.document,
       ),
-    ).toBe(true)
+    ).toBe(false)
+    expect(
+      native.inputs[3]!.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
+    ).toBeUndefined()
     expect(
       native.inputs[6]!.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
     ).toBeUndefined()
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM scheduling_evaluations`)).toEqual({
-      count: 1,
+      count: 0,
     })
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM agent_runs`)).toEqual({ count: 8 })
   })
@@ -966,7 +984,7 @@ describe('Optional plan revision guidance through the original workflow owner', 
     hold.resolve()
     await vi.waitFor(() => expect(f.db.conversationRepository.activeEvaluation()).toBeUndefined())
     expect(f.db.conversationRepository.collaboration(f.sessionId)?.automation).toBe('paused')
-    expect(native.inputs).toHaveLength(4)
+    expect(native.inputs).toHaveLength(3)
     expect(native.guidanceBodies).toEqual([])
     expect(f.db.drizzle.get(sql`SELECT called,outcome FROM scheduling_evaluations`)).toEqual({
       called: 1,
@@ -999,9 +1017,9 @@ describe('Optional plan revision guidance through the original workflow owner', 
       hold.resolve()
       await completedPlanRevision(f)
       expectNoRepeatedConsultation(handoffId)
-      expect(guidanceForHandoff(handoffId)).toEqual([])
+      expect(native.guidanceBodies).toEqual([])
       expect(
-        native.inputs[4]!.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
+        native.inputs[3]!.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
       ).toBeUndefined()
       expect(
         f.db.drizzle.get(
@@ -1025,12 +1043,7 @@ async function repairDecisionFlow(primary: RuntimeAgentId, candidate: 'propose_r
   await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
   await f.settled()
   expect(native.decisions).toEqual([])
-  const settings = f.db.conversationRepository.schedulingSettings()
-  f.db.conversationRepository.saveSchedulingSettings({
-    expectedRevision: settings.revision,
-    enabled: true,
-    selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
-  })
+  enableRelaySettings(f)
   native.decisionCandidate = candidate
   native.nextReview = { verdict: 'changes_requested' }
   await f.act('respond')
@@ -1111,7 +1124,7 @@ describe('Grounded Repair decisions through the existing Conversation owner', ()
         expect(native.inputs).toHaveLength(5)
         expect(native.decisions).toHaveLength(1)
       } finally {
-        native.decisionCandidate = 'continue_code_review'
+        native.decisionCandidate = null
         native.hold = undefined
         hold.resolve()
       }
@@ -1152,9 +1165,9 @@ describe('Grounded Repair decisions through the existing Conversation owner', ()
       })
       expect(repo.schedulingBudget(`task:${before.id}`)).toMatchObject({
         extraCodeTurns: 1,
-        evaluationCalls: 2,
+        evaluationCalls: 1,
       })
-      // The completed Repair is a distinct eligible handoff. Answer readback never re-evaluates the original one.
+      // The fixed review needs no model call; answer readback does not re-evaluate the original handoff.
       expect(
         native.decisions.map((decision) => ({
           producer: decision.handoff.freshnessGuard.runId,
@@ -1165,9 +1178,8 @@ describe('Grounded Repair decisions through the existing Conversation owner', ()
           producer: before.runId,
           candidates: ['propose_supplement_code_response', 'propose_repair'],
         },
-        { producer: repair.runId, candidates: ['continue_code_review'] },
       ])
-      expect(new Set(native.decisions.map((decision) => decision.handoff.id)).size).toBe(2)
+      expect(new Set(native.decisions.map((decision) => decision.handoff.id)).size).toBe(1)
       expect(await f.flow.answerRelayDecision(answer)).toEqual(accepted)
       expect(
         f.flow.getRelayDecisionReceipt({
@@ -1180,7 +1192,7 @@ describe('Grounded Repair decisions through the existing Conversation owner', ()
         await f.flow.answerRelayDecision({ ...answer, clientOperationId: randomUUID() }),
       ).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
       expect(native.inputs).toHaveLength(6)
-      expect(native.decisions).toHaveLength(2)
+      expect(native.decisions).toHaveLength(1)
       expect(
         f.db.drizzle.get(
           sql`SELECT count(*) AS count FROM collaboration_action_receipts WHERE action='repair'`,
@@ -1240,6 +1252,131 @@ describe('Grounded Repair decisions through the existing Conversation owner', ()
           sql`SELECT count(*) AS count FROM collaboration_action_receipts WHERE action='repair'`,
         ),
       ).toEqual({ count: 0 })
+    },
+  )
+
+  it.each(['codex', 'claude'] as const)(
+    'consults and admits a repair at the very first review when Primary is %s',
+    async (primary) => {
+      const f = await fixture(primary)
+      enableRelaySettings(f)
+      native.decisionCandidate = 'propose_repair'
+      native.nextReview = { verdict: 'changes_requested' }
+      expect((await f.flow.send(f.input('/build Preserve the current review scope.'))).ok).toBe(
+        true,
+      )
+      await vi.waitFor(() => {
+        expect(native.inputs).toHaveLength(2)
+        expect(native.decisions).toHaveLength(1)
+      })
+      await f.settled()
+      const repo = f.db.conversationRepository,
+        before = repo.collaboration(f.sessionId)!,
+        card = repo.relaySchedulingDecision(f.sessionId)!
+      expect(before).toMatchObject({
+        stage: 'code_review',
+        status: 'waiting',
+        repairAttempts: 0,
+        reviewCycles: 1,
+      })
+      expect(native.decisions[0]!.candidates.map(({ id }) => id)).toEqual([
+        'propose_supplement_code_response',
+        'propose_repair',
+      ])
+      expect(card.request).toMatchObject({
+        category: 'new_authorization',
+        operation: {
+          kind: 'repair',
+          actor: primary === 'codex' ? 'claude' : 'codex',
+          returnActor: primary,
+          afterRunId: before.runId,
+        },
+      })
+      // The objective records durable progress facts; no synthetic prior review or
+      // owner response is manufactured for a first-review consult.
+      const envelope = JSON.parse(native.decisions[0]!.objective.split('\n').pop()!)
+      expect(envelope.progress).toEqual({
+        discussionRounds: 0,
+        reviewCycles: 1,
+        repairAttempts: 0,
+      })
+      expect(envelope.reviews).toEqual([])
+      expect(envelope.responses).toEqual([])
+      const answer = {
+        reference: {
+          sessionId: f.sessionId,
+          decisionId: card.decisionId,
+          revision: card.revision,
+        },
+        clientOperationId: randomUUID(),
+        answer: { kind: 'confirm' as const },
+      }
+      const accepted = await f.flow.answerRelayDecision(answer)
+      expect(accepted).toMatchObject({ ok: true, value: { disposition: 'confirmed' } })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(4))
+      const completed = await f.settled(),
+        repair = native.inputs[2]!,
+        fixedReview = native.inputs[3]!
+      expect(repair.promptEnvelope.collaboration).toMatchObject({
+        stage: 'repair',
+        actor: primary === 'codex' ? 'claude' : 'codex',
+        reviewScopeRef: before.reviewScopeRef,
+      })
+      expect(repair.promptEnvelope.collaborationAuthorization?.userAuthority).toMatchObject({
+        purpose: 'action',
+      })
+      expect(
+        collaborationReadOnly(
+          repair.promptEnvelope.collaboration,
+          repair.promptEnvelope.collaborationAuthorization,
+        ),
+      ).toBe(false)
+      expect(fixedReview.promptEnvelope.collaboration).toMatchObject({
+        stage: 'code_review',
+        actor: primary,
+      })
+      expect(
+        collaborationReadOnly(
+          fixedReview.promptEnvelope.collaboration,
+          fixedReview.promptEnvelope.collaborationAuthorization,
+        ),
+      ).toBe(true)
+      expect(completed).toMatchObject({ repairAttempts: 1, reviewCycles: 2 })
+      expect(native.decisions).toHaveLength(1)
+      expect(
+        f.db.drizzle.get(
+          sql`SELECT count(*) AS count FROM collaboration_action_receipts WHERE action='repair'`,
+        ),
+      ).toEqual({ count: 1 })
+    },
+  )
+
+  it.each(['codex', 'claude'] as const)(
+    'keeps the waiting task unchanged when the first-review selection is null for %s',
+    async (primary) => {
+      const f = await fixture(primary)
+      enableRelaySettings(f)
+      native.decisionCandidate = null
+      native.nextReview = { verdict: 'changes_requested' }
+      expect((await f.flow.send(f.input('/build Preserve the current review scope.'))).ok).toBe(
+        true,
+      )
+      await vi.waitFor(() => {
+        expect(native.inputs).toHaveLength(2)
+        expect(native.decisions).toHaveLength(1)
+      })
+      const repo = f.db.conversationRepository
+      expect(await f.settled()).toMatchObject({
+        stage: 'code_review',
+        status: 'waiting',
+        repairAttempts: 0,
+        reviewCycles: 1,
+      })
+      expect(repo.relaySchedulingDecision(f.sessionId)).toBeNull()
+      expect(native.inputs).toHaveLength(2)
+      expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM scheduling_evaluations`)).toEqual({
+        count: 1,
+      })
     },
   )
 })
@@ -1928,7 +2065,7 @@ describe('Ordinary input routing through the original Send owner', () => {
         await f.flow.send({
           ...f.input('Original reference'),
           route: { type: 'agent', agentId: 'claude' },
-          routeIntent: 'explicit',
+          routeIntent: 'explicit' as const,
         })
       ).ok,
     ).toBe(true)
@@ -1961,7 +2098,7 @@ describe('Ordinary input routing through the original Send owner', () => {
       ...f.input('Follow up on the complete referenced response.'),
       commentIds: [commentId],
       route: { type: 'primary' },
-      routeIntent: 'implicit',
+      routeIntent: 'implicit' as const,
       composerRevision: 17,
     }
     return { ...f, input, anchor, commentId }
@@ -2345,4 +2482,537 @@ it('prepares a cold plan outside page RPCs and publishes readiness without dispa
     brokenListener()
     unsubscribe()
   }
+})
+
+describe('Initial stage-role assignment through the modern Composer', () => {
+  it.each(['codex', 'claude'] as const)(
+    'assigns roles_claude_claude when Primary is %s without changing Session Primary',
+    async (primary) => {
+      const f = await fixture(primary)
+      enableRelaySettings(f)
+      native.decisionCandidate = 'roles_claude_claude'
+      native.reviews = [{ verdict: 'accepted' }]
+      const roles = {
+        planAuthor: 'claude',
+        planReviewer: 'codex',
+        codeAuthor: 'claude',
+        codeReviewer: 'codex',
+      }
+      expect(
+        (
+          await f.flow.send({
+            ...f.input('/plan Preserve the original cancellation boundary.'),
+            routeIntent: 'implicit' as const,
+            composerRevision: 0,
+          })
+        ).ok,
+      ).toBe(true)
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+      const planTask = await f.settled()
+      await vi.waitFor(() => expect(native.decisions).toHaveLength(2))
+      expect(native.decisions[0]!.handoff.slot).toBe('input_dispatch')
+      expect(native.decisions[0]!.candidates.map((candidate) => candidate.id)).toEqual(
+        initialTaskRoleCandidates('plan', primary).map((candidate) => candidate.id),
+      )
+      expect(native.decisions[1]!.handoff.slot).toBe('workflow_next')
+      expect(native.decisions[1]!.candidates.map((candidate) => candidate.id)).toEqual([
+        'propose_reassign_roles',
+      ])
+      expect(f.db.conversationRepository.relaySchedulingDecision(f.sessionId)).toBeNull()
+      expect(native.inputs.map((input) => input.promptEnvelope.collaboration)).toMatchObject([
+        { stage: 'plan', actor: roles.planAuthor, owner: primary },
+        { stage: 'plan_review', actor: roles.planReviewer },
+      ])
+      for (const input of native.inputs)
+        expect(input.promptEnvelope.collaboration?.stageRoles).toMatchObject(roles)
+      expect(planTask.stageRoles).toMatchObject(roles)
+      expect(f.db.sessionRepository.find(f.sessionId)!.settings.primaryAgentId).toBe(primary)
+      expect(f.db.conversationRepository.relaySchedulingDecision(f.sessionId)).toBeNull()
+      expect(await f.act('execute')).toMatchObject({
+        stage: 'code_review',
+        status: 'complete',
+      })
+      expect(native.inputs).toHaveLength(4)
+      expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.actor)).toEqual([
+        roles.planAuthor,
+        roles.planReviewer,
+        roles.codeAuthor,
+        roles.codeReviewer,
+      ])
+      expect(native.decisions).toHaveLength(2)
+    },
+  )
+
+  it('runs the default assignment for a send without modern Composer metadata', async () => {
+    const f = await fixture('codex')
+    enableRelaySettings(f)
+    native.reviews = [{ verdict: 'accepted' }]
+    expect((await f.flow.send(f.input('/plan Keep the frozen default.'))).ok).toBe(true)
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+    const task = await f.settled()
+    await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
+    expect(native.decisions[0]!.handoff.slot).toBe('workflow_next')
+    expect(native.decisions[0]!.candidates.map((candidate) => candidate.id)).toEqual([
+      'propose_reassign_roles',
+    ])
+    expect(f.db.conversationRepository.relaySchedulingDecision(f.sessionId)).toBeNull()
+    expect(task.stageRoles).toMatchObject({
+      planAuthor: 'codex',
+      planReviewer: 'claude',
+      codeAuthor: 'claude',
+      codeReviewer: 'codex',
+    })
+    expect(native.inputs[0]!.promptEnvelope.collaboration?.actor).toBe('codex')
+  })
+})
+
+describe('Initial role assignment boundaries', () => {
+  it('assigns roles_codex_codex for /build through implement and review with exact write authority', async () => {
+    const f = await fixture('codex')
+    enableRelaySettings(f)
+    native.decisionCandidate = 'roles_codex_codex'
+    const input = {
+      ...f.input('/build Keep the original write authority.'),
+      routeIntent: 'implicit' as const,
+      composerRevision: 0,
+    }
+    expect((await f.flow.send(input)).ok).toBe(true)
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+    const task = await f.settled()
+    expect(
+      native.inputs.map((x) => ({
+        stage: x.promptEnvelope.collaboration?.stage,
+        actor: x.promptEnvelope.collaboration?.actor,
+      })),
+    ).toEqual([
+      { stage: 'implement', actor: 'codex' },
+      { stage: 'code_review', actor: 'claude' },
+    ])
+    expect(task).toMatchObject({ status: 'complete', stage: 'code_review' })
+    expect(native.inputs[0]!.promptEnvelope.message.content).toBe(input.content)
+    expect(native.decisions).toHaveLength(1)
+    expect(native.decisions[0]!.handoff.slot).toBe('input_dispatch')
+    const runs = f.db.conversationRepository.read(f.sessionId).runs
+    const writeAuth = f.db.conversationRepository.collaborationTurnAuthorization(runs[0]!.id)!
+    const reviewAuth = f.db.conversationRepository.collaborationTurnAuthorization(runs[1]!.id)!
+    expect(collaborationReadOnly(task, writeAuth)).toBe(false)
+    expect(collaborationReadOnly(task, reviewAuth)).toBe(true)
+    expect(writeAuth.stageRoles).toEqual(task.stageRoles)
+    expect(reviewAuth.stageRoles).toEqual(task.stageRoles)
+    expect(writeAuth.userAuthority?.purpose).toBe('action')
+    const receipts = f.db.drizzle.select().from(collaborationActionReceipts).all()
+    expect(receipts).toHaveLength(1)
+    expect(receipts[0]).toMatchObject({ action: 'build', actor: 'codex', boundRunId: runs[0]!.id })
+    expect(JSON.parse(receipts[0]!.basisJson).stageRoles).toEqual(task.stageRoles)
+    expect(f.db.sessionRepository.find(f.sessionId)!.settings.primaryAgentId).toBe('codex')
+  })
+
+  it('assigns roles_codex_codex for /review as a read-only turn then repairs as code author', async () => {
+    const f = await fixture('codex')
+    enableRelaySettings(f)
+    native.decisionStarted = (decision) => {
+      native.decisionCandidate =
+        decision.handoff.slot === 'input_dispatch' ? 'roles_codex_codex' : null
+    }
+    native.reviews = [{ verdict: 'changes_requested' }, { verdict: 'accepted' }]
+    expect(
+      (
+        await f.flow.send({
+          ...f.input('/review Keep the original write authority.'),
+          routeIntent: 'implicit' as const,
+          composerRevision: 0,
+        })
+      ).ok,
+    ).toBe(true)
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+    const waiting = await f.settled()
+    expect(waiting).toMatchObject({
+      stage: 'code_review',
+      status: 'waiting',
+      actor: 'claude',
+      review: { verdict: 'changes_requested' },
+    })
+    const firstRun = f.db.conversationRepository.read(f.sessionId).runs[0]!
+    const reviewAuth = f.db.conversationRepository.collaborationTurnAuthorization(firstRun.id)!
+    expect(collaborationReadOnly(waiting, reviewAuth)).toBe(true)
+    expect(reviewAuth.userAuthority).toBeUndefined()
+    expect(f.db.drizzle.select().from(collaborationActionReceipts).all()).toHaveLength(0)
+    expect(f.db.conversationRepository.relaySchedulingDecision(f.sessionId)).toBeNull()
+    const repaired = await f.act('repair')
+    expect(repaired).toMatchObject({ stage: 'code_review', status: 'complete' })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+    const task = await f.settled()
+    expect(
+      native.inputs.map((x) => ({
+        stage: x.promptEnvelope.collaboration?.stage,
+        actor: x.promptEnvelope.collaboration?.actor,
+      })),
+    ).toEqual([
+      { stage: 'code_review', actor: 'claude' },
+      { stage: 'repair', actor: 'codex' },
+      { stage: 'code_review', actor: 'claude' },
+    ])
+    const runs = f.db.conversationRepository.read(f.sessionId).runs
+    const repairAuth = f.db.conversationRepository.collaborationTurnAuthorization(runs[1]!.id)!
+    expect(collaborationReadOnly(task, repairAuth)).toBe(false)
+    expect(repairAuth.userAuthority?.purpose).toBe('action')
+    const receipts = f.db.drizzle.select().from(collaborationActionReceipts).all()
+    expect(receipts).toHaveLength(1)
+    expect(receipts[0]).toMatchObject({ action: 'repair', actor: 'codex', boundRunId: runs[1]!.id })
+    // The initial-role consult is the only input_dispatch evaluation; workflow consults return null.
+    expect(native.decisions.filter((d) => d.handoff.slot === 'input_dispatch')).toHaveLength(1)
+    expect(task.stageRoles).toMatchObject({
+      planAuthor: 'codex',
+      planReviewer: 'claude',
+      codeAuthor: 'codex',
+      codeReviewer: 'claude',
+    })
+    expect(f.db.sessionRepository.find(f.sessionId)!.settings.primaryAgentId).toBe('codex')
+  })
+
+  it.each([null, 'unsupported_role_id'] as const)(
+    'keeps the default map for selection %s and starts the original command once',
+    async (candidate) => {
+      const f = await fixture('codex')
+      enableRelaySettings(f)
+      native.decisionCandidate = candidate
+      native.reviews = [{ verdict: 'accepted' }]
+      expect(
+        (
+          await f.flow.send({
+            ...f.input('/plan Keep the default assignment.'),
+            routeIntent: 'implicit' as const,
+            composerRevision: 0,
+          })
+        ).ok,
+      ).toBe(true)
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+      const task = await f.settled()
+      // The distinct plan_ready handoff remains eligible after abstention or invalid output.
+      expect(native.decisions).toHaveLength(2)
+      expect(new Set(native.decisions.map((input) => input.handoff.id)).size).toBe(2)
+      expect(
+        native.decisions.filter((input) => input.candidates[0]?.id === 'propose_reassign_roles'),
+      ).toHaveLength(1)
+      expect(f.db.conversationRepository.relaySchedulingDecision(f.sessionId)).toBeNull()
+      expect(task.stageRoles).toMatchObject({
+        planAuthor: 'codex',
+        planReviewer: 'claude',
+        codeAuthor: 'claude',
+        codeReviewer: 'codex',
+      })
+      expect(native.inputs[0]!.promptEnvelope.collaboration?.actor).toBe('codex')
+      expect(f.db.conversationRepository.relaySchedulingDecision(f.sessionId)).toBeNull()
+    },
+  )
+
+  it('keeps the default map when the decision fails', async () => {
+    const f = await fixture('codex')
+    enableRelaySettings(f)
+    native.decisionFailure = 'timeout'
+    native.reviews = [{ verdict: 'accepted' }]
+    expect(
+      (
+        await f.flow.send({
+          ...f.input('/plan Keep the default assignment.'),
+          routeIntent: 'implicit' as const,
+          composerRevision: 0,
+        })
+      ).ok,
+    ).toBe(true)
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+    const task = await f.settled()
+    expect(task.stageRoles).toMatchObject({ planAuthor: 'codex', planReviewer: 'claude' })
+    expect(native.decisions).toHaveLength(2)
+    expect(new Set(native.decisions.map((input) => input.handoff.id)).size).toBe(2)
+  })
+
+  it.each(['agent', 'all'] as const)(
+    'skips role consult for explicit %s recipients',
+    async (routeType) => {
+      const f = await fixture('codex')
+      enableRelaySettings(f)
+      native.reviews = [{ verdict: 'accepted' }]
+      const route =
+        routeType === 'agent'
+          ? { type: 'agent' as const, agentId: 'codex' as const }
+          : {
+              type: 'all' as const,
+              firstAgentId: 'codex' as const,
+              secondAgentId: 'claude' as const,
+            }
+      const result = await f.flow.send({
+        ...f.input('/plan Keep the explicit recipient.'),
+        route,
+        routeIntent: 'explicit' as const,
+      })
+      expect(result.ok).toBe(routeType === 'agent')
+      expect(native.decisions).toEqual([])
+    },
+  )
+
+  it('stops before the first Run without creating a task or dispatching native input', async () => {
+    const f = await fixture('codex')
+    enableRelaySettings(f)
+    const hold = Promise.withResolvers<void>()
+    native.decisionHold = hold.promise
+    const input = {
+      ...f.input('/plan Stop before the task exists.'),
+      routeIntent: 'implicit' as const,
+      composerRevision: 0,
+    }
+    const pending = f.flow.send(input)
+    await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
+    expect(native.inputs).toEqual([])
+    expect(f.db.conversationRepository.collaboration(f.sessionId)).toBeUndefined()
+    const stopped = f.flow.stop({ sessionId: f.sessionId })
+    expect(stopped.ok).toBe(true)
+    hold.resolve()
+    const result = await pending
+    expect(result.ok).toBe(false)
+    expect(native.inputs).toEqual([])
+    expect(f.db.conversationRepository.collaboration(f.sessionId)).toBeUndefined()
+    const retry = await f.flow.send(input)
+    expect(retry.ok).toBe(false)
+  })
+})
+
+describe('Initial role staleness and mutation boundaries', () => {
+  it('falls back to the default map when durable config changes after selection', async () => {
+    const f = await fixture('claude'),
+      repo = f.db.conversationRepository
+    enableRelaySettings(f)
+    native.decisionCandidate = 'roles_claude_claude'
+    native.reviews = [{ verdict: 'accepted' }]
+    const readRoles = repo.preparedInitialTaskRoles.bind(repo)
+    vi.spyOn(repo, 'preparedInitialTaskRoles').mockImplementationOnce((...args) => {
+      const value = readRoles(...args)
+      const settings = repo.schedulingSettings()
+      repo.saveSchedulingSettings({ expectedRevision: settings.revision, enabled: false })
+      return value
+    })
+    expect(
+      (
+        await f.flow.send({
+          ...f.input('/plan Keep the exact original scope.'),
+          routeIntent: 'implicit' as const,
+          composerRevision: 0,
+        })
+      ).ok,
+    ).toBe(true)
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+    const task = await f.settled()
+    // The disabled Relay invalidates the prepared receipt; the default map still runs once.
+    expect(task.stageRoles).toMatchObject({
+      planAuthor: 'claude',
+      planReviewer: 'codex',
+      codeAuthor: 'codex',
+      codeReviewer: 'claude',
+    })
+    expect(native.decisions).toHaveLength(1)
+    expect(native.inputs[0]!.promptEnvelope.collaboration?.actor).toBe('claude')
+  })
+
+  it('refuses a task whose future roles mutated while its first actor stayed the same', async () => {
+    const f = await fixture('codex'),
+      repo = f.db.conversationRepository
+    enableRelaySettings(f)
+    native.decisionCandidate = 'roles_claude_claude'
+    native.reviews = [{ verdict: 'accepted' }]
+    expect(
+      (
+        await f.flow.send({
+          ...f.input('/plan Preserve the map.'),
+          routeIntent: 'implicit' as const,
+          composerRevision: 0,
+        })
+      ).ok,
+    ).toBe(true)
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+    const task = await f.settled()
+    expect(task.stageRoles).toMatchObject({ planAuthor: 'claude', codeAuthor: 'claude' })
+    // Intercept the real continuation beginRun and inject a mutated plan pair; the code pair
+    // and first actor stay identical, so only the stageRoles guard can refuse it.
+    const begin = repo.beginRun.bind(repo)
+    vi.spyOn(repo, 'beginRun').mockImplementationOnce((input) => {
+      if (!input.collaboration) throw Error('Expected real collaboration continuation.')
+      return begin({
+        ...input,
+        collaboration: {
+          ...input.collaboration,
+          stageRoles: {
+            ...input.collaboration.stageRoles!,
+            planAuthor: 'codex',
+            planReviewer: 'claude',
+          },
+        },
+      })
+    })
+    const before = repo.collaboration(f.sessionId)!
+    const result = await f.flow.actOnCollaboration({
+      sessionId: f.sessionId,
+      taskId: before.id,
+      revision: before.revision,
+      clientMessageId: randomUUID(),
+      action: 'execute',
+    })
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: 'CONFLICT',
+        message: 'The collaboration changed before this Turn was admitted.',
+      },
+    })
+    expect(native.inputs).toHaveLength(2)
+    expect(repo.collaboration(f.sessionId)!.stageRoles).toEqual(before.stageRoles)
+  })
+})
+
+describe('Future code-role change through the real Conversation owner', () => {
+  it('proposes, confirms and starts implementation with the new code pair', async () => {
+    const f = await fixture('codex')
+    enableRelaySettings(f)
+    native.decisionCandidate = 'propose_reassign_roles'
+    native.reviews = [{ verdict: 'accepted' }]
+    expect((await f.flow.send(f.input('/plan Preserve the accepted scope.'))).ok).toBe(true)
+    const repo = f.db.conversationRepository
+    await vi.waitFor(() =>
+      expect(repo.relaySchedulingDecision(f.sessionId)?.request).toMatchObject({
+        category: 'arrangement_change',
+        operation: { kind: 'reassign_roles' },
+      }),
+    )
+    const before = repo.collaboration(f.sessionId)!
+    const card = repo.relaySchedulingDecision(f.sessionId)!
+    const result = await f.flow.answerRelayDecision({
+      reference: { sessionId: f.sessionId, decisionId: card.decisionId, revision: card.revision },
+      clientOperationId: randomUUID(),
+      answer: { kind: 'confirm' },
+    })
+    expect(result).toMatchObject({
+      ok: true,
+      value: { disposition: 'confirmed', runId: null, rebuildId: null },
+    })
+    expect(native.inputs).toHaveLength(2)
+    const task = repo.collaboration(f.sessionId)!
+    expect(task.stageRoles).toMatchObject({
+      planAuthor: 'codex',
+      planReviewer: 'claude',
+      codeAuthor: 'codex',
+      codeReviewer: 'claude',
+      revision: 1,
+    })
+    expect(task.revision).toBe(before.revision + 1)
+    // Confirmation created no Run and no action receipt.
+    expect(repo.read(f.sessionId).runs).toHaveLength(2)
+    expect(f.db.drizzle.select().from(collaborationActionReceipts).all()).toHaveLength(0)
+    // Explicit Implement plan uses the confirmed map.
+    native.decisionCandidate = null
+    await f.act('execute')
+    const executed = repo.read(f.sessionId).runs
+    expect(executed.length).toBe(4)
+    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.actor)).toEqual([
+      'codex',
+      'claude',
+      'codex',
+      'claude',
+    ])
+    const implementRun = repo.read(f.sessionId).runs[2]!
+    expect(implementRun.agentId).toBe('codex')
+    const reviewRun = repo.read(f.sessionId).runs[3]!
+    expect(reviewRun.agentId).toBe('claude')
+  })
+
+  it('cancellation preserves the whole ready task and uses the original code pair', async () => {
+    const f = await fixture('codex')
+    enableRelaySettings(f)
+    native.decisionCandidate = 'propose_reassign_roles'
+    native.reviews = [{ verdict: 'accepted' }]
+    expect((await f.flow.send(f.input('/plan Preserve the accepted scope.'))).ok).toBe(true)
+    const repo = f.db.conversationRepository
+    await vi.waitFor(() => expect(repo.relaySchedulingDecision(f.sessionId)).not.toBeNull())
+    const before = repo.collaboration(f.sessionId)!
+    const card = repo.relaySchedulingDecision(f.sessionId)!
+    const result = await f.flow.answerRelayDecision({
+      reference: { sessionId: f.sessionId, decisionId: card.decisionId, revision: card.revision },
+      clientOperationId: randomUUID(),
+      answer: { kind: 'cancel' },
+    })
+    expect(result).toMatchObject({ ok: true, value: { disposition: 'cancelled', runId: null } })
+    expect(repo.collaboration(f.sessionId)).toEqual(before)
+    native.decisionCandidate = null
+    await f.act('execute')
+    const runs = repo.read(f.sessionId).runs
+    expect(runs.length).toBe(4)
+    expect(runs[2]!.agentId).toBe('claude')
+    expect(runs[3]!.agentId).toBe('codex')
+  })
+
+  it.each([null, 'invalid_output', 'timeout'] as const)(
+    'a %s role selection leaves the ready task and produces no card',
+    async (failure) => {
+      const f = await fixture('codex')
+      enableRelaySettings(f)
+      if (failure === null) native.decisionCandidate = null
+      else native.decisionFailure = failure === 'timeout' ? 'timeout' : 'invalid_output'
+      native.reviews = [{ verdict: 'accepted' }]
+      expect((await f.flow.send(f.input('/plan Preserve the accepted scope.'))).ok).toBe(true)
+      const repo = f.db.conversationRepository
+      await f.settled()
+      await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
+      expect(native.decisions[0]!.candidates.map((candidate) => candidate.id)).toEqual([
+        'propose_reassign_roles',
+      ])
+      await vi.waitFor(() =>
+        expect(
+          f.db.drizzle.all<{ active: number }>(sql`SELECT active FROM scheduling_evaluations`),
+        ).toEqual([{ active: 0 }]),
+      )
+      expect(repo.relaySchedulingDecision(f.sessionId)).toBeNull()
+      expect(repo.collaboration(f.sessionId)!.status).toBe('ready')
+      expect(repo.read(f.sessionId).runs).toHaveLength(2)
+    },
+  )
+
+  it.each(['stop', 'disable'] as const)(
+    'a held role consultation cannot resurrect a card after %s',
+    async (cancellation) => {
+      const f = await fixture('codex')
+      enableRelaySettings(f)
+      native.decisionCandidate = 'propose_reassign_roles'
+      const hold = Promise.withResolvers<void>()
+      native.decisionHold = hold.promise
+      native.reviews = [{ verdict: 'accepted' }]
+      const sent = await f.flow.send(f.input('/plan Preserve the accepted scope.'))
+      expect(sent.ok).toBe(true)
+      const repo = f.db.conversationRepository
+      await vi.waitFor(() =>
+        expect(
+          native.decisions.some((input) => input.candidates[0]?.id === 'propose_reassign_roles'),
+        ).toBe(true),
+      )
+      const before = repo.collaboration(f.sessionId)!
+      const runsBefore = repo.read(f.sessionId).runs.length
+      const cancelled =
+        cancellation === 'stop'
+          ? f.flow.stop({ sessionId: f.sessionId })
+          : await f.flow.saveSchedulingSettings({
+              expectedRevision: repo.schedulingSettings().revision,
+              enabled: false,
+            })
+      expect(cancelled).toMatchObject({ ok: true })
+      hold.resolve()
+      await vi.waitFor(() => expect(repo.relaySchedulingDecision(f.sessionId)).toBeNull())
+      await vi.waitFor(() =>
+        expect(
+          f.db.drizzle
+            .all<{ active: number }>(sql`SELECT active FROM scheduling_evaluations`)
+            .every((row) => row.active === 0),
+        ).toBe(true),
+      )
+      expect(repo.relaySchedulingDecision(f.sessionId)).toBeNull()
+      expect(repo.collaboration(f.sessionId)!.stageRoles).toEqual(before.stageRoles)
+      expect(repo.read(f.sessionId).runs).toHaveLength(runsBefore)
+    },
+  )
 })

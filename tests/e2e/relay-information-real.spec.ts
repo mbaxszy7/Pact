@@ -7,10 +7,10 @@ import type {
   ConversationSendInput,
   DesktopBridge,
   RelaySchedulingDecision,
-  SchedulingModelSelection,
 } from '../../packages/contracts/src/index.js'
 
 import {
+  OPENAI_DECISION_MODEL,
   preparedInformationControlSchema,
   collaborationDocumentSchema,
   relaySchedulingDecisionProofSchema,
@@ -27,6 +27,7 @@ import {
 } from './real-harness.js'
 import { findNativeSourceRecord } from './real-native-evidence.js'
 import { releaseNoteBusinessOutcome } from './relay-information-outcome.js'
+import { createRealRelayFixture } from './relay-real-credential.js'
 import { retainRoutingNativeSourceEvidence } from './relay-routing-native-source-evidence.js'
 import {
   emitRoutingEvidence,
@@ -35,7 +36,7 @@ import {
   routingUsageCounts,
   retainSourceReadFailureDiagnostics,
 } from './relay-routing-real-observation.js'
-import { createRuntimeFixture, test } from './runtime-fixture.js'
+import { test } from './runtime-fixture.js'
 import { sourceReadFailureScript } from './source-read-failure-diagnostics.js'
 
 const digest = (text: string) => createHash('sha256').update(text).digest('hex')
@@ -44,7 +45,7 @@ const source =
 const comment =
   'Keep this complete agreed scope and the source context. Do not invent or expand requirements.'
 const readSources =
-  'First read the complete current inputBatchRef and every attached Comment body through the Pact read_collaboration_source reader, using the current sourceGrant and copying sourceReadArguments without changing its identities. Read clarificationAnswer completely when supplied. Use only that source reader; do not use other tools, delegate, inspect or change files, change permissions, or start a workflow.'
+  'Read clarificationAnswer completely when supplied before deciding that the date is missing. If the date is missing, you may ask the brief date question directly without reading the drafting sources. Before drafting the release note, read the complete current inputBatchRef, any supplied user declaration, and every attached Comment body through the Pact read_collaboration_source reader, using the current sourceGrant and copying sourceReadArguments without changing its identities. Use only that source reader when a tool is needed; do not use other tools, delegate, inspect or change files, change permissions, or start a workflow.'
 const positive = `I reserve the launch date choice for myself: I will supply the launch date before you draft the release note. Ask me for that user-supplied value before drafting. If no date has been supplied, ask one brief question in ordinary text and end the turn. After I supply the date, write one short release note using that exact date and the attached agreed scope. ${readSources}`
 const negative = `The launch date is already supplied by me: 2027-04-12. Write one short release note using that date and the complete attached agreed scope. An Agent disagreement about wording is a technical judgment you can resolve within this read-only request; it is not a missing user decision. ${readSources}`
 const migrationsFolder = resolve(import.meta.dirname, '../../packages/persistence/drizzle')
@@ -467,14 +468,19 @@ async function businessEvidence(
       answerSha256: digest(response.content),
       ...businessOutcome,
     })
+    let sourceVerified = Boolean(
+      access.sourceGrantMatched &&
+      access.completeBatch &&
+      access.completeBatchBody &&
+      access.batchBodySha256 === digest(input.content) &&
+      access.completeComment &&
+      (!declarationExpected || access.completeDeclaredInformation) &&
+      (!answered || (access.completeAnswer && access.answerSha256 === answer!.sha256)),
+    )
     if (
       !access.allToolsAllowed ||
-      !access.sourceGrantMatched ||
-      !access.completeBatch ||
-      !access.completeBatchBody ||
-      !access.completeComment ||
-      (declarationExpected && !access.completeDeclaredInformation) ||
-      (answered && !access.completeAnswer)
+      (access.sourceToolCalls > 0 && !access.sourceGrantMatched) ||
+      (!missingDate && !sourceVerified)
     ) {
       await emitRoutingEvidence(
         test.info(),
@@ -519,20 +525,35 @@ async function businessEvidence(
     }
     if (expectedBatchId) expect(batch.id).toBe(expectedBatchId)
     expect(answer !== undefined).toBe(answered)
-    expect(access).toMatchObject({
-      allToolsAllowed: true,
-      sourceGrantMatched: true,
-      completeBatch: true,
-      completeBatchBody: true,
-      batchBodySha256: digest(input.content),
-      completeComment: true,
-      ...(declarationExpected ? { completeDeclaredInformation: true } : {}),
-      ...(answered ? { completeAnswer: true, answerSha256: answer!.sha256 } : {}),
-    })
+    expect(access.allToolsAllowed).toBe(true)
+    if (access.sourceToolCalls > 0) expect(access.sourceGrantMatched).toBe(true)
+    if (!missingDate)
+      expect(access).toMatchObject({
+        sourceGrantMatched: true,
+        completeBatch: true,
+        completeBatchBody: true,
+        batchBodySha256: digest(input.content),
+        completeComment: true,
+        ...(declarationExpected ? { completeDeclaredInformation: true } : {}),
+        ...(answered ? { completeAnswer: true, answerSha256: answer!.sha256 } : {}),
+      })
+    if (missingDate && access.genericToolCallCount === 0) {
+      // These question arms use Codex. Tool absence needs its complete matching native
+      // answer, not merely a prefix containing the user input and no observed calls.
+      expect(run.agentId).toBe('codex')
+      const parity = pendingNative.answerParity({
+        nativeSessionId: run.nativeSessionId!,
+        nativeTurnId: run.nativeTurnId!,
+        text: response.content,
+        markers: [],
+      })
+      await emitRoutingEvidence(test.info(), `information-${arm}-no-tool-answer`, parity)
+      expect(parity).toMatchObject({ completeProjection: true, exactMatch: true })
+    }
     const native = pendingNative.certifySourceAudit(access)
     expect(run.agentId === 'codex' ? native.codexModelStarts : native.claudeUserInputs).toBe(1)
     expect(native.containsText(input.content)).toBe(true)
-    expect(native.containsText(comment)).toBe(true)
+    if (!missingDate) expect(native.containsText(comment)).toBe(true)
     expect(extraComments.length).toBeLessThanOrEqual(1)
     for (const extra of extraComments) {
       const extraAccess = await retainRoutingNativeSourceEvidence(
@@ -549,14 +570,23 @@ async function businessEvidence(
         (receipt) =>
           emitRoutingEvidence(test.info(), `information-current-comment-${arm}`, receipt),
       )
-      expect(extraAccess).toMatchObject({
-        allToolsAllowed: true,
-        sourceGrantMatched: true,
-        completeBatch: true,
-        completeBatchBody: true,
-        completeComment: true,
-      })
-      expect(native.containsText(extra.body)).toBe(true)
+      expect(extraAccess.allToolsAllowed).toBe(true)
+      if (extraAccess.sourceToolCalls > 0) expect(extraAccess.sourceGrantMatched).toBe(true)
+      sourceVerified =
+        sourceVerified &&
+        extraAccess.sourceGrantMatched &&
+        extraAccess.completeBatch &&
+        extraAccess.completeBatchBody &&
+        extraAccess.completeComment
+      if (!missingDate) {
+        expect(extraAccess).toMatchObject({
+          sourceGrantMatched: true,
+          completeBatch: true,
+          completeBatchBody: true,
+          completeComment: true,
+        })
+        expect(native.containsText(extra.body)).toBe(true)
+      }
     }
     expect(native.shellCommands).toEqual([])
     expect(native.execScripts.map((script) => digest(script.input))).toEqual(
@@ -627,6 +657,8 @@ async function businessEvidence(
         : 'Use the supplied date in the requested release note; ask no further question.',
       businessOutcome,
       sourceAccess: access,
+      sourceRequirement: missingDate ? 'optional_for_question' : 'complete_before_drafting',
+      sourceVerified,
     }
   } finally {
     db.close()
@@ -649,7 +681,8 @@ async function emitArm(
     model: evidence.model,
     answerSha256: evidence.answerSha256,
     answerChars: evidence.answerChars,
-    sourceVerified: true,
+    sourceRequirement: evidence.sourceRequirement,
+    sourceVerified: evidence.sourceVerified,
   }
 }
 
@@ -659,17 +692,13 @@ async function runInformationScenario(
   info: TestInfo,
   confirmedOnly = false,
 ) {
-  const fixture = await createRuntimeFixture({ mode: 'real' })
+  const fixture = await createRealRelayFixture()
   let ctx: RealWorkspace | undefined
   try {
     const claudeModel = fixture.readConfigurationModels().claude
     if (!claudeModel || !/^claude-haiku-5-5(?:-\d{8})?$/u.test(claudeModel))
       throw Error('An exact configured Haiku 5.5 model is required.')
-    const selection: SchedulingModelSelection =
-        target === 'codex_luna'
-          ? { target, provider: 'codex', modelId: 'gpt-6-luna' }
-          : { target, provider: 'claude', modelId: claudeModel },
-      db = await PactDatabase.open({ filePath: fixture.databaseFile, migrationsFolder })
+    const db = await PactDatabase.open({ filePath: fixture.databaseFile, migrationsFolder })
     const fixtures: Seed[] = []
     try {
       for (const label of ['Off', 'Cancel', 'Answer', 'Already answered'])
@@ -685,9 +714,8 @@ async function runInformationScenario(
           ),
         )
       db.conversationRepository.saveSchedulingSettings({
-        expectedRevision: 0,
+        expectedRevision: db.conversationRepository.schedulingSettings().revision,
         enabled: false,
-        selection,
       })
       db.drizzle.delete(nativeAgentContexts).run()
     } finally {
@@ -705,8 +733,9 @@ async function runInformationScenario(
       projectDirectory: off.projectDirectory,
     }
     await emitRoutingEvidence(info, 'information-preregistered', {
-      version: 1,
-      target,
+      version: 2,
+      acceptanceContract: 'information-business-phases-v2',
+      baselineCase: target,
       businessAgent,
       scenarioArms: confirmedOnly
         ? ['answer', 'already-answered']
@@ -718,7 +747,7 @@ async function runInformationScenario(
       sourceSha256: digest(source),
       retries: 0,
       declarationPrerequisite:
-        'Actual typed user declaration sent through DesktopBridge; no inference from text. Dispatched declarations require their own authenticated complete native read. The approved Cancel fresh Send withdraws the old declaration and must have no declaration document; all other arms still require one. Original natural task, models, permissions, deadlines and other source assertions remain.',
+        'Actual typed user declaration sent through DesktopBridge; no inference from text. The approved Cancel fresh Send withdraws the old declaration and must have no declaration document; all other arms still require one. Complete authenticated drafting-source reads are required before writing. A missing-date question may omit drafting-source reads; every observed tool remains audited, and a zero-tool question requires a complete matching native answer. Unread sources are never reported as verified. The release-note objective, models, permissions, deadlines and other lifecycle obligations remain.',
       expected: {
         offCalls: 0,
         positiveCallsEach: 1,
@@ -729,9 +758,9 @@ async function runInformationScenario(
         questionCriterion:
           'Ask only for the launch date explicitly reserved by the current user; no technical, permission, scope, model or Agent question.',
         offAndCancelCriterion:
-          'The actual native answer asks for the missing date without inventing a date or drafting the note.',
+          'The actual native answer asks for the missing date without inventing a date or drafting the note. Drafting-source consumption is optional; any actual read must remain authorized and any zero-tool observation must be complete.',
         answerAndNegativeCriterion:
-          'The actual native answer uses 2027-04-12 to complete the requested release note without another question.',
+          'The actual native answer uses 2027-04-12 to complete the requested release note without another question, with complete authenticated Batch, body, Comment, declaration and applicable answer reads.',
       },
     })
     const observations: Awaited<ReturnType<typeof emitArm>>[] = []
@@ -751,14 +780,22 @@ async function runInformationScenario(
         enabled: true,
       })
     })
-    expect(enabled).toMatchObject({ ok: true, value: { enabled: true, selection } })
+    expect(enabled).toMatchObject({
+      ok: true,
+      value: {
+        enabled: true,
+        provider: 'openai',
+        model: OPENAI_DECISION_MODEL,
+        credential: { configured: true },
+      },
+    })
     for (const [index, answered] of [
       [1, false],
       [2, true],
     ] as const) {
       if (confirmedOnly && !answered) continue
       const item = fixtures[index]!
-      const observation = await routingSchedulingObservation(page, item.sessionId, true),
+      const observation = await routingSchedulingObservation(page, item.sessionId),
         started = await send(ctx, item, positive)
       await retainInformationAdmissionEvidence(
         ctx,
@@ -986,8 +1023,9 @@ async function runInformationScenario(
           called: true,
           active: false,
           outcome: 'completed',
-          provider: selection.provider,
-          model: selection.modelId,
+          remoteOutcome: 'responded',
+          provider: 'openai',
+          model: OPENAI_DECISION_MODEL,
         })
         const owner = observer.drizzle.query.schedulingRuntimeOwners
           .findFirst({
@@ -1004,8 +1042,8 @@ async function runInformationScenario(
         observer.drizzle.query.collaborationActionReceipts.findMany({ limit: 1 }).sync(),
       ).toEqual([])
       await emitRoutingEvidence(info, 'information-complete', {
-        target,
-        selection,
+        baselineCase: target,
+        decisionBackend: { provider: 'openai', model: OPENAI_DECISION_MODEL },
         evaluations: evaluations.map((values) =>
           values.map((value) => ({
             called: value.called,
@@ -1035,6 +1073,7 @@ async function runInformationScenario(
   }
 }
 
+// Preserve reviewed case identities; both cases now use OpenAI Decisions exclusively.
 for (const target of ['codex_luna', 'claude_haiku_5_5'] as const)
   test(
     `real Relay ${target} preserves necessary information through Cancel and a fresh Send without inventing user questions`,
@@ -1042,7 +1081,7 @@ for (const target of ['codex_luna', 'claude_haiku_5_5'] as const)
     async ({ browserName: _browserName }, info) => {
       test.skip(
         process.platform !== 'darwin',
-        'Production decision containment is currently verified on macOS.',
+        'This real native collaboration journey is verified on macOS.',
       )
       test.setTimeout(480_000)
       await runInformationScenario(target, 'codex', info)
@@ -1055,7 +1094,7 @@ test(
   async ({ browserName: _browserName }, info) => {
     test.skip(
       process.platform !== 'darwin',
-      'Production decision containment is currently verified on macOS.',
+      'This real native collaboration journey is verified on macOS.',
     )
     test.setTimeout(480_000)
     await runInformationScenario('claude_haiku_5_5', 'claude', info, true)

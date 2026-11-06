@@ -1,14 +1,17 @@
 import { expect, type Page } from '@playwright/test'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
+import { RELAY_CIPHERTEXT_BYTES } from '../../packages/contracts/src/relay-credential.js'
 import { syncEvaluationActivity } from '../../packages/persistence/src/conversation-scheduling-activity.js'
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import {
+  relayCredentials,
   schedulingEvaluations,
   schedulingHandoffs,
 } from '../../packages/persistence/src/schema/index.js'
@@ -17,6 +20,16 @@ import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import { createRuntimeFixture, test, type RuntimeFixture } from './runtime-fixture.js'
 
 const migrationsFolder = resolve(import.meta.dirname, '../../packages/persistence/drizzle')
+const requireFromPersistence = createRequire(
+  resolve(import.meta.dirname, '../../packages/persistence/package.json'),
+)
+// Module resolution cannot see the package types; the owner-bounded query fixes its operands.
+const drizzleOperators: {
+  and: (...operands: any[]) => any
+  eq: (column: any, value: any) => any
+  sql: (strings: TemplateStringsArray, ...params: any[]) => any
+} = requireFromPersistence('drizzle-orm')
+const { and, eq, sql } = drizzleOperators
 const source = 'The typed IPC boundary keeps the Renderer isolated from privileged code.'
 async function seed(fixture: RuntimeFixture, activity = 0) {
   const directory = await fixture.createProjectDirectory('relay'),
@@ -149,6 +162,7 @@ test(
       await writeFile(skillPath, '# Check\n\nOwned review Skill source.\n')
       const fixture = await createRuntimeFixture({
         mode: 'deterministic',
+        nativeCredentialStore: true,
         codexAppServer: 'complete',
         codexModels: [{ id: 'gpt-6-luna', displayName: 'GPT-6 Luna' }],
         codexSkills: [
@@ -234,67 +248,68 @@ test(
       await toggle.focus()
       await page.keyboard.press('Space')
       await expect(toggle).toHaveAttribute('aria-checked', 'true')
-      const luna = page.getByRole('radio', { name: 'GPT-6 Luna · Codex', exact: true })
-      await expect(luna).toBeEnabled()
-      await page.getByText('GPT-6 Luna · Codex', { exact: true }).click()
-      await expect(luna).toBeChecked()
+      await expect(page.getByRole('heading', { name: 'Decisions API', exact: true })).toBeVisible()
+      await expect(page.getByRole('radiogroup', { name: 'Model' })).toHaveCount(0)
       await expect
         .poll(() => settings(page))
         .toMatchObject({
           ok: true,
-          value: { enabled: true, selection: { modelId: 'gpt-6-luna' } },
+          value: {
+            enabled: true,
+            provider: 'openai',
+            credential: { configured: false, revision: 0 },
+          },
         })
-      await expect(
-        page.getByRole('radio', { name: 'Haiku 5.5 · Claude Code', exact: true }),
-      ).toBeDisabled()
+      const key = page.getByLabel('OpenAI API key', { exact: true })
+      await expect(key).toHaveAttribute('type', 'password')
+      await expect(page.getByRole('button', { name: 'Save key', exact: true })).toBeDisabled()
+      await expect(page.getByLabel('OpenAI API key', { exact: true })).not.toHaveAttribute(
+        'placeholder',
+        '••••••••••••',
+      )
+      await expect(page.getByRole('button', { name: 'Show API key', exact: true })).toBeDisabled()
+      await key.fill('sk-synthetic-relay-ui-first-0000')
+      await expect(page.getByRole('button', { name: 'Save key', exact: true })).toBeEnabled()
+      await page.getByRole('button', { name: 'Save key', exact: true }).click()
+      await expect
+        .poll(() => settings(page))
+        .toMatchObject({
+          ok: true,
+          value: { provider: 'openai', credential: { configured: true, revision: 1 } },
+        })
+      await expect(key).toHaveValue('')
+      await expect(key).toHaveAttribute('placeholder', '••••••••••••')
+      await page.getByRole('button', { name: 'Show API key', exact: true }).click()
+      await expect(key).toHaveAttribute('type', 'text')
+      await expect(key).toHaveValue('sk-synthetic-relay-ui-first-0000')
+      await expect(page.getByRole('button', { name: 'Replace key', exact: true })).toBeDisabled()
+      await page.getByRole('button', { name: 'Hide API key', exact: true }).click()
+      await expect(key).toHaveAttribute('type', 'password')
+      await expect(key).toHaveValue('')
+      await key.fill('sk-synthetic-relay-ui-second-0000')
+      await expect(page.getByRole('button', { name: 'Replace key', exact: true })).toBeEnabled()
+      await page.getByRole('button', { name: 'Replace key', exact: true }).click()
+      await expect
+        .poll(() => settings(page))
+        .toMatchObject({
+          ok: true,
+          value: { credential: { configured: true, revision: 2 } },
+        })
+      await expect(key).toHaveValue('')
       await expect
         .poll(() => schedulingState(page, sessionId))
         .toMatchObject({
           ok: true,
           value: {
-            context: {
-              sessionId,
-              eligibility: 'unconfirmed',
-              observation: { status: 'unconfirmed', capability: null, expiresAt: null },
+            settings: {
+              provider: 'openai',
+              credential: { configured: true, revision: 2 },
             },
+            connection: { status: 'unconfirmed', checkedAt: null, expiresAt: null },
+            context: { sessionId },
             activity: { decision: { status: 'idle' }, check: { status: 'idle' } },
           },
         })
-      await page
-        .getByRole('button', { name: 'Refresh models and compatibility', exact: true })
-        .click()
-      await expect
-        .poll(() => schedulingState(page, sessionId))
-        .toMatchObject({
-          ok: true,
-          value: {
-            context: {
-              sessionId,
-              eligibility: 'unavailable',
-              observation: {
-                status: 'unavailable',
-                capability: {
-                  provider: 'codex',
-                  modelId: 'gpt-6-luna',
-                  status: 'unavailable',
-                  supported: false,
-                  reason:
-                    process.platform === 'darwin' ? 'unsupported_protocol' : 'unsupported_platform',
-                  physicalReleased: true,
-                },
-              },
-            },
-            activity: { decision: { status: 'idle' }, check: { status: 'idle' } },
-          },
-        })
-      await expect(
-        page.getByText(
-          process.platform === 'darwin'
-            ? 'The installed native runtime does not support Relay decisions.'
-            : 'This platform does not support Relay decisions.',
-          { exact: true },
-        ),
-      ).toBeVisible()
       await expect(page.getByText('No activity yet.')).toBeVisible()
       await page.getByRole('switch', { name: 'Show activity indicator' }).click()
       await expect
@@ -341,7 +356,8 @@ test(
           value: {
             enabled: false,
             showIndicator: false,
-            selection: { modelId: 'gpt-6-luna' },
+            provider: 'openai',
+            credential: { configured: true, revision: 2 },
           },
         })
       await expect
@@ -352,16 +368,62 @@ test(
             settings: {
               enabled: false,
               showIndicator: false,
-              selection: { modelId: 'gpt-6-luna' },
+              provider: 'openai',
+              credential: { configured: true, revision: 2 },
             },
-            context: {
-              sessionId,
-              eligibility: 'disabled',
-              observation: { status: 'unconfirmed', capability: null, expiresAt: null },
-            },
+            connection: { status: 'unconfirmed', checkedAt: null, expiresAt: null },
+            context: { sessionId, eligibility: 'disabled' },
             activity: { decision: { status: 'idle' }, check: { status: 'idle' } },
           },
         })
+      const credentialObservation = ReadonlyFixtureDatabase.open(fixture)
+      let ciphertext: string
+      try {
+        const row = credentialObservation.drizzle
+          .select({ ciphertext: relayCredentials.ciphertext })
+          .from(relayCredentials)
+          .where(
+            and(
+              eq(relayCredentials.id, 1),
+              sql`length(CAST(${relayCredentials.ciphertext} AS BLOB)) <= ${Math.ceil(RELAY_CIPHERTEXT_BYTES / 3) * 4}`,
+            ),
+          )
+          .get()
+        if (!row || typeof row.ciphertext !== 'string')
+          throw new Error('Owned encrypted credential unavailable')
+        ciphertext = row.ciphertext
+      } finally {
+        credentialObservation.close()
+      }
+      expect(
+        await app.evaluate(async ({ safeStorage }, stored) => {
+          const decrypted = await safeStorage.decryptStringAsync(Buffer.from(stored, 'base64'))
+          return decrypted.result === 'sk-synthetic-relay-ui-second-0000'
+        }, ciphertext),
+      ).toBe(true)
+      await page.getByRole('switch', { name: 'Enable Relay', exact: true }).click()
+      const cold = page.getByLabel('OpenAI API key', { exact: true })
+      await expect(cold).toHaveValue('')
+      await expect(cold).toHaveAttribute('placeholder', '••••••••••••')
+      await page.getByRole('button', { name: 'Show API key', exact: true }).click()
+      await expect(cold).toHaveAttribute('type', 'text')
+      await expect(cold).toHaveValue('sk-synthetic-relay-ui-second-0000')
+      await page.getByRole('button', { name: 'Hide API key', exact: true }).click()
+      await expect(cold).toHaveAttribute('type', 'password')
+      await page.getByRole('button', { name: 'Remove', exact: true }).click()
+      await expect
+        .poll(() => settings(page))
+        .toMatchObject({
+          ok: true,
+          value: { credential: { configured: false, revision: 3 } },
+        })
+      await expect(page.getByRole('button', { name: 'Save key', exact: true })).toBeDisabled()
+      await expect(page.getByLabel('OpenAI API key', { exact: true })).not.toHaveAttribute(
+        'placeholder',
+        '••••••••••••',
+      )
+      await expect(page.getByRole('button', { name: 'Show API key', exact: true })).toBeDisabled()
+      await page.getByRole('switch', { name: 'Enable Relay', exact: true }).click()
       await page.getByRole('button', { name: 'Back to app' }).click()
       await page.getByRole('button', { name: 'Retained Relay draft', exact: true }).click()
       await expect(page.getByLabel('Attached Comment drafts')).toContainText(
@@ -396,15 +458,28 @@ test(
       await openRelay(page)
       const activity = page.getByRole('region', { name: 'Relay activity', exact: true })
       await expect(activity.locator('[data-activity-row]')).toHaveCount(25)
-      await expect(activity).toContainText('Result: No decision request sent')
+      await expect(activity.locator('[data-activity-text="action"]').first()).toHaveText(
+        'Workflow handoff',
+      )
+      await expect(activity.locator('[data-activity-text="outcome"]').first()).toHaveText(
+        'Not consulted',
+      )
       await expect(activity.getByRole('button')).toHaveCount(0)
       await expect(activity.getByRole('link')).toHaveCount(0)
-      const title = activity.locator('[data-activity-row]').first().locator('p').first()
-      await expect(title).toHaveText('Relay fixture · Retained Relay draft')
+      const title = activity
+        .locator('[data-activity-row]')
+        .first()
+        .locator('[data-activity-text="project"]')
+      await expect(title).toHaveText('Relay fixture')
+      await expect(
+        activity.locator('[data-activity-row]').first().locator('[data-activity-text="session"]'),
+      ).toHaveText('Retained Relay draft')
       await title.scrollIntoViewIfNeeded()
       await expect(title).toBeVisible()
       const selected = await activity.evaluate((element) => {
-        const text = element.querySelector('[data-activity-row] p')?.firstChild
+        const text = element.querySelector(
+          '[data-activity-row] [data-activity-text="project"]',
+        )?.firstChild
         if (!(text instanceof Text) || text.data !== 'Relay fixture')
           throw Error('The complete visible activity title is unavailable')
         const range = document.createRange()

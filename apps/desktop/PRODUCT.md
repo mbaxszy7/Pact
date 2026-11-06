@@ -20,7 +20,7 @@ Pact is a shared dual-agent coding workspace. It makes the current task, receivi
 
 ## Positioning
 
-The user controls routing, writing authorization and continuation. Ordinary messages stay lightweight; explicit `/plan`, `/build` and `/review` use native planning, complete natural reports and bounded automatic handoffs between frozen planning, implementation and independent review roles. Default orchestration is deterministic. Optional Relay uses a separately selected model for scheduling advice; Pact retains execution, source, authorization and recovery ownership.
+The user controls routing, writing authorization and continuation. Ordinary messages stay lightweight; explicit `/plan`, `/build` and `/review` use native planning, complete natural reports and bounded automatic handoffs between frozen planning, implementation and independent review roles. Default orchestration is deterministic. Optional Relay uses OpenAI's Decisions API to select among host-admitted scheduling choices, with a locally encrypted API key; Pact retains execution, source, authorization and recovery ownership.
 
 Forward execution preserves native tools and user permissions. Recorded Changes support guarded whole-round Undo where evidence is reliable. Pact does not provide a hard filesystem Writer Lease against external editors/native tools or full Session/workspace Checkpoints.
 
@@ -37,8 +37,8 @@ Forward execution preserves native tools and user permissions. Recorded Changes 
 
 - Projects, history, managed images and diagnostics are local. Native Agents/tools can communicate with the services configured by the user; local-first does not imply offline execution.
 - Claude Code and Codex are the only built-in Agents, with independent native configuration, credentials, Skills, MCP, Plugins and context.
-- Pact tasks freeze Primary for planning and code review, Secondary for plan review and implementation/repair. Ordinary @Agent routing remains explicit; a conflicting recipient on a Pact command preserves the draft and refuses dispatch.
-- The frozen Primary maintains the native plan and reviews code; Secondary reviews exact plans and implements. Necessary questions may precede a plan. Accepted plans require an explicit Implement action.
+- Pact tasks default to Primary for planning and code review, Secondary for plan review and implementation/repair. Relay may select other independent role pairs before the first Run. Ordinary @Agent routing remains explicit; a conflicting recipient on a Pact command preserves the draft and refuses dispatch.
+- The assigned plan author maintains the native plan; its reviewer checks exact versions. Necessary questions may precede a plan. After acceptance and before code work starts, Relay may propose swapping future code responsibilities. User confirmation changes only those roles; Implement plan still requires separate approval. Historical authors, permissions and consumed allowances remain unchanged.
 - Build automatically proceeds to independent code review. Direct Review stays read-only; Respond and Repair are explicit and automatically return to the reviewer. Session settings count each plan review, each code review and each new repair separately.
 - Sending workflow feedback immediately pauses later automatic work and prioritizes a reply after current native work settles. The reply stays paused until Continue collaboration; answering a native form resumes its root without clearing that pause. Restart also pauses the chain and reconciles unknown work before continuation.
 - `@all` runs Primary then Secondary, excluding the current Primary answer from Secondary's input; the boundary does not isolate shared Project files.

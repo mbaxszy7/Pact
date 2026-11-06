@@ -522,14 +522,14 @@ void test('delivery and publication consume exact accepted IDs in separate non-e
   assert.doesNotMatch(JSON.stringify(release), /release_created/u)
 })
 
-void test('the required macOS native job runs the separate pinned decision profile after legacy and preserves independent strict evidence', () => {
+void test('the required macOS native job runs the separate pinned execution profile after legacy and preserves independent strict evidence', () => {
   const steps = distribution.jobs.native_mac.steps
   const legacy = steps.findIndex((step) => step.run === 'node scripts/ci.mjs native')
   const prepare = steps.findIndex(
-    (step) => step.run === 'node scripts/ci-native.mjs decision-codex',
+    (step) => step.run === 'node scripts/ci-native.mjs execution-codex',
   )
   const decision = steps.findIndex(
-    (step) => step.run === 'node scripts/ci.mjs native decision-codex',
+    (step) => step.run === 'node scripts/ci.mjs native execution-codex',
   )
   assert(legacy >= 0 && prepare > legacy && decision > prepare)
   assert.equal(
@@ -552,7 +552,7 @@ void test('the required macOS native job runs the separate pinned decision profi
   for (const suffix of ['win', 'win_arm64'])
     assert.doesNotMatch(
       commands(distribution.jobs[`native_${suffix}`]),
-      /node scripts\/ci(?:-native)?\.mjs (?:native )?decision-codex/u,
+      /node scripts\/ci(?:-native)?\.mjs (?:native )?execution-codex/u,
     )
   assert(distribution.jobs.complete.needs.includes('native_mac'))
 })
@@ -638,32 +638,31 @@ function assertProfileEvidence(steps, execution, profile) {
   assert.doesNotMatch(JSON.stringify(command), /secrets\.|--grep|--testNamePattern|--reporter/u)
 }
 
-void test('macOS requires the pinned Claude profile while Windows preserves blocked decision evidence and denies execution', () => {
+void test('macOS requires the pinned execution profile while Windows preserves blocked owner evidence and denies execution', () => {
   for (const suffix of ['mac', 'win', 'win_arm64']) {
     const job = distribution.jobs[`native_${suffix}`]
     const steps = job.steps
     const legacy = steps.findIndex((step) => step.run === 'node scripts/ci.mjs native')
     const prepare = steps.findIndex(
-      (step) => step.run === 'node scripts/ci-native.mjs decision-claude',
+      (step) => step.run === 'node scripts/ci-native.mjs execution-codex',
     )
     const execute = steps.findIndex(
-      (step) => step.run === 'node scripts/ci.mjs native decision-claude',
+      (step) => step.run === 'node scripts/ci.mjs native execution-codex',
     )
     assert(legacy >= 0)
     if (suffix !== 'mac') {
       assert.equal(prepare, -1)
       assert.equal(execute, -1)
       const guard = steps.find(
-        (step) => step.name === 'Verify decision isolation remains unavailable on Windows',
+        (step) => step.name === 'Keep macOS process-group proofs on their native runner',
       )
       assert.match(guard.run, /nativeProfileSupports/u)
-      assert.match(guard.run, /decision-codex/u)
-      assert.match(guard.run, /decision-claude/u)
+      assert.match(guard.run, /execution-codex/u)
       assert.match(guard.run, /throw new Error/u)
       const blocked = steps.find(
         (step) =>
           step.run === 'node scripts/ci-native-report.mjs' &&
-          step.env?.PACT_CI_NATIVE_PROFILE === 'decision-claude',
+          step.env?.PACT_CI_NATIVE_PROFILE === 'windows-owner',
       )
       assert.equal(blocked.if, 'always()')
       assert.equal(
@@ -683,11 +682,6 @@ void test('macOS requires the pinned Claude profile while Windows preserves bloc
       continue
     }
     assert(prepare > legacy && execute > prepare)
-    if (suffix === 'mac')
-      assert(
-        prepare >
-          steps.findIndex((step) => step.run === 'node scripts/ci.mjs native decision-codex'),
-      )
     assert.equal(
       steps[execute].env.PACT_CI_NATIVE_IDENTITY_FILE,
       steps[legacy].env.PACT_CI_NATIVE_IDENTITY_FILE,
@@ -700,7 +694,7 @@ void test('macOS requires the pinned Claude profile while Windows preserves bloc
       steps[execute].env.PACT_CI_NATIVE_ARTIFACT,
       steps[legacy].env.PACT_CI_NATIVE_ARTIFACT,
     )
-    assertProfileEvidence(steps, execute, 'decision-claude')
+    assertProfileEvidence(steps, execute, 'execution-codex')
     assert.equal(job.environment, undefined)
     assert.doesNotMatch(JSON.stringify(job), /secrets\.PACT_(CLAUDE|CODEX)_/u)
     assert(distribution.jobs.complete.needs.includes(`native_${suffix}`))

@@ -1,110 +1,145 @@
 // @vitest-environment jsdom
-import { act, cleanup, render, renderHook, screen, waitFor } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type {
   DesktopBridge,
   RpcResult,
+  RelayCredentialReceipt,
   SchedulingActivityPage,
   SchedulingActivityRow,
-  SchedulingModels,
   SchedulingSettings,
   SchedulingState,
 } from '@pact/contracts'
 
-import { schedulingActivityPageSchema } from '@pact/contracts'
+import { OPENAI_DECISION_MODEL, schedulingActivityPageSchema } from '@pact/contracts'
 
 import { DecisionSchedulingSettings, useSchedulingSettings } from './DecisionSchedulingSettings'
 
 const timestamp = '2026-10-22T00:00:00.000Z'
 const settings = (overrides: Partial<SchedulingSettings> = {}): SchedulingSettings => ({
   enabled: false,
-  selection: null,
+  provider: 'openai',
+  model: OPENAI_DECISION_MODEL,
+  credential: { configured: false, revision: 0 },
   showIndicator: true,
   revision: 0,
   updatedAt: timestamp,
   ...overrides,
 })
-const models: SchedulingModels = {
-  catalogIdentity: 'a'.repeat(64),
-  models: [
-    {
-      target: 'codex_luna',
-      status: 'found',
-      selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
-      checkedAt: timestamp,
-    },
-    { target: 'claude_haiku_5_5', status: 'not_found', selection: null, checkedAt: timestamp },
-  ],
-}
 const empty: SchedulingActivityPage = { asOf: timestamp, rows: [], nextCursor: null }
-const observedState = (value: SchedulingSettings): SchedulingState => ({
+const observedState = (value: SchedulingSettings, sessionId?: string): SchedulingState => ({
   settings: value,
   configurationGeneration: value.revision,
-  host: { status: 'unconfirmed', capability: null, expiresAt: null },
-  context: null,
+  connection: { status: 'unconfirmed', checkedAt: null, expiresAt: null },
+  context: sessionId
+    ? {
+        sessionId,
+        eligibility: !value.enabled
+          ? 'disabled'
+          : value.credential.configured
+            ? 'unconfirmed'
+            : 'key_required',
+      }
+    : null,
   activity: { decision: { status: 'idle' }, check: { status: 'idle' } },
 })
-function row(index: number): SchedulingActivityRow {
+function row(index: number, overrides: Partial<SchedulingActivityRow> = {}): SchedulingActivityRow {
   return {
     id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
     createdAt: new Date(Date.parse(timestamp) - index * 1000).toISOString(),
     project: 'Project',
     session: 'Session',
-    provider: 'codex',
-    model: 'gpt-6-luna',
+    provider: 'openai',
+    model: OPENAI_DECISION_MODEL,
     reason: 'workflow',
     result: 'not_sent',
     called: false,
     physicalUnconfirmed: false,
     suggestion: null,
+    ...overrides,
   }
 }
 function fixture(initial = settings()) {
   let value = initial
   const listeners = new Set<() => void>()
-  const readSettings = vi.fn<DesktopBridge['getSchedulingSettings']>(async () => ({
-    ok: true,
-    value,
-  }))
   const bridge = {
-    getSchedulingSettings: readSettings,
-    getSchedulingState: vi.fn<DesktopBridge['getSchedulingState']>(async () => {
-      const result = await readSettings()
-      return result.ok ? { ok: true, value: observedState(result.value) } : result
-    }),
-    refreshSchedulingState: vi.fn<DesktopBridge['refreshSchedulingState']>(async () => {
-      const result = await readSettings()
-      return result.ok ? { ok: true, value: observedState(result.value) } : result
-    }),
+    getSchedulingState: vi.fn<DesktopBridge['getSchedulingState']>(async (input) => ({
+      ok: true as const,
+      value: observedState(value, input?.sessionId),
+    })),
     saveSchedulingSettings: vi.fn<DesktopBridge['saveSchedulingSettings']>(async (input) => {
       value = settings({
         ...value,
         enabled: input.enabled ?? value.enabled,
-        selection: input.selection === undefined ? value.selection : input.selection,
         showIndicator: input.showIndicator ?? value.showIndicator,
         revision: value.revision + 1,
       })
-      return { ok: true, value }
+      return { ok: true as const, value }
     }),
-    refreshSchedulingModels: vi
-      .fn<DesktopBridge['refreshSchedulingModels']>()
-      .mockResolvedValue({ ok: true, value: models }),
+    saveRelayApiKey: vi.fn<DesktopBridge['saveRelayApiKey']>(async (input) => {
+      value = settings({
+        ...value,
+        credential: { configured: true, revision: value.credential.revision + 1 },
+        revision: value.revision + 1,
+      })
+      return {
+        ok: true as const,
+        value: {
+          nonce: input.nonce,
+          operation: 'save' as const,
+          revision: value.credential.revision,
+          configured: true,
+        } satisfies RelayCredentialReceipt,
+      }
+    }),
+    removeRelayApiKey: vi.fn<DesktopBridge['removeRelayApiKey']>(async (input) => {
+      value = settings({
+        ...value,
+        credential: { configured: false, revision: value.credential.revision + 1 },
+        revision: value.revision + 1,
+      })
+      return {
+        ok: true as const,
+        value: {
+          nonce: input.nonce,
+          operation: 'remove' as const,
+          revision: value.credential.revision,
+          configured: false,
+        } satisfies RelayCredentialReceipt,
+      }
+    }),
+    revealRelayApiKey: vi.fn<DesktopBridge['revealRelayApiKey']>().mockResolvedValue({
+      ok: true as const,
+      value: { revision: 1, key: 'sk-synthetic-reveal-0000' },
+    }),
+    readRelayCredentialReceipt: vi
+      .fn<DesktopBridge['readRelayCredentialReceipt']>()
+      .mockResolvedValue({ ok: true as const, value: null }),
     readSchedulingActivity: vi
       .fn<DesktopBridge['readSchedulingActivity']>()
-      .mockResolvedValue({ ok: true, value: empty }),
+      .mockResolvedValue({ ok: true as const, value: empty }),
     onSchedulingChanged: (listener: () => void) => {
       listeners.add(listener)
       return () => listeners.delete(listener)
     },
   } satisfies Pick<
     DesktopBridge,
-    | 'getSchedulingSettings'
     | 'getSchedulingState'
-    | 'refreshSchedulingState'
     | 'saveSchedulingSettings'
-    | 'refreshSchedulingModels'
+    | 'saveRelayApiKey'
+    | 'removeRelayApiKey'
+    | 'revealRelayApiKey'
+    | 'readRelayCredentialReceipt'
     | 'readSchedulingActivity'
     | 'onSchedulingChanged'
   >
@@ -118,6 +153,18 @@ function fixture(initial = settings()) {
     },
   }
 }
+function Surface({
+  active = true,
+  sessionId,
+  settingsVisible = active,
+}: {
+  active?: boolean
+  sessionId?: string
+  settingsVisible?: boolean
+}) {
+  const state = useSchedulingSettings(active, sessionId, settingsVisible)
+  return <DecisionSchedulingSettings state={state} />
+}
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
@@ -125,92 +172,51 @@ afterEach(() => {
 })
 
 describe('Relay mounted App owner', () => {
-  it('reads only settings while Off, discovers only expanded details and releases hidden subscriptions', async () => {
+  it('reads only state while Off, loads details when enabled and releases hidden subscriptions', async () => {
     const f = fixture(),
       hook = renderHook(({ active }) => useSchedulingSettings(active), {
         initialProps: { active: true },
       })
     await waitFor(() => expect(hook.result.current.settings?.enabled).toBe(false))
-    expect(f.bridge.refreshSchedulingModels).not.toHaveBeenCalled()
     expect(f.bridge.readSchedulingActivity).not.toHaveBeenCalled()
     await act(() => hook.result.current.save({ enabled: true }))
-    await waitFor(() => expect(hook.result.current.models).toEqual(models))
-    expect(f.bridge.refreshSchedulingModels).toHaveBeenCalledOnce()
-    expect(f.bridge.readSchedulingActivity).toHaveBeenCalledExactlyOnceWith({})
+    await waitFor(() => expect(hook.result.current.settings?.enabled).toBe(true))
+    await waitFor(() => expect(f.bridge.readSchedulingActivity).toHaveBeenCalledExactlyOnceWith({}))
     hook.rerender({ active: false })
     expect(f.listeners.size).toBe(0)
-    const reads = f.bridge.getSchedulingSettings.mock.calls.length
+    const reads = f.bridge.getSchedulingState.mock.calls.length
     act(() => f.publish(settings({ enabled: false, revision: 2 })))
-    expect(f.bridge.getSchedulingSettings).toHaveBeenCalledTimes(reads)
+    expect(f.bridge.getSchedulingState).toHaveBeenCalledTimes(reads)
     hook.rerender({ active: true })
     await waitFor(() => expect(hook.result.current.settings?.revision).toBe(2))
-    expect(f.bridge.refreshSchedulingModels).toHaveBeenCalledOnce()
-    expect(f.bridge.readSchedulingActivity).toHaveBeenCalledOnce()
     hook.unmount()
     expect(f.listeners.size).toBe(0)
   })
 
   it.each(['success', 'failure'] as const)(
-    'keeps one settings read and one latest intent across hidden %s',
+    'keeps one state read and one latest intent across hidden %s',
     async (outcome) => {
       const f = fixture(),
-        first = Promise.withResolvers<RpcResult<SchedulingSettings>>()
-      f.bridge.getSchedulingSettings.mockReturnValueOnce(first.promise)
+        first = Promise.withResolvers<RpcResult<SchedulingState>>()
+      f.bridge.getSchedulingState.mockReturnValueOnce(first.promise)
       const hook = renderHook(({ active }) => useSchedulingSettings(active), {
         initialProps: { active: true },
       })
-      await waitFor(() => expect(f.bridge.getSchedulingSettings).toHaveBeenCalledOnce())
+      await waitFor(() => expect(f.bridge.getSchedulingState).toHaveBeenCalledOnce())
       hook.rerender({ active: false })
       hook.rerender({ active: true })
       await act(async () => {
         first.resolve(
           outcome === 'success'
-            ? { ok: true, value: settings({ enabled: true, revision: 100 }) }
+            ? { ok: true, value: observedState(settings({ enabled: true, revision: 100 })) }
             : { ok: false, error: { code: 'INTERNAL', message: 'Obsolete read failure' } },
         )
       })
       await waitFor(() => expect(hook.result.current.settings?.revision).toBe(0))
-      expect(f.bridge.getSchedulingSettings).toHaveBeenCalledTimes(2)
+      expect(f.bridge.getSchedulingState.mock.calls.length).toBeGreaterThanOrEqual(2)
       expect(hook.result.current.error).toBeUndefined()
       expect(hook.result.current.loading).toBe(false)
-      expect(f.bridge.refreshSchedulingModels).not.toHaveBeenCalled()
-    },
-  )
-
-  it.each(['success', 'failure'] as const)(
-    'retains physical detail reservations and drops obsolete %s after hide/reopen',
-    async (outcome) => {
-      const f = fixture(settings({ enabled: true })),
-        catalog = Promise.withResolvers<RpcResult<SchedulingModels>>(),
-        activity = Promise.withResolvers<RpcResult<SchedulingActivityPage>>()
-      f.bridge.refreshSchedulingModels.mockReturnValueOnce(catalog.promise)
-      f.bridge.readSchedulingActivity.mockReturnValueOnce(activity.promise)
-      const hook = renderHook(({ active }) => useSchedulingSettings(active), {
-        initialProps: { active: true },
-      })
-      await waitFor(() => expect(f.bridge.readSchedulingActivity).toHaveBeenCalledOnce())
-      hook.rerender({ active: false })
-      hook.rerender({ active: true })
-      await act(async () => {
-        expect(f.bridge.refreshSchedulingModels).toHaveBeenCalledOnce()
-        expect(f.bridge.readSchedulingActivity).toHaveBeenCalledOnce()
-        catalog.resolve(
-          outcome === 'success'
-            ? { ok: true, value: { ...models, catalogIdentity: 'b'.repeat(64) } }
-            : { ok: false, error: { code: 'INTERNAL', message: 'Obsolete catalog' } },
-        )
-        activity.resolve(
-          outcome === 'success'
-            ? { ok: true, value: { ...empty, rows: [row(999)] } }
-            : { ok: false, error: { code: 'INTERNAL', message: 'Obsolete activity' } },
-        )
-      })
-      await waitFor(() => expect(hook.result.current.models).toEqual(models))
-      expect(f.bridge.refreshSchedulingModels).toHaveBeenCalledTimes(2)
-      expect(f.bridge.readSchedulingActivity).toHaveBeenCalledTimes(2)
-      expect(hook.result.current.rows).toEqual([])
-      expect(hook.result.current.modelError).toBeUndefined()
-      expect(hook.result.current.activityError).toBeUndefined()
+      hook.unmount()
     },
   )
 
@@ -218,14 +224,17 @@ describe('Relay mounted App owner', () => {
     const f = fixture(),
       hook = renderHook(() => useSchedulingSettings(true))
     await waitFor(() => expect(hook.result.current.settings).toBeDefined())
-    const readback = Promise.withResolvers<RpcResult<SchedulingSettings>>()
-    f.bridge.getSchedulingSettings.mockReturnValueOnce(readback.promise)
+    const readback = Promise.withResolvers<RpcResult<SchedulingState>>()
+    f.bridge.getSchedulingState.mockReturnValueOnce(readback.promise)
     f.bridge.saveSchedulingSettings.mockRejectedValueOnce(new Error('Lost save ACK'))
     await act(() => hook.result.current.save({ enabled: true }))
     await act(() => hook.result.current.save({ enabled: true }))
     expect(f.bridge.saveSchedulingSettings).toHaveBeenCalledOnce()
     await act(async () =>
-      readback.resolve({ ok: true, value: settings({ enabled: true, revision: 1 }) }),
+      readback.resolve({
+        ok: true,
+        value: observedState(settings({ enabled: true, revision: 1 })),
+      }),
     )
     await waitFor(() => expect(hook.result.current.settings?.revision).toBe(1))
     await act(() => hook.result.current.save({ showIndicator: false }))
@@ -233,6 +242,7 @@ describe('Relay mounted App owner', () => {
       expectedRevision: 1,
       showIndicator: false,
     })
+    hook.unmount()
   })
 
   it('does not let a save ACK from a hidden epoch overwrite newer settings', async () => {
@@ -256,6 +266,7 @@ describe('Relay mounted App owner', () => {
       await pending
     })
     expect(hook.result.current.settings).toMatchObject({ enabled: false, revision: 3 })
+    hook.unmount()
   })
 
   it('keeps uncertain writes blocked when readback fails and unlocks only after a later successful read', async () => {
@@ -266,7 +277,7 @@ describe('Relay mounted App owner', () => {
       ok: false,
       error: { code: 'TIMEOUT', message: 'Save unconfirmed' },
     })
-    f.bridge.getSchedulingSettings.mockResolvedValueOnce({
+    f.bridge.getSchedulingState.mockResolvedValueOnce({
       ok: false,
       error: { code: 'INTERNAL', message: 'Readback failed' },
     })
@@ -278,6 +289,7 @@ describe('Relay mounted App owner', () => {
     await waitFor(() => expect(hook.result.current.settings?.revision).toBe(1))
     await act(() => hook.result.current.save({ enabled: false }))
     expect(f.bridge.saveSchedulingSettings).toHaveBeenCalledTimes(2)
+    hook.unmount()
   })
 
   it('retains a definite save failure after successful unchanged readback and clears it on an explicit successful retry', async () => {
@@ -286,38 +298,29 @@ describe('Relay mounted App owner', () => {
     await waitFor(() => expect(hook.result.current.settings).toBeDefined())
     f.bridge.saveSchedulingSettings.mockResolvedValueOnce({
       ok: false,
-      error: {
-        code: 'CONFLICT',
-        message: 'The native model configuration changed. Refresh models before selecting again.',
-      },
+      error: { code: 'CONFLICT', message: 'The settings changed. Save again to retry.' },
     })
-    await act(() =>
-      hook.result.current.save({
-        selection: models.models[0]!.selection,
-        catalogIdentity: models.catalogIdentity,
-      }),
-    )
+    await act(() => hook.result.current.save({ showIndicator: false }))
     await waitFor(() => expect(hook.result.current.loading).toBe(false))
     expect(hook.result.current.settings?.revision).toBe(0)
-    expect(hook.result.current.error).toBe(
-      'The native model configuration changed. Refresh models before selecting again.',
-    )
+    expect(hook.result.current.error).toBe('The settings changed. Save again to retry.')
     expect(hook.result.current.saveBlocked).toBe(false)
     await act(() => hook.result.current.save({ enabled: true }))
     expect(hook.result.current.error).toBeUndefined()
     expect(hook.result.current.settings?.enabled).toBe(true)
+    hook.unmount()
   })
 
   it('keeps a delayed own-change read from rolling back an acknowledged save or leaving the editor busy', async () => {
     const f = fixture(),
       hook = renderHook(() => useSchedulingSettings(true))
     await waitFor(() => expect(hook.result.current.settings).toBeDefined())
-    const changeRead = Promise.withResolvers<RpcResult<SchedulingSettings>>()
-    f.bridge.getSchedulingSettings.mockReturnValueOnce(changeRead.promise)
+    const changeRead = Promise.withResolvers<RpcResult<SchedulingState>>()
+    f.bridge.getSchedulingState.mockReturnValueOnce(changeRead.promise)
     act(() => f.publish())
     await act(() => hook.result.current.save({ enabled: true }))
     expect(hook.result.current.settings?.revision).toBe(1)
-    await act(async () => changeRead.resolve({ ok: true, value: settings() }))
+    await act(async () => changeRead.resolve({ ok: true, value: observedState(settings()) }))
     expect(hook.result.current.settings?.revision).toBe(1)
     expect(hook.result.current.saving).toBe(false)
     expect(hook.result.current.saveBlocked).toBe(false)
@@ -326,28 +329,30 @@ describe('Relay mounted App owner', () => {
       expectedRevision: 1,
       showIndicator: false,
     })
+    hook.unmount()
   })
 
-  it('coalesces Off/On detail intents without releasing still pending catalog or activity reads', async () => {
+  it('coalesces Off/On detail intents without releasing a still pending activity read', async () => {
     const f = fixture(settings({ enabled: true })),
-      catalog = Promise.withResolvers<RpcResult<SchedulingModels>>(),
       activity = Promise.withResolvers<RpcResult<SchedulingActivityPage>>()
-    f.bridge.refreshSchedulingModels.mockReturnValueOnce(catalog.promise)
     f.bridge.readSchedulingActivity.mockReturnValueOnce(activity.promise)
     const hook = renderHook(() => useSchedulingSettings(true))
     await waitFor(() => expect(f.bridge.readSchedulingActivity).toHaveBeenCalledOnce())
     await act(() => hook.result.current.save({ enabled: false }))
     await act(() => hook.result.current.save({ enabled: true }))
+    // The Off/On coalesced intents fired no second read while the first was pending.
     expect(f.bridge.readSchedulingActivity).toHaveBeenCalledOnce()
-    expect(f.bridge.refreshSchedulingModels).toHaveBeenCalledOnce()
-    await act(async () => {
-      catalog.resolve({ ok: true, value: { ...models, catalogIdentity: 'c'.repeat(64) } })
-      activity.resolve({ ok: true, value: { ...empty, rows: [row(999)] } })
+    f.bridge.readSchedulingActivity.mockResolvedValue({
+      ok: true,
+      value: { ...empty, rows: [row(999)] },
     })
-    await waitFor(() => expect(hook.result.current.models).toEqual(models))
-    expect(hook.result.current.rows).toEqual([])
-    expect(f.bridge.readSchedulingActivity).toHaveBeenCalledTimes(2)
-    expect(f.bridge.refreshSchedulingModels).toHaveBeenCalledTimes(2)
+    await act(async () => {
+      activity.resolve({ ok: true, value: { ...empty, rows: [] } })
+      await activity.promise
+    })
+    // The stale Off-window response is dropped; the re-enabled details reads afresh.
+    await waitFor(() => expect(hook.result.current.rows.map((r) => r.id)).toEqual([row(999).id]))
+    hook.unmount()
   })
 
   it('bounds resident history to 100 rows, deduplicates overlapping keysets and returns toward the latest edge', async () => {
@@ -537,158 +542,398 @@ describe('Relay mounted App owner', () => {
   })
 })
 
-function Surface() {
-  return <DecisionSchedulingSettings state={useSchedulingSettings(true)} />
-}
 describe('Relay surface', () => {
-  it('labels native rebuild decisions and native initialization separately from business completion, with no invented model provenance', async () => {
-    const f = fixture(settings({ enabled: true }))
-    f.bridge.readSchedulingActivity.mockResolvedValue({
-      ok: true,
-      value: {
-        ...empty,
-        rows: [
-          {
-            ...row(1),
-            provider: null,
-            model: null,
-            reason: 'native_rebuild',
-            suggestionState: 'awaiting_user',
-            action: 'rebuild_native_context',
-            actionResult: null,
-            originalUnconfirmed: true,
-          },
-          {
-            ...row(2),
-            provider: null,
-            model: null,
-            reason: 'native_rebuild',
-            suggestionState: 'adopted',
-            action: 'rebuild_native_context',
-            actionResult: 'completed',
-            originalUnconfirmed: true,
-          },
-          {
-            ...row(3),
-            provider: null,
-            model: null,
-            reason: 'native_rebuild',
-            suggestionState: 'adopted',
-            action: 'rebuild_native_context',
-            actionResult: 'superseded',
-          },
-        ],
-      },
-    })
-    render(<Surface />)
-    await screen.findByText('Result: Awaiting your rebuild decision; original work unconfirmed')
-    expect(
-      screen.getByText('Result: Native context rebuilt; original work unconfirmed'),
-    ).toBeDefined()
-    expect(screen.getByText('Result: Native rebuild superseded')).toBeDefined()
-    expect(screen.queryByText('Result: Business turn completed')).toBeNull()
-    expect(screen.queryByText('Codex · gpt-6-luna')).toBeNull()
-    expect(screen.getAllByRole('button')).toHaveLength(1)
-  })
-
-  it('keeps the accepted header, disables unavailable models and supports keyboard disclosure without activity actions', async () => {
+  it('supports keyboard disclosure and restores focus without making activity actionable', async () => {
     fixture()
     render(<Surface />)
     const user = userEvent.setup()
     const toggle = screen.getByRole('switch', { name: 'Enable Relay' })
     await waitFor(() => expect(toggle.getAttribute('aria-disabled')).toBe('false'))
     expect(screen.getByRole('heading', { name: 'Relay' })).toBeDefined()
-    expect(screen.queryByRole('radiogroup')).toBeNull()
+    expect(screen.queryByLabelText('OpenAI API key')).toBeNull()
     toggle.focus()
     await user.keyboard(' ')
-    await screen.findByRole('radiogroup', { name: 'Model' })
-    expect(
-      screen.getByRole('radio', { name: 'Haiku 5.5 · Claude Code' }).hasAttribute('disabled'),
-    ).toBe(true)
-    expect(screen.queryByText('Choose a model to use Relay.')).toBeNull()
+    await screen.findByLabelText('OpenAI API key')
+    expect(screen.queryByRole('radiogroup')).toBeNull()
     expect(screen.getByText('No activity yet.')).toBeDefined()
-    expect(
-      screen.getAllByRole('button').map((button) => button.getAttribute('aria-label')),
-    ).toEqual(['Refresh models and compatibility'])
+    expect(document.querySelector('.relay-activity-list a, .relay-activity-list button')).toBeNull()
     await user.keyboard('{Enter}')
-    await waitFor(() => expect(screen.queryByRole('radiogroup')).toBeNull())
+    await waitFor(() => expect(screen.queryByLabelText('OpenAI API key')).toBeNull())
     expect(document.activeElement).toBe(toggle)
     await user.tab()
     expect(document.activeElement?.closest('#relay-details')).toBeNull()
   })
 
-  it('distinguishes suggested, accepted and dispatched work and omits model provenance for native checks', async () => {
-    const f = fixture(settings({ enabled: true }))
-    f.bridge.readSchedulingActivity.mockResolvedValue({
-      ok: true,
-      value: {
-        ...empty,
-        rows: [
-          {
-            ...row(1),
-            called: true,
-            model: 'historical-native-model',
-            result: 'completed',
-            suggestion: 'Continue the fixed Plan review.',
-            suggestionState: 'adopted',
-            action: 'plan_review',
-            actionResult: 'reserved',
-          },
-          {
-            ...row(2),
-            provider: null,
-            model: null,
-            reason: 'native_check',
-            result: 'failed',
-            physicalUnconfirmed: true,
-            originalUnconfirmed: true,
-            action: 'native_check',
-            actionResult: 'failed',
-          },
-          {
-            ...row(3),
-            called: true,
-            result: 'completed',
-            suggestion: 'Request one read-only Plan clarification.',
-            suggestionState: 'discarded',
-            action: 'supplement_plan',
-            actionResult: 'not_sent',
-          },
-        ],
-      },
-    })
-    render(<Surface />)
-    await screen.findByText('Codex · historical-native-model')
-    expect(screen.getByText('Suggestion accepted: Continue the fixed Plan review.')).toBeDefined()
-    expect(screen.getByText('Result: Action prepared; not started')).toBeDefined()
-    expect(
-      screen.getByText('Result: Check failed; original work unconfirmed; cleanup unconfirmed'),
-    ).toBeDefined()
-    expect(
-      screen.getByText('Suggestion not used: Request one read-only Plan clarification.'),
-    ).toBeDefined()
-    expect(screen.queryByText('Result: Business turn completed')).toBeNull()
-    const check = screen.getByText('Native session check').closest('[data-activity-row]')
-    expect(check?.textContent).not.toContain('Codex')
-    expect(
-      screen.getAllByRole('button').map((button) => button.getAttribute('aria-label')),
-    ).toEqual(['Refresh models and compatibility'])
+  it('keeps the header, disclosure and read-only activity without model radios or action links', async () => {
+    fixture(settings({ enabled: true, credential: { configured: false, revision: 0 } }))
+    const { container } = render(<Surface active />)
+    await waitFor(() => expect(container.querySelector('.relay-activity-list')).not.toBeNull())
+    expect(container.textContent).toContain('Decisions API')
+    expect(container.textContent).toContain('OpenAI API key')
+    expect(container.textContent).toContain('Show activity indicator')
+    expect(container.querySelector('input[type="radio"]')).toBeNull()
+    expect(container.querySelector('.relay-activity-list a')).toBeNull()
   })
 
-  it('preserves the selected text and row node when updated activity moves the same stable ID', async () => {
-    const f = fixture(settings({ enabled: true })),
-      first = row(1),
+  it('clears the masked key when accepted and preserves invalid unsent input', async () => {
+    const f = fixture(settings({ enabled: true }))
+    const user = userEvent.setup()
+    const { container } = render(<Surface active />)
+    await waitFor(() => expect(container.querySelector('#relay-api-key')).not.toBeNull())
+    const input = container.querySelector<HTMLInputElement>('#relay-api-key')!
+    await user.type(input, 'sk-synthetic-preview-key-0000')
+    await user.click(container.querySelector('.relay-key-controls button[type="submit"]')!)
+    await waitFor(() => expect(f.bridge.saveRelayApiKey).toHaveBeenCalledOnce())
+    expect(input.value).toBe('')
+    await waitFor(() => expect(input.disabled).toBe(false))
+    await user.type(input, 'invalid key with spaces')
+    await user.click(container.querySelector('.relay-key-controls button[type="submit"]')!)
+    expect(input.value).toBe('invalid key with spaces')
+    expect(screen.getByText('Enter a valid API key.')).toBeDefined()
+    expect(f.bridge.saveRelayApiKey).toHaveBeenCalledOnce()
+  })
+
+  it('clears unsent text on hide and disable and never rehydrates a stored key', async () => {
+    const f = fixture(settings({ enabled: true, credential: { configured: true, revision: 1 } }))
+    const user = userEvent.setup()
+    const { container, rerender } = render(<Surface active />)
+    await waitFor(() => expect(container.querySelector('#relay-api-key')).not.toBeNull())
+    const input = container.querySelector<HTMLInputElement>('#relay-api-key')!
+    await user.type(input, 'sk-unsent')
+    rerender(<Surface active settingsVisible={false} />)
+    await waitFor(() => expect(input.value).toBe(''))
+    rerender(<Surface active />)
+    const reopened = await screen.findByLabelText<HTMLInputElement>('OpenAI API key')
+    expect(reopened.value).toBe('')
+    await user.type(reopened, 'sk-unsent-again')
+    await user.click(screen.getByRole('switch', { name: 'Enable Relay' }))
+    await waitFor(() => expect(screen.queryByLabelText('OpenAI API key')).toBeNull())
+    await user.click(screen.getByRole('switch', { name: 'Enable Relay' }))
+    const enabledAgain = await screen.findByLabelText<HTMLInputElement>('OpenAI API key')
+    expect(enabledAgain.value).toBe('')
+    expect(screen.getByText('Saved')).toBeDefined()
+    expect(f.bridge.saveRelayApiKey).not.toHaveBeenCalled()
+    expect(f.bridge.removeRelayApiKey).not.toHaveBeenCalled()
+  })
+
+  it.each(['uncertain', 'throw'] as const)(
+    'retains a late %s result across hide and session change until receipt readback',
+    async (outcome) => {
+      const f = fixture(settings({ enabled: true, credential: { configured: false, revision: 0 } }))
+      const mutation = Promise.withResolvers<RpcResult<RelayCredentialReceipt>>()
+      f.bridge.saveRelayApiKey.mockReturnValue(mutation.promise)
+      const { container, rerender } = render(<Surface active />)
+      const user = userEvent.setup()
+      await waitFor(() => expect(container.querySelector('#relay-api-key')).not.toBeNull())
+      const input = container.querySelector<HTMLInputElement>('#relay-api-key')!
+      await user.type(input, 'sk-synthetic-preview-key-0000')
+      await user.click(container.querySelector('.relay-key-controls button[type="submit"]')!)
+      const nonce = f.bridge.saveRelayApiKey.mock.calls[0]?.[0]?.nonce
+      rerender(<Surface active={false} settingsVisible={false} />)
+      await act(async () => {
+        if (outcome === 'throw') mutation.reject(new Error('Transport closed.'))
+        else
+          mutation.resolve({
+            ok: false,
+            error: { code: 'UNCERTAIN', message: 'The key change could not be confirmed.' },
+          })
+        await mutation.promise.catch(() => undefined)
+      })
+      rerender(<Surface active sessionId="11111111-1111-4111-8111-111111111111" />)
+      await waitFor(() => expect(container.textContent).toContain('Check status'))
+      act(() => f.publish())
+      expect(f.bridge.saveRelayApiKey).toHaveBeenCalledOnce()
+      expect(container.querySelector('#relay-api-key')?.getAttribute('value') ?? '').toBe('')
+      f.bridge.readRelayCredentialReceipt.mockResolvedValue({
+        ok: true,
+        value: { nonce: nonce ?? '', operation: 'save', revision: 1, configured: true },
+      })
+      const check = [...container.querySelectorAll('button')].find(
+        (b) => b.textContent === 'Check status',
+      )!
+      await user.click(check)
+      await waitFor(() => expect(container.textContent).not.toContain('Check status'))
+    },
+  )
+
+  it('keeps uncertainty when the bridge throws and after a changed event', async () => {
+    const f = fixture(settings({ enabled: true }))
+    f.bridge.saveRelayApiKey.mockRejectedValue(new Error('transport closed'))
+    const { container } = render(<Surface active />)
+    const user = userEvent.setup()
+    await waitFor(() => expect(container.querySelector('#relay-api-key')).not.toBeNull())
+    await user.type(
+      container.querySelector<HTMLInputElement>('#relay-api-key')!,
+      'sk-synthetic-preview-key-0000',
+    )
+    await user.click(container.querySelector('.relay-key-controls button[type="submit"]')!)
+    await waitFor(() => expect(container.textContent).toContain('Check status'))
+    act(() => f.publish())
+    await waitFor(() => expect(container.textContent).toContain('Check status'))
+    expect(f.bridge.saveRelayApiKey).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    { field: 'nonce', value: { nonce: '99999999-9999-4999-8999-999999999999' } },
+    { field: 'operation', value: { operation: 'remove' } },
+    { field: 'revision', value: { revision: 9 } },
+    { field: 'configured', value: { configured: false } },
+  ] as const)('does not confirm a receipt with wrong $field', async ({ value }) => {
+    const f = fixture(settings({ enabled: true, credential: { configured: false, revision: 0 } }))
+    f.bridge.saveRelayApiKey.mockImplementation(async (input) => ({
+      ok: true,
+      value: {
+        nonce: input.nonce,
+        operation: 'save',
+        revision: 1,
+        configured: true,
+        ...value,
+      },
+    }))
+    const { container } = render(<Surface active />)
+    const user = userEvent.setup()
+    await waitFor(() => expect(container.querySelector('#relay-api-key')).not.toBeNull())
+    await user.type(
+      container.querySelector<HTMLInputElement>('#relay-api-key')!,
+      'sk-synthetic-preview-key-0000',
+    )
+    await user.click(container.querySelector('.relay-key-controls button[type="submit"]')!)
+    await waitFor(() => expect(container.textContent).toContain('Check status'))
+    const nonce = f.bridge.saveRelayApiKey.mock.calls[0]?.[0]?.nonce
+    expect(nonce).not.toBe('99999999-9999-4999-8999-999999999999')
+    expect(container.textContent).not.toContain('Saved')
+    expect(container.textContent).toContain('Not configured')
+    f.bridge.readRelayCredentialReceipt.mockResolvedValue({
+      ok: true,
+      value: { nonce: nonce!, operation: 'save', revision: 1, configured: true, ...value },
+    })
+    await user.click(screen.getByRole('button', { name: 'Check status' }))
+    await waitFor(() => expect(f.bridge.readRelayCredentialReceipt).toHaveBeenCalledOnce())
+    expect(screen.getByRole('button', { name: 'Check status' })).toBeDefined()
+    expect(f.bridge.saveRelayApiKey).toHaveBeenCalledOnce()
+  })
+
+  it('reports the deadline-passed missing receipt and unlocks a fresh attempt after readback', async () => {
+    const f = fixture(settings({ enabled: true, credential: { configured: false, revision: 0 } }))
+    f.bridge.saveRelayApiKey.mockResolvedValue({
+      ok: false,
+      error: { code: 'UNCERTAIN', message: 'unconfirmed' },
+    })
+    const { container } = render(<Surface active />)
+    const user = userEvent.setup()
+    await waitFor(() => expect(container.querySelector('#relay-api-key')).not.toBeNull())
+    await user.type(
+      container.querySelector<HTMLInputElement>('#relay-api-key')!,
+      'sk-synthetic-preview-key-0000',
+    )
+    await user.click(container.querySelector('.relay-key-controls button[type="submit"]')!)
+    await waitFor(() => expect(container.textContent).toContain('Check status'))
+    const originalDeadline = f.bridge.saveRelayApiKey.mock.calls[0]![0].deadlineAt
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(originalDeadline - 1)
+    f.bridge.readRelayCredentialReceipt.mockResolvedValue({ ok: true, value: null })
+    const check = [...container.querySelectorAll('button')].find(
+      (b) => b.textContent === 'Check status',
+    )!
+    await user.click(check)
+    expect(screen.getByRole('button', { name: 'Check status' })).toBeDefined()
+    expect(screen.queryByText('The key change was not saved.')).toBeNull()
+    spy.mockReturnValue(originalDeadline)
+    await user.click(screen.getByRole('button', { name: 'Check status' }))
+    await waitFor(() => expect(container.textContent).toContain('The key change was not saved.'))
+    spy.mockRestore()
+    expect(f.bridge.saveRelayApiKey).toHaveBeenCalledOnce()
+    await user.type(
+      container.querySelector<HTMLInputElement>('#relay-api-key')!,
+      'sk-fresh-attempt',
+    )
+    await user.click(container.querySelector('.relay-key-controls button[type="submit"]')!)
+    expect(f.bridge.saveRelayApiKey).toHaveBeenCalledTimes(2)
+  })
+
+  it('blocks key writes while ordinary save is in flight and vice versa', async () => {
+    const f = fixture(settings({ enabled: true }))
+    const save = Promise.withResolvers<RpcResult<SchedulingSettings>>()
+    f.bridge.saveSchedulingSettings.mockReturnValueOnce(save.promise)
+    const { container } = render(<Surface active />)
+    const user = userEvent.setup()
+    await waitFor(() => expect(container.querySelector('#relay-api-key')).not.toBeNull())
+    const toggle = [...container.querySelectorAll('[role="switch"]')].find((b) =>
+      b.textContent?.includes('Enable Relay'),
+    )!
+    await user.click(toggle)
+    expect(container.querySelector<HTMLInputElement>('#relay-api-key')?.disabled).toBe(true)
+    save.resolve({ ok: true, value: settings({ enabled: true, revision: 1 }) })
+    await waitFor(() =>
+      expect(container.querySelector<HTMLInputElement>('#relay-api-key')?.disabled).toBe(false),
+    )
+    const keyWrite = Promise.withResolvers<RpcResult<RelayCredentialReceipt>>()
+    f.bridge.saveRelayApiKey.mockReturnValue(keyWrite.promise)
+    await user.type(
+      container.querySelector<HTMLInputElement>('#relay-api-key')!,
+      'sk-synthetic-preview-key-0000',
+    )
+    await user.click(container.querySelector('.relay-key-controls button[type="submit"]')!)
+    expect(f.bridge.saveSchedulingSettings).toHaveBeenCalledOnce()
+    await user.click(toggle)
+    expect(f.bridge.saveSchedulingSettings).toHaveBeenCalledOnce()
+    keyWrite.resolve({
+      ok: true,
+      value: {
+        nonce: f.bridge.saveRelayApiKey.mock.calls[0]?.[0]?.nonce ?? '',
+        operation: 'save',
+        revision: 1,
+        configured: true,
+      },
+    })
+  })
+
+  it('labels Remove as Removing while pending and never Saving on the wrong button', async () => {
+    const f = fixture(settings({ enabled: true, credential: { configured: true, revision: 1 } }))
+    const pending = Promise.withResolvers<RpcResult<RelayCredentialReceipt>>()
+    f.bridge.removeRelayApiKey.mockReturnValue(pending.promise)
+    const { container } = render(<Surface active />)
+    const user = userEvent.setup()
+    await waitFor(() => expect(container.textContent).toContain('Saved'))
+    const remove = [...container.querySelectorAll('button')].find(
+      (b) => b.textContent === 'Remove',
+    )!
+    await user.click(remove)
+    await waitFor(() => expect(container.textContent).toContain('Removing…'))
+    expect(container.textContent).not.toContain('Saving…')
+    pending.resolve({
+      ok: true,
+      value: {
+        nonce: f.bridge.removeRelayApiKey.mock.calls[0]?.[0]?.nonce ?? '',
+        operation: 'remove',
+        revision: 2,
+        configured: false,
+      },
+    })
+  })
+
+  it('keeps an uncertain Remove until its own receipt readback', async () => {
+    const f = fixture(settings({ enabled: true, credential: { configured: true, revision: 1 } }))
+    f.bridge.removeRelayApiKey.mockResolvedValue({
+      ok: false,
+      error: { code: 'UNCERTAIN', message: 'The key change could not be confirmed.' },
+    })
+    const { container } = render(<Surface active />)
+    const user = userEvent.setup()
+    await waitFor(() => expect(container.textContent).toContain('Saved'))
+    const remove = [...container.querySelectorAll('button')].find(
+      (b) => b.textContent === 'Remove',
+    )!
+    await user.click(remove)
+    await waitFor(() => expect(container.textContent).toContain('Check status'))
+    const nonce = f.bridge.removeRelayApiKey.mock.calls[0]?.[0]?.nonce
+    expect(nonce).toBeDefined()
+    f.bridge.readRelayCredentialReceipt.mockResolvedValue({
+      ok: true,
+      value: { nonce: nonce!, operation: 'remove', revision: 2, configured: false },
+    })
+    await user.click(screen.getByRole('button', { name: 'Check status' }))
+    await waitFor(() =>
+      expect(f.bridge.readRelayCredentialReceipt).toHaveBeenCalledExactlyOnceWith({ nonce }),
+    )
+    await waitFor(() => expect(container.textContent).not.toContain('Check status'))
+    expect(f.bridge.removeRelayApiKey).toHaveBeenCalledOnce()
+  })
+
+  it('shows Saved only as stored metadata with an unconfirmed connection', async () => {
+    fixture(settings({ enabled: true, credential: { configured: true, revision: 1 } }))
+    const { container } = render(<Surface active />)
+    await waitFor(() => expect(container.textContent).toContain('Saved'))
+    expect(container.textContent).not.toContain('verified')
+    expect(container.textContent).not.toContain('ready')
+  })
+
+  it('fences all writes until a successful credential receipt receives authoritative state readback', async () => {
+    const f = fixture(settings({ enabled: true }))
+    const hook = renderHook(() => useSchedulingSettings(true))
+    await waitFor(() => expect(hook.result.current.settings).toBeDefined())
+    const readback = Promise.withResolvers<RpcResult<SchedulingState>>()
+    f.bridge.getSchedulingState.mockReturnValueOnce(readback.promise)
+    act(() => {
+      expect(hook.result.current.saveKey('sk-synthetic-first')).toBe(true)
+    })
+    await waitFor(() => expect(f.bridge.getSchedulingState).toHaveBeenCalledTimes(2))
+    expect(hook.result.current.saveBlocked).toBe(true)
+    act(() => {
+      expect(hook.result.current.saveKey('sk-synthetic-second')).toBe(false)
+    })
+    await act(() => hook.result.current.save({ showIndicator: false }))
+    expect(f.bridge.saveRelayApiKey).toHaveBeenCalledOnce()
+    expect(f.bridge.saveSchedulingSettings).not.toHaveBeenCalled()
+    await act(async () =>
+      readback.resolve({
+        ok: true,
+        value: observedState(
+          settings({
+            enabled: true,
+            revision: 1,
+            credential: { configured: true, revision: 1 },
+          }),
+        ),
+      }),
+    )
+    await waitFor(() => expect(hook.result.current.saveBlocked).toBe(false))
+    act(() => {
+      expect(hook.result.current.saveKey('sk-synthetic-second')).toBe(true)
+    })
+    await waitFor(() => expect(hook.result.current.credentialSaving).toBe(false))
+    expect(f.bridge.saveRelayApiKey).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps one explicit status read and performs no follow-up work after unmount', async () => {
+    const f = fixture(settings({ enabled: true }))
+    f.bridge.saveRelayApiKey.mockResolvedValue({
+      ok: false,
+      error: { code: 'UNCERTAIN', message: 'Unconfirmed.' },
+    })
+    const hook = renderHook(() => useSchedulingSettings(true))
+    await waitFor(() => expect(hook.result.current.settings).toBeDefined())
+    act(() => {
+      hook.result.current.saveKey('sk-synthetic-key')
+    })
+    await waitFor(() => expect(hook.result.current.credentialUncertain).toBe(true))
+    const status = Promise.withResolvers<RpcResult<RelayCredentialReceipt | null>>()
+    f.bridge.readRelayCredentialReceipt.mockReturnValue(status.promise)
+    act(() => {
+      hook.result.current.checkCredentialStatus()
+      hook.result.current.checkCredentialStatus()
+    })
+    expect(f.bridge.readRelayCredentialReceipt).toHaveBeenCalledOnce()
+    const reads = f.bridge.getSchedulingState.mock.calls.length
+    const nonce = f.bridge.saveRelayApiKey.mock.calls[0]![0].nonce
+    hook.unmount()
+    await act(async () =>
+      status.resolve({
+        ok: true,
+        value: { nonce, operation: 'save', revision: 1, configured: true },
+      }),
+    )
+    expect(f.listeners.size).toBe(0)
+    expect(f.bridge.getSchedulingState).toHaveBeenCalledTimes(reads)
+    expect(f.bridge.saveRelayApiKey).toHaveBeenCalledOnce()
+  })
+})
+
+describe('Relay activity display', () => {
+  it('preserves selected text and the same row node when updated activity reorders its stable ID', async () => {
+    const f = fixture(settings({ enabled: true }))
+    const first = row(1),
       selected = { ...row(2), project: 'Selected project' }
     f.bridge.readSchedulingActivity.mockResolvedValueOnce({
       ok: true,
       value: { ...empty, rows: [first, selected] },
     })
     render(<Surface />)
-    const text = await screen.findByText('Selected project · Session'),
-      element = text.closest('[data-activity-row]'),
-      selection = document.getSelection()!
+    await waitFor(() => expect(document.querySelectorAll('[data-activity-row]')).toHaveLength(2))
+    const element = document.querySelector(`[data-activity-row="${selected.id}"]`)!
+    const text = element.querySelector('[data-activity-text="project"]')!.firstChild!
+    const selection = document.getSelection()!
     act(() => {
-      selection.setBaseAndExtent(text.firstChild!, 0, text.firstChild!, 8)
+      selection.setBaseAndExtent(text, 0, text, 8)
       document.dispatchEvent(new Event('selectionchange'))
     })
     expect(selection.toString()).toBe('Selected')
@@ -710,15 +955,331 @@ describe('Relay surface', () => {
       },
     })
     act(() => f.publish())
-    await screen.findByText('Result: Business turn completed')
-    expect(screen.getByText('Selected project · Session').closest('[data-activity-row]')).toBe(
-      element,
-    )
-    expect(document.getSelection()?.toString()).toBe('Selected')
-    expect(selection.anchorNode).toBe(text.firstChild)
-    expect(selection.anchorOffset).toBe(0)
-    expect(selection.focusNode).toBe(text.firstChild)
-    expect(selection.focusOffset).toBe(8)
+    await screen.findByText('Completed')
     expect(document.querySelector('[data-activity-row]')).toBe(element)
+    expect(selection.toString()).toBe('Selected')
+    expect(selection.anchorNode).toBe(text)
+    expect(selection.anchorOffset).toBe(0)
+    expect(selection.focusNode).toBe(text)
+    expect(selection.focusOffset).toBe(8)
+    await userEvent.setup().click(screen.getByRole('switch', { name: 'Show activity indicator' }))
+    expect(document.querySelector(`[data-activity-row="${selected.id}"]`)).toBe(element)
+  })
+
+  const activityRows = (rows: SchedulingActivityRow[]): SchedulingActivityPage => ({
+    asOf: timestamp,
+    rows,
+    nextCursor: null,
+  })
+  const renderActivity = async (rows: SchedulingActivityRow[]) => {
+    const f = fixture(settings({ enabled: true }))
+    f.bridge.readSchedulingActivity.mockResolvedValue({ ok: true, value: activityRows(rows) })
+    const { container } = render(<Surface active />)
+    await waitFor(() =>
+      expect(container.querySelectorAll('[data-activity-row]').length).toBe(rows.length),
+    )
+    return [...container.querySelectorAll('[data-activity-row]')]
+  }
+
+  it('labels each row action first and outcome second, scoped per row', async () => {
+    const els = await renderActivity([
+      row(1, {
+        reason: 'input',
+        action: 'route_claude',
+        actionResult: 'dispatched',
+        suggestionState: 'adopted',
+        result: 'completed',
+      }),
+      row(2, {
+        action: 'code_review',
+        actionResult: 'completed',
+        suggestionState: 'adopted',
+        result: 'completed',
+      }),
+      row(3, {
+        action: 'repair',
+        actionResult: null,
+        suggestionState: 'awaiting_user',
+        result: 'completed',
+      }),
+      row(4, {
+        reason: 'input',
+        action: null,
+        actionResult: null,
+        suggestionState: 'fallback',
+        result: 'failed',
+      }),
+      row(5, {
+        reason: 'input',
+        action: null,
+        actionResult: null,
+        suggestionState: 'none',
+        result: 'failed',
+      }),
+      row(6, { action: 'code_review', actionResult: 'failed', result: 'completed' }),
+      row(7, { result: 'completed', suggestion: null, suggestionState: 'none' }),
+    ])
+    const text = els.map((el) => el.textContent ?? '')
+    expect(text[0]).toContain('Route to Claude Code')
+    expect(text[0]).toContain('Awaiting result')
+    expect(text[1]).toContain('Review code')
+    expect(text[1]).toContain('Completed')
+    expect(text[2]).toContain('Repair code')
+    expect(text[2]).toContain('Needs confirmation')
+    expect(text[3]).toContain('Message routing')
+    expect(text[3]).toContain('Default kept')
+    expect(text[4]).toContain('Message routing')
+    expect(text[4]).toContain('No decision')
+    expect(text[5]).toContain('Failed')
+    expect(text[5]).not.toContain('Completed')
+    expect(els[5]?.querySelector('.text-danger')).not.toBeNull()
+    expect(els[4]?.querySelector('.text-danger')).toBeNull()
+    expect(text[6]).toContain('No change')
+  })
+
+  it('outcomes truthfully mark failed runs and omit suggestion prose and provider model text', async () => {
+    const els = await renderActivity([
+      row(1, {
+        reason: 'native_check',
+        action: 'native_check',
+        actionResult: null,
+        suggestionState: 'none',
+        result: 'failed',
+        physicalUnconfirmed: true,
+        originalUnconfirmed: true,
+        suggestion: 'generated suggestion prose that must not display',
+      }),
+      row(2, {
+        reason: 'input',
+        action: 'clarify_prepared_input',
+        actionResult: null,
+        suggestionState: 'awaiting_user',
+        result: 'completed',
+        suggestion: 'generated suggestion prose that must not display',
+      }),
+      row(3, {
+        reason: 'input',
+        action: null,
+        actionResult: null,
+        suggestionState: 'adopted',
+        result: 'completed',
+        suggestion: 'generated suggestion prose that must not display',
+      }),
+    ])
+    const [failed, clarify, applied] = els
+    expect(failed?.textContent).toContain('Check agent session')
+    expect(failed?.textContent).toContain('Check failed')
+    expect(failed?.querySelector('.text-danger')).not.toBeNull()
+    expect(failed?.textContent).toContain('Previous work unconfirmed')
+    expect(failed?.textContent).toContain('Cleanup unconfirmed')
+    expect(clarify?.textContent).toContain('Clarify input')
+    expect(clarify?.textContent).toContain('Needs information')
+    expect(applied?.textContent).toContain('Message routing')
+    expect(applied?.textContent).toContain('Applied')
+    expect(applied?.textContent).not.toContain('Completed')
+    for (const el of els) {
+      expect(el.textContent).not.toContain('generated suggestion prose')
+      expect(el.textContent).not.toContain('OpenAI')
+      expect(el.textContent).not.toContain('gpt-6-luna')
+    }
+    expect(clarify?.querySelector('.text-danger')).toBeNull()
+    expect(applied?.querySelector('.text-danger')).toBeNull()
+  })
+})
+
+const findKey = async (container: HTMLElement): Promise<HTMLInputElement> => {
+  let input: HTMLInputElement | null = null
+  await waitFor(() => {
+    input = container.querySelector<HTMLInputElement>('#relay-api-key')
+    expect(input).not.toBeNull()
+  })
+  return input!
+}
+
+describe('Saved key reveal', () => {
+  beforeEach(() => {
+    // Simulated active window; afterEach restores.
+    vi.spyOn(document, 'hasFocus').mockReturnValue(true)
+  })
+  const configured = () =>
+    fixture(settings({ enabled: true, credential: { configured: true, revision: 1 } }))
+
+  it('masks the saved key, reveals on explicit click only and hides again', async () => {
+    const user = userEvent.setup()
+    const f = configured()
+    const { container } = render(<Surface />)
+    const input = await findKey(container)
+    // Saved configured revision1: dots placeholder, password, zero calls on mount.
+    expect(input.value).toBe('')
+    expect(input.placeholder).toBe('••••••••••••')
+    expect(input.type).toBe('password')
+    expect(f.bridge.revealRelayApiKey).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Show API key' }))
+    await waitFor(() => expect(input.type).toBe('text'))
+    expect(input.value).toBe('sk-synthetic-reveal-0000')
+    expect(f.bridge.revealRelayApiKey).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        expectedRevision: 1,
+        deadlineAt: expect.any(Number),
+      }),
+    )
+    // Reveal alone does not enable Replace.
+    expect(screen.getByRole('button', { name: 'Replace key' }).getAttribute('disabled')).toBe('')
+    await user.click(screen.getByRole('button', { name: 'Hide API key' }))
+    expect(input.type).toBe('password')
+    expect(input.value).toBe('')
+    expect(input.placeholder).toBe('••••••••••••')
+    expect(f.bridge.revealRelayApiKey).toHaveBeenCalledOnce()
+    // A typed draft toggles locally without any stored-key read and enables Replace.
+    await user.type(input, 'sk-synthetic-draft')
+    await user.click(screen.getByRole('button', { name: 'Show API key' }))
+    expect(input.type).toBe('text')
+    expect(f.bridge.revealRelayApiKey).toHaveBeenCalledOnce()
+    expect(screen.getByRole('button', { name: 'Replace key' }).getAttribute('disabled')).toBeNull()
+  })
+
+  it('shows a generic inline error on rejection and allows a successful retry', async () => {
+    const user = userEvent.setup()
+    const f = configured()
+    f.bridge.revealRelayApiKey.mockRejectedValueOnce(new Error('private-detail'))
+    const { container } = render(<Surface />)
+    await waitFor(() => expect(container.querySelector('#relay-api-key')).not.toBeNull())
+    await user.click(screen.getByRole('button', { name: 'Show API key' }))
+    const error = await screen.findByText(/Couldn't show the saved API key/u)
+    expect(error.textContent).not.toContain('private-detail')
+    await user.click(screen.getByRole('button', { name: 'Show API key' }))
+    await waitFor(() =>
+      expect(container.querySelector<HTMLInputElement>('#relay-api-key')!.type).toBe('text'),
+    )
+    expect(container.querySelector<HTMLInputElement>('#relay-api-key')!.value).toBe(
+      'sk-synthetic-reveal-0000',
+    )
+  })
+
+  it('keeps a typed draft when a pending reveal resolves late and admits one request', async () => {
+    const user = userEvent.setup()
+    const f = configured()
+    const deferred =
+      Promise.withResolvers<Awaited<ReturnType<DesktopBridge['revealRelayApiKey']>>>()
+    f.bridge.revealRelayApiKey.mockReturnValueOnce(deferred.promise)
+    const { container } = render(<Surface />)
+    const input = await findKey(container)
+    const eye = screen.getByRole('button', { name: 'Show API key' })
+    await user.click(eye)
+    await user.click(eye)
+    await user.type(input, 'sk-synthetic-draft')
+    await act(async () => {
+      deferred.resolve({ ok: true, value: { revision: 1, key: 'sk-synthetic-reveal-0000' } })
+      await deferred.promise
+    })
+    expect(f.bridge.revealRelayApiKey).toHaveBeenCalledOnce()
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Show API key' }).getAttribute('disabled'),
+      ).toBeNull(),
+    )
+    expect(input.value).toBe('sk-synthetic-draft')
+    expect(input.type).toBe('password')
+  })
+
+  it('ignores a reply settled while hidden and can reveal anew after returning', async () => {
+    const user = userEvent.setup()
+    const f = configured()
+    const deferred =
+      Promise.withResolvers<Awaited<ReturnType<DesktopBridge['revealRelayApiKey']>>>()
+    f.bridge.revealRelayApiKey.mockReturnValueOnce(deferred.promise)
+    const { container, rerender } = render(<Surface />)
+    await waitFor(() => expect(container.querySelector('#relay-api-key')).not.toBeNull())
+    await user.click(screen.getByRole('button', { name: 'Show API key' }))
+    rerender(<Surface settingsVisible={false} />)
+    await act(async () => {
+      deferred.resolve({ ok: true, value: { revision: 1, key: 'sk-synthetic-reveal-0000' } })
+      await deferred.promise
+    })
+    expect(f.bridge.revealRelayApiKey).toHaveBeenCalledOnce()
+    rerender(<Surface settingsVisible={true} />)
+    const input = container.querySelector<HTMLInputElement>('#relay-api-key')
+    await waitFor(() => expect(input?.type).toBe('password'))
+    expect(input?.value).toBe('')
+    expect(input?.placeholder).toBe('••••••••••••')
+    expect(screen.getByRole('button', { name: 'Show API key' }).getAttribute('disabled')).toBeNull()
+    await user.click(screen.getByRole('button', { name: 'Show API key' }))
+    await waitFor(() => expect(input?.type).toBe('text'))
+    expect(f.bridge.revealRelayApiKey).toHaveBeenCalledTimes(2)
+  })
+
+  it('ignores a reply whose revision changed while pending', async () => {
+    const user = userEvent.setup()
+    const f = configured()
+    const deferred =
+      Promise.withResolvers<Awaited<ReturnType<DesktopBridge['revealRelayApiKey']>>>()
+    f.bridge.revealRelayApiKey.mockReturnValueOnce(deferred.promise)
+    const { container } = render(<Surface />)
+    const input = await findKey(container)
+    await user.click(screen.getByRole('button', { name: 'Show API key' }))
+    act(() => f.publish(settings({ enabled: true, credential: { configured: true, revision: 2 } })))
+    await act(async () => {
+      deferred.resolve({ ok: true, value: { revision: 1, key: 'sk-synthetic-reveal-0000' } })
+      await deferred.promise
+    })
+    expect(f.bridge.revealRelayApiKey).toHaveBeenCalledOnce()
+    await waitFor(() => expect(input.type).toBe('password'))
+    expect(input.value).toBe('')
+    expect(input.placeholder).toBe('••••••••••••')
+    expect(screen.getByRole('button', { name: 'Show API key' }).getAttribute('disabled')).toBeNull()
+  })
+
+  it('masks the revealed value on blur or document hidden', async () => {
+    const user = userEvent.setup()
+    configured()
+    const { container } = render(<Surface />)
+    const input = await findKey(container)
+    await user.click(screen.getByRole('button', { name: 'Show API key' }))
+    await waitFor(() => expect(input.type).toBe('text'))
+    fireEvent(window, new Event('blur'))
+    await waitFor(() => expect(input.type).toBe('password'))
+    expect(input.value).toBe('')
+    expect(input.placeholder).toBe('••••••••••••')
+    await user.click(screen.getByRole('button', { name: 'Show API key' }))
+    await waitFor(() => expect(input.type).toBe('text'))
+    const hiddenSpy = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
+    fireEvent(document, new Event('visibilitychange'))
+    await waitFor(() => expect(input.type).toBe('password'))
+    expect(input.value).toBe('')
+    expect(input.placeholder).toBe('••••••••••••')
+    hiddenSpy.mockRestore()
+  })
+
+  it('removes this surface window listeners on unmount and ignores a late pending reply', async () => {
+    const user = userEvent.setup()
+    const f = configured()
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const removeSpy = vi.spyOn(window, 'removeEventListener')
+    const deferred =
+      Promise.withResolvers<Awaited<ReturnType<DesktopBridge['revealRelayApiKey']>>>()
+    f.bridge.revealRelayApiKey.mockReturnValueOnce(deferred.promise)
+    const { container, unmount } = render(<Surface />)
+    await findKey(container)
+    // Find this surface's blur listener added after mount.
+    const blurAdd = addSpy.mock.calls.find((call) => call[0] === 'blur')
+    expect(blurAdd).toBeDefined()
+    const handler = blurAdd![1]
+    await user.click(screen.getByRole('button', { name: 'Show API key' }))
+    expect(f.bridge.revealRelayApiKey).toHaveBeenCalledOnce()
+    unmount()
+    expect(removeSpy.mock.calls.some((call) => call[0] === 'blur' && call[1] === handler)).toBe(
+      true,
+    )
+    await act(async () => {
+      deferred.resolve({ ok: true, value: { revision: 1, key: 'sk-synthetic-reveal-0000' } })
+      await deferred.promise
+    })
+    // Fresh configured surface mounts masked with no extra stored-key read.
+    const { container: fresh } = render(<Surface />)
+    const next = await findKey(fresh)
+    expect(next.value).toBe('')
+    expect(next.placeholder).toBe('••••••••••••')
+    expect(next.type).toBe('password')
+    expect(f.bridge.revealRelayApiKey).toHaveBeenCalledOnce()
   })
 })

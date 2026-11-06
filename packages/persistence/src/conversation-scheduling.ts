@@ -12,10 +12,12 @@ import {
   schedulingSettingsSaveSchema,
   type SchedulingSettingsSave,
   decisionPhysicalWitnessSchema,
-  decisionPhysicalWitnessExtends,
-  decisionNativeStageSchema,
-  type DecisionNativeStage,
-  type DecisionPhysicalWitness,
+  decisionHttpOwnerSchema,
+  decisionRemoteOutcomeSchema,
+  type DecisionHttpOwner,
+  type DecisionRemoteOutcome,
+  DECISION_HTTP_OWNER_BYTES,
+  OPENAI_DECISION_MODEL,
   DECISION_PHYSICAL_RECEIPT_ITEMS,
   DECISION_PHYSICAL_RECEIPT_BYTES,
   schedulingCheckPhysicalOwnerSchema,
@@ -54,6 +56,7 @@ import {
   schedulingSettings,
   schedulingRuntimeOwners,
   schedulingPhysicalReceipts,
+  relayCredentials,
   schedulingRecoveryFaults,
   schedulingRecoveryAttempts,
   runExecutionInputs,
@@ -73,9 +76,22 @@ export {
 
 export function readSettings(db: PactDrizzleDatabase) {
   const row = db.select().from(schedulingSettings).where(eq(schedulingSettings.id, 1)).get()
+  const credential = db
+    .select({
+      configured: sql<boolean>`${relayCredentials.ciphertext} IS NOT NULL`.mapWith(Boolean),
+      revision: relayCredentials.revision,
+    })
+    .from(relayCredentials)
+    .where(eq(relayCredentials.id, 1))
+    .get()
   return schedulingSettingsSchema.parse({
     enabled: row?.enabled ?? false,
-    selection: row?.selectionJson ? JSON.parse(row.selectionJson) : null,
+    provider: 'openai',
+    model: 'gpt-6-luna',
+    credential: {
+      configured: credential?.configured ?? false,
+      revision: credential?.revision ?? 0,
+    },
     showIndicator: row?.showIndicator ?? true,
     revision: row?.revision ?? 0,
     updatedAt: row?.updatedAt ?? new Date(0).toISOString(),
@@ -97,10 +113,7 @@ export function saveSettings(db: PactDrizzleDatabase, raw: SchedulingSettingsSav
     current = readSettings(db)
   if (input.expectedRevision !== current.revision)
     throw new RunOperationConflictError('Scheduling settings changed. Refresh before saving again.')
-  const selection = input.selection === undefined ? current.selection : input.selection
-  const changed =
-    (input.enabled ?? current.enabled) !== current.enabled ||
-    JSON.stringify(selection) !== JSON.stringify(current.selection)
+  const changed = (input.enabled ?? current.enabled) !== current.enabled
   const generation = configurationGeneration(db) + (changed ? 1 : 0)
   if (!Number.isSafeInteger(generation))
     throw new RunOperationConflictError('Scheduling configuration generation is unavailable.')
@@ -108,7 +121,6 @@ export function saveSettings(db: PactDrizzleDatabase, raw: SchedulingSettingsSav
     .values({
       id: 1,
       enabled: input.enabled ?? current.enabled,
-      selectionJson: selection ? JSON.stringify(selection) : null,
       showIndicator: input.showIndicator ?? current.showIndicator,
       revision: current.revision + 1,
       configurationGeneration: generation,
@@ -118,7 +130,6 @@ export function saveSettings(db: PactDrizzleDatabase, raw: SchedulingSettingsSav
       target: schedulingSettings.id,
       set: {
         enabled: input.enabled ?? current.enabled,
-        selectionJson: selection ? JSON.stringify(selection) : null,
         showIndicator: input.showIndicator ?? current.showIndicator,
         revision: current.revision + 1,
         configurationGeneration: generation,
@@ -141,7 +152,6 @@ export function recordRecoveryFault(
     node = schedulingHandoffSchema.parse(input.node)
   if (
     !settings.enabled ||
-    !settings.selection ||
     !node.fault ||
     !node.freshnessGuard.runId ||
     !node.freshnessGuard.agentId
@@ -206,7 +216,6 @@ export function reserveRecoveryCheck(
     fault.utilityEpoch !== input.epoch ||
     fault.configurationGeneration !== generation ||
     !settings.enabled ||
-    !settings.selection ||
     fault.consideredFingerprint !== node.factFingerprint ||
     node.fault?.id !== fault.faultId ||
     node.fault.kind !== fault.faultKind ||
@@ -562,15 +571,47 @@ export function readEvaluationReceipt(db: PactDrizzleDatabase, node: SchedulingH
     .get()
 }
 
+/** The exact persisted HTTP request identity; canonical form is always <=512 bytes. */
+function canonicalHttpOwner(raw: unknown): DecisionHttpOwner {
+  const owner = decisionHttpOwnerSchema.parse(raw)
+  if (Buffer.byteLength(JSON.stringify(owner)) > DECISION_HTTP_OWNER_BYTES)
+    throw new RunOperationConflictError('The HTTP physical owner identity is invalid.')
+  return owner
+}
+
+/** An HTTP owner binds one request identity; it must carry no native witness fields. */
+function persistedHttpOwner(
+  owner: typeof schedulingRuntimeOwners.$inferSelect | undefined,
+  evaluation: typeof schedulingEvaluations.$inferSelect,
+): boolean {
+  return Boolean(
+    owner &&
+    evaluation.provider === 'openai' &&
+    evaluation.model === OPENAI_DECISION_MODEL &&
+    evaluation.physicalWitnessJson === null &&
+    owner.provider === 'openai' &&
+    owner.model === OPENAI_DECISION_MODEL &&
+    owner.kind === 'evaluation' &&
+    owner.evaluationId === evaluation.id &&
+    owner.id === evaluation.id &&
+    owner.sessionId === evaluation.sessionId &&
+    owner.configurationFingerprint === evaluation.configurationFingerprint &&
+    owner.deadline === evaluation.deadline &&
+    owner.physicalWitnessJson === null &&
+    owner.nativeStage === null &&
+    owner.nativeGeneration === 0 &&
+    owner.httpOwnerJson !== null,
+  )
+}
+
 export function reserveEvaluation(
   db: PactDrizzleDatabase,
   input: {
     handoff: SchedulingHandoff
-    provider: 'codex' | 'claude'
-    model: string
     configurationFingerprint: string
-    inputSha256?: string
-    deadlineAt?: number
+    inputSha256: string
+    deadlineAt: number
+    httpOwner: DecisionHttpOwner
   },
 ) {
   const node = input.handoff,
@@ -579,35 +620,38 @@ export function reserveEvaluation(
   if (existing) return { status: 'duplicate' as const, evaluation: existing }
   if (saved.action) return { status: 'claimed' as const }
   if (activeRuntimeOwner(db)) return { status: 'busy' as const }
+  const httpOwner = canonicalHttpOwner(input.httpOwner)
   if (
-    !['codex', 'claude'].includes(input.provider) ||
-    !input.model.trim() ||
-    Buffer.byteLength(input.model) > 256 ||
-    !/^[a-f0-9]{64}$/u.test(input.configurationFingerprint)
+    !/^[a-f0-9]{64}$/u.test(input.configurationFingerprint) ||
+    input.configurationFingerprint !== decisionConfigurationFingerprint(db)
   )
-    throw new RunOperationConflictError('An exact provider, model and configuration are required.')
-  if (input.inputSha256 !== undefined && !/^[a-f0-9]{64}$/u.test(input.inputSha256))
+    throw new RunOperationConflictError('An exact configuration identity is required.')
+  if (!/^[a-f0-9]{64}$/u.test(input.inputSha256))
     throw new RunOperationConflictError('The complete evaluation input identity is invalid.')
   const now = Date.now()
-  const deadlineAt = input.deadlineAt ?? now + 15_000
-  if (!Number.isSafeInteger(deadlineAt) || deadlineAt <= now || deadlineAt > now + 15_000)
+  if (
+    !Number.isSafeInteger(input.deadlineAt) ||
+    input.deadlineAt <= now ||
+    input.deadlineAt > now + 15_000
+  )
     throw new RunOperationConflictError('The evaluation deadline is unavailable.')
   const evaluation = db
     .insert(schedulingEvaluations)
     .values({
-      id: randomUUID(),
+      id: httpOwner.requestId,
       sessionId: node.sessionId,
       handoffId: node.id,
       budgetSubjectId: node.budgetSubjectId,
       factFingerprint: node.factFingerprint,
-      provider: input.provider,
-      model: input.model,
+      provider: 'openai',
+      model: OPENAI_DECISION_MODEL,
       configurationFingerprint: input.configurationFingerprint,
-      inputSha256: input.inputSha256 ?? null,
+      inputSha256: input.inputSha256,
+      remoteOutcome: 'not_sent',
       handoffJson: JSON.stringify(node),
       outcome: 'reserved',
       createdAt: new Date(now).toISOString(),
-      deadline: new Date(deadlineAt).toISOString(),
+      deadline: new Date(input.deadlineAt).toISOString(),
     })
     .returning()
     .get()
@@ -618,9 +662,10 @@ export function reserveEvaluation(
       kind: 'evaluation',
       sessionId: node.sessionId,
       evaluationId: evaluation.id,
-      provider: input.provider,
-      model: input.model,
+      provider: 'openai',
+      model: OPENAI_DECISION_MODEL,
       configurationFingerprint: input.configurationFingerprint,
+      httpOwnerJson: JSON.stringify(httpOwner),
       createdAt: evaluation.createdAt,
       deadline: evaluation.deadline,
     })
@@ -635,54 +680,6 @@ export function activeRuntimeOwner(db: PactDrizzleDatabase) {
     .from(schedulingRuntimeOwners)
     .where(eq(schedulingRuntimeOwners.active, true))
     .get()
-}
-
-/** Reserve before any native construction. A missing witness after restart stays unresolved. */
-export function reserveRuntimeProbe(
-  db: PactDrizzleDatabase,
-  input: {
-    id: string
-    sessionId: string | null
-    provider: 'codex' | 'claude'
-    model: string
-    configurationFingerprint: string
-    deadlineAt: number
-  },
-) {
-  if (activeRuntimeOwner(db)) return false
-  if (
-    !/^[a-f0-9-]{36}$/u.test(input.id) ||
-    !/^[a-f0-9]{64}$/u.test(input.configurationFingerprint) ||
-    !input.model.trim() ||
-    Buffer.byteLength(input.model) > 256 ||
-    !Number.isSafeInteger(input.deadlineAt) ||
-    input.deadlineAt <= Date.now() ||
-    input.deadlineAt > Date.now() + 15_000
-  )
-    throw new RunOperationConflictError('The native probe identity is unavailable.')
-  // A completed probe has no semantic history. Retain only its latest physical receipt.
-  db.delete(schedulingRuntimeOwners)
-    .where(
-      and(
-        eq(schedulingRuntimeOwners.kind, 'probe'),
-        eq(schedulingRuntimeOwners.active, false),
-        sql`NOT EXISTS (SELECT 1 FROM ${schedulingPhysicalReceipts} r WHERE r.runtime_owner_id = ${schedulingRuntimeOwners.id})`,
-      ),
-    )
-    .run()
-  db.insert(schedulingRuntimeOwners)
-    .values({
-      id: input.id,
-      kind: 'probe',
-      sessionId: input.sessionId,
-      provider: input.provider,
-      model: input.model,
-      configurationFingerprint: input.configurationFingerprint,
-      createdAt: new Date().toISOString(),
-      deadline: new Date(input.deadlineAt).toISOString(),
-    })
-    .run()
-  return true
 }
 
 const PHYSICAL_RECEIPT_RECORD_BYTES = 2 * 1024
@@ -809,124 +806,6 @@ export function acknowledgePhysicalReceipt(
   )
 }
 
-export function recordRuntimeWitness(
-  db: PactDrizzleDatabase,
-  id: string,
-  value: {
-    witness: DecisionPhysicalWitness
-    configurationFingerprint?: string
-    nativeGeneration?: number
-  },
-) {
-  const witness = decisionPhysicalWitnessSchema.parse(value.witness)
-  const saved = db
-    .select()
-    .from(schedulingRuntimeOwners)
-    .where(eq(schedulingRuntimeOwners.id, id))
-    .get()
-  if (!saved?.active) throw new RunOperationConflictError('The native reservation is unavailable.')
-  if (
-    saved.nativeStage === 'native_context' &&
-    (!['claude', 'codex'].includes(saved.provider) || witness.platform !== 'win32')
-  )
-    throw new RunOperationConflictError('The native context requires a supported Windows owner.')
-  if ((value.nativeGeneration ?? 0) !== saved.nativeGeneration)
-    throw new RunOperationConflictError('The native witness belongs to an older physical stage.')
-  if (value.configurationFingerprint && !/^[a-f0-9]{64}$/u.test(value.configurationFingerprint))
-    throw new RunOperationConflictError('Invalid native configuration identity.')
-  if (saved.physicalWitnessJson) {
-    const previous = decisionPhysicalWitnessSchema.parse(JSON.parse(saved.physicalWitnessJson))
-    if (!decisionPhysicalWitnessExtends(previous, witness))
-      throw new RunOperationConflictError('The native physical owner changed.')
-  }
-  db.update(schedulingRuntimeOwners)
-    .set({
-      phase: saved.phase === 'cleanup_unconfirmed' ? 'cleanup_unconfirmed' : 'running',
-      physicalWitnessJson: JSON.stringify(witness),
-      ...(value.configurationFingerprint
-        ? { configurationFingerprint: value.configurationFingerprint }
-        : {}),
-    })
-    .where(eq(schedulingRuntimeOwners.id, id))
-    .run()
-}
-
-/** An invocation keeps its one admission while independently witnessed native stages change. */
-export function beginNativeStage(
-  db: PactDrizzleDatabase,
-  id: string,
-  input: {
-    expectedGeneration: number
-    stage: DecisionNativeStage
-    previousWitness: DecisionPhysicalWitness | null
-    previousPhysicalReleased: boolean
-  },
-): number {
-  const stage = decisionNativeStageSchema.parse(input.stage)
-  const owner = db
-    .select()
-    .from(schedulingRuntimeOwners)
-    .where(eq(schedulingRuntimeOwners.id, id))
-    .get()
-  if (
-    !owner?.active ||
-    !['claude', 'codex'].includes(owner.provider) ||
-    !input.previousPhysicalReleased ||
-    !Number.isSafeInteger(input.expectedGeneration) ||
-    input.expectedGeneration !== owner.nativeGeneration ||
-    owner.nativeGeneration >= 4 ||
-    Date.parse(owner.deadline) <= Date.now() ||
-    owner.phase === 'cleanup_unconfirmed'
-  )
-    throw new RunOperationConflictError('The native stage is no longer eligible.')
-  if (owner.nativeGeneration === 0) {
-    if (
-      (stage !== 'host_metadata' &&
-        !(stage === 'native_context' && ['claude', 'codex'].includes(owner.provider))) ||
-      owner.phase !== 'reserved' ||
-      owner.nativeStage !== null ||
-      owner.physicalWitnessJson !== null ||
-      input.previousWitness !== null
-    )
-      throw new RunOperationConflictError('The initial native stage is not empty.')
-  } else {
-    const witness =
-      input.previousWitness && decisionPhysicalWitnessSchema.parse(input.previousWitness)
-    if (
-      owner.phase !== 'running' ||
-      !witness ||
-      !owner.physicalWitnessJson ||
-      JSON.stringify(witness) !== owner.physicalWitnessJson
-    )
-      throw new RunOperationConflictError(
-        'The previous native stage has not been physically confirmed.',
-      )
-    const next =
-      owner.nativeStage === 'host_metadata'
-        ? owner.provider === 'claude' && owner.sessionId
-          ? 'project_metadata'
-          : 'guarded_context'
-        : owner.nativeStage === 'project_metadata'
-          ? 'guarded_context'
-          : owner.nativeStage === 'guarded_context' && owner.kind === 'evaluation'
-            ? 'project_verification'
-            : null
-    if (stage !== next) throw new RunOperationConflictError('The native stage order is invalid.')
-  }
-  retainClosedReceipt(db, owner)
-  const generation = owner.nativeGeneration + 1
-  db.update(schedulingRuntimeOwners)
-    .set({
-      nativeGeneration: generation,
-      nativeStage: stage,
-      phase: 'preparing',
-      physicalWitnessJson: null,
-    })
-    .where(eq(schedulingRuntimeOwners.id, id))
-    .run()
-  return generation
-}
-
 /** Caller supplies direct runtime settlement or matching persisted-witness proof, never a timeout. */
 export function settleRuntimeProbe(db: PactDrizzleDatabase, id: string, physicalReleased: boolean) {
   const saved = db
@@ -953,6 +832,7 @@ function assertEvaluationMetadata(row: typeof schedulingEvaluations.$inferSelect
   const future = {
     ...row,
     outcome: 'possibly_sent',
+    remoteOutcome: 'responded',
     selectedCandidateId: 'x'.repeat(160),
     called: false,
     active: false,
@@ -966,63 +846,108 @@ function assertEvaluationMetadata(row: typeof schedulingEvaluations.$inferSelect
     throw new RunOperationConflictError('Evaluation metadata capacity is full.')
 }
 
-export function recordEvaluationPhysicalWitness(
+export function settleEvaluation(
   db: PactDrizzleDatabase,
   id: string,
-  value: {
-    witness: DecisionPhysicalWitness
-    configurationFingerprint: string
-    nativeGeneration?: number
+  input: {
+    outcome: 'completed' | 'failed' | 'not_sent'
+    physicalReleased: boolean
+    selectedCandidateId?: string | null
+    usage?: SchedulingUsage
+    httpOwner: DecisionHttpOwner
+    remoteOutcome: DecisionRemoteOutcome
   },
 ) {
-  const witness = decisionPhysicalWitnessSchema.parse(value.witness)
-  if (!/^[a-f0-9]{64}$/u.test(value.configurationFingerprint))
-    throw new RunOperationConflictError('Invalid native configuration identity.')
   const saved = db
     .select()
     .from(schedulingEvaluations)
     .where(eq(schedulingEvaluations.id, id))
     .get()
-  if (!saved?.active)
-    throw new RunOperationConflictError('The evaluation reservation is unavailable.')
-  const owner = db
+  if (!saved) throw new RunOperationConflictError('The evaluation receipt is unavailable.')
+  if (saved.provider !== 'openai')
+    throw new RunOperationConflictError('An HTTP evaluation requires its exact owner proof.')
+  const requestOwner = canonicalHttpOwner(input.httpOwner),
+    canonicalOwner = JSON.stringify(requestOwner)
+  const remoteOutcome = decisionRemoteOutcomeSchema.parse(input.remoteOutcome)
+  const usage = input.usage ? schedulingUsageSchema.parse(input.usage) : undefined
+  const runtimeOwner = db
     .select()
     .from(schedulingRuntimeOwners)
     .where(eq(schedulingRuntimeOwners.id, id))
     .get()
   if (
-    owner?.nativeGeneration &&
-    owner.nativeStage !== 'guarded_context' &&
-    !(
-      owner.nativeStage === 'native_context' &&
-      ['claude', 'codex'].includes(owner.provider) &&
-      witness.platform === 'win32' &&
-      witness.phase === 'contained'
-    )
+    !persistedHttpOwner(runtimeOwner, saved) ||
+    requestOwner.requestId !== id ||
+    runtimeOwner!.httpOwnerJson !== canonicalOwner
   )
+    throw new RunOperationConflictError('The evaluation owner proof does not match.')
+  if (
+    !['completed', 'failed', 'not_sent'].includes(input.outcome) ||
+    typeof input.physicalReleased !== 'boolean'
+  )
+    throw new RunOperationConflictError('Physical release requires a terminal evaluation outcome.')
+  if (
+    input.selectedCandidateId !== undefined &&
+    input.selectedCandidateId !== null &&
+    (!/^[\w.:-]{1,160}$/u.test(input.selectedCandidateId) || input.outcome !== 'completed')
+  )
+    throw new RunOperationConflictError('The selected decision candidate is invalid.')
+  if (saved.called && input.outcome === 'not_sent')
+    throw new RunOperationConflictError('A possibly sent evaluation cannot be refunded.')
+  if (
+    ['completed', 'failed', 'not_sent'].includes(saved.outcome) &&
+    saved.outcome !== input.outcome
+  )
+    throw new RunOperationConflictError('A terminal evaluation outcome cannot be reopened.')
+  if (
+    saved.outcome === 'completed' &&
+    input.selectedCandidateId !== undefined &&
+    saved.selectedCandidateId !== input.selectedCandidateId
+  )
+    throw new RunOperationConflictError('A settled decision candidate cannot be replaced.')
+  if (!saved.called && input.outcome !== 'not_sent')
     throw new RunOperationConflictError(
-      'Only the inference stage may record evaluation provenance.',
+      'Record the evaluation invocation before settling its result.',
     )
-  if (saved.physicalWitnessJson) {
-    const previous = decisionPhysicalWitnessSchema.parse(JSON.parse(saved.physicalWitnessJson))
-    if (
-      !decisionPhysicalWitnessExtends(previous, witness) ||
-      saved.configurationFingerprint !== value.configurationFingerprint
-    )
-      throw new RunOperationConflictError('The evaluation physical owner changed.')
+  // A reservation is not a response; possibly escaped delivery can never be refunded.
+  if (
+    (!saved.called &&
+      (saved.remoteOutcome !== 'not_sent' ||
+        remoteOutcome !== 'not_sent' ||
+        input.outcome !== 'not_sent')) ||
+    (saved.called &&
+      ((saved.remoteOutcome !== 'unknown' && saved.remoteOutcome !== 'responded') ||
+        remoteOutcome === 'not_sent')) ||
+    (saved.remoteOutcome === 'responded' && remoteOutcome !== 'responded') ||
+    (input.outcome === 'completed' && remoteOutcome !== 'responded')
+  )
+    throw new RunOperationConflictError('The evaluation remote outcome cannot regress.')
+  if (!saved.active) {
+    if (runtimeOwner!.active)
+      throw new RunOperationConflictError('The evaluation physical reservation is inconsistent.')
+    return saved
   }
-  const next = {
-    ...saved,
-    physicalWitnessJson: JSON.stringify(witness),
-    configurationFingerprint: value.configurationFingerprint,
-  }
-  assertEvaluationMetadata(next)
-  recordRuntimeWitness(db, id, value)
+  if (!runtimeOwner!.active || runtimeOwner!.evaluationId !== id)
+    throw new RunOperationConflictError('The evaluation physical reservation is unavailable.')
+  db.update(schedulingRuntimeOwners)
+    .set({
+      active: !input.physicalReleased,
+      phase: input.physicalReleased ? 'released' : 'cleanup_unconfirmed',
+      ...(input.physicalReleased ? { settledAt: new Date().toISOString() } : {}),
+    })
+    .where(eq(schedulingRuntimeOwners.id, id))
+    .run()
   const result = db
     .update(schedulingEvaluations)
     .set({
-      physicalWitnessJson: next.physicalWitnessJson,
-      configurationFingerprint: next.configurationFingerprint,
+      outcome: input.outcome,
+      remoteOutcome,
+      ...(input.selectedCandidateId !== undefined
+        ? { selectedCandidateId: input.selectedCandidateId }
+        : {}),
+      active: !input.physicalReleased,
+      ...(usage ? { usageJson: JSON.stringify(usage) } : {}),
+      ...(input.physicalReleased ? { settledAt: new Date().toISOString() } : {}),
     })
     .where(eq(schedulingEvaluations.id, id))
     .returning()
@@ -1031,12 +956,15 @@ export function recordEvaluationPhysicalWitness(
   return result
 }
 
-export function settleEvaluation(
+/**
+ * Historical native release only: persisted witness rows keep their own proof path and never carry
+ * an HTTP owner. New evaluations are always HTTP and must present the exact owner proof.
+ */
+export function settleNativeEvaluationAfterProof(
   db: PactDrizzleDatabase,
   id: string,
   input: {
-    outcome: 'possibly_sent' | 'completed' | 'failed' | 'not_sent'
-    physicalReleased: boolean
+    outcome: 'completed' | 'failed' | 'not_sent'
     selectedCandidateId?: string | null
     usage?: SchedulingUsage
   },
@@ -1046,18 +974,10 @@ export function settleEvaluation(
     .from(schedulingEvaluations)
     .where(eq(schedulingEvaluations.id, id))
     .get()
-  if (!saved) throw new RunOperationConflictError('The evaluation reservation is unavailable.')
-  if (saved.called && input.outcome === 'not_sent')
-    throw new RunOperationConflictError('A possibly sent evaluation cannot be refunded.')
-  if (input.physicalReleased && input.outcome === 'possibly_sent')
-    throw new RunOperationConflictError('Physical release requires a terminal evaluation outcome.')
-  const usage = input.usage ? schedulingUsageSchema.parse(input.usage) : undefined
-  if (
-    input.selectedCandidateId !== undefined &&
-    input.selectedCandidateId !== null &&
-    (!/^[\w.:-]{1,160}$/u.test(input.selectedCandidateId) || input.outcome !== 'completed')
-  )
-    throw new RunOperationConflictError('The selected decision candidate is invalid.')
+  if (!saved) throw new RunOperationConflictError('The evaluation receipt is unavailable.')
+  if (saved.provider === 'openai')
+    throw new RunOperationConflictError('An HTTP evaluation requires its exact owner proof.')
+  const usage = input.usage === undefined ? undefined : schedulingUsageSchema.parse(input.usage)
   if (!saved.active) return saved
   if (
     ['completed', 'failed', 'not_sent'].includes(saved.outcome) &&
@@ -1081,13 +1001,9 @@ export function settleEvaluation(
     .get()
   if (!owner?.active || owner.evaluationId !== id)
     throw new RunOperationConflictError('The evaluation physical reservation is unavailable.')
-  if (input.physicalReleased) retainClosedReceipt(db, owner)
+  retainClosedReceipt(db, owner)
   db.update(schedulingRuntimeOwners)
-    .set({
-      active: !input.physicalReleased,
-      phase: input.physicalReleased ? 'released' : 'cleanup_unconfirmed',
-      ...(input.physicalReleased ? { settledAt: new Date().toISOString() } : {}),
-    })
+    .set({ active: false, phase: 'released', settledAt: new Date().toISOString() })
     .where(eq(schedulingRuntimeOwners.id, id))
     .run()
   const result = db
@@ -1097,9 +1013,9 @@ export function settleEvaluation(
       ...(input.selectedCandidateId !== undefined
         ? { selectedCandidateId: input.selectedCandidateId }
         : {}),
-      active: !input.physicalReleased,
+      active: false,
       ...(usage ? { usageJson: JSON.stringify(usage) } : {}),
-      ...(input.physicalReleased ? { settledAt: new Date().toISOString() } : {}),
+      settledAt: new Date().toISOString(),
     })
     .where(eq(schedulingEvaluations.id, id))
     .returning()
@@ -1108,16 +1024,51 @@ export function settleEvaluation(
   return result
 }
 
+/** Single source of truth for the configured Relay decision API identity. */
+export function decisionConfigurationFingerprint(db: PactDrizzleDatabase): string {
+  const settings = readSettings(db)
+  return fingerprint({
+    provider: 'openai',
+    model: OPENAI_DECISION_MODEL,
+    policyVersion: 'decisions-v1',
+    configurationGeneration: configurationGeneration(db),
+    credentialRevision: settings.credential.revision,
+  })
+}
+
 /** Synchronous invocation receipt: its winner alone may invoke the exact configured provider. */
-export function dispatchEvaluation(db: PactDrizzleDatabase, id: string) {
+export function dispatchEvaluation(db: PactDrizzleDatabase, id: string, httpOwner: unknown) {
   const saved = db
     .select()
     .from(schedulingEvaluations)
     .where(eq(schedulingEvaluations.id, id))
     .get()
-  if (!saved) throw new RunOperationConflictError('The evaluation reservation is unavailable.')
+  if (!saved || saved.provider !== 'openai')
+    throw new RunOperationConflictError('The evaluation reservation is unavailable.')
+  // Identity is validated even on a duplicate readback, before the called early return.
+  const owner = canonicalHttpOwner(httpOwner),
+    canonicalOwner = JSON.stringify(owner)
+  const persisted = db
+    .select()
+    .from(schedulingRuntimeOwners)
+    .where(eq(schedulingRuntimeOwners.id, id))
+    .get()
+  if (
+    !persistedHttpOwner(persisted, saved) ||
+    owner.requestId !== id ||
+    persisted!.httpOwnerJson !== canonicalOwner
+  )
+    throw new RunOperationConflictError('The HTTP physical owner identity changed.')
   if (saved.called) return { evaluation: saved, created: false }
-  if (!saved.active || saved.outcome !== 'reserved' || Date.parse(saved.deadline) <= Date.now())
+  if (
+    !persisted!.active ||
+    persisted!.phase !== 'reserved' ||
+    !saved.active ||
+    saved.outcome !== 'reserved' ||
+    saved.remoteOutcome !== 'not_sent' ||
+    saved.configurationFingerprint !== decisionConfigurationFingerprint(db) ||
+    Date.parse(saved.deadline) <= Date.now()
+  )
     throw new RunOperationConflictError('The evaluation invocation is no longer eligible.')
   const node = schedulingHandoffSchema.parse(JSON.parse(saved.handoffJson))
   if (
@@ -1141,9 +1092,13 @@ export function dispatchEvaluation(db: PactDrizzleDatabase, id: string) {
       payload: JSON.stringify({ evaluationId: id, handoffId: saved.handoffId }),
       createdAt: new Date().toISOString(),
     })
+  db.update(schedulingRuntimeOwners)
+    .set({ phase: 'running' })
+    .where(eq(schedulingRuntimeOwners.id, id))
+    .run()
   const evaluation = db
     .update(schedulingEvaluations)
-    .set({ called: true, outcome: 'possibly_sent' })
+    .set({ called: true, outcome: 'possibly_sent', remoteOutcome: 'unknown' })
     .where(eq(schedulingEvaluations.id, id))
     .returning()
     .get()
@@ -1533,7 +1488,6 @@ export function reacquireUnsentExtraTurnBudget(
       .get()
   if (
     !settings.enabled ||
-    !settings.selection ||
     !fault.active ||
     fault.configurationGeneration !== configurationGeneration(db) ||
     !captured?.effectiveJson ||

@@ -11,8 +11,10 @@ import {
 // depend on electron-builder's internal utility package resolution.
 const ELECTRON_BUILDER_ARM64 = 3
 const ELECTRON_BUILDER_X64 = 1
-import { writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { execFile } from 'node:child_process'
+import { mkdir, stat, writeFile } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
+import { promisify } from 'node:util'
 
 export default async function afterPack(context) {
   const distribution = context.packager.info.metadata.pactDistribution
@@ -55,6 +57,40 @@ export default async function afterPack(context) {
   const resources = isMac
     ? join(context.appOutDir, `${productFilename}.app`, 'Contents/Resources')
     : join(context.appOutDir, 'resources')
+  if (isMac) {
+    // The packaged smoke loads only this bundled guard; no arbitrary external module is admitted.
+    const source = resolve(import.meta.dirname, '../../../tests/e2e/mac-credential-guard.c')
+    if ((await stat(source)).size > 64 * 1024)
+      throw new Error('Packaged credential guard source exceeds 64 KiB.')
+    const directory = join(resources, 'native')
+    await mkdir(directory, { recursive: true })
+    await promisify(execFile)(
+      '/usr/bin/clang',
+      [
+        '-bundle',
+        '-undefined',
+        'dynamic_lookup',
+        '-fPIC',
+        '-DNAPI_VERSION=8',
+        '-Wall',
+        '-Wextra',
+        '-Werror',
+        '-Wno-deprecated-declarations',
+        '-I',
+        resolve(dirname(process.execPath), '../include/node'),
+        '-framework',
+        'Security',
+        '-framework',
+        'CoreFoundation',
+        source,
+        '-o',
+        join(directory, 'relay-credential-guard.node'),
+      ],
+      { shell: false, timeout: 15_000, maxBuffer: 64 * 1024 },
+    )
+    if ((await stat(join(directory, 'relay-credential-guard.node'))).size > 256 * 1024)
+      throw new Error('Packaged credential guard exceeds 256 KiB.')
+  }
   if (context.electronPlatformName === 'win32')
     await inspectWindowsOwnedProcessResource(
       join(resources, 'native'),

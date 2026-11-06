@@ -983,6 +983,7 @@ export function ConversationView({
   const sessionIssues = snapshot?.sessionIssues
   const relayRebuild =
     currentRelayDecision?.request.request.category === 'arrangement_change' &&
+    currentRelayDecision.request.request.operation.kind === 'rebuild_native_context' &&
     !decisionTakeover &&
     !nativeRequests.length &&
     !planRecovery

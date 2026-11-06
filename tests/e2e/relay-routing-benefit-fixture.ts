@@ -236,7 +236,14 @@ export async function verifyRoutingPreconditions() {
     repo.saveSchedulingSettings({
       expectedRevision: 0,
       enabled: true,
-      selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
+    })
+    // Admission prerequisite only; this preflight never invokes a provider or decrypts a key.
+    repo.writeRelayCredential({
+      operation: 'save',
+      nonce: randomUUID(),
+      expectedRevision: repo.schedulingSettings().credential.revision,
+      deadlineAt: Date.now() + 5_000,
+      ciphertext: Buffer.from('synthetic-routing-preflight-ciphertext').toString('base64'),
     })
     const input = initialRoutingInput(db, seeded)
     assert.equal(repo.ordinaryInputWorthConsulting(input, 'claude'), true)
@@ -288,7 +295,7 @@ export async function verifyRoutingPreconditions() {
       })),
       admission: {
         enabled: true,
-        modelSelected: true,
+        keyConfigured: repo.schedulingSettings().credential.configured,
         runtimeAdmission: 'may_attempt',
         evaluationResourcesAvailable: true,
         factAlreadyEvaluated: false,

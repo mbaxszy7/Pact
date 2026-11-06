@@ -299,10 +299,15 @@ Image preview is a native modal with previous/next, directional keys, bounded fi
 
 ### Relay scheduling
 
-Relay Settings retains its heading and intelligent-orchestration subtitle, independent enable and
-indicator preferences, exact model choice, explicit usage notice and read-only Scheduling activity.
-The settings surface stays opaque in translucent windows. Activity shows time, Project/Session,
-reason and actual result, with no filter, details, navigation, copy, export, retry or clearing actions.
+Relay Settings retains its heading and intelligent-orchestration subtitle naming Decisions API,
+independent enable and indicator preferences, Decisions API configuration, an encrypted
+API-key field with Save/Replace/Remove and explicit status check, the usage notice and read-only
+Scheduling activity. Saved keys appear as masked dots in the field. An inline Eye/EyeOff button
+reveals or hides the saved key on explicit request; typing starts a replacement draft. Revealing
+alone does not enable Replace. Leaving Settings or hiding the key clears the revealed value.
+The settings surface stays opaque in translucent windows. Activity shows the scheduled action and its
+outcome first, then time and Project/Session, plus only unresolved-work warnings; records carry no
+filter, details, navigation, copy, export, retry or clearing actions.
 
 Place the compact rectangular `Scheduling in background` indicator immediately above the current
 Composer's upper-left edge. Show it only for that Session's real evaluation/check activity while
@@ -336,6 +341,13 @@ warnings about old work continuing or earlier uncertain creation, and replaces o
 recovery row. Cancel preserves the underlying recovery facts. Activity distinguishes a rebuilt native
 context from a completed business task, and displays historical model identity only for actual
 inference. Suggestions, acceptance and real execution results remain separate readable facts.
+
+A future code-role change uses the same card and **Confirm role change** action. Name the proposed
+implementation recipient, show both old-to-new code responsibilities, and state that the accepted
+Plan and completed reviews remain unchanged. Keep the consequence explicit: no new write access;
+Implement plan still requires approval. Cancellation retains the existing pause semantics and button.
+Activity records the saved arrangement separately from any later implementation result. Layout,
+input replacement, focus, motion and indicator treatment remain unchanged.
 
 ## Windows installer preview
 

@@ -120,22 +120,14 @@ jobs:
           PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-evidence/darwin-arm64
           PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
           PACT_CI_NATIVE_ARTIFACT: native-e2e-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
-      - name: Prepare the separate pinned Codex decision protocol profile
-        run: node scripts/ci-native.mjs decision-codex
-      - name: Actual Codex decision protocol and physical lifecycle cases
-        run: node scripts/ci.mjs native decision-codex
+      - name: Prepare the pinned Codex execution protocol profile
+        run: node scripts/ci-native.mjs execution-codex
+      - name: Actual Codex reexecution and historical owner lifecycle cases
+        run: node scripts/ci.mjs native execution-codex
         env:
-          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-decision-evidence/darwin-arm64
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-execution-evidence/darwin-arm64
           PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
-          PACT_CI_NATIVE_ARTIFACT: native-decision-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
-      - name: Prepare the separate pinned Claude decision protocol profile
-        run: node scripts/ci-native.mjs decision-claude
-      - name: Actual Claude decision protocol and production response guard cases
-        run: node scripts/ci.mjs native decision-claude
-        env:
-          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-claude-decision-evidence/darwin-arm64
-          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
-          PACT_CI_NATIVE_ARTIFACT: native-claude-decision-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          PACT_CI_NATIVE_ARTIFACT: native-execution-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
       - name: Preserve sanitized native case results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -147,32 +139,22 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Preserve sanitized decision native case results
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: native-decision-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/pact-native-decision-evidence/darwin-arm64/native-summary.json
-            ${{ runner.temp }}/pact-native-decision-evidence/darwin-arm64/native-summary.md
-          if-no-files-found: ignore
-          retention-days: 14
-      - name: Preserve unavailable claude-decision execution as blocked evidence
+      - name: Preserve unavailable Codex execution as blocked evidence
         if: always()
         run: node scripts/ci-native-report.mjs
         env:
-          PACT_CI_NATIVE_PROFILE: decision-claude
-          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-claude-decision-evidence/darwin-arm64
+          PACT_CI_NATIVE_PROFILE: execution-codex
+          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-execution-evidence/darwin-arm64
           PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
-          PACT_CI_NATIVE_ARTIFACT: native-claude-decision-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
-      - name: Preserve sanitized claude-decision case results
+          PACT_CI_NATIVE_ARTIFACT: native-execution-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+      - name: Preserve sanitized Codex execution case results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: native-claude-decision-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
+          name: native-execution-darwin-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/pact-native-claude-decision-evidence/darwin-arm64/native-summary.json
-            ${{ runner.temp }}/pact-native-claude-decision-evidence/darwin-arm64/native-summary.md
+            ${{ runner.temp }}/pact-native-execution-evidence/darwin-arm64/native-summary.json
+            ${{ runner.temp }}/pact-native-execution-evidence/darwin-arm64/native-summary.md
           if-no-files-found: ignore
           retention-days: 14
 
@@ -380,12 +362,12 @@ jobs:
           PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-evidence/win32-x64
           PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
           PACT_CI_NATIVE_ARTIFACT: native-e2e-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
-      - name: Verify decision isolation remains unavailable on Windows
+      - name: Keep macOS process-group proofs on their native runner
         run: >-
           node --input-type=module -e
           "import { nativeProfile, nativeProfileSupports } from './scripts/native-profiles.mjs';
-          for (const name of ['decision-codex', 'decision-claude'])
-          if (nativeProfileSupports(nativeProfile(name))) throw new Error('Unsafe decision platform admission');"
+          if (nativeProfileSupports(nativeProfile('execution-codex')))
+          throw new Error('macOS proof profile admitted on Windows');"
       - name: Preserve sanitized native case results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -412,24 +394,6 @@ jobs:
           path: |
             ${{ runner.temp }}/pact-native-windows-owner-evidence/win32-x64/native-summary.json
             ${{ runner.temp }}/pact-native-windows-owner-evidence/win32-x64/native-summary.md
-          if-no-files-found: ignore
-          retention-days: 14
-      - name: Preserve unavailable claude-decision execution as blocked evidence
-        if: always()
-        run: node scripts/ci-native-report.mjs
-        env:
-          PACT_CI_NATIVE_PROFILE: decision-claude
-          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-claude-decision-evidence/win32-x64
-          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
-          PACT_CI_NATIVE_ARTIFACT: native-claude-decision-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
-      - name: Preserve sanitized claude-decision case results
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: native-claude-decision-win32-x64-${{ inputs.channel }}-a${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/pact-native-claude-decision-evidence/win32-x64/native-summary.json
-            ${{ runner.temp }}/pact-native-claude-decision-evidence/win32-x64/native-summary.md
           if-no-files-found: ignore
           retention-days: 14
 
@@ -623,12 +587,12 @@ jobs:
           PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-evidence/win32-arm64
           PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
           PACT_CI_NATIVE_ARTIFACT: native-e2e-win32-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
-      - name: Verify decision isolation remains unavailable on Windows
+      - name: Keep macOS process-group proofs on their native runner
         run: >-
           node --input-type=module -e
           "import { nativeProfile, nativeProfileSupports } from './scripts/native-profiles.mjs';
-          for (const name of ['decision-codex', 'decision-claude'])
-          if (nativeProfileSupports(nativeProfile(name))) throw new Error('Unsafe decision platform admission');"
+          if (nativeProfileSupports(nativeProfile('execution-codex')))
+          throw new Error('macOS proof profile admitted on Windows');"
       - name: Preserve sanitized native case results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -655,24 +619,6 @@ jobs:
           path: |
             ${{ runner.temp }}/pact-native-windows-owner-evidence/win32-arm64/native-summary.json
             ${{ runner.temp }}/pact-native-windows-owner-evidence/win32-arm64/native-summary.md
-          if-no-files-found: ignore
-          retention-days: 14
-      - name: Preserve unavailable claude-decision execution as blocked evidence
-        if: always()
-        run: node scripts/ci-native-report.mjs
-        env:
-          PACT_CI_NATIVE_PROFILE: decision-claude
-          PACT_CI_NATIVE_REPORT_DIR: ${{ runner.temp }}/pact-native-claude-decision-evidence/win32-arm64
-          PACT_CI_NATIVE_IDENTITY_FILE: ${{ runner.temp }}/e2e-metadata.json
-          PACT_CI_NATIVE_ARTIFACT: native-claude-decision-win32-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
-      - name: Preserve sanitized claude-decision case results
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: native-claude-decision-win32-arm64-${{ inputs.channel }}-a${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/pact-native-claude-decision-evidence/win32-arm64/native-summary.json
-            ${{ runner.temp }}/pact-native-claude-decision-evidence/win32-arm64/native-summary.md
           if-no-files-found: ignore
           retention-days: 14
 

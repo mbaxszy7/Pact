@@ -76,9 +76,9 @@ vi.mock('./claude-agent-adapter.js', async () => {
   const { workflowAdapter } = await import('./relay-workflow-fixture.test-support.js')
   return { ClaudeAgentAdapter: workflowAdapter('claude', native) }
 })
-vi.mock('./codex-decision-runtime.js', async () => {
+vi.mock('./openai-decision-runtime.js', async () => {
   const { workflowDecisionRuntime } = await import('./relay-workflow-fixture.test-support.js')
-  return { CodexDecisionRuntime: workflowDecisionRuntime(native) }
+  return { OpenAIDecisionRuntime: workflowDecisionRuntime(native) }
 })
 const owners: Array<Awaited<ReturnType<typeof workflowConversation>>> = []
 afterEach(async () => {
@@ -159,6 +159,47 @@ async function fixture() {
   expect(card?.request.category).toBe('necessary_information')
   return { ...f, repo, input, card }
 }
+
+it('passes the declared field binding from Conversation to production runtime admission', async () => {
+  const f = await fixture()
+  const input = native.decisions[0]!
+  const { OpenAIDecisionRuntime } = await vi.importActual<
+    typeof import('./openai-decision-runtime.js')
+  >('./openai-decision-runtime.js')
+  const reserve = vi.fn<
+    (input: DecisionInput, facts: { deadlineAt: number }) => 'reserved' | 'duplicate' | 'busy'
+  >(() => 'reserved' as const)
+  const credential = vi.fn<
+    (context: { signal: AbortSignal; deadlineAt: number }) => Promise<string | null> | string | null
+  >(() => null)
+  const dispatch = vi.fn<() => void>()
+  const runtime = new OpenAIDecisionRuntime({
+    deadlineAt: Date.now() + 15_000,
+    current: () => true,
+    reserve,
+    credential,
+    dispatch,
+  })
+  try {
+    // The actual producer input must pass real validation. Stop at credentials:
+    // no HTTP request or new authority is needed to test this contract boundary.
+    expect(await runtime.evaluateDecision(input, new AbortController().signal)).toEqual({
+      kind: 'unavailable',
+      reason: 'runtime_unavailable',
+    })
+    expect(reserve).toHaveBeenCalledOnce()
+    expect(credential).toHaveBeenCalledOnce()
+    expect(dispatch).not.toHaveBeenCalled()
+    expect(runtime.invoked).toBe(false)
+    expect(runtime.diagnostics().phase).toBe('credential')
+    expect(
+      input.candidates.find((candidate) => candidate.id === 'clarify_prepared_input'),
+    ).toMatchObject({ information: { fieldId: f.input.userInformation.id } })
+    expect(await runtime.settlement()).toBe(true)
+  } finally {
+    await runtime.dispose()
+  }
+})
 
 it('saves the typed answer, dispatches one ordinary root and reads its immutable answer with the actual source grant', async () => {
   const f = await fixture()
@@ -305,7 +346,10 @@ it('Cancel ends the old pending request and the next Send uses the current draft
 it('closing Relay dispatches the unpaused original default once through the existing scheduler', async () => {
   const f = await fixture()
   expect(
-    await f.flow.saveSchedulingSettings({ expectedRevision: 1, enabled: false, selection: null }),
+    await f.flow.saveSchedulingSettings({
+      expectedRevision: f.db.conversationRepository.schedulingSettings().revision,
+      enabled: false,
+    }),
   ).toMatchObject({ ok: true })
   await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
   expect(native.inputs.at(-1)?.promptEnvelope.message.id).toBe(f.input.clientMessageId)
@@ -326,7 +370,10 @@ it('a stale default publishes restored Comment revision and drafts resync to the
       primaryAgentId: 'claude',
     })
     expect(
-      await f.flow.saveSchedulingSettings({ expectedRevision: 1, enabled: false, selection: null }),
+      await f.flow.saveSchedulingSettings({
+        expectedRevision: f.db.conversationRepository.schedulingSettings().revision,
+        enabled: false,
+      }),
     ).toMatchObject({ ok: true })
     await vi.waitFor(() =>
       expect(

@@ -309,7 +309,7 @@ async function fixture(withWorkspace = false) {
       db.sessionRepository,
       db.projectCatalogRepository,
       preparation,
-      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
       workspace,
     )
   const owner = {

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { AgentAnswerAssembler } from './agent-answer-assembler.js'
 import { AgentExecutionError } from './agent-execution-error.js'
+import { NATIVE_OWNER_WORKING_BYTES } from './native-working-memory.js'
 
 describe('AgentAnswerAssembler', () => {
   it('keeps answer text emitted before and after a peer Tool item', () => {
@@ -40,5 +41,28 @@ describe('AgentAnswerAssembler', () => {
     expect(assembler.append('answer', 'Final answer')).toBe('Final answer')
     expect(assembler.complete('answer', 'Final answer')).toBe('Final answer')
     expect(assembler.finalize()).toBeUndefined()
+  })
+})
+
+describe('AgentAnswerAssembler streamed content', () => {
+  it('merges provider items into one logical answer with separators', () => {
+    using answer = new AgentAnswerAssembler('run-probe')
+    expect(answer.append('a', 'Hello')).toBe('Hello')
+    expect(answer.append('b', 'World')).toBe('\n\nWorld')
+    expect(answer.append('b', '!')).toBe('!')
+    expect(answer.complete('b', 'World!')).toBe('Hello\n\nWorld!')
+    expect(answer.complete('b', 'World!')).toBeUndefined()
+    expect(answer.finalize()).toBeUndefined()
+  })
+
+  it('accepts an answer above the old content ceiling and refuses working-capacity overflow', () => {
+    using answer = new AgentAnswerAssembler('run-probe-2')
+    const text = 'x'.repeat(1_100_000)
+    expect(answer.append('a', text)).toBe(text)
+    expect(answer.text).toBe(text)
+    expect(() => answer.append('b', 'x'.repeat(NATIVE_OWNER_WORKING_BYTES / 12))).toThrow(
+      /working capacity/,
+    )
+    expect(answer.text).toBe(text)
   })
 })

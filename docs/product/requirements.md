@@ -32,9 +32,10 @@ Use these terms consistently in code, UI and documentation.
 | Peer Proposal              | A validated lazy suggestion to ask the other Agent. It starts no work until the user clicks and cannot consume current drafts.                                                           |
 | Collaboration Task         | One `/plan`, `/build` or `/review` objective with frozen stage responsibilities, versioned sources, bounded automatic handoffs, pause state and counted actions.                         |
 | Workflow stage             | One host-authorized responsibility: plan, plan review, implementation, code review, response, repair or priority user reply. A role label alone grants no edit or acceptance authority.  |
-| Current Plan               | The complete native plan snapshot maintained by the task owner. Its independent reviewer comments on an exact version without maintaining a second plan.                                 |
+| Current Plan               | The complete native plan snapshot maintained by the assigned plan author. Its independent reviewer comments on an exact version without maintaining a second plan.                       |
 | Review basis / fact        | Exact frozen plan or code scope/source plus the responsible Actor's actual completed verdict. It is not an entire workspace snapshot or an inferred agreement.                           |
-| Task owner                 | The frozen Primary authors plans and reviews code; the other Agent reviews plans and implements, responds to code review and repairs.                                                    |
+| Task owner                 | The task's frozen Primary identity. Stage roles specify the actual planning, implementation and review responsibilities.                                                                 |
+| Stage roles                | A task's versioned plan and code author/reviewer assignments. Each author has a different reviewer; assigning a role grants no writing authority.                                        |
 | Native question            | A provider-originated user interaction answered through its live form. The answer resumes that same native root and grants no new implementation or repair authority.                    |
 | Automatic collaboration    | Previously authorized, bounded handoffs between the fixed author and reviewer. It pauses independently of the current root and never grants an unapproved code-writing step.             |
 | Input Batch                | All accepted body, image, Skill and Comment sources from one atomic Send, including members outside the resident UI page.                                                                |
@@ -62,7 +63,7 @@ Avoid using `completed`, `accepted`, `ready`, `responded` and `resolved` interch
 
 - Serve independent developers and small teams using Claude Code and Codex to discuss, implement, review and safely continue work.
 - Keep Projects, Session records, managed images, diagnostics and recovery evidence local. Agent requests and native tools may communicate with user-configured services; local-first does not mean offline.
-- Integrate exactly two built-in Agents. Primary/Secondary determine Pact stage responsibilities; ordinary explicit routing can choose either Agent without changing Session defaults.
+- Integrate exactly two built-in Agents. Primary/Secondary determine default Pact stage responsibilities; task stage roles and ordinary explicit routing can choose either Agent without changing Session defaults.
 - Preserve each CLI's native configuration, authentication, project instructions, Skills, MCP, Plugins, Hooks and tools. Share results and quoted sources, never authentication, tokens, tool instances or configuration between Agents.
 - Do not manage Provider endpoints/API keys, compatible backends, CLI installation, third-party plugin installation or native global settings. A backend configured outside Pact remains the user's runtime configuration.
 - The deterministic orchestrator does not act as a third model or substitute inferred agreement for recorded results and user authorization.
@@ -325,13 +326,53 @@ The Composer displays completed Pact commands as icon-and-`pact:<command>` badge
 
 Pact workflow commands reach Claude as request text, not native slash-command invocations, including bare `/plan` routed to Claude as Primary. Native serialization adds a request heading without changing saved Messages or frozen sources; the Adapter selects native Plan mode. Ordinary native commands and Skill requests retain their existing serialization.
 
-| Entry              | Initial work                                                                                              | Fixed owner and reviewer                                                              |
+| Entry              | Initial work                                                                                              | Default stage responsibilities                                                        |
 | ------------------ | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | `/plan [task]`     | Native planning and necessary clarification, followed by automatic independent review and author revision | Primary authors the plan and reviews code. Secondary reviews the plan and implements. |
 | `/build [task]`    | Explicit implementation, then automatic independent code review                                           | Secondary implements; Primary reviews code.                                           |
 | `/review [target]` | Read-only review of the specified scope                                                                   | Primary reviews code; Secondary responds and performs explicitly authorized repairs.  |
 
-Freeze stage roles from Session Primary when a new task or queued command is accepted, then freeze objective, stage, authorized scope, input sequence and plan/review basis at each Run's admission. Conflicting explicit recipients on Pact commands refuse without clearing drafts; ordinary @Agent messages remain explicit. Later Primary changes do not transfer task responsibilities. The same planner maintains one plan throughout drafting and revision. Legacy tasks and queued commands retain their frozen role policy. Explicit adoption is limited to an accepted plan with the same planner/reviewer, no unresolved input or native work and no code work or action authority; it preserves plan/review sources and historical authorizations, journals the change and starts no Run.
+New tasks freeze their stage roles at the first Run's admission, together with the original objective,
+authorized scope and input. Each Run retains that assignment with its plan/review basis. Without a
+valid Relay choice, the defaults above apply. Later Primary changes do not transfer responsibilities.
+The same plan author maintains the plan throughout drafting and revision. Conflicting explicit
+recipients refuse without clearing drafts; ordinary @Agent messages remain explicit. Legacy tasks
+and accepted queued commands retain their frozen role policy. Explicit adoption remains limited to
+an accepted plan with the same planner/reviewer, no unresolved input or native work and no code work
+or action authority; it preserves sources and historical authorizations, journals the change and
+starts no Run.
+
+For a new implicit-recipient Pact command, Relay may select the initial plan and code author/reviewer
+pairs before any task or Run exists. Both executors must pass the existing readiness admission.
+Plan tasks offer the nondefault combinations of both pairs; Build and Review vary only the code
+pair. Each author has a distinct reviewer. Complete frozen task and Comment sources inform the
+choice; provider stereotypes do not establish suitability. Choosing roles changes neither Session
+settings nor execution permissions. Implementing an accepted plan and each new Repair still require
+their existing user authorization.
+
+For an existing split-stage Plan task, Relay may propose swapping future implementation and code
+review responsibilities after the current Plan is accepted and before any code stage has started.
+Both native bindings must be ready; pending or unknown work, unprocessed input, queued messages,
+existing action authority and claimed handoffs exclude the proposal. Unversioned legacy tasks are
+not automatically upgraded. Plan authorship and completed review facts stay unchanged.
+
+The existing confirmation card compares current and suggested code roles and offers
+**Keep current roles** and **Use suggested roles**.
+Confirmation saves the next role version and an audit receipt; it starts no Run, grants no writing
+permission, resets no allowance and resumes no paused workflow. Implement plan remains a separate
+explicit action. Cancellation keeps the original roles and workflow unchanged. Failed or declined
+advice keeps the lawful default without a card. The same producing fact cannot obtain another
+consultation or proposal through role or configuration changes. Restart discards unconfirmed advice
+and retains confirmed roles; historical Runs retain their original assignments and authorizations.
+
+The prepared input and decision receipt bind the choice to the original command, candidate set,
+sources, configuration and native bindings. The first-Run transaction revalidates and saves the
+assignment with the task and original Batch exactly once. Unavailable, declined, invalid or stale
+advice preserves the lawful frozen default without a confirmation card or another inference.
+Stop, failed preparation and restart preserve unsent sources and never replay the decision.
+Explicit recipients, accepted queued/returned inputs and existing unfinished tasks are not
+reassigned by this path. Once a task starts, its role map is immutable; changing roles at a later
+handoff is a separate, unimplemented capability.
 
 ### Native planning and clarification
 
@@ -377,22 +418,27 @@ the next handoff; continuing unfinished authorized work retains its original wri
 
 Persistence records same-fact evaluation deduplication, invocation counts and independent budgets
 for extra Turns and recovery. Evaluation calls have no cumulative task, stage, input or fault cap;
-counts and reservations never grant business authorization. Relay defaults off and requires an
-explicit exact-model selection. Enabling it, reading its state or refreshing a native catalog does
-not start inference. Automatic checks, positive-unsent replacements and qualified extra-turn
+counts and reservations never grant business authorization. Relay defaults off and uses a locally
+encrypted OpenAI API key for the Decisions API. Enabling it, reading its state or changing its key
+does not start inference. An explicit Settings reveal may return the saved key to the trusted
+field; its transient value is cleared on hide, departure or window blur and never enters ordinary
+settings projections. Automatic checks, positive-unsent replacements and qualified extra-turn
 proposals use the existing Conversation execution owner and durable Repository facts. Existing
 Check session/status and Rebuild retain their controls when Relay is off or unavailable. Native,
 platform, visual and real-provider acceptance is separate from local fixture tests.
 
-Relay consults only at qualified handoffs. A Plan containing a processed user decision after review
-can receive review focus when it has at least two frozen sources. A second changes-requested review
-with an intervening complete owner response can receive revision focus. An owner completing the
-same repeated-review chain can receive rereview focus; retaining a Plan alone does not qualify.
-Repair following a complete Respond in the same review scope can receive code-review focus. Simple
-first plans, first review feedback and first implementations skip consultation. The owner, reviewer,
-original goal, permissions and required review steps remain fixed. Manual Continue does not wait for
-advice and competes for the same durable handoff claim. Further code-review actions still require
-concrete user authorization.
+Relay considers only host-admitted candidates at qualified handoffs. Decisions selects a candidate
+or abstains; it does not generate review focus, questions or new actions. Pact supplies the original
+sources and fixed action descriptions. The owner, reviewer, original goal, permissions and required
+review steps remain fixed. Manual Continue does not wait for advice and competes for the same
+durable handoff claim. Further code-review actions still require concrete user authorization.
+
+Repository provides one current workflow snapshot and its legal alternatives. Conversation uses
+that qualification directly, loads complete sources within the original decision lease and
+revalidates alternatives before consulting. Proposal and confirmation transactions independently
+recheck source identity, scope, authority and budgets. A mandatory next step with no alternative
+does not load decision bodies or call the API. Ordinary routing also skips inference when only
+one recipient remains and there is no admitted information alternative.
 
 Relay decisions use their own request/revision and answer/receipt identities. The only admission
 categories are a concrete arrangement change, genuinely missing new authorization, or necessary
@@ -415,14 +461,17 @@ Cancel mutation or resume the old request. Closing Relay uses the
 original legal default once only when the user has not paused and its original admission is current.
 Do not invent business questions or ask for facts available through authorized investigation.
 
-At a qualified repeated-review handoff, Relay may propose one read-only author
-supplement and its mandatory return to the fixed reviewer. The user does not first request or
+After the first complete Plan-author response to a changes-requested review, or the first complete
+changes-requested code review, Relay may propose one read-only author supplement and its mandatory
+return to the fixed reviewer. Review counts are context, not an admission threshold. The first
+Plan review still follows its normal author revision without consulting merely to approve that
+required step. The user does not first request or
 preauthorize an evaluation. Confirmation grants that exact extra Turn; no second inference decides
 whether to use it. Its approved responsibility and cited complete originals are frozen for the
 receiving Agent. The existing task-level extra-turn allowance and return-review limit still apply.
 An existing concrete manual action or Run claim takes priority over a late proposal.
 
-At the same qualified repeated code-review checkpoint, Relay may request one scoped Repair. No
+At that current code-review checkpoint, Relay may request one scoped Repair. No
 writing grant exists before confirmation. Its normal Repair receipt freezes current review scope,
 complete sources, owner, execution permissions and fixed reviewer. It charges both the extra-code
 allowance and the original Repair count, with room for the required review. Use ordinary
@@ -507,100 +556,75 @@ and output validation, without renewal. It is followed by the original 10-second
 window. Send's outer RPC allows 27 seconds, or 37 seconds when it first resolves an existing sealed
 body through the bounded 10-second body reader. These outer deadlines do not extend native execution
 or other readiness and Steer limits. A logically finished consultation retains its physical
-reservation until its owned processes, readers and cleanup operations have actually joined; default
+reservation until its HTTP transport, credential reader and cleanup operations have actually joined; default
 business work uses its existing independent capacity.
 
 Consultation requires all relevant complete frozen inputs, Comments, anchors and exact source
 contents, including the complete target of every message anchor. Workflow material also includes the
 original task and applicable Plan, reviews, owner responses and review scope. It never substitutes a
 fresh worktree read or a generated summary for missing facts. More than 12 sources, complete input
-over 128 KiB, required images or unavailable material skip the entire consultation. A processing
-budget never truncates the original business input or its sources.
+over 128 KiB, required images or unavailable material skip the entire consultation. The 128 KiB
+limit measures the complete serialized decision input, including host metadata and candidate
+descriptions. The HTTP body is separately bounded to 257 KiB: complete input plus copied candidate
+data and at most 1 KiB of fixed envelope overhead, within the existing 4 MiB runtime workspace.
+A processing budget never truncates the original business input or its sources.
 
-A recommendation selects a supplied legal candidate or null and may include up to eight grounded
-highlights. Complete highlight JSON is at most 8 KiB and an adopted guidance proposal at most 16 KiB.
-Workflow guidance uses `handoff-guidance-v2`, with historical `plan-revision-guidance-v1` still readable.
-The receiving Run transaction rechecks its evaluation receipt, complete source fingerprint, input
-hash, configuration generation, scope and deadline before sealing adopted focus as evidence. It
-never becomes permission or a substitute for the original sources. Ordinary recipient selection
-retains only its scalar adoption receipt. Unadopted advice bodies are not durable; historical grants
-cannot authorize a new execution.
+A decision result selects a supplied legal candidate or null. It contains no generated highlights.
+The applying transaction rechecks its evaluation receipt, complete source fingerprint, input hash,
+configuration generation, scope and deadline. Advice never becomes permission or a substitute for
+the original sources. Ordinary recipient selection retains its scalar adoption receipt. Historical
+`handoff-guidance-v2` and `plan-revision-guidance-v1` evidence remains readable and cannot authorize
+a new execution.
 
-Settings shows global enable intent, exact model selection and the indicator preference independently
-of Session model and permission choices. State reads are side-effect free. Explicit Refresh checks
-native compatibility without a model request, separately for the host and the current Project.
-Observations expire after 60 seconds and never replace admission checks. Native catalogs identify
-GPT-6 Luna through Codex or exact Haiku 5.5 through Claude Code; aliases and unavailable models do not
-cause substitution. Configuration changes invalidate in-flight discovery and advice. Indicators
-reflect actual evaluation or cleanup ownership, not merely an enabled preference.
+Settings shows global enable intent, Decisions API configuration and the indicator preference
+independently of Session model and permission choices. State reads are side-effect free and perform
+no native catalog or compatibility probe. Connection observations come from actual attempts, expire
+after 60 seconds and never replace admission checks or suppress subsequent eligible consultations
+in any Session or Project. Saving a key establishes only local storage
+status. Configuration and credential changes invalidate in-flight advice. Indicators reflect actual
+evaluation or cleanup ownership, not merely an enabled preference.
 
-Codex decision execution admits exact GPT-6 Luna only with Codex 0.163.0. Claude decision execution
-admits exact Haiku 5.5 on macOS through verified native authentication, configuration, isolation and
-protocol capabilities. This acceptance was executed with Claude Code 2.1.272; other Claude versions
-have not been certified by these checks. The native runtime retains its login
-owner and global instructions, uses an ephemeral context outside the Project, and never resumes
-development history. Its operating-system sandbox denies child processes, execution outside the
-selected native binary, writes outside owned temporary storage and network access outside the owned
-response guard. Hooks and MCP startup therefore cannot execute processes or contact services.
-Claude keeps its ordinary global configuration; it does not use a bare replacement home.
+Relay uses one bounded HTTPS request to OpenAI's Decisions API with a fixed model. It does not start
+Codex or Claude Code as decision agents, use their native login, or fall back to a native decision
+engine. Model output is untrusted and can select only a currently admitted candidate. Abstention,
+invalid output, unavailable credentials, timeout and stale state preserve the existing lawful
+default. They do not independently create a confirmation card. Codex and Claude Code retain their
+business execution, permissions and native authentication owners.
 
-On macOS, the bounded guard binds the native destination, exact model and request. It permits only the required
-native metadata route during admission, then the single bound inference request. It rejects tools
-before forwarding and withholds all model output until the complete response is verified. Complete
-inherited input remains within 128 KiB and the native transport envelope within 256 KiB. Observable
-usage is retained even for rejected output. Authentication requiring native credential refresh fails
-closed instead of modifying the original authentication files or replaying inference.
-
-The Codex version boundary is deliberate because its identifier behavior is version-specific.
-Codex requires its existing valid, singly linked installation identifier with native mode 0644. The
-native binary opens that one file for data writing even when its contents are valid. The sandbox
-permits file-write-data on that exact existing file, while denying creation, replacement, metadata
-changes and other home writes. The pinned CLI's validated-existing-state path performs no write.
-A retained file descriptor verifies identity and content through physical
-completion; Pact never creates or repairs this identifier. This is a narrow trusted-native exception,
-not an operating-system guarantee that every native-home file is read-only.
-
-Windows Relay uses a trusted native Claude Code or Codex CLI in one fresh, tool-disabled context outside the
-Project, retaining the original native login. It uses fixed Relay instructions and the complete
-Pact-supplied business context, disables built-in tools, MCP, Hooks, Skills, plugins and other
-development customizations, and never resumes development history. Native organization policy remains
-trusted; if it prevents effective disablement, Relay refuses inference. Startup configuration runs
-under normal native permissions. Effective credential helpers remain unavailable even with cached
-account identity. This mode was checked with Claude Code 2.1.309 and Codex 0.161.0. Codex uses an ephemeral
-native thread, empty environment and capability selections, disabled feature switches, and explicit
-MCP and Skill overrides. Native login and cache directories remain native-owned.
-
-Windows trusts the installed CLI and its native authentication behavior. The CLI may maintain its
-normal authentication, cache and client state. Pact does not provide OS-level filesystem, ACL or
-network isolation for this process and does not insert the macOS response guard. Model output is
-untrusted: require the exact selected model, one normally completed bound turn, no tool-use blocks,
-matching assistant/result text and a valid admitted recommendation before adoption. The existing
-Windows Job owner provides cancellation, physical exit and durable receipt proof. One 15-second,
-16-MiB invocation reservation, bounded input/output and host freshness/authorization checks remain.
-Refresh performs no inference. The same Relay model selections are available on Windows and macOS;
-compatibility checks still verify the installed native protocol. Platform,
-packaged and real-provider acceptance remain separate requirements.
+OpenAI API usage is billed to the supplied key's account. Main performs OS encryption and decryption;
+Utility owns encrypted persistence and the HTTP request. Plaintext keys do not enter ordinary
+settings projections, activity, diagnostics, business-agent environments or persistent storage.
+There is no plaintext storage fallback when OS encryption is unavailable. Save, replace and remove
+use credential revisions and durable nonce receipts; an uncertain result requires explicit receipt
+readback rather than automatic mutation retry. Cancellation prevents late use of a key while
+physical crypto ownership remains held until the OS operation settles. Platform, packaged and
+real-provider acceptance remain separate requirements.
 
 Evaluation rows record only invocation/outcome/usage and bounded physical identity metadata below
-4 KiB, never complete inputs or unadopted suggestion bodies. Adopted guidance is separately sealed
-with its receiving Run and remains available in history and Fork. Fork remaps standard references
+4 KiB, never complete inputs or unadopted suggestion bodies. Historical adopted guidance remains
+available with its receiving Run in history and Fork. Fork remaps standard references
 while retaining historical evaluated hashes; historical guidance creates no new dispatch authority.
 Restart preserves committed guidance, discards uncommitted proposals and never replays advice.
 Logical timeout/cancellation does not release physical
 reservations or refund possible delivery. Restart performs no replay: unknown owners remain held
-until the old Utility, recorded native identities and private process group are proven absent.
-Global enable/model changes permanently invalidate the old invocation, including value changes
-back to the original selection; indicator-only changes remain independent.
+until the recorded HTTP Utility owner is proven absent; historical native owners require their
+original physical-release proofs. Global enable and credential changes permanently invalidate the
+old invocation, including changes back to an earlier value; indicator-only changes remain independent.
 
 The Relay heading and core-function subtitle remain visible. Off reduces configuration to the
-Enable Relay row; On reveals Model, usage terms, indicator preference and read-only Activity.
-Closing retains the saved model and indicator choice. Catalog discovery and activity reads run
-only while the expanded surface is visible. Relay's workspace background remains opaque in
+Enable Relay row; On reveals Decisions API key controls, usage terms, indicator preference and
+read-only Activity. Closing retains the encrypted key and indicator choice, clears unsent password
+text, and preserves any pending credential receipt check. Activity reads run only while the expanded
+surface is visible. Relay's workspace background remains opaque in
 translucent windows so background text cannot interfere with its controls and reading area.
 
 Scheduling activity is a read-only SQLite projection of actual auxiliary evaluation records, showing
-recent and unresolved facts with the recorded provider/model. Normal default handoffs are excluded.
-Results describe decision requests, not business completion; suggestions remain separate. Scrolling
+recent and unresolved facts. Each row leads with the scheduled action and its outcome, followed by
+time and Project/Session. API completion alone cannot imply business completion: waiting for
+confirmation, adopted advice, requested execution and actual completion remain distinct. Recipient
+names appear only when established by the recorded action; model details and repeated suggestion
+prose are omitted. Unconfirmed original work or cleanup remains visible when relevant. Normal
+default handoffs without an auxiliary record are excluded. Scrolling
 loads older/newer pages with bounded residency and preserves the reading anchor. Hiding Settings
 releases its subscription and display state; pending physical reads settle before a latest intent.
 The activity region has no filters, details, navigation, copy, export, retry or clearing controls.

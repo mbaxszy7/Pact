@@ -58,10 +58,8 @@ const systemKeys = [
   'PACT_NATIVE_CLAUDE_EXECUTABLE',
   'PACT_NATIVE_CODEX_EXECUTABLE',
   'PACT_NATIVE_CODEX_PACKAGE_ROOT',
-  'PACT_NATIVE_DECISION_CODEX_EXECUTABLE',
-  'PACT_NATIVE_DECISION_CODEX_VERSION',
-  'PACT_NATIVE_DECISION_CLAUDE_EXECUTABLE',
-  'PACT_NATIVE_DECISION_CLAUDE_VERSION',
+  'PACT_NATIVE_EXECUTION_CODEX_EXECUTABLE',
+  'PACT_NATIVE_EXECUTION_CODEX_VERSION',
   'PACT_GITLEAKS_EXECUTABLE',
 ]
 
@@ -411,31 +409,18 @@ export async function main(args = process.argv.slice(2), source = process.env) {
     if (forwarded.length > 1)
       throw new Error('Reported native execution owns its reporter arguments')
     const profile = nativeProfile(forwarded[0])
-    if (profile.name === 'decision-codex') {
-      const executable = env.PACT_NATIVE_DECISION_CODEX_EXECUTABLE
-      if (
-        process.platform !== 'darwin' ||
-        process.arch !== 'arm64' ||
-        typeof executable !== 'string' ||
-        !isAbsolute(executable) ||
-        /[\r\n\0]/u.test(executable) ||
-        env.PACT_NATIVE_DECISION_CODEX_VERSION !== profile.codexVersion
-      )
-        throw new Error('The fixed decision native profile requires its pinned macOS CLI')
-      env.PACT_NATIVE_CODEX_EXECUTABLE = executable
-    }
-    if (profile.name === 'decision-claude') {
-      const executable = env.PACT_NATIVE_DECISION_CLAUDE_EXECUTABLE
+    if (profile.name === 'execution-codex') {
+      const executable = env.PACT_NATIVE_EXECUTION_CODEX_EXECUTABLE
       if (
         !nativeProfileSupports(profile) ||
         typeof executable !== 'string' ||
         !isAbsolute(executable) ||
         Buffer.byteLength(executable) > 4096 ||
         /[\r\n\0]/u.test(executable) ||
-        env.PACT_NATIVE_DECISION_CLAUDE_VERSION !== profile.claudeVersion
+        env.PACT_NATIVE_EXECUTION_CODEX_VERSION !== profile.codexVersion
       )
-        throw new Error('The fixed Claude decision native profile requires its pinned native CLI')
-      env.PACT_NATIVE_CLAUDE_EXECUTABLE = executable
+        throw new Error('The fixed Codex execution profile requires its pinned macOS CLI')
+      env.PACT_NATIVE_CODEX_EXECUTABLE = executable
     }
     if (profile.name === 'windows-owner' && !nativeProfileSupports(profile))
       throw new Error('The Windows owner profile requires a native Windows x64 or arm64 runner')
@@ -486,9 +471,7 @@ export async function main(args = process.argv.slice(2), source = process.env) {
         summary: source.GITHUB_STEP_SUMMARY,
         profile: profile.name,
         verifiedCodexVersion:
-          profile.name === 'decision-codex' ? env.PACT_NATIVE_DECISION_CODEX_VERSION : null,
-        verifiedClaudeVersion:
-          profile.name === 'decision-claude' ? env.PACT_NATIVE_DECISION_CLAUDE_VERSION : null,
+          profile.name === 'execution-codex' ? env.PACT_NATIVE_EXECUTION_CODEX_VERSION : null,
         requireIdentity: profile.name !== 'legacy' && source.GITHUB_ACTIONS === 'true',
       })
       reportPreserved = true

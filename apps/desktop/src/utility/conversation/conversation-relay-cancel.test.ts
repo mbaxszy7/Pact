@@ -43,9 +43,9 @@ vi.mock('./claude-agent-adapter.js', async () => {
   const { workflowAdapter } = await import('./relay-workflow-fixture.test-support.js')
   return { ClaudeAgentAdapter: workflowAdapter('claude', native) }
 })
-vi.mock('./codex-decision-runtime.js', async () => {
+vi.mock('./openai-decision-runtime.js', async () => {
   const { workflowDecisionRuntime } = await import('./relay-workflow-fixture.test-support.js')
-  return { CodexDecisionRuntime: workflowDecisionRuntime(native) }
+  return { OpenAIDecisionRuntime: workflowDecisionRuntime(native) }
 })
 vi.mock('node:worker_threads', async (original) => {
   const actual = await original<typeof import('node:worker_threads')>()
@@ -169,7 +169,7 @@ describe('Cancel an optional Relay advancement, then continue through the origin
     async (primary) => {
       const f = await fixture(primary),
         repo = f.db.conversationRepository
-      const physicalCompletion = vi.spyOn(repo, 'completeSchedulingRuntimePhysical')
+      const settleEvaluation = vi.spyOn(repo, 'settleEvaluation')
       enableWorkflowRelay(f.db)
       native.reviews = [{ verdict: 'changes_requested' }, { verdict: 'changes_requested' }]
       native.candidate = 'propose_supplement_plan'
@@ -184,15 +184,23 @@ describe('Cancel an optional Relay advancement, then continue through the origin
           }),
         { timeout: 5_000 },
       )
-      expect(physicalCompletion).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({ completed: true, candidateId: 'propose_supplement_plan' }),
+      await vi.waitFor(() =>
+        expect(settleEvaluation).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({
+            outcome: 'completed',
+            physicalReleased: true,
+            selectedCandidateId: 'propose_supplement_plan',
+            httpOwner: expect.objectContaining({ version: 1, kind: 'http' }),
+            remoteOutcome: 'responded',
+          }),
+        ),
       )
       const state = await cancel(f)
-      expect(native.inputs).toHaveLength(5)
+      expect(native.inputs).toHaveLength(3)
       await f.settled()
-      expect(native.inputs).toHaveLength(5)
-      native.candidate = undefined
+      expect(native.inputs).toHaveLength(3)
+      native.candidate = null
       expect(await f.act('resume')).toMatchObject({ ok: true })
       await vi.waitFor(() => expect(native.inputs).toHaveLength(6))
       expect(await f.settled()).toMatchObject({ status: 'ready' })
@@ -200,7 +208,8 @@ describe('Cancel an optional Relay advancement, then continue through the origin
         stage: 'plan_review',
         actor: state.task.reviewer,
       })
-      expect(native.decisions).toHaveLength(state.decisionCount)
+      // The next owner->review handoff consults again on the resumed path.
+      expect(native.decisions).toHaveLength(state.decisionCount + 1)
       expect(await f.act('execute')).toMatchObject({ ok: true })
       await vi.waitFor(() => expect(native.inputs).toHaveLength(8))
       expect(await f.settled()).toMatchObject({ status: 'complete' })
@@ -519,8 +528,10 @@ it.each(['implement', 'repair'] as const)(
 it('controlled decision cancellation releases its admitted lease after loader rejection', async () => {
   const Runtime = controlledDecisionRuntime(native),
     runtime = new Runtime({
-      executable: async () => process.execPath,
+      deadlineAt: Date.now() + 15_000,
+      credential: () => 'OWNED_WORKFLOW_CREDENTIAL',
       current: () => true,
+      reserve: () => 'reserved',
       dispatch: vi.fn<() => void>(),
     }),
     controller = new AbortController()

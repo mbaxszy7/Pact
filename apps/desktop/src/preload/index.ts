@@ -40,7 +40,12 @@ import {
   schedulingStateSchema,
   schedulingStateInputSchema,
   schedulingSettingsSaveSchema,
-  schedulingModelsSchema,
+  relayCredentialSaveSchema,
+  relayCredentialRemoveSchema,
+  relayCredentialReceiptReadSchema,
+  relayCredentialReceiptSchema,
+  relayCredentialRevealSchema,
+  relayCredentialRevealedSchema,
   schedulingActivityReadSchema,
   schedulingActivityPageSchema,
   schedulingChangedSchema,
@@ -333,10 +338,6 @@ const bridge: DesktopBridge = {
     rpcResultSchema(schedulingStateSchema).parse(
       await invoke(IPC_CHANNELS.schedulingStateGet, schedulingStateInputSchema.parse(input)),
     ),
-  refreshSchedulingState: async (input) =>
-    rpcResultSchema(schedulingStateSchema).parse(
-      await invoke(IPC_CHANNELS.schedulingStateRefresh, schedulingStateInputSchema.parse(input)),
-    ),
   getSchedulingSettings: async () =>
     rpcResultSchema(schedulingSettingsSchema).parse(
       await invoke(IPC_CHANNELS.schedulingSettingsGet),
@@ -345,9 +346,24 @@ const bridge: DesktopBridge = {
     rpcResultSchema(schedulingSettingsSchema).parse(
       await invoke(IPC_CHANNELS.schedulingSettingsSave, schedulingSettingsSaveSchema.parse(input)),
     ),
-  refreshSchedulingModels: async () =>
-    rpcResultSchema(schedulingModelsSchema).parse(
-      await invoke(IPC_CHANNELS.schedulingModelsRefresh),
+  saveRelayApiKey: async (input) =>
+    rpcResultSchema(relayCredentialReceiptSchema).parse(
+      await invoke(IPC_CHANNELS.relayCredentialSave, relayCredentialSaveSchema.parse(input)),
+    ),
+  removeRelayApiKey: async (input) =>
+    rpcResultSchema(relayCredentialReceiptSchema).parse(
+      await invoke(IPC_CHANNELS.relayCredentialRemove, relayCredentialRemoveSchema.parse(input)),
+    ),
+  revealRelayApiKey: async (input) =>
+    rpcResultSchema(relayCredentialRevealedSchema).parse(
+      await invoke(IPC_CHANNELS.relayCredentialReveal, relayCredentialRevealSchema.parse(input)),
+    ),
+  readRelayCredentialReceipt: async (input) =>
+    rpcResultSchema(relayCredentialReceiptSchema.nullable()).parse(
+      await invoke(
+        IPC_CHANNELS.relayCredentialReceiptRead,
+        relayCredentialReceiptReadSchema.parse(input),
+      ),
     ),
   readSchedulingActivity: async (input) =>
     rpcResultSchema(schedulingActivityPageSchema).parse(

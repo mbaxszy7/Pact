@@ -11,6 +11,7 @@ import { PactDatabase } from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { AgentExecutionError } from './agent-execution-error.js'
 import { Conversation } from './conversation.js'
 
@@ -136,7 +137,11 @@ async function fixture(primaryAgentId: RuntimeAgentId) {
       owner.db.sessionRepository,
       owner.db.projectCatalogRepository,
       preparation,
-      new ProjectFileReader(owner.db.sessionRepository, owner.db.projectCatalogRepository),
+      new ProjectFileReader(
+        owner.db.sessionRepository,
+        owner.db.projectCatalogRepository,
+        runDirectoryWorker,
+      ),
     )
     return owner.flow
   }

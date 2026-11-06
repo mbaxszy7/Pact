@@ -28,6 +28,7 @@ import {
 export * from './collaboration.js'
 export * from './scheduling-settings.js'
 export * from './relay-decisions.js'
+export * from './relay-credential.js'
 export * from './prepared-input.js'
 import {
   preparedInputContinueSchema,
@@ -44,18 +45,29 @@ import {
 export * from './decision-runtime.js'
 export * from './plan-revision-guidance.js'
 import {
+  relayCredentialWriteSchema,
+  relayCredentialReceiptSchema,
+  relayCredentialReceiptReadSchema,
+  relayCredentialRevealSchema,
+  relayCredentialStoredSchema,
+  type RelayCredentialSave,
+  type RelayCredentialRemove,
+  type RelayCredentialReceiptRead,
+  type RelayCredentialReceipt,
+  type RelayCredentialReveal,
+  type RelayCredentialRevealed,
+} from './relay-credential.js'
+import {
   schedulingSettingsSchema,
   schedulingSettingsSaveSchema,
   schedulingStateSchema,
   schedulingStateInputSchema,
-  schedulingModelsSchema,
   schedulingActivityReadSchema,
   schedulingActivityPageSchema,
   type SchedulingSettings,
   type SchedulingSettingsSave,
   type SchedulingState,
   type SchedulingStateInput,
-  type SchedulingModels,
   type SchedulingActivityRead,
   type SchedulingActivityPage,
 } from './scheduling-settings.js'
@@ -229,9 +241,11 @@ export const IPC_CHANNELS = {
   schedulingSettingsGet: 'pact:scheduling:settings:get',
   schedulingSettingsSave: 'pact:scheduling:settings:save',
   schedulingStateGet: 'pact:scheduling:state:get',
-  schedulingStateRefresh: 'pact:scheduling:state:refresh',
-  schedulingModelsRefresh: 'pact:scheduling:models:refresh',
   schedulingActivityRead: 'pact:scheduling:activity:read',
+  relayCredentialSave: 'pact:relay:credential:save',
+  relayCredentialRemove: 'pact:relay:credential:remove',
+  relayCredentialReceiptRead: 'pact:relay:credential:receipt:read',
+  relayCredentialReveal: 'pact:relay:credential:reveal',
   schedulingChanged: 'pact:scheduling:changed',
   defaultSessionSettingsSave: 'pact:default-session-settings:save',
   projectCatalogGet: 'pact:project-catalog:get',
@@ -2598,11 +2612,7 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
     requestId: z.string().uuid(),
     input: schedulingStateInputSchema,
   }),
-  z.strictObject({
-    type: z.literal('scheduling.state.refresh.request'),
-    requestId: z.string().uuid(),
-    input: schedulingStateInputSchema,
-  }),
+
   z.strictObject({
     type: z.literal('scheduling.settings.get.request'),
     requestId: z.string().uuid(),
@@ -2612,9 +2622,21 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
     requestId: z.string().uuid(),
     input: schedulingSettingsSaveSchema,
   }),
+
   z.strictObject({
-    type: z.literal('scheduling.models.refresh.request'),
+    type: z.literal('relay.credential.write.request'),
     requestId: z.string().uuid(),
+    input: relayCredentialWriteSchema,
+  }),
+  z.strictObject({
+    type: z.literal('relay.credential.receipt.read.request'),
+    requestId: z.string().uuid(),
+    input: relayCredentialReceiptReadSchema,
+  }),
+  z.strictObject({
+    type: z.literal('relay.credential.read.request'),
+    requestId: z.string().uuid(),
+    input: relayCredentialRevealSchema,
   }),
   z.strictObject({
     type: z.literal('scheduling.activity.read.request'),
@@ -3007,10 +3029,21 @@ export const utilityResponseSchema = z.discriminatedUnion('type', [
     requestId: z.string().uuid(),
     result: rpcResultSchema(schedulingSettingsSchema),
   }),
+
   z.strictObject({
-    type: z.literal('scheduling.models.response'),
+    type: z.literal('relay.credential.write.response'),
     requestId: z.string().uuid(),
-    result: rpcResultSchema(schedulingModelsSchema),
+    result: rpcResultSchema(relayCredentialReceiptSchema),
+  }),
+  z.strictObject({
+    type: z.literal('relay.credential.receipt.read.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(relayCredentialReceiptSchema.nullable()),
+  }),
+  z.strictObject({
+    type: z.literal('relay.credential.read.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(relayCredentialStoredSchema),
   }),
   z.strictObject({
     type: z.literal('scheduling.activity.response'),
@@ -3279,10 +3312,14 @@ export interface DesktopBridge {
     input: PreparedInputContinue,
   ): Promise<RpcResult<ConversationPatch>>
   getSchedulingState(input: SchedulingStateInput): Promise<RpcResult<SchedulingState>>
-  refreshSchedulingState(input: SchedulingStateInput): Promise<RpcResult<SchedulingState>>
   getSchedulingSettings(): Promise<RpcResult<SchedulingSettings>>
   saveSchedulingSettings(input: SchedulingSettingsSave): Promise<RpcResult<SchedulingSettings>>
-  refreshSchedulingModels(): Promise<RpcResult<SchedulingModels>>
+  saveRelayApiKey(input: RelayCredentialSave): Promise<RpcResult<RelayCredentialReceipt>>
+  removeRelayApiKey(input: RelayCredentialRemove): Promise<RpcResult<RelayCredentialReceipt>>
+  revealRelayApiKey(input: RelayCredentialReveal): Promise<RpcResult<RelayCredentialRevealed>>
+  readRelayCredentialReceipt(
+    input: RelayCredentialReceiptRead,
+  ): Promise<RpcResult<RelayCredentialReceipt | null>>
   readSchedulingActivity(input: SchedulingActivityRead): Promise<RpcResult<SchedulingActivityPage>>
   onSchedulingChanged(listener: () => void): () => void
   getUpdateState(): Promise<RpcResult<UpdateState>>

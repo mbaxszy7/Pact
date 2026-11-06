@@ -87,7 +87,6 @@ async function fixture(options: { proof?: boolean; filePath?: string; route?: 'a
   repo.saveSchedulingSettings({
     expectedRevision: 0,
     enabled: true,
-    selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
   })
   repo.beginSchedulingRecoveryEpoch(epoch)
   const content = 'Complete original line 🧭\n'.repeat(3000) + 'THE ORIGINAL FINAL SENTENCE.',

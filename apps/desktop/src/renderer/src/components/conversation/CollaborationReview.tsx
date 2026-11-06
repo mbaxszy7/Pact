@@ -277,6 +277,7 @@ export const CollaborationReview = memo(function CollaborationReview({
           ? 'Ready to continue'
           : 'Reply complete'
         : 'Reply to your message'
+  const showStageLabel = stage !== 'implement' && stage !== 'repair'
   const label =
     stage === 'plan'
       ? `Plan${planVersion ? ` · v${planVersion}` : ''}`
@@ -284,11 +285,9 @@ export const CollaborationReview = memo(function CollaborationReview({
         ? `Plan review${planVersion ? ` · v${planVersion}` : ''}`
         : stage === 'code_review'
           ? 'Code review'
-          : stage === 'implement' || stage === 'repair'
-            ? 'Changes'
-            : stage === 'respond'
-              ? 'Review response'
-              : replyLabel
+          : stage === 'respond'
+            ? 'Review response'
+            : replyLabel
   const actions = actionable
     ? (view?.availableActions ?? []).filter(
         (action): action is DisplayedCollaborationAction =>
@@ -324,23 +323,25 @@ export const CollaborationReview = memo(function CollaborationReview({
     <section
       aria-label="Pact collaboration result"
       data-pact-collaboration-run-id={run.id}
-      className="pact-review-card mt-2 mb-7 w-full min-w-0 max-w-[72ch] self-start text-caption"
+      className="pact-review-card mt-2 mb-7 w-full min-w-0 max-w-[72ch] self-start text-caption empty:hidden"
     >
-      <div className="flex min-h-7 flex-wrap items-center gap-x-2.5 gap-y-1 text-secondary">
-        <FileText aria-hidden="true" className="size-3.5 shrink-0" strokeWidth={1.75} />
-        <span>{label}</span>
-        {review ? <span>· {verdictLabel[review.verdict]}</span> : null}
-        {stage === 'plan' && onOpenPlan && view?.planSource && planVersion ? (
-          <button
-            type="button"
-            onClick={() => onOpenPlan({ ...view.planSource!, version: planVersion })}
-            className="min-h-7 rounded-control px-2 text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
-          >
-            Open plan
-          </button>
-        ) : null}
-        {actionable && task.status === 'complete' ? <span>· Complete</span> : null}
-      </div>
+      {showStageLabel ? (
+        <div className="flex min-h-7 flex-wrap items-center gap-x-2.5 gap-y-1 text-secondary">
+          <FileText aria-hidden="true" className="size-3.5 shrink-0" strokeWidth={1.75} />
+          <span>{label}</span>
+          {review ? <span>· {verdictLabel[review.verdict]}</span> : null}
+          {stage === 'plan' && onOpenPlan && view?.planSource && planVersion ? (
+            <button
+              type="button"
+              onClick={() => onOpenPlan({ ...view.planSource!, version: planVersion })}
+              className="min-h-7 rounded-control px-2 text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+            >
+              Open plan
+            </button>
+          ) : null}
+          {actionable && task.status === 'complete' ? <span>· Complete</span> : null}
+        </div>
+      ) : null}
       {showReportSource && reportDocument ? (
         <ReportSource
           sessionId={session.id}

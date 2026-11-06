@@ -753,6 +753,155 @@ test('Batch body reference cannot change between authenticated index pages', () 
   )
 })
 
+test.each([
+  'complete',
+  'missing-input',
+  'missing-terminal',
+  'failed-terminal',
+  'wrong-root',
+  'different-answer',
+  'non-source-tool',
+  'open-wrapper',
+  'unmatched-output',
+  'unknown-operation',
+  'unknown-event',
+  'malformed-event',
+  'foreign-settings',
+  'malformed-settings',
+] as const)(
+  'question-only native evidence proves tool absence and a complete matching answer: %s',
+  async (mode) => {
+    const f = routingCodeModeFixture(),
+      question = 'What launch date should I use?',
+      records: unknown[] = [
+        { type: 'session_meta', payload: { id: f.expected.nativeSessionId } },
+        {
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: f.expected.nativeTurnId },
+        },
+        {
+          type: 'turn_context',
+          payload: { turn_id: f.expected.nativeTurnId, model: 'gpt-6-luna', effort: 'low' },
+        },
+        ...f.records.slice(0, 2),
+        {
+          type: 'event_msg',
+          payload: {
+            type: 'thread_settings_applied',
+            thread_id: f.expected.nativeSessionId,
+            thread_settings: { model: 'gpt-6-luna', effort: 'low' },
+          },
+        },
+        evidenceResponse({
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          id: 'question',
+          content: [{ type: 'output_text', text: question }],
+        }),
+        f.completed({ type: 'AgentMessage', phase: 'final_answer', text: question }),
+        {
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: f.expected.nativeTurnId,
+            last_agent_message: question,
+          },
+        },
+      ]
+    if (mode === 'missing-input') records.splice(3, 2)
+    if (mode === 'missing-terminal') records.pop()
+    if (mode === 'failed-terminal') {
+      const terminal = requiredEvidenceRecord(records.at(-1))
+      requiredEvidenceRecord(terminal['payload'])['status'] = 'failed'
+    }
+    if (mode === 'wrong-root') f.expected.nativeTurnId = randomUUID()
+    if (mode === 'non-source-tool')
+      records.splice(
+        5,
+        0,
+        evidenceResponse({
+          type: 'function_call',
+          name: 'exec_command',
+          call_id: 'unallowed-command',
+          arguments: JSON.stringify({ cmd: 'must-not-run' }),
+        }),
+      )
+    if (mode === 'open-wrapper') records.splice(5, 0, f.records[2])
+    if (mode === 'unmatched-output')
+      records.splice(
+        5,
+        0,
+        evidenceResponse({
+          type: 'function_call_output',
+          call_id: 'unobserved-call',
+          output: '{}',
+        }),
+      )
+    if (mode === 'unknown-operation')
+      records.splice(5, 0, evidenceResponse({ type: 'unrecognized_tool_call' }))
+    if (mode === 'unknown-event')
+      records.splice(5, 0, { type: 'event_msg', payload: { type: 'unrecognized_operation' } })
+    if (mode === 'malformed-event') records.splice(5, 0, { type: 'event_msg', payload: null })
+    if (mode === 'foreign-settings' || mode === 'malformed-settings') {
+      const settings = records.find(
+        (entry) =>
+          isEvidenceRecord(entry) &&
+          isEvidenceRecord(entry['payload']) &&
+          entry['payload']['type'] === 'thread_settings_applied',
+      )
+      const payload = requiredEvidenceRecord(requiredEvidenceRecord(settings)['payload'])
+      if (mode === 'foreign-settings') payload['thread_id'] = randomUUID()
+      else payload['thread_settings'] = null
+    }
+    const root = await mkdtemp(join(tmpdir(), 'pact-question-evidence-'))
+    try {
+      const path = join(root, 'native.jsonl')
+      await writeFile(path, records.map((record) => JSON.stringify(record)).join('\n') + '\n')
+      const native = await readNativeSourceEvidence(path),
+        access = {
+          ...inspectRoutingSourceRecords(records, f.expected),
+          sourceFileSha256: native.sha256,
+        },
+        parity = native.answerParity({
+          nativeSessionId: f.expected.nativeSessionId,
+          nativeTurnId: f.expected.nativeTurnId,
+          text: mode === 'different-answer' ? 'An invented release note.' : question,
+          markers: [],
+        }),
+        accepted = access.allToolsAllowed && parity.completeProjection && parity.exactMatch
+      expect({ accepted, parity }).toMatchObject({
+        accepted: mode === 'complete',
+        ...(mode === 'complete' ? { parity: { completeProjection: true, exactMatch: true } } : {}),
+      })
+      // A permitted question never manufactures evidence that its drafting sources were read.
+      expect(access).toMatchObject({
+        sourceToolCalls: 0,
+        sourceGrantMatched: false,
+        completeBatch: false,
+        completeBatchBody: false,
+        completeComment: false,
+      })
+      const certified = accepted ? native.certifySourceAudit(access) : undefined
+      expect(
+        certified
+          ? {
+              shellCommands: certified.shellCommands,
+              toolNames: certified.toolNames,
+              snapshotStable: parity.file.snapshotStable,
+            }
+          : undefined,
+      ).toEqual(
+        mode === 'complete'
+          ? { shellCommands: [], toolNames: [], snapshotStable: true }
+          : undefined,
+      )
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  },
+)
+
 test('routing source evidence binds CodeMode leaf receipts to the current native root and ordered wrapper', () => {
   const f = routingCodeModeFixture(),
     facts = inspectRoutingSourceRecords(f.records, f.expected)

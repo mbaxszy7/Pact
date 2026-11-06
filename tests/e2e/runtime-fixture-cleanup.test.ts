@@ -1,6 +1,6 @@
 import { _electron as electron, test as playwrightTest } from '@playwright/test'
 import { EventEmitter } from 'node:events'
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, expect, it, vi } from 'vitest'
@@ -14,6 +14,8 @@ const failureProbe = vi.hoisted(() => ({
   clientReleasedError: false,
   root: '',
   clients: [] as Array<{ released: boolean; closeCalls: number }>,
+  credentialDisposeFails: false,
+  credentialStores: [] as Array<{ disposeCalls: number }>,
 }))
 
 beforeEach(() => {
@@ -26,6 +28,8 @@ beforeEach(() => {
   failureProbe.clientReleasedError = false
   failureProbe.root = ''
   failureProbe.clients = []
+  failureProbe.credentialDisposeFails = false
+  failureProbe.credentialStores = []
 })
 
 vi.mock('../native/native-harness.js', async (original) => {
@@ -71,6 +75,31 @@ vi.mock('../native/native-harness.js', async (original) => {
           return undefined
         })
         return this.closing
+      }
+    },
+  }
+})
+
+vi.mock('./mac-credential-store.js', async (original) => {
+  const actual = await original<typeof import('./mac-credential-store.js')>()
+  return {
+    ...actual,
+    MacCredentialStore: class {
+      private readonly record = { disposeCalls: 0 }
+
+      constructor() {
+        failureProbe.credentialStores.push(this.record)
+      }
+
+      async prepare(): Promise<void> {}
+
+      async install(): Promise<void> {}
+
+      dispose(): Promise<void> {
+        this.record.disposeCalls++
+        return failureProbe.credentialDisposeFails
+          ? Promise.reject(new Error('Native credential store release is unconfirmed'))
+          : Promise.resolve()
       }
     },
   }
@@ -604,3 +633,147 @@ it
   },
   10_000,
 )
+
+it('retains the directory and fixture reservation when native credential release fails', async () => {
+  if (process.platform !== 'darwin') return
+  const { createRuntimeFixture } = await import('./runtime-fixture.js')
+  failureProbe.credentialDisposeFails = true
+  const fixture = await createRuntimeFixture({
+    mode: 'ui',
+    nativeCredentialStore: true,
+  })
+  const retainers: Array<{ dispose(): Promise<void> }> = []
+  try {
+    expect(failureProbe.credentialStores).toHaveLength(1)
+    await expect(fixture.dispose()).rejects.toThrow(/unconfirmed|retained/u)
+    expect(failureProbe.credentialStores[0]?.disposeCalls).toBe(1)
+    // An unconfirmed release retains the directory and the fixture reservation.
+    expect((await stat(fixture.directory)).isDirectory()).toBe(true)
+    for (let index = 0; index < 7; index++)
+      // oxlint-disable-next-line no-await-in-loop -- Sequential reservations own the capacity count.
+      retainers.push(await createRuntimeFixture({ mode: 'ui' }))
+    await expect(createRuntimeFixture({ mode: 'ui' })).rejects.toThrow('eight')
+  } finally {
+    failureProbe.credentialDisposeFails = false
+    for (const retainer of retainers)
+      // oxlint-disable-next-line no-await-in-loop -- Each retainer must settle before manual cleanup.
+      await retainer.dispose().catch(() => undefined)
+    await rm(fixture.directory, { recursive: true, force: true })
+  }
+})
+
+it('releases a definite owned store after a cancelled create without a second delete', async () => {
+  if (process.platform !== 'darwin') return
+  const { MacCredentialStore } = await vi.importActual<typeof import('./mac-credential-store.js')>(
+    './mac-credential-store.js',
+  )
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'pact-runtime-e2e-')))
+  try {
+    const home = join(root, 'home')
+    await mkdir(home, { recursive: true, mode: 0o700 })
+    let createGate!: (result: { exitCode: number; stdout: string; stderr: string }) => void
+    const calls: string[][] = []
+    const store = new MacCredentialStore({
+      directory: root,
+      environment: { HOME: home },
+      isCurrent: () => true,
+      run: (executable, args) => {
+        calls.push([executable, ...args])
+        if (args[0] === 'create')
+          return new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
+            createGate = done
+          })
+        if (args[0] === 'delete')
+          return Promise.resolve({ exitCode: 0, stdout: '{"ok":true,"deleted":true}', stderr: '' })
+        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' })
+      },
+    })
+    const preparing = store.prepare()
+    await vi.waitFor(() => {
+      expect(calls.some((call) => call[1] === 'create')).toBe(true)
+    })
+    const disposal = store.dispose()
+    createGate({ exitCode: 0, stdout: '{"ok":true,"created":true}', stderr: '' })
+    await expect(preparing).rejects.toThrow(/disposing|owner/u)
+    await disposal
+    expect(calls.filter((call) => call[1] === 'delete')).toHaveLength(1)
+    await store.dispose()
+    expect(calls.filter((call) => call[1] === 'delete')).toHaveLength(1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+it('retains an unrecognised create receipt without any delete or retry', async () => {
+  if (process.platform !== 'darwin') return
+  const { MacCredentialStore } = await vi.importActual<typeof import('./mac-credential-store.js')>(
+    './mac-credential-store.js',
+  )
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'pact-runtime-e2e-')))
+  try {
+    const home = join(root, 'home')
+    await mkdir(home, { recursive: true, mode: 0o700 })
+    const calls: string[][] = []
+    const store = new MacCredentialStore({
+      directory: root,
+      environment: { HOME: home },
+      isCurrent: () => true,
+      run: (executable, args) => {
+        calls.push([executable, ...args])
+        if (args[0] === 'create')
+          return Promise.resolve({ exitCode: 0, stdout: 'not-json', stderr: '' })
+        if (args[0] === 'delete')
+          return Promise.resolve({ exitCode: 0, stdout: '{"ok":true,"deleted":true}', stderr: '' })
+        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' })
+      },
+    })
+    await expect(store.prepare()).rejects.toThrow('unrecognised')
+    await expect(store.dispose()).rejects.toThrow('unconfirmed')
+    expect(calls.filter((call) => call[1] === 'delete')).toHaveLength(0)
+    await expect(store.dispose()).rejects.toThrow('unconfirmed')
+    expect(calls.filter((call) => call[1] === 'delete')).toHaveLength(0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+it('retains a failed release even when the cleanup reply is shaped like success', async () => {
+  if (process.platform !== 'darwin') return
+  const { MacCredentialStore } = await vi.importActual<typeof import('./mac-credential-store.js')>(
+    './mac-credential-store.js',
+  )
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'pact-runtime-e2e-')))
+  try {
+    const home = join(root, 'home')
+    await mkdir(home, { recursive: true, mode: 0o700 })
+    const calls: string[][] = []
+    const store = new MacCredentialStore({
+      directory: root,
+      environment: { HOME: home },
+      isCurrent: () => true,
+      run: (executable, args) => {
+        calls.push([executable, ...args])
+        if (args[0] === 'create')
+          return Promise.resolve({
+            exitCode: 2,
+            stdout: '{"ok":false,"stage":"private-preferences","status":-1,"created":true}',
+            stderr: '',
+          })
+        if (args[0] === 'delete')
+          return Promise.resolve({
+            exitCode: 1,
+            stdout: '{"ok":true,"deleted":true}',
+            stderr: '',
+          })
+        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' })
+      },
+    })
+    await expect(store.prepare()).rejects.toThrow('private-preferences')
+    await expect(store.dispose()).rejects.toThrow('unconfirmed')
+    expect(calls.filter((call) => call[1] === 'delete')).toHaveLength(1)
+    await expect(store.dispose()).rejects.toThrow('unconfirmed')
+    expect(calls.filter((call) => call[1] === 'delete')).toHaveLength(1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

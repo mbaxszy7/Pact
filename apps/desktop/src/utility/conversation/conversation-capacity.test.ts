@@ -14,6 +14,7 @@ import { HandoffSourceUnavailableError, PactDatabase } from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation as RuntimePreparationOwner } from '../runtime-preparation/runtime-preparation.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { AgentExecutionError } from './agent-execution-error.js'
 import { Conversation } from './conversation.js'
 
@@ -77,7 +78,7 @@ async function fixture() {
     db.sessionRepository,
     db.projectCatalogRepository,
     preparation,
-    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
   )
   return { db, conversation, preparation, sessionIds }
 }

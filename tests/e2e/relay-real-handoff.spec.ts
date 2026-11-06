@@ -3,17 +3,13 @@ import { createHash, randomUUID } from 'node:crypto'
 import { lstat, open } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 
-import type {
-  CollaborationDocument,
-  DesktopBridge,
-  SchedulingModelSelection,
-} from '../../packages/contracts/src/index.js'
+import type { CollaborationDocument, DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import { diagnosticRecordSchema } from '../../packages/contracts/src/diagnostics.js'
 import {
   collaborationTaskSchema,
   advanceCollaboration,
-  handoffGuidanceV2Schema,
+  OPENAI_DECISION_MODEL,
   collaborationTurnAuthorizationSchema,
 } from '../../packages/contracts/src/index.js'
 import { PactDatabase } from '../../packages/persistence/src/pact-database.js'
@@ -26,7 +22,9 @@ import {
   type RealWorkspace,
 } from './real-harness.js'
 import { findNativeRecord } from './real-native-evidence.js'
-import { createRuntimeFixture, test, type RuntimeFixture } from './runtime-fixture.js'
+import { createRealRelayFixture } from './relay-real-credential.js'
+import { routingSchedulingObservation } from './relay-routing-real-observation.js'
+import { test, type RuntimeFixture } from './runtime-fixture.js'
 
 // The five preceding Turns are explicit fixture prerequisites produced through
 // the real Repository, not native/model execution evidence. Only the later
@@ -49,6 +47,7 @@ interface Seed {
   taskId: string
   planVersion: number
   sourceHashes: Array<{ roles: string[]; sha256: string; bytes: number; chars: number }>
+  sourceDocuments: Array<{ document: CollaborationDocument; sourceRunId: string | undefined }>
   fixtureRunIds: string[]
 }
 
@@ -119,15 +118,6 @@ async function seed(
     })
     repo.applyEvent(sessionId, runId, { type: 'turn.started', agentId: run.agentId, turnId })
     if (publish) repo.recordWorkflowPlan(runId, { nativeId: `fixture-plan-${runId}`, text: plan })
-    else if (run.collaboration?.stage === 'plan') {
-      const document = repo.collaboration(sessionId)!.planReference!.document
-      repo.recordWorkflowPlanRetained(runId, {
-        nativeId: `fixture-retained-${runId}`,
-        sha256: document.sha256,
-        bytes: document.bytes,
-        chars: document.chars,
-      })
-    }
     if (verdict) repo.recordWorkflowReview(runId, { verdict })
     repo.applyEvent(sessionId, runId, {
       type: 'text.completed',
@@ -151,6 +141,16 @@ async function seed(
       },
     })
     repo.recordNativeEffects(runId, 'settled')
+    if (!publish && run.collaboration?.stage === 'plan') {
+      const document = repo.collaboration(sessionId)!.planReference!.document
+      repo.recordWorkflowPlanRetained(runId, {
+        nativeId: `fixture-retained-${runId}`,
+        confirmation: 'native_root_settled_v1',
+        sha256: document.sha256,
+        bytes: document.bytes,
+        chars: document.chars,
+      })
+    }
     repo.applyEvent(sessionId, runId, {
       type: 'turn.completed',
       agentId: run.agentId,
@@ -199,7 +199,11 @@ async function seed(
   finish(next().id, false)
   const task = repo.collaboration(sessionId)!,
     handoff = repo.workflowHandoff(task, task.reviewer)
-  expect(repo.relaySupplementOpportunity(handoff)).toMatchObject({ kind: 'supplement_plan' })
+  expect(
+    repo
+      .relayWorkflowAlternatives(handoff)
+      ?.alternatives.find((entry) => entry.kind === 'supplement_plan'),
+  ).toMatchObject({ kind: 'supplement_plan' })
   const material = await repo.readRelayWorkflowDecisionSources(
     handoff,
     [
@@ -219,6 +223,7 @@ async function seed(
       chars: source.document.chars,
     }))
     .toSorted((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
+  repo.pauseCollaboration(sessionId, 'user')
   return {
     sessionId,
     projectId,
@@ -226,6 +231,10 @@ async function seed(
     taskId: task.id,
     planVersion: task.planVersion,
     sourceHashes,
+    sourceDocuments: material.sources.map(({ document, sourceRunId }) => ({
+      document,
+      sourceRunId,
+    })),
     fixtureRunIds: ids,
   }
 }
@@ -287,38 +296,6 @@ async function readCompleteSource(
   expect(createHash('sha256').update(completeText).digest('hex')).toBe(source.sha256)
   return completeText
 }
-async function schedulingObservation(page: Page, sessionId: string, refresh = false) {
-  return page.evaluate(
-    async (payload) => {
-      const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
-      const reply = payload.refresh
-        ? await bridge.refreshSchedulingState({ sessionId: payload.sessionId })
-        : await bridge.getSchedulingState({ sessionId: payload.sessionId })
-      if (!reply.ok) return { ok: false as const, error: reply.error.code }
-      const state = reply.value
-      // oxlint-disable-next-line unicorn/consistent-function-scoping -- This helper must travel inside the serialized browser closure.
-      const project = (value: typeof state.host) => ({
-        status: value.status,
-        provider: value.capability?.provider ?? null,
-        model: value.capability?.modelId ?? null,
-        reason: value.capability?.reason ?? null,
-        physicalReleased: value.capability?.physicalReleased ?? null,
-      })
-      return {
-        ok: true as const,
-        enabled: state.settings.enabled,
-        host: project(state.host),
-        context: state.context
-          ? { eligibility: state.context.eligibility, ...project(state.context.observation) }
-          : null,
-        decision: state.activity.decision.status,
-        check: state.activity.check.status,
-      }
-    },
-    { sessionId, refresh },
-  )
-}
-
 async function safeLogPhases(fixture: RuntimeFixture) {
   try {
     const path = join(dirname(fixture.databaseFile), 'logs/development/pact-0.jsonl'),
@@ -386,23 +363,20 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
   ctx.sessionId = prepared.sessionId
   ctx.projectDirectory = prepared.projectDirectory
   await selectRealSession(ctx, prepared.sessionId)
-  const beforeProbe = await schedulingObservation(ctx.page, prepared.sessionId)
+  const beforeObservation = await routingSchedulingObservation(ctx.page, prepared.sessionId)
   const probeStartedAt = Date.now()
-  const zeroTurnProbe = enabled
-    ? await schedulingObservation(ctx.page, prepared.sessionId, true)
-    : beforeProbe
   if (enabled)
     await expect
       .poll(
         async () => {
-          const value = await schedulingObservation(ctx.page, prepared.sessionId)
+          const value = await routingSchedulingObservation(ctx.page, prepared.sessionId)
           return value.ok ? value.decision : 'unavailable'
         },
         { timeout: 20_000, intervals: [100, 250, 500] },
       )
       .toBe('idle')
-  const afterProbe = await schedulingObservation(ctx.page, prepared.sessionId)
-  const probeElapsedMs = Date.now() - probeStartedAt
+  const afterObservation = await routingSchedulingObservation(ctx.page, prepared.sessionId)
+  const observationElapsedMs = Date.now() - probeStartedAt
   // Disposable observations never authorize this handoff: production Runtime
   // independently performs every admission/native check again after Continue.
   const observation = ReadonlyFixtureDatabase.open(ctx.fixture)
@@ -489,33 +463,14 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
     expect(turn.reportBodyId).toBeTruthy()
     const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
     expect(auth.userAuthority).toBeUndefined()
-    let guidance: null | {
-      sourceCount: number
-      highlightCount: number
-      predefinedFocusCovered: boolean
-    } = null
-    if (auth.sourceManifestRef) {
-      const parsed = handoffGuidanceV2Schema.parse(
-        JSON.parse(
-          await readCompleteSource(ctx.page, prepared.sessionId, run.id, auth.sourceManifestRef),
-        ),
-      )
-      expect(parsed.basis.task.id).toBe(prepared.taskId)
-      for (const source of parsed.sources) {
-        expect(prepared.sourceHashes.map((value) => value.sha256)).toContain(source.document.sha256)
-        expect(source.sourceRunId).toBeTruthy()
-        // oxlint-disable-next-line eslint/no-await-in-loop -- Verify complete citations rather than truncated source samples.
-        await readCompleteSource(ctx.page, prepared.sessionId, source.sourceRunId!, source.document)
-      }
-      const text = parsed.highlights
-        .map((value) => value.text)
-        .join(' ')
-        .toLowerCase()
-      guidance = {
-        sourceCount: parsed.sources.length,
-        highlightCount: parsed.highlights.length,
-        predefinedFocusCovered: focus.terms.every((term) => text.includes(term)),
-      }
+    expect(auth.sourceManifestRef).toBeUndefined()
+    // Decisions generates no prose or new document grants. Check the complete frozen
+    // source bytes independently of its choice; this is source integrity, not native tool-use evidence.
+    for (const source of prepared.sourceDocuments) {
+      expect(prepared.sourceHashes.map((value) => value.sha256)).toContain(source.document.sha256)
+      expect(source.sourceRunId).toBeTruthy()
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Read every original source completely in order.
+      await readCompleteSource(ctx.page, prepared.sessionId, source.sourceRunId!, source.document)
     }
     const evaluations = observation.drizzle.query.schedulingEvaluations
       .findMany({ where: (fields, { eq }) => eq(fields.sessionId, prepared.sessionId), limit: 4 })
@@ -532,11 +487,10 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
         settledAt: value.settledAt,
         usage: usageCounts(value.usageJson),
       })),
-      beforeProbe,
-      zeroTurnProbe,
-      afterProbe,
-      afterHandoff: await schedulingObservation(ctx.page, prepared.sessionId),
-      probeElapsedMs,
+      beforeObservation,
+      afterObservation,
+      afterHandoff: await routingSchedulingObservation(ctx.page, prepared.sessionId),
+      observationElapsedMs,
       logs: await safeLogPhases(ctx.fixture),
     }
     const diagnosticText = JSON.stringify(diagnostic)
@@ -554,6 +508,7 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
         called: true,
         active: false,
         outcome: 'completed',
+        remoteOutcome: 'responded',
       })
       const owner = observation.drizzle.query.schedulingRuntimeOwners
         .findFirst({ where: (fields, { eq }) => eq(fields.evaluationId, evaluated.id) })
@@ -602,7 +557,7 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
       nativeRecordSha256: native.sha256,
       reviewFocusCovered: focus.terms.every((term) => answer.content.toLowerCase().includes(term)),
       elapsedMs: Date.now() - startedAt,
-      zeroTurnProbeElapsedMs: probeElapsedMs,
+      preflightObservationElapsedMs: observationElapsedMs,
       decisionCalls: evaluations.filter((value) => value.called).length,
       decisionModel: evaluated?.model ?? null,
       decisionProvider: evaluated?.provider ?? null,
@@ -617,13 +572,14 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
       manualCheckRequests: 0,
       cancelledCards,
       pausedOnlyFollowingAutomation: true,
-      guidance,
+      generatedGuidance: false,
     }
   } finally {
     observation.close()
   }
 }
 
+// Preserve reviewed case identities; both cases now use OpenAI Decisions exclusively.
 for (const target of ['codex_luna', 'claude_haiku_5_5'] as const)
   test(
     `real Relay ${target} compares Off and On through the fixed native reviewer`,
@@ -631,19 +587,15 @@ for (const target of ['codex_luna', 'claude_haiku_5_5'] as const)
     async () => {
       test.skip(
         process.platform !== 'darwin',
-        'Production decision runtimes currently require the verified macOS native profile.',
+        'This real native collaboration journey is verified on macOS.',
       )
       test.setTimeout(360_000)
-      const fixture = await createRuntimeFixture({ mode: 'real' })
+      const fixture = await createRealRelayFixture()
       let ctx: RealWorkspace | undefined
       try {
         const claudeModel = fixture.readConfigurationModels().claude
         if (!claudeModel || !/^claude-haiku-5-5(?:-\d{8})?$/u.test(claudeModel))
           throw Error('Exact configured Claude Haiku 5.5 wire model is required')
-        const selection: SchedulingModelSelection =
-          target === 'codex_luna'
-            ? { target, provider: 'codex', modelId: 'gpt-6-luna' }
-            : { target, provider: 'claude', modelId: claudeModel }
         const db = await PactDatabase.open({ filePath: fixture.databaseFile, migrationsFolder })
         let off: Seed, on: Seed
         try {
@@ -653,7 +605,6 @@ for (const target of ['codex_luna', 'claude_haiku_5_5'] as const)
           db.conversationRepository.saveSchedulingSettings({
             expectedRevision: db.conversationRepository.schedulingSettings().revision,
             enabled: false,
-            selection,
           })
           db.drizzle.delete(nativeAgentContexts).run()
         } finally {
@@ -708,13 +659,21 @@ for (const target of ['codex_luna', 'claude_haiku_5_5'] as const)
             enabled: true,
           })
         })
-        expect(enabled).toMatchObject({ ok: true, value: { enabled: true, selection } })
+        expect(enabled).toMatchObject({
+          ok: true,
+          value: {
+            enabled: true,
+            provider: 'openai',
+            model: OPENAI_DECISION_MODEL,
+            credential: { configured: true },
+          },
+        })
         const withRelay = await runHandoff(ctx, on, true)
-        expect(withRelay.decisionModel).toBe(selection.modelId)
-        expect(withRelay.decisionProvider).toBe(selection.provider)
+        expect(withRelay.decisionModel).toBe(OPENAI_DECISION_MODEL)
+        expect(withRelay.decisionProvider).toBe('openai')
         expect(withRelay.decisionCalls).toBe(1)
         const comparison = {
-          target,
+          baselineCase: target,
           fixturePrerequisitesOnly: true,
           sourceContentEqual: true,
           sourceHashes: off.sourceHashes,
@@ -724,7 +683,7 @@ for (const target of ['codex_luna', 'claude_haiku_5_5'] as const)
           },
           predefinedFocus: { id: focus.id, terms: focus.terms },
           metrics: [
-            'grounded focus',
+            'source integrity',
             'fixed reviewer',
             'required review',
             'business Turns',

@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto'
 import { constants, type BigIntStats } from 'node:fs'
 import { link, lstat, open, rename, stat, type FileHandle } from 'node:fs/promises'
-import { dirname, isAbsolute } from 'node:path'
+import { dirname, isAbsolute, sep } from 'node:path'
 
 import {
   directoryFileOperationInputSchema,
   directoryFileOperationResultSchema,
+  PROJECT_FILE_PREVIEW_BYTES,
   type DirectoryFileOperationInput,
   type DirectoryFileOperationResult,
 } from '@pact/contracts/directory-file-operations'
@@ -66,6 +67,9 @@ async function syncDirectory(path: string): Promise<void> {
 
 /** All Project operations use this process's anchored cwd, never a reconstructed absolute path. */
 async function enterDirectory(input: DirectoryFileOperationInput): Promise<void> {
+  for (const value of [...input.directories, input.name])
+    if (value.includes(sep))
+      throw new DirectoryFileError('UNSUPPORTED', 'Invalid preview file-name component.')
   const root = await stat('.', { bigint: true })
   if (
     !root.isDirectory() ||
@@ -174,9 +178,74 @@ async function copySnapshot(
   }
 }
 
+async function readPreview(
+  leaf: string,
+  deadlineAt: number,
+): Promise<DirectoryFileOperationResult> {
+  if (Date.now() >= deadlineAt) throw new DirectoryFileError('CANCELLED', 'File preview timed out.')
+  const named = await lstat(leaf, { bigint: true })
+  if (!named.isFile() || named.isSymbolicLink())
+    throw new DirectoryFileError('UNSUPPORTED', 'This link does not point to a file.')
+  const handle = await open(
+    leaf,
+    constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0),
+  )
+  try {
+    const before = await handle.stat({ bigint: true })
+    if (!before.isFile() || !sameObject(named, before))
+      throw new DirectoryFileError('PATH_CHANGED', 'This file changed while being read. Try again.')
+    if (before.size > BigInt(PROJECT_FILE_PREVIEW_BYTES))
+      throw new DirectoryFileError('TOO_LARGE', 'This file is too large to preview.')
+    const buffer = Buffer.alloc(Number(before.size) + 1)
+    let length = 0
+    while (length < buffer.length) {
+      if (Date.now() >= deadlineAt)
+        throw new DirectoryFileError('CANCELLED', 'File preview timed out.')
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Read the same bounded descriptor sequentially until EOF or the byte limit.
+      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length)
+      if (!bytesRead) break
+      length += bytesRead
+    }
+    const after = await handle.stat({ bigint: true })
+    const stillNamed = await lstat(leaf, { bigint: true })
+    if (
+      length !== Number(before.size) ||
+      !stableVersion(before, after) ||
+      !stableVersion(after, stillNamed) ||
+      stillNamed.isSymbolicLink()
+    )
+      throw new DirectoryFileError('PATH_CHANGED', 'This file changed while being read. Try again.')
+    const bytes = buffer.subarray(0, length)
+    if (bytes.includes(0))
+      throw new DirectoryFileError('UNSUPPORTED', 'Binary files cannot be previewed.')
+    let content: string
+    try {
+      content = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    } catch {
+      throw new DirectoryFileError('UNSUPPORTED', 'This file is not valid UTF-8 text.')
+    }
+    const result = metadata(after, createHash('sha256').update(bytes).digest('hex'))
+    if (!result.ok) return result
+    const preview = {
+      ...result,
+      preview: { content, updatedAt: new Date(Number(after.mtimeMs)).toISOString() },
+    }
+    if (Buffer.byteLength(JSON.stringify(preview), 'utf8') > PROJECT_FILE_PREVIEW_BYTES)
+      throw new DirectoryFileError('TOO_LARGE', 'This file is too large to preview.')
+    if (Date.now() >= deadlineAt)
+      throw new DirectoryFileError('CANCELLED', 'File preview timed out.')
+    return preview
+  } finally {
+    await handle.close()
+  }
+}
+
 async function execute(input: DirectoryFileOperationInput): Promise<DirectoryFileOperationResult> {
+  if (input.operation === 'preview' && Date.now() >= input.deadlineAt)
+    throw new DirectoryFileError('CANCELLED', 'File preview timed out.')
   await enterDirectory(input)
   const leaf = `./${input.name}`
+  if (input.operation === 'preview') return readPreview(leaf, input.deadlineAt)
   if (input.operation === 'absent') {
     try {
       await lstat(leaf, { bigint: true })

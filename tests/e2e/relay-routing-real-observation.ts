@@ -13,35 +13,26 @@ import {
   sourceReadDiagnosticSchema,
 } from '../../packages/contracts/src/diagnostics.js'
 
-export async function routingSchedulingObservation(page: Page, sessionId: string, refresh = false) {
+export async function routingSchedulingObservation(page: Page, sessionId: string) {
   return page.evaluate(
     async (payload) => {
       const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
-      const reply = payload.refresh
-        ? await bridge.refreshSchedulingState({ sessionId: payload.sessionId })
-        : await bridge.getSchedulingState({ sessionId: payload.sessionId })
+      const reply = await bridge.getSchedulingState({ sessionId: payload.sessionId })
       if (!reply.ok) return { ok: false as const, error: reply.error.code }
       const state = reply.value
-      // oxlint-disable-next-line unicorn/consistent-function-scoping -- This helper must travel inside the serialized browser closure.
-      const project = (value: typeof state.host) => ({
-        status: value.status,
-        provider: value.capability?.provider ?? null,
-        model: value.capability?.modelId ?? null,
-        reason: value.capability?.reason ?? null,
-        physicalReleased: value.capability?.physicalReleased ?? null,
-      })
       return {
         ok: true as const,
         enabled: state.settings.enabled,
-        host: project(state.host),
-        context: state.context
-          ? { eligibility: state.context.eligibility, ...project(state.context.observation) }
-          : null,
+        provider: state.settings.provider,
+        model: state.settings.model,
+        credentialConfigured: state.settings.credential.configured,
+        connection: state.connection,
+        context: state.context ? { eligibility: state.context.eligibility } : null,
         decision: state.activity.decision.status,
         check: state.activity.check.status,
       }
     },
-    { sessionId, refresh },
+    { sessionId },
   )
 }
 

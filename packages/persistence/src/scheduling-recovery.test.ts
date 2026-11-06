@@ -1,10 +1,10 @@
 import { eq } from 'drizzle-orm'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import type { PactDatabase } from './pact-database.js'
 
-import { decisionFixture } from './decision-fixture.test-support.js'
+import { decisionFixture, decisionHttpOwnerFixture } from './decision-fixture.test-support.js'
 import { schedulingRecoveryFaults } from './schema/index.js'
 
 const databases = new Set<PactDatabase>()
@@ -65,8 +65,14 @@ describe('durable automatic recovery admission', () => {
   it('does not replay an old fault after configuration ABA or a new Utility epoch', async () => {
     const f = await fixture(),
       candidate = fault(f)
-    f.repo.saveSchedulingSettings({ expectedRevision: 1, enabled: false })
-    f.repo.saveSchedulingSettings({ expectedRevision: 2, enabled: true })
+    f.repo.saveSchedulingSettings({
+      expectedRevision: f.repo.schedulingSettings().revision,
+      enabled: false,
+    })
+    f.repo.saveSchedulingSettings({
+      expectedRevision: f.repo.schedulingSettings().revision,
+      enabled: true,
+    })
     f.repo.observationUnavailable(f.first.run.id, 'Repeated original failure.')
     f.repo.armSchedulingRecoveryFaults(f.sessionId)
     expect(f.repo.takeSchedulingRecoveryFaults()).toEqual([])
@@ -97,12 +103,14 @@ describe('durable automatic recovery admission', () => {
       active: true,
     })
     expect(f.repo.schedulingBudget(candidate.node.budgetSubjectId)?.automaticChecks).toBe(1)
+    const input = { ...f.input, handoff: candidate.node }
     expect(
       f.repo.reserveEvaluation({
         handoff: candidate.node,
-        provider: 'codex',
-        model: 'gpt-6-luna',
-        configurationFingerprint: 'a'.repeat(64),
+        configurationFingerprint: f.repo.schedulingConfigurationFingerprint(),
+        inputSha256: createHash('sha256').update(JSON.stringify(input)).digest('hex'),
+        deadlineAt: Date.now() + 15_000,
+        httpOwner: decisionHttpOwnerFixture(),
       }).status,
     ).toBe('busy')
     f.repo.settleSchedulingRecoveryCheck(attempt.id, { ok: false, physicalReleased: true })

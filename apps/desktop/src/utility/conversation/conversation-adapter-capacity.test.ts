@@ -9,6 +9,7 @@ import { PactDatabase } from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { Conversation } from './conversation.js'
 
 const lifecycle = vi.hoisted(() => ({
@@ -225,7 +226,7 @@ describe('bounded Conversation Adapter lifetime', () => {
       db.sessionRepository,
       db.projectCatalogRepository,
       preparation,
-      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
     )
     try {
       for (let index = 0; index < 1_000; index += 1) {
@@ -361,7 +362,7 @@ describe('bounded Conversation Adapter lifetime', () => {
       db.sessionRepository,
       db.projectCatalogRepository,
       preparation,
-      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
     )
     inspections.enabled = true
     try {

@@ -48,7 +48,6 @@ async function fixture(
   f.repo.saveSchedulingSettings({
     expectedRevision: 0,
     enabled: true,
-    selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
   })
   f.repo.beginSchedulingRecoveryEpoch(randomUUID())
   expect(f.repo.nativeIssueMetadata(f.sessionId).agents).toEqual([

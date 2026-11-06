@@ -200,22 +200,32 @@ await test('native report recovery binds the same source and run instead of acce
   )
 })
 
-await test('decision evidence requires every fixed file, the verified pin and every executed assertion, with CI source identity when required', async () => {
-  const { decisionNativeFiles } = await import('./native-profiles.mjs')
+await test('execution evidence requires every fixed file, the verified pin and every executed assertion, with CI source identity when required', async () => {
+  const { codexExecutionNativeCases, codexExecutionNativeFiles } =
+    await import('./native-profiles.mjs')
+  // The exact four titles distribute across the three owned files as authored.
+  const titlesByFile = {
+    'tests/native/codex-reexecution.test.ts': codexExecutionNativeCases.slice(0, 2),
+    'tests/native/codex-inline-provider.test.ts': codexExecutionNativeCases.slice(2, 3),
+    'tests/native/relay-historical-owner.test.ts': codexExecutionNativeCases.slice(3, 4),
+  }
   const raw = {
     success: true,
-    numTotalTests: decisionNativeFiles.length,
-    testResults: decisionNativeFiles.map((name, index) => ({
+    numTotalTests: codexExecutionNativeCases.length,
+    testResults: codexExecutionNativeFiles.map((name) => ({
       name: '/owned/' + name,
-      assertionResults: [
-        { fullName: `Owned decision ${index}`, status: 'passed', duration: 1, failureMessages: [] },
-      ],
+      assertionResults: titlesByFile[name].map((fullName) => ({
+        fullName,
+        status: 'passed',
+        duration: 1,
+        failureMessages: [],
+      })),
     })),
   }
   const options = {
     completed: true,
     exitCode: 0,
-    profile: 'decision-codex',
+    profile: 'execution-codex',
     verifiedCodexVersion: '0.163.0',
   }
   const supported = process.platform === 'darwin' && process.arch === 'arm64'
@@ -260,6 +270,17 @@ await test('decision evidence requires every fixed file, the verified pin and ev
   const wrong = structuredClone(raw)
   wrong.testResults[0].name = '/owned/tests/native/not-the-required-file.test.ts'
   assert.notEqual(nativeReport(wrong, options).status, 'passed')
+  for (const defect of ['missing', 'renamed', 'duplicated']) {
+    const changed = structuredClone(raw)
+    const cases = changed.testResults[0].assertionResults
+    if (defect === 'missing') {
+      cases.pop()
+      changed.numTotalTests--
+    }
+    if (defect === 'renamed') cases[0].fullName = 'Unregistered execution substitute'
+    if (defect === 'duplicated') cases[0].fullName = cases[1].fullName
+    assert.notEqual(nativeReport(changed, options).status, 'passed')
+  }
 })
 
 function exactNativeFixture(name) {
@@ -279,37 +300,6 @@ function exactNativeFixture(name) {
     ],
   }
 }
-
-await test('Claude report rejects catalog-only, renamed, skipped and wrong-version substitutes for its six exact native obligations', () => {
-  const raw = exactNativeFixture('decision-claude')
-  const options = {
-    completed: true,
-    exitCode: 0,
-    profile: 'decision-claude',
-    verifiedClaudeVersion: '2.1.272',
-  }
-  const report = nativeReport(raw, options)
-  assert.equal(
-    report.status,
-    nativeProfileSupports(nativeProfile(options.profile)) ? 'passed' : 'blocked',
-  )
-  assert.equal(report.requiredClaudeVersion, '2.1.272')
-  assert.equal(report.requiredCodexVersion, null)
-  assert(nativeMarkdown(report).includes('required Claude 2.1.272'))
-  for (const verifiedClaudeVersion of [null, '2.1.286'])
-    assert.notEqual(nativeReport(raw, { ...options, verifiedClaudeVersion }).status, 'passed')
-  for (const defect of ['missing', 'renamed', 'skipped']) {
-    const changed = structuredClone(raw)
-    const cases = changed.testResults[0].assertionResults
-    if (defect === 'missing') {
-      cases.pop()
-      changed.numTotalTests--
-    }
-    if (defect === 'renamed') cases[0].fullName = 'Catalog found Haiku'
-    if (defect === 'skipped') cases[0].status = 'pending'
-    assert.notEqual(nativeReport(changed, options).status, 'passed')
-  }
-})
 
 await test('Windows ownership acceptance requires all thirteen real cases and five host seams on Windows, never skipped macOS observations', () => {
   const raw = exactNativeFixture('windows-owner')

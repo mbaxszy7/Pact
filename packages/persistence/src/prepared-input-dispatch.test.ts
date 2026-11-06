@@ -6,12 +6,21 @@ import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  collaborationInitialStage,
+  collaborationTaskSchema,
   conversationSendInputSchema,
+  defaultTaskStageRoles,
+  initialTaskRoleCandidates,
+  initialTaskRolesProposalSchema,
   inputRoutingProposalSchema,
+  parseComposerCommandPrefix,
+  type CollaborationTask,
   type ConversationSendInput,
   type DefaultSessionSettings,
   type InputRoutingProposal,
+  type InitialTaskRolesProposal,
   type RelaySchedulingDecision,
+  type DecisionHttpOwner,
 } from '@pact/contracts'
 
 import type { BeginRunInput, PreparedInputDispatch } from './conversation-repository.js'
@@ -21,6 +30,7 @@ import { PactDatabase } from './pact-database.js'
 import {
   agentEventJournal,
   agentRuns,
+  collaborationActionReceipts,
   anchoredComments,
   conversationBodyInputs,
   conversationBodyParts,
@@ -44,7 +54,16 @@ const candidates = [
   { id: 'route_codex', description: 'Send this ordinary input to Codex.' },
   { id: 'route_claude', description: 'Send this ordinary input to Claude.' },
 ]
-const configurationFingerprint = 'a'.repeat(64)
+const utilityEpoch = randomUUID()
+function httpOwner(): DecisionHttpOwner {
+  return {
+    version: 1,
+    kind: 'http',
+    utilityEpoch,
+    utilityPid: process.pid,
+    requestId: randomUUID(),
+  }
+}
 const digest = (text: string) => createHash('sha256').update(text).digest('hex')
 
 afterEach(async () => {
@@ -184,8 +203,15 @@ async function fixture(filePath = ':memory:') {
   f.repo.saveSchedulingSettings({
     expectedRevision: 0,
     enabled: true,
-    selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
   })
+  const credential = f.repo.writeRelayCredential({
+    operation: 'save',
+    nonce: randomUUID(),
+    expectedRevision: f.repo.readRelayCredential().revision,
+    deadlineAt: Date.now() + 5000,
+    ciphertext: Buffer.from('owned prepared-input ciphertext').toString('base64'),
+  })
+  if (!credential.configured) throw Error('Owned prepared-input ciphertext must be saved')
   const input = conversationSendInputSchema.parse({
     sessionId,
     clientMessageId: randomUUID(),
@@ -229,20 +255,23 @@ async function evaluate(f: Fixture, receipt = prepare(f)) {
     signal: new AbortController().signal,
     deadlineAt,
   })
+  const owner = httpOwner(),
+    configurationFingerprint = f.repo.schedulingConfigurationFingerprint()
   const reserved = f.repo.reserveEvaluation({
     handoff,
-    provider: 'codex',
-    model: 'gpt-6-luna',
     configurationFingerprint,
     inputSha256: material.inputSha256,
     deadlineAt,
+    httpOwner: owner,
   })
   if (reserved.status !== 'reserved') throw Error('Expected one admitted input evaluation.')
-  expect(f.repo.dispatchEvaluation(reserved.evaluation.id).created).toBe(true)
+  expect(f.repo.dispatchEvaluation(reserved.evaluation.id, owner).created).toBe(true)
   f.repo.settleEvaluation(reserved.evaluation.id, {
     outcome: 'completed',
     physicalReleased: true,
     selectedCandidateId: 'route_claude',
+    httpOwner: owner,
+    remoteOutcome: 'responded',
   })
   const proposal = inputRoutingProposalSchema.parse({
     version: 'input-routing-v1',
@@ -255,7 +284,14 @@ async function evaluate(f: Fixture, receipt = prepare(f)) {
     configurationFingerprint,
     deadlineAt,
   })
-  return { receipt, handoff, material, proposal, evaluationId: reserved.evaluation.id }
+  return {
+    receipt,
+    handoff,
+    material,
+    proposal,
+    evaluationId: reserved.evaluation.id,
+    httpOwner: owner,
+  }
 }
 
 async function informationRequest(
@@ -294,20 +330,23 @@ async function informationRequest(
     ],
     { signal: new AbortController().signal, deadlineAt },
   )
+  const owner = httpOwner(),
+    configurationFingerprint = f.repo.schedulingConfigurationFingerprint()
   const reserved = f.repo.reserveEvaluation({
     handoff,
-    provider: 'codex',
-    model: 'gpt-6-luna',
     configurationFingerprint,
     inputSha256: material.inputSha256,
     deadlineAt,
+    httpOwner: owner,
   })
   if (reserved.status !== 'reserved') throw Error('Expected one admitted information evaluation.')
-  f.repo.dispatchEvaluation(reserved.evaluation.id)
+  f.repo.dispatchEvaluation(reserved.evaluation.id, owner)
   f.repo.settleEvaluation(reserved.evaluation.id, {
     outcome: 'completed',
     physicalReleased: true,
     selectedCandidateId: 'clarify_prepared_input',
+    httpOwner: owner,
+    remoteOutcome: 'responded',
   })
   const request = {
     receipt,
@@ -321,9 +360,8 @@ async function informationRequest(
       configurationFingerprint,
       deadlineAt,
     },
-    recommendation: {
+    selection: {
       candidateId: 'clarify_prepared_input',
-      highlights: [],
       information: { fieldId: change.selectedFieldId ?? declaration?.id ?? randomUUID() },
     },
   }
@@ -766,7 +804,10 @@ describe('saved ordinary input information consumer', () => {
     f.repo.recoverInterruptedRuns()
     expect(batch(f, receipt.batchId).dispatchState).toBe('paused')
     expect(members(f, receipt.batchId)).toEqual(pins)
-    f.repo.saveSchedulingSettings({ expectedRevision: 1, enabled: false, selection: null })
+    f.repo.saveSchedulingSettings({
+      expectedRevision: f.repo.schedulingSettings().revision,
+      enabled: false,
+    })
     expect(f.repo.pendingPreparedInformationDefaults()).toEqual([])
     expect(f.repo.takePreparedInformationDefault(receipt.batchId)).toBeUndefined()
     expect(businessFacts(f).runs).toHaveLength(1)
@@ -775,7 +816,10 @@ describe('saved ordinary input information consumer', () => {
   it('closes an unused card on disabling Relay and admits its original default exactly once', async () => {
     const f = await fixture(),
       { receipt } = await information(f)
-    f.repo.saveSchedulingSettings({ expectedRevision: 1, enabled: false, selection: null })
+    f.repo.saveSchedulingSettings({
+      expectedRevision: f.repo.schedulingSettings().revision,
+      enabled: false,
+    })
     expect(f.repo.pendingPreparedInformationDefaults()).toEqual([
       { sessionId: f.sessionId, batchId: receipt.batchId },
     ])
@@ -1151,7 +1195,7 @@ describe('prepared ordinary input through repository admission', () => {
       evaluationCalls: 1,
       automaticResends: 0,
     })
-    expect(f.repo.dispatchEvaluation(e.evaluationId).created).toBe(false)
+    expect(f.repo.dispatchEvaluation(e.evaluationId, e.httpOwner).created).toBe(false)
     expect(f.repo.schedulingBudget(e.handoff.budgetSubjectId)?.evaluationCalls).toBe(1)
     expect(f.db.drizzle.select().from(schedulingEvaluations).all()).toMatchObject([
       { called: true, active: false, outcome: 'completed', handoffId: e.handoff.id },
@@ -1209,7 +1253,7 @@ describe('prepared ordinary input through repository admission', () => {
       created: false,
       run: { id: first.run.id },
     })
-    expect(f.repo.dispatchEvaluation(e.evaluationId).created).toBe(false)
+    expect(f.repo.dispatchEvaluation(e.evaluationId, e.httpOwner).created).toBe(false)
     expect(f.repo.schedulingBudget(e.handoff.budgetSubjectId)?.evaluationCalls).toBe(1)
     expect(businessFacts(f)).toEqual(committed)
   })
@@ -1457,20 +1501,34 @@ describe('prepared ordinary input through repository admission', () => {
     const f = await fixture(),
       receipt = prepare(f),
       handoff = f.repo.preparedInputHandoff(receipt.batchId)
+    const deadlineAt = Date.now() + 15_000,
+      owner = httpOwner()
+    const material = await f.repo.readPreparedInputDecisionSources(receipt, candidates, {
+      signal: new AbortController().signal,
+      deadlineAt,
+    })
     const reserved = f.repo.reserveEvaluation({
       handoff,
-      provider: 'codex',
-      model: 'gpt-6-luna',
-      configurationFingerprint,
+      configurationFingerprint: f.repo.schedulingConfigurationFingerprint(),
+      inputSha256: material.inputSha256,
+      deadlineAt,
+      httpOwner: owner,
     })
     if (reserved.status !== 'reserved') throw Error('Expected an evaluation reservation.')
     f.repo.markNativeContextsMissing(f.sessionId, ['claude'])
     const before = businessFacts(f)
     expect(f.repo.evaluationIsCurrent(handoff)).toBe(false)
-    expect(() => f.repo.dispatchEvaluation(reserved.evaluation.id)).toThrow('handoff facts changed')
+    expect(() => f.repo.dispatchEvaluation(reserved.evaluation.id, owner)).toThrow(
+      'handoff facts changed',
+    )
     expect(f.repo.schedulingBudget(handoff.budgetSubjectId)?.evaluationCalls ?? 0).toBe(0)
     expect(businessFacts(f)).toEqual(before)
-    f.repo.settleEvaluation(reserved.evaluation.id, { outcome: 'not_sent', physicalReleased: true })
+    f.repo.settleEvaluation(reserved.evaluation.id, {
+      outcome: 'not_sent',
+      physicalReleased: true,
+      httpOwner: owner,
+      remoteOutcome: 'not_sent',
+    })
   })
 
   it('rejects changed Session settings without consuming or rerouting the frozen request', async () => {
@@ -1501,7 +1559,10 @@ describe('prepared ordinary input through repository admission', () => {
       const proposal = { ...e.proposal }
       if (change === 'late') vi.spyOn(Date, 'now').mockReturnValue(proposal.deadlineAt)
       if (change === 'configuration')
-        f.repo.saveSchedulingSettings({ expectedRevision: 1, enabled: false, selection: null })
+        f.repo.saveSchedulingSettings({
+          expectedRevision: f.repo.schedulingSettings().revision,
+          enabled: false,
+        })
       if (change === 'source') proposal.sourceFingerprint = 'b'.repeat(64)
       if (change === 'input') proposal.inputSha256 = 'b'.repeat(64)
       if (change === 'candidate') proposal.candidateId = 'route_codex'
@@ -1607,5 +1668,401 @@ describe('prepared ordinary input through repository admission', () => {
         sql`SELECT count(*) AS count FROM agent_runs WHERE user_message_id=${f.input.clientMessageId}`,
       )?.count,
     ).toBe(0)
+  })
+})
+
+const roleInput = (sessionId: string, content: string, commentsRevision: number) =>
+  conversationSendInputSchema.parse({
+    sessionId,
+    clientMessageId: randomUUID(),
+    content,
+    expectedCommentsRevision: commentsRevision,
+    commentIds: [],
+    route: { type: 'primary' },
+    routeIntent: 'implicit',
+    composerRevision: 3,
+  })
+
+function rolePrepare(f: Fixture, input: ConversationSendInput) {
+  return f.repo.prepareInputDispatch(
+    input,
+    randomUUID(),
+    ['codex', 'claude'],
+    undefined,
+    'task_roles',
+  )
+}
+
+async function evaluateRoles(f: Fixture, receipt: PreparedInputDispatch, candidateId: string) {
+  const handoff = f.repo.preparedInputHandoff(receipt.batchId)
+  const deadlineAt = Date.now() + 15_000
+  const roleCandidates = receipt.metadata.taskRoles!.candidates.map((candidate) => ({
+    id: candidate.id,
+    description: 'Assign roles.',
+  }))
+  const material = await f.repo.readPreparedInputDecisionSources(receipt, roleCandidates, {
+    signal: new AbortController().signal,
+    deadlineAt,
+  })
+  const owner = httpOwner(),
+    configurationFingerprint = f.repo.schedulingConfigurationFingerprint()
+  const reserved = f.repo.reserveEvaluation({
+    handoff,
+    configurationFingerprint,
+    inputSha256: material.inputSha256,
+    deadlineAt,
+    httpOwner: owner,
+  })
+  if (reserved.status !== 'reserved') throw Error('Expected one admitted role evaluation.')
+  expect(f.repo.dispatchEvaluation(reserved.evaluation.id, owner).created).toBe(true)
+  f.repo.settleEvaluation(reserved.evaluation.id, {
+    outcome: 'completed',
+    physicalReleased: true,
+    selectedCandidateId: candidateId,
+    httpOwner: owner,
+    remoteOutcome: 'responded',
+  })
+  const proposal = initialTaskRolesProposalSchema.parse({
+    version: 'initial-task-roles-v1',
+    evaluationId: reserved.evaluation.id,
+    handoffId: handoff.id,
+    inputSha256: material.inputSha256,
+    sourceFingerprint: material.sourceFingerprint,
+    candidateId,
+    configurationGeneration: f.repo.schedulingConfigurationGeneration(),
+    configurationFingerprint,
+    deadlineAt,
+  })
+  return { receipt, handoff, material, proposal }
+}
+
+function roleAdmission(
+  f: Fixture,
+  receipt: PreparedInputDispatch,
+  proposal: InitialTaskRolesProposal | undefined,
+  input: ConversationSendInput,
+  override: Partial<CollaborationTask> = {},
+) {
+  const roles = receipt.metadata.taskRoles!
+  const task = collaborationTaskSchema.parse({
+    protocol: 'native-workflow-v1',
+    id: randomUUID(),
+    sessionId: input.sessionId,
+    kind: roles.kind,
+    revision: 0,
+    owner: roles.primaryAgentId,
+    reviewer: roles.primaryAgentId === 'codex' ? 'claude' : 'codex',
+    rolePolicy: 'split-stages-v1',
+    stageRoles: f.repo.preparedInitialTaskRoles(receipt, proposal),
+    task: input.content
+      .slice(parseComposerCommandPrefix(input.content, input.skills).argumentsStart)
+      .trim(),
+    taskMessageId: input.clientMessageId,
+    stage: collaborationInitialStage(roles.kind),
+    actor: f.repo.preparedInputRecipient(receipt, proposal),
+    status: 'running',
+    automation: 'active',
+    runId: randomUUID(),
+    inputSequence: 0,
+    handledInputSequence: 0,
+    planVersion: 0,
+    discussionRounds: 0,
+    reviewCycles: roles.kind === 'review' ? 1 : 0,
+    repairAttempts: 0,
+    ...override,
+  })
+  return {
+    ...input,
+    preparedInput: receipt,
+    ...(proposal ? { initialTaskRoles: proposal } : {}),
+    collaboration: task,
+    agentId: f.repo.preparedInputRecipient(receipt, proposal),
+    settingsRevision: receipt.metadata.settingsRevision,
+    model: null,
+    effort: null,
+  }
+}
+
+describe('initial task roles through the prepared-input lease', () => {
+  it('prepares a modern implicit /plan with role metadata but no task, Run or message', async () => {
+    const f = await fixture(),
+      input = roleInput(
+        f.sessionId,
+        '/plan Plan the saved cancellation boundary.',
+        drafts(f).commentsRevision,
+      )
+    const opportunity = f.repo.initialTaskRoleOpportunity(input, ['codex', 'claude'])!
+    expect(opportunity).toMatchObject({
+      kind: 'plan',
+      primaryAgentId: 'codex',
+      defaults: defaultTaskStageRoles('codex'),
+    })
+    expect(opportunity.candidates).toEqual(initialTaskRoleCandidates('plan', 'codex'))
+    expect(opportunity.candidates).toHaveLength(3)
+    const receipt = rolePrepare(f, input)
+    expect(receipt.metadata.taskRoles).toEqual(opportunity)
+    expect(receipt.metadata.defaultAgentId).toBe('codex')
+    expect(f.repo.collaboration(f.sessionId)).toBeUndefined()
+    expect(f.db.drizzle.select().from(agentRuns).all()).toHaveLength(1)
+    expect(
+      f.db.drizzle
+        .select()
+        .from(conversationMessages)
+        .all()
+        .filter((message) => message.id === input.clientMessageId),
+    ).toEqual([])
+    expect(f.repo.preparedInitialTaskRoles(receipt)).toEqual(opportunity.defaults)
+    expect(f.repo.preparedInputRecipient(receipt)).toBe('codex')
+  })
+
+  it.each(['build', 'review'] as const)(
+    'offers one opposite-author candidate for /%s',
+    async (kind) => {
+      const f = await fixture(),
+        input = roleInput(
+          f.sessionId,
+          `/${kind} Keep the original scope.`,
+          drafts(f).commentsRevision,
+        )
+      const opportunity = f.repo.initialTaskRoleOpportunity(input, ['codex', 'claude'])!
+      expect(opportunity.candidates).toEqual(initialTaskRoleCandidates(kind, 'codex'))
+      expect(opportunity.candidates).toHaveLength(1)
+      const receipt = rolePrepare(f, input)
+      expect(receipt.metadata.defaultAgentId).toBe(kind === 'build' ? 'claude' : 'codex')
+    },
+  )
+
+  it('binds an accepted nondefault assignment to the new task, Run and Batch', async () => {
+    const f = await fixture(),
+      input = roleInput(
+        f.sessionId,
+        '/plan Plan the retained cancellation boundary.',
+        drafts(f).commentsRevision,
+      )
+    const receipt = rolePrepare(f, input)
+    const { proposal } = await evaluateRoles(f, receipt, 'roles_claude_claude')
+    const selected = receipt.metadata.taskRoles!.candidates.find(
+      (candidate) => candidate.id === 'roles_claude_claude',
+    )!
+    expect(f.repo.preparedInputRecipient(receipt, proposal)).toBe('claude')
+    expect(f.repo.preparedInitialTaskRoles(receipt, proposal)).toEqual(selected.roles)
+    const { run } = f.repo.beginRun(roleAdmission(f, receipt, proposal, input))
+    const task = f.repo.collaboration(f.sessionId)!
+    expect(task).toMatchObject({
+      kind: 'plan',
+      stage: 'plan',
+      actor: 'claude',
+      inputSequence: 1,
+    })
+    expect(task.stageRoles).toEqual(selected.roles)
+    expect(f.repo.collaborationTurnAuthorization(run.id)).toMatchObject({
+      stageRoles: selected.roles,
+    })
+    const boundBatch = f.db.drizzle
+      .select()
+      .from(conversationInputBatches)
+      .where(eq(conversationInputBatches.clientMessageId, input.clientMessageId))
+      .get()!
+    expect(boundBatch.taskId).toBe(task.id)
+    expect(boundBatch.sequence).toBe(1)
+    expect(f.db.drizzle.select().from(agentRuns).all()).toHaveLength(2)
+    const replay = f.repo.beginRun(roleAdmission(f, receipt, proposal, input))
+    expect(replay.run.id).toBe(run.id)
+    expect(f.db.drizzle.select().from(agentRuns).all()).toHaveLength(2)
+    // Provider completion is not task completion: the adopted evaluation is reserved until
+    // the real native Run finishes and settles its business outcome.
+    expect(f.repo.readSchedulingActivity({}).rows).toEqual([
+      expect.objectContaining({
+        id: proposal.evaluationId,
+        suggestionState: 'adopted',
+        action: 'route_claude',
+        actionResult: 'reserved',
+      }),
+    ])
+    complete(f, run.id, 'The original role-selected Run completed.')
+    expect(f.repo.readSchedulingActivity({}).rows[0]).toMatchObject({
+      action: 'route_claude',
+      actionResult: 'completed',
+    })
+  })
+
+  it('rejects a /plan role proof presented as a build task with the same actor', async () => {
+    const f = await fixture(),
+      input = roleInput(
+        f.sessionId,
+        '/plan Plan the saved cancellation boundary.',
+        drafts(f).commentsRevision,
+      )
+    const receipt = rolePrepare(f, input),
+      { proposal } = await evaluateRoles(f, receipt, 'roles_claude_claude')
+    // The same proposal, actor and map, but the task claims build/implement.
+    const forged = roleAdmission(f, receipt, proposal, input, {
+      kind: 'build',
+      stage: 'implement',
+    })
+    expect(() => f.repo.beginRun(forged)).toThrow(
+      'The prepared roles do not belong to this new task.',
+    )
+    expect(f.repo.collaboration(f.sessionId)).toBeUndefined()
+    expect(f.db.drizzle.select().from(agentRuns).all()).toHaveLength(1)
+    expect(f.db.drizzle.select().from(collaborationActionReceipts).all()).toEqual([])
+    const bound = f.db.drizzle
+      .select()
+      .from(conversationInputBatches)
+      .where(eq(conversationInputBatches.id, receipt.batchId))
+      .get()!
+    expect(bound.dispatchState).toBe('prepared')
+    expect(bound.taskId).toBeNull()
+    expect(bound.runId).toBeNull()
+  })
+
+  it('rejects a nondefault map with no receipt and accepts the default without an API call', async () => {
+    const f = await fixture(),
+      input = roleInput(
+        f.sessionId,
+        '/plan Keep the exact default assignment.',
+        drafts(f).commentsRevision,
+      )
+    const receipt = rolePrepare(f, input)
+    const based = roleAdmission(f, receipt, undefined, input)
+    const clientMessageId = randomUUID()
+    const plain = {
+      ...based,
+      clientMessageId,
+      preparedInput: undefined,
+      initialTaskRoles: undefined,
+      expectedCommentsRevision: drafts(f).commentsRevision,
+      collaboration: { ...based.collaboration, taskMessageId: clientMessageId },
+    }
+    expect(() =>
+      f.repo.beginRun({
+        ...plain,
+        collaboration: {
+          ...plain.collaboration,
+          stageRoles: {
+            ...defaultTaskStageRoles('codex'),
+            codeAuthor: 'codex',
+            codeReviewer: 'claude',
+          },
+        },
+      }),
+    ).toThrow('The initial stage roles have no current selection receipt.')
+    expect(f.repo.collaboration(f.sessionId)).toBeUndefined()
+    expect(f.db.drizzle.select().from(schedulingEvaluations).all()).toHaveLength(0)
+    expect(f.repo.beginRun(plain).created).toBe(true)
+    expect(f.repo.collaboration(f.sessionId)!.stageRoles).toEqual(defaultTaskStageRoles('codex'))
+  })
+
+  it.each([
+    { kind: 'build' },
+    { stage: 'code_review' },
+    { status: 'waiting' },
+    { revision: 1 },
+    { inputSequence: 1 },
+    { reviewCycles: 1 },
+    {
+      stageRoles: {
+        ...defaultTaskStageRoles('codex'),
+        codeAuthor: 'codex',
+        codeReviewer: 'claude',
+      },
+    },
+  ] as const)('rejects a forged task field %o on a valid role preparation', async (tamper) => {
+    const f = await fixture(),
+      input = roleInput(
+        f.sessionId,
+        '/plan Plan the saved cancellation boundary.',
+        drafts(f).commentsRevision,
+      )
+    const receipt = rolePrepare(f, input),
+      { proposal } = await evaluateRoles(f, receipt, 'roles_claude_claude')
+    expect(() => f.repo.beginRun(roleAdmission(f, receipt, proposal, input, tamper))).toThrow(
+      RunOperationConflictError,
+    )
+    expect(f.repo.collaboration(f.sessionId)).toBeUndefined()
+    expect(f.db.drizzle.select().from(collaborationActionReceipts).all()).toEqual([])
+  })
+
+  it.each(['roles_codex_codex', 'route_claude'] as const)(
+    'rejects a mismatched or ordinary proposal ID %s without granting roles',
+    async (candidateId) => {
+      const f = await fixture(),
+        input = roleInput(
+          f.sessionId,
+          '/plan Keep the default assignment.',
+          drafts(f).commentsRevision,
+        )
+      const receipt = rolePrepare(f, input)
+      const { proposal } = await evaluateRoles(f, receipt, 'roles_claude_claude')
+      const forged = initialTaskRolesProposalSchema.safeParse({ ...proposal, candidateId })
+      expect(forged.success).toBe(candidateId.startsWith('roles_'))
+      const forgedProposal = forged.success ? forged.data : undefined
+      expect(f.repo.preparedInitialTaskRoles(receipt, forgedProposal)).toEqual(
+        receipt.metadata.taskRoles!.defaults,
+      )
+      expect(f.repo.preparedInputRecipient(receipt, forgedProposal)).toBe(
+        receipt.metadata.defaultAgentId,
+      )
+    },
+  )
+
+  it('rejects a later stageRoles mutation through the state write', async () => {
+    const f = await fixture(),
+      input = roleInput(f.sessionId, '/plan Keep the original roles.', drafts(f).commentsRevision)
+    const receipt = rolePrepare(f, input)
+    const { proposal } = await evaluateRoles(f, receipt, 'roles_claude_claude')
+    const roleArgs = roleAdmission(f, receipt, proposal, input)
+    f.repo.beginRun(roleArgs)
+    const task = f.repo.collaboration(f.sessionId)!
+    expect(() =>
+      f.repo.setCollaborationState({
+        ...task,
+        revision: task.revision + 1,
+        stageRoles: { ...task.stageRoles!, codeAuthor: 'codex', codeReviewer: 'claude' },
+      }),
+    ).toThrow('The collaboration changed before this action.')
+  })
+
+  it('preserves an admitted nondefault map and its Run authorization across a genuine reopen', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'pact-initial-roles-'))
+    directories.push(directory)
+    const filePath = join(directory, 'pact.sqlite'),
+      f = await fixture(filePath),
+      input = roleInput(
+        f.sessionId,
+        '/plan Plan the saved cancellation boundary.',
+        drafts(f).commentsRevision,
+      )
+    const receipt = rolePrepare(f, input),
+      { proposal } = await evaluateRoles(f, receipt, 'roles_claude_claude')
+    const { run } = f.repo.beginRun(roleAdmission(f, receipt, proposal, input))
+    const task = f.repo.collaboration(f.sessionId)!
+    expect(task.stageRoles).toEqual(
+      receipt.metadata.taskRoles!.candidates.find(
+        (candidate) => candidate.id === 'roles_claude_claude',
+      )!.roles,
+    )
+    databases.delete(f.db)
+    f.db.close()
+    const cold = await PactDatabase.open({
+      filePath,
+      migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
+    })
+    databases.add(cold)
+    const reopened = cold.conversationRepository.collaboration(f.sessionId)!
+    expect(reopened.stageRoles).toEqual(task.stageRoles)
+    expect(cold.conversationRepository.collaborationTurnAuthorization(run.id)).toMatchObject({
+      stageRoles: task.stageRoles,
+    })
+    expect(cold.drizzle.select().from(schedulingEvaluations).all()).toHaveLength(1)
+    expect(cold.drizzle.select().from(collaborationActionReceipts).all()).toHaveLength(0)
+  })
+
+  it('keeps the default for an ordinary implicit send and rejects task-role metadata', async () => {
+    const f = await fixture()
+    expect(f.repo.initialTaskRoleOpportunity(f.input, ['codex', 'claude'])).toBeUndefined()
+    const receipt = prepare(f)
+    expect(receipt.metadata.taskRoles).toBeUndefined()
+    expect(f.repo.preparedInitialTaskRoles(receipt)).toBeUndefined()
   })
 })

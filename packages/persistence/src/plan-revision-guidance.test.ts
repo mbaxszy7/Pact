@@ -7,12 +7,20 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   collaborationDocumentSchema,
+  decisionInputSchema,
   planRevisionGuidanceSchema,
-  type PlanRevisionGuidanceProposal,
 } from '@pact/contracts'
 
+import {
+  configureDecisionFixtureCredential,
+  decisionHttpOwnerFixture,
+} from './decision-fixture.test-support.js'
 import { PactDatabase } from './pact-database.js'
-import { planRevisionFixture } from './plan-revision-guidance.test-support.js'
+import {
+  historicalPlanGuidance,
+  planRevisionFixture,
+  seedHistoricalGuidance,
+} from './plan-revision-guidance.test-support.js'
 import {
   agentEventJournal,
   agentRuns,
@@ -44,50 +52,71 @@ async function fixture(options: Parameters<typeof planRevisionFixture>[0] = {}) 
   return value
 }
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
-async function proposal(f: Awaited<ReturnType<typeof fixture>>) {
-  const deadlineAt = Date.now() + 15_000
-  const material = await f.repo.readPlanRevisionDecisionSources(f.handoff, {
-    signal: new AbortController().signal,
-    deadlineAt,
+async function sourceFixture(options: Parameters<typeof planRevisionFixture>[0] = {}) {
+  const f = await fixture({ ...options, review: 'Earlier complete review.' })
+  const response = f.repo.beginRun(f.admission()).run
+  const plan = f.repo.collaboration(f.sessionId)!.planReference!.document
+  f.repo.recordWorkflowPlanRetained(response.id, {
+    nativeId: `retained-${response.id}`,
+    confirmation: 'native_root_settled_v1',
+    sha256: plan.sha256,
+    bytes: plan.bytes,
+    chars: plan.chars,
   })
-  const reserved = f.repo.reserveEvaluation({
-    handoff: f.handoff,
-    provider: 'codex',
-    model: 'gpt-6-luna',
-    configurationFingerprint: 'a'.repeat(64),
-    deadlineAt,
+  f.finish(response.id, { answer: 'Complete response to the prior review.' })
+  const reviewRun = f.repo.beginRun(f.admission()).run
+  f.finish(reviewRun.id, {
+    verdict: 'changes_requested',
+    answer: options.review ?? 'Handle cancellation before completing the Plan.',
   })
-  if (reserved.status !== 'reserved') throw Error('Missing evaluation reservation')
-  f.repo.dispatchEvaluation(reserved.evaluation.id)
-  f.repo.settleEvaluation(reserved.evaluation.id, { outcome: 'completed', physicalReleased: true })
-  const value: PlanRevisionGuidanceProposal = {
-    guidance: {
-      version: 'plan-revision-guidance-v1',
-      evaluationId: reserved.evaluation.id,
-      handoffId: f.handoff.id,
-      inputSha256: material.inputSha256,
-      sourceFingerprint: material.sourceFingerprint,
-      taskId: material.taskId,
-      inputSequence: material.inputSequence,
-      planVersion: material.planVersion,
-      candidateId: 'continue_plan_revision',
-      sources: material.sources,
-      highlights: [
-        {
-          text: 'Keep the cancellation boundary explicit.',
-          sourceIds: [material.sources.find((source) => source.roles.includes('review'))!.id],
-        },
-      ],
-    },
-    configurationGeneration: f.repo.schedulingConfigurationGeneration(),
-    configurationFingerprint: 'a'.repeat(64),
-    deadlineAt,
-  }
-  return { material, value }
+  const task = f.repo.collaboration(f.sessionId)!
+  return { ...f, task, reviewRun, handoff: f.repo.workflowHandoff(task, task.owner) }
 }
+const sourceCandidates = [
+  { id: 'continue_plan_revision', description: 'Continue the original owner revision.' },
+]
 
 describe('Plan revision advice persistence', () => {
-  it('skips a single review followed by explicit Plan retention before loading advice', async () => {
+  it.each(['retained', 'revised'] as const)(
+    'offers a supplement after the first complete Plan response while preserving the fixed review',
+    async (outcome) => {
+      const f = await fixture(),
+        response = f.repo.beginRun(f.admission()).run,
+        plan = f.repo.collaboration(f.sessionId)!.planReference!.document
+      if (outcome === 'retained')
+        f.repo.recordWorkflowPlanRetained(response.id, {
+          nativeId: `retained-${response.id}`,
+          confirmation: 'native_root_settled_v1',
+          sha256: plan.sha256,
+          bytes: plan.bytes,
+          chars: plan.chars,
+        })
+      f.finish(
+        response.id,
+        outcome === 'revised' ? { plan: 'Complete revised scope and verification.' } : {},
+      )
+      const current = f.repo.collaboration(f.sessionId)!,
+        handoff = f.repo.workflowHandoff(current, current.reviewer),
+        alternatives = f.repo.relayWorkflowAlternatives(handoff)
+      expect(alternatives?.snapshot.node).toBe('owner_to_review')
+      expect(alternatives?.snapshot.producer.runId).toBe(response.id)
+      expect(alternatives?.snapshot.reviews.map((review) => review.runId)).toEqual([f.reviewRun.id])
+      expect(alternatives?.snapshot.responses).toEqual([])
+      expect(alternatives?.alternatives).toEqual([
+        expect.objectContaining({
+          kind: 'supplement_plan',
+          actor: current.owner,
+          returnActor: current.reviewer,
+        }),
+      ])
+      expect(f.db.drizzle.select().from(schedulingEvaluations).all().length).toBe(0)
+      expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
+      expect(f.repo.findRun(response.id)?.status).toBe('completed')
+      expect(f.admission().agentId).toBe(current.reviewer)
+    },
+  )
+
+  it('rejects an offer when the durable Plan settlement no longer matches the current reference', async () => {
     const f = await fixture(),
       response = f.repo.beginRun(f.admission()).run,
       plan = f.repo.collaboration(f.sessionId)!.planReference!.document
@@ -99,12 +128,18 @@ describe('Plan revision advice persistence', () => {
       chars: plan.chars,
     })
     f.finish(response.id)
-    const current = f.repo.collaboration(f.sessionId)!,
-      handoff = f.repo.workflowHandoff(current, current.reviewer)
-    expect(f.repo.relayWorkflowWorthConsulting(handoff)).toBe(false)
-    expect(f.repo.relayWorkflowSnapshot(handoff)).toBeUndefined()
-    expect(f.repo.findRun(response.id)?.status).toBe('completed')
-    expect(f.admission().agentId).toBe(current.reviewer)
+    const current = f.repo.collaboration(f.sessionId)!
+    // The current Plan reference differs from what the producer Turn settled.
+    f.repo.setCollaborationState({
+      ...current,
+      revision: current.revision + 1,
+      planReference: { ...current.planReference!, document: current.taskDocument! },
+    })
+    const next = f.repo.collaboration(f.sessionId)!,
+      handoff = f.repo.workflowHandoff(next, next.reviewer)
+    expect(f.repo.relayWorkflowAlternatives(handoff)).toBeUndefined()
+    expect(f.db.drizzle.select().from(schedulingEvaluations).all()).toHaveLength(0)
+    expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
   })
 
   it.each(['retained', 'revised'] as const)(
@@ -133,7 +168,7 @@ describe('Plan revision advice persistence', () => {
       )
       const current = f.repo.collaboration(f.sessionId)!,
         handoff = f.repo.workflowHandoff(current, current.reviewer)
-      expect(f.repo.relayWorkflowWorthConsulting(handoff)).toBe(true)
+      expect(f.repo.relayWorkflowAlternatives(handoff)?.alternatives).toHaveLength(1)
       const material = await f.repo.readRelayWorkflowDecisionSources(
         handoff,
         [{ id: 'continue_plan_review', description: 'Keep the fixed independent review.' }],
@@ -158,19 +193,32 @@ describe('Plan revision advice persistence', () => {
   it.each(['reserved', 'completed', 'not_sent'] as const)(
     'reads only the indexed durable identity for an existing %s evaluation',
     async (outcome) => {
-      const f = await fixture()
+      const f = await sourceFixture()
+      configureDecisionFixtureCredential(f.repo)
+      const deadlineAt = Date.now() + 15_000,
+        owner = decisionHttpOwnerFixture()
+      const material = await f.repo.readRelayWorkflowDecisionSources(f.handoff, sourceCandidates, {
+        signal: new AbortController().signal,
+        deadlineAt,
+      })
       const read = vi.spyOn(f.repo, 'readPage')
       expect(f.repo.decisionEvaluationReceipt(f.handoff)).toBeUndefined()
       const reserved = f.repo.reserveEvaluation({
         handoff: f.handoff,
-        provider: 'codex',
-        model: 'gpt-6-luna',
-        configurationFingerprint: 'a'.repeat(64),
+        configurationFingerprint: f.repo.schedulingConfigurationFingerprint(),
+        deadlineAt,
+        inputSha256: material.inputSha256,
+        httpOwner: owner,
       })
       if (reserved.status !== 'reserved') throw Error('Missing reservation')
-      if (outcome === 'completed') f.repo.dispatchEvaluation(reserved.evaluation.id)
+      if (outcome === 'completed') f.repo.dispatchEvaluation(reserved.evaluation.id, owner)
       if (outcome !== 'reserved')
-        f.repo.settleEvaluation(reserved.evaluation.id, { outcome, physicalReleased: true })
+        f.repo.settleEvaluation(reserved.evaluation.id, {
+          outcome,
+          physicalReleased: true,
+          httpOwner: owner,
+          remoteOutcome: outcome === 'completed' ? 'responded' : 'not_sent',
+        })
       expect(f.repo.decisionEvaluationReceipt(f.handoff)).toEqual({ id: reserved.evaluation.id })
       if (!f.handoff.freshnessGuard.runId) throw Error('Expected workflow freshness')
       expect(
@@ -204,8 +252,8 @@ describe('Plan revision advice persistence', () => {
       review = `Review ${'r'.repeat(22_000)} final cancellation requirement.`
     const earlier = `Earlier ${'e'.repeat(18_000)} original input tail.`,
       later = `Later ${'l'.repeat(18_000)} newest input tail.`
-    const f = await fixture({ plan, review, commentCount: 2, inputs: [earlier, later] })
-    const material = await f.repo.readPlanRevisionDecisionSources(f.handoff, {
+    const f = await sourceFixture({ plan, review, commentCount: 1, inputs: [earlier, later] })
+    const material = await f.repo.readRelayWorkflowDecisionSources(f.handoff, sourceCandidates, {
       signal: new AbortController().signal,
       deadlineAt: Date.now() + 15_000,
     })
@@ -213,36 +261,70 @@ describe('Plan revision advice persistence', () => {
     expect(material.input.sources.find((source) => source.text === review)).toBeDefined()
     expect(material.input.sources.find((source) => source.text === earlier)).toBeDefined()
     expect(material.input.sources.find((source) => source.text === later)).toBeDefined()
-    expect(material.sources.filter((source) => source.roles.includes('comment'))).toHaveLength(2)
-    expect(material.sources.filter((source) => source.roles.includes('anchor'))).toHaveLength(2)
-    expect(material.sources[0]!.roles).toEqual(['task', 'input'])
+    expect(material.sources.filter((source) => source.roles.includes('comment'))).toHaveLength(1)
+    expect(material.sources.filter((source) => source.roles.includes('anchor'))).toHaveLength(1)
+    expect(material.sources[0]!.roles).toEqual(['task', 'input', 'review_scope'])
     expect(material.input.sources[0]!.text).toBe('/plan Review cancellation.')
     expect(material.inputSha256).toBe(hash(material.input))
-    expect(material.sourceFingerprint).toBe(
-      hash({
-        version: 'plan-revision-guidance-v1',
-        taskId: material.taskId,
-        inputSequence: material.inputSequence,
-        planVersion: material.planVersion,
-        sources: material.sources,
-      }),
-    )
+    const { task: snapshotTask, sourceFingerprint, ...facts } = material.snapshot
+    expect(snapshotTask.id).toBe(f.task.id)
+    expect(sourceFingerprint).toBe(material.sourceFingerprint)
+    expect(material.sourceFingerprint).toBe(hash(facts))
     expect(
       material.sources.filter((source) => source.roles.includes('anchor_target')),
-    ).toHaveLength(2)
+    ).toHaveLength(1)
     expect(
       new Set(
         material.sources
           .filter((source) => source.roles.includes('anchor_target'))
           .map((source) => source.memberId),
       ).size,
-    ).toBe(2)
+    ).toBe(1)
     expect(f.db.drizzle.select().from(schedulingEvaluations).all()).toHaveLength(0)
+  })
+
+  it('collects two complete Comment, anchor and shared message-target sources without extra inputs', async () => {
+    const f = await sourceFixture({ commentCount: 2 })
+    const material = await f.repo.readRelayWorkflowDecisionSources(f.handoff, sourceCandidates, {
+      signal: new AbortController().signal,
+      deadlineAt: Date.now() + 15_000,
+    })
+    expect(material.sources).toHaveLength(12)
+    expect(material.sources.filter((source) => source.roles.includes('comment'))).toHaveLength(2)
+    expect(material.sources.filter((source) => source.roles.includes('anchor'))).toHaveLength(2)
+    const targets = material.sources.filter((source) => source.roles.includes('anchor_target'))
+    expect(targets).toHaveLength(2)
+    expect(new Set(targets.map((source) => source.memberId)).size).toBe(2)
+    expect(new Set(targets.map((source) => source.document.id)).size).toBe(1)
+    expect(
+      material.input.sources.some((source) => source.text.includes('Required Comment 0.')),
+    ).toBe(true)
+    expect(
+      material.input.sources.some((source) => source.text.includes('Required Comment 1.')),
+    ).toBe(true)
+    expect(f.db.drizzle.select().from(schedulingEvaluations).all()).toHaveLength(0)
+  })
+
+  it('rejects the complete two-Comment plus explicit-input fixture over its sources budget', async () => {
+    const plan = `Start ${'p'.repeat(22_000)} complete Plan tail.`,
+      review = `Review ${'r'.repeat(22_000)} final cancellation requirement.`
+    const earlier = `Earlier ${'e'.repeat(18_000)} original input tail.`,
+      later = `Later ${'l'.repeat(18_000)} newest input tail.`
+    const f = await sourceFixture({ plan, review, commentCount: 2, inputs: [earlier, later] })
+    await expect(
+      f.repo.readRelayWorkflowDecisionSources(f.handoff, sourceCandidates, {
+        signal: new AbortController().signal,
+        deadlineAt: Date.now() + 15_000,
+      }),
+    ).rejects.toThrow('Complete Relay sources exceed their budget.')
+    expect(f.db.drizzle.select().from(schedulingEvaluations).all()).toHaveLength(0)
+    const run = f.repo.beginRun(f.admission()).run
+    expect(f.repo.collaborationTurnAuthorization(run.id)?.sourceManifestRef).toBeUndefined()
   })
 
   it('rejects a frozen v1 Plan anchor target before consulting while the owner can revise v2 without that grant', async () => {
     const oldPlan = 'Frozen original v1 Plan with historical-only context.'
-    const f = await fixture({
+    const f = await sourceFixture({
       plan: oldPlan,
       replyPlan: 'Current v2 Plan for the same original task.',
       commentCount: 1,
@@ -261,7 +343,7 @@ describe('Plan revision advice persistence', () => {
     )
     const reserve = vi.spyOn(f.repo, 'reserveEvaluation')
     await expect(
-      f.repo.readPlanRevisionDecisionSources(f.handoff, {
+      f.repo.readRelayWorkflowDecisionSources(f.handoff, sourceCandidates, {
         signal: new AbortController().signal,
         deadlineAt: Date.now() + 15_000,
       }),
@@ -291,7 +373,7 @@ describe('Plan revision advice persistence', () => {
   ] as const)(
     'refuses complete unsupported %s material before any evaluation while business can continue',
     async (kind) => {
-      const f = await fixture(
+      const f = await sourceFixture(
         kind === 'source-count'
           ? { commentCount: 5 }
           : kind === 'source-bytes'
@@ -356,7 +438,7 @@ describe('Plan revision advice persistence', () => {
           .run()
       }
       await expect(
-        f.repo.readPlanRevisionDecisionSources(f.handoff, {
+        f.repo.readRelayWorkflowDecisionSources(f.handoff, sourceCandidates, {
           signal: new AbortController().signal,
           deadlineAt: Date.now() + 15_000,
         }),
@@ -366,35 +448,31 @@ describe('Plan revision advice persistence', () => {
     },
   )
 
-  it('adopts one immutable manifest in the Run transaction and keeps original submitted/handoff receipts', async () => {
+  it('reads one immutable historical manifest without rewriting it and keeps original submitted/handoff receipts', async () => {
     const f = await fixture({ commentCount: 1 })
-    const { value } = await proposal(f)
-    const input = f.admission(value)
+    const guidance = historicalPlanGuidance(f)
+    const input = f.admission()
     const result = f.repo.beginRun(input)
+    const manifest = seedHistoricalGuidance(f, result.run.id, f.handoff, guidance)
     const auth = f.repo.collaborationTurnAuthorization(result.run.id)!
-    expect(auth.sourceManifestRef).toBeDefined()
+    expect(auth.sourceManifestRef).toEqual(manifest)
     expect(
       planRevisionGuidanceSchema.parse(JSON.parse(f.readDocument(auth.sourceManifestRef!))),
-    ).toEqual(value.guidance)
+    ).toEqual(guidance)
     expect(
-      value.guidance.sources.every((source) =>
+      guidance.sources.every((source) =>
         f.repo.sourceDocumentAuthorized(result.run.id, source.document),
       ),
     ).toBe(true)
-    expect(f.repo.beginRun({ ...input, planRevisionGuidance: undefined }).run.id).toBe(
-      result.run.id,
-    )
-    expect(
-      f.repo.beginRun({ ...input, clientMessageId: randomUUID(), planRevisionGuidance: undefined })
-        .run.id,
-    ).toBe(result.run.id)
+    expect(f.repo.beginRun(input).run.id).toBe(result.run.id)
+    expect(f.repo.beginRun({ ...input, clientMessageId: randomUUID() }).run.id).toBe(result.run.id)
     expect(
       f.db.drizzle
         .select()
         .from(agentEventJournal)
         .where(eq(agentEventJournal.eventType, 'scheduling.plan_revision_guidance_adopted'))
         .all(),
-    ).toHaveLength(1)
+    ).toHaveLength(0)
     expect(f.db.drizzle.select().from(schedulingEvaluations).all()).toHaveLength(1)
   })
 
@@ -406,8 +484,11 @@ describe('Plan revision advice persistence', () => {
       '🧭' +
       '\n"quoted"\\path\n' +
       'tail'.repeat(2500)
-    const f = await fixture({ plan })
-    const { material, value } = await proposal(f)
+    const f = await sourceFixture({ plan })
+    const material = await f.repo.readRelayWorkflowDecisionSources(f.handoff, sourceCandidates, {
+      signal: new AbortController().signal,
+      deadlineAt: Date.now() + 15_000,
+    })
     expect(material.input.sources.find((source) => source.text === plan)).toBeDefined()
     expect(material.inputSha256).toBe(hash(material.input))
     const source = material.sources.find((entry) => entry.roles.includes('plan'))!
@@ -417,81 +498,69 @@ describe('Plan revision advice persistence', () => {
       .where(eq(conversationBodyParts.inputId, source.document.id))
       .all()
     expect(parts.some((part) => part.offset === 8191)).toBe(true)
-    const admitted = f.repo.beginRun(f.admission(value))
-    expect(f.repo.collaborationTurnAuthorization(admitted.run.id)!.sourceManifestRef).toBeDefined()
-  })
-
-  it.each(['input-hash', 'source-map', 'generation', 'evaluation', 'deadline'] as const)(
-    'ignores stale or invalid guidance %s without changing default business admission',
-    async (kind) => {
-      const f = await fixture()
-      const { value } = await proposal(f)
-      if (kind === 'input-hash') value.guidance.inputSha256 = '0'.repeat(64)
-      if (kind === 'source-map') value.guidance.sources[0]!.document.chars++
-      if (kind === 'generation') value.configurationGeneration++
-      if (kind === 'evaluation') value.guidance.evaluationId = randomUUID()
-      if (kind === 'deadline') value.deadlineAt = Date.now() - 1
-      const result = f.repo.beginRun(f.admission(value))
-      expect(result.created).toBe(true)
-      expect(
-        f.repo.collaborationTurnAuthorization(result.run.id)!.sourceManifestRef,
-      ).toBeUndefined()
-    },
-  )
-
-  it('rolls manifest, authorization, handoff and event back together on a late transaction failure', async () => {
-    const f = await fixture()
-    const { value } = await proposal(f)
-    const beforeBodies = f.db.drizzle
-      .select({ id: conversationBodyInputs.id })
-      .from(conversationBodyInputs)
-      .all()
-    f.db.drizzle.run(
-      sql`CREATE TEMP TRIGGER reject_guidance_claim BEFORE UPDATE ON scheduling_handoffs WHEN new.action IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture late admission failure'); END`,
-    )
-    expect(() => f.repo.beginRun(f.admission(value))).toThrow(/fixture late admission failure/)
+    const admitted = f.repo.beginRun(f.admission())
     expect(
-      f.db.drizzle.select({ id: conversationBodyInputs.id }).from(conversationBodyInputs).all(),
-    ).toEqual(beforeBodies)
-    expect(f.repo.handoffReceipt(f.handoff.id)!.runId).toBeNull()
-    expect(f.repo.collaboration(f.sessionId)!.runId).toBe(f.reviewRun.id)
-    expect(f.db.drizzle.select().from(agentRuns).all()).toHaveLength(2)
-    expect(
-      f.db.drizzle
-        .select()
-        .from(agentEventJournal)
-        .where(eq(agentEventJournal.eventType, 'scheduling.plan_revision_guidance_adopted'))
-        .all(),
-    ).toHaveLength(0)
+      f.repo.collaborationTurnAuthorization(admitted.run.id)!.sourceManifestRef,
+    ).toBeUndefined()
   })
 
   it('retains the existing business conflict when the handoff changes after evaluation', async () => {
     const f = await fixture()
-    const { value } = await proposal(f)
-    const input = f.admission(value)
+    configureDecisionFixtureCredential(f.repo)
+    const text = JSON.stringify(f.handoff)
+    const input = decisionInputSchema.parse({
+      version: 1,
+      handoff: f.handoff,
+      objective: 'Check the supplied scheduling fact.',
+      candidates: [{ id: 'wait', description: 'Keep the current workflow.' }],
+      sources: [{ id: 'handoff', digest: createHash('sha256').update(text).digest('hex'), text }],
+    })
+    const owner = decisionHttpOwnerFixture()
+    const reserved = f.repo.reserveEvaluation({
+      handoff: f.handoff,
+      configurationFingerprint: f.repo.schedulingConfigurationFingerprint(),
+      inputSha256: hash(input),
+      deadlineAt: Date.now() + 15_000,
+      httpOwner: owner,
+    })
+    if (reserved.status !== 'reserved') throw Error('Missing evaluation reservation')
+    f.repo.dispatchEvaluation(reserved.evaluation.id, owner)
+    f.repo.settleEvaluation(reserved.evaluation.id, {
+      outcome: 'completed',
+      physicalReleased: true,
+      httpOwner: owner,
+      remoteOutcome: 'responded',
+    })
+    const admission = f.admission()
     f.repo.pauseCollaboration(f.sessionId)
-    expect(() => f.repo.beginRun(input)).toThrow(/handoff facts changed/iu)
+    expect(() => f.repo.beginRun(admission)).toThrow(/handoff facts changed/iu)
     expect(f.repo.handoffReceipt(f.handoff.id)!.runId).toBeNull()
     expect(f.db.drizzle.select().from(agentRuns).all()).toHaveLength(2)
   })
 
   it('preserves the absolute invocation deadline and rejects abort before source reading', async () => {
-    const f = await fixture()
+    const f = await sourceFixture({ commentCount: 1 })
     const controller = new AbortController()
     controller.abort()
     await expect(
-      f.repo.readPlanRevisionDecisionSources(f.handoff, {
+      f.repo.readRelayWorkflowDecisionSources(f.handoff, sourceCandidates, {
         signal: controller.signal,
         deadlineAt: Date.now() + 15_000,
       }),
     ).rejects.toThrow(/abort/iu)
-    const deadlineAt = Date.now() + 4_000
+    configureDecisionFixtureCredential(f.repo)
+    const deadlineAt = Date.now() + 4_000,
+      owner = decisionHttpOwnerFixture()
+    const material = await f.repo.readRelayWorkflowDecisionSources(f.handoff, sourceCandidates, {
+      signal: new AbortController().signal,
+      deadlineAt,
+    })
     const reserved = f.repo.reserveEvaluation({
       handoff: f.handoff,
-      provider: 'codex',
-      model: 'gpt-6-luna',
-      configurationFingerprint: 'a'.repeat(64),
+      configurationFingerprint: f.repo.schedulingConfigurationFingerprint(),
       deadlineAt,
+      inputSha256: material.inputSha256,
+      httpOwner: owner,
     })
     if (reserved.status !== 'reserved') throw Error('Missing reservation')
     expect(Date.parse(reserved.evaluation.deadline)).toBe(deadlineAt)
@@ -512,8 +581,9 @@ describe('Plan revision advice persistence', () => {
 
   it('preserves the adopted immutable refs through completed Plan Handoff, quoting and Rebuild', async () => {
     const f = await fixture({ commentCount: 1 })
-    const { value } = await proposal(f)
-    const adopted = f.repo.beginRun(f.admission(value)).run
+    const guidance = historicalPlanGuidance(f)
+    const adopted = f.repo.beginRun(f.admission()).run
+    seedHistoricalGuidance(f, adopted.id, f.handoff, guidance)
     f.finish(adopted.id, {
       plan: 'Revised cancellation boundary.',
       answer: 'The Plan now covers cancellation.',
@@ -551,7 +621,7 @@ describe('Plan revision advice persistence', () => {
       frozen.items[0]!.documents.some((entry) => entry.source.id === auth.sourceManifestRef!.id),
     ).toBe(true)
     expect(
-      value.guidance.sources.every((source) =>
+      guidance.sources.every((source) =>
         f.repo.sourceDocumentAuthorized(ordinary.id, source.document),
       ),
     ).toBe(true)
@@ -588,8 +658,9 @@ describe('Plan revision advice persistence', () => {
 
   it('remaps only standard document/source identities in a Fork and retains historical evaluation digests', async () => {
     const f = await fixture({ commentCount: 1 })
-    const { value } = await proposal(f)
-    const adopted = f.repo.beginRun(f.admission(value)).run
+    const guidance = historicalPlanGuidance(f)
+    const adopted = f.repo.beginRun(f.admission()).run
+    seedHistoricalGuidance(f, adopted.id, f.handoff, guidance)
     f.finish(adopted.id, { plan: 'Revised cancellation boundary.' })
     const source = f.db.sessionRepository.find(f.sessionId)!
     const selection = f.repo.selectForkSource(
@@ -627,17 +698,17 @@ describe('Plan revision advice persistence', () => {
     const manifest = planRevisionGuidanceSchema.parse(
       JSON.parse(f.readDocument(auth.sourceManifestRef!, fork.sessionId)),
     )
-    expect(manifest.taskId).not.toBe(value.guidance.taskId)
-    expect(manifest.evaluationId).toBe(value.guidance.evaluationId)
-    expect(manifest.handoffId).toBe(value.guidance.handoffId)
-    expect(manifest.inputSha256).toBe(value.guidance.inputSha256)
-    expect(manifest.sourceFingerprint).toBe(value.guidance.sourceFingerprint)
+    expect(manifest.taskId).not.toBe(guidance.taskId)
+    expect(manifest.evaluationId).toBe(guidance.evaluationId)
+    expect(manifest.handoffId).toBe(guidance.handoffId)
+    expect(manifest.inputSha256).toBe(guidance.inputSha256)
+    expect(manifest.sourceFingerprint).toBe(guidance.sourceFingerprint)
     expect(manifest.sources.map((entry) => entry.evaluatedSha256)).toEqual(
-      value.guidance.sources.map((entry) => entry.evaluatedSha256),
+      guidance.sources.map((entry) => entry.evaluatedSha256),
     )
     expect(
       manifest.sources.every(
-        (entry, index) => entry.document.id !== value.guidance.sources[index]!.document.id,
+        (entry, index) => entry.document.id !== guidance.sources[index]!.document.id,
       ),
     ).toBe(true)
     expect(
@@ -654,8 +725,9 @@ describe('Plan revision advice persistence', () => {
     directories.push(directory)
     const filePath = join(directory, 'pact.sqlite')
     const f = await fixture({ filePath, commentCount: 1 })
-    const { value } = await proposal(f)
-    const adopted = f.repo.beginRun(f.admission(value)).run
+    const guidance = historicalPlanGuidance(f)
+    const adopted = f.repo.beginRun(f.admission()).run
+    seedHistoricalGuidance(f, adopted.id, f.handoff, guidance)
     f.finish(adopted.id, { plan: 'Revised cancellation boundary.' })
     const ref = f.repo.collaborationTurnAuthorization(adopted.id)!.sourceManifestRef!
     fixtures.splice(fixtures.indexOf(f), 1)
@@ -668,13 +740,13 @@ describe('Plan revision advice persistence', () => {
     const repo = db.conversationRepository
     expect(repo.collaborationTurnAuthorization(adopted.id)!.sourceManifestRef).toEqual(ref)
     expect(
-      value.guidance.sources.every((source) =>
+      guidance.sources.every((source) =>
         repo.sourceDocumentAuthorized(adopted.id, source.document),
       ),
     ).toBe(true)
     expect(db.drizzle.select().from(schedulingEvaluations).all()).toHaveLength(1)
     await expect(
-      repo.readPlanRevisionDecisionSources(f.handoff, {
+      repo.readRelayWorkflowDecisionSources(f.handoff, sourceCandidates, {
         signal: new AbortController().signal,
         deadlineAt: Date.now() + 15_000,
       }),

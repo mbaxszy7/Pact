@@ -4,13 +4,11 @@ import {
   DECISION_HIGHLIGHT_BYTES,
   PLAN_REVISION_GUIDANCE_BYTES,
   PLAN_REVISION_GUIDANCE_VERSION,
-  decisionRecommendationSchema,
-  planRevisionGuidanceProposalSchema,
+  decisionSelectionSchema,
   planRevisionGuidanceSchema,
   planRevisionGuidanceSourceSchema,
   type DecisionEvaluationOutcome,
   type PlanRevisionGuidance,
-  type PlanRevisionGuidanceProposal,
   type PlanRevisionGuidanceSource,
 } from './index.js'
 
@@ -42,15 +40,6 @@ function guidance(): PlanRevisionGuidance {
     candidateId: 'continue_plan_revision',
     sources: [source(0, ['task']), source(1, ['plan']), source(2, ['review'])],
     highlights: [{ text: 'Verify the original review against the plan.', sourceIds: ['s1', 's2'] }],
-  }
-}
-
-function proposal(): PlanRevisionGuidanceProposal {
-  return {
-    guidance: guidance(),
-    configurationGeneration: 0,
-    configurationFingerprint: 'e'.repeat(64),
-    deadlineAt: Number.MAX_SAFE_INTEGER,
   }
 }
 
@@ -89,11 +78,11 @@ function padHighlightToBytes(
 
 describe('plan revision guidance contracts', () => {
   it('round trips standard source references and retains historical evaluated hashes after Fork', () => {
-    const value = proposal()
-    value.guidance.sources = fullSources()
-    const original = value.guidance.sources[0]!
+    const value = guidance()
+    value.sources = fullSources()
+    const original = value.sources[0]!
     original.document.sha256 = 'f'.repeat(64)
-    expect(planRevisionGuidanceProposalSchema.parse(value)).toEqual(value)
+    expect(planRevisionGuidanceSchema.parse(value)).toEqual(value)
     expect(original.evaluatedSha256).toBe('a'.repeat(64))
     expect(planRevisionGuidanceSourceSchema.parse(original)).toEqual(original)
   })
@@ -160,52 +149,37 @@ describe('plan revision guidance contracts', () => {
     ).toBe(true)
   })
 
-  it('rejects unknown fields at every persisted and proposal boundary, including authority fields', () => {
-    const valid = proposal()
-    const originalSource = valid.guidance.sources[0]!
+  it('rejects unknown authority fields throughout historical guidance', () => {
+    const valid = guidance(),
+      originalSource = valid.sources[0]!
     for (const value of [
       { ...valid, runId: uuid() },
       { ...valid, handoff: {} },
-      { ...valid, guidance: { ...valid.guidance, command: 'implement' } },
+      { ...valid, command: 'implement' },
+      { ...valid, sources: [{ ...originalSource, grant: uuid() }, ...valid.sources.slice(1)] },
       {
         ...valid,
-        guidance: {
-          ...valid.guidance,
-          sources: [{ ...originalSource, grant: uuid() }, ...valid.guidance.sources.slice(1)],
-        },
+        sources: [
+          { ...originalSource, document: { ...originalSource.document, body: 'hidden' } },
+          ...valid.sources.slice(1),
+        ],
       },
       {
         ...valid,
-        guidance: {
-          ...valid.guidance,
-          sources: [
-            { ...originalSource, document: { ...originalSource.document, body: 'hidden' } },
-            ...valid.guidance.sources.slice(1),
-          ],
-        },
+        sources: [
+          {
+            ...originalSource,
+            inputBatchRef: { id: uuid(), revision: 0, memberCount: 1, grant: uuid() },
+          },
+          ...valid.sources.slice(1),
+        ],
       },
       {
         ...valid,
-        guidance: {
-          ...valid.guidance,
-          sources: [
-            {
-              ...originalSource,
-              inputBatchRef: { id: uuid(), revision: 0, memberCount: 1, grant: uuid() },
-            },
-            ...valid.guidance.sources.slice(1),
-          ],
-        },
-      },
-      {
-        ...valid,
-        guidance: {
-          ...valid.guidance,
-          highlights: [{ text: 'Unknown permission', sourceIds: ['s0'], approved: true }],
-        },
+        highlights: [{ text: 'Unknown permission', sourceIds: ['s0'], approved: true }],
       },
     ])
-      expect(planRevisionGuidanceProposalSchema.safeParse(value).success).toBe(false)
+      expect(planRevisionGuidanceSchema.safeParse(value).success).toBe(false)
   })
 
   it('preserves the complete 8 KiB highlight JSON budget with escaped and multibyte text', () => {
@@ -230,50 +204,23 @@ describe('plan revision guidance contracts', () => {
     expect(planRevisionGuidanceSchema.safeParse(value).success).toBe(false)
   })
 
-  it('bounds the whole deeper proposal separately from otherwise valid guidance', () => {
-    const value = proposal()
-    value.guidance.sources = fullSources()
-    padHighlightToBytes(value, value.guidance.highlights[0]!, PLAN_REVISION_GUIDANCE_BYTES)
-    expect(bytes(value.guidance.highlights)).toBeLessThanOrEqual(DECISION_HIGHLIGHT_BYTES)
-    expect(planRevisionGuidanceProposalSchema.safeParse(value).success).toBe(true)
-    value.guidance.highlights[0]!.text += 'x'
-    expect(bytes(value)).toBe(PLAN_REVISION_GUIDANCE_BYTES + 1)
-    expect(planRevisionGuidanceSchema.safeParse(value.guidance).success).toBe(true)
-    expect(planRevisionGuidanceProposalSchema.safeParse(value).success).toBe(false)
-  })
-
-  it('keeps host receipts separate from model recommendation output and rejects unsafe freshness', () => {
-    const valid = proposal()
-    for (const fields of [
-      { configurationGeneration: -1 },
-      { configurationGeneration: 0.5 },
-      { configurationFingerprint: 'unknown' },
-      { deadlineAt: -1 },
-      { deadlineAt: 0.5 },
-      { deadlineAt: Number.MAX_SAFE_INTEGER + 1 },
-      { deadlineAt: Number.POSITIVE_INFINITY },
-    ])
-      expect(planRevisionGuidanceProposalSchema.safeParse({ ...valid, ...fields }).success).toBe(
-        false,
-      )
+  it('keeps host receipts separate from model selection output', () => {
+    const stored = guidance()
     const result: DecisionEvaluationOutcome = {
-      kind: 'recommendation',
-      recommendation: {
-        candidateId: valid.guidance.candidateId,
-        highlights: valid.guidance.highlights,
-      },
+      kind: 'selection',
+      selection: { candidateId: 'route_claude' },
       evaluationReceipt: {
-        evaluationId: valid.guidance.evaluationId,
-        handoffId: valid.guidance.handoffId,
-        configurationGeneration: valid.configurationGeneration,
-        configurationFingerprint: valid.configurationFingerprint,
-        deadlineAt: valid.deadlineAt,
+        evaluationId: stored.evaluationId,
+        handoffId: stored.handoffId,
+        configurationGeneration: 0,
+        configurationFingerprint: 'e'.repeat(64),
+        deadlineAt: Number.MAX_SAFE_INTEGER,
       },
     }
-    expect(decisionRecommendationSchema.safeParse(result.recommendation).success).toBe(true)
+    expect(decisionSelectionSchema.safeParse(result.selection).success).toBe(true)
     expect(
-      decisionRecommendationSchema.safeParse({
-        ...result.recommendation,
+      decisionSelectionSchema.safeParse({
+        ...result.selection,
         evaluationReceipt: result.evaluationReceipt,
       }).success,
     ).toBe(false)

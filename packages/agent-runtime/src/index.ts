@@ -565,6 +565,9 @@ export function serializeAgentPromptEnvelope(
             actor: envelope.collaboration.actor,
             owner: envelope.collaboration.owner,
             reviewer: envelope.collaboration.reviewer,
+            ...(envelope.collaboration.stageRoles
+              ? { stageRoles: envelope.collaboration.stageRoles }
+              : {}),
             task: envelope.collaboration.taskDocument ?? envelope.collaboration.task,
             plan: envelope.collaboration.planReference,
             planVersion: envelope.collaboration.planVersion,

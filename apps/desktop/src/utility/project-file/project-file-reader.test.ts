@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { projectFileSchema, type AnchoredComment, type FileCommentAnchor } from '@pact/contracts'
 import { PactDatabase } from '@pact/persistence'
 
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { ProjectFileReader } from './project-file-reader'
 
 vi.mock('node:fs/promises', { spy: true })
@@ -52,7 +53,11 @@ beforeEach(async () => {
       maxRepairAttempts: 3,
     },
   )
-  reader = new ProjectFileReader(database.sessionRepository, database.projectCatalogRepository)
+  reader = new ProjectFileReader(
+    database.sessionRepository,
+    database.projectCatalogRepository,
+    runDirectoryWorker,
+  )
 })
 
 afterEach(async () => {
@@ -140,37 +145,39 @@ describe('Session-bound local file preview', () => {
     })
   })
 
-  it('keeps relative Project files and names beginning with two dots valid', async () => {
-    await fs.writeFile(join(project, '..notes.md'), text)
-    await Promise.all(
-      ['..notes.md', join(project, '..notes.md')].map(async (path) => {
-        const result = await reader.read({ sessionId, path })
-        expect(result).toMatchObject({
-          ok: true,
-          value: { relativePath: '..notes.md', content: text },
-        })
-        if (!result.ok) throw new Error(result.error.message)
-        expect(result.value.isExternal).toBeUndefined()
-      }),
-    )
-  })
+  it.each([{ absolute: false }, { absolute: true }])(
+    'keeps names beginning with two dots valid through a $absolute path',
+    async ({ absolute }) => {
+      await fs.writeFile(join(project, '..notes.md'), text)
+      const result = await reader.read({
+        sessionId,
+        path: absolute ? join(project, '..notes.md') : '..notes.md',
+      })
+      expect(result).toMatchObject({
+        ok: true,
+        value: { relativePath: '..notes.md', content: text },
+      })
+      if (!result.ok) throw new Error(result.error.message)
+      expect(result.value.isExternal).toBeUndefined()
+    },
+  )
 
-  it('requires an explicit absolute path for traversal and external symlink targets', async () => {
-    const link = join(project, 'linked.md')
-    await fs.symlink(external, link, 'file')
-    await Promise.all(
-      ['../SKILL.md', 'linked.md'].map(async (path) => {
-        expect(await reader.read({ sessionId, path })).toMatchObject({
-          ok: false,
-          error: { message: 'Use an absolute path to preview a file outside this Project.' },
-        })
-      }),
-    )
-    expect(await reader.read({ sessionId, path: link })).toMatchObject({
-      ok: true,
-      value: { isExternal: true, absolutePath: await fs.realpath(external), content: text },
-    })
-  })
+  it.each(['../SKILL.md', 'linked.md'])(
+    'requires an explicit absolute path for %s',
+    async (path) => {
+      const link = join(project, 'linked.md')
+      await fs.rm(link, { force: true })
+      await fs.symlink(external, link, 'file')
+      expect(await reader.read({ sessionId, path })).toMatchObject({
+        ok: false,
+        error: { message: 'Use an absolute path to preview a file outside this Project.' },
+      })
+      expect(await reader.read({ sessionId, path: link })).toMatchObject({
+        ok: true,
+        value: { isExternal: true, absolutePath: await fs.realpath(external), content: text },
+      })
+    },
+  )
 
   it('refuses binary, invalid UTF-8, non-files, missing files and invalid line links', async () => {
     const binary = join(directory, 'binary.bin')
@@ -207,22 +214,18 @@ describe('Session-bound local file preview', () => {
     }
   })
 
-  it('settles a growing file with a visible error and closes its descriptor', async () => {
-    const handle = await fs.open(external, 'r')
-    const metadata = await handle.stat()
-    metadata.size = 0
-    vi.spyOn(handle, 'stat').mockResolvedValue(metadata)
-    const close = vi.spyOn(handle, 'close')
-    vi.mocked(fs.open).mockResolvedValueOnce(handle)
-    try {
-      expect(await reader.read({ sessionId, path: external })).toMatchObject({
-        ok: false,
-        error: { message: 'This file changed while being read. Try again.' },
-      })
-      expect(close).toHaveBeenCalledOnce()
-    } finally {
-      await handle.close()
-    }
+  it('settles a growing file with a visible error and closes its descriptor inside the real worker', async () => {
+    const evidence = join(directory, 'grow-evidence.txt')
+    const faultReader = new ProjectFileReader(
+      database.sessionRepository,
+      database.projectCatalogRepository,
+      (input, signal) => runDirectoryWorker(input, signal, { kind: 'preview-grow', evidence }),
+    )
+    expect(await faultReader.read({ sessionId, path: external })).toMatchObject({
+      ok: false,
+      error: { message: 'This file changed while being read. Try again.' },
+    })
+    expect(await fs.readFile(evidence, 'utf8')).toContain('closed')
   })
 
   it('preserves Project Comment validation and rejects external Comment creation/navigation', async () => {
@@ -267,5 +270,268 @@ describe('Session-bound local file preview', () => {
       ok: false,
       error: { message: 'This Session is unavailable.' },
     })
+  })
+
+  it.each([
+    { label: 'nested', path: 'sub/dir/nested.md' },
+    { label: 'inside-Project symlink', path: 'inside-link.md' },
+    { label: 'hardlink', path: 'hardlinked.md' },
+  ])('reads a $label file through the anchored worker', async ({ label, path }) => {
+    await fs.mkdir(join(project, 'sub', 'dir'), { recursive: true })
+    await fs.writeFile(join(project, 'sub', 'dir', 'nested.md'), text)
+    if (label === 'inside-Project symlink')
+      await fs.symlink('sub/dir/nested.md', join(project, 'inside-link.md'), 'file')
+    if (label === 'hardlink')
+      await fs.link(join(project, 'sub', 'dir', 'nested.md'), join(project, 'hardlinked.md'))
+    const relativePath = label === 'hardlink' ? 'hardlinked.md' : join('sub', 'dir', 'nested.md')
+    expect(await reader.read({ sessionId, path })).toMatchObject({
+      ok: true,
+      value: { relativePath, content: text },
+    })
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'reads a POSIX backslash file name through the anchored worker',
+    async () => {
+      await fs.writeFile(join(project, 'a\\b.md'), text)
+      expect(await reader.read({ sessionId, path: 'a\\b.md' })).toMatchObject({
+        ok: true,
+        value: { relativePath: 'a\\b.md', content: text },
+      })
+    },
+  )
+
+  it('admits exactly one in-flight read and refuses a second until it settles', async () => {
+    const held = Promise.withResolvers<import('@pact/contracts').DirectoryFileOperationResult>()
+    const busyReader = new ProjectFileReader(
+      database.sessionRepository,
+      database.projectCatalogRepository,
+      () => held.promise,
+    )
+    const first = busyReader.read({ sessionId, path: external })
+    expect(await busyReader.read({ sessionId, path: external })).toMatchObject({
+      ok: false,
+      error: {
+        code: 'RUNTIME_UNAVAILABLE',
+        message: 'File preview is busy or closing. Try again.',
+      },
+    })
+    held.resolve({
+      ok: true,
+      existed: true,
+      hash: contentHash,
+      bytes: Buffer.byteLength(text),
+      mode: 0o644,
+      preview: { content: text, updatedAt: new Date().toISOString() },
+    })
+    await expect(first).resolves.toMatchObject({ ok: true, value: { content: text } })
+    expect(await busyReader.read({ sessionId, path: external })).toMatchObject({ ok: true })
+    await busyReader.dispose()
+  })
+
+  it('retains its slot past the abort deadline while physical work is pending and reports TIMEOUT', async () => {
+    vi.useFakeTimers()
+    const held = Promise.withResolvers<import('@pact/contracts').DirectoryFileOperationResult>()
+    let seen: AbortSignal | undefined
+    const busyReader = new ProjectFileReader(
+      database.sessionRepository,
+      database.projectCatalogRepository,
+      (_input, signal) => {
+        seen = signal
+        return held.promise
+      },
+    )
+    try {
+      const first = busyReader.read({ sessionId, path: external })
+      await vi.waitFor(() => expect(seen).toBeDefined())
+      expect(seen?.aborted).toBe(false)
+      let settled = false
+      void first.then(() => (settled = true))
+      await vi.advanceTimersToNextTimerAsync()
+      expect(seen?.aborted).toBe(true)
+      expect(settled).toBe(false)
+      expect(await busyReader.read({ sessionId, path: external })).toMatchObject({
+        ok: false,
+        error: { code: 'RUNTIME_UNAVAILABLE' },
+      })
+      held.resolve({
+        ok: true,
+        existed: true,
+        hash: contentHash,
+        bytes: Buffer.byteLength(text),
+        mode: 0o644,
+        preview: { content: text, updatedAt: new Date().toISOString() },
+      })
+      await expect(first).resolves.toMatchObject({
+        ok: false,
+        error: { code: 'TIMEOUT', message: 'File preview timed out.' },
+      })
+      await busyReader.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps its slot while pre-worker metadata I/O outlives the abort deadline', async () => {
+    vi.useFakeTimers()
+    const held = Promise.withResolvers<string>()
+    vi.mocked(fs.realpath).mockImplementation(() => held.promise)
+    const busyReader = new ProjectFileReader(
+      database.sessionRepository,
+      database.projectCatalogRepository,
+      vi.fn<() => Promise<import('@pact/contracts').DirectoryFileOperationResult>>(),
+    )
+    try {
+      const first = busyReader.read({ sessionId, path: external })
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(await busyReader.read({ sessionId, path: external })).toMatchObject({
+        ok: false,
+        error: { code: 'RUNTIME_UNAVAILABLE' },
+      })
+      held.resolve(external)
+      await expect(first).resolves.toMatchObject({
+        ok: false,
+        error: { code: 'TIMEOUT', message: 'File preview timed out.' },
+      })
+      await busyReader.dispose()
+    } finally {
+      vi.mocked(fs.realpath).mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it('aborts a hung operation on dispose and keeps admission closed forever', async () => {
+    const held = Promise.withResolvers<import('@pact/contracts').DirectoryFileOperationResult>()
+    let seen: AbortSignal | undefined
+    const busyReader = new ProjectFileReader(
+      database.sessionRepository,
+      database.projectCatalogRepository,
+      (_input, signal) => {
+        seen = signal
+        return held.promise
+      },
+    )
+    const first = busyReader.read({ sessionId, path: external })
+    await vi.waitFor(() => expect(seen).toBeDefined())
+    const disposed = busyReader.dispose()
+    expect(seen?.aborted).toBe(true)
+    let disposeSettled = false
+    void disposed.then(() => (disposeSettled = true))
+    await Promise.resolve()
+    expect(disposeSettled).toBe(false)
+    held.resolve({
+      ok: true,
+      existed: true,
+      hash: contentHash,
+      bytes: Buffer.byteLength(text),
+      mode: 0o644,
+      preview: { content: text, updatedAt: new Date().toISOString() },
+    })
+    await disposed
+    await expect(first).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'RUNTIME_UNAVAILABLE', message: 'File preview is closing.' },
+    })
+    expect(await busyReader.read({ sessionId, path: external })).toMatchObject({
+      ok: false,
+      error: {
+        code: 'RUNTIME_UNAVAILABLE',
+        message: 'File preview is busy or closing. Try again.',
+      },
+    })
+  })
+
+  it.each(['leaf', 'ancestor', 'root'] as const)(
+    'never returns an external marker when the %s is replaced after canonical resolution',
+    async (target) => {
+      const mirror = join(directory, 'outside-mirror')
+      await fs.mkdir(join(mirror, 'swapproot', 'inner'), { recursive: true })
+      await fs.writeFile(join(mirror, 'swapproot', 'inner', 'race.md'), 'external marker')
+      const nested = join(project, 'swapproot', 'inner')
+      await fs.mkdir(nested, { recursive: true })
+      await fs.writeFile(join(nested, 'race.md'), text)
+      const swaps: string[] = []
+      const raced = new ProjectFileReader(
+        database.sessionRepository,
+        database.projectCatalogRepository,
+        async (input, signal) => {
+          if (target === 'leaf') {
+            await fs.rm(join(nested, 'race.md'))
+            await fs.symlink(
+              join(mirror, 'swapproot', 'inner', 'race.md'),
+              join(nested, 'race.md'),
+              'file',
+            )
+          } else if (target === 'ancestor') {
+            const dir = join(project, 'swapproot')
+            await fs.rename(dir, `${dir}.orig`)
+            await fs.symlink(join(mirror, 'swapproot'), dir, 'dir')
+          } else {
+            await fs.rename(project, `${project}.orig`)
+            await fs.symlink(mirror, project, 'dir')
+          }
+          swaps.push(target)
+          return runDirectoryWorker(input, signal)
+        },
+      )
+      const result = await raced.read({
+        sessionId,
+        path: join('swapproot', 'inner', 'race.md'),
+      })
+      expect(swaps).toEqual([target])
+      expect(result.ok).toBe(false)
+      expect(JSON.stringify(result)).not.toContain('external marker')
+      await fs.rename(`${project}.orig`, project).catch(() => {})
+      expect(await reader.read({ sessionId, path: external })).toMatchObject({
+        ok: true,
+        value: { isExternal: true },
+      })
+    },
+  )
+
+  it('rejects a leaf swapped for an external symlink during open inside the real worker', async () => {
+    const marker = join(directory, 'outside-marker.md')
+    await fs.writeFile(marker, 'external marker')
+    const nested = join(project, 'intra')
+    await fs.mkdir(nested, { recursive: true })
+    await fs.writeFile(join(nested, 'raceleaf'), text)
+    const evidence = join(directory, 'leaf-swap-evidence.txt')
+    const faultReader = new ProjectFileReader(
+      database.sessionRepository,
+      database.projectCatalogRepository,
+      (input, signal) =>
+        runDirectoryWorker(input, signal, {
+          kind: 'preview-leaf-swap',
+          evidence,
+          target: marker,
+        }),
+    )
+    const result = await faultReader.read({ sessionId, path: join('intra', 'raceleaf') })
+    expect(result.ok).toBe(false)
+    expect(JSON.stringify(result)).not.toContain('external marker')
+    expect(await fs.readFile(evidence, 'utf8')).toContain('swapped')
+  })
+
+  it('rejects an ancestor swapped for an external directory between lstat and chdir', async () => {
+    const mirror = join(directory, 'mirror-swapdir')
+    await fs.mkdir(mirror, { recursive: true })
+    await fs.writeFile(join(mirror, 'race.md'), 'external marker')
+    await fs.mkdir(join(project, 'swapdir'), { recursive: true })
+    await fs.writeFile(join(project, 'swapdir', 'race.md'), text)
+    const evidence = join(directory, 'ancestor-swap-evidence.txt')
+    const faultReader = new ProjectFileReader(
+      database.sessionRepository,
+      database.projectCatalogRepository,
+      (input, signal) =>
+        runDirectoryWorker(input, signal, {
+          kind: 'preview-ancestor-swap',
+          evidence,
+          target: mirror,
+        }),
+    )
+    const result = await faultReader.read({ sessionId, path: join('swapdir', 'race.md') })
+    expect(result.ok).toBe(false)
+    expect(JSON.stringify(result)).not.toContain('external marker')
+    expect(await fs.readFile(evidence, 'utf8')).toContain('swapped')
   })
 })

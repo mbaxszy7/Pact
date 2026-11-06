@@ -1,4 +1,5 @@
 import { ChevronDown, FileDiff, RotateCcw } from 'lucide-react'
+import { useId, useState } from 'react'
 
 import type { WorkspaceChangeSet, WorkspaceFileChange } from '@pact/contracts'
 
@@ -41,6 +42,27 @@ export function WorkspaceChangesCard({
           : changeSet.state === 'recovery_required'
             ? 'File recovery must finish before Undo is available.'
             : undefined))
+  const undoTooltipId = useId()
+  const [undoTooltipDismissed, setUndoTooltipDismissed] = useState(false)
+  const undoDisabled = unavailable || disabled || undoing
+  const undoReason = undoing
+    ? 'Undo in progress.'
+    : changeSet.state === 'undone'
+      ? 'Already undone.'
+      : changeSet.state === 'recording'
+        ? 'Waiting for file changes to finish.'
+        : changeSet.state === 'mixed'
+          ? 'Concurrent edits prevent Undo.'
+          : changeSet.state === 'recovery_required'
+            ? 'Recover files before Undo.'
+            : reason?.startsWith(
+                  'The Agent did not provide complete original and final file versions.',
+                )
+              ? 'Original or final file versions are missing.'
+              : reason?.split(/(?<=[.!?])\s/u)[0]?.trim() ||
+                (disabled
+                  ? 'Wait for the current operation to finish.'
+                  : 'Undo is unavailable for these changes.')
   const files = list?.files.slice(0, list.expanded ? list.files.length : 3) ?? []
   const remaining = Math.max(0, changeSet.fileCount - files.length)
 
@@ -71,24 +93,49 @@ export function WorkspaceChangesCard({
               <span className="text-diff-added-foreground">+{changeSet.additions}</span>
               <span className="text-diff-removed-foreground">−{changeSet.deletions}</span>
             </p>
-          ) : (
-            <p className="mt-0.5 text-secondary">Line counts unavailable</p>
-          )}
+          ) : null}
         </div>
-        <button
-          className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-control px-2 text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-50"
-          type="button"
-          disabled={unavailable || disabled || undoing}
-          title={reason}
-          onClick={() => onUndo(changeSet.id)}
+        {/* oxlint-disable-next-line jsx-a11y/no-static-element-interactions -- The disabled button needs a focusable tooltip group; enabled interaction belongs to the native button. */}
+        <span
+          className="group/undo relative inline-flex rounded-control focus-visible:outline-2 focus-visible:outline-focus"
+          tabIndex={undoDisabled ? 0 : undefined}
+          role={undoDisabled ? 'group' : undefined}
+          aria-label={undoDisabled ? 'Undo unavailable' : undefined}
+          aria-describedby={undoDisabled && !undoTooltipDismissed ? undoTooltipId : undefined}
+          onMouseEnter={() => setUndoTooltipDismissed(false)}
+          onFocus={() => setUndoTooltipDismissed(false)}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape' && undoDisabled && !undoTooltipDismissed) {
+              setUndoTooltipDismissed(true)
+              event.stopPropagation()
+            }
+          }}
         >
-          {undoing ? (
-            <span className="primary-action-spinner" aria-hidden="true" />
-          ) : (
-            <RotateCcw aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
-          )}
-          {undoing ? 'Undoing' : 'Undo'}
-        </button>
+          <button
+            className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-control px-2 text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:pointer-events-none disabled:cursor-default disabled:opacity-50"
+            type="button"
+            disabled={undoDisabled}
+            onClick={() => onUndo(changeSet.id)}
+          >
+            {undoing ? (
+              <span className="primary-action-spinner" aria-hidden="true" />
+            ) : (
+              <RotateCcw aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
+            )}
+            {undoing ? 'Undoing' : 'Undo'}
+          </button>
+          {undoDisabled && undoReason && !undoTooltipDismissed ? (
+            <span
+              id={undoTooltipId}
+              role="tooltip"
+              className="invisible absolute right-0 bottom-full z-30 w-56 max-w-[calc(100vw-2rem)] pb-2 opacity-0 transition-opacity duration-150 group-hover/undo:visible group-hover/undo:opacity-100 group-focus-within/undo:visible group-focus-within/undo:opacity-100 motion-reduce:transition-none"
+            >
+              <span className="block rounded-control border border-border bg-surface-raised px-3 py-2 text-left text-caption font-normal leading-relaxed text-primary shadow-popover">
+                {undoReason}
+              </span>
+            </span>
+          ) : null}
+        </span>
         <button
           className="h-7 cursor-pointer rounded-control border border-border px-2.5 font-medium text-primary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-50"
           type="button"
@@ -98,7 +145,7 @@ export function WorkspaceChangesCard({
           View changes
         </button>
       </header>
-      {reason && changeSet.state !== 'undone' ? (
+      {reason && changeSet.state !== 'ready' && changeSet.state !== 'undone' ? (
         <p className="line-clamp-2 break-words px-3 pb-2.5 text-secondary" title={reason}>
           {reason}
         </p>
@@ -121,14 +168,7 @@ export function WorkspaceChangesCard({
                     <span className="text-diff-added-foreground">+{file.additions}</span>
                     <span className="text-diff-removed-foreground">−{file.deletions}</span>
                   </span>
-                ) : (
-                  <span
-                    className="max-w-40 shrink-0 truncate text-tertiary"
-                    title={file.reason ?? undefined}
-                  >
-                    {file.reason ?? file.kind}
-                  </span>
-                )}
+                ) : null}
               </button>
             </li>
           ))}

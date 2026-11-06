@@ -11,6 +11,7 @@ export * from './collaboration-documents.js'
 export * from './scheduling.js'
 
 const agent = z.enum(['claude', 'codex'])
+type AgentId = z.infer<typeof agent>
 export const PACT_SKILLS = ['plan', 'build', 'review'] as const
 export type PactSkill = (typeof PACT_SKILLS)[number]
 export const pactSkillSchema = z.enum(PACT_SKILLS)
@@ -28,6 +29,76 @@ export const collaborationStageSchema = z.enum([
 ])
 export type CollaborationStage = z.infer<typeof collaborationStageSchema>
 export const collaborationWorkStageSchema = collaborationStageSchema.exclude(['reply'])
+
+export const taskStageRolesSchema = z
+  .strictObject({
+    version: z.literal('task-stage-roles-v1'),
+    revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    planAuthor: agent,
+    planReviewer: agent,
+    codeAuthor: agent,
+    codeReviewer: agent,
+  })
+  .refine(
+    (roles) => roles.planAuthor !== roles.planReviewer && roles.codeAuthor !== roles.codeReviewer,
+    'Each author requires a distinct reviewer.',
+  )
+export type TaskStageRoles = z.infer<typeof taskStageRolesSchema>
+
+export const initialTaskRoleCandidateIdSchema = z.enum([
+  'roles_codex_codex',
+  'roles_codex_claude',
+  'roles_claude_codex',
+  'roles_claude_claude',
+])
+export type InitialTaskRoleCandidateId = z.infer<typeof initialTaskRoleCandidateIdSchema>
+export const initialTaskRoleCandidateSchema = z.strictObject({
+  id: initialTaskRoleCandidateIdSchema,
+  roles: taskStageRolesSchema.refine((roles) => roles.revision === 0, {
+    message: 'Initial candidates always start at revision 0.',
+  }),
+})
+export type InitialTaskRoleCandidate = z.infer<typeof initialTaskRoleCandidateSchema>
+
+export function defaultTaskStageRoles(primary: AgentId): TaskStageRoles {
+  const secondary = primary === 'codex' ? 'claude' : 'codex'
+  return {
+    version: 'task-stage-roles-v1',
+    revision: 0,
+    planAuthor: primary,
+    planReviewer: secondary,
+    codeAuthor: secondary,
+    codeReviewer: primary,
+  }
+}
+export function initialTaskRoleCandidates(
+  kind: PactSkill,
+  primary: AgentId,
+): InitialTaskRoleCandidate[] {
+  const defaults = defaultTaskStageRoles(primary)
+  const planAuthors: AgentId[] = kind === 'plan' ? ['codex', 'claude'] : [defaults.planAuthor]
+  const candidates: InitialTaskRoleCandidate[] = []
+  for (const planAuthor of planAuthors) {
+    for (const codeAuthor of ['codex', 'claude'] as const) {
+      if (planAuthor === defaults.planAuthor && codeAuthor === defaults.codeAuthor) continue
+      candidates.push({
+        id: `roles_${planAuthor}_${codeAuthor}`,
+        roles: {
+          version: 'task-stage-roles-v1',
+          revision: 0,
+          planAuthor,
+          planReviewer: planAuthor === 'codex' ? 'claude' : 'codex',
+          codeAuthor,
+          codeReviewer: codeAuthor === 'codex' ? 'claude' : 'codex',
+        },
+      })
+    }
+  }
+  return candidates
+}
+export function collaborationInitialStage(kind: PactSkill): CollaborationStage {
+  return kind === 'plan' ? 'plan' : kind === 'build' ? 'implement' : 'code_review'
+}
 
 export const collaborationReviewVerdictSchema = z.enum([
   'accepted',
@@ -193,6 +264,7 @@ export const collaborationTurnAuthorizationSchema = z.strictObject({
   taskRevision: z.number().int().nonnegative(),
   actor: agent,
   stage: collaborationStageSchema,
+  stageRoles: taskStageRolesSchema.optional(),
   inputSequence: z.number().int().nonnegative(),
   planReference: collaborationPlanReferenceSchema.optional(),
   reviewScopeRef: collaborationDocumentSchema.optional(),
@@ -229,6 +301,7 @@ export const collaborationTaskSchema = z
     owner: agent,
     reviewer: agent,
     rolePolicy: z.literal('split-stages-v1').optional(),
+    stageRoles: taskStageRolesSchema.optional(),
     task: z.string(),
     taskDocument: collaborationDocumentSchema.optional(),
     taskMessageId: z.string().uuid(),
@@ -272,9 +345,12 @@ export const collaborationTaskSchema = z
   .refine((task) => !task.rolePolicy || task.owner !== task.reviewer, {
     message: 'Split collaboration stages require two distinct Agents.',
   })
+  .refine((task) => !task.stageRoles || task.rolePolicy === 'split-stages-v1', {
+    message: 'Explicit stage roles require frozen Primary and Secondary identities.',
+  })
 export type CollaborationTask = z.infer<typeof collaborationTaskSchema>
 
-/** Only the frozen owner may publish or retain a native plan for this root. */
+/** Only the assigned plan author may publish or retain a native plan for this root. */
 export function collaborationPlanMode(
   task: CollaborationTask | undefined,
   authorization?: CollaborationTurnAuthorization,
@@ -288,7 +364,7 @@ export function collaborationPlanMode(
   )
 }
 
-/** Shared by both providers; only a frozen owner with an existing plan may retain it. */
+/** Shared by both providers; only the assigned plan author with an existing plan may retain it. */
 export function collaborationPlanRetentionAllowed(
   task: CollaborationTask | undefined,
   authorization: CollaborationTurnAuthorization | undefined = task?.authorization,
@@ -370,6 +446,7 @@ export const relayDecisionProofSchema = z.strictObject({
 export const collaborationActionBasisSchema = z.strictObject({
   handoff: schedulingHandoffSchema,
   rolePolicy: z.literal('split-stages-v1').optional(),
+  stageRoles: taskStageRolesSchema.optional(),
   taskId: z.string().uuid(),
   inputSequence: z.number().int().nonnegative(),
   stage: collaborationStageSchema,
@@ -500,9 +577,25 @@ export function collaborationNextStage(task: CollaborationTask): CollaborationSt
 
 /** The one role resolver for both frozen legacy tasks and split-stage tasks. */
 export function collaborationActor(
-  task: Pick<CollaborationTask, 'owner' | 'reviewer' | 'rolePolicy' | 'kind' | 'codeRunId'>,
+  task: Pick<
+    CollaborationTask,
+    'owner' | 'reviewer' | 'rolePolicy' | 'stageRoles' | 'kind' | 'codeRunId'
+  >,
   stage: CollaborationStage,
 ) {
+  const roles = task.stageRoles
+  if (roles) {
+    if (stage === 'plan') return roles.planAuthor
+    if (stage === 'plan_review') return roles.planReviewer
+    if (stage === 'code_review') return roles.codeReviewer
+    if (stage === 'reply')
+      return task.kind === 'review'
+        ? roles.codeReviewer
+        : task.kind === 'plan' && !task.codeRunId
+          ? roles.planAuthor
+          : roles.codeAuthor
+    return roles.codeAuthor
+  }
   if (task.rolePolicy === 'split-stages-v1') {
     if (stage === 'plan' || stage === 'code_review') return task.owner
     if (stage === 'reply')

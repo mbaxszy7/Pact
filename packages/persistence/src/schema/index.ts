@@ -26,11 +26,29 @@ export const appearanceSettings = sqliteTable('appearance_settings', {
 export const schedulingSettings = sqliteTable('scheduling_settings', {
   id: integer('id').primaryKey(),
   enabled: integer('enabled', { mode: 'boolean' }).notNull().default(false),
-  selectionJson: text('selection_json'),
   showIndicator: integer('show_indicator', { mode: 'boolean' }).notNull().default(true),
   revision: integer('revision').notNull().default(0),
   configurationGeneration: integer('configuration_generation').notNull().default(0),
   updatedAt: text('updated_at').notNull(),
+})
+
+/** Encrypted-at-rest singleton; the plaintext key never enters this table. */
+export const relayCredentials = sqliteTable('relay_credentials', {
+  id: integer('id').primaryKey(),
+  ciphertext: text('ciphertext'),
+  revision: integer('revision').notNull().default(0),
+  updatedAt: text('updated_at').notNull(),
+})
+
+/** Durable credential mutation receipts; requestFingerprint is a ciphertext-identity hash, never key material. */
+export const relayCredentialReceipts = sqliteTable('relay_credential_receipts', {
+  nonce: text('nonce').primaryKey(),
+  operation: text('operation', { enum: ['save', 'remove'] }).notNull(),
+  expectedRevision: integer('expected_revision').notNull(),
+  revision: integer('revision').notNull(),
+  configured: integer('configured', { mode: 'boolean' }).notNull(),
+  requestFingerprint: text('request_fingerprint').notNull(),
+  createdAt: text('created_at').notNull(),
 })
 
 export const appUpdateSettings = sqliteTable('app_update_settings', {
@@ -1054,7 +1072,7 @@ export const collaborationTasks = sqliteTable(
     index('collaboration_tasks_pending_workflow')
       .on(table.updatedAt, table.id)
       .where(
-        sql`${table.active} = 1 AND json_extract(${table.stateJson}, '$.protocol') = 'native-workflow-v1' AND json_extract(${table.stateJson}, '$.automation') = 'active' AND json_extract(${table.stateJson}, '$.status') = 'waiting'`,
+        sql`${table.active} = 1 AND json_extract(${table.stateJson}, '$.protocol') = 'native-workflow-v1' AND json_extract(${table.stateJson}, '$.automation') = 'active' AND json_extract(${table.stateJson}, '$.status') IN ('waiting','ready')`,
       ),
   ],
 )
@@ -1076,6 +1094,7 @@ export const relayDecisions = sqliteTable(
         'rebuild_native_context',
         'scheduling_information',
         'prepared_input_continue',
+        'reassign_roles',
       ],
     }).notNull(),
     formatVersion: integer('format_version').notNull().default(1),
@@ -1298,10 +1317,13 @@ export const schedulingEvaluations = sqliteTable(
       .references(() => schedulingHandoffs.id),
     budgetSubjectId: text('budget_subject_id').notNull(),
     factFingerprint: text('fact_fingerprint').notNull(),
-    provider: text('provider', { enum: ['codex', 'claude'] }).notNull(),
+    provider: text('provider', { enum: ['codex', 'claude', 'openai'] }).notNull(),
     model: text('model').notNull(),
     configurationFingerprint: text('configuration_fingerprint').notNull(),
     inputSha256: text('input_sha256'),
+    remoteOutcome: text('remote_outcome', {
+      enum: ['not_sent', 'unknown', 'responded'],
+    }),
     selectedCandidateId: text('selected_candidate_id'),
     handoffJson: text('handoff_json').notNull(),
     active: integer('active', { mode: 'boolean' }).notNull().default(true),
@@ -1334,10 +1356,11 @@ export const schedulingRuntimeOwners = sqliteTable(
     kind: text('kind', { enum: ['probe', 'evaluation', 'check'] }).notNull(),
     sessionId: text('session_id').references(() => sessions.id),
     evaluationId: text('evaluation_id').references(() => schedulingEvaluations.id),
-    provider: text('provider', { enum: ['codex', 'claude'] }).notNull(),
+    provider: text('provider', { enum: ['codex', 'claude', 'openai'] }).notNull(),
     model: text('model').notNull(),
     configurationFingerprint: text('configuration_fingerprint').notNull(),
     physicalWitnessJson: text('physical_witness_json'),
+    httpOwnerJson: text('http_owner_json'),
     nativeGeneration: integer('native_generation').notNull().default(0),
     nativeStage: text('native_stage', {
       enum: [

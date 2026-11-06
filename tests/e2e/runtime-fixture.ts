@@ -33,6 +33,7 @@ import {
   within,
   type WindowsFixtureProcessScope,
 } from '../native/native-harness.js'
+import { MacCredentialStore } from './mac-credential-store.js'
 import {
   writeNativeTransportFault,
   type NativeTransportFault,
@@ -111,6 +112,10 @@ type ProbeState =
 export interface RuntimeFixtureOptions {
   /** Credential-free fixture only; the fixture owns the nonce and canonical isolated root. */
   measureIpcTraffic?: boolean
+  /** Real isolated OS store for synthetic credential UI checks. */
+  nativeCredentialStore?: boolean
+  /** Owned OS store for the private-file Relay bootstrap in real-provider fixtures. */
+  realRelayCredentialStore?: true
   mode?: 'ui' | 'real' | 'deterministic'
   configuration?: ProviderConfiguration
   transportFault?: NativeTransportFault
@@ -388,6 +393,10 @@ export async function createRuntimeFixture(
   options: RuntimeFixtureOptions = {},
 ): Promise<RuntimeFixture> {
   if (fixtureAdmissionClosed) throw new Error('Fixture admission is closed during teardown')
+  if (options.mode === 'real' && options.nativeCredentialStore)
+    throw new Error('Native credential stores are limited to synthetic fixture credentials')
+  if (options.realRelayCredentialStore && options.mode !== 'real')
+    throw new Error('Real Relay credential stores require a real-provider fixture')
   if (fixtureReservations >= 8) throw new Error('A test owns at most eight fixtures')
   fixtureReservations++
   let reserved = true,
@@ -473,6 +482,7 @@ export async function createRuntimeFixture(
     let claudePath: string
     let codexPath: string
     let transport: NativeTransportFaultFiles | undefined
+    let credentialStore: MacCredentialStore | undefined
     let controlGeneration = 0
     const redact = (text: string): string => configuration?.redact(text) ?? text
     const releaseLaunch = (owner: WindowsLaunchOwner): Promise<void> => {
@@ -706,6 +716,7 @@ export async function createRuntimeFixture(
         }
         if (releaseUnconfirmed)
           throw new Error(`${failures.join('; ')}; owned fixture retained at ${directory}`)
+        if (credentialStore) await credentialStore.dispose()
         // Auxiliary product groups have already joined above. Residual durable
         // receipts or a replaced directory retain the fixture instead of being erased.
         await windowsProcessScope?.assertReceiptsRetired()
@@ -725,6 +736,28 @@ export async function createRuntimeFixture(
       if (mode === 'real' && process.platform === 'win32')
         windowsProcessScope = await createWindowsFixtureProcessScope(directory)
       if (creationCancelled) throw new Error('E2E fixture construction was cancelled')
+      if (options.nativeCredentialStore || options.realRelayCredentialStore) {
+        if (process.platform === 'darwin') {
+          credentialStore = new MacCredentialStore({
+            directory,
+            environment: environment.env,
+            isCurrent: () => !disposed && !creationCancelled,
+            run: (executable, args, deadline) =>
+              boundedCommand(executable, args, directory, environment.env, redact, deadline),
+          })
+          const preparation = credentialStore.prepare()
+          pendingOperations.add(preparation)
+          const settled = (): void => {
+            pendingOperations.delete(preparation)
+          }
+          void preparation.then(settled, settled)
+          await preparation
+          if (creationCancelled) throw new Error('E2E fixture construction was cancelled')
+          if (disposed) throw new Error('E2E fixture is disposed')
+        }
+        // Windows keeps the genuine DPAPI store; other platforms have no native
+        // credential helper and the store stays unset rather than faked.
+      }
       environment.env.NODE_ENV = 'test'
       environment.env.PACT_TEST_DB_FILE = databaseFile
       environment.env.PACT_E2E_ROOT = directory
@@ -1001,6 +1034,14 @@ export async function createRuntimeFixture(
                   // oxlint-disable-next-line eslint/no-await-in-loop -- Each actual process path is validated before returning the app.
                   if ((await realpath(actual!)) !== (await realpath(expected!)))
                     throw new Error('Electron escaped its owned data profile')
+                }
+                if (credentialStore) {
+                  const guardBudget = Math.min(5_000, remainingStartupTime(startupDeadline))
+                  await within(
+                    credentialStore.install(app),
+                    guardBudget,
+                    'Owned credential guard did not settle',
+                  )
                 }
                 await app.evaluate(({ BrowserWindow, screen }) => {
                   const secondary = screen

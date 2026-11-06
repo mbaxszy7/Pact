@@ -1,13 +1,12 @@
 import { expect, type Page, type TestInfo } from '@playwright/test'
 import { randomUUID } from 'node:crypto'
 
-import type {
-  ConversationSendInput,
-  DesktopBridge,
-  SchedulingModelSelection,
-} from '../../packages/contracts/src/index.js'
+import type { ConversationSendInput, DesktopBridge } from '../../packages/contracts/src/index.js'
 
-import { messageCommentAnchorSchema } from '../../packages/contracts/src/index.js'
+import {
+  OPENAI_DECISION_MODEL,
+  messageCommentAnchorSchema,
+} from '../../packages/contracts/src/index.js'
 import { PactDatabase } from '../../packages/persistence/src/pact-database.js'
 import { nativeAgentContexts } from '../../packages/persistence/src/schema/index.js'
 import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
@@ -18,6 +17,7 @@ import {
   type RealWorkspace,
 } from './real-harness.js'
 import { findNativeSourceRecord } from './real-native-evidence.js'
+import { createRealRelayFixture } from './relay-real-credential.js'
 import {
   correctionQuestion,
   hash,
@@ -39,7 +39,7 @@ import {
   routingUsageCounts,
   retainSourceReadFailureDiagnostics,
 } from './relay-routing-real-observation.js'
-import { createRuntimeFixture, test } from './runtime-fixture.js'
+import { test } from './runtime-fixture.js'
 
 async function send(page: Page, input: ConversationSendInput) {
   const sent = await page.evaluate(async (value) => {
@@ -138,9 +138,6 @@ async function runRouting(ctx: RealWorkspace, seed: RoutingSeed, enabled: boolea
   ctx.projectDirectory = seed.projectDirectory
   await selectRealSession(ctx, seed.sessionId)
   const beforeState = await routingSchedulingObservation(ctx.page, seed.sessionId)
-  const probe = enabled
-    ? await routingSchedulingObservation(ctx.page, seed.sessionId, true)
-    : beforeState
   if (enabled)
     await expect
       .poll(
@@ -413,7 +410,6 @@ async function runRouting(ctx: RealWorkspace, seed: RoutingSeed, enabled: boolea
         : 'baseline',
       nativeFacts,
       beforeState,
-      zeroTurnProbe: probe,
       afterState: await routingSchedulingObservation(ctx.page, seed.sessionId),
       safeLogPhases: await routingSafeLogPhases(ctx.fixture),
     }
@@ -424,6 +420,7 @@ async function runRouting(ctx: RealWorkspace, seed: RoutingSeed, enabled: boolea
         called: true,
         active: false,
         outcome: 'completed',
+        remoteOutcome: 'responded',
       })
       expect(owner).toMatchObject({ kind: 'evaluation', active: false, phase: 'released' })
       if (evaluation?.selectedCandidateId === null) {
@@ -454,6 +451,7 @@ async function runRouting(ctx: RealWorkspace, seed: RoutingSeed, enabled: boolea
   }
 }
 
+// Preserve reviewed case identities; both cases now use OpenAI Decisions exclusively.
 for (const target of ['codex_luna', 'claude_haiku_5_5'] as const)
   test(
     `real Relay ${target} saves one source-author route correction against the legal default`,
@@ -461,21 +459,17 @@ for (const target of ['codex_luna', 'claude_haiku_5_5'] as const)
     async ({ browserName: _browserName }, info) => {
       test.skip(
         process.platform !== 'darwin',
-        'Verified production decision runtimes currently require macOS.',
+        'This real native collaboration journey is verified on macOS.',
       )
       test.setTimeout(360_000)
       const preflight = await verifyRoutingPreconditions()
       await emitRoutingEvidence(info, 'preregistered', preflight)
-      const fixture = await createRuntimeFixture({ mode: 'real' })
+      const fixture = await createRealRelayFixture()
       let ctx: RealWorkspace | undefined
       try {
         const claudeModel = fixture.readConfigurationModels().claude
         if (!claudeModel || !/^claude-haiku-5-5(?:-\d{8})?$/u.test(claudeModel))
           throw Error('Exact configured Haiku 5.5 model is required')
-        const selection: SchedulingModelSelection =
-          target === 'codex_luna'
-            ? { target, provider: 'codex', modelId: 'gpt-6-luna' }
-            : { target, provider: 'claude', modelId: claudeModel }
         const db = await PactDatabase.open({
           filePath: fixture.databaseFile,
           migrationsFolder: routingMigrations,
@@ -507,7 +501,6 @@ for (const target of ['codex_luna', 'claude_haiku_5_5'] as const)
           db.conversationRepository.saveSchedulingSettings({
             expectedRevision: db.conversationRepository.schedulingSettings().revision,
             enabled: false,
-            selection,
           })
           const contexts = db.drizzle.query.nativeAgentContexts.findMany().sync()
           expect(
@@ -566,14 +559,22 @@ for (const target of ['codex_luna', 'claude_haiku_5_5'] as const)
             enabled: true,
           })
         })
-        expect(enabled).toMatchObject({ ok: true, value: { selection, enabled: true } })
+        expect(enabled).toMatchObject({
+          ok: true,
+          value: {
+            provider: 'openai',
+            model: OPENAI_DECISION_MODEL,
+            enabled: true,
+            credential: { configured: true },
+          },
+        })
         const withRelay = await runRouting(ctx, on, true, info)
         expect(withRelay.evaluation).toMatchObject({
-          provider: selection.provider,
-          model: selection.modelId,
+          provider: 'openai',
+          model: OPENAI_DECISION_MODEL,
         })
         await emitRoutingEvidence(info, 'benefit', {
-          target,
+          baselineCase: target,
           preregistered: preregisteredRoutingMetrics,
           businessSettings: {
             codex: { model: 'gpt-6-luna', effort: 'low', permission: 'ask' },

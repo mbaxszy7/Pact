@@ -443,7 +443,7 @@ async function fixture(agentId: RuntimeAgentId) {
     db.sessionRepository,
     db.projectCatalogRepository,
     preparation,
-    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
     workspace,
   )
   const patches: ConversationPatch[] = []

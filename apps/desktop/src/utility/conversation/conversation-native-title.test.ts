@@ -21,6 +21,7 @@ import { DefaultSessionSettings } from '../default-session-settings/default-sess
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
 import { SessionWorkspace } from '../session-workspace/session-workspace.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { Conversation } from './conversation.js'
 
 const native = vi.hoisted(() => ({
@@ -263,7 +264,7 @@ async function fixture() {
     db.sessionRepository,
     db.projectCatalogRepository,
     preparation,
-    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
   )
   owned.push({ db, flow })
   const workspace = new SessionWorkspace(

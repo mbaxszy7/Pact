@@ -1,11 +1,21 @@
 import { eq, sql } from 'drizzle-orm'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
+
+import type { DecisionDarwinPhysicalWitness } from '@pact/contracts'
+
+import { OPENAI_DECISION_MODEL } from '@pact/contracts'
 
 import type { PactDatabase } from './pact-database.js'
 
 import { createQueueFixture } from './conversation-queue.test-helper.js'
-import { decisionFixture } from './decision-fixture.test-support.js'
+import { syncEvaluationActivity } from './conversation-scheduling-activity.js'
+import {
+  configureDecisionFixtureCredential,
+  decisionFixture,
+  decisionHttpOwnerFixture,
+  seedHistoricalDecisionEvaluation,
+} from './decision-fixture.test-support.js'
 import { planRevisionFixture } from './plan-revision-guidance.test-support.js'
 import { schedulingActivity, schedulingEvaluations } from './schema/index.js'
 
@@ -33,7 +43,6 @@ async function nativeProposal(withOrigin = false) {
   f.repo.saveSchedulingSettings({
     expectedRevision: 0,
     enabled: true,
-    selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
   })
   f.repo.beginSchedulingRecoveryEpoch(randomUUID())
   let origin: { faultId: string; attemptId: string } | undefined
@@ -76,8 +85,11 @@ async function proposal() {
   })
   const revised = f.repo.beginRun(f.admission()).run
   f.finish(revised.id, { plan: 'Current Plan with the original cancellation boundary.' })
+  const owner = decisionHttpOwnerFixture()
+  configureDecisionFixtureCredential(f.repo)
   const handoff = f.admission().schedulingHandoff,
-    deadlineAt = Date.now() + 15_000
+    deadlineAt = Date.now() + 15_000,
+    configurationFingerprint = f.repo.schedulingConfigurationFingerprint()
   const material = await f.repo.readRelayWorkflowDecisionSources(
     handoff,
     [{ id: 'propose_supplement_plan', description: 'Request one read-only clarification.' }],
@@ -85,28 +97,29 @@ async function proposal() {
   )
   const reserved = f.repo.reserveEvaluation({
     handoff,
-    provider: 'codex',
-    model: 'gpt-6-luna',
-    configurationFingerprint: 'a'.repeat(64),
+    configurationFingerprint,
     inputSha256: material.inputSha256,
     deadlineAt,
+    httpOwner: owner,
   })
   if (reserved.status !== 'reserved') throw Error('Missing evaluation reservation')
-  f.repo.dispatchEvaluation(reserved.evaluation.id)
+  f.repo.dispatchEvaluation(reserved.evaluation.id, owner)
   f.repo.settleEvaluation(reserved.evaluation.id, {
     outcome: 'completed',
     physicalReleased: true,
     selectedCandidateId: 'propose_supplement_plan',
+    httpOwner: owner,
+    remoteOutcome: 'responded',
   })
   const card = f.repo.proposeRelayWorkflowAction({
     handoff,
     kind: 'supplement_plan',
     evaluationId: reserved.evaluation.id,
     configurationGeneration: f.repo.schedulingConfigurationGeneration(),
+    configurationFingerprint,
     inputSha256: material.inputSha256,
     sourceFingerprint: material.sourceFingerprint,
     deadlineAt,
-    reason: 'Clarify the original cancellation boundary against the complete review.',
     sourceIds: [material.sources[0]!.id],
   })
   const answer = {
@@ -272,13 +285,16 @@ describe('durable Relay activity facts', () => {
     },
   )
 
-  it('attributes the exact historical model only after actual invocation and retains logical failure separately from physical release', async () => {
+  it('attributes OpenAI after dispatch and retains uncertain failure across credential replacement', async () => {
     const f = await decision()
+    const owner = decisionHttpOwnerFixture(),
+      deadlineAt = Date.now() + 15_000
     const reserved = f.repo.reserveEvaluation({
       handoff: f.input.handoff,
-      provider: 'codex',
-      model: 'gpt-6-luna',
-      configurationFingerprint: 'a'.repeat(64),
+      configurationFingerprint: f.repo.schedulingConfigurationFingerprint(),
+      inputSha256: createHash('sha256').update(JSON.stringify(f.input)).digest('hex'),
+      deadlineAt,
+      httpOwner: owner,
     })
     if (reserved.status !== 'reserved') throw Error('Missing evaluation reservation')
     const before = f.repo.readSchedulingActivity({}).rows[0]!
@@ -289,8 +305,13 @@ describe('durable Relay activity facts', () => {
       model: null,
       result: 'reserved',
     })
-    f.repo.dispatchEvaluation(reserved.evaluation.id)
-    f.repo.settleEvaluation(reserved.evaluation.id, { outcome: 'failed', physicalReleased: false })
+    f.repo.dispatchEvaluation(reserved.evaluation.id, owner)
+    f.repo.settleEvaluation(reserved.evaluation.id, {
+      outcome: 'failed',
+      physicalReleased: false,
+      httpOwner: owner,
+      remoteOutcome: 'unknown',
+    })
     expect(
       f.db.drizzle
         .select()
@@ -298,19 +319,21 @@ describe('durable Relay activity facts', () => {
         .where(eq(schedulingActivity.id, before.id))
         .get(),
     ).toMatchObject({ unresolved: true })
-    f.repo.saveSchedulingSettings({
-      expectedRevision: 1,
-      selection: { target: 'claude_haiku_5_5', provider: 'claude', modelId: 'claude-haiku-5-5' },
-    })
+    configureDecisionFixtureCredential(f.repo)
     expect(f.repo.readSchedulingActivity({}).rows[0]).toMatchObject({
       id: before.id,
       called: true,
-      provider: 'codex',
-      model: 'gpt-6-luna',
+      provider: 'openai',
+      model: OPENAI_DECISION_MODEL,
       result: 'failed',
       physicalUnconfirmed: true,
     })
-    f.repo.settleEvaluation(reserved.evaluation.id, { outcome: 'failed', physicalReleased: true })
+    f.repo.settleEvaluation(reserved.evaluation.id, {
+      outcome: 'failed',
+      physicalReleased: true,
+      httpOwner: owner,
+      remoteOutcome: 'unknown',
+    })
     expect(
       f.db.drizzle
         .select()
@@ -324,6 +347,33 @@ describe('durable Relay activity facts', () => {
       physicalUnconfirmed: false,
     })
     expect(f.db.drizzle.select().from(schedulingActivity).all()).toHaveLength(1)
+  })
+
+  it('reads historical native activity without releasing its unproven owner or restarting a decision', async () => {
+    const f = await decision()
+    const root = { pid: 4102, pgid: 4102, started: 'historical-activity-root-birth' }
+    const witness: DecisionDarwinPhysicalWitness = {
+      version: 1,
+      platform: 'darwin',
+      ownerId: randomUUID(),
+      owner: { pid: 4101, started: 'historical-activity-owner-birth' },
+      root,
+      members: [root],
+    }
+    const id = seedHistoricalDecisionEvaluation(f.db, f.input, witness)
+    syncEvaluationActivity(f.db.drizzle, id)
+    const before = f.repo.readSchedulingActivity({}).rows[0]!
+    expect(before).toMatchObject({
+      id,
+      called: true,
+      provider: 'codex',
+      model: 'gpt-6-luna',
+      result: 'failed',
+      physicalUnconfirmed: true,
+    })
+    configureDecisionFixtureCredential(f.repo)
+    expect(f.repo.readSchedulingActivity({}).rows).toEqual([before])
+    expect(f.repo.activeSchedulingRuntimeOwner()?.id).toBe(id)
   })
 
   it('separates a model proposal, user acceptance, actual dispatch and complete business output in the same stable row', async () => {
@@ -422,7 +472,10 @@ describe('durable Relay activity facts', () => {
 
   it('records the actual default review after unused advice is discarded, without relabeling it as an extra authorized Turn', async () => {
     const f = await proposal()
-    f.repo.saveSchedulingSettings({ expectedRevision: 1, enabled: false })
+    f.repo.saveSchedulingSettings({
+      expectedRevision: f.repo.schedulingSettings().revision,
+      enabled: false,
+    })
     const review = f.repo.beginRun(f.admission()).run
     expect(review.agentId).toBe('claude')
     expect(f.repo.readSchedulingActivity({}).rows[0]).toMatchObject({

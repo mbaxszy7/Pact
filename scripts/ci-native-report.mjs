@@ -138,9 +138,9 @@ export function nativeReport(
       'Informational report; the required native command and platform job remain the merge gate.',
       'Unexecuted cases require investigation; none are represented as passing.',
       'Raw native errors, stdout, configuration and credentials are excluded.',
-      ...(profile.name === 'decision-claude'
+      ...(profile.name === 'execution-codex'
         ? [
-            'Owned loopback and synthetic catalog evidence does not establish real Haiku entitlement or benefit.',
+            'Owned native execution and historical recovery evidence does not establish Decisions API behavior.',
           ]
         : profile.name === 'windows-owner'
           ? ['Host OS-seam assertions do not establish Windows Job or installed-helper acceptance.']

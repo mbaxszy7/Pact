@@ -4,6 +4,7 @@ import { isAbsolute } from 'node:path'
 import {
   directoryFileOperationInputSchema,
   directoryFileOperationResultSchema,
+  PROJECT_FILE_PREVIEW_TIMEOUT_MS,
   WORKSPACE_OPERATION_TIMEOUT_MS,
   type DirectoryFileOperationInput,
   type DirectoryFileOperationResult,
@@ -28,6 +29,8 @@ interface DirectoryWorker {
   abort?: (() => void) | undefined
   stopping: boolean
   settled: boolean
+  physical: Promise<void>
+  resolvePhysical: () => void
 }
 
 /** Main owns only process control; the anchored child owns filesystem effects. */
@@ -63,6 +66,19 @@ export class DirectoryFileOperations {
         ok: false,
         code: 'TOO_LARGE',
         message: 'The directory operation exceeds its request size.',
+      })
+    const deadlineMs =
+      parsed.data.operation === 'preview'
+        ? Math.max(
+            0,
+            Math.min(PROJECT_FILE_PREVIEW_TIMEOUT_MS, parsed.data.deadlineAt - Date.now()),
+          )
+        : WORKSPACE_OPERATION_TIMEOUT_MS
+    if (parsed.data.operation === 'preview' && deadlineMs === 0)
+      return Promise.resolve({
+        ok: false,
+        code: 'CANCELLED',
+        message: 'File preview timed out.',
       })
     const rootIdentity = `${parsed.data.rootDevice}:${parsed.data.rootInode}`
     if (
@@ -102,6 +118,7 @@ export class DirectoryFileOperations {
       })
     }
     const pending = Promise.withResolvers<DirectoryFileOperationResult>()
+    const physical = Promise.withResolvers<void>()
     const worker: DirectoryWorker = {
       child,
       rootIdentity,
@@ -114,8 +131,10 @@ export class DirectoryFileOperations {
             code: 'CANCELLED',
             message: 'The protected directory operation exceeded its deadline.',
           }),
-        WORKSPACE_OPERATION_TIMEOUT_MS,
+        deadlineMs,
       ),
+      physical: physical.promise,
+      resolvePhysical: physical.resolve,
       signal,
       stopping: false,
       settled: false,
@@ -173,6 +192,7 @@ export class DirectoryFileOperations {
     child.once('exit', (code: number) => {
       settleTraffic?.()
       this.workers.delete(child)
+      worker.resolvePhysical()
       clearTimeout(worker.deadline)
       if (worker.forceTimer) clearTimeout(worker.forceTimer)
       if (worker.confirmTimer) clearTimeout(worker.confirmTimer)
@@ -208,6 +228,10 @@ export class DirectoryFileOperations {
     if (this.workers.size) throw new Error('A protected directory worker did not confirm exit.')
   }
 
+  async settlement(): Promise<void> {
+    await Promise.all([...this.workers.values()].map((worker) => worker.physical))
+  }
+
   private stop(worker: DirectoryWorker, result: DirectoryFileOperationResult): void {
     if (worker.stopping || !this.workers.has(worker.child)) return
     worker.stopping = true
@@ -218,6 +242,7 @@ export class DirectoryFileOperations {
     } catch {
       /* Keep ownership and escalate only through the bounded force-exit path. */
     }
+    if (!this.workers.has(worker.child)) return
     worker.forceTimer = setTimeout(() => {
       const pid = worker.child.pid
       if (pid !== undefined) {

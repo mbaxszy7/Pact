@@ -3,6 +3,10 @@ import { z } from 'zod'
 import {
   collaborationInputBatchReferenceSchema,
   collaborationPlanReferenceSchema,
+  initialTaskRoleCandidateIdSchema,
+  initialTaskRoleCandidateSchema,
+  pactSkillSchema,
+  taskStageRolesSchema,
 } from './collaboration.js'
 import {
   DECISION_SOURCES,
@@ -192,20 +196,6 @@ export type HandoffGuidanceV2 = z.infer<typeof handoffGuidanceV2Schema>
 export const handoffGuidanceSchema = z.union([planRevisionGuidanceSchema, handoffGuidanceV2Schema])
 export type HandoffGuidance = z.infer<typeof handoffGuidanceSchema>
 
-/** Ephemeral v2 adoption proposal; the host must independently verify freshness and scope. */
-export const handoffGuidanceProposalSchema = z
-  .strictObject({
-    guidance: handoffGuidanceV2Schema,
-    configurationGeneration: z.number().int().nonnegative(),
-    configurationFingerprint: digest,
-    deadlineAt: z.number().int().nonnegative(),
-  })
-  .refine(
-    (value) => jsonBytesWithinBudget(value, HANDOFF_GUIDANCE_BYTES),
-    'The complete guidance proposal exceeds its byte budget.',
-  )
-export type HandoffGuidanceProposal = z.infer<typeof handoffGuidanceProposalSchema>
-
 /** Ordinary routing retains only the selected recipient's receipt, never unadopted model prose. */
 export const inputRoutingProposalSchema = z.strictObject({
   version: z.literal('input-routing-v1'),
@@ -219,6 +209,13 @@ export const inputRoutingProposalSchema = z.strictObject({
   deadlineAt: z.number().int().nonnegative(),
 })
 export type InputRoutingProposal = z.infer<typeof inputRoutingProposalSchema>
+
+/** A versioned initial-role selection proof; its scalars match the ordinary routing receipt. */
+export const initialTaskRolesProposalSchema = inputRoutingProposalSchema.extend({
+  version: z.literal('initial-task-roles-v1'),
+  candidateId: initialTaskRoleCandidateIdSchema,
+})
+export type InitialTaskRolesProposal = z.infer<typeof initialTaskRolesProposalSchema>
 
 /** Durable ordinary-Send receipt metadata; no model prose or native credentials. */
 export const preparedInputMetadataSchema = z.strictObject({
@@ -235,6 +232,16 @@ export const preparedInputMetadataSchema = z.strictObject({
   routeIntent: z.literal('implicit'),
   composerRevision: z.number().int().nonnegative(),
   settingsRevision: z.number().int().nonnegative(),
+  taskRoles: z
+    .strictObject({
+      kind: pactSkillSchema,
+      primaryAgentId: z.enum(['claude', 'codex']),
+      defaults: taskStageRolesSchema.refine((roles) => roles.revision === 0, {
+        message: 'Prepared role defaults always start at revision 0.',
+      }),
+      candidates: z.array(initialTaskRoleCandidateSchema).min(1).max(3),
+    })
+    .optional(),
   sourceFingerprint: digest,
   cancellationReason: z.enum(['cancelled', 'preparation_failed', 'restarted']).optional(),
 })

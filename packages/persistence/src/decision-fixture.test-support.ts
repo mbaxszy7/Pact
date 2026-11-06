@@ -2,9 +2,17 @@ import { sql } from 'drizzle-orm'
 import { createHash, randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 
+import type { DecisionHttpOwner, DecisionInput, DecisionPhysicalWitness } from '@pact/contracts'
+
 import { decisionInputSchema } from '@pact/contracts'
 
+import { ensureHandoff } from './conversation-scheduling.js'
 import { PactDatabase } from './pact-database.js'
+import {
+  schedulingBudgetCounters,
+  schedulingEvaluations,
+  schedulingRuntimeOwners,
+} from './schema/index.js'
 
 /** Authoritative existing Run -> stable recovery handoff, without dispatching any recovery policy. */
 export async function decisionFixture(filePath = ':memory:', directoryPath = '/decision-fixture') {
@@ -58,12 +66,83 @@ export async function decisionFixture(filePath = ':memory:', directoryPath = '/d
     candidates: [{ id: 'wait', description: 'Keep the original wait.' }],
     sources: [{ id: 'source:1', digest: createHash('sha256').update(text).digest('hex'), text }],
   })
-  repo.saveSchedulingSettings({
+  repo.saveSchedulingSettings({ expectedRevision: 0, enabled: true })
+  repo.writeRelayCredential({
+    operation: 'save',
+    nonce: randomUUID(),
     expectedRevision: 0,
-    enabled: true,
-    selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
+    deadlineAt: Date.now() + 5000,
+    ciphertext: Buffer.from('synthetic fixture ciphertext').toString('base64'),
   })
   return { db, repo, projectId, sessionId, first, input }
+}
+
+/** Historical native decision left physically unconfirmed before the Decisions cutover. */
+export function seedHistoricalDecisionEvaluation(
+  db: PactDatabase,
+  input: DecisionInput,
+  witness: DecisionPhysicalWitness | null,
+): string {
+  const id = randomUUID(),
+    createdAt = new Date().toISOString(),
+    deadline = new Date(Date.now() + 15000).toISOString(),
+    configurationFingerprint = 'a'.repeat(64),
+    physicalWitnessJson = witness === null ? null : JSON.stringify(witness)
+  db.drizzle.transaction(() => {
+    ensureHandoff(db.drizzle, input.handoff)
+    db.drizzle
+      .insert(schedulingEvaluations)
+      .values({
+        id,
+        sessionId: input.handoff.sessionId,
+        handoffId: input.handoff.id,
+        budgetSubjectId: input.handoff.budgetSubjectId,
+        factFingerprint: input.handoff.factFingerprint,
+        provider: 'codex',
+        model: 'gpt-6-luna',
+        configurationFingerprint,
+        handoffJson: JSON.stringify(input.handoff),
+        active: true,
+        called: true,
+        outcome: 'failed',
+        usageJson: JSON.stringify({ inputTokens: 17, outputTokens: 5 }),
+        physicalWitnessJson,
+        createdAt,
+        deadline,
+      })
+      .run()
+    db.drizzle
+      .insert(schedulingRuntimeOwners)
+      .values({
+        id,
+        kind: 'evaluation',
+        sessionId: input.handoff.sessionId,
+        evaluationId: id,
+        provider: 'codex',
+        model: 'gpt-6-luna',
+        configurationFingerprint,
+        physicalWitnessJson,
+        nativeGeneration: 0,
+        active: true,
+        phase: 'cleanup_unconfirmed',
+        createdAt,
+        deadline,
+      })
+      .run()
+    db.drizzle
+      .insert(schedulingBudgetCounters)
+      .values({
+        subjectId: input.handoff.budgetSubjectId,
+        sessionId: input.handoff.sessionId,
+        evaluationCalls: 1,
+      })
+      .onConflictDoUpdate({
+        target: schedulingBudgetCounters.subjectId,
+        set: { evaluationCalls: sql`${schedulingBudgetCounters.evaluationCalls} + 1` },
+      })
+      .run()
+  })
+  return id
 }
 
 export function decisionEvaluationFacts(db: PactDatabase) {
@@ -75,4 +154,30 @@ export function decisionEvaluationFacts(db: PactDatabase) {
   }>(sql`SELECT * FROM scheduling_evaluations`)
   if (!result) throw Error('Missing decision evaluation')
   return result
+}
+
+const fixtureUtilityEpoch = randomUUID()
+
+export function decisionHttpOwnerFixture(): DecisionHttpOwner {
+  return {
+    version: 1,
+    kind: 'http',
+    utilityEpoch: fixtureUtilityEpoch,
+    utilityPid: process.pid,
+    requestId: randomUUID(),
+  }
+}
+
+export function configureDecisionFixtureCredential(
+  repo: PactDatabase['conversationRepository'],
+): void {
+  const receipt = repo.writeRelayCredential({
+    operation: 'save',
+    nonce: randomUUID(),
+    expectedRevision: repo.readRelayCredential().revision,
+    deadlineAt: Date.now() + 5000,
+    ciphertext: Buffer.from('synthetic fixture ciphertext').toString('base64'),
+  })
+  if (!receipt.configured)
+    throw Error('Expected the synthetic decision credential to be configured')
 }

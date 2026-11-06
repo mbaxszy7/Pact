@@ -12,6 +12,6 @@
     "../playwright.config.ts",
     "../vitest.config.ts",
     "../vitest.native.config.ts",
-    "../vitest.native-decision.config.ts"
+    "../vitest.native-execution.config.ts"
   ]
 }

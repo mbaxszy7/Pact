@@ -1,11 +1,12 @@
-import { Check, RefreshCw } from 'lucide-react'
+import { Eye, EyeOff } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import type {
+  RpcResult,
+  RelayCredentialRevealed,
   SchedulingSettings,
   SchedulingState,
   SchedulingSettingsSave,
-  SchedulingModels,
   SchedulingActivityRow,
   SchedulingActivityPage,
   SchedulingActivityRead,
@@ -18,19 +19,23 @@ import {
   SCHEDULING_USAGE_NOTICE,
   SCHEDULING_ACTIVITY_RESIDENT_ITEMS,
   SCHEDULING_ACTIVITY_RESIDENT_BYTES,
+  relayApiKeySchema,
+  RELAY_KEY_BYTES,
+  RELAY_CREDENTIAL_TIMEOUT_MS,
 } from '@pact/contracts'
 
 type ReadIntent = 'latest' | 'older' | 'newer'
 const bytes = (rows: SchedulingActivityRow[]) =>
   new TextEncoder().encode(JSON.stringify(rows)).byteLength
 
-type StateIntent = 'read' | 'refresh'
-const expireObservation = (observation: SchedulingState['host']): SchedulingState['host'] =>
-  observation.expiresAt && Date.parse(observation.expiresAt) <= Date.now()
-    ? { ...observation, status: 'stale' }
-    : observation
+const expireConnection = (
+  connection: SchedulingState['connection'],
+): SchedulingState['connection'] =>
+  connection.expiresAt && Date.parse(connection.expiresAt) <= Date.now()
+    ? { ...connection, status: 'stale' }
+    : connection
 
-/** App owns one state reader and the Settings-only catalog/history readers. */
+/** App owns one state reader, credential mutations, and the Settings-only history reader. */
 export function useSchedulingSettings(
   active: boolean,
   sessionId?: string,
@@ -40,14 +45,17 @@ export function useSchedulingSettings(
   const [settings, setSettings] = useState<SchedulingSettings>()
   const [settingsEpoch, setSettingsEpoch] = useState(-1)
   const [snapshot, setSnapshot] = useState<{ value: SchedulingState; scope: typeof scope }>()
-  const [models, setModels] = useState<SchedulingModels>()
   const [loading, setLoading] = useState(false),
     [saving, setSaving] = useState(false)
   const [saveBlocked, setSaveBlocked] = useState(false)
-  const [refreshingModels, setRefreshingModels] = useState(false),
-    [refreshingState, setRefreshingState] = useState(false)
   const [error, setError] = useState<string>()
-  const [modelError, setModelError] = useState<string>()
+  const [credentialView, setCredentialView] = useState<{
+    saving: boolean
+    checking: boolean
+    uncertain: boolean
+    operation: 'save' | 'remove' | undefined
+    error: string | undefined
+  }>({ saving: false, checking: false, uncertain: false, operation: undefined, error: undefined })
   const [rows, setRows] = useState<SchedulingActivityRow[]>([])
   const [activityLoading, setActivityLoading] = useState(false),
     [activityError, setActivityError] = useState<string>()
@@ -69,40 +77,43 @@ export function useSchedulingSettings(
     older: false,
     newer: false,
     readingState: false,
-    refreshingState: false,
-    pendingState: undefined as StateIntent | undefined,
+    pendingRead: false,
     saving: false,
     saveBlocked: false,
     readbackVersion: 0,
     saveFailure: undefined as string | undefined,
-    refreshing: false,
-    pendingModels: false,
+    credentialPending: undefined as
+      | {
+          nonce: string
+          operation: 'save' | 'remove'
+          expectedRevision: number
+          deadlineAt: number
+        }
+      | undefined,
+    credentialChecking: false,
+    credentialSaving: false,
+    credentialError: undefined as string | undefined,
   })
-  const readState = useCallback(function requestState(intent: StateIntent = 'read'): void {
+  const readState = useCallback(function requestState(): void {
     const current = owner.current
-    if (!current.active || !current.mounted || (intent === 'refresh' && !current.details)) return
+    if (!current.active || !current.mounted) return
     if (current.readingState) {
-      if (intent === 'refresh' || current.pendingState !== 'refresh') current.pendingState = intent
-      if (intent === 'refresh') setRefreshingState(true)
+      current.pendingRead = true
       return
     }
     current.readingState = true
-    current.refreshingState = intent === 'refresh'
     const epoch = current.epoch
     const changeVersion = current.changeVersion
     const readbackVersion = current.readbackVersion
     const requestScope = current.scope
     setLoading(true)
-    if (intent === 'refresh') setRefreshingState(true)
     void (async () => {
       try {
         const input = requestScope.sessionId ? { sessionId: requestScope.sessionId } : {}
-        const result = await (intent === 'refresh'
-          ? window.pact.refreshSchedulingState(input)
-          : window.pact.getSchedulingState(input))
+        const result = await window.pact.getSchedulingState(input)
         if (!current.mounted || !current.active || current.epoch !== epoch) return
         if (current.changeVersion !== changeVersion) {
-          if (current.pendingState !== 'refresh') current.pendingState = 'read'
+          current.pendingRead = true
           return
         }
         if (!result.ok) {
@@ -119,13 +130,7 @@ export function useSchedulingSettings(
         current.configurationGeneration = value.configurationGeneration
         current.settingsRevision = value.settings.revision
         setSnapshot({
-          value: {
-            ...value,
-            host: expireObservation(value.host),
-            context: value.context
-              ? { ...value.context, observation: expireObservation(value.context.observation) }
-              : null,
-          },
+          value: { ...value, connection: expireConnection(value.connection) },
           scope: requestScope,
         })
         setSettings(value.settings)
@@ -140,89 +145,13 @@ export function useSchedulingSettings(
           setError('Relay status could not be loaded. Reopen Relay settings to try again.')
       } finally {
         current.readingState = false
-        current.refreshingState = false
-        const pending = current.pendingState
-        current.pendingState = undefined
-        if (current.mounted) {
-          setLoading(false)
-          setRefreshingState(false)
-        }
-        if (pending && current.active && current.mounted)
-          requestState(pending === 'refresh' && current.details ? 'refresh' : 'read')
+        const pending = current.pendingRead
+        current.pendingRead = false
+        if (current.mounted) setLoading(false)
+        if (pending && current.active && current.mounted) requestState()
       }
     })()
   }, [])
-  const refreshModels = useCallback(
-    function refreshCurrentModels(checkCompatibility = true): void {
-      const current = owner.current
-      if (!current.active || !current.details || !current.mounted) return
-      if (current.refreshing) {
-        // Reopening can request one latest catalog; repeated clicks never queue native probes.
-        if (!checkCompatibility) current.pendingModels = true
-        return
-      }
-      if (current.refreshingState || current.pendingState === 'refresh') {
-        if (!checkCompatibility) current.pendingModels = true
-        return
-      }
-      current.pendingModels = false
-      current.refreshing = true
-      const epoch = current.detailsEpoch
-      const scopeEpoch = current.epoch
-      setRefreshingModels(true)
-      void (async () => {
-        try {
-          const result = await window.pact.refreshSchedulingModels()
-          if (
-            !current.mounted ||
-            !current.active ||
-            !current.details ||
-            current.detailsEpoch !== epoch
-          )
-            return
-          if (result.ok) {
-            setModels(result.value)
-            setModelError(undefined)
-          } else {
-            setModels(undefined)
-            setModelError(result.error.message)
-          }
-        } catch {
-          if (
-            current.mounted &&
-            current.active &&
-            current.details &&
-            current.detailsEpoch === epoch
-          ) {
-            setModels(undefined)
-            setModelError('Model availability could not be confirmed.')
-          }
-        } finally {
-          current.refreshing = false
-          if (current.mounted) setRefreshingModels(false)
-          const pending = current.pendingModels
-          current.pendingModels = false
-          if (
-            checkCompatibility &&
-            current.mounted &&
-            current.active &&
-            current.details &&
-            current.detailsEpoch === epoch &&
-            current.epoch === scopeEpoch
-          )
-            readState('refresh')
-          else if (pending && current.active && current.details && current.mounted)
-            refreshCurrentModels(false)
-        }
-      })()
-    },
-    // oxlint-disable-next-line react/memo-dependencies -- Exhaustive-deps requires the stable state-reader callback to stay explicit.
-    [readState],
-  )
-  useEffect(() => {
-    if (!refreshingState && owner.current.pendingModels && !owner.current.refreshing)
-      refreshModels(false)
-  }, [refreshingState, refreshModels])
   const read = useCallback(function request(intent: ReadIntent) {
     const current = owner.current
     if (!current.active || !current.details || !current.mounted) return
@@ -339,8 +268,7 @@ export function useSchedulingSettings(
       current.active = false
       current.details = false
       current.pending = undefined
-      current.pendingState = undefined
-      current.pendingModels = false
+      current.pendingRead = false
     }
   }, [])
   useEffect(() => {
@@ -349,7 +277,7 @@ export function useSchedulingSettings(
     current.active = scope.active
     current.sessionId = scope.sessionId
     current.scope = scope
-    current.pendingState = undefined
+    current.pendingRead = false
     if (!scope.active) return undefined
     queueMicrotask(() => {
       if (current.active && current.mounted) readState()
@@ -361,7 +289,7 @@ export function useSchedulingSettings(
     })
     return () => {
       unsubscribe()
-      current.pendingState = undefined
+      current.pendingRead = false
     }
   }, [scope, readState, read])
   useEffect(() => {
@@ -376,8 +304,6 @@ export function useSchedulingSettings(
       settings?.enabled === true
     if (!current.details) {
       current.pending = undefined
-      current.pendingModels = false
-      if (current.pendingState === 'refresh') current.pendingState = 'read'
       current.rows = []
       current.asOf = ''
       current.older = false
@@ -385,24 +311,19 @@ export function useSchedulingSettings(
       queueMicrotask(() => {
         if (!current.mounted || current.details || current.detailsEpoch !== epoch) return
         setRows([])
-        setModels(undefined)
-        setModelError(undefined)
         setActivityError(undefined)
-        if (!current.refreshingState) setRefreshingState(false)
       })
       return undefined
     }
     queueMicrotask(() => {
       if (!current.mounted || !current.active || !current.details || current.detailsEpoch !== epoch)
         return
-      refreshModels(false)
       read('latest')
     })
     return () => {
       current.pending = undefined
-      current.pendingModels = false
     }
-  }, [scope, settingsVisible, settings?.enabled, settingsEpoch, refreshModels, read])
+  }, [scope, settingsVisible, settings?.enabled, settingsEpoch, read])
   const state =
     active &&
     snapshot?.scope === scope &&
@@ -411,28 +332,19 @@ export function useSchedulingSettings(
       ? snapshot.value
       : undefined
   useEffect(() => {
-    if (!active || !state) return undefined
-    const expires = [state.host, state.context?.observation]
-      .filter((observation) => observation && observation.status !== 'stale')
-      .flatMap((observation) => (observation?.expiresAt ? [Date.parse(observation.expiresAt)] : []))
-    if (!expires.length) return undefined
-    const deadline = Math.min(...expires)
+    if (!active || !state || state.connection.status === 'stale') return undefined
+    const deadline = state.connection.expiresAt ? Date.parse(state.connection.expiresAt) : undefined
+    if (deadline === undefined) return undefined
     const timer = window.setTimeout(
       () => {
         const current = owner.current
         if (!current.active || !current.mounted) return
-        // Expiry changes the disposable view immediately; only an explicit refresh probes native.
+        // Expiry marks the disposable connection view stale, then re-reads plain state.
         setSnapshot((previous) => {
           if (!previous || previous.value !== state) return previous
           return {
             ...previous,
-            value: {
-              ...state,
-              host: expireObservation(state.host),
-              context: state.context
-                ? { ...state.context, observation: expireObservation(state.context.observation) }
-                : null,
-            },
+            value: { ...state, connection: expireConnection(state.connection) },
           }
         })
         readState()
@@ -441,20 +353,28 @@ export function useSchedulingSettings(
     )
     return () => window.clearTimeout(timer)
   }, [active, state, readState])
+  const readbackSettings = useCallback(() => {
+    const current = owner.current
+    current.readbackVersion += 1
+    current.saveBlocked = true
+    if (current.mounted) setSaveBlocked(true)
+    readState()
+  }, [readState])
   const save = useCallback(
     async (input: Omit<SchedulingSettingsSave, 'expectedRevision'>) => {
       const current = owner.current
-      if (!settings || current.saving || current.saveBlocked || !current.active) return
+      if (
+        !settings ||
+        current.saving ||
+        current.saveBlocked ||
+        current.credentialPending ||
+        !current.active
+      )
+        return
       current.saving = true
       current.saveFailure = undefined
       current.changeVersion += 1
       const epoch = current.epoch
-      const readback = () => {
-        current.readbackVersion += 1
-        current.saveBlocked = true
-        if (current.mounted) setSaveBlocked(true)
-        readState()
-      }
       setSaving(true)
       setError(undefined)
       try {
@@ -465,7 +385,7 @@ export function useSchedulingSettings(
         if (!current.mounted) return
         current.changeVersion += 1
         if (!current.active || current.epoch !== epoch) {
-          readback()
+          readbackSettings()
           return
         }
         if (result.ok) {
@@ -477,157 +397,282 @@ export function useSchedulingSettings(
         } else {
           current.saveFailure = result.error.message
           setError(result.error.message)
-          readback()
+          readbackSettings()
         }
       } catch {
         if (current.mounted) {
           current.changeVersion += 1
           current.saveFailure = 'Could not confirm the save. Reopen Relay settings to try again.'
           if (current.active && current.epoch === epoch) setError(current.saveFailure)
-          readback()
+          readbackSettings()
         }
       } finally {
         current.saving = false
         if (current.mounted) setSaving(false)
       }
     },
-    [settings, readState],
+    [settings, readState, readbackSettings],
   )
+  const projectCredential = useCallback(() => {
+    const current = owner.current
+    if (!current.mounted) return
+    setCredentialView({
+      saving: current.credentialSaving,
+      checking: current.credentialChecking,
+      uncertain: current.credentialPending !== undefined && !current.credentialSaving,
+      operation: current.credentialPending?.operation,
+      error: current.credentialError,
+    })
+  }, [])
+  const credentialWrite = useCallback(
+    (operation: 'save' | 'remove', key?: string): boolean => {
+      const current = owner.current
+      if (
+        !settings ||
+        !current.active ||
+        !current.mounted ||
+        current.credentialPending ||
+        current.credentialChecking ||
+        current.saving ||
+        current.saveBlocked
+      )
+        return false
+      if (operation === 'save' && !relayApiKeySchema.safeParse(key).success) return false
+      const pending = {
+        nonce: crypto.randomUUID(),
+        operation,
+        expectedRevision: settings.credential.revision,
+        deadlineAt: Date.now() + RELAY_CREDENTIAL_TIMEOUT_MS,
+      }
+      current.credentialPending = pending
+      current.credentialError = undefined
+      current.credentialSaving = true
+      projectCredential()
+      void (async () => {
+        try {
+          const result =
+            operation === 'save'
+              ? await window.pact.saveRelayApiKey({
+                  nonce: pending.nonce,
+                  expectedRevision: pending.expectedRevision,
+                  deadlineAt: pending.deadlineAt,
+                  key: key!,
+                })
+              : await window.pact.removeRelayApiKey({
+                  nonce: pending.nonce,
+                  expectedRevision: pending.expectedRevision,
+                  deadlineAt: pending.deadlineAt,
+                })
+          if (!current.mounted || current.credentialPending !== pending) return
+          current.changeVersion += 1
+          if (result.ok) {
+            if (
+              result.value.nonce === pending.nonce &&
+              result.value.operation === pending.operation &&
+              result.value.revision === pending.expectedRevision + 1 &&
+              result.value.configured === (pending.operation === 'save')
+            ) {
+              current.credentialPending = undefined
+              current.credentialError = undefined
+            }
+            // A committed receipt is metadata, never a live availability claim.
+            readbackSettings()
+          } else if (result.error.code === 'UNCERTAIN') {
+            // The retained nonce/operation/revision is the status-check identity.
+          } else {
+            current.credentialPending = undefined
+            current.credentialError = result.error.message
+            readbackSettings()
+          }
+        } catch {
+          // An unacknowledged result keeps the retained nonce until Check status resolves it.
+        } finally {
+          current.credentialSaving = false
+          projectCredential()
+        }
+      })()
+      return true
+    },
+    [settings, readbackSettings, projectCredential],
+  )
+  const checkCredentialStatus = useCallback((): void => {
+    const current = owner.current
+    const pending = current.credentialPending
+    if (
+      !pending ||
+      current.credentialChecking ||
+      current.credentialSaving ||
+      !current.mounted ||
+      !current.active
+    )
+      return
+    current.credentialChecking = true
+    projectCredential()
+    void (async () => {
+      try {
+        const result = await window.pact.readRelayCredentialReceipt({ nonce: pending.nonce })
+        if (!current.mounted || current.credentialPending !== pending) return
+        current.changeVersion += 1
+        if (
+          result.ok &&
+          result.value &&
+          result.value.nonce === pending.nonce &&
+          result.value.operation === pending.operation &&
+          result.value.revision === pending.expectedRevision + 1 &&
+          result.value.configured === (pending.operation === 'save')
+        ) {
+          current.credentialPending = undefined
+          current.credentialError = undefined
+          readbackSettings()
+        } else if (result.ok && result.value === null && Date.now() >= pending.deadlineAt) {
+          // Missing receipt after the original request deadline: no stored mutation.
+          current.credentialPending = undefined
+          current.credentialError = 'The key change was not saved.'
+          readbackSettings()
+        }
+        // Any other outcome keeps the retained nonce for a later explicit check.
+      } catch {
+        // A failed status read keeps uncertainty.
+      } finally {
+        current.credentialChecking = false
+        projectCredential()
+      }
+    })()
+  }, [readbackSettings, projectCredential])
   return {
     settings,
     state,
-    models,
     loading,
     saving,
     saveBlocked,
-    refreshing: refreshingModels || refreshingState,
-    refreshingModels,
-    refreshingState,
     error,
-    modelError,
     rows,
     activityLoading,
     activityError,
-    refreshModels,
     save,
     readOlder: () => read('older'),
     readNewer: () => read('newer'),
+    saveKey: (key: string) => credentialWrite('save', key),
+    removeKey: () => credentialWrite('remove'),
+    checkCredentialStatus,
+    credentialSaving: credentialView.saving,
+    credentialChecking: credentialView.checking,
+    credentialUncertain: credentialView.uncertain,
+    credentialOperation: credentialView.operation,
+    credentialError: credentialView.error,
+    visible: active && settingsVisible,
   }
 }
 
-const targets = [
-  { id: 'codex_luna', label: 'GPT-6 Luna · Codex' },
-  { id: 'claude_haiku_5_5', label: 'Haiku 5.5 · Claude Code' },
-] as const
-const reasonLabels: Record<SchedulingActivityRow['reason'], string> = {
-  workflow: 'Workflow handoff',
-  input: 'Input routing',
-  native_check: 'Native session check',
-  queue_check: 'Delivery status check',
-  rebuild_check: 'Rebuild candidate check',
-  native_rebuild: 'Native context rebuild',
-  confirmed_resend: 'Confirmed-unsent resend',
+const activityActions: Record<NonNullable<SchedulingActivityRow['action']>, string> = {
+  plan_review: 'Review Plan',
+  plan_revision: 'Revise Plan',
+  implementation: 'Implement changes',
+  code_review: 'Review code',
+  respond: 'Respond to review',
+  repair: 'Repair code',
+  reply: 'Reply to message',
+  route_codex: 'Route to Codex',
+  route_claude: 'Route to Claude Code',
+  clarify_prepared_input: 'Clarify input',
+  supplement_plan: 'Clarify Plan',
+  supplement_code_response: 'Clarify review',
+  native_check: 'Check agent session',
+  queue_check: 'Check delivery',
+  rebuild_check: 'Check rebuild',
+  confirmed_resend: 'Retry unsent work',
+  rebuild_native_context: 'Rebuild agent session',
+  reassign_roles: 'Change code roles',
 }
-function resultLabel(row: SchedulingActivityRow): string {
-  const check =
-    row.reason === 'native_check' || row.reason === 'queue_check' || row.reason === 'rebuild_check'
-  let result: string
-  if (row.action === 'rebuild_native_context' && !row.actionResult) {
-    result = 'Awaiting your rebuild decision'
-  } else if (check) {
-    result =
-      row.result === 'reserved'
-        ? 'Check prepared; not started'
-        : row.result === 'possibly_sent'
-          ? 'Check result unconfirmed'
-          : row.result === 'not_sent'
-            ? 'Check not started'
-            : row.result === 'completed'
-              ? 'Check completed'
-              : 'Check failed'
-    if (row.originalUnconfirmed) result += '; original work unconfirmed'
-  } else if (row.actionResult) {
-    const labels: Record<NonNullable<SchedulingActivityRow['actionResult']>, string> = {
-      reserved:
-        row.action === 'rebuild_native_context'
-          ? 'Rebuild prepared; not started'
-          : 'Action prepared; not started',
-      dispatched:
-        row.action === 'rebuild_native_context'
-          ? 'Rebuild requested; result unconfirmed'
-          : 'Action requested; result unconfirmed',
-      completed:
-        row.action === 'rebuild_native_context'
-          ? 'Native context rebuilt'
-          : row.action === 'confirmed_resend'
-            ? 'Reexecution completed'
-            : 'Business turn completed',
-      failed:
-        row.action === 'rebuild_native_context'
-          ? 'Native rebuild failed'
-          : row.action === 'confirmed_resend'
-            ? 'Reexecution failed'
-            : 'Business turn failed',
-      not_sent: 'Action not sent',
-      unconfirmed: 'Action result unconfirmed',
-      cancelled: 'Scheduling action cancelled',
-      superseded: 'Native rebuild superseded',
-    }
-    result = labels[row.actionResult]
-  } else
-    result =
-      row.result === 'reserved'
-        ? 'Decision prepared; no request sent'
-        : row.result === 'not_sent'
-          ? 'No decision request sent'
+const activityReasons: Record<SchedulingActivityRow['reason'], string> = {
+  workflow: 'Workflow handoff',
+  input: 'Message routing',
+  native_check: 'Check agent session',
+  queue_check: 'Check delivery',
+  rebuild_check: 'Check rebuild',
+  native_rebuild: 'Rebuild agent session',
+  confirmed_resend: 'Retry unsent work',
+}
+const activityResults: Record<NonNullable<SchedulingActivityRow['actionResult']>, string> = {
+  reserved: 'Not started',
+  dispatched: 'Awaiting result',
+  completed: 'Completed',
+  failed: 'Failed',
+  not_sent: 'Not started',
+  unconfirmed: 'Unconfirmed',
+  cancelled: 'Cancelled',
+  superseded: 'Superseded',
+}
+function activityDisplay(row: SchedulingActivityRow): {
+  action: string
+  outcome: string
+  warning: string | null
+  failed: boolean
+} {
+  const action = row.action ? activityActions[row.action] : activityReasons[row.reason]
+  const check = ['native_check', 'queue_check', 'rebuild_check'].includes(row.reason)
+  let outcome: string
+  if (row.suggestionState === 'awaiting_user')
+    outcome = row.action === 'clarify_prepared_input' ? 'Needs information' : 'Needs confirmation'
+  else if (row.actionResult) outcome = activityResults[row.actionResult]
+  else if (check)
+    outcome =
+      row.result === 'completed'
+        ? 'Checked'
+        : row.result === 'failed'
+          ? 'Check failed'
           : row.result === 'possibly_sent'
-            ? 'Decision result unconfirmed'
-            : row.result === 'completed'
-              ? 'Decision request completed'
-              : 'Decision request failed'
-  if (row.action === 'rebuild_native_context' && row.originalUnconfirmed)
-    result += '; original work unconfirmed'
+            ? 'Awaiting result'
+            : 'Not started'
+  else if (row.suggestionState === 'adopted') outcome = 'Applied'
+  else if (row.suggestionState === 'suggested') outcome = 'Suggested'
+  else if (row.suggestionState === 'discarded') outcome = 'Not used'
+  else if (row.suggestionState === 'fallback') outcome = 'Default kept'
+  else
+    outcome =
+      row.result === 'completed'
+        ? row.suggestion
+          ? 'Suggested'
+          : 'No change'
+        : row.result === 'failed'
+          ? 'No decision'
+          : row.result === 'not_sent'
+            ? 'Not consulted'
+            : row.result === 'possibly_sent'
+              ? 'Awaiting result'
+              : 'Pending'
   const terminal = row.actionResult
     ? ['completed', 'failed', 'not_sent', 'cancelled', 'superseded'].includes(row.actionResult)
     : ['completed', 'failed', 'not_sent'].includes(row.result)
-  return result + (terminal && row.physicalUnconfirmed ? '; cleanup unconfirmed' : '')
+  const warnings = [
+    row.originalUnconfirmed ? 'Previous work unconfirmed' : null,
+    terminal && row.physicalUnconfirmed ? 'Cleanup unconfirmed' : null,
+  ].filter(Boolean)
+  return {
+    action,
+    outcome,
+    warning: warnings.length ? warnings.join(' · ') : null,
+    failed: outcome === 'Failed' || outcome === 'Check failed',
+  }
 }
 
-const actionLabels: Record<NonNullable<SchedulingActivityRow['action']>, string> = {
-  plan_review: 'Independent Plan review',
-  plan_revision: 'Author Plan revision',
-  implementation: 'Authorized implementation',
-  code_review: 'Independent code review',
-  respond: 'Read-only response',
-  repair: 'Authorized repair',
-  reply: 'User-input response',
-  route_codex: 'Route to Codex',
-  route_claude: 'Route to Claude Code',
-  clarify_prepared_input: 'Request missing information',
-  supplement_plan: 'Extra read-only Plan clarification',
-  supplement_code_response: 'Extra read-only code-review response',
-  native_check: 'Native session check',
-  queue_check: 'Delivery status check',
-  rebuild_check: 'Rebuild candidate check',
-  confirmed_resend: 'Confirmed-unsent reexecution',
-  rebuild_native_context: 'Rebuild native context',
+const selectionParts = [
+  'action',
+  'outcome',
+  'context',
+  'time',
+  'time-context',
+  'project',
+  'project-session',
+  'session',
+  'warning',
+] as const
+type SelectionPoint = {
+  id: string
+  part?: (typeof selectionParts)[number]
+  offset: number
+  affinity: 'following' | 'preceding'
 }
-function suggestionLabel(row: SchedulingActivityRow): string | null {
-  if (row.suggestionState === 'fallback') return 'Default workflow used.'
-  if (row.suggestionState === 'awaiting_user')
-    return row.suggestion
-      ? `Suggestion: ${row.suggestion} Awaiting your decision.`
-      : 'Awaiting your scheduling decision.'
-  if (row.suggestionState === 'discarded')
-    return row.suggestion
-      ? `Suggestion not used: ${row.suggestion}`
-      : 'Scheduling suggestion discarded.'
-  return row.suggestion
-    ? `${row.suggestionState === 'adopted' ? 'Suggestion accepted' : 'Suggestion'}: ${row.suggestion}`
-    : null
-}
-
-type SelectionPoint = { id: string; offset: number; affinity: 'following' | 'preceding' }
 function selectionPoint(
   container: HTMLElement,
   node: Node | null,
@@ -636,11 +681,14 @@ function selectionPoint(
   const element = node instanceof Element ? node : node?.parentElement,
     row = element?.closest<HTMLElement>('[data-activity-row]')
   if (!node || !row || !container.contains(row)) return undefined
-  const range = document.createRange()
-  range.selectNodeContents(row)
+  const segment = element?.closest<HTMLElement>('[data-activity-text]'),
+    part = selectionParts.find((name) => name === segment?.dataset.activityText),
+    range = document.createRange()
+  range.selectNodeContents(part && segment && row.contains(segment) ? segment : row)
   range.setEnd(node, offset)
   return {
     id: row.dataset.activityRow!,
+    ...(part ? { part } : {}),
     offset: range.toString().length,
     affinity: offset === 0 ? 'following' : 'preceding',
   }
@@ -653,7 +701,11 @@ function selectionNode(
     (element) => element.dataset.activityRow === point.id,
   )
   if (!row) return undefined
-  const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT)
+  const segment = point.part
+    ? row.querySelector<HTMLElement>(`[data-activity-text="${point.part}"]`)
+    : row
+  if (!segment) return undefined
+  const walker = document.createTreeWalker(segment, NodeFilter.SHOW_TEXT)
   let offset = point.offset,
     node = walker.nextNode(),
     last: Node | undefined
@@ -716,12 +768,101 @@ export function DecisionSchedulingSettings({
 }: {
   state: ReturnType<typeof useSchedulingSettings>
 }): React.JSX.Element {
-  const { settings, models } = state
+  const { settings } = state
+  const [key, setKey] = useState('')
+  const [keyError, setKeyError] = useState<string>()
+  const [showKey, setShowKey] = useState(false)
+  const [revealed, setRevealed] = useState<{ key: string; revision: number }>()
+  const [revealing, setRevealing] = useState(false)
+  const [revealError, setRevealError] = useState<string>()
+  const revealIntent = useRef(0)
+  const revealMounted = useRef(false)
+  const revealRequest = useRef<Promise<unknown> | undefined>(undefined)
+  const revealFacts = useRef({
+    visible: false,
+    enabled: false,
+    configured: false,
+    busy: false,
+    revision: 0,
+  })
+  const clearRevealed = useCallback(() => {
+    revealIntent.current++
+    setRevealed(undefined)
+    setShowKey(false)
+    setRevealError(undefined)
+  }, [])
+  const credentialBusy =
+    state.saving ||
+    state.saveBlocked ||
+    state.credentialSaving ||
+    state.credentialChecking ||
+    state.credentialUncertain
+  const savingKey = state.credentialSaving && state.credentialOperation === 'save'
+  const removingKey = state.credentialSaving && state.credentialOperation === 'remove'
   const enabled = settings?.enabled === true
-  const nativeBusy =
-    state.state &&
-    (state.state.activity.decision.status !== 'idle' ||
-      state.state.activity.check.status !== 'idle')
+  const credentialConfigured = settings?.credential.configured === true
+  const credentialRevision = settings?.credential.revision
+  // Mount + window/document listeners; unmount marks scope and invalidates intent without setState.
+  useLayoutEffect(() => {
+    const mounted = revealMounted
+    const facts = revealFacts
+    const intentRef = revealIntent
+    mounted.current = true
+    const clear = (): void => {
+      if (document.hidden) clearRevealed()
+    }
+    window.addEventListener('blur', clearRevealed)
+    document.addEventListener('visibilitychange', clear)
+    return () => {
+      window.removeEventListener('blur', clearRevealed)
+      document.removeEventListener('visibilitychange', clear)
+      mounted.current = false
+      facts.current.visible = false
+      intentRef.current++
+    }
+  }, [clearRevealed])
+  useLayoutEffect(() => {
+    const previous = revealFacts.current
+    const next = {
+      visible: state.visible,
+      enabled,
+      configured: credentialConfigured,
+      busy: credentialBusy,
+      revision: credentialRevision ?? -1,
+    }
+    revealFacts.current = next
+    if (
+      previous.visible === next.visible &&
+      previous.enabled === next.enabled &&
+      previous.configured === next.configured &&
+      previous.busy === next.busy &&
+      previous.revision === next.revision
+    )
+      return
+    // Only a real scope change invalidates the in-flight intent.
+    const intent = ++revealIntent.current
+    queueMicrotask(() => {
+      if (revealMounted.current && revealIntent.current === intent) clearRevealed()
+    })
+  }, [
+    state.visible,
+    enabled,
+    credentialConfigured,
+    credentialBusy,
+    credentialRevision,
+    clearRevealed,
+  ])
+  const currentRevealed =
+    state.visible &&
+    enabled &&
+    credentialConfigured &&
+    !credentialBusy &&
+    revealed &&
+    revealed.revision === settings?.credential.revision
+      ? revealed
+      : undefined
+  const keyShown =
+    showKey && state.visible && enabled && !credentialBusy && (!!key || !!currentRevealed)
   const toggle = useRef<HTMLButtonElement>(null)
   const focusWithin = useRef(false)
   const wasEnabled = useRef(enabled)
@@ -769,6 +910,81 @@ export function DecisionSchedulingSettings({
       toggle.current?.focus({ preventScroll: true })
     wasEnabled.current = enabled
   }, [enabled])
+  useEffect(() => {
+    if (state.visible && enabled) return
+    queueMicrotask(() => {
+      setKey('')
+      setKeyError(undefined)
+    })
+  }, [state.visible, enabled])
+  const toggleKeyVisibility = (): void => {
+    if (key) {
+      setShowKey((value) => !value)
+      return
+    }
+    if (currentRevealed) {
+      clearRevealed()
+      return
+    }
+    if (revealRequest.current) return
+    if (
+      !credentialConfigured ||
+      revealing ||
+      !settings ||
+      !state.visible ||
+      !enabled ||
+      credentialBusy ||
+      !revealMounted.current
+    ) {
+      setShowKey(false)
+      return
+    }
+    const intent = ++revealIntent.current
+    setRevealing(true)
+    setRevealError(undefined)
+    const input = {
+      expectedRevision: settings.credential.revision,
+      deadlineAt: Date.now() + RELAY_CREDENTIAL_TIMEOUT_MS,
+    }
+    const request = Promise.resolve().then(() => window.pact.revealRelayApiKey(input))
+    revealRequest.current = request
+    const complete = (result?: RpcResult<RelayCredentialRevealed>): void => {
+      if (revealRequest.current !== request) return
+      revealRequest.current = undefined
+      if (!revealMounted.current) return
+      setRevealing(false)
+      if (revealIntent.current !== intent) return
+      const facts = revealFacts.current
+      if (
+        !facts.visible ||
+        !facts.enabled ||
+        !facts.configured ||
+        facts.busy ||
+        document.hidden ||
+        !document.hasFocus()
+      )
+        return
+      if (result?.ok && result.value.revision === facts.revision) {
+        setRevealed(result.value)
+        setShowKey(true)
+      } else {
+        setRevealError("Couldn't show the saved API key. Try again.")
+      }
+    }
+    void request.then(complete, () => complete())
+  }
+  const submitKey = (event: React.FormEvent): void => {
+    event.preventDefault()
+    if (!relayApiKeySchema.safeParse(key).success) {
+      setKeyError('Enter a valid API key.')
+      return
+    }
+    setKeyError(undefined)
+    if (state.saveKey(key)) {
+      setKey('')
+      clearRevealed()
+    }
+  }
   useLayoutEffect(() => {
     if (!state.rows.length) {
       anchor.current = undefined
@@ -798,7 +1014,7 @@ export function DecisionSchedulingSettings({
   return (
     <div className="relay-settings-surface">
       <main
-        className="relay-settings mx-auto min-h-full w-full max-w-[48rem] p-section sm:p-spacious"
+        className="relay-settings mx-auto min-h-full w-full max-w-3xl p-section sm:p-spacious"
         aria-label="Relay settings"
         onFocusCapture={() => {
           focusWithin.current = true
@@ -812,14 +1028,14 @@ export function DecisionSchedulingSettings({
         }}
       >
         <header className="relay-header">
-          <h2 className="text-title font-medium tracking-[-0.025em] text-primary">Relay</h2>
+          <h2 className="text-title font-medium tracking-tight text-primary">Relay</h2>
           <p className="mt-2 max-w-[60ch] text-body leading-[1.6] text-secondary">
-            Smarter orchestration between Codex and Claude Code.
+            Smarter orchestration between Codex and Claude Code, powered by Decisions API.
           </p>
         </header>
         <RelaySwitch
           checked={enabled}
-          disabled={!settings || state.saving || state.saveBlocked}
+          disabled={!settings || state.saving || state.saveBlocked || credentialBusy}
           busy={state.loading || state.saving}
           buttonRef={toggle}
           descriptionId="relay-authorization"
@@ -831,8 +1047,7 @@ export function DecisionSchedulingSettings({
           id="relay-authorization"
           className="mt-1 max-w-[65ch] text-caption leading-relaxed text-secondary"
         >
-          Enabling Relay authorizes Codex or Claude Code to run with full access for background
-          decisions; the decision model cannot use tools or edit project files.
+          Relay can adjust routing and handoffs within existing permissions.
         </p>
         {state.error ? (
           <output className="mt-group block text-caption text-danger">{state.error}</output>
@@ -840,110 +1055,150 @@ export function DecisionSchedulingSettings({
         {enabled && settings ? (
           <div className="relay-details" id="relay-details">
             <div className="relay-details-inner">
-              <section className="relay-section" aria-labelledby="relay-model-heading">
+              <section className="relay-section" aria-labelledby="relay-key-heading">
                 <div className="flex items-center justify-between gap-group">
-                  <h3 id="relay-model-heading" className="text-body font-medium text-primary">
-                    Model
+                  <h3 id="relay-key-heading" className="text-body font-medium text-primary">
+                    Decisions API
                   </h3>
-                  <button
-                    className="relay-refresh"
-                    type="button"
-                    title={
-                      state.refreshing
-                        ? 'Refreshing models and compatibility…'
-                        : 'Refresh models and compatibility'
-                    }
-                    aria-label="Refresh models and compatibility"
-                    aria-busy={state.refreshing}
-                    disabled={state.refreshing || state.saving || nativeBusy}
-                    onClick={() => state.refreshModels()}
+                  <span className="text-caption text-secondary">
+                    {settings.credential.configured ? 'Saved' : 'Not configured'}
+                  </span>
+                </div>
+                <form onSubmit={submitKey} className="mt-group">
+                  <label
+                    htmlFor="relay-api-key"
+                    className="block text-caption font-medium text-primary"
                   >
-                    <RefreshCw aria-hidden="true" className="size-4" strokeWidth={1.75} />
-                  </button>
-                </div>
-                <div
-                  className="relay-models"
-                  role="radiogroup"
-                  aria-labelledby="relay-model-heading"
-                >
-                  {targets.map((target) => {
-                    const available = models?.models.find((model) => model.target === target.id)
-                    const saved = settings.selection?.target === target.id
-                    const checked =
-                      saved &&
-                      (!available?.selection ||
-                        available.selection.modelId === settings.selection?.modelId)
-                    const catalogUnavailable = !available?.selection
-                    const unavailable = catalogUnavailable || state.refreshing
-                    const detail = state.refreshingModels
-                      ? 'Checking…'
-                      : available?.status === 'not_found'
-                        ? 'Unavailable'
-                        : catalogUnavailable
-                          ? 'Not confirmed'
-                          : saved && !checked
-                            ? 'Saved version unavailable'
+                    OpenAI API key
+                  </label>
+                  <div className="relay-key-controls">
+                    <div className="relay-key-field">
+                      <input
+                        id="relay-api-key"
+                        type={keyShown ? 'text' : 'password'}
+                        autoComplete="off"
+                        spellCheck={false}
+                        maxLength={RELAY_KEY_BYTES}
+                        value={key || currentRevealed?.key || ''}
+                        placeholder={
+                          credentialConfigured && !key && !currentRevealed
+                            ? '••••••••••••'
                             : undefined
-                    const wireId =
-                      available?.selection?.modelId ??
-                      (saved ? settings.selection?.modelId : undefined)
-                    const dated = wireId && /-\d{8}$/u.test(wireId)
-                    return (
-                      <label
-                        key={target.id}
-                        className="relay-model-row"
-                        data-selected={checked || undefined}
-                        data-disabled={unavailable || undefined}
-                        title={
-                          unavailable
-                            ? `${target.label}: ${detail}${saved ? `. Saved: ${settings.selection!.modelId}` : ''}`
-                            : dated
-                              ? wireId
-                              : undefined
                         }
+                        onChange={(event) => {
+                          const text = event.target.value
+                          revealIntent.current++
+                          setRevealed(undefined)
+                          setKey(text)
+                          setKeyError(undefined)
+                          setRevealError(undefined)
+                          if (!text) setShowKey(false)
+                        }}
+                        aria-invalid={keyError !== undefined || undefined}
+                        aria-describedby={[
+                          'relay-key-help',
+                          keyError ? 'relay-key-error' : undefined,
+                          state.credentialError ? 'relay-credential-error' : undefined,
+                          revealError ? 'relay-reveal-error' : undefined,
+                        ]
+                          .filter(Boolean)
+                          .join(' ')}
+                        disabled={credentialBusy}
+                      />
+                      <button
+                        className="relay-key-eye"
+                        type="button"
+                        aria-label={keyShown ? 'Hide API key' : 'Show API key'}
+                        title={keyShown ? 'Hide API key' : 'Show API key'}
+                        aria-controls="relay-api-key"
+                        disabled={
+                          credentialBusy ||
+                          revealing ||
+                          (!key && !credentialConfigured && !currentRevealed)
+                        }
+                        aria-busy={revealing}
+                        onClick={toggleKeyVisibility}
                       >
-                        <input
-                          className="sr-only"
-                          type="radio"
-                          name="relay-model"
-                          aria-label={dated ? `${target.label}, ${wireId}` : target.label}
-                          aria-describedby={detail ? `relay-${target.id}-status` : undefined}
-                          checked={checked}
-                          disabled={unavailable || state.saving || state.saveBlocked}
-                          onChange={() => {
-                            if (available?.selection)
-                              void state.save({
-                                selection: available.selection,
-                                catalogIdentity: models?.catalogIdentity,
-                              })
+                        {keyShown ? (
+                          <EyeOff size={16} strokeWidth={1.75} aria-hidden="true" />
+                        ) : (
+                          <Eye size={16} strokeWidth={1.75} aria-hidden="true" />
+                        )}
+                      </button>
+                    </div>
+                    <button
+                      className="primary-action-button"
+                      type="submit"
+                      disabled={credentialBusy || revealing || !key}
+                      aria-busy={savingKey}
+                      data-busy={savingKey || undefined}
+                    >
+                      {savingKey ? (
+                        <span className="primary-action-spinner" aria-hidden="true" />
+                      ) : null}
+                      {savingKey
+                        ? 'Saving…'
+                        : settings.credential.configured
+                          ? 'Replace key'
+                          : 'Save key'}
+                    </button>
+                  </div>
+                  <p id="relay-key-help" className="mt-2 text-caption text-secondary">
+                    Stored encrypted on this device.
+                  </p>
+                  {keyError ? (
+                    <output id="relay-key-error" className="mt-2 block text-caption text-danger">
+                      {keyError}
+                    </output>
+                  ) : null}
+                  {state.credentialError ? (
+                    <output
+                      id="relay-credential-error"
+                      className="mt-2 block text-caption text-danger"
+                    >
+                      {state.credentialError}
+                    </output>
+                  ) : null}
+                  {revealError ? (
+                    <output id="relay-reveal-error" className="mt-2 block text-caption text-danger">
+                      {revealError}
+                    </output>
+                  ) : null}
+                  {state.credentialUncertain ? (
+                    <p className="mt-2 text-caption text-secondary">
+                      The key change could not be confirmed.
+                    </p>
+                  ) : null}
+                  {settings.credential.configured || state.credentialUncertain ? (
+                    <div className="relay-key-actions">
+                      {state.credentialUncertain ? (
+                        <button
+                          className="relay-key-secondary"
+                          type="button"
+                          disabled={state.credentialChecking}
+                          aria-busy={state.credentialChecking}
+                          onClick={() => state.checkCredentialStatus()}
+                        >
+                          {state.credentialChecking ? 'Checking…' : 'Check status'}
+                        </button>
+                      ) : null}
+                      {settings.credential.configured ? (
+                        <button
+                          className="relay-key-secondary"
+                          type="button"
+                          disabled={credentialBusy || revealing}
+                          aria-busy={removingKey}
+                          onClick={() => {
+                            clearRevealed()
+                            state.removeKey()
                           }}
-                        />
-                        <span className="min-w-0 flex-1">
-                          <span className="block text-body font-medium">{target.label}</span>
-                          {dated ? (
-                            <span className="mt-0.5 block break-all text-caption text-secondary">
-                              {wireId}
-                            </span>
-                          ) : null}
-                        </span>
-                        {detail ? (
-                          <span id={`relay-${target.id}-status`} className="shrink-0 text-caption">
-                            {saved && checked ? 'Saved · ' : ''}
-                            {detail}
-                          </span>
-                        ) : null}
-                        <span className="relay-model-mark" aria-hidden="true">
-                          {checked ? <Check className="size-3" strokeWidth={2.5} /> : null}
-                        </span>
-                      </label>
-                    )
-                  })}
-                </div>
-                {state.modelError ? (
-                  <output className="mt-2 block text-caption text-secondary">
-                    {state.modelError}
-                  </output>
-                ) : null}
+                        >
+                          {removingKey ? 'Removing…' : 'Remove'}
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </form>
               </section>
               <p className="relay-usage text-caption leading-relaxed text-secondary">
                 {SCHEDULING_USAGE_NOTICE}
@@ -951,7 +1206,7 @@ export function DecisionSchedulingSettings({
               <section className="relay-section relay-preference" aria-label="Indicator preference">
                 <RelaySwitch
                   checked={settings.showIndicator}
-                  disabled={state.saving || state.saveBlocked}
+                  disabled={state.saving || state.saveBlocked || credentialBusy}
                   busy={state.saving}
                   compact
                   onChange={(checked) => void state.save({ showIndicator: checked })}
@@ -982,43 +1237,65 @@ export function DecisionSchedulingSettings({
                 >
                   {state.rows.length ? (
                     <div className="divide-y divide-border">
-                      {state.rows.map((row) => (
-                        <div
-                          key={row.id}
-                          data-activity-row={row.id}
-                          className="grid gap-1 py-3 text-caption sm:grid-cols-[6rem_minmax(0,1fr)] sm:gap-x-group"
-                        >
-                          <time className="tabular-nums text-tertiary" dateTime={row.createdAt}>
-                            {new Date(row.createdAt).toLocaleString('en-US', {
-                              month: 'short',
-                              day: 'numeric',
-                              hour: '2-digit',
-                              minute: '2-digit',
-                              hour12: false,
-                            })}
-                          </time>
-                          <div className="min-w-0">
-                            <p className="break-words font-medium text-primary">
-                              {row.project} · {row.session}
+                      {state.rows.map((row) => {
+                        const display = activityDisplay(row)
+                        return (
+                          <div
+                            key={row.id}
+                            data-activity-row={row.id}
+                            className="py-3 text-caption"
+                          >
+                            <div className="relay-activity-summary">
+                              <p
+                                data-activity-text="action"
+                                className="min-w-0 wrap-break-word text-body font-medium text-primary"
+                              >
+                                {display.action}
+                              </p>
+                              <p
+                                data-activity-text="outcome"
+                                className={
+                                  display.failed
+                                    ? 'font-medium text-danger'
+                                    : 'font-medium text-secondary'
+                                }
+                              >
+                                {display.outcome}
+                              </p>
+                            </div>
+                            <p
+                              data-activity-text="context"
+                              className="mt-1 wrap-break-word text-tertiary"
+                            >
+                              <time
+                                data-activity-text="time"
+                                className="tabular-nums"
+                                dateTime={row.createdAt}
+                              >
+                                {new Date(row.createdAt).toLocaleString('en-US', {
+                                  month: 'short',
+                                  day: 'numeric',
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                  hour12: false,
+                                })}
+                              </time>
+                              <span data-activity-text="time-context">{' · '}</span>
+                              <span data-activity-text="project">{row.project}</span>
+                              <span data-activity-text="project-session">{' / '}</span>
+                              <span data-activity-text="session">{row.session}</span>
                             </p>
-                            <p className="mt-1 text-secondary">{reasonLabels[row.reason]}</p>
-                            {row.called && row.provider && row.model ? (
-                              <p className="mt-1 break-words text-secondary">
-                                {row.provider === 'codex' ? 'Codex' : 'Claude Code'} · {row.model}
+                            {display.warning ? (
+                              <p
+                                data-activity-text="warning"
+                                className="mt-1 wrap-break-word text-secondary"
+                              >
+                                {display.warning}
                               </p>
                             ) : null}
-                            {suggestionLabel(row) ? (
-                              <p className="mt-1 text-secondary">{suggestionLabel(row)}</p>
-                            ) : null}
-                            {row.action ? (
-                              <p className="mt-1 text-secondary">
-                                Action: {actionLabels[row.action]}
-                              </p>
-                            ) : null}
-                            <p className="mt-1 text-primary">Result: {resultLabel(row)}</p>
                           </div>
-                        </div>
-                      ))}
+                        )
+                      })}
                     </div>
                   ) : (
                     <p className="py-3 text-caption text-tertiary">

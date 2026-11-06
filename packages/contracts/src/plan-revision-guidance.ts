@@ -4,12 +4,7 @@ import {
   collaborationDocumentSchema,
   collaborationInputBatchReferenceSchema,
 } from './collaboration-documents.js'
-import {
-  DECISION_SOURCES,
-  decisionRecommendationSchema,
-  type DecisionInput,
-  type DecisionOutcome,
-} from './decision-runtime.js'
+import { DECISION_SOURCES, decisionRecommendationSchema } from './decision-runtime.js'
 
 export const PLAN_REVISION_GUIDANCE_VERSION = 'plan-revision-guidance-v1'
 export const PLAN_REVISION_GUIDANCE_BYTES = 16 * 1024
@@ -135,42 +130,3 @@ export const planRevisionGuidanceSchema = z
       })
   })
 export type PlanRevisionGuidance = z.infer<typeof planRevisionGuidanceSchema>
-
-/** Ephemeral adoption proposal; freshness scalars grant no authority to dispatch a Run. */
-export const planRevisionGuidanceProposalSchema = z
-  .strictObject({
-    guidance: planRevisionGuidanceSchema,
-    configurationGeneration: z.number().int().nonnegative(),
-    configurationFingerprint: digest,
-    deadlineAt: z.number().int().nonnegative(),
-  })
-  .refine(
-    (value) => jsonBytesWithinBudget(value, PLAN_REVISION_GUIDANCE_BYTES),
-    'The complete guidance proposal exceeds its byte budget.',
-  )
-export type PlanRevisionGuidanceProposal = z.infer<typeof planRevisionGuidanceProposalSchema>
-
-export type PlanRevisionDecisionMaterial = {
-  input: DecisionInput
-  sources: PlanRevisionGuidanceSource[]
-  inputSha256: string
-  sourceFingerprint: string
-  taskId: string
-  inputSequence: number
-  planVersion: number
-}
-
-export type DecisionEvaluationReceipt = {
-  evaluationId: string
-  handoffId: string
-  configurationGeneration: number
-  configurationFingerprint: string
-  deadlineAt: number
-}
-
-/** Host result only; the model recommendation schema does not accept receipt identities. */
-export type DecisionEvaluationOutcome =
-  | Extract<DecisionOutcome, { kind: 'unavailable' }>
-  | (Extract<DecisionOutcome, { kind: 'recommendation' }> & {
-      evaluationReceipt: DecisionEvaluationReceipt
-    })

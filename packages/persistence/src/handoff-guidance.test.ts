@@ -5,12 +5,14 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   advanceCollaboration,
   collaborationDocumentSchema,
-  handoffGuidanceProposalSchema,
   handoffGuidanceV2Schema,
 } from '@pact/contracts'
 
-import { planRevisionFixture } from './plan-revision-guidance.test-support.js'
-import { agentRuns, conversationRunSourceRefs, schedulingEvaluations } from './schema/index.js'
+import {
+  planRevisionFixture,
+  seedHistoricalGuidance,
+} from './plan-revision-guidance.test-support.js'
+import { agentRuns, schedulingEvaluations } from './schema/index.js'
 
 const fixtures: Awaited<ReturnType<typeof planRevisionFixture>>[] = []
 afterEach(() => {
@@ -22,7 +24,7 @@ async function secondReview(unselectedPlan?: string) {
     review: 'Original finding, including its final page.\n'.repeat(700),
   })
   fixtures.push(f)
-  expect(f.repo.relayWorkflowWorthConsulting(f.handoff)).toBe(false)
+  expect(f.repo.relayWorkflowAlternatives(f.handoff)).toBeUndefined()
   const response = f.repo.beginRun(f.admission()).run
   let unselectedDocument
   if (unselectedPlan !== undefined) {
@@ -59,52 +61,31 @@ async function secondReview(unselectedPlan?: string) {
 }
 
 async function evaluated(unselectedPlan?: string) {
-  const f = await secondReview(unselectedPlan),
-    deadlineAt = Date.now() + 15_000
-  const reserved = f.repo.reserveEvaluation({
-    handoff: f.handoff,
-    provider: 'codex',
-    model: 'gpt-6-luna',
-    configurationFingerprint: 'a'.repeat(64),
-    deadlineAt,
-    inputSha256: createHash('sha256').update(JSON.stringify(f.material.input)).digest('hex'),
+  const f = await secondReview(unselectedPlan)
+  const guidance = handoffGuidanceV2Schema.parse({
+    version: 'handoff-guidance-v2',
+    evaluationId: randomUUID(),
+    handoffId: f.handoff.id,
+    inputSha256: f.material.inputSha256,
+    sourceFingerprint: f.material.sourceFingerprint,
+    basis: f.material.basis,
+    sources: f.material.sources,
+    candidateId: 'continue_plan_revision',
+    highlights: [
+      {
+        text: 'Address the original finding and the complete intervening response.',
+        sourceIds: [
+          f.material.snapshot.reviews[0]!.sourceId,
+          f.material.snapshot.responses[0]!.sourceId,
+        ],
+      },
+    ],
   })
-  if (reserved.status !== 'reserved') throw Error('Expected one eligible evaluation.')
-  f.repo.dispatchEvaluation(reserved.evaluation.id)
-  f.repo.settleEvaluation(reserved.evaluation.id, {
-    outcome: 'completed',
-    physicalReleased: true,
-    selectedCandidateId: 'continue_plan_revision',
-  })
-  const proposal = handoffGuidanceProposalSchema.parse({
-    guidance: {
-      version: 'handoff-guidance-v2',
-      evaluationId: reserved.evaluation.id,
-      handoffId: f.handoff.id,
-      inputSha256: f.material.inputSha256,
-      sourceFingerprint: f.material.sourceFingerprint,
-      basis: f.material.basis,
-      sources: f.material.sources,
-      candidateId: 'continue_plan_revision',
-      highlights: [
-        {
-          text: 'Address the original finding and the complete intervening response.',
-          sourceIds: [
-            f.material.snapshot.reviews[0]!.sourceId,
-            f.material.snapshot.responses[0]!.sourceId,
-          ],
-        },
-      ],
-    },
-    configurationGeneration: f.repo.schedulingConfigurationGeneration(),
-    configurationFingerprint: 'a'.repeat(64),
-    deadlineAt,
-  })
-  return { ...f, proposal }
+  return { ...f, guidance }
 }
 
-describe('generic handoff guidance through source grants and Run admission', () => {
-  it('skips the first review and reads the complete earlier review, owner response and exact Plan versions for the second', async () => {
+describe('current workflow sources and historical handoff guidance', () => {
+  it('keeps the normal first revision and reads the complete earlier review, owner response and exact Plan versions for the second', async () => {
     const f = await secondReview()
     expect(f.material.snapshot.node).toBe('plan_review_to_owner')
     expect(
@@ -138,7 +119,7 @@ describe('generic handoff guidance through source grants and Run admission', () 
     expect(plan.some((row) => row.detail.includes('TEMP B-TREE'))).toBe(false)
   })
 
-  it('freezes only selected historical documents into the receiving Run and stores one adopted v2 manifest', async () => {
+  it('reads a historical v2 manifest without granting an unselected sibling document', async () => {
     const text = 'Same task, but not a selected review source.'
     const f = await evaluated(text)
     const unrelated = collaborationDocumentSchema.parse(f.unselectedDocument)
@@ -149,13 +130,21 @@ describe('generic handoff guidance through source grants and Run admission', () 
     })
     expect(f.repo.findRun(f.response.id)?.collaboration?.taskId).toBe(f.task.id)
     expect(f.material.sources.some((source) => source.document.id === unrelated.id)).toBe(false)
-    const adopted = f.repo.beginRun({ ...f.admission, handoffGuidance: f.proposal })
+    const adopted = f.repo.beginRun(f.admission)
+    const manifest = seedHistoricalGuidance(
+      f,
+      adopted.run.id,
+      f.handoff,
+      f.guidance,
+      f.material.snapshot.sourceGrants,
+    )
     const auth = f.repo.collaborationTurnAuthorization(adopted.run.id)!
-    const manifest = handoffGuidanceV2Schema.parse(
+    expect(auth.sourceManifestRef).toEqual(manifest)
+    const stored = handoffGuidanceV2Schema.parse(
       JSON.parse(f.readDocument(auth.sourceManifestRef!)),
     )
-    expect(manifest).toEqual(f.proposal.guidance)
-    for (const source of manifest.sources)
+    expect(stored).toEqual(f.guidance)
+    for (const source of stored.sources)
       expect(f.repo.sourceDocumentAuthorized(adopted.run.id, source.document)).toBe(true)
     expect(f.repo.sourceDocumentAuthorized(adopted.run.id, unrelated)).toBe(false)
     expect(f.repo.handoffReceipt(f.handoff.id)?.runId).toBe(adopted.run.id)
@@ -163,10 +152,10 @@ describe('generic handoff guidance through source grants and Run admission', () 
       f.db.drizzle.all(
         sql`SELECT event_type FROM agent_event_journal WHERE run_id=${adopted.run.id} AND event_type='scheduling.handoff_guidance_adopted'`,
       ),
-    ).toHaveLength(1)
+    ).toHaveLength(0)
   })
 
-  it('rejects a tampered source without granting it, while keeping the already-authorized default Run', async () => {
+  it('refuses an ungranted source in a stored historical manifest', async () => {
     const text = 'Unselected document.'
     const f = await evaluated(text)
     const unrelated = collaborationDocumentSchema.parse(f.unselectedDocument)
@@ -177,35 +166,32 @@ describe('generic handoff guidance through source grants and Run admission', () 
     })
     expect(f.repo.findRun(f.response.id)?.collaboration?.taskId).toBe(f.task.id)
     expect(f.material.sources.some((source) => source.document.id === unrelated.id)).toBe(false)
-    f.proposal.guidance.sources.push({
+    f.guidance.sources.push({
       id: 's11',
       roles: ['owner_response'],
       document: unrelated,
       evaluatedSha256: unrelated.sha256,
     })
-    const adopted = f.repo.beginRun({ ...f.admission, handoffGuidance: f.proposal })
-    expect(f.repo.collaborationTurnAuthorization(adopted.run.id)?.sourceManifestRef).toBeUndefined()
-    expect(f.repo.sourceDocumentAuthorized(adopted.run.id, unrelated)).toBe(false)
-    expect(adopted.run.agentId).toBe(f.task.owner)
-  })
-
-  it('rolls back grants, manifest, Run and handoff claim together after an adoption write fails', async () => {
-    const f = await evaluated()
-    const beforeRuns = f.db.drizzle.select().from(agentRuns).all().length
-    const beforeGrants = f.db.drizzle.select().from(conversationRunSourceRefs).all().length
-    f.db.drizzle.run(sql`CREATE TRIGGER reject_relay_adoption BEFORE INSERT ON agent_event_journal
-      WHEN NEW.event_type='scheduling.handoff_guidance_adopted' BEGIN SELECT RAISE(ABORT, 'owned admission failure'); END`)
-    expect(() => f.repo.beginRun({ ...f.admission, handoffGuidance: f.proposal })).toThrow(
-      'owned admission failure',
+    const adopted = f.repo.beginRun(f.admission)
+    const manifest = seedHistoricalGuidance(
+      f,
+      adopted.run.id,
+      f.handoff,
+      f.guidance,
+      f.material.snapshot.sourceGrants,
     )
-    expect(f.db.drizzle.select().from(agentRuns).all()).toHaveLength(beforeRuns)
-    expect(f.db.drizzle.select().from(conversationRunSourceRefs).all()).toHaveLength(beforeGrants)
-    expect(f.repo.handoffReceipt(f.handoff.id)?.runId).toBeNull()
+    const auth = f.repo.collaborationTurnAuthorization(adopted.run.id)!
+    expect(auth.sourceManifestRef).toEqual(manifest)
+    expect(f.repo.sourceDocumentAuthorized(adopted.run.id, unrelated)).toBe(false)
+    for (const grant of f.material.snapshot.sourceGrants)
+      expect(f.repo.sourceDocumentAuthorized(adopted.run.id, grant.document)).toBe(true)
+    expect(adopted.run.agentId).toBe(f.task.owner)
   })
 
   it('remaps v2 historical sources during Fork without replaying evaluation or changing evaluated digests', async () => {
     const f = await evaluated()
-    const adopted = f.repo.beginRun({ ...f.admission, handoffGuidance: f.proposal }).run
+    const adopted = f.repo.beginRun(f.admission).run
+    seedHistoricalGuidance(f, adopted.id, f.handoff, f.guidance, f.material.snapshot.sourceGrants)
     f.finish(adopted.id, { plan: 'Final revised Plan.' })
     const sourceSession = f.db.sessionRepository.find(f.sessionId)!
     const selection = f.repo.selectForkSource(
@@ -247,11 +233,11 @@ describe('generic handoff guidance through source grants and Run admission', () 
     const manifest = handoffGuidanceV2Schema.parse(
       JSON.parse(f.readDocument(auth.sourceManifestRef!, fork.sessionId)),
     )
-    expect(manifest.basis.task.id).not.toBe(f.proposal.guidance.basis.task.id)
-    expect(manifest.basis.producerRunId).not.toBe(f.proposal.guidance.basis.producerRunId)
-    expect(manifest.inputSha256).toBe(f.proposal.guidance.inputSha256)
+    expect(manifest.basis.task.id).not.toBe(f.guidance.basis.task.id)
+    expect(manifest.basis.producerRunId).not.toBe(f.guidance.basis.producerRunId)
+    expect(manifest.inputSha256).toBe(f.guidance.inputSha256)
     expect(manifest.sources.map((source) => source.evaluatedSha256)).toEqual(
-      f.proposal.guidance.sources.map((source) => source.evaluatedSha256),
+      f.guidance.sources.map((source) => source.evaluatedSha256),
     )
     expect(
       manifest.sources.every((source) =>
@@ -326,40 +312,21 @@ describe('generic handoff guidance through source grants and Run admission', () 
       },
     )
     expect(material.snapshot.node).toBe('execution_to_review')
-    const reserved = f.repo.reserveEvaluation({
-      handoff,
-      provider: 'codex',
-      model: 'gpt-6-luna',
-      configurationFingerprint: 'a'.repeat(64),
-      deadlineAt,
+    const guidance = handoffGuidanceV2Schema.parse({
+      version: 'handoff-guidance-v2',
+      evaluationId: randomUUID(),
+      handoffId: handoff.id,
       inputSha256: material.inputSha256,
+      sourceFingerprint: material.sourceFingerprint,
+      basis: material.basis,
+      sources: material.sources,
+      candidateId: 'continue_code_review',
+      highlights: [
+        { text: 'Verify the same repair scope.', sourceIds: [material.snapshot.scopeSourceId] },
+      ],
     })
-    if (reserved.status !== 'reserved') throw Error('Missing evaluation')
-    f.repo.dispatchEvaluation(reserved.evaluation.id)
-    f.repo.settleEvaluation(reserved.evaluation.id, {
-      outcome: 'completed',
-      physicalReleased: true,
-      selectedCandidateId: 'continue_code_review',
-    })
-    const proposal = handoffGuidanceProposalSchema.parse({
-      guidance: {
-        version: 'handoff-guidance-v2',
-        evaluationId: reserved.evaluation.id,
-        handoffId: handoff.id,
-        inputSha256: material.inputSha256,
-        sourceFingerprint: material.sourceFingerprint,
-        basis: material.basis,
-        sources: material.sources,
-        candidateId: 'continue_code_review',
-        highlights: [
-          { text: 'Verify the same repair scope.', sourceIds: [material.snapshot.scopeSourceId] },
-        ],
-      },
-      configurationGeneration: f.repo.schedulingConfigurationGeneration(),
-      configurationFingerprint: 'a'.repeat(64),
-      deadlineAt,
-    })
-    const adopted = f.repo.beginRun({ ...input, handoffGuidance: proposal }).run
+    const adopted = f.repo.beginRun(input).run
+    seedHistoricalGuidance(f, adopted.id, handoff, guidance, material.snapshot.sourceGrants)
     f.finish(adopted.id, { verdict: 'accepted' })
     const session = f.db.sessionRepository.find(f.sessionId)!
     const selection = f.repo.selectForkSource(

@@ -68,12 +68,19 @@ import type {
   SchedulingSettingsSave,
   SchedulingState,
   SchedulingStateInput,
-  SchedulingModels,
   SchedulingActivityRead,
   SchedulingActivityPage,
+  RelayCredentialReceipt,
+  RelayCredentialRemove,
+  RelayCredentialReveal,
+  RelayCredentialRevealed,
+  RelayCredentialSave,
+  RelayCredentialStored,
+  RelayCredentialWrite,
 } from '@pact/contracts'
 
 import {
+  RELAY_CREDENTIAL_TIMEOUT_MS,
   rpcResultSchema,
   nativePresenceSnapshotSchema,
   nativeAttentionPageSchema,
@@ -112,6 +119,7 @@ import {
   LogicalIpcWorkerTraffic,
   logicalIpcTrafficSnapshot,
 } from '../../shared/logical-ipc-traffic'
+import { RelayCredentialCrypto } from '../modules/settings/relay-credential-crypto'
 import { DirectoryFileOperations } from './directory-file-operations'
 
 const REQUEST_TIMEOUT_MS = 2_000
@@ -156,10 +164,14 @@ export type NativeQuitPreparationAttempt =
 
 export interface UtilityProcessClient {
   getSchedulingState(input: SchedulingStateInput): Promise<RpcResult<SchedulingState>>
-  refreshSchedulingState(input: SchedulingStateInput): Promise<RpcResult<SchedulingState>>
   getSchedulingSettings(): Promise<RpcResult<SchedulingSettings>>
   saveSchedulingSettings(input: SchedulingSettingsSave): Promise<RpcResult<SchedulingSettings>>
-  refreshSchedulingModels(): Promise<RpcResult<SchedulingModels>>
+  /** Encrypted write only; the plaintext key is handled by the Main crypto module. */
+  /** Composes Main-side OS crypto with the durable Utility write. */
+  saveRelayApiKey(input: RelayCredentialSave): Promise<RpcResult<RelayCredentialReceipt>>
+  removeRelayApiKey(input: RelayCredentialRemove): Promise<RpcResult<RelayCredentialReceipt>>
+  revealRelayApiKey(input: RelayCredentialReveal): Promise<RpcResult<RelayCredentialRevealed>>
+  readRelayCredentialReceipt(nonce: string): Promise<RpcResult<RelayCredentialReceipt | null>>
   readSchedulingActivity(input: SchedulingActivityRead): Promise<RpcResult<SchedulingActivityPage>>
   subscribeSchedulingChanges(listener: () => void): () => void
   getNativePresence(): Promise<RpcResult<NativePresenceSnapshot>>
@@ -320,6 +332,7 @@ export interface UtilityProcessClient {
   dispose(): void
   isRunning(): boolean
   shutdown(): Promise<RpcResult<{ flushed: true }>>
+  settlement(): Promise<void>
 }
 
 interface InFlightRequest {
@@ -383,6 +396,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   >()
   private readonly nativePresenceListeners = new Set<(version: NativePresenceVersion) => void>()
   private readonly schedulingListeners = new Set<() => void>()
+  private readonly relayCrypto = new RelayCredentialCrypto()
   private readonly nativeQuitRecentListeners = new Set<
     (version: NativePresenceVersion, sessions: NativeSessionRow[]) => void
   >()
@@ -581,6 +595,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         exitCode: code,
       })
       this.cancelDirectoryRequests(startedChild)
+      this.relayCrypto.cancelSource(startedChild)
       if (this.child !== startedChild) return
       this.child = undefined
       this.readyChild = undefined
@@ -811,18 +826,6 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected scheduling state response.' } }
   }
 
-  async refreshSchedulingState(input: SchedulingStateInput): Promise<RpcResult<SchedulingState>> {
-    const result = await this.request(
-      { type: 'scheduling.state.refresh.request', input },
-      'scheduling.state.response',
-      20_000,
-    )
-    if (result.kind !== 'response') return { ok: false, error: result.error }
-    return result.response.type === 'scheduling.state.response'
-      ? result.response.result
-      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected scheduling state response.' } }
-  }
-
   async getSchedulingSettings(): Promise<RpcResult<SchedulingSettings>> {
     const result = await this.request(
       { type: 'scheduling.settings.get.request' },
@@ -844,7 +847,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     const result = await this.request(
       { type: 'scheduling.settings.save.request', input },
       'scheduling.settings.response',
-      input.selection ? DEFAULT_SESSION_SETTINGS_TIMEOUT_MS : 5_000,
+      5_000,
     )
     if (result.kind !== 'response') return { ok: false, error: result.error }
     return result.response.type === 'scheduling.settings.response'
@@ -855,16 +858,122 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         }
   }
 
-  async refreshSchedulingModels(): Promise<RpcResult<SchedulingModels>> {
+  async saveRelayApiKey(input: RelayCredentialSave): Promise<RpcResult<RelayCredentialReceipt>> {
+    const target = this.child
+    if (!target || this.terminatingChild || this.shutdownTask)
+      return {
+        ok: false,
+        error: {
+          code: 'RUNTIME_UNAVAILABLE',
+          message: 'Secure credential storage is unavailable.',
+        },
+      }
+    return this.relayCrypto.save(input, {
+      source: target,
+      deadlineAt: Math.min(input.deadlineAt, Date.now() + RELAY_CREDENTIAL_TIMEOUT_MS),
+      isCurrent: () => this.child === target && !this.terminatingChild && !this.shutdownTask,
+      write: (encrypted) => this.writeRelayCredential(encrypted),
+    })
+  }
+
+  async removeRelayApiKey(
+    input: RelayCredentialRemove,
+  ): Promise<RpcResult<RelayCredentialReceipt>> {
+    return this.writeRelayCredential({
+      operation: 'remove',
+      nonce: input.nonce,
+      expectedRevision: input.expectedRevision,
+      deadlineAt: Math.min(input.deadlineAt, Date.now() + RELAY_CREDENTIAL_TIMEOUT_MS),
+    })
+  }
+
+  async revealRelayApiKey(
+    input: RelayCredentialReveal,
+  ): Promise<RpcResult<RelayCredentialRevealed>> {
+    const target = this.child
+    if (!target || this.terminatingChild || this.shutdownTask)
+      return {
+        ok: false,
+        error: {
+          code: 'RUNTIME_UNAVAILABLE',
+          message: 'Secure credential storage is unavailable.',
+        },
+      }
+    return this.relayCrypto.reveal(input, {
+      source: target,
+      isCurrent: () => this.child === target && !this.terminatingChild && !this.shutdownTask,
+      read: (request) => this.readRelayCredential(request),
+    })
+  }
+
+  private async readRelayCredential(
+    input: RelayCredentialReveal,
+  ): Promise<RpcResult<RelayCredentialStored>> {
+    const deadlineAt = Math.min(input.deadlineAt, Date.now() + RELAY_CREDENTIAL_TIMEOUT_MS)
+    if (deadlineAt <= Date.now())
+      return {
+        ok: false,
+        error: {
+          code: 'RUNTIME_UNAVAILABLE',
+          message: 'Secure credential storage is unavailable.',
+        },
+      }
     const result = await this.request(
-      { type: 'scheduling.models.refresh.request' },
-      'scheduling.models.response',
-      DEFAULT_SESSION_SETTINGS_TIMEOUT_MS,
+      {
+        type: 'relay.credential.read.request',
+        input: { expectedRevision: input.expectedRevision, deadlineAt },
+      },
+      'relay.credential.read.response',
+      Math.min(RELAY_CREDENTIAL_TIMEOUT_MS, deadlineAt - Date.now()),
     )
     if (result.kind !== 'response') return { ok: false, error: result.error }
-    return result.response.type === 'scheduling.models.response'
+    return result.response.type === 'relay.credential.read.response'
       ? result.response.result
-      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected scheduling model response.' } }
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected credential response.' } }
+  }
+
+  private async writeRelayCredential(
+    input: RelayCredentialWrite,
+  ): Promise<RpcResult<RelayCredentialReceipt>> {
+    if (input.deadlineAt <= Date.now())
+      return {
+        ok: false,
+        error: {
+          code: 'RUNTIME_UNAVAILABLE',
+          message: 'Secure credential storage is unavailable.',
+        },
+      }
+    const result = await this.request(
+      { type: 'relay.credential.write.request', input },
+      'relay.credential.write.response',
+      Math.min(RELAY_CREDENTIAL_TIMEOUT_MS, input.deadlineAt - Date.now()),
+    )
+    if (result.kind === 'unknown-delivery')
+      return {
+        ok: false,
+        error: {
+          code: 'UNCERTAIN',
+          message: 'The key change could not be confirmed. Check its status.',
+        },
+      }
+    if (result.kind === 'not-sent') return { ok: false, error: result.error }
+    return result.response.type === 'relay.credential.write.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected credential response.' } }
+  }
+
+  async readRelayCredentialReceipt(
+    nonce: string,
+  ): Promise<RpcResult<RelayCredentialReceipt | null>> {
+    const result = await this.request(
+      { type: 'relay.credential.receipt.read.request', input: { nonce } },
+      'relay.credential.receipt.read.response',
+      5_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'relay.credential.receipt.read.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected credential response.' } }
   }
 
   async readSchedulingActivity(
@@ -1665,8 +1774,11 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         ok: false,
         error: ElectronUtilityProcessClient.unavailable('Utility runtime is shutting down.'),
       })
+    if (this.shutdownTask) return this.shutdownTask
     const deadline = performance.now() + WORKSPACE_OPERATION_TIMEOUT_MS
-    this.shutdownTask ??= this.request(
+    this.relayCrypto.dispose()
+    const cryptoJoined = this.relayCrypto.settlement(deadline)
+    this.shutdownTask = this.request(
       { type: 'runtime.shutdown.request' },
       'runtime.shutdown.response',
       WORKSPACE_OPERATION_TIMEOUT_MS - 1_000,
@@ -1681,6 +1793,14 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
                 error: { code: 'INTERNAL', message: 'Unexpected shutdown acknowledgement.' },
               }
       this.dispose()
+      if (!(await cryptoJoined))
+        return {
+          ok: false,
+          error: {
+            code: 'UNCERTAIN',
+            message: 'Utility runtime exit could not be confirmed. Its ownership is retained.',
+          },
+        }
       if (target && !(await this.waitForExit(target, deadline)))
         return {
           ok: false,
@@ -1692,6 +1812,17 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       return acknowledged
     })
     return this.shutdownTask
+  }
+
+  async settlement(): Promise<void> {
+    const target = this.child
+    await Promise.all([
+      this.relayCrypto.settlement(),
+      this.directoryOperations.settlement(),
+      target
+        ? new Promise<void>((resolve) => target.once('exit', () => resolve()))
+        : Promise.resolve(),
+    ])
   }
 
   isRunning(): boolean {
@@ -1713,6 +1844,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   }
 
   dispose(): void {
+    this.relayCrypto.dispose()
     // Main's measurement lives through child shutdown and diagnostic-log close. Its fixed
     // counters survive late deliveries/restarts; disposing this client must not reset them.
     this.conversationListeners.clear()
@@ -1927,6 +2059,14 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   }
 
   private receiveResponse(source: UtilityProcess, message: unknown): void {
+    if (
+      this.relayCrypto.receive(
+        source,
+        message,
+        () => source === this.child && !this.terminatingChild,
+      )
+    )
+      return
     let diagnosticAccepted = false
     if (this.traffic) {
       const diagnostic = diagnosticPacketSchema.safeParse(message)

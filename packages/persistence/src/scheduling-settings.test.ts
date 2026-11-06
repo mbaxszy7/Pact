@@ -5,9 +5,9 @@ import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { schedulingActivityPageSchema } from '@pact/contracts'
+import { OPENAI_DECISION_MODEL, schedulingActivityPageSchema } from '@pact/contracts'
 
 import { refreshNativeRebuildActivityForRecovery } from './conversation-scheduling-activity.js'
 import { PactDatabase } from './pact-database.js'
@@ -147,7 +147,7 @@ describe('Global Relay settings and authoritative activity', () => {
     })
   })
 
-  it('defaults Off without a model, saves with CAS independently from Session defaults/settings and survives restart', async () => {
+  it('defaults Off without a credential, saves with CAS independently from Session defaults/settings and survives restart', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'pact-relay-settings-'))
     directories.push(directory)
     const file = join(directory, 'pact.sqlite'),
@@ -157,7 +157,9 @@ describe('Global Relay settings and authoritative activity', () => {
       beforeSession = f.db.sessionRepository.find(f.sessionId)
     expect(f.repo.schedulingSettings()).toEqual({
       enabled: false,
-      selection: null,
+      provider: 'openai',
+      model: OPENAI_DECISION_MODEL,
+      credential: { configured: false, revision: 0 },
       showIndicator: true,
       revision: 0,
       updatedAt: new Date(0).toISOString(),
@@ -169,25 +171,27 @@ describe('Global Relay settings and authoritative activity', () => {
     const first = f.repo.saveSchedulingSettings({ expectedRevision: 0, enabled: true })
     expect(first).toMatchObject({
       enabled: true,
-      selection: null,
+      credential: { configured: false, revision: 0 },
       showIndicator: true,
       revision: 1,
     })
     expect(() =>
       f.repo.saveSchedulingSettings({ expectedRevision: 0, showIndicator: false }),
     ).toThrow(/changed/u)
-    const selected = f.repo.saveSchedulingSettings({
+    expect(f.repo.schedulingConfigurationGeneration()).toBe(1)
+    const indicator = f.repo.saveSchedulingSettings({
       expectedRevision: 1,
-      selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
       showIndicator: false,
     })
+    // Indicator preference is presentation-only and never bumps the semantic generation.
+    expect(f.repo.schedulingConfigurationGeneration()).toBe(1)
     const saved = f.repo.saveSchedulingSettings({
-      expectedRevision: selected.revision,
+      expectedRevision: indicator.revision,
       enabled: false,
     })
     expect(saved).toMatchObject({
       enabled: false,
-      selection: selected.selection,
+      credential: { configured: false, revision: 0 },
       showIndicator: false,
       revision: 3,
     })
@@ -197,13 +201,13 @@ describe('Global Relay settings and authoritative activity', () => {
     unsubscribe()
     expect(f.repo.readSchedulingActivity({}).rows).toEqual([])
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM agent_runs`)).toEqual({ count: 0 })
-    expect(f.repo.schedulingConfigurationGeneration()).toBe(3)
+    expect(f.repo.schedulingConfigurationGeneration()).toBe(2)
     f.db.close()
     databases.delete(f.db)
     const reopened = await PactDatabase.open({ filePath: file, migrationsFolder })
     databases.add(reopened)
     expect(reopened.conversationRepository.schedulingSettings()).toEqual(saved)
-    expect(reopened.conversationRepository.schedulingConfigurationGeneration()).toBe(3)
+    expect(reopened.conversationRepository.schedulingConfigurationGeneration()).toBe(2)
     expect(reopened.sessionRepository.find(f.sessionId)).toEqual(beforeSession)
     expect(reopened.conversationRepository.readSchedulingActivity({}).rows).toEqual([])
   })
@@ -402,6 +406,11 @@ describe('Global Relay settings and authoritative activity', () => {
               throw Error('Invalid migration columns')
             return column.name
           })
+          .filter(
+            (name) =>
+              table !== 'scheduling_settings' ||
+              !['selection_json', 'enabled', 'revision', 'updated_at'].includes(name),
+          )
           .join(','),
       )
       const before = tables.map((table, index) =>
@@ -424,19 +433,245 @@ describe('Global Relay settings and authoritative activity', () => {
             .all()
             .slice(0, history.length),
         ).toEqual(history)
-        expect(db.conversationRepository.schedulingSettings()).toMatchObject({
-          enabled: previous === 76,
-          selection:
-            previous === 76
-              ? { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' }
-              : null,
+        // The cutover always lands on disabled OpenAI-only settings; preserved
+        // native selection is intentionally dropped, not carried forward.
+        expect(db.conversationRepository.schedulingSettings()).toEqual({
+          enabled: false,
+          provider: 'openai',
+          model: OPENAI_DECISION_MODEL,
+          credential: { configured: false, revision: 0 },
           showIndicator: previous !== 76,
-          revision: previous === 76 ? 7 : 0,
+          revision: previous === 76 ? 8 : 0,
+          updatedAt: expect.any(String),
         })
+        expect(
+          current
+            .prepare('PRAGMA table_info(scheduling_settings)')
+            .all()
+            .some(
+              (column) =>
+                !!column &&
+                typeof column === 'object' &&
+                'name' in column &&
+                column.name === 'selection_json',
+            ),
+        ).toBe(false)
       } finally {
         current.close()
       }
+      db.close()
+      databases.delete(db)
+      // A cold second reopen must not bump the cutover revision again.
+      const second = await PactDatabase.open({ filePath: file, migrationsFolder })
+      databases.add(second)
+      expect(second.conversationRepository.schedulingSettings().revision).toBe(
+        previous === 76 ? 8 : 0,
+      )
     },
   )
 })
 const timestamp = '2026-10-22T00:00:00.000Z'
+
+const cipherA = Buffer.from('synthetic encrypted fixture A').toString('base64')
+const cipherB = Buffer.from('synthetic encrypted fixture B').toString('base64')
+const cipherC = Buffer.from('synthetic encrypted fixture C').toString('base64')
+const saveRequest = (nonce: string, expectedRevision: number, ciphertext: string) => ({
+  operation: 'save' as const,
+  nonce,
+  expectedRevision,
+  deadlineAt: Date.now() + 5000,
+  ciphertext,
+})
+
+describe('Relay credential durable write/readback', () => {
+  it('writes, survives a cold reopen and removes with durable receipt metadata only', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'pact-relay-credential-'))
+    directories.push(directory)
+    const file = join(directory, 'pact.sqlite'),
+      f = await fixture(file)
+    const beforeDefaults = f.db.defaultSessionSettingsRepository.read(),
+      beforeSession = f.db.sessionRepository.find(f.sessionId)
+    expect(f.repo.readRelayCredential()).toEqual({ ciphertext: null, revision: 0 })
+    const nonce = randomUUID(),
+      receipt = f.repo.writeRelayCredential(saveRequest(nonce, 0, cipherA))
+    expect(receipt).toEqual({ nonce, operation: 'save', revision: 1, configured: true })
+    expect(f.repo.readRelayCredential()).toEqual({ ciphertext: cipherA, revision: 1 })
+    expect(f.repo.schedulingSettings()).toMatchObject({
+      credential: { configured: true, revision: 1 },
+      revision: 1,
+    })
+    expect(f.repo.schedulingConfigurationGeneration()).toBe(1)
+    expect(JSON.stringify(f.repo.schedulingSettings())).not.toContain(cipherA)
+    expect(JSON.stringify(f.repo.readRelayCredentialReceipt(nonce))).not.toContain(cipherA)
+    expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM agent_runs`)).toEqual({ count: 0 })
+    expect(f.repo.readSchedulingActivity({}).rows).toEqual([])
+    f.db.close()
+    databases.delete(f.db)
+    const reopened = await PactDatabase.open({ filePath: file, migrationsFolder })
+    databases.add(reopened)
+    const repo = reopened.conversationRepository
+    expect(repo.readRelayCredential()).toEqual({ ciphertext: cipherA, revision: 1 })
+    expect(repo.readRelayCredentialReceipt(nonce)).toEqual({
+      nonce,
+      operation: 'save',
+      revision: 1,
+      configured: true,
+    })
+    expect(repo.readRelayCredentialReceipt(randomUUID())).toBeUndefined()
+    expect(reopened.sessionRepository.find(f.sessionId)).toEqual(beforeSession)
+    expect(reopened.defaultSessionSettingsRepository.read()).toEqual(beforeDefaults)
+    const removed = repo.writeRelayCredential({
+      operation: 'remove' as const,
+      nonce: randomUUID(),
+      expectedRevision: 1,
+      deadlineAt: Date.now() + 5000,
+    })
+    expect(removed).toMatchObject({ revision: 2, configured: false })
+    expect(repo.readRelayCredential()).toEqual({ ciphertext: null, revision: 2 })
+    expect(repo.schedulingSettings()).toMatchObject({
+      credential: { configured: false, revision: 2 },
+      revision: 2,
+    })
+    expect(repo.schedulingConfigurationGeneration()).toBe(2)
+    expect(repo.readRelayCredentialReceipt(nonce)).toEqual({
+      nonce,
+      operation: 'save',
+      revision: 1,
+      configured: true,
+    })
+    expect(
+      reopened.drizzle.get(sql`SELECT count(*) AS count FROM relay_credential_receipts`),
+    ).toEqual({ count: 2 })
+  })
+
+  it('replays a lost ACK against the same request and refuses conflicting nonces, revisions and stale expected revisions', async () => {
+    const f = await fixture()
+    const nonce = randomUUID(),
+      request = saveRequest(nonce, 0, cipherA),
+      receipt = f.repo.writeRelayCredential(request)
+    expect(f.repo.writeRelayCredential(request)).toEqual(receipt)
+    expect(f.repo.readRelayCredential()).toEqual({ ciphertext: cipherA, revision: 1 })
+    expect(f.repo.schedulingSettings().revision).toBe(1)
+    expect(f.repo.schedulingConfigurationGeneration()).toBe(1)
+    expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM relay_credential_receipts`)).toEqual({
+      count: 1,
+    })
+    for (const conflicting of [
+      saveRequest(nonce, 0, cipherB),
+      { operation: 'remove' as const, nonce, expectedRevision: 0, deadlineAt: Date.now() + 5000 },
+      saveRequest(nonce, 1, cipherA),
+    ])
+      expect(() => f.repo.writeRelayCredential(conflicting)).toThrow(
+        /credential|Scheduling settings/u,
+      )
+    expect(f.repo.readRelayCredential()).toEqual({ ciphertext: cipherA, revision: 1 })
+    expect(() => f.repo.writeRelayCredential(saveRequest(randomUUID(), 0, cipherB))).toThrow(
+      /Scheduling settings changed/u,
+    )
+    expect(f.repo.readRelayCredential()).toEqual({ ciphertext: cipherA, revision: 1 })
+    expect(f.repo.schedulingConfigurationGeneration()).toBe(1)
+  })
+
+  it('rejects expired deadlines, plaintext fields and malformed ciphertext before any side effect', async () => {
+    const f = await fixture()
+    const valid = saveRequest(randomUUID(), 0, cipherA)
+    for (const invalid of [
+      { ...valid, deadlineAt: Date.now() - 1 },
+      { ...valid, key: 'sk-synthetic' },
+      { ...valid, ciphertext: 'AB==' },
+      { ...valid, ciphertext: Buffer.alloc(8193).toString('base64') },
+      { ...valid, nonce: 'not-a-uuid' },
+      { ...valid, expectedRevision: -1 },
+      { ...valid, deadlineAt: 0 },
+    ])
+      expect(() => f.repo.writeRelayCredential(invalid)).toThrow(/credential/u)
+    expect(f.repo.readRelayCredential()).toEqual({ ciphertext: null, revision: 0 })
+    expect(f.repo.schedulingConfigurationGeneration()).toBe(0)
+    // Expiry inside the transaction: the third deadline check expires before the write.
+    const t = Date.now()
+    const spy = vi
+      .spyOn(Date, 'now')
+      .mockReturnValueOnce(t)
+      .mockReturnValueOnce(t + 10)
+      .mockReturnValue(t + 20)
+    try {
+      expect(() =>
+        f.repo.writeRelayCredential({
+          operation: 'save' as const,
+          nonce: randomUUID(),
+          expectedRevision: 0,
+          deadlineAt: t + 15,
+          ciphertext: cipherA,
+        }),
+      ).toThrow(/no longer current/u)
+      expect(f.repo.readRelayCredential()).toEqual({ ciphertext: null, revision: 0 })
+      expect(f.repo.schedulingSettings().revision).toBe(0)
+      expect(
+        f.db.drizzle.get(sql`SELECT count(*) AS count FROM relay_credential_receipts`),
+      ).toEqual({ count: 0 })
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('rolls back the whole credential write when the receipt insert fails', async () => {
+    const f = await fixture()
+    const request = saveRequest(randomUUID(), 0, cipherA)
+    const changed = vi.fn<() => void>()
+    const unsubscribe = f.repo.subscribeSchedulingChanges(changed)
+    f.db.drizzle.run(
+      sql`CREATE TEMP TRIGGER reject_credential_receipt BEFORE INSERT ON relay_credential_receipts BEGIN SELECT RAISE(ABORT,'controlled credential receipt failure'); END`,
+    )
+    expect(() => f.repo.writeRelayCredential(request)).toThrow(
+      /controlled credential receipt failure/u,
+    )
+    expect(f.repo.readRelayCredential()).toEqual({ ciphertext: null, revision: 0 })
+    expect(f.repo.schedulingSettings().revision).toBe(0)
+    expect(f.repo.schedulingConfigurationGeneration()).toBe(0)
+    expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM relay_credential_receipts`)).toEqual({
+      count: 0,
+    })
+    expect(changed).not.toHaveBeenCalled()
+    f.db.drizzle.run(sql`DROP TRIGGER reject_credential_receipt`)
+    const receipt = f.repo.writeRelayCredential(request)
+    expect(receipt).toMatchObject({ revision: 1, configured: true })
+    expect(changed).toHaveBeenCalledOnce()
+    unsubscribe()
+  })
+
+  it('rotates ciphertext under CAS without touching settings authority, receipts or generation', async () => {
+    const f = await fixture()
+    const nonce = randomUUID(),
+      original = f.repo.writeRelayCredential(saveRequest(nonce, 0, cipherA)),
+      settingsBefore = f.repo.schedulingSettings(),
+      generation = f.repo.schedulingConfigurationGeneration(),
+      fingerprint = f.repo.schedulingConfigurationFingerprint()
+    expect(f.repo.rotateRelayCredentialCiphertext(1, cipherA, cipherB)).toBe(true)
+    expect(f.repo.readRelayCredential()).toEqual({ ciphertext: cipherB, revision: 1 })
+    expect(f.repo.schedulingSettings()).toEqual(settingsBefore)
+    expect(f.repo.schedulingConfigurationGeneration()).toBe(generation)
+    expect(f.repo.schedulingConfigurationFingerprint()).toBe(fingerprint)
+    expect(f.repo.readRelayCredentialReceipt(nonce)).toEqual(original)
+    for (const attempt of [
+      [2, cipherB, cipherC],
+      [1, cipherA, cipherC],
+      [1, cipherB, 'AB=='],
+    ] as const)
+      expect(f.repo.rotateRelayCredentialCiphertext(attempt[0], attempt[1], attempt[2])).toBe(false)
+    // Replaying the original save nonce returns the durable receipt without reverting the rotation.
+    expect(f.repo.writeRelayCredential(saveRequest(nonce, 0, cipherA))).toEqual(original)
+    expect(f.repo.readRelayCredential()).toEqual({ ciphertext: cipherB, revision: 1 })
+    const second = f.repo.writeRelayCredential(saveRequest(randomUUID(), 1, cipherC))
+    expect(second).toMatchObject({ revision: 2, configured: true })
+    expect(f.repo.schedulingConfigurationGeneration()).toBe(generation + 1)
+    expect(f.repo.rotateRelayCredentialCiphertext(1, cipherB, cipherA)).toBe(false)
+    const removed = f.repo.writeRelayCredential({
+      operation: 'remove' as const,
+      nonce: randomUUID(),
+      expectedRevision: 2,
+      deadlineAt: Date.now() + 5000,
+    })
+    expect(removed).toMatchObject({ revision: 3, configured: false })
+    expect(f.repo.rotateRelayCredentialCiphertext(3, cipherC, cipherB)).toBe(false)
+  })
+})

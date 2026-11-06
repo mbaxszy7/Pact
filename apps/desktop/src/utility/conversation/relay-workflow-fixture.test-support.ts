@@ -9,12 +9,14 @@ import type {
   CollaborationAction,
   CollaborationReviewObservation,
   DecisionInput,
-  DecisionOutcome,
+  DecisionRemoteOutcome,
+  DecisionSelectionOutcome,
   NormalizedAgentEvent,
   RuntimeAgentId,
 } from '@pact/contracts'
 
 import {
+  OPENAI_DECISION_MODEL,
   advanceCollaboration,
   collaborationTaskSchema,
   collaborationDocumentSchema,
@@ -22,12 +24,13 @@ import {
 } from '@pact/contracts'
 import { PactDatabase } from '@pact/persistence'
 
-import type { CodexDecisionRuntime } from './codex-decision-runtime.js'
-import type { DecisionInputLoader } from './codex-decision-runtime.js'
 import type { Conversation } from './conversation.js'
+import type { DecisionInputLoader } from './decision-runtime.js'
+import type { OpenAIDecisionRuntime } from './openai-decision-runtime.js'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { AgentExecutionError } from './agent-execution-error.js'
 import { collaborationPlanMode } from './collaboration-prompt.js'
 import { DecisionMemoryLease } from './native-working-memory.js'
@@ -257,48 +260,51 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
 
 export function workflowDecisionRuntime(state: WorkflowNativeState) {
   return class {
+    readonly provider = 'openai'
+    readonly modelId = OPENAI_DECISION_MODEL
     invoked = false
     usage = { inputTokens: 31, outputTokens: 7 }
-    private work: Promise<DecisionOutcome> | undefined
+    private remoteOutcome: DecisionRemoteOutcome = 'not_sent'
+    private work: Promise<DecisionSelectionOutcome> | undefined
     private closeTask: Promise<boolean> | undefined
     private readonly controller = new AbortController()
     private readonly memory = new DecisionMemoryLease()
-    constructor(readonly context: ConstructorParameters<typeof CodexDecisionRuntime>[0]) {}
+    constructor(readonly context: ConstructorParameters<typeof OpenAIDecisionRuntime>[0]) {}
     evaluateDecision(load: DecisionInputLoader, signal: AbortSignal) {
       const observed = AbortSignal.any([signal, this.controller.signal])
-      this.work = (async (): Promise<DecisionOutcome> => {
+      this.work = (async (): Promise<DecisionSelectionOutcome> => {
         try {
-          const deadlineAt = this.context.deadlineAt ?? Date.now() + 15_000,
+          const deadlineAt = this.context.deadlineAt,
             input = await load({ signal: observed, deadlineAt })
-          const reserved = this.context.reserve!(input, { deadlineAt })
+          const reserved = this.context.reserve(input, { deadlineAt })
           if (reserved !== 'reserved') return { kind: 'unavailable', reason: reserved }
+          observed.throwIfAborted()
+          if (!(await this.context.credential({ signal: observed, deadlineAt })))
+            return { kind: 'unavailable', reason: 'runtime_unavailable' }
           observed.throwIfAborted()
           this.context.dispatch()
           this.invoked = true
+          this.remoteOutcome = 'responded'
           state.decisions.push(input)
-          const requested = state.candidate,
-            candidateId =
-              requested === null
+          const requested = state.candidate
+          const roleChoice = input.candidates.some(
+            (candidate) => candidate.id === 'propose_reassign_roles',
+          )
+          const candidateId =
+            roleChoice && requested !== 'propose_reassign_roles'
+              ? null
+              : requested === null
                 ? null
                 : (input.candidates.find((candidate) => candidate.id === requested)?.id ??
                   input.candidates[0]?.id ??
                   null)
           return {
-            kind: 'recommendation',
-            recommendation: {
+            kind: 'selection',
+            selection: {
               candidateId,
               ...(candidateId === 'clarify_prepared_input' && state.information
                 ? { information: state.information }
                 : {}),
-              highlights:
-                candidateId && candidateId !== 'clarify_prepared_input'
-                  ? [
-                      {
-                        text: 'Clarify the complete current scope once before fixed review.',
-                        sourceIds: [input.sources.at(-1)!.id],
-                      },
-                    ]
-                  : [],
             },
           }
         } catch {
@@ -309,21 +315,17 @@ export function workflowDecisionRuntime(state: WorkflowNativeState) {
         }
       })()
       return this.work.then(async (outcome) =>
-        outcome.kind === 'recommendation' && !(await this.settlement())
+        outcome.kind === 'selection' && !(await this.settlement())
           ? { kind: 'unavailable' as const, reason: 'runtime_unavailable' as const }
           : outcome,
       )
     }
+    diagnostics() {
+      return { remoteOutcome: this.remoteOutcome, working: this.memory.diagnostics() }
+    }
     settlement() {
       this.closeTask ??= (async () => {
-        const outcome = await this.work
-        await this.context.physicalCompletion?.({
-          memory: this.memory,
-          deadlineAt: Date.now() + 4_000,
-          nativeGeneration: 0,
-          witness: null,
-          ...(outcome ? { outcome, usage: this.usage } : {}),
-        })
+        await this.work
         this.memory.release()
         return true
       })().catch(() => false)
@@ -392,7 +394,11 @@ export async function workflowConversation(
     db.sessionRepository,
     db.projectCatalogRepository,
     preparation,
-    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
+    undefined,
+    undefined,
+    undefined,
+    () => 'OWNED_WORKFLOW_CREDENTIAL',
   )
   const input = (content: string) => {
     const drafts = db.conversationRepository.readPage({ scope: 'drafts', sessionId })
@@ -442,8 +448,16 @@ export function enableWorkflowRelay(db: PactDatabase) {
   repo.saveSchedulingSettings({
     expectedRevision: repo.schedulingSettings().revision,
     enabled: true,
-    selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
   })
+  // Idempotent opaque fixture ciphertext: never rotate existing cards on repeated calls.
+  if (repo.readRelayCredential().ciphertext === null)
+    repo.writeRelayCredential({
+      operation: 'save',
+      nonce: randomUUID(),
+      expectedRevision: repo.readRelayCredential().revision,
+      deadlineAt: Date.now() + 5000,
+      ciphertext: Buffer.from('owned encrypted workflow fixture').toString('base64'),
+    })
 }
 
 /** Reuses genuine Run publication and review producers within one shared authoritative database. */
@@ -462,30 +476,38 @@ export async function proposeWorkflowPlanOn(db: PactDatabase, index: number) {
     [{ id: 'propose_supplement_plan', description: 'Request one exact read-only clarification.' }],
     { signal: new AbortController().signal, deadlineAt },
   )
+  const httpOwner = {
+    version: 1,
+    kind: 'http',
+    utilityEpoch: randomUUID(),
+    utilityPid: process.pid,
+    requestId: randomUUID(),
+  } as const
   const reserved = f.repo.reserveEvaluation({
     handoff,
-    provider: 'codex',
-    model: 'gpt-6-luna',
-    configurationFingerprint: 'a'.repeat(64),
+    configurationFingerprint: f.repo.schedulingConfigurationFingerprint(),
     deadlineAt,
     inputSha256: material.inputSha256,
+    httpOwner,
   })
   if (reserved.status !== 'reserved') throw Error('Expected the current real reservation')
-  f.repo.dispatchEvaluation(reserved.evaluation.id)
+  f.repo.dispatchEvaluation(reserved.evaluation.id, httpOwner)
   f.repo.settleEvaluation(reserved.evaluation.id, {
     outcome: 'completed',
     physicalReleased: true,
     selectedCandidateId: 'propose_supplement_plan',
+    httpOwner,
+    remoteOutcome: 'responded',
   })
   const card = f.repo.proposeRelayWorkflowAction({
     handoff,
     kind: 'supplement_plan',
     evaluationId: reserved.evaluation.id,
     configurationGeneration: f.repo.schedulingConfigurationGeneration(),
+    configurationFingerprint: f.repo.schedulingConfigurationFingerprint(),
     inputSha256: material.inputSha256,
     sourceFingerprint: material.sourceFingerprint,
     deadlineAt,
-    reason: 'One specific read-only clarification before the fixed reviewer.',
     sourceIds: material.sources.map((source) => source.id),
   })
   return { sessionId: f.sessionId, card }

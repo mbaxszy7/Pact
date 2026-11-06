@@ -1,4 +1,5 @@
 /* oxlint-disable vitest/no-conditional-expect, no-await-in-loop -- Each Off/On target has distinct mandatory native assertions and shares the one serial physical owner. */
+import { sql } from 'drizzle-orm'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -12,7 +13,6 @@ import type {
   AgentRunInput,
 } from '@pact/agent-runtime'
 import type {
-  DecisionCapability,
   NativeProbeResult,
   NormalizedAgentEvent,
   NativeContextRebuildChunk,
@@ -22,6 +22,7 @@ import { PactDatabase } from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { AgentExecutionError } from './agent-execution-error'
 import { Conversation } from './conversation'
 
@@ -32,7 +33,6 @@ const native = vi.hoisted(() => ({
   physical: undefined as ReturnType<typeof Promise.withResolvers<void>> | undefined,
   mode: 'unknown' as 'unknown' | 'unsent',
   fences: [] as boolean[],
-  probes: 0,
   receipts: [] as AgentNativeInputProbeInput[],
   candidates: [] as AgentNativeContextRebuildInput[],
   candidateSources: [] as NativeContextRebuildChunk[][],
@@ -171,27 +171,11 @@ vi.mock('./claude-agent-adapter.js', () => ({
     async dispose() {}
   },
 }))
-vi.mock('./codex-decision-runtime.js', () => ({
-  CodexDecisionRuntime: class {
-    async probeAdmission(): Promise<DecisionCapability> {
-      native.probes++
-      return {
-        provider: 'codex',
-        modelId: 'gpt-6-luna',
-        status: 'supported',
-        supported: true,
-        reason: 'supported',
-        configurationFingerprint: 'a'.repeat(64),
-        checkedAt: new Date().toISOString(),
-        physicalReleased: true,
-      }
-    }
-    async settlement() {
-      return true
-    }
-    async dispose() {
-      return true
-    }
+const api = vi.hoisted(() => ({ constructions: 0 }))
+vi.mock('./openai-decision-runtime.js', () => ({
+  OpenAIDecisionRuntime: function () {
+    api.constructions++
+    throw Error('Deterministic recovery must not consult a decision model')
   },
 }))
 
@@ -206,21 +190,23 @@ afterEach(async () => {
       await rm(f.directory, { recursive: true, force: true })
     }),
   )
+  const constructions = api.constructions
+  api.constructions = 0
   native.runs = []
   native.checks = []
   native.signal = undefined
   native.physical = undefined
   native.mode = 'unknown'
   native.fences = []
-  native.probes = 0
   native.receipts = []
   native.candidates = []
   native.candidateSources = []
   native.rootEnded = false
   vi.restoreAllMocks()
+  if (constructions !== 0) throw Error('Deterministic recovery constructed a decision model')
 })
 
-async function fixture(enabled = true, warmContext = true) {
+async function fixture(enabled = true) {
   const directory = await mkdtemp(join(tmpdir(), 'pact-automatic-recovery-'))
   const db = await PactDatabase.open({
     filePath: ':memory:',
@@ -249,7 +235,6 @@ async function fixture(enabled = true, warmContext = true) {
   db.conversationRepository.saveSchedulingSettings({
     expectedRevision: 0,
     enabled,
-    selection: { target: 'codex_luna', provider: 'codex', modelId: 'gpt-6-luna' },
   })
   const preparation = new RuntimePreparation(db.runtimePreparationRepository)
   vi.spyOn(preparation, 'findRecoveryExecutable').mockResolvedValue('/controlled/codex')
@@ -279,14 +264,9 @@ async function fixture(enabled = true, warmContext = true) {
     db.sessionRepository,
     db.projectCatalogRepository,
     preparation,
-    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
   )
   fixtures.push({ db, flow, directory })
-  if (warmContext) {
-    const refreshed = await flow.refreshSchedulingState({ sessionId })
-    if (!refreshed.ok || refreshed.value.context?.observation.status !== 'supported')
-      throw Error('The recovery fixture requires supported native compatibility.')
-  }
   return {
     db,
     repo: db.conversationRepository,
@@ -450,7 +430,7 @@ describe('automatic recovery through Conversation', () => {
         businessDispatches: number
       }> = []
       for (const enabled of [false, true]) {
-        const f = await fixture(enabled, false)
+        const f = await fixture(enabled)
         const starts = {
           status: native.checks.length,
           receipts: native.receipts.length,
@@ -546,26 +526,17 @@ describe('automatic recovery through Conversation', () => {
       )
     },
   )
-  it('checks a new Session fault without first opening its Relay settings', async () => {
-    const f = await fixture(true, false)
-    expect(native.probes).toBe(0)
+  it('checks a new Session fault without first consulting a decision model', async () => {
+    const f = await fixture(true)
+    expect(f.repo.schedulingSettings().credential.configured).toBe(false)
+    expect(api.constructions).toBe(0)
     expect((await f.send()).ok).toBe(true)
     await vi.waitFor(() => expect(native.checks).toHaveLength(1))
-    expect(native.probes).toBe(1)
+    expect(api.constructions).toBe(0)
+    expect(f.db.drizzle.get(sql`SELECT count(*) AS n FROM scheduling_evaluations`)).toEqual({
+      n: 0,
+    })
     expect(native.runs).toHaveLength(1)
-  })
-  it('refreshes expired native compatibility once before checking a later fault', async () => {
-    const f = await fixture()
-    const state = f.flow.getSchedulingState({ sessionId: f.sessionId })
-    expect(state.ok).toBe(true)
-    if (!state.ok) throw Error('Relay state unavailable')
-    const expiry = state.value.context!.observation.expiresAt!
-    const now = vi.spyOn(Date, 'now').mockReturnValue(Date.parse(expiry) + 1)
-    expect((await f.send()).ok).toBe(true)
-    await vi.waitFor(() => expect(native.checks).toHaveLength(1))
-    expect(native.probes).toBe(2)
-    expect(native.runs).toHaveLength(1)
-    now.mockRestore()
   })
   it('does not reopen a Relay recovery action when stopped readback physically finishes later', async () => {
     const f = await fixture()
