@@ -1021,20 +1021,64 @@ describe('Relay activity display', () => {
     ])
     const text = els.map((el) => el.textContent ?? '')
     expect(text[0]).toContain('Route to Claude Code')
-    expect(text[0]).toContain('Awaiting result')
+    expect(text[0]).toContain('Pending')
     expect(text[1]).toContain('Review code')
     expect(text[1]).toContain('Completed')
     expect(text[2]).toContain('Repair code')
-    expect(text[2]).toContain('Needs confirmation')
-    expect(text[3]).toContain('Message routing')
-    expect(text[3]).toContain('Default kept')
-    expect(text[4]).toContain('Message routing')
-    expect(text[4]).toContain('No decision')
+    expect(text[2]).toContain('Needs attention')
+    expect(text[2]).toContain('Your confirmation is needed')
+    expect(text[3]).toContain('Relay decision')
+    expect(text[3]).toContain('Default workflow')
+    expect(text[4]).toContain('Relay decision')
+    expect(text[4]).toContain('Failed')
     expect(text[5]).toContain('Failed')
     expect(text[5]).not.toContain('Completed')
     expect(els[5]?.querySelector('.text-danger')).not.toBeNull()
-    expect(els[4]?.querySelector('.text-danger')).toBeNull()
-    expect(text[6]).toContain('No change')
+    expect(els[4]?.querySelector('.text-danger')).not.toBeNull()
+    expect(text[6]).toContain('Completed')
+    expect(text[6]).toContain('Relay decision')
+  })
+
+  it('keeps failed Relay decisions separate from dispatch results and never presents adopted advice as completed work', async () => {
+    const els = await renderActivity([
+      row(1, {
+        action: 'plan_review',
+        actionResult: 'completed',
+        suggestionState: 'fallback',
+        called: true,
+        result: 'failed',
+      }),
+      row(2, {
+        action: 'plan_review',
+        actionResult: 'not_sent',
+        suggestionState: 'fallback',
+        called: true,
+        result: 'failed',
+      }),
+      row(3, {
+        action: 'plan_review',
+        actionResult: null,
+        suggestionState: 'adopted',
+        called: true,
+        result: 'completed',
+      }),
+      row(4, { action: 'plan_review', actionResult: 'unconfirmed', result: 'completed' }),
+      row(5, { action: 'plan_review', actionResult: 'reserved' }),
+      row(6, { action: 'plan_review', actionResult: 'superseded' }),
+    ])
+    expect(
+      els.map((el) => el.querySelector('[data-activity-text="outcome"]')?.textContent),
+    ).toEqual(['Completed', 'Not sent', 'Pending', 'Needs attention', 'Pending', 'Stopped'])
+    for (const el of els.slice(0, 2)) {
+      expect(el.textContent).toContain('Relay failed · Default workflow')
+      expect(
+        el.querySelector('[data-activity-text="decision"]')?.classList.contains('text-danger'),
+      ).toBe(true)
+      expect(el.querySelector('[data-activity-text="review"]')).toBeNull()
+    }
+    expect(els[2]?.textContent).toContain('Relay: Applied')
+    expect(els[2]?.textContent).not.toContain('Completed')
+    expect(els[3]?.textContent).toContain('Result unconfirmed')
   })
 
   it('outcomes truthfully mark failed runs and omit suggestion prose and provider model text', async () => {
@@ -1068,15 +1112,16 @@ describe('Relay activity display', () => {
     ])
     const [failed, clarify, applied] = els
     expect(failed?.textContent).toContain('Check agent session')
-    expect(failed?.textContent).toContain('Check failed')
+    expect(failed?.textContent).toContain('Failed')
     expect(failed?.querySelector('.text-danger')).not.toBeNull()
     expect(failed?.textContent).toContain('Previous work unconfirmed')
     expect(failed?.textContent).toContain('Cleanup unconfirmed')
     expect(clarify?.textContent).toContain('Clarify input')
-    expect(clarify?.textContent).toContain('Needs information')
-    expect(applied?.textContent).toContain('Message routing')
+    expect(clarify?.textContent).toContain('Needs attention')
+    expect(clarify?.textContent).toContain('Your input is needed')
+    expect(applied?.textContent).toContain('Relay decision')
     expect(applied?.textContent).toContain('Applied')
-    expect(applied?.textContent).not.toContain('Completed')
+    expect(applied?.textContent).toContain('Completed')
     for (const el of els) {
       expect(el.textContent).not.toContain('generated suggestion prose')
       expect(el.textContent).not.toContain('OpenAI')

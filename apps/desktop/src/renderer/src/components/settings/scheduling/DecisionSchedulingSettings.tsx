@@ -594,71 +594,96 @@ const activityReasons: Record<SchedulingActivityRow['reason'], string> = {
   confirmed_resend: 'Retry unsent work',
 }
 const activityResults: Record<NonNullable<SchedulingActivityRow['actionResult']>, string> = {
-  reserved: 'Not started',
-  dispatched: 'Awaiting result',
+  reserved: 'Pending',
+  dispatched: 'Pending',
   completed: 'Completed',
   failed: 'Failed',
-  not_sent: 'Not started',
-  unconfirmed: 'Unconfirmed',
-  cancelled: 'Cancelled',
-  superseded: 'Superseded',
+  not_sent: 'Not sent',
+  unconfirmed: 'Needs attention',
+  cancelled: 'Stopped',
+  superseded: 'Stopped',
 }
 function activityDisplay(row: SchedulingActivityRow): {
   action: string
   outcome: string
+  decision: string | null
+  decisionFailed: boolean
   warning: string | null
   failed: boolean
 } {
-  const action = row.action ? activityActions[row.action] : activityReasons[row.reason]
   const check = ['native_check', 'queue_check', 'rebuild_check'].includes(row.reason)
+  const decisionOnly = !row.action && (row.reason === 'workflow' || row.reason === 'input')
+  const action = row.action
+    ? activityActions[row.action]
+    : decisionOnly
+      ? 'Relay decision'
+      : activityReasons[row.reason]
   let outcome: string
-  if (row.suggestionState === 'awaiting_user')
-    outcome = row.action === 'clarify_prepared_input' ? 'Needs information' : 'Needs confirmation'
+  if (row.suggestionState === 'awaiting_user') outcome = 'Needs attention'
   else if (row.actionResult) outcome = activityResults[row.actionResult]
-  else if (check)
+  else if (check || decisionOnly)
     outcome =
-      row.result === 'completed'
-        ? 'Checked'
-        : row.result === 'failed'
-          ? 'Check failed'
-          : row.result === 'possibly_sent'
-            ? 'Awaiting result'
-            : 'Not started'
-  else if (row.suggestionState === 'adopted') outcome = 'Applied'
-  else if (row.suggestionState === 'suggested') outcome = 'Suggested'
-  else if (row.suggestionState === 'discarded') outcome = 'Not used'
-  else if (row.suggestionState === 'fallback') outcome = 'Default kept'
-  else
-    outcome =
-      row.result === 'completed'
-        ? row.suggestion
-          ? 'Suggested'
-          : 'No change'
-        : row.result === 'failed'
-          ? 'No decision'
-          : row.result === 'not_sent'
-            ? 'Not consulted'
-            : row.result === 'possibly_sent'
-              ? 'Awaiting result'
+      row.suggestionState === 'discarded'
+        ? 'Stopped'
+        : row.result === 'completed'
+          ? 'Completed'
+          : row.result === 'failed'
+            ? 'Failed'
+            : row.result === 'not_sent'
+              ? 'Not sent'
               : 'Pending'
+  else if (row.suggestionState === 'discarded') outcome = 'Stopped'
+  else outcome = 'Pending'
   const terminal = row.actionResult
     ? ['completed', 'failed', 'not_sent', 'cancelled', 'superseded'].includes(row.actionResult)
     : ['completed', 'failed', 'not_sent'].includes(row.result)
   const warnings = [
+    row.suggestionState === 'awaiting_user'
+      ? row.action === 'clarify_prepared_input'
+        ? 'Your input is needed'
+        : 'Your confirmation is needed'
+      : row.actionResult === 'unconfirmed'
+        ? 'Result unconfirmed'
+        : null,
     row.originalUnconfirmed ? 'Previous work unconfirmed' : null,
     terminal && row.physicalUnconfirmed ? 'Cleanup unconfirmed' : null,
   ].filter(Boolean)
+  const decisionFailed =
+    !check &&
+    row.reason !== 'native_rebuild' &&
+    row.reason !== 'confirmed_resend' &&
+    row.called &&
+    row.result === 'failed'
+  const decision =
+    !check && row.reason !== 'native_rebuild' && row.reason !== 'confirmed_resend'
+      ? decisionFailed
+        ? row.suggestionState === 'fallback'
+          ? 'Relay failed · Default workflow'
+          : decisionOnly
+            ? null
+            : 'Relay: Failed'
+        : row.suggestionState === 'fallback'
+          ? 'Default workflow'
+          : row.suggestionState === 'adopted'
+            ? 'Relay: Applied'
+            : row.suggestionState === 'suggested'
+              ? 'Relay: Suggested'
+              : null
+      : null
   return {
     action,
     outcome,
+    decision,
+    decisionFailed,
     warning: warnings.length ? warnings.join(' · ') : null,
-    failed: outcome === 'Failed' || outcome === 'Check failed',
+    failed: outcome === 'Failed',
   }
 }
 
 const selectionParts = [
   'action',
   'outcome',
+  'decision',
   'context',
   'time',
   'time-context',
@@ -1263,6 +1288,14 @@ export function DecisionSchedulingSettings({
                                 {display.outcome}
                               </p>
                             </div>
+                            {display.decision ? (
+                              <p
+                                data-activity-text="decision"
+                                className={`mt-1 wrap-break-word ${display.decisionFailed ? 'text-danger' : 'text-secondary'}`}
+                              >
+                                {display.decision}
+                              </p>
+                            ) : null}
                             <p
                               data-activity-text="context"
                               className="mt-1 wrap-break-word text-tertiary"

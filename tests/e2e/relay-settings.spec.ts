@@ -459,10 +459,10 @@ test(
       const activity = page.getByRole('region', { name: 'Relay activity', exact: true })
       await expect(activity.locator('[data-activity-row]')).toHaveCount(25)
       await expect(activity.locator('[data-activity-text="action"]').first()).toHaveText(
-        'Workflow handoff',
+        'Relay decision',
       )
       await expect(activity.locator('[data-activity-text="outcome"]').first()).toHaveText(
-        'Not consulted',
+        'Not sent',
       )
       await expect(activity.getByRole('button')).toHaveCount(0)
       await expect(activity.getByRole('link')).toHaveCount(0)
