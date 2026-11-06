@@ -39,6 +39,8 @@ export function CurrentPlanPanel({
   onRetry,
   onOpenProjectFile,
   onCreatePlanComment,
+  latestVersion,
+  onOpenLatest,
 }: {
   plan?: CurrentPlanDocument | undefined
   loading: boolean
@@ -53,6 +55,8 @@ export function CurrentPlanPanel({
   onRetry: () => void
   onOpenProjectFile: (target: ProjectFileTarget) => void
   onCreatePlanComment?: ((selection: PlanTextSelection) => void) | undefined
+  latestVersion?: number | undefined
+  onOpenLatest?: (() => void) | undefined
 }): React.JSX.Element {
   const planDocumentRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -77,10 +81,26 @@ export function CurrentPlanPanel({
     >
       <header className="flex shrink-0 items-start justify-between gap-group border-b border-border px-section py-panel">
         <div className="min-w-0">
-          <h2 className="flex items-baseline gap-2 text-body font-medium text-primary">
-            {source ? 'Plan source' : 'Current plan'}
-            {plan ? <span className="font-normal text-secondary">· v{plan.version}</span> : null}
-          </h2>
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="flex items-baseline gap-2 text-body font-medium text-primary">
+              {source ? 'Plan source' : 'Current plan'}
+              {plan ? <span className="font-normal text-secondary">· v{plan.version}</span> : null}
+            </h2>
+            {source &&
+            plan &&
+            latestVersion !== undefined &&
+            latestVersion > plan.version &&
+            onOpenLatest ? (
+              <button
+                type="button"
+                aria-label={`View latest plan version ${latestVersion}`}
+                onClick={onOpenLatest}
+                className="inline-flex min-h-7 items-center rounded-control bg-surface-inverse px-2.5 text-caption font-medium text-inverse hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+              >
+                View latest · v{latestVersion}
+              </button>
+            ) : null}
+          </div>
           {plan ? (
             <p className="mt-2 text-caption text-secondary">
               Plan by {plan.author === 'claude' ? 'Claude Code' : 'Codex'} · {plan.status}

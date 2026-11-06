@@ -16,6 +16,7 @@ import { collaborationFixture, reportPage, markdownPage } from './collaboration.
 import { composerBridgeFixture } from './composer.test-helper'
 import { windowFromPage } from './conversation-window'
 import { ConversationView } from './ConversationView'
+import { CurrentPlanPanel, type CurrentPlanDocument } from './CurrentPlanPanel'
 import { focusProjectionRange } from './message-selection'
 
 const virtualState = vi.hoisted(() => ({
@@ -1939,4 +1940,73 @@ it('keeps cancellation receipt recovery visible after the host card disappears, 
   expect(screen.getByRole('combobox', { name: 'Message' }).textContent).toBe(props.composer)
   expect(screen.queryByRole('button', { name: 'Cancel this scheduling action' })).toBeNull()
   expect(props.onSend).not.toHaveBeenCalled()
+})
+
+const sourcePlanFixture = (): CurrentPlanDocument => ({
+  runId: crypto.randomUUID(),
+  messageId: crypto.randomUUID(),
+  version: 1,
+  author: 'claude',
+  content: '',
+  status: 'Original version',
+})
+
+const renderPlanPanel = ({
+  plan,
+  source,
+  latestVersion,
+  onOpenLatest,
+}: {
+  plan?: CurrentPlanDocument | undefined
+  source?: boolean | undefined
+  latestVersion?: number | undefined
+  onOpenLatest?: (() => void) | undefined
+}) =>
+  render(
+    <CurrentPlanPanel
+      plan={plan}
+      loading={false}
+      source={source}
+      latestVersion={latestVersion}
+      onOpenLatest={onOpenLatest}
+      onClose={vi.fn<() => void>()}
+      onRetry={vi.fn<() => void>()}
+      onOpenProjectFile={vi.fn<ComponentProps<typeof CurrentPlanPanel>['onOpenProjectFile']>()}
+    />,
+  )
+
+it('offers the latest plan version while viewing an older plan source', () => {
+  const onOpenLatest = vi.fn<() => void>()
+  renderPlanPanel({
+    plan: sourcePlanFixture(),
+    source: true,
+    latestVersion: 5,
+    onOpenLatest,
+  })
+  const button = screen.getByRole('button', { name: 'View latest plan version 5' })
+  expect(button.textContent).toBe('View latest · v5')
+  expect(screen.getByRole('heading', { name: 'Plan source· v1' })).toBeDefined()
+  fireEvent.click(button)
+  expect(onOpenLatest).toHaveBeenCalledTimes(1)
+})
+
+it.each([
+  { description: 'the current plan view', source: false, latestVersion: 5, handler: true },
+  { description: 'the same source plan version', source: true, latestVersion: 1, handler: true },
+  { description: 'an older latest version', source: true, latestVersion: 0, handler: true },
+  { description: 'no newer version', source: true, latestVersion: undefined, handler: true },
+  { description: 'a missing open handler', source: true, latestVersion: 5, handler: false },
+])('hides the latest-version button for $description', ({ source, latestVersion, handler }) => {
+  renderPlanPanel({
+    plan: sourcePlanFixture(),
+    source,
+    latestVersion,
+    onOpenLatest: handler ? vi.fn<() => void>() : undefined,
+  })
+  expect(screen.queryByRole('button', { name: /View latest plan version/ })).toBeNull()
+})
+
+it('hides the latest-version button when no plan source is shown', () => {
+  renderPlanPanel({ source: true, latestVersion: 5, onOpenLatest: vi.fn<() => void>() })
+  expect(screen.queryByRole('button', { name: /View latest plan version/ })).toBeNull()
 })

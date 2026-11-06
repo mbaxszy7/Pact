@@ -2666,6 +2666,7 @@ export function ConversationView({
       : `restore:${gapRecoveryPending ?? ''}:${gapRestoreRef.current?.messageId ?? ''}`
   const [planSourcePreview, setPlanSourcePreview] = useState<{
     key: string
+    taskId?: string | undefined
     plan?: CurrentPlanDocument | undefined
     error?: string | undefined
   }>()
@@ -2724,6 +2725,7 @@ export function ConversationView({
         }
         setPlanSourcePreview({
           key: requested.key,
+          taskId: task.id,
           plan: {
             runId: requested.runId,
             messageId: source.messageId,
@@ -3573,6 +3575,30 @@ export function ConversationView({
     </>
   )
 
+  const sourcePreview =
+    planSourceKey && planSourcePreview?.key === planSourceKey ? planSourcePreview : undefined
+  const latestPlanVersion =
+    sourcePreview?.plan &&
+    planningTask?.planReference &&
+    currentPlan?.source &&
+    planningTask.id === sourcePreview.taskId &&
+    planningTask.planVersion > sourcePreview.plan.version
+      ? planningTask.planVersion
+      : undefined
+  const showCurrentPlan = (): void => {
+    if (planSourceNavigation) {
+      planSourceRead.current.desired = undefined
+      setPlanSourcePreview(undefined)
+      setCardPlanNavigation(undefined)
+      setDismissedNavigation(messageNavigation)
+      planAvailableCallback.current?.(
+        session.id,
+        planningTask?.planReference && currentPlan?.source ? planningTask.id : undefined,
+      )
+    }
+    onOpenPlan?.()
+  }
+
   return (
     <main className="@container/conversation flex h-full min-h-0 flex-col">
       {planPanelHost
@@ -3639,6 +3665,8 @@ export function ConversationView({
                     : undefined
               }
               source={Boolean(planSourceKey)}
+              latestVersion={latestPlanVersion}
+              onOpenLatest={showCurrentPlan}
               onPlanReady={handlePanelPlanReady}
               onRevealApplied={(id) => {
                 const navigation = planSourceNavigationRef.current
@@ -3682,19 +3710,7 @@ export function ConversationView({
           <button
             ref={planRestoreFocusRef}
             type="button"
-            onClick={() => {
-              if (planSourceNavigation) {
-                planSourceRead.current.desired = undefined
-                setPlanSourcePreview(undefined)
-                setCardPlanNavigation(undefined)
-                setDismissedNavigation(messageNavigation)
-                planAvailableCallback.current?.(
-                  session.id,
-                  planningTask?.planReference && currentPlan?.source ? planningTask.id : undefined,
-                )
-              }
-              onOpenPlan?.()
-            }}
+            onClick={showCurrentPlan}
             className="inline-flex min-h-8 items-center gap-2 rounded-control px-2 text-caption font-medium text-secondary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
           >
             <BookOpen aria-hidden="true" className="size-4" strokeWidth={1.75} /> Plan
