@@ -537,7 +537,7 @@ export async function writeWindowsObservedLauncher(
       firstFailure ||
       !Number.isFinite(remaining) ||
       remaining <= 0 ||
-      remaining > 30_000
+      deadline > now + 30_000
     )
       throw new Error('Windows Job startup requires one live bounded caller deadline')
     if (preparationDeadline === undefined || now >= preparationDeadline) {

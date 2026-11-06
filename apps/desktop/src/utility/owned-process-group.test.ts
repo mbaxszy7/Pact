@@ -9,6 +9,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { OwnedProcessGroup, OwnedProcessIdentityError } from './owned-process-group'
 
+await import('../../../../tests/native/windows-process-owner-setup.js')
+
 interface ProcessIdentity {
   pid: number
   groupId: number
@@ -309,6 +311,25 @@ describe('Owned physical process groups', () => {
       })
       expect(closeInput).toHaveBeenCalledOnce()
       expect(fixture.child.stdin.listenerCount('error')).toBe(0)
+    },
+  )
+
+  it.skipIf(process.platform !== 'win32')(
+    'releases Windows facade error listeners without removing caller listeners',
+    async () => {
+      const fixture = await createFixture('eof')
+      const inputError = vi.fn<(error: Error) => void>(),
+        childError = vi.fn<(error: Error) => void>()
+      fixture.child.stdin.on('error', inputError)
+      fixture.child.on('error', childError)
+      await fixture.owner.close()
+      await expectReleased(fixture)
+      expect(fixture.child.stdin.listeners('error')).toEqual([inputError])
+      expect(fixture.child.listeners('error')).toEqual([childError])
+      expect(inputError).not.toHaveBeenCalled()
+      expect(childError).not.toHaveBeenCalled()
+      fixture.child.stdin.off('error', inputError)
+      fixture.child.off('error', childError)
     },
   )
 

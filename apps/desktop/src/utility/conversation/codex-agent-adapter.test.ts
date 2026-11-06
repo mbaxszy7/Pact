@@ -1591,7 +1591,8 @@ describe('Codex Agent lifecycle', () => {
       if (variant === 'native-plugin')
         Object.assign(rawConfig.plugins, { custom: { enabled: true } })
       const updates: object[] = [],
-        probeRequests: object[] = []
+        probeRequests: object[] = [],
+        modelRequests: object[] = []
       let probeReleased = false,
         releasedAtModelStart: boolean | undefined,
         modelTurns = 0,
@@ -1603,6 +1604,7 @@ describe('Codex Agent lifecycle', () => {
             method = Reflect.get(request, 'method')
           if (method === 'initialize') respond({ id, result: {} })
           else if (method === 'turn/start') {
+            modelRequests.push(Reflect.get(request, 'params'))
             releasedAtModelStart = probeReleased
             modelTurns += 1
             respond({ id, result: { turn: { id: 'turn-1' } } })
@@ -1768,11 +1770,26 @@ describe('Codex Agent lifecycle', () => {
             ? [
                 {
                   threadId: 'thread-1',
-                  model: 'gpt-test',
-                  reasoningEffort: 'medium',
                   approvalPolicy: 'on-request',
                   approvalsReviewer: 'user',
                   sandboxPolicy: nativeSandbox,
+                },
+              ]
+            : [],
+        )
+        expect(modelRequests.map((request) => Reflect.get(request, 'threadId'))).toEqual(
+          succeeds ? ['thread-1'] : [],
+        )
+        expect(modelRequests.map((request) => Reflect.get(request, 'collaborationMode'))).toEqual(
+          succeeds
+            ? [
+                {
+                  mode: 'default',
+                  settings: {
+                    model: 'gpt-test',
+                    reasoning_effort: 'medium',
+                    developer_instructions: null,
+                  },
                 },
               ]
             : [],

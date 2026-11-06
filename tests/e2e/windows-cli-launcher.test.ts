@@ -35,6 +35,8 @@ import {
   writeWindowsObservedLauncher,
 } from './windows-cli-launcher.js'
 
+await import('../native/windows-process-owner-setup.js')
+
 afterAll(() => {
   if (process.platform !== 'win32') return
   disposeWindowsLauncherImage()
@@ -373,6 +375,35 @@ it.skipIf(process.platform !== 'win32').each(['cancelled', 'disposed', 'already-
       if (state === 'already-armed') await owner.started.catch(() => undefined)
     } finally {
       await owner.disposeControl()
+      await rm(root, { recursive: true, force: true })
+    }
+  },
+)
+
+it.skipIf(process.platform !== 'win32').each([30_000, 30_001])(
+  'checks the startup deadline at a fractional clock without extending its bound: %s',
+  async (duration) => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-fractional-startup-test-'))
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(15_001.3)
+    let owner: Awaited<ReturnType<typeof writeWindowsObservedLauncher>> | undefined
+    try {
+      owner = await writeWindowsObservedLauncher(root, process.execPath, 10_000)
+      let failure: unknown
+      try {
+        owner.armStartup(performance.now() + duration)
+      } catch (error) {
+        failure = error
+      }
+      expect(failure instanceof Error ? failure.message : failure).toBe(
+        duration === 30_000
+          ? undefined
+          : 'Windows Job startup requires one live bounded caller deadline',
+      )
+      expect(owner.diagnostic().stages.armed).toBe(duration === 30_000 ? 0 : undefined)
+      expect(owner.diagnostic().startupDeadlineMs).toBe(duration === 30_000 ? 30_000 : undefined)
+    } finally {
+      clock.mockRestore()
+      await owner?.disposeControl()
       await rm(root, { recursive: true, force: true })
     }
   },

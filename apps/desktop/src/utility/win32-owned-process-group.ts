@@ -437,6 +437,7 @@ export class WindowsOwnedProcess {
   private rootExitCode: number | null = null
   private killed = false
   private readonly abort = () => this.requestStop()
+  private readonly ignoreFacadeError = () => undefined
 
   constructor(
     command: string,
@@ -484,8 +485,8 @@ export class WindowsOwnedProcess {
     this.child.unref = () => {
       this.helper?.process.unref()
     }
-    this.input.on('error', () => undefined)
-    this.child.on('error', () => undefined)
+    this.input.on('error', this.ignoreFacadeError)
+    this.child.on('error', this.ignoreFacadeError)
     spawnOptions.signal?.addEventListener('abort', this.abort, { once: true })
     this.initialization = Promise.resolve().then(() => this.initialize(command, args))
     void within(this.initialization, this.preparationDeadline).catch(() => {
@@ -750,6 +751,8 @@ export class WindowsOwnedProcess {
       )
     }
     this.closeFacade()
+    this.input.off('error', this.ignoreFacadeError)
+    this.child.off('error', this.ignoreFacadeError)
     this.didRelease = true
     this.reservation.release()
   }

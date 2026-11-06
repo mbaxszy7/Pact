@@ -2528,10 +2528,14 @@ describe('Initial stage-role assignment through the modern Composer', () => {
       expect(planTask.stageRoles).toMatchObject(roles)
       expect(f.db.sessionRepository.find(f.sessionId)!.settings.primaryAgentId).toBe(primary)
       expect(f.db.conversationRepository.relaySchedulingDecision(f.sessionId)).toBeNull()
-      expect(await f.act('execute')).toMatchObject({
-        stage: 'code_review',
-        status: 'complete',
-      })
+      await f.act('execute')
+      await vi.waitFor(() =>
+        expect(f.db.conversationRepository.collaboration(f.sessionId)).toMatchObject({
+          stage: 'code_review',
+          status: 'complete',
+        }),
+      )
+      await f.settled()
       expect(native.inputs).toHaveLength(4)
       expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.actor)).toEqual([
         roles.planAuthor,
@@ -2638,8 +2642,13 @@ describe('Initial role assignment boundaries', () => {
     expect(reviewAuth.userAuthority).toBeUndefined()
     expect(f.db.drizzle.select().from(collaborationActionReceipts).all()).toHaveLength(0)
     expect(f.db.conversationRepository.relaySchedulingDecision(f.sessionId)).toBeNull()
-    const repaired = await f.act('repair')
-    expect(repaired).toMatchObject({ stage: 'code_review', status: 'complete' })
+    await f.act('repair')
+    await vi.waitFor(() =>
+      expect(f.db.conversationRepository.collaboration(f.sessionId)).toMatchObject({
+        stage: 'code_review',
+        status: 'complete',
+      }),
+    )
     await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
     const task = await f.settled()
     expect(
@@ -2689,7 +2698,7 @@ describe('Initial role assignment boundaries', () => {
       await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
       const task = await f.settled()
       // The distinct plan_ready handoff remains eligible after abstention or invalid output.
-      expect(native.decisions).toHaveLength(2)
+      await vi.waitFor(() => expect(native.decisions).toHaveLength(2))
       expect(new Set(native.decisions.map((input) => input.handoff.id)).size).toBe(2)
       expect(
         native.decisions.filter((input) => input.candidates[0]?.id === 'propose_reassign_roles'),
@@ -2723,7 +2732,7 @@ describe('Initial role assignment boundaries', () => {
     await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
     const task = await f.settled()
     expect(task.stageRoles).toMatchObject({ planAuthor: 'codex', planReviewer: 'claude' })
-    expect(native.decisions).toHaveLength(2)
+    await vi.waitFor(() => expect(native.decisions).toHaveLength(2))
     expect(new Set(native.decisions.map((input) => input.handoff.id)).size).toBe(2)
   })
 
@@ -2909,6 +2918,8 @@ describe('Future code-role change through the real Conversation owner', () => {
     // Explicit Implement plan uses the confirmed map.
     native.decisionCandidate = null
     await f.act('execute')
+    await vi.waitFor(() => expect(repo.read(f.sessionId).runs).toHaveLength(4))
+    await f.settled()
     const executed = repo.read(f.sessionId).runs
     expect(executed.length).toBe(4)
     expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.actor)).toEqual([
@@ -2942,6 +2953,8 @@ describe('Future code-role change through the real Conversation owner', () => {
     expect(repo.collaboration(f.sessionId)).toEqual(before)
     native.decisionCandidate = null
     await f.act('execute')
+    await vi.waitFor(() => expect(repo.read(f.sessionId).runs).toHaveLength(4))
+    await f.settled()
     const runs = repo.read(f.sessionId).runs
     expect(runs.length).toBe(4)
     expect(runs[2]!.agentId).toBe('claude')

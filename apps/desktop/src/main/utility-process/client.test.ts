@@ -83,6 +83,7 @@ const harness = vi.hoisted(() => {
 })
 
 vi.mock('electron', () => ({
+  app: { isPackaged: false },
   utilityProcess: {
     fork: () => {
       const child = new harness.FakeUtilityProcess()

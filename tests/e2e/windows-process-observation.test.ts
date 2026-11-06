@@ -15,6 +15,8 @@ import {
   stopWindowsOwnedAgentProcess,
 } from './windows-process-observation.js'
 
+await import('../native/windows-process-owner-setup.js')
+
 async function observedTree(nested: boolean, count = 1, grandchild = false) {
   const root = await mkdtemp(join(tmpdir(), 'pact-process-observer-'))
   const owner = new OwnedProcessGroup()
@@ -105,9 +107,12 @@ it.skipIf(process.platform !== 'win32').each([false, true])(
       expect(sentinel.exitCode).toBeNull()
       expect(sentinel.signalCode).toBeNull()
     } finally {
-      await tree.close()
-      sentinel.kill()
-      await sentinelClosed
+      try {
+        await tree.close()
+      } finally {
+        sentinel.kill()
+        await sentinelClosed
+      }
     }
   },
   25_000,
