@@ -371,7 +371,11 @@ export const CollaborationReview = memo(function CollaborationReview({
         </p>
       ) : continuationLimit && limitName ? (
         <p className="mt-1 text-secondary">
-          {limitName.step} limit reached ({continuationLimit.used}/{continuationLimit.maximum}).
+          {limitName.step} limit reached (
+          {continuationLimit.used > continuationLimit.maximum
+            ? `${continuationLimit.used} used; Session limit ${continuationLimit.maximum}`
+            : `${continuationLimit.used}/${continuationLimit.maximum}`}
+          ).
           {' Increase '}
           {limitName.setting} in Session settings to continue.
         </p>

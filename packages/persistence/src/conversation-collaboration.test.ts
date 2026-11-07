@@ -88,7 +88,12 @@ function evaluationArgs(f: Awaited<ReturnType<typeof fixture>>, handoff: Schedul
 async function fixture(
   filePath = ':memory:',
   onOpened?: () => void,
-  roles: { primary: 'codex' | 'claude'; split?: boolean; inputSequence?: number } = {
+  roles: {
+    primary: 'codex' | 'claude'
+    split?: boolean
+    inputSequence?: number
+    nativeSessionId?: string
+  } = {
     primary: 'codex',
   },
 ) {
@@ -162,16 +167,18 @@ async function fixture(
     } = { plan: 'Scope and acceptance.' },
     settleEffects = true,
   ) => {
-    const run = repo.findRun(runId)!
+    const run = repo.findRun(runId)!,
+      nativeSessionId = roles.nativeSessionId ?? `fixture-${run.agentId}`,
+      nativeTurnId = roles.nativeSessionId ? runId : `turn-${runId}`
     repo.applyEvent(sessionId, runId, {
       type: 'session.started',
       agentId: run.agentId,
-      nativeSessionId: `fixture-${run.agentId}`,
+      nativeSessionId,
     })
     repo.applyEvent(sessionId, runId, {
       type: 'turn.started',
       agentId: run.agentId,
-      turnId: `turn-${runId}`,
+      turnId: nativeTurnId,
     })
     if (result.plan)
       repo.recordWorkflowPlan(runId, { nativeId: `plan-${runId}`, text: result.plan })
@@ -188,7 +195,7 @@ async function fixture(
     repo.applyEvent(sessionId, runId, {
       type: 'text.completed',
       agentId: run.agentId,
-      turnId: `turn-${runId}`,
+      turnId: nativeTurnId,
       outputId: `answer-${runId}`,
       text: result.answer ?? 'Checked current scope.',
     })
@@ -201,8 +208,8 @@ async function fixture(
         agentId: run.agentId,
         requestId: runId,
         runId,
-        nativeSessionId: `fixture-${run.agentId}`,
-        nativeTurnId: `turn-${runId}`,
+        nativeSessionId,
+        nativeTurnId,
         bindingGeneration: run.bindingGeneration ?? 1,
       },
     })
@@ -210,7 +217,7 @@ async function fixture(
     repo.applyEvent(sessionId, runId, {
       type: 'turn.completed',
       agentId: run.agentId,
-      turnId: `turn-${runId}`,
+      turnId: nativeTurnId,
       outcome: result.outcome ?? 'completed',
     })
     if (settleEffects) repo.recordNativeEffects(runId, 'settled')
@@ -659,9 +666,7 @@ describe('Shared handoff receipts and persistent scheduling budgets', () => {
     f.receive(f.input('Preserve the clarified Plan while documenting the latest acceptance.'))
     const reply = f.materialize()
     f.finish(reply.run.id, { plan: 'Current complete Plan after the new priority input.' })
-    f.repo.setCollaborationState(
-      advanceCollaboration(f.repo.collaboration(f.sessionId)!, 'resume', settings),
-    )
+    expect(f.repo.collaboration(f.sessionId)?.automation).toBe('active')
     const after = f.repo.collaboration(f.sessionId)!,
       nextNode = f.repo.workflowHandoff(after, after.reviewer)
     expect(nextNode.id).not.toBe(node.id)
@@ -1346,6 +1351,58 @@ it('binds native plan/review facts to their actual actor and exact version, then
   })
 })
 
+it.each(['valid', 'source_owner', 'source_binding', 'changed_input', 'changed_body'] as const)(
+  'authenticates only the current Claude planner frozen published checkpoint: %s',
+  async (mode) => {
+    const nativeSessionId = randomUUID(),
+      f = await fixture(undefined, undefined, { primary: 'claude', nativeSessionId })
+    expect(f.repo.workflowPlanCheckpoint(f.first.run.id, nativeSessionId)).toBeUndefined()
+    f.finish()
+    const basis = f.repo.collaboration(f.sessionId)!.planReference!
+    const review = advance(f)
+    f.finish(review.id, { verdict: 'accepted' })
+    f.receive()
+    const reply = f.materialize()
+    const source = f.repo.workflowPlanCheckpoint(reply.run.id, nativeSessionId)!
+    expect(source.checkpoint).toMatchObject({
+      targetRunId: reply.run.id,
+      targetNativeTurnId: reply.run.id,
+      nativeSessionId,
+      bindingGeneration: 1,
+      basis,
+      sourceNativeTurnId: f.first.run.id,
+    })
+    expect(f.repo.workflowPlanCheckpoint(reply.run.id, randomUUID())).toBeUndefined()
+    if (mode === 'source_owner')
+      f.db.drizzle
+        .update(conversationBodyInputs)
+        .set({ ownerKey: `collaboration:${randomUUID()}` })
+        .where(eq(conversationBodyInputs.id, basis.document.id))
+        .run()
+    if (mode === 'source_binding')
+      f.db.drizzle
+        .update(agentRuns)
+        .set({ bindingGeneration: 2 })
+        .where(eq(agentRuns.id, f.first.run.id))
+        .run()
+    if (mode === 'changed_input') f.receive(f.input('A newer decision.'))
+    if (mode === 'changed_body')
+      f.db.drizzle.run(
+        sql`UPDATE conversation_body_parts SET text='Corrupted saved source' WHERE input_id=${basis.document.id}`,
+      )
+    const result = await source.read(new AbortController().signal).then(
+      (text) => ({ text }),
+      (error: unknown) => ({ error }),
+    )
+    const failure = {
+      error: expect.objectContaining({
+        message: expect.stringMatching(/source changed|body changed/iu),
+      }),
+    }
+    expect(result).toEqual(mode === 'valid' ? { text: 'Scope and acceptance.' } : failure)
+  },
+)
+
 it('keeps the full natural plan and report in handoff/rebuild sources without an envelope', async () => {
   const f = await fixture()
   const full = 'Complete scope with ownership and cleanup.\n'.repeat(5000)
@@ -1403,7 +1460,8 @@ it('does not settle stale planning over a newer acknowledged input', async () =>
   expect(f.repo.collaboration(f.sessionId)).toMatchObject({
     planVersion: 0,
     inputSequence: 2,
-    automation: 'paused',
+    automation: 'active',
+    status: 'waiting',
     inputProcessing: { pending: { inputId: received.send.clientMessageId, inputSequence: 2 } },
   })
   const reply = f.materialize()
@@ -1411,11 +1469,138 @@ it('does not settle stale planning over a newer acknowledged input', async () =>
   expect(f.repo.collaboration(f.sessionId)).toMatchObject({
     planVersion: 1,
     planInputSequence: 2,
-    automation: 'paused',
+    automation: 'active',
     inputProcessing: { settled: { runId: reply.run.id, inputSequence: 2 } },
   })
   expect(f.repo.collaboration(f.sessionId)!.inputProcessing?.pending).toBeUndefined()
+  expect(advance(f).collaboration?.stage).toBe('plan_review')
 })
+
+it('waits for the latest reply before automatically reviewing its exact plan', async () => {
+  const f = await fixture()
+  f.finish()
+  f.receive(f.input('First correction.'))
+  const first = f.materialize()
+  const latest = f.receive(f.input('Second correction.'))
+  f.finish(first.run.id, { plan: 'Only the first correction.' })
+  const pending = f.repo.collaboration(f.sessionId)!
+  expect(pending).toMatchObject({
+    status: 'waiting',
+    automation: 'active',
+    planVersion: 1,
+    inputProcessing: {
+      pending: { inputId: latest.send.clientMessageId, inputSequence: 3 },
+    },
+  })
+  expect(() => advance(f)).toThrow(/Reply/)
+  const last = f.materialize()
+  f.finish(last.run.id, { plan: 'Both corrections, complete current plan.' })
+  const settled = f.repo.collaboration(f.sessionId)!
+  expect(settled).toMatchObject({
+    status: 'waiting',
+    automation: 'active',
+    planVersion: 2,
+    planInputSequence: 3,
+    inputProcessing: { settled: { runId: last.run.id, inputSequence: 3 } },
+  })
+  const review = advance(f)
+  expect(review.collaboration?.stage).toBe('plan_review')
+  expect(f.repo.collaborationTurnAuthorization(review.id)?.planReference).toEqual(
+    settled.planReference,
+  )
+})
+
+it('does not hide a failed native plan capture behind newer input', async () => {
+  const f = await fixture()
+  f.repo.recordWorkflowPlanUnavailable(f.first.run.id)
+  f.receive()
+  f.finish(f.first.run.id, { answer: 'The native plan capture failed.' })
+  expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+    status: 'failed',
+    automation: 'paused',
+    pauseReason: 'failure',
+    planVersion: 0,
+  })
+  const reply = f.materialize()
+  f.finish(reply.run.id, { plan: 'Confirmed current plan.' })
+  expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+    status: 'waiting',
+    automation: 'paused',
+    pauseReason: 'failure',
+    planVersion: 1,
+  })
+  expect(() => advance(f)).toThrow(/Continue collaboration/)
+})
+
+it.each(['user', 'stopped', 'failure', 'restart', 'limit', 'user_message', 'needs_user'] as const)(
+  'preserves an existing %s pause through new input and successful plan settlement',
+  async (reason) => {
+    const f = await fixture()
+    f.finish()
+    f.repo.pauseCollaboration(f.sessionId, reason)
+    f.receive()
+    const reply = f.materialize()
+    f.finish(reply.run.id, { plan: 'Updated complete plan.' })
+    const task = f.repo.collaboration(f.sessionId)!
+    expect(task).toMatchObject({ automation: 'paused', pauseReason: reason, planVersion: 2 })
+    expect(task.inputProcessing?.pending).toBeUndefined()
+    expect(() => advance(f)).toThrow(/Continue collaboration/)
+  },
+)
+
+it.each(['user', 'stopped', 'restart'] as const)(
+  'preserves a concurrent %s pause while the reply completes or asks another question',
+  async (reason) => {
+    const f = await fixture()
+    f.finish()
+    f.receive()
+    const reply = f.materialize()
+    f.repo.pauseCollaboration(f.sessionId, reason)
+    f.finish(reply.run.id, {
+      inputOutcome: 'needs_user',
+      questions: [{ prompt: 'Which remaining scope?', selection: 'single' }],
+    })
+    expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+      status: 'questions',
+      automation: 'paused',
+      pauseReason: reason,
+    })
+    f.receive(decisionInput(f, 'Current scope.'))
+    const followup = f.materialize()
+    f.finish(followup.run.id, { plan: 'Current complete plan.' })
+    expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+      status: 'waiting',
+      automation: 'paused',
+      pauseReason: reason,
+    })
+    expect(() => advance(f)).toThrow(/Continue collaboration/)
+  },
+)
+
+it.each(['remove', 'return', 'cancel'] as const)(
+  'requires reconciliation when %s withdraws a newer workflow input',
+  async (action) => {
+    const f = await fixture()
+    f.finish()
+    const queued = f.receive()
+    const request = {
+      sessionId: f.sessionId,
+      inputId: queued.send.clientMessageId,
+      expectedRevision: f.repo.queueState(f.sessionId).revision,
+      operationId: randomUUID(),
+    }
+    if (action === 'remove') f.repo.removeQueuedConversationMessage(request)
+    else if (action === 'return')
+      f.repo.returnQueuedConversationMessage({ ...request, phase: 'return' })
+    else f.repo.setReceivedInputState(f.sessionId, 'cancelled', request.inputId)
+    const task = f.repo.collaboration(f.sessionId)!
+    expect(task).toMatchObject({ automation: 'paused', pauseReason: 'failure', inputSequence: 2 })
+    expect(task.planInputSequence).toBe(1)
+    expect(f.repo.pendingWorkflowTasks()).toEqual([])
+    expect(() => advance(f)).toThrow(/Continue collaboration/)
+    expect(f.repo.read(f.sessionId).runs).toHaveLength(1)
+  },
+)
 
 it.each(['missing', 'conflicting'] as const)(
   'keeps %s native review conclusions from accepting the plan',
@@ -1475,14 +1660,11 @@ it('persists structured questions with host IDs and requires a settled native re
   expect(settled.inputProcessing?.decision).toBeUndefined()
   expect(settled.inputProcessing?.pending).toBeUndefined()
   expect(settled).toMatchObject({
-    automation: 'paused',
+    automation: 'active',
     planInputSequence: 1,
     inputProcessing: { settled: { runId: reply.run.id, inputSequence: 2 } },
   })
-  expect(advanceCollaboration(settled, 'resume', settings)).toMatchObject({
-    automation: 'active',
-    nextStage: 'plan',
-  })
+  expect(advance(f).collaboration?.stage).toBe('plan')
 })
 
 it('retains unresolved questions when a reply fails to provide its authenticated plan', async () => {
@@ -1581,11 +1763,10 @@ it.each(['identical', 'changed', 'retained'] as const)(
     expect(current.planVersion).toBe(kind === 'changed' ? 2 : 1)
     expect(current.planInputSequence).toBe(2)
     expect(current.inputProcessing?.pending).toBeUndefined()
-    expect(current.automation).toBe('paused')
+    expect(current.automation).toBe('active')
     expect(current.review?.inputSequence).toBe(1)
-    const resumed = advanceCollaboration(current, 'resume', settings)
-    expect(resumed.nextStage).toBe('plan_review')
-    expect(() => advanceCollaboration(resumed, 'execute', settings)).toThrow(/not been accepted/)
+    expect(current.nextStage).toBe('plan_review')
+    expect(() => advanceCollaboration(current, 'execute', settings)).toThrow(/not been accepted/)
     expect(current.planReference?.sourceRunId).toBe(
       kind === 'retained' ? original.sourceRunId : reply.run.id,
     )
@@ -1793,7 +1974,7 @@ it.each(['present', 'legacy'] as const)(
     f.finish(reply.run.id, { inputOutcome: 'processed' })
     expect(f.repo.collaboration(f.sessionId)).toMatchObject({
       status: 'waiting',
-      automation: 'paused',
+      automation: 'active',
       planVersion: 1,
       inputProcessing: { settled: { runId: reply.run.id, inputSequence: 2 } },
     })
@@ -1844,7 +2025,7 @@ it('does not clear real unanswered questions when a native plan is recovered', a
   })
   f.repo.reconcileCompletedCollaboration(f.first.run.id)
   const current = f.repo.collaboration(f.sessionId)!
-  expect(current).toMatchObject({ status: 'questions', planVersion: 0, automation: 'paused' })
+  expect(current).toMatchObject({ status: 'questions', planVersion: 0, automation: 'active' })
   expect(current.inputProcessing?.decision).toEqual(before.inputProcessing?.decision)
   expect(f.repo.needsWorkflowPlanRecovery(f.first.run.id)).toBe(false)
   expect(() => advanceCollaboration(current, 'resume', settings)).toThrow(/Reply/)

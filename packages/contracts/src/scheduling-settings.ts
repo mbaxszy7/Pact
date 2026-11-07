@@ -131,6 +131,7 @@ export const schedulingActivityActionSchema = z.enum([
   'confirmed_resend',
   'rebuild_native_context',
   'reassign_roles',
+  'extend_plan_review',
 ])
 export type SchedulingActivityAction = z.infer<typeof schedulingActivityActionSchema>
 export const schedulingActivityActionResultSchema = z.enum([

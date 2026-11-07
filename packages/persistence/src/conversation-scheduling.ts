@@ -1115,14 +1115,14 @@ const budgetColumn = {
 
 /** Only the concrete, confirmed Relay repair card may spend the extra code allowance.
  * An ordinary manual Repair receipt has no such provenance. */
-function relayRepairGrantMatches(
+function relayConfirmedExtraGrantMatches(
   decision: typeof relayDecisions.$inferSelect | undefined,
   grant: typeof collaborationActionReceipts.$inferSelect,
   generation: number,
 ): boolean {
   if (
     !decision ||
-    decision.kind !== 'repair' ||
+    (decision.kind !== 'repair' && decision.kind !== 'extend_plan_review') ||
     decision.formatVersion !== 2 ||
     decision.id !== grant.decisionId ||
     decision.sessionId !== grant.sessionId ||
@@ -1139,7 +1139,9 @@ function relayRepairGrantMatches(
       request = proof.card.request
     return (
       request.category === 'new_authorization' &&
-      request.operation.kind === 'repair' &&
+      (request.operation.kind === 'repair' || request.operation.kind === 'extend_plan_review') &&
+      request.operation.kind === decision.kind &&
+      proof.candidateId === `propose_${decision.kind}` &&
       proof.card.decisionId === decision.id &&
       proof.card.sessionId === grant.sessionId &&
       proof.card.revision === decision.revision &&
@@ -1152,7 +1154,15 @@ function relayRepairGrantMatches(
       proof.handoff.budgetSubjectId === `task:${grant.taskId}` &&
       request.operation.taskId === grant.taskId &&
       request.operation.actor === grant.actor &&
-      request.operation.returnActor !== grant.actor &&
+      (request.operation.kind === 'repair'
+        ? request.operation.returnActor !== grant.actor
+        : fingerprint(request.operation.planReference) ===
+            fingerprint(
+              collaborationActionBasisSchema.parse(JSON.parse(grant.basisJson)).planReference,
+            ) &&
+          request.operation.inputSequence ===
+            collaborationActionBasisSchema.parse(JSON.parse(grant.basisJson)).inputSequence &&
+          request.operation.expectedDiscussionRounds >= request.operation.maximum) &&
       request.operation.afterRunId === proof.handoff.freshnessGuard.runId &&
       request.operation.scopeFingerprint === proof.sourceFingerprint &&
       proof.operationFingerprint === fingerprint(request.operation)
@@ -1160,6 +1170,29 @@ function relayRepairGrantMatches(
   } catch {
     return false
   }
+}
+
+/** Readback of one previously confirmed review grant; this never creates or reopens authority. */
+export function confirmedPlanReviewExtension(db: PactDrizzleDatabase, receiptId: string) {
+  const grant = db
+    .select()
+    .from(collaborationActionReceipts)
+    .where(eq(collaborationActionReceipts.id, receiptId))
+    .get()
+  const decision = grant?.decisionId
+    ? db.select().from(relayDecisions).where(eq(relayDecisions.id, grant.decisionId)).get()
+    : undefined
+  if (
+    !grant ||
+    grant.action !== 'extend_plan_review' ||
+    !relayConfirmedExtraGrantMatches(decision, grant, configurationGeneration(db))
+  )
+    return undefined
+  const proof = relaySchedulingDecisionProofSchema.parse(JSON.parse(decision!.proofJson))
+  return proof.card.request.category === 'new_authorization' &&
+    proof.card.request.operation.kind === 'extend_plan_review'
+    ? proof.card.request.operation
+    : undefined
 }
 
 /** Accounting reserves capacity only. It never grants business or native authorization. */
@@ -1211,10 +1244,14 @@ export function reserveBudget(
     const decision = grant?.decisionId
       ? db.select().from(relayDecisions).where(eq(relayDecisions.id, grant.decisionId)).get()
       : undefined
+    const relayReview =
+      budget === 'extra_plan_turn' &&
+      grant?.action === 'extend_plan_review' &&
+      relayConfirmedExtraGrantMatches(decision, grant, configurationGeneration(db))
     const relayRepair =
       budget === 'extra_code_turn' &&
       grant?.action === 'repair' &&
-      relayRepairGrantMatches(decision, grant, configurationGeneration(db))
+      relayConfirmedExtraGrantMatches(decision, grant, configurationGeneration(db))
     if (
       !grant ||
       !decision ||
@@ -1225,11 +1262,13 @@ export function reserveBudget(
       grant.taskId !== node.budgetRoot.id ||
       grant.handoffId !== node.id ||
       grant.action !==
-        (relayRepair
-          ? 'repair'
-          : budget === 'extra_plan_turn'
-            ? 'supplement_plan'
-            : 'supplement_code_response') ||
+        (relayReview
+          ? 'extend_plan_review'
+          : relayRepair
+            ? 'repair'
+            : budget === 'extra_plan_turn'
+              ? 'supplement_plan'
+              : 'supplement_code_response') ||
       decision.state !== 'available' ||
       !decision.active ||
       decision.handoffId !== node.id
@@ -1362,13 +1401,22 @@ export function reacquireUnsentExtraTurnBudget(
       .from(workflowTurns)
       .where(eq(workflowTurns.runId, operation.originalRunId))
       .get()
+  const extension = original.budget === 'extra_plan_turn' && grant?.action === 'extend_plan_review'
   const repair = original.budget === 'extra_code_turn' && grant?.action === 'repair',
-    action = repair
-      ? 'repair'
-      : original.budget === 'extra_plan_turn'
-        ? 'supplement_plan'
-        : 'supplement_code_response',
-    stage = repair ? 'repair' : action === 'supplement_plan' ? 'plan' : 'respond'
+    action = extension
+      ? 'extend_plan_review'
+      : repair
+        ? 'repair'
+        : original.budget === 'extra_plan_turn'
+          ? 'supplement_plan'
+          : 'supplement_code_response',
+    stage = extension
+      ? 'plan_review'
+      : repair
+        ? 'repair'
+        : action === 'supplement_plan'
+          ? 'plan'
+          : 'respond'
   if (
     !grant ||
     !source ||
@@ -1403,11 +1451,11 @@ export function reacquireUnsentExtraTurnBudget(
     handoffRow.budgetSubjectId !== original.budgetSubjectId
   )
     throw unsentExtraTurnConflict()
-  if (repair) {
+  if (repair || extension) {
     const decision = grant.decisionId
       ? db.select().from(relayDecisions).where(eq(relayDecisions.id, grant.decisionId)).get()
       : undefined
-    if (!relayRepairGrantMatches(decision, grant, fault.configurationGeneration))
+    if (!relayConfirmedExtraGrantMatches(decision, grant, fault.configurationGeneration))
       throw unsentExtraTurnConflict()
   }
   if (
@@ -1431,8 +1479,8 @@ export function reacquireUnsentExtraTurnBudget(
     authority.stage !== stage ||
     authority.userAuthority?.receiptId !== grant.id ||
     authority.userAuthority.rootReceiptId !== grant.rootReceiptId ||
-    authority.userAuthority.purpose !== (repair ? 'action' : action) ||
-    (repair
+    authority.userAuthority.purpose !== (repair || extension ? 'action' : action) ||
+    (repair || extension
       ? authority.userAuthority.returnStage !== undefined ||
         authority.userAuthority.returnActor !== undefined
       : authority.userAuthority.returnStage !==
@@ -1513,7 +1561,7 @@ export function reacquireUnsentExtraTurnBudget(
     grant.active ||
     grant.boundRunId !== source.id ||
     grant.budgetReservationId !== original.id ||
-    grant.reviewState !== (repair ? null : 'not_required') ||
+    grant.reviewState !== (repair || extension ? null : 'not_required') ||
     grant.reviewRunId ||
     !resend ||
     resend.budget !== 'automatic_resend' ||

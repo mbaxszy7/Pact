@@ -121,7 +121,7 @@ export function collaborationInstructions(
     repair:
       'Repair the explicitly authorized reviewed scope. Preserve unrelated work. Fix the cause of each confirmed finding rather than only its cited example, and check the rest of the authorized scope for the same defect. Do not weaken, delete or skip tests or checks, or remove required behavior, to make a finding disappear; say plainly which findings you did not change and why. Explain changes and the checks you actually performed, including their observed results and failures, so the reviewer can reassess them; the reviewer will re-verify each finding independently. Label checks and platforms without confirmed results as Unverified, using the corresponding label in the user’s language. Do not accept your own repair.',
     reply:
-      'Prioritize the latest user message. Answer or clarify it within this turn’s authority. Automatic collaboration stays paused after the reply; the user continues it explicitly. A reply does not authorize implementation or repair.',
+      'Prioritize the latest user message. Answer or clarify it within this turn’s authority. Once the latest input and native work are confirmed complete, Pact automatically continues the authorized workflow unless the user paused or stopped it, or recovery is required. A reply does not authorize implementation or repair.',
   }[stage]
   return [
     `Pact ${task.kind}. Current responsibility: ${stage}. Plan author: ${collaborationActor(task, 'plan')}; plan reviewer: ${collaborationActor(task, 'plan_review')}; implementer: ${collaborationActor(task, 'implement')}; code reviewer: ${collaborationActor(task, 'code_review')}. Keep these stage responsibilities fixed for this task.`,

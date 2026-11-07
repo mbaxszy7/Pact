@@ -37,6 +37,7 @@ export function RelayDecisionCard({
     request.request.category === 'necessary_information' ? request.request.field : undefined
   const operation =
     request.request.category === 'necessary_information' ? undefined : request.request.operation
+  const extendedReview = operation?.kind === 'extend_plan_review' ? operation : undefined
   const confirmLabel = field
     ? 'Continue scheduling'
     : operation?.kind === 'rebuild_native_context'
@@ -45,7 +46,9 @@ export function RelayDecisionCard({
         ? 'Use suggested roles'
         : operation?.kind === 'repair'
           ? 'Allow repair'
-          : 'Allow one read-only turn'
+          : extendedReview
+            ? 'Add one review'
+            : 'Allow one read-only turn'
   const answer: RelayDecisionAnswer['answer'] | undefined = !field
     ? { kind: 'confirm' }
     : field.input.kind === 'single'
@@ -69,23 +72,31 @@ export function RelayDecisionCard({
       </header>
       <div className="relay-decision-body">
         <p id={actionId} className="relay-action-title">
-          {decision.cancelling ? 'Cancellation pending' : request.title}
-        </p>
-        <p className="relay-action-target">
-          {operation?.kind === 'rebuild_native_context'
-            ? `${operation.agentId === 'codex' ? 'Codex' : 'Claude Code'} · Current session`
-            : operation?.kind === 'reassign_roles'
-              ? `Current: ${operation.previousRoles.codeAuthor === 'codex' ? 'Codex' : 'Claude Code'} implements · ${operation.previousRoles.codeReviewer === 'codex' ? 'Codex' : 'Claude Code'} reviews`
-              : operation
-                ? `${operation.actor === 'codex' ? 'Codex' : 'Claude Code'} · ${operation.kind === 'repair' ? 'One repair' : 'One read-only turn'}, then ${operation.returnActor === 'codex' ? 'Codex' : 'Claude Code'} reviews`
-                : 'Scheduling information'}
-        </p>
-        <p className="relay-action-explanation">
           {decision.cancelling
-            ? 'Check this decision to confirm the cancellation before sending again.'
-            : request.reason}
+            ? 'Cancellation pending'
+            : extendedReview
+              ? `Have ${extendedReview.actor === 'codex' ? 'Codex' : 'Claude Code'} review plan v${extendedReview.planReference.version} once more.`
+              : request.title}
         </p>
-        {operation?.kind !== 'reassign_roles' || decision.cancelling ? (
+        {operation?.kind !== 'extend_plan_review' ? (
+          <p className="relay-action-target">
+            {operation?.kind === 'rebuild_native_context'
+              ? `${operation.agentId === 'codex' ? 'Codex' : 'Claude Code'} · Current session`
+              : operation?.kind === 'reassign_roles'
+                ? `Current: ${operation.previousRoles.codeAuthor === 'codex' ? 'Codex' : 'Claude Code'} implements · ${operation.previousRoles.codeReviewer === 'codex' ? 'Codex' : 'Claude Code'} reviews`
+                : operation
+                  ? `${operation.actor === 'codex' ? 'Codex' : 'Claude Code'} · ${operation.kind === 'repair' ? 'One repair' : 'One read-only turn'}, then ${operation.returnActor === 'codex' ? 'Codex' : 'Claude Code'} reviews`
+                  : 'Scheduling information'}
+          </p>
+        ) : null}
+        {!extendedReview || decision.cancelling ? (
+          <p className="relay-action-explanation">
+            {decision.cancelling
+              ? 'Check this decision to confirm the cancellation before sending again.'
+              : request.reason}
+          </p>
+        ) : null}
+        {(!extendedReview && operation?.kind !== 'reassign_roles') || decision.cancelling ? (
           <p className="relay-action-explanation">
             {decision.cancelling
               ? 'This check does not send your draft. Your current draft and Comments are kept.'
@@ -120,7 +131,7 @@ export function RelayDecisionCard({
             )}
           </div>
         ) : null}
-        {operation?.kind !== 'reassign_roles' ? (
+        {!extendedReview && operation?.kind !== 'reassign_roles' ? (
           <p className="relay-action-source">
             Source: {request.sources.map((source) => source.label).join(' · ')}
           </p>
@@ -144,7 +155,9 @@ export function RelayDecisionCard({
               : 'Cancel requested'
             : operation?.kind === 'reassign_roles'
               ? 'Keep current roles'
-              : 'Cancel this scheduling action'}
+              : extendedReview
+                ? 'Keep paused'
+                : 'Cancel this scheduling action'}
         </button>
         <button
           className="relay-submit"

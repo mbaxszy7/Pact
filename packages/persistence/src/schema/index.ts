@@ -1072,7 +1072,7 @@ export const collaborationTasks = sqliteTable(
     index('collaboration_tasks_pending_workflow')
       .on(table.updatedAt, table.id)
       .where(
-        sql`${table.active} = 1 AND json_extract(${table.stateJson}, '$.protocol') = 'native-workflow-v1' AND json_extract(${table.stateJson}, '$.automation') = 'active' AND json_extract(${table.stateJson}, '$.status') IN ('waiting','ready')`,
+        sql`${table.active} = 1 AND json_extract(${table.stateJson}, '$.protocol') = 'native-workflow-v1' AND (json_extract(${table.stateJson}, '$.automation') = 'active' OR (json_extract(${table.stateJson}, '$.automation') = 'paused' AND json_extract(${table.stateJson}, '$.pauseReason') = 'limit' AND json_extract(${table.stateJson}, '$.kind') = 'plan' AND json_extract(${table.stateJson}, '$.stage') IN ('plan','reply'))) AND json_extract(${table.stateJson}, '$.status') IN ('waiting','ready')`,
       ),
   ],
 )
@@ -1095,6 +1095,7 @@ export const relayDecisions = sqliteTable(
         'scheduling_information',
         'prepared_input_continue',
         'reassign_roles',
+        'extend_plan_review',
       ],
     }).notNull(),
     formatVersion: integer('format_version').notNull().default(1),

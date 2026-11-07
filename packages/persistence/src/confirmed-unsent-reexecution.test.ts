@@ -7,6 +7,10 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import type { FrozenExecutionEnvelope, RunEffectiveExecutionSettings } from '@pact/contracts'
 
+import {
+  configureDecisionFixtureCredential,
+  decisionHttpOwnerFixture,
+} from './decision-fixture.test-support.js'
 import { PactDatabase } from './pact-database.js'
 import { planRevisionFixture } from './plan-revision-guidance.test-support.js'
 import { agentRuns, conversationMessages, runReexecutionOperations } from './schema/index.js'
@@ -57,6 +61,69 @@ function drafts(f: { repo: PactDatabase['conversationRepository']; sessionId: st
 function draftContents(f: { repo: PactDatabase['conversationRepository']; sessionId: string }) {
   const { observation: _observation, ...contents } = drafts(f)
   return contents
+}
+
+async function beginExtendedPlanReview(f: Awaited<ReturnType<typeof planRevisionFixture>>) {
+  const { db, repo, sessionId } = f,
+    originalAdmission = f.admission(),
+    session = db.sessionRepository.find(sessionId)!,
+    task = repo.collaboration(sessionId)!
+  db.sessionRepository.saveSettings(sessionId, { ...session.settings, maxDiscussionRounds: 1 })
+  configureDecisionFixtureCredential(repo)
+  const handoff = repo.workflowHandoff(task, task.reviewer),
+    kind = 'extend_plan_review',
+    candidate = { id: 'propose_extend_plan_review', description: 'Add one read-only Plan review.' },
+    deadlineAt = Date.now() + 15_000,
+    configurationFingerprint = repo.schedulingConfigurationFingerprint(),
+    material = await repo.readRelayWorkflowDecisionSources(handoff, [candidate], {
+      signal: new AbortController().signal,
+      deadlineAt,
+    }),
+    httpOwner = decisionHttpOwnerFixture(),
+    reserved = repo.reserveEvaluation({
+      handoff,
+      configurationFingerprint,
+      deadlineAt,
+      inputSha256: material.inputSha256,
+      httpOwner,
+    })
+  if (reserved.status !== 'reserved') throw Error('Missing Relay evaluation reservation')
+  repo.dispatchEvaluation(reserved.evaluation.id, httpOwner)
+  repo.settleEvaluation(reserved.evaluation.id, {
+    outcome: 'completed',
+    physicalReleased: true,
+    selectedCandidateId: candidate.id,
+    httpOwner,
+    remoteOutcome: 'responded',
+  })
+  const card = repo.proposeRelayWorkflowAction({
+    handoff,
+    kind,
+    evaluationId: reserved.evaluation.id,
+    configurationGeneration: repo.schedulingConfigurationGeneration(),
+    configurationFingerprint,
+    inputSha256: material.inputSha256,
+    sourceFingerprint: material.sourceFingerprint,
+    deadlineAt,
+    sourceIds: material.sources.map((source) => source.id),
+  })
+  const answer = repo.answerRelaySchedulingDecision({
+    reference: { sessionId, decisionId: card.decisionId, revision: card.revision },
+    clientOperationId: randomUUID(),
+    answer: { kind: 'confirm' },
+  })
+  if (!answer.receiptId) throw Error('Missing Relay authorization receipt')
+  const prepared = repo.preparedRelayWorkflowAction(answer.receiptId)
+  return repo.beginRun({
+    ...originalAdmission,
+    clientMessageId: prepared.receipt.clientNonce,
+    agentId: prepared.next.actor,
+    settingsRevision: db.sessionRepository.find(sessionId)!.settingsRevision,
+    expectedCollaborationRevision: prepared.task.revision,
+    collaboration: prepared.next,
+    schedulingHandoff: prepared.handoff,
+    collaborationActionReceiptId: prepared.receipt.id,
+  }).run
 }
 
 async function fixture(options: { proof?: boolean; filePath?: string; route?: 'all' } = {}) {
@@ -780,134 +847,179 @@ describe('confirmed-unsent reexecution through the authoritative repository', ()
     expect(message.routePendingAgentId).toBe('claude')
     expect(counts(f).messages).toBe(1)
   })
-  it('restores the exact failed Plan review duty and reacquires its refunded discussion round exactly once', async () => {
-    const f = await planRevisionFixture()
-    databases.add(f.db)
-    f.repo.beginSchedulingRecoveryEpoch(randomUUID())
-    const response = f.repo.beginRun(f.admission()).run
-    f.finish(response.id, { plan: 'Complete revised Plan for the original reviewer.' })
-    const started = f.repo.beginRun(f.admission()).run,
-      task = f.repo.collaboration(f.sessionId)!,
-      auth = f.repo.collaborationTurnAuthorization(started.id),
-      nativeGeneration = randomUUID(),
-      executorId = randomUUID(),
-      nativeSessionId = `fixture-${started.agentId}`
-    if (!auth) throw new Error('The original Plan duty has no actual authorization')
-    expect(task.discussionRounds).toBeGreaterThan(0)
-    f.repo.recordExecutor(started.id, executorId)
-    f.repo.applyEvent(f.sessionId, started.id, {
-      agentId: started.agentId,
-      type: 'session.started',
-      nativeSessionId,
-    })
-    f.repo.setContinuation(f.sessionId, started.agentId, 'ready')
-    const inputBatchRef = f.repo.inputBatchForRun(started.id),
-      envelope: FrozenExecutionEnvelope = {
-        version: 'pact-agent-prompt-v1',
-        sessionId: f.sessionId,
-        message: { id: started.userMessageId, content: 'Continue authorized work.' },
-        comments: [],
-        collaboration: f.repo.collaborationPromptState(task),
-        collaborationAuthorization: auth,
-        ...(inputBatchRef ? { inputBatchRef } : {}),
-      }
-    const captured = await f.repo.captureExecutionInput({
-      runId: started.id,
-      nativeGeneration,
-      requested: {
-        ...requested,
-        provider: started.agentId,
-        model: started.model ?? null,
-        effort: started.effort ?? null,
-      },
-      source: bytes(JSON.stringify(envelope)),
-      signal: new AbortController().signal,
-    })
-    expect(captured).toBeDefined()
-    f.repo.recordEffectiveExecutionSettings(
-      started.id,
-      nativeGeneration,
-      {
-        ...effective,
-        provider: started.agentId,
-        provenance:
-          started.agentId === 'codex' ? 'codex_thread_configuration' : 'claude_applied_settings',
-      },
-      {
-        executorId,
+  it.each(['Session settings', 'Relay configuration', 'Pause'] as const)(
+    'withholds the bound Relay review at dispatch after %s changes',
+    async (change) => {
+      const f = await planRevisionFixture()
+      databases.add(f.db)
+      const response = f.repo.beginRun(f.admission()).run
+      f.finish(response.id, { plan: 'Revised Plan for the original independent reviewer.' })
+      const started = await beginExtendedPlanReview(f)
+      expect(() => f.repo.assertWorkflowDispatch(started.id)).not.toThrow()
+      if (change === 'Session settings') {
+        const session = f.db.sessionRepository.find(f.sessionId)!
+        f.db.sessionRepository.saveSettings(f.sessionId, {
+          ...session.settings,
+          maxDiscussionRounds: 2,
+        })
+      } else if (change === 'Relay configuration') {
+        f.repo.saveSchedulingSettings({
+          expectedRevision: f.repo.schedulingSettings().revision,
+          enabled: false,
+        })
+      } else f.repo.pauseCollaboration(f.sessionId)
+      expect(() => f.repo.assertWorkflowDispatch(started.id)).toThrow('before native dispatch')
+    },
+  )
+
+  it.each(['ordinary', 'Relay extension'] as const)(
+    'restores the exact failed %s Plan review duty and reacquires its refunded discussion round exactly once',
+    async (mode) => {
+      const f = await planRevisionFixture()
+      databases.add(f.db)
+      f.repo.beginSchedulingRecoveryEpoch(randomUUID())
+      const response = f.repo.beginRun(f.admission()).run
+      f.finish(response.id, { plan: 'Complete revised Plan for the original reviewer.' })
+      const started =
+          mode === 'ordinary'
+            ? f.repo.beginRun(f.admission()).run
+            : await beginExtendedPlanReview(f),
+        task = f.repo.collaboration(f.sessionId)!,
+        auth = f.repo.collaborationTurnAuthorization(started.id),
+        nativeGeneration = randomUUID(),
+        executorId = randomUUID(),
+        nativeSessionId = `fixture-${started.agentId}`
+      if (!auth) throw new Error('The original Plan duty has no actual authorization')
+      expect(task.discussionRounds).toBeGreaterThan(0)
+      const extraPlanTurns = () => f.repo.schedulingBudget(`task:${task.id}`)?.extraPlanTurns ?? 0
+      expect(extraPlanTurns()).toBe(mode === 'ordinary' ? 0 : 1)
+      f.repo.recordExecutor(started.id, executorId)
+      f.repo.applyEvent(f.sessionId, started.id, {
+        agentId: started.agentId,
+        type: 'session.started',
         nativeSessionId,
-      },
-    )
-    f.repo.recordDispatch(started.id, 'rejected', nativeSessionId, executorId)
-    f.repo.recordConfirmedUnsent(
-      started.id,
-      nativeGeneration,
-      started.agentId === 'codex'
-        ? { kind: 'codex_root_frame_not_written', requestId: 8 }
-        : { kind: 'claude_root_not_yielded' },
-      { executorId, nativeSessionId },
-    )
-    f.repo.failRun(
-      started.id,
-      'transient_transport',
-      'Physical root writer confirmed no input bytes.',
-    )
-    f.repo.finishCollaboration(started.id, false, 'Physical root writer confirmed no input bytes.')
-    const failed = f.repo.collaboration(f.sessionId)!
-    expect(failed).toMatchObject({
-      id: task.id,
-      status: 'failed',
-      pauseReason: 'failure',
-      actor: task.actor,
-      stage: task.stage,
-      discussionRounds: task.discussionRounds - 1,
-    })
-    f.repo.armSchedulingRecoveryFaults(f.sessionId)
-    const candidate = f.repo
-      .takeSchedulingRecoveryFaults()
-      .find((row) => row.fault.runId === started.id)
-    if (!candidate) throw new Error('The original Plan response fault was not recorded')
-    const operation = {
-        operationId: randomUUID(),
-        faultId: candidate.fault.id,
-        handoff: f.repo.recoveryHandoff({ kind: 'run', id: started.id }),
-      },
-      replacement = f.repo.beginConfirmedUnsentReexecution(operation),
-      resumed = f.repo.collaboration(f.sessionId)!
-    expect(resumed).toMatchObject({
-      id: task.id,
-      status: 'running',
-      actor: task.actor,
-      stage: task.stage,
-      owner: task.owner,
-      reviewer: task.reviewer,
-      discussionRounds: task.discussionRounds,
-      runId: replacement.run.id,
-      planReference: task.planReference,
-      review: task.review,
-    })
-    expect(f.repo.collaborationTurnAuthorization(replacement.run.id)).toEqual({
-      ...auth,
-      runId: replacement.run.id,
-      taskRevision: resumed.revision,
-    })
-    expect(f.repo.canDispatchReexecution(replacement.run.id)).toBe(true)
-    expect(f.repo.beginConfirmedUnsentReexecution(operation)).toMatchObject({
-      created: false,
-      run: { id: replacement.run.id },
-    })
-    expect(f.repo.collaboration(f.sessionId)?.discussionRounds).toBe(task.discussionRounds)
-    expect(f.repo.findRun(started.id)).toMatchObject({
-      status: 'failed',
-      userMessageId: started.userMessageId,
-    })
-    f.finish(replacement.run.id, {
-      verdict: 'changes_requested',
-      answer: 'Original reviewer responsibility addressed completely.',
-    })
-    expect(f.repo.findRun(replacement.run.id)).toMatchObject({ status: 'completed' })
-    expect(f.repo.collaboration(f.sessionId)?.discussionRounds).toBe(task.discussionRounds)
-  })
+      })
+      f.repo.setContinuation(f.sessionId, started.agentId, 'ready')
+      const inputBatchRef = f.repo.inputBatchForRun(started.id),
+        envelope: FrozenExecutionEnvelope = {
+          version: 'pact-agent-prompt-v1',
+          sessionId: f.sessionId,
+          message: { id: started.userMessageId, content: 'Continue authorized work.' },
+          comments: [],
+          collaboration: f.repo.collaborationPromptState(task),
+          collaborationAuthorization: auth,
+          ...(inputBatchRef ? { inputBatchRef } : {}),
+        }
+      const captured = await f.repo.captureExecutionInput({
+        runId: started.id,
+        nativeGeneration,
+        requested: {
+          ...requested,
+          provider: started.agentId,
+          model: started.model ?? null,
+          effort: started.effort ?? null,
+        },
+        source: bytes(JSON.stringify(envelope)),
+        signal: new AbortController().signal,
+      })
+      expect(captured).toBeDefined()
+      f.repo.recordEffectiveExecutionSettings(
+        started.id,
+        nativeGeneration,
+        {
+          ...effective,
+          provider: started.agentId,
+          provenance:
+            started.agentId === 'codex' ? 'codex_thread_configuration' : 'claude_applied_settings',
+        },
+        {
+          executorId,
+          nativeSessionId,
+        },
+      )
+      f.repo.recordDispatch(started.id, 'rejected', nativeSessionId, executorId)
+      f.repo.recordConfirmedUnsent(
+        started.id,
+        nativeGeneration,
+        started.agentId === 'codex'
+          ? { kind: 'codex_root_frame_not_written', requestId: 8 }
+          : { kind: 'claude_root_not_yielded' },
+        { executorId, nativeSessionId },
+      )
+      f.repo.failRun(
+        started.id,
+        'transient_transport',
+        'Physical root writer confirmed no input bytes.',
+      )
+      f.repo.finishCollaboration(
+        started.id,
+        false,
+        'Physical root writer confirmed no input bytes.',
+      )
+      const failed = f.repo.collaboration(f.sessionId)!
+      expect(extraPlanTurns()).toBe(0)
+      expect(failed).toMatchObject({
+        id: task.id,
+        status: 'failed',
+        pauseReason: 'failure',
+        actor: task.actor,
+        stage: task.stage,
+        discussionRounds: task.discussionRounds - 1,
+      })
+      f.repo.armSchedulingRecoveryFaults(f.sessionId)
+      const candidate = f.repo
+        .takeSchedulingRecoveryFaults()
+        .find((row) => row.fault.runId === started.id)
+      if (!candidate) throw new Error('The original Plan response fault was not recorded')
+      const operation = {
+          operationId: randomUUID(),
+          faultId: candidate.fault.id,
+          handoff: f.repo.recoveryHandoff({ kind: 'run', id: started.id }),
+        },
+        replacement = f.repo.beginConfirmedUnsentReexecution(operation),
+        resumed = f.repo.collaboration(f.sessionId)!
+      expect(resumed).toMatchObject({
+        id: task.id,
+        status: 'running',
+        actor: task.actor,
+        stage: task.stage,
+        owner: task.owner,
+        reviewer: task.reviewer,
+        discussionRounds: task.discussionRounds,
+        runId: replacement.run.id,
+        planReference: task.planReference,
+        review: task.review,
+      })
+      const rebound = f.repo.collaborationTurnAuthorization(replacement.run.id)!
+      const { relayWorkRef: reboundWork, ...reboundScope } = rebound,
+        { relayWorkRef: originalWork, ...originalScope } = auth
+      expect(reboundScope).toEqual({
+        ...originalScope,
+        runId: replacement.run.id,
+        taskRevision: resumed.revision,
+      })
+      expect(reboundWork && f.readDocument(reboundWork)).toEqual(
+        originalWork && f.readDocument(originalWork),
+      )
+      expect(f.repo.canDispatchReexecution(replacement.run.id)).toBe(true)
+      expect(f.repo.beginConfirmedUnsentReexecution(operation)).toMatchObject({
+        created: false,
+        run: { id: replacement.run.id },
+      })
+      expect(f.repo.collaboration(f.sessionId)?.discussionRounds).toBe(task.discussionRounds)
+      expect(extraPlanTurns()).toBe(mode === 'ordinary' ? 0 : 1)
+      expect(f.repo.findRun(started.id)).toMatchObject({
+        status: 'failed',
+        userMessageId: started.userMessageId,
+      })
+      f.finish(replacement.run.id, {
+        verdict: 'changes_requested',
+        answer: 'Original reviewer responsibility addressed completely.',
+      })
+      expect(f.repo.findRun(replacement.run.id)).toMatchObject({ status: 'completed' })
+      expect(f.repo.collaboration(f.sessionId)?.discussionRounds).toBe(task.discussionRounds)
+    },
+  )
   it('replaces only the failed second @all stage and retains the completed first stage and its full answer', async () => {
     const f = await fixture(),
       messageId = randomUUID(),

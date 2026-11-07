@@ -1183,7 +1183,7 @@ const collaborationReport = async (prefix, facts, transport) => {
     const verdict=facts.reviewCount===1?'changes_requested':'accepted'
     return {tool:'submit_review',args:{verdict},text:verdict==='accepted'?'No unresolved feedback. Cancellation and restart verified.':'Keep cancellation with its owner. Release the pending request when its owner stops.'}
   }
-  if(reference.stage==='reply')return {tool:'submit_input_result',args:{outcome:'processed'},text:'The supplied scope decision has been handled. Continue explicitly to resume collaboration.'}
+  if(reference.stage==='reply')return {tool:'submit_input_result',args:{outcome:'processed'},text:'The supplied scope decision has been handled.'}
   return {text:reference.stage==='respond'?'The cancellation finding is confirmed; an explicit repair is required.':'Cancellation work is complete and ready for independent review.'}
 }
 const readFixtureSource = async (request, call) => {
@@ -1251,7 +1251,8 @@ const nativePlan = async (sessionId, promptId, plan) => {
   const cwd=realpathSync(process.cwd()), project=join(process.env.CLAUDE_CONFIG_DIR,'projects',cwd.replace(/[^a-z0-9]/giu,'-'))
   mkdirSync(project,{recursive:true})
   const transcript=join(project,sessionId+'.jsonl'),path=join(process.env.CLAUDE_CONFIG_DIR,'plans','fixture-'+sessionId+'.md')
-  let parent=null
+  // Continued native planning roots retain the real Session ancestry.
+  let parent=existsSync(transcript)?readFileSync(transcript,'utf8').trim().split('\\n').filter(Boolean).map(line=>JSON.parse(line)).at(-1)?.uuid??null:null
   const append=record=>{const entry={...record,sessionId,cwd,timestamp:new Date().toISOString(),parentUuid:parent};appendFileSync(transcript,JSON.stringify(entry)+'\\n');parent=entry.uuid}
   append({type:'user',uuid:promptId,promptId,message:{role:'user',content:'Native planning request'}})
   append({type:'attachment',uuid:randomUUID(),attachment:{type:'plan_mode',isSubAgent:false,planFilePath:path}})

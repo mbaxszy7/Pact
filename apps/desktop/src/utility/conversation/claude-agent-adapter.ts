@@ -918,6 +918,9 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             nativeSessionId,
             nativeTurnId,
             includePlan: Boolean(input.planSource || input.inspectMissingPlan),
+            ...(input.planSource || input.inspectMissingPlan
+              ? { planCheckpoint: input.planCheckpoint }
+              : {}),
             ...(input.nativeInputIds ? { nativeInputIds: input.nativeInputIds } : {}),
           },
           signal,
@@ -2233,6 +2236,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                   id: hook.tool_use_id,
                   inputFingerprint: claudePlanInputFingerprint(hook.tool_name, hook.tool_input),
                 },
+                planCheckpoint: input.getPlanCheckpoint?.(hook.session_id),
               },
               signal,
             )
@@ -2852,6 +2856,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                   promptId: intent.promptId,
                   inputFingerprint: intent.inputFingerprint,
                 },
+                planCheckpoint: input.getPlanCheckpoint?.(resolvedSessionId),
               },
               signal,
             )

@@ -163,6 +163,203 @@ async function cancel(f: Fixture) {
   return { task, request, result, decisionCount }
 }
 
+async function reachPlanReviewLimit(primary: 'codex' | 'claude' = 'claude') {
+  const f = await fixture(primary),
+    repo = f.db.conversationRepository,
+    session = f.db.sessionRepository.find(f.sessionId)!
+  f.db.sessionRepository.saveSettings(f.sessionId, {
+    ...session.settings,
+    maxDiscussionRounds: 1,
+  })
+  expect(await f.flow.send(f.input('/plan Preserve cancellation ownership.'))).toMatchObject({
+    ok: true,
+  })
+  await vi.waitFor(() => expect(repo.collaboration(f.sessionId)?.status).toBe('ready'))
+  enableWorkflowRelay(f.db)
+  native.candidate = 'propose_extend_plan_review'
+  expect(await f.flow.send(f.input('Clarify the acceptance wording.'))).toMatchObject({ ok: true })
+  await vi.waitFor(() =>
+    expect(repo.relaySchedulingDecision(f.sessionId)?.request).toMatchObject({
+      category: 'new_authorization',
+      operation: { kind: 'extend_plan_review' },
+    }),
+  )
+  const task = await f.settled(),
+    card = repo.relaySchedulingDecision(f.sessionId)!,
+    request = {
+      reference: { sessionId: f.sessionId, decisionId: card.decisionId, revision: card.revision },
+      clientOperationId: randomUUID(),
+      answer: { kind: 'confirm' as const },
+    }
+  expect(task).toMatchObject({ status: 'waiting', pauseReason: 'limit', discussionRounds: 1 })
+  expect(card.request).toMatchObject({
+    operation: {
+      taskId: task.id,
+      afterRunId: task.runId,
+      actor: task.reviewer,
+      inputSequence: task.inputSequence,
+      planReference: task.planReference,
+      expectedDiscussionRounds: 1,
+      maximum: 1,
+    },
+  })
+  expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
+    'plan',
+    'plan_review',
+    'reply',
+  ])
+  return { ...f, repo, task, card, request }
+}
+
+describe('Relay confirmation at the Plan review limit', () => {
+  it.each([
+    { primary: 'claude' as const, verdict: 'accepted' as const },
+    { primary: 'codex' as const, verdict: 'changes_requested' as const },
+  ])(
+    'binds one fixed review for $primary when the verdict is $verdict',
+    async ({ primary, verdict }) => {
+      const f = await reachPlanReviewLimit(primary)
+      native.reviews.push({ verdict })
+      const result = await f.flow.answerRelayDecision(f.request)
+      if (!result.ok) throw Error(result.error.message)
+      expect(result.value.disposition).toBe('confirmed')
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(verdict === 'accepted' ? 4 : 5))
+      const current = await f.settled(),
+        review = native.inputs[3]!,
+        authorization = review.promptEnvelope.collaborationAuthorization!
+      expect(result).toMatchObject({ value: { runId: review.runId } })
+      expect(authorization).toMatchObject({
+        runId: review.runId,
+        stage: 'plan_review',
+        actor: f.task.reviewer,
+        planReference: f.task.planReference,
+        inputSequence: f.task.inputSequence,
+        userAuthority: { purpose: 'action' },
+      })
+      expect(authorization.userAuthority?.returnStage).toBeUndefined()
+      expect(
+        f.db.drizzle.get(sql`
+        SELECT a.bound_run_id AS runId, a.review_state AS reviewState, b.budget AS budget,
+          b.authorization_id AS authorizationId, d.state AS decisionState, h.run_id AS handoffRunId
+        FROM collaboration_action_receipts a
+        JOIN relay_decisions d ON d.id = a.decision_id AND d.handoff_id = a.handoff_id
+        JOIN scheduling_handoffs h ON h.id = a.handoff_id
+        JOIN scheduling_budget_reservations b ON b.id = a.budget_reservation_id
+        WHERE a.id = ${authorization.userAuthority!.receiptId} AND d.id = ${f.card.decisionId}
+      `),
+      ).toEqual({
+        runId: review.runId,
+        reviewState: null,
+        budget: 'extra_plan_turn',
+        authorizationId: authorization.userAuthority!.receiptId,
+        decisionState: 'bound',
+        handoffRunId: review.runId,
+      })
+      expect(current).toMatchObject({
+        discussionRounds: 2,
+        status: verdict === 'accepted' ? 'ready' : 'waiting',
+      })
+      expect(f.db.sessionRepository.find(f.sessionId)?.settings.maxDiscussionRounds).toBe(1)
+      expect(f.repo.schedulingBudget(`task:${f.task.id}`)?.extraPlanTurns).toBe(1)
+      const expectedTask =
+        verdict === 'accepted'
+          ? { status: 'ready', discussionRounds: 2 }
+          : { stage: 'plan', automation: 'paused', pauseReason: 'limit', discussionRounds: 2 }
+      const waitForConclusion = () =>
+        vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)).toMatchObject(expectedTask))
+      await waitForConclusion()
+      if (verdict === 'changes_requested') await f.act('resume')
+      await waitForConclusion()
+      expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
+      expect(await f.flow.answerRelayDecision(f.request)).toEqual(result)
+      expect(
+        await f.flow.answerRelayDecision({ ...f.request, clientOperationId: randomUUID() }),
+      ).toMatchObject({ ok: false })
+      expect(
+        native.inputs.slice(3).map(({ promptEnvelope }) => ({
+          stage: promptEnvelope.collaboration?.stage,
+          actor: promptEnvelope.collaboration?.actor,
+        })),
+      ).toEqual([
+        { stage: 'plan_review', actor: f.task.reviewer },
+        ...(verdict === 'changes_requested' ? [{ stage: 'plan', actor: primary }] : []),
+      ])
+    },
+  )
+
+  it('keeps the original Plan and count when the user declines the card', async () => {
+    const f = await reachPlanReviewLimit()
+    const request = { ...f.request, answer: { kind: 'cancel' as const } },
+      declined = await f.flow.answerRelayDecision(request)
+    expect(declined).toMatchObject({ ok: true, value: { disposition: 'cancelled', runId: null } })
+    expect(await f.flow.answerRelayDecision(request)).toEqual(declined)
+    expect(await f.settled()).toMatchObject({
+      runId: f.task.runId,
+      planReference: f.task.planReference,
+      discussionRounds: 1,
+      automation: 'paused',
+    })
+    expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
+    expect(native.inputs).toHaveLength(3)
+    expect(f.repo.schedulingBudget(`task:${f.task.id}`)?.extraPlanTurns).toBe(0)
+  })
+
+  it.each(['continue', 'settings'] as const)(
+    'refuses a stale card after %s supersedes the original proposal',
+    async (change) => {
+      const f = await reachPlanReviewLimit()
+      if (change === 'continue') {
+        const manual = await f.act('continue')
+        if (manual.ok) throw Error('Ordinary Continue bypassed the review limit')
+      } else {
+        const session = f.db.sessionRepository.find(f.sessionId)!
+        f.db.sessionRepository.saveSettings(f.sessionId, {
+          ...session.settings,
+          maxDiscussionRounds: 2,
+        })
+      }
+      expect(await f.flow.answerRelayDecision(f.request)).toMatchObject({ ok: false })
+      expect(await f.settled()).toMatchObject({ runId: f.task.runId, discussionRounds: 1 })
+      expect(native.inputs).toHaveLength(3)
+      expect(f.repo.schedulingBudget(`task:${f.task.id}`)?.extraPlanTurns).toBe(0)
+    },
+  )
+
+  it('retires a confirmation left unused when publishing its first projection fails', async () => {
+    const f = await reachPlanReviewLimit()
+    vi.spyOn(f.repo, 'metadataPatch').mockImplementationOnce(() => {
+      throw Error('The confirmation projection failed after the durable answer.')
+    })
+    expect(await f.flow.answerRelayDecision(f.request)).toMatchObject({ ok: false })
+    expect(
+      f.flow.getRelayDecisionReceipt({
+        sessionId: f.sessionId,
+        decisionId: f.card.decisionId,
+        clientOperationId: f.request.clientOperationId,
+      }),
+    ).toMatchObject({ ok: true, value: { disposition: 'confirmed', runId: null } })
+    expect(await f.flow.answerRelayDecision(f.request)).toMatchObject({
+      ok: true,
+      value: { runId: null },
+    })
+    expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
+    expect(await f.settled()).toMatchObject({ automation: 'paused', discussionRounds: 1 })
+    expect(native.inputs).toHaveLength(3)
+    expect(f.repo.schedulingBudget(`task:${f.task.id}`)?.extraPlanTurns).toBe(0)
+  })
+
+  it('retains the charged review and does not replay after the accepted delivery loses observation', async () => {
+    const f = await reachPlanReviewLimit()
+    native.loseObservation = true
+    const result = await f.flow.answerRelayDecision(f.request)
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(4))
+    expect(await f.settled()).toMatchObject({ automation: 'paused', discussionRounds: 2 })
+    expect(await f.flow.answerRelayDecision(f.request)).toEqual(result)
+    expect(f.repo.schedulingBudget(`task:${f.task.id}`)?.extraPlanTurns).toBe(1)
+    expect(native.inputs).toHaveLength(4)
+  })
+})
+
 describe('Cancel an optional Relay advancement, then continue through the original workflow owner', () => {
   it.each(['codex', 'claude'] as const)(
     'continues the %s Plan through its fixed reviewer and explicit Implement',
@@ -208,8 +405,22 @@ describe('Cancel an optional Relay advancement, then continue through the origin
         stage: 'plan_review',
         actor: state.task.reviewer,
       })
-      // The next owner->review handoff consults again on the resumed path.
-      expect(native.decisions).toHaveLength(state.decisionCount + 1)
+      // Native settlement precedes the optional accepted-plan role consultation.
+      // Wait for both distinct handoffs rather than sampling a transient total.
+      await vi.waitFor(() =>
+        expect(
+          native.decisions.slice(state.decisionCount).map((decision) => ({
+            candidates: decision.candidates.map((candidate) => candidate.id),
+            runId: decision.handoff?.freshnessGuard.runId,
+          })),
+        ).toEqual([
+          { candidates: ['propose_supplement_plan'], runId: native.inputs[4]!.runId },
+          { candidates: ['propose_reassign_roles'], runId: native.inputs[5]!.runId },
+        ]),
+      )
+      expect(native.decisions).toHaveLength(state.decisionCount + 2)
+      expect(repo.collaboration(f.sessionId)?.stageRoles).toEqual(state.task.stageRoles)
+      expect(native.inputs).toHaveLength(6)
       expect(await f.act('execute')).toMatchObject({ ok: true })
       await vi.waitFor(() => expect(native.inputs).toHaveLength(8))
       expect(await f.settled()).toMatchObject({ status: 'complete' })

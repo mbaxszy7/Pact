@@ -93,6 +93,8 @@ function suggestionFor(candidate: string | null): string | null {
     supplement_code_response: 'Add one read-only code-review response.',
     propose_supplement_code_response: 'Request one read-only code-review response.',
     propose_reassign_roles: 'Request a future code-role change.',
+    extend_plan_review: 'Add one independent Plan review.',
+    propose_extend_plan_review: 'Request one additional Plan review.',
     route_codex: 'Route the input to Codex.',
     route_claude: 'Route the input to Claude Code.',
     clarify_prepared_input: 'Ask for missing information.',

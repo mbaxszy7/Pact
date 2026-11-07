@@ -235,10 +235,7 @@ function answerWithNewInput(f: Fixture) {
     collaboration: next,
   }).run
   f.finish(reply.id, { plan: 'Current Plan after the new input. Keep cancellation explicit.' })
-  const settings = f.db.sessionRepository.find(f.sessionId)!.settings
-  f.repo.setCollaborationState(
-    advanceCollaboration(f.repo.collaboration(f.sessionId)!, 'resume', settings),
-  )
+  expect(f.repo.collaboration(f.sessionId)?.automation).toBe('active')
   return reply
 }
 

@@ -16,6 +16,7 @@ import { decisionWorkingMemoryDiagnostics } from './native-working-memory.js'
 import {
   enableWorkflowRelay,
   proposeWorkflowPlanOn,
+  seedPausedPlanReviewLimit,
   workflowConversation,
 } from './relay-workflow-fixture.test-support.js'
 
@@ -29,6 +30,7 @@ const native = vi.hoisted(() => ({
   rebuilds: [] as string[],
   sourceReads: [] as WorkflowSourceRead[],
   failNextDecision: false,
+  abstainForSession: undefined as string | undefined,
   workerPath: '',
 }))
 vi.mock('./codex-agent-adapter.js', async () => {
@@ -49,6 +51,12 @@ vi.mock('./openai-decision-runtime.js', async () => {
           native.failNextDecision = false
           return { kind: 'unavailable' as const, reason: 'runtime_unavailable' as const }
         }
+        if (
+          outcome.kind === 'selection' &&
+          native.abstainForSession &&
+          native.decisions.at(-1)?.handoff.sessionId === native.abstainForSession
+        )
+          return { kind: 'selection' as const, selection: { candidateId: null } }
         return outcome
       }
     },
@@ -91,6 +99,7 @@ afterEach(async () => {
   native.rebuilds = []
   native.sourceReads = []
   native.failNextDecision = false
+  native.abstainForSession = undefined
   vi.restoreAllMocks()
 })
 async function fixture(primary: 'codex' | 'claude' = 'codex') {
@@ -219,6 +228,60 @@ it('keeps five Relay decisions waiting while an independent sixth Session comple
   expect(decisionWorkingMemoryDiagnostics().chargedBytes).toBe(0)
 })
 
+it.each(['abstain', 'source refused'] as const)(
+  'advances the second paused review-limit Session after the first has %s',
+  async (outcome) => {
+    const f = await fixture(),
+      repo = f.db.conversationRepository
+    enableWorkflowRelay(f.db)
+    await f.flow.saveSchedulingSettings({
+      expectedRevision: repo.schedulingSettings().revision,
+      enabled: false,
+    })
+    seedPausedPlanReviewLimit(f.db, 1)
+    seedPausedPlanReviewLimit(f.db, 2)
+    const order = repo.pendingWorkflowTasks().map((task) => task.sessionId),
+      [first, second] = order,
+      read = repo.readRelayWorkflowDecisionSources.bind(repo),
+      readSources = vi
+        .spyOn(repo, 'readRelayWorkflowDecisionSources')
+        .mockImplementation((...args) => {
+          if (outcome === 'source refused' && args[0].sessionId === first)
+            return Promise.reject(Error('A required Plan source could not be prepared.'))
+          return read(...args)
+        })
+    expect(order).toHaveLength(2)
+    native.abstainForSession = outcome === 'abstain' ? first : undefined
+    native.candidate = 'propose_extend_plan_review'
+    expect(
+      await f.flow.saveSchedulingSettings({
+        expectedRevision: repo.schedulingSettings().revision,
+        enabled: true,
+      }),
+    ).toMatchObject({ ok: true })
+    await vi.waitFor(() =>
+      expect(repo.relaySchedulingDecision(second!)?.request).toMatchObject({
+        operation: { kind: 'extend_plan_review' },
+      }),
+    )
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const firstTask = repo.collaboration(first!)!,
+      handoff = repo.workflowHandoff(firstTask, firstTask.reviewer)
+    expect(firstTask).toMatchObject({
+      automation: 'paused',
+      pauseReason: 'limit',
+      discussionRounds: 1,
+    })
+    expect(repo.relaySchedulingDecision(first!)).toBeNull()
+    expect(repo.planReviewLimitAdviceConsidered(handoff)).toBe(outcome === 'source refused')
+    expect(readSources.mock.calls.map(([node]) => node.sessionId)).toEqual(order)
+    expect(native.decisions.map((decision) => decision.handoff.sessionId)).toEqual(
+      outcome === 'abstain' ? order : [second],
+    )
+    expect(native.inputs).toEqual([])
+  },
+)
+
 describe.each([32, 100])('%i independently waiting Relay cards', (count) => {
   let representative: Awaited<ReturnType<typeof workflowConversation>>
   beforeAll(
@@ -258,7 +321,11 @@ describe.each([32, 100])('%i independently waiting Relay cards', (count) => {
     const queryPlan = representative.db.drizzle.all<{ detail: string }>(sql`
       EXPLAIN QUERY PLAN SELECT session_id,id,updated_at FROM collaboration_tasks
       WHERE active=1 AND json_extract(state_json,'$.protocol')='native-workflow-v1'
-        AND json_extract(state_json,'$.automation')='active'
+        AND (json_extract(state_json,'$.automation')='active'
+          OR (json_extract(state_json,'$.automation')='paused'
+            AND json_extract(state_json,'$.pauseReason')='limit'
+            AND json_extract(state_json,'$.kind')='plan'
+            AND json_extract(state_json,'$.stage') IN ('plan','reply')))
         AND json_extract(state_json,'$.status') IN ('waiting','ready')
         AND (updated_at,id)>(${first!.updatedAt},${first!.id})
       ORDER BY updated_at,id LIMIT 5`)

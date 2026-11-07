@@ -583,6 +583,7 @@ const activityActions: Record<NonNullable<SchedulingActivityRow['action']>, stri
   confirmed_resend: 'Retry unsent work',
   rebuild_native_context: 'Rebuild agent session',
   reassign_roles: 'Change code roles',
+  extend_plan_review: 'Add one Plan review',
 }
 const activityReasons: Record<SchedulingActivityRow['reason'], string> = {
   workflow: 'Workflow handoff',

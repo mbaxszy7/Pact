@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { afterAll, beforeAll, expect, it, vi } from 'vitest'
 
+import type { ClaudePlanCheckpointSource } from '@pact/agent-runtime'
 import type { AgentNativeForkWitness } from '@pact/contracts'
 
 import { LogicalIpcWorkerTraffic } from '../../shared/logical-ipc-traffic'
@@ -73,6 +74,298 @@ afterAll(async () => {
   if (directory) await rm(directory, { recursive: true, force: true })
 })
 const hash = (text: string) => createHash('sha256').update(text).digest('hex')
+
+async function publishedCheckpointFixture(mode = 'valid') {
+  const profile = join(directory, randomUUID()),
+    nativeSessionId = randomUUID(),
+    sourceRoot = randomUUID(),
+    targetRoot = randomUUID(),
+    planPath = join(profile, 'plan.md'),
+    sourcePrompt = randomUUID(),
+    targetPrompt = randomUUID(),
+    project = join(profile, 'projects', (await realpath(directory)).replace(/[^a-z0-9]/giu, '-'))
+  await mkdir(project, { recursive: true })
+  await writeFile(planPath, 'An unrelated filesystem plan is never a recovery authority.')
+  const base = 'Scope\nA1\nB1\n',
+    expected = 'Scope\nA2\nB1\n'
+  const records: Record<string, unknown>[] = []
+  let parent: string | null = null
+  const add = (record: Record<string, unknown>) => {
+    const uuid = typeof record.uuid === 'string' ? record.uuid : randomUUID()
+    const row: Record<string, unknown> = {
+      sessionId: nativeSessionId,
+      cwd: directory,
+      timestamp,
+      uuid,
+      parentUuid: parent,
+      ...record,
+    }
+    records.push(row)
+    parent = uuid
+    return row
+  }
+  const edit = (id: string, old: string, next: string) => ({
+    type: 'tool_use',
+    id,
+    name: 'Edit',
+    input: { file_path: planPath, old_string: old, new_string: next },
+  })
+  const call = (block: ReturnType<typeof edit> | Array<ReturnType<typeof edit>>) =>
+    add({
+      type: 'assistant',
+      message: {
+        id: randomUUID(),
+        role: 'assistant',
+        content: Array.isArray(block) ? block : [block],
+      },
+    })
+  const ack = (block: ReturnType<typeof edit>, extra: object = {}) =>
+    add({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: block.id, content: 'Done', ...extra }],
+      },
+      toolUseResult: {
+        filePath: planPath,
+        oldString: block.input.old_string,
+        newString: block.input.new_string,
+        originalFile: null,
+        userModified: false,
+        replaceAll: false,
+      },
+    })
+  let oldCall: Record<string, unknown> | undefined
+  const oldEdit = edit('old-edit', 'B1', 'B2')
+  if (mode === 'late_old_receipt') {
+    add({ type: 'user', promptId: randomUUID(), message: { role: 'user', content: 'Older root.' } })
+    oldCall = call(oldEdit)
+  }
+  if (mode === 'old_finished_overlap') {
+    add({
+      type: 'user',
+      promptId: randomUUID(),
+      message: { role: 'user', content: 'Older ambiguous root.' },
+    })
+    const other = edit('old-other', 'A1', 'A2')
+    call(oldEdit)
+    call(other)
+    ack(oldEdit)
+    ack(other)
+  }
+  add({
+    type: 'user',
+    uuid: sourceRoot,
+    promptId: sourcePrompt,
+    message: { role: 'user', content: 'Previous planning root.' },
+  })
+  add({
+    type: 'attachment',
+    attachment: { type: 'plan_mode', isSubAgent: false, planFilePath: planPath },
+  })
+  const anchor = edit('source-edit', 'B0', 'B1')
+  call(mode === 'anchor_frame_write' ? [anchor, edit('after-anchor', 'B1', 'changed')] : anchor)
+  const receipt = ack(anchor, mode === 'failed_receipt' ? { is_error: true } : {})
+  if (oldCall) {
+    const tail = parent
+    ack(oldEdit).parentUuid = oldCall.uuid
+    parent = tail
+  }
+  if (mode === 'late_unknown_receipt') ack(edit('unknown-old-operation', 'B1', 'changed'))
+  if (mode === 'duplicate_receipt') ack(anchor)
+  if (mode === 'wrong_receipt_path') {
+    const response = receipt.toolUseResult
+    if (!response || typeof response !== 'object') throw Error('Missing fixture receipt.')
+    Reflect.set(response, 'filePath', '/foreign/plan.md')
+  }
+  if (mode === 'foreign_receipt') receipt.sessionId = randomUUID()
+  if (mode === 'late_sibling_write') {
+    const tail = parent
+    add({
+      type: 'assistant',
+      parentUuid: sourceRoot,
+      isSidechain: true,
+      message: {
+        id: randomUUID(),
+        role: 'assistant',
+        content: [edit('hidden-write', 'B1', 'lost')],
+      },
+    })
+    parent = tail
+  }
+  if (mode === 'intervening_input')
+    add({
+      type: 'user',
+      promptId: randomUUID(),
+      message: { role: 'user', content: 'Another root.' },
+    })
+  add({
+    type: 'user',
+    uuid: targetRoot,
+    promptId: targetPrompt,
+    message: { role: 'user', content: 'Current planning root.' },
+  })
+  const current = edit('target-edit', 'A1', 'A2')
+  call(current)
+  if (mode === 'overlap') call(edit('other-edit', 'B1', 'B2'))
+  if (mode !== 'missing_result') ack(current)
+  if (mode === 'overlap') ack(edit('other-edit', 'B1', 'B2'))
+  if (mode === 'target_sidechain') {
+    const tail = parent,
+      child = edit('child-edit', 'B1', 'B2')
+    call(child).isSidechain = true
+    ack(child).isSidechain = true
+    parent = tail
+  }
+  if (mode === 'target_unknown_receipt') ack(edit('unknown-target-operation', 'B1', 'changed'))
+  if (mode === 'target_receipt_without_id') {
+    const row = ack(edit('unattributed', 'B1', 'changed'))
+    row.message = { role: 'user', content: [{ type: 'tool_result', content: 'Done' }] }
+  }
+  await writeFile(
+    join(project, `${nativeSessionId}.jsonl`),
+    records.map((row) => JSON.stringify(row)).join('\n') + '\n',
+  )
+  const read = vi.fn<(signal: AbortSignal) => Promise<string>>(async (_signal) =>
+    mode === 'wrong_body' ? base + 'forged' : base,
+  )
+  const planCheckpoint: ClaudePlanCheckpointSource = {
+    checkpoint: {
+      targetRunId: targetRoot,
+      targetNativeTurnId: mode === 'wrong_target' ? randomUUID() : targetRoot,
+      nativeSessionId,
+      bindingGeneration: 1,
+      sourceNativeTurnId: mode === 'wrong_source' ? randomUUID() : sourceRoot,
+      sourceNativeId: mode === 'wrong_anchor' ? 'missing-anchor' : anchor.id,
+      basis: {
+        version: 6,
+        sourceRunId: sourceRoot,
+        sourceMessageId: randomUUID(),
+        document: {
+          id: randomUUID(),
+          sha256: hash(base),
+          bytes: mode === 'capacity' ? 128 * 1024 * 1024 : Buffer.byteLength(base),
+          chars: base.length,
+        },
+      },
+    },
+    read,
+  }
+  vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
+  return {
+    request: { cwd: directory, nativeSessionId, nativeTurnId: targetRoot, planCheckpoint },
+    read,
+    base,
+    expected,
+    current,
+  }
+}
+
+it.each([
+  'valid',
+  'wrong_target',
+  'wrong_source',
+  'wrong_anchor',
+  'duplicate_receipt',
+  'failed_receipt',
+  'foreign_receipt',
+  'wrong_receipt_path',
+  'late_sibling_write',
+  'intervening_input',
+  'wrong_body',
+  'capacity',
+  'missing_result',
+  'overlap',
+  'late_old_receipt',
+  'target_sidechain',
+  'anchor_frame_write',
+  'late_unknown_receipt',
+  'target_unknown_receipt',
+  'old_finished_overlap',
+  'target_receipt_without_id',
+] as const)(
+  'recovers a published checkpoint through the actual native Worker without trusting disk: %s',
+  async (mode) => {
+    const f = await publishedCheckpointFixture(mode)
+    try {
+      const success = ['valid', 'old_finished_overlap', 'missing_result', 'overlap'].includes(mode)
+      const complete = mode === 'valid' || mode === 'old_finished_overlap'
+      const outcome = await files.readAnswer(f.request, new AbortController().signal).then(
+        (value) => ({ value, error: undefined }),
+        (error: unknown) => ({ value: undefined, error }),
+      )
+      const failure = expect.objectContaining({
+        message: expect.stringMatching(
+          mode === 'foreign_receipt' ? /ancestry/iu : /checkpoint|reconstruction working memory/iu,
+        ),
+      })
+      expect(outcome.error).toEqual(success ? undefined : failure)
+      expect(outcome.value?.plan?.text).toBe(complete ? f.expected : undefined)
+      expect(outcome.value?.planUnavailable).toBe(success && !complete ? true : undefined)
+      expect(f.read).toHaveBeenCalledTimes(success || mode === 'wrong_body' ? 1 : 0)
+      expect(workerLocation.live).toBe(0)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  },
+)
+
+it('uses the same authenticated checkpoint for live Hook prefixes and complete cold readback', async () => {
+  const f = await publishedCheckpointFixture()
+  try {
+    const original = await files.readAnswer(
+      { ...f.request, planCheckpoint: undefined },
+      new AbortController().signal,
+    )
+    expect(original.planUnavailable).toBe(true)
+    expect(original.plan).toBeUndefined()
+    expect(f.read).not.toHaveBeenCalled()
+    const prefix = await files.readAnswer(
+      {
+        ...f.request,
+        planHook: {
+          id: f.current.id,
+          inputFingerprint: claudePlanInputFingerprint('Edit', f.current.input),
+        },
+      },
+      new AbortController().signal,
+    )
+    expect(prefix.planState).toMatchObject({ text: f.base, complete: true, pending: [] })
+    const complete = await files.readAnswer(f.request, new AbortController().signal)
+    expect(complete.plan?.text).toBe(f.expected)
+    expect(f.read).toHaveBeenCalledTimes(2)
+    expect(workerLocation.live).toBe(0)
+  } finally {
+    vi.unstubAllEnvs()
+  }
+})
+
+it('retains the native owner until a cancelled checkpoint reader physically settles', async () => {
+  const f = await publishedCheckpointFixture(),
+    controller = new AbortController(),
+    held = Promise.withResolvers<string>()
+  f.read.mockImplementation(() => held.promise)
+  try {
+    const reading = files.readAnswer(f.request, controller.signal).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    await vi.waitFor(() => expect(f.read).toHaveBeenCalledTimes(1))
+    controller.abort()
+    expect(await reading).toMatchObject({ message: expect.stringMatching(/cancelled/iu) })
+    expect(files.active).toBe(true)
+    await expect(files.readAnswer(f.request, new AbortController().signal)).rejects.toThrow(
+      /already active/iu,
+    )
+    held.resolve(f.base)
+    await vi.waitFor(() => expect(files.active).toBe(false))
+    expect(workerLocation.live).toBe(0)
+  } finally {
+    held.resolve(f.base)
+    await files.dispose()
+    vi.unstubAllEnvs()
+  }
+})
 
 async function claudeAccountingFixture() {
   const profile = join(directory, randomUUID()),

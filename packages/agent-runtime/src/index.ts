@@ -1,4 +1,5 @@
 import type {
+  ClaudePlanCheckpoint,
   SkillBinding,
   FrozenSkillInvocation,
   AnchoredComment,
@@ -201,6 +202,13 @@ export interface AgentNativeRunProbeInput
   inspectMissingPlan?: boolean
   /** Host-frozen planner scope; ordinary/review roots do not recover plan metadata. */
   planSource?: boolean
+  planCheckpoint?: ClaudePlanCheckpointSource | undefined
+}
+
+/** Borrowed host capability; only read after the native owner admits its working memory. */
+export interface ClaudePlanCheckpointSource {
+  checkpoint: ClaudePlanCheckpoint
+  read(signal: AbortSignal): Promise<string>
 }
 
 export interface AgentNativeInitializedBindingProbeInput
@@ -328,6 +336,7 @@ export interface AgentRunInput {
   readCollaborationSourcePart?: ((input: unknown) => CollaborationSourceReadResult) | undefined
   /** Borrowed from the current NativeObservation; never included in frozen execution JSON. */
   collaborationSourceReader?: AgentCollaborationSourceReader | undefined
+  getPlanCheckpoint?: (nativeSessionId: string) => ClaudePlanCheckpointSource | undefined
   recordDispatch?: (
     phase: 'possibly_sent' | 'accepted' | 'rejected',
     nativeSessionId?: string,

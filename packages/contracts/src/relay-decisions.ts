@@ -1,7 +1,7 @@
 import { z } from 'zod'
 
 import { collaborationDocumentSchema } from './collaboration-documents.js'
-import { taskStageRolesSchema } from './collaboration.js'
+import { taskStageRolesSchema, collaborationPlanReferenceSchema } from './collaboration.js'
 import { schedulingHandoffSchema } from './scheduling.js'
 
 export const RELAY_DECISION_BYTES = 4 * 1024
@@ -39,6 +39,20 @@ export const relayRebuildOperationSchema = z.strictObject({
 export const relayRepairOperationSchema = relaySupplementOperationSchema.extend({
   kind: z.literal('repair'),
 })
+export const relayPlanReviewExtensionOperationSchema = z.strictObject({
+  kind: z.literal('extend_plan_review'),
+  taskId: uuid,
+  afterRunId: uuid,
+  actor: z.enum(['codex', 'claude']),
+  inputSequence: z.number().int().nonnegative(),
+  planReference: collaborationPlanReferenceSchema,
+  expectedDiscussionRounds: z.number().int().nonnegative(),
+  maximum: z.number().int().nonnegative(),
+  scopeFingerprint: digest,
+})
+export type RelayPlanReviewExtensionOperation = z.infer<
+  typeof relayPlanReviewExtensionOperationSchema
+>
 export const relayReassignRolesOperationSchema = z
   .strictObject({
     kind: z.literal('reassign_roles'),
@@ -123,6 +137,7 @@ export const relaySchedulingDecisionSchema = relayDecisionReferenceSchema
         operation: z.discriminatedUnion('kind', [
           relaySupplementOperationSchema,
           relayRepairOperationSchema,
+          relayPlanReviewExtensionOperationSchema,
         ]),
       }),
       z.strictObject({

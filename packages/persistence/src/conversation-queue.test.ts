@@ -81,12 +81,10 @@ describe('queued workflow classification through the sealed body', () => {
     expect(() => value.prepare(root, request)).toThrow(/answered in the next Turn/)
     expect(value.repo.collaboration(value.sessionId)).toEqual({
       ...task,
-      automation: 'paused',
-      pauseReason: 'user_message',
       revision: task.revision + 1,
       latestUserMessageId: request.inputId,
       inputProcessing: { pending: { inputId: request.inputId, inputSequence: task.inputSequence } },
-      notice: 'Automatic collaboration is paused. Your message will be answered next.',
+      notice: 'Your message will be answered before collaboration continues.',
     })
     expect(value.repo.queueState(value.sessionId).input?.state).toBe('queued')
   })

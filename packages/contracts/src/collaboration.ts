@@ -309,7 +309,7 @@ export const collaborationTaskSchema = z
     stage: collaborationStageSchema,
     actor: agent,
     status: z.enum(['running', 'waiting', 'questions', 'ready', 'complete', 'failed']),
-    /** Pausing automation never suppresses settlement of the current native root. */
+    /** Persistent pause intent; inputProcessing separately gates unanswered or pending input. */
     automation: z.enum(['active', 'paused']),
     pauseReason: z
       .enum(['user_message', 'user', 'needs_user', 'restart', 'limit', 'failure', 'stopped'])

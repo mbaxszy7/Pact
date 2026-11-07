@@ -922,6 +922,9 @@ export class Conversation {
             }
           }
           this.schedulingListener?.()
+          // A completed attempt releases the single Decision slot for other waiting Sessions.
+          // Duplicate facts are filtered before allocating a runtime, so this is not a retry loop.
+          if (handoff) this.schedulePendingRoutedContinuations()
         }
         return undefined
       })
@@ -3004,6 +3007,8 @@ export class Conversation {
       )
         return Conversation.capacityFailure()
       const answer = this.conversations.answerRelaySchedulingDecision(input)
+      // Own the committed intent before projection or listener code can fail.
+      if (answer.created && answer.receiptId) unusedReceiptId = answer.receiptId
       // Only the successful Repository call has checked the original request digest and committed.
       if (
         input.answer.kind === 'cancel' &&
@@ -3034,7 +3039,6 @@ export class Conversation {
           answer.nativeRebuild.operationId,
         )
       if (answer.created && answer.receiptId) {
-        unusedReceiptId = answer.receiptId
         const prepared = this.conversations.preparedRelayWorkflowAction(answer.receiptId)
         const dispatched = await this.startWorkflowTurn(
           prepared.task,
@@ -4637,9 +4641,12 @@ export class Conversation {
     handoff: SchedulingHandoff,
   ): Promise<void> {
     let material: Omit<RelayDecisionMaterial, 'input'> | undefined
+    let limitAttempt = false
     try {
       const preferences = this.conversations.schedulingSettings()
       if (!preferences.enabled || !preferences.credential.configured) return
+      if (this.conversations.decisionEvaluationReceipt(handoff)) return
+      if (this.conversations.planReviewLimitAdviceConsidered(handoff)) return
       const runtimeAdmission = this.decisionRuntimeAdmission()
       if (runtimeAdmission !== 'may_attempt') return
       const session = this.sessions.find(task.sessionId)
@@ -4648,21 +4655,27 @@ export class Conversation {
       const current = this.conversations.relayWorkflowAlternatives(handoff)
       if (!current?.alternatives.length) return
       const { alternatives } = current
+      limitAttempt = current.snapshot.node === 'plan_review_limit'
       const candidates = alternatives.map((entry) =>
-        entry.kind === 'reassign_roles'
+        entry.kind === 'extend_plan_review'
           ? {
-              id: 'propose_reassign_roles',
-              description: `Propose swapping future code responsibilities: ${entry.operation.proposedRoles.codeAuthor} implements, responds and repairs; ${entry.operation.proposedRoles.codeReviewer} reviews code. Propose only when the complete accepted Plan and review establish a clear benefit over the current assignment. Preserve the Plan authors, accepted artifacts, original scope and permissions. The user must confirm the role change; this does not start work or grant writing. Choose false when the current assignment remains suitable.`,
+              id: 'propose_extend_plan_review',
+              description: `Propose one additional read-only review of the current plan by ${entry.actor} despite the exhausted plan-review limit. Recommend it only when the complete current plan, latest review and author response establish that another independent check is useful. User confirmation is required. This permits one review only, preserves all consumed counts and Session defaults, and grants no implementation or repair. Abstain when work is not ready for another review.`,
             }
-          : entry.kind === 'repair'
+          : entry.kind === 'reassign_roles'
             ? {
-                id: 'propose_repair',
-                description: `Request one scoped repair by ${collaborationActor(task, 'repair')} under a new exact user grant, followed by the fixed ${collaborationActor(task, 'code_review')} review. Propose this only when complete current review sources establish concrete work within the original task. It grants no execution and cannot expand scope or permissions. Return false when no extra work is necessary.`,
+                id: 'propose_reassign_roles',
+                description: `Propose swapping future code responsibilities: ${entry.operation.proposedRoles.codeAuthor} implements, responds and repairs; ${entry.operation.proposedRoles.codeReviewer} reviews code. Propose only when the complete accepted Plan and review establish a clear benefit over the current assignment. Preserve the Plan authors, accepted artifacts, original scope and permissions. The user must confirm the role change; this does not start work or grant writing. Choose false when the current assignment remains suitable.`,
               }
-            : {
-                id: `propose_${entry.kind}`,
-                description: `Propose one extra read-only turn by ${entry.actor}, followed by the fixed ${entry.returnActor} review, only if complete sources establish a concrete remaining gap that the normal next step cannot address. This candidate requests the user's specific authorization and grants no execution. Choose false when no extra turn is necessary.`,
-              },
+            : entry.kind === 'repair'
+              ? {
+                  id: 'propose_repair',
+                  description: `Request one scoped repair by ${collaborationActor(task, 'repair')} under a new exact user grant, followed by the fixed ${collaborationActor(task, 'code_review')} review. Propose this only when complete current review sources establish concrete work within the original task. It grants no execution and cannot expand scope or permissions. Return false when no extra work is necessary.`,
+                }
+              : {
+                  id: `propose_${entry.kind}`,
+                  description: `Propose one extra read-only turn by ${entry.actor}, followed by the fixed ${entry.returnActor} review, only if complete sources establish a concrete remaining gap that the normal next step cannot address. This candidate requests the user's specific authorization and grants no execution. Choose false when no extra turn is necessary.`,
+                },
       )
       const outcome = await this.evaluateDecision(
         {
@@ -4698,6 +4711,11 @@ export class Conversation {
         },
         new AbortController().signal,
       )
+      if (
+        outcome.kind === 'unavailable' &&
+        ['busy', 'duplicate', 'cancelled', 'stale'].includes(outcome.reason)
+      )
+        limitAttempt = false
       if (outcome.kind !== 'selection' || !material || material.basis.kind !== 'workflow') return
       const chosenProposal = alternatives.find(
         (entry) => `propose_${entry.kind}` === outcome.selection.candidateId,
@@ -4727,6 +4745,7 @@ export class Conversation {
     } catch {
       // Advisory consultation never blocks the lawful default step.
     } finally {
+      if (limitAttempt) this.conversations.recordPlanReviewLimitAdviceConsidered(handoff)
       material = undefined
     }
   }
@@ -4751,10 +4770,22 @@ export class Conversation {
       !task ||
       !session ||
       session.status === 'archived' ||
-      task.automation !== 'active' ||
+      (task.automation !== 'active' && task.pauseReason !== 'limit') ||
       (task.status !== 'waiting' && task.status !== 'ready')
     )
       return
+    if (collaborationInputGate(task)) return
+    if (task.automation === 'paused') {
+      const handoff = this.conversations.workflowHandoff(
+        task,
+        collaborationActor(task, 'plan_review'),
+      )
+      await this.consultWorkflowAlternatives(task, handoff)
+      const owner = this.decisionRuntime
+      if (owner?.kind === 'evaluation' && owner.handoff?.id === handoff.id)
+        this.releaseDecisionHandoff(owner)
+      return
+    }
     if (task.status === 'ready') {
       const handoff = this.conversations.workflowHandoff(
         task,
@@ -4764,18 +4795,6 @@ export class Conversation {
       const owner = this.decisionRuntime
       if (owner?.kind === 'evaluation' && owner.handoff?.id === handoff.id)
         this.releaseDecisionHandoff(owner)
-      return
-    }
-    if (collaborationInputGate(task)) {
-      this.publish(
-        this.conversations.setCollaborationState({
-          ...task,
-          revision: task.revision + 1,
-          automation: 'paused',
-          pauseReason: 'needs_user',
-          notice: 'Your input must be processed before collaboration can continue.',
-        }),
-      )
       return
     }
     if (!collaborationNextStage(task)) {
@@ -4810,6 +4829,7 @@ export class Conversation {
           notice: notice.slice(0, 512),
         }),
       )
+      if (notice.includes('limit')) this.schedulePendingRoutedContinuations()
       return
     }
     let consultation: DecisionInvocationOwner | undefined
@@ -6334,6 +6354,10 @@ export class Conversation {
                 ...(run.nativeTurnId ? { nativeTurnId: run.nativeTurnId } : {}),
                 nativeInputIds: this.conversations.nativeInputIdsForRun(run.id),
                 planSource: this.conversations.workflowPlanSourceExpected(run.id),
+                planCheckpoint: this.conversations.workflowPlanCheckpoint(
+                  run.id,
+                  run.nativeSessionId!,
+                ),
                 ...(run.executorId ? { executorId: run.executorId } : {}),
                 cwd: project.directoryPath,
                 model: run.model,
@@ -6602,6 +6626,10 @@ export class Conversation {
                   ? {
                       nativeInputIds: this.conversations.nativeInputIdsForRun(run.id),
                       planSource: this.conversations.workflowPlanSourceExpected(run.id),
+                      planCheckpoint: this.conversations.workflowPlanCheckpoint(
+                        run.id,
+                        context.nativeSessionId,
+                      ),
                     }
                   : {}),
                 ...(run && this.conversations.needsWorkflowPlanRecovery(run.id)
@@ -9169,6 +9197,10 @@ export class Conversation {
           },
           recordArchivedEvent: archive,
           collaborationSourceReader: owner.sourceReader,
+          getPlanCheckpoint: (nativeSessionId) =>
+            stillOwned()
+              ? this.conversations.workflowPlanCheckpoint(run.id, nativeSessionId)
+              : undefined,
           readCollaborationSourcePart: owner.sourceReader
             ? (raw) => {
                 const {

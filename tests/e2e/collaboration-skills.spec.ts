@@ -1,13 +1,18 @@
 import { expect, type Page } from '@playwright/test'
-import { randomUUID } from 'node:crypto'
-import { mkdir, open, writeFile } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { mkdir, open, realpath, writeFile } from 'node:fs/promises'
 import { resolve, join } from 'node:path'
 
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
+import {
+  advanceCollaboration,
+  collaborationTaskSchema,
+} from '../../packages/contracts/src/index.js'
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { quitPact } from './native-quit.js'
-import { createRuntimeFixture, test } from './runtime-fixture.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
+import { createRuntimeFixture, test, type RuntimeFixture } from './runtime-fixture.js'
 async function closeContextOverlay(page: Page): Promise<void> {
   const overlay = page.getByRole('dialog', { name: 'Context panel', exact: true })
   if (await overlay.isVisible())
@@ -24,6 +29,12 @@ async function current(page: Page, sessionId: string) {
 async function prepare(
   primary: 'codex' | 'claude' = 'codex',
   viewport?: { width: number; height: number },
+  seed?: (context: {
+    db: PactDatabase
+    fixture: RuntimeFixture
+    directory: string
+    sessionId: string
+  }) => Promise<void>,
 ) {
   const fixture = await createRuntimeFixture({
     mode: 'deterministic',
@@ -64,6 +75,7 @@ async function prepare(
         maxRepairAttempts: 3,
       },
     )
+    await seed?.({ db, fixture, directory, sessionId })
   } finally {
     db.close()
   }
@@ -85,6 +97,276 @@ async function prepare(
   })
   return { fixture, app, page, send, counts, directory, sessionId }
 }
+
+test('@deterministic Restore saved plan uses its authenticated checkpoint and native edits without another Agent turn', async () => {
+  const original = 'Scope\nA1\nB1\n',
+    restored = 'Scope\nA2\nB1\n'
+  let targetRunId = '',
+    sourceMessageId = '',
+    sourceRunId = ''
+  const f = await prepare('claude', undefined, async ({ db, fixture, directory, sessionId }) => {
+    const repo = db.conversationRepository,
+      settings = db.sessionRepository.find(sessionId)!.settings,
+      nativeSessionId = randomUUID(),
+      userId = randomUUID()
+    const initial = collaborationTaskSchema.parse({
+      protocol: 'native-workflow-v1',
+      id: randomUUID(),
+      sessionId,
+      kind: 'plan',
+      revision: 0,
+      owner: 'claude',
+      reviewer: 'codex',
+      actor: 'claude',
+      stage: 'plan',
+      status: 'running',
+      automation: 'active',
+      task: 'Restore the saved plan.',
+      taskMessageId: userId,
+      runId: userId,
+      inputSequence: 0,
+      handledInputSequence: 0,
+      planVersion: 0,
+      discussionRounds: 0,
+      reviewCycles: 0,
+      repairAttempts: 0,
+    })
+    const begin = (task: typeof initial, messageId = randomUUID(), revision?: number) => {
+      const drafts = repo.readPage({ scope: 'drafts', sessionId })
+      if (drafts.scope !== 'drafts') throw Error('Missing source draft revision.')
+      return repo.beginRun({
+        sessionId,
+        clientMessageId: messageId,
+        content: '/plan Restore the saved plan.',
+        commentIds: [],
+        expectedCommentsRevision: drafts.commentsRevision,
+        agentId: task.actor,
+        settingsRevision: 1,
+        model: null,
+        effort: null,
+        collaboration: task,
+        ...(revision === undefined ? {} : { expectedCollaborationRevision: revision }),
+      }).run
+    }
+    const finish = (runId: string, plan?: string, review = false) => {
+      const run = repo.findRun(runId)!,
+        native = run.agentId === 'claude' ? nativeSessionId : randomUUID()
+      repo.applyEvent(sessionId, runId, {
+        type: 'session.started',
+        agentId: run.agentId,
+        nativeSessionId: native,
+      })
+      repo.applyEvent(sessionId, runId, {
+        type: 'turn.started',
+        agentId: run.agentId,
+        turnId: runId,
+      })
+      if (plan) repo.recordWorkflowPlan(runId, { nativeId: 'published-edit', text: plan })
+      else if (review) repo.recordWorkflowReview(runId, { verdict: 'changes_requested' })
+      else repo.recordWorkflowPlanUnavailable(runId)
+      repo.applyEvent(sessionId, runId, {
+        type: 'text.completed',
+        agentId: run.agentId,
+        turnId: runId,
+        outputId: runId,
+        text: review
+          ? 'Update A1 to A2.'
+          : plan
+            ? 'Published original plan.'
+            : 'Plan saved; native capture unavailable.',
+      })
+      repo.recordNativeEvidence({
+        kind: 'ended',
+        source: 'stored_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId,
+          agentId: run.agentId,
+          requestId: runId,
+          runId,
+          nativeSessionId: native,
+          nativeTurnId: runId,
+          bindingGeneration: run.bindingGeneration ?? 1,
+        },
+      })
+      repo.recordNativeEffects(runId, 'settled')
+      repo.applyEvent(sessionId, runId, {
+        type: 'turn.completed',
+        agentId: run.agentId,
+        turnId: runId,
+        outcome: 'completed',
+      })
+      repo.recordNativeEffects(runId, 'settled')
+    }
+    const source = begin(initial, userId)
+    sourceRunId = source.id
+    finish(source.id, original)
+    let task = repo.collaboration(sessionId)!
+    const review = begin(
+      advanceCollaboration(task, 'continue', settings),
+      randomUUID(),
+      task.revision,
+    )
+    finish(review.id, undefined, true)
+    task = repo.collaboration(sessionId)!
+    const target = begin(
+      advanceCollaboration(task, 'continue', settings),
+      randomUUID(),
+      task.revision,
+    )
+    targetRunId = target.id
+    finish(target.id)
+    sourceMessageId = repo.findRun(target.id)!.responseMessageId!
+    expect(repo.needsWorkflowPlanRecovery(target.id)).toBe(true)
+    const planPath = join(fixture.claudeHome, 'plans', 'checkpoint-plan.md'),
+      project = join(
+        fixture.claudeHome,
+        'projects',
+        (await realpath(directory)).replace(/[^a-z0-9]/giu, '-'),
+      )
+    await mkdir(project, { recursive: true })
+    await mkdir(join(fixture.claudeHome, 'plans'), { recursive: true })
+    await writeFile(planPath, 'Untrusted newer disk text must not replace the recovered plan.')
+    const rows: object[] = []
+    let parent: string | null = null
+    const add = (record: Record<string, unknown>) => {
+      const uuid = typeof record.uuid === 'string' ? record.uuid : randomUUID()
+      rows.push({
+        sessionId: nativeSessionId,
+        cwd: directory,
+        timestamp: new Date().toISOString(),
+        uuid,
+        parentUuid: parent,
+        ...record,
+      })
+      parent = uuid
+    }
+    const edit = (id: string, oldString: string, newString: string) => {
+      add({
+        type: 'assistant',
+        message: {
+          id: randomUUID(),
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id,
+              name: 'Edit',
+              input: { file_path: planPath, old_string: oldString, new_string: newString },
+            },
+          ],
+        },
+      })
+      add({
+        type: 'user',
+        toolUseResult: {
+          filePath: planPath,
+          oldString,
+          newString,
+          originalFile: null,
+          userModified: false,
+          replaceAll: false,
+        },
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: id, content: 'Done' }],
+        },
+      })
+    }
+    add({
+      type: 'user',
+      uuid: source.id,
+      promptId: randomUUID(),
+      message: { role: 'user', content: 'Original planning root.' },
+    })
+    add({
+      type: 'attachment',
+      attachment: { type: 'plan_mode', isSubAgent: false, planFilePath: planPath },
+    })
+    // The old native preimage is unavailable; only the prior host-published plan authenticates it.
+    edit('published-edit', 'B0', 'B1')
+    add({
+      type: 'user',
+      uuid: target.id,
+      promptId: randomUUID(),
+      message: { role: 'user', content: 'Revise A1 to A2.' },
+    })
+    edit('current-edit', 'A1', 'A2')
+    add({
+      type: 'assistant',
+      message: {
+        id: randomUUID(),
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Plan saved; native capture unavailable.' }],
+      },
+    })
+    await writeFile(
+      join(project, `${nativeSessionId}.jsonl`),
+      rows.map((row) => JSON.stringify(row)).join('\n') + '\n',
+    )
+  })
+  try {
+    await closeContextOverlay(f.page)
+    const before = await current(f.page, f.sessionId)
+    expect(before).toMatchObject({ runId: targetRunId, planVersion: 1, automation: 'paused' })
+    await f.page.getByRole('button', { name: 'Restore saved plan', exact: true }).click()
+    await expect.poll(async () => (await current(f.page, f.sessionId))?.planVersion).toBe(2)
+    const after = await current(f.page, f.sessionId)
+    expect(after).toMatchObject({
+      runId: targetRunId,
+      status: 'waiting',
+      automation: 'paused',
+      nextStage: 'plan_review',
+    })
+    expect(after?.planReference?.sourceRunId).toBe(targetRunId)
+    expect(after?.planReference?.document).toMatchObject({
+      bytes: Buffer.byteLength(restored),
+      chars: restored.length,
+    })
+    expect(after?.planReference?.document.sha256).toBe(
+      createHash('sha256').update(restored).digest('hex'),
+    )
+    const database = ReadonlyFixtureDatabase.open(f.fixture)
+    try {
+      expect(
+        database.drizzle.query.agentRuns.findMany({ columns: { id: true }, limit: 4 }).sync(),
+      ).toHaveLength(3)
+    } finally {
+      database.close()
+    }
+    await expect(
+      f.page.getByRole('button', { name: 'Restore saved plan', exact: true }),
+    ).toHaveCount(0)
+    await expect(
+      f.page.getByRole('button', { name: 'Continue collaboration', exact: true }),
+    ).toBeVisible()
+    expect(after?.sourceMessageId).toBe(sourceMessageId)
+    expect(after?.review?.planReference?.sourceRunId).toBe(sourceRunId)
+    const repeated = await f.page.evaluate(
+      async (input) => {
+        const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+        return bridge.actOnCollaboration(input)
+      },
+      {
+        sessionId: f.sessionId,
+        taskId: after!.id,
+        revision: after!.revision,
+        clientMessageId: randomUUID(),
+        action: 'recover_plan' as const,
+      },
+    )
+    expect(repeated.ok).toBe(false)
+    expect(await current(f.page, f.sessionId)).toMatchObject({
+      runId: targetRunId,
+      planVersion: 2,
+      automation: 'paused',
+    })
+    expect(await f.counts()).toEqual({ codex: 0, claude: 0 })
+  } finally {
+    await quitPact(f.app)
+    await f.fixture.dispose()
+  }
+})
 
 for (const primary of ['codex', 'claude'] as const)
   test(`@deterministic native plan from ${primary} is independently reviewed before explicit Secondary implementation and repair`, async () => {
@@ -161,7 +443,7 @@ for (const primary of ['codex', 'claude'] as const)
     }
   })
 
-test('@deterministic structured question answers stay bound to the requesting actor and resume only on explicit continuation', async () => {
+test('@deterministic structured question answers stay bound to the requesting actor and automatically continue review', async () => {
   const f = await prepare('claude', { width: 1000, height: 720 })
   try {
     await f.send('@claude /plan unclear cancellation requirement')
@@ -181,17 +463,19 @@ test('@deterministic structured question answers stay bound to the requesting ac
       .fill('Preserve restart handling.')
     expect(await f.counts()).toEqual({ codex: 0, claude: 1 })
     await card.getByRole('button', { name: 'Send answers', exact: true }).click()
-    await expect.poll(async () => (await current(f.page, f.sessionId))?.planVersion).toBe(1)
+    await expect.poll(async () => (await current(f.page, f.sessionId))?.status).toBe('ready')
     await expect(card).toHaveCount(0)
     expect(await current(f.page, f.sessionId)).toMatchObject({
       owner: 'claude',
-      actor: 'claude',
-      stage: 'reply',
-      automation: 'paused',
+      actor: 'codex',
+      stage: 'plan_review',
+      automation: 'active',
+      review: { inputSequence: 2, verdict: 'accepted' },
     })
-    expect(await f.counts()).toEqual({ codex: 0, claude: 2 })
     await closeContextOverlay(f.page)
-    await f.page.getByRole('button', { name: 'Continue collaboration', exact: true }).click()
+    await expect(
+      f.page.getByRole('button', { name: 'Continue collaboration', exact: true }),
+    ).toHaveCount(0)
     await expect(
       f.page.getByRole('button', { name: 'Implement plan · Codex', exact: true }),
     ).toBeEnabled()
@@ -284,7 +568,7 @@ test('@deterministic cold restart preserves the accepted native plan and pauses 
 })
 
 for (const primary of ['codex', 'claude'] as const) {
-  test(`@deterministic ${primary} plan reviewer receives decision answers before explicit author continuation`, async () => {
+  test(`@deterministic ${primary} plan reviewer receives decision answers before automatic author continuation`, async () => {
     const f = await prepare(primary)
     const reviewer = primary === 'codex' ? 'claude' : 'codex'
     try {
@@ -297,10 +581,7 @@ for (const primary of ['codex', 'claude'] as const) {
       await card.getByRole('radio', { name: 'Current request', exact: true }).check()
       await card.getByRole('button', { name: 'Send answers', exact: true }).click()
       await expect(
-        f.page.getByText(
-          'The supplied scope decision has been handled. Continue explicitly to resume collaboration.',
-          { exact: true },
-        ),
+        f.page.getByText('The supplied scope decision has been handled.', { exact: true }),
       ).toBeVisible()
       await expect(card).toHaveCount(0)
       const reply = f.page.locator('article').filter({ hasText: 'Replies to your questions' })
@@ -312,17 +593,18 @@ for (const primary of ['codex', 'claude'] as const) {
         reply.locator('p').filter({ hasText: '1. Which cancellation scope should change?' }),
       ).toHaveCount(1)
       await expect(reply.locator('li').filter({ hasText: 'Current request' })).toHaveCount(1)
+      await expect.poll(async () => (await current(f.page, f.sessionId))?.status).toBe('ready')
       expect(await current(f.page, f.sessionId)).toMatchObject({
         owner: primary,
         actor: reviewer,
-        stage: 'reply',
-        automation: 'paused',
+        stage: 'plan_review',
+        automation: 'active',
         planVersion: 1,
+        review: { inputSequence: 2, verdict: 'accepted' },
       })
-      expect(await f.counts()).toEqual(
-        primary === 'codex' ? { codex: 1, claude: 2 } : { codex: 2, claude: 1 },
-      )
-      await f.page.getByRole('button', { name: 'Continue collaboration', exact: true }).click()
+      await expect(
+        f.page.getByRole('button', { name: 'Continue collaboration', exact: true }),
+      ).toHaveCount(0)
       await expect(
         f.page.getByRole('button', {
           name: `Implement plan · ${primary === 'codex' ? 'Claude Code' : 'Codex'}`,

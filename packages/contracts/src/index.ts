@@ -3477,3 +3477,4 @@ export interface DesktopBridge {
 
 export * from './handoff-guidance.js'
 export * from './scheduling-recovery.js'
+export * from './claude-plan-checkpoint.js'

@@ -1,12 +1,21 @@
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { Worker } from 'node:worker_threads'
 
-import type { AgentNativeForkBoundary, AgentNativeForkWitness } from '@pact/agent-runtime'
+import type {
+  AgentNativeForkBoundary,
+  AgentNativeForkWitness,
+  ClaudePlanCheckpointSource,
+} from '@pact/agent-runtime'
 
 import {
   collaborationRetainedPlanSchema,
   type CollaborationRetainedPlan,
   ipcTrafficMeasurementSchema,
+  claudePlanCheckpointSchema,
+  claudePlanCheckpointRequestSchema,
+  claudePlanCheckpointWorkingBytes,
+  type ClaudePlanCheckpoint,
 } from '@pact/contracts'
 import {
   collaborationReviewObservationSchema,
@@ -103,6 +112,7 @@ export interface NativeForkFileInput {
     inputFingerprint: string
   }
   includePlan?: boolean
+  planCheckpoint?: ClaudePlanCheckpoint
   lastDispatchedPhase?: 'fork' | 'initialize'
   cwd: string
   nativeSessionId: string
@@ -287,17 +297,24 @@ export class NativeForkFiles {
       | 'includePlan'
     > & {
       nativeTurnId: string
+      planCheckpoint?: ClaudePlanCheckpointSource | undefined
     },
     signal: AbortSignal,
   ): Promise<NativeForkAnswerResult> {
+    const { planCheckpoint, ...request } = input
+    if (planCheckpoint) claudePlanCheckpointSchema.parse(planCheckpoint.checkpoint)
     const answer = await this.run(
       {
-        ...input,
+        ...request,
+        ...(planCheckpoint ? { planCheckpoint: planCheckpoint.checkpoint } : {}),
         provider: 'claude',
         action: 'read-answer',
       },
       signal,
       answerResult,
+      undefined,
+      undefined,
+      planCheckpoint,
     )
     if (
       answer.nativeSessionId !== input.nativeSessionId ||
@@ -387,6 +404,7 @@ export class NativeForkFiles {
       nativeSessionId: string,
       signal: AbortSignal,
     ) => Promise<NativeForkHistoryReference>,
+    checkpointSource?: ClaudePlanCheckpointSource,
   ): Promise<T> {
     signal.throwIfAborted()
     if (this.worker)
@@ -428,11 +446,14 @@ export class NativeForkFiles {
     let timer: ReturnType<typeof setTimeout> | undefined
     let abort: (() => void) | undefined
     let physicallySettled = false
+    let workerExited = false
+    let checkpointRequested = false
+    let checkpointReading: Promise<void> | undefined
     const physical = Promise.withResolvers<void>()
     this.observePhysicalOperation?.(signal, physical.promise)
     let termination: Promise<void> | undefined
     const settlePhysical = (): void => {
-      if (physicallySettled) return
+      if (physicallySettled || !workerExited || checkpointReading) return
       physicallySettled = true
       reservation.release()
       if (this.worker === worker) {
@@ -445,7 +466,11 @@ export class NativeForkFiles {
       if (physicallySettled) return Promise.resolve()
       if (!termination) {
         try {
-          termination = worker.terminate().then(settlePhysical)
+          termination = worker.terminate().then(() => {
+            workerExited = true
+            settlePhysical()
+            return undefined
+          })
         } catch (error) {
           return Promise.reject(error)
         }
@@ -456,8 +481,15 @@ export class NativeForkFiles {
       }
       return termination
     }
-    this.terminateWorker = terminate
-    worker.once('exit', settlePhysical)
+    this.terminateWorker = async () => {
+      references.abort()
+      await terminate()
+      await physical.promise
+    }
+    worker.once('exit', () => {
+      workerExited = true
+      settlePhysical()
+    })
     try {
       return await new Promise<T>((resolve, reject) => {
         abort = () =>
@@ -502,7 +534,46 @@ export class NativeForkFiles {
               else traffic.invalidate('unvalidated_message')
             }
             if (!active) return
-            if (message.type === 'history_reference') {
+            if (message.type === 'plan_checkpoint_request') {
+              const meta = input.planCheckpoint,
+                request = { ...message }
+              Reflect.deleteProperty(request, 'ipcMeasurement')
+              if (
+                !claudePlanCheckpointRequestSchema.safeParse(request).success ||
+                !meta ||
+                !checkpointSource ||
+                checkpointRequested ||
+                !Number.isSafeInteger(claudePlanCheckpointWorkingBytes(meta)) ||
+                claudePlanCheckpointWorkingBytes(meta) > NATIVE_OWNER_WORKING_BYTES
+              ) {
+                reject(new Error('Invalid or oversized native plan checkpoint request.'))
+                return
+              }
+              checkpointRequested = true
+              checkpointReading = Promise.resolve()
+                .then(async () => {
+                  signal.throwIfAborted()
+                  references.signal.throwIfAborted()
+                  const text = await checkpointSource.read(
+                    AbortSignal.any([signal, references.signal]),
+                  )
+                  const document = meta.basis.document
+                  if (
+                    text.length !== document.chars ||
+                    Buffer.byteLength(text) !== document.bytes ||
+                    createHash('sha256').update(text).digest('hex') !== document.sha256
+                  )
+                    throw new Error('The native plan checkpoint body does not match its source.')
+                  if (active && !signal.aborted && !references.signal.aborted)
+                    worker.postMessage({ type: 'plan_checkpoint_body', text })
+                  return undefined
+                })
+                .catch(reject)
+                .finally(() => {
+                  checkpointReading = undefined
+                  settlePhysical()
+                })
+            } else if (message.type === 'history_reference') {
               const id = message.nativeSessionId
               if (
                 input.provider !== 'codex' ||

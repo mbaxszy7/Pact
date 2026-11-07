@@ -914,13 +914,10 @@ describe('Decisions choices through the original workflow owner', () => {
       ).ok,
     ).toBe(true)
     native.next = { plan: 'Current v2 Plan.' }
+    enableRelay(f)
     expect(
       (await f.flow.send({ ...f.input('Revise after this Comment.'), commentIds: [commentId] })).ok,
     ).toBe(true)
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
-    await f.settled()
-    enableRelay(f)
-    await f.act('resume')
     await vi.waitFor(() => {
       expect(native.inputs).toHaveLength(8)
       expect(f.db.conversationRepository.collaboration(f.sessionId)?.status).toBe('ready')
@@ -1702,7 +1699,7 @@ describe('Native workflow admission and durable dispatch', () => {
     },
     process.platform === 'win32' ? 60_000 : 15_000,
   )
-  it('binds decision replies to the current question and keeps continuation paused after answering', async () => {
+  it('binds decision replies to the current question and automatically reviews the completed plan', async () => {
     const f = await fixture('claude')
     native.next = {
       input: {
@@ -1719,7 +1716,7 @@ describe('Native workflow admission and durable dispatch', () => {
     expect((await f.flow.send(f.input('/plan'))).ok).toBe(true)
     const asked = await f.settled(),
       decision = asked.inputProcessing!.decision!
-    expect(asked).toMatchObject({ status: 'questions', automation: 'paused', actor: 'claude' })
+    expect(asked).toMatchObject({ status: 'questions', automation: 'active', actor: 'claude' })
     expect(decision.questions?.[0]).toMatchObject({
       id: 'q1',
       options: [
@@ -1743,25 +1740,29 @@ describe('Native workflow admission and durable dispatch', () => {
     expect(native.inputs).toHaveLength(1)
     const response = await f.flow.send({ ...f.input('File'), freezeDrafts: false, replyToDecision })
     if (!response.ok) throw Error(JSON.stringify(response.error))
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+    await vi.waitFor(() =>
+      expect(f.db.conversationRepository.collaboration(f.sessionId)?.status).toBe('ready'),
+    )
     const answered = await f.settled()
     expect(answered).toMatchObject({
-      automation: 'paused',
-      stage: 'reply',
-      actor: 'claude',
+      automation: 'active',
+      stage: 'plan_review',
+      actor: 'codex',
       planVersion: 1,
     })
     expect(answered.inputProcessing?.decision).toBeUndefined()
-    expect(native.inputs).toHaveLength(2)
+    expect(native.inputs).toHaveLength(3)
     expect(collaborationReadOnly(native.inputs[1]!.promptEnvelope.collaboration)).toBe(true)
     expect(
       await f.flow.send({ ...f.input('Module'), freezeDrafts: false, replyToDecision }),
     ).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
-    expect((await f.act('resume')).status).toBe('ready')
     expect(native.inputs).toHaveLength(3)
+    expect(
+      native.inputs.every((input) => collaborationReadOnly(input.promptEnvelope.collaboration)),
+    ).toBe(true)
   })
   it.each(['claude', 'codex'] as const)(
-    'routes %s plan reviewer decisions to the actual reviewer and returns to the owner only after Continue',
+    'routes %s plan reviewer decisions to the actual reviewer then automatically returns to author and review',
     async (owner) => {
       const f = await fixture(owner)
       const reviewer = owner === 'claude' ? 'codex' : 'claude'
@@ -1781,7 +1782,7 @@ describe('Native workflow admission and durable dispatch', () => {
         stage: 'plan_review',
         actor: reviewer,
         status: 'questions',
-        automation: 'paused',
+        automation: 'active',
       })
       const decision = asked.inputProcessing!.decision!
       expect(decision.actor).toBe(reviewer)
@@ -1796,19 +1797,24 @@ describe('Native workflow admission and durable dispatch', () => {
         },
       }
       expect(await f.flow.send(answer)).toMatchObject({ ok: true })
-      await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+      await vi.waitFor(() =>
+        expect(f.db.conversationRepository.collaboration(f.sessionId)?.status).toBe('ready'),
+      )
       const replied = await f.settled(),
         input = native.inputs[2]!
       expect(replied).toMatchObject({
-        stage: 'reply',
+        stage: 'plan_review',
         actor: reviewer,
-        automation: 'paused',
-        status: 'waiting',
+        automation: 'active',
+        status: 'ready',
         planVersion: 1,
       })
       expect(replied.inputProcessing).toEqual({ settled: { runId: input.runId, inputSequence: 2 } })
-      expect(replied.planReference).toEqual(asked.planReference)
-      expect(replied.planInputSequence).toBe(1)
+      expect(input.promptEnvelope.collaborationAuthorization?.planReference).toEqual(
+        asked.planReference,
+      )
+      expect(replied.planInputSequence).toBe(2)
+      expect(replied.review?.inputSequence).toBe(2)
       expect(input.promptEnvelope.collaborationAuthorization?.actor).toBe(reviewer)
       expect(
         collaborationReadOnly(
@@ -1829,12 +1835,7 @@ describe('Native workflow admission and durable dispatch', () => {
         ),
       ).toBe(true)
       expect(await f.flow.send(answer)).toMatchObject({ ok: true })
-      expect(native.inputs).toHaveLength(3)
-      await f.act('resume')
-      // The bounded workflow scan yields before its mandatory return review starts.
-      await vi.waitFor(() =>
-        expect(f.db.conversationRepository.collaboration(f.sessionId)?.status).toBe('ready'),
-      )
+      expect(native.inputs).toHaveLength(5)
       expect(native.inputs.map((value) => value.promptEnvelope.collaboration?.stage)).toEqual([
         'plan',
         'plan_review',
@@ -1851,7 +1852,7 @@ describe('Native workflow admission and durable dispatch', () => {
       ])
     },
   )
-  it('receives a user message during a native turn once and pauses automatic peer dispatch', async () => {
+  it('receives a user message during a native turn once and automatically reviews after its reply', async () => {
     const f = await fixture(),
       held = Promise.withResolvers<void>()
     native.hold = held.promise
@@ -1865,14 +1866,17 @@ describe('Native workflow admission and durable dispatch', () => {
     expect(await f.flow.send(send)).toMatchObject({ ok: true })
     native.hold = undefined
     held.resolve()
+    await vi.waitFor(() =>
+      expect(f.db.conversationRepository.collaboration(f.sessionId)?.status).toBe('complete'),
+    )
     const task = await f.settled()
-    expect(native.inputs).toHaveLength(2)
+    expect(native.inputs).toHaveLength(3)
     expect(native.inputs[1]!.promptEnvelope.message).toMatchObject({
       id: send.clientMessageId,
       content: send.content,
     })
-    expect(task).toMatchObject({ automation: 'paused', stage: 'reply' })
-    expect(await f.act('resume')).toMatchObject({ stage: 'code_review', status: 'complete' })
+    expect(task).toMatchObject({ automation: 'active', stage: 'code_review', status: 'complete' })
+    expect(collaborationReadOnly(native.inputs[1]!.promptEnvelope.collaboration)).toBe(true)
     expect(native.inputs).toHaveLength(3)
   })
   it('rejects stale actions and keeps missing native plans failed without inventing questions or a document', async () => {

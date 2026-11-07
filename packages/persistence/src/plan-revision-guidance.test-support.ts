@@ -284,9 +284,8 @@ export async function planRevisionFixture(
       collaboration: next,
     })
     finish(reply.run.id, { plan: options.replyPlan ?? options.plan ?? 'Scope and acceptance.' })
-    repo.setCollaborationState(
-      advanceCollaboration(repo.collaboration(sessionId)!, 'resume', selectedSettings),
-    )
+    if (repo.collaboration(sessionId)?.automation !== 'active')
+      throw new Error('Confirmed input did not retain automatic collaboration.')
   }
   const reviewRun = repo.beginRun(admission()).run
   finish(reviewRun.id, {

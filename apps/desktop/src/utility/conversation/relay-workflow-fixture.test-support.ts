@@ -463,6 +463,7 @@ export function enableWorkflowRelay(db: PactDatabase) {
 /** Reuses genuine Run publication and review producers within one shared authoritative database. */
 export async function proposeWorkflowPlanOn(db: PactDatabase, index: number) {
   const f = sharedPlanFixture(db, index)
+  enableWorkflowRelay(db)
   const response = f.repo.beginRun(f.admission()).run
   f.finish(response.id, { plan: 'Complete current scope.' })
   const review = f.repo.beginRun(f.admission()).run
@@ -513,7 +514,20 @@ export async function proposeWorkflowPlanOn(db: PactDatabase, index: number) {
   return { sessionId: f.sessionId, card }
 }
 
-function sharedPlanFixture(db: PactDatabase, index: number) {
+export function seedPausedPlanReviewLimit(db: PactDatabase, index: number) {
+  const f = sharedPlanFixture(db, index, 1),
+    revised = f.repo.beginRun(f.admission()).run
+  f.finish(revised.id, { plan: 'Revised cancellation plan for the original reviewer.' })
+  const task = f.repo.collaboration(f.sessionId)!
+  f.repo.setCollaborationState({
+    ...task,
+    revision: task.revision + 1,
+    automation: 'paused',
+    pauseReason: 'limit',
+  })
+}
+
+function sharedPlanFixture(db: PactDatabase, index: number, maxDiscussionRounds = 6) {
   const repo = db.conversationRepository,
     sessionId = randomUUID(),
     projectId = randomUUID(),
@@ -522,7 +536,7 @@ function sharedPlanFixture(db: PactDatabase, index: number) {
   const settings = {
     primaryAgentId: 'codex',
     agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
-    maxDiscussionRounds: 6,
+    maxDiscussionRounds,
     maxReviewCycles: 3,
     maxRepairAttempts: 3,
   } as const
@@ -635,6 +649,5 @@ function sharedPlanFixture(db: PactDatabase, index: number) {
   finish(first.id, { plan: 'Original complete cancellation plan.' })
   const review = repo.beginRun(admission()).run
   finish(review.id, { verdict: 'changes_requested' })
-  enableWorkflowRelay(db)
   return { repo, sessionId, finish, admission }
 }

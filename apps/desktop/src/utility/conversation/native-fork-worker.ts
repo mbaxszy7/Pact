@@ -7,7 +7,13 @@ import { homedir } from 'node:os'
 import { isAbsolute, join, relative } from 'node:path'
 import { parentPort, workerData } from 'node:worker_threads'
 
-import { nativeForkBoundarySchema, nativeForkWitnessSchema } from '@pact/contracts'
+import {
+  nativeForkBoundarySchema,
+  nativeForkWitnessSchema,
+  claudePlanCheckpointSchema,
+  claudePlanCheckpointReplySchema,
+  claudePlanCheckpointWorkingBytes,
+} from '@pact/contracts'
 
 import type {
   NativeForkFileInput,
@@ -165,6 +171,15 @@ function isInput(value: unknown): value is NativeForkFileInput {
   )
     return false
   if (value.includePlan !== undefined && typeof value.includePlan !== 'boolean') return false
+  if (
+    value.planCheckpoint !== undefined &&
+    (value.provider !== 'claude' ||
+      value.action !== 'read-answer' ||
+      value.includePlan === false ||
+      value.terminalPlanRetention !== undefined ||
+      !claudePlanCheckpointSchema.safeParse(value.planCheckpoint).success)
+  )
+    return false
   if (value.planHook && value.includePlan === false) return false
   if (value.action === 'verify-seed') {
     if (
@@ -984,8 +999,16 @@ async function claude(
   }
   const sourceWorkingBytes =
     (raw.rawBytes - raw.imageBytes) * 4 + raw.imageBytes * 2 + raw.rawRecords * 512
+  const checkpointWorkingBytes = input.planCheckpoint
+    ? claudePlanCheckpointWorkingBytes(input.planCheckpoint)
+    : 0
+  let checkpointIndexBytes = 0
   const reservePlan = (bytes: number): void => {
-    if (sourceWorkingBytes + bytes > NATIVE_OWNER_WORKING_BYTES)
+    if (
+      !Number.isSafeInteger(checkpointWorkingBytes) ||
+      sourceWorkingBytes + checkpointWorkingBytes + checkpointIndexBytes + bytes >
+        NATIVE_OWNER_WORKING_BYTES
+    )
       throw new Error(
         'The native plan exceeds its available reconstruction working memory. Its source is preserved.',
       )
@@ -1036,6 +1059,204 @@ async function claude(
       !content.every((block) => object(block).type === 'tool_result')
     )
   }
+  let checkpointBase: string | undefined
+  let checkpointBinding: ClaudePlanBinding | undefined
+  if (input.planCheckpoint) {
+    const checkpoint = input.planCheckpoint,
+      sourceIndex = main.findIndex((entry) => entry.uuid === checkpoint.sourceNativeTurnId),
+      ancestorIds = new Set(ancestors.map((entry) => entry.uuid)),
+      positions = new Map(main.map((entry, index) => [entry, index]))
+    if (
+      checkpoint.nativeSessionId !== input.nativeSessionId ||
+      checkpoint.targetNativeTurnId !== input.nativeTurnId ||
+      sourceIndex < 0 ||
+      sourceIndex >= start ||
+      !ancestorIds.has(checkpoint.sourceNativeTurnId) ||
+      !realInput(main[sourceIndex]!) ||
+      main[sourceIndex]!.agentId ||
+      main[sourceIndex]!.parent_tool_use_id
+    )
+      throw new Error('The published plan checkpoint belongs to another native root.')
+    const interval = main.slice(sourceIndex + 1, start)
+    if (interval.some(realInput))
+      throw new Error('The published plan checkpoint has intervening native input.')
+    const uses = interval.flatMap((entry) => {
+      const content = isObject(entry.message) ? entry.message.content : undefined
+      return entry.type === 'assistant' && Array.isArray(content)
+        ? content
+            .filter(
+              (block) =>
+                isObject(block) &&
+                block.type === 'tool_use' &&
+                block.id === checkpoint.sourceNativeId,
+            )
+            .map((block) => ({ entry, block: object(block) }))
+        : []
+    })
+    const receipts = interval.flatMap((entry) => {
+      const content = isObject(entry.message) ? entry.message.content : undefined
+      return entry.type === 'user' && Array.isArray(content)
+        ? content
+            .filter(
+              (block) =>
+                isObject(block) &&
+                block.type === 'tool_result' &&
+                block.tool_use_id === checkpoint.sourceNativeId,
+            )
+            .map((block) => ({ entry, block: object(block) }))
+        : []
+    })
+    const use = uses[0],
+      receipt = receipts[0]
+    if (
+      uses.length !== 1 ||
+      receipts.length !== 1 ||
+      !use ||
+      !receipt ||
+      !ancestorIds.has(use.entry.uuid) ||
+      !ancestorIds.has(receipt.entry.uuid) ||
+      use.entry.sessionId !== input.nativeSessionId ||
+      receipt.entry.sessionId !== input.nativeSessionId ||
+      use.entry.agentId ||
+      receipt.entry.agentId ||
+      use.entry.parent_tool_use_id ||
+      receipt.entry.parent_tool_use_id ||
+      !['Write', 'Edit'].includes(String(use.block.name)) ||
+      receipt.block.is_error === true ||
+      (receipt.block.is_error !== undefined && receipt.block.is_error !== false)
+    )
+      throw new Error('The published plan checkpoint has no unique successful native operation.')
+    const useIndex = positions.get(use.entry)!,
+      receiptIndex = positions.get(receipt.entry)!
+    if (receiptIndex <= useIndex)
+      throw new Error('The published plan checkpoint acknowledgement precedes its operation.')
+    for (const entry of ancestors) {
+      if (positions.get(entry)! > useIndex) break
+      const binding = nativeBinding(entry)
+      if (binding) checkpointBinding = binding
+    }
+    const operation = object(use.block.input),
+      acknowledgement = object(receipt.entry.toolUseResult)
+    if (
+      !checkpointBinding ||
+      operation.file_path !== checkpointBinding.path ||
+      acknowledgement.filePath !== checkpointBinding.path ||
+      acknowledgement.userModified !== false ||
+      (use.block.name === 'Write'
+        ? typeof operation.content !== 'string' || acknowledgement.content !== operation.content
+        : typeof operation.old_string !== 'string' ||
+          !operation.old_string ||
+          typeof operation.new_string !== 'string' ||
+          acknowledgement.oldString !== operation.old_string ||
+          acknowledgement.newString !== operation.new_string ||
+          typeof acknowledgement.replaceAll !== 'boolean' ||
+          acknowledgement.replaceAll !== (operation.replace_all ?? false))
+    )
+      throw new Error('The published plan checkpoint operation does not match its native receipt.')
+    for (const entry of ancestors) {
+      if (positions.get(entry)! <= useIndex) continue
+      const binding = nativeBinding(entry)
+      if (binding && binding.path !== checkpointBinding.path)
+        throw new Error('The native plan attachment changed after its published checkpoint.')
+    }
+    // The checkpoint authenticates only the prefix through its exact operation.
+    // Inspect the raw interval too: a sibling/child write cannot be hidden by the selected ancestry.
+    const rawUseIndex = sourceEntries.indexOf(use.entry),
+      rawReceiptIndex = sourceEntries.indexOf(receipt.entry),
+      rawTargetIndex = sourceEntries.indexOf(rootEntry),
+      rawEnd = next < main.length ? sourceEntries.indexOf(main[next]!) : sourceEntries.length,
+      document = checkpoint.basis.document,
+      baseWorkingBytes = 4096 + document.bytes * 4 + document.chars * 2
+    const acknowledgementContent = object(receipt.entry.message).content
+    if (
+      !Array.isArray(acknowledgementContent) ||
+      acknowledgementContent.filter((block) => isObject(block) && block.type === 'tool_result')
+        .length !== 1
+    )
+      throw new Error('The published checkpoint acknowledgement is ambiguous.')
+    const priorOperations = new Set<string>(),
+      targetOperations = new Set<string>()
+    for (let index = 0; index < rawEnd; index++) {
+      const entry = sourceEntries[index]!,
+        content = isObject(entry.message) ? entry.message.content : undefined
+      if (!Array.isArray(content)) continue
+      for (const value of content) {
+        const block = object(value)
+        if (
+          block.type === 'tool_use' &&
+          ['Write', 'Edit'].includes(String(block.name)) &&
+          object(block.input).file_path === checkpointBinding.path
+        ) {
+          if (typeof block.id !== 'string') throw new Error('Invalid checkpoint plan operation.')
+          const operations = index < rawTargetIndex ? priorOperations : targetOperations
+          if (!operations.has(block.id)) {
+            checkpointIndexBytes += 128 + block.id.length * 2
+            reservePlan(baseWorkingBytes)
+            operations.add(block.id)
+          }
+          if (
+            index < rawTargetIndex &&
+            (index > rawUseIndex ||
+              (index === rawUseIndex && block.id !== checkpoint.sourceNativeId) ||
+              (block.id === checkpoint.sourceNativeId && entry !== use.entry))
+          )
+            throw new Error('A later or conflicting native plan write invalidates the checkpoint.')
+          if (
+            index >= rawTargetIndex &&
+            (entry.type !== 'assistant' ||
+              entry.isSidechain ||
+              entry.agentId ||
+              entry.parent_tool_use_id ||
+              entry.isCompactSummary ||
+              entry.sessionId !== input.nativeSessionId ||
+              !belongsToRoot(entry))
+          )
+            throw new Error('An unowned target plan write invalidates the checkpoint.')
+        }
+        if (
+          block.type === 'tool_result' &&
+          index > rawReceiptIndex &&
+          ((typeof block.tool_use_id === 'string' &&
+            (priorOperations.has(block.tool_use_id) || targetOperations.has(block.tool_use_id))) ||
+            (isObject(entry.toolUseResult) &&
+              entry.toolUseResult.filePath === checkpointBinding.path))
+        ) {
+          if (typeof block.tool_use_id !== 'string' || !block.tool_use_id)
+            throw new Error('A native plan acknowledgement has no checkpoint operation identity.')
+          if (index < rawTargetIndex)
+            throw new Error('A later native plan acknowledgement invalidates the checkpoint.')
+          if (
+            !targetOperations.has(block.tool_use_id) ||
+            entry.type !== 'user' ||
+            entry.isSidechain ||
+            entry.agentId ||
+            entry.parent_tool_use_id ||
+            entry.isCompactSummary ||
+            entry.sessionId !== input.nativeSessionId ||
+            !belongsToRoot(entry)
+          )
+            throw new Error('An unowned target plan acknowledgement invalidates the checkpoint.')
+        }
+      }
+    }
+    reservePlan(baseWorkingBytes)
+    checkpointBase = await new Promise<string>((resolve, reject) => {
+      const receive = (message: unknown) => {
+        parentPort!.off('message', receive)
+        const body = claudePlanCheckpointReplySchema.safeParse(message)
+        if (
+          !body.success ||
+          body.data.text.length !== document.chars ||
+          Buffer.byteLength(body.data.text) !== document.bytes ||
+          createHash('sha256').update(body.data.text).digest('hex') !== document.sha256
+        )
+          reject(new Error('The published plan checkpoint body is not authenticated.'))
+        else resolve(body.data.text)
+      }
+      parentPort!.on('message', receive)
+      void postReply({ type: 'plan_checkpoint_request' }).catch(reject)
+    })
+  }
   let inherited: ClaudeNativePlan | undefined
   let inheritedCalls = new Map<string, { name: string; input: unknown }>()
   const observeArtifact = (
@@ -1068,7 +1289,7 @@ async function claude(
       }
     }
   }
-  for (const entry of ancestors) {
+  for (const entry of input.planCheckpoint ? [] : ancestors) {
     if (entry.isCompactSummary) continue
     const binding = nativeBinding(entry)
     if (binding && (!inherited || binding.path !== inherited.binding.path)) {
@@ -1091,8 +1312,12 @@ async function claude(
       throw new Error('The native root has conflicting plan attachments.')
     currentBinding = binding
   }
-  const planBinding = currentBinding ?? inherited?.binding
-  const base = planBinding?.path === inherited?.binding.path ? inherited?.completeText : undefined
+  const planBinding = currentBinding ?? checkpointBinding ?? inherited?.binding
+  if (checkpointBinding && planBinding?.path !== checkpointBinding.path)
+    throw new Error('The current native plan path differs from its published checkpoint.')
+  const base =
+    checkpointBase ??
+    (planBinding?.path === inherited?.binding.path ? inherited?.completeText : undefined)
   const artifact = planBinding ? new ClaudeNativePlan(planBinding, reservePlan, base) : undefined
   const operations = new Map<string, { name: string; input: unknown }>()
   let hookLocated = false

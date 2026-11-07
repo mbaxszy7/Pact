@@ -82,6 +82,8 @@ import {
   bindCollaborationQuestions,
   collaborationRetainedPlanSchema,
   collaborationPlanSettlementSchema,
+  claudePlanCheckpointSchema,
+  type ClaudePlanCheckpoint,
   collaborationInputProcessing,
   collaborationInputGate,
   collaborationInputObservationSchema,
@@ -112,6 +114,7 @@ import {
   type RelaySchedulingDecision,
   type RelaySchedulingDecisionProof,
   type RelayReassignRolesOperation,
+  type RelayPlanReviewExtensionOperation,
   relayReassignRolesOperationSchema,
   type RelayDecisionAnswer,
   type RelayDecisionReceipt,
@@ -625,6 +628,7 @@ export type RelayWorkflowAlternative = RelayWorkflowAlternativeBase &
   (
     | { kind: 'supplement_plan' | 'supplement_code_response' | 'repair' }
     | { kind: 'reassign_roles'; operation: RelayReassignRolesOperation }
+    | { kind: 'extend_plan_review'; operation: RelayPlanReviewExtensionOperation }
   )
 
 export interface RelayWorkflowSnapshot {
@@ -637,6 +641,7 @@ export interface RelayWorkflowSnapshot {
     | 'execution_to_review'
     | 'code_review_to_next'
     | 'plan_ready'
+    | 'plan_review_limit'
   producer: RelayWorkflowTurnSource
   reviews: RelayWorkflowTurnSource[]
   responses: RelayWorkflowTurnSource[]
@@ -5779,6 +5784,127 @@ export class ConversationRepository {
     return collaborationPlanMode(task, auth)
   }
 
+  /** Only the current planner's frozen, published source may seed native readback. */
+  workflowPlanCheckpoint(
+    runId: string,
+    nativeSessionId: string,
+  ): { checkpoint: ClaudePlanCheckpoint; read(signal: AbortSignal): Promise<string> } | undefined {
+    const run = this.findRun(runId),
+      current = run && this.collaboration(run.sessionId),
+      turn = this.database.select().from(workflowTurns).where(eq(workflowTurns.runId, runId)).get()
+    if (
+      !run ||
+      run.agentId !== 'claude' ||
+      run.forkSourceRunId ||
+      run.controlDisposition === 'abandoned' ||
+      !turn ||
+      current?.runId !== runId ||
+      current.id !== turn.taskId
+    )
+      return undefined
+    const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson)),
+      frozen = this.decodedCollaboration(turn.stateJson),
+      basis = auth.planReference,
+      binding = this.nativeContext(run.sessionId, 'claude')
+    if (
+      !basis ||
+      !collaborationPlanMode(frozen, auth) ||
+      auth.actor !== 'claude' ||
+      auth.inputSequence !== current.inputSequence ||
+      !binding ||
+      binding.nativeSessionId !== nativeSessionId ||
+      binding.bindingGeneration !== run.bindingGeneration ||
+      (run.nativeSessionId && run.nativeSessionId !== nativeSessionId)
+    )
+      return undefined
+    const source = this.findRun(basis.sourceRunId),
+      sourceTurn = this.database
+        .select()
+        .from(workflowTurns)
+        .where(eq(workflowTurns.runId, basis.sourceRunId))
+        .get(),
+      settled = this.workflowPlanSettlement(basis.sourceRunId)
+    if (
+      !source ||
+      source.id === runId ||
+      source.sessionId !== run.sessionId ||
+      source.agentId !== 'claude' ||
+      source.forkSourceRunId ||
+      source.controlDisposition === 'abandoned' ||
+      source.nativeSessionId !== nativeSessionId ||
+      source.bindingGeneration !== run.bindingGeneration ||
+      !source.nativeTurnId ||
+      source.dispatchPhase !== 'ended' ||
+      source.nativeOutcome !== 'completed' ||
+      source.nativeEffectsState !== 'settled' ||
+      source.responseMessageId !== basis.sourceMessageId ||
+      !this.hasCompleteResponse(source.id) ||
+      !sourceTurn ||
+      sourceTurn.taskId !== turn.taskId ||
+      !settled ||
+      settled.kind !== 'published' ||
+      !isDeepStrictEqual(settled.planReference, basis) ||
+      sourceTurn.planNativeId !== settled.nativeId ||
+      sourceTurn.planBodyId !== basis.document.id
+    )
+      return undefined
+    const document = this.collaborationDocumentRow(run.sessionId, basis.document)
+    if (
+      document.sourceRunId !== source.id ||
+      document.ownerKey !== `collaboration:${source.id}` ||
+      document.purpose !== 'collaboration'
+    )
+      return undefined
+    const checkpoint = claudePlanCheckpointSchema.parse({
+      targetRunId: runId,
+      targetNativeTurnId: run.nativeTurnId ?? runId,
+      nativeSessionId,
+      bindingGeneration: run.bindingGeneration,
+      basis,
+      sourceNativeTurnId: source.nativeTurnId,
+      sourceNativeId: settled.nativeId,
+    })
+    return {
+      checkpoint,
+      read: async (signal) => {
+        const check = () => {
+          signal.throwIfAborted()
+          if (
+            !isDeepStrictEqual(
+              this.workflowPlanCheckpoint(runId, nativeSessionId)?.checkpoint,
+              checkpoint,
+            )
+          )
+            throw new RunOperationConflictError('The authenticated native plan source changed.')
+        }
+        check()
+        const chunks: string[] = []
+        for (let offset = 0; offset < basis.document.chars; offset += 8192) {
+          signal.throwIfAborted()
+          chunks.push(
+            this.collaborationRawRange(
+              run.sessionId,
+              basis.document,
+              offset,
+              Math.min(basis.document.chars, offset + 8192),
+            ),
+          )
+          // oxlint-disable-next-line no-await-in-loop -- The admitted native owner retains its deadline and capacity while complete source parts are read.
+          await yieldImmediate(undefined, { signal })
+        }
+        check()
+        const text = chunks.join('')
+        if (
+          text.length !== basis.document.chars ||
+          Buffer.byteLength(text) !== basis.document.bytes ||
+          createHash('sha256').update(text).digest('hex') !== basis.document.sha256
+        )
+          throw new RunOperationConflictError('The authenticated native plan body changed.')
+        return text
+      },
+    }
+  }
+
   /** Recovery repairs a missing result; it never resumes business work. */
   needsWorkflowPlanRecovery(runId: string): boolean {
     const run = this.findRun(runId),
@@ -5957,8 +6083,6 @@ export class ConversationRepository {
           },
         }
         task.nextStage = 'plan'
-        task.automation = 'paused'
-        if (task.pauseReason !== 'user') task.pauseReason = 'needs_user'
         task.notice = 'Your answers are needed before this plan response can be reviewed.'
         task.revision++
         this.saveCollaboration(task)
@@ -6116,7 +6240,7 @@ export class ConversationRepository {
       if (planner) {
         task.status = 'failed'
         task.automation = 'paused'
-        task.pauseReason = 'user_message'
+        task.pauseReason = 'failure'
         task.notice =
           'A later message was withdrawn. Send a follow-up to confirm the current plan before continuing.'
         return false
@@ -6128,11 +6252,12 @@ export class ConversationRepository {
         : undefined
       : this.workflowInputResult(run.id)?.outcome
     const unanswered = this.workflowPlanHasUnansweredInput(run.id)
-    task.automation = 'paused'
     if (outcome === 'processed' && !unanswered) {
       task.inputProcessing = { settled: { runId: run.id, inputSequence: auth.inputSequence } }
-      task.pauseReason = 'user_message'
-      task.notice = 'Your reply has been processed. Continue collaboration when you are ready.'
+      task.notice =
+        task.automation === 'paused'
+          ? 'Your reply has been processed. Continue collaboration when you are ready.'
+          : undefined
       this.nativeFact(run.id, 'workflow.input_settled', { inputSequence: auth.inputSequence })
       return true
     }
@@ -6151,7 +6276,10 @@ export class ConversationRepository {
         }
       : state
     task.status = needsUser ? 'questions' : 'failed'
-    task.pauseReason = needsUser ? 'needs_user' : 'failure'
+    if (!needsUser) {
+      task.automation = 'paused'
+      task.pauseReason = 'failure'
+    }
     task.notice = needsUser
       ? 'More input is needed. Read the response and reply in the message box.'
       : 'Your reply has not been confirmed as processed. Check the response or recovery notice before sending a follow-up.'
@@ -6226,7 +6354,7 @@ export class ConversationRepository {
         and(
           eq(collaborationTasks.active, true),
           sql`json_extract(${collaborationTasks.stateJson}, '$.protocol') = ${COLLABORATION_PROTOCOL}`,
-          sql`json_extract(${collaborationTasks.stateJson}, '$.automation') = 'active'`,
+          sql`(json_extract(${collaborationTasks.stateJson}, '$.automation') = 'active' OR (json_extract(${collaborationTasks.stateJson}, '$.automation') = 'paused' AND json_extract(${collaborationTasks.stateJson}, '$.pauseReason') = 'limit' AND json_extract(${collaborationTasks.stateJson}, '$.kind') = 'plan' AND json_extract(${collaborationTasks.stateJson}, '$.stage') IN ('plan','reply')))`,
           sql`json_extract(${collaborationTasks.stateJson}, '$.status') IN ('waiting','ready')`,
           after
             ? sql`(${collaborationTasks.updatedAt}, ${collaborationTasks.id}) > (${after.updatedAt}, ${after.id})`
@@ -6238,18 +6366,16 @@ export class ConversationRepository {
       .all()
   }
 
-  pauseWorkflowForInput(sessionId: string, messageId: string): void {
+  registerWorkflowInput(sessionId: string, messageId: string): void {
     const task = this.collaboration(sessionId)
     if (!task || task.status === 'complete') return
     task.inputProcessing = {
       ...collaborationInputProcessing(task),
       pending: { inputId: messageId, inputSequence: task.inputSequence },
     }
-    task.automation = 'paused'
-    task.pauseReason = 'user_message'
     task.latestUserMessageId = messageId
     task.revision++
-    task.notice = 'Automatic collaboration is paused. Your message will be answered next.'
+    task.notice = 'Your message will be answered before collaboration continues.'
     if (task.status !== 'running') task.status = 'waiting'
     this.saveCollaboration(task)
   }
@@ -6263,8 +6389,6 @@ export class ConversationRepository {
       stage: 'reply' as const,
       actor,
       status: 'running' as const,
-      automation: 'paused' as const,
-      pauseReason: 'user_message' as const,
       authorization: undefined,
       revision: task.revision + 1,
     }
@@ -8821,7 +8945,7 @@ export class ConversationRepository {
         this.requireInstalledQueueReturn(input.sessionId, input.queueReturnOperationId)
         this.consumeQueuedReturn(input.sessionId, input.queueReturnOperationId)
       }
-      this.pauseWorkflowForInput(input.sessionId, input.clientMessageId)
+      this.registerWorkflowInput(input.sessionId, input.clientMessageId)
       return this.createPatch(input.sessionId, {
         receivedInputIds: [input.clientMessageId],
         ...(waitingForWork ? { queuedInputIds: [input.clientMessageId] } : {}),
@@ -9413,6 +9537,27 @@ export class ConversationRepository {
         receipt.rootReceiptId !== auth.userAuthority.rootReceiptId
       )
         throw new RunOperationConflictError('The native Turn has no current bound action receipt.')
+      if (receipt.action === 'extend_plan_review') {
+        const extension = scheduling.confirmedPlanReviewExtension(this.database, receipt.id),
+          session = this.database
+            .select({ settingsRevision: sessions.settingsRevision })
+            .from(sessions)
+            .where(eq(sessions.id, run.sessionId))
+            .get()
+        if (
+          !this.schedulingSettings().enabled ||
+          !extension ||
+          session?.settingsRevision !== run.settingsRevision ||
+          auth.stage !== 'plan_review' ||
+          extension.taskId !== auth.taskId ||
+          extension.actor !== auth.actor ||
+          extension.inputSequence !== auth.inputSequence ||
+          !isDeepStrictEqual(extension.planReference, auth.planReference)
+        )
+          throw new RunOperationConflictError(
+            'The one-review confirmation changed before native dispatch.',
+          )
+      }
     } else if (auth && ['implement', 'repair', 'respond'].includes(auth.stage))
       throw new RunOperationConflictError(
         'The native action is missing its concrete user authorization.',
@@ -9473,6 +9618,14 @@ export class ConversationRepository {
       task.latestUserMessageId = latest?.messageId ?? undefined
       const processing = collaborationInputProcessing(task)
       if (processing.pending?.inputSequence === batch.sequence) {
+        // Withdrawal changes the input basis without a new confirmed reply. Retain
+        // explicit pauses and require reconciliation before any automatic handoff.
+        if (task.automation === 'active') {
+          task.automation = 'paused'
+          task.pauseReason = 'failure'
+        }
+        task.notice =
+          'An input was withdrawn. Confirm the current scope before continuing collaboration.'
         const turn = this.database
           .select()
           .from(workflowTurns)
@@ -9876,14 +10029,18 @@ export class ConversationRepository {
       }
       const retained = this.workflowPlanRetention(runId, turn.planNativeId)
       const planSettled = planner && this.settleWorkflowPlan(task, run, auth, turn)
+      // A completed older root cannot settle or fail a newer accepted input.
+      // Its native facts remain available; only the latest reply may release the input gate.
+      const supersededInput =
+        auth.inputSequence < task.inputSequence &&
+        task.inputProcessing?.pending?.inputSequence === task.inputSequence &&
+        (!planner || !this.workflowPlanCaptureFailed(runId))
       task.sourceMessageId = messageId ?? run.userMessageId
       task.authorization = auth
       task.handledInputSequence = Math.max(task.handledInputSequence, auth.inputSequence)
       task.notice = undefined
       if (auth.stage === 'reply') {
         task.status = 'waiting'
-        task.automation = 'paused'
-        task.pauseReason = 'user_message'
         if (collaborationRequiresPlan(task))
           task.nextStage =
             task.planReference && task.planInputSequence === task.inputSequence
@@ -9891,10 +10048,12 @@ export class ConversationRepository {
               : 'plan'
         else if (!task.pendingWork) task.nextStage = 'code_review'
         if (
+          !supersededInput &&
           !this.settleWorkflowInput(task, run, auth, turn, planSettled) &&
           task.status === 'waiting'
         ) {
           task.status = 'failed'
+          task.automation = 'paused'
           task.pauseReason = 'failure'
           task.notice =
             'Your reply has not been confirmed as processed. Check its response before continuing.'
@@ -9903,6 +10062,9 @@ export class ConversationRepository {
         if (planSettled) {
           task.status = 'waiting'
           task.nextStage = 'plan_review'
+        } else if (supersededInput) {
+          task.status = 'waiting'
+          task.nextStage = 'plan'
         } else {
           const unanswered = this.workflowPlanHasUnansweredInput(runId)
           const unavailable =
@@ -9915,8 +10077,10 @@ export class ConversationRepository {
             )
           task.status = unanswered ? 'questions' : 'failed'
           task.nextStage = 'plan'
-          task.automation = 'paused'
-          task.pauseReason = unanswered ? 'needs_user' : 'failure'
+          if (!unanswered) {
+            task.automation = 'paused'
+            task.pauseReason = 'failure'
+          }
           if (unanswered)
             task.inputProcessing = {
               ...collaborationInputProcessing(task),
@@ -9977,8 +10141,6 @@ export class ConversationRepository {
         } else if (verdict === 'needs_user') {
           task.status = 'questions'
           task.nextStage = auth.stage === 'plan_review' ? 'plan' : 'code_review'
-          task.automation = 'paused'
-          task.pauseReason = 'needs_user'
           task.inputProcessing = {
             ...collaborationInputProcessing(task),
             decision: {
@@ -11422,7 +11584,12 @@ export class ConversationRepository {
   private relayWorkflowActionExecutionFingerprint(
     task: CollaborationTask,
     handoff: SchedulingHandoff,
-    kind: 'supplement_plan' | 'supplement_code_response' | 'repair' | 'reassign_roles',
+    kind:
+      | 'supplement_plan'
+      | 'supplement_code_response'
+      | 'repair'
+      | 'reassign_roles'
+      | 'extend_plan_review',
   ): string {
     if (kind === 'reassign_roles')
       return scheduling.fingerprint({
@@ -11431,6 +11598,11 @@ export class ConversationRepository {
         bindings: (['codex', 'claude'] as const).map(
           (actor) => this.workflowHandoff(task, actor).freshnessGuard,
         ),
+      })
+    if (kind === 'extend_plan_review')
+      return scheduling.fingerprint({
+        action: this.actionReceiptBasis(task, this.relayWorkflowActionNext(task, kind), handoff),
+        maximum: this.planReviewLimits(task.sessionId).maxDiscussionRounds,
       })
     return scheduling.fingerprint({
       action: this.actionReceiptBasis(task, this.relayWorkflowActionNext(task, kind), handoff),
@@ -11464,6 +11636,38 @@ export class ConversationRepository {
       return undefined
     const resolved = this.relayWorkflowTurns(handoff)
     if (!resolved || resolved.task.owner === resolved.task.reviewer) return undefined
+    if (resolved.node === 'plan_review_limit') {
+      if (!this.planReviewExtensionAvailable(resolved.task)) return undefined
+      const snapshot = this.relayWorkflowSnapshotFromTurns(resolved),
+        actor = collaborationActor(snapshot.task, 'plan_review')
+      const operation: RelayPlanReviewExtensionOperation = {
+        kind: 'extend_plan_review',
+        taskId: snapshot.task.id,
+        afterRunId: snapshot.task.runId,
+        actor,
+        inputSequence: snapshot.task.inputSequence,
+        planReference: snapshot.task.planReference!,
+        expectedDiscussionRounds: snapshot.task.discussionRounds,
+        maximum: this.planReviewLimits(snapshot.task.sessionId).maxDiscussionRounds,
+        scopeFingerprint: snapshot.sourceFingerprint,
+      }
+      return {
+        snapshot,
+        alternatives: [
+          {
+            kind: 'extend_plan_review',
+            operation,
+            taskId: snapshot.task.id,
+            afterRunId: snapshot.task.runId,
+            actor,
+            returnActor: collaborationActor(snapshot.task, 'plan'),
+            inputSequence: snapshot.task.inputSequence,
+            sourceFingerprint: snapshot.sourceFingerprint,
+            budgetAvailable: true,
+          },
+        ],
+      }
+    }
     if (resolved.node === 'plan_ready') {
       const snapshot = this.relayWorkflowSnapshotFromTurns(resolved)
       const operation = this.relayRoleChangeOperation(snapshot, handoff, existingDecisionId)
@@ -11641,8 +11845,20 @@ export class ConversationRepository {
 
   private relayWorkflowActionNext(
     task: CollaborationTask,
-    kind: 'supplement_plan' | 'supplement_code_response' | 'repair',
+    kind: 'supplement_plan' | 'supplement_code_response' | 'repair' | 'extend_plan_review',
   ): CollaborationTask {
+    if (kind === 'extend_plan_review') {
+      if (!this.planReviewExtensionAvailable(task))
+        throw new RunOperationConflictError('The one-review extension is no longer available.')
+      return advanceCollaboration(
+        { ...task, automation: 'active', pauseReason: undefined },
+        'continue',
+        {
+          ...this.planReviewLimits(task.sessionId),
+          maxDiscussionRounds: task.discussionRounds + 1,
+        },
+      )
+    }
     if (kind !== 'repair') return this.supplementNext(task, kind)
     if (!this.relayRepairAvailable(task))
       throw new RunOperationConflictError(
@@ -11664,6 +11880,89 @@ export class ConversationRepository {
       )
       .get()!
     return advanceCollaboration(task, 'repair', limits)
+  }
+
+  private planReviewLimits(sessionId: string): CollaborationLimits {
+    const row = this.database
+      .select({
+        maxDiscussionRounds: sessionSettingsRevisions.maxDiscussionRounds,
+        maxReviewCycles: sessionSettingsRevisions.maxReviewCycles,
+        maxRepairAttempts: sessionSettingsRevisions.maxRepairAttempts,
+      })
+      .from(sessions)
+      .innerJoin(
+        sessionSettingsRevisions,
+        and(
+          eq(sessions.id, sessionSettingsRevisions.sessionId),
+          eq(sessions.settingsRevision, sessionSettingsRevisions.revision),
+        ),
+      )
+      .where(eq(sessions.id, sessionId))
+      .get()
+    if (!row) throw new RunOperationConflictError('The current review allowance is unavailable.')
+    return row
+  }
+
+  private planReviewLimitReached(task: CollaborationTask): boolean {
+    return (
+      task.kind === 'plan' &&
+      ['plan', 'reply'].includes(task.stage) &&
+      task.status === 'waiting' &&
+      !task.codeRunId &&
+      !task.pendingWork &&
+      Boolean(task.planReference) &&
+      task.planInputSequence === task.inputSequence &&
+      !collaborationInputGate(task) &&
+      collaborationNextStage(task) === 'plan_review' &&
+      task.discussionRounds >= this.planReviewLimits(task.sessionId).maxDiscussionRounds &&
+      (task.automation === 'active' ||
+        (task.automation === 'paused' && task.pauseReason === 'limit'))
+    )
+  }
+
+  private planReviewExtensionAvailable(task: CollaborationTask): boolean {
+    return (
+      this.planReviewLimitReached(task) &&
+      (this.schedulingBudget(`task:${task.id}`)?.extraPlanTurns ?? 0) === 0 &&
+      !this.pendingSupplementReview(task) &&
+      !this.receivedCollaborationInput(task.sessionId) &&
+      !this.hasPendingRoutedContinuation(task.sessionId) &&
+      !this.nativeRecoveryBlocksInput(task.sessionId)
+    )
+  }
+
+  planReviewLimitAdviceConsidered(handoff: SchedulingHandoff): boolean {
+    if (!handoff.freshnessGuard.runId) return false
+    return Boolean(
+      this.database
+        .select({ sequence: agentEventJournal.sequence })
+        .from(agentEventJournal)
+        .where(
+          and(
+            eq(agentEventJournal.runId, handoff.freshnessGuard.runId),
+            eq(agentEventJournal.eventType, 'scheduling.limit_advice_considered'),
+            sql`json_extract(${agentEventJournal.payload}, '$.factFingerprint') = ${handoff.factFingerprint}`,
+          ),
+        )
+        .limit(1)
+        .get(),
+    )
+  }
+
+  /** A refused source preparation is a considered fact, not a model invocation or a grant. */
+  recordPlanReviewLimitAdviceConsidered(handoff: SchedulingHandoff): void {
+    if (this.decisionEvaluationReceipt(handoff) || this.planReviewLimitAdviceConsidered(handoff))
+      return
+    try {
+      this.assertSchedulingFreshness(handoff)
+    } catch {
+      return
+    }
+    const task = this.collaboration(handoff.sessionId)
+    if (!task || !this.planReviewLimitReached(task)) return
+    this.nativeFact(task.runId, 'scheduling.limit_advice_considered', {
+      factFingerprint: handoff.factFingerprint,
+    })
   }
 
   /** The complete recommendation is accepted while its evaluation receipt is still current. */
@@ -11870,7 +12169,12 @@ export class ConversationRepository {
 
   proposeRelayWorkflowAction(input: {
     handoff: SchedulingHandoff
-    kind: 'supplement_plan' | 'supplement_code_response' | 'repair' | 'reassign_roles'
+    kind:
+      | 'supplement_plan'
+      | 'supplement_code_response'
+      | 'repair'
+      | 'reassign_roles'
+      | 'extend_plan_review'
     evaluationId: string
     configurationGeneration: number
     configurationFingerprint: string
@@ -11883,6 +12187,7 @@ export class ConversationRepository {
       supplement_plan: 'Clarify the current Plan before another review.',
       supplement_code_response: 'Add one read-only response to the current review.',
       repair: 'Request one repair within the current task.',
+      extend_plan_review: 'Review the current revised plan once more.',
     } as const
     return this.database.transaction(() => {
       this.assertSchedulingFreshness(input.handoff)
@@ -11924,7 +12229,7 @@ export class ConversationRepository {
       )
         throw new RunOperationConflictError('The proposed scheduling action is no longer current.')
       const operation =
-        opportunity.kind === 'reassign_roles'
+        opportunity.kind === 'reassign_roles' || opportunity.kind === 'extend_plan_review'
           ? opportunity.operation
           : {
               kind: opportunity.kind,
@@ -11955,23 +12260,27 @@ export class ConversationRepository {
         revision: 0,
         handoffId: input.handoff.id,
         title:
-          operation.kind === 'reassign_roles'
-            ? 'Change code roles?'
-            : operation.kind === 'repair'
-              ? 'Allow a scoped repair before review?'
-              : operation.kind === 'supplement_plan'
-                ? 'Add one plan clarification before review?'
-                : 'Add one read-only response before review?',
+          operation.kind === 'extend_plan_review'
+            ? `Have ${operation.actor === 'codex' ? 'Codex' : 'Claude Code'} review plan v${operation.planReference.version} once more.`
+            : operation.kind === 'reassign_roles'
+              ? 'Change code roles?'
+              : operation.kind === 'repair'
+                ? 'Allow a scoped repair before review?'
+                : operation.kind === 'supplement_plan'
+                  ? 'Add one plan clarification before review?'
+                  : 'Add one read-only response before review?',
         reason:
           operation.kind === 'reassign_roles'
             ? `Suggested: ${operation.proposedRoles.codeAuthor === 'codex' ? 'Codex' : 'Claude Code'} implements · ${operation.proposedRoles.codeReviewer === 'codex' ? 'Codex' : 'Claude Code'} reviews`
             : proposalReasons[operation.kind],
         consequence:
-          operation.kind === 'reassign_roles'
-            ? 'Changes future code roles only.'
-            : operation.kind === 'repair'
-              ? `Allows one repair within the current task, then the fixed reviewer checks it. ${repairPermission === 'full' ? 'Runs with Full access.' : 'Uses the current execution permissions.'}`
-              : 'Allows one extra read-only turn and its return to the fixed reviewer. It does not authorize code changes.',
+          operation.kind === 'extend_plan_review'
+            ? 'Allows exactly one additional review of this plan for this task. Session defaults are unchanged.'
+            : operation.kind === 'reassign_roles'
+              ? 'Changes future code roles only.'
+              : operation.kind === 'repair'
+                ? `Allows one repair within the current task, then the fixed reviewer checks it. ${repairPermission === 'full' ? 'Runs with Full access.' : 'Uses the current execution permissions.'}`
+                : 'Allows one extra read-only turn and its return to the fixed reviewer. It does not authorize code changes.',
         sources: snapshot.sources
           .filter((source) => input.sourceIds.includes(source.id))
           .map((source) => ({
@@ -12157,6 +12466,27 @@ export class ConversationRepository {
     if (proof.card.request.category !== 'new_authorization')
       throw new RunOperationConflictError('The scheduling operation has no admitted consumer.')
     const operation = proof.card.request.operation
+    if (operation.kind === 'extend_plan_review') {
+      const opportunity = this.relayWorkflowAlternatives(proof.handoff, row.id)?.alternatives.find(
+        (entry) => entry.kind === 'extend_plan_review',
+      )
+      if (
+        row.kind !== 'extend_plan_review' ||
+        opportunity?.kind !== 'extend_plan_review' ||
+        !isDeepStrictEqual(opportunity.operation, operation) ||
+        proof.candidateId !== 'propose_extend_plan_review' ||
+        proof.sourceFingerprint !== opportunity.sourceFingerprint ||
+        proof.operationFingerprint !== scheduling.fingerprint(operation) ||
+        proof.executionFingerprint !==
+          this.relayWorkflowActionExecutionFingerprint(
+            this.collaboration(row.sessionId)!,
+            proof.handoff,
+            'extend_plan_review',
+          )
+      )
+        throw new RunOperationConflictError('The one-review extension is no longer current.')
+      return proof
+    }
     const opportunity = this.relayWorkflowAlternatives(proof.handoff, row.id)?.alternatives.find(
       (entry) => entry.kind === operation.kind,
     )
@@ -13351,8 +13681,19 @@ export class ConversationRepository {
       scheduling.recordRelayDecisionActivity(this.database, receipt.decisionId)
       const task = this.collaboration(receipt.sessionId)
       if (task && task.id === receipt.taskId && pause) {
-        task.automation = 'paused'
-        task.pauseReason = 'user'
+        if (receipt.action === 'extend_plan_review') {
+          const basis = collaborationActionBasisSchema.parse(JSON.parse(receipt.basisJson))
+          if (
+            task.automation !== 'paused' ||
+            task.pauseReason !== 'limit' ||
+            task.runId !== basis.previousRunId ||
+            task.inputSequence !== basis.inputSequence
+          )
+            return this.metadataPatch(receipt.sessionId)
+        } else {
+          task.automation = 'paused'
+          task.pauseReason = 'user'
+        }
         task.revision++
         task.notice = 'The scheduling action did not start. Collaboration remains paused.'
         this.saveCollaboration(task)
@@ -13521,6 +13862,7 @@ export class ConversationRepository {
       !receipt.active ||
       (receipt.action !== 'supplement_plan' &&
         receipt.action !== 'supplement_code_response' &&
+        receipt.action !== 'extend_plan_review' &&
         receipt.action !== 'repair')
     )
       throw new RunOperationConflictError('This supplement grant is no longer available.')
@@ -14291,6 +14633,7 @@ export class ConversationRepository {
           .get()
       : undefined
     const relayAction =
+      (receipt.action === 'extend_plan_review' ? 'extend_plan_review' : undefined) ??
       supplement ??
       (receipt.action === 'repair' && decided?.formatVersion === 2 && decided.kind === 'repair'
         ? 'repair'
@@ -14307,17 +14650,20 @@ export class ConversationRepository {
       .get()
     if (!limits)
       throw new RunOperationConflictError('The original collaboration limits are unavailable.')
-    const expected = supplement
-      ? this.supplementNext(current, supplement)
-      : advanceCollaboration(
-          receipt.action === 'resume'
-            ? { ...current, automation: 'active', pauseReason: undefined }
-            : current,
-          receipt.action === 'resume'
-            ? 'continue'
-            : collaborationActionSchema.parse(receipt.action),
-          limits,
-        )
+    const expected =
+      receipt.action === 'extend_plan_review'
+        ? this.relayWorkflowActionNext(current, 'extend_plan_review')
+        : supplement
+          ? this.supplementNext(current, supplement)
+          : advanceCollaboration(
+              receipt.action === 'resume'
+                ? { ...current, automation: 'active', pauseReason: undefined }
+                : current,
+              receipt.action === 'resume'
+                ? 'continue'
+                : collaborationActionSchema.parse(receipt.action),
+              limits,
+            )
     if (!isDeepStrictEqual(next, expected))
       throw new RunOperationConflictError(
         'The authorized action, scope or original business counters changed before admission.',
@@ -14336,8 +14682,18 @@ export class ConversationRepository {
         accepted.data.card.request.operation.taskId === current.id &&
         accepted.data.card.request.operation.afterRunId === current.runId &&
         accepted.data.card.request.operation.actor === next.actor &&
-        accepted.data.card.request.operation.returnActor ===
-          collaborationActor(current, next.stage === 'plan' ? 'plan_review' : 'code_review') &&
+        (accepted.data.card.request.operation.kind === 'extend_plan_review'
+          ? next.stage === 'plan_review' &&
+            accepted.data.card.request.operation.expectedDiscussionRounds ===
+              current.discussionRounds &&
+            accepted.data.card.request.operation.maximum === limits.maxDiscussionRounds &&
+            accepted.data.card.request.operation.inputSequence === current.inputSequence &&
+            isDeepStrictEqual(
+              accepted.data.card.request.operation.planReference,
+              current.planReference,
+            )
+          : accepted.data.card.request.operation.returnActor ===
+            collaborationActor(current, next.stage === 'plan' ? 'plan_review' : 'code_review')) &&
         accepted.data.operationFingerprint ===
           scheduling.fingerprint(accepted.data.card.request.operation) &&
         accepted.data.configurationGeneration === this.schedulingConfigurationGeneration() &&
@@ -14349,9 +14705,11 @@ export class ConversationRepository {
         decided.answerJson === this.authorityJson({ kind: 'confirm' })
       if (
         (candidateId !== relayAction && !confirmed) ||
-        !(relayAction === 'repair'
-          ? this.relayRepairAvailable(current)
-          : this.supplementAvailable(current, relayAction))
+        !(relayAction === 'extend_plan_review'
+          ? this.planReviewExtensionAvailable(current)
+          : relayAction === 'repair'
+            ? this.relayRepairAvailable(current)
+            : this.supplementAvailable(current, relayAction))
       )
         throw new RunOperationConflictError(
           'The supplement was not selected by a current decision or its return review is unavailable.',
@@ -14383,7 +14741,10 @@ export class ConversationRepository {
       }
       const reserved = scheduling.reserveBudget(this.database, {
         handoff,
-        budget: relayAction === 'supplement_plan' ? 'extra_plan_turn' : 'extra_code_turn',
+        budget:
+          relayAction === 'supplement_plan' || relayAction === 'extend_plan_review'
+            ? 'extra_plan_turn'
+            : 'extra_code_turn',
         authorizationId: receipt.id,
       })
       if (reserved.status !== 'reserved')
@@ -14884,7 +15245,11 @@ export class ConversationRepository {
       eventId: inputId ?? task.runId,
       slot: inputId ? 'input_dispatch' : 'workflow_next',
       factFingerprint: scheduling.fingerprint(
-        roleHandoff ? { ...facts, stageRoles: undefined } : facts,
+        this.planReviewLimitReached(task)
+          ? { ...facts, profile: 'plan_review_limit' }
+          : roleHandoff
+            ? { ...facts, stageRoles: undefined }
+            : facts,
       ),
       freshnessGuard: {
         taskRevision: task.revision,
@@ -15212,7 +15577,7 @@ export class ConversationRepository {
       !task ||
       (task.status !== 'waiting' &&
         !(task.status === 'ready' && task.kind === 'plan' && task.stage === 'plan_review')) ||
-      (task.automation !== 'active' && !requestedPause) ||
+      (task.automation !== 'active' && !requestedPause && !this.planReviewLimitReached(task)) ||
       collaborationInputGate(task) ||
       !task.taskDocument ||
       handoff.slot !== 'workflow_next' ||
@@ -15261,7 +15626,15 @@ export class ConversationRepository {
     let response: ReturnType<ConversationRepository['earlierRelayTurn']>
     let decisionBatch: { id: string; sequence: number; body: string | null } | undefined
     const settlement = planning ? this.workflowPlanSettlement(producer.source.runId) : undefined
-    if (task.stage === 'plan_review') {
+    if (planning && this.planReviewLimitReached(task)) {
+      if (
+        !settlement ||
+        !previous ||
+        !isDeepStrictEqual(settlement.planReference, task.planReference)
+      )
+        return undefined
+      node = 'plan_review_limit'
+    } else if (task.stage === 'plan_review') {
       if (producer.source.verdict !== 'changes_requested') {
         if (
           task.status !== 'ready' ||
@@ -15500,7 +15873,7 @@ export class ConversationRepository {
         },
         turn.source.actor,
       )
-      if (turn.auth.planReference) {
+      if (turn.auth.planReference && node !== 'plan_review_limit') {
         const plan = turn.auth.planReference
         add(
           plan.document,
@@ -16734,12 +17107,32 @@ export class ConversationRepository {
               ),
             )
             .get()!
-          const limit =
+          let limit =
             turn.reservation === 'discussionRounds'
               ? limits.maxDiscussionRounds
               : turn.reservation === 'reviewCycles'
                 ? limits.maxReviewCycles
                 : limits.maxRepairAttempts
+          if (
+            turn.reservation === 'discussionRounds' &&
+            task.discussionRounds + 1 > limit &&
+            originalAuth.userAuthority?.purpose === 'action'
+          ) {
+            const extension = scheduling.confirmedPlanReviewExtension(
+              this.database,
+              originalAuth.userAuthority.receiptId,
+            )
+            if (
+              extension &&
+              extension.taskId === task.id &&
+              extension.actor === originalAuth.actor &&
+              extension.inputSequence === originalAuth.inputSequence &&
+              extension.expectedDiscussionRounds === task.discussionRounds &&
+              extension.maximum === limits.maxDiscussionRounds &&
+              isDeepStrictEqual(extension.planReference, originalAuth.planReference)
+            )
+              limit = task.discussionRounds + 1
+          }
           if (
             task[turn.reservation] !== before[turn.reservation] - 1 ||
             task[turn.reservation] + 1 > limit
@@ -17498,11 +17891,13 @@ export class ConversationRepository {
                 .get()
             : undefined
           const explicitResume =
-            resuming?.action === 'resume' &&
+            ((resuming?.action === 'resume' && Boolean(current?.pendingWork)) ||
+              (resuming?.action === 'extend_plan_review' &&
+                current?.pauseReason === 'limit' &&
+                task.stage === 'plan_review')) &&
             resuming.state === 'available' &&
             resuming.active &&
             resuming.taskId === current?.id &&
-            Boolean(current?.pendingWork) &&
             task.automation === 'active'
           if (current?.id === task.id) {
             if (
@@ -17555,7 +17950,7 @@ export class ConversationRepository {
               .run()
           }
         } else if (!input.sourceProposalId) {
-          this.pauseWorkflowForInput(input.sessionId, userMessageId)
+          this.registerWorkflowInput(input.sessionId, userMessageId)
         }
         transaction
           .insert(conversationMessages)

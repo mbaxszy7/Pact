@@ -89,7 +89,9 @@ for (const owner of ['codex', 'claude'] as const)
               return (
                 view.task?.inputProcessing?.settled?.inputSequence === initial.inputSequence + 1 &&
                 !view.task.inputProcessing.pending &&
-                view.task.automation === 'paused'
+                view.task.automation === 'active' &&
+                view.accepted &&
+                view.task.status === 'ready'
               )
             },
             { timeout: Math.max(1, deadline - Date.now()), intervals: [250, 500, 1000] },
@@ -99,15 +101,23 @@ for (const owner of ['codex', 'claude'] as const)
         expect(retained.task?.planReference).toEqual(originalPlan)
         expect(retained.task?.planVersion).toBe(initial.planVersion)
         expect(retained.task?.planInputSequence).toBe(initial.inputSequence + 1)
-        expect(retained.task?.review).toEqual(initial.review)
-        expect(retained.task?.pauseReason).toBe('user_message')
-        expect(retained.accepted).toBe(false)
-        expect(retained.availableActions).toContain('resume')
-        expect(retained.availableActions).not.toContain('execute')
+        expect(retained.task?.review).toMatchObject({
+          actor: initial.reviewer,
+          inputSequence: initial.inputSequence + 1,
+          planReference: originalPlan,
+          verdict: 'accepted',
+        })
+        expect(retained.task?.review?.runId).not.toBe(initial.review?.runId)
+        expect(retained.task?.pauseReason).toBeUndefined()
+        expect(retained.accepted).toBe(true)
+        expect(retained.availableActions).not.toContain('resume')
+        expect(retained.availableActions).toContain('execute')
         expect(await readRequiredPlanSource(ctx, retained.task!.planReference!)).toBe(originalText)
         const snapshot = await readRealConversation(ctx)
-        expect(snapshot.runs).toHaveLength(initialRuns + 1)
-        const reply = snapshot.runs.find((run) => run.id === retained.task!.runId)!
+        expect(snapshot.runs).toHaveLength(initialRuns + 2)
+        const reply = snapshot.runs.find(
+          (run) => run.id === retained.task!.inputProcessing!.settled!.runId,
+        )!
         expect(reply).toMatchObject({
           agentId: owner,
           status: 'completed',
@@ -156,7 +166,7 @@ for (const owner of ['codex', 'claude'] as const)
         expect(cold.task?.planReference).toEqual(originalPlan)
         expect(cold.task?.inputProcessing).toEqual(retained.task?.inputProcessing)
         expect(cold.task?.automation).toBe('paused')
-        expect((await readRealConversation(ctx)).runs).toHaveLength(initialRuns + 1)
+        expect((await readRealConversation(ctx)).runs).toHaveLength(initialRuns + 2)
         await ctx.page.getByRole('button', { name: 'Continue collaboration', exact: true }).click()
         await expect
           .poll(
@@ -172,6 +182,8 @@ for (const owner of ['codex', 'claude'] as const)
         const reviewed = await readView()
         expect(reviewed.task?.review?.actor).toBe(initial.reviewer)
         expect(reviewed.task?.planReference).toEqual(originalPlan)
+        expect(reviewed.task?.review).toEqual(retained.task?.review)
+        expect((await readRealConversation(ctx)).runs).toHaveLength(initialRuns + 2)
         expect(reviewed.availableActions).toContain('execute')
         expect(
           (await readRealConversation(ctx)).runs.some((run) =>
