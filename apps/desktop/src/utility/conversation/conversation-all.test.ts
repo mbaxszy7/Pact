@@ -11,6 +11,7 @@ import { PactDatabase } from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { AgentExecutionError } from './agent-execution-error.js'
 import { Conversation } from './conversation.js'
 
@@ -104,7 +105,7 @@ async function fixture(primaryAgentId: RuntimeAgentId) {
       primaryAgentId,
       agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
       maxDiscussionRounds: 3,
-      runningMessagePolicy: 'next_round',
+
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
     },
@@ -136,7 +137,11 @@ async function fixture(primaryAgentId: RuntimeAgentId) {
       owner.db.sessionRepository,
       owner.db.projectCatalogRepository,
       preparation,
-      new ProjectFileReader(owner.db.sessionRepository, owner.db.projectCatalogRepository),
+      new ProjectFileReader(
+        owner.db.sessionRepository,
+        owner.db.projectCatalogRepository,
+        runDirectoryWorker,
+      ),
     )
     return owner.flow
   }

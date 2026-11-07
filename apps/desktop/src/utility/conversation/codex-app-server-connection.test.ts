@@ -12,7 +12,12 @@ import {
   CODEX_QUEUE_LOW_WATER_BYTES,
   CodexAppServerConnection,
 } from './codex-app-server-connection.js'
-import { NATIVE_OWNER_WORKING_BYTES } from './native-working-memory.js'
+import {
+  DecisionMemoryLease,
+  NativeWorkingMemory,
+  nativeWorkingMemoryCapacities,
+  NATIVE_OWNER_WORKING_BYTES,
+} from './native-working-memory.js'
 
 afterEach(() => {
   vi.useRealTimers()
@@ -213,13 +218,17 @@ describe('Codex App Server connection budgets', () => {
   })
 
   it.each(['cancelled', 'deadline'] as const)(
-    'restores the existing mid-water queue pause when a dispatched RPC is %s',
+    'keeps late-reply drainage after a dispatched RPC is %s and restores mid-water pause at physical completion',
     async (mode) => {
       const child = fakeChild()
       const connection = new CodexAppServerConnection(child.process)
       const controller = new AbortController()
       const dispatched = Promise.withResolvers<void>()
-      child.onRequest(() => dispatched.resolve())
+      let requestId: unknown
+      child.onRequest((request) => {
+        requestId = Reflect.get(request, 'id')
+        dispatched.resolve()
+      })
       try {
         const queuedMessages = await pauseAtMidWater(child, connection)
         const request = connection.request(
@@ -237,9 +246,17 @@ describe('Codex App Server connection budgets', () => {
         expect(await outcome).toMatchObject({
           kind: mode === 'cancelled' ? 'agent_process_crash' : 'transient_transport',
         })
+        expect(connection.diagnostics()).toMatchObject({
+          pendingRequests: 0,
+          pendingPhysicalRequests: 1,
+          stdoutPaused: false,
+          open: true,
+        })
+        child.stdout.write(`${JSON.stringify({ id: requestId, result: { late: true } })}\n`)
         await vi.waitFor(() =>
           expect(connection.diagnostics()).toMatchObject({
             pendingRequests: 0,
+            pendingPhysicalRequests: 0,
             queuedMessages,
             stdoutPaused: true,
             open: true,
@@ -456,6 +473,86 @@ describe('Codex App Server connection budgets', () => {
           open: false,
         }),
       )
+    }
+  })
+})
+
+describe('Independent auxiliary native transport', () => {
+  it('retains full text under one-byte framing with fixed storage and no business capacity consumption', async () => {
+    const child = fakeChild(),
+      memory = new DecisionMemoryLease()
+    const connection = new CodexAppServerConnection(
+      child.process,
+      undefined,
+      undefined,
+      undefined,
+      () => true,
+      memory,
+    )
+    const text = 'Complete framed context. '.repeat(256)
+    try {
+      const result = connection.nextNotification(5000)
+      const frame = Buffer.from(
+        JSON.stringify({ method: 'owned/progress', params: { text } }) + '\n',
+      )
+      for (const byte of frame) {
+        child.stdout.write(Buffer.from([byte]))
+        await Promise.resolve()
+        await Promise.resolve()
+      }
+      expect(await result).toEqual({ method: 'owned/progress', params: { text } })
+      expect(memory.diagnostics().highWaterBytes).toBeLessThan(3 * 1024 * 1024)
+      expect(nativeWorkingMemoryCapacities().business.chargedBytes).toBe(0)
+    } finally {
+      await connection.close()
+      memory.release()
+    }
+    expect(memory.diagnostics()).toMatchObject({ heldBytes: 0, items: 0, released: true })
+  })
+  it('rejects structural amplification before parse while physical close remains held and the original business 512 MiB can still fill', async () => {
+    const child = fakeChild(),
+      memory = new DecisionMemoryLease()
+    let release!: () => void
+    const physical = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const connection = new CodexAppServerConnection(
+      child.process,
+      undefined,
+      async () => {
+        await physical
+        child.process.kill()
+      },
+      undefined,
+      () => true,
+      memory,
+    )
+    const body =
+      JSON.stringify({ method: 'owned/overloaded', params: { values: Array(9000).fill('') } }) +
+      '\n'
+    expect(Buffer.byteLength(body)).toBeLessThan(256 * 1024)
+    const business = []
+    try {
+      const outcome = connection.nextNotification(1000).catch((error: unknown) => error)
+      child.stdout.write(body)
+      expect(await outcome).toMatchObject({
+        message: 'Decision native structure capacity is full.',
+      })
+      const close = connection.close()
+      expect(() => memory.release()).toThrow('physical work is still held')
+      for (let index = 0; index < 4; index++)
+        business.push(new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES))
+      expect(nativeWorkingMemoryCapacities().chargedBytes).toBe(528 * 1024 * 1024)
+      release()
+      await close
+      memory.release()
+      expect(memory.diagnostics()).toMatchObject({ heldBytes: 0, items: 0, released: true })
+    } finally {
+      release()
+      await connection.close()
+      business.forEach((reservation) => reservation.release())
+      memory.release()
+      child.process.kill()
     }
   })
 })

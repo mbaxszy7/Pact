@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-14T12:28:07.341Z",
+  "generatedAt": "2026-10-30T05:01:36.781045+00:00",
   "title": "Design System: Pact Desktop",
   "extensions": {
     "colorMeta": {
@@ -218,7 +218,7 @@
       },
       {
         "name": "The Density-by-Importance Rule",
-        "body": "In translucent mode, Sidebar is most transparent, Chat is denser, and Diff/terminal/permissions are nearly opaque. Light translucency uses a brighter ice-blue Sidebar overlay fixed seven percentage points below Chat so it never turns gray or becomes fully opaque. Text and code never inherit surface Alpha.",
+        "body": "In translucent mode, Sidebar is most transparent, Chat is denser, and Diff/terminal/permissions are nearly opaque. Text and code never inherit surface Alpha.",
         "section": "colors"
       },
       {
@@ -230,36 +230,6 @@
         "name": "The Legibility-before-Material Rule",
         "body": "If desktop content competes with UI content, increase the local surface Alpha before adding blur, outline, or shadow.",
         "section": "elevation"
-      },
-      {
-        "name": "The Shared Icon Vocabulary Rule",
-        "body": "Product controls use lucide-react at a normal 16px size and 1.75px stroke. Common controls do not introduce one-off inline SVG drawings.",
-        "section": "components"
-      },
-      {
-        "name": "The Transparent Backing Rule",
-        "body": "macOS uses transparent true with explicit #00000000 backing and no Vibrancy. Supported Windows build 22621 or newer uses frameless transparent backing, native Window Controls Overlay and background material none rather than Mica. Transparency strength 0/50/100 maps to stored materialOpacity 100/85/70. Text, code and focus remain opaque. Unsupported system/build, reduced transparency, high contrast, forced colors or observable initialization failure uses the complete Solid theme with a concise fallback reason. API success or Renderer Alpha does not establish desktop-compositor correctness.",
-        "section": "elevation"
-      },
-      {
-        "name": "The Project Navigation Rule",
-        "body": "Project folder controls disclosure; name or Pencil opens an inline editor. Hover and keyboard focus expose New Session, Rename and Archive. Expanded headers leave 6px before indented Sessions. Rename trims a nonempty single-line name of at most 120 UTF-16 units; Enter saves, Escape cancels and blur retains the draft. Failed save keeps input and local error. The shell has no dedicated fullscreen feature. Local layout state does not imply persisted per-Session pane preferences.",
-        "section": "layout"
-      },
-      {
-        "name": "The Accessible Desktop Layout Rule",
-        "body": "Fill the Renderer viewport with internally scrolling panes. Wide is at least 1100px; compact is 860 to 1099px; narrower supported windows retain Navigation left of Chat with Context overlaying right. Native minimum is 720 by 520px. Side-pane close restores labeled control focus; overlay Context contains Tab and closes on Escape. Separators are 1px with invisible 6px hit extensions and keyboard resize. Interactive titlebar content is no-drag and respects native control safe areas. Short interruptible transitions honor reduced motion; lazy details have scoped loading and retry. Focus, forced colors, placeholders, status and Diff foregrounds remain readable across themes.",
-        "section": "layout"
-      },
-      {
-        "name": "The Single Current Plan Rule",
-        "body": "Context Plan is the sole full-plan reading area and Todos owns shared Pending/Done rows. Chat keeps compact opaque version/review cards with title, feedback count and one disclosure; required actions and errors remain visible. Todo tick is status rather than a checkbox; Done info explains the reason. Questions and Comments add persistent drafts through Add to comment, with Send only in Composer. Historical sources preserve then/current distinction and exact Comment focus after asynchronous body readiness. Internal IDs, hashes, JSON fields and submission instructions stay out of product prose.",
-        "section": "components"
-      },
-      {
-        "name": "The Composer and Recovery Rule",
-        "body": "Composer starts at least two lines high, with atomic inline Skill/route units, Comment/answer chips above and image controls below full-width body. Observed response replaces Send with Stop without auto-sending the next draft. Image modal uses directional navigation, bounded filmstrip, 180ms reduced-motion-aware transition and close focus return, without zoom controls. Recovery is one concise card showing affected Agents and their currently valid action.",
-        "section": "components"
       }
     ],
     "dos": [
@@ -268,17 +238,18 @@
       "Do preserve meaningful differences between solid/translucent and light/dark modes.",
       "Do keep text, icons, code, and focus indicators fully opaque.",
       "Do use Lucide React for common product controls and state icons.",
+      "Do keep keyboard focus, forced-colors states, placeholders and status/Diff foregrounds readable in both themes; speaker alignment and labels supplement color.",
       "Do expose Project actions on Hover and keyboard focus together.",
       "Do fall back to the complete Solid theme when native material is unavailable or inappropriate."
     ],
     "donts": [
       "Don't use whole-window opacity to implement translucency.",
       "Don't draw Project-to-Session connector lines or show branch/Changes/path/count metadata by default.",
-      "Don't add a persistent Sessions label under an already expanded Project.",
-      "Don't use gradients, 3D illustration, giant typography, or 32px marketing-card radii in product UI.",
+      "Don't add a persistent `Sessions` label under an already expanded Project.",
+      "Don't use gradients outside Relay's specified edge treatment, 3D illustration, giant typography, or 32px marketing-card radii in product UI.",
       "Don't let wallpaper reduce Diff, terminal, permission, or body-text contrast.",
       "Don't treat Agent color as the only provenance cue.",
-      "Don't draw one-off inline SVG icons when Lucide already provides the control or state symbol."
+      "Don't draw one-off inline SVG icons when Lucide provides the control or state symbol."
     ]
   }
 }

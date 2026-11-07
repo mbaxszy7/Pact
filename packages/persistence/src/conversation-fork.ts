@@ -5,7 +5,6 @@ import {
   asc,
   desc,
   eq,
-  gte,
   getTableColumns,
   inArray,
   isNull,
@@ -21,11 +20,15 @@ import {
   collaborationTaskSchema,
   collaborationTurnAuthorizationSchema,
   collaborationDocumentSchema,
+  preparedInformationControlSchema,
+  handoffGuidanceSchema,
+  HANDOFF_GUIDANCE_BYTES,
   type CollaborationDocument,
   type CollaborationTurnAuthorization,
   nativeForkBoundarySchema,
   nativeForkWitnessSchema,
   commentAnchorSchema,
+  storedCommentAnchor,
   sessionForkOperationSchema,
   type AgentNativeForkBoundary,
   type AgentNativeForkWitness,
@@ -41,18 +44,9 @@ import { appendAgentEvent } from './agent-event-journal.js'
 import { refreshNativeSessionMetadata } from './native-presence-metadata.js'
 import {
   collaborationTasks,
-  collaborationTurns,
-  collaborationReportItems,
-  collaborationTurnAuthorizations,
-  collaborationTodos,
-  collaborationTodoRevisions,
+  workflowTurns,
   conversationInputBatches,
   conversationInputBatchMembers,
-  collaborationRequiredInputMembers,
-  collaborationReviewFacts,
-  collaborationResultApplications,
-  collaborationResultOperations,
-  collaborationResultInputResponses,
   conversationRunSourceRefs,
   conversationBodyInputs,
   conversationBodyParts,
@@ -253,15 +247,6 @@ function forkId(sessionId: string, kind: string, sourceId: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
-function todoKey(taskId: string, todoId: string): string {
-  return `${taskId}:${todoId}`
-}
-function inputDisposition(value: string): 'responded' | 'awaiting_confirmation' | 'resolved' {
-  if (value === 'responded' || value === 'awaiting_confirmation' || value === 'resolved')
-    return value
-  throw new Error('The historical input disposition is invalid.')
-}
-
 /** Commit Pact identity, independent frozen facts, consent and both intents before any native write. */
 export function commitFork(
   database: PactDrizzleDatabase,
@@ -424,13 +409,13 @@ export function commitFork(
     )
     const runIds = runs.map((row) => row.id)
     const runSet = new Set(runIds)
-    const collaborationPredicate = inArray(collaborationTurns.runId, runIds)
-    if (runIds.length) preflight(collaborationTurns, collaborationPredicate)
+    const collaborationPredicate = inArray(workflowTurns.runId, runIds)
+    if (runIds.length) preflight(workflowTurns, collaborationPredicate)
     const collaborationHistory = runIds.length
       ? bound(
           database
             .select()
-            .from(collaborationTurns)
+            .from(workflowTurns)
             .where(collaborationPredicate)
             .limit(MAX_ENTITIES + 1)
             .all(),
@@ -460,60 +445,34 @@ export function commitFork(
       preflight(table, predicate)
       return bound(read())
     }
-    const authorizationRows = runIds.length
-      ? readBounded(
-          collaborationTurnAuthorizations,
-          inArray(collaborationTurnAuthorizations.runId, runIds),
-          () =>
-            database
-              .select()
-              .from(collaborationTurnAuthorizations)
-              .where(inArray(collaborationTurnAuthorizations.runId, runIds))
-              .limit(MAX_ENTITIES + 1)
-              .all(),
-        )
-      : []
     const runById = new Map(runs.map((run) => [run.id, run]))
     const historicalAuthorizations = new Map(
-      authorizationRows.map((row) => {
+      collaborationHistory.map((row) => {
         const base = collaborationTurnAuthorizationSchema.parse(JSON.parse(row.authorizationJson))
         const run = runById.get(row.runId)
         const effective =
           run?.status === 'completed' && run.nativeOutcome === 'completed'
             ? authorizationForRun?.(row.runId)
             : undefined
-        const appended = (effective?.inputRevision ?? 0) > (base.inputRevision ?? 0)
+        const appended = effective && effective.inputSequence > base.inputSequence
         const authorization = appended
           ? collaborationTurnAuthorizationSchema.parse(effective)
           : base
         if (
-          authorization.runId !== base.runId ||
-          authorization.taskId !== base.taskId ||
-          authorization.actor !== base.actor ||
-          authorization.duty !== base.duty
+          authorization.runId !== row.runId ||
+          authorization.taskId !== row.taskId ||
+          authorization.actor !== row.actor ||
+          authorization.stage !== row.stage ||
+          base.runId !== row.runId ||
+          base.taskId !== row.taskId ||
+          base.actor !== row.actor ||
+          base.stage !== row.stage
         )
-          throw new Error('The historical Run input grant does not match its immutable duty.')
+          throw new Error('The historical workflow authorization does not match its frozen root.')
         if (appended) bound([authorization])
         return [row.runId, authorization] as const
       }),
     )
-    const todoRevisionRows = runIds.length
-      ? readBounded(
-          collaborationTodoRevisions,
-          inArray(collaborationTodoRevisions.sourceRunId, runIds),
-          () =>
-            database
-              .select()
-              .from(collaborationTodoRevisions)
-              .where(inArray(collaborationTodoRevisions.sourceRunId, runIds))
-              .orderBy(
-                asc(collaborationTodoRevisions.ledgerRevision),
-                asc(collaborationTodoRevisions.revision),
-              )
-              .limit(MAX_ENTITIES + 1)
-              .all(),
-        )
-      : []
     const batchPredicate = and(
       eq(conversationInputBatches.sessionId, source.id),
       inArray(conversationInputBatches.messageId, messageIds),
@@ -528,6 +487,18 @@ export function commitFork(
         .limit(MAX_ENTITIES + 1)
         .all(),
     )
+    const includedInputSequences = new Map<string, number>()
+    for (const batch of batchRows)
+      if (batch.taskId)
+        includedInputSequences.set(
+          batch.taskId,
+          Math.max(includedInputSequences.get(batch.taskId) ?? 0, batch.sequence),
+        )
+    for (const authorization of historicalAuthorizations.values())
+      if (authorization.inputSequence > (includedInputSequences.get(authorization.taskId) ?? 0))
+        throw new Error(
+          'The workflow authorization includes input outside the selected Fork boundary.',
+        )
     const batchIds = batchRows.map((row) => row.id)
     const batchSet = new Set(batchIds)
     const memberRows = batchIds.length
@@ -539,77 +510,6 @@ export function commitFork(
               .select()
               .from(conversationInputBatchMembers)
               .where(inArray(conversationInputBatchMembers.batchId, batchIds))
-              .limit(MAX_ENTITIES + 1)
-              .all(),
-        )
-      : []
-    const requiredRows = runIds.length
-      ? readBounded(
-          collaborationRequiredInputMembers,
-          and(
-            inArray(collaborationRequiredInputMembers.runId, runIds),
-            eq(collaborationRequiredInputMembers.active, true),
-          ),
-          () =>
-            database
-              .select()
-              .from(collaborationRequiredInputMembers)
-              .where(
-                and(
-                  inArray(collaborationRequiredInputMembers.runId, runIds),
-                  eq(collaborationRequiredInputMembers.active, true),
-                ),
-              )
-              .limit(MAX_ENTITIES + 1)
-              .all(),
-        )
-      : []
-    const reviewRows = runIds.length
-      ? readBounded(collaborationReviewFacts, inArray(collaborationReviewFacts.runId, runIds), () =>
-          database
-            .select()
-            .from(collaborationReviewFacts)
-            .where(inArray(collaborationReviewFacts.runId, runIds))
-            .limit(MAX_ENTITIES + 1)
-            .all(),
-        )
-      : []
-    const applicationRows = runIds.length
-      ? readBounded(
-          collaborationResultApplications,
-          inArray(collaborationResultApplications.runId, runIds),
-          () =>
-            database
-              .select()
-              .from(collaborationResultApplications)
-              .where(inArray(collaborationResultApplications.runId, runIds))
-              .orderBy(asc(collaborationResultApplications.runId))
-              .limit(MAX_ENTITIES + 1)
-              .all(),
-        )
-      : []
-    const operationRows = runIds.length
-      ? readBounded(
-          collaborationResultOperations,
-          inArray(collaborationResultOperations.runId, runIds),
-          () =>
-            database
-              .select()
-              .from(collaborationResultOperations)
-              .where(inArray(collaborationResultOperations.runId, runIds))
-              .limit(MAX_ENTITIES + 1)
-              .all(),
-        )
-      : []
-    const responseRows = runIds.length
-      ? readBounded(
-          collaborationResultInputResponses,
-          inArray(collaborationResultInputResponses.runId, runIds),
-          () =>
-            database
-              .select()
-              .from(collaborationResultInputResponses)
-              .where(inArray(collaborationResultInputResponses.runId, runIds))
               .limit(MAX_ENTITIES + 1)
               .all(),
         )
@@ -665,59 +565,25 @@ export function commitFork(
     const memberIdentity = (id: string) => (id === '$body' ? id : identity('comment', id))
     const userIdentity = (id: string) => identity(commentSet.has(id) ? 'comment' : 'message', id)
     const structuredDocuments = new Set<string>()
+    const guidanceDocuments = new Set<string>()
     const registerDocument = (value: unknown, structured = false): void => {
       const parsed = collaborationDocumentSchema.safeParse(value)
       if (parsed.success && structured) structuredDocuments.add(parsed.data.id)
     }
-    const registerTaskSources = (task: import('@pact/contracts').CollaborationTask): void => {
-      for (const ref of [
-        task.resultDocument,
-        task.priorResultDocument,
-        task.reviewScopeRef,
-        task.requiredInputScopeRef,
-        task.effectiveDecisionIndexRef,
-        task.todoIdentityIndexRef,
-      ])
-        registerDocument(ref, true)
-      if (task.authorization)
-        for (const ref of [
-          task.authorization.requiredInputScopeRef,
-          task.authorization.effectiveDecisionIndexRef,
-          task.authorization.todoIdentityIndexRef,
-          task.authorization.reviewScopeRef,
-          task.authorization.basis,
-        ])
-          registerDocument(ref, true)
-    }
     for (const turn of collaborationHistory) {
-      registerTaskSources(collaborationTaskSchema.parse(JSON.parse(turn.stateJson)))
-      for (const id of [turn.nativeEnvelopeBodyId, turn.pendingEnvelopeBodyId])
-        if (id) structuredDocuments.add(id)
-      if (turn.resultJson) {
-        const value = JSON.parse(turn.resultJson)
-        registerDocument(value.source, true)
-        for (const entry of value.documents ?? [])
-          if (entry.key.startsWith('todo:') || entry.key.startsWith('input:'))
-            registerDocument(entry.source, true)
-      }
+      const task = collaborationTaskSchema.parse(JSON.parse(turn.stateJson))
+      if (task.id !== turn.taskId || task.runId !== turn.runId)
+        throw new Error('The workflow snapshot does not belong to its frozen Fork root.')
+      registerDocument(task.reviewScopeRef, true)
+      registerDocument(task.review?.scopeRef, true)
+      const auth = historicalAuthorizations.get(turn.runId)!
+      registerDocument(auth.reviewScopeRef, true)
+      registerDocument(auth.sourceManifestRef, true)
+      registerDocument(auth.relayWorkRef, true)
+      if (auth.sourceManifestRef) guidanceDocuments.add(auth.sourceManifestRef.id)
     }
-    for (const row of authorizationRows) {
-      const auth = historicalAuthorizations.get(row.runId)!
-      for (const ref of [
-        auth.requiredInputScopeRef,
-        auth.effectiveDecisionIndexRef,
-        auth.todoIdentityIndexRef,
-        auth.reviewScopeRef,
-        auth.basis,
-      ])
-        registerDocument(ref, true)
-    }
-    for (const row of todoRevisionRows) registerDocument(JSON.parse(row.contentDocumentJson), true)
     for (const row of memberRows)
       if (row.anchorDocumentJson) registerDocument(JSON.parse(row.anchorDocumentJson), true)
-    for (const row of operationRows) registerDocument(JSON.parse(row.documentJson), true)
-    for (const row of responseRows) registerDocument(JSON.parse(row.documentJson), true)
-    for (const row of applicationRows) registerDocument(JSON.parse(row.sourceJson), true)
     const pendingDocuments = new Set<string>()
     const remapDocument = (
       ref: CollaborationDocument | undefined,
@@ -771,8 +637,21 @@ export function commitFork(
         } catch {
           value = undefined
         }
-        // Invalid native carriers remain exact private evidence, never a new valid result.
-        if (value !== undefined) text = JSON.stringify(remapMetadata(value))
+        // Unknown/invalid manifests remain evidence; they cannot add recursive references.
+        const guidance =
+          guidanceDocuments.has(ref.id) && old.bytes <= HANDOFF_GUIDANCE_BYTES
+            ? handoffGuidanceSchema.safeParse(value)
+            : undefined
+        if (guidanceDocuments.has(ref.id)) {
+          if (guidance?.success) {
+            const mapped = handoffGuidanceSchema.parse(remapMetadata(guidance.data))
+            if (mapped.version === 'handoff-guidance-v2') {
+              mapped.basis.task.id = identity('collaboration', mapped.basis.task.id)
+              mapped.basis.producerRunId = identity('run', mapped.basis.producerRunId)
+            }
+            text = JSON.stringify(handoffGuidanceSchema.parse(mapped))
+          }
+        } else if (value !== undefined) text = JSON.stringify(remapMetadata(value))
       }
       const sha256 =
         text === undefined ? ref.sha256 : createHash('sha256').update(text).digest('hex')
@@ -837,23 +716,34 @@ export function commitFork(
       const object: Record<string, unknown> = Object.fromEntries(Object.entries(value))
       const mapped: Record<string, unknown> = {}
       for (const [key, item] of Object.entries(object)) {
+        // A Fork carries historical source facts, never the parent's usable action grant.
+        if (key === 'userAuthority') continue
         if (item == null) {
           mapped[key] = item
           continue
         }
         if (key === 'sessionId') mapped[key] = sessionId
-        else if (['taskId', 'sourceTaskId'].includes(key) && typeof item === 'string')
+        else if (key === 'inputProcessing') {
+          const processing = remapMetadata(item, depth + 1)
+          const pending =
+            processing && typeof processing === 'object'
+              ? Reflect.get(processing, 'pending')
+              : undefined
+          const inputId =
+            pending && typeof pending === 'object' ? Reflect.get(pending, 'inputId') : undefined
+          if (pending && typeof pending === 'object' && typeof inputId === 'string')
+            Object.assign(pending, { inputId: forkId(sessionId, 'workflow-input', inputId) })
+          mapped[key] = processing
+        } else if (['taskId', 'sourceTaskId'].includes(key) && typeof item === 'string')
           mapped[key] = identity('collaboration', item)
         else if (
           [
             'runId',
             'sourceRunId',
-            'reportSourceRunId',
-            'confirmedRunId',
             'responseRunId',
-            'implementationRunId',
-            'repairRunId',
+            'codeRunId',
             'sourceChangeSetId',
+            'implementationRunId',
           ].includes(key) &&
           typeof item === 'string'
         )
@@ -865,6 +755,7 @@ export function commitFork(
             'userMessageId',
             'taskMessageId',
             'latestUserMessageId',
+            'requestMessageId',
           ].includes(key) &&
           typeof item === 'string'
         )
@@ -900,29 +791,83 @@ export function commitFork(
       }
       return mapped
     }
-    const remapStoredResult = (json: string): string =>
-      JSON.stringify(remapMetadata(JSON.parse(json)))
+    const remapCommentAnchor = (json: string): string => {
+      const sourceAnchor = storedCommentAnchor(JSON.parse(json))
+      return JSON.stringify(commentAnchorSchema.parse(remapMetadata(sourceAnchor)))
+    }
     const remapCollaboration = (stateJson: string): string => {
       const task = collaborationTaskSchema.parse(JSON.parse(stateJson))
+      const inputSequence = Math.min(task.inputSequence, includedInputSequences.get(task.id) ?? 0)
       return JSON.stringify(
         collaborationTaskSchema.parse({
-          ...collaborationTaskSchema.parse(remapMetadata(task)),
+          ...collaborationTaskSchema.parse(
+            remapMetadata({
+              ...task,
+              latestUserMessageId:
+                task.latestUserMessageId && messageSet.has(task.latestUserMessageId)
+                  ? task.latestUserMessageId
+                  : undefined,
+              inputSequence,
+              handledInputSequence: Math.min(task.handledInputSequence, inputSequence),
+              authorization: undefined,
+              pendingWork: undefined,
+              nextStage: undefined,
+            }),
+          ),
           id: identity('collaboration', task.id),
           sessionId,
-          runId: identity('run', task.runId),
-          previousRunId:
-            task.previousRunId && runSet.has(task.previousRunId)
-              ? identity('run', task.previousRunId)
-              : undefined,
-          // Historical authorization is copied separately as evidence; the task cannot dispatch it.
-          authorization: undefined,
-          approvedPlanVersion: undefined,
-          reportRecovery: undefined,
-          resumePhase: undefined,
-          releasedReservation: true,
-          notice: 'Inherited collaboration history is read-only; no Turn is authorized.',
+          // The original outcome remains historical evidence. It authorizes no work in this Session.
+          automation: 'paused',
+          pauseReason: 'user',
+          notice: 'Inherited collaboration history is read-only; no Agent action is authorized.',
         }),
       )
+    }
+    const copyArtifactBody = (bodyId: string): string => {
+      const old = database
+        .select()
+        .from(conversationBodyInputs)
+        .where(eq(conversationBodyInputs.id, bodyId))
+        .get()
+      if (!old || old.sessionId !== source.id || !old.sourceRunId || !runSet.has(old.sourceRunId))
+        throw new Error('The historical workflow artifact is outside the frozen Fork history.')
+      if (old.sealed && old.hash)
+        return remapDocument({ id: old.id, sha256: old.hash, bytes: old.bytes, chars: old.chars })!
+          .id
+      const id = forkId(sessionId, 'document', old.id)
+      if (
+        database
+          .select({ id: conversationBodyInputs.id })
+          .from(conversationBodyInputs)
+          .where(eq(conversationBodyInputs.id, id))
+          .get()
+      )
+        return id
+      readBounded(conversationBodyParts, eq(conversationBodyParts.inputId, old.id), () =>
+        database
+          .select()
+          .from(conversationBodyParts)
+          .where(eq(conversationBodyParts.inputId, old.id))
+          .limit(MAX_ENTITIES + 1)
+          .all(),
+      )
+      bound([old])
+      database
+        .insert(conversationBodyInputs)
+        .values({
+          ...old,
+          id,
+          sessionId,
+          sourceRunId: identity('run', old.sourceRunId),
+          ownerKey: `fork:${forkId(sessionId, 'body-owner', old.ownerKey)}`,
+          committedMessageId: null,
+          pendingReceiptId: null,
+        })
+        .run()
+      database.run(
+        sql`INSERT INTO conversation_body_parts(input_id,offset,text,end_bytes) SELECT ${id},offset,text,end_bytes FROM conversation_body_parts WHERE input_id=${old.id}`,
+      )
+      return id
     }
     const activityPredicate = and(
       eq(agentRunActivities.sessionId, source.id),
@@ -1023,9 +968,19 @@ export function commitFork(
           sessionId,
           userMessageId: forkId(sessionId, 'message', row.userMessageId),
           forkSourceRunId: row.forkSourceRunId ?? row.id,
-          collaborationTaskId: row.collaborationTaskId
-            ? forkId(sessionId, 'collaboration', row.collaborationTaskId)
-            : null,
+          collaborationTaskId:
+            row.collaborationTaskId && taskSet.has(row.collaborationTaskId)
+              ? identity('collaboration', row.collaborationTaskId)
+              : null,
+          collaborationKind:
+            row.collaborationTaskId && taskSet.has(row.collaborationTaskId)
+              ? row.collaborationKind
+              : null,
+          collaborationStage:
+            row.collaborationTaskId && taskSet.has(row.collaborationTaskId)
+              ? row.collaborationStage
+              : null,
+          answerFormat: null,
           peerProposalId: row.peerProposalId
             ? forkId(sessionId, 'proposal', row.peerProposalId)
             : null,
@@ -1063,23 +1018,13 @@ export function commitFork(
         )
     const orderedHistory = collaborationHistory.toSorted(
       (left, right) =>
-        (messageOrdinal.get(left.runId) ?? -1) - (messageOrdinal.get(right.runId) ?? -1),
+        (messageOrdinal.get(left.runId) ?? -1) - (messageOrdinal.get(right.runId) ?? -1) ||
+        left.createdAt.localeCompare(right.createdAt) ||
+        left.runId.localeCompare(right.runId),
     )
     for (const row of orderedHistory) {
-      for (const id of [
-        row.pendingEnvelopeBodyId,
-        row.nativeEnvelopeBodyId,
-        row.answerProjectionBodyId,
-      ]) {
-        if (!id) continue
-        const body = database
-          .select()
-          .from(conversationBodyInputs)
-          .where(eq(conversationBodyInputs.id, id))
-          .get()
-        if (!body?.hash) throw new Error('The Fork submitted source is unavailable.')
-        remapDocument({ id, sha256: body.hash, bytes: body.bytes, chars: body.chars })
-      }
+      const planBodyId = row.planBodyId ? copyArtifactBody(row.planBodyId) : null
+      const reportBodyId = row.reportBodyId ? copyArtifactBody(row.reportBodyId) : null
       const stateJson = remapCollaboration(row.stateJson)
       const task = collaborationTaskSchema.parse(JSON.parse(stateJson))
       if (!inheritedTaskIds.has(task.id)) {
@@ -1090,9 +1035,8 @@ export function commitFork(
             sessionId,
             stateJson,
             active: false,
-            ledgerRevision: task.ledgerRevision,
             inputSequence: task.inputSequence,
-            processedWatermark: task.processedWatermark,
+            processedWatermark: task.handledInputSequence,
             updatedAt: now,
           })
           .run()
@@ -1102,60 +1046,27 @@ export function commitFork(
           .update(collaborationTasks)
           .set({
             stateJson,
-            ledgerRevision: task.ledgerRevision,
             inputSequence: task.inputSequence,
-            processedWatermark: task.processedWatermark,
+            processedWatermark: task.handledInputSequence,
           })
           .where(eq(collaborationTasks.id, task.id))
           .run()
+      const authorization = collaborationTurnAuthorizationSchema.parse(
+        remapMetadata(historicalAuthorizations.get(row.runId)!),
+      )
       database
-        .insert(collaborationTurns)
+        .insert(workflowTurns)
         .values({
           ...row,
-          runId: forkId(sessionId, 'run', row.runId),
+          runId: identity('run', row.runId),
           taskId: task.id,
+          inputSequence: authorization.inputSequence,
+          authorizationJson: JSON.stringify(authorization),
           stateJson,
-          pendingEnvelopeBodyId: row.pendingEnvelopeBodyId
-            ? forkId(sessionId, 'document', row.pendingEnvelopeBodyId)
-            : null,
-          nativeEnvelopeBodyId: row.nativeEnvelopeBodyId
-            ? forkId(sessionId, 'document', row.nativeEnvelopeBodyId)
-            : null,
-          answerProjectionBodyId: row.answerProjectionBodyId
-            ? forkId(sessionId, 'document', row.answerProjectionBodyId)
-            : null,
-          resultJson: row.resultJson ? remapStoredResult(row.resultJson) : null,
+          planBodyId,
+          reportBodyId,
         })
         .run()
-    }
-    for (const turn of collaborationHistory) {
-      let ordinal = 0
-      for (;;) {
-        const items = database
-          .select()
-          .from(collaborationReportItems)
-          .where(
-            and(
-              eq(collaborationReportItems.runId, turn.runId),
-              gte(collaborationReportItems.ordinal, ordinal),
-            ),
-          )
-          .orderBy(asc(collaborationReportItems.ordinal))
-          .limit(24)
-          .all()
-        if (!items.length) break
-        bound(items)
-        for (const item of items)
-          database
-            .insert(collaborationReportItems)
-            .values({
-              ...item,
-              runId: forkId(sessionId, 'run', item.runId),
-              documentJson: JSON.stringify(remapDocument(JSON.parse(item.documentJson))),
-            })
-            .run()
-        ordinal = items.at(-1)!.ordinal + 1
-      }
     }
     for (const row of messages)
       database
@@ -1200,19 +1111,8 @@ export function commitFork(
         .insert(conversationMessageImages)
         .values({ ...row, messageId: forkId(sessionId, 'message', row.messageId) })
         .run()
-    const availableTodoRevisions = new Set(
-      todoRevisionRows.map((row) => `${todoKey(row.taskId, row.todoId)}:${row.revision}`),
-    )
     for (const row of comments) {
-      const anchor = commentAnchorSchema.parse(remapMetadata(JSON.parse(row.anchorJson)))
-      const original = commentAnchorSchema.parse(JSON.parse(row.anchorJson))
-      if (
-        original.type === 'todo' &&
-        !availableTodoRevisions.has(
-          `${todoKey(original.taskId, original.todoId)}:${original.todoRevision}`,
-        )
-      )
-        throw new Error('A Todo Comment revision is outside the frozen Fork history.')
+      const anchorJson = remapCommentAnchor(row.anchorJson)
       database
         .insert(anchoredComments)
         .values({
@@ -1221,150 +1121,61 @@ export function commitFork(
           sessionId,
           pendingReceiptId: null,
           returnOperationId: null,
-          answerKey:
-            anchor.type === 'todo' && anchor.question
-              ? `${anchor.taskId}:${anchor.todoId}:${anchor.question.id}:${anchor.question.revision}`
-              : null,
-          anchorJson: JSON.stringify(anchor),
+          answerKey: null,
+          anchorJson,
           sentWithMessageId: identity('message', row.sentWithMessageId!),
         })
         .run()
     }
-    const latestTodos = new Map<string, typeof collaborationTodoRevisions.$inferSelect>()
-    for (const row of todoRevisionRows) {
-      const document = remapDocument(JSON.parse(row.documentJson))!
-      const content = remapDocument(JSON.parse(row.contentDocumentJson))!
-      const reason = row.reasonDocumentJson
-        ? remapDocument(JSON.parse(row.reasonDocumentJson))
-        : undefined
-      const mapped = {
-        ...row,
-        taskId: identity('collaboration', row.taskId),
-        sourceRunId: identity('run', row.sourceRunId),
-        confirmedRunId: row.confirmedRunId ? identity('run', row.confirmedRunId) : null,
-        documentId: document.id,
-        contentDocumentId: content.id,
-        contentDocumentJson: JSON.stringify(content),
-        reasonDocumentId: reason?.id ?? null,
-        documentJson: JSON.stringify(document),
-        reasonDocumentJson: reason ? JSON.stringify(reason) : null,
-      }
-      database.insert(collaborationTodoRevisions).values(mapped).run()
-      latestTodos.set(todoKey(row.taskId, row.todoId), row)
-    }
-    for (const row of latestTodos.values()) {
-      const document = remapDocument(JSON.parse(row.documentJson))!
-      const content = remapDocument(JSON.parse(row.contentDocumentJson))!
-      const reason = row.reasonDocumentJson
-        ? remapDocument(JSON.parse(row.reasonDocumentJson))
-        : undefined
-      database
-        .insert(collaborationTodos)
-        .values({
-          ...row,
-          taskId: identity('collaboration', row.taskId),
-          sourceRunId: identity('run', row.sourceRunId),
-          confirmedRunId: row.confirmedRunId ? identity('run', row.confirmedRunId) : null,
-          documentId: document.id,
-          contentDocumentId: content.id,
-          contentDocumentJson: JSON.stringify(content),
-          reasonDocumentId: reason?.id ?? null,
-          documentJson: JSON.stringify(document),
-          reasonDocumentJson: reason ? JSON.stringify(reason) : null,
-        })
-        .run()
-    }
-    const completedResponseRuns = new Set(
-      messages
-        .filter(
-          (message) =>
-            message.role === 'assistant' &&
-            message.isVisible &&
-            message.state === 'complete' &&
-            message.runId,
-        )
-        .map((message) => message.runId!),
-    )
-    // Applied index columns are the immutable effective settlement. The linked
-    // carrier/document preserves the Agent's original claims and is not authority.
-    const appliedRuns = new Set(
-      applicationRows
-        .filter((row) => row.state === 'applied' && completedResponseRuns.has(row.runId))
-        .map((row) => row.runId),
-    )
-    const reportAuthorizations = historicalAuthorizations
-    const settledReportLineages = new Set<string>()
-    for (const runId of appliedRuns) {
-      const auth = reportAuthorizations.get(runId)
-      if (auth?.reportSourceRunId)
-        settledReportLineages.add(`${auth.taskId}:${auth.reportSourceRunId}`)
-    }
-    const applicationOrder = new Map(
-      applicationRows
-        .toSorted(
-          (left, right) =>
-            (messageOrdinal.get(left.runId) ?? -1) - (messageOrdinal.get(right.runId) ?? -1) ||
-            left.runId.localeCompare(right.runId),
-        )
-        .map((row, index) => [row.runId, index]),
-    )
-    const latestResponses = new Map<string, typeof collaborationResultInputResponses.$inferSelect>()
-    for (const row of responseRows.toSorted(
-      (a, b) => (applicationOrder.get(a.runId) ?? -1) - (applicationOrder.get(b.runId) ?? -1),
-    ))
-      if (appliedRuns.has(row.runId)) latestResponses.set(`${row.batchId}:${row.memberId}`, row)
     for (const row of batchRows) {
-      const response = latestResponses.get(`${row.id}:$body`)
       const body = row.bodyDocumentJson
         ? remapDocument(JSON.parse(row.bodyDocumentJson))
         : undefined
-      const reportAuth = row.runId ? reportAuthorizations.get(row.runId) : undefined
-      // Host settlement closes only zero-member report-formatting controls from
-      // an applied, completed recovery in this exact origin lineage. It has no
-      // native inputResponse; mutable current bodyState cannot prove this fact.
-      const settledReportControl =
-        row.memberCount === 0 &&
-        Boolean(
-          reportAuth?.reportSourceRunId &&
-          reportAuth.taskId === row.taskId &&
-          settledReportLineages.has(`${reportAuth.taskId}:${reportAuth.reportSourceRunId}`),
-        )
-      // Reconstruct from effective applied facts at the visible completed cutoff, never raw report claims.
-      const bodyState = settledReportControl
-        ? 'resolved'
-        : ((response ? inputDisposition(response.disposition) : undefined) ??
-          (row.bodyState === 'withdrawn' &&
-          row.closedAt &&
-          row.closedAt <= messages.at(-1)!.updatedAt
-            ? 'withdrawn'
-            : 'pending_response'))
+      const information = row.dispatchInformationJson
+        ? preparedInformationControlSchema.parse(JSON.parse(row.dispatchInformationJson))
+        : undefined
+      const historicalInformation = information
+        ? preparedInformationControlSchema.parse({
+            version: 'prepared-information-v1',
+            decisionId: forkId(sessionId, 'historical-information', information.decisionId),
+            revision: 0,
+            preview: information.preview,
+            originalCommentIds: information.originalCommentIds.map((id) => identity('comment', id)),
+            draftCopies: [],
+            ...(information.answerDocument
+              ? { answerDocument: remapDocument(information.answerDocument) }
+              : {}),
+          })
+        : undefined
       database
         .insert(conversationInputBatches)
         .values({
           ...row,
           id: identity('batch', row.id),
           sessionId,
-          taskId: row.taskId ? identity('collaboration', row.taskId) : null,
+          taskId:
+            row.taskId && taskSet.has(row.taskId) ? identity('collaboration', row.taskId) : null,
           clientMessageId: forkId(sessionId, 'historical-batch-nonce', row.clientMessageId),
           runId: row.runId ? identity('run', row.runId) : null,
           messageId: row.messageId ? identity('message', row.messageId) : null,
           inputId: null,
+          dispatchInformationJson: historicalInformation
+            ? JSON.stringify(historicalInformation)
+            : null,
+          userInformationDocumentJson: row.userInformationDocumentJson
+            ? JSON.stringify(remapDocument(JSON.parse(row.userInformationDocumentJson)))
+            : null,
           bodyDocumentJson: body ? JSON.stringify(body) : null,
-          bodyState,
-          state: 'open',
-          closedAt: null,
         })
         .run()
     }
     for (const row of memberRows) {
-      const response = latestResponses.get(`${row.batchId}:${row.memberId}`)
       const body = row.bodyDocumentJson
         ? remapDocument(JSON.parse(row.bodyDocumentJson))
         : undefined
-      const anchorDoc = row.anchorDocumentJson
+      const anchor = row.anchorDocumentJson
         ? remapDocument(JSON.parse(row.anchorDocumentJson))
         : undefined
-      const responseDoc = response ? remapDocument(JSON.parse(response.documentJson)) : undefined
       database
         .insert(conversationInputBatchMembers)
         .values({
@@ -1372,92 +1183,18 @@ export function commitFork(
           batchId: identity('batch', row.batchId),
           memberId: memberIdentity(row.memberId),
           commentId: identity('comment', row.commentId),
-          anchorJson: JSON.stringify(
-            commentAnchorSchema.parse(remapMetadata(JSON.parse(row.anchorJson))),
-          ),
+          anchorJson: remapCommentAnchor(row.anchorJson),
           bodyDocumentJson: body ? JSON.stringify(body) : null,
-          anchorDocumentJson: anchorDoc ? JSON.stringify(anchorDoc) : null,
-          sourceTaskId: row.sourceTaskId ? identity('collaboration', row.sourceTaskId) : null,
-          state:
-            (response ? inputDisposition(response.disposition) : undefined) ??
-            (row.state === 'withdrawn' && row.updatedAt <= messages.at(-1)!.updatedAt
-              ? 'withdrawn'
-              : 'pending_response'),
-          responseRunId: response ? identity('run', response.runId) : null,
-          responseDocumentJson: responseDoc ? JSON.stringify(responseDoc) : null,
-          todoId: response?.todoId ?? null,
+          anchorDocumentJson: anchor ? JSON.stringify(anchor) : null,
+          sourceTaskId: null,
+          sourceTodoId: null,
+          questionId: null,
+          questionRevision: null,
+          answerResolver: null,
+          responseRunId: null,
+          responseDocumentJson: null,
+          todoId: null,
         })
-        .run()
-    }
-    for (const row of batchRows)
-      database.run(
-        sql`UPDATE conversation_input_batches SET state='closed' WHERE id=${identity('batch', row.id)} AND body_state IN ('resolved','withdrawn') AND NOT EXISTS (SELECT 1 FROM conversation_input_batch_members WHERE batch_id=${identity('batch', row.id)} AND state NOT IN ('resolved','withdrawn'))`,
-      )
-    const settlementRevisions = new Map<string, number>()
-    for (const row of applicationRows)
-      if (appliedRuns.has(row.runId)) {
-        const taskId = identity('collaboration', row.taskId)
-        settlementRevisions.set(
-          taskId,
-          Math.max(settlementRevisions.get(taskId) ?? 0, row.settlementRevision ?? 0),
-        )
-      }
-    // The new namespace has no active task, but its historical projection must
-    // still describe this cutoff's effective ledger and contiguous input facts.
-    for (const taskId of inheritedTaskIds) {
-      const saved = database
-        .select()
-        .from(collaborationTasks)
-        .where(eq(collaborationTasks.id, taskId))
-        .get()!
-      const task = collaborationTaskSchema.parse(JSON.parse(saved.stateJson))
-      const counts = database.all<{ status: string; count: number; questions: number }>(
-        sql`SELECT status,count(*) AS count,sum(CASE WHEN question_id IS NOT NULL AND kind IN ('decision','information') THEN 1 ELSE 0 END) AS questions FROM collaboration_todos WHERE task_id=${taskId} GROUP BY status`,
-      )
-      const input = database.get<{ sequence: number; firstOpen: number | null }>(
-        sql`SELECT coalesce(max(sequence),0) AS sequence,min(CASE WHEN state='open' THEN sequence END) AS firstOpen FROM conversation_input_batches WHERE task_id=${taskId}`,
-      )
-      const ledger = database.get<{ revision: number }>(
-        sql`SELECT coalesce(max(ledger_revision),0) AS revision FROM collaboration_todo_revisions WHERE task_id=${taskId}`,
-      ).revision
-      const unanswered = database.get<{
-        count: number
-      }>(sql`SELECT count(*) AS count FROM collaboration_todos t WHERE t.task_id=${taskId} AND t.status<>'done' AND t.question_id IS NOT NULL AND NOT EXISTS (
-        SELECT 1 FROM conversation_input_batch_members m JOIN conversation_input_batches b ON b.id=m.batch_id
-        WHERE b.task_id=t.task_id AND m.source_task_id=t.task_id AND m.source_todo_id=t.todo_id
-        AND m.question_id=t.question_id AND m.question_revision=t.question_revision AND m.state<>'withdrawn')`).count
-      const count = (status: string) => counts.find((value) => value.status === status)?.count ?? 0
-      task.ledgerOpenCount = count('open')
-      task.ledgerAwaitingCount = count('awaiting_review')
-      task.doneTodoCount = count('done')
-      task.unansweredCount = unanswered
-      task.questionPendingCount = counts.reduce(
-        (total, row) => total + (row.status === 'done' ? 0 : row.questions),
-        0,
-      )
-      task.inputSequence = input.sequence
-      task.processedWatermark =
-        input.firstOpen === null ? input.sequence : Math.max(0, input.firstOpen - 1)
-      // An empty-delta result still advances the ledger; finalized applications
-      // are copied below, so use their cutoff-filtered immutable settlement here.
-      task.ledgerRevision = Math.max(ledger, settlementRevisions.get(taskId) ?? 0)
-      const pending = Boolean(
-        task.ledgerOpenCount || task.ledgerAwaitingCount || unanswered || input.firstOpen !== null,
-      )
-      if (
-        task.status === 'running' ||
-        (pending && (task.status === 'ready' || task.status === 'complete'))
-      )
-        task.status = unanswered ? 'questions' : 'waiting'
-      database
-        .update(collaborationTasks)
-        .set({
-          stateJson: JSON.stringify(task),
-          ledgerRevision: task.ledgerRevision,
-          inputSequence: task.inputSequence,
-          processedWatermark: task.processedWatermark,
-        })
-        .where(eq(collaborationTasks.id, taskId))
         .run()
     }
     for (const row of runSourceRows)
@@ -1469,78 +1206,6 @@ export function commitFork(
           sourceMessageId: identity('message', row.sourceMessageId),
           batchId: row.batchId ? identity('batch', row.batchId) : null,
           documentsJson: JSON.stringify(remapMetadata(JSON.parse(row.documentsJson))),
-        })
-        .run()
-    for (const row of authorizationRows) {
-      const authorization = historicalAuthorizations.get(row.runId)!
-      database
-        .insert(collaborationTurnAuthorizations)
-        .values({
-          ...row,
-          runId: identity('run', row.runId),
-          taskId: identity('collaboration', row.taskId),
-          inputBatchId: row.inputBatchId ? identity('batch', row.inputBatchId) : null,
-          inputSequence: authorization.inputSequence,
-          basisJson: JSON.stringify(remapMetadata(JSON.parse(row.basisJson))),
-          authorizationJson: JSON.stringify(remapMetadata(authorization)),
-        })
-        .run()
-    }
-    for (const row of requiredRows)
-      database
-        .insert(collaborationRequiredInputMembers)
-        .values({
-          ...row,
-          runId: identity('run', row.runId),
-          batchId: identity('batch', row.batchId),
-          memberId: memberIdentity(row.memberId),
-        })
-        .run()
-    for (const row of reviewRows)
-      database
-        .insert(collaborationReviewFacts)
-        .values({
-          ...row,
-          id: forkId(sessionId, 'review-fact', row.id),
-          taskId: identity('collaboration', row.taskId),
-          runId: identity('run', row.runId),
-          basisJson: JSON.stringify(remapMetadata(JSON.parse(row.basisJson))),
-        })
-        .run()
-    for (const row of applicationRows) {
-      const sourceDocument = remapDocument(JSON.parse(row.sourceJson))!
-      const manifest = remapMetadata(JSON.parse(row.manifestJson))
-      database
-        .insert(collaborationResultApplications)
-        .values({
-          ...row,
-          runId: identity('run', row.runId),
-          taskId: identity('collaboration', row.taskId),
-          resultId: `${identity('run', row.runId)}:${sourceDocument.sha256}`,
-          digest: sourceDocument.sha256,
-          sourceJson: JSON.stringify(sourceDocument),
-          manifestJson: JSON.stringify(manifest),
-        })
-        .run()
-    }
-    for (const row of operationRows)
-      database
-        .insert(collaborationResultOperations)
-        .values({
-          ...row,
-          runId: identity('run', row.runId),
-          documentJson: JSON.stringify(remapDocument(JSON.parse(row.documentJson))),
-        })
-        .run()
-    for (const row of responseRows)
-      database
-        .insert(collaborationResultInputResponses)
-        .values({
-          ...row,
-          runId: identity('run', row.runId),
-          batchId: identity('batch', row.batchId),
-          memberId: memberIdentity(row.memberId),
-          documentJson: JSON.stringify(remapDocument(JSON.parse(row.documentJson))),
         })
         .run()
     for (const row of activities)

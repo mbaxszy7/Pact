@@ -55,7 +55,7 @@ public static class PactE2EJob
 
     // Only the current Job is inspected. Export fixed roles, never paths/arguments.
     // Two snapshots per observed launch; 16 visible rows, 256 real Job members.
-    static string Members(IntPtr job, uint rootPid) {
+    static string Members(IntPtr job, uint rootPid, bool runnerDiagnostic = false) {
         int bytes = 8 + 256 * IntPtr.Size;
         IntPtr list = Marshal.AllocHGlobal(bytes);
         bool incomplete = false; int count = 0;
@@ -90,6 +90,18 @@ public static class PactE2EJob
                         else if (name == "conhost.exe") kind = "conhost";
                         else if (name == "git.exe") kind = "git";
                         else if (name == "rg.exe") kind = "rg";
+                        else if (runnerDiagnostic) {
+                            if (name == "pnpm.exe") kind = "pnpm";
+                            else if (name == "esbuild.exe") kind = "esbuild";
+                            else if (name == "app-builder.exe") kind = "app-builder";
+                            else if (name == "7za.exe" || name == "7z.exe") kind = "7zip";
+                            else if (name == "makensis.exe") kind = "nsis";
+                            else if (name == "csc.exe" || name == "vbcscompiler.exe" || name == "msbuild.exe") kind = "compiler";
+                            else if (name == "powershell.exe" || name == "pwsh.exe") kind = "powershell";
+                            else if (name == "owned-process-group-win32-x64.exe" || name == "owned-process-group-win32-arm64.exe") kind = "owned-helper";
+                            else if (name == "electron.exe" || name == "pact dev.exe") kind = "electron";
+                            else if (name == "werfault.exe" || name == "crashpad_handler.exe") kind = "crash-reporter";
+                        }
                     } else incomplete = true;
                     if (!IsProcessInJob(process, job, out belongs) || !belongs) { incomplete = true; continue; }
                     if (count++ != 0) rows.Append(',');
@@ -106,6 +118,18 @@ public static class PactE2EJob
         if (generation == null) return;
         Emit(writer, "{\"kind\":\"root-exit\",\"pid\":" + pid + ",\"exitCode\":" + unchecked((int)code) +
             ",\"elapsedMs\":" + elapsed + ",\"natural\":" + (natural ? "true" : "false") + ",\"active\":" + active + "," + Members(job, pid) + "}", generation);
+    }
+
+    static string DiagnosticMembers(IntPtr job, uint pid) {
+        try { return Members(job, pid, true); }
+        catch { return "\"members\":[],\"membersIncomplete\":true"; }
+    }
+    static string RunnerRoot(IntPtr job, uint pid, uint code, long elapsed, bool natural, uint active) {
+        try {
+            return "{\"pid\":" + pid + ",\"exitCode\":" + unchecked((int)code) +
+                ",\"elapsedMs\":" + elapsed + ",\"natural\":" + (natural ? "true" : "false") +
+                ",\"active\":" + active + "," + DiagnosticMembers(job, pid) + "}";
+        } catch { return null; }
     }
 
     static void Check(bool success) { if (!success) throw new Win32Exception(Marshal.GetLastWin32Error()); }
@@ -170,6 +194,9 @@ public static class PactE2EJob
         IntPtr input = IntPtr.Zero, output = IntPtr.Zero, error = IntPtr.Zero;
         ProcessInfo process = new ProcessInfo(); bool attributesReady = false, empty = false;
         int exit = 1;
+        bool runnerDiagnostic = !forwardInput && writer != null;
+        string rootDiagnostic = null, stopDiagnostic = null, afterTerminateDiagnostic = null;
+        int? diagnosticError = null;
         try {
             job = CreateJobObjectW(IntPtr.Zero, null);
             Check(job != IntPtr.Zero);
@@ -205,6 +232,7 @@ public static class PactE2EJob
                     uint code; Check(GetExitCodeProcess(process.Process, out code));
                     if (stoppedAt < 0) exit = unchecked((int)code);
                     exitedAt = clock.ElapsedMilliseconds;
+                    if (runnerDiagnostic) rootDiagnostic = RunnerRoot(job, process.Pid, code, exitedAt, stoppedAt < 0, active);
                     RootExited(writer, generation, job, process.Pid, code, exitedAt, stoppedAt < 0, active);
                 }
                 if (active == 0) {
@@ -215,6 +243,7 @@ public static class PactE2EJob
                         uint code; Check(GetExitCodeProcess(process.Process, out code));
                         if (stoppedAt < 0) exit = unchecked((int)code);
                         exitedAt = clock.ElapsedMilliseconds;
+                        if (runnerDiagnostic) rootDiagnostic = RunnerRoot(job, process.Pid, code, exitedAt, stoppedAt < 0, 0);
                         RootExited(writer, generation, job, process.Pid, code, exitedAt, stoppedAt < 0, 0);
                     }
                     empty = true; break;
@@ -224,10 +253,15 @@ public static class PactE2EJob
                 // the five-second post-root drain. Job ownership and cancellation never change.
                 string reason = cancel.IsCompleted ? "control-closed" : clock.ElapsedMilliseconds >= timeout ? "deadline" : argumentMode != "nsis" && exitedAt >= 0 && clock.ElapsedMilliseconds - exitedAt >= 5000 ? "descendants-still-running" : null;
                 if (stoppedAt < 0 && reason != null) {
+                    if (runnerDiagnostic) stopDiagnostic = "{\"reason\":\"" + reason + "\",\"active\":" + active + "}";
                     if (generation != null)
                         Emit(writer, "{\"kind\":\"members\",\"phase\":\"before-stop\"," + Members(job, process.Pid) + "}", generation);
                     Check(TerminateJobObject(job, 1)); exit = 1; stoppedAt = clock.ElapsedMilliseconds;
                     Emit(writer, "{\"kind\":\"stopping\",\"reason\":\"" + reason + "\"}", generation);
+                    if (runnerDiagnostic) {
+                        try { afterTerminateDiagnostic = "{\"phase\":\"after-terminate\"," + DiagnosticMembers(job, process.Pid) + "}"; }
+                        catch { afterTerminateDiagnostic = null; }
+                    }
                 }
                 if (stoppedAt >= 0 && clock.ElapsedMilliseconds - stoppedAt >= 5000) throw new IOException("Job closure unconfirmed");
                 if (active != lastActive && clock.ElapsedMilliseconds - sampledAt >= 1000) {
@@ -237,6 +271,7 @@ public static class PactE2EJob
             }
             return exit;
         } catch (Exception exception) {
+            diagnosticError = exception is Win32Exception ? ((Win32Exception)exception).NativeErrorCode : 0;
             try { Emit(writer, "{\"kind\":\"error\",\"code\":" + (exception is Win32Exception ? ((Win32Exception)exception).NativeErrorCode : 0) + "}", generation); } catch { }
             return 1;
         } finally {
@@ -245,7 +280,20 @@ public static class PactE2EJob
                 var confirmation = Stopwatch.StartNew();
                 try { while (Active(job) != 0 && confirmation.ElapsedMilliseconds < 5000) Thread.Sleep(25); empty = Active(job) == 0; } catch { }
             }
-            if (empty) { try { Emit(writer, "{\"kind\":\"empty\",\"exitCode\":" + exit + ",\"active\":0}", generation); } catch { } }
+            if (empty) {
+                string receipt = "{\"kind\":\"empty\",\"exitCode\":" + exit + ",\"active\":0}";
+                if (runnerDiagnostic && (exit != 0 || stopDiagnostic != null || diagnosticError.HasValue)) {
+                    try {
+                        string facts = "{\"version\":1,\"root\":" + (rootDiagnostic ?? "null") +
+                            ",\"stop\":" + (stopDiagnostic ?? "null") + ",\"afterTerminate\":" + (afterTerminateDiagnostic ?? "null") +
+                            ",\"errorCode\":" + (diagnosticError.HasValue ? diagnosticError.Value.ToString() : "null") + "}";
+                        string observed = receipt.Substring(0, receipt.Length - 1) + ",\"diagnostic\":" + facts + "}";
+                        // Leave space for adjacent stopping/count frames under the original 4096-byte bound.
+                        if (Encoding.UTF8.GetByteCount(observed) <= 3584) receipt = observed;
+                    } catch { /* An optional observation must never suppress the genuine empty receipt. */ }
+                }
+                try { Emit(writer, receipt, generation); } catch { }
+            }
             if (process.Thread != IntPtr.Zero) CloseHandle(process.Thread);
             if (process.Process != IntPtr.Zero) CloseHandle(process.Process);
             if (attributesReady) DeleteProcThreadAttributeList(attributes);

@@ -65,6 +65,18 @@ export function projectSessionIssues(
     const pending =
       operation && ['preparing', 'creating', 'seeding', 'unconfirmed'].includes(operation.stage)
     const state = context?.continuationState
+    const cursor = cursors.find((item) => item?.agentId === agentId)
+    const uncertainWork =
+      state === 'responding' ||
+      state === 'waiting_user' ||
+      [run, cursor].some(
+        (item) =>
+          item &&
+          ((!['not_sent', 'rejected', 'ended'].includes(item.dispatchPhase ?? '') &&
+            !item.nativeOutcome) ||
+            item.nativeEffectsState === 'pending' ||
+            item.nativeEffectsState === 'unknown'),
+      )
     const blocked =
       state === 'recovery_required' ||
       state === 'rebuilding' ||
@@ -187,6 +199,25 @@ export function projectSessionIssues(
         title = `${name} session not found`
         reason = 'The saved session could not be found.'
       } else title = `${name} session check failed`
+    } else if (
+      run?.dispatchPhase === 'ended' &&
+      run.nativeOutcome === 'interrupted' &&
+      run.nativeEffectsState === 'settled' &&
+      !uncertainWork &&
+      context?.state === 'active' &&
+      state === 'ready' &&
+      !context.recoveryReason &&
+      !context.recoveryFailureKind &&
+      !context.recoveryFailureMessage &&
+      (!run.failureKind || run.failureKind === 'user_stopped') &&
+      (!run.failureMessage || run.failureKind === 'user_stopped')
+    ) {
+      // An interrupted task may never produce a final answer. Preserve that
+      // fact without offering another check of an already resolved session.
+      phase = 'resolved'
+      action = 'none'
+      title = `${name} task stopped`
+      reason = 'The task was interrupted. This session is ready.'
     } else if (context?.recoveryAction === 'none') {
       action = 'none'
     } else if (incomplete && !blocked) {
@@ -240,18 +271,6 @@ export function projectSessionIssues(
     }
     if (/connection reset|ECONNRESET/iu.test(reason))
       reason = 'The connection was reset during the session check.'
-    const cursor = cursors.find((item) => item?.agentId === agentId)
-    const uncertainWork =
-      state === 'responding' ||
-      state === 'waiting_user' ||
-      [run, cursor].some(
-        (item) =>
-          item &&
-          ((!['not_sent', 'rejected', 'ended'].includes(item.dispatchPhase ?? '') &&
-            !item.nativeOutcome) ||
-            item.nativeEffectsState === 'pending' ||
-            item.nativeEffectsState === 'unknown'),
-      )
     agents.push({
       agentId,
       generation: context?.bindingGeneration ?? run?.bindingGeneration ?? 1,

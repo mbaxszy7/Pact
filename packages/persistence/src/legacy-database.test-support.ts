@@ -49,7 +49,9 @@ export function copyLegacyDatabase(
           .all(),
       )
       for (const { name } of tables) {
-        const columns = names(legacy.prepare(`PRAGMA table_info(${quote(name)})`).all())
+        const columns = names(legacy.prepare(`PRAGMA table_info(${quote(name)})`).all()).filter(
+          (column) => name !== 'scheduling_settings' || column.name !== 'selection_json',
+        )
         const projection = columns.map((column) => quote(column.name)).join(', ')
         const rows = current.drizzle.all<Record<string, unknown>>(
           sql.raw(`SELECT ${projection} FROM ${quote(name)}`),

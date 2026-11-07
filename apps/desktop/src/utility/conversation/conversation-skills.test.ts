@@ -11,6 +11,7 @@ import { PactDatabase } from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { Conversation } from './conversation.js'
 import { nativeSkillCatalog } from './native-skill-catalog.js'
 
@@ -127,7 +128,7 @@ async function fixture() {
       primaryAgentId: 'codex',
       agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
       maxDiscussionRounds: 3,
-      runningMessagePolicy: 'next_round',
+
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
     },
@@ -159,7 +160,7 @@ async function fixture() {
     db.sessionRepository,
     db.projectCatalogRepository,
     preparation,
-    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
   )
   owner.conversation = conversation
   const input = (content: string): ConversationSendInput => ({

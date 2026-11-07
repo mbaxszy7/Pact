@@ -361,7 +361,9 @@ export function ProjectNavigation({
                               className="size-3.5 shrink-0"
                               strokeWidth={1.75}
                             />
-                            <span className="min-w-0 flex-1 truncate">{session.title}</span>
+                            <span className="min-w-0 flex-1 truncate" title={session.title}>
+                              {session.title}
+                            </span>
                             <SessionActivityIndicator
                               activity={session.activity}
                               hasUnread={session.hasUnread}

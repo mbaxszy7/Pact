@@ -29,10 +29,14 @@ test(
       const app = await fixture.launch(),
         page = await app.firstWindow()
       await expect(page.getByText('2 of 2 ready', { exact: true })).toBeVisible({ timeout: 30_000 })
-      await expect(page.getByText(versions[0].stdout.trim(), { exact: true })).toBeVisible()
+      await expect(
+        page.getByText('Detected: ' + versions[0].stdout.trim(), { exact: true }),
+      ).toBeVisible()
       const codexVersion = versions[1].stdout.match(/\d+\.\d+\.\d+/u)?.[0]
       expect(codexVersion).toBeTruthy()
-      await expect(page.getByText('codex-cli ' + codexVersion, { exact: true })).toBeVisible()
+      await expect(
+        page.getByText('Detected: codex-cli ' + codexVersion, { exact: true }),
+      ).toBeVisible()
       await expect(page.getByRole('button', { name: 'Continue', exact: true })).toBeEnabled()
       const ready = await page.evaluate(async () => {
         const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')

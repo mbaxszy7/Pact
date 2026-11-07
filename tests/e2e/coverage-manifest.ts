@@ -466,6 +466,29 @@ function journey(
   return {
     originalPath,
     originalTitle: title,
+    ...(file === 'runtime-preparation.spec.ts' &&
+    title === 'shows independent first-use readiness for both CLIs'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 16,
+              reason:
+                'The accepted CLI compatibility page labels the detected version explicitly; retain the exact Claude Code version and its visible identity.',
+              replacementAssertions: [
+                "expect(window.getByText('Detected: 2.1.272 (Claude Code)', { exact: true })).toBeVisible()",
+              ],
+            },
+            {
+              originalLine: 17,
+              reason:
+                'The accepted minimum Codex version is 0.159.2. The UI fixture now represents that supported release; preserve the exact visible detected-version assertion and both independent Ready/Continue obligations.',
+              replacementAssertions: [
+                "expect(window.getByText('Detected: codex-cli 0.159.2', { exact: true })).toBeVisible()",
+              ],
+            },
+          ],
+        }
+      : {}),
     ...(projectNameContracts.length
       ? {
           contractUpdates: projectNameContracts.map(([originalLine, name, state]) => ({
@@ -483,6 +506,21 @@ function journey(
                     `expect(navigation.getByText('${name}', { exact: true })).toHaveCount(0)`,
                   ],
           })),
+        }
+      : {}),
+    ...(file === 'default-session-settings.spec.ts' &&
+    title === 'saves first-use defaults and reopens the singleton from Settings'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 32,
+              reason:
+                'The accepted collaboration-limit terminology labels the same maxDiscussionRounds field Plan reviews. Preserve the exact saved value 4 after cold restart, Codex primary, repair attempts 3, unchanged-default save disabling and cursor obligations.',
+              replacementAssertions: [
+                "expect(window.getByRole('spinbutton', { name: 'Plan reviews' })).toHaveValue('4')",
+              ],
+            },
+          ],
         }
       : {}),
     ...(file === 'workspace-shell.spec.ts' && title.startsWith('resizes and collapses')

@@ -54,7 +54,7 @@ export async function createInputReturnFixture(
       primaryAgentId: 'codex' as const,
       agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
       maxDiscussionRounds: 3,
-      runningMessagePolicy: 'next_round' as const,
+
       maxReviewCycles: 2,
       maxRepairAttempts: 2,
     }

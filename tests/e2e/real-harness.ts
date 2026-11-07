@@ -297,6 +297,7 @@ export async function selectRealAskPermission(
 export async function selectRealConfiguredEffort(
   ctx: RealWorkspace,
   agentIds: readonly ('claude' | 'codex')[] = ['claude', 'codex'],
+  primaryAgentId?: 'claude' | 'codex',
 ): Promise<void> {
   if (agentIds.length < 1 || agentIds.length > 2 || new Set(agentIds).size !== agentIds.length)
     throw new Error('Real effort selection requires one or two unique Agents')
@@ -331,10 +332,9 @@ export async function selectRealConfiguredEffort(
     {
       sessionId: ctx.sessionId,
       settings: {
-        primaryAgentId: previous.primaryAgentId,
+        primaryAgentId: primaryAgentId ?? previous.primaryAgentId,
         agents,
         maxDiscussionRounds: previous.maxDiscussionRounds,
-        runningMessagePolicy: previous.runningMessagePolicy,
         maxReviewCycles: previous.maxReviewCycles,
         maxRepairAttempts: previous.maxRepairAttempts,
       },

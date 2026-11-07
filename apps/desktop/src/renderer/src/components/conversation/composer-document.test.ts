@@ -3,10 +3,12 @@ import { describe, expect, it } from 'vitest'
 import {
   composerHasContent,
   composerListCommand,
+  composerPactCommand,
   editComposerDocument,
   indexComposerLists,
   releaseComposerRoute,
   resolveComposerRoute,
+  wholeComposerAtoms,
   type ComposerDocument,
 } from './composer-document'
 
@@ -20,6 +22,42 @@ function command(
   if (!result) throw new Error('Expected an owned list transaction')
   return result
 }
+
+describe('Pact command projection ranges', () => {
+  it.each(['plan', 'review', 'build'])('projects completed /%s without native metadata', (name) => {
+    expect(composerPactCommand(document(`  @codex /${name} task`))).toEqual({
+      kind: 'pact',
+      name,
+      start: 9,
+      end: 10 + name.length,
+    })
+    expect(composerPactCommand(document(`/${name}`))).toBeUndefined()
+    expect(composerPactCommand(document(`body /${name} task`))).toBeUndefined()
+  })
+
+  it('keeps explicit native names and conflicting command syntax as their original facts', () => {
+    expect(
+      composerPactCommand({
+        text: '/plan task',
+        skills: [
+          {
+            id: 'a'.repeat(64),
+            agentId: 'codex',
+            name: 'plan',
+            start: 0,
+            end: 5,
+          },
+        ],
+      }),
+    ).toBeUndefined()
+    for (const text of ['/plan /build task', '/native /plan task', '`/plan` task'])
+      expect(composerPactCommand(document(text))).toBeUndefined()
+    expect(wholeComposerAtoms(document('/plan task'), { start: 4, end: 5 })).toEqual({
+      start: 0,
+      end: 5,
+    })
+  })
+})
 
 describe('canonical list editing', () => {
   it('keeps an arbitrary start and renumbers an inserted middle item', () => {

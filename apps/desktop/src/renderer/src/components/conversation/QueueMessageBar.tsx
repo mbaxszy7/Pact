@@ -22,7 +22,7 @@ interface QueueMessageBarProps {
   respondingAgentId?: RuntimeAgentId | undefined
   onSteer: () => Promise<boolean>
   onRemove: () => Promise<boolean>
-  onEdit: () => Promise<boolean>
+  onEdit?: (() => Promise<boolean>) | undefined
   onResume: () => Promise<boolean>
   onSetEnabled: (enabled: boolean) => Promise<boolean>
   onCheckStatus?: (() => Promise<boolean>) | undefined
@@ -306,10 +306,10 @@ export function QueueMessageBar({
           type="button"
           role="menuitem"
           className="pact-composer-menu-item disabled:opacity-40"
-          disabled={busy || locked}
+          disabled={busy || locked || !onEdit}
           onClick={() => {
             close()
-            void onEdit()
+            void onEdit?.()
           }}
         >
           <Pencil aria-hidden="true" className="size-4" strokeWidth={1.75} />

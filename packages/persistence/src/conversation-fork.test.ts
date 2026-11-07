@@ -9,11 +9,13 @@ import type {
   AgentNativeForkWitness,
   DefaultSessionSettings,
   RuntimeAgentId,
-  CollaborationResult,
-  CollaborationTodoDelta,
 } from '@pact/contracts'
 
-import { collaborationTaskSchema, prepareCollaborationSupplement } from '@pact/contracts'
+import {
+  advanceCollaboration,
+  collaborationTaskSchema,
+  defaultTaskStageRoles,
+} from '@pact/contracts'
 
 import { PactDatabase } from './pact-database.js'
 import {
@@ -47,12 +49,12 @@ const settings: DefaultSessionSettings = {
     codex: { model: 'fixture-codex', effort: 'high' },
   },
   maxDiscussionRounds: 3,
-  runningMessagePolicy: 'next_round',
+
   maxReviewCycles: 2,
   maxRepairAttempts: 2,
 }
 
-async function fixture(filePath = ':memory:', withCollaboration = false) {
+async function fixture(filePath = ':memory:', withCollaboration = false, withStageRoles = false) {
   const db = await PactDatabase.open({ filePath, migrationsFolder })
   ownedDatabases.push(db)
   const projectId = randomUUID(),
@@ -169,40 +171,29 @@ async function fixture(filePath = ':memory:', withCollaboration = false) {
       sessionId: sourceId,
       kind: 'plan',
       revision: 0,
-      primary: 'codex',
-      drafter: 'claude',
-      implementer: 'claude',
+      protocol: 'native-workflow-v1',
+      owner: 'claude',
+      automation: 'active',
+      inputSequence: 0,
+      handledInputSequence: 0,
       reviewer: 'codex',
       task: 'Implement cancellation.',
       taskMessageId: taskMessageId,
-      stage: 'draft',
+      stage: 'plan',
       actor: 'claude',
       status: 'running',
       runId: taskMessageId,
       planVersion: 0,
       discussionRounds: 0,
-      discussionHalf: false,
       reviewCycles: 0,
       repairAttempts: 0,
-      rereview: false,
-      nextCycle: false,
+      ...(withStageRoles
+        ? { rolePolicy: 'split-stages-v1' as const, stageRoles: defaultTaskStageRoles('claude') }
+        : {}),
     })
-    const finish = (runId: string, report: CollaborationResult) => {
+    const finish = (runId: string, plan: string) => {
       const run = repo.findRun(runId)!
-      const auth = repo.collaborationTurnAuthorization(runId)!
-      const required = repo.readRequiredInputMembers(runId).items
-      const normalized = {
-        ...report,
-        submission: auth.duty,
-        inputResponses: required.map((item) => ({
-          batchId: item.batchId,
-          memberId: item.memberId,
-          disposition: 'resolved' as const,
-          reason: 'Handled the original request and its exact source.',
-          todoId: null,
-        })),
-      }
-      const answer = run.agentId === 'claude' ? 'message-1' : 'message-3'
+      const answer = runId === runIds[0] ? 'message-1' : 'message-3'
       repo.applyEvent(sourceId, runId, {
         type: 'session.started',
         agentId: run.agentId,
@@ -213,12 +204,9 @@ async function fixture(filePath = ':memory:', withCollaboration = false) {
         agentId: run.agentId,
         turnId: runId,
       })
-      repo.recordCollaborationCarrier(runId, {
-        version: 'pact-collaboration-envelope-v5',
-        answer,
-        result: normalized,
-      })
-      repo.recordCollaborationResult(runId, normalized)
+      if (run.agentId === 'claude') repo.recordWorkflowPlan(runId, { nativeId: runId, text: plan })
+      else repo.recordWorkflowReview(runId, { verdict: 'accepted' })
+      repo.recordNativeEffects(runId, 'settled')
       repo.applyEvent(sourceId, runId, {
         type: 'text.completed',
         agentId: run.agentId,
@@ -238,7 +226,6 @@ async function fixture(filePath = ':memory:', withCollaboration = false) {
           nativeSessionId: `source-${run.agentId}`,
           nativeTurnId: runId,
           bindingGeneration: 1,
-          answerFormat: 'collaboration_envelope_v5',
         },
       })
       repo.applyEvent(sourceId, runId, {
@@ -252,25 +239,7 @@ async function fixture(filePath = ':memory:', withCollaboration = false) {
         .set({ nativeEffectsState: 'settled' })
         .where(eq(agentRuns.id, runId))
         .run()
-      if (repo.collaboration(sourceId)?.reportFailure)
-        throw Error(repo.collaboration(sourceId)?.notice)
       return repo.findRun(runId)!.responseMessageId!
-    }
-    const opinion: CollaborationTodoDelta = {
-      todoId: 'ownership',
-      expectedRevision: 0,
-      operation: 'create',
-      kind: 'opinion',
-      title: 'Keep ownership together',
-      detail: 'Dispose with the request owner.',
-      recommendation: 'Use the existing lifecycle.',
-      evidence: null,
-      question: null,
-      resolutionKind: null,
-      reason: '',
-      mergeTargetId: null,
-      userSourceIds: [],
-      evidenceRefs: [],
     }
     const first = repo.beginRun({
       sessionId: sourceId,
@@ -285,14 +254,7 @@ async function fixture(filePath = ':memory:', withCollaboration = false) {
       collaboration: initial,
     })
     runIds[0] = first.run.id
-    messageIds[1] = finish(first.run.id, {
-      submission: 'plan_submission',
-      outcome: 'complete',
-      summary: 'Draft ready for review.',
-      plan: 'Draft plan',
-      todoDeltas: [opinion],
-      inputResponses: [],
-    })
+    messageIds[1] = finish(first.run.id, 'Draft plan')
     const draft = repo.collaboration(sourceId)!
     repo.saveCommentDraft({
       mode: 'create',
@@ -327,7 +289,7 @@ async function fixture(filePath = ':memory:', withCollaboration = false) {
         quote: 'Draft',
       },
     })
-    const next = prepareCollaborationSupplement(draft, 'codex', settings, 'maintain_plan')
+    const next = advanceCollaboration(draft, 'continue', settings)
     const second = repo.beginRun({
       sessionId: sourceId,
       clientMessageId: messageIds[2]!,
@@ -338,25 +300,11 @@ async function fixture(filePath = ':memory:', withCollaboration = false) {
       settingsRevision: 2,
       model: settings.agents.codex.model,
       effort: 'high',
+      expectedCollaborationRevision: draft.revision,
       collaboration: next,
     })
     runIds[1] = second.run.id
-    messageIds[3] = finish(second.run.id, {
-      submission: 'plan_adoption',
-      outcome: 'complete',
-      summary: 'One opinion needs confirmation.',
-      plan: 'Confirmed plan',
-      todoDeltas: [
-        {
-          ...opinion,
-          operation: 'propose_resolution',
-          expectedRevision: 1,
-          resolutionKind: 'not_adopted',
-          reason: 'The request already belongs to its lifecycle owner.',
-        },
-      ],
-      inputResponses: [],
-    })
+    messageIds[3] = finish(second.run.id, 'Confirmed plan')
     repo.saveCommentDraft({
       mode: 'create',
       sessionId: sourceId,
@@ -431,71 +379,72 @@ function witness(
 }
 
 describe('Frozen Fork through ConversationRepository', () => {
-  it('copies exact Todo revisions, plan sources and Batch members as readonly history without dispatch authority', async () => {
-    const f = await fixture(':memory:', true)
-    const sourceTask = f.repo.collaboration(f.sourceId)!
-    expect(sourceTask).toMatchObject({ planVersion: 2, ledgerAwaitingCount: 1 })
-    const sourceTodo = f.repo.readTodoRevision(sourceTask.id, 'ownership', 2)
-    expect(sourceTodo).toMatchObject({ status: 'awaiting_review', resolutionKind: 'not_adopted' })
-    const child = f.commit(),
-      page = f.repo.read(child.sessionId)
-    const inheritedTask = page.runs.find((run) => run.agentId === 'codex')!
-    const inherited = f.repo.readPage({
-      scope: 'collaboration',
-      sessionId: child.sessionId,
-      runId: inheritedTask.id,
-      projection: 'todos',
-      todoId: 'ownership',
-      todoRevision: 1,
-      todoStatus: 'source',
-    })
-    if (inherited.scope !== 'collaboration') throw Error('Missing collaboration history')
-    expect(inherited.view).toMatchObject({
-      actionable: false,
-      task: { sessionId: child.sessionId, runId: inheritedTask.id, planVersion: 2 },
-      todo: { id: 'ownership', revision: 1, status: 'open' },
-      todoCurrent: { revision: 2, status: 'awaiting_review' },
-      todos: { group: 'active', activeCount: 1 },
-    })
-    expect(inherited.view.task?.approvedPlanVersion).toBeUndefined()
-    expect(inherited.view.task?.authorization).toBeUndefined()
-    expect(f.repo.collaboration(child.sessionId)).toBeUndefined()
-    expect(
-      f.db.drizzle
-        .select()
-        .from(collaborationInputs)
-        .where(eq(collaborationInputs.sessionId, child.sessionId))
-        .all(),
-    ).toHaveLength(0)
-    expect(page.runs).toHaveLength(2)
-    const sentWith = page.messages.find((message) => message.sequence === 2)!
-    const comment = f.repo
-      .commentsForMessage(sentWith.id)
-      .find((value) => value.body === 'Plan reference')!
-    if (comment.anchor.type !== 'message' || !comment.anchor.plan)
-      throw Error('Missing inherited plan Comment')
-    expect(comment.anchor.messageId).not.toBe(f.messageIds[0])
-    expect(comment.anchor.plan.runId).not.toBe(f.runIds[0])
-    expect(comment.anchor.contentHash).toBe(hash('Draft plan'))
-    expect(f.repo.findRun(comment.anchor.plan.runId)).toMatchObject({
-      sessionId: child.sessionId,
-      userMessageId: comment.anchor.messageId,
-    })
-    expect(f.repo.collaboration(child.sessionId, comment.anchor.plan.runId, true)).toMatchObject({
-      plan: 'Draft plan',
-      planVersion: 1,
-    })
-    expect(
-      f.repo.collaboration(child.sessionId, comment.anchor.plan.runId)?.approvedPlanVersion,
-    ).toBeUndefined()
-    const sourceBatch = f.repo.inputBatchForRun(f.runIds[1]!)!
-    const inheritedBatch = f.repo.inputBatchForRun(inheritedTask.id)!
-    expect(inheritedBatch.id).not.toBe(sourceBatch.id)
-    expect(inheritedBatch.memberCount).toBe(2)
-    const frozen = f.repo.readFrozenInputBatch(inheritedTask.id, inheritedBatch.id)
-    expect(frozen.members).toHaveLength(2)
-    expect(frozen.members.map((item) => item.commentId)).toContain(comment.id)
-  })
+  it.each([false, true])(
+    'copies exact plan sources and Batch members as readonly history without dispatch authority (stageRoles=%s)',
+    async (withStageRoles) => {
+      const f = await fixture(':memory:', true, withStageRoles)
+      const sourceTask = f.repo.collaboration(f.sourceId)!
+      expect(sourceTask.stageRoles).toEqual(
+        withStageRoles ? defaultTaskStageRoles('claude') : undefined,
+      )
+      expect(sourceTask).toMatchObject({ planVersion: 1 })
+      const child = f.commit(),
+        page = f.repo.read(child.sessionId)
+      const inheritedTask = page.runs.find((run) => run.forkSourceRunId === f.runIds[1])!
+      const inherited = f.repo.readPage({
+        scope: 'collaboration',
+        sessionId: child.sessionId,
+        runId: inheritedTask.id,
+        projection: 'current',
+      })
+      if (inherited.scope !== 'collaboration') throw Error('Missing collaboration history')
+      expect(inherited.view).toMatchObject({
+        actionable: false,
+        task: { sessionId: child.sessionId, runId: inheritedTask.id, planVersion: 1 },
+      })
+      expect(inherited.view.task?.stageRoles).toEqual(sourceTask.stageRoles)
+      expect(inherited.view.task?.authorization).toBeUndefined()
+      // The frozen turn's authorization record survives as history; the live task has none.
+      expect(f.repo.collaborationTurnAuthorization(inheritedTask.id)?.stageRoles).toEqual(
+        sourceTask.stageRoles,
+      )
+      expect(f.repo.collaboration(child.sessionId)).toBeUndefined()
+      expect(
+        f.db.drizzle
+          .select()
+          .from(collaborationInputs)
+          .where(eq(collaborationInputs.sessionId, child.sessionId))
+          .all(),
+      ).toHaveLength(0)
+      expect(page.runs).toHaveLength(2)
+      const sentWith = page.messages.find((message) => message.sequence === 2)!
+      const comment = f.repo
+        .commentsForMessage(sentWith.id)
+        .find((value) => value.body === 'Plan reference')!
+      if (comment.anchor.type !== 'message' || !comment.anchor.plan)
+        throw Error('Missing inherited plan Comment')
+      expect(comment.anchor.messageId).not.toBe(f.messageIds[0])
+      expect(comment.anchor.plan.runId).not.toBe(f.runIds[0])
+      expect(comment.anchor.contentHash).toBe(hash('Draft plan'))
+      expect(f.repo.findRun(comment.anchor.plan.runId)).toMatchObject({
+        sessionId: child.sessionId,
+        userMessageId: comment.anchor.messageId,
+      })
+      expect(f.repo.collaboration(child.sessionId, comment.anchor.plan.runId, true)).toMatchObject({
+        planVersion: 1,
+      })
+      expect(
+        f.repo.collaboration(child.sessionId, comment.anchor.plan.runId)?.authorization,
+      ).toBeUndefined()
+      const sourceBatch = f.repo.inputBatchForRun(f.runIds[1]!)!
+      const inheritedBatch = f.repo.inputBatchForRun(inheritedTask.id)!
+      expect(inheritedBatch.id).not.toBe(sourceBatch.id)
+      expect(inheritedBatch.memberCount).toBe(2)
+      const frozen = f.repo.readFrozenInputBatch(inheritedTask.id, inheritedBatch.id)
+      expect(frozen.members).toHaveLength(2)
+      expect(frozen.members.map((item) => item.commentId)).toContain(comment.id)
+    },
+  )
   it('refuses a plan Comment whose source Run lies outside the frozen prefix', async () => {
     const f = await fixture()
     f.db.drizzle

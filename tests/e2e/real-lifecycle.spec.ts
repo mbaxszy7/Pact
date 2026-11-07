@@ -364,9 +364,86 @@ test(
         `Start with ${marker}. Then write 180 numbered lines, each with twelve ordinary words about software testing. Write the complete list without abbreviation. Do not use tools.`,
         'codex',
       )
-      await expect(ctx.page.locator('article[data-pact-speaker="codex"]')).toContainText(marker, {
-        timeout: 120_000,
-      })
+      try {
+        await expect(ctx.page.locator('article[data-pact-speaker="codex"]')).toContainText(marker, {
+          timeout: 120_000,
+        })
+      } catch (error) {
+        const boundary: Record<string, unknown> = { version: 1, phase: 'before-quit-first-output' }
+        try {
+          const snapshot = await readRealConversation(ctx),
+            run = snapshot.runs[0]
+          const response = snapshot.messages.find(
+            (message) => message.runId === run?.id && message.role === 'assistant',
+          )
+          boundary['host'] = {
+            runs: snapshot.runs.length,
+            runId: run?.id,
+            status: run?.status,
+            dispatchPhase: run?.dispatchPhase,
+            nativeOutcome: run?.nativeOutcome,
+            nativeEffectsState: run?.nativeEffectsState,
+            nativeSessionPresent: Boolean(run?.nativeSessionId),
+            nativeTurnPresent: Boolean(run?.nativeTurnId),
+            responseState: response?.state,
+            responseRevision: response?.contentRevision,
+            responseChars: response?.content.length ?? 0,
+            responseBytes: Buffer.byteLength(response?.content ?? ''),
+            responseSha256: createHash('sha256')
+              .update(response?.content ?? '')
+              .digest('hex'),
+            markerPresent: response?.content.includes(marker) ?? false,
+          }
+          boundary['renderer'] = await ctx.page.evaluate(
+            (expectedMarker) => ({
+              visibility: document.visibilityState,
+              focused: document.hasFocus(),
+              articles: document.querySelectorAll('article[data-pact-speaker="codex"]').length,
+              markerPresent: [
+                ...document.querySelectorAll('article[data-pact-speaker="codex"]'),
+              ].some((element) => element.textContent?.includes(expectedMarker)),
+            }),
+            marker,
+          )
+          if (run?.nativeSessionId && run.nativeTurnId) {
+            const native = await findNativeRecord(ctx, 'codex', run.nativeSessionId)
+            const parity = native.answerParity({
+              nativeSessionId: run.nativeSessionId,
+              nativeTurnId: run.nativeTurnId,
+              text: response?.content ?? '',
+              markers: [marker],
+            })
+            boundary['nativeFile'] = {
+              starts: native.codexModelStarts,
+              file: parity.file,
+              rootAssistant: parity.native,
+              markerOffsets: parity.markers,
+              terminals: parity.terminals,
+              ambiguous: parity.ambiguous,
+              completeProjection: parity.completeProjection,
+              exactMatch: parity.exactMatch,
+              items: parity.items.slice(0, 4),
+              omittedItems: Math.max(0, parity.items.length - 4),
+              note: 'Persisted Native text is not a live token-delivery witness; an unfinished item may not yet be stored.',
+            }
+          }
+        } catch {
+          boundary['observation'] = 'unavailable'
+        }
+        const evidence = JSON.stringify(boundary)
+        try {
+          if (Buffer.byteLength(evidence) <= 16 * 1024) {
+            console.info('[pact-graceful-start-boundary]', evidence)
+            await test.info().attach('graceful-start-boundary', {
+              body: evidence,
+              contentType: 'application/json',
+            })
+          } else console.info('[pact-graceful-start-boundary]', '{"observation":"unavailable"}')
+        } catch {
+          console.info('[pact-graceful-start-boundary]', '{"observation":"unavailable"}')
+        }
+        throw error
+      }
       const before = await readRealConversation(ctx)
       const response = before.messages.find(
         (row) => row.role === 'assistant' && row.content.includes(marker),

@@ -266,6 +266,7 @@ let quitApproval: Promise<void> | undefined
 let quitCompletion: Promise<void> | undefined
 function finishQuit(): Promise<void> {
   quitCompletion ??= (async () => {
+    await utilityClient.settlement()
     try {
       await diagnostics?.close()
     } catch {

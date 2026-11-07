@@ -3,7 +3,12 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
-import type { CollaborationDocument, ConversationPage, DesktopBridge } from '@pact/contracts'
+import type {
+  CollaborationDocument,
+  ConversationPage,
+  ConversationPatch,
+  DesktopBridge,
+} from '@pact/contracts'
 
 import { markdownProjectionPages } from '../../../../shared/message-anchor-text'
 import { CollaborationDocumentView } from './CollaborationDocumentView'
@@ -27,6 +32,7 @@ afterEach(() => {
   window.getSelection()?.removeAllRanges()
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
+  Reflect.deleteProperty(document, 'caretRangeFromPoint')
 })
 
 it.each(['markdown-visible-v2', 'plain-visible-v1'] as const)(
@@ -115,7 +121,7 @@ it('ignores a completed read for an evicted document source', async () => {
       return pending
     return next.read(request)
   })
-  vi.stubGlobal('pact', { getConversation: read })
+  vi.stubGlobal('pact', { getConversation: read, onConversationChanged: () => () => {} })
   const view = render(<CollaborationDocumentView {...old.props} />)
   await waitFor(() => expect(read).toHaveBeenCalledTimes(1))
   view.rerender(<CollaborationDocumentView {...next.props} />)
@@ -124,6 +130,193 @@ it('ignores a completed read for an evicted document source', async () => {
   expect(screen.queryByText('Old document')).toBeNull()
   expect(screen.getByText('New document')).toBeDefined()
 })
+
+it.each([
+  { edge: 'top', y: 131, start: 0, end: 33 },
+  { edge: 'bottom', y: 499, start: 45, end: 78 },
+])('keeps the exact caret inside the $edge auto-scroll band', async ({ y, start, end }) => {
+  const harness = continuousFixture('0123456789'.repeat(100))
+  await harness.ready()
+  harness.down(start, y)
+  harness.move(end, y)
+  await harness.frame()
+  harness.up()
+  fireEvent.click(await screen.findByRole('button', { name: 'Comment on selected text' }))
+  expect(harness.comment).toHaveBeenCalledWith(
+    expect.objectContaining({
+      startOffset: start,
+      endOffset: end,
+      quote: harness.text.slice(start, end),
+    }),
+  )
+  harness.dispose()
+})
+
+it.each([
+  { edge: 'top boundary', y: 129, start: 78, caret: 45, expectedStart: 0, expectedEnd: 78 },
+  { edge: 'below viewport', y: 510, start: 45, caret: 78, expectedStart: 45, expectedEnd: 1000 },
+])(
+  'retains resident-edge snapping at the $edge',
+  async ({ y, start, caret, expectedStart, expectedEnd }) => {
+    const harness = continuousFixture('0123456789'.repeat(100))
+    await harness.ready()
+    harness.down(start, 300)
+    harness.move(caret, y)
+    await harness.frame()
+    harness.up()
+    fireEvent.click(await screen.findByRole('button', { name: 'Comment on selected text' }))
+    expect(harness.comment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        startOffset: expectedStart,
+        endOffset: expectedEnd,
+        quote: harness.text.slice(expectedStart, expectedEnd),
+      }),
+    )
+    harness.dispose()
+  },
+)
+
+it.each(['next', 'previous'] as const)(
+  'keeps an exact four-page Comment after real %s page eviction',
+  async (direction) => {
+    const forward = direction === 'next'
+    const harness = continuousFixture('0123456789'.repeat(1900), forward ? 0 : 8192)
+    await harness.ready()
+    const initial = projectionSpans(harness.root)
+    const evicted = forward ? initial[0]! : initial.at(-1)!
+    const start = forward ? 100 : 16484
+    const end = forward ? 16484 : 100
+    harness.down(start, 300)
+    // Outside the viewport must still cover the resident edge before its page is evicted.
+    harness.move(forward ? 12000 : 8300, forward ? 510 : 120)
+    await harness.frame()
+    await waitFor(() =>
+      expect(projectionSpans(harness.root)[0]?.dataset.pactProjectionStart).toBe('4096'),
+    )
+    expect(evicted.isConnected).toBe(false)
+    expect(projectionSpans(harness.root)).toHaveLength(3)
+    harness.move(forward ? 16000 : 4200, forward ? 510 : 120)
+    await harness.frame()
+    await waitFor(() =>
+      expect(projectionSpans(harness.root)[0]?.dataset.pactProjectionStart).toBe(
+        forward ? '8192' : '0',
+      ),
+    )
+    expect(projectionSpans(harness.root)).toHaveLength(3)
+    harness.move(end, 300)
+    await harness.frame()
+    harness.up()
+    fireEvent.click(await screen.findByRole('button', { name: 'Comment on selected text' }))
+    expect(harness.comment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        startOffset: 100,
+        endOffset: 16484,
+        quote: harness.text.slice(100, 16484),
+      }),
+    )
+    expect(harness.peakReads()).toBe(1)
+    expect(
+      harness.fixture.read.mock.calls.filter(
+        ([request]) => request.scope === 'collaboration-quote',
+      ),
+    ).toHaveLength(4)
+    harness.dispose()
+  },
+)
+
+const pointer = (target: Element | Document, type: string, y: number) => {
+  fireEvent(target, new MouseEvent(type, { bubbles: true, button: 0, clientX: 100, clientY: y }))
+}
+
+function continuousFixture(text: string, aroundOffset = 0) {
+  const fixture = documentFixture(text)
+  const root = document.createElement('div')
+  document.body.append(root)
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(
+    new DOMRect(0, 129, 900, 372),
+  )
+  Object.defineProperty(root, 'clientHeight', { value: 372 })
+  Object.defineProperty(root, 'scrollHeight', { value: 372 })
+  // Model a viewport at either scroll boundary; actual projection/window movement remains real.
+  Object.defineProperty(root, 'scrollTop', { get: () => 0, set: () => undefined })
+  const frames = new Map<number, FrameRequestCallback>()
+  let nextFrame = 0
+  vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+    frames.set(++nextFrame, callback)
+    return nextFrame
+  })
+  vi.stubGlobal('cancelAnimationFrame', (id: number) => frames.delete(id))
+  let offset = 0
+  Object.defineProperty(document, 'caretRangeFromPoint', {
+    configurable: true,
+    value: () => {
+      const span = projectionSpans(root).find(
+        (entry) =>
+          Number(entry.dataset.pactProjectionStart) <= offset &&
+          Number(entry.dataset.pactProjectionEnd) >= offset,
+      )
+      if (!span?.firstChild) return null
+      const range = document.createRange()
+      range.setStart(span.firstChild, offset - Number(span.dataset.pactProjectionStart))
+      range.collapse(true)
+      return range
+    },
+  })
+  let active = 0,
+    peak = 0
+  vi.stubGlobal('pact', {
+    onConversationChanged: () => () => {},
+    getConversation: async (request: Request) => {
+      active++
+      peak = Math.max(peak, active)
+      try {
+        return await fixture.read(request)
+      } finally {
+        active--
+      }
+    },
+  })
+  const comment = vi.fn<(selection: unknown) => void>()
+  const view = render(
+    <CollaborationDocumentView
+      {...fixture.props}
+      aroundOffset={aroundOffset}
+      continuous={{ viewport: { current: root } }}
+      onCreateComment={comment}
+    />,
+    { container: root },
+  )
+  return {
+    text,
+    fixture,
+    root,
+    comment,
+    peakReads: () => peak,
+    ready: () =>
+      waitFor(() => expect(projectionSpans(root)).toHaveLength(Math.min(3, fixture.pages.length))),
+    down: (value: number, y: number) => {
+      offset = value
+      pointer(screen.getByRole('textbox', { name: 'Plan text' }), 'pointerdown', y)
+    },
+    move: (value: number, y: number) => {
+      offset = value
+      pointer(document, 'pointermove', y)
+    },
+    up: () => pointer(document, 'pointerup', 300),
+    frame: async () => {
+      await act(async () => {
+        const pending = [...frames.values()]
+        frames.clear()
+        pending.forEach((callback) => callback(0))
+      })
+    },
+    dispose: () => {
+      view.unmount()
+      root.remove()
+      Reflect.deleteProperty(document, 'caretRangeFromPoint')
+    },
+  }
+}
 
 function projectionSpans(container: HTMLElement) {
   return [...container.querySelectorAll<HTMLElement>('[data-pact-projection-start]')]
@@ -189,6 +382,17 @@ function documentFixture(text: string, basis: Page['basis'] = 'markdown-visible-
         : null,
   }))
   const read = vi.fn<DesktopBridge['getConversation']>(async (request: Request) => {
+    if (request.scope === 'collaboration-quote') {
+      const end = Math.min(request.endOffset, request.offset + 4096)
+      return {
+        ok: true,
+        value: {
+          ...request,
+          text: text.slice(request.offset, end),
+          nextOffset: end < request.endOffset ? end : null,
+        },
+      }
+    }
     if (request.scope !== 'collaboration-markdown') throw new Error(`Unexpected ${request.scope}`)
     const index =
       request.aroundOffset !== undefined
@@ -198,7 +402,7 @@ function documentFixture(text: string, basis: Page['basis'] = 'markdown-visible-
           : request.offset
     return { ok: true, value: pages[index]! }
   })
-  vi.stubGlobal('pact', { getConversation: read })
+  vi.stubGlobal('pact', { getConversation: read, onConversationChanged: () => () => {} })
   return {
     props: {
       sessionId,
@@ -213,3 +417,154 @@ function documentFixture(text: string, basis: Page['basis'] = 'markdown-visible-
 }
 
 const pagesOffset = (index: number) => index * 4096
+
+it.each([true, false])(
+  'loads a cold document when readiness arrives before the pending receipt: %s',
+  async (early) => {
+    const fixture = documentFixture('The original plan is complete.')
+    const preparationId = crypto.randomUUID()
+    let listener!: (patch: Pick<ConversationPatch, 'sessionId' | 'documentProjection'>) => void
+    const unsubscribe = vi.fn<() => void>()
+    const patch: Pick<ConversationPatch, 'sessionId' | 'documentProjection'> = {
+      sessionId: fixture.props.sessionId,
+      documentProjection: {
+        runId: fixture.props.runId,
+        document: fixture.props.source,
+        preparationId,
+        status: 'ready',
+      },
+    }
+    fixture.read.mockImplementationOnce(async () => {
+      if (early) listener(patch)
+      return {
+        ok: true,
+        value: {
+          scope: 'collaboration-markdown-pending',
+          sessionId: fixture.props.sessionId,
+          runId: fixture.props.runId,
+          document: fixture.props.source,
+          preparationId,
+          deadline: Date.now() + 30_000,
+        },
+      }
+    })
+    vi.stubGlobal('pact', {
+      getConversation: fixture.read,
+      onConversationChanged: (value: typeof listener) => {
+        listener = value
+        return unsubscribe
+      },
+    })
+    const view = render(<CollaborationDocumentView {...fixture.props} />)
+    await waitFor(() => expect(fixture.read).toHaveBeenCalled())
+    if (!early) act(() => listener(patch))
+    await screen.findByText('The original plan is complete.')
+    expect(fixture.read).toHaveBeenCalledTimes(2)
+    expect(fixture.read.mock.calls[1]?.[0]).toMatchObject({ preparationId })
+    view.unmount()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+  },
+)
+
+it('removes the readiness subscription when a pending document closes', async () => {
+  const fixture = documentFixture('Preserved source')
+  const unsubscribe = vi.fn<() => void>()
+  fixture.read.mockResolvedValueOnce({
+    ok: true,
+    value: {
+      scope: 'collaboration-markdown-pending',
+      sessionId: fixture.props.sessionId,
+      runId: fixture.props.runId,
+      document: fixture.props.source,
+      preparationId: crypto.randomUUID(),
+      deadline: Date.now() + 30_000,
+    },
+  })
+  vi.stubGlobal('pact', { getConversation: fixture.read, onConversationChanged: () => unsubscribe })
+  const view = render(<CollaborationDocumentView {...fixture.props} />)
+  await waitFor(() => expect(fixture.read).toHaveBeenCalledTimes(1))
+  view.unmount()
+  await waitFor(() => expect(unsubscribe).toHaveBeenCalledTimes(1))
+  expect(fixture.read).toHaveBeenCalledTimes(1)
+})
+
+it('does not carry the previous document coordinate basis into a new source', async () => {
+  const first = documentFixture('First source', 'plain-visible-v1')
+  const second = documentFixture('Second source', 'markdown-visible-v2')
+  const read = vi.fn<DesktopBridge['getConversation']>((input) =>
+    'document' in input && input.document.id === first.props.source.id
+      ? first.read(input)
+      : second.read(input),
+  )
+  vi.stubGlobal('pact', { getConversation: read, onConversationChanged: () => () => {} })
+  const root = document.createElement('div')
+  document.body.append(root)
+  const continuous = { viewport: { current: root } }
+  const view = render(<CollaborationDocumentView {...first.props} continuous={continuous} />, {
+    container: root,
+  })
+  try {
+    await screen.findByText('First source')
+    view.rerender(<CollaborationDocumentView {...second.props} continuous={continuous} />)
+    await waitFor(() => expect(second.read).toHaveBeenCalled())
+    expect(second.read.mock.calls[0]?.[0]).not.toHaveProperty('basis')
+    await screen.findByText('Second source')
+  } finally {
+    view.unmount()
+    root.remove()
+  }
+})
+
+it('retires a pending retry when switching to another document', async () => {
+  const first = documentFixture('First source')
+  const second = documentFixture('Second source')
+  first.read
+    .mockResolvedValueOnce({
+      ok: false,
+      error: { code: 'TIMEOUT', message: 'Initial read failed.' },
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      value: {
+        scope: 'collaboration-markdown-pending',
+        sessionId: first.props.sessionId,
+        runId: first.props.runId,
+        document: first.props.source,
+        preparationId: crypto.randomUUID(),
+        deadline: Date.now() + 30_000,
+      },
+    })
+  const read = vi.fn<DesktopBridge['getConversation']>((input) =>
+    'document' in input && input.document.id === first.props.source.id
+      ? first.read(input)
+      : second.read(input),
+  )
+  const unsubscribers: Array<ReturnType<typeof vi.fn<() => void>>> = []
+  vi.stubGlobal('pact', {
+    getConversation: read,
+    onConversationChanged: () => {
+      const unsubscribe = vi.fn<() => void>()
+      unsubscribers.push(unsubscribe)
+      return unsubscribe
+    },
+  })
+  const root = document.createElement('div')
+  document.body.append(root)
+  const continuous = { viewport: { current: root } }
+  const view = render(<CollaborationDocumentView {...first.props} continuous={continuous} />, {
+    container: root,
+  })
+  try {
+    await screen.findByText('Initial read failed.')
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }))
+    await waitFor(() => expect(first.read).toHaveBeenCalledTimes(2))
+    view.rerender(<CollaborationDocumentView {...second.props} continuous={continuous} />)
+    await waitFor(() => expect(second.read).toHaveBeenCalled())
+    await screen.findByText('Second source')
+    expect(unsubscribers[1]).toHaveBeenCalledOnce()
+    expect(first.read).toHaveBeenCalledTimes(2)
+  } finally {
+    view.unmount()
+    root.remove()
+  }
+})

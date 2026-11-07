@@ -23,6 +23,30 @@ Keep pnpm's isolated dependency layout and exact lockfile. Do not switch to hois
 hand-edit links, or introduce another package manager. Native runtime dependencies belong in
 `apps/desktop/package.json` and must be rebuilt for Electron. Use Oxlint and Oxfmt only.
 
+Windows development and packaging also require Visual Studio Build Tools with the MSVC C++ tools
+and Windows SDK for the chosen architecture. `pnpm dev` works from ordinary PowerShell: the local
+development launcher opts into `--auto-msvc`, using Visual Studio Installer's `vswhere.exe` and
+Developer PowerShell to load the matching compiler environment automatically. An existing matching
+MSVC developer environment is reused. Setup changes only the build's child environment, shares
+the original 60-second build deadline and uses the same Job owner and cleanup policy as compilation.
+Missing tools produce an installation hint. CI and packaging retain their existing preconfigured
+MSVC environment and do not opt into automatic setup. Run local packaging from the matching MSVC
+Developer Command Prompt or Developer PowerShell. These build steps compile the owned-process helper;
+packaged applications use the bundled helper and never download or compile it at runtime.
+
+MSVC preparation uses the existing compiled Windows Job launcher and the system .NET Framework
+compiler to own the compiler's auxiliary processes. A successful compile requires its natural root
+exit, authenticated empty Job and closed launcher before validating or publishing the artifact.
+Packaged applications still use the native helper and do not acquire a .NET runtime dependency.
+Control files stay on the system temporary volume while compilation retains its own working
+directory. Preparation and execution share the original deadline; late preparation is reclaimed
+before its capacity is reused, and unconfirmed cleanup preserves its recovery files.
+The [compiler action owner](scripts/run-windows-compiler.mjs) admits one action per Node process
+with no queue. Native-helper builds use a 60-second absolute deadline and 256 KiB per output stream;
+the test observer uses 30 seconds and 64 KiB per stream. Preparation shares that deadline, startup
+uses at most 15 seconds, and failure cleanup has one fixed five-second window. Missing root,
+nonzero compilation, cancellation, protocol errors or unconfirmed release remain failures.
+
 Windows file-symlink boundary tests require permission to create symbolic links. Run them in a
 suitably privileged session, or manually enable
 [Developer Mode](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createsymboliclinkw)
@@ -41,6 +65,11 @@ runs formatting/lint, checks the complete staged publication file set, and scans
 A missing scanner, wrong version, error, timeout, or detected secret blocks the commit. Inline allow
 comments and local ignore files do not bypass scanning. Refresh changed hook configuration with
 `pnpm exec simple-git-hooks`.
+
+Local `pnpm test:infra` also requires that pinned scanner. On Windows, add Git for Windows' `bin`
+directory (containing `bash.exe`) to the verification process's PATH: workflow tests execute the
+actual Bash commands from the Actions definitions. Playwright discovery uses the workspace's
+installed CLI through Node and does not depend on whether pnpm is exposed as an EXE or shell shim.
 
 ```sh
 pnpm docs:check
@@ -211,27 +240,82 @@ Do not commit credentials, provider homes, environment files, databases, checkpo
 or raw user/agent output. Ignore rules do not protect tracked/forcibly added files. Test credentials
 must be unmistakably nonfunctional; never broadly exempt test directories from scanning.
 
+## Diagnostic logs
+
+Use **Diagnostics → Open log folder** when the native menu is available. For `pnpm dev`,
+the default directory is `<repository>/.pact-data/dev/logs/development` (on Windows,
+`.pact-data\dev\logs\development`). Logs live beside the active database, under
+`logs/development` or `logs/production`; Electron's AppData profile directory is not the
+source of truth. Custom database locations also relocate the log directory.
+
+Share the relevant `pact-*.jsonl` files with the approximate failure time and platform.
+Claude plan capture and submission events use `operation: "claude_plan"`, with Session/Run
+identifiers, a phase and finite reason codes. Capture failures and submission rejections
+are warnings, and successful capture/submission are informational; neither requires Debug
+logging. `planCapture` is the latest capture failure hint, when present, and is not proof
+that it caused the current rejection. Repeated identical outcomes are deduplicated within
+the Run. The Adapter owns at most 64 fixed-enum keys (under 16 KiB), cleared on Run disposal;
+restart recreates them. Capture keys include tool/Hook phase; submission keys include only
+outcome reason, with no new timer or queue. Authentication and retry policy are unchanged.
+These records contain no plan body, source path, tool input, native receipt body,
+raw exception or credentials. Debug logging does not backfill earlier events.
+
 ## Testing
 
 ### Evidence and commands
 
-| Lane                  | Command                                                          | Prerequisites and evidence                                                              |
-| --------------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| Unit                  | `pnpm test`                                                      | Vitest; public, isolated fixtures, no paid models                                       |
-| Infrastructure        | `pnpm test:infra`                                                | Node tests for publication, baseline integrity, coverage, runners, and packaged harness |
-| UI                    | `pnpm test:e2e:ui`                                               | Real Electron UI with fixture data; no provider credentials                             |
-| Deterministic         | `pnpm test:e2e:deterministic`                                    | Electron plus controlled protocols/fixed loads; not real model evidence                 |
-| Real provider         | `pnpm test:e2e:real`                                             | Installed/authenticated CLIs and private configuration; paid model requests             |
-| Core real provider    | `pnpm test:e2e:real:core`                                        | The `@real-core` business cases; the same actual CLIs and isolated configuration        |
-| Complete E2E          | `pnpm test:e2e`                                                  | All three Electron lanes; private configuration admitted before the sole build          |
-| Native protocol       | `pnpm test:native`                                               | Actual CLI/SDK storage and protocol against isolated loopback providers; no paid models |
-| Packaged smoke        | Manifest-based commands below                                    | Actual installation/extraction, private data, seed and cold verification                |
-| Packaged visible core | `node scripts/package-smoke.mjs --manifest MANIFEST --real-core` | Trusted local real-provider configuration; manual actual business observations required |
+| Lane                  | Command                                                          | Prerequisites and evidence                                                                 |
+| --------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Unit                  | `pnpm test`                                                      | Vitest; public, isolated fixtures, no paid models                                          |
+| Infrastructure        | `pnpm test:infra`                                                | Node tests for publication, baseline integrity, coverage, runners, and packaged harness    |
+| UI                    | `pnpm test:e2e:ui`                                               | Real Electron UI with fixture data; no provider credentials                                |
+| Deterministic         | `pnpm test:e2e:deterministic`                                    | Electron plus controlled protocols/fixed loads; not real model evidence                    |
+| Real provider         | `pnpm test:e2e:real`                                             | Installed/authenticated CLIs and private configuration; paid model requests                |
+| Core real provider    | `pnpm test:e2e:real:core`                                        | The `@real-core` business cases; the same actual CLIs and isolated configuration           |
+| Complete E2E          | `pnpm test:e2e`                                                  | All three Electron lanes; private configuration admitted before the sole build             |
+| Codex execution       | `pnpm test:native:execution`                                     | macOS arm64, Codex 0.163.0; owned reexecution, inline-provider and historical-owner proofs |
+| Native protocol       | `pnpm test:native`                                               | Actual CLI/SDK storage and protocol against isolated loopback providers; no paid models    |
+| Packaged smoke        | Manifest-based commands below                                    | Actual installation/extraction, private data, seed and cold verification                   |
+| Packaged visible core | `node scripts/package-smoke.mjs --manifest MANIFEST --real-core` | Trusted local real-provider configuration; manual actual business observations required    |
 
 Electron runners build the selected lane, use one Playwright worker, zero retries, and a two-hour
 total deadline with a five-minute build budget. Forward file names and `--grep` after `--`; do not
 override the project's lane with a second `--project`. UI/native changes follow the visual-first
 acceptance order in [change discipline above](#change-discipline).
+
+`pnpm test:native` retains the original Codex 0.159.2 and Claude Code 2.1.272 business-execution
+cases on each supported platform. `pnpm test:native:execution` preserves four exact cases across
+three files: two genuine Codex reexecution boundaries, thread-local provider configuration and
+historical native-owner recovery. It requires macOS arm64 with Codex 0.163.0. The required
+`native_mac` job runs both sequentially; skipped cases, missing files or a changed case inventory
+cannot satisfy the execution report gate. `node scripts/ci-native.mjs execution-codex` installs the second
+CLI through a separate private pnpm project, generates a lockfile, installs frozen and verifies
+its version. It publishes a separate executable namespace without replacing the legacy CLI or
+changing native homes. `node scripts/ci.mjs native execution-codex` selects that pinned executable
+and writes a separate sanitized, source-bound report through the existing native evidence owner.
+These profiles use owned loopback providers, not paid model inference.
+
+Relay decision selection uses the direct Decisions runtime. Its unit and deterministic fixtures
+exercise the HTTP protocol, credential ownership and durable selection receipts without paid
+requests. Synthetic credential UI checks run against a real private macOS
+keychain under an isolated fixture HOME; they need local `clang` and the
+installed Node's N-API headers, fail rather than prompt for Keychain
+interaction, and never reuse the host credential stores. Native
+decision-engine profiles and their response-guard tests are retired; historical
+physical recovery and business execution obligations remain. The separate
+`pnpm test:native:windows-owner` profile retains its native Windows Job and host-seam obligations.
+Actual OpenAI inference requires explicit authorization and separate API credentials; protocol
+fixtures do not establish decision quality or provider availability.
+For authorized real Relay cases, provide `OPENAI_API_KEY` in the private file
+`tests/e2e/env/codex/.env`, or set `PACT_E2E_RELAY_API_KEY_FILE` to its absolute path.
+The real-fixture bootstrap reads at most 8 KiB only inside Electron Main, uses the normal named
+credential-save interface, verifies the receipt and joins Pact Quit before database seeding.
+Its read/save phase has a 15 s deadline. Subsequent cold launches use the fixture's own encrypted
+store; macOS uses the existing noninteractive private keychain. Plaintext never crosses the
+Playwright transport, enters business-agent environment variables, or appears in test evidence.
+The source file is read-only. Missing or invalid credentials fail setup without a plaintext fallback.
+The reviewed case titles retain their historical identifiers; every Relay decision now uses
+OpenAI Decisions, while Codex and Claude Code remain the real business executors.
 
 Native workspace journeys use the ordinary Pact Quit action and confirm pending work before waiting
 for physical process exit. `tests/e2e/native-quit.ts` provides this bounded teardown; an Electron
@@ -255,7 +339,26 @@ Keep the full `@real` lane. Each real case also has exactly one Playwright tag:
 `scripts/real-e2e-policy.mjs` gives each existing case its business scenario and tier.
 Discovery must match that inventory and its tags; a missing, new, duplicate or retagged
 case cannot silently change the merge gate. Test titles, assertions and the immutable
-baseline remain unchanged.
+baseline remain unchanged. The approved ordinary-input Cancel contract is an explicit exception:
+the two Relay information cases verify terminal cancellation, restored drafts and a fresh Send of
+the current draft instead of resuming the old request. Preserve their other obligations and the
+immutable baseline. The two Relay source-author routing cases additionally accept a completed valid
+null recommendation: the frozen default runs once, then a new explicit user correction reaches the
+original source author. That branch must record zero savings and Unverified benefit. A positive
+recommendation still must select the source author and save exactly one correction and business
+Turn. Source completeness, refused-call obligations, native completion, settings, permissions,
+physical release, original titles and the immutable baseline remain unchanged.
+
+The approved information-business acceptance additionally requires the final actual answer to use
+the confirmed user value, fulfill the short release-note request and ask no further question for
+that supplied field. Source/lifecycle success alone is insufficient. The approved phase-specific
+information contract allows Off/Cancel to ask only for the missing value without reading drafting
+material first. Any actual tool call still needs the original audit; zero-tool questions require a
+complete matching native answer. Unread sources are reported as unverified. Writing and supplied-answer
+arms retain complete authenticated source reads. Preserve the existing cases, immutable baseline,
+permission, cancellation, fresh-input and lifecycle checks; a Claude business case exercises the
+confirmed-answer and already-answered arms with Codex source history. Keep complete bounded final text
+for independent review. These test-only checks create no production semantic gate, model judge or retry.
 
 Automatic CI requires the existing `@real-core` business case on Windows x64/arm64 and macOS arm64:
 `real @all completes each Agent once and keeps ordered distinct response rows`. It launches the
@@ -347,6 +450,11 @@ dispatch never publishes a formal release. A successful preflight does not estab
 protected-main publication. Ordinary branch and PR validation needs no readiness switches.
 
 Local production uses the same entry point with `--profile production-local --channel stable`; its name and existing data directories remain separate from both CI channels. Local `dist:mac`, `dist:win`, and `package:dir:local` select this profile. Smoke commands require the exact generated manifest.
+
+On macOS, add `--relay-credentials` to smoke for synthetic save, replacement, reveal and removal
+through the packaged DesktopBridge. Three cold launches verify retained and removed credentials.
+The owner creates a private Keychain; the bundled guard prevents prompts. Unconfirmed cleanup
+retains recovery data. No model calls or host credentials are used.
 
 For an isolated Windows arm64 local package, use the native toolchain and a new output directory.
 Running through pnpm supplies its exact native executable entry to Windows command supervision:
@@ -492,6 +600,20 @@ attributed to the current root command; historical/background/peer work is exclu
 control settlement, 64 identities/64 KiB, and 64-page/256 KiB native reading remain bounded. Capability
 probing is two seconds/64 KiB/256 lines, generation-scoped, without persisted readiness caching.
 
+`RuntimeHealth.conversation` may expose scalar stream diagnostics from existing NativeObservation
+owners and one retired slot. Each slot reserves 8192 bytes from the existing business pool: at most
+40 owners plus one retired slot, or 328 KiB. Observations expire 600 seconds after creation; health
+reads, retirement and disposal release their reservations. At most six validated DTOs are exposed,
+each at most 2048 bytes. Export generation hashes, never source capabilities, output, native IDs or
+parameters. Loop counters are downstream of Connection listeners; zero observations do not prove
+that stdout was silent. Diagnostic failures cannot change execution or publication policy.
+
+Real streaming evidence retains at most 64 snapshots and 64 KiB including metadata, preserving the
+original three suppression-window baselines within that same ring. Database observation failures
+retain the sampled boundaries and must not replace the original assertion. Default mixed/real
+report cleanup removes raw attachments; use an explicit private `--output` directory when the
+original bounded diagnostics must remain available. Safe summaries are retained independently.
+
 Claude Stop/peer fixtures may choose a real catalog-supported low effort within their isolated Session;
 settings tests independently prove actual effort effects. Source provider configuration remains exact.
 Approvals are current native request actions only, scoped once or to the fixture Session. No retained
@@ -508,6 +630,11 @@ JSON in place. Diagnostics preserve the actual failing boundary before fixture d
 Selection uses PATH or `PACT_NATIVE_CODEX_EXECUTABLE` / `PACT_NATIVE_CLAUDE_EXECUTABLE`. The CI seam uses
 Codex 0.159.2, Claude Code 2.1.272, and the pinned desktop SDK; other versions/platforms need their own
 results. It builds actual production Adapters/Workers into a temporary fixture.
+
+The generated Codex loopback configuration disables optional plugins, so protocol fixtures do not
+start external marketplace downloads or leave their Git children behind after native EOF. The writer
+lifecycle case verifies that no marketplace-sync lock is created and retains its original natural
+exit, takeover and physical cleanup obligations. Real-provider configuration is unchanged.
 
 Claude initializes copied candidates with zero model input, tests effort precedence and null/default
 inheritance, and verifies exact source bytes, candidate identity, initialization manifests, and cold

@@ -1,25 +1,10 @@
-// TEMPORARY R09 effect probe — not part of the delivery; delete before the formal gate.
-// Run: pnpm exec vitest run apps/desktop/src/utility/conversation/temp-r09-effect.test.ts
-import { randomUUID } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
 import { request as httpRequest, type ClientRequest } from 'node:http'
-import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import type { DefaultSessionSettings } from '@pact/contracts'
+import { PactPeerToolServer } from './pact-peer-tool-server.js'
 
-import { PactDatabase } from '@pact/persistence'
-
-import { AgentAnswerAssembler } from './agent-answer-assembler'
-import { NATIVE_OWNER_WORKING_BYTES } from './native-working-memory'
-import { PactPeerToolServer } from './pact-peer-tool-server'
-import { PeerAssistanceTurn } from './peer-assistance-policy'
-
-const migrationsFolder = resolve(import.meta.dirname, '../../../../../packages/persistence/drizzle')
 const REQUEST_BYTES = 64 * 1024
 const requests = new Set<ClientRequest>()
-const temporaryDirectories: string[] = []
 
 function trackRequest(request: ClientRequest): ClientRequest {
   requests.add(request)
@@ -35,15 +20,6 @@ interface RpcReply {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
-
-const proposalEvent = (kind: 'review' | 'fact_check') => ({
-  agentId: 'codex' as const,
-  type: 'peer.assistance.requested' as const,
-  turnId: `turn-${kind}`,
-  proposalId: randomUUID(),
-  targetAgentId: 'claude' as const,
-  kind,
-})
 
 function postJson(url: string, message: unknown): Promise<RpcReply> {
   return postPayload(url, JSON.stringify(message))
@@ -182,18 +158,10 @@ async function expectHttpStatus(url: string, status: number): Promise<void> {
 
 afterEach(async () => {
   for (const request of requests) request.destroy()
-  try {
-    await Promise.all(started.splice(0).map((server) => server.dispose()))
-  } finally {
-    await Promise.all(
-      temporaryDirectories
-        .splice(0)
-        .map((directory) => rm(directory, { recursive: true, force: true })),
-    )
-  }
+  await Promise.all(started.splice(0).map((server) => server.dispose()))
 })
 
-describe('R09 peer tool server — temporary effect probe', () => {
+describe('PactPeerToolServer transport and admission', () => {
   it('exposes the tool and validates arguments without consuming root Turn admission', async () => {
     const { server, url, receipt } = await startServer()
     const listed = await postJson(url, { jsonrpc: '2.0', id: 1, method: 'tools/list' })
@@ -326,149 +294,5 @@ describe('R09 peer tool server — temporary effect probe', () => {
     await expect(callTool(url, { target: 'claude', kind: 'review' })).rejects.toThrow(
       /ECONNREFUSED/u,
     )
-  })
-})
-
-describe('R09 peer assistance turn — temporary effect probe', () => {
-  it('enforces one target and one proposal per Turn', () => {
-    const turn = new PeerAssistanceTurn('claude', true)
-    expect(turn.accept({ target: 'codex', kind: 'review' })).toMatchObject({ ok: false })
-    expect(turn.accept({ target: 'claude', kind: 'review', reason: 'probe' })).toMatchObject({
-      ok: true,
-    })
-    expect(turn.accept({ target: 'claude', kind: 'review' })).toMatchObject({
-      ok: false,
-      error: 'This answer already has a peer request.',
-    })
-    expect(turn.receipt).toBeTruthy()
-    expect(
-      new PeerAssistanceTurn('claude', false).accept({ target: 'claude', kind: 'review' }),
-    ).toMatchObject({
-      ok: false,
-      error: 'Peer assistance is unavailable for this routed request.',
-    })
-  })
-})
-
-describe('R09 proposal durability — temporary effect probe', () => {
-  const settings: DefaultSessionSettings = {
-    primaryAgentId: 'codex',
-    agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
-    maxDiscussionRounds: 6,
-    runningMessagePolicy: 'immediate_safe_point',
-    maxReviewCycles: 3,
-    maxRepairAttempts: 3,
-  }
-
-  async function fixture(filePath = ':memory:') {
-    const db = await PactDatabase.open({ filePath, migrationsFolder })
-    const projectId = randomUUID()
-    const sessionId = randomUUID()
-    const createdAt = new Date().toISOString()
-    db.projectCatalogRepository.add({
-      id: projectId,
-      name: 'Probe',
-      kind: 'git',
-      directoryPath: '/probe',
-      createdAt,
-    })
-    db.sessionRepository.create({ id: sessionId, projectId, title: 'Probe', createdAt }, settings)
-    const repo = db.conversationRepository
-    const runStart = repo.beginRun({
-      sessionId,
-      clientMessageId: randomUUID(),
-      content: 'Probe',
-      expectedCommentsRevision: 0,
-      commentIds: [],
-      agentId: 'codex',
-      settingsRevision: 1,
-      model: null,
-      effort: null,
-    })
-    return { db, repo, sessionId, runId: runStart.run.id }
-  }
-
-  it('supersedes the pending proposal on retry and replaces it on the next Turn', async () => {
-    const f = await fixture()
-    try {
-      f.repo.applyEvent(f.sessionId, f.runId, proposalEvent('review'))
-      const first = f.repo.findRun(f.runId)!.peerProposal
-      expect(first).toMatchObject({ state: 'pending', kind: 'review' })
-      f.repo.updateAttempt(f.runId, 2, true)
-      expect(f.repo.findRun(f.runId)!.peerProposal).toMatchObject({
-        id: first!.id,
-        state: 'superseded',
-      })
-      const second = proposalEvent('fact_check')
-      f.repo.applyEvent(f.sessionId, f.runId, second)
-      expect(f.repo.findRun(f.runId)!.peerProposal).toMatchObject({
-        id: second.proposalId,
-        state: 'pending',
-        kind: 'fact_check',
-      })
-    } finally {
-      f.db.close()
-    }
-  })
-
-  it('persists pending, superseded and replacement proposals across database reopen', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'pact-r09-probe-'))
-    temporaryDirectories.push(directory)
-    const filePath = join(directory, 'pact.sqlite')
-    const f = await fixture(filePath)
-    let db = f.db
-    try {
-      const first = proposalEvent('review')
-      db.conversationRepository.applyEvent(f.sessionId, f.runId, first)
-      db.close()
-      db = await PactDatabase.open({ filePath, migrationsFolder })
-      expect(db.conversationRepository.findRun(f.runId)?.peerProposal).toMatchObject({
-        id: first.proposalId,
-        state: 'pending',
-        kind: 'review',
-      })
-      db.conversationRepository.updateAttempt(f.runId, 2, true)
-      db.close()
-      db = await PactDatabase.open({ filePath, migrationsFolder })
-      expect(db.conversationRepository.findRun(f.runId)?.peerProposal).toMatchObject({
-        id: first.proposalId,
-        state: 'superseded',
-      })
-      const second = proposalEvent('fact_check')
-      db.conversationRepository.applyEvent(f.sessionId, f.runId, second)
-      db.close()
-      db = await PactDatabase.open({ filePath, migrationsFolder })
-      expect(db.conversationRepository.findRun(f.runId)?.peerProposal).toMatchObject({
-        id: second.proposalId,
-        state: 'pending',
-        kind: 'fact_check',
-        targetAgentId: 'claude',
-      })
-    } finally {
-      if (db.isHealthy()) db.close()
-    }
-  })
-})
-
-describe('R09 answer assembler — temporary effect probe', () => {
-  it('merges provider items into one logical answer with separators', () => {
-    using answer = new AgentAnswerAssembler('run-probe')
-    expect(answer.append('a', 'Hello')).toBe('Hello')
-    expect(answer.append('b', 'World')).toBe('\n\nWorld')
-    expect(answer.append('b', '!')).toBe('!')
-    expect(answer.complete('b', 'World!')).toBe('Hello\n\nWorld!')
-    expect(answer.complete('b', 'World!')).toBeUndefined()
-    expect(answer.finalize()).toBeUndefined()
-  })
-
-  it('accepts an answer above the old content ceiling and refuses working-capacity overflow', () => {
-    using answer = new AgentAnswerAssembler('run-probe-2')
-    const text = 'x'.repeat(1_100_000)
-    expect(answer.append('a', text)).toBe(text)
-    expect(answer.text).toBe(text)
-    expect(() => answer.append('b', 'x'.repeat(NATIVE_OWNER_WORKING_BYTES / 12))).toThrow(
-      /working capacity/,
-    )
-    expect(answer.text).toBe(text)
   })
 })

@@ -1,0 +1,1 @@
+ALTER TABLE `run_reexecution_operations` ADD `dispatch_guard_json` text;

@@ -15,10 +15,89 @@ import {
   disposeWindowsLauncherImage,
   windowsLauncherImageDiagnostic,
 } from '../tests/e2e/windows-cli-launcher.ts'
-import { runWindows, validateWindowsArgumentMode } from './run-e2e-windows.mjs'
+import {
+  runWindows,
+  validateWindowsArgumentMode,
+  windowsJobDiagnostic,
+} from './run-e2e-windows.mjs'
 import { run } from './run-e2e.mjs'
 
 const windowsOnly = { skip: process.platform !== 'win32', timeout: 20_000 }
+
+function diagnosticFixture() {
+  const members = Array.from({ length: 16 }, (_, index) => ({
+    pid: 4294967295 - index,
+    createdMs: Number.MAX_SAFE_INTEGER,
+    role: 'descendant',
+    image: 'crash-reporter',
+  }))
+  return {
+    version: 1,
+    root: {
+      pid: 4294967279,
+      exitCode: -2147483648,
+      elapsedMs: Number.MAX_SAFE_INTEGER,
+      natural: false,
+      active: 256,
+      members,
+      membersIncomplete: false,
+    },
+    stop: { reason: 'descendants-still-running', active: 256 },
+    afterTerminate: { phase: 'after-terminate', members, membersIncomplete: false },
+    errorCode: -2147483648,
+  }
+}
+
+await test('Windows runner failure facts fit the original control bound with adjacent frames', () => {
+  const diagnostic = diagnosticFixture()
+  assert.deepEqual(windowsJobDiagnostic(diagnostic), diagnostic)
+  const frames = [
+    { kind: 'stopping', reason: 'descendants-still-running' },
+    { kind: 'counts', active: 256 },
+    { kind: 'counts', active: 256 },
+    { kind: 'empty', active: 0, exitCode: -2147483648, diagnostic },
+  ]
+  assert(Buffer.byteLength(JSON.stringify(frames.at(-1))) <= 3584)
+  assert(Buffer.byteLength(frames.map((frame) => JSON.stringify(frame) + '\r\n').join('')) < 4096)
+})
+
+await test('Windows runner diagnostics withhold arbitrary strings and never mutate empty evidence', () => {
+  const diagnostic = diagnosticFixture()
+  diagnostic.path = 'private path'
+  diagnostic.root.argv = 'private argument'
+  diagnostic.root.members[0].command = 'private command'
+  const empty = { kind: 'empty', active: 0, exitCode: 7, diagnostic }
+  const snapshot = structuredClone(empty)
+  const result = windowsJobDiagnostic(empty.diagnostic)
+  assert(!JSON.stringify(result).includes('private'))
+  assert.deepEqual(empty, snapshot)
+  assert.equal(result.root.exitCode, -2147483648)
+  assert.equal(empty.exitCode, 7)
+})
+
+await test('missing malformed and oversized Windows diagnostics stay incomplete without throwing', () => {
+  const extraMembers = diagnosticFixture()
+  extraMembers.root.members.push(extraMembers.root.members[0])
+  const privateImage = diagnosticFixture()
+  privateImage.root.members[0].image = 'private executable name'
+  const invalidCode = diagnosticFixture()
+  invalidCode.root.exitCode = Number.MAX_SAFE_INTEGER
+  const invalidPhase = diagnosticFixture()
+  invalidPhase.afterTerminate.phase = 'before-stop'
+  for (const value of [
+    undefined,
+    null,
+    [],
+    {},
+    extraMembers,
+    privateImage,
+    invalidCode,
+    invalidPhase,
+  ])
+    assert.deepEqual(windowsJobDiagnostic(value), { incomplete: true })
+  const natural = { ...diagnosticFixture(), stop: null, afterTerminate: null, errorCode: null }
+  assert.equal(windowsJobDiagnostic(natural).stop, null)
+})
 
 await test(
   'a cold Windows Job starts and releases without a PowerShell compiler dependency',
@@ -660,42 +739,75 @@ for (const phase of ['bootstrapping', 'initializing', 'started', 'supervisor-kil
     const fixture = await tree(context, 'hold'),
       driver = join(fixture.root, 'runner.mjs'),
       stateFile = join(fixture.root, 'state.json')
+    const reportedPhases = [
+      'preparing',
+      'prepared',
+      'bootstrapping',
+      'initializing',
+      'started',
+      'stopping',
+      'settled',
+    ]
+    const began = performance.now()
+    const phases = []
     await writeFile(
       driver,
       `import {run} from ${JSON.stringify(pathToFileURL(join(import.meta.dirname, 'run-e2e.mjs')).href)};import{writeFileSync}from'node:fs';
-run([${JSON.stringify(fixture.entry)}],15000,{executable:process.execPath,cwd:${JSON.stringify(fixture.root)},write:()=>{},onState:s=>{if(s.kind===${JSON.stringify(phase === 'supervisor-killed' ? 'started' : phase)})writeFileSync(${JSON.stringify(stateFile)},JSON.stringify(s))}}).then(()=>process.exit(0),()=>process.exit(1));\n`,
+const phases=new Set(${JSON.stringify(reportedPhases)});
+run([${JSON.stringify(fixture.entry)}],15000,{executable:process.execPath,cwd:${JSON.stringify(fixture.root)},write:()=>{},onState:s=>{if(phases.has(s.kind))process.send({kind:s.kind,ownerPid:s.ownerPid},()=>{});if(s.kind===${JSON.stringify(phase === 'supervisor-killed' ? 'started' : phase)})writeFileSync(${JSON.stringify(stateFile)},JSON.stringify(s))}}).then(()=>process.exit(0),()=>process.exit(1));\n`,
     )
     const runner = spawn(process.execPath, [driver], {
         shell: false,
         windowsHide: true,
-        stdio: 'ignore',
+        stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
       }),
       exited = new Promise((r) => runner.once('close', r))
+    const recordPhase = (message) => {
+      if (
+        reportedPhases.includes(message?.kind) &&
+        (message.ownerPid === null || Number.isSafeInteger(message.ownerPid)) &&
+        phases.length < 8
+      )
+        phases.push({
+          kind: message.kind,
+          ownerPid: message.ownerPid,
+          elapsedMs: Math.round(performance.now() - began),
+        })
+    }
+    runner.on('message', recordPhase)
     context.after(async () => {
       if (runner.exitCode === null && runner.signalCode === null) runner.kill()
       await exited
+      runner.removeListener('message', recordPhase)
     })
-    let state
-    await waitFor(async () => {
-      try {
-        state = JSON.parse(await readFile(stateFile, 'utf8'))
-        return true
-      } catch (e) {
-        if (e.code === 'ENOENT' || e instanceof SyntaxError) return false
-        throw e
+    try {
+      let state
+      await waitFor(async () => {
+        try {
+          state = JSON.parse(await readFile(stateFile, 'utf8'))
+          return true
+        } catch (e) {
+          if (e.code === 'ENOENT' || e instanceof SyntaxError) return false
+          throw e
+        }
+      })
+      if (phase === 'initializing' || phase === 'bootstrapping') {
+        runner.kill()
+        await exited
+        await waitFor(() => pidGone(state.ownerPid))
+        await assert.rejects(readFile(fixture.report), { code: 'ENOENT' })
+      } else {
+        const pids = await fixture.pids()
+        if (phase === 'supervisor-killed') process.kill(state.ownerPid, 'SIGKILL')
+        else runner.kill()
+        await exited
+        await waitFor(() => pidGone(state.ownerPid) && pidGone(pids.parent) && pidGone(pids.worker))
       }
-    })
-    if (phase === 'initializing' || phase === 'bootstrapping') {
-      runner.kill()
-      await exited
-      await waitFor(() => pidGone(state.ownerPid))
-      await assert.rejects(readFile(fixture.report), { code: 'ENOENT' })
-    } else {
-      const pids = await fixture.pids()
-      if (phase === 'supervisor-killed') process.kill(state.ownerPid, 'SIGKILL')
-      else runner.kill()
-      await exited
-      await waitFor(() => pidGone(state.ownerPid) && pidGone(pids.parent) && pidGone(pids.worker))
+    } catch (error) {
+      context.diagnostic(
+        JSON.stringify({ phase, phases, exitCode: runner.exitCode, signalCode: runner.signalCode }),
+      )
+      throw error
     }
   })
 }

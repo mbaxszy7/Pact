@@ -89,7 +89,7 @@ test.describe('Native Session permission lifetime', () => {
 test(
   'provider completion releases the Composer while title enrichment is silent',
   { tag: '@deterministic' },
-  async () => {
+  async ({ browserName: _browserName }, testInfo) => {
     test.setTimeout(120_000)
     const fixture = await createRuntimeFixture({ codexAppServer: 'complete_title_silent' })
     const directory = await fixture.createProjectDirectory('bounded-agent-lifecycle')
@@ -106,7 +106,23 @@ test(
       await window.getByRole('button', { name: 'Add project', exact: true }).click()
       await window.getByRole('button', { name: 'New Session in bounded-agent-lifecycle' }).focus()
       await window.getByRole('button', { name: 'New Session in bounded-agent-lifecycle' }).click()
-      await window.getByRole('button', { name: 'Create Session' }).click()
+      await window
+        .getByRole('button', { name: 'Create Session' })
+        .click()
+        .catch(async (error) => {
+          const facts = await fixture.readCodexFacts().catch(() => undefined)
+          const body = Buffer.from(
+            JSON.stringify({
+              phase: 'session-creation',
+              visibleState: (await window.getByRole('main').innerText()).slice(0, 4096),
+              nativeMethods: facts?.methods.slice(-32),
+              fixtureError: facts?.fixtureError,
+              modelStarts: facts?.modelStarts.length,
+            }),
+          )
+          await testInfo.attach('session-creation-state', { body, contentType: 'application/json' })
+          throw error
+        })
 
       const composer = window.getByRole('combobox', { name: 'Message' })
       await composer.fill('Does title silence block completion?')
@@ -536,7 +552,6 @@ async function seedDeliveryFailure(
         codex: { model: null, effort: null },
       },
       maxDiscussionRounds: 6,
-      runningMessagePolicy: 'immediate_safe_point',
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
     },

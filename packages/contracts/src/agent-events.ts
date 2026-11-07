@@ -11,7 +11,7 @@ export const sessionTitleInputShape = {
 }
 export const sessionTitleInputSchema = z.strictObject(sessionTitleInputShape)
 
-import { collaborationResultSchema } from './collaboration.js'
+import { collaborationReviewVerdictSchema, collaborationQuestionsSchema } from './collaboration.js'
 
 const agentId = z.enum(['claude', 'codex'])
 const opaqueId = z.string().min(1)
@@ -33,13 +33,15 @@ export const normalizedAgentEventSchema = z.discriminatedUnion('type', [
   }),
   z.strictObject({
     ...turnEvent,
-    type: z.literal('collaboration.result_incomplete'),
-    reason: z.enum(['missing', 'invalid']),
+    type: z.literal('collaboration.plan'),
+    nativeId: z.string().min(1).max(1024),
+    text: z.string(),
   }),
   z.strictObject({
     ...turnEvent,
-    type: z.literal('collaboration.result'),
-    result: collaborationResultSchema,
+    type: z.literal('collaboration.review'),
+    verdict: collaborationReviewVerdictSchema,
+    questions: collaborationQuestionsSchema.optional(),
   }),
   z.strictObject({ ...agentEvent, type: z.literal('session.started'), nativeSessionId: opaqueId }),
   z.strictObject({

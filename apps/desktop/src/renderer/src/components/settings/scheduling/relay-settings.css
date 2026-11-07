@@ -1,0 +1,291 @@
+.relay-settings-surface {
+  width: 100%;
+  min-height: 100%;
+  background: var(--pact-surface);
+  isolation: isolate;
+}
+
+.relay-settings {
+  --relay-thumb: light-dark(var(--pact-surface-raised), var(--pact-text-primary));
+  --relay-thumb-edge: light-dark(rgb(10 13 18 / 12%), rgb(10 13 18 / 24%));
+  --relay-thumb-shadow: 0 1px 2px light-dark(rgb(10 13 18 / 18%), rgb(0 0 0 / 30%));
+}
+
+.relay-header {
+  border-bottom: 1px solid var(--pact-border);
+  padding-bottom: 1.5rem;
+}
+
+.relay-header p {
+  text-wrap: pretty;
+}
+
+.relay-header + .relay-toggle {
+  margin-top: 1.5rem;
+}
+
+.relay-toggle {
+  display: flex;
+  width: 100%;
+  min-height: 3rem;
+  align-items: center;
+  flex-direction: row-reverse;
+  justify-content: space-between;
+  gap: 0.875rem;
+  padding-right: 0.25rem;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.relay-toggle:focus-visible {
+  outline: none;
+}
+
+.relay-toggle:focus-visible .relay-switch-track {
+  outline: 2px solid var(--pact-focus);
+  outline-offset: 2px;
+}
+
+.relay-toggle:disabled,
+.relay-toggle[aria-disabled='true'] {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.relay-switch-track {
+  display: block;
+  width: 2.625rem;
+  height: 1.5rem;
+  flex: 0 0 auto;
+  padding: 0.1875rem;
+  border-radius: 9999px;
+  background: var(--pact-border-strong);
+  transition: background-color 180ms var(--ease-out-pact);
+}
+
+.relay-switch-thumb {
+  display: block;
+  width: 1.125rem;
+  height: 1.125rem;
+  border-radius: 9999px;
+  border: 1px solid var(--relay-thumb-edge);
+  background: var(--relay-thumb);
+  box-shadow: var(--relay-thumb-shadow);
+  transition: transform 180ms var(--ease-out-pact);
+}
+
+.relay-switch-track[data-on='true'] {
+  background: var(--pact-focus);
+}
+
+.relay-switch-track[data-on='true'] .relay-switch-thumb {
+  transform: translateX(1.125rem);
+}
+
+.relay-details {
+  display: grid;
+  grid-template-rows: 1fr;
+  animation: relay-open 180ms var(--ease-out-pact);
+}
+
+.relay-details-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.relay-section {
+  margin-top: 1.5rem;
+}
+
+.relay-key-controls {
+  margin-top: 0.5rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+/* The wrapper owns the field's sizing so the eye button can sit inside its edge. */
+.relay-key-field {
+  position: relative;
+  min-width: 12rem;
+  flex: 1 1 14rem;
+}
+
+.relay-key-field input {
+  width: 100%;
+  min-width: 0;
+  height: 2.25rem;
+  border: 1px solid var(--pact-border);
+  border-radius: var(--radius-control);
+  background: var(--pact-surface-raised);
+  padding-inline: 0.75rem;
+  padding-inline-end: 2.75rem;
+  color: var(--pact-text-primary);
+  font-size: 0.875rem;
+}
+
+.relay-key-field input::placeholder {
+  color: var(--pact-text-primary);
+  opacity: 1;
+}
+
+.relay-key-eye {
+  position: absolute;
+  inset-inline-end: 0.125rem;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 2rem;
+  height: 2rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--pact-text-secondary);
+  cursor: pointer;
+}
+
+.relay-key-eye:hover:not(:disabled) {
+  background: var(--pact-surface-muted);
+  color: var(--pact-text-primary);
+}
+
+.relay-key-eye:focus-visible {
+  outline: 2px solid var(--pact-focus);
+  outline-offset: -1px;
+}
+
+.relay-key-eye:disabled {
+  color: var(--pact-text-tertiary);
+  opacity: 0.6;
+  cursor: default;
+}
+
+.relay-key-controls input:focus-visible {
+  outline: 2px solid var(--pact-focus);
+  outline-offset: -1px;
+}
+
+.relay-key-controls input:disabled {
+  cursor: default;
+  color: var(--pact-text-tertiary);
+  opacity: 0.6;
+}
+
+.relay-key-actions {
+  margin-top: 0.75rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.relay-key-secondary {
+  display: inline-flex;
+  height: 2rem;
+  align-items: center;
+  border: 1px solid var(--pact-border);
+  border-radius: var(--radius-control);
+  padding-inline: 0.75rem;
+  color: var(--pact-text-primary);
+  cursor: pointer;
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.relay-key-secondary:hover:not(:disabled) {
+  background: var(--pact-surface-muted);
+}
+
+.relay-key-secondary:focus-visible {
+  outline: 2px solid var(--pact-focus);
+  outline-offset: -1px;
+}
+
+.relay-key-secondary:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.relay-usage {
+  max-width: 65ch;
+  margin-top: 1rem;
+}
+
+.relay-toggle[data-compact='true'] {
+  gap: 0.75rem;
+  min-height: 2.25rem;
+}
+
+.relay-activity-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  column-gap: 1rem;
+  row-gap: 0.25rem;
+}
+
+.relay-activity-summary > :last-child {
+  flex: 0 0 auto;
+}
+
+.relay-activity-list {
+  max-height: 24rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+@keyframes relay-open {
+  from {
+    grid-template-rows: 0fr;
+    opacity: 0;
+  }
+  to {
+    grid-template-rows: 1fr;
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .relay-details {
+    animation: none;
+  }
+  .relay-switch-track,
+  .relay-switch-thumb {
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .relay-switch-track {
+    forced-color-adjust: none;
+    border: 1px solid ButtonText;
+    padding: 0.125rem;
+    background: Canvas;
+  }
+
+  .relay-switch-thumb {
+    background: ButtonText;
+    border: none;
+    box-shadow: none;
+  }
+
+  .relay-switch-track[data-on='true'] {
+    border-color: Highlight;
+    background: Highlight;
+  }
+
+  .relay-switch-track[data-on='true'] .relay-switch-thumb {
+    background: HighlightText;
+  }
+
+  .relay-toggle:focus-visible .relay-switch-track,
+  .relay-key-controls input:focus-visible,
+  .relay-key-eye:focus-visible,
+  .relay-key-secondary:focus-visible {
+    outline-color: Highlight;
+  }
+}

@@ -139,13 +139,13 @@ export function SpeedMenu({
   }
 
   return (
-    <div className="shrink-0 text-caption">
+    <div className="min-w-0 text-caption">
       <button
         ref={trigger}
         type="button"
         popoverTarget={id}
         disabled={disabled || saving}
-        className="pact-agent-trigger"
+        className="pact-agent-trigger max-w-full"
         style={{ anchorName: `--${id}` }}
         aria-label={`${name} speed: ${speeds[selected].label}`}
         aria-haspopup="menu"
@@ -159,7 +159,7 @@ export function SpeedMenu({
           focusChoice()
         }}
       >
-        <span className="whitespace-nowrap">Speed: {speeds[selected].label}</span>
+        <span className="truncate">Speed: {speeds[selected].label}</span>
         <ChevronDown aria-hidden="true" className="pact-agent-chevron size-3 shrink-0" />
       </button>
       <div

@@ -17,6 +17,14 @@ const probe = vi.hoisted(() => ({
   rejectEmpty: false,
   nativeInitializeGate: undefined as Promise<void> | undefined,
   clients: [] as Array<{ initialized: boolean; released: boolean; closeCalls: number }>,
+  credentialPrepareGate: undefined as Promise<void> | undefined,
+  credentialStores: [] as Array<{
+    prepareCalls: number
+    installCalls: number
+    disposeCalls: number
+    prepared: boolean
+    disposed: boolean
+  }>,
 }))
 
 vi.mock('../native/native-harness.js', async (original) => {
@@ -83,6 +91,51 @@ vi.mock('./provider-environment.js', async (original) => {
   }
 })
 
+vi.mock('./mac-credential-store.js', async (original) => {
+  const actual = await original<typeof import('./mac-credential-store.js')>()
+  return {
+    ...actual,
+    MacCredentialStore: class {
+      private readonly record = {
+        prepareCalls: 0,
+        installCalls: 0,
+        disposeCalls: 0,
+        prepared: false,
+        disposed: false,
+      }
+      private prepared!: Promise<void>
+      private disposedPromise!: Promise<void>
+
+      constructor() {
+        probe.credentialStores.push(this.record)
+      }
+
+      prepare(): Promise<void> {
+        this.record.prepareCalls++
+        this.prepared ??= (probe.credentialPrepareGate ?? Promise.resolve()).then(() => {
+          this.record.prepared = true
+          return undefined
+        })
+        return this.prepared
+      }
+
+      async install(): Promise<void> {
+        await this.prepared
+        this.record.installCalls++
+      }
+
+      dispose(): Promise<void> {
+        this.record.disposeCalls++
+        this.disposedPromise ??= this.prepared.then(() => {
+          this.record.disposed = true
+          return undefined
+        })
+        return this.disposedPromise
+      }
+    },
+  }
+})
+
 vi.mock('./windows-cli-launcher.js', async (original) => {
   const actual = await original<typeof import('./windows-cli-launcher.js')>()
   return {
@@ -141,6 +194,8 @@ beforeEach(() => {
   probe.rejectEmpty = false
   probe.nativeInitializeGate = undefined
   probe.clients = []
+  probe.credentialPrepareGate = undefined
+  probe.credentialStores = []
 })
 
 function gate(): { promise: Promise<void>; resolve: () => void } {
@@ -680,3 +735,69 @@ it('bounds three pending fixture operations and drains both client constructors 
     await rm(fixture.directory, { recursive: true, force: true })
   }
 })
+
+it('rejects a native credential store for a real fixture before any preparation', async () => {
+  const { createRuntimeFixture } = await import('./runtime-fixture.js')
+  await expect(createRuntimeFixture({ mode: 'real', nativeCredentialStore: true })).rejects.toThrow(
+    'synthetic',
+  )
+  expect(probe.credentialStores).toHaveLength(0)
+})
+
+it('requires real-provider mode for the private-file Relay credential store', async () => {
+  const { createRuntimeFixture } = await import('./runtime-fixture.js')
+  await expect(
+    createRuntimeFixture({ mode: 'ui', realRelayCredentialStore: true }),
+  ).rejects.toThrow('real-provider')
+  expect(probe.credentialStores).toHaveLength(0)
+})
+
+it.skipIf(process.platform !== 'darwin')(
+  'waits for a pending credential-store preparation before admitting construction',
+  async () => {
+    const { createRuntimeFixture } = await import('./runtime-fixture.js')
+    const launch = vi.spyOn(electron, 'launch')
+    const held = gate()
+    let fixture: Awaited<ReturnType<typeof createRuntimeFixture>> | undefined
+    let constructing: ReturnType<typeof createRuntimeFixture> | undefined
+    try {
+      probe.credentialPrepareGate = held.promise
+      constructing = createRuntimeFixture({
+        mode: 'ui',
+        nativeCredentialStore: true,
+      }).then((built) => {
+        fixture = built
+        return built
+      })
+      let resolved = false
+      void constructing.then(
+        () => {
+          resolved = true
+          return undefined
+        },
+        () => {
+          resolved = true
+          return undefined
+        },
+      )
+      await vi.waitFor(() => {
+        expect(probe.credentialStores.length > 0).toBe(true)
+        expect(probe.credentialStores[0]?.prepareCalls).toBe(1)
+      })
+      expect(resolved).toBe(false)
+      expect(launch).not.toHaveBeenCalled()
+      held.resolve()
+      await constructing
+      expect(resolved).toBe(true)
+      await fixture!.dispose()
+      expect(probe.credentialStores[0]?.disposeCalls).toBe(1)
+      await expect(fixture!.launch()).rejects.toThrow('disposed')
+      expect(probe.credentialStores[0]?.installCalls).toBe(0)
+    } finally {
+      held.resolve()
+      await constructing?.catch(() => undefined)
+      await fixture?.dispose().catch(() => undefined)
+      launch.mockRestore()
+    }
+  },
+)

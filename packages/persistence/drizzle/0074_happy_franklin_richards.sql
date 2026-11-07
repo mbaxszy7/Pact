@@ -1,0 +1,1 @@
+CREATE INDEX `agent_event_journal_run_type_sequence` ON `agent_event_journal` (`run_id`,`event_type`,`sequence`);

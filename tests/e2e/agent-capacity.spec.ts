@@ -42,7 +42,6 @@ async function seedSessions(fixture: RuntimeFixture, count: number): Promise<str
             codex: { model: null, effort: null },
           },
           maxDiscussionRounds: 6,
-          runningMessagePolicy: 'immediate_safe_point',
           maxReviewCycles: 3,
           maxRepairAttempts: 3,
         },

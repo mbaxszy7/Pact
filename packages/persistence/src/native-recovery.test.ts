@@ -29,7 +29,7 @@ const settings: DefaultSessionSettings = {
     codex: { model: 'frozen-model', effort: 'high' },
   },
   maxDiscussionRounds: 6,
-  runningMessagePolicy: 'immediate_safe_point',
+
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
 }

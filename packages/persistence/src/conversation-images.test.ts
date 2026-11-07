@@ -23,7 +23,7 @@ async function fixture() {
     primaryAgentId: 'codex',
     agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
     maxDiscussionRounds: 6,
-    runningMessagePolicy: 'immediate_safe_point',
+
     maxReviewCycles: 3,
     maxRepairAttempts: 3,
   } as const

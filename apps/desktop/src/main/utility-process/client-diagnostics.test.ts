@@ -25,6 +25,7 @@ const harness = vi.hoisted(() => {
   return { Child, children: [] as Child[] }
 })
 vi.mock('electron', () => ({
+  app: { isPackaged: false },
   utilityProcess: {
     fork: () => {
       const child = new harness.Child()

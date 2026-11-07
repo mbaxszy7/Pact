@@ -27,7 +27,6 @@ export const initialSessionSettings: DefaultSessionSettings = {
     codex: { model: null, effort: null, speed: 'native' },
   },
   maxDiscussionRounds: 6,
-  runningMessagePolicy: 'immediate_safe_point',
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
 }
@@ -43,7 +42,6 @@ export function sessionSettingsEqual(
     left.agents.codex.model === right.agents.codex.model &&
     left.agents.codex.effort === right.agents.codex.effort &&
     left.maxDiscussionRounds === right.maxDiscussionRounds &&
-    left.runningMessagePolicy === right.runningMessagePolicy &&
     left.maxReviewCycles === right.maxReviewCycles &&
     left.maxRepairAttempts === right.maxRepairAttempts
   )
@@ -79,8 +77,8 @@ export function SessionSettingsFields({
           Choose the primary LLM
         </h2>
         <p className="mt-1 text-caption text-secondary">
-          The Primary leads the collaboration. You can still direct either Agent for a specific
-          task.
+          The Primary receives ordinary messages and new workflows by default. You can direct either
+          Agent for a specific task.
         </p>
         <div
           className={`mt-group grid overflow-hidden rounded-card border border-border ${compact ? 'grid-cols-1' : 'sm:grid-cols-2'}`}
@@ -125,8 +123,8 @@ export function SessionSettingsFields({
                 <strong className="mt-0.5 block font-medium text-primary">{primaryName}</strong>
               </dt>
               <dd className="text-secondary">
-                Clarifies requirements, maintains the Plan and Summary, coordinates the Secondary,
-                and performs the final read-only review.
+                Default recipient for ordinary messages and new workflows. Each task selects its
+                author, default implementer and peer reviewer.
               </dd>
             </div>
             <div className="grid gap-1 py-group sm:grid-cols-[10rem_minmax(0,1fr)] sm:gap-section">
@@ -135,8 +133,8 @@ export function SessionSettingsFields({
                 <strong className="mt-0.5 block font-medium text-primary">{secondaryName}</strong>
               </dt>
               <dd className="text-secondary">
-                Challenges the plan, inspects the codebase, implements approved work, runs checks,
-                and repairs review findings.
+                Available for explicit routing. The task author is its default implementer, and the
+                other Agent reviews.
               </dd>
             </div>
           </dl>
@@ -205,27 +203,27 @@ export function SessionSettingsFields({
         </p>
         <div className={`mt-group grid gap-group ${compact ? 'grid-cols-1' : 'sm:grid-cols-2'}`}>
           <NumberSetting
-            label="Maximum discussion rounds"
+            label="Plan reviews"
             value={settings.maxDiscussionRounds}
             max={20}
             disabled={disabled}
-            description="One round is peer review plus the original drafter responding or confirming, whichever Agent drafted first. Review starts the round; a new version needs a new review round."
+            description="Each peer review of a plan counts once. Drafting, revisions and user questions do not count."
             onChange={(maxDiscussionRounds) => onChange({ ...settings, maxDiscussionRounds })}
           />
           <NumberSetting
-            label="Maximum review cycles"
+            label="Code reviews"
             value={settings.maxReviewCycles}
             max={10}
             disabled={disabled}
-            description="One cycle is review, response or repair, and re-review. Suggestions and declined suggestions also count. Remaining feedback starts a new cycle at the next response."
+            description="Each code review counts once, including the first review and every review after a response or repair."
             onChange={(maxReviewCycles) => onChange({ ...settings, maxReviewCycles })}
           />
           <NumberSetting
-            label="Repair attempts per task"
+            label="Repair attempts"
             value={settings.maxRepairAttempts}
             max={10}
             disabled={disabled}
-            description="Each explicitly authorized repair Turn counts, whether successful or failed. Initial implementation and read-only response or review do not count."
+            description="Each authorized repair counts once. Initial implementation and read-only responses or reviews do not count."
             onChange={(maxRepairAttempts) => onChange({ ...settings, maxRepairAttempts })}
           />
         </div>

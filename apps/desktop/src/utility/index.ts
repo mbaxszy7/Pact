@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { realpath, rm } from 'node:fs/promises'
-import { basename, dirname, isAbsolute } from 'node:path'
+import { basename, dirname, isAbsolute, join } from 'node:path'
 import { monitorEventLoopDelay } from 'node:perf_hooks'
 
 import {
   utilityEventSchema,
   utilityRequestSchema,
+  relayCredentialStoredSchema,
   utilityResponseSchema,
   workspaceStorageRootSchema,
   runtimeStartupFailureSchema,
@@ -19,8 +20,13 @@ import { AppUpdates } from './app-updates/app-updates'
 import { handleAppearanceRequest } from './appearance/handler'
 import { Conversation } from './conversation/conversation'
 import { ConversationImages } from './conversation/conversation-images'
-import { nativeWorkingMemoryDiagnostics } from './conversation/native-working-memory'
+import {
+  nativeWorkingMemoryCapacities,
+  nativeWorkingMemoryDiagnostics,
+} from './conversation/native-working-memory'
+import { UtilityRelayCredentialClient } from './conversation/relay-credential-client'
 import { DefaultSessionSettings } from './default-session-settings/default-session-settings'
+import { configureOwnedProcessGroups } from './owned-process-group'
 import { ProjectCatalog } from './project-catalog/project-catalog'
 import { ProjectFileReader } from './project-file/project-file-reader'
 import { RuntimePreparation } from './runtime-preparation/runtime-preparation'
@@ -81,6 +87,7 @@ function performanceSnapshot(
     resourceHighWater,
     resourceCapacityExceeded,
     nativeMemory: nativeWorkingMemoryDiagnostics(),
+    nativeMemoryCapacities: nativeWorkingMemoryCapacities(),
   }
 }
 
@@ -89,6 +96,15 @@ async function bootstrap(
   runtimeMigrationsFolder: string,
   runtimeWorkspaceStorageRoot: string,
 ): Promise<void> {
+  if (process.platform === 'win32') {
+    const windowsBridgeExecutable = process.argv[7]
+    if (!windowsBridgeExecutable || !isAbsolute(windowsBridgeExecutable))
+      throw new Error('Windows native work requires its installed process owner.')
+    configureOwnedProcessGroups({
+      windowsBridgeExecutable,
+      receiptDirectory: join(runtimeWorkspaceStorageRoot, 'native-process-receipts'),
+    })
+  }
   recordDiagnostic({ operation: 'utility', phase: 'started' })
   const measurementRoot = process.env.PACT_E2E_ROOT
   const measurePerformance = Boolean(
@@ -136,6 +152,7 @@ async function bootstrap(
   const projectFileReader = new ProjectFileReader(
     openedDatabase.sessionRepository,
     openedDatabase.projectCatalogRepository,
+    (input, signal) => directoryOwner.run(input, signal),
   )
   const sessionWorkspace = new SessionWorkspace(
     openedDatabase.projectCatalogRepository,
@@ -150,6 +167,7 @@ async function bootstrap(
     workerTraffic,
   )
   await images.initialize()
+  const relayCredentialClient = new UtilityRelayCredentialClient(parentPort)
   conversation = new Conversation(
     openedDatabase.conversationRepository,
     openedDatabase.sessionRepository,
@@ -159,7 +177,38 @@ async function bootstrap(
     runtimeDatabaseFile === ':memory:' ? undefined : workspaceOwner,
     images,
     workerTraffic,
+    async (context) => {
+      const stored = openedDatabase.conversationRepository.readRelayCredential()
+      const generation = openedDatabase.conversationRepository.schedulingConfigurationGeneration()
+      if (!stored.ciphertext || context.signal.aborted || Date.now() >= context.deadlineAt)
+        return null
+      const opened = await relayCredentialClient.decrypt(stored.ciphertext, context)
+      if (!opened || context.signal.aborted || Date.now() >= context.deadlineAt) return null
+      const after = openedDatabase.conversationRepository.readRelayCredential()
+      // Any credential, revision or configuration-generation change while decrypting
+      // means this key is not current.
+      if (
+        after.ciphertext !== stored.ciphertext ||
+        after.revision !== stored.revision ||
+        openedDatabase.conversationRepository.schedulingConfigurationGeneration() !== generation
+      )
+        return null
+      // Rotation is authority-neutral but must land on the exact prior ciphertext.
+      if (
+        opened.replacementCiphertext &&
+        !openedDatabase.conversationRepository.rotateRelayCredentialCiphertext(
+          stored.revision,
+          stored.ciphertext,
+          opened.replacementCiphertext,
+        )
+      )
+        return null
+      return opened.key
+    },
   )
+  const unsubscribeScheduling = conversation.subscribeSchedulingChanges(() => {
+    parentPort.postMessage(utilityEventSchema.parse({ type: 'scheduling.changed.event' }))
+  })
   conversation.subscribe((patch, progress) => {
     parentPort.postMessage(
       utilityEventSchema.parse({ type: 'conversation.patch.event', patch, progress }),
@@ -194,12 +243,132 @@ async function bootstrap(
   }
 
   parentPort.on('message', (event) => {
+    if (relayCredentialClient.consume(event.data)) return
     if (receiveDiagnostic(event.data)) return
     const request = utilityRequestSchema.safeParse(event.data)
     if (!request.success) return
     if (closing && request.data.type !== 'runtime.shutdown.request') return
 
     switch (request.data.type) {
+      case 'scheduling.state.get.request': {
+        const input = request.data
+        runRequest(async () => {
+          const result = conversationOwner.getSchedulingState(input.input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'scheduling.state.response',
+              requestId: input.requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+      case 'scheduling.settings.get.request':
+      case 'scheduling.settings.save.request': {
+        const input = request.data
+        runRequest(async () => {
+          const result =
+            input.type === 'scheduling.settings.get.request'
+              ? conversationOwner.getSchedulingSettings()
+              : await conversationOwner.saveSchedulingSettings(input.input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'scheduling.settings.response',
+              requestId: input.requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+      case 'scheduling.activity.read.request': {
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'scheduling.activity.response',
+            requestId: request.data.requestId,
+            result: conversationOwner.readSchedulingActivity(request.data.input),
+          }),
+        )
+        return
+      }
+      case 'relay.credential.write.request': {
+        const input = request.data
+        runRequest(async () => {
+          const result = await conversationOwner.writeRelayCredential(input.input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'relay.credential.write.response',
+              requestId: input.requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+      case 'relay.credential.receipt.read.request': {
+        const input = request.data
+        let result: import('@pact/contracts').RpcResult<
+          import('@pact/contracts').RelayCredentialReceipt | null
+        >
+        try {
+          result = {
+            ok: true,
+            value:
+              openedDatabase.conversationRepository.readRelayCredentialReceipt(input.input.nonce) ??
+              null,
+          }
+        } catch {
+          result = {
+            ok: false,
+            error: { code: 'INTERNAL', message: 'The credential receipt could not be read.' },
+          }
+        }
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'relay.credential.receipt.read.response',
+            requestId: input.requestId,
+            result,
+          }),
+        )
+        return
+      }
+      case 'relay.credential.read.request': {
+        const input = request.data
+        let result: import('@pact/contracts').RpcResult<
+          import('@pact/contracts').RelayCredentialStored
+        >
+        try {
+          if (Date.now() >= input.input.deadlineAt)
+            result = {
+              ok: false,
+              error: { code: 'CONFLICT', message: 'The credential read is no longer current.' },
+            }
+          else {
+            const stored = openedDatabase.conversationRepository.readRelayCredential()
+            result =
+              stored.revision !== input.input.expectedRevision
+                ? {
+                    ok: false,
+                    error: { code: 'CONFLICT', message: 'The saved credential changed.' },
+                  }
+                : { ok: true, value: relayCredentialStoredSchema.parse(stored) }
+          }
+        } catch {
+          result = {
+            ok: false,
+            error: { code: 'INTERNAL', message: 'The stored credential could not be read.' },
+          }
+        }
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'relay.credential.read.response',
+            requestId: input.requestId,
+            result,
+          }),
+        )
+        return
+      }
       case 'updates.check.request': {
         const requestId = request.data.requestId
         runRequest(async () => {
@@ -389,6 +558,7 @@ async function bootstrap(
         const requestId = request.data.requestId
         shutdown ??= (async () => {
           closing = true
+          unsubscribeScheduling()
           await appUpdates.dispose()
           projectCatalog.dispose()
           const drainRequests =
@@ -399,9 +569,13 @@ async function bootstrap(
                 })
           // Await every request before closing its database, even if one owner's
           // cleanup fails. A failed owner never produces a successful flush ACK.
+          // Close credential admission before Conversation disposal; the private
+          // consume route stays alive on parentPort through cleanup.
+          relayCredentialClient.dispose()
           const results = await Promise.allSettled([
             conversationOwner.dispose(),
             defaultSessionSettings.dispose(),
+            projectFileReader.dispose(),
             drainRequests,
           ])
           try {
@@ -951,6 +1125,28 @@ async function bootstrap(
         return
       }
 
+      case 'conversation.prepared-input.continue.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = conversation
+            ? await conversation.continuePreparedInput(input)
+            : {
+                ok: false as const,
+                error: {
+                  code: 'RUNTIME_UNAVAILABLE' as const,
+                  message: 'Conversation runtime is unavailable.',
+                },
+              }
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'conversation.prepared-input.continue.response',
+              requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
       case 'conversation.send.request': {
         const { input, requestId, ownerKey } = request.data
         runRequest(async () => {
@@ -1034,6 +1230,31 @@ async function bootstrap(
         return
       }
 
+      case 'relay.decision.answer.request':
+      case 'relay.decision.receipt.request': {
+        const operation = request.data
+        runRequest(async () => {
+          const result = conversation
+            ? operation.type === 'relay.decision.answer.request'
+              ? await conversation.answerRelayDecision(operation.input)
+              : conversation.getRelayDecisionReceipt(operation.input)
+            : {
+                ok: false as const,
+                error: {
+                  code: 'RUNTIME_UNAVAILABLE' as const,
+                  message: 'Conversation runtime is unavailable.',
+                },
+              }
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'relay.decision.receipt.response',
+              requestId: operation.requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
       case 'collaboration.action.request': {
         const { input, requestId } = request.data
         runRequest(async () => {

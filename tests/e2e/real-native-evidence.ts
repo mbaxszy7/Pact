@@ -1,12 +1,31 @@
+import type { Stats } from 'node:fs'
+
 import { createHash } from 'node:crypto'
-import { open, opendir, realpath } from 'node:fs/promises'
+import { lstat, open, opendir, realpath } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 
 import type { RealWorkspace } from './real-harness.js'
+
+import { nativeAnswerParity, type NativeAnswerParityInput } from './native-answer-parity.js'
 const nativeFileLimit = 1000
 export const nativeByteLimit = 8 * 1024 * 1024
 const nativeRecordLimit = 10_000
+
+/** Path and handle must describe the same unchanged complete snapshot throughout the read. */
+export function nativeSnapshotStable(
+  observations: readonly Pick<Stats, 'isFile' | 'dev' | 'ino' | 'size' | 'mtimeMs' | 'ctimeMs'>[],
+  bytes: number,
+): boolean {
+  const first = observations[0]
+  const keys = ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'] as const
+  return (
+    observations.length === 4 &&
+    first !== undefined &&
+    first.size === bytes &&
+    observations.every((item) => item.isFile() && keys.every((key) => item[key] === first[key]))
+  )
+}
 
 export type NativeEffortField = { present: false } | { present: true; value: string | null }
 
@@ -43,15 +62,62 @@ export interface NativeEvidence {
   commandResults: Array<{ callId: string; output: string; at?: string }>
   execScripts: Array<{ callId?: string; input: string; at?: string }>
   codexTurnSettings: CodexNativeTurnSettings[]
+  containsLiteralText(text: string): boolean
   containsText(text: string): boolean
+  answerParity(input: NativeAnswerParityInput): ReturnType<typeof nativeAnswerParity> & {
+    file: {
+      sha256: string
+      bytes: number
+      records: number
+      beforeSize: number
+      afterSize: number
+      identityStable: boolean
+      snapshotStable: boolean
+      modifiedDuringRead: boolean
+    }
+  }
 }
 
-/** This observer owns one bounded scan of this fixture's Native files; no symlinks are followed. */
+export interface NativeSourceAuditProof {
+  sourceFileSha256: string
+  allToolsAllowed: boolean
+  boundaryDiagnostics: { ledgerValid: boolean }
+  codeModeScripts: Array<{ sha256: string }>
+}
+export type NativeSourceEvidence = Omit<
+  NativeEvidence,
+  'shellCommands' | 'commandCalls' | 'commandResults'
+> & {
+  commandInspection: {
+    status: 'requires_source_audit'
+    syntaxFailures: Array<{ sha256: string; bytes: number }>
+  }
+  certifySourceAudit(proof: NativeSourceAuditProof): NativeEvidence
+}
+
+export async function findNativeSourceRecord(
+  ctx: RealWorkspace,
+  agentId: 'claude' | 'codex',
+  nativeSessionId: string,
+): Promise<NativeSourceEvidence> {
+  return findNativeRecordWith(ctx, agentId, nativeSessionId, readNativeSourceEvidence)
+}
+
 export async function findNativeRecord(
   ctx: RealWorkspace,
   agentId: 'claude' | 'codex',
   nativeSessionId: string,
 ): Promise<NativeEvidence> {
+  return findNativeRecordWith(ctx, agentId, nativeSessionId, readNativeEvidence)
+}
+
+/** This observer owns one bounded scan of this fixture's Native files; no symlinks are followed. */
+async function findNativeRecordWith<T extends { nativeIds: Set<string> }>(
+  ctx: RealWorkspace,
+  agentId: 'claude' | 'codex',
+  nativeSessionId: string,
+  read: (path: string) => Promise<T>,
+): Promise<T> {
   if (!/^[A-Za-z0-9_-]{1,128}$/u.test(nativeSessionId))
     throw new Error('Unexpected Native file identity')
   const storageRoot = await realpath(
@@ -86,15 +152,62 @@ export async function findNativeRecord(
     }
   }
   if (matches.length !== 1) throw new Error('Expected exactly one authentic Native record')
-  const evidence = await readNativeEvidence(matches[0]!)
+  const evidence = await read(matches[0]!)
   if (!evidence.nativeIds.has(nativeSessionId))
     throw new Error('Native filename and stored identity disagree')
   return evidence
 }
 
 export async function readNativeEvidence(path: string): Promise<NativeEvidence> {
+  return (await readNativeEvidenceWith(path, 'strict')).evidence
+}
+
+/** Typed diagnostic path: command absence stays unavailable until a complete source audit certifies it. */
+export async function readNativeSourceEvidence(path: string): Promise<NativeSourceEvidence> {
+  const { evidence, syntaxFailures } = await readNativeEvidenceWith(path, 'source')
+  const {
+    shellCommands: _commands,
+    commandCalls: _calls,
+    commandResults: _results,
+    ...snapshot
+  } = evidence
+  return {
+    ...snapshot,
+    commandInspection: { status: 'requires_source_audit', syntaxFailures },
+    certifySourceAudit(proof) {
+      if (
+        proof.sourceFileSha256 !== evidence.sha256 ||
+        !proof.allToolsAllowed ||
+        !proof.boundaryDiagnostics.ledgerValid ||
+        proof.codeModeScripts.length !== evidence.execScripts.length ||
+        proof.codeModeScripts.some(
+          (entry, index) =>
+            entry.sha256 !==
+            createHash('sha256').update(evidence.execScripts[index]!.input).digest('hex'),
+        )
+      )
+        throw Error('Native command inspection requires the complete matching source audit.')
+      return evidence
+    },
+  }
+}
+
+async function readNativeEvidenceWith(
+  path: string,
+  mode: 'strict' | 'source',
+): Promise<{ evidence: NativeEvidence; syntaxFailures: Array<{ sha256: string; bytes: number }> }> {
+  const syntaxFailures: Array<{ sha256: string; bytes: number }> = []
+  const pathBefore = await lstat(path)
+  if (!pathBefore.isFile()) throw new Error('Native evidence must be a regular file')
   const handle = await open(path, 'r')
   let bytes: Buffer
+  let observedFile: {
+    beforeSize: number
+    afterSize: number
+    identityStable: boolean
+    snapshotStable: boolean
+    modifiedDuringRead: boolean
+  }
   try {
     const info = await handle.stat()
     if (!info.isFile() || info.size > nativeByteLimit)
@@ -109,13 +222,33 @@ export async function readNativeEvidence(path: string): Promise<NativeEvidence> 
     }
     if (length > nativeByteLimit) throw new Error('Native evidence exceeds 8 MiB')
     bytes = bytes.subarray(0, length)
+    const after = await handle.stat()
+    const pathAfter = await lstat(path)
+    observedFile = {
+      beforeSize: info.size,
+      afterSize: after.size,
+      identityStable: [pathBefore, after, pathAfter].every(
+        (item) => item.isFile() && item.dev === info.dev && item.ino === info.ino,
+      ),
+      snapshotStable: nativeSnapshotStable([pathBefore, info, after, pathAfter], length),
+      modifiedDuringRead:
+        info.size !== after.size ||
+        info.mtimeMs !== after.mtimeMs ||
+        info.ctimeMs !== after.ctimeMs,
+    }
   } finally {
     await handle.close()
   }
   const lines = bytes.toString('utf8').split('\n').filter(Boolean)
   if (lines.length > nativeRecordLimit) throw new Error('Native evidence exceeds 10000 records')
   const texts: string[] = []
+  const codexStartedTurns = new Set<string>()
   const userRequestIds = new Set<string>()
+  const containsLiteralText = (text: string): boolean =>
+    bytes.toString('utf8').includes(JSON.stringify(text).slice(1, -1)) ||
+    texts.some(
+      (stored) => stored.includes(text) || stored.includes(JSON.stringify(text).slice(1, -1)),
+    )
   const evidence: NativeEvidence = {
     path,
     sha256: createHash('sha256').update(bytes).digest('hex'),
@@ -129,11 +262,33 @@ export async function readNativeEvidence(path: string): Promise<NativeEvidence> 
     commandResults: [],
     execScripts: [],
     codexTurnSettings: [],
+    containsLiteralText,
     containsText: (text) =>
-      bytes.toString('utf8').includes(JSON.stringify(text).slice(1, -1)) ||
-      texts.some(
-        (stored) => stored.includes(text) || stored.includes(JSON.stringify(text).slice(1, -1)),
-      ),
+      containsLiteralText(text) ||
+      (evidence.nativeIds.size === 1 &&
+        evidence.codexModelStarts === 1 &&
+        codexStartedTurns.size === 1 &&
+        observedFile.snapshotStable &&
+        nativeAnswerParity(lines, {
+          nativeSessionId: [...evidence.nativeIds][0]!,
+          nativeTurnId: [...codexStartedTurns][0]!,
+          text,
+          markers: [],
+        }).exactMatch),
+    answerParity: (input) => {
+      const projection = nativeAnswerParity(lines, input)
+      return {
+        ...projection,
+        completeProjection: projection.completeProjection && observedFile.snapshotStable,
+        exactMatch: projection.exactMatch && observedFile.snapshotStable,
+        file: {
+          sha256: createHash('sha256').update(bytes).digest('hex'),
+          bytes: bytes.length,
+          records: lines.length,
+          ...observedFile,
+        },
+      }
+    },
   }
   for (const line of lines) {
     let record: unknown
@@ -204,8 +359,10 @@ export async function readNativeEvidence(path: string): Promise<NativeEvidence> 
     if (isRecord(payload)) {
       if (record['type'] === 'session_meta' && typeof payload['id'] === 'string')
         evidence.nativeIds.add(payload['id'])
-      if (record['type'] === 'event_msg' && payload['type'] === 'task_started')
+      if (record['type'] === 'event_msg' && payload['type'] === 'task_started') {
         evidence.codexModelStarts += 1
+        if (typeof payload['turn_id'] === 'string') codexStartedTurns.add(payload['turn_id'])
+      }
       if (record['type'] === 'turn_context') {
         const model = nativeSettingText(payload['model'], 'turn_context model')
         const effortFields = {
@@ -267,6 +424,12 @@ export async function readNativeEvidence(path: string): Promise<NativeEvidence> 
           })
         try {
           const argumentsValue: unknown = JSON.parse(argument)
+          // A CodeMode body remains JavaScript even when it also looks like JSON.
+          if (
+            payload['type'] === 'custom_tool_call' &&
+            String(payload['name']).replace(/^functions\./u, '') === 'exec'
+          )
+            parseNativeExecScript(argument)
           if (isRecord(argumentsValue)) {
             const command = argumentsValue['cmd'] ?? argumentsValue['command']
             if (typeof command === 'string') {
@@ -288,8 +451,22 @@ export async function readNativeEvidence(path: string): Promise<NativeEvidence> 
           // Native custom exec runs JavaScript that calls tools.exec_command.
           // Parse literal arguments without evaluating the untrusted script.
           if (payload['type'] === 'custom_tool_call') {
-            const calls = literalExecCalls(argument)
-            for (const call of calls) {
+            let calls: NativeEvidence['commandCalls'] | undefined
+            try {
+              calls = literalExecCalls(argument)
+            } catch (error) {
+              if (mode !== 'source' || !(error instanceof SyntaxError)) throw error
+              // oxlint-disable-next-line eslint/preserve-caught-error -- Parser causes may contain private script literals; retain bounded facts only.
+              if (syntaxFailures.length >= 256) throw Error('Source syntax diagnostics exceed 256')
+              syntaxFailures.push({
+                sha256: createHash('sha256').update(argument).digest('hex'),
+                bytes: Buffer.byteLength(argument),
+              })
+              // Unknown command inspection remains explicit and cannot leave this diagnostic path
+              // until the caller supplies the matching complete source-ledger proof.
+              calls = undefined
+            }
+            for (const call of calls ?? []) {
               evidence.shellCommands.push(call.command)
               evidence.commandCalls.push({
                 ...call,
@@ -367,7 +544,7 @@ export async function readNativeEvidence(path: string): Promise<NativeEvidence> 
     }
   }
   evidence.claudeUserInputs = userRequestIds.size
-  return evidence
+  return { evidence, syntaxFailures }
 }
 
 /** Parse only the independent config/read ACK's settings scalars, never its private config. */
@@ -415,7 +592,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function literalExecCalls(script: string): NativeEvidence['commandCalls'] {
+export function parseNativeExecScript(script: string): unknown {
   const desktopRequire = createRequire(
     resolve(import.meta.dirname, '../../apps/desktop/package.json'),
   )
@@ -424,10 +601,92 @@ function literalExecCalls(script: string): NativeEvidence['commandCalls'] {
   const parser: unknown = babelRequire('@babel/parser')
   if (!isRecord(parser) || typeof parser['parse'] !== 'function')
     throw new Error('Native exec parser is unavailable')
-  const source: unknown = Reflect.apply(parser['parse'], undefined, [
-    script,
-    { sourceType: 'module' },
-  ])
+  try {
+    return Reflect.apply(parser['parse'], undefined, [script, { sourceType: 'module' }])
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error
+    const position: unknown = Reflect.get(error, 'pos'),
+      location: unknown = Reflect.get(error, 'loc'),
+      reason: unknown = Reflect.get(error, 'reasonCode'),
+      offset =
+        typeof position === 'number' &&
+        Number.isSafeInteger(position) &&
+        position >= 0 &&
+        position <= script.length
+          ? position
+          : null,
+      punctuation: Record<string, string> = {
+        '{': 'brace_open',
+        '}': 'brace_close',
+        '[': 'bracket_open',
+        ']': 'bracket_close',
+        '(': 'parenthesis_open',
+        ')': 'parenthesis_close',
+        ':': 'colon',
+        ',': 'comma',
+        ';': 'semicolon',
+        "'": 'single_quote',
+        '"': 'double_quote',
+        '`': 'backtick',
+        '\\': 'backslash',
+        '/': 'slash',
+        '=': 'equals',
+        '.': 'period',
+      },
+      start = offset === null ? 0 : Math.max(0, offset - 8),
+      characters =
+        offset === null
+          ? []
+          : Array.from({ length: Math.min(script.length, offset + 9) - start }, (_, index) => {
+              const value = script[start + index]!
+              return {
+                relativeOffset: start + index - offset,
+                kind:
+                  punctuation[value] ??
+                  (/[a-zA-Z_$]/u.test(value)
+                    ? 'ascii_letter'
+                    : /[0-9]/u.test(value)
+                      ? 'digit'
+                      : /[\r\n]/u.test(value)
+                        ? 'linebreak'
+                        : /\s/u.test(value)
+                          ? 'whitespace'
+                          : value.charCodeAt(0) > 127
+                            ? 'non_ascii'
+                            : 'other_punctuation'),
+              }
+            }),
+      boundedCoordinate = (key: string) => {
+        const value: unknown = isRecord(location) ? location[key] : undefined
+        return typeof value === 'number' &&
+          Number.isSafeInteger(value) &&
+          value >= 0 &&
+          value <= script.length + 1
+          ? value
+          : null
+      },
+      facts = {
+        version: 'pact-native-script-syntax-v1',
+        inputSha256: createHash('sha256').update(script).digest('hex'),
+        inputUtf8Bytes: Buffer.byteLength(script),
+        reasonCode:
+          typeof reason === 'string' && /^[A-Za-z]{1,80}$/u.test(reason) ? reason : 'unknown',
+        offset,
+        line: boundedCoordinate('line'),
+        column: boundedCoordinate('column'),
+        characters,
+        rawScriptOrParserMessageRetained: false,
+      },
+      message = `Native exec script syntax inspection failed: ${JSON.stringify(facts)}`
+    // Keep rejection and safe localization before fixture cleanup; Babel messages/causes may quote private inputs.
+    throw new SyntaxError(
+      Buffer.byteLength(message) <= 2048 ? message : 'Native exec script syntax inspection failed',
+    )
+  }
+}
+
+function literalExecCalls(script: string): NativeEvidence['commandCalls'] {
+  const source = parseNativeExecScript(script)
   const pending: unknown[] = [source]
   const calls: NativeEvidence['commandCalls'] = []
   let nodes = 0

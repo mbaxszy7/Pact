@@ -10,7 +10,11 @@ import {
 } from '@pact/contracts'
 
 import { markdownProjectionRehypePlugin } from '../../../../shared/message-anchor-text'
-import { MessageSelectionSurface, type MessageTextSelection } from './MessageSelectionSurface'
+import {
+  MessageSelectionSurface,
+  type MessageTextSelection,
+  type DocumentSelectionAdapter,
+} from './MessageSelectionSurface'
 
 export interface ProjectFileTarget {
   path: string
@@ -30,6 +34,7 @@ interface MessageMarkdownProps {
   onOpenProjectFile: (target: ProjectFileTarget) => void
   messageId?: string | undefined
   onCreateComment?: ((selection: MessageTextSelection) => void) | undefined
+  documentSelection?: DocumentSelectionAdapter | undefined
 }
 
 export const MessageMarkdown = memo(function MessageMarkdown({
@@ -39,6 +44,7 @@ export const MessageMarkdown = memo(function MessageMarkdown({
   onOpenProjectFile,
   messageId,
   onCreateComment,
+  documentSelection,
 }: MessageMarkdownProps): React.JSX.Element {
   const openProjectFileRef = useRef(onOpenProjectFile)
   useLayoutEffect(() => {
@@ -64,11 +70,17 @@ export const MessageMarkdown = memo(function MessageMarkdown({
           )
           .map(([name, start, end]) => ({ name, start, end }))
       : []
+    const prefix = parseComposerCommandPrefix(decorationContent, selected)
     const ranges: SkillRange[] = []
-    for (const entry of [
-      ...parseComposerCommandPrefix(decorationContent, selected).skills,
-      ...selected,
-    ]) {
+    if (prefix.pact && !prefix.error) {
+      const leading = decorationContent.slice(0, prefix.argumentsStart)
+      const command = /(?:^|\s)\/(plan|review|build)(?=\s|$)/u.exec(leading)
+      if (command?.[1] === prefix.pact) {
+        const start = command.index + command[0].lastIndexOf('/')
+        ranges.push({ name: prefix.pact, start, end: start + prefix.pact.length + 1, pact: true })
+      }
+    }
+    for (const entry of [...prefix.skills, ...selected]) {
       if (
         decorationContent.slice(entry.start, entry.end) !== `/${entry.name}` ||
         ranges.some((range) => range.start === entry.start && range.end === entry.end)
@@ -106,7 +118,11 @@ export const MessageMarkdown = memo(function MessageMarkdown({
     [content, tree, markdownComponents, remarkPlugins, rehypePlugins],
   )
   return (
-    <MessageSelectionSurface messageId={messageId} onCreateComment={onCreateComment}>
+    <MessageSelectionSurface
+      messageId={messageId}
+      onCreateComment={onCreateComment}
+      documentSelection={documentSelection}
+    >
       {renderedMarkdown}
     </MessageSelectionSurface>
   )
@@ -125,9 +141,20 @@ function renderProjectionTree(
   key = 'root',
 ): React.ReactNode {
   if (node.type === 'text') return node.value ?? ''
-  const children = (node.children ?? []).map((child, index) =>
-    renderProjectionTree(child, components, `${key}:${index}`),
-  )
+  const children = (node.children ?? []).map((child, index) => {
+    const properties = child.properties
+    const identity =
+      properties?.['data-pact-projection-start'] !== undefined
+        ? `text:${String(properties['data-pact-projection-start'])}:${String(properties['data-pact-projection-end'])}`
+        : properties?.['data-pact-source-start'] !== undefined
+          ? `alias:${String(properties['data-pact-source-start'])}:${String(properties['data-pact-source-end'])}`
+          : properties?.['data-pact-fragment-start'] !== undefined
+            ? `fragment:${String(properties['data-pact-fragment-start'])}:${String(properties['data-pact-fragment-end'])}`
+            : properties?.['data-pact-node-id'] !== undefined
+              ? `node:${String(properties['data-pact-node-id'])}`
+              : `child:${index}`
+    return renderProjectionTree(child, components, `${key}:${identity}`)
+  })
   if (node.type === 'root') return children
   const tag = node.tagName ?? 'span'
   const props: Record<string, unknown> = { ...node.properties, key }
@@ -186,15 +213,20 @@ function createMarkdownComponents(
         parts.push(
           <span
             key={`skill-${start}`}
-            title={`Skill · ${entry.name}`}
-            className="relative mx-0.5 inline-flex max-w-full items-baseline gap-1.5 rounded-control border border-border/60 bg-surface-raised/50 px-2 py-0.5 align-baseline text-caption font-medium leading-normal text-primary"
+            title={`${entry.pact ? 'Pact' : 'Skill'} · ${entry.name}`}
+            data-pact-command={entry.pact ? entry.name : undefined}
+            className={`relative mx-0.5 inline-flex max-w-full items-baseline gap-1.5 rounded-control border border-border/60 ${entry.pact ? 'bg-surface-muted' : 'bg-surface-raised/50'} px-2 py-0.5 align-baseline text-caption font-medium leading-normal text-primary`}
           >
             <BookOpen
               aria-hidden="true"
               className="size-3.5 shrink-0 self-center"
               strokeWidth={1.75}
             />
-            <span className="min-w-0 break-all">
+            <span
+              className={
+                entry.pact ? "min-w-0 break-all before:content-['pact:']" : 'min-w-0 break-all'
+              }
+            >
               <span
                 aria-hidden="true"
                 className="text-[0px]"
@@ -304,6 +336,7 @@ interface SkillRange {
   name: string
   start: number
   end: number
+  pact?: boolean
 }
 
 function safeMarkdownUrl(url: string): string {
@@ -318,27 +351,25 @@ function projectFileTarget(href: string): ProjectFileTarget | undefined {
   if (/^[a-z][a-z\d+.-]*:/iu.test(href) && !/^file:/iu.test(href) && !/^[a-z]:[\\/]/iu.test(href)) {
     return undefined
   }
-  let decoded: string
+  const hashIndex = href.lastIndexOf('#')
+  let path = hashIndex >= 0 ? href.slice(0, hashIndex) : href
+  if (!path) return undefined
+  let hash: string
   try {
-    decoded = decodeURIComponent(href)
+    hash = decodeURIComponent(hashIndex >= 0 ? href.slice(hashIndex + 1) : '')
   } catch {
     return undefined
   }
-  if (decoded.startsWith('file://')) {
-    try {
-      decoded = new URL(decoded).pathname
-    } catch {
-      return undefined
-    }
-  }
-  const hashIndex = decoded.lastIndexOf('#')
-  let path = hashIndex >= 0 ? decoded.slice(0, hashIndex) : decoded
-  if (!path) return undefined
-  const hash = hashIndex >= 0 ? decoded.slice(hashIndex + 1) : ''
   const range = /^L(\d+)(?:-L?(\d+))?$/u.exec(hash)
   if (hash && !range) return undefined
   const suffixRange = hash ? undefined : /^(.*):(\d+)(?::\d+)?(?:-(\d+))?$/u.exec(path)
   if (suffixRange?.[1]) path = suffixRange[1]
+  try {
+    // Utility decodes file URLs with the host platform's native path rules.
+    if (!/^file:/iu.test(path)) path = decodeURIComponent(path)
+  } catch {
+    return undefined
+  }
   const lineStart = range?.[1]
     ? Number(range[1])
     : suffixRange?.[2]

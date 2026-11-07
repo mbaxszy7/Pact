@@ -36,13 +36,24 @@ const invalid = (message: string): AgentExecutionError =>
 export async function readCodexInitializationRollout(
   input: CodexInitializationRolloutInput,
   signal: AbortSignal,
+  observePhysicalCompletion?: (completion: Promise<void>) => void,
 ): Promise<NativeInitializationWitness> {
   const reservation = new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES)
+  const physical = Promise.withResolvers<void>()
+  observePhysicalCompletion?.(physical.promise)
   const controller = new AbortController()
   const deadline = setTimeout(() => controller.abort(), READ_DEADLINE_MS)
   const observed = AbortSignal.any([signal, controller.signal])
   let handle: Awaited<ReturnType<typeof open>> | undefined
-  let stream: ReturnType<Awaited<ReturnType<typeof open>>['createReadStream']> | undefined
+  let handleClosed = false,
+    readJoined = false,
+    released = false
+  const settlePhysical = (): void => {
+    if (released || !readJoined || (handle && !handleClosed)) return
+    released = true
+    reservation.release()
+    physical.resolve()
+  }
   try {
     observed.throwIfAborted()
     if (
@@ -194,15 +205,20 @@ export async function readCodexInitializationRollout(
       seedHash.update(text)
       seeds += 1
     }
-    stream = handle.createReadStream({
-      autoClose: false,
-      start: 0,
-      end: bytes - 1,
-      highWaterMark: 64 * 1024,
-      signal: observed,
-    })
-    for await (const raw of stream) {
-      if (!Buffer.isBuffer(raw)) throw invalid('The native rollout reader did not return bytes.')
+    // Keep one close owner. ReadStream destruction can initiate FileHandle.close itself,
+    // after which a second close() may resolve before the first OS close has settled.
+    const readBuffer = Buffer.allocUnsafe(64 * 1024)
+    while (position < bytes) {
+      observed.throwIfAborted()
+      // oxlint-disable-next-line no-await-in-loop -- One bounded physical read at a time; no stream can close this handle.
+      const { bytesRead } = await handle.read(
+        readBuffer,
+        0,
+        Math.min(readBuffer.length, bytes - position),
+        position,
+      )
+      if (bytesRead === 0) break
+      const raw = readBuffer.subarray(0, bytesRead)
       observed.throwIfAborted()
       const prefixLength = Math.max(0, Math.min(raw.length, prefixBytes - position))
       if (prefixLength) prefixHash.update(raw.subarray(0, prefixLength))
@@ -221,7 +237,8 @@ export async function readCodexInitializationRollout(
             'A native rollout record exceeds the complete read budget.',
             false,
           )
-        if (part.length) parts.push(part)
+        // An incomplete record survives the next reuse of the fixed read buffer.
+        if (part.length) parts.push(Buffer.from(part))
         if (newline < 0) break
         recordEnd += lineBytes + 1
         inspect(Buffer.concat(parts, lineBytes))
@@ -268,11 +285,12 @@ export async function readCodexInitializationRollout(
     )
   } finally {
     clearTimeout(deadline)
-    stream?.destroy()
     try {
       await handle?.close()
+      handleClosed = true
     } finally {
-      reservation.release()
+      readJoined = true
+      settlePhysical()
     }
   }
 }

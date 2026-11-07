@@ -26,11 +26,32 @@ const session: CollaborationSession = {
     primaryAgentId: 'codex',
     agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
     maxDiscussionRounds: 3,
-    runningMessagePolicy: 'next_round',
+
     maxReviewCycles: 3,
     maxRepairAttempts: 3,
   },
 }
+
+it('keeps a dismissed query closed across cursor events until the command changes', () => {
+  vi.stubGlobal('pact', composerBridgeFixture())
+  const hook = renderHook(
+    ({ text }) => useSkillComposer({ session, text, selections: [], disabled: false }),
+    { initialProps: { text: '/' } },
+  )
+  act(() => hook.result.current.update('/', 1, []))
+  expect(hook.result.current.query?.text).toBe('')
+  act(() => hook.result.current.close())
+  act(() => hook.result.current.update('/', 1, []))
+  expect(hook.result.current.query).toBeUndefined()
+  hook.rerender({ text: '/p' })
+  act(() => hook.result.current.update('/p', 2, []))
+  expect(hook.result.current.query?.text).toBe('p')
+  act(() => hook.result.current.close())
+  act(() => hook.result.current.update('', 0, []))
+  hook.rerender({ text: '/' })
+  act(() => hook.result.current.update('/', 1, []))
+  expect(hook.result.current.query?.text).toBe('')
+})
 
 it('More Skills advances the visible window, crosses native pages and permits reverse navigation', async () => {
   const bridge = composerBridgeFixture()

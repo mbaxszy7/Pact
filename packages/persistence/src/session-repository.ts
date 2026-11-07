@@ -779,7 +779,7 @@ export class SessionRepository {
       claudePermissionMode: settings.permissionModes?.claude ?? 'ask',
       codexPermissionMode: settings.permissionModes?.codex ?? 'native',
       maxDiscussionRounds: settings.maxDiscussionRounds,
-      runningMessagePolicy: settings.runningMessagePolicy,
+      runningMessagePolicy: 'next_round',
       maxReviewCycles: settings.maxReviewCycles,
       maxRepairAttempts: settings.maxRepairAttempts,
       createdAt,
@@ -833,7 +833,6 @@ export class SessionRepository {
         },
       },
       maxDiscussionRounds: settings.maxDiscussionRounds,
-      runningMessagePolicy: settings.runningMessagePolicy,
       maxReviewCycles: settings.maxReviewCycles,
       maxRepairAttempts: settings.maxRepairAttempts,
     }
