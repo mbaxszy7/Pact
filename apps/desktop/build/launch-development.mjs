@@ -1,10 +1,9 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { closeSync, constants, openSync, unlinkSync } from 'node:fs'
+import { constants } from 'node:fs'
 import {
   copyFile,
   cp,
-  mkdir,
   readFile,
   realpath,
   rename,
@@ -19,6 +18,7 @@ import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
 import identities from '../app-identities.json' with { type: 'json' }
+import { acquireMacDevelopmentLaunchLock } from './mac-development-launch-lock.mjs'
 import { prepareWindowsOwnedProcessResource } from './windows-owned-process-resource.mjs'
 
 const require = createRequire(import.meta.url)
@@ -118,8 +118,7 @@ async function prepareMacRuntime(signal) {
 }
 
 const cancellation = new AbortController()
-let lock
-const lockPath = join(runtimeDirectory, 'launch.lock')
+let release = () => {}
 const onSignal = (signal) => {
   cancellation.abort()
   process.exitCode = signal === 'SIGINT' ? 130 : 143
@@ -128,27 +127,13 @@ const interrupt = () => onSignal('SIGINT')
 const terminate = () => onSignal('SIGTERM')
 process.on('SIGINT', interrupt)
 process.on('SIGTERM', terminate)
-const release = () => {
-  if (lock === undefined) return
-  closeSync(lock)
-  lock = undefined
-  unlinkSync(lockPath)
-}
-
 try {
   if (process.platform === 'darwin') {
-    await mkdir(runtimeDirectory, { recursive: true })
-    try {
-      lock = openSync(lockPath, 'wx', 0o600)
-      process.once('exit', release)
-    } catch (error) {
-      if (error.code === 'EEXIST')
-        throw new Error(
-          'This checkout already has a development launch. Close it before starting again. If a previous launch was forcibly terminated, remove .pact-data/mac-development-runtime/launch.lock after confirming it has exited.',
-          { cause: error },
-        )
-      throw error
-    }
+    release = await acquireMacDevelopmentLaunchLock(
+      runtimeDirectory,
+      join(runtimeDirectory, `${identity.name}.app`),
+      cancellation.signal,
+    )
     process.env.ELECTRON_EXEC_PATH = await prepareMacRuntime(cancellation.signal)
   }
   if (process.platform === 'win32')

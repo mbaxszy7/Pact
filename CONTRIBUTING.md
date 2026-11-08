@@ -106,8 +106,12 @@ The generated copy is ad-hoc signed without changing Electron's entitlements or 
 installed Electron remains untouched. The existing electron-vite CLI runs with that executable,
 including normal hot reload. One generated runtime is reused until its source, branding or launcher
 changes. Exit the running development instance before starting another from the same checkout.
-A forcibly terminated launch may leave `launch.lock`; remove only that generated lock after
-confirming the previous instance has exited. This development bundle is not a distribution package.
+`launch.lock` is a persistent file backing a macOS kernel lock, not an existence marker. The kernel
+releases ownership even after a forced exit; an abandoned empty lock from an older launcher is reused
+automatically. Do not delete the lock file: replacing its inode can bypass a live owner's lock.
+Startup checks also preserve live older launchers and development application/helper processes left
+behind after a launcher exits. Quit those processes before retrying; an unverifiable exit blocks
+runtime replacement. This development bundle is not a distribution package.
 
 `pnpm dist:win` and `pnpm dist:mac` explicitly build `Pact - Production - Local`. Its application ID,
 executable/bundle name, installation directory, shortcuts, package identity and persistent profile
