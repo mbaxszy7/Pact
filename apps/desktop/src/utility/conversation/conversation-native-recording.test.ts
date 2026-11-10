@@ -1,3 +1,4 @@
+import { eq } from 'drizzle-orm'
 import { randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -17,7 +18,14 @@ import type {
   RuntimeAgentId,
 } from '@pact/contracts'
 
-import { agentEventJournal, PactDatabase } from '@pact/persistence'
+import { isConversationBackgroundReport } from '@pact/contracts'
+import {
+  agentEventJournal,
+  agentRuns,
+  conversationMessages,
+  nativeAgentContexts,
+  PactDatabase,
+} from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
@@ -33,6 +41,8 @@ const native = vi.hoisted(() => ({
   actors: 0,
   disposed: 0,
   retainNext: false,
+  terminalGate: undefined as Promise<void> | undefined,
+  unavailableReport: false,
   inspect:
     vi.fn<
       (
@@ -81,7 +91,19 @@ async function* scriptedRun(
     outputId: 'answer',
     text: 'Changes are recorded. The development server may continue in the background.',
   }
+  if (native.terminalGate) await native.terminalGate
   yield { type: 'turn.completed', agentId, turnId: `turn:${input.runId}`, outcome: 'completed' }
+  if (native.unavailableReport && agentId === 'claude')
+    input.recordBackgroundReportUnavailable?.({
+      agentId,
+      runId: input.runId,
+      nativeSessionId,
+      nativeTurnId: `turn:${input.runId}`,
+      bindingGeneration: input.bindingGeneration!,
+      executorId,
+      frameId: randomUUID(),
+      nativeMessageId: 'owned-unavailable-report',
+    })
   if (!native.background.has(input.runId))
     input.reportNativeEffects?.({
       runId: input.runId,
@@ -114,6 +136,11 @@ vi.mock('./codex-agent-adapter.js', () => ({
         ? native.background.has(runId)
         : native.background.size + native.extraBackground > 0
     }
+    backgroundWork(runId: string, executorId: string) {
+      return executorId === this.executorId && native.background.has(runId)
+        ? ('working' as const)
+        : undefined
+    }
     run(input: AgentRunInput, signal: AbortSignal) {
       return scriptedRun(this.id, this.executorId, input, signal)
     }
@@ -132,6 +159,11 @@ vi.mock('./claude-agent-adapter.js', () => ({
         ? native.background.has(runId)
         : native.background.size + native.extraBackground > 0
     }
+    backgroundWork(runId: string, executorId: string) {
+      return executorId === this.executorId && native.background.has(runId)
+        ? ('working' as const)
+        : undefined
+    }
     run(input: AgentRunInput, signal: AbortSignal) {
       return scriptedRun(this.id, this.executorId, input, signal)
     }
@@ -149,6 +181,8 @@ afterEach(() => {
   native.actors = 0
   native.disposed = 0
   native.retainNext = false
+  native.terminalGate = undefined
+  native.unavailableReport = false
   native.inspect.mockReset()
 })
 
@@ -249,13 +283,15 @@ it('offers a newly confirmed creation after an unconfirmed candidate cannot be v
       abandon: false,
     })
     const chunks: NativeContextRebuildChunk[] = []
+    const sourceRevisions = new Map<string, number>()
     for await (const chunk of repo.nativeContextRebuildSource(
       f.sessionId,
       new AbortController().signal,
       id,
+      sourceRevisions,
     ))
       chunks.push(chunk)
-    repo.freezeNativeRebuildSource(id, chunks)
+    repo.freezeNativeRebuildSource(id, chunks, sourceRevisions)
     const observed: import('@pact/contracts').NativeContextRebuildChunk[] = []
     native.inspect.mockImplementation(async (_input, source) => {
       for await (const chunk of source) observed.push(chunk)
@@ -333,13 +369,15 @@ it('does not let an old candidate check alter a newer recovery operation', async
       abandon: false,
     })
     const chunks: NativeContextRebuildChunk[] = []
+    const sourceRevisions = new Map<string, number>()
     for await (const chunk of repo.nativeContextRebuildSource(
       f.sessionId,
       new AbortController().signal,
       id,
+      sourceRevisions,
     ))
       chunks.push(chunk)
-    repo.freezeNativeRebuildSource(id, chunks)
+    repo.freezeNativeRebuildSource(id, chunks, sourceRevisions)
     repo.markNativeRebuildDispatched(id)
     repo.recordNativeRebuildIdentity(id, 'candidate')
     repo.failNativeRebuild(id, 'Reply lost')
@@ -610,6 +648,311 @@ it.each(['codex', 'claude'] as const)(
   // Root ending and Composer admission are checked earlier; this wait covers
   // asynchronous immutable-file finalization after actual background EOF.
   30_000,
+)
+
+it('persists an attributed unavailable report without changing the completed root or work outcome', async () => {
+  const f = await fixture('claude')
+  native.unavailableReport = true
+  try {
+    const id = await f.send()
+    const saved = f.db.conversationRepository.read(f.sessionId)
+    const report = saved.messages.find(isConversationBackgroundReport)
+    expect(report).toMatchObject({
+      sourceMessageId: saved.runs[0]!.userMessageId,
+      role: 'assistant',
+      agentId: 'claude',
+      state: 'incomplete',
+      content: '',
+    })
+    const root = saved.messages.find(
+      (message) => message.runId === id && message.role === 'assistant',
+    )
+    expect(root?.state).toBe('complete')
+    expect(root?.content).toContain('Changes are recorded.')
+    expect(saved.runs[0]).toMatchObject({
+      nativeOutcome: 'completed',
+      nativeEffectsState: 'pending',
+    })
+    f.endBackground(id)
+    expect(f.db.conversationRepository.findRun(id)?.nativeEffectsState).toBe('settled')
+    expect(native.actors).toBe(1)
+  } finally {
+    await f.dispose()
+  }
+})
+
+it('pauses the original foreground queue when its retained observer later loses work evidence', async () => {
+  const f = await fixture('codex')
+  const terminal = Promise.withResolvers<void>()
+  native.terminalGate = terminal.promise
+  try {
+    const first = f.send()
+    await vi.waitFor(() => expect(native.inputs.size).toBe(1))
+    const input = [...native.inputs.values()][0]!
+    const queuedId = randomUUID()
+    const drafts = f.db.conversationRepository.readPage({ scope: 'drafts', sessionId: f.sessionId })
+    if (drafts.scope !== 'drafts') throw new Error('Missing draft revision')
+    const accepted = await f.flow.send({
+      sessionId: f.sessionId,
+      clientMessageId: queuedId,
+      content: 'Keep this queued source intact.',
+      expectedCommentsRevision: drafts.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'codex' },
+    })
+    expect(accepted).toMatchObject({ ok: true })
+    terminal.resolve()
+    await first
+    expect(f.db.conversationRepository.queueState(f.sessionId).input).toMatchObject({
+      id: queuedId,
+      state: 'queued',
+    })
+    input.reportNativeEffects!({
+      runId: input.runId,
+      generation: input.nativeGeneration!,
+      state: 'unknown',
+      reason: 'native_observation_lost',
+    })
+    expect(f.db.conversationRepository.queueState(f.sessionId).input).toMatchObject({
+      id: queuedId,
+      state: 'paused',
+    })
+    expect(f.db.conversationRepository.readReceivedInput(f.sessionId)?.content).toBe(
+      'Keep this queued source intact.',
+    )
+    expect(native.actors).toBe(1)
+  } finally {
+    terminal.resolve()
+    await f.dispose()
+  }
+})
+
+it('never auto-dispatches a peer-anchored queue while another current background owner is unknown', async () => {
+  const f = await fixture('codex')
+  const terminal = Promise.withResolvers<void>()
+  try {
+    await writeFile(join(f.projectDirectory, 'file-3.ts'), 'export const value = 0\n')
+    const original = await f.send()
+    const sendToClaude = async (content: string) => {
+      const drafts = f.db.conversationRepository.readPage({
+        scope: 'drafts',
+        sessionId: f.sessionId,
+      })
+      if (drafts.scope !== 'drafts') throw new Error('Missing draft revision')
+      return f.flow.send({
+        sessionId: f.sessionId,
+        clientMessageId: randomUUID(),
+        content,
+        expectedCommentsRevision: drafts.commentsRevision,
+        commentIds: [],
+        route: { type: 'agent', agentId: 'claude' },
+      })
+    }
+    native.terminalGate = terminal.promise
+    const peer = await sendToClaude('Complete the independent peer response.')
+    expect(peer).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(native.actors).toBe(2))
+    const queued = await sendToClaude('Keep this later peer input frozen.')
+    expect(queued).toMatchObject({ ok: true })
+    const queuedId = f.db.conversationRepository.queueState(f.sessionId).input!.id
+    const input = native.inputs.get(original)!
+    native.background.delete(original)
+    input.reportNativeEffects!({
+      runId: original,
+      generation: input.nativeGeneration!,
+      state: 'unknown',
+      reason: 'native_connection_lost',
+    })
+    terminal.resolve()
+    await vi.waitFor(() => expect(f.flow.diagnostics().activeExecutions).toBe(0), {
+      timeout: 10_000,
+    })
+    await vi.waitFor(() => {
+      expect(
+        native.actors > 2 ||
+          f.db.conversationRepository.queueState(f.sessionId).input?.state === 'paused',
+      ).toBe(true)
+    })
+    expect(native.actors).toBe(2)
+    expect(f.db.conversationRepository.readReceivedInput(f.sessionId)?.content).toBe(
+      'Keep this later peer input frozen.',
+    )
+    const state = f.db.conversationRepository.queueState(f.sessionId)
+    expect(state.input).toMatchObject({ id: queuedId, state: 'paused' })
+    // A direct/stale Resume must not bypass the shared execution-admission gate.
+    f.flow.resumeConversationQueue({
+      sessionId: f.sessionId,
+      inputId: queuedId,
+      operationId: randomUUID(),
+      expectedRevision: state.revision,
+    })
+    await vi.waitFor(() => {
+      expect(
+        native.actors > 2 ||
+          f.db.conversationRepository.queueState(f.sessionId).input?.state === 'paused',
+      ).toBe(true)
+    })
+    expect(native.actors).toBe(2)
+    expect(f.db.conversationRepository.queueState(f.sessionId).input).toMatchObject({
+      id: queuedId,
+      state: 'paused',
+    })
+    expect(f.db.conversationRepository.findRun(original)?.nativeEffectsState).toBe('unknown')
+  } finally {
+    terminal.resolve()
+    await f.dispose()
+  }
+}, 30_000)
+
+it('keeps unknown current background work visible and blocks Send after a newer unsent refusal', async () => {
+  const f = await fixture('codex')
+  try {
+    const original = await f.send()
+    native.extraBackground = 7
+    const refused = await f.send()
+    expect(f.db.conversationRepository.findRun(refused)?.dispatchPhase).toBe('not_sent')
+    native.extraBackground = 0
+    const input = native.inputs.get(original)!
+    input.reportNativeEffects!({
+      runId: original,
+      generation: input.nativeGeneration!,
+      state: 'unknown',
+      reason: 'native_observation_lost',
+    })
+    const page = await f.flow.load({ scope: 'messages', sessionId: f.sessionId })
+    if (!page.ok || page.value.scope !== 'messages') throw new Error('Missing message view')
+    expect(page.value.header.sessionIssues).toMatchObject({
+      inputGate: 'send_blocked',
+      agents: [expect.objectContaining({ runId: original, phase: 'background_check' })],
+    })
+    const drafts = f.db.conversationRepository.readPage({ scope: 'drafts', sessionId: f.sessionId })
+    if (drafts.scope !== 'drafts') throw new Error('Missing draft revision')
+    const sent = await f.flow.send({
+      sessionId: f.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'This must remain unsent until recovery.',
+      expectedCommentsRevision: drafts.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'codex' },
+    })
+    expect(sent).toMatchObject({
+      ok: false,
+      error: { message: expect.stringContaining('background work') },
+    })
+    expect(native.actors).toBe(1)
+    expect(f.db.conversationRepository.findRun(original)?.nativeEffectsState).toBe('unknown')
+  } finally {
+    native.extraBackground = 0
+    await f.dispose()
+  }
+})
+
+it.each([
+  ['interrupted', 'incomplete', undefined],
+  ['interrupted', 'complete', undefined],
+  ['failed', 'incomplete', undefined],
+  ['failed', 'complete', undefined],
+  ['failed', 'complete', 'response_too_large'],
+] as const)(
+  'keeps %s roots with %s output and unknown work behind the same recovery gate',
+  async (status, bodyState, failureKind) => {
+    const f = await fixture('codex')
+    try {
+      const original = await f.send()
+      const repo = f.db.conversationRepository
+      const response = repo
+        .read(f.sessionId)
+        .messages.find((message) => message.runId === original && message.role === 'assistant')!
+      f.db.drizzle
+        .update(agentRuns)
+        .set({ status, nativeOutcome: status, ...(failureKind ? { failureKind } : {}) })
+        .where(eq(agentRuns.id, original))
+        .run()
+      f.db.drizzle
+        .update(conversationMessages)
+        .set({ state: bodyState })
+        .where(eq(conversationMessages.id, response.id))
+        .run()
+      native.background.delete(original)
+      repo.recordNativeEffects(original, 'unknown', 'pact_restarted')
+      for (const action of ['retry_check', 'rebuild'] as const) {
+        if (action === 'rebuild')
+          repo.recordNativeEffects(original, 'unknown', 'background_check_unconfirmed')
+        // oxlint-disable-next-line eslint/no-await-in-loop -- Observe this exact cursor before and after its ordered recovery fact.
+        const page = await f.flow.load({ scope: 'messages', sessionId: f.sessionId })
+        if (!page.ok || page.value.scope !== 'messages') throw new Error('Missing message view')
+        expect(page.value.header.sessionIssues).toMatchObject({
+          inputGate: 'send_blocked',
+          agents: [expect.objectContaining({ runId: original, phase: 'background_check', action })],
+        })
+      }
+      const drafts = repo.readPage({ scope: 'drafts', sessionId: f.sessionId })
+      if (drafts.scope !== 'drafts') throw new Error('Missing draft revision')
+      const sent = await f.flow.send({
+        sessionId: f.sessionId,
+        clientMessageId: randomUUID(),
+        content: 'Keep this draft until native work is confirmed.',
+        expectedCommentsRevision: drafts.commentsRevision,
+        commentIds: [],
+        route: { type: 'agent', agentId: 'codex' },
+      })
+      expect(sent).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
+      expect(repo.read(f.sessionId).runs).toHaveLength(1)
+      expect(native.actors).toBe(1)
+    } finally {
+      await f.dispose()
+    }
+  },
+)
+
+it.each(['missing', 'changed'] as const)(
+  'keeps a current background cursor blocked when executor authority is %s',
+  async (authority) => {
+    const f = await fixture('codex')
+    try {
+      const original = await f.send()
+      // A pre-executor stored cursor has native identity but no process-control receipt.
+      if (authority === 'missing')
+        f.db.drizzle
+          .update(agentRuns)
+          .set({ executorId: null })
+          .where(eq(agentRuns.id, original))
+          .run()
+      f.db.drizzle
+        .update(nativeAgentContexts)
+        .set({ executorId: authority === 'missing' ? null : randomUUID() })
+        .where(eq(nativeAgentContexts.sessionId, f.sessionId))
+        .run()
+      const page = await f.flow.load({ scope: 'messages', sessionId: f.sessionId })
+      if (!page.ok || page.value.scope !== 'messages') throw new Error('Missing message view')
+      expect(page.value.header.sessionIssues).toMatchObject({
+        inputGate: 'send_blocked',
+        agents: [expect.objectContaining({ runId: original, phase: 'background_check' })],
+      })
+      expect(page.value.header.sessionIssues?.agents[0]?.backgroundStop).toBeUndefined()
+      const drafts = f.db.conversationRepository.readPage({
+        scope: 'drafts',
+        sessionId: f.sessionId,
+      })
+      if (drafts.scope !== 'drafts') throw new Error('Missing draft revision')
+      const sent = await f.flow.send({
+        sessionId: f.sessionId,
+        clientMessageId: randomUUID(),
+        content: 'Do not bypass unclassified native work.',
+        expectedCommentsRevision: drafts.commentsRevision,
+        commentIds: [],
+        route: { type: 'agent', agentId: 'codex' },
+      })
+      expect(sent).toMatchObject({
+        ok: false,
+        error: { message: expect.stringContaining('background work') },
+      })
+      expect(native.actors).toBe(1)
+      expect(f.db.conversationRepository.findRun(original)?.nativeEffectsState).toBe('pending')
+    } finally {
+      await f.dispose()
+    }
+  },
 )
 
 it.each(['codex', 'claude'] as const)(

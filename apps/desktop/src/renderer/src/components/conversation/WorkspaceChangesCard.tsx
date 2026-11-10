@@ -33,15 +33,12 @@ export function WorkspaceChangesCard({
   onOpenFile: (changeSetId: string, path: string) => void
 }): React.JSX.Element {
   const unavailable = changeSet.state !== 'ready' || Boolean(changeSet.undoUnavailableReason)
-  const reason =
-    changeSet.state === 'recording'
-      ? 'Background work is still being observed. You can review recorded changes; Undo is unavailable until recording settles.'
-      : (changeSet.undoUnavailableReason ??
-        (changeSet.state === 'mixed'
-          ? 'Concurrent changes were preserved. This round cannot be undone.'
-          : changeSet.state === 'recovery_required'
-            ? 'File recovery must finish before Undo is available.'
-            : undefined))
+  const reason = changeSet.undoUnavailableReason
+  const shortReason = reason?.startsWith(
+    'The Agent did not provide complete original and final file versions.',
+  )
+    ? 'Original or final file versions are missing.'
+    : reason?.split(/(?<=[.!?])\s/u)[0]?.trim()
   const undoTooltipId = useId()
   const [undoTooltipDismissed, setUndoTooltipDismissed] = useState(false)
   const undoDisabled = unavailable || disabled || undoing
@@ -51,18 +48,12 @@ export function WorkspaceChangesCard({
       ? 'Already undone.'
       : changeSet.state === 'recording'
         ? 'Waiting for file changes to finish.'
-        : changeSet.state === 'mixed'
-          ? 'Concurrent edits prevent Undo.'
-          : changeSet.state === 'recovery_required'
+        : shortReason ||
+          (changeSet.state === 'recovery_required'
             ? 'Recover files before Undo.'
-            : reason?.startsWith(
-                  'The Agent did not provide complete original and final file versions.',
-                )
-              ? 'Original or final file versions are missing.'
-              : reason?.split(/(?<=[.!?])\s/u)[0]?.trim() ||
-                (disabled
-                  ? 'Wait for the current operation to finish.'
-                  : 'Undo is unavailable for these changes.')
+            : disabled && changeSet.state === 'ready'
+              ? 'Wait for the current operation to finish.'
+              : 'Undo is unavailable for these changes.')
   const files = list?.files.slice(0, list.expanded ? list.files.length : 3) ?? []
   const remaining = Math.max(0, changeSet.fileCount - files.length)
 
@@ -145,11 +136,6 @@ export function WorkspaceChangesCard({
           View changes
         </button>
       </header>
-      {reason && changeSet.state !== 'ready' && changeSet.state !== 'undone' ? (
-        <p className="line-clamp-2 break-words px-3 pb-2.5 text-secondary" title={reason}>
-          {reason}
-        </p>
-      ) : null}
       {files.length ? (
         <ul className="max-h-64 overflow-auto border-t border-border py-1">
           {files.map((file) => (

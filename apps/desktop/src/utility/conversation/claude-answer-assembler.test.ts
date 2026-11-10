@@ -129,4 +129,33 @@ describe('Claude native text frames', () => {
     expect(nativeWorkingMemoryDiagnostics().chargedBytes).toBe(before)
     answer.dispose()
   })
+
+  it('keeps bounded native identities after dropping failed projection and releases them at owner disposal', () => {
+    const before = nativeWorkingMemoryDiagnostics().chargedBytes
+    if (before === null) throw new Error('Native working observations are unavailable')
+    const answer = new ClaudeAnswerAssembler('run')
+    try {
+      answer.frame('root-api', 'frame', 'x'.repeat(64 * 1024))
+      const withBody = nativeWorkingMemoryDiagnostics().chargedBytes
+      if (withBody === null) throw new Error('Native working observations are unavailable')
+      answer.discardProjection()
+      expect(answer.text).toBe('')
+      expect(answer.hasNativeMessage('root-api')).toBe(true)
+      expect(nativeWorkingMemoryDiagnostics().chargedBytes).toBeLessThan(withBody)
+      expect(nativeWorkingMemoryDiagnostics().chargedBytes).toBeGreaterThan(before)
+      answer.observeNativeMessage('unprojected-root-api')
+      expect(answer.hasNativeMessage('unprojected-root-api')).toBe(true)
+      expect(() => answer.frame('other', 'frame-other', 'Not a new projection')).toThrow(
+        'identity or ordering',
+      )
+      expect(() => answer.observeNativeMessage('x'.repeat(513))).toThrow('budget')
+      for (let index = 2; index < 10_000; index++) answer.observeNativeMessage(`root-${index}`)
+      expect(() => answer.observeNativeMessage('beyond-record-bound')).toThrow('budget')
+    } finally {
+      answer.dispose()
+    }
+    expect(nativeWorkingMemoryDiagnostics().chargedBytes).toBe(before)
+    expect(answer.hasNativeMessage('root-api')).toBe(false)
+    expect(() => answer.observeNativeMessage('after-disposal')).toThrow('identity or ordering')
+  })
 })

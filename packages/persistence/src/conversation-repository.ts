@@ -42,6 +42,7 @@ import type {
   ConversationPatch,
   ConversationSnapshot,
   NativeAgentContext,
+  NativeBackgroundReport,
   NativeContextRebuildChunk,
   NormalizedAgentEvent,
   RunFailureKind,
@@ -59,6 +60,7 @@ import type {
 
 import {
   COLLABORATION_PROTOCOL,
+  isConversationBackgroundReport,
   collaborationInitialStage,
   defaultTaskStageRoles,
   initialTaskRoleCandidates,
@@ -221,6 +223,7 @@ import {
   parseOutputSnapshotSummary,
   outputRunContext,
   outputTimelineSql,
+  hasArchivedBackgroundReports,
   beforeOutputOrder,
   afterOutputOrder,
   type OutputTimelineItem,
@@ -527,6 +530,24 @@ export type CompleteAnswerMetadata = Omit<
   'text'
 >
 export type ImageAssetRecord = typeof conversationImageAssets.$inferSelect
+
+type BackgroundReportIdentity = Omit<NativeBackgroundReport, 'text'>
+
+function backgroundReportId(report: BackgroundReportIdentity): string {
+  const hex = createHash('sha256')
+    .update(
+      JSON.stringify([
+        'pact-background-report-v1',
+        report.runId,
+        report.bindingGeneration,
+        report.nativeSessionId,
+        report.executorId,
+        report.frameId,
+      ]),
+    )
+    .digest('hex')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`
+}
 
 interface SealedBodyFact {
   version: 1
@@ -2549,7 +2570,10 @@ export class ConversationRepository {
       .orderBy(asc(conversationMessages.sequence))
       .all()
     const latestCompleteAssistantSequence = messages.findLast(
-      (message) => message.role === 'assistant' && message.state === 'complete',
+      (message) =>
+        message.role === 'assistant' &&
+        message.state === 'complete' &&
+        (message.isVisible || !isConversationBackgroundReport(message)),
     )?.sequence
     const title = projectSessionTitle(session.title, session.titleSource)
     return {
@@ -2654,17 +2678,19 @@ export class ConversationRepository {
     throughSequence: number,
     excludeMessageId?: string,
   ): HandoffRow[] {
-    return this.database
+    const rows = this.database
       .select({
         id: conversationMessages.id,
+        runId: conversationMessages.runId,
+        sourceMessageId: conversationMessages.sourceMessageId,
         sequence: conversationMessages.sequence,
         role: conversationMessages.role,
         contentBytes: sql<number>`length(CAST(${conversationMessages.content} AS BLOB))`,
         contentRevision: conversationMessages.contentRevision,
-        handledBy: agentRuns.agentId,
+        handledBy: sql<RuntimeAgentId>`coalesce(${agentRuns.agentId}, ${conversationMessages.agentId})`,
       })
       .from(conversationMessages)
-      .innerJoin(agentRuns, eq(agentRuns.id, conversationMessages.runId))
+      .leftJoin(agentRuns, eq(agentRuns.id, conversationMessages.runId))
       .where(
         and(
           eq(conversationMessages.sessionId, sessionId),
@@ -2675,6 +2701,7 @@ export class ConversationRepository {
           or(
             and(
               eq(conversationMessages.role, 'user'),
+              isNotNull(agentRuns.id),
               sql`EXISTS (
                 SELECT 1 FROM agent_runs AS accepted
                 WHERE (accepted.user_message_id = ${conversationMessages.id}
@@ -2694,12 +2721,24 @@ export class ConversationRepository {
                 sql`${agentRuns.failureKind} NOT IN ('context_limit', 'unknown_delivery')`,
               ),
             ),
+            and(
+              eq(conversationMessages.role, 'assistant'),
+              eq(conversationMessages.state, 'complete'),
+              isNull(conversationMessages.runId),
+              isNotNull(conversationMessages.sourceMessageId),
+              ne(conversationMessages.agentId, targetAgentId),
+            ),
           ),
         ),
       )
       .orderBy(asc(conversationMessages.sequence))
       .limit(HANDOFF_PAGE_ITEMS + 1)
       .all()
+    // A required visible report with a missing immutable carrier is unavailable,
+    // not an optional context row that may silently disappear from the page.
+    for (const row of rows)
+      if (isConversationBackgroundReport(row)) this.backgroundReportDocument(sessionId, row.id)
+    return rows
   }
 
   readHandoffPage(
@@ -5453,6 +5492,25 @@ export class ConversationRepository {
     return { id: body.id, sha256: body.hash, bytes: body.bytes, chars: body.chars }
   }
 
+  private backgroundReportDocument(sessionId: string, messageId: string): CollaborationDocument {
+    const body = this.database
+      .select({
+        committed: conversationBodyInputs.committedMessageId,
+        purpose: conversationBodyInputs.purpose,
+      })
+      .from(conversationBodyInputs)
+      .where(
+        and(
+          eq(conversationBodyInputs.id, messageId),
+          eq(conversationBodyInputs.sessionId, sessionId),
+        ),
+      )
+      .get()
+    if (body?.committed !== messageId || body.purpose !== 'answer')
+      throw new HandoffSourceUnavailableError('The immutable background update is unavailable.')
+    return this.documentReference(sessionId, messageId)
+  }
+
   private messageDocument(
     sessionId: string,
     runId: string,
@@ -6412,13 +6470,26 @@ export class ConversationRepository {
         id: conversationMessages.id,
         runId: conversationMessages.runId,
         role: conversationMessages.role,
+        sourceMessageId: conversationMessages.sourceMessageId,
         contentRevision: conversationMessages.contentRevision,
+        state: conversationMessages.state,
       })
       .from(conversationMessages)
       .where(
         and(eq(conversationMessages.id, messageId), eq(conversationMessages.sessionId, sessionId)),
       )
       .get()
+    if (message && isConversationBackgroundReport(message))
+      return {
+        sourceMessageId: messageId,
+        sourceRevision: message.contentRevision,
+        batchId: null,
+        documentsJson: JSON.stringify(
+          message.state === 'incomplete'
+            ? []
+            : [{ key: 'message', source: this.backgroundReportDocument(sessionId, messageId) }],
+        ),
+      }
     if (!message?.runId)
       throw new HandoffSourceUnavailableError('The frozen quoted Message is unavailable.')
     const batch = this.inputBatchForMessage(sessionId, messageId)
@@ -6969,14 +7040,17 @@ export class ConversationRepository {
       const rows = this.database
         .select({
           id: conversationMessages.id,
+          sessionId: conversationMessages.sessionId,
+          runId: conversationMessages.runId,
+          sourceMessageId: conversationMessages.sourceMessageId,
           sequence: conversationMessages.sequence,
           role: conversationMessages.role,
           contentBytes: sql<number>`length(CAST(${conversationMessages.content} AS BLOB))`,
           contentRevision: conversationMessages.contentRevision,
-          handledBy: agentRuns.agentId,
+          handledBy: sql<RuntimeAgentId>`coalesce(${agentRuns.agentId}, ${conversationMessages.agentId})`,
         })
         .from(conversationMessages)
-        .innerJoin(agentRuns, eq(agentRuns.id, conversationMessages.runId))
+        .leftJoin(agentRuns, eq(agentRuns.id, conversationMessages.runId))
         .where(
           inArray(
             conversationMessages.id,
@@ -6987,8 +7061,14 @@ export class ConversationRepository {
       const metadataById = new Map(rows.map((row) => [row.id, row]))
       const ordered = page.map((ref) => {
         const row = metadataById.get(ref.id)
-        if (!row || row.contentRevision !== ref.revision)
+        if (
+          !row ||
+          row.contentRevision !== ref.revision ||
+          !['codex', 'claude'].includes(row.handledBy)
+        )
           throw new HandoffSourceUnavailableError('A saved context source changed.')
+        if (isConversationBackgroundReport(row))
+          this.backgroundReportDocument(row.sessionId, row.id)
         return row
       })
       for (const row of ordered) {
@@ -7542,6 +7622,16 @@ export class ConversationRepository {
     return this.database.transaction(() => {
       const check = this.queueOperation(input, 'resume')
       if (check.old) return this.createPatch(input.sessionId)
+      const anchor = check.row && this.findRun(check.row.anchorRunId)
+      if (
+        !anchor ||
+        ['starting', 'running', 'recovering'].includes(anchor.status) ||
+        !['ended', 'not_sent', 'rejected'].includes(anchor.dispatchPhase ?? 'not_sent') ||
+        !['settled', 'not_dispatched'].includes(anchor.nativeEffectsState ?? '')
+      )
+        throw new RunOperationConflictError(
+          'The original work has not settled. Check it, or use Edit message or Remove for this queued input.',
+        )
       this.saveQueueOperation(input, 'resume')
       this.database
         .update(collaborationInputs)
@@ -10619,8 +10709,15 @@ export class ConversationRepository {
         .where(eq(conversationOutputSnapshots.sessionId, input.sessionId))
         .limit(1)
         .get()
+      const archivedBackground = hasArchivedBackgroundReports(this.database, input.sessionId)
       const timelineFor = (filter: ReturnType<typeof sql>, newer: boolean) =>
-        outputTimelineSql(input.sessionId, snapshotView, { filter, newer, legacy, preserveRunId })
+        outputTimelineSql(input.sessionId, snapshotView, {
+          filter,
+          newer,
+          legacy,
+          preserveRunId,
+          archivedBackground,
+        })
       const snapshotOrder = target
         ? outputSnapshotMetadata(this.database, target.id, snapshotView, preserveRunId)?.order
         : undefined
@@ -10654,6 +10751,7 @@ export class ConversationRepository {
             id: conversationMessages.id,
             sessionId: conversationMessages.sessionId,
             runId: conversationMessages.runId,
+            isVisible: conversationMessages.isVisible,
             replyToMessageId: conversationMessages.replyToMessageId,
             role: conversationMessages.role,
             agentId: conversationMessages.agentId,
@@ -10844,6 +10942,9 @@ export class ConversationRepository {
           ...(row.replyToMessageId ? { replyToMessageId: row.replyToMessageId } : {}),
           ...(row.agentId ? { agentId: row.agentId } : {}),
           ...(row.sourceMessageId ? { sourceMessageId: row.sourceMessageId } : {}),
+          ...(!row.isVisible && isConversationBackgroundReport(row)
+            ? { historicalBackgroundReport: true as const }
+            : {}),
           ...(row.routePendingAgentId ? { pendingAgentId: row.routePendingAgentId } : {}),
           ...ConversationRepository.toMessageRoute(row),
           ...ConversationRepository.toMessageSkills(row),
@@ -11191,6 +11292,7 @@ export class ConversationRepository {
         id: conversationMessages.id,
         sessionId: conversationMessages.sessionId,
         runId: conversationMessages.runId,
+        isVisible: conversationMessages.isVisible,
         replyToMessageId: conversationMessages.replyToMessageId,
         role: conversationMessages.role,
         agentId: conversationMessages.agentId,
@@ -11242,6 +11344,9 @@ export class ConversationRepository {
         ...(row.replyToMessageId ? { replyToMessageId: row.replyToMessageId } : {}),
         ...(row.agentId ? { agentId: row.agentId } : {}),
         ...(row.sourceMessageId ? { sourceMessageId: row.sourceMessageId } : {}),
+        ...(!row.isVisible && isConversationBackgroundReport(row)
+          ? { historicalBackgroundReport: true as const }
+          : {}),
         ...(row.routePendingAgentId ? { pendingAgentId: row.routePendingAgentId } : {}),
         ...ConversationRepository.toMessageRoute(row),
         ...ConversationRepository.toMessageSkills(row),
@@ -12878,6 +12983,7 @@ export class ConversationRepository {
             sessionId: row.sessionId,
             agentId: operation.agentId,
             expectedGeneration: operation.expectedGeneration,
+            expectedRunId: operation.expectedRunId,
             abandon: operation.abandonOldWork,
             ...(operation.agentId === 'claude' ? { reservedNativeSessionId: randomUUID() } : {}),
           })
@@ -16297,6 +16403,7 @@ export class ConversationRepository {
         id: conversationMessages.id,
         runId: conversationMessages.runId,
         role: conversationMessages.role,
+        sourceMessageId: conversationMessages.sourceMessageId,
         state: conversationMessages.state,
         revision: conversationMessages.contentRevision,
         bytes: sql<number>`length(CAST(${conversationMessages.content} AS BLOB))`,
@@ -16309,7 +16416,7 @@ export class ConversationRepository {
         ),
       )
       .get()
-    if (!message?.runId || message.state !== 'complete')
+    if (!message || message.state !== 'complete')
       throw new RunOperationConflictError(
         'The complete immutable Comment target Message is unavailable.',
       )
@@ -16325,7 +16432,13 @@ export class ConversationRepository {
         'Decision advice does not support required target images.',
       )
     let document: CollaborationDocument | undefined
-    if (anchor.plan || anchor.report) {
+    if (isConversationBackgroundReport(message) && !anchor.plan && !anchor.report) {
+      document = this.backgroundReportDocument(sessionId, message.id)
+    } else if (!message.runId) {
+      throw new RunOperationConflictError(
+        'The complete immutable Comment target Message is unavailable.',
+      )
+    } else if (anchor.plan || anchor.report) {
       document = this.collaborationCommentDocument(sessionId, anchor)
     } else if (message.role === 'user') {
       const batch = this.database
@@ -18655,6 +18768,24 @@ export class ConversationRepository {
     )
   }
 
+  /** Current durable work may need recovery even when no executor can be controlled. */
+  isCurrentBackgroundCursor(runId: string): boolean {
+    const run = this.findRun(runId)
+    if (!run || run.forkSourceRunId || !run.nativeSessionId) return false
+    const context = this.nativeContext(run.sessionId, run.agentId)
+    return Boolean(context && this.isCurrentNativeCursor(run, context))
+  }
+
+  /** Exact background control; later definitely-unsent attempts own no native work. */
+  ownsBackgroundControl(runId: string): boolean {
+    const run = this.findRun(runId)
+    if (!run || run.forkSourceRunId || !run.nativeSessionId || !run.executorId) return false
+    const context = this.nativeContext(run.sessionId, run.agentId)
+    return Boolean(
+      context && context.executorId === run.executorId && this.isCurrentNativeCursor(run, context),
+    )
+  }
+
   private mayProjectNativeBody(run: AgentRun): boolean {
     const context = this.nativeContext(run.sessionId, run.agentId)
     return (
@@ -19130,14 +19261,21 @@ export class ConversationRepository {
 
   /** Binding projection only: a refused local attempt cannot erase the actual native cursor. */
   private isCurrentNativeCursor(run: AgentRun, context: NativeAgentContext): boolean {
+    return (
+      !this.pendingNativeRebuild(run.sessionId, run.agentId) &&
+      this.matchesDurableNativeCursor(run, context)
+    )
+  }
+
+  /** Durable identity only. A pending candidate fences live control, not its recovery source. */
+  private matchesDurableNativeCursor(run: AgentRun, context: NativeAgentContext): boolean {
     if (
       run.controlDisposition === 'abandoned' ||
       context.lastRunId !== run.id ||
       context.sessionId !== run.sessionId ||
       context.agentId !== run.agentId ||
       context.nativeSessionId !== run.nativeSessionId ||
-      context.bindingGeneration !== run.bindingGeneration ||
-      this.pendingNativeRebuild(run.sessionId, run.agentId)
+      context.bindingGeneration !== run.bindingGeneration
     )
       return false
     const blocker = this.database
@@ -19155,6 +19293,26 @@ export class ConversationRepository {
       .limit(1)
       .get()
     return blocker === undefined
+  }
+
+  /** The same recovery owner is used by UI scope, explicit Rebuild and Relay. */
+  nativeRecoveryRun(sessionId: string, agentId: RuntimeAgentId): AgentRun | undefined {
+    const context = this.nativeContext(sessionId, agentId)
+    const cursor = context?.lastRunId ? this.findRun(context.lastRunId) : undefined
+    if (
+      cursor &&
+      context &&
+      !cursor.forkSourceRunId &&
+      cursor.nativeSessionId &&
+      cursor.dispatchPhase === 'ended' &&
+      ['pending', 'unknown'].includes(cursor.nativeEffectsState ?? '') &&
+      this.matchesDurableNativeCursor(cursor, context)
+    )
+      return cursor
+    return (
+      (!context ? this.unacknowledgedNativeRun(sessionId, agentId) : undefined) ??
+      this.latestAgentRun(sessionId, agentId, context?.bindingGeneration)
+    )
   }
 
   latestAgentRun(
@@ -19240,17 +19398,25 @@ export class ConversationRepository {
     return this.createPatch(sessionId)
   }
 
-  verifyRebuildReceipt(id: string, sessionId: string, agentId: RuntimeAgentId): void {
+  verifyRebuildReceipt(
+    id: string,
+    sessionId: string,
+    agentId: RuntimeAgentId,
+    expectedRunId?: string | null,
+  ): void {
     const row = this.database
       .select({
         sessionId: nativeRebuildOperations.sessionId,
         agentId: nativeRebuildOperations.agentId,
+        oldRunId: nativeRebuildOperations.oldRunId,
       })
       .from(nativeRebuildOperations)
       .where(eq(nativeRebuildOperations.id, id))
       .get()
     if (!row || row.sessionId !== sessionId || row.agentId !== agentId)
       throw new RunOperationConflictError('The rebuild receipt belongs to another binding.')
+    if (expectedRunId !== undefined && row.oldRunId !== expectedRunId)
+      throw new RunOperationConflictError('The rebuild receipt belongs to another recovery target.')
   }
 
   settleKnownNativeEnding(
@@ -19483,47 +19649,46 @@ export class ConversationRepository {
     sessionId: string
     agentId: RuntimeAgentId
     expectedGeneration: number
+    expectedRunId?: string | null
     abandon: boolean
     reservedNativeSessionId?: string
   }): ConversationPatch {
     const existing = this.nativeRebuildOperation(input.id)
     if (existing) {
-      const identity = this.database
-        .select({
-          sessionId: nativeRebuildOperations.sessionId,
-          agentId: nativeRebuildOperations.agentId,
-        })
-        .from(nativeRebuildOperations)
-        .where(eq(nativeRebuildOperations.id, input.id))
-        .get()
-      if (identity?.sessionId !== input.sessionId || identity.agentId !== input.agentId)
-        throw new RunOperationConflictError('This rebuild confirmation belongs to another binding.')
+      this.verifyRebuildReceipt(input.id, input.sessionId, input.agentId, input.expectedRunId)
       return this.createPatch(input.sessionId)
     }
-    const context = this.nativeContext(input.sessionId, input.agentId)
-    if ((context?.bindingGeneration ?? 1) !== input.expectedGeneration)
-      throw new RunOperationConflictError('The Native binding changed. Check it again.')
-    const run = this.latestAgentRun(input.sessionId, input.agentId)
-    if (
-      this.bindingHasUnsettledWork(input.sessionId, input.agentId, input.expectedGeneration) &&
-      !input.abandon
-    )
-      throw new RunOperationConflictError(
-        'The previous binding may still have native work. Review its effects and confirm rebuilding before continuing.',
-      )
-    if (
-      run &&
-      run.controlDisposition !== 'abandoned' &&
-      run.bindingGeneration === input.expectedGeneration &&
-      !run.nativeOutcome &&
-      run.dispatchPhase !== 'ended' &&
-      !['not_sent', 'rejected'].includes(run.dispatchPhase ?? '') &&
-      !input.abandon
-    )
-      throw new RunOperationConflictError(
-        'Confirm abandoning the unverified task before rebuilding.',
-      )
     this.nativeMetadataTransaction(input.sessionId, () => {
+      const context = this.nativeContext(input.sessionId, input.agentId)
+      if ((context?.bindingGeneration ?? 1) !== input.expectedGeneration)
+        throw new RunOperationConflictError('The Native binding changed. Check it again.')
+      const run = this.nativeRecoveryRun(input.sessionId, input.agentId)
+      if (input.expectedRunId !== undefined && (run?.id ?? null) !== input.expectedRunId)
+        throw new RunOperationConflictError('The recovery target changed. Check it again.')
+      if (
+        this.bindingHasUnsettledWork(input.sessionId, input.agentId, input.expectedGeneration) &&
+        !input.abandon
+      )
+        throw new RunOperationConflictError(
+          'The previous binding may still have native work. Review its effects and confirm rebuilding before continuing.',
+        )
+      if (
+        run &&
+        run.controlDisposition !== 'abandoned' &&
+        run.bindingGeneration === input.expectedGeneration &&
+        !run.nativeOutcome &&
+        run.dispatchPhase !== 'ended' &&
+        !['not_sent', 'rejected'].includes(run.dispatchPhase ?? '') &&
+        !input.abandon
+      )
+        throw new RunOperationConflictError(
+          'Confirm abandoning the unverified task before rebuilding.',
+        )
+      const returnable = this.latestAgentRun(
+        input.sessionId,
+        input.agentId,
+        input.expectedGeneration,
+      )
       const pending = this.pendingNativeRebuild(input.sessionId, input.agentId)
       assertSessionAvailable(this.database, input.sessionId)
       if (pending && pending.stage !== 'unconfirmed')
@@ -19546,8 +19711,8 @@ export class ConversationRepository {
           oldNativeSessionId: context?.nativeSessionId ?? null,
           oldRunId: run?.id ?? null,
           returnedInputJson:
-            run && run.bindingGeneration === input.expectedGeneration
-              ? this.freezeReturnedInput(run)
+            returnable && returnable.bindingGeneration === input.expectedGeneration
+              ? this.freezeReturnedInput(returnable)
               : null,
           abandon: input.abandon,
           provisionalNativeSessionId: input.reservedNativeSessionId ?? null,
@@ -19571,7 +19736,11 @@ export class ConversationRepository {
     return this.createPatch(input.sessionId)
   }
 
-  freezeNativeRebuildSource(id: string, chunks: NativeContextRebuildChunk[]): string {
+  freezeNativeRebuildSource(
+    id: string,
+    chunks: NativeContextRebuildChunk[],
+    sourceRevisions: ReadonlyMap<string, number>,
+  ): string {
     const json = JSON.stringify(chunks)
     if (chunks.length > 4096 || Buffer.byteLength(json) > HANDOFF_SAFETY_BYTES)
       throw new HandoffTooLargeError('The complete rebuild history exceeds its preparation limit.')
@@ -19589,14 +19758,33 @@ export class ConversationRepository {
     if (row.sourceHash && row.sourceHash !== hash)
       throw new RunOperationConflictError('The rebuild history changed.')
     if (row.sourceHash === hash) return hash
+    if (sourceRevisions.size > 4096)
+      throw new HandoffTooLargeError(
+        'The rebuild source revision map exceeds its preparation limit.',
+      )
     this.database.transaction(() => {
       const operation = this.database
-        .select({ sessionId: nativeRebuildOperations.sessionId })
+        .select({
+          sessionId: nativeRebuildOperations.sessionId,
+          stage: nativeRebuildOperations.stage,
+          sourceHash: nativeRebuildOperations.sourceHash,
+        })
         .from(nativeRebuildOperations)
         .where(eq(nativeRebuildOperations.id, id))
-        .get()!
+        .get()
+      if (!operation || operation.stage !== 'preparing')
+        throw new RunOperationConflictError('The rebuild source owner changed.')
+      if (operation.sourceHash === hash) return
+      if (operation.sourceHash) throw new RunOperationConflictError('The rebuild history changed.')
       for (const messageId of new Set(chunks.map((chunk) => chunk.messageId))) {
+        const revision = sourceRevisions.get(messageId)
+        if (!Number.isSafeInteger(revision) || revision === undefined || revision < 0)
+          throw new RunOperationConflictError('The rebuild source revision is missing or invalid.')
         const source = this.quotedSource(operation.sessionId, messageId)
+        if (source.sourceRevision !== revision)
+          throw new RunOperationConflictError(
+            'A Message changed while the Native Session was preparing.',
+          )
         this.database
           .insert(conversationRebuildSourceRefs)
           .values({ operationId: id, ...source })
@@ -19657,6 +19845,13 @@ export class ConversationRepository {
           eq(conversationMessages.isVisible, true),
           gt(conversationMessages.sequence, message.sequence),
           inArray(conversationMessages.role, ['user', 'assistant']),
+          // A separately attributed background report does not consume this
+          // rejected input. Later user input and ordinary replies still do.
+          or(
+            eq(conversationMessages.role, 'user'),
+            isNotNull(conversationMessages.runId),
+            isNull(conversationMessages.sourceMessageId),
+          ),
         ),
       )
       .orderBy(asc(conversationMessages.sequence))
@@ -20372,12 +20567,21 @@ export class ConversationRepository {
           returnedInputJson: (() => {
             const returned = this.parseReturnedInput(row.returnedInputJson)
             if (!returned || returned.state !== 'prepared') return row.returnedInputJson
-            const current = oldRun && this.freezeReturnedInput(oldRun)
+            const returnedRun = this.findRun(returned.runId)
+            const current =
+              returnedRun &&
+              returnedRun.sessionId === row.sessionId &&
+              returnedRun.agentId === row.agentId &&
+              returnedRun.bindingGeneration === row.oldGeneration &&
+              returnedRun.userMessageId === returned.messageId &&
+              (returnedRun.id === oldRun?.id || returnedRun.controlDisposition !== 'abandoned')
+                ? this.parseReturnedInput(this.freezeReturnedInput(returnedRun))
+                : undefined
             if (
               !current ||
-              JSON.parse(current).hash !== returned.hash ||
-              JSON.parse(row.sourceChunksJson!).some(
-                (chunk: NativeContextRebuildChunk) => chunk.messageId === returned.messageId,
+              JSON.stringify(current) !== JSON.stringify(returned) ||
+              this.readNativeRebuildSource(id).some(
+                (chunk) => chunk.messageId === returned.messageId,
               )
             )
               return null
@@ -20896,10 +21100,199 @@ export class ConversationRepository {
       (run.nativeTurnId && run.nativeTurnId !== metadata.turnId)
     )
       throw new RunOperationConflictError('This complete answer has no matching Run owner.')
+    return this.sealAnswerBody(run, randomUUID(), metadata.outputId, source, signal, (body) =>
+      this.commitEvents(
+        run.sessionId,
+        runId,
+        [{ ...metadata, text: '' }],
+        options.archive ?? false,
+        options.bodyState,
+        body,
+      ),
+    )
+  }
+
+  async recordBackgroundReport(
+    report: NativeBackgroundReport,
+    source: (physicalSignal: AbortSignal) => AsyncIterable<string>,
+    signal: AbortSignal,
+  ): Promise<ConversationPatch | undefined> {
+    signal.throwIfAborted()
+    const run = this.backgroundReportRun(report)
+    const id = backgroundReportId(report)
+    const digest = createHash('sha256').update(report.text).digest('hex')
+    const previous = this.database
+      .select({
+        hash: conversationBodyInputs.hash,
+        committed: conversationBodyInputs.committedMessageId,
+        clientMessageId: conversationBodyInputs.clientMessageId,
+      })
+      .from(conversationBodyInputs)
+      .where(eq(conversationBodyInputs.id, id))
+      .get()
+    if (previous) {
+      if (
+        previous.committed !== id ||
+        previous.hash !== digest ||
+        previous.clientMessageId !== `${report.nativeMessageId}:${id}`
+      )
+        throw new RunOperationConflictError('A background update repeated with a different source.')
+      return undefined
+    }
+    // A prior unavailable admission is already durable. Never re-seal a replay
+    // after its uncommitted body was discarded on cancellation or cold startup.
+    if (
+      this.database
+        .select({ id: conversationMessages.id })
+        .from(conversationMessages)
+        .where(eq(conversationMessages.id, id))
+        .get()
+    )
+      return undefined
+    this.commitBackgroundReport(report, id, undefined, 'pending')
+    return this.sealAnswerBody(run, id, report.nativeMessageId, source, signal, (body) => {
+      if (body.sha256 !== digest)
+        throw new RunOperationConflictError('The complete background update source changed.')
+      return this.commitBackgroundReport(report, id, body)
+    })
+  }
+
+  recordBackgroundReportUnavailable(
+    report: BackgroundReportIdentity,
+  ): ConversationPatch | undefined {
+    return this.commitBackgroundReport(report, backgroundReportId(report))
+  }
+
+  private backgroundReportRun(report: BackgroundReportIdentity): AgentRun {
+    const run = this.findRun(report.runId)
+    if (
+      !run ||
+      run.forkSourceRunId ||
+      run.agentId !== report.agentId ||
+      run.dispatchPhase !== 'ended' ||
+      run.nativeOutcome !== 'completed' ||
+      run.nativeSessionId !== report.nativeSessionId ||
+      run.nativeTurnId !== report.nativeTurnId ||
+      run.bindingGeneration !== report.bindingGeneration ||
+      run.executorId !== report.executorId
+    )
+      throw new RunOperationConflictError(
+        'The background update has no matching completed native owner.',
+      )
+    return run
+  }
+
+  private commitBackgroundReport(
+    report: BackgroundReportIdentity,
+    id: string,
+    body?: SealedBodyFact,
+    phase: 'pending' | 'unavailable' = 'unavailable',
+  ): ConversationPatch | undefined {
+    return this.database.transaction((transaction) => {
+      const run = this.backgroundReportRun(report)
+      const binding = this.nativeContext(run.sessionId, run.agentId)
+      const visible =
+        this.ownsBackgroundControl(run.id) &&
+        binding?.nativeSessionId === report.nativeSessionId &&
+        binding.executorId === report.executorId &&
+        this.sourceQueries.session().get({ sessionId: run.sessionId })?.status !== 'archived'
+      const previous = transaction
+        .select({
+          state: conversationMessages.state,
+          visible: conversationMessages.isVisible,
+          revision: conversationMessages.contentRevision,
+        })
+        .from(conversationMessages)
+        .where(eq(conversationMessages.id, id))
+        .get()
+      if (
+        previous &&
+        (previous.state === 'complete' || (!body && (phase === 'pending' || previous.revision > 0)))
+      )
+        return undefined
+      const current = visible && (previous?.visible ?? true)
+
+      const content = body
+        ? sql<string>`(SELECT group_concat(text, '') FROM (SELECT text FROM conversation_body_parts WHERE input_id=${body.inputId} ORDER BY offset))`
+        : ''
+      const now = new Date().toISOString()
+      const state = body ? 'complete' : 'incomplete'
+      if (previous) {
+        transaction
+          .update(conversationMessages)
+          .set({
+            state,
+            content,
+            updatedAt: now,
+            isVisible: current,
+            contentRevision: sql`${conversationMessages.contentRevision} + 1`,
+          })
+          .where(eq(conversationMessages.id, id))
+          .run()
+      } else {
+        transaction
+          .insert(conversationMessages)
+          .values({
+            id,
+            sessionId: run.sessionId,
+            sourceMessageId: run.userMessageId,
+            role: 'assistant',
+            agentId: report.agentId,
+            isVisible: current,
+            state,
+            content,
+            contentRevision: !body && phase === 'unavailable' ? 1 : 0,
+            sequence: sql<number>`(SELECT coalesce(max(${conversationMessages.sequence}), -1) + 1
+              FROM ${conversationMessages} WHERE ${conversationMessages.sessionId} = ${run.sessionId})`,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .run()
+      }
+      if (body)
+        transaction
+          .update(conversationBodyInputs)
+          .set({ committedMessageId: id })
+          .where(eq(conversationBodyInputs.id, body.inputId))
+          .run()
+      appendAgentEvent(transaction, {
+        sessionId: run.sessionId,
+        runId: run.id,
+        eventType: body ? 'background.report' : `background.report_${phase}`,
+        payload: JSON.stringify({
+          frameId: report.frameId,
+          nativeMessageId: report.nativeMessageId,
+          executorId: report.executorId,
+          bindingGeneration: report.bindingGeneration,
+          messageId: id,
+          ...(body ? { source: body } : {}),
+        }),
+        createdAt: now,
+      })
+      if (!current || (!body && phase === 'pending')) return undefined
+      transaction
+        .update(sessions)
+        .set({ updatedAt: now })
+        .where(eq(sessions.id, run.sessionId))
+        .run()
+      return this.createPatch(run.sessionId, {
+        messages: [this.messageChange(id, 'replace')],
+      })
+    })
+  }
+
+  private async sealAnswerBody<T>(
+    run: AgentRun,
+    inputId: string,
+    outputId: string,
+    source: (physicalSignal: AbortSignal) => AsyncIterable<string>,
+    signal: AbortSignal,
+    commit: (body: SealedBodyFact) => T,
+  ): Promise<T> {
+    const runId = run.id
     const ownerKey = `answer:${runId}`
     this.sweepConversationInputs()
     const now = new Date().toISOString()
-    const inputId = randomUUID()
     const expiresAt = performance.now() + 10_000
     this.database.transaction(() => {
       this.bodyCapacity(ownerKey, 0, true)
@@ -20908,7 +21301,7 @@ export class ConversationRepository {
         .values({
           id: inputId,
           sessionId: run.sessionId,
-          clientMessageId: `${metadata.outputId}:${inputId}`,
+          clientMessageId: `${outputId}:${inputId}`,
           ownerKey,
           purpose: 'answer',
           sourceRunId: runId,
@@ -20966,14 +21359,7 @@ export class ConversationRepository {
       const row = this.bodyInput(inputId, run.sessionId, ownerKey)
       if (!row.hash) throw new RunOperationConflictError('Complete answer candidate changed.')
       check()
-      return this.commitEvents(
-        run.sessionId,
-        runId,
-        [{ ...metadata, text: '' }],
-        options.archive ?? false,
-        options.bodyState,
-        { version: 1, inputId, sha256: row.hash, bytes: row.bytes, chars: row.chars },
-      )
+      return commit({ version: 1, inputId, sha256: row.hash, bytes: row.bytes, chars: row.chars })
     } finally {
       deadline.abort()
       try {
@@ -22503,7 +22889,12 @@ export class ConversationRepository {
     sessionId: string,
     signal: AbortSignal,
     operationId?: string,
+    sourceRevisions?: Map<string, number>,
   ): AsyncIterable<NativeContextRebuildChunk> {
+    if (sourceRevisions && sourceRevisions.size > 4096)
+      throw new HandoffTooLargeError(
+        'The rebuild source revision map exceeds its preparation limit.',
+      )
     const operation = operationId
       ? this.database
           .select()
@@ -22584,6 +22975,17 @@ export class ConversationRepository {
         .all()
       if (rows.length === 0) break
       for (const row of rows) {
+        if (sourceRevisions) {
+          if (sourceRevisions.has(row.id) && sourceRevisions.get(row.id) !== row.contentRevision)
+            throw new HandoffSourceUnavailableError(
+              'A Message changed while the Native Session was rebuilding.',
+            )
+          if (!sourceRevisions.has(row.id) && sourceRevisions.size >= 4096)
+            throw new HandoffTooLargeError(
+              'The rebuild source revision map exceeds its preparation limit.',
+            )
+          sourceRevisions.set(row.id, row.contentRevision)
+        }
         if (row.role === 'assistant' && !row.agentId)
           throw new HandoffSourceUnavailableError('An Assistant Message has no Agent identity.')
         const speaker = row.role === 'user' ? ('user' as const) : row.agentId
@@ -22742,6 +23144,7 @@ export class ConversationRepository {
 
   private toMessage(
     row: Omit<typeof conversationMessages.$inferSelect, 'isVisible' | 'skillInvocationJson'> & {
+      isVisible?: boolean
       skillInvocationJson?: string | null
       skillsJson?: string | null
     },
@@ -22762,6 +23165,9 @@ export class ConversationRepository {
       ...(row.replyToMessageId ? { replyToMessageId: row.replyToMessageId } : {}),
       ...(row.agentId ? { agentId: row.agentId } : {}),
       ...(row.sourceMessageId ? { sourceMessageId: row.sourceMessageId } : {}),
+      ...(row.isVisible === false && isConversationBackgroundReport(row)
+        ? { historicalBackgroundReport: true as const }
+        : {}),
       ...(row.routePendingAgentId ? { pendingAgentId: row.routePendingAgentId } : {}),
       ...ConversationRepository.toMessageRoute(row),
       ...ConversationRepository.toMessageSkills(row),

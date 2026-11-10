@@ -77,7 +77,7 @@ function seed(f: Fixture, agentId: RuntimeAgentId = 'codex', abandon = false) {
     expectedGeneration: generation,
     abandon,
   })
-  const sourceHash = f.repo.freezeNativeRebuildSource(id, [])
+  const sourceHash = f.repo.freezeNativeRebuildSource(id, [], new Map())
   f.repo.markNativeRebuildDispatched(id)
   f.repo.recordNativeRebuildIdentity(id, nativeSessionId)
   const witness = {
@@ -609,7 +609,7 @@ describe('Durable Native recovery ownership', () => {
           expectedGeneration: 1,
           abandon: false,
         })
-        f.repo.freezeNativeRebuildSource(id, [])
+        f.repo.freezeNativeRebuildSource(id, [], new Map())
         f.repo.markNativeRebuildDispatched(id)
         expect(() => f.repo.recordNativeRebuildIdentity(id, nativeSessionId)).toThrow(/string/iu)
         expect(f.repo.nativeRebuildOperation(id)).toMatchObject({ stage: 'creating' })

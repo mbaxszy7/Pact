@@ -647,6 +647,7 @@ describe('UtilityProcessClient', () => {
       runtime.start(startOptions)
       const child = harness.children.at(-1)!
       const pending = runtime.request({ type: 'appearance.get.request' }, 'appearance.response')
+      const startedAt = Date.now()
       const shutdown = runtime.shutdown()
       expect(runtime.shutdown()).toBe(shutdown)
       expect(child.killed).toBe(false)
@@ -663,6 +664,10 @@ describe('UtilityProcessClient', () => {
       })
       await expect(shutdown).resolves.toEqual({ ok: true, value: { flushed: true } })
       await expect(pending).resolves.toMatchObject({ kind: 'unknown-delivery' })
+      expect(child.posted[1]).toMatchObject({
+        type: 'runtime.shutdown.request',
+        flushDeadlineAt: startedAt + 4_000,
+      })
       expect(child.killed).toBe(true)
       expect(vi.getTimerCount()).toBe(0)
     } finally {
@@ -768,14 +773,21 @@ describe('UtilityProcessClient', () => {
     runtime.start(startOptions)
     const child = harness.children.at(-1)!
     child.exitOnKill = false
+    const startedAt = Date.now()
     const shutdown = runtime.shutdown()
     await vi.advanceTimersByTimeAsync(3_900)
+    expect(runtime.shutdown()).toBe(shutdown)
+    expect(child.posted).toHaveLength(1)
     expect(child.killed).toBe(false)
     shutdownAck(child)
     await turn()
     expect(child.killed).toBe(true)
     await vi.advanceTimersByTimeAsync(1_100)
     await expect(shutdown).resolves.toMatchObject({ ok: false, error: { code: 'UNCERTAIN' } })
+    expect(child.posted[0]).toMatchObject({
+      type: 'runtime.shutdown.request',
+      flushDeadlineAt: startedAt + 4_000,
+    })
     expect(vi.getTimerCount()).toBe(0)
     runtime.start(startOptions)
     expect(harness.children.at(-1)).toBe(child)

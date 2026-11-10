@@ -53,6 +53,7 @@ import {
   collaborationInputResultSchema,
   collaborationPlanRetentionInputSchema,
   collaborationPlanRetentionAllowed,
+  nativeBackgroundReportIdentitySchema,
   sessionTitleInputShape,
   sessionTitleInputSchema,
 } from '@pact/contracts'
@@ -169,25 +170,47 @@ const defaultClaudeAgentDependencies: ClaudeAgentDependencies = {
 class ClaudeNativeWork {
   private readonly hooks = new Set<string>()
   private readonly tasks = new Set<string>()
-  private backgroundCount: number | undefined
+  private readonly ambientTasks = new Set<string>()
+  private hasBackgroundLevel = false
   private unconfirmed = false
 
   get pending(): boolean {
-    return (
-      this.unconfirmed ||
-      this.hooks.size > 0 ||
-      (this.backgroundCount === undefined ? this.tasks.size > 0 : this.backgroundCount > 0)
-    )
+    return this.unconfirmed || this.active || this.ambientTasks.size > 0
+  }
+
+  get active(): boolean {
+    return this.hooks.size > 0 || this.tasks.size > 0
+  }
+
+  get stoppable(): boolean {
+    return this.active && !this.unconfirmed
+  }
+
+  get taskIds(): readonly string[] {
+    return [...this.tasks]
+  }
+
+  get hooksRunning(): boolean {
+    return this.hooks.size > 0
+  }
+
+  hasTask(id: string): boolean {
+    return this.tasks.has(id)
   }
 
   observe(message: SDKMessage): void {
     if (message.type !== 'system') return
     const add = (set: Set<string>, id: string): void => {
-      const bytes = [...set].reduce((sum, value) => sum + Buffer.byteLength(value), 0)
+      let bytes = 0
+      for (const value of this.hooks) bytes += Buffer.byteLength(value)
+      for (const value of this.tasks) bytes += Buffer.byteLength(value)
+      for (const value of this.ambientTasks) bytes += Buffer.byteLength(value)
       if (
         !id ||
         id.length > 1024 ||
-        (!set.has(id) && (set.size >= 64 || bytes + Buffer.byteLength(id) > 64 * 1024))
+        (!set.has(id) &&
+          (this.hooks.size + this.tasks.size + this.ambientTasks.size >= 64 ||
+            bytes + Buffer.byteLength(id) > 64 * 1024))
       )
         this.unconfirmed = true
       else set.add(id)
@@ -197,17 +220,56 @@ class ClaudeNativeWork {
     else if (message.subtype === 'background_tasks_changed') {
       // Level and edge ordering is unspecified. Once present, only the level
       // owns task activity; a trailing task_started must not resurrect it.
+      this.hasBackgroundLevel = true
+      if (message.tasks.length > 64) {
+        this.unconfirmed = true
+        return
+      }
+      let count = this.hooks.size,
+        bytes = 0
+      for (const id of this.hooks) bytes += Buffer.byteLength(id)
+      // Validate the replacement without retaining a second task set or losing
+      // previously observed identities when the new level cannot be admitted.
+      for (let index = 0; index < message.tasks.length; index++) {
+        const task = message.tasks[index]!
+        if (!task.task_id || task.task_id.length > 1024) {
+          this.unconfirmed = true
+          return
+        }
+        const duplicate = message.tasks.findIndex((other) => other.task_id === task.task_id)
+        if (duplicate < index) {
+          if ((message.tasks[duplicate]!.ambient === true) !== (task.ambient === true)) {
+            this.unconfirmed = true
+            return
+          }
+          continue
+        }
+        const taskBytes = Buffer.byteLength(task.task_id)
+        count++
+        bytes += taskBytes
+        if (count > 64 || bytes > 64 * 1024) {
+          this.unconfirmed = true
+          return
+        }
+      }
       this.tasks.clear()
-      if (message.tasks.length > 64) this.unconfirmed = true
-      this.backgroundCount = message.tasks.length
-    } else if (this.backgroundCount === undefined) {
-      if (message.subtype === 'task_started') add(this.tasks, message.task_id)
-      else if (
+      this.ambientTasks.clear()
+      for (const task of message.tasks)
+        (task.ambient === true ? this.ambientTasks : this.tasks).add(task.task_id)
+    } else if (!this.hasBackgroundLevel) {
+      if (message.subtype === 'task_started') {
+        const set = message.ambient === true ? this.ambientTasks : this.tasks
+        const other = message.ambient === true ? this.tasks : this.ambientTasks
+        if (other.has(message.task_id)) this.unconfirmed = true
+        else add(set, message.task_id)
+      } else if (
         message.subtype === 'task_notification' ||
         (message.subtype === 'task_updated' &&
           ['completed', 'failed', 'killed'].includes(String(message.patch.status)))
-      )
+      ) {
         this.tasks.delete(message.task_id)
+        this.ambientTasks.delete(message.task_id)
+      }
     }
   }
 }
@@ -257,6 +319,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       sourceGrant?: { runId: string; grant: string; active: boolean } | undefined
       sourceReader?: AgentRunInput['collaborationSourceReader'] | undefined
       steer?: (input: AgentSteerInput, signal: AbortSignal) => Promise<AgentSteerResult>
+      work?: () => 'working' | 'stoppable' | undefined
+      stopWork?: (signal: AbortSignal) => Promise<void>
     }
   >()
   private readonly peerServerName = `pact_peer_${randomUUID().replaceAll('-', '')}`
@@ -1592,6 +1656,18 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       : { status: 'rejected', reason: 'The target execution is no longer available for steering.' }
   }
 
+  backgroundWork(runId: string, executorId: string): 'working' | 'stoppable' | undefined {
+    const owner = this.backgroundRuns.get(runId)
+    return owner?.executorId === executorId ? owner.work?.() : undefined
+  }
+
+  async stopBackgroundWork(runId: string, executorId: string, signal: AbortSignal): Promise<void> {
+    const owner = this.backgroundRuns.get(runId)
+    if (owner?.executorId !== executorId || owner.work?.() !== 'stoppable' || !owner.stopWork)
+      throw new Error('The original Claude background work is no longer available to stop.')
+    await owner.stopWork(signal)
+  }
+
   async *run(input: AgentRunInput, signal: AbortSignal): AsyncIterable<NormalizedAgentEvent> {
     const startupDeadline = Date.now() + RUN_STARTUP_TIMEOUT_MS
     if (this.disposed) {
@@ -1645,7 +1721,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     let assistantMessageId = input.runId
     let nativeResultAssistantText = false
     let nativeResultNumber = 0
-    const answer = new ClaudeAnswerAssembler(input.runId)
+    const queryMemory = new NativeWorkingMemory()
+    const answer = new ClaudeAnswerAssembler(input.runId, queryMemory)
     let resolvedModel = input.model
     let terminalKnown = false
     let terminalOutcome: 'completed' | 'failed' | 'interrupted' | undefined
@@ -1653,6 +1730,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     let foregroundReleased = false
     let nativeNotStarted = false
     let inputWithheldError: NativeInputWithheldError | undefined
+    let observedReportableTask = false
+    let foreignBackgroundInput = false
     let observedBackgroundActivity = false
     const nativeWork = new ClaudeNativeWork()
     const observation = new AbortController()
@@ -1660,6 +1739,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     let recordingTail = Promise.resolve()
     let pendingRead: Promise<IteratorResult<SDKMessage>> | undefined
     let iteratorDone = false
+    let interruptedReaderClosed = false
     let unknownReported = false
     let rootObservationUnknown = false
     const reportUnknown = (unconfirmed = true): void => {
@@ -1708,10 +1788,11 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     const nativePlanning = collaborationPlanMode(workflow, authorization)
     const nativeRetention = collaborationPlanRetentionAllowed(workflow, authorization)
     const nativeReview = collaborationReviewMode(workflow, authorization)
-    const planMemory = new NativeWorkingMemory().reserve(0)
-    const metadataMemory = new NativeWorkingMemory().reserve(0)
-    const planProofMemory = new NativeWorkingMemory().reserve(0)
+    const planMemory = queryMemory.reserve(0)
+    const metadataMemory = queryMemory.reserve(0)
+    const planProofMemory = queryMemory.reserve(0)
     const planPublication = new ClaudePlanPublication()
+    let workflowProjectionFailed = false
     let nativePlan: ClaudeNativePlan | undefined
     let planBindingTask: Promise<ClaudeNativePlan | undefined> | undefined
     let planBindingReads = 0
@@ -1740,19 +1821,23 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         )
       }, 0)
     const retentionCall = (id: string) => {
-      if (!id || id.length > 1024)
+      if (!id || id.length > 1024) {
+        workflowProjectionFailed = true
         throw new Error('The native plan retention identity exceeds its bound.')
+      }
       const existing = retentionCalls.get(id)
       if (existing) return existing
       if (
         retentionCalls.size >= 64 ||
         retentionMetadataBytes() + Buffer.byteLength(id) + id.length * 2 + 1024 > 64 * 1024
-      )
+      ) {
+        workflowProjectionFailed = true
         throw new AgentExecutionError(
           'response_too_large',
           'Native plan retention activity exceeded its bounded owner.',
           false,
         )
+      }
       const entry: NonNullable<ReturnType<typeof retentionCalls.get>> = {
         observed: false,
         succeeded: false,
@@ -1859,12 +1944,14 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       }
       const encoded = JSON.stringify(entry)
       bytes += Buffer.byteLength(encoded) + encoded.length * 2 + id.length * 2
-      if (bytes > 64 * 1024)
+      if (bytes > 64 * 1024) {
+        workflowProjectionFailed = true
         throw new AgentExecutionError(
           'response_too_large',
           'Pending question metadata exceeded its bounded owner.',
           false,
         )
+      }
       workflowCalls.set(id, entry)
     }
     const planCalls = new Set<string>()
@@ -2140,19 +2227,20 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     let readerSettled = false
     let readerEof = false
     let transportReleased = false
-    const inputMemory = new NativeWorkingMemory()
+    const inputMemory = queryMemory
     const deferredResultMemory = inputMemory.reserve(0)
     let deferredResult: SDKMessage | undefined
     let deferredEnding: 'completed' | 'failed' | 'interrupted' | undefined
     let deferredResultHasText = false
     let projectionFailure: AgentExecutionError | undefined
+    let nativeMessageIdentityUnconfirmed = false
     const failProjection = (error: unknown, deferForegroundFailure = false): void => {
       if (!projectionFailure) {
         projectionFailure = classifyAgentError(error)
         reasoningBlocks.clear()
         reasoningBytes = 0
         tools.clear()
-        answer.dispose()
+        answer.discardProjection()
         deferredResult = undefined
         deferredResultMemory.resize(0)
         input.recordOutputFailure?.(projectionFailure)
@@ -2183,6 +2271,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       } catch (error) {
         planPublication.invalidate()
         refreshCachedPlan()
+        workflowProjectionFailed = true
         failProjection(error)
       }
     }
@@ -2195,7 +2284,10 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         try {
           input.recordWorkflowPlanUnavailable?.()
         } catch (error) {
-          if (!retentionOnly || invalidatesSubmittedPlan) failProjection(error)
+          if (!retentionOnly || invalidatesSubmittedPlan) {
+            workflowProjectionFailed = true
+            failProjection(error)
+          }
         }
       }
     }
@@ -2448,7 +2540,10 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         if (signal.aborted) return
         captureUnavailable()
         if (!failureRecorded) failed('plan_capture_failed')
-        if (error instanceof NativeCapacityError) failProjection(error)
+        if (error instanceof NativeCapacityError) {
+          workflowProjectionFailed = true
+          failProjection(error)
+        }
       }
     }
     const captureReview = (verdict: CollaborationReviewObservation): void => {
@@ -2456,6 +2551,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         reviewResult = mergeWorkflowReview(reviewResult, verdict)
         input.recordWorkflowReview?.(reviewResult)
       } catch (error) {
+        workflowProjectionFailed = true
         failProjection(error)
       }
     }
@@ -2465,6 +2561,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         inputResult = mergeWorkflowInput(inputResult, outcome)
         input.recordWorkflowInputResult?.(inputResult)
       } catch (error) {
+        workflowProjectionFailed = true
         failProjection(error)
       }
     }
@@ -2490,6 +2587,39 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     let interruptTask: Promise<void> | undefined
     const unfinishedSteering = (): boolean =>
       [...steeredInputs.values()].some((entry) => entry.yielded && !entry.finished)
+    const backgroundWork = (): 'working' | 'stoppable' | undefined =>
+      terminalKnown && !actorExited && !readerSettled && nativeWork.active
+        ? nativeWork.stoppable && inputOpen && nativeActor?.stdin?.writable !== false
+          ? 'stoppable'
+          : 'working'
+        : undefined
+    const stopBackgroundWork = async (stopSignal: AbortSignal): Promise<void> => {
+      const queryOwner = session
+      if (!queryOwner || backgroundWork() !== 'stoppable')
+        throw new Error('The original Claude background work is no longer available to stop.')
+      const tasks = nativeWork.taskIds
+      const requestSignal = AbortSignal.any([stopSignal, observation.signal])
+      // This Query belongs only to this Run. Keep its writer open while observed
+      // work remains and keep its reader alive through the terminal work receipts.
+      if (nativeWork.hooksRunning) {
+        requestSignal.throwIfAborted()
+        await ClaudeAgentAdapter.withDeadline(
+          queryOwner.interrupt(),
+          NATIVE_INTERRUPT_TIMEOUT_MS,
+          requestSignal,
+        )
+      }
+      for (const taskId of tasks) {
+        requestSignal.throwIfAborted()
+        if (!nativeWork.hasTask(taskId)) continue
+        // oxlint-disable-next-line no-await-in-loop -- One write per exact task, within the shared Stop deadline.
+        await ClaudeAgentAdapter.withDeadline(
+          queryOwner.stopTask(taskId),
+          NATIVE_INTERRUPT_TIMEOUT_MS,
+          requestSignal,
+        )
+      }
+    }
     const closeInput = (): void => {
       inputOpen = false
       if (pendingInput && !pendingInput.yielded) {
@@ -2926,8 +3056,9 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         const workConfirmed =
           (terminalKnown || permissionRefused || nativeNotStarted) &&
           !terminalPlanProjectionFailed &&
-          !projectionFailure &&
-          (!inputWithheldError || readerEof) &&
+          !workflowProjectionFailed &&
+          !rootObservationUnknown &&
+          (!session || readerEof || (actorObserved && actorExited && interruptedReaderClosed)) &&
           !unfinishedSteering() &&
           !nativeWork.pending &&
           !permissionWait.waiting
@@ -3036,20 +3167,109 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         recordings.delete(recording)
       }
     }
+    const backgroundReport = async (message: SDKMessage): Promise<void> => {
+      if (
+        terminalOutcome !== 'completed' ||
+        !observedReportableTask ||
+        nativeMessageIdentityUnconfirmed ||
+        foreignBackgroundInput ||
+        !input.recordBackgroundReport
+      )
+        return
+      // A native synthetic update has no client request echo. A different
+      // explicit request on this Query disqualifies its later unstamped frames.
+      const echoed: unknown = Reflect.get(message, 'user_message_uuid')
+      const echoes: unknown = Reflect.get(message, 'user_message_uuids')
+      if (echoed !== undefined || echoes !== undefined) {
+        const ownsInput = (id: unknown): boolean =>
+          typeof id === 'string' && (id === input.runId || steeredInputs.get(id)?.finished === true)
+        if (
+          (echoed !== undefined && !ownsInput(echoed)) ||
+          (echoes !== undefined &&
+            (!Array.isArray(echoes) ||
+              echoes.length > 64 ||
+              echoes.some((id: unknown) => !ownsInput(id))))
+        )
+          foreignBackgroundInput = true
+        return
+      }
+      if (
+        message.type !== 'assistant' ||
+        message.session_id !== resolvedSessionId ||
+        message.parent_tool_use_id !== null ||
+        message.resume_reason ||
+        message.aborted ||
+        message.error ||
+        answer.hasNativeMessage(message.message.id) ||
+        !ClaudeAgentAdapter.isRequestUuid(message.uuid)
+      )
+        return
+      const identity = nativeBackgroundReportIdentitySchema.parse({
+        agentId: 'claude',
+        runId: input.runId,
+        nativeSessionId: resolvedSessionId,
+        nativeTurnId: input.runId,
+        bindingGeneration: input.bindingGeneration ?? 1,
+        executorId: nativeExecutorId,
+        frameId: message.uuid,
+        nativeMessageId: message.message.id,
+      })
+      let reservation: NativeMemoryReservation | undefined
+      try {
+        let text: string
+        try {
+          let chars = 0,
+            bytes = 0,
+            blocks = 0,
+            hasText = false
+          // Measurement borrows the SDK's blocks. No joined text or duplicate
+          // block array exists until this same Query admits the full workspace.
+          for (const block of message.message.content) {
+            if (block.type !== 'text') continue
+            if (typeof block.text !== 'string')
+              throw new AgentExecutionError(
+                'protocol_error',
+                'The native background update has an invalid text block.',
+                false,
+              )
+            chars += block.text.length
+            bytes += Buffer.byteLength(block.text)
+            blocks++
+            hasText ||= /\S/u.test(block.text)
+          }
+          if (!hasText) return
+          reservation = queryMemory.reserve(4096 + chars * 10 + bytes * 2 + blocks * 16)
+          const parts: string[] = []
+          for (const block of message.message.content)
+            if (block.type === 'text') parts.push(block.text)
+          text = parts.join('')
+        } catch (error) {
+          if (!input.recordBackgroundReportUnavailable) throw error
+          input.recordBackgroundReportUnavailable(identity)
+          recordDiagnostic({
+            operation: 'native_check',
+            phase: 'failed',
+            level: 'warn',
+            scope: 'run',
+            sessionId: input.sessionId,
+            runId: input.runId,
+            agentId: this.id,
+            runtimeBoundary: 'archive',
+            code: classifyAgentError(error).kind,
+          })
+          return
+        }
+        // The consumer borrows this admitted text through its complete seal;
+        // persistence failures retain their existing observation error path.
+        await input.recordBackgroundReport({ ...identity, text })
+      } finally {
+        reservation?.release()
+      }
+    }
     const projectMessage = function* (
       this: ClaudeAgentAdapter,
       message: SDKMessage,
     ): Generator<NormalizedAgentEvent> {
-      if (
-        message.type === 'system' &&
-        ['hook_started', 'task_started', 'background_tasks_changed'].includes(message.subtype)
-      ) {
-        observedBackgroundActivity = true
-        nativeEffectsUncertain(
-          input,
-          'Native hooks or background work may modify files beyond the available operation evidence.',
-        )
-      }
       const providerSessionId = Reflect.get(message, 'session_id')
       if (
         typeof providerSessionId === 'string' &&
@@ -3062,12 +3282,62 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           false,
         )
       }
+      const previousWork = backgroundWork()
       nativeWork.observe(message)
+      if (providerSessionId === resolvedSessionId && message.type === 'system') {
+        if (message.subtype === 'background_tasks_changed' && message.tasks.length <= 64)
+          observedReportableTask ||= message.tasks.some(
+            (task) => task.ambient !== true && nativeWork.hasTask(task.task_id),
+          )
+        else if (
+          message.subtype === 'task_started' &&
+          message.ambient !== true &&
+          message.is_backgrounded !== false &&
+          nativeWork.hasTask(message.task_id)
+        )
+          observedReportableTask = true
+      }
+      if (!observedBackgroundActivity && nativeWork.pending) {
+        observedBackgroundActivity = true
+        nativeEffectsUncertain(
+          input,
+          'Native hooks or background work may modify files beyond the available operation evidence.',
+        )
+      }
+      if (terminalKnown) {
+        if (!nativeWork.active) closeInput()
+        if (previousWork !== backgroundWork()) input.backgroundWorkChanged?.()
+        if (
+          observedReportableTask &&
+          providerSessionId === resolvedSessionId &&
+          message.type === 'system' &&
+          message.subtype === 'task_notification' &&
+          !message.ambient &&
+          !message.skip_transcript &&
+          message.task_id &&
+          message.task_id.length <= 1024 &&
+          ['completed', 'failed', 'stopped'].includes(message.status)
+        )
+          yield {
+            agentId: 'claude',
+            type: 'tool.completed',
+            turnId: input.runId,
+            toolCallId: `background-task:${message.task_id}`,
+            toolName: 'Background task',
+            title: `Background task ${message.status}`,
+            outcome: message.status === 'completed' ? 'completed' : 'failed',
+          }
+      }
       if (message.type === 'system' && message.subtype === 'init')
         nativeQueueCancellationSupported =
           Array.isArray(message.capabilities) &&
           message.capabilities.length <= 256 &&
           message.capabilities.includes('interrupt_cancel_queued_v1')
+      if (message.type === 'system' && message.subtype === 'commands_changed') {
+        skillCatalogChangedDuringRun = true
+        this.skillCatalogChanged?.()
+      }
+      if (terminalKnown && ['assistant', 'stream_event', 'result'].includes(message.type)) return
       const echoed = Reflect.get(message, 'user_message_uuid')
       const echoes = Reflect.get(message, 'user_message_uuids')
       const explicit = typeof echoed === 'string' || Array.isArray(echoes)
@@ -3093,8 +3363,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         [...steeredInputs.values()].some(
           (entry) => entry.yielded && inputIds.has(entry.request.inputId),
         )
-      if (explicit) {
-        if (currentRequestMatched && !matched && !terminalKnown)
+      if (explicit && !terminalKnown) {
+        if (currentRequestMatched && !matched)
           this.recordEvidence(input, resolvedSessionId, {
             kind: 'no_evidence',
             reason:
@@ -3117,10 +3387,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           this.recordEvidence(input, resolvedSessionId, { kind: 'running', source: 'live_runtime' })
         // Idle can be the boundary before a submitted `next` input starts.
         // Only the exact result(s), not this state level, end the logical Run.
-      }
-      if (message.type === 'system' && message.subtype === 'commands_changed') {
-        skillCatalogChangedDuringRun = true
-        this.skillCatalogChanged?.()
       }
       if (['assistant', 'stream_event', 'result'].includes(message.type) && !currentRequestMatched)
         return
@@ -3163,6 +3429,25 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       while (peerRequests.length > 0) {
         const proposal = peerRequests.shift()
         if (proposal) yield proposal
+      }
+
+      const nativeMessageId =
+        message.type === 'assistant' && message.parent_tool_use_id === null
+          ? message.message.id
+          : message.type === 'stream_event' &&
+              !message.parent_tool_use_id &&
+              message.event.type === 'message_start'
+            ? message.event.message.id
+            : undefined
+      if (nativeMessageId !== undefined) {
+        try {
+          // Root identity survives failed body projection. Otherwise a later
+          // replay of an unprojected root item could become a Background update.
+          answer.observeNativeMessage(nativeMessageId)
+        } catch (error) {
+          nativeMessageIdentityUnconfirmed = true
+          failProjection(error)
+        }
       }
 
       if (!projectionFailure) {
@@ -3345,12 +3630,14 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                   !block.id ||
                   block.id.length > 1024 ||
                   (!workflowCalls.has(block.id) && workflowCalls.size >= 64)
-                )
+                ) {
+                  workflowProjectionFailed = true
                   throw new AgentExecutionError(
                     'response_too_large',
                     'Native review submission activity exceeded its bounded owner.',
                     false,
                   )
+                }
                 if (verdict) {
                   const prior = workflowCalls.get(block.id)
                   const merged =
@@ -3367,12 +3654,14 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                   !block.id ||
                   block.id.length > 1024 ||
                   (!workflowCalls.has(block.id) && workflowCalls.size >= 64)
-                )
+                ) {
+                  workflowProjectionFailed = true
                   throw new AgentExecutionError(
                     'response_too_large',
                     'Native input-result activity exceeded its bounded owner.',
                     false,
                   )
+                }
                 const parsed = collaborationInputResultSchema.safeParse(block.input)
                 if (parsed.success) {
                   const prior = workflowCalls.get(block.id)
@@ -3390,12 +3679,14 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                   !block.id ||
                   block.id.length > 1024 ||
                   (!planCalls.has(block.id) && planCalls.size >= 64)
-                )
+                ) {
+                  workflowProjectionFailed = true
                   throw new AgentExecutionError(
                     'response_too_large',
                     'Native plan submission activity exceeded its bounded owner.',
                     false,
                   )
+                }
                 planCalls.add(block.id)
                 continue
               }
@@ -3448,6 +3739,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           ) {
             for (const block of message.message.content) {
               if (block.type !== 'tool_result') continue
+              if (terminalKnown && !tools.has(block.tool_use_id)) continue
               const retention = retentionCalls.get(block.tool_use_id)
               if (retention) {
                 if (block.is_error || !currentRequestMatched || terminalKnown)
@@ -3637,7 +3929,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         deferredResult = undefined
         deferredEnding = undefined
         deferredResultMemory.resize(0)
-        closeInput()
+        if (!nativeWork.active) closeInput()
         // A body/report failure must not revoke the exact native ending.
         recordEnding(outcome)
         if (projectionFailure) {
@@ -4149,6 +4441,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         recordings,
         executorId: nativeExecutorId,
         steer,
+        work: backgroundWork,
+        stopWork: stopBackgroundWork,
       })
       iterator = session[Symbol.asyncIterator]()
       if (speedInput) {
@@ -4377,7 +4671,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       speedInput?.resolve(false)
       recoveryInput?.resolve(false)
       confirmPermissionInput?.(false)
-      closeInput()
+      if (!terminalKnown || !nativeWork.active || iteratorDone) closeInput()
       foregroundReleased = true
       const emptyRejectedOwner =
         nativeNotStarted &&
@@ -4389,13 +4683,26 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         const ownedIterator = iterator
         const drain = (async () => {
           let effectsKnown = false
+          let readingNative = false
+          let rootOutputTransferred = false
           try {
             while (true) {
+              if (terminalKnown && !rootOutputTransferred) {
+                // Foreground consumption can finish while the receiver still
+                // seals archived root text. Join that owner before reading a
+                // report, without treating output transfer as native settlement.
+                // oxlint-disable-next-line no-await-in-loop -- This one-time barrier precedes the first post-terminal SDK read.
+                await input.waitForRootOutput?.()
+                answer.discardProjection()
+                rootOutputTransferred = true
+              }
               // A timed-out foreground read remains the sole in-flight iterator read.
+              readingNative = true
               const next = pendingRead ?? ownedIterator.next()
               pendingRead = undefined
               // oxlint-disable-next-line no-await-in-loop -- The native stream remains owned until actual EOF.
               const result = await next
+              readingNative = false
               if (result.done) {
                 // oxlint-disable-next-line no-await-in-loop -- Native EOF must include the one bounded Stop receipt before settling queued inputs.
                 await interruptTask
@@ -4414,7 +4721,12 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 effectsKnown = true
                 break
               }
+              const hadEnded = terminalKnown
               for (const event of projectMessage(result.value)) input.recordArchivedEvent?.(event)
+              if (hadEnded) {
+                // oxlint-disable-next-line no-await-in-loop -- One background body is durably sealed before reading the next SDK frame.
+                await backgroundReport(result.value)
+              }
             }
           } catch {
             nativeEffectsUncertain(input, 'Native background completion could not be confirmed.')
@@ -4423,8 +4735,19 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 kind: 'no_evidence',
                 reason: 'The native stream ended without a matching terminal receipt.',
               })
-            reportUnknown()
+            // The SDK may terminate its iterator with the actor's nonzero exit
+            // after the exact requested interruption. Only physical actor exit
+            // can finish this path; completed roots still require genuine EOF.
+            interruptedReaderClosed =
+              readingNative &&
+              terminalOutcome === 'interrupted' &&
+              interruptRequested &&
+              !unfinishedSteering() &&
+              !nativeWork.pending &&
+              !permissionWait.waiting
+            reportUnknown(!interruptedReaderClosed)
           } finally {
+            closeInput()
             await Promise.allSettled(recordings)
             signal.removeEventListener('abort', abort)
             readerSettled = true

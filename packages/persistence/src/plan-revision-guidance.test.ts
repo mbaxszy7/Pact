@@ -635,11 +635,13 @@ describe('Plan revision advice persistence', () => {
       expectedGeneration: 1,
       abandon: false,
     })
+    const sourceRevisions = new Map<string, number>()
     const chunks = []
     for await (const chunk of f.repo.nativeContextRebuildSource(
       f.sessionId,
       new AbortController().signal,
       rebuildId,
+      sourceRevisions,
     ))
       chunks.push(chunk)
     expect(
@@ -647,7 +649,7 @@ describe('Plan revision advice persistence', () => {
         (chunk) => chunk.kind === 'message' && chunk.content.includes(auth.sourceManifestRef!.id),
       ),
     ).toBe(true)
-    f.repo.freezeNativeRebuildSource(rebuildId, chunks)
+    f.repo.freezeNativeRebuildSource(rebuildId, chunks, sourceRevisions)
     const saved = f.db.drizzle
       .select()
       .from(conversationRebuildSourceRefs)

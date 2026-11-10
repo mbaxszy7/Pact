@@ -51,6 +51,11 @@ import { planRunInput } from './collaboration-fixture.test-support.js'
 import { FrozenSourceReader } from './frozen-source-reader'
 import { NativeForkFiles } from './native-fork-files'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
+import {
+  NativeWorkingMemory,
+  NATIVE_OWNER_WORKING_BYTES,
+  nativeWorkingMemoryDiagnostics,
+} from './native-working-memory'
 import { PactPeerToolServer } from './pact-peer-tool-server'
 
 let workerFixture: Awaited<ReturnType<typeof nativeWorkerFixture>>
@@ -2181,6 +2186,99 @@ describe('Claude Agent lifecycle', () => {
       await f.dispose()
     }
   })
+
+  it.each(['completed-root', 'unfinished-hook'] as const)(
+    'does not treat an actor exit error as a complete background drain: %s',
+    async (mode) => {
+      const tail =
+        mode === 'unfinished-hook'
+          ? [
+              {
+                type: 'system',
+                subtype: 'hook_started',
+                session_id: runInput().nativeSessionId,
+                hook_id: 'unfinished',
+              } as SDKMessage,
+            ]
+          : []
+      const f = cancellationFixture(undefined, {}, undefined, false, tail)
+      try {
+        await f.ready()
+        f.controller.abort()
+        await f.outcome
+        f.child.emit('close', 1, null)
+        f.finishResult({
+          done: false,
+          value: {
+            type: 'result',
+            subtype: mode === 'completed-root' ? 'success' : 'error_during_execution',
+            is_error: mode !== 'completed-root',
+            ...(mode === 'unfinished-hook'
+              ? { terminal_reason: 'aborted_tools', errors: ['Interrupted'] }
+              : { result: 'Completed' }),
+            session_id: runInput().nativeSessionId,
+            user_message_uuid: runInput().runId,
+          } as SDKMessage,
+        })
+        await vi.waitFor(() =>
+          expect(f.adapter.diagnostics()).toEqual({ activeQueries: 0, activeSessions: 0 }),
+        )
+        expect(f.adapter.hasActiveBackgroundWork()).toBe(true)
+        expect(f.report).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'unknown' }))
+      } finally {
+        await f.dispose()
+      }
+    },
+  )
+
+  it('does not confuse a post-interruption observation failure with the SDK actor-exit error', async () => {
+    const changed = vi
+      .fn<NonNullable<AgentRunInput['backgroundWorkChanged']>>()
+      .mockImplementationOnce(() => {})
+      .mockImplementationOnce(() => {
+        throw new Error('Controlled work projection failure')
+      })
+    const f = cancellationFixture(undefined, { backgroundWorkChanged: changed }, undefined, false, [
+      {
+        type: 'system',
+        subtype: 'hook_started',
+        session_id: runInput().nativeSessionId,
+        hook_id: 'work',
+      } as SDKMessage,
+      {
+        type: 'system',
+        subtype: 'hook_response',
+        session_id: runInput().nativeSessionId,
+        hook_id: 'work',
+      } as SDKMessage,
+    ])
+    try {
+      await f.ready()
+      f.controller.abort()
+      await f.outcome
+      f.finishResult({
+        done: false,
+        value: {
+          type: 'result',
+          subtype: 'error_during_execution',
+          is_error: true,
+          terminal_reason: 'aborted_tools',
+          errors: ['Interrupted'],
+          session_id: runInput().nativeSessionId,
+          user_message_uuid: runInput().runId,
+        } as SDKMessage,
+      })
+      await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(2))
+      f.child.emit('close', 1, null)
+      await vi.waitFor(() =>
+        expect(f.adapter.diagnostics()).toEqual({ activeQueries: 0, activeSessions: 0 }),
+      )
+      expect(f.report).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'unknown' }))
+      expect(f.adapter.hasActiveBackgroundWork()).toBe(true)
+    } finally {
+      await f.dispose()
+    }
+  })
   it.each(['reject', 'deadline'] as const)(
     'does not retry or fabricate an ending after interruption %s',
     async (fault) => {
@@ -2895,6 +2993,555 @@ describe('Claude Agent lifecycle', () => {
     },
   )
 
+  it.each([
+    'terminal-seal',
+    'earlier-body',
+    'foreign-request',
+    'unconfirmed-identity',
+    'unobserved-work',
+  ] as const)(
+    'keeps background report attribution and native drain separate from root body failure: %s',
+    async (mode) => {
+      const input = { ...runInput(), bindingGeneration: 7 }
+      const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
+      const outputFailure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
+      const report = vi.fn<NonNullable<AgentRunInput['recordBackgroundReport']>>(async () => {})
+      const unavailable = vi.fn<NonNullable<AgentRunInput['recordBackgroundReportUnavailable']>>()
+      const effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+      const earlier = mode === 'earlier-body' || mode === 'unconfirmed-identity'
+      const assistant = (id: string, text: string, echo = false): SDKMessage =>
+        ({
+          type: 'assistant',
+          uuid: randomUUID(),
+          session_id: input.nativeSessionId,
+          parent_tool_use_id: null,
+          ...(echo ? { user_message_uuid: input.runId } : {}),
+          message: { id, model: 'fixture', content: [{ type: 'text', text }] },
+        }) as SDKMessage
+      const messages: SDKMessage[] = []
+      if (mode !== 'unobserved-work')
+        messages.push({
+          type: 'system',
+          subtype: 'background_tasks_changed',
+          session_id: input.nativeSessionId,
+          tasks: [{ task_id: 'owned-task', ambient: false }],
+        } as SDKMessage)
+      for (const event of [
+        { type: 'message_start', message: { id: 'root-api', model: 'fixture' } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: 'Partial root' },
+        },
+        ...(earlier ? [{ type: 'content_block_stop', index: 0 }] : []),
+      ])
+        messages.push({
+          type: 'stream_event',
+          uuid: randomUUID(),
+          session_id: input.nativeSessionId,
+          user_message_uuid: input.runId,
+          parent_tool_use_id: null,
+          event,
+        } as SDKMessage)
+      if (earlier) messages.push(assistant('unprojected-root-api', 'Unprojected root', true))
+      if (mode === 'unconfirmed-identity')
+        messages.push(assistant('x'.repeat(513), 'Unconfirmed root item', true))
+      messages.push({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        session_id: input.nativeSessionId,
+        user_message_uuid: input.runId,
+        result: 'Unsealed root body',
+      } as SDKMessage)
+      messages.push(assistant('root-api', 'Replayed root'))
+      if (earlier) messages.push(assistant('unprojected-root-api', 'Replayed unprojected root'))
+      if (mode === 'foreign-request')
+        messages.push({
+          type: 'user',
+          uuid: randomUUID(),
+          user_message_uuid: randomUUID(),
+          session_id: input.nativeSessionId,
+          parent_tool_use_id: null,
+          message: { role: 'user', content: 'A different explicit request' },
+        } as SDKMessage)
+      messages.push(assistant('background-api', 'Complete independently attributed update'), {
+        type: 'system',
+        uuid: randomUUID(),
+        subtype: 'background_tasks_changed',
+        session_id: input.nativeSessionId,
+        tasks: [],
+      } as SDKMessage)
+      const adapter = new ClaudeAgentAdapter('/fake/claude', {
+        getSessionInfo: vi.fn() as never,
+        query: fakeQuery(messages),
+      })
+      const events: string[] = []
+      try {
+        const outcome = (async () => {
+          for await (const event of adapter.run(
+            {
+              ...input,
+              recordNativeEvidence: evidence,
+              recordOutputFailure: outputFailure,
+              recordBackgroundReport: report,
+              recordBackgroundReportUnavailable: unavailable,
+              reportNativeEffects: effects,
+            },
+            new AbortController().signal,
+          ))
+            events.push(event.type)
+        })()
+        await expect(outcome).rejects.toMatchObject({
+          kind: earlier ? 'unknown_delivery' : 'protocol_error',
+        })
+        await vi.waitFor(() =>
+          expect(adapter.diagnostics()).toEqual({ activeQueries: 0, activeSessions: 0 }),
+        )
+        expect(outputFailure).toHaveBeenCalledTimes(1)
+        expect(outputFailure).toHaveBeenCalledWith(
+          expect.objectContaining({ kind: 'protocol_error' }),
+        )
+        expect(events).not.toContain('turn.completed')
+        expect(events).not.toContain('text.completed')
+        expect(evidence).toHaveBeenCalledWith(
+          expect.objectContaining({ kind: 'ended', outcome: 'completed' }),
+        )
+        const reportable = mode === 'terminal-seal' || mode === 'earlier-body'
+        expect(report).toHaveBeenCalledTimes(Number(reportable))
+        const expectedReport = {
+          agentId: 'claude',
+          runId: input.runId,
+          nativeSessionId: input.nativeSessionId,
+          nativeTurnId: input.runId,
+          bindingGeneration: 7,
+          executorId: adapter.executorId,
+          frameId: expect.any(String),
+          nativeMessageId: 'background-api',
+          text: 'Complete independently attributed update',
+        }
+        expect(report.mock.calls).toEqual(reportable ? [[expectedReport]] : [])
+        expect(unavailable).not.toHaveBeenCalled()
+        expect(effects).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'settled' }))
+        expect(adapter.hasActiveBackgroundWork(input.runId)).toBe(false)
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  )
+
+  it('hands off a large root before admitting a report under the same Query budget and retains it through persistence', async () => {
+    const input = runInput(),
+      rootText = 'r'.repeat(8 * 1024 * 1024)
+    const reportText = 'b'.repeat(8 * 1024 * 1024)
+    const rootStored = Promise.withResolvers<void>(),
+      reportStored = Promise.withResolvers<void>()
+    const reportEntered = Promise.withResolvers<void>(),
+      allowEof = Promise.withResolvers<void>()
+    const effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+    const unavailable = vi.fn<NonNullable<AgentRunInput['recordBackgroundReportUnavailable']>>()
+    const waitForRootOutput = vi.fn(() => rootStored.promise)
+    let readReport = false,
+      reportDrained = false,
+      completedLength = 0
+    const before = nativeWorkingMemoryDiagnostics().chargedBytes
+    const query = ((request: { prompt: AsyncIterable<SDKUserMessage> }) => ({
+      async *[Symbol.asyncIterator]() {
+        await request.prompt[Symbol.asyncIterator]().next()
+        yield {
+          type: 'system',
+          subtype: 'task_started',
+          session_id: input.nativeSessionId,
+          task_id: 'task',
+        } as SDKMessage
+        yield {
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          session_id: input.nativeSessionId,
+          user_message_uuid: input.runId,
+          result: rootText,
+        } as SDKMessage
+        readReport = true
+        yield {
+          type: 'assistant',
+          uuid: randomUUID(),
+          session_id: input.nativeSessionId,
+          parent_tool_use_id: null,
+          message: {
+            id: 'large-report',
+            model: 'fixture',
+            content: [
+              { type: 'text', text: reportText.slice(0, reportText.length / 2) },
+              { type: 'text', text: reportText.slice(reportText.length / 2) },
+            ],
+          },
+        } as SDKMessage
+        reportDrained = true
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          session_id: input.nativeSessionId,
+          task_id: 'task',
+        } as SDKMessage
+        await allowEof.promise
+      },
+      initializationResult: vi.fn(async () => ({ current_permission_mode: 'default' })),
+      setPermissionMode: vi.fn(async () => {}),
+      close: vi.fn(),
+      return: vi.fn(async () => ({ done: true, value: undefined })),
+    })) as unknown as typeof sdkQuery
+    const adapter = new ClaudeAgentAdapter('/fake/claude', {
+      query,
+      getSessionInfo: vi.fn() as never,
+    })
+    const owners = new Set<NativeWorkingMemory>()
+    // oxlint-disable-next-line typescript/unbound-method -- Delegate every observed reservation with its original allocator as this.
+    const reserve = NativeWorkingMemory.prototype.reserve
+    const reservationProbe = vi
+      .spyOn(NativeWorkingMemory.prototype, 'reserve')
+      .mockImplementation(function (this: NativeWorkingMemory, bytes) {
+        owners.add(this)
+        return reserve.call(this, bytes)
+      })
+    const held = () => [...owners].reduce((total, owner) => total + owner.bytes, 0)
+    const report = vi.fn<NonNullable<AgentRunInput['recordBackgroundReport']>>(async (value) => {
+      expect(value.text.length).toBe(reportText.length)
+      expect(createHash('sha256').update(value.text).digest('hex')).toBe(
+        createHash('sha256').update(reportText).digest('hex'),
+      )
+      reportEntered.resolve()
+      await reportStored.promise
+    })
+    try {
+      for await (const event of adapter.run(
+        {
+          ...input,
+          waitForRootOutput,
+          recordBackgroundReport: report,
+          recordBackgroundReportUnavailable: unavailable,
+          reportNativeEffects: effects,
+        },
+        new AbortController().signal,
+      ))
+        if (event.type === 'text.completed') completedLength = event.text.length
+      await vi.waitFor(() => expect(waitForRootOutput).toHaveBeenCalledOnce())
+      expect(completedLength).toBe(rootText.length)
+      expect(readReport).toBe(false)
+      expect(held()).toBeGreaterThanOrEqual(rootText.length * 12)
+      const rootPendingBytes = held()
+      const queryOwner = [...owners].find((owner) => owner.bytes >= rootText.length * 12)!
+      rootStored.resolve()
+      await reportEntered.promise
+      expect(readReport).toBe(true)
+      expect(reportDrained).toBe(false)
+      expect(queryOwner.bytes).toBeGreaterThanOrEqual(reportText.length * 12)
+      expect(held()).toBeLessThanOrEqual(NATIVE_OWNER_WORKING_BYTES)
+      expect(queryOwner.diagnostics().highWaterBytes).toBeLessThanOrEqual(
+        NATIVE_OWNER_WORKING_BYTES,
+      )
+      const reportPendingBytes = held()
+      reportStored.resolve()
+      await vi.waitFor(() => expect(reportDrained).toBe(true))
+      expect(held()).toBeLessThan(1024 * 1024)
+      expect(effects.mock.calls.some(([value]) => value.state === 'settled')).toBe(false)
+      expect(adapter.diagnostics()).toEqual({ activeQueries: 1, activeSessions: 1 })
+      console.info(
+        '[pact-claude-query-body-budget]',
+        JSON.stringify({
+          unit: 'native-working-reservations-v1',
+          ownerLimitBytes: NATIVE_OWNER_WORKING_BYTES,
+          rootPendingBytes,
+          reportPendingBytes,
+          afterPersistenceBytes: held(),
+          queryHighWaterBytes: queryOwner.diagnostics().highWaterBytes,
+        }),
+      )
+      allowEof.resolve()
+      await vi.waitFor(() =>
+        expect(effects).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'settled' })),
+      )
+      expect(unavailable).not.toHaveBeenCalled()
+    } finally {
+      rootStored.resolve()
+      reportStored.resolve()
+      allowEof.resolve()
+      await adapter.dispose()
+      reservationProbe.mockRestore()
+    }
+    expect(nativeWorkingMemoryDiagnostics().chargedBytes).toBe(before)
+  })
+
+  it.each(['capacity', 'live-input', 'invalid-text'] as const)(
+    'retains only the attributable unavailable report on local materialization failure: %s',
+    async (fault) => {
+      const base = runInput()
+      const input = {
+        ...base,
+        promptEnvelope: {
+          ...base.promptEnvelope,
+          message: {
+            ...base.promptEnvelope.message,
+            content:
+              fault === 'live-input'
+                ? 'q'.repeat(4 * 1024 * 1024)
+                : base.promptEnvelope.message.content,
+          },
+        },
+      }
+      const failedFrameId = randomUUID()
+      const report = vi.fn<NonNullable<AgentRunInput['recordBackgroundReport']>>(async () => {})
+      const unavailable = vi.fn<NonNullable<AgentRunInput['recordBackgroundReportUnavailable']>>()
+      const outputFailure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
+      const effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+      const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
+      const adapter = new ClaudeAgentAdapter('/fake/claude', {
+        getSessionInfo: vi.fn() as never,
+        query: fakeQuery([
+          {
+            type: 'system',
+            subtype: 'task_started',
+            session_id: input.nativeSessionId,
+            task_id: 'task',
+          } as SDKMessage,
+          {
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            session_id: input.nativeSessionId,
+            user_message_uuid: input.runId,
+            result: 'Complete root',
+          } as SDKMessage,
+          {
+            type: 'assistant',
+            uuid: failedFrameId,
+            session_id: input.nativeSessionId,
+            parent_tool_use_id: null,
+            message: {
+              id: 'unavailable-report',
+              model: 'fixture',
+              content: [
+                {
+                  type: 'text',
+                  text:
+                    fault === 'invalid-text'
+                      ? 42
+                      : 'x'.repeat((fault === 'capacity' ? 12 : 8) * 1024 * 1024),
+                },
+              ],
+            },
+          } as unknown as SDKMessage,
+          {
+            type: 'assistant',
+            uuid: randomUUID(),
+            session_id: input.nativeSessionId,
+            parent_tool_use_id: null,
+            message: {
+              id: 'next-report',
+              model: 'fixture',
+              content: [{ type: 'text', text: 'A later valid report' }],
+            },
+          } as SDKMessage,
+          {
+            type: 'system',
+            subtype: 'task_notification',
+            session_id: input.nativeSessionId,
+            task_id: 'task',
+          } as SDKMessage,
+        ]),
+      })
+      try {
+        const events: string[] = []
+        for await (const event of adapter.run(
+          {
+            ...input,
+            recordBackgroundReport: report,
+            recordBackgroundReportUnavailable: unavailable,
+            recordOutputFailure: outputFailure,
+            reportNativeEffects: effects,
+            recordNativeEvidence: evidence,
+          },
+          new AbortController().signal,
+        ))
+          events.push(event.type)
+        await vi.waitFor(() =>
+          expect(adapter.diagnostics()).toEqual({ activeQueries: 0, activeSessions: 0 }),
+        )
+        expect(events).toContain('turn.completed')
+        expect(outputFailure).not.toHaveBeenCalled()
+        expect(unavailable.mock.calls).toEqual([
+          [
+            {
+              agentId: 'claude',
+              runId: input.runId,
+              nativeSessionId: input.nativeSessionId,
+              nativeTurnId: input.runId,
+              bindingGeneration: 1,
+              executorId: adapter.executorId,
+              frameId: failedFrameId,
+              nativeMessageId: 'unavailable-report',
+            },
+          ],
+        ])
+        expect(report).toHaveBeenCalledTimes(1)
+        expect(report).toHaveBeenCalledWith(
+          expect.objectContaining({ nativeMessageId: 'next-report', text: 'A later valid report' }),
+        )
+        expect(evidence).toHaveBeenCalledWith(
+          expect.objectContaining({
+            kind: 'ended',
+            outcome: 'completed',
+            output: expect.objectContaining({ text: 'Complete root', completeness: 'complete' }),
+          }),
+        )
+        expect(effects).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'settled' }))
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  )
+
+  it.each(
+    (['edge', 'level'] as const).flatMap((kind) =>
+      (['items', 'bytes'] as const).flatMap((budget) =>
+        [false, true].map((overflow) => ({ kind, budget, overflow })),
+      ),
+    ),
+  )(
+    'shares the Hook and task observation budget: $kind $budget overflow=$overflow',
+    async ({ kind, budget, overflow }) => {
+      const input = runInput(),
+        effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+      const hooks = Array.from(
+        { length: budget === 'items' ? 32 : 11 },
+        (_, index) => `h${index}-${budget === 'bytes' ? '界'.repeat(1000) : 'hook'}`,
+      )
+      const tasks = Array.from(
+        { length: (budget === 'items' ? 32 : 10) + Number(overflow) },
+        (_, index) => `t${index}-${budget === 'bytes' ? '界'.repeat(1000) : 'task'}`,
+      )
+      const system = (fields: object): SDKMessage =>
+        ({ type: 'system', session_id: input.nativeSessionId, ...fields }) as SDKMessage
+      const hookStarts = hooks.map((hook_id) => system({ subtype: 'hook_started', hook_id }))
+      const taskStarts = tasks.map((task_id) => system({ subtype: 'task_started', task_id }))
+      const messages =
+        kind === 'edge'
+          ? [...taskStarts, ...hookStarts]
+          : [
+              ...hookStarts,
+              system({
+                subtype: 'background_tasks_changed',
+                tasks: tasks.map((task_id) => ({ task_id })),
+              }),
+            ]
+      messages.push({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        session_id: input.nativeSessionId,
+        user_message_uuid: input.runId,
+        result: 'Root reply',
+      } as SDKMessage)
+      messages.push(...hooks.map((hook_id) => system({ subtype: 'hook_response', hook_id })))
+      messages.push(
+        ...(kind === 'edge'
+          ? tasks.map((task_id) => system({ subtype: 'task_notification', task_id }))
+          : [system({ subtype: 'background_tasks_changed', tasks: [] })]),
+      )
+      const adapter = new ClaudeAgentAdapter('/fake/claude', {
+        getSessionInfo: vi.fn() as never,
+        query: fakeQuery(messages),
+      })
+      try {
+        for await (const event of adapter.run(
+          { ...input, reportNativeEffects: effects },
+          new AbortController().signal,
+        ))
+          void event
+        await vi.waitFor(() =>
+          expect(adapter.diagnostics()).toEqual({ activeQueries: 0, activeSessions: 0 }),
+        )
+        expect(effects).toHaveBeenLastCalledWith(
+          expect.objectContaining({ state: overflow ? 'unknown' : 'settled' }),
+        )
+        expect(adapter.hasActiveBackgroundWork(input.runId)).toBe(overflow)
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  )
+
+  it.each(['edge', 'level'] as const)(
+    'does not offer an ambient task as an owned Stop target: %s',
+    async (kind) => {
+      const input = runInput(),
+        drain = Promise.withResolvers<void>()
+      const stopTask = vi.fn(async () => {})
+      const effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+      const query = ((request: { prompt: AsyncIterable<SDKUserMessage> }) => ({
+        async *[Symbol.asyncIterator]() {
+          await request.prompt[Symbol.asyncIterator]().next()
+          yield {
+            type: 'system',
+            session_id: input.nativeSessionId,
+            ...(kind === 'edge'
+              ? { subtype: 'task_started', task_id: 'ambient-task', ambient: true }
+              : {
+                  subtype: 'background_tasks_changed',
+                  tasks: [{ task_id: 'ambient-task', ambient: true }],
+                }),
+          } as SDKMessage
+          yield {
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            session_id: input.nativeSessionId,
+            user_message_uuid: input.runId,
+            result: 'Root reply',
+          } as SDKMessage
+          await drain.promise
+          yield {
+            type: 'system',
+            session_id: input.nativeSessionId,
+            ...(kind === 'edge'
+              ? { subtype: 'task_notification', task_id: 'ambient-task', ambient: true }
+              : { subtype: 'background_tasks_changed', tasks: [] }),
+          } as SDKMessage
+        },
+        initializationResult: vi.fn(async () => ({ current_permission_mode: 'default' })),
+        setPermissionMode: vi.fn(async () => {}),
+        stopTask,
+        close: vi.fn(),
+        return: vi.fn(async () => ({ done: true, value: undefined })),
+      })) as unknown as typeof sdkQuery
+      const adapter = new ClaudeAgentAdapter('/fake/claude', {
+        query,
+        getSessionInfo: vi.fn() as never,
+      })
+      try {
+        for await (const event of adapter.run(
+          { ...input, reportNativeEffects: effects },
+          new AbortController().signal,
+        ))
+          void event
+        const executor = adapter.executorId!
+        expect(adapter.backgroundWork(input.runId, executor)).toBeUndefined()
+        await expect(
+          adapter.stopBackgroundWork(input.runId, executor, new AbortController().signal),
+        ).rejects.toThrow('The original Claude background work is no longer available to stop.')
+        expect(stopTask).not.toHaveBeenCalled()
+        drain.resolve()
+        await vi.waitFor(() =>
+          expect(effects).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'settled' })),
+        )
+      } finally {
+        drain.resolve()
+        await adapter.dispose()
+      }
+    },
+  )
+
   it.each(['hook', 'task', 'level-before-edge'] as const)(
     'settles completed %s work after the root result and natural EOF',
     async (kind) => {
@@ -3189,6 +3836,7 @@ function cancellationFixture(
   input: Partial<AgentRunInput> = {},
   beforePrompt?: Promise<void>,
   naturalEof = false,
+  afterResult: SDKMessage[] = [],
 ) {
   const effectiveInput = { ...runInput(), ...input }
   const child = Object.assign(new EventEmitter(), {
@@ -3250,6 +3898,8 @@ function cancellationFixture(
             }
           }
           if (reads === 2) return read
+          const tail = afterResult[reads - 3]
+          if (tail) return { done: false, value: tail }
           if (naturalEof) return { done: true, value: undefined }
           throw new Error('Actor exited with code 1')
         },

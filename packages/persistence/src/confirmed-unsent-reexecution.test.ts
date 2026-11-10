@@ -803,14 +803,16 @@ describe('confirmed-unsent reexecution through the authoritative repository', ()
       expectedGeneration: 1,
       abandon: false,
     })
+    const sourceRevisions = new Map<string, number>()
     const chunks = []
     for await (const chunk of f.repo.nativeContextRebuildSource(
       f.sessionId,
       new AbortController().signal,
       id,
+      sourceRevisions,
     ))
       chunks.push(chunk)
-    f.repo.freezeNativeRebuildSource(id, chunks)
+    f.repo.freezeNativeRebuildSource(id, chunks, sourceRevisions)
     f.repo.markNativeRebuildDispatched(id)
     f.repo.recordNativeRebuildIdentity(id, nativeSessionId)
     f.repo.completeNativeRebuild(id, nativeSessionId, undefined, {

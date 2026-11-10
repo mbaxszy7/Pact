@@ -338,7 +338,7 @@ test('@deterministic Restore saved plan uses its authenticated checkpoint and na
       f.page.getByRole('button', { name: 'Restore saved plan', exact: true }),
     ).toHaveCount(0)
     await expect(
-      f.page.getByRole('button', { name: 'Continue collaboration', exact: true }),
+      f.page.getByRole('button', { name: 'Continue to Codex plan review', exact: true }),
     ).toBeVisible()
     expect(after?.sourceMessageId).toBe(sourceMessageId)
     expect(after?.review?.planReference?.sourceRunId).toBe(sourceRunId)

@@ -258,8 +258,10 @@ export class OwnedProcessGroup {
     return child
   }
 
-  close(): Promise<void> {
-    this.closingDeadline ??= Date.now() + CLEANUP_MS
+  close(deadlineAt?: number): Promise<void> {
+    if (deadlineAt !== undefined && (!Number.isSafeInteger(deadlineAt) || deadlineAt <= 0))
+      return Promise.reject(new Error('Invalid owned process cleanup deadline.'))
+    this.closingDeadline ??= Math.min(Date.now() + CLEANUP_MS, deadlineAt ?? Infinity)
     this.closing = true
     clearTimeout(this.startupTimer)
     this.startupTimer = undefined

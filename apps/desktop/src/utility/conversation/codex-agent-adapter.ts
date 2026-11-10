@@ -19,6 +19,7 @@ import type {
 
 import {
   type AgentAdapter,
+  type AgentShutdownSettlement,
   type AgentNativeCheckOperation,
   type AgentNativeCheckContext,
   type AgentNativeProbeInput,
@@ -132,7 +133,7 @@ export interface CodexRunConfiguration {
 
 type OwnedCodexProcess = {
   child: ChildProcessWithoutNullStreams
-  close: () => Promise<void>
+  close: (deadlineAt?: number) => Promise<void>
 }
 type CodexProcessFactory = (
   cwd: string,
@@ -181,6 +182,8 @@ interface NativeBackground {
   foregroundCommands: Map<string, string | undefined>
   foregroundCommandBytes: number
   cancellationPending: boolean
+  /** One exact child Stop in flight; the native observer owns its terminal fact. */
+  interruptingChild?: { threadId: string; turnId: string; terminal: boolean } | undefined
   connection?: CodexAppServerConnection
   steering?: boolean
   steeringDone?: Promise<void>
@@ -599,6 +602,7 @@ export class CodexAgentAdapter implements AgentAdapter {
   private nativeSourceContextSupported = false
   private running = false
   private disposed = false
+  private disposal: Promise<void> | undefined
   private readonly loadedThreadIds = new Set<string>()
   private readonly loadedThreadConfigurations = new Map<
     string,
@@ -2503,6 +2507,8 @@ export class CodexAgentAdapter implements AgentAdapter {
             this.nativeInspection === owner &&
             this.connection === live,
         )
+        if (this.shutdownDeadlineAt !== undefined)
+          connection.capShutdownDeadline(this.shutdownDeadlineAt)
         owner.connection = connection
         const checkContext = this.nativeCheck.contextFor(signal)
         if (checkContext && owned.physicalWitness) {
@@ -3069,6 +3075,8 @@ export class CodexAgentAdapter implements AgentAdapter {
   }
 
   async *run(input: AgentRunInput, signal: AbortSignal): AsyncIterable<NormalizedAgentEvent> {
+    if (this.disposed || this.disposal)
+      throw new AgentExecutionError('agent_process_crash', 'Codex is shutting down.', false)
     if (this.peerToolServer.hasSourceGrant())
       throw new NativeCapacityError(
         'The previous native root still owns its frozen sources. No new task was submitted.',
@@ -3341,7 +3349,13 @@ export class CodexAgentAdapter implements AgentAdapter {
         )
       }
     }
+    let lastBackgroundWork: 'working' | 'stoppable' | undefined
     const maybeSettle = (): void => {
+      const work = this.describeBackgroundWork(background)
+      if (work !== lastBackgroundWork) {
+        lastBackgroundWork = work
+        input.backgroundWorkChanged?.()
+      }
       if (
         background.foregroundReleased &&
         (background.rootTerminal || background.rootNotStarted) &&
@@ -3820,8 +3834,18 @@ export class CodexAgentAdapter implements AgentAdapter {
               })
             } else settleTerminal()
           }
-        } else if (background.turns.get(eventThread) === eventTurnId)
-          background.threads.delete(eventThread)
+        } else if (background.turns.get(eventThread) === eventTurnId) {
+          const interrupting = background.interruptingChild,
+            status =
+              eventTurn && typeof eventTurn === 'object'
+                ? Reflect.get(eventTurn, 'status')
+                : undefined
+          if (status === 'completed' || status === 'failed' || status === 'interrupted') {
+            if (interrupting?.threadId === eventThread && interrupting.turnId === eventTurnId)
+              interrupting.terminal = true
+            background.threads.delete(eventThread)
+          }
+        }
       }
       if (root && background.foregroundReleased && ownedTurn) {
         if (eventMethod === 'item/agentMessage/delta') {
@@ -5258,7 +5282,40 @@ export class CodexAgentAdapter implements AgentAdapter {
     )
   }
 
-  async dispose(): Promise<void> {
+  private shutdownDeadlineAt: number | undefined
+
+  dispose(shutdown?: AgentShutdownSettlement): Promise<void> {
+    if (this.disposal) return this.disposal
+    const connection = this.connection
+    if (shutdown) {
+      this.shutdownDeadlineAt = Math.min(
+        this.shutdownDeadlineAt ?? Infinity,
+        shutdown.flushDeadlineAt,
+      )
+      connection?.capShutdownDeadline(this.shutdownDeadlineAt)
+      this.nativeInspection?.connection?.capShutdownDeadline(this.shutdownDeadlineAt)
+    }
+    const foreground = shutdown?.foregroundSettlement && connection?.isOpen ? shutdown : undefined
+    if (!foreground) this.disposed = true
+    // Publish the single close owner before callbacks or the abort path can reenter.
+    const disposal = Promise.resolve().then(() =>
+      this.closeAdapter(
+        shutdown
+          ? { ...shutdown, foregroundSettlement: foreground?.foregroundSettlement }
+          : undefined,
+      ),
+    )
+    this.disposal = disposal
+    void disposal.catch(() => {
+      // A later explicit disposal can join a late physical release. The native
+      // close owners keep their original promises and are never restarted here.
+      this.disposed = true
+      if (this.disposal === disposal) this.disposal = undefined
+    })
+    return disposal
+  }
+
+  private async closeAdapter(shutdown?: AgentShutdownSettlement): Promise<void> {
     let failure: { error: unknown } | undefined
     const attempt = async (work: () => void | Promise<unknown>): Promise<void> => {
       try {
@@ -5268,12 +5325,23 @@ export class CodexAgentAdapter implements AgentAdapter {
       }
     }
     this.skillCatalogChanged = undefined
-    this.disposed = true
     this.nativeCheck.cancel()
     const reader = this.nativeInspection
     reader?.controller.abort()
     const probe = this.featureProbe
     probe?.stop()
+    let foregroundClosing: Promise<void> | undefined
+    if (shutdown) {
+      if (shutdown.foregroundSettlement) await attempt(() => shutdown.foregroundSettlement!)
+      this.disposed = true
+      const foreground = this.connection
+      if (foreground) {
+        this.detachConnection(foreground)
+        foregroundClosing = this.closeConnection(foreground, new Error('Codex connection closed.'))
+        // Physical closing starts at proof/cutoff, independently of reader/probe cleanup.
+        void foregroundClosing.catch(() => undefined)
+      }
+    } else this.disposed = true
     await probe?.task.catch(() => undefined)
     await this.connectionStarting?.task.catch(() => undefined)
     if (reader) {
@@ -5298,7 +5366,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     if (connection) this.detachConnection(connection)
     const closing = connection
       ? this.closeConnection(connection, new Error('Codex connection closed.'))
-      : this.closingConnection
+      : (foregroundClosing ?? this.closingConnection)
     if (closing) await attempt(() => closing)
     for (const background of this.nativeBackground) {
       background.unknown = true
@@ -5329,6 +5397,79 @@ export class CodexAgentAdapter implements AgentAdapter {
         ([id, receipt]) => receipt.pending && (!runId || runId === id),
       )
     )
+  }
+
+  backgroundWork(runId: string, executorId: string): 'working' | 'stoppable' | undefined {
+    const owner = [...this.nativeBackground].find(
+      (item) => item.input.runId === runId && item.connection?.executorId === executorId,
+    )
+    return owner && this.describeBackgroundWork(owner)
+  }
+
+  private describeBackgroundWork(owner: NativeBackground): 'working' | 'stoppable' | undefined {
+    if (
+      !owner.rootTerminal ||
+      owner.closed ||
+      !owner.connection?.isOpen ||
+      (!owner.threads.size && !owner.operations.size && !owner.spawns.size)
+    )
+      return undefined
+    // Codex has no exact cancellation request for a Hook, an unbound child,
+    // or a detached non-command operation. Keep observing those live owners.
+    if (
+      owner.unknown ||
+      owner.untrackedWork ||
+      owner.spawns.size ||
+      owner.early.length ||
+      [...owner.threads].some((thread) => !owner.turns.has(thread)) ||
+      [...owner.operations].some((key) => {
+        const operation: unknown = JSON.parse(key)
+        if (!Array.isArray(operation)) return true
+        const [thread, turn, id] = operation
+        if (typeof thread !== 'string' || typeof turn !== 'string' || typeof id !== 'string')
+          return true
+        return thread === owner.primaryThreadId
+          ? turn !== owner.primaryTurnId || !owner.foregroundCommands.has(id)
+          : !owner.threads.has(thread) || owner.turns.get(thread) !== turn
+      })
+    )
+      return 'working'
+    return 'stoppable'
+  }
+
+  async stopBackgroundWork(runId: string, executorId: string, signal: AbortSignal): Promise<void> {
+    const owner = [...this.nativeBackground].find(
+      (item) => item.input.runId === runId && item.connection?.executorId === executorId,
+    )
+    const connection = owner?.connection
+    if (!owner || !connection || this.describeBackgroundWork(owner) !== 'stoppable')
+      throw new Error('The original Codex background work is no longer available to stop.')
+    const commands = new Map(owner.foregroundCommands)
+    const children = [...owner.threads].map((thread) => [thread, owner.turns.get(thread)!] as const)
+    if (commands.size && owner.primaryThreadId && owner.primaryTurnId)
+      await this.interruptForegroundCommands(
+        owner,
+        connection,
+        owner.primaryThreadId,
+        owner.primaryTurnId,
+        commands,
+        signal,
+        true,
+      )
+    for (const [thread, turn] of children) {
+      if (
+        signal.aborted ||
+        this.disposed ||
+        this.connection !== connection ||
+        owner.connection !== connection ||
+        !connection.isOpen
+      )
+        throw new Error('Native interruption ownership is no longer current.')
+      if (owner.closed) return
+      if (!owner.threads.has(thread) || owner.turns.get(thread) !== turn) continue
+      // oxlint-disable-next-line no-await-in-loop -- Exact owned child Turns share one Stop deadline.
+      await this.interruptForegroundCommands(owner, connection, thread, turn, new Map(), signal)
+    }
   }
 
   private beginNativeCheck<T>(
@@ -5777,7 +5918,7 @@ export class CodexAgentAdapter implements AgentAdapter {
   }
 
   private async ensureConnection(cwd: string): Promise<CodexAppServerConnection> {
-    if (this.disposed)
+    if (this.disposed || this.disposal)
       throw new AgentExecutionError('agent_process_crash', 'Codex is shutting down.', false)
     const storageRoot = resolvePath(
       cwd,
@@ -5831,10 +5972,18 @@ export class CodexAgentAdapter implements AgentAdapter {
       : await this.startProcess(cwd, this.processStorageRoot, env)
     if (this.disposed) {
       const closing = owned.close
-        ? Promise.resolve().then(() => owned.close!())
-        : new CodexAppServerConnection(owned.child, undefined, undefined, this.ipcTraffic).close(
-            new Error('Injected Codex process arrived during disposal.'),
-          )
+        ? Promise.resolve().then(() => owned.close!(this.shutdownDeadlineAt))
+        : Promise.resolve().then(() => {
+            const connection = new CodexAppServerConnection(
+              owned.child,
+              undefined,
+              undefined,
+              this.ipcTraffic,
+            )
+            if (this.shutdownDeadlineAt !== undefined)
+              connection.capShutdownDeadline(this.shutdownDeadlineAt)
+            return connection.close(new Error('Injected Codex process arrived during disposal.'))
+          })
       this.closingConnection = closing
       await closing
       if (this.closingConnection === closing) this.closingConnection = undefined
@@ -6097,11 +6246,22 @@ export class CodexAgentAdapter implements AgentAdapter {
     threadId: string,
     turnId: string,
     commands: Map<string, string | undefined>,
+    stopSignal?: AbortSignal,
+    terminalsOnly = false,
   ): Promise<void> {
+    const interruptingChild =
+      threadId !== background.primaryThreadId ? { threadId, turnId, terminal: false } : undefined
+    if (interruptingChild && background.interruptingChild)
+      throw new Error('An exact Codex child interruption is already pending.')
+    if (interruptingChild) background.interruptingChild = interruptingChild
     const deadline = new AbortController()
     const expiresAt = Date.now() + CODEX_STOP_TIMEOUT_MS
     const timer = setTimeout(() => deadline.abort(), CODEX_STOP_TIMEOUT_MS)
-    const signal = AbortSignal.any([deadline.signal, background.observation.signal])
+    const signal = AbortSignal.any([
+      deadline.signal,
+      background.observation.signal,
+      ...(stopSignal ? [stopSignal] : []),
+    ])
     const current = (): boolean =>
       !signal.aborted &&
       !this.disposed &&
@@ -6109,16 +6269,38 @@ export class CodexAgentAdapter implements AgentAdapter {
       this.connection === connection &&
       background.connection === connection &&
       connection.isOpen &&
-      background.primaryThreadId === threadId &&
-      background.primaryTurnId === turnId
-    const request = async (method: string, params: object): Promise<object> => {
+      ((background.primaryThreadId === threadId && background.primaryTurnId === turnId) ||
+        (background.threads.has(threadId) && background.turns.get(threadId) === turnId))
+    const childEnded = (): boolean =>
+      Boolean(interruptingChild?.terminal) &&
+      background.interruptingChild === interruptingChild &&
+      background.turns.get(threadId) === turnId &&
+      !deadline.signal.aborted &&
+      !stopSignal?.aborted &&
+      !this.disposed &&
+      this.connection === connection &&
+      background.connection === connection &&
+      connection.isOpen
+    const request = async (method: string, params: object): Promise<object | undefined> => {
       if (!current()) throw new Error('Native interruption ownership is no longer current.')
-      const response = await connection.request(method, params, {
-        timeoutMs: Math.max(1, Math.min(2_000, expiresAt - Date.now())),
-        signal,
-        canDispatch: current,
-      })
-      if (!current() || Object.hasOwn(response, 'error'))
+      let response: object
+      try {
+        response = await connection.request(method, params, {
+          timeoutMs: Math.max(1, Math.min(2_000, expiresAt - Date.now())),
+          signal,
+          canDispatch: current,
+        })
+      } catch (error) {
+        // The last exact child terminal closes its observation before the ACK.
+        // This is independent ending evidence, not a fabricated acknowledgement.
+        if (method === 'turn/interrupt' && background.observation.signal.aborted && childEnded())
+          return undefined
+        throw error
+      }
+      if (
+        Object.hasOwn(response, 'error') ||
+        (!current() && !(method === 'turn/interrupt' && childEnded()))
+      )
         throw new Error('Native interruption could not be confirmed.')
       return response
     }
@@ -6131,7 +6313,7 @@ export class CodexAgentAdapter implements AgentAdapter {
       handleBytes = 0,
       cursorBytes = 0
     try {
-      await request('turn/interrupt', { threadId, turnId })
+      if (!terminalsOnly) await request('turn/interrupt', { threadId, turnId })
       if (!commands.size) return
       for (let page = 0; ; page += 1) {
         if (page >= CODEX_STOP_COMMANDS)
@@ -6142,6 +6324,7 @@ export class CodexAgentAdapter implements AgentAdapter {
           limit: 1,
           ...(cursor ? { cursor } : {}),
         })
+        if (!response) throw new Error('Native terminal discovery returned no acknowledgement.')
         const pageBytes = Buffer.byteLength(JSON.stringify(response))
         bytes += pageBytes
         if (pageBytes > CODEX_STOP_IDENTITY_BYTES || bytes > CODEX_STOP_DISCOVERY_BYTES)
@@ -6197,7 +6380,7 @@ export class CodexAgentAdapter implements AgentAdapter {
           threadId,
           processId: handle,
         })
-        const result = Reflect.get(response, 'result')
+        const result = response && Reflect.get(response, 'result')
         if (
           !result ||
           typeof result !== 'object' ||
@@ -6207,6 +6390,8 @@ export class CodexAgentAdapter implements AgentAdapter {
         // Only real item/turn receipts can release effects and record an ending.
       }
     } finally {
+      if (background.interruptingChild === interruptingChild)
+        background.interruptingChild = undefined
       clearTimeout(timer)
       deadline.abort()
       handles.clear()
@@ -6217,7 +6402,7 @@ export class CodexAgentAdapter implements AgentAdapter {
 
   private async injectedProcess(cwd: string): Promise<{
     child: ChildProcessWithoutNullStreams
-    close: (() => Promise<void>) | undefined
+    close: ((deadlineAt?: number) => Promise<void>) | undefined
     physicalWitness?: (
       ownerId: string,
     ) => Promise<import('@pact/contracts').DecisionPhysicalWitness>
@@ -6232,7 +6417,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     env = codexProcessEnvironment(storageRoot),
   ): Promise<{
     child: ChildProcessWithoutNullStreams
-    close: () => Promise<void>
+    close: (deadlineAt?: number) => Promise<void>
     physicalWitness: (ownerId: string) => Promise<import('@pact/contracts').DecisionPhysicalWitness>
   }> {
     const isWindowsCommand = process.platform === 'win32' && /\.cmd$/iu.test(this.executablePath)
@@ -6270,7 +6455,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     )
     return {
       child,
-      close: () => processGroup.close(),
+      close: (deadlineAt) => processGroup.close(deadlineAt),
       physicalWitness: (ownerId) => processGroup.physicalWitness(ownerId),
     }
   }

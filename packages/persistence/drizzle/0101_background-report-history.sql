@@ -1,0 +1,1 @@
+CREATE INDEX `conversation_messages_archived_background_idx` ON `conversation_messages` (`session_id`,`sequence`) WHERE "conversation_messages"."is_visible" = 0 AND "conversation_messages"."role" = 'assistant' AND "conversation_messages"."run_id" IS NULL AND "conversation_messages"."source_message_id" IS NOT NULL;

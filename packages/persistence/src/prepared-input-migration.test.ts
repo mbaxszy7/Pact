@@ -130,15 +130,17 @@ async function writeLegacyFixture(filePath: string, projectDirectory: string) {
       expectedGeneration: run.bindingGeneration,
       abandon: false,
     })
+    const sourceRevisions = new Map<string, number>()
     const chunks: NativeContextRebuildChunk[] = []
     for await (const chunk of fixture.repo.nativeContextRebuildSource(
       fixture.sessionId,
       new AbortController().signal,
       rebuildId,
+      sourceRevisions,
     ))
       chunks.push(chunk)
     expect(chunks.length).toBeGreaterThan(0)
-    fixture.repo.freezeNativeRebuildSource(rebuildId, chunks)
+    fixture.repo.freezeNativeRebuildSource(rebuildId, chunks, sourceRevisions)
 
     const session = fixture.db.sessionRepository.find(fixture.sessionId)
     if (!session) throw Error('The migration fixture Session is unavailable')

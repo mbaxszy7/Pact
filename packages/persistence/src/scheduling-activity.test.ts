@@ -206,7 +206,7 @@ describe('durable Relay activity facts', () => {
     const id = f.answer.clientOperationId,
       executorId = randomUUID(),
       nativeSessionId = randomUUID()
-    f.repo.freezeNativeRebuildSource(id, [])
+    f.repo.freezeNativeRebuildSource(id, [], new Map())
     f.repo.markNativeRebuildDispatched(id, executorId)
     expect(f.repo.readSchedulingActivity({}).rows[0]).toMatchObject({
       id: before.id,
@@ -267,7 +267,7 @@ describe('durable Relay activity facts', () => {
       const f = await nativeProposal()
       f.repo.answerRelaySchedulingDecision(f.answer)
       if (stage === 'creating') {
-        f.repo.freezeNativeRebuildSource(f.answer.clientOperationId, [])
+        f.repo.freezeNativeRebuildSource(f.answer.clientOperationId, [], new Map())
         f.repo.markNativeRebuildDispatched(f.answer.clientOperationId, randomUUID())
       }
       const id = f.repo.readSchedulingActivity({}).rows[0]!.id

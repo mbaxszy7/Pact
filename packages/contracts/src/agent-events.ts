@@ -23,6 +23,22 @@ const agentEvent = { agentId }
 // when its selected provider stream has no equivalent.
 const turnEvent = { ...agentEvent, turnId: opaqueId }
 
+export const nativeBackgroundReportIdentitySchema = z.strictObject({
+  agentId: z.literal('claude'),
+  runId: z.string().uuid(),
+  nativeSessionId: z.string().min(1).max(1024),
+  nativeTurnId: z.string().min(1).max(1024),
+  bindingGeneration: z.number().int().positive(),
+  executorId: z.string().min(1).max(1024),
+  frameId: z.string().uuid(),
+  nativeMessageId: z.string().min(1).max(512),
+})
+export type NativeBackgroundReportIdentity = z.infer<typeof nativeBackgroundReportIdentitySchema>
+export const nativeBackgroundReportSchema = nativeBackgroundReportIdentitySchema.extend({
+  text: z.string().min(1),
+})
+export type NativeBackgroundReport = z.infer<typeof nativeBackgroundReportSchema>
+
 export const normalizedAgentEventSchema = z.discriminatedUnion('type', [
   z.strictObject({
     ...agentEvent,

@@ -199,6 +199,10 @@ import {
 } from './anchored-comments.js'
 
 export {
+  nativeBackgroundReportIdentitySchema,
+  type NativeBackgroundReportIdentity,
+  nativeBackgroundReportSchema,
+  type NativeBackgroundReport,
   normalizedAgentEventSchema,
   sessionTitleInputSchema,
   sessionTitleInputShape,
@@ -1235,6 +1239,7 @@ export const conversationRunContextSchema = z.strictObject({
 export type ConversationRunContext = z.infer<typeof conversationRunContextSchema>
 
 export const conversationMessageSchema = z.strictObject({
+  historicalBackgroundReport: z.literal(true).optional(),
   outputSnapshot: z
     .strictObject({
       ordinal: z.number().int().nonnegative().max(63),
@@ -1262,6 +1267,15 @@ export const conversationMessageSchema = z.strictObject({
   updatedAt: z.string().datetime(),
 })
 export type ConversationMessage = z.infer<typeof conversationMessageSchema>
+
+/** An Assistant update with an origin Message and no canonical reply or Turn slot. */
+export function isConversationBackgroundReport(message: {
+  role: ConversationMessage['role']
+  runId?: string | null | undefined
+  sourceMessageId?: string | null | undefined
+}): boolean {
+  return message.role === 'assistant' && !message.runId && Boolean(message.sourceMessageId)
+}
 
 export function conversationMessageOrder(
   message: Pick<ConversationMessage, 'id' | 'sequence' | 'outputSnapshot'>,
@@ -1543,13 +1557,33 @@ export const nativeAgentContextSchema = z.strictObject({
 })
 export type NativeAgentContext = z.infer<typeof nativeAgentContextSchema>
 
+export const backgroundStopTargetSchema = z.strictObject({
+  runId: z.string().uuid(),
+  nativeSessionId: z.string().min(1).max(1024),
+  bindingGeneration: z.number().int().positive(),
+  executorId: z.string().min(1).max(1024),
+})
+export type BackgroundStopTarget = z.infer<typeof backgroundStopTargetSchema>
+
 export const sessionIssueSchema = z.strictObject({
   agentId: runtimeAgentIdSchema,
   generation: z.number().int().positive(),
   nativeSessionId: z.string().min(1).max(1024).optional(),
   runId: z.string().uuid().optional(),
   rebuildId: z.string().uuid().optional(),
-  phase: z.enum(['warning', 'checking', 'rebuild_offer', 'rebuilding', 'unconfirmed', 'resolved']),
+  phase: z.enum([
+    'warning',
+    'checking',
+    'rebuild_offer',
+    'rebuilding',
+    'unconfirmed',
+    'resolved',
+    'background_working',
+    'background_stopping',
+    'background_check',
+    'background_checking',
+  ]),
+  backgroundStop: backgroundStopTargetSchema.optional(),
   title: z.string().max(120),
   reason: z.string().max(1024),
   inputDisposition: z.enum(['not_submitted', 'possibly_submitted', 'submitted']),
@@ -2409,7 +2443,10 @@ export const conversationRetryInputSchema = z.strictObject({
 })
 export type ConversationRetryInput = z.infer<typeof conversationRetryInputSchema>
 
-export const conversationStopInputSchema = z.strictObject({ sessionId: z.string().uuid() })
+export const conversationStopInputSchema = z.strictObject({
+  sessionId: z.string().uuid(),
+  background: backgroundStopTargetSchema.optional(),
+})
 export type ConversationStopInput = z.infer<typeof conversationStopInputSchema>
 
 export const nativeContextRebuildInputSchema = z.strictObject({
@@ -2690,7 +2727,11 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
     requestId: z.string().uuid(),
     input: conversationInterestsSchema,
   }),
-  z.object({ type: z.literal('runtime.shutdown.request'), requestId: z.string().uuid() }),
+  z.object({
+    type: z.literal('runtime.shutdown.request'),
+    requestId: z.string().uuid(),
+    flushDeadlineAt: z.number().finite().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  }),
   z.object({ type: z.literal('native-presence.read.request'), requestId: z.string().uuid() }),
   z.object({
     type: z.literal('native-attention.read.request'),

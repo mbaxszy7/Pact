@@ -1652,11 +1652,11 @@ function App(): React.JSX.Element {
           }}
           onConversationComposerMentionChange={(value) => conversation.setComposerMention(value)}
           onCreateFileComment={createFileComment}
-          onStopRun={() => conversation.stop()}
+          onStopRun={(background) => conversation.stop(background)}
           onRebuildNativeContext={(agentId, options) =>
             conversation.rebuildNativeContext(agentId, options)
           }
-          onCheckNativeContext={(agentId) => conversation.checkNativeContext(agentId)}
+          onCheckNativeContext={(agentId, runId) => conversation.checkNativeContext(agentId, runId)}
           onAcceptPeerProposal={(proposalId) => conversation.acceptPeerProposal(proposalId)}
           onDismissPeerProposal={(proposalId) => conversation.dismissPeerProposal(proposalId)}
           onRespondNativePermission={(operationId, permissionId, decision) =>

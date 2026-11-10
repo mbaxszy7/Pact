@@ -173,6 +173,7 @@ export class CodexAppServerConnection {
   private notificationQueuePaused = false
   private closed = false
   private shutdownPromise: Promise<void> | undefined
+  private shutdownDeadlineAt: number | undefined
   private closeError: Error | undefined
   private exitRecorded = false
   private observedCloseError: Error | undefined
@@ -222,7 +223,7 @@ export class CodexAppServerConnection {
   constructor(
     private readonly child: ChildProcessWithoutNullStreams,
     private readonly onClosed?: () => void,
-    private readonly closeOwnedProcess?: () => Promise<void>,
+    private readonly closeOwnedProcess?: (deadlineAt?: number) => Promise<void>,
     private readonly ipcTraffic?: LogicalIpcWorkerTraffic,
     private readonly isLifetimeCurrent?: () => boolean,
     private readonly decisionMemory?: NativeMemoryAllocator,
@@ -547,6 +548,14 @@ export class CodexAppServerConnection {
       }
       this.notificationWaiter = waiter
     })
+  }
+
+  /** Pin the existing App-quit cap before an exit or receive failure can start close. */
+  capShutdownDeadline(deadlineAt: number): void {
+    if (this.shutdownPromise) return
+    if (!Number.isSafeInteger(deadlineAt) || deadlineAt <= 0)
+      throw new Error('Invalid Codex shutdown deadline.')
+    this.shutdownDeadlineAt = Math.min(this.shutdownDeadlineAt ?? deadlineAt, deadlineAt)
   }
 
   async close(error = new Error('Codex connection closed.')): Promise<void> {
@@ -1098,7 +1107,7 @@ export class CodexAppServerConnection {
 
   private async shutdown(): Promise<void> {
     if (this.closeOwnedProcess) {
-      await this.closeOwnedProcess()
+      await this.closeOwnedProcess(this.shutdownDeadlineAt)
       this.recordExit(this.child.exitCode)
       return
     }
@@ -1106,6 +1115,9 @@ export class CodexAppServerConnection {
       this.recordExit(this.child.exitCode)
       return
     }
+    const remaining = (): number =>
+      this.shutdownDeadlineAt === undefined ? Infinity : this.shutdownDeadlineAt - Date.now()
+    if (remaining() <= 0) throw new Error('Codex shutdown exceeded its existing deadline.')
     await new Promise<void>((resolve, reject) => {
       let settled = false
       let forceTimeout: ReturnType<typeof setTimeout> | undefined
@@ -1124,17 +1136,27 @@ export class CodexAppServerConnection {
       const fail = (error: unknown): void => {
         if (cleanup()) reject(error instanceof Error ? error : new Error(String(error)))
       }
-      const timeout = setTimeout(() => {
-        try {
-          this.child.kill('SIGKILL')
-        } catch (error) {
-          fail(error)
-          return
-        }
-        forceTimeout = setTimeout(() => {
-          fail(new Error('Codex process did not exit after SIGKILL.'))
-        }, CODEX_FORCE_EXIT_TIMEOUT_MS)
-      }, CODEX_SHUTDOWN_TIMEOUT_MS)
+      const timeout = setTimeout(
+        () => {
+          if (remaining() <= 0) {
+            fail(new Error('Codex shutdown exceeded its existing deadline.'))
+            return
+          }
+          try {
+            this.child.kill('SIGKILL')
+          } catch (error) {
+            fail(error)
+            return
+          }
+          forceTimeout = setTimeout(
+            () => {
+              fail(new Error('Codex process did not exit after SIGKILL.'))
+            },
+            Math.min(CODEX_FORCE_EXIT_TIMEOUT_MS, Math.max(1, remaining())),
+          )
+        },
+        Math.min(CODEX_SHUTDOWN_TIMEOUT_MS, Math.max(1, remaining())),
+      )
       this.child.once('exit', finish)
       try {
         this.child.stdin.end()

@@ -11,6 +11,7 @@ import {
   nativeRebuildOperations,
 } from '../../packages/persistence/src/schema/index.js'
 import { quitPact } from './native-quit.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import { test } from './runtime-fixture.js'
 import { createRuntimeFixture } from './runtime-fixture.js'
 
@@ -92,6 +93,25 @@ test(
       await expect(window.getByText('Bounded lifecycle response.', { exact: true })).toBeVisible({
         timeout: 10_000,
       })
+      // The new request follows the peer's failure, rather than entering its
+      // live foreground queue while the primary response is already visible.
+      const observed = ReadonlyFixtureDatabase.open(fixture)
+      try {
+        await expect
+          .poll(
+            () =>
+              observed.drizzle.query.agentRuns
+                .findFirst({
+                  where: (fields, { eq }) => eq(fields.agentId, 'claude'),
+                  columns: { status: true, nativeOutcome: true, nativeEffectsState: true },
+                })
+                .sync(),
+            { timeout: 10_000 },
+          )
+          .toEqual({ status: 'failed', nativeOutcome: 'failed', nativeEffectsState: 'settled' })
+      } finally {
+        observed.close()
+      }
       await expect(window.getByRole('button', { name: 'Reexecute…', exact: true })).toHaveCount(0)
       const composer = window.getByRole('combobox', { name: 'Message' })
       await composer.fill('@claude')
@@ -590,18 +610,28 @@ test(
         expectedGeneration: 1,
         abandon: false,
       })
-      database.conversationRepository.freezeNativeRebuildSource(operationId, [
-        {
-          kind: 'message',
-          messageId: run.userMessageId,
-          sequence: 0,
-          speaker: 'user',
-          state: 'complete',
-          part: 0,
-          final: true,
-          content: 'Original task remains saved',
-        },
-      ])
+      database.conversationRepository.freezeNativeRebuildSource(
+        operationId,
+        [
+          {
+            kind: 'message',
+            messageId: run.userMessageId,
+            sequence: 0,
+            speaker: 'user',
+            state: 'complete',
+            part: 0,
+            final: true,
+            content: 'Original task remains saved',
+          },
+        ],
+        new Map([
+          [
+            run.userMessageId,
+            database.conversationRepository.internalMessage(run.userMessageId, sessionId)!
+              .contentRevision,
+          ],
+        ]),
+      )
       database.conversationRepository.markNativeRebuildDispatched(operationId)
       database.conversationRepository.recordNativeRebuildIdentity(
         operationId,
@@ -632,7 +662,7 @@ test(
         .attach('candidate-check-failed', { path: warningPath, contentType: 'image/png' })
       await card.getByRole('button', { name: 'Rebuild…', exact: true }).click()
       await expect(
-        card.getByText('The previous attempt may already have created a session.'),
+        card.getByText('A previous attempt may already have created a session.'),
       ).toBeVisible()
       await expect(card.getByText('Pact couldn’t confirm the new session.')).toHaveCount(0)
       const confirmationPath = test.info().outputPath('candidate-confirmation.png')

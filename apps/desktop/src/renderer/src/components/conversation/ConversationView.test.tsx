@@ -18,6 +18,7 @@ import { windowFromPage } from './conversation-window'
 import { ConversationView } from './ConversationView'
 import { CurrentPlanPanel, type CurrentPlanDocument } from './CurrentPlanPanel'
 import { focusProjectionRange } from './message-selection'
+import { WorkspaceChangesCard } from './WorkspaceChangesCard'
 
 const virtualState = vi.hoisted(() => ({
   interactive: false,
@@ -823,7 +824,7 @@ it('keeps a previously accepted code review waiting when a newer input is Receiv
   await screen.findByRole('region', { name: 'Pact collaboration result' })
   expect(screen.queryByText('· Complete')).toBeNull()
   expect(screen.queryByText('Review complete')).toBeNull()
-  expect(screen.getAllByRole('button', { name: 'Continue collaboration' })).toHaveLength(1)
+  expect(screen.getAllByRole('button', { name: 'Continue to Claude Code review' })).toHaveLength(1)
   expect(bridge.actOnCollaboration).not.toHaveBeenCalled()
   expect(task.status).toBe('waiting')
 })
@@ -1387,11 +1388,10 @@ it('shows recorded changes after the root ends, even without a body, and permits
   const { props, readWorkspaceChanges } = recordingFixture()
   render(<ConversationView {...props} />)
   expect(await screen.findByRole('region', { name: 'Changes from this response' })).toBeDefined()
+  const explanation = screen.getByRole('group', { name: 'Undo unavailable' })
   expect(
-    screen.getByText(
-      'Background work is still being observed. You can review recorded changes; Undo is unavailable until recording settles.',
-    ),
-  ).toBeDefined()
+    document.getElementById(explanation.getAttribute('aria-describedby') ?? '')?.textContent,
+  ).toBe('Waiting for file changes to finish.')
   const undo = screen.getByRole<HTMLButtonElement>('button', { name: 'Undo' })
   expect(undo.disabled).toBe(true)
   fireEvent.click(undo)
@@ -1408,6 +1408,54 @@ it('shows recorded changes after the root ends, even without a body, and permits
   )
   expect(screen.queryByRole('button', { name: 'Rebuild' })).toBeNull()
   expect(props.snapshot!.nativeContexts[0]!.continuationState).toBe('ready')
+})
+
+it.each([
+  {
+    reason:
+      'The Agent did not provide complete original and final file versions. A patch alone cannot safely identify this change for Undo.',
+    expected: 'Original or final file versions are missing.',
+  },
+  {
+    reason:
+      'The file changed outside the recorded native operation. Undo is unavailable for this mixed round.',
+    expected: 'The file changed outside the recorded native operation.',
+  },
+  { reason: null, expected: 'Undo is unavailable for these changes.' },
+])('shows the actual mixed Undo cause: $expected', ({ reason, expected }) => {
+  const { changeSet } = recordingFixture()
+  changeSet.state = 'mixed'
+  changeSet.undoUnavailableReason = reason
+  const onUndo = vi.fn<ComponentProps<typeof WorkspaceChangesCard>['onUndo']>()
+  const onView = vi.fn<ComponentProps<typeof WorkspaceChangesCard>['onView']>()
+  render(
+    <WorkspaceChangesCard
+      changeSet={changeSet}
+      undoing={false}
+      disabled={false}
+      onUndo={onUndo}
+      onView={onView}
+      onShowFiles={vi.fn<ComponentProps<typeof WorkspaceChangesCard>['onShowFiles']>()}
+      onOpenFile={vi.fn<ComponentProps<typeof WorkspaceChangesCard>['onOpenFile']>()}
+    />,
+  )
+  const undo = screen.getByRole<HTMLButtonElement>('button', { name: 'Undo' })
+  expect(undo.disabled).toBe(true)
+  fireEvent.click(undo)
+  expect(onUndo).not.toHaveBeenCalled()
+  const explanation = screen.getByRole('group', { name: 'Undo unavailable' })
+  fireEvent.focus(explanation)
+  const tooltip = screen.getByRole('tooltip')
+  expect(tooltip.textContent).toBe(expected)
+  expect(explanation.getAttribute('aria-describedby')).toBe(tooltip.id)
+  fireEvent.keyDown(explanation, { key: 'Escape' })
+  expect(screen.queryByRole('tooltip')).toBeNull()
+  fireEvent.focus(explanation)
+  expect(screen.getByRole('tooltip').textContent).toBe(expected)
+  const view = screen.getByRole<HTMLButtonElement>('button', { name: 'View changes' })
+  expect(view.disabled).toBe(false)
+  fireEvent.click(view)
+  expect(onView).toHaveBeenCalledExactlyOnceWith(changeSet.id)
 })
 
 it('shows an unavailable recording warning without inventing a zero-file card or a native rebuild problem', async () => {
@@ -1593,7 +1641,7 @@ it('checks the candidate named by the backend and requires a fresh confirmation 
   rendered.rerender(<ConversationView {...props} />)
   fireEvent.click(screen.getByRole('button', { name: 'Rebuild…' }))
   expect(screen.queryByText(issue.reason)).toBeNull()
-  expect(screen.getByText('The previous attempt may already have created a session.')).toBeDefined()
+  expect(screen.getByText(/A previous attempt may already have created a session\./u)).toBeDefined()
   let resolve!: (accepted: boolean) => void
   props.onRebuildNativeContext = vi.fn<
     ComponentProps<typeof ConversationView>['onRebuildNativeContext']
@@ -1649,6 +1697,51 @@ it.each(['read_only', 'send_blocked', 'open'] as const)(
     )
     expect(screen.getByRole('combobox', { name: 'Message' }).textContent).toBe('Preserved draft')
     expect(screen.queryByRole('button', { name: 'Reexecute…' })).toBeNull()
+  },
+)
+
+it.each(['button', 'enter'] as const)(
+  'permits an explicit %s Send with the queue disabled and confirmed post-reply background work',
+  async (action) => {
+    const props = fixture()
+    const runId = crypto.randomUUID()
+    props.composer = 'Start the next explicit task.'
+    props.snapshot!.queue = { enabled: false, revision: 1, input: null }
+    props.snapshot!.sessionIssues = {
+      sessionId: props.session.id,
+      inputGate: 'open',
+      agents: [
+        {
+          agentId: 'claude',
+          generation: 1,
+          runId,
+          nativeSessionId: 'owned-background-session',
+          phase: 'background_working',
+          title: 'Working in background…',
+          reason: '',
+          inputDisposition: 'submitted',
+          resultDisposition: 'complete',
+          action: 'none',
+          abandon: true,
+          previousCreationUnconfirmed: false,
+          backgroundStop: {
+            runId,
+            executorId: 'owned-background-executor',
+            nativeSessionId: 'owned-background-session',
+            bindingGeneration: 1,
+          },
+        },
+      ],
+    }
+    render(<ConversationView {...props} />)
+    const send = screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' })
+    expect(send.disabled).toBe(false)
+    expect(screen.getByRole('button', { name: 'Stop background work' })).toBeDefined()
+    if (action === 'button') fireEvent.click(send)
+    else fireEvent.keyDown(screen.getByRole('combobox', { name: 'Message' }), { key: 'Enter' })
+    await waitFor(() => expect(props.onSend).toHaveBeenCalledTimes(1))
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toBe('Start the next explicit task.')
+    expect(props.onStop).not.toHaveBeenCalled()
   },
 )
 

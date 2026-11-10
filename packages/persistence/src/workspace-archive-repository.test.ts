@@ -217,7 +217,7 @@ function settledRebuildCandidate(f: Fixture, agentId: RuntimeAgentId) {
     expectedGeneration: 7,
     abandon: false,
   })
-  repo.freezeNativeRebuildSource(id, [])
+  repo.freezeNativeRebuildSource(id, [], new Map())
   repo.markNativeRebuildDispatched(id, executorId)
   repo.recordNativeRebuildIdentity(id, nativeSessionId)
   repo.recordNativeRebuildWork(id, executorId, nativeSessionId, 'settled')

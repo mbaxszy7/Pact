@@ -57,6 +57,10 @@ export interface AgentAdapter {
   readonly id: AgentId
   readonly executorId?: string
   hasActiveBackgroundWork?(runId?: string): boolean
+  /** Observable work retained by this exact executor after its root reply ends. */
+  backgroundWork?(runId: string, executorId: string): 'working' | 'stoppable' | undefined
+  /** Send native cancellation to that owner. The observation still proves settlement. */
+  stopBackgroundWork?(runId: string, executorId: string, signal: AbortSignal): Promise<void>
   probe(signal?: AbortSignal): Promise<AgentProbeResult>
   discoverSkills?(cwd: string, signal: AbortSignal): Promise<SkillBinding[]>
   setSkillCatalogListener?(listener: (() => void) | undefined): void
@@ -121,7 +125,13 @@ export interface AgentAdapter {
     input: AgentNativeTitleInput,
     signal: AbortSignal,
   ): Promise<'synchronized' | 'unavailable' | 'unknown_delivery'>
-  dispose(): Promise<void>
+  dispose(shutdown?: AgentShutdownSettlement): Promise<void>
+}
+
+/** App quit only: the existing foreground owner may settle before the same flush deadline. */
+export interface AgentShutdownSettlement {
+  flushDeadlineAt: number
+  foregroundSettlement?: Promise<void> | undefined
 }
 
 export interface AgentSteerInput {
@@ -323,6 +333,16 @@ export interface AgentRunInput {
   ) => void
   /** Output processing failed; native control and work observation remain owned. */
   recordOutputFailure?: (error: Error) => void
+  /** Join already-delivered root output before its Query releases text workspace; never await native work settlement here. */
+  waitForRootOutput?: () => Promise<void>
+  /** Seal a provider-authored background update before reading more of this Query. */
+  recordBackgroundReport?: (
+    report: import('@pact/contracts').NativeBackgroundReport,
+  ) => Promise<void>
+  /** Retain an attributable report whose body cannot be materialized within the Query's working budget. */
+  recordBackgroundReportUnavailable?: (
+    identity: import('@pact/contracts').NativeBackgroundReportIdentity,
+  ) => void
   recordArchivedEvent?: (event: NormalizedAgentEvent) => void
   /** Capture authenticated native metadata; Repository promotes only a normally completed root. */
   recordWorkflowPlan?: (plan: { nativeId: string; text: string }) => void
@@ -347,6 +367,8 @@ export interface AgentRunInput {
   /** Observes applied native results; recording failure must never deny a native tool. */
   recordFileChange?: (change: NativeFileChange, signal: AbortSignal) => Promise<void>
   recordUncertainEffects?: (reason: string, scope?: 'unlisted' | 'recorded_files') => void
+  /** Publish a changed live work projection without writing another durable effects receipt. */
+  backgroundWorkChanged?: () => void
   /** Run/generation-bound native observation, independent of foreground completion. */
   reportNativeEffects?: (report: {
     runId: string

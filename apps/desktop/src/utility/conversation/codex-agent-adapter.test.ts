@@ -4121,6 +4121,40 @@ describe('Codex Native display metadata', () => {
   })
 })
 
+it.each([false, true])(
+  'caps physical disposal without a settlement window, late startup: %s',
+  async (late) => {
+    const child = completedCapabilityActor()
+    const close = vi.fn<(deadlineAt?: number) => Promise<void>>(async () => {
+      child.kill()
+    })
+    const starting = Promise.withResolvers<{
+      child: ChildProcessWithoutNullStreams
+      close: typeof close
+    }>()
+    const factory = vi.fn<
+      () => Promise<{ child: ChildProcessWithoutNullStreams; close: typeof close }>
+    >(async () => (late ? starting.promise : { child, close }))
+    const adapter = new CodexAgentAdapter('/owned/codex', factory, { storageRoot: '/owned/native' })
+    const run = collectRun(adapter).catch((error: unknown) => error)
+    try {
+      await vi.waitFor(() => expect(factory).toHaveBeenCalledOnce())
+      if (!late) await run
+      const deadlineAt = Date.now() + 2900
+      const disposal = adapter.dispose({ flushDeadlineAt: deadlineAt })
+      starting.resolve({ child, close })
+      await disposal
+      expect(close).toHaveBeenCalledExactlyOnceWith(deadlineAt)
+      await run
+    } finally {
+      starting.resolve({ child, close })
+      child.kill()
+      await adapter.dispose()
+      await run
+    }
+  },
+)
+
 it('keeps injected live and history process owners in control before EOF or root signals', async () => {
   const owners: Array<{ child: ChildProcessWithoutNullStreams; close: ReturnType<typeof vi.fn> }> =
     []
@@ -4335,6 +4369,375 @@ it.each([false, true])(
     }
   },
 )
+
+describe('Codex background Stop', () => {
+  it.each(['invalid-child-status', 'missing-child-status'] as const)(
+    'retains children after %s notifications and a failed interrupt',
+    async (mode) => {
+      const fixture = backgroundStopFixture(mode)
+      try {
+        await fixture.ready()
+        await expect(
+          fixture.adapter.stopBackgroundWork(
+            'run-1',
+            fixture.adapter.executorId,
+            fixture.controller.signal,
+          ),
+        ).rejects.toThrow('Native interruption could not be confirmed.')
+        expect(fixture.adapter.hasActiveBackgroundWork('run-1')).toBe(true)
+        await expect(
+          fixture.adapter.stopBackgroundWork(
+            'run-1',
+            fixture.adapter.executorId,
+            fixture.controller.signal,
+          ),
+        ).resolves.toBeUndefined()
+        expect(fixture.interruptions).toEqual([
+          { threadId: 'child-1', turnId: 'child-turn-1' },
+          { threadId: 'child-1', turnId: 'child-turn-1' },
+          { threadId: 'child-2', turnId: 'child-turn-2' },
+        ])
+        expect(fixture.adapter.hasActiveBackgroundWork('run-1')).toBe(false)
+      } finally {
+        await fixture.dispose()
+      }
+    },
+  )
+
+  it('stops every exact child when terminal notifications precede interrupt acknowledgements', async () => {
+    const fixture = backgroundStopFixture('terminal-before-ack')
+    try {
+      await fixture.ready()
+      await expect(
+        fixture.adapter.stopBackgroundWork(
+          'run-1',
+          fixture.adapter.executorId,
+          fixture.controller.signal,
+        ),
+      ).resolves.toBeUndefined()
+      expect(fixture.interruptions).toEqual([
+        { threadId: 'child-1', turnId: 'child-turn-1' },
+        { threadId: 'child-2', turnId: 'child-turn-2' },
+      ])
+      expect(fixture.adapter.hasActiveBackgroundWork('run-1')).toBe(false)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it.each(['wrong-run', 'wrong-executor'] as const)(
+    'does not write a background Stop for a %s identity',
+    async (identity) => {
+      const fixture = backgroundStopFixture('terminal-before-ack')
+      try {
+        await fixture.ready()
+        await expect(
+          fixture.adapter.stopBackgroundWork(
+            identity === 'wrong-run' ? 'another-run' : 'run-1',
+            identity === 'wrong-executor' ? 'another-executor' : fixture.adapter.executorId,
+            fixture.controller.signal,
+          ),
+        ).rejects.toThrow(/no longer available/u)
+        expect(fixture.interruptions).toEqual([])
+      } finally {
+        await fixture.dispose()
+      }
+    },
+  )
+
+  it('admits no overlapping child Stop and releases its witness before the next child', async () => {
+    const fixture = backgroundStopFixture('held-first-ack')
+    try {
+      await fixture.ready()
+      const stopping = fixture.adapter
+        .stopBackgroundWork('run-1', fixture.adapter.executorId, fixture.controller.signal)
+        .then(
+          () => 'stopped',
+          (error: unknown) => error,
+        )
+      await vi.waitFor(() => expect(fixture.interruptions).toHaveLength(1))
+      await expect(
+        fixture.adapter.stopBackgroundWork(
+          'run-1',
+          fixture.adapter.executorId,
+          fixture.controller.signal,
+        ),
+      ).rejects.toThrow('An exact Codex child interruption is already pending.')
+      expect(fixture.interruptions).toEqual([{ threadId: 'child-1', turnId: 'child-turn-1' }])
+      fixture.release()
+      expect(await stopping).toBe('stopped')
+      expect(fixture.interruptions).toEqual([
+        { threadId: 'child-1', turnId: 'child-turn-1' },
+        { threadId: 'child-2', turnId: 'child-turn-2' },
+      ])
+      expect(fixture.adapter.hasActiveBackgroundWork('run-1')).toBe(false)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('releases a failed child Stop witness for a new explicit Stop of remaining work', async () => {
+    const fixture = backgroundStopFixture('error-ack')
+    try {
+      await fixture.ready()
+      await expect(
+        fixture.adapter.stopBackgroundWork(
+          'run-1',
+          fixture.adapter.executorId,
+          fixture.controller.signal,
+        ),
+      ).rejects.toThrow('Native interruption could not be confirmed.')
+      expect(fixture.interruptions).toEqual([{ threadId: 'child-1', turnId: 'child-turn-1' }])
+      await expect(
+        fixture.adapter.stopBackgroundWork(
+          'run-1',
+          fixture.adapter.executorId,
+          fixture.controller.signal,
+        ),
+      ).resolves.toBeUndefined()
+      expect(fixture.interruptions).toEqual([
+        { threadId: 'child-1', turnId: 'child-turn-1' },
+        { threadId: 'child-2', turnId: 'child-turn-2' },
+      ])
+      expect(fixture.adapter.hasActiveBackgroundWork('run-1')).toBe(false)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it.each(['error-ack', 'replaced-turn', 'closed-connection', 'cancelled', 'unconfirmed'] as const)(
+    'retains a %s failure after a child terminal without stopping later children',
+    async (mode) => {
+      const fixture = backgroundStopFixture(mode)
+      try {
+        await fixture.ready()
+        await expect(
+          fixture.adapter.stopBackgroundWork(
+            'run-1',
+            fixture.adapter.executorId,
+            fixture.controller.signal,
+          ),
+        ).rejects.toThrow(/interrupt|exited|closed|deadline/u)
+        expect(fixture.interruptions).toEqual([{ threadId: 'child-1', turnId: 'child-turn-1' }])
+      } finally {
+        await fixture.dispose()
+      }
+    },
+  )
+})
+
+function backgroundStopFixture(
+  mode:
+    | 'terminal-before-ack'
+    | 'invalid-child-status'
+    | 'missing-child-status'
+    | 'error-ack'
+    | 'replaced-turn'
+    | 'closed-connection'
+    | 'cancelled'
+    | 'unconfirmed'
+    | 'held-first-ack',
+) {
+  const controller = new AbortController()
+  const interruptions: object[] = []
+  let release: (() => void) | undefined
+  let child: ChildProcessWithoutNullStreams
+  child = fakeCodexProcess((request, respond, notify) => {
+    const id = Reflect.get(request, 'id'),
+      method = Reflect.get(request, 'method')
+    if (method === 'initialize') respond({ id, result: {} })
+    else if (method === 'thread/start') respond({ id, result: { thread: { id: 'thread-1' } } })
+    else if (method === 'turn/start') {
+      respond({ id, result: { turn: { id: 'turn-1' } } })
+      notify({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            id: 'spawn-children',
+            type: 'collabAgentToolCall',
+            tool: 'spawnAgent',
+            senderThreadId: 'thread-1',
+            receiverThreadIds: ['child-1', 'child-2'],
+            agentsStates: { 'child-1': { status: 'running' }, 'child-2': { status: 'running' } },
+          },
+        },
+      })
+      for (const index of [1, 2])
+        notify({
+          method: 'turn/started',
+          params: { threadId: `child-${index}`, turn: { id: `child-turn-${index}` } },
+        })
+      notify({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: { id: 'answer', type: 'agentMessage', text: 'The root reply is complete.' },
+        },
+      })
+      notify({
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } },
+      })
+    } else if (method === 'turn/interrupt') {
+      const params = Reflect.get(request, 'params') as { threadId: string; turnId: string }
+      interruptions.push(params)
+      if (
+        (mode === 'invalid-child-status' || mode === 'missing-child-status') &&
+        interruptions.length === 1
+      ) {
+        for (const index of [1, 2])
+          notify({
+            method: 'turn/completed',
+            params: {
+              threadId: `child-${index}`,
+              turn: {
+                id: `child-turn-${index}`,
+                ...(mode === 'invalid-child-status' ? { status: 'inProgress' } : {}),
+              },
+            },
+          })
+        respond({ id, error: { code: -32000, message: 'The native Stop was refused.' } })
+        return
+      }
+      if (mode === 'unconfirmed') {
+        notify({
+          method: 'turn/completed',
+          params: {
+            threadId: params.threadId,
+            turn: { id: 'another-turn', status: 'interrupted' },
+          },
+        })
+        return
+      }
+      notify({
+        method: 'turn/completed',
+        params: {
+          threadId: params.threadId,
+          turn: { id: params.turnId, status: 'interrupted' },
+        },
+      })
+      if (mode === 'replaced-turn')
+        notify({
+          method: 'turn/started',
+          params: { threadId: params.threadId, turn: { id: 'replacement-turn' } },
+        })
+      if (mode === 'closed-connection') {
+        child.kill()
+        return
+      }
+      if (mode === 'cancelled') controller.abort()
+      if (mode === 'held-first-ack' && interruptions.length === 1) {
+        release = () => respond({ id, result: {} })
+        return
+      }
+      respond(
+        mode === 'error-ack' && interruptions.length === 1
+          ? { id, error: { code: -32000, message: 'The native Stop was refused.' } }
+          : { id, result: {} },
+      )
+    }
+  })
+  const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child))
+  const outcome = collectRun(adapter)
+  return {
+    adapter,
+    controller,
+    interruptions,
+    release: () => {
+      if (!release) throw new Error('The child interrupt has not been dispatched')
+      release()
+    },
+    ready: async () => {
+      await outcome
+      expect(adapter.backgroundWork('run-1', adapter.executorId)).toBe('stoppable')
+    },
+    dispose: async () => {
+      controller.abort()
+      await adapter.dispose()
+      await outcome
+    },
+  }
+}
+
+it('keeps the exact foreground cancellation observable until the App shutdown proof is complete', async () => {
+  const methods: string[] = []
+  const controller = new AbortController()
+  const proof = Promise.withResolvers<void>()
+  let liveEnding = false,
+    workDrained = false
+  const child = fakeCodexProcess((request, respond, notify) => {
+    const id = Reflect.get(request, 'id'),
+      method = String(Reflect.get(request, 'method'))
+    methods.push(method)
+    if (method === 'initialize') respond({ id, result: {} })
+    else if (method === 'thread/start')
+      respond({ id, result: { thread: { id: 'thread-1' }, model: 'gpt-test' } })
+    else if (method === 'turn/start') {
+      respond({ id, result: { turn: { id: 'turn-1' } } })
+      notify({
+        method: 'item/agentMessage/delta',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          itemId: 'answer',
+          delta: 'Saved prefix.',
+        },
+      })
+    } else if (method === 'turn/interrupt') {
+      respond({ id, result: {} })
+      notify({
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'interrupted' } },
+      })
+    }
+  })
+  const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child))
+  const outcome = collectRun(
+    adapter,
+    {
+      nativeGeneration: 'generation-1',
+      bindingGeneration: 1,
+      recordNativeEvidence: (evidence) => {
+        if (
+          evidence.kind === 'ended' &&
+          evidence.source === 'live_terminal' &&
+          evidence.identity.nativeTurnId === 'turn-1'
+        )
+          liveEnding = true
+        if (liveEnding && workDrained) proof.resolve()
+      },
+      reportNativeEffects: (report) => {
+        if (report.state === 'settled' && report.reason === 'native_work_drained')
+          workDrained = true
+        if (liveEnding && workDrained) proof.resolve()
+      },
+    },
+    controller.signal,
+  ).catch((error: unknown) => error)
+  try {
+    await vi.waitFor(() => expect(methods).toContain('turn/start'))
+    const disposal = adapter.dispose({
+      flushDeadlineAt: Date.now() + 4000,
+      foregroundSettlement: proof.promise,
+    })
+    controller.abort()
+    await vi.waitFor(() =>
+      expect({ liveEnding, workDrained }).toEqual({ liveEnding: true, workDrained: true }),
+    )
+    await disposal
+    expect(methods.filter((method) => method === 'turn/interrupt')).toHaveLength(1)
+    expect(methods.filter((method) => method === 'turn/start')).toHaveLength(1)
+    expect(child.exitCode).not.toBeNull()
+  } finally {
+    proof.resolve()
+    controller.abort()
+    await adapter.dispose()
+    await outcome
+  }
+})
 
 async function collectRun(
   adapter: CodexAgentAdapter,

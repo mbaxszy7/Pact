@@ -150,6 +150,8 @@ import {
   CONVERSATION_MARKDOWN_BYTES,
   MESSAGE_ANCHOR_TEXT_BASIS,
   normalizedAgentEventSchema,
+  nativeBackgroundReportSchema,
+  nativeBackgroundReportIdentitySchema,
   nativePermissionRequestSchema,
   NATIVE_PERMISSION_REQUESTS,
   NATIVE_PERMISSION_TIMEOUT_MS,
@@ -210,8 +212,10 @@ import { presentSessionIssues } from './session-issues'
 
 const DELIVERY_RECONCILIATION_TIMEOUT_MS = 10_000
 const MAX_AGENT_OPERATIONS = 5
+const BACKGROUND_INPUT_REASON = 'Check the background work before sending another message.'
 const MAX_ADAPTER_SLOTS = 5
 const PREPARATION_TIMEOUT_MS = 10_000
+const BACKGROUND_STOP_TIMEOUT_MS = 5_000
 const CAPACITY_NOTICE = 'At most 5 Sessions can run Agents at once. Try again when one finishes.'
 
 interface ActiveExecution {
@@ -338,6 +342,19 @@ interface OwnedStreamTrace {
 }
 
 interface NativeObservation {
+  shutdown?:
+    | {
+        deadlineAt: number
+        nativeSessionId: string
+        nativeTurnId: string
+        executorId: string
+        bindingGeneration: number
+        ended: boolean
+        drained: boolean
+        failed: boolean
+        complete: () => void
+      }
+    | undefined
   sourceReader?: FrozenSourceReader | undefined
   streamTrace?: OwnedStreamTrace | undefined
   generation: string
@@ -348,6 +365,13 @@ interface NativeObservation {
   archiveController: AbortController
   archiveMemory: NativeWorkingMemory
   outputFailure?: AgentExecutionError
+  backgroundStop?:
+    | {
+        controller: AbortController
+        deadline: ReturnType<typeof setTimeout>
+      }
+    | undefined
+  backgroundStopUnconfirmed?: boolean
 }
 
 interface NativeInteractionOwner {
@@ -456,6 +480,7 @@ export class Conversation {
       configurationGeneration?: number | undefined
       adapter?: AgentAdapter | undefined
       receiptSessionId?: string | undefined
+      targetRunId?: string | undefined
     }
   >()
   private adapterSlotTail: Promise<void> = Promise.resolve()
@@ -3254,6 +3279,8 @@ export class Conversation {
         return Conversation.archiveBusy()
       if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
         return Conversation.nativeRecoveryRequired()
+      if (this.hasBlockingBackgroundWork(input.sessionId))
+        throw new RunOperationConflictError(BACKGROUND_INPUT_REASON)
 
       if (input.imageIds?.length) {
         if (!this.images) throw new Error('Image input is unavailable.')
@@ -4310,6 +4337,10 @@ export class Conversation {
     } catch (error) {
       return Promise.resolve(Conversation.sendFailure(error))
     }
+    if (this.hasBlockingBackgroundWork(input.sessionId))
+      return Promise.resolve(
+        Conversation.sendFailure(new RunOperationConflictError(BACKGROUND_INPUT_REASON)),
+      )
     if (this.hasSessionOperation(input.sessionId)) {
       return Promise.resolve({
         ok: false,
@@ -5914,6 +5945,8 @@ export class Conversation {
         // A stale recommendation returns to the frozen default within the same business deadline.
         return await this.sendAdmitted(input, controller, options)
       }
+      if (this.hasBlockingBackgroundWork(input.sessionId))
+        throw new RunOperationConflictError(BACKGROUND_INPUT_REASON)
       const started = this.conversations.beginRun({
         preparedInput: options.preparedInput,
         inputRouting: options.inputRouting,
@@ -6084,23 +6117,111 @@ export class Conversation {
     }
   }
 
+  private isCurrentBackground(run: AgentRun): boolean {
+    return (
+      run.dispatchPhase === 'ended' &&
+      ['pending', 'unknown'].includes(run.nativeEffectsState ?? '') &&
+      this.conversations.isCurrentBackgroundCursor(run.id)
+    )
+  }
+
+  /** All new execution admissions share this gate; confirmed work permits explicit Send. */
+  private hasBlockingBackgroundWork(sessionId: string): boolean {
+    return this.conversations.nativeContexts(sessionId).some((binding) => {
+      const run = binding.lastRunId && this.conversations.findRun(binding.lastRunId)
+      if (!run || !this.isCurrentBackground(run)) return false
+      const owner = this.ownedBackground(run)
+      return Boolean(
+        !owner ||
+        owner.backgroundStop ||
+        owner.backgroundStopUnconfirmed ||
+        run.nativeEffectsState === 'unknown' ||
+        !owner.adapter.backgroundWork?.(run.id, run.executorId!),
+      )
+    })
+  }
+
+  private ownedBackground(run: AgentRun): NativeObservation | undefined {
+    const owner = this.nativeObservations.get(run.id)
+    return owner?.adapter.hasActiveBackgroundWork?.(run.id) &&
+      this.isCurrentBackground(run) &&
+      this.conversations.ownsBackgroundControl(run.id)
+      ? owner
+      : undefined
+  }
+
+  private pauseSessionForStop(
+    sessionId: string,
+    queueReason = 'The execution was stopped. Resume the queued message when ready.',
+  ): void {
+    this.conversations.cancelSchedulingRecoveryFaults(sessionId)
+    if (this.conversations.pausePreparedInputForStop(sessionId))
+      this.publish(this.conversations.metadataPatch(sessionId, { draftsChanged: true }))
+    for (const [key, check] of this.nativeChecks)
+      if (check.automaticAttemptId && key.startsWith(`${sessionId}:`)) check.controller.abort()
+    if (this.conversations.receivedCollaborationInput(sessionId))
+      this.publish(this.conversations.pauseConversationQueue(sessionId, queueReason))
+    this.conversations.pauseCollaboration(sessionId, 'stopped')
+  }
+
+  private clearBackgroundStop(owner: NativeObservation): void {
+    if (!owner.backgroundStop) return
+    clearTimeout(owner.backgroundStop.deadline)
+    owner.backgroundStop.controller.abort()
+    owner.backgroundStop = undefined
+  }
+
+  private stopBackground(
+    sessionId: string,
+    target: NonNullable<ConversationStopInput['background']>,
+  ): RpcResult<ConversationPatch> {
+    const { runId, executorId } = target
+    const run = this.conversations.findRun(runId)
+    const owner =
+      run?.sessionId === sessionId &&
+      run.bindingGeneration === target.bindingGeneration &&
+      run.nativeSessionId === target.nativeSessionId &&
+      run.executorId === executorId
+        ? this.ownedBackground(run)
+        : undefined
+    if (owner?.backgroundStop) return this.recoveryResult(sessionId)
+    if (
+      !run ||
+      !owner ||
+      owner.backgroundStopUnconfirmed ||
+      run.nativeEffectsState !== 'pending' ||
+      !owner.adapter.stopBackgroundWork ||
+      owner.adapter.backgroundWork?.(runId, executorId) !== 'stoppable'
+    )
+      throw new RunOperationConflictError(
+        'The original background work is no longer available to stop.',
+      )
+
+    this.pauseSessionForStop(sessionId, '')
+    this.publish(this.conversations.cancelPendingRoutedContinuation(sessionId))
+    const controller = new AbortController()
+    const unconfirmed = (): void => {
+      if (this.disposed || owner.backgroundStop?.controller !== controller) return
+      this.clearBackgroundStop(owner)
+      owner.backgroundStopUnconfirmed = true
+      this.publish(this.conversations.metadataPatch(sessionId))
+    }
+    owner.backgroundStop = {
+      controller,
+      deadline: setTimeout(unconfirmed, BACKGROUND_STOP_TIMEOUT_MS),
+    }
+    const result = this.recoveryResult(sessionId)
+    // The RPC acknowledges this request. Only the existing native effects owner
+    // can confirm that work has ended and clear the stopping projection.
+    void owner.adapter.stopBackgroundWork(runId, executorId, controller.signal).catch(unconfirmed)
+    return result
+  }
+
   stop(input: ConversationStopInput): RpcResult<ConversationPatch> {
     if (this.disposed) return Conversation.shuttingDown()
     try {
-      this.conversations.cancelSchedulingRecoveryFaults(input.sessionId)
-      if (this.conversations.pausePreparedInputForStop(input.sessionId))
-        this.publish(this.conversations.metadataPatch(input.sessionId, { draftsChanged: true }))
-      for (const [key, check] of this.nativeChecks)
-        if (check.automaticAttemptId && key.startsWith(`${input.sessionId}:`))
-          check.controller.abort()
-      if (this.conversations.receivedCollaborationInput(input.sessionId))
-        this.publish(
-          this.conversations.pauseConversationQueue(
-            input.sessionId,
-            'The execution was stopped. Resume the queued message when ready.',
-          ),
-        )
-      this.conversations.pauseCollaboration(input.sessionId, 'stopped')
+      if (input.background) return this.stopBackground(input.sessionId, input.background)
+      this.pauseSessionForStop(input.sessionId)
       const execution = this.activeExecutions.get(input.sessionId)
       const continuation = this.preparingContinuations.get(input.sessionId)
       const preparingSend = [...this.preparingSends.values()].find(
@@ -6184,6 +6305,14 @@ export class Conversation {
         ok: false,
         error: { code: 'VALIDATION', message: 'The native binding is unavailable.' },
       }
+    if (
+      (original && (original.sessionId !== sessionId || original.agentId !== agentId)) ||
+      (!original && input.runId !== sessionId)
+    )
+      return {
+        ok: false,
+        error: { code: 'CONFLICT', message: 'This Check does not match its original execution.' },
+      }
     const binding = this.conversations.nativeContext(sessionId, agentId)
     const receiptCheck = original && this.nativeChecks.get(`${sessionId}:${agentId}:${original.id}`)
     if (receiptCheck?.receiptSessionId)
@@ -6192,10 +6321,16 @@ export class Conversation {
       original &&
       (!binding ||
         original.bindingGeneration !== binding.bindingGeneration ||
-        original.nativeSessionId !== binding.nativeSessionId)
+        original.nativeSessionId !== binding.nativeSessionId ||
+        !this.conversations.isCurrentBackgroundCursor(original.id))
     )
       return this.inspectPreviousRun(original)
-    return this.checkNativeBinding(sessionId, agentId)
+    // The first cold Check may establish the root ending. Keep its exact owner
+    // so that the result can expose recovery for still-unconfirmed work.
+    const background = original
+      ? { runId: original.id, owner: this.ownedBackground(original) }
+      : undefined
+    return this.checkNativeBinding(sessionId, agentId, original?.id, undefined, background)
   }
 
   private scheduleSteerReceiptCheck(
@@ -6426,7 +6561,9 @@ export class Conversation {
     agentId: RuntimeAgentId,
     expectedRunId?: string,
     automaticAttemptId?: string,
+    background?: { runId: string; owner?: NativeObservation | undefined },
   ): Promise<RpcResult<ConversationPatch>> {
+    const backgroundOwner = background?.owner
     const fork = this.conversations.forkOperation(sessionId)
     const forkBinding = this.conversations.nativeContext(sessionId, agentId)
     if (
@@ -6440,8 +6577,17 @@ export class Conversation {
       )
     const key = `${sessionId}:${agentId}`
     const pending = this.nativeChecks.get(key)
-    if (pending) return pending.task
-    if (this.hasSessionOperation(sessionId, false, undefined, true))
+    if (pending)
+      return pending.targetRunId === expectedRunId
+        ? pending.task
+        : Promise.resolve({
+            ok: false,
+            error: { code: 'CONFLICT', message: 'A different native execution is being checked.' },
+          })
+    if (
+      this.hasSessionOperation(sessionId, false, undefined, true) ||
+      backgroundOwner?.backgroundStop
+    )
       return Promise.resolve(Conversation.capacityFailure())
     if (this.operationCount() >= MAX_AGENT_OPERATIONS)
       return Promise.resolve(Conversation.capacityFailure())
@@ -6478,15 +6624,30 @@ export class Conversation {
             },
           }
         const generation = context.bindingGeneration ?? 1
-        markLogicalTimeout = () => {
+        const currentTarget = (): boolean => {
           const current = this.conversations.nativeContext(sessionId, agentId)
-          if (
-            this.disposed ||
-            controller.signal.aborted ||
-            current?.bindingGeneration !== generation ||
-            current.nativeSessionId !== context.nativeSessionId
+          return (
+            !this.disposed &&
+            !controller.signal.aborted &&
+            this.nativeChecks.get(key)?.controller === controller &&
+            current?.bindingGeneration === generation &&
+            current.nativeSessionId === context.nativeSessionId &&
+            current.lastRunId === context.lastRunId &&
+            !this.conversations.pendingNativeRebuild(sessionId, agentId) &&
+            (!run ||
+              context.lastRunId !== run.id ||
+              this.conversations.isCurrentBackgroundCursor(run.id))
           )
-            return
+        }
+        const changedTarget: RpcResult<ConversationPatch> = {
+          ok: false,
+          error: {
+            code: 'CONFLICT',
+            message: 'The native Check target changed. The current binding was not changed.',
+          },
+        }
+        markLogicalTimeout = () => {
+          if (!currentTarget()) return
           const message =
             'Native state check timed out. Cleanup remains pending. No task was reexecuted.'
           this.publish(
@@ -6500,6 +6661,7 @@ export class Conversation {
             ),
           )
         }
+        if (!currentTarget()) return changedTarget
         this.publish(
           this.conversations.setContinuation(sessionId, agentId, 'checking', undefined, generation),
         )
@@ -6507,30 +6669,38 @@ export class Conversation {
           const session = this.sessions.find(sessionId)
           const project = session && this.projects.find(session.projectId)
           if (!session || !project) throw new Error('The Session project is unavailable.')
-          const executable = await this.runtimePreparation.findRecoveryExecutable(
-            agentId,
-            controller.signal,
-          )
-          if (executable === undefined)
-            throw new AgentExecutionError(
-              'runtime_incompatible',
-              'The native executable is unavailable. Restore the executable, then Retry.',
-              false,
+          let adapter = backgroundOwner?.adapter
+          if (adapter) {
+            const owner = this.nativeChecks.get(key)
+            if (owner?.controller !== controller)
+              throw new RunOperationConflictError('The native check is no longer current.')
+            owner.adapter = adapter
+          } else {
+            const executable = await this.runtimePreparation.findRecoveryExecutable(
+              agentId,
+              controller.signal,
             )
-          const adapter = await this.adapterFor(
-            sessionId,
-            agentId,
-            executable,
-            controller.signal,
-            project.directoryPath,
-            (acquired) => {
-              const owner = this.nativeChecks.get(key)
-              if (owner?.controller !== controller || controller.signal.aborted)
-                throw new RunOperationConflictError('The native check is no longer current.')
-              owner.adapter = acquired
-              this.nativeMetadataChanged()
-            },
-          )
+            if (executable === undefined)
+              throw new AgentExecutionError(
+                'runtime_incompatible',
+                'The native executable is unavailable. Restore the executable, then Retry.',
+                false,
+              )
+            adapter = await this.adapterFor(
+              sessionId,
+              agentId,
+              executable,
+              controller.signal,
+              project.directoryPath,
+              (acquired) => {
+                const owner = this.nativeChecks.get(key)
+                if (owner?.controller !== controller || controller.signal.aborted)
+                  throw new RunOperationConflictError('The native check is no longer current.')
+                owner.adapter = acquired
+                this.nativeMetadataChanged()
+              },
+            )
+          }
           if (run) {
             try {
               await this.probeSteerInputs(run, adapter, controller)
@@ -6542,8 +6712,7 @@ export class Conversation {
           const observeCheckedTitle = (nativeSessionId: string, logicalTitle?: string): void => {
             const current = this.conversations.nativeContext(sessionId, agentId)
             if (
-              this.disposed ||
-              controller.signal.aborted ||
+              !currentTarget() ||
               this.adapters.get(key)?.adapter !== adapter ||
               current?.nativeSessionId !== nativeSessionId ||
               current.bindingGeneration !== generation
@@ -6599,7 +6768,7 @@ export class Conversation {
                 checkContext,
               ),
             )
-            if (!evidence || controller.signal.aborted || this.disposed)
+            if (!evidence || !currentTarget())
               throw new Error('The initialized binding could not be checked.')
             this.publish(this.conversations.recordNativeEvidence(evidence))
             if (evidence.kind !== 'binding_ready')
@@ -6670,26 +6839,21 @@ export class Conversation {
               checkContext,
             )
           })
-          if (!evidence || controller.signal.aborted)
+          if (!evidence || !currentTarget())
             throw new Error('The native check did not return evidence.')
           const archiveTail = run && this.nativeObservations.get(run.id)?.archiveTail
           if (archiveTail) await archiveTail
-          if (
-            this.disposed ||
-            controller.signal.aborted ||
-            this.conversations.nativeContext(sessionId, agentId)?.bindingGeneration !== generation
-          )
-            throw new RunOperationConflictError('The binding changed while checking.')
+          if (!currentTarget()) return changedTarget
           if (run) this.flushRunOutput(run)
           this.publish(this.conversations.recordNativeEvidence(evidence))
           if (run && 'output' in evidence && evidence.output) {
-            this.publish(
-              await this.conversations.recordNativeOutputComplete(
-                run.id,
-                evidence.output,
-                controller.signal,
-              ),
+            const outputPatch = await this.conversations.recordNativeOutputComplete(
+              run.id,
+              evidence.output,
+              controller.signal,
             )
+            if (!currentTarget()) return changedTarget
+            this.publish(outputPatch)
           }
           if (run && evidence.kind === 'ended') {
             this.publish(this.conversations.settleKnownNativeEnding(run.id))
@@ -6717,20 +6881,33 @@ export class Conversation {
                     : 'The native check did not confirm the Turn. You can retry or rebuild; no task was reexecuted.',
               },
             }
-          if (this.conversations.pendingNativeRebuild(sessionId, agentId))
-            this.publish(
-              this.conversations.setContinuation(
-                sessionId,
-                agentId,
-                'recovery_required',
-                'The candidate rebuild has not been confirmed. Check that creation or explicitly create another.',
-                generation,
-              ),
-            )
+          if (background && evidence.kind === 'ended') {
+            const checked = this.conversations.findRun(background.runId)
+            const owned = checked && this.ownedBackground(checked)
+            if (
+              checked &&
+              this.isCurrentBackground(checked) &&
+              (checked.nativeEffectsState === 'pending' ||
+                checked.nativeEffectsState === 'unknown') &&
+              (owned?.backgroundStopUnconfirmed ||
+                owned?.adapter.backgroundWork?.(checked.id, checked.executorId!) !== 'stoppable')
+            ) {
+              // The check confirmed a root ending, not the old work. Record an
+              // explicit recovery choice without changing the effects evidence.
+              this.publish(
+                this.conversations.recordNativeEffects(
+                  checked.id,
+                  checked.nativeEffectsState,
+                  'background_check_unconfirmed',
+                ),
+              )
+            }
+          }
           this.scheduleNativeTitleSync(sessionId)
           return { ok: true, value: this.conversations.contextPatch(sessionId) }
         } catch (error) {
           if (this.disposed) return Conversation.shuttingDown()
+          if (!currentTarget()) return changedTarget
           const patch = this.conversations.setContinuation(
             sessionId,
             agentId,
@@ -6768,7 +6945,11 @@ export class Conversation {
           }
         }
       },
-      { automaticAttemptId, onLogicalTimeout: () => markLogicalTimeout?.() },
+      {
+        automaticAttemptId,
+        targetRunId: expectedRunId,
+        onLogicalTimeout: () => markLogicalTimeout?.(),
+      },
     )
   }
 
@@ -6817,6 +6998,7 @@ export class Conversation {
           input.clientOperationId,
           input.sessionId,
           input.agentId,
+          input.expectedRunId,
         )
         return this.recoveryResult(input.sessionId)
       } catch (error) {
@@ -6833,16 +7015,8 @@ export class Conversation {
       (input.expectedNativeSessionId !== undefined &&
         context?.nativeSessionId !== input.expectedNativeSessionId) ||
       (input.expectedRunId !== undefined &&
-        (
-          (!context
-            ? this.conversations.unacknowledgedNativeRun(input.sessionId, input.agentId)
-            : undefined) ??
-          this.conversations.latestAgentRun(
-            input.sessionId,
-            input.agentId,
-            context?.bindingGeneration,
-          )
-        )?.id !== (input.expectedRunId ?? undefined)) ||
+        this.conversations.nativeRecoveryRun(input.sessionId, input.agentId)?.id !==
+          (input.expectedRunId ?? undefined)) ||
       (input.expectedRebuildId !== undefined && currentOperationId !== input.expectedRebuildId)
     )
       return {
@@ -6864,6 +7038,7 @@ export class Conversation {
             input.clientOperationId,
             input.sessionId,
             input.agentId,
+            input.expectedRunId,
           )
           if (
             input.expectedGeneration !== undefined &&
@@ -6924,6 +7099,7 @@ export class Conversation {
         sessionId: input.sessionId,
         agentId: input.agentId,
         expectedGeneration: input.expectedGeneration ?? context?.bindingGeneration ?? 1,
+        ...(input.expectedRunId !== undefined ? { expectedRunId: input.expectedRunId } : {}),
         abandon: input.abandon === true,
         ...(input.agentId === 'claude' ? { reservedNativeSessionId: randomUUID() } : {}),
       })
@@ -7095,6 +7271,7 @@ export class Conversation {
         )
       rebuild.executorId = adapter.executorId
       const chunks: import('@pact/contracts').NativeContextRebuildChunk[] = []
+      const sourceRevisions = new Map<string, number>()
 
       let bytes = 2
       const sourceDeadline = Date.now() + HANDOFF_READ_DEADLINE_MS
@@ -7102,6 +7279,7 @@ export class Conversation {
         sessionId,
         rebuild.abortController.signal,
         rebuild.rebuildId,
+        sourceRevisions,
       )) {
         bytes += Buffer.byteLength(JSON.stringify(chunk)) + 1
         if (chunks.length >= 4096 || bytes > HANDOFF_SAFETY_BYTES || Date.now() > sourceDeadline)
@@ -7110,7 +7288,12 @@ export class Conversation {
           )
         chunks.push(chunk)
       }
-      const sourceHash = this.conversations.freezeNativeRebuildSource(rebuild.rebuildId, chunks)
+      const sourceHash = this.conversations.freezeNativeRebuildSource(
+        rebuild.rebuildId,
+        chunks,
+        sourceRevisions,
+      )
+      sourceRevisions.clear()
       const operation = this.conversations.nativeRebuildOperation(rebuild.rebuildId)!
       const current = (): boolean => {
         const saved = this.conversations.nativeRebuildOperation(rebuild.rebuildId)
@@ -7644,18 +7827,18 @@ export class Conversation {
     return () => this.listeners.delete(listener)
   }
 
-  dispose(): Promise<void> {
+  dispose(shutdown?: { flushDeadlineAt?: number }): Promise<void> {
     clearTimeout(this.nativeQuitPreparation?.timer)
     this.nativeQuitPreparation = undefined
     this.nativeListeners.clear()
     this.skillDocumentOwner?.controller.abort()
     for (const owner of this.skillDiscoveries.values()) owner.controller.abort()
     this.skillCatalogs.clear()
-    this.disposal ??= this.close()
+    this.disposal ??= this.close(shutdown)
     return this.disposal
   }
 
-  private async close(): Promise<void> {
+  private async close(shutdown?: { flushDeadlineAt?: number }): Promise<void> {
     this.disposed = true
     if (this.pendingContinuationImmediate) clearImmediate(this.pendingContinuationImmediate)
     this.pendingContinuationImmediate = undefined
@@ -7664,8 +7847,8 @@ export class Conversation {
     this.decisionRuntime?.controller.abort()
     const decisionCleanup = this.decisionRuntime?.runtime?.dispose().catch(() => false)
     this.decisionConnection = undefined
-    await this.markdownWorker?.terminate()
-    await this.markdownTail
+    const markdownCleanup: Promise<unknown>[] = [this.markdownTail]
+    if (this.markdownWorker) markdownCleanup.push(this.markdownWorker.terminate())
     const forkOwners = [...this.nativeForks.values()]
     const forkPreparations = [...this.forkPreparations.values()]
     for (const owner of forkOwners) owner.controller.abort()
@@ -7699,6 +7882,84 @@ export class Conversation {
         flushed = false
       }
     }
+    // This is the first part of Main's existing four-second flush, not a new
+    // Stop deadline. One cutoff covers at most the existing execution slots.
+    const flushDeadlineAt =
+      shutdown?.flushDeadlineAt !== undefined &&
+      Number.isSafeInteger(shutdown.flushDeadlineAt) &&
+      shutdown.flushDeadlineAt > 0
+        ? Math.min(shutdown.flushDeadlineAt, Date.now() + 4000)
+        : 0
+    const drainUntil = flushDeadlineAt - 3000
+    const cutoff = Promise.withResolvers<void>()
+    const shutdownOwners: NativeObservation[] = []
+    const foregroundDisposals = new Map<AgentAdapter, Promise<void>>()
+    let shutdownTimer: ReturnType<typeof setTimeout> | undefined
+    if (drainUntil > Date.now()) {
+      for (const execution of executions) {
+        try {
+          const saved = this.conversations.findRun(execution.run.id)
+          const owner = this.nativeObservations.get(execution.run.id)
+          if (
+            saved?.agentId !== 'codex' ||
+            saved.dispatchPhase !== 'accepted' ||
+            !saved.nativeSessionId ||
+            !saved.nativeTurnId ||
+            !saved.executorId ||
+            !owner ||
+            owner.adapter.executorId !== saved.executorId ||
+            this.adapters.get(`${saved.sessionId}:${saved.agentId}`)?.adapter !== owner.adapter ||
+            !this.conversations.isCurrentBackgroundCursor(saved.id)
+          )
+            continue
+          const proof = Promise.withResolvers<void>()
+          owner.shutdown = {
+            deadlineAt: drainUntil,
+            nativeSessionId: saved.nativeSessionId,
+            nativeTurnId: saved.nativeTurnId,
+            executorId: saved.executorId,
+            bindingGeneration: saved.bindingGeneration ?? 1,
+            ended: false,
+            drained: false,
+            failed: false,
+            complete: () => proof.resolve(),
+          }
+          shutdownOwners.push(owner)
+          // dispose pins the connection cap before abort can enter its existing
+          // native interruption path. Actual physical close waits for this proof/cutoff.
+          let disposal: Promise<void>
+          try {
+            disposal = owner.adapter.dispose({
+              flushDeadlineAt,
+              foregroundSettlement: Promise.race([proof.promise, cutoff.promise]),
+            })
+          } catch (error) {
+            disposal = Promise.reject(error)
+          }
+          void disposal.catch(() => undefined)
+          foregroundDisposals.set(owner.adapter, disposal)
+        } catch {
+          // Lost metadata cannot skip abort, physical join, or arm another owner forever.
+          flushed = false
+        }
+      }
+      if (shutdownOwners.length)
+        shutdownTimer = setTimeout(() => cutoff.resolve(), Math.max(0, drainUntil - Date.now()))
+    }
+    // Even late shutdown delivery retains Main's original physical cleanup cap.
+    if (flushDeadlineAt) {
+      for (const { adapter } of this.adapters.values()) {
+        if (adapter.id !== 'codex' || foregroundDisposals.has(adapter)) continue
+        let disposal: Promise<void>
+        try {
+          disposal = adapter.dispose({ flushDeadlineAt })
+        } catch (error) {
+          disposal = Promise.reject(error)
+        }
+        void disposal.catch(() => undefined)
+        foregroundDisposals.set(adapter, disposal)
+      }
+    }
     this.titleEnrichments.clear()
     for (const execution of executions) execution.abortController.abort()
     for (const admission of preparing) admission.controller.abort()
@@ -7715,6 +7976,7 @@ export class Conversation {
     this.adapters.clear()
     for (const owner of this.nativeObservations.values()) {
       owner.sourceReader?.retire()
+      this.clearBackgroundStop(owner)
       owner.archiveController.abort()
     }
     await Promise.allSettled(
@@ -7735,14 +7997,14 @@ export class Conversation {
     }
     this.lastSettledStreamTrace?.reservation.release()
     this.lastSettledStreamTrace = undefined
-    this.nativeObservations.clear()
     const cleanup = await Promise.allSettled([
+      ...markdownCleanup,
       ...(decisionCleanup ? [decisionCleanup] : []),
 
       ...(this.decisionRecovery ? [this.decisionRecovery] : []),
       ...[...this.collaborationActions.values()].map((owner) => owner.task),
       ...adapters.map(async ({ adapter }) => {
-        await adapter.dispose()
+        await (foregroundDisposals.get(adapter) ?? adapter.dispose())
       }),
       ...forkOwners.flatMap((owner) => (owner.completion ? [owner.completion] : [])),
       ...forkPreparations.map((owner) => owner.task),
@@ -7756,6 +8018,10 @@ export class Conversation {
       ),
       ...nativeRebuilds.flatMap((rebuild) => (rebuild.completion ? [rebuild.completion] : [])),
     ])
+    clearTimeout(shutdownTimer)
+    if (shutdownOwners.some((owner) => owner.shutdown?.failed)) flushed = false
+    for (const owner of shutdownOwners) delete owner.shutdown
+    this.nativeObservations.clear()
     this.activeExecutions.clear()
     this.preparingSends.clear()
     this.preparingContinuations.clear()
@@ -7989,6 +8255,7 @@ export class Conversation {
       model: context.settings.agents[agentId].model,
       effort: context.settings.agents[agentId].effort,
     })
+    if (this.hasBlockingBackgroundWork(pending.sessionId)) return undefined
     return {
       started: this.conversations.beginRoutedContinuation({
         sessionId: pending.sessionId,
@@ -8398,7 +8665,8 @@ export class Conversation {
       !saved?.proof ||
       !cached ||
       cached.adapter.executorId !== saved.proof.executorId ||
-      !settings
+      !settings ||
+      this.hasBlockingBackgroundWork(original.sessionId)
     )
       return
     const snapshot = this.conversations.frozenExecutionEnvelope(original.id)
@@ -8573,6 +8841,7 @@ export class Conversation {
               throw new Error('The late native output could not be committed.')
             this.retireStreamTrace(owner, execution.streamBuffer)
             owner.sourceReader?.retire()
+            this.clearBackgroundStop(owner)
             this.nativeObservations.delete(execution.run.id)
             if (this.conversations.findRun(execution.run.id)?.nativeEffectsState === 'pending')
               this.publish(
@@ -8719,6 +8988,31 @@ export class Conversation {
     owner.streamTrace = this.createStreamTrace(run, owner)
     const stillOwned = (): boolean =>
       !this.disposed && this.nativeObservations.get(run.id) === owner
+    const closingObservation = (): NativeObservation['shutdown'] => {
+      const shutdown = owner.shutdown
+      if (
+        !this.disposed ||
+        !shutdown ||
+        Date.now() >= shutdown.deadlineAt ||
+        this.nativeObservations.get(run.id) !== owner ||
+        owner.adapter !== adapter ||
+        adapter.executorId !== shutdown.executorId
+      )
+        return undefined
+      const saved = this.conversations.findRun(run.id)
+      const closingContext = this.conversations.nativeContext(run.sessionId, run.agentId)
+      return saved &&
+        saved.controlDisposition !== 'abandoned' &&
+        saved.executorId === shutdown.executorId &&
+        saved.nativeSessionId === shutdown.nativeSessionId &&
+        saved.nativeTurnId === shutdown.nativeTurnId &&
+        saved.bindingGeneration === shutdown.bindingGeneration &&
+        closingContext?.lastRunId === run.id &&
+        closingContext.nativeSessionId === shutdown.nativeSessionId &&
+        closingContext.bindingGeneration === shutdown.bindingGeneration
+        ? shutdown
+        : undefined
+    }
     const ownsCurrentNativeRun = (): boolean =>
       this.activeExecutions.get(run.sessionId) === execution &&
       this.conversations.ownsNativeControl(run.id)
@@ -8897,6 +9191,7 @@ export class Conversation {
       if (owner.outputFailure) this.workspaceChanges?.observeUncertainEffects(run.id)
       this.retireStreamTrace(owner, buffer)
       owner.sourceReader?.retire()
+      this.clearBackgroundStop(owner)
       this.nativeObservations.delete(run.id)
       void this.finalizeWorkspaceChanges(run.id).catch(() => undefined)
     }
@@ -9119,6 +9414,42 @@ export class Conversation {
             if (stillOwned()) this.observeNativeDelta(owner, value)
           },
           recordNativeEvidence: (evidence) => {
+            if (this.disposed) {
+              try {
+                const shutdown = closingObservation()
+                if (
+                  !shutdown ||
+                  evidence.kind !== 'ended' ||
+                  evidence.source !== 'live_terminal' ||
+                  evidence.identity.agentId !== run.agentId ||
+                  evidence.identity.sessionId !== run.sessionId ||
+                  evidence.identity.runId !== run.id ||
+                  evidence.identity.requestId !== run.id ||
+                  evidence.identity.nativeSessionId !== shutdown.nativeSessionId ||
+                  evidence.identity.nativeTurnId !== shutdown.nativeTurnId ||
+                  evidence.identity.executorId !== shutdown.executorId ||
+                  evidence.identity.bindingGeneration !== shutdown.bindingGeneration
+                )
+                  return
+                this.conversations.recordNativeEvidence({
+                  kind: evidence.kind,
+                  identity: evidence.identity,
+                  source: evidence.source,
+                  outcome: evidence.outcome,
+                })
+                shutdown.ended = true
+                if (shutdown.drained) {
+                  this.conversations.recordNativeEffects(run.id, 'settled', 'native_work_drained')
+                  shutdown.complete()
+                }
+              } catch {
+                if (owner.shutdown) {
+                  owner.shutdown.failed = true
+                  owner.shutdown.complete()
+                }
+              }
+              return
+            }
             if (
               !stillOwned() ||
               evidence.identity.bindingGeneration !== (run.bindingGeneration ?? 1) ||
@@ -9195,6 +9526,60 @@ export class Conversation {
           recordOutputFailure: (error) => {
             if (stillOwned()) this.failRunOutput(run, error)
           },
+          waitForRootOutput: async () => {
+            if (stillOwned()) this.flushRunOutput(run)
+            // This captured tail only seals already-delivered text. It never
+            // waits for the Query drain, which owns the caller of this barrier.
+            const pending = owner.archiveTail
+            if (pending) await pending
+          },
+          recordBackgroundReportUnavailable: (value) => {
+            if (!stillOwned() || owner.archiveController.signal.aborted) return
+            const report = nativeBackgroundReportIdentitySchema.parse(value)
+            if (
+              report.runId !== run.id ||
+              report.bindingGeneration !== (run.bindingGeneration ?? 1)
+            )
+              return
+            const patch = this.conversations.recordBackgroundReportUnavailable(report)
+            if (patch) this.publish(patch)
+          },
+          recordBackgroundReport: async (value) => {
+            if (!stillOwned() || owner.archiveController.signal.aborted) return
+            const report = nativeBackgroundReportSchema.parse(value)
+            if (
+              report.runId !== run.id ||
+              report.bindingGeneration !== (run.bindingGeneration ?? 1)
+            )
+              return
+            try {
+              // The Adapter retains this body's shared Query reservation until
+              // persistence returns; do not admit it through a second budget.
+              if (owner.archiveTail) await owner.archiveTail
+              if (!stillOwned() || owner.archiveController.signal.aborted) return
+              const patch = await this.conversations.recordBackgroundReport(
+                report,
+                (bodySignal) => Conversation.answerParts(report.text, bodySignal),
+                owner.archiveController.signal,
+              )
+              if (patch && stillOwned()) this.publish(patch)
+            } catch (error) {
+              if (!stillOwned() || owner.archiveController.signal.aborted) return
+              const patch = this.conversations.recordBackgroundReportUnavailable(report)
+              if (patch) this.publish(patch)
+              recordDiagnostic({
+                operation: 'native_check',
+                phase: 'failed',
+                level: 'warn',
+                scope: 'run',
+                sessionId: run.sessionId,
+                runId: run.id,
+                agentId: run.agentId,
+                runtimeBoundary: 'archive',
+                code: classifyAgentError(error).kind,
+              })
+            }
+          },
           recordArchivedEvent: archive,
           collaborationSourceReader: owner.sourceReader,
           getPlanCheckpoint: (nativeSessionId) =>
@@ -9245,12 +9630,59 @@ export class Conversation {
               : scope === 'recorded_files'
                 ? this.workspaceChanges?.uncertain(run.id, reason)
                 : this.workspaceChanges?.observeUncertainEffects(run.id),
+          backgroundWorkChanged: () => {
+            if (stillOwned()) this.publish(this.conversations.metadataPatch(run.sessionId))
+          },
           reportNativeEffects: (report) => {
+            if (this.disposed) {
+              try {
+                const shutdown = closingObservation()
+                if (
+                  !shutdown ||
+                  report.runId !== run.id ||
+                  report.generation !== generation ||
+                  report.state !== 'settled' ||
+                  report.reason !== 'native_work_drained'
+                )
+                  return
+                shutdown.drained = true
+                if (shutdown.ended) {
+                  this.conversations.recordNativeEffects(run.id, report.state, report.reason)
+                  shutdown.complete()
+                }
+              } catch {
+                if (owner.shutdown) {
+                  owner.shutdown.failed = true
+                  owner.shutdown.complete()
+                }
+              }
+              return
+            }
             if (!stillOwned() || report.runId !== run.id || report.generation !== generation) return
+            if (owner.backgroundStop && report.state !== 'pending') {
+              this.clearBackgroundStop(owner)
+              if (report.state === 'unknown') owner.backgroundStopUnconfirmed = true
+            }
             this.publish(
               this.conversations.recordNativeEffects(run.id, report.state, report.reason),
             )
-            if (report.state === 'unknown') this.workspaceChanges?.observeUncertainEffects(run.id)
+            if (report.state === 'unknown') {
+              this.workspaceChanges?.observeUncertainEffects(run.id)
+              const queued = this.conversations.receivedCollaborationInput(run.sessionId)
+              if (
+                queued &&
+                (queued.anchorRunId === run.id ||
+                  this.isCurrentBackground(this.conversations.findRun(run.id)!)) &&
+                !queued.taskId &&
+                queued.queueState === 'queued'
+              )
+                this.publish(
+                  this.conversations.pauseConversationQueue(
+                    run.sessionId,
+                    'Background work could not be confirmed. Check its state before resuming, or edit or remove the queued message.',
+                  ),
+                )
+            }
             if (report.state !== 'pending') {
               const saved = this.conversations.findRun(run.id)
               if (
@@ -9629,6 +10061,7 @@ export class Conversation {
       onPhysicalCompletion?: () => void
       automaticAttemptId?: string | undefined
       onLogicalTimeout?: () => void
+      targetRunId?: string | undefined
     } = {},
   ): Promise<RpcResult<ConversationPatch>> {
     const physical = Promise.withResolvers<void>()
@@ -9657,6 +10090,7 @@ export class Conversation {
       },
       phase: 'checking',
       automaticAttemptId: options.automaticAttemptId,
+      targetRunId: options.targetRunId,
       configurationGeneration: options.automaticAttemptId
         ? this.conversations.schedulingConfigurationGeneration()
         : undefined,
@@ -10309,7 +10743,7 @@ export class Conversation {
     const cursors = contexts.map((context) =>
       context.lastRunId ? this.conversations.findRun(context.lastRunId) : undefined,
     )
-    const incomplete = runs.flatMap((run) =>
+    const incomplete = [...runs, ...cursors].flatMap((run) =>
       run?.dispatchPhase === 'ended' && !this.conversations.hasCompleteResponse(run.id)
         ? [run.id]
         : [],
@@ -10323,6 +10757,42 @@ export class Conversation {
       this.conversations.rebuildOperations(sessionId),
     )
     for (const issue of projection.agents) {
+      const run = [...runs, ...cursors].find((candidate) => candidate?.id === issue.runId)
+      const currentBackground = run && this.isCurrentBackground(run)
+      const owner = currentBackground ? this.ownedBackground(run) : undefined
+      if (issue.phase === 'background_check' && owner && run?.executorId && run.nativeSessionId) {
+        const work = owner.adapter.backgroundWork?.(run.id, run.executorId)
+        if (owner.backgroundStop) {
+          issue.phase = 'background_stopping'
+          issue.title = 'Stopping…'
+          issue.reason = ''
+          issue.action = 'none'
+        } else if (owner.backgroundStopUnconfirmed && issue.action !== 'rebuild') {
+          issue.title = 'Stop not confirmed'
+          issue.reason = work
+            ? 'Stop was not confirmed. The native session still reports background work.'
+            : 'Pact could not confirm that Stop ended the background work.'
+        } else if (run.nativeEffectsState === 'pending' && work && issue.action !== 'rebuild') {
+          issue.phase = 'background_working'
+          issue.title =
+            issue.resultDisposition === 'incomplete'
+              ? 'Response incomplete. Background work continues.'
+              : 'Working in background…'
+          issue.reason = ''
+          issue.action = 'none'
+          if (work === 'stoppable' && owner.adapter.stopBackgroundWork) {
+            issue.backgroundStop = {
+              runId: run.id,
+              executorId: run.executorId,
+              nativeSessionId: run.nativeSessionId,
+              bindingGeneration: run.bindingGeneration ?? 1,
+            }
+          } else {
+            issue.reason = 'The provider has not exposed a Stop target for this work.'
+            issue.action = 'retry_check'
+          }
+        }
+      }
       if (this.nativeChecks.has(`${sessionId}:${issue.agentId}:rebuild`)) {
         issue.phase = 'checking'
         issue.action = 'none'
@@ -10335,6 +10805,8 @@ export class Conversation {
         issue.generation,
       )
     }
+    if (projection.inputGate === 'open' && this.hasBlockingBackgroundWork(sessionId))
+      projection.inputGate = 'send_blocked'
     return projection
   }
 

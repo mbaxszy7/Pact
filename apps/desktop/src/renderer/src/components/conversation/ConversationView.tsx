@@ -57,6 +57,7 @@ import type { ConversationImage } from '@pact/contracts/images'
 import {
   compareConversationDisplayOrder,
   conversationMessageOrder,
+  isConversationBackgroundReport,
   CONVERSATION_MARKDOWN_BYTES,
   parseComposerCommandPrefix,
   CONVERSATION_WINDOW_MESSAGES,
@@ -193,7 +194,7 @@ interface ConversationViewProps {
   onSend: ConversationFlow['send']
   onSaveCommentDraft: ConversationFlow['saveCommentDraft']
   onRemoveCommentDraft: (commentId: string) => Promise<boolean>
-  onStop: () => Promise<boolean>
+  onStop: ConversationFlow['stop']
   onRebuildNativeContext: ConversationFlow['rebuildNativeContext']
   onCheckNativeContext: ConversationFlow['checkNativeContext']
   onAcceptPeerProposal: (proposalId: string) => Promise<boolean>
@@ -333,7 +334,7 @@ export function ConversationView({
   onComposerMentionChange,
   loading,
   sending,
-  stopping,
+  stopping: stopRequested,
   agentActionsEnabled,
   error,
   onSend,
@@ -1019,16 +1020,25 @@ export function ConversationView({
     )?.agentId ??
     activeRun?.agentId ??
     (!recoveryLocked ? pendingRoutedAgentId : undefined)
+  const backgroundIssues = visibleSessionIssues?.agents ?? []
+  const backgroundWorking = backgroundIssues.some((issue) => issue.phase === 'background_working')
+  const backgroundStopping = backgroundIssues.some((issue) => issue.phase === 'background_stopping')
+  const backgroundCheckNeeded = backgroundIssues.some(
+    (issue) => issue.phase === 'background_check' || issue.phase === 'background_checking',
+  )
+  const backgroundStopIssue = backgroundIssues.find((issue) => issue.backgroundStop)
+  const backgroundStop = backgroundStopIssue?.backgroundStop
+  const stopping = stopRequested || backgroundStopping
   const responseInProgress = Boolean(respondingAgentId) || stopping
-  const composerActionLabel = stopping
-    ? 'Stopping response'
-    : respondingAgentId &&
-        !(
-          unfinishedTask &&
-          (composerHasContent(composer) || snapshot?.draftComments.length || composerImages.length)
-        )
+  const showStop = stopping || (!recoveryLocked && Boolean(respondingAgentId || backgroundStop))
+  const stopLabel = stopping
+    ? 'Stopping…'
+    : respondingAgentId
       ? `Stop ${respondingAgentId === 'claude' ? 'Claude Code' : 'Codex'} response`
-      : 'Send message'
+      : 'Stop background work'
+  const requestStop = (): Promise<boolean> => onStop(respondingAgentId ? undefined : backgroundStop)
+  const continuationBlocked =
+    inputGate !== 'open' || backgroundWorking || backgroundCheckNeeded || stopping
   const activeRunHasMessage = Boolean(
     activeRun &&
     snapshot?.messages.some(
@@ -1069,6 +1079,7 @@ export function ConversationView({
     queuedInput.recipient === activeRun?.agentId &&
     activeRun.status === 'running' &&
     activeRun.dispatchPhase === 'accepted' &&
+    !activeRun.collaboration &&
     !queuedInput.workflowCommand,
   )
   const steerUnavailableReason = queuedInput?.workflowCommand
@@ -1082,7 +1093,7 @@ export function ConversationView({
     Boolean(skillComposer.warning) ||
     skillComposer.checking ||
     composerDisabled ||
-    (inputGate === 'send_blocked' && !activeRun?.collaboration) ||
+    (inputGate === 'send_blocked' && (!activeRun?.collaboration || backgroundCheckNeeded)) ||
     sending ||
     stopping ||
     history.draftsLoading
@@ -1107,12 +1118,30 @@ export function ConversationView({
     Boolean(history.restoringInput) ||
     !incompleteCanAnswer
   const draftComments = snapshot?.draftComments ?? EMPTY_COMMENTS
-  const sendWhileWorking = Boolean(
-    unfinishedTask &&
-    responseInProgress &&
-    (composerContentReady || draftComments.length || composerImages.length),
+  const hasDraft = composerContentReady || draftComments.length > 0 || composerImages.length > 0
+  const showSend = !showStop || hasDraft
+  const workingIssues = backgroundIssues.filter((issue) => issue.phase === 'background_working')
+  const waitingBackgroundIssue =
+    queueEnabled &&
+    queuedInput?.state === 'queued' &&
+    workingIssues.length === 1 &&
+    workingIssues[0]?.action === 'none'
+      ? workingIssues[0]
+      : undefined
+  const stoppingBackgroundAgent =
+    !respondingAgentId && stopping
+      ? (backgroundIssues.find((issue) => issue.phase === 'background_stopping')?.agentId ??
+        backgroundStopIssue?.agentId)
+      : undefined
+  const stoppingBackgroundInQueue = Boolean(
+    queuedInput &&
+    queuedInput.state !== 'unknown' &&
+    queuedInput.state !== 'dispatching' &&
+    stoppingBackgroundAgent,
   )
-  const stopComposerAction = responseInProgress && !sendWhileWorking
+  const queuedBackgroundAgent = stoppingBackgroundInQueue
+    ? stoppingBackgroundAgent
+    : waitingBackgroundIssue?.agentId
   const feedbackDraft = Boolean(
     unfinishedTask &&
     (composerContentReady ||
@@ -2883,7 +2912,9 @@ export function ConversationView({
           ? 'Stopped'
           : run.status === 'failed'
             ? 'Failed'
-            : 'Completed'}
+            : run.nativeEffectsState === 'pending' || run.nativeEffectsState === 'unknown'
+              ? 'Reply complete'
+              : 'Completed'}
     </p>
   )
   const renderRecordingWarning = (run: AgentRun): React.JSX.Element | null =>
@@ -3057,6 +3088,7 @@ export function ConversationView({
               run={row.run}
               latestRunId={latestRun?.id}
               disabled={disabled || responseInProgress}
+              continuationBlocked={continuationBlocked}
               onOpenPlan={openRecordedPlan}
               onOpenSessionSettings={onOpenSessionSettings}
               onOpenProjectFile={openProjectFile}
@@ -3122,6 +3154,7 @@ export function ConversationView({
               run={placeholderRun}
               latestRunId={latestRun?.id}
               disabled={disabled || responseInProgress}
+              continuationBlocked={continuationBlocked}
               onOpenPlan={openRecordedPlan}
               onOpenSessionSettings={onOpenSessionSettings}
               onOpenProjectFile={openProjectFile}
@@ -3165,6 +3198,7 @@ export function ConversationView({
         </div>
       )
     }
+    const backgroundReport = isConversationBackgroundReport(message)
     const speaker =
       message.role === 'user' ? 'You' : message.agentId === 'claude' ? 'Claude Code' : 'Codex'
     const background =
@@ -3221,6 +3255,7 @@ export function ConversationView({
       !activeRun &&
       !recoveryLocked &&
       message.role === 'assistant' &&
+      !backgroundReport &&
       message.outputSnapshot?.canonical !== false &&
       message.replyToMessageId === pendingRoutedMessage?.id &&
       message.agentId !== pendingRoutedAgentId
@@ -3260,7 +3295,11 @@ export function ConversationView({
                     @{replyRecipient}
                   </span>
                 ) : null}
-                {message.role === 'assistant' && messageRun ? (
+                {backgroundReport ? (
+                  <span>
+                    · Background update{message.historicalBackgroundReport ? ' · Earlier task' : ''}
+                  </span>
+                ) : message.role === 'assistant' && messageRun ? (
                   <RunConfiguration run={messageRun} />
                 ) : null}
               </p>
@@ -3291,7 +3330,11 @@ export function ConversationView({
                     : 'mt-1'
                 }
               >
-                {messageMeta?.oversized ? (
+                {backgroundReport && message.state === 'incomplete' ? (
+                  <p className="text-caption text-secondary">
+                    The background update could not be saved.
+                  </p>
+                ) : messageMeta?.oversized ? (
                   <LargeMessagePreview preview={messageMeta.oversized.preview} />
                 ) : !commentOnly ? (
                   <MessageMarkdown
@@ -3347,6 +3390,7 @@ export function ConversationView({
               onCopy={copyMessage}
               onFork={
                 message.role === 'assistant' &&
+                !backgroundReport &&
                 message.outputSnapshot?.canonical !== false &&
                 message.state === 'complete' &&
                 onForkSessionCreated
@@ -3382,6 +3426,7 @@ export function ConversationView({
             run={messageRun}
             latestRunId={latestRun?.id}
             disabled={disabled || responseInProgress}
+            continuationBlocked={continuationBlocked}
             onOpenPlan={openRecordedPlan}
             onOpenSessionSettings={onOpenSessionSettings}
             onOpenProjectFile={openProjectFile}
@@ -3400,6 +3445,7 @@ export function ConversationView({
             }
             onReportReady={handlePlanReady}
             renderedMessageId={message.id}
+            replyBodyComplete={message.state === 'complete'}
           />
         ) : null}
         {message.role === 'assistant' &&
@@ -3948,6 +3994,8 @@ export function ConversationView({
             <SessionWarningCard
               value={visibleSessionIssues}
               enabled={agentActionsEnabled}
+              queuedBackgroundAgent={queuedBackgroundAgent}
+              stoppingAgent={stoppingBackgroundAgent}
               onRetry={(issue) =>
                 issue.action === 'inspect_rebuild'
                   ? onRebuildNativeContext(issue.agentId, {
@@ -3955,7 +4003,7 @@ export function ConversationView({
                       clientOperationId: issue.rebuildId,
                       expectedGeneration: issue.generation,
                     })
-                  : onCheckNativeContext(issue.agentId)
+                  : onCheckNativeContext(issue.agentId, issue.runId)
               }
               onRebuild={(issue, operationId) =>
                 onRebuildNativeContext(issue.agentId, {
@@ -3988,8 +4036,24 @@ export function ConversationView({
               <QueueMessageBar
                 queue={queue}
                 pending={queueActions.pending}
-                disabled={composerDisabled || sending || stopping}
-                canSteer={!inputTakeover && canSteerQueuedInput}
+                disabled={composerDisabled || sending}
+                canResume={!continuationBlocked}
+                backgroundStatus={
+                  stoppingBackgroundInQueue
+                    ? 'stopping'
+                    : waitingBackgroundIssue?.resultDisposition === 'incomplete'
+                      ? 'waiting_incomplete'
+                      : waitingBackgroundIssue
+                        ? 'waiting'
+                        : undefined
+                }
+                showSteer={
+                  activeRun?.status === 'running' &&
+                  !activeRun.collaboration &&
+                  !unfinishedTask &&
+                  !queuedInput?.workflowCommand
+                }
+                canSteer={!inputTakeover && !stopping && canSteerQueuedInput}
                 steerUnavailableReason={
                   inputTakeover ? 'Resolve the current interaction first.' : steerUnavailableReason
                 }
@@ -4093,11 +4157,11 @@ export function ConversationView({
                                 Your message draft is kept until these questions are resolved.
                               </p>
                             </div>
-                            {responseInProgress ? (
+                            {showStop ? (
                               <button
                                 type="button"
                                 disabled={stopping}
-                                onClick={() => void onStop()}
+                                onClick={() => void requestStop()}
                                 className="min-h-8 rounded-control px-3 font-medium text-primary hover:bg-surface-raised focus-visible:outline-2 focus-visible:outline-focus"
                               >
                                 {stopping ? 'Stopping…' : 'Stop'}
@@ -4668,55 +4732,49 @@ export function ConversationView({
                         )}
                       </button>
                     ) : null}
-                    {sendWhileWorking ? (
-                      <button
-                        type="button"
-                        aria-label={`Stop ${respondingAgentId === 'claude' ? 'Claude Code' : 'Codex'} response`}
-                        title="Stop current response"
-                        disabled={stopping}
-                        onClick={() => void onStop()}
-                        className="ml-auto grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-40"
-                      >
-                        <Square
-                          aria-hidden="true"
-                          className="size-3.5"
-                          fill="currentColor"
-                          strokeWidth={1.5}
-                        />
-                      </button>
-                    ) : null}
-                    <button
-                      className={`${sendWhileWorking ? '' : 'ml-auto '}grid size-9 shrink-0 cursor-pointer place-items-center rounded-control bg-surface-inverse text-inverse hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-40`}
-                      type="button"
-                      aria-label={composerActionLabel}
-                      title={composerActionLabel}
-                      disabled={
-                        stopComposerAction
-                          ? stopping
-                          : disabled ||
-                            (!composerContentReady &&
-                              draftComments.length === 0 &&
-                              composerImages.length === 0)
-                      }
-                      onClick={() => void (stopComposerAction ? onStop() : submit())}
-                    >
-                      {stopping ? (
-                        <LoaderCircle
-                          aria-hidden="true"
-                          className="size-4 animate-spin"
-                          strokeWidth={1.8}
-                        />
-                      ) : stopComposerAction ? (
-                        <Square
-                          aria-hidden="true"
-                          className="size-3.5"
-                          fill="currentColor"
-                          strokeWidth={1.5}
-                        />
-                      ) : (
-                        <ArrowUp aria-hidden="true" className="size-4" strokeWidth={1.9} />
-                      )}
-                    </button>
+                    <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                      {showStop ? (
+                        <button
+                          type="button"
+                          aria-label={stopLabel}
+                          title={stopLabel}
+                          disabled={stopping || !agentActionsEnabled}
+                          onClick={() => void requestStop()}
+                          className={`grid size-9 place-items-center rounded-control focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default ${showSend ? 'border border-border bg-surface-muted text-secondary enabled:hover:border-border-strong enabled:hover:text-primary' : 'bg-surface-inverse text-inverse hover:opacity-85'}`}
+                        >
+                          {stopping ? (
+                            <LoaderCircle
+                              aria-hidden="true"
+                              className="size-4 animate-spin motion-reduce:animate-none"
+                              strokeWidth={1.8}
+                            />
+                          ) : (
+                            <Square
+                              aria-hidden="true"
+                              className="size-3.5"
+                              fill="currentColor"
+                              strokeWidth={1.5}
+                            />
+                          )}
+                        </button>
+                      ) : null}
+                      {showSend ? (
+                        <button
+                          className="grid size-9 place-items-center rounded-control bg-surface-inverse text-inverse hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-40"
+                          type="button"
+                          aria-label="Send message"
+                          title="Send message"
+                          disabled={
+                            disabled ||
+                            !hasDraft ||
+                            (responseInProgress && !queueEnabled && !unfinishedTask)
+                          }
+                          onClick={() => void submit()}
+                        >
+                          <ArrowUp aria-hidden="true" className="size-4" strokeWidth={1.9} />
+                        </button>
+                      ) : null}
+                    </div>
                   </div>
                 </div>
                 <div className="pact-composer-controls flex min-w-0 items-center gap-2">

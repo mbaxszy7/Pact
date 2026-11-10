@@ -227,16 +227,31 @@ export interface OutputTimelineItem {
 }
 
 /** The descriptor and bodies share one keyset and LIMIT; collapsed rows cost no page slots. */
+export function hasArchivedBackgroundReports(database: Reader, sessionId: string): boolean {
+  return Boolean(
+    database.get(sql`
+    SELECT id FROM conversation_messages INDEXED BY conversation_messages_archived_background_idx
+    WHERE session_id=${sessionId} AND is_visible=0 AND role='assistant'
+      AND run_id IS NULL AND source_message_id IS NOT NULL LIMIT 1`),
+  )
+}
+
 export function outputTimelineSql(
   sessionId: string,
   view?: ConversationSnapshotView,
-  options: { filter: SQL; newer: boolean; legacy: boolean; preserveRunId?: string | undefined } = {
+  options: {
+    filter: SQL
+    newer: boolean
+    legacy: boolean
+    preserveRunId?: string | undefined
+    archivedBackground?: boolean
+  } = {
     filter: sql`1=1`,
     newer: false,
     legacy: false,
   },
 ): SQL {
-  if (options.legacy)
+  if (options.legacy && !options.archivedBackground)
     return sql`WITH timeline AS (
     SELECT id,'message' AS kind,run_id AS runId,sequence,1 AS rank FROM conversation_messages INDEXED BY conversation_messages_session_visible_sequence_idx
     WHERE session_id=${sessionId} AND is_visible=1)`
@@ -250,6 +265,29 @@ export function outputTimelineSql(
   ): SQL => sql`${name} AS MATERIALIZED (
     SELECT * FROM (${source}) WHERE ${options.filter}
     ORDER BY sequence ${direction},${variableRank ? sql`rank ${direction},` : sql``}id ${direction} LIMIT 26)`
+  const archived = options.archivedBackground
+    ? candidates(
+        sql`archived_background_candidates`,
+        sql`
+        SELECT id,'message' AS kind,run_id AS runId,sequence,1 AS rank
+        FROM conversation_messages INDEXED BY conversation_messages_archived_background_idx
+        WHERE session_id=${sessionId} AND is_visible=0 AND role='assistant'
+          AND run_id IS NULL AND source_message_id IS NOT NULL`,
+      )
+    : undefined
+  const archiveUnion = archived
+    ? sql`UNION ALL SELECT * FROM archived_background_candidates`
+    : sql``
+  if (options.legacy)
+    return sql`WITH ${candidates(
+      sql`normal_candidates`,
+      sql`
+      SELECT id,'message' AS kind,run_id AS runId,sequence,1 AS rank
+      FROM conversation_messages INDEXED BY conversation_messages_session_visible_sequence_idx
+      WHERE session_id=${sessionId} AND is_visible=1`,
+    )},
+      ${archived},
+      timeline AS (SELECT * FROM normal_candidates ${archiveUnion})`
   // Immutable order keys are indexed. Bound each branch before the common merge;
   // neither a large legacy transcript nor collapsed bodies are materialized to sort it.
   return sql`WITH ${candidates(
@@ -292,8 +330,10 @@ export function outputTimelineSql(
       WHERE session_id=${sessionId} AND ordinal=0`,
       true,
     )},
+    ${archived ? sql`${archived},` : sql``}
     timeline AS (SELECT * FROM normal_candidates UNION ALL SELECT * FROM snapshot_candidates
-      UNION ALL SELECT * FROM final_candidates UNION ALL SELECT * FROM context_candidates)`
+      UNION ALL SELECT * FROM final_candidates UNION ALL SELECT * FROM context_candidates
+      ${archiveUnion})`
 }
 
 export function beforeOutputOrder(order: ConversationDisplayOrder): SQL {

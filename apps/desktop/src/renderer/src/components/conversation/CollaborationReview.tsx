@@ -16,6 +16,7 @@ import {
   collaborationActor,
   collaborationInputGate,
   collaborationInputProcessing,
+  collaborationNextStage,
 } from '@pact/contracts'
 
 import type { ProjectFileTarget } from './MessageMarkdown'
@@ -63,6 +64,8 @@ export const CollaborationReview = memo(function CollaborationReview({
   run,
   latestRunId,
   disabled,
+  continuationBlocked = false,
+  replyBodyComplete = false,
   onOpenProjectFile,
   onCreateReportComment,
   feedbackDraft = false,
@@ -80,6 +83,8 @@ export const CollaborationReview = memo(function CollaborationReview({
   run: AgentRun
   latestRunId?: string | undefined
   disabled: boolean
+  continuationBlocked?: boolean
+  replyBodyComplete?: boolean
   onOpenProjectFile: (target: ProjectFileTarget) => void
   onCreateReportComment?: ((selection: ReportTextSelection) => void) | undefined
   feedbackDraft?: boolean | undefined
@@ -272,10 +277,9 @@ export const CollaborationReview = memo(function CollaborationReview({
       ? actionable
         ? 'Waiting for your answer'
         : 'Asked for your input'
-      : inputState.settled?.runId === run.id
-        ? readyToContinue
-          ? 'Ready to continue'
-          : 'Reply complete'
+      : inputState.settled?.runId === run.id ||
+          (replyBodyComplete && run.dispatchPhase === 'ended' && run.nativeOutcome === 'completed')
+        ? 'Reply complete'
         : 'Reply to your message'
   const showStageLabel = stage !== 'implement' && stage !== 'repair'
   const label =
@@ -296,18 +300,25 @@ export const CollaborationReview = memo(function CollaborationReview({
           action !== 'confirm_supplement' &&
           action !== 'continue' &&
           action !== 'pause' &&
+          (!continuationBlocked || action !== 'resume') &&
           (!continuationLimit || !['resume', 'retry'].includes(action)) &&
           (!inputGate || action === 'recover_plan') &&
           !(action === 'recover_plan' && actionError),
       )
     : []
+  const resumeStage = collaborationNextStage(task)
   const actionLabel = (action: DisplayedCollaborationAction): string =>
     ({
       execute: `Implement plan · ${agentName(collaborationActor(task, 'implement'))}`,
       respond: `Respond · ${agentName(collaborationActor(task, 'respond'))}`,
       repair: `Repair · ${agentName(collaborationActor(task, 'repair'))}`,
       pause: 'Pause collaboration',
-      resume: 'Continue collaboration',
+      resume:
+        resumeStage === 'code_review'
+          ? `Continue to ${agentName(collaborationActor(task, 'code_review'))} review`
+          : resumeStage === 'plan_review'
+            ? `Continue to ${agentName(collaborationActor(task, 'plan_review'))} plan review`
+            : 'Continue collaboration',
       recover_plan: planSync?.kind === 'response' ? 'Restore plan response' : 'Restore saved plan',
       retry: `Retry · ${agentName(task.actor)}`,
       continue: 'Continue collaboration',

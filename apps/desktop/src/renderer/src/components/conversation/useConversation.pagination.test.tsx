@@ -15,6 +15,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import type {
   AgentActivity,
   AgentRun,
+  BackgroundStopTarget,
   ConversationPage,
   ConversationPatch,
   DesktopBridge,
@@ -156,6 +157,190 @@ function historyFixture(header: Partial<MessagePage['header']> = {}) {
   }
   return { ...hook, page, firstId, getConversation, deliver, change, defer, client, onNotice }
 }
+
+async function blockedUploadFixture(holdAt: 'begin' | 'append') {
+  const f = historyFixture()
+  await waitFor(() => expect(f.result.current.snapshot).toBeDefined())
+  await waitFor(() => expect(f.result.current.history.draftsLoading).toBe(false))
+  const sessionId = f.page().sessionId,
+    inputId = crypto.randomUUID(),
+    text = '大'.repeat(25_000)
+  const uploadGate = Promise.withResolvers<void>(),
+    stopReply = Promise.withResolvers<Awaited<ReturnType<DesktopBridge['stopConversation']>>>()
+  let blocked = false,
+    uploaded = '',
+    sequence = 1
+  const patch = (): ConversationPatch => ({
+    version: 'conversation-patch-v1',
+    sessionId,
+    observation: { ...f.page().observation, sequence: ++sequence },
+    session: f.page().header.session,
+    messages: [],
+    activities: [],
+    runs: [],
+    activityStates: [],
+  })
+  const write = vi.fn<DesktopBridge['writeConversationInput']>(async (request) => {
+    if (request.type === 'release')
+      return { ok: true, value: { inputId, offset: 0, bytes: 0, chars: 0, sealed: false } }
+    if (request.type === 'append') {
+      if (request.inputId !== inputId || request.offset !== uploaded.length)
+        throw Error('The input upload escaped its exact acknowledged source')
+      uploaded += request.text
+    }
+    const state = {
+      inputId,
+      offset: uploaded.length,
+      bytes: new TextEncoder().encode(uploaded).byteLength,
+      chars: uploaded.length,
+      sealed: request.type === 'seal',
+    }
+    if (request.type === holdAt && !blocked) {
+      blocked = true
+      await uploadGate.promise
+    }
+    return { ok: true, value: state }
+  })
+  const stop = vi.fn<DesktopBridge['stopConversation']>(() => stopReply.promise)
+  const send = vi.fn<DesktopBridge['sendConversationMessage']>(async () => ({
+    ok: true,
+    value: patch(),
+  }))
+  window.pact.writeConversationInput = write
+  window.pact.stopConversation = stop
+  window.pact.sendConversationMessage = send
+  act(() => f.result.current.setComposer(text))
+  let submitted!: Promise<boolean>
+  act(() => {
+    submitted = f.result.current.send(text, [])
+  })
+  await waitFor(() => expect(blocked).toBe(true))
+  expect(send).not.toHaveBeenCalled()
+  const target: BackgroundStopTarget = {
+    runId: crypto.randomUUID(),
+    nativeSessionId: 'owned-background-session',
+    bindingGeneration: 2,
+    executorId: 'owned-background-executor',
+  }
+  return {
+    ...f,
+    sessionId,
+    inputId,
+    text,
+    target,
+    write,
+    stop,
+    send,
+    submitted,
+    uploaded: () => uploaded,
+    releaseUpload: () => uploadGate.resolve(),
+    acknowledgeStop: (ok: boolean) =>
+      stopReply.resolve(
+        ok
+          ? { ok: true, value: patch() }
+          : { ok: false, error: { code: 'CONFLICT', message: 'The background owner changed.' } },
+      ),
+    finish: async () => {
+      uploadGate.resolve()
+      stopReply.resolve({
+        ok: false,
+        error: { code: 'CONFLICT', message: 'The fixture is closing.' },
+      })
+      await act(async () => {
+        await submitted
+      })
+    },
+  }
+}
+
+it.each([
+  { holdAt: 'begin', acknowledged: true },
+  { holdAt: 'append', acknowledged: true },
+  { holdAt: 'begin', acknowledged: false },
+  { holdAt: 'append', acknowledged: false },
+] as const)(
+  'keeps the $holdAt upload owned while targeted background Stop settles; acknowledged=$acknowledged',
+  async ({ holdAt, acknowledged }) => {
+    const f = await blockedUploadFixture(holdAt)
+    try {
+      let stopped!: Promise<boolean>
+      act(() => {
+        stopped = f.result.current.stop(f.target)
+      })
+      await waitFor(() =>
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith({
+          sessionId: f.sessionId,
+          background: f.target,
+        }),
+      )
+      expect(f.result.current.stopping).toBe(true)
+      expect(f.result.current.sending).toBe(true)
+      await act(async () => expect(await f.result.current.stop(f.target)).toBe(false))
+      expect(f.stop).toHaveBeenCalledTimes(1)
+      await act(async () => {
+        f.acknowledgeStop(acknowledged)
+        expect(await stopped).toBe(acknowledged)
+      })
+      expect(f.result.current.stopping).toBe(false)
+      expect(f.result.current.sending).toBe(true)
+      expect(f.result.current.composer).toBe(f.text)
+      expect(f.result.current.error).toBe(
+        acknowledged ? undefined : 'The background owner changed.',
+      )
+      expect(f.write.mock.calls.some(([request]) => request.type === 'release')).toBe(false)
+      expect(f.send).not.toHaveBeenCalled()
+      await act(async () => {
+        f.releaseUpload()
+        expect(await f.submitted).toBe(true)
+      })
+      const begin = f.write.mock.calls.find(([request]) => request.type === 'begin')?.[0]
+      if (begin?.type !== 'begin') throw Error('The original upload nonce is unavailable')
+      expect(f.send).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          sessionId: f.sessionId,
+          clientMessageId: begin.clientMessageId,
+          inputId: f.inputId,
+          content: '',
+        }),
+      )
+      expect(f.uploaded()).toBe(f.text)
+      expect(f.result.current.sending).toBe(false)
+      expect(f.result.current.composer).toBe('')
+    } finally {
+      await f.finish()
+    }
+  },
+)
+
+it.each(['begin', 'append'] as const)(
+  'retains foreground Stop cancellation and late upload release during %s',
+  async (holdAt) => {
+    const f = await blockedUploadFixture(holdAt)
+    try {
+      await act(async () => {
+        expect(await f.result.current.stop()).toBe(true)
+        expect(await f.submitted).toBe(false)
+      })
+      expect(f.stop).not.toHaveBeenCalled()
+      expect(f.send).not.toHaveBeenCalled()
+      expect(f.result.current.composer).toBe(f.text)
+      expect(f.result.current.sending).toBe(false)
+      expect(f.result.current.stopping).toBe(false)
+      expect(f.result.current.error).toContain('Input preparation was cancelled')
+      await act(async () => f.releaseUpload())
+      await waitFor(() =>
+        expect(f.write).toHaveBeenCalledWith({
+          type: 'release',
+          sessionId: f.sessionId,
+          inputId: f.inputId,
+        }),
+      )
+      expect(f.send).not.toHaveBeenCalled()
+    } finally {
+      await f.finish()
+    }
+  },
+)
 
 function snapshotRun(
   f: ReturnType<typeof historyFixture>,

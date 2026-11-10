@@ -176,14 +176,16 @@ export async function createInputReturnFixture(
         abandon: rebuildOptions.abandon ?? false,
       })
       rebuildOptions.onPatch?.(beginning)
+      const sourceRevisions = new Map<string, number>()
       const chunks: NativeContextRebuildChunk[] = []
       for await (const chunk of repo.nativeContextRebuildSource(
         sessionId,
         new AbortController().signal,
         operationId,
+        sourceRevisions,
       ))
         chunks.push(chunk)
-      repo.freezeNativeRebuildSource(operationId, chunks)
+      repo.freezeNativeRebuildSource(operationId, chunks, sourceRevisions)
       repo.markNativeRebuildDispatched(operationId)
       repo.recordNativeRebuildIdentity(operationId, candidateId)
       const patch = repo.completeNativeRebuild(

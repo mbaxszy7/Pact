@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 
 import { AgentAnswerAssembler } from './agent-answer-assembler'
 import { AgentExecutionError } from './agent-execution-error'
-import { NativeWorkingMemory } from './native-working-memory'
+import { NativeWorkingMemory, type NativeMemoryAllocator } from './native-working-memory'
 
 // Match the existing cold Native record bound; final text items keep the Assembler's 128 limit.
 const MAX_NATIVE_RECORDS = 10_000
@@ -26,18 +26,19 @@ interface CurrentMessage {
 
 /** One Claude API item can contain multiple independently identified SDK text frames. */
 export class ClaudeAnswerAssembler {
-  private readonly memory = new NativeWorkingMemory()
   private readonly answer: AgentAnswerAssembler
   private readonly working
   private readonly frames = new Map<string, { apiId: string; hash: string; chars: number }>()
-  private readonly messages = new Set<string>()
+  private readonly messages = new Map<string, boolean>()
   private current: CurrentMessage | undefined
   private metadataBytes = 0
+  private messageMetadataBytes = 0
+  private projectionDiscarded = false
   private disposed = false
 
-  constructor(runId: string) {
-    this.answer = new AgentAnswerAssembler(runId, this.memory)
-    this.working = this.memory.reserve(0)
+  constructor(runId: string, memory: NativeMemoryAllocator = new NativeWorkingMemory()) {
+    this.answer = new AgentAnswerAssembler(runId, memory)
+    this.working = memory.reserve(0)
   }
 
   get outputId(): string {
@@ -46,6 +47,24 @@ export class ClaudeAnswerAssembler {
 
   get text(): string {
     return this.answer.text
+  }
+
+  hasNativeMessage(id: string): boolean {
+    return this.messages.has(id)
+  }
+
+  /** Native identity remains usable after the root's text projection fails. */
+  observeNativeMessage(id: string): void {
+    if (this.disposed) this.invalid()
+    this.requireId(id)
+    if (this.messages.has(id)) return
+    if (this.messages.size >= MAX_NATIVE_RECORDS) this.tooLarge()
+    const bytes = id.length * 2 + 128
+    const metadata = this.metadataBytes + bytes
+    this.charge(0, metadata)
+    this.messages.set(id, false)
+    this.metadataBytes = metadata
+    this.messageMetadataBytes += bytes
   }
 
   stream(event: StreamEvent): ClaudeTextUpdate {
@@ -92,7 +111,7 @@ export class ClaudeAnswerAssembler {
     textBlocks = 1,
   ): ClaudeTextUpdate {
     this.requireOpen()
-    this.requireId(apiId)
+    this.observeNativeMessage(apiId)
     let hash = ''
     if (text !== undefined) {
       this.requireId(frameId)
@@ -167,6 +186,17 @@ export class ClaudeAnswerAssembler {
     return this.finish(false) ?? this.answer.finalize()
   }
 
+  /** Release failed text/frame workspace without forgetting the root's API IDs. */
+  discardProjection(): void {
+    if (this.disposed || this.projectionDiscarded) return
+    this.projectionDiscarded = true
+    this.current = undefined
+    this.frames.clear()
+    this.answer.dispose()
+    this.metadataBytes = this.messageMetadataBytes
+    this.charge()
+  }
+
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
@@ -182,15 +212,11 @@ export class ClaudeAnswerAssembler {
   }
 
   private begin(id: string, mode: CurrentMessage['mode']): string | undefined {
-    this.requireId(id)
+    this.observeNativeMessage(id)
     if (this.current?.mode === 'stream') this.invalid()
     const completed = this.finish(false)
-    if (this.messages.has(id)) this.invalid()
-    if (this.messages.size >= MAX_NATIVE_RECORDS) this.tooLarge()
-    const metadata = this.metadataBytes + id.length * 2 + 128
-    this.charge(0, metadata)
-    this.messages.add(id)
-    this.metadataBytes = metadata
+    if (this.messages.get(id)) this.invalid()
+    this.messages.set(id, true)
     this.current = { id, mode, parts: [], chars: 0, lastBlock: -1 }
     return completed
   }
@@ -203,7 +229,7 @@ export class ClaudeAnswerAssembler {
   }
 
   private requireOpen(): void {
-    if (this.disposed) this.invalid()
+    if (this.disposed || this.projectionDiscarded) this.invalid()
   }
 
   private requireId(value: string): void {

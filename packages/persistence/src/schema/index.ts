@@ -302,6 +302,11 @@ export const conversationMessages = sqliteTable(
       table.isVisible,
       table.sequence,
     ),
+    index('conversation_messages_archived_background_idx')
+      .on(table.sessionId, table.sequence)
+      .where(
+        sql`${table.isVisible} = 0 AND ${table.role} = 'assistant' AND ${table.runId} IS NULL AND ${table.sourceMessageId} IS NOT NULL`,
+      ),
     uniqueIndex('conversation_messages_visible_reply_unique')
       .on(table.replyToMessageId, table.agentId)
       .where(

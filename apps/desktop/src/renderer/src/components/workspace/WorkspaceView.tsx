@@ -156,7 +156,7 @@ interface WorkspaceViewProps {
         report?: import('@pact/contracts').MessageCommentAnchor['report']
       }
     | undefined
-  onStopRun: () => Promise<boolean>
+  onStopRun: ConversationFlow['stop']
   onRebuildNativeContext: ConversationFlow['rebuildNativeContext']
   onCheckNativeContext: ConversationFlow['checkNativeContext']
   onAcceptPeerProposal: (proposalId: string) => Promise<boolean>

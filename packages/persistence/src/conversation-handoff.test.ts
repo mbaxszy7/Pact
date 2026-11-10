@@ -129,17 +129,19 @@ describe('Conversation handoff through the repository Interface', () => {
           expectedGeneration: 1,
           abandon: false,
         })
+        const sourceRevisions = new Map<string, number>()
         const chunks = []
         for await (const chunk of f.repo.nativeContextRebuildSource(
           f.sessionId,
           new AbortController().signal,
           rebuildId,
+          sourceRevisions,
         ))
           chunks.push(chunk)
         expect(
           chunks.filter((chunk) => chunk.kind === 'message').map((chunk) => chunk.content),
         ).toEqual(['Prior task', batchSuffix(f, old.run.id), 'Prior answer'])
-        f.repo.freezeNativeRebuildSource(rebuildId, chunks)
+        f.repo.freezeNativeRebuildSource(rebuildId, chunks, sourceRevisions)
         f.repo.markNativeRebuildDispatched(rebuildId)
         f.repo.recordNativeRebuildIdentity(rebuildId, 'rebuilt-secondary')
         f.repo.completeNativeRebuild(
@@ -398,7 +400,7 @@ describe('Conversation handoff through the repository Interface', () => {
       expect(boundary).toContain('agent_runs_session_agent_accepted_idx')
       const sources = f.db.drizzle
         .all<{ detail: string }>(
-          sql`EXPLAIN QUERY PLAN SELECT m.id FROM conversation_messages m JOIN agent_runs r ON r.id = m.run_id WHERE m.session_id = ${f.sessionId} AND m.is_visible = 1 AND m.sequence > 0 AND m.sequence <= 999 AND ((m.role = 'user' AND EXISTS (SELECT 1 FROM agent_runs accepted WHERE accepted.user_message_id = m.id AND accepted.agent_id <> 'codex' AND accepted.native_turn_id IS NOT NULL AND (accepted.failure_kind IS NULL OR accepted.failure_kind NOT IN ('context_limit', 'unknown_delivery')))) OR (m.role = 'assistant' AND m.state = 'complete' AND r.agent_id <> 'codex' AND r.native_turn_id IS NOT NULL AND (r.failure_kind IS NULL OR r.failure_kind NOT IN ('context_limit', 'unknown_delivery')))) ORDER BY m.sequence ASC LIMIT 26`,
+          sql`EXPLAIN QUERY PLAN SELECT m.id FROM conversation_messages m LEFT JOIN agent_runs r ON r.id = m.run_id WHERE m.session_id = ${f.sessionId} AND m.is_visible = 1 AND m.sequence > 0 AND m.sequence <= 999 AND ((m.role = 'user' AND r.id IS NOT NULL AND EXISTS (SELECT 1 FROM agent_runs accepted WHERE (accepted.user_message_id = m.id OR accepted.id = m.run_id) AND accepted.agent_id <> 'codex' AND accepted.native_turn_id IS NOT NULL AND (accepted.failure_kind IS NULL OR accepted.failure_kind NOT IN ('context_limit', 'unknown_delivery')))) OR (m.role = 'assistant' AND m.state = 'complete' AND r.agent_id <> 'codex' AND r.native_turn_id IS NOT NULL AND (r.failure_kind IS NULL OR r.failure_kind NOT IN ('context_limit', 'unknown_delivery'))) OR (m.role = 'assistant' AND m.state = 'complete' AND m.run_id IS NULL AND m.source_message_id IS NOT NULL AND m.agent_id <> 'codex')) ORDER BY m.sequence ASC LIMIT 26`,
         )
         .map((row) => row.detail)
         .join('\n')
@@ -683,10 +685,14 @@ describe('Conversation handoff through the repository Interface', () => {
         }).nativeContexts,
       ).toMatchObject([{ agentId: 'codex', continuationState: 'rebuilding' }])
 
+      const sourceRevisions = new Map<string, number>()
+
       const chunks = []
       for await (const chunk of f.repo.nativeContextRebuildSource(
         f.sessionId,
         new AbortController().signal,
+        rebuildId,
+        sourceRevisions,
       ))
         chunks.push(chunk)
       expect(
@@ -717,7 +723,7 @@ describe('Conversation handoff through the repository Interface', () => {
         }),
       ).toMatchObject({ text: 'Keep this sent Comment' })
       const throughSequence = Math.max(...chunks.map((chunk) => chunk.sequence))
-      f.repo.freezeNativeRebuildSource(rebuildId, chunks)
+      f.repo.freezeNativeRebuildSource(rebuildId, chunks, sourceRevisions)
       f.repo.markNativeRebuildDispatched(rebuildId)
       f.repo.recordNativeRebuildIdentity(rebuildId, 'codex-rebuilt')
       const completed = f.repo.completeNativeRebuild(rebuildId, 'codex-rebuilt', undefined, {

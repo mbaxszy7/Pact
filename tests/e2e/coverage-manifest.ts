@@ -636,6 +636,22 @@ function journey(
           ],
         }
       : {}),
+    ...(file === 'agent-handoff.spec.ts' &&
+    title ===
+      'a failed candidate check offers one confirmed creation and never dispatches the old task'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 583,
+              reason:
+                'The background recovery card combines its warnings in one paragraph and says A previous attempt instead of The previous attempt. Preserve the visible warning that a candidate may already exist; all confirmation, native creation count, old-task non-replay and cold-recovery assertions remain unchanged.',
+              replacementAssertions: [
+                `expect(card.getByText('A previous attempt may already have created a session.')).toBeVisible()`,
+              ],
+            },
+          ],
+        }
+      : {}),
     classification,
     status: 'planned',
     targets,

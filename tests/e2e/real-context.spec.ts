@@ -160,7 +160,7 @@ test.describe('real evidence', { tag: ['@real', '@real-extended'] }, () => {
         timeout: 30_000,
       })
       await recovery.getByRole('button', { name: 'Rebuild…', exact: true }).click()
-      await expect(recovery).toContainText('previous task won’t be repeated')
+      await expect(recovery).toContainText('Your previous task won’t run again.')
       await recovery.getByRole('button', { name: 'Confirm rebuild', exact: true }).click()
       await expect(ctx.page.getByRole('combobox', { name: 'Message' })).toBeEnabled({
         timeout: 120_000,

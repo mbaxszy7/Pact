@@ -1776,10 +1776,11 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       })
     if (this.shutdownTask) return this.shutdownTask
     const deadline = performance.now() + WORKSPACE_OPERATION_TIMEOUT_MS
+    const flushDeadlineAt = Date.now() + WORKSPACE_OPERATION_TIMEOUT_MS - 1_000
     this.relayCrypto.dispose()
     const cryptoJoined = this.relayCrypto.settlement(deadline)
     this.shutdownTask = this.request(
-      { type: 'runtime.shutdown.request' },
+      { type: 'runtime.shutdown.request', flushDeadlineAt },
       'runtime.shutdown.response',
       WORKSPACE_OPERATION_TIMEOUT_MS - 1_000,
     ).then(async (result): Promise<RpcResult<{ flushed: true }>> => {

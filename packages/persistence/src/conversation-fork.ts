@@ -18,6 +18,7 @@ import { createHash, randomUUID } from 'node:crypto'
 
 import {
   collaborationTaskSchema,
+  isConversationBackgroundReport,
   collaborationTurnAuthorizationSchema,
   collaborationDocumentSchema,
   preparedInformationControlSchema,
@@ -109,7 +110,8 @@ export function selectForkSource(
       !selected ||
       selected.role !== 'assistant' ||
       selected.state !== 'complete' ||
-      !selected.isVisible
+      !selected.isVisible ||
+      isConversationBackgroundReport(selected)
     )
       throw new Error('Only a completed Agent message can be forked.')
     // A Steer User is appended after the root assistant's reserved sequence.
@@ -603,7 +605,9 @@ export function commitFork(
         old.hash !== ref.sha256
       )
         throw new Error('The Fork document source is unavailable at the chosen boundary.')
-      const id = forkId(sessionId, 'document', ref.id)
+      // Background updates pair their message and immutable body primary keys.
+      const background = old.purpose === 'answer' && old.committedMessageId === old.id
+      const id = forkId(sessionId, background ? 'message' : 'document', ref.id)
       const copied = database
         .select()
         .from(conversationBodyInputs)
@@ -669,7 +673,7 @@ export function commitFork(
           sessionId,
           sourceRunId: identity('run', old.sourceRunId),
           ownerKey: `fork:${forkId(sessionId, 'body-owner', old.ownerKey)}`,
-          clientMessageId: sha256,
+          clientMessageId: background ? id : sha256,
           committedMessageId: null,
           pendingReceiptId: null,
           bytes: next.bytes,
@@ -1087,6 +1091,33 @@ export function commitFork(
           routePendingAgentId: null,
         })
         .run()
+    for (const row of messages) {
+      if (!isConversationBackgroundReport(row) || row.state !== 'complete') continue
+      const body = database
+        .select()
+        .from(conversationBodyInputs)
+        .where(eq(conversationBodyInputs.id, row.id))
+        .get()
+      if (
+        body?.committedMessageId !== row.id ||
+        !body.sealed ||
+        !body.hash ||
+        body.purpose !== 'answer'
+      )
+        throw new Error('The background update body is outside the frozen Fork history.')
+      const copied = remapDocument({
+        id: body.id,
+        sha256: body.hash,
+        bytes: body.bytes,
+        chars: body.chars,
+      })
+      if (!copied) throw new Error('The background update body could not be copied.')
+      database
+        .update(conversationBodyInputs)
+        .set({ committedMessageId: copied.id })
+        .where(eq(conversationBodyInputs.id, copied.id))
+        .run()
+    }
     for (const row of outputSnapshotRows) {
       if (
         row.sessionId !== source.id ||

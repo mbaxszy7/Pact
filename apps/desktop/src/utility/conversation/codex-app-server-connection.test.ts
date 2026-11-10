@@ -24,6 +24,31 @@ afterEach(() => {
 })
 
 describe('Codex App Server connection budgets', () => {
+  it.each(['explicit', 'process-exit'] as const)(
+    'pins the App flush cutoff before %s starts physical close',
+    async (source) => {
+      const child = fakeChild()
+      const deadlines: Array<number | undefined> = []
+      const connection = new CodexAppServerConnection(
+        child.process,
+        undefined,
+        async (deadline) => {
+          deadlines.push(deadline)
+          if (child.process.exitCode === null) child.process.kill()
+        },
+      )
+      const deadline = Date.now() + 3000
+      connection.capShutdownDeadline(deadline)
+      connection.capShutdownDeadline(deadline + 1000)
+      if (source === 'process-exit') child.process.kill()
+      await connection.close()
+      expect(deadlines).toEqual([deadline])
+      connection.capShutdownDeadline(deadline + 2000)
+      await connection.close()
+      expect(deadlines).toEqual([deadline])
+    },
+  )
+
   it.each(['lifetime', 'notification-abort'] as const)(
     'keeps a queued %s frame unwritten after its owner stops under real stream backpressure',
     async (mode) => {

@@ -442,13 +442,15 @@ async function settledUnconfirmedCandidate(f: Awaited<ReturnType<typeof fixture>
     abandon: false,
   })
   const chunks: NativeContextRebuildChunk[] = []
+  const sourceRevisions = new Map<string, number>()
   for await (const chunk of repo.nativeContextRebuildSource(
     sessionId,
     new AbortController().signal,
     rebuildId,
+    sourceRevisions,
   ))
     chunks.push(chunk)
-  repo.freezeNativeRebuildSource(rebuildId, chunks)
+  repo.freezeNativeRebuildSource(rebuildId, chunks, sourceRevisions)
   const creatingExecutorId = randomUUID()
   const candidateNativeSessionId = 'settled-unconfirmed-claude'
   repo.markNativeRebuildDispatched(rebuildId, creatingExecutorId)

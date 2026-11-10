@@ -246,11 +246,11 @@ Dispatch, foreground Run status, native outcome, body completeness, background w
 
 Endings persist before body flush. Failed output keeps incomplete durable prefixes; the sole reader observes terminal/Steer/work facts. Failed buffers cannot cross input cuts or accept reports. Empty frames use no answer identity. Claude cold checks require saved live termination and Session existence; `end_turn` is insufficient. Its bounded reader recovers partial text without proving completion. Codex requires exact Thread/Turn, legal terminal metadata, nonactive status and later-Turn evidence. Accepted complete bytes/row/revision stay immutable; recovery preserves execution connections.
 
-Explicit Rebuild freezes Run/source/settings/nonce and persists candidate identity before I/O. Adapter seeds one candidate and verifies full readback, natural completion and settled work; one transaction switches ID/generation. Claude uses one canonical false-only UUID/hash envelope, never per-chunk receipts. Codex requires its metadata-identified rollout witness under the effective root; injected context need not be a Turn. Later Runs inherit only the completed candidate's frozen refs with matching Session/Agent/generation/Native ID/source cut; Claude needs no Codex witness. Failure retains the old binding. Retry inspects that candidate; another creation needs consent. Abandonment proves no physical stop. Late old-generation facts cannot change current title/permissions/proposals/unread/continuation.
+Explicit Rebuild checks source revisions and freezes Run/source/settings/nonce and persists candidate identity before I/O. Adapter seeds one candidate and verifies full readback, natural completion and settled work; one transaction switches ID/generation. Claude uses one canonical false-only UUID/hash envelope, never per-chunk receipts. Codex requires its metadata-identified rollout witness under the effective root; injected context need not be a Turn. Later Runs inherit only the completed candidate's frozen refs with matching Session/Agent/generation/Native ID/source cut; Claude needs no Codex witness. Failure retains the old binding. Retry inspects that candidate; another creation needs consent. Abandonment proves no physical stop. Late old-generation facts cannot change current title/permissions/proposals/unread/continuation.
 
 Successful Rebuild excludes definitely unsent input and creates one durable return receipt while retaining original rows. Restore reads exact body/image/Skill/route/Batch sources, clones drafts once, preserves newer edits. Claim/send settles atomically. Native generation fences an operation, not permanent draft identity; restart never sends restored input automatically.
 
-SessionIssues projects one recovery row per Agent and the input gate. Complete answer is not ready binding. Live ownership controls admission; historical unknown effects remain visible without a permanent Send lock. Codex `willRetry:true` or lost foreground cannot retire a healthy observer; root/work drain settles it, gaps remain unknown.
+SessionIssues gates current background work per binding. Old Runs do not lock replacements. Exact Stop waits 5 s without releasing the observer. Claude keeps its Query writer for observed work within 64 items/64 KiB. Codex `willRetry:true` and lost foreground retain the observer. Native receipts and drain prove settlement.
 
 ## Native Fork, Changes, and Undo
 
@@ -514,11 +514,7 @@ retain their own existing slots, actual handles, and unreleased scratch credits 
 scope settlement reads all three owners without retrying close, Stop, finalization, or file writes.
 An invalidated JavaScript descriptor alone is not evidence of physical release.
 
-Main's normal Utility shutdown keeps its existing five-second deadline: up to four seconds for the
-flush response and the remaining time for actual child exit. A kill request does not release the
-child identity. Unconfirmed exit reports uncertainty and keeps Main and its profile alive; the
-existing exit notification completes quitting when the old child actually exits. No replacement
-Utility, polling, or additional shutdown deadline is introduced.
+Main's five-second shutdown budget gives flush four seconds and the remainder to actual child exit. The same cutoff caps Codex cleanup: exact foreground owners may persist live ending/work-drain facts until cutoff minus three seconds; other callbacks remain closed. Missing proof stays unknown. A kill never releases ownership. Unconfirmed exit retains Main/profile until its child exit event. No replacement Utility, polling or renewed deadline.
 
 App owns the archive-result projection and the single prepare/confirm/check/restore action gate.
 ArchiveNotice receives result rows and named callbacks; it owns only disclosure, details, page and

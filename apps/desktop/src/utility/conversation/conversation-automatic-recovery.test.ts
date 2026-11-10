@@ -408,7 +408,11 @@ function seedRecoveryTarget(
       final: true,
       content: message.content,
     }))
-    sourceHash = repo.freezeNativeRebuildSource(rebuildId, chunks)
+    sourceHash = repo.freezeNativeRebuildSource(
+      rebuildId,
+      chunks,
+      new Map(messages.map((message) => [message.id, message.contentRevision])),
+    )
     repo.markNativeRebuildDispatched(rebuildId, executorId)
     repo.recordNativeRebuildIdentity(rebuildId, candidateId)
     repo.recordNativeRebuildWork(rebuildId, executorId, candidateId, 'settled')

@@ -62,6 +62,51 @@ function completeMessage(item: ConversationPageMessage | undefined) {
   return item.message
 }
 
+it.each(['pending', 'unknown'] as const)(
+  'keeps an unsent queue paused when its exact anchor effects remain %s',
+  async (state) => {
+    const f = await fixture(true),
+      root = f.root()
+    const request = f.queue(root, 'Preserve this queued source')
+    f.finish(root)
+    f.repo.recordNativeEffects(root.id, state)
+    f.repo.pauseConversationQueue(f.sessionId, 'Check the original work')
+    await f.reopen()
+    const before = f.repo.queueState(f.sessionId)
+    const source = f.repo.readReceivedInput(f.sessionId)!
+    const resume = { ...request, expectedRevision: before.revision, operationId: randomUUID() }
+    expect(() => f.repo.resumeConversationQueue(resume)).toThrow(/Edit message or Remove/)
+    expect(operation(f, resume.operationId)).toBeUndefined()
+    expect(f.repo.queueState(f.sessionId)).toEqual(before)
+    expect(f.repo.readReceivedInput(f.sessionId)).toEqual(source)
+    expect(f.repo.findRun(root.id)?.nativeEffectsState).toBe(state)
+  },
+)
+
+it('resumes settled work and replays the same Resume receipt without clearing a later pause', async () => {
+  const f = await fixture(),
+    root = f.root(),
+    request = f.queue(root, 'Original queued source')
+  f.finish(root)
+  f.repo.recordNativeEffects(root.id, 'settled')
+  f.repo.pauseConversationQueue(f.sessionId, 'Paused')
+  const resume = { ...request, expectedRevision: f.repo.queueState(f.sessionId).revision }
+  f.repo.resumeConversationQueue(resume)
+  expect(f.repo.queueState(f.sessionId).input?.state).toBe('queued')
+  f.repo.recordNativeEffects(root.id, 'unknown')
+  f.repo.pauseConversationQueue(f.sessionId, 'Observation was lost')
+  const paused = f.repo.queueState(f.sessionId)
+  f.repo.resumeConversationQueue(resume)
+  expect(f.repo.queueState(f.sessionId)).toEqual(paused)
+  expect(
+    f.db.drizzle
+      .select()
+      .from(conversationQueueOperations)
+      .all()
+      .filter((row) => row.kind === 'resume'),
+  ).toHaveLength(1)
+})
+
 describe('queued workflow classification through the sealed body', () => {
   it.each([
     '/review inspect',

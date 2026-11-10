@@ -61,6 +61,11 @@ function adapter(id: RuntimeAgentId) {
         text: 'Owned answer',
       }
       yield { agentId: id, type: 'turn.completed', turnId: input.runId, outcome: 'completed' }
+      input.reportNativeEffects?.({
+        runId: input.runId,
+        generation: input.nativeGeneration!,
+        state: 'settled',
+      })
     }
     async dispose() {}
   }

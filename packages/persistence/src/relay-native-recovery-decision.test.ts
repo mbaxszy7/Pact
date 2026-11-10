@@ -116,7 +116,7 @@ function beginOtherRebuild(f: Fixture) {
     expectedGeneration: f.run.bindingGeneration,
     abandon: true,
   })
-  f.repo.freezeNativeRebuildSource(id, [])
+  f.repo.freezeNativeRebuildSource(id, [], new Map())
   f.repo.markNativeRebuildDispatched(id, randomUUID())
   return id
 }

@@ -343,8 +343,8 @@ export interface ConversationFlow {
     draft: Pick<NativeInputDraft, 'values' | 'page'>,
     initializeOnly?: boolean,
   ): void
-  stop(): Promise<boolean>
-  checkNativeContext(agentId: RuntimeAgentId): Promise<boolean>
+  stop(background?: import('@pact/contracts').BackgroundStopTarget): Promise<boolean>
+  checkNativeContext(agentId: RuntimeAgentId, runId?: string): Promise<boolean>
   rebuildNativeContext(
     agentId: RuntimeAgentId,
     options?: Omit<NativeContextRebuildInput, 'sessionId' | 'agentId'>,
@@ -2959,6 +2959,7 @@ export function useConversation(
       // including when the bounded Patch carries resync instead of the oversized message.
       if (
         result.value.queuedInputIds?.includes(clientMessageId) &&
+        !result.value.sessionIssues?.agents.some((issue) => issue.phase === 'background_working') &&
         !result.value.messages.some((item) => item.message.id === clientMessageId)
       )
         onInfoNotice("Your message is queued until the current Agent's work finishes.")
@@ -3161,8 +3162,9 @@ export function useConversation(
     }
   }
 
-  const checkNativeContext = (agentId: RuntimeAgentId): Promise<boolean> => {
+  const checkNativeContext = (agentId: RuntimeAgentId, runId?: string): Promise<boolean> => {
     if (!sessionId) return Promise.resolve(false)
+    if (runId) return inspectNativeContext(runId, agentId)
     const current = windowRef.current
     const context = current?.view.nativeContexts.find((item) => item.agentId === agentId)
     const matching = context
@@ -3812,10 +3814,12 @@ export function useConversation(
     }
   }
 
-  const stop = async (): Promise<boolean> => {
+  const stop = async (
+    background?: import('@pact/contracts').BackgroundStopTarget,
+  ): Promise<boolean> => {
     if (!sessionId || stopping) return false
     const preparing = pendingBySessionRef.current.get(sessionId)?.inputPreparation
-    if (preparing) {
+    if (preparing && !background) {
       preparing.abort()
       return true
     }
@@ -3826,7 +3830,10 @@ export function useConversation(
       error: undefined,
     }))
     try {
-      const result = await window.pact.stopConversation({ sessionId })
+      const result = await window.pact.stopConversation({
+        sessionId,
+        ...(background ? { background } : {}),
+      })
       if (!result.ok) {
         updateSessionOperations(sessionId, (current) => ({
           ...current,

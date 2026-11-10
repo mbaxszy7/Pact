@@ -93,14 +93,16 @@ async function rebuiltSourceFixture(agentId: RuntimeAgentId) {
       expectedGeneration: 1,
       abandon: false,
     })
+    const sourceRevisions = new Map<string, number>()
     const chunks = []
     for await (const chunk of repo.nativeContextRebuildSource(
       sessionId,
       new AbortController().signal,
       operationId,
+      sourceRevisions,
     ))
       chunks.push(chunk)
-    repo.freezeNativeRebuildSource(operationId, chunks)
+    repo.freezeNativeRebuildSource(operationId, chunks, sourceRevisions)
     const saved = db.drizzle
       .select()
       .from(conversationRebuildSourceRefs)

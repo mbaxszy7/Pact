@@ -556,6 +556,7 @@ async function bootstrap(
       }
       case 'runtime.shutdown.request': {
         const requestId = request.data.requestId
+        const flushDeadlineAt = request.data.flushDeadlineAt
         shutdown ??= (async () => {
           closing = true
           unsubscribeScheduling()
@@ -573,7 +574,9 @@ async function bootstrap(
           // consume route stays alive on parentPort through cleanup.
           relayCredentialClient.dispose()
           const results = await Promise.allSettled([
-            conversationOwner.dispose(),
+            flushDeadlineAt === undefined
+              ? conversationOwner.dispose()
+              : conversationOwner.dispose({ flushDeadlineAt }),
             defaultSessionSettings.dispose(),
             projectFileReader.dispose(),
             drainRequests,

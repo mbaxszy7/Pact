@@ -269,7 +269,7 @@ it('requires explicit Continue after updated Session limits and refreshes the sa
       onOpenSessionSettings={onOpenSessionSettings}
     />,
   )
-  const resume = await screen.findByRole('button', { name: 'Continue collaboration' })
+  const resume = await screen.findByRole('button', { name: 'Continue to Claude Code plan review' })
   expect(bridge.getConversation).toHaveBeenCalledTimes(2)
   expect(bridge.actOnCollaboration).not.toHaveBeenCalled()
   expect(screen.queryByText(/limit.*reached/i)).toBeNull()
