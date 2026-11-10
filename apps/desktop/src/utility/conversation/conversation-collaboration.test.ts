@@ -984,14 +984,27 @@ describe('Decisions choices through the original workflow owner', () => {
     ).toBe(true)
     native.next = { plan: 'Current v2 Plan.' }
     enableRelay(f)
-    expect(
-      (await f.flow.send({ ...f.input('Revise after this Comment.'), commentIds: [commentId] })).ok,
-    ).toBe(true)
-    await vi.waitFor(() => {
-      expect(native.inputs).toHaveLength(8)
-      expect(f.db.conversationRepository.collaboration(f.sessionId)?.status).toBe('ready')
+    const reviewReady = Promise.withResolvers<void>()
+    const unsubscribe = f.flow.subscribe((patch, progress) => {
+      if (
+        !progress &&
+        patch.sessionId === f.sessionId &&
+        native.inputs.length >= 8 &&
+        f.db.conversationRepository.collaboration(f.sessionId)?.status === 'ready'
+      )
+        reviewReady.resolve()
     })
-    await f.settled()
+    try {
+      expect(
+        (await f.flow.send({ ...f.input('Revise after this Comment.'), commentIds: [commentId] }))
+          .ok,
+      ).toBe(true)
+      await reviewReady.promise
+    } finally {
+      unsubscribe()
+    }
+    expect((await f.settled()).status).toBe('ready')
+    expect(native.inputs).toHaveLength(8)
     expect(native.inputs[6]!.promptEnvelope.collaboration?.actor).toBe('codex')
     expect(native.inputs[6]!.promptEnvelope.collaboration?.stage).toBe('plan')
     expect(
