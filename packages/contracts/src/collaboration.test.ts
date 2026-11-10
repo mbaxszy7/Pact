@@ -16,6 +16,7 @@ import {
   collaborationPlanAccepted,
   collaborationPlanRetentionAllowed,
   collaborationPlanRetentionInputSchema,
+  collaborationPlanMode,
   collaborationQuestionsSchema,
   collaborationReviewInputSchema,
   collaborationSourceReadSchema,
@@ -133,6 +134,102 @@ function task(fields: Partial<CollaborationTask> = {}): CollaborationTask {
     ...fields,
   })
 }
+function interruptedPlanImplementation() {
+  const current = accepted()
+  const replyRunId = randomUUID()
+  Object.assign(current, {
+    rolePolicy: 'split-stages-v1',
+    stage: 'reply',
+    actor: 'claude',
+    status: 'waiting',
+    automation: 'paused',
+    pauseReason: 'stopped',
+    runId: replyRunId,
+    inputSequence: 2,
+    handledInputSequence: 2,
+    inputProcessing: { settled: { runId: replyRunId, inputSequence: 2 } },
+    pendingWork: {
+      stage: 'implement',
+      runId: randomUUID(),
+      inputSequence: 0,
+      planReference: current.planReference,
+    },
+    nextStage: 'plan',
+  })
+  return collaborationTaskSchema.parse(current)
+}
+
+it('continues interrupted plan implementation after a processed status reply', () => {
+  const current = interruptedPlanImplementation()
+  expect(collaborationNextStage(current)).toBe('implement')
+  const next = advanceCollaboration(
+    advanceCollaboration(current, 'resume', limits),
+    'continue',
+    limits,
+  )
+  expect(next).toMatchObject({ stage: 'implement', actor: 'claude', repairAttempts: 0 })
+})
+
+it.each(['codex', 'claude'] as const)(
+  'keeps the %s reply read-only outside native Plan mode after implementation stopped',
+  (actor) => {
+    const current = { ...interruptedPlanImplementation(), actor }
+    expect(collaborationActor(current, 'reply')).toBe('claude')
+    expect(collaborationPlanMode(current)).toBe(false)
+  },
+)
+
+it.each(['pending', 'decision', 'changed_plan'] as const)(
+  'does not resume an interrupted implementation with %s',
+  (change) => {
+    const current = interruptedPlanImplementation()
+    if (change === 'pending')
+      current.inputProcessing = {
+        pending: { inputId: randomUUID(), inputSequence: current.inputSequence },
+      }
+    else if (change === 'decision')
+      current.inputProcessing = {
+        decision: { runId: current.runId, inputSequence: current.inputSequence },
+      }
+    else current.planReference = { ...current.planReference!, version: 2, document: document() }
+    expect(collaborationNextStage(current)).not.toBe('implement')
+    expect(collaborationPlanAccepted(current)).toBe(false)
+  },
+)
+
+it('preserves historical native Plan replies while new read-only replies cannot publish a Plan', () => {
+  const current = interruptedPlanImplementation()
+  const authorization = {
+    runId: current.runId,
+    taskId: current.id,
+    taskRevision: current.revision,
+    actor: current.owner,
+    stage: 'reply' as const,
+    inputSequence: current.inputSequence,
+  }
+  expect(collaborationPlanMode(current, authorization)).toBe(true)
+  expect(collaborationPlanMode(current, { ...authorization, replyMode: 'read_only' })).toBe(false)
+  expect(collaborationPlanMode(current, { ...authorization, replyMode: 'plan' })).toBe(true)
+  expect(
+    collaborationPlanMode(current, { ...authorization, replyMode: 'plan', actor: 'claude' }),
+  ).toBe(false)
+})
+
+it('reviews a genuinely retained Plan before continuing its unfinished implementation', () => {
+  const current = interruptedPlanImplementation()
+  current.planInputSequence = current.inputSequence
+  expect(collaborationNextStage(current)).toBe('plan_review')
+})
+
+it('recovers the unfinished implementation after a historical mistaken planning Run was stopped', () => {
+  const current = interruptedPlanImplementation()
+  current.stage = 'plan'
+  current.actor = current.owner
+  current.status = 'failed'
+  current.runId = randomUUID()
+  expect(collaborationNextStage(current)).toBe('implement')
+})
+
 function accepted(): CollaborationTask {
   const ref = plan()
   return task({

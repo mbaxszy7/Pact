@@ -41,6 +41,7 @@ export interface WorkflowNativeState {
   decisions: DecisionInput[]
   candidate: string | null | undefined
   interruptNextWrite: boolean
+  holdNextWrite?: boolean
   loseObservation: boolean
   rebuilds: string[]
   sourceReads: WorkflowSourceRead[]
@@ -161,7 +162,7 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
   return class {
     readonly id = agentId
     readonly executorId = randomUUID()
-    async *run(input: AgentRunInput): AsyncGenerator<NormalizedAgentEvent> {
+    async *run(input: AgentRunInput, signal?: AbortSignal): AsyncGenerator<NormalizedAgentEvent> {
       state.inputs.push(input)
       const nativeSessionId = input.nativeSessionId ?? `${input.sessionId}-${agentId}`,
         phase = input.promptEnvelope.collaboration
@@ -177,6 +178,35 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
           true,
         )
       if (phase) state.sourceReads.push(readWorkflowSources(input, state.forbiddenDocuments))
+      if (state.holdNextWrite && (phase?.stage === 'implement' || phase?.stage === 'repair')) {
+        if (!signal) throw Error('A held write requires its native cancellation signal')
+        state.holdNextWrite = false
+        await new Promise<void>((done) => {
+          if (signal.aborted) done()
+          else signal.addEventListener('abort', () => done(), { once: true })
+        })
+        input.recordNativeEvidence?.({
+          kind: 'ended',
+          source: 'stored_terminal',
+          outcome: 'interrupted',
+          identity: {
+            sessionId: input.sessionId,
+            agentId,
+            requestId: input.runId,
+            runId: input.runId,
+            nativeSessionId,
+            nativeTurnId: input.runId,
+            bindingGeneration: input.bindingGeneration ?? 1,
+            executorId: this.executorId,
+          },
+        })
+        input.reportNativeEffects?.({
+          runId: input.runId,
+          generation: input.nativeGeneration!,
+          state: 'settled',
+        })
+        signal.throwIfAborted()
+      }
       const interrupted =
         state.interruptNextWrite && (phase?.stage === 'implement' || phase?.stage === 'repair')
       if (interrupted) state.interruptNextWrite = false

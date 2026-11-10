@@ -347,6 +347,8 @@ export const collaborationTurnAuthorizationSchema = z.strictObject({
   actor: agent,
   stage: collaborationStageSchema,
   stageRoles: taskStageRolesSchema.optional(),
+  /** Host-frozen reply execution mode. Missing on historical Runs retains their original policy. */
+  replyMode: z.enum(['plan', 'read_only']).optional(),
   inputSequence: z.number().int().nonnegative(),
   planReference: collaborationPlanReferenceSchema.optional(),
   reviewScopeRef: collaborationDocumentSchema.optional(),
@@ -452,10 +454,14 @@ export function collaborationPlanMode(
   if (collaborationAskMode(task, authorization ?? task?.authorization)) return false
   const stage = authorization?.stage ?? task?.stage
   const actor = authorization?.actor ?? task?.actor
+  const planningReply = authorization
+    ? authorization.replyMode === 'plan' ||
+      (authorization.replyMode === undefined && task?.kind === 'plan' && !task.codeRunId)
+    : task?.kind === 'plan' && !task.codeRunId && !task.pendingWork
   return Boolean(
     task &&
     actor === collaborationActor(task, 'plan') &&
-    (stage === 'plan' || (stage === 'reply' && task.kind === 'plan' && !task.codeRunId)),
+    (stage === 'plan' || (stage === 'reply' && planningReply)),
   )
 }
 
@@ -578,28 +584,46 @@ export function collaborationRequiresPlan(task: CollaborationTask): boolean {
   const pending = task.pendingWork
   if (pending?.stage !== 'implement') return true
   const unchangedPlan =
+    Boolean(pending.planReference && task.planReference) &&
     pending.planReference?.version === task.planReference?.version &&
-    pending.planReference?.document.sha256 === task.planReference?.document.sha256
+    pending.planReference?.document.sha256 === task.planReference?.document.sha256 &&
+    pending.planReference?.document.bytes === task.planReference?.document.bytes &&
+    pending.planReference?.document.chars === task.planReference?.document.chars
+  if (!unchangedPlan) return true
+  if (pending.inputSequence === task.inputSequence || collaborationPlanAccepted(task)) return false
+  // A later processed reply advances the input cursor, not the original write grant.
+  // Later replies cannot erase an outstanding review of a genuinely retained/revised Plan.
   return (
-    !unchangedPlan ||
-    (pending.inputSequence !== task.inputSequence && !collaborationPlanAccepted(task))
+    (task.planInputSequence !== undefined &&
+      task.planInputSequence > pending.inputSequence &&
+      acceptedPlanReview(task)?.review.inputSequence !== task.planInputSequence) ||
+    Boolean(collaborationInputGate(task)) ||
+    task.handledInputSequence !== task.inputSequence ||
+    collaborationInputProcessing(task).settled?.inputSequence !== task.inputSequence
   )
 }
 
-export function collaborationPlanAccepted(task: CollaborationTask): boolean {
+function acceptedPlanReview(task: CollaborationTask) {
   const plan = task.planReference
   const review = task.review
+  const reference = review?.planReference
   if (
-    collaborationInputGate(task) ||
     !plan ||
-    task.planInputSequence !== task.inputSequence ||
     review?.stage !== 'plan_review' ||
     review.actor !== collaborationActor(task, 'plan_review') ||
     review.verdict !== 'accepted' ||
-    review.planReference?.version !== plan.version ||
-    review.planReference.document.sha256 !== plan.document.sha256
+    reference?.version !== plan.version ||
+    reference.document.sha256 !== plan.document.sha256
   )
+    return undefined
+  return { plan, review, reference }
+}
+
+export function collaborationPlanAccepted(task: CollaborationTask): boolean {
+  const accepted = acceptedPlanReview(task)
+  if (!accepted || collaborationInputGate(task) || task.planInputSequence !== task.inputSequence)
     return false
+  const { plan, review, reference } = accepted
   if (review.inputSequence === task.inputSequence) return true
 
   const coverage = task.planAcceptanceCoverage
@@ -622,7 +646,7 @@ export function collaborationPlanAccepted(task: CollaborationTask): boolean {
     settled?.inputSequence === coverage.throughInputSequence &&
     settled.runId === coverage.producerRunId &&
     sameReference(coverage.planReference) &&
-    sameReference(review.planReference),
+    sameReference(reference),
   )
 }
 
@@ -772,7 +796,7 @@ export function collaborationNextStage(task: CollaborationTask): CollaborationSt
 export function collaborationActor(
   task: Pick<
     CollaborationTask,
-    'owner' | 'reviewer' | 'rolePolicy' | 'stageRoles' | 'kind' | 'codeRunId'
+    'owner' | 'reviewer' | 'rolePolicy' | 'stageRoles' | 'kind' | 'codeRunId' | 'pendingWork'
   >,
   stage: CollaborationStage,
 ) {
@@ -784,7 +808,7 @@ export function collaborationActor(
     if (stage === 'reply')
       return task.kind === 'review'
         ? roles.codeReviewer
-        : task.kind === 'plan' && !task.codeRunId
+        : task.kind === 'plan' && !task.codeRunId && !task.pendingWork
           ? roles.planAuthor
           : roles.codeAuthor
     return roles.codeAuthor
@@ -792,7 +816,8 @@ export function collaborationActor(
   if (task.rolePolicy === 'split-stages-v1') {
     if (stage === 'plan' || stage === 'code_review') return task.owner
     if (stage === 'reply')
-      return task.kind === 'review' || (task.kind === 'plan' && !task.codeRunId)
+      return task.kind === 'review' ||
+        (task.kind === 'plan' && !task.codeRunId && !task.pendingWork)
         ? task.owner
         : task.reviewer
     return task.reviewer

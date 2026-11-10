@@ -5422,12 +5422,28 @@ export class ConversationRepository {
       throw new RunOperationConflictError(
         'The queued Plan question no longer matches its accepted Plan.',
       )
+    const decision = collaborationInputProcessing(task).decision
+    const decisionAuthorization = decision && this.collaborationTurnAuthorization(decision.runId)
+    const planningDecision = Boolean(
+      decisionAuthorization &&
+      decisionAuthorization.taskId === task.id &&
+      decisionAuthorization.actor === task.actor &&
+      collaborationPlanMode(task, decisionAuthorization),
+    )
     const authorization: CollaborationTurnAuthorization = {
       runId,
       taskId: task.id,
       taskRevision: task.revision,
       actor: task.actor,
       stage: task.stage,
+      ...(task.stage === 'reply'
+        ? {
+            replyMode:
+              !askOnly && (planningDecision || collaborationPlanMode(task))
+                ? ('plan' as const)
+                : ('read_only' as const),
+          }
+        : {}),
       inputSequence: task.inputSequence,
       ...(task.stageRoles ? { stageRoles: task.stageRoles } : {}),
       ...(task.planReference ? { planReference: task.planReference } : {}),

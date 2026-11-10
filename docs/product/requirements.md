@@ -403,6 +403,8 @@ Implementation, repair and code-review reports state confirmed verification resu
 
 An interrupted implementation or repair retains its unfinished authorized scope and owner. Continuing that same work does not create a new repair attempt. A priority user reply stays read-only; it cannot complete unfinished implementation or substitute for write authorization. A completely processed later reply may advance the input cursor while the original write grant remains bound to its original input. Pre-receipt workflow records retain their verified original grant and complete source access on explicit Continue; migration does not manufacture consent or rewrite historical authorization.
 
+After interrupted implementation, an ordinary reply defaults to the fixed code author and remains outside native Plan mode. Explicit recipients and verified question owners retain their routing. Once that reply is fully processed, Continue resumes the original unchanged authorized scope without requiring another Plan solely because the input cursor advanced. A genuinely changed or retained Plan still follows its independent review, and unresolved input or unverifiable original authority blocks continuation. Read-only replies explain the Continue action rather than requesting new approval solely because their current turn cannot edit.
+
 Context Plan is the sole full-plan reading area. Chat retains complete natural replies and review reports with compact plan-version/status/action footers, not a duplicated full plan or shared Todos tab. Current Implement, Respond, Repair, Continue collaboration and failure actions remain visible independently of historical disclosure.
 
 ### Automatic limits, pause and continuation

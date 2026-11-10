@@ -240,7 +240,7 @@ async function fixture(
     expectedCommentsRevision: drafts().commentsRevision,
     route: { type: 'primary' },
   })
-  const receive = (send = input()) => {
+  const receive = (send = input(), actor?: 'codex' | 'claude') => {
     const body = repo.writeConversationInput(
       { type: 'begin', sessionId, clientMessageId: send.clientMessageId },
       owner,
@@ -260,7 +260,7 @@ async function fixture(
     const patch = repo.receiveCollaborationInput(
       send,
       body.inputId,
-      repo.collaborationReplyActor(repo.collaboration(sessionId)!, send.replyToDecision),
+      actor ?? repo.collaborationReplyActor(repo.collaboration(sessionId)!, send.replyToDecision),
       'immediate_safe_point',
       owner,
     )
@@ -2436,13 +2436,180 @@ describe('Explicit adoption of split roles for a ready plan', () => {
   )
 })
 
+async function legacyRetainedPlan() {
+  const f = await fixture(':memory:', undefined, { primary: 'codex', split: true })
+  f.finish()
+  const review = advance(f)
+  f.finish(review.id, { verdict: 'accepted' })
+  const write = advance(f, 'execute')
+  const original = f.repo.collaborationTurnAuthorization(write.id)!
+  f.finish(write.id, { outcome: 'interrupted' })
+  f.receive(f.input('Check and retain the original plan.'), 'codex')
+  const reply = f.materialize()
+  // Replay the pre-replyMode persisted shape: this historical planner already ran in native Plan mode.
+  const turn = f.db.drizzle
+    .select()
+    .from(workflowTurns)
+    .where(eq(workflowTurns.runId, reply.run.id))
+    .get()!
+  const authorization = f.repo.collaborationTurnAuthorization(reply.run.id)!
+  delete authorization.replyMode
+  const frozen = JSON.parse(turn.stateJson)
+  frozen.authorization = authorization
+  f.db.drizzle
+    .update(workflowTurns)
+    .set({ authorizationJson: JSON.stringify(authorization), stateJson: JSON.stringify(frozen) })
+    .where(eq(workflowTurns.runId, reply.run.id))
+    .run()
+  expect(f.repo.workflowPlanSourceExpected(reply.run.id)).toBe(true)
+  f.repo.recordWorkflowPlanRetained(reply.run.id, {
+    nativeId: 'legacy-retained-plan',
+    confirmation: 'native_root_settled_v1',
+    sha256: original.planReference!.document.sha256,
+    bytes: original.planReference!.document.bytes,
+    chars: original.planReference!.document.chars,
+  })
+  f.finish(reply.run.id, { answer: 'The original plan is retained.' })
+  const retained = f.repo.collaboration(f.sessionId)!
+  expect(retained).toMatchObject({
+    planReference: original.planReference,
+    nextStage: 'plan_review',
+    automation: 'paused',
+  })
+  return { f, original, retained }
+}
+
+it.each(['pending', 'rejected'] as const)(
+  'does not erase a %s legacy retained Plan review after another processed reply',
+  async (scenario) => {
+    const { f, retained } = await legacyRetainedPlan()
+    if (scenario === 'rejected') {
+      f.repo.setCollaborationState(advanceCollaboration(retained, 'resume', settings))
+      f.finish(advance(f).id, { verdict: 'changes_requested' })
+    }
+    f.receive(f.input('Status only; keep the original scope.'))
+    const status = f.materialize()
+    f.finish(status.run.id, { inputOutcome: 'processed' })
+    const current = f.repo.collaboration(f.sessionId)!
+    const prepared = f.repo.prepareCollaborationAction(
+      {
+        sessionId: f.sessionId,
+        taskId: current.id,
+        revision: current.revision,
+        clientMessageId: randomUUID(),
+        action: current.automation === 'paused' ? 'resume' : 'continue',
+      },
+      settings,
+    )
+    expect(prepared.next?.stage).toBe('plan')
+  },
+)
+
+it.each(['direct', 'accepted_reply'] as const)(
+  'preserves legacy planning reply settlement and reacceptance before resuming an unfinished write: %s',
+  async (scenario) => {
+    const { f, original, retained } = await legacyRetainedPlan()
+    f.repo.setCollaborationState(advanceCollaboration(retained, 'resume', settings))
+    const rereview = advance(f)
+    expect(rereview.collaboration?.stage).toBe('plan_review')
+    f.finish(rereview.id, { verdict: 'accepted' })
+    if (scenario === 'accepted_reply') {
+      f.receive(f.input('Status only; keep the reviewed original scope.'))
+      const status = f.materialize()
+      f.finish(status.run.id, { inputOutcome: 'processed' })
+    }
+    const resumed = advance(f)
+    expect(f.repo.collaborationTurnAuthorization(resumed.id)).toMatchObject({
+      stage: 'implement',
+      actor: 'claude',
+      planReference: original.planReference,
+      userAuthority: {
+        purpose: 'write_continuation',
+        rootReceiptId: original.userAuthority!.rootReceiptId,
+      },
+    })
+  },
+)
+
+it.each(['codex', 'claude'] as const)(
+  'resumes interrupted plan implementation after processed replies with %s as Primary',
+  async (primary) => {
+    const f = await fixture(':memory:', undefined, { primary, split: true })
+    const implementer = primary === 'codex' ? 'claude' : 'codex'
+    f.finish()
+    const review = advance(f)
+    f.finish(review.id, { verdict: 'accepted' })
+    const write = advance(f, 'execute')
+    const original = f.repo.collaborationTurnAuthorization(write.id)!
+    f.finish(write.id, { outcome: 'interrupted' })
+    const interrupted = f.repo.collaboration(f.sessionId)!
+    for (let index = 0; index < 2; index++) {
+      f.receive(f.input('Continue the same accepted implementation; keep its scope unchanged.'))
+      const reply = f.materialize()
+      expect(reply.run.agentId).toBe(implementer)
+      expect(reply.run.collaboration?.stage).toBe('reply')
+      f.finish(reply.run.id, { inputOutcome: 'processed' })
+      expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+        automation: 'paused',
+        pendingWork: interrupted.pendingWork,
+        planReference: interrupted.planReference,
+      })
+    }
+    const current = f.repo.collaboration(f.sessionId)!
+    const prepared = f.repo.prepareCollaborationAction(
+      {
+        sessionId: f.sessionId,
+        taskId: current.id,
+        revision: current.revision,
+        clientMessageId: randomUUID(),
+        action: 'resume',
+      },
+      settings,
+    )
+    expect(prepared.next).toMatchObject({ stage: 'implement', actor: implementer })
+    if (!prepared.next || !prepared.task || !prepared.handoff) throw Error('Missing continuation')
+    const admission = {
+      sessionId: f.sessionId,
+      clientMessageId: prepared.receipt.clientNonce,
+      content: 'Continue the original implementation.',
+      commentIds: [],
+      expectedCommentsRevision: f.drafts().commentsRevision,
+      agentId: prepared.next.actor,
+      settingsRevision: 1,
+      model: null,
+      effort: null,
+      preserveDraftComments: true,
+      expectedCollaborationRevision: prepared.task.revision,
+      collaboration: prepared.next,
+      schedulingHandoff: prepared.handoff,
+      collaborationActionReceiptId: prepared.receipt.id,
+    }
+    const continued = f.repo.beginRun(admission)
+    expect(f.repo.collaborationTurnAuthorization(continued.run.id)).toMatchObject({
+      stage: 'implement',
+      actor: implementer,
+      inputSequence: current.inputSequence,
+      planReference: original.planReference,
+      userAuthority: {
+        purpose: 'write_continuation',
+        rootReceiptId: original.userAuthority!.rootReceiptId,
+      },
+    })
+    expect(f.repo.beginRun(admission)).toMatchObject({ created: false })
+    expect(f.repo.collaboration(f.sessionId)?.repairAttempts).toBe(0)
+    expect(f.repo.collaborationTurnAuthorization(write.id)).toEqual(original)
+    f.finish(continued.run.id, { answer: 'Original implementation completed.' })
+    expect(advance(f).collaboration).toMatchObject({ stage: 'code_review' })
+  },
+)
+
 it.each([
   { primary: 'codex', split: false },
   { primary: 'claude', split: false },
   { primary: 'codex', split: true },
   { primary: 'claude', split: true },
 ] as const)(
-  'continues the exact original $primary write after restart and Primary changes; split=$split',
+  'continues the exact original $primary write after processed input, restart and Primary changes; split=$split',
   async ({ primary, split }) => {
     const directory = await mkdtemp(join(tmpdir(), 'pact-role-continuation-'))
     directories.push(directory)
@@ -2466,6 +2633,10 @@ it.each([
     })
     const interrupted = f.repo.collaboration(f.sessionId)!
     expect(interrupted.pendingWork).toMatchObject({ stage: 'implement', runId: write.id })
+    f.receive(f.input('Report where the original implementation stopped; preserve its scope.'))
+    const reply = f.materialize()
+    expect(reply.run.agentId).toBe(implementer)
+    f.finish(reply.run.id, { inputOutcome: 'processed' })
     const frozenTurn = f.db.drizzle
       .select()
       .from(workflowTurns)
