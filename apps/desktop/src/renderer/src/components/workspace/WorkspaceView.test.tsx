@@ -2,6 +2,7 @@
 
 import type { ComponentProps } from 'react'
 
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { useState } from 'react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
@@ -10,9 +11,15 @@ import type { DecisionAnswerDraft } from '../conversation/useConversation'
 
 import { CollaborationQuestionCard } from '../conversation/CollaborationQuestionCard'
 import { InputReplacement } from '../ui/InputReplacement'
+import { useSessionWorkspace } from './useSessionWorkspace'
 import { WorkspaceView } from './WorkspaceView'
 
-type Props = ComponentProps<typeof WorkspaceView>
+type Props = Omit<ComponentProps<typeof WorkspaceView>, 'sessionWorkspace'>
+
+function WorkspaceFixture(props: Props) {
+  const workspace = useSessionWorkspace(false, props.projects, props.onRetry)
+  return <WorkspaceView {...props} sessionWorkspace={workspace} />
+}
 
 vi.mock('./ProjectNavigation', () => ({ ProjectNavigation: () => <nav>Projects</nav> }))
 vi.mock('./SessionHeader', () => ({ SessionHeader: () => <header>Session</header> }))
@@ -123,10 +130,8 @@ function fixture(): Props {
     ],
     selectedSessionId: sessionId,
     selectedProjectId: projectId,
-    sessionProjectPages: {},
     loading: false,
     sessionsLoading: false,
-    loadMoreErrors: {},
     adding: false,
     creatingSession: false,
     savingSessionSettings: false,
@@ -174,7 +179,6 @@ function fixture(): Props {
     onRenameProject: vi.fn<Props['onRenameProject']>(),
     onRetry: noop,
     onRetrySessions: noop,
-    onLoadMoreSessions: vi.fn<Props['onLoadMoreSessions']>(),
     onOpenSettings: noop,
     onBackToApp: noop,
     onStartSession: noop,
@@ -229,7 +233,12 @@ function isPainted(element: HTMLElement): boolean {
 
 it('hides pending input on every settings page and preserves both drafts when returning', () => {
   const props = fixture()
-  const view = render(<WorkspaceView {...props} />)
+  const client = new QueryClient()
+  const view = render(<WorkspaceFixture {...props} />, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  })
   const reply = screen.getByRole<HTMLTextAreaElement>('textbox', { name: 'Your answer' })
   const message = screen.getByLabelText<HTMLTextAreaElement>('Message')
   const replyPane = reply.closest<HTMLElement>('[style]')!
@@ -243,7 +252,7 @@ it('hides pending input on every settings page and preserves both drafts when re
     'updates',
   ] as const) {
     view.rerender(
-      <WorkspaceView
+      <WorkspaceFixture
         {...props}
         settingsPage={settingsPage}
         conversationVisible={false}
@@ -254,7 +263,7 @@ it('hides pending input on every settings page and preserves both drafts when re
     expect(isPainted(replyPane)).toBe(false)
     expect(isPainted(messagePane)).toBe(false)
     expect(view.container.contains(reply)).toBe(true)
-    view.rerender(<WorkspaceView {...props} />)
+    view.rerender(<WorkspaceFixture {...props} />)
     expect(screen.getByRole('textbox', { name: 'Your answer' })).toBe(reply)
     expect(isPainted(replyPane)).toBe(true)
     expect(reply.value).toBe('Unsent reply')

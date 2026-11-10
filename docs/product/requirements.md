@@ -129,6 +129,8 @@ Project/Session Archive hides App entries without deleting files, settings, mess
 
 Archive feedback combines successful, failed and unconfirmed results in one summary with an expandable, paged list. Each entry identifies the Session or Project and its own result; a Project counts as one entry even when its affected Sessions have different Stop outcomes. Undo restores only the selected successful entry and removes that entry after confirmed restoration. Failure details preserve individual Stop outcomes; Review again prepares current task identities and requires confirmation for active work. An unconfirmed entry only checks the original operation; it cannot authorize another Stop or be dismissed until resolved. Retrying a failed item updates its existing entry. Results remain available until explicitly dismissed or the Renderer restarts; new archives do not overwrite earlier Undo actions. At the display capacity, further archives require reviewing or dismissing resolved entries first. Restoring an independently archived Session requires its Project to be visible first. Feedback is a disposable projection; durable archive receipts remain authoritative.
 
+Blocked or unsuccessful Session archives offer **Remove from sidebar**. Removal keeps chat, runs and ongoing work. **Undo** restores visibility, in Ungrouped if the group was deleted. An unconfirmed archive retains **Check status**.
+
 The Composer footer shows the canonical folder basename and current Git branch beside the permission menus. Folder actions open the registered Project directory in the native file manager or copy its complete path; the branch action copies the complete branch name. A renamed Project display name does not rename this filesystem label. Refresh on entering the visible Session, returning window focus, opening a context menu and Run-state changes. A selected subdirectory inside a repository shows that containing repository's branch without changing the Project directory or classification. Directories outside a repository omit Git metadata; detached HEAD shows its commit without inventing a branch name. Read/open/clipboard failures remain visible and retry is explicit.
 
 ### Session ownership, title and activity
@@ -144,6 +146,19 @@ After adopting a native title into Pact, Codex's display name may become `[Pact]
 Activity projects actual Run/interaction/recovery facts, independent of collaboration phase/verdict. Normal completion returns Idle; Waiting means an actual required question/approval. Completed, failed, interrupted, unknown-delivery and abandoned remain distinct. Unread follows durable completed-message sequence and recorded reading position, not transient deltas/title changes.
 
 Navigation is Project → Session, with neutral Project rows, folder disclosure, hover/keyboard-focus actions, 6 px before indented child Sessions and no persistent connectors/`Sessions`/branch/path/count/Changes metadata. There is no dedicated application fullscreen feature. The center header retains title. Settings temporarily replace navigation content and hide Context; Back restores workspace topology.
+
+### Session groups
+
+A Project may organize its Sessions into named Session groups. A Session belongs to at most one group or to Ungrouped; groups never span Projects. Groups and their members have saved manual order. Existing member order starts with newest creation time, with descending Session ID breaking ties. Ungrouped Sessions keep that time order. Each group has a trimmed, single-line name of at most 120 UTF-16 units, a fixed decorative color, a permanent Project-local creation ordinal, a position and a persisted collapsed state. Headers, menus and confirmations use the group name.
+
+The Project menu creates groups. The Session “Move to group” menu moves members, offers a new group for an Ungrouped Session, and offers removal for a grouped Session. The group menu provides rename, color, new Session in the group, move up/down and dissolve. Dissolve confirms that Sessions move to Ungrouped and are neither deleted nor stopped; it covers unloaded and archived members. Moving or hiding the last visible member deletes its group in the same transaction. Newly created empty groups remain available. Moving a Session during an active Run does not stop that Run. Group organization does not alter Session history, settings, Run state or Agent context.
+
+The sidebar shows Ungrouped Sessions before group headers. Groups support within-Project pointer
+dragging and menu actions. Dragging a Session onto a member places it before or after that member. Dropping on a group header or moving into a group from the menu places it first. A collapsed group containing the selected Session shows a
+Current indicator. Moving, restoring and dissolving can locate Sessions while preserving the open
+conversation. Group creation and ordinary Session creation follow their existing selection intent.
+
+The first version provides individual Session archive/restore only; archived Sessions keep their group membership and restore there, or to Ungrouped if the group was dissolved. A group-level archive is a separate future module. The first version also excludes nested groups, group-level batch operations and whole-group activity aggregation.
 
 ### Resident application and native Session navigation
 

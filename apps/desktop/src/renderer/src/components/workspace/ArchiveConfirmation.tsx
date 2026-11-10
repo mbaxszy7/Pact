@@ -9,10 +9,12 @@ interface ArchiveConfirmationProps {
   receipt?: WorkspaceArchiveReceipt
   error?: string
   uncertain?: boolean
+  removing?: boolean
   onCancel: () => void
   onConfirm: () => void
   onCheck: () => void
   onReview: () => void
+  onRemove?: () => void
 }
 
 export function ArchiveConfirmation({
@@ -21,10 +23,12 @@ export function ArchiveConfirmation({
   receipt,
   error,
   uncertain = false,
+  removing = false,
   onCancel,
   onConfirm,
   onCheck,
   onReview,
+  onRemove,
 }: ArchiveConfirmationProps): React.JSX.Element {
   const dialogRef = useRef<HTMLDialogElement>(null)
   const cancelRef = useRef<HTMLButtonElement>(null)
@@ -32,6 +36,7 @@ export function ArchiveConfirmation({
   const descriptionId = useId()
   const result = Boolean(receipt || error || uncertain)
   const blocked = Boolean(preview.blockedReason)
+  const canRemove = onRemove && (blocked || result)
   const subject = preview.scope.kind === 'session' ? 'Session' : 'Project'
   useEffect(() => {
     const trigger = document.activeElement
@@ -143,13 +148,19 @@ export function ArchiveConfirmation({
         ) : null}
         {error || receipt?.message ? (
           <p className="pact-archive-error text-body text-danger" role="alert">
-            {receipt?.message ?? error}
+            {error ?? receipt?.message}
           </p>
         ) : null}
         {!blocked && !result ? (
           <p className="text-caption text-secondary">
             Messages and completed file changes stay saved. Undo restores the{' '}
             {subject.toLowerCase()} without restarting its tasks.
+          </p>
+        ) : null}
+        {canRemove ? (
+          <p className="text-caption text-secondary">
+            Removing from the sidebar keeps your chat and run history. Any ongoing work can
+            continue.
           </p>
         ) : null}
       </div>
@@ -176,13 +187,29 @@ export function ArchiveConfirmation({
             }
             className="h-9 rounded-control bg-surface-inverse px-panel text-body font-medium text-inverse disabled:cursor-wait disabled:opacity-60"
           >
-            {busy
-              ? 'Stopping…'
+            {busy && !removing
+              ? result
+                ? 'Checking…'
+                : 'Stopping…'
               : result
                 ? uncertain || receipt?.state === 'unresolved' || receipt?.state === 'stopping'
                   ? 'Check status'
                   : 'Review again'
                 : 'Stop and archive'}
+          </button>
+        ) : null}
+        {canRemove ? (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onRemove}
+            className={
+              blocked
+                ? 'h-9 rounded-control bg-surface-inverse px-panel text-body font-medium text-inverse disabled:cursor-wait disabled:opacity-60'
+                : 'h-9 rounded-control px-panel text-body font-medium text-secondary hover:bg-surface-muted hover:text-primary disabled:opacity-45'
+            }
+          >
+            {removing ? 'Removing…' : 'Remove from sidebar'}
           </button>
         ) : null}
       </div>

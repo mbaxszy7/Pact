@@ -262,12 +262,25 @@ export const IPC_CHANNELS = {
   projectContextRead: 'pact:project-context:read',
   projectDirectoryOpen: 'pact:project-directory:open',
   sessionCatalogGet: 'pact:session-catalog:get',
+  sessionPageGet: 'pact:session-page:get',
+  sessionGroupsGet: 'pact:session-groups:get',
+  sessionGroupGet: 'pact:session-group:get',
+  sessionMembershipGet: 'pact:session-membership:get',
+  sessionNavigationLocate: 'pact:session-navigation:locate',
+  sessionCreationState: 'pact:session-creation:state',
+  sessionOrganizationRecover: 'pact:session-organization:recover',
+  sessionGroupCreate: 'pact:session-group:create',
+  sessionGroupUpdate: 'pact:session-group:update',
+  sessionGroupMove: 'pact:session-group:move',
+  sessionGroupDissolve: 'pact:session-group:dissolve',
+  sessionGroupSet: 'pact:session-group:set',
   sessionCreationPrepare: 'pact:session-creation:prepare',
   sessionCreate: 'pact:session:create',
   sessionRename: 'pact:session:rename',
   sessionMarkRead: 'pact:session:mark-read',
   sessionArchive: 'pact:session:archive',
   sessionRestore: 'pact:session:restore',
+  sessionSidebarHiddenSet: 'pact:session-sidebar-hidden:set',
   sessionSettingsGet: 'pact:session-settings:get',
   sessionSettingsSave: 'pact:session-settings:save',
   sessionPermissionSave: 'pact:session-permission:save',
@@ -1005,6 +1018,8 @@ export const collaborationSessionSchema = z.strictObject({
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
   archivedAt: z.string().datetime().optional(),
+  groupId: z.string().uuid().nullable().optional(),
+  sidebarHidden: z.literal(true).optional(),
 })
 export type CollaborationSession = z.infer<typeof collaborationSessionSchema>
 
@@ -1037,6 +1052,8 @@ export type SessionCatalogPage = z.infer<typeof sessionCatalogPageSchema>
 export const sessionCatalogChangeSchema = z.strictObject({
   kind: z.literal('change'),
   revision: z.number().int().nonnegative(),
+  groupRevision: z.number().int().nonnegative().optional(),
+  dissolvedGroupId: z.string().uuid().optional(),
   session: collaborationSessionSchema,
 })
 export type SessionCatalogChange = z.infer<typeof sessionCatalogChangeSchema>
@@ -1047,15 +1064,288 @@ export const sessionCatalogReplySchema = z.discriminatedUnion('kind', [
 ])
 export type SessionCatalogReply = z.infer<typeof sessionCatalogReplySchema>
 
+export const SESSION_GROUP_PAGE_ITEMS = 20
+export const SESSION_GROUP_PAGE_BYTES = 64 * 1024
+export const SESSION_GROUP_NAME_LIMIT = 120
+
+export const SESSION_GROUP_COLORS = [
+  'gray',
+  'blue',
+  'red',
+  'yellow',
+  'green',
+  'rose',
+  'purple',
+  'cyan',
+  'orange',
+] as const
+export const sessionGroupColorSchema = z.enum(SESSION_GROUP_COLORS)
+export type SessionGroupColor = z.infer<typeof sessionGroupColorSchema>
+
+export const sessionGroupNameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(SESSION_GROUP_NAME_LIMIT)
+  .regex(/^[^\r\n\u2028\u2029]+$/, 'Use a single line for a Session group name.')
+
+export const sessionGroupSchema = z.strictObject({
+  id: z.string().uuid(),
+  projectId: z.string().uuid(),
+  name: sessionGroupNameSchema,
+  color: sessionGroupColorSchema,
+  creationOrdinal: z.number().int().positive(),
+  position: z.number().int().nonnegative(),
+  collapsed: z.boolean(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+})
+export type SessionGroup = z.infer<typeof sessionGroupSchema>
+
+export const sessionPageScopeSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('ungrouped') }),
+  z.strictObject({ kind: z.literal('group'), groupId: z.string().uuid() }),
+])
+export type SessionPageScope = z.infer<typeof sessionPageScopeSchema>
+
+export const sessionPageCursorSchema = z
+  .strictObject({
+    projectId: z.string().uuid(),
+    scope: sessionPageScopeSchema,
+    revision: z.number().int().nonnegative(),
+    direction: z.enum(['newer', 'older']),
+    createdAt: z.string().datetime(),
+    id: z.string().uuid(),
+    groupPosition: z.number().int().nonnegative().optional(),
+  })
+  .refine((value) => (value.scope.kind === 'group') === (value.groupPosition !== undefined))
+export type SessionPageCursor = z.infer<typeof sessionPageCursorSchema>
+
+export const sessionPageInputSchema = z.strictObject({
+  projectId: z.string().uuid(),
+  scope: sessionPageScopeSchema,
+  cursor: sessionPageCursorSchema.optional(),
+})
+export type SessionPageInput = z.infer<typeof sessionPageInputSchema>
+
+export const sessionPageSchema = z.strictObject({
+  kind: z.literal('page'),
+  projectId: z.string().uuid(),
+  scope: sessionPageScopeSchema,
+  groupRevision: z.number().int().nonnegative(),
+  revision: z.number().int().nonnegative(),
+  sessions: z.array(collaborationSessionSchema).max(SESSION_CATALOG_PAGE_ITEMS),
+  nextCursor: sessionPageCursorSchema.optional(),
+  previousCursor: sessionPageCursorSchema.optional(),
+  hasGroups: z.boolean(),
+})
+export type SessionPage = z.infer<typeof sessionPageSchema>
+
+export const sessionGroupPageCursorSchema = z.strictObject({
+  projectId: z.string().uuid(),
+  revision: z.number().int().nonnegative(),
+  direction: z.enum(['newer', 'older']),
+  position: z.number().int().nonnegative(),
+  id: z.string().uuid(),
+})
+export type SessionGroupPageCursor = z.infer<typeof sessionGroupPageCursorSchema>
+
+export const sessionGroupPageInputSchema = z
+  .strictObject({
+    projectId: z.string().uuid(),
+    aroundGroupId: z.string().uuid().optional(),
+    cursor: sessionGroupPageCursorSchema.optional(),
+  })
+  .refine((input) => !input.cursor || !input.aroundGroupId)
+export type SessionGroupPageInput = z.infer<typeof sessionGroupPageInputSchema>
+
+export const sessionGroupPageSchema = z.strictObject({
+  kind: z.literal('groups'),
+  projectId: z.string().uuid(),
+  revision: z.number().int().nonnegative(),
+  groups: z.array(sessionGroupSchema).max(SESSION_GROUP_PAGE_ITEMS),
+  nextCursor: sessionGroupPageCursorSchema.optional(),
+  previousCursor: sessionGroupPageCursorSchema.optional(),
+})
+export type SessionGroupPage = z.infer<typeof sessionGroupPageSchema>
+
+export const sessionGroupDetailInputSchema = z.strictObject({
+  projectId: z.string().uuid(),
+  groupId: z.string().uuid(),
+})
+export type SessionGroupDetailInput = z.infer<typeof sessionGroupDetailInputSchema>
+
+export const sessionGroupDetailSchema = z.union([
+  z.strictObject({
+    exists: z.literal(false),
+    revision: z.number().int().nonnegative(),
+  }),
+  z.strictObject({
+    exists: z.literal(true),
+    group: sessionGroupSchema,
+    previousGroupId: z.string().uuid().optional(),
+    nextGroupId: z.string().uuid().optional(),
+    revision: z.number().int().nonnegative(),
+  }),
+])
+export type SessionGroupDetail = z.infer<typeof sessionGroupDetailSchema>
+
+export const sessionMembershipInputSchema = z.strictObject({
+  projectId: z.string().uuid(),
+  sessionId: z.string().uuid(),
+})
+export type SessionMembershipInput = z.infer<typeof sessionMembershipInputSchema>
+
+export const sessionMembershipSchema = z.strictObject({
+  exists: z.boolean(),
+  sessionId: z.string().uuid(),
+  projectId: z.string().uuid(),
+  groupId: z.string().uuid().nullable(),
+  archived: z.boolean(),
+  createdAt: z.string().datetime().optional(),
+  groupPosition: z.number().int().nonnegative().optional(),
+  previousSessionId: z.string().uuid().optional(),
+  nextSessionId: z.string().uuid().optional(),
+  revision: z.number().int().nonnegative(),
+})
+export type SessionMembership = z.infer<typeof sessionMembershipSchema>
+
+export const locateSessionNavigationInputSchema = z.strictObject({
+  projectId: z.string().uuid(),
+  sessionId: z.string().uuid(),
+})
+export type LocateSessionNavigationInput = z.infer<typeof locateSessionNavigationInputSchema>
+
+export const locatedSessionNavigationSchema = z.strictObject({
+  membership: sessionMembershipSchema,
+  catalogRevision: z.number().int().nonnegative(),
+  sessions: z.array(collaborationSessionSchema).max(SESSION_CATALOG_PAGE_ITEMS),
+  nextCursor: sessionPageCursorSchema.optional(),
+  previousCursor: sessionPageCursorSchema.optional(),
+  groups: z.array(sessionGroupSchema).max(SESSION_GROUP_PAGE_ITEMS),
+  nextGroupCursor: sessionGroupPageCursorSchema.optional(),
+  previousGroupCursor: sessionGroupPageCursorSchema.optional(),
+  hasGroups: z.boolean(),
+})
+export type LocatedSessionNavigation = z.infer<typeof locatedSessionNavigationSchema>
+
+export const sessionCreationStateInputSchema = z.strictObject({
+  projectId: z.string().uuid(),
+  sessionId: z.string().uuid(),
+})
+export type SessionCreationStateInput = z.infer<typeof sessionCreationStateInputSchema>
+
+const creationRevisions = {
+  revision: z.number().int().nonnegative(),
+  catalogRevision: z.number().int().nonnegative(),
+}
+
+export const sessionCreationStateSchema = z.discriminatedUnion('state', [
+  z.strictObject({ state: z.literal('pending'), ...creationRevisions }),
+  z.strictObject({ state: z.literal('absent'), ...creationRevisions }),
+  z.strictObject({
+    state: z.literal('present'),
+    session: collaborationSessionSchema,
+    groupId: z.string().uuid().nullable(),
+    ...creationRevisions,
+  }),
+])
+export type SessionCreationState = z.infer<typeof sessionCreationStateSchema>
+
+export const createSessionGroupInputSchema = z.strictObject({
+  projectId: z.string().uuid(),
+  groupId: z.string().uuid(),
+  name: sessionGroupNameSchema,
+  color: sessionGroupColorSchema,
+  expectedRevision: z.number().int().nonnegative(),
+  sessionId: z.string().uuid().optional(),
+})
+export type CreateSessionGroupInput = z.infer<typeof createSessionGroupInputSchema>
+
+export const updateSessionGroupInputSchema = z.strictObject({
+  projectId: z.string().uuid(),
+  groupId: z.string().uuid(),
+  expectedRevision: z.number().int().nonnegative(),
+  name: sessionGroupNameSchema.optional(),
+  color: sessionGroupColorSchema.optional(),
+  collapsed: z.boolean().optional(),
+})
+export type UpdateSessionGroupInput = z.infer<typeof updateSessionGroupInputSchema>
+
+export const moveSessionGroupInputSchema = z
+  .strictObject({
+    projectId: z.string().uuid(),
+    groupId: z.string().uuid(),
+    expectedRevision: z.number().int().nonnegative(),
+    direction: z.enum(['up', 'down']).optional(),
+    targetGroupId: z.string().uuid().optional(),
+    placement: z.enum(['before', 'after']).optional(),
+  })
+  .refine(
+    (input) =>
+      input.direction !== undefined ||
+      (input.targetGroupId !== undefined && input.placement !== undefined),
+    'A move needs a direction or a target group and placement.',
+  )
+export type MoveSessionGroupInput = z.infer<typeof moveSessionGroupInputSchema>
+
+export const dissolveSessionGroupInputSchema = z.strictObject({
+  projectId: z.string().uuid(),
+  groupId: z.string().uuid(),
+  expectedRevision: z.number().int().nonnegative(),
+})
+export type DissolveSessionGroupInput = z.infer<typeof dissolveSessionGroupInputSchema>
+
+export const sessionGroupPlacementSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('first') }),
+  z.strictObject({ kind: z.enum(['before', 'after']), sessionId: z.string().uuid() }),
+])
+export type SessionGroupPlacement = z.infer<typeof sessionGroupPlacementSchema>
+
+export const setSessionGroupInputSchema = z
+  .strictObject({
+    projectId: z.string().uuid(),
+    sessionId: z.string().uuid(),
+    groupId: z.string().uuid().nullable(),
+    placement: sessionGroupPlacementSchema.optional(),
+    expectedRevision: z.number().int().nonnegative(),
+  })
+  .refine(
+    (value) =>
+      !value.placement ||
+      (value.groupId !== null &&
+        (value.placement.kind === 'first' || value.placement.sessionId !== value.sessionId)),
+  )
+export type SetSessionGroupInput = z.infer<typeof setSessionGroupInputSchema>
+
+export const sessionGroupMutationSchema = z.strictObject({
+  kind: z.literal('group-change'),
+  revision: z.number().int().nonnegative(),
+  group: sessionGroupSchema.optional(),
+  dissolvedGroupId: z.string().uuid().optional(),
+  session: collaborationSessionSchema.optional(),
+  sourceScope: sessionPageScopeSchema.optional(),
+  targetScope: sessionPageScopeSchema.optional(),
+})
+export type SessionGroupMutation = z.infer<typeof sessionGroupMutationSchema>
+
 export const sessionCreationPrepareInputSchema = z.strictObject({
   projectId: z.string().uuid(),
 })
 export type SessionCreationPrepareInput = z.infer<typeof sessionCreationPrepareInputSchema>
 
-export const sessionCreateInputSchema = z.strictObject({
-  projectId: z.string().uuid(),
-  settings: defaultSessionSettingsSchema,
-})
+export const sessionCreateInputSchema = z
+  .strictObject({
+    projectId: z.string().uuid(),
+    sessionId: z.string().uuid(),
+    groupId: z.string().uuid().optional(),
+    expectedGroupRevision: z.number().int().nonnegative().optional(),
+    settings: defaultSessionSettingsSchema,
+  })
+  .refine(
+    (input) => Boolean(input.groupId) === (input.expectedGroupRevision !== undefined),
+    'Group creation requires the current organization revision.',
+  )
 export type SessionCreateInput = z.infer<typeof sessionCreateInputSchema>
 
 export const sessionSettingsInputSchema = z.strictObject({
@@ -1068,6 +1358,12 @@ export const sessionArchiveInputSchema = z.strictObject({
   operationId: z.string().uuid().optional(),
 })
 export type SessionArchiveInput = z.infer<typeof sessionArchiveInputSchema>
+
+export const sessionSidebarHiddenInputSchema = z.strictObject({
+  sessionId: z.string().uuid(),
+  hidden: z.boolean(),
+})
+export type SessionSidebarHiddenInput = z.infer<typeof sessionSidebarHiddenInputSchema>
 
 export const sessionRenameInputSchema = z.strictObject({
   sessionId: z.string().uuid(),
@@ -2871,6 +3167,61 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
     input: sessionCatalogPageInputSchema,
   }),
   z.object({
+    type: z.literal('session-page.get.request'),
+    requestId: z.string().uuid(),
+    input: sessionPageInputSchema,
+  }),
+  z.object({
+    type: z.literal('session-groups.get.request'),
+    requestId: z.string().uuid(),
+    input: sessionGroupPageInputSchema,
+  }),
+  z.object({
+    type: z.literal('session-group.get.request'),
+    requestId: z.string().uuid(),
+    input: sessionGroupDetailInputSchema,
+  }),
+  z.object({
+    type: z.literal('session-membership.get.request'),
+    requestId: z.string().uuid(),
+    input: sessionMembershipInputSchema,
+  }),
+  z.object({
+    type: z.literal('session-navigation.locate.request'),
+    requestId: z.string().uuid(),
+    input: locateSessionNavigationInputSchema,
+  }),
+  z.object({
+    type: z.literal('session-creation.state.request'),
+    requestId: z.string().uuid(),
+    input: sessionCreationStateInputSchema,
+  }),
+  z.object({
+    type: z.literal('session-group.create.request'),
+    requestId: z.string().uuid(),
+    input: createSessionGroupInputSchema,
+  }),
+  z.object({
+    type: z.literal('session-group.update.request'),
+    requestId: z.string().uuid(),
+    input: updateSessionGroupInputSchema,
+  }),
+  z.object({
+    type: z.literal('session-group.move.request'),
+    requestId: z.string().uuid(),
+    input: moveSessionGroupInputSchema,
+  }),
+  z.object({
+    type: z.literal('session-group.dissolve.request'),
+    requestId: z.string().uuid(),
+    input: dissolveSessionGroupInputSchema,
+  }),
+  z.object({
+    type: z.literal('session-group.set.request'),
+    requestId: z.string().uuid(),
+    input: setSessionGroupInputSchema,
+  }),
+  z.object({
     type: z.literal('session-creation.prepare.request'),
     requestId: z.string().uuid(),
     input: sessionCreationPrepareInputSchema,
@@ -2899,6 +3250,11 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
     type: z.literal('session.restore.request'),
     requestId: z.string().uuid(),
     input: sessionArchiveInputSchema,
+  }),
+  z.object({
+    type: z.literal('session-sidebar-hidden.set.request'),
+    requestId: z.string().uuid(),
+    input: sessionSidebarHiddenInputSchema,
   }),
   z.object({
     type: z.literal('session-settings.get.request'),
@@ -3248,6 +3604,41 @@ export const utilityResponseSchema = z.discriminatedUnion('type', [
     result: rpcResultSchema(sessionCatalogReplySchema),
   }),
   z.object({
+    type: z.literal('session-page.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(sessionPageSchema),
+  }),
+  z.object({
+    type: z.literal('session-groups.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(sessionGroupPageSchema),
+  }),
+  z.object({
+    type: z.literal('session-group.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(sessionGroupDetailSchema),
+  }),
+  z.object({
+    type: z.literal('session-membership.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(sessionMembershipSchema),
+  }),
+  z.object({
+    type: z.literal('session-navigation.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(locatedSessionNavigationSchema),
+  }),
+  z.object({
+    type: z.literal('session-creation-state.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(sessionCreationStateSchema),
+  }),
+  z.object({
+    type: z.literal('session-group-change.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(sessionGroupMutationSchema),
+  }),
+  z.object({
     type: z.literal('session-creation.prepare.response'),
     requestId: z.string().uuid(),
     result: rpcResultSchema(defaultSessionSettingsEditorStateSchema),
@@ -3443,12 +3834,31 @@ export interface DesktopBridge {
     projectId: string,
     cursor?: SessionCatalogCursor,
   ): Promise<RpcResult<SessionCatalogPage>>
+  getSessionPage(input: SessionPageInput): Promise<RpcResult<SessionPage>>
+  getSessionGroups(input: SessionGroupPageInput): Promise<RpcResult<SessionGroupPage>>
+  getSessionGroup(input: SessionGroupDetailInput): Promise<RpcResult<SessionGroupDetail>>
+  getSessionMembership(input: SessionMembershipInput): Promise<RpcResult<SessionMembership>>
+  locateSessionNavigation(
+    input: LocateSessionNavigationInput,
+  ): Promise<RpcResult<LocatedSessionNavigation>>
+  recoverSessionOrganization(): Promise<RpcResult<{ ready: true }>>
+  getSessionCreationState(
+    input: SessionCreationStateInput,
+  ): Promise<RpcResult<SessionCreationState>>
+  createSessionGroup(input: CreateSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
+  updateSessionGroup(input: UpdateSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
+  moveSessionGroup(input: MoveSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
+  dissolveSessionGroup(input: DissolveSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
+  setSessionGroup(input: SetSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
   prepareSessionCreation(projectId: string): Promise<RpcResult<DefaultSessionSettingsEditorState>>
   createSession(input: SessionCreateInput): Promise<RpcResult<SessionCatalogChange>>
   renameSession(input: SessionRenameInput): Promise<RpcResult<SessionCatalogChange>>
   markSessionRead(input: SessionMarkReadInput): Promise<RpcResult<SessionCatalogChange>>
   archiveSession(sessionId: string, operationId?: string): Promise<RpcResult<SessionCatalogChange>>
   restoreSession(sessionId: string): Promise<RpcResult<SessionCatalogChange>>
+  setSessionSidebarHidden(
+    input: SessionSidebarHiddenInput,
+  ): Promise<RpcResult<SessionCatalogChange>>
   getSessionSettings(sessionId: string): Promise<RpcResult<SessionSettingsEditorState>>
   saveSessionSettings(
     input: SessionSettingsSaveInput,

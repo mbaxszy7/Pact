@@ -37,6 +37,7 @@ vi.mock('./components/workspace/WorkspaceView', () => ({
       </button>
       <output aria-label="Selected Session">{props.selectedSessionId ?? 'none'}</output>
       <output aria-label="Selected Project">{props.selectedProjectId ?? 'none'}</output>
+      <output aria-label="Session to reveal">{props.navigationIntent?.sessionId ?? 'none'}</output>
       <nav aria-label="Projects">
         {props.projects.map((project) => (
           <button key={project.id} type="button" onClick={() => props.onArchiveProject(project.id)}>
@@ -239,15 +240,18 @@ function fixture(projectCount = 2) {
       ok: true,
       value: catalog(),
     })),
-    getSessionCatalog: vi.fn<DesktopBridge['getSessionCatalog']>(async (projectId) => ({
+    getSessionPage: vi.fn<DesktopBridge['getSessionPage']>(async ({ projectId, scope }) => ({
       ok: true,
       value: {
         kind: 'page',
         projectId,
+        scope,
+        groupRevision: 0,
         revision,
         sessions: sessions
           .filter((session) => session.projectId === projectId && !archivedSessions.has(session.id))
           .toSorted((left, right) => right.id.localeCompare(left.id)),
+        hasGroups: false,
       },
     })),
     prepareWorkspaceArchive: vi.fn<DesktopBridge['prepareWorkspaceArchive']>(
@@ -326,7 +330,7 @@ function fixture(projectCount = 2) {
     | 'getNativeQuitState'
     | 'recordNativeSessionOpened'
     | 'getProjectCatalog'
-    | 'getSessionCatalog'
+    | 'getSessionPage'
     | 'prepareWorkspaceArchive'
     | 'readWorkspaceArchive'
     | 'cancelWorkspaceArchive'
@@ -366,6 +370,7 @@ function dialog(): HTMLElement {
 describe('App archive flow through DesktopBridge', () => {
   it('keeps multiple success entries and removes only the independently restored item', async () => {
     const context = fixture()
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Session C' }))
     await archiveSession('A')
     await archiveSession('B')
     const list = expandResults()
@@ -377,8 +382,12 @@ describe('App archive flow through DesktopBridge', () => {
     )
     expect(screen.getByRole('button', { name: 'Undo archive of B' })).not.toBeNull()
     expect(context.bridge.restoreSession).toHaveBeenCalledExactlyOnceWith(context.sessions[0]!.id)
-    expect(screen.getByRole('status', { name: 'Selected Session' }).textContent).toBe(
+    expect(screen.getByRole('status', { name: 'Session to reveal' }).textContent).toBe(
       context.sessions[0]!.id,
+    )
+    expect(screen.getByRole('button', { name: 'Open Session A' })).not.toBeNull()
+    expect(screen.getByRole('status', { name: 'Selected Session' }).textContent).toBe(
+      context.sessions[2]!.id,
     )
     expect(context.bridge.prepareWorkspaceArchive).toHaveBeenCalledTimes(2)
     expect(context.bridge.archiveSession).toHaveBeenCalledTimes(2)
@@ -677,7 +686,7 @@ describe('App archive flow through DesktopBridge', () => {
     expandResults()
     fireEvent.click(screen.getByRole('button', { name: 'Undo archive of A' }))
     expect(
-      screen.getByText('Restore or re-add its Project first, then undo this Session archive.'),
+      screen.getByText('Restore or re-add its Project first, then try Undo again.'),
     ).not.toBeNull()
     expect(context.bridge.restoreSession).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Undo archive of Project 1' }))

@@ -54,6 +54,7 @@ export {
   OversizedCatalogSessionError,
   SessionRepository,
   StaleCatalogCursorError,
+  StaleSessionGroupError,
   type NewSessionRecord,
 } from './session-repository.js'
 
@@ -92,5 +93,7 @@ export {
   runtimeCliPaths,
   sessions,
   sessionSettingsRevisions,
+  sessionGroups,
+  sessionGroupMembers,
   schema,
 } from './schema/index.js'

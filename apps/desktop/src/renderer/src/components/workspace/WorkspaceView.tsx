@@ -27,7 +27,8 @@ import type {
   ConversationFlow,
 } from '../conversation/useConversation'
 import type { RelayDecisionPresentation } from '../scheduling/RelayDecisionCard'
-import type { SessionCatalogCache } from './session-catalog-cache'
+import type { NavigationIntent } from './ProjectNavigation'
+import type { SessionWorkspaceFlow } from './useSessionWorkspace'
 
 import { nativeRecoveryTargets } from '../conversation/conversation-window'
 import { ConversationView } from '../conversation/ConversationView'
@@ -62,11 +63,10 @@ interface WorkspaceViewProps {
   onSaveSessionSpeed: (input: SessionSpeedSaveInput) => Promise<boolean>
   projects: Project[]
   sessions: CollaborationSession[]
-  sessionProjectPages: SessionCatalogCache['projectPages']
+  sessionWorkspace: SessionWorkspaceFlow
+  navigationIntent?: NavigationIntent | undefined
   loading: boolean
   sessionsLoading: boolean
-  loadingMoreProjectId?: string | undefined
-  loadMoreErrors: Record<string, string>
   adding: boolean
   creatingSession: boolean
   savingSessionSettings: boolean
@@ -89,6 +89,7 @@ interface WorkspaceViewProps {
   selectedSessionId?: string | undefined
   selectedProjectId?: string | undefined
   creatingProjectId?: string | undefined
+  creatingGroupId?: string | undefined
   creationEditorState?: DefaultSessionSettingsEditorState | undefined
   creationLoading: boolean
   sessionSettingsEditorState?: SessionSettingsEditorState | undefined
@@ -118,10 +119,9 @@ interface WorkspaceViewProps {
   onRenameProject: (projectId: string, name: string) => Promise<RpcResult<ProjectNameChange>>
   onRetry: () => void
   onRetrySessions: () => void
-  onLoadMoreSessions: (projectId: string) => Promise<number>
   onOpenSettings: (page: Exclude<SettingsPage, null>) => void
   onBackToApp: () => void
-  onStartSession: (projectId: string) => void
+  onStartSession: (projectId: string, groupId?: string) => void
   onCancelSessionCreation: () => void
   onCreateSession: (projectId: string, settings: DefaultSessionSettings) => void
   onSelectSession: (sessionId: string) => void
@@ -250,11 +250,10 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
             updateAvailable={props.updateAvailable ?? false}
             projects={props.projects}
             sessions={props.sessions}
-            projectPages={props.sessionProjectPages}
+            workspace={props.sessionWorkspace}
+            navigationIntent={props.navigationIntent}
             loading={props.loading || props.sessionsLoading}
-            loadingMoreProjectId={props.loadingMoreProjectId}
-            loadMoreErrors={props.loadMoreErrors}
-            error={selectedSession ? props.sessionError : undefined}
+            error={props.sessionError}
             adding={props.adding}
             archivingProjectId={props.archivingProjectId}
             renamingProjectId={props.renamingProjectId}
@@ -266,7 +265,6 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
             onRenameProject={props.onRenameProject}
             onOpenSettings={props.onOpenSettings}
             onRetrySessions={props.onRetrySessions}
-            onLoadMoreSessions={props.onLoadMoreSessions}
             onStartSession={props.onStartSession}
             onSelectSession={props.onSelectSession}
             onArchiveSession={props.onArchiveSession}
@@ -444,7 +442,7 @@ function WorkspaceContent({
         creating={props.creatingSession}
         error={props.sessionError}
         onCancel={props.onCancelSessionCreation}
-        onRetry={() => props.onStartSession(creatingProject.id)}
+        onRetry={() => props.onStartSession(creatingProject.id, props.creatingGroupId)}
         onCreate={(settings) => props.onCreateSession(creatingProject.id, settings)}
         onOpenAppDefaults={() => props.onOpenSettings('session-defaults')}
       />

@@ -7,13 +7,14 @@ import {
   MessageSquare,
 } from 'lucide-react'
 
-import type { NativeSessionRow } from '@pact/contracts'
+import type { NativeQuitSessionRow } from '@pact/contracts'
 
-export function nativeSessionStateLabel(state: NativeSessionRow['state']): string {
-  const labels: Record<NativeSessionRow['state'], string> = {
+export function nativeSessionStateLabel(state: NativeQuitSessionRow['state']): string {
+  const labels: Record<NativeQuitSessionRow['state'], string> = {
     preparing: 'Starting',
     running: 'Running',
     recovering: 'Recovering',
+    unsettled: 'Status unconfirmed',
     approval: 'Needs approval',
     input: 'Needs your answer',
     attention: 'Needs attention',
@@ -25,7 +26,7 @@ export function nativeSessionStateLabel(state: NativeSessionRow['state']): strin
 export function NativeSessionState({
   state,
 }: {
-  state: NativeSessionRow['state']
+  state: NativeQuitSessionRow['state']
 }): React.JSX.Element {
   const Icon =
     state === 'preparing'
@@ -36,7 +37,7 @@ export function NativeSessionState({
           ? CircleHelp
           : state === 'input'
             ? MessageSquare
-            : state === 'attention'
+            : state === 'attention' || state === 'unsettled'
               ? CircleAlert
               : CircleCheck
   return (

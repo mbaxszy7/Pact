@@ -715,6 +715,34 @@
       "when": 1794234147970,
       "tag": "0101_background-report-history",
       "breakpoints": true
+    },
+    {
+      "idx": 102,
+      "version": "6",
+      "when": 1794285511631,
+      "tag": "0102_naive_jimmy_woo",
+      "breakpoints": true
+    },
+    {
+      "idx": 103,
+      "version": "6",
+      "when": 1794304479039,
+      "tag": "0103_session_group_member_order",
+      "breakpoints": true
+    },
+    {
+      "idx": 104,
+      "version": "6",
+      "when": 1794308587353,
+      "tag": "0104_session_sidebar_hidden",
+      "breakpoints": true
+    },
+    {
+      "idx": 105,
+      "version": "6",
+      "when": 1794315022661,
+      "tag": "0105_legacy_sidebar_empty_groups",
+      "breakpoints": true
     }
   ]
 }

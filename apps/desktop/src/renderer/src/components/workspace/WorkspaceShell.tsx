@@ -36,6 +36,8 @@ export interface WorkspaceShellProps {
 
 type WorkspaceViewport = 'wide' | 'compact' | 'narrow'
 
+const wideNavigationDefaultSize = '23%'
+
 const defaultLayoutState: WorkspaceLayoutState = {
   navigationPanel: 'open',
   contextPanel: 'open',
@@ -150,6 +152,7 @@ export function WorkspaceShell({
   const [contextPanelElement, setContextPanelElement] = useState<HTMLDivElement | null>(null)
   const navigationPanelRef = usePanelRef()
   const contextPanelRef = usePanelRef()
+  const openedWideNavigationPanelRef = useRef<HTMLDivElement | null>(null)
   const lastNavigationPanelWidthRef = useRef(0)
   const lastContextPanelWidthRef = useRef(0)
   const navigationToggleRef = useRef<HTMLButtonElement>(null)
@@ -214,9 +217,26 @@ export function WorkspaceShell({
   }, [])
 
   useEffect(() => {
-    if (isNavigationVisible) navigationPanelRef.current?.expand()
-    else navigationPanelRef.current?.collapse()
-  }, [isNavigationVisible, navigationPanelRef])
+    const panel = navigationPanelRef.current
+    if (!panel) return
+    if (!isNavigationVisible) {
+      panel.collapse()
+      return
+    }
+    if (viewport === 'wide' && navigationPanelElement) {
+      const previousWidth =
+        openedWideNavigationPanelRef.current === navigationPanelElement
+          ? lastNavigationPanelWidthRef.current
+          : 0
+      openedWideNavigationPanelRef.current = navigationPanelElement
+      if (panel.isCollapsed()) {
+        // The panel may have mounted at zero before Projects arrived.
+        panel.resize(previousWidth > 1 ? previousWidth : wideNavigationDefaultSize)
+        return
+      }
+    }
+    panel.expand()
+  }, [isNavigationVisible, navigationPanelElement, navigationPanelRef, viewport])
 
   useEffect(() => {
     if (viewport !== 'wide') return
@@ -456,7 +476,7 @@ export function WorkspaceShell({
             collapsedSize="0%"
             collapsible
             data-open={isNavigationVisible}
-            defaultSize={isNavigationVisible ? '21%' : '0%'}
+            defaultSize={isNavigationVisible ? wideNavigationDefaultSize : '0%'}
             elementRef={setNavigationPanelElement}
             id="workspace-navigation"
             maxSize="30%"

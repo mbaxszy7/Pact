@@ -1,0 +1,1 @@
+ALTER TABLE `sessions` ADD `sidebar_hidden` integer DEFAULT false NOT NULL;

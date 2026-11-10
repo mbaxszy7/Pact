@@ -42,10 +42,29 @@ import type {
   RuntimeHealth,
   RuntimePreparation,
   SessionArchiveInput,
+  SessionSidebarHiddenInput,
   SessionCatalogChange,
   SessionCatalogPage,
   SessionCatalogPageInput,
   SessionCreateInput,
+  SessionPage,
+  SessionPageInput,
+  SessionGroupPage,
+  SessionGroupPageInput,
+  SessionGroupDetail,
+  SessionGroupDetailInput,
+  SessionMembership,
+  SessionMembershipInput,
+  LocateSessionNavigationInput,
+  LocatedSessionNavigation,
+  SessionCreationState,
+  SessionCreationStateInput,
+  CreateSessionGroupInput,
+  UpdateSessionGroupInput,
+  MoveSessionGroupInput,
+  DissolveSessionGroupInput,
+  SetSessionGroupInput,
+  SessionGroupMutation,
   SessionForkInput,
   SessionForkResult,
   SessionCreationPrepareInput,
@@ -232,6 +251,22 @@ export interface UtilityProcessClient {
   restoreProject(input: ProjectArchiveInput): Promise<RpcResult<ProjectCatalogState>>
   renameProject(input: ProjectNameChange): Promise<RpcResult<ProjectNameChange>>
   getSessionCatalog(input: SessionCatalogPageInput): Promise<RpcResult<SessionCatalogPage>>
+  getSessionPage(input: SessionPageInput): Promise<RpcResult<SessionPage>>
+  getSessionGroups(input: SessionGroupPageInput): Promise<RpcResult<SessionGroupPage>>
+  getSessionGroup(input: SessionGroupDetailInput): Promise<RpcResult<SessionGroupDetail>>
+  getSessionMembership(input: SessionMembershipInput): Promise<RpcResult<SessionMembership>>
+  locateSessionNavigation(
+    input: LocateSessionNavigationInput,
+  ): Promise<RpcResult<LocatedSessionNavigation>>
+  recoverSessionOrganization(): Promise<RpcResult<{ ready: true }>>
+  getSessionCreationState(
+    input: SessionCreationStateInput,
+  ): Promise<RpcResult<SessionCreationState>>
+  createSessionGroup(input: CreateSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
+  updateSessionGroup(input: UpdateSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
+  moveSessionGroup(input: MoveSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
+  dissolveSessionGroup(input: DissolveSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
+  setSessionGroup(input: SetSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
   prepareSessionCreation(
     input: SessionCreationPrepareInput,
   ): Promise<RpcResult<DefaultSessionSettingsEditorState>>
@@ -240,6 +275,9 @@ export interface UtilityProcessClient {
   markSessionRead(input: SessionMarkReadInput): Promise<RpcResult<SessionCatalogChange>>
   archiveSession(input: SessionArchiveInput): Promise<RpcResult<SessionCatalogChange>>
   restoreSession(input: SessionArchiveInput): Promise<RpcResult<SessionCatalogChange>>
+  setSessionSidebarHidden(
+    input: SessionSidebarHiddenInput,
+  ): Promise<RpcResult<SessionCatalogChange>>
   getSessionSettings(input: SessionSettingsInput): Promise<RpcResult<SessionSettingsEditorState>>
   saveSessionSettings(
     input: SessionSettingsSaveInput,
@@ -386,10 +424,28 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     | undefined
   private terminatingChild: UtilityProcess | undefined
   private startupFailure: import('@pact/contracts').RuntimeStartupFailure | undefined
+  private restartOptions: UtilityProcessStartOptions | undefined
+  private sessionOrganizationRecovery:
+    | { kind: 'creation'; projectId: string; sessionId: string }
+    | {
+        kind: 'group'
+        projectId: string
+        groupId?: string | undefined
+        sessionId?: string | undefined
+      }
+    | undefined
   private startupFailureCallback: UtilityProcessStartOptions['onStartupFailed']
   private diagnostics: UtilityProcessStartOptions['diagnostics']
   private traffic: LogicalIpcTrafficCollector | undefined
   private workerTraffic: LogicalIpcWorkerTraffic | undefined
+  private navigationRead:
+    | {
+        child: UtilityProcess
+        id: string
+        type: UtilityResponse['type']
+        barrierIds: string[]
+      }
+    | undefined
   private readonly inFlightRequests = new Map<string, InFlightRequest>()
   private readonly conversationListeners = new Set<
     (patch: ConversationPatch, progress: boolean) => void
@@ -535,6 +591,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       throw new TypeError('Workspace storage must be an absolute private path.')
     if (options.workspaceStorageRoot) workspaceStorageRootSchema.parse(options.workspaceStorageRoot)
 
+    this.restartOptions = options
     this.diagnostics = options.diagnostics
     this.shutdownTask = undefined
     this.terminatingChild = undefined
@@ -594,6 +651,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         level: this.shutdownTask ? 'info' : 'error',
         exitCode: code,
       })
+      if (this.navigationRead?.child === startedChild) this.navigationRead = undefined
       this.cancelDirectoryRequests(startedChild)
       this.relayCrypto.cancelSource(startedChild)
       if (this.child !== startedChild) return
@@ -664,6 +722,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     payload: UtilityRequestPayload,
     expectedResponseType: UtilityResponse['type'],
     timeoutMs = REQUEST_TIMEOUT_MS,
+    navigationBarrierFor?: NonNullable<ElectronUtilityProcessClient['navigationRead']>,
   ): Promise<UtilityTransportResult> {
     const startupError = this.startupFailureError()
     if (startupError) return Promise.resolve({ kind: 'not-sent', error: startupError })
@@ -681,6 +740,43 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       return Promise.resolve({
         kind: 'not-sent',
         error: ElectronUtilityProcessClient.unavailable('Utility runtime is not running.'),
+      })
+    }
+
+    const navigationRead =
+      payload.type === 'session-page.get.request' ||
+      payload.type === 'session-groups.get.request' ||
+      payload.type === 'session-navigation.locate.request'
+    const prior = this.navigationRead
+    if (navigationRead && prior) {
+      const busy: UtilityTransportResult = {
+        kind: 'not-sent',
+        error: { code: 'CONFLICT', message: 'The previous navigation read is still settling.' },
+      }
+      if (
+        this.inFlightRequests.has(prior.id) ||
+        prior.barrierIds.length >= 2 ||
+        prior.barrierIds.some((id) => this.inFlightRequests.has(id))
+      )
+        return Promise.resolve(busy)
+      // Navigation reads and this health reply execute synchronously on the same
+      // Utility message port. The reply proves that an earlier lost read settled.
+      const deadline = performance.now() + timeoutMs
+      return this.request(
+        { type: 'runtime.health.request' },
+        'runtime.health.response',
+        Math.min(timeoutMs, REQUEST_TIMEOUT_MS),
+        prior,
+      ).then((settlement) => {
+        const remaining = deadline - performance.now()
+        if (
+          settlement.kind !== 'response' ||
+          this.child !== target ||
+          this.navigationRead === prior ||
+          remaining <= 0
+        )
+          return busy
+        return this.request(payload, expectedResponseType, remaining)
       })
     }
 
@@ -712,6 +808,14 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
 
       try {
         const packet = { ...payload, requestId }
+        if (navigationRead)
+          this.navigationRead = {
+            child: target,
+            id: requestId,
+            type: expectedResponseType,
+            barrierIds: [],
+          }
+        if (navigationBarrierFor) navigationBarrierFor.barrierIds.push(requestId)
         target.postMessage(packet)
         request.sent = true
         const traffic = this.traffic
@@ -733,6 +837,9 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
           }
         }
       } catch {
+        if (this.navigationRead?.id === requestId) this.navigationRead = undefined
+        if (navigationBarrierFor?.barrierIds.at(-1) === requestId)
+          navigationBarrierFor.barrierIds.pop()
         this.traffic?.invalidate('transport_error')
         this.finishRequest(requestId, {
           kind: 'not-sent',
@@ -1139,6 +1246,310 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     )
   }
 
+  async getSessionPage(input: SessionPageInput): Promise<RpcResult<SessionPage>> {
+    const result = await this.request(
+      { type: 'session-page.get.request', input },
+      'session-page.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    return result.kind !== 'response'
+      ? { ok: false, error: result.error }
+      : result.response.type === 'session-page.response'
+        ? result.response.result
+        : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected Session page.' } }
+  }
+
+  async getSessionGroups(input: SessionGroupPageInput): Promise<RpcResult<SessionGroupPage>> {
+    const result = await this.request(
+      { type: 'session-groups.get.request', input },
+      'session-groups.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    return result.kind !== 'response'
+      ? { ok: false, error: result.error }
+      : result.response.type === 'session-groups.response'
+        ? result.response.result
+        : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected Session group page.' } }
+  }
+
+  async getSessionGroup(input: SessionGroupDetailInput): Promise<RpcResult<SessionGroupDetail>> {
+    const result = await this.request(
+      { type: 'session-group.get.request', input },
+      'session-group.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    if (result.response.type === 'session-group.response') {
+      const reply = result.response.result
+      if (!reply.ok) return reply
+      if (
+        !reply.value.exists ||
+        (reply.value.group.id === input.groupId && reply.value.group.projectId === input.projectId)
+      ) {
+        const pending = this.sessionOrganizationRecovery
+        if (
+          pending?.kind === 'group' &&
+          pending.projectId === input.projectId &&
+          pending.groupId === input.groupId &&
+          (!pending.sessionId || !reply.value.exists)
+        )
+          this.sessionOrganizationRecovery = undefined
+        return reply
+      }
+    }
+    return {
+      ok: false,
+      error: { code: 'INTERNAL', message: 'The readback identity could not be verified.' },
+    }
+  }
+
+  async getSessionMembership(input: SessionMembershipInput): Promise<RpcResult<SessionMembership>> {
+    const result = await this.request(
+      { type: 'session-membership.get.request', input },
+      'session-membership.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    if (result.response.type === 'session-membership.response') {
+      const reply = result.response.result
+      if (!reply.ok) return reply
+      if (reply.value.sessionId === input.sessionId && reply.value.projectId === input.projectId) {
+        const pending = this.sessionOrganizationRecovery
+        if (
+          pending?.kind === 'group' &&
+          pending.projectId === input.projectId &&
+          pending.sessionId === input.sessionId
+        )
+          this.sessionOrganizationRecovery = undefined
+        return reply
+      }
+    }
+    return {
+      ok: false,
+      error: { code: 'INTERNAL', message: 'The readback identity could not be verified.' },
+    }
+  }
+
+  async locateSessionNavigation(
+    input: LocateSessionNavigationInput,
+  ): Promise<RpcResult<LocatedSessionNavigation>> {
+    const result = await this.request(
+      { type: 'session-navigation.locate.request', input },
+      'session-navigation.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    return result.kind !== 'response'
+      ? { ok: false, error: result.error }
+      : result.response.type === 'session-navigation.response'
+        ? result.response.result
+        : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected Session location.' } }
+  }
+
+  async recoverSessionOrganization(): Promise<RpcResult<{ ready: true }>> {
+    if (this.child) return this.waitUntilReady()
+    const options = this.restartOptions
+    if (!this.sessionOrganizationRecovery || this.shutdownTask || !options) {
+      return {
+        ok: false,
+        error: ElectronUtilityProcessClient.unavailable(
+          'Restart Pact to recover the local runtime.',
+        ),
+      }
+    }
+    // The exit handler alone clears the child. The new Utility still has to
+    // acquire the writer reservation and finish ordinary startup recovery.
+    this.sessionOrganizationRecovery = undefined
+    try {
+      this.start(options)
+    } catch {
+      return {
+        ok: false,
+        error: ElectronUtilityProcessClient.unavailable(
+          'Pact could not recover the local runtime.',
+        ),
+      }
+    }
+    return this.waitUntilReady()
+  }
+
+  async getSessionCreationState(
+    input: SessionCreationStateInput,
+  ): Promise<RpcResult<SessionCreationState>> {
+    const result = await this.request(
+      { type: 'session-creation.state.request', input },
+      'session-creation-state.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    if (result.response.type === 'session-creation-state.response') {
+      const reply = result.response.result
+      if (!reply.ok) return reply
+      if (
+        reply.value.state !== 'present' ||
+        (reply.value.session.id === input.sessionId &&
+          reply.value.session.projectId === input.projectId &&
+          reply.value.groupId === (reply.value.session.groupId ?? null))
+      ) {
+        const pending = this.sessionOrganizationRecovery
+        if (
+          reply.value.state !== 'pending' &&
+          pending?.kind === 'creation' &&
+          pending.projectId === input.projectId &&
+          pending.sessionId === input.sessionId
+        )
+          this.sessionOrganizationRecovery = undefined
+        return reply
+      }
+    }
+    return {
+      ok: false,
+      error: { code: 'INTERNAL', message: 'The readback identity could not be verified.' },
+    }
+  }
+
+  async createSessionGroup(
+    input: CreateSessionGroupInput,
+  ): Promise<RpcResult<SessionGroupMutation>> {
+    return this.sessionGroupMutation({ type: 'session-group.create.request', input })
+  }
+
+  async updateSessionGroup(
+    input: UpdateSessionGroupInput,
+  ): Promise<RpcResult<SessionGroupMutation>> {
+    return this.sessionGroupMutation({ type: 'session-group.update.request', input })
+  }
+
+  async moveSessionGroup(input: MoveSessionGroupInput): Promise<RpcResult<SessionGroupMutation>> {
+    return this.sessionGroupMutation({ type: 'session-group.move.request', input })
+  }
+
+  async dissolveSessionGroup(
+    input: DissolveSessionGroupInput,
+  ): Promise<RpcResult<SessionGroupMutation>> {
+    return this.sessionGroupMutation({ type: 'session-group.dissolve.request', input })
+  }
+
+  async setSessionGroup(input: SetSessionGroupInput): Promise<RpcResult<SessionGroupMutation>> {
+    return this.sessionGroupMutation({ type: 'session-group.set.request', input })
+  }
+
+  private async sessionGroupMutation(
+    request: Extract<
+      UtilityRequestPayload,
+      {
+        type:
+          | 'session-group.create.request'
+          | 'session-group.update.request'
+          | 'session-group.move.request'
+          | 'session-group.dissolve.request'
+          | 'session-group.set.request'
+      }
+    >,
+  ): Promise<RpcResult<SessionGroupMutation>> {
+    const armRecovery = (): void => {
+      const { input } = request
+      this.sessionOrganizationRecovery = {
+        kind: 'group',
+        projectId: input.projectId,
+        groupId: input.groupId ?? undefined,
+        sessionId: 'sessionId' in input ? input.sessionId : undefined,
+      }
+    }
+    const result = await this.request(
+      request,
+      'session-group-change.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind === 'not-sent') return { ok: false, error: result.error }
+    if (result.kind === 'unknown-delivery') {
+      armRecovery()
+      return { ok: false, error: { code: 'UNCERTAIN', message: result.error.message } }
+    }
+    if (result.response.type === 'session-group-change.response') {
+      const reply = result.response.result
+      if (!reply.ok) {
+        if (reply.error.code === 'UNCERTAIN') armRecovery()
+        return reply
+      }
+      const { input } = request
+      const { group, session, dissolvedGroupId, sourceScope, targetScope, revision } = reply.value
+      const matchesGroup = group?.id === input.groupId && group?.projectId === input.projectId
+      const matchesTarget =
+        targetScope?.kind === 'group'
+          ? targetScope.groupId === input.groupId
+          : targetScope?.kind === 'ungrouped' && input.groupId === null
+      const matchesSession =
+        session?.projectId === input.projectId &&
+        (session.groupId ?? null) === input.groupId &&
+        Boolean(sourceScope) &&
+        matchesTarget
+      const changed = revision === input.expectedRevision + 1
+      const unchanged = revision === input.expectedRevision
+      const onlyGroup =
+        matchesGroup && !dissolvedGroupId && !session && !sourceScope && !targetScope
+      let matches: boolean
+      switch (request.type) {
+        case 'session-group.create.request':
+          matches =
+            changed &&
+            !dissolvedGroupId &&
+            matchesGroup &&
+            (request.input.sessionId
+              ? matchesSession &&
+                session?.id === request.input.sessionId &&
+                sourceScope?.kind === 'ungrouped'
+              : onlyGroup)
+          break
+        case 'session-group.update.request':
+          matches =
+            changed &&
+            onlyGroup &&
+            (request.input.name === undefined || group?.name === request.input.name) &&
+            (request.input.color === undefined || group?.color === request.input.color) &&
+            (request.input.collapsed === undefined || group?.collapsed === request.input.collapsed)
+          break
+        case 'session-group.move.request':
+          matches = (changed || unchanged) && onlyGroup
+          break
+        case 'session-group.dissolve.request':
+          matches =
+            changed &&
+            !group &&
+            !session &&
+            dissolvedGroupId === input.groupId &&
+            sourceScope?.kind === 'group' &&
+            sourceScope.groupId === input.groupId &&
+            targetScope?.kind === 'ungrouped'
+          break
+        case 'session-group.set.request': {
+          const sameScope =
+            sourceScope?.kind === 'group'
+              ? sourceScope.groupId === input.groupId
+              : sourceScope?.kind === 'ungrouped' && input.groupId === null
+          const matchesDissolve =
+            dissolvedGroupId === undefined ||
+            (changed &&
+              !sameScope &&
+              sourceScope?.kind === 'group' &&
+              dissolvedGroupId === sourceScope.groupId)
+          matches =
+            !group &&
+            matchesDissolve &&
+            matchesSession &&
+            session?.id === request.input.sessionId &&
+            (sameScope ? unchanged || (changed && Boolean(request.input.placement)) : changed)
+          break
+        }
+      }
+      if (matches) return reply
+    }
+    armRecovery()
+    return {
+      ok: false,
+      error: { code: 'UNCERTAIN', message: 'The Session group receipt could not be verified.' },
+    }
+  }
+
   async prepareSessionCreation(
     input: SessionCreationPrepareInput,
   ): Promise<RpcResult<DefaultSessionSettingsEditorState>> {
@@ -1152,13 +1563,46 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   }
 
   async createSession(input: SessionCreateInput): Promise<RpcResult<SessionCatalogChange>> {
-    return ElectronUtilityProcessClient.toSessionCatalogChangeResult(
-      await this.request(
-        { type: 'session.create.request', input },
-        'session-catalog.response',
-        DEFAULT_SESSION_SETTINGS_TIMEOUT_MS,
-      ),
+    const armRecovery = (): void => {
+      this.sessionOrganizationRecovery = {
+        kind: 'creation',
+        projectId: input.projectId,
+        sessionId: input.sessionId,
+      }
+    }
+    const result = await this.request(
+      { type: 'session.create.request', input },
+      'session-catalog.response',
+      DEFAULT_SESSION_SETTINGS_TIMEOUT_MS,
     )
+    if (result.kind === 'not-sent') return { ok: false, error: result.error }
+    if (result.kind === 'unknown-delivery') {
+      armRecovery()
+      return { ok: false, error: { code: 'UNCERTAIN', message: result.error.message } }
+    }
+    if (result.response.type === 'session-catalog.response') {
+      const reply = result.response.result
+      if (!reply.ok) {
+        if (reply.error.code === 'UNCERTAIN') armRecovery()
+        return reply
+      }
+      if (reply.value.kind === 'change') {
+        const { session, groupRevision } = reply.value
+        if (
+          session.id === input.sessionId &&
+          session.projectId === input.projectId &&
+          (session.groupId ?? null) === (input.groupId ?? null) &&
+          (input.expectedGroupRevision === undefined ||
+            groupRevision === input.expectedGroupRevision + 1)
+        )
+          return { ok: true, value: reply.value }
+      }
+    }
+    armRecovery()
+    return {
+      ok: false,
+      error: { code: 'UNCERTAIN', message: 'The Session creation receipt could not be verified.' },
+    }
   }
 
   async renameSession(input: SessionRenameInput): Promise<RpcResult<SessionCatalogChange>> {
@@ -1206,6 +1650,19 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         WORKSPACE_OPERATION_TIMEOUT_MS,
       ),
     )
+  }
+
+  async setSessionSidebarHidden(
+    input: SessionSidebarHiddenInput,
+  ): Promise<RpcResult<SessionCatalogChange>> {
+    const result = await this.request(
+      { type: 'session-sidebar-hidden.set.request', input },
+      'session-catalog.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind === 'unknown-delivery')
+      return { ok: false, error: { code: 'UNCERTAIN', message: result.error.message } }
+    return ElectronUtilityProcessClient.toSessionCatalogChangeResult(result)
   }
 
   async getSessionSettings(
@@ -2219,6 +2676,15 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       message,
     )
     if (this.child !== source) return
+
+    const navigationRead = this.navigationRead
+    if (
+      navigationRead?.child === source &&
+      ((navigationRead.id === parsed.data.requestId && navigationRead.type === parsed.data.type) ||
+        (navigationRead.barrierIds.includes(parsed.data.requestId) &&
+          parsed.data.type === 'runtime.health.response'))
+    )
+      this.navigationRead = undefined
 
     const request = this.inFlightRequests.get(parsed.data.requestId)
     if (!request || request.child !== source || request.expectedResponseType !== parsed.data.type)

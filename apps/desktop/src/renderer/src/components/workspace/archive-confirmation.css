@@ -1,5 +1,5 @@
 @layer components {
-  .pact-archive-confirmation {
+  :is(.pact-archive-confirmation, .pact-dissolve-confirmation) {
     width: min(32rem, calc(100vw - 2rem));
     max-height: calc(100vh - 3rem);
     margin: auto;
@@ -9,10 +9,10 @@
     overflow: auto;
     overscroll-behavior: contain;
   }
-  .pact-archive-confirmation::backdrop {
+  :is(.pact-archive-confirmation, .pact-dissolve-confirmation)::backdrop {
     background: color-mix(in srgb, var(--pact-text-primary) 22%, transparent);
   }
-  .pact-archive-confirmation[open] {
+  :is(.pact-archive-confirmation, .pact-dissolve-confirmation)[open] {
     display: flex;
     flex-direction: column;
   }
@@ -74,6 +74,7 @@
   }
   .pact-archive-actions {
     display: flex;
+    flex-wrap: wrap;
     flex-shrink: 0;
     align-items: center;
     justify-content: flex-end;
@@ -82,7 +83,7 @@
     border-top: 1px solid var(--pact-border);
   }
   @media (prefers-reduced-motion: no-preference) {
-    .pact-archive-confirmation:open {
+    :is(.pact-archive-confirmation, .pact-dissolve-confirmation):open {
       animation: pact-archive-enter 160ms cubic-bezier(0.16, 1, 0.3, 1);
     }
   }
@@ -93,10 +94,10 @@
     }
   }
   @media (forced-colors: active) {
-    .pact-archive-confirmation {
+    :is(.pact-archive-confirmation, .pact-dissolve-confirmation) {
       outline: 1px solid CanvasText;
     }
-    .pact-archive-confirmation::backdrop {
+    :is(.pact-archive-confirmation, .pact-dissolve-confirmation)::backdrop {
       background: Canvas;
       opacity: 0.7;
     }

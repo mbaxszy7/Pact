@@ -1,9 +1,8 @@
-import { randomUUID } from 'node:crypto'
-
 import type {
   DefaultSessionSettingsEditorState,
   RpcResult,
   SessionArchiveInput,
+  SessionSidebarHiddenInput,
   SessionCatalogChange,
   SessionCatalogPage,
   SessionCatalogPageInput,
@@ -19,6 +18,24 @@ import type {
   NativeSessionOpenInput,
   NativeJumpListSuppressionInput,
   NativeSessionRow,
+  SessionPage,
+  SessionPageInput,
+  SessionGroupPage,
+  SessionGroupPageInput,
+  SessionGroupDetail,
+  SessionGroupDetailInput,
+  SessionMembership,
+  SessionMembershipInput,
+  LocateSessionNavigationInput,
+  LocatedSessionNavigation,
+  SessionCreationState,
+  SessionCreationStateInput,
+  CreateSessionGroupInput,
+  UpdateSessionGroupInput,
+  MoveSessionGroupInput,
+  DissolveSessionGroupInput,
+  SetSessionGroupInput,
+  SessionGroupMutation,
 } from '@pact/contracts'
 
 import {
@@ -26,11 +43,14 @@ import {
   ProjectCatalogRepository,
   SessionRepository,
   StaleCatalogCursorError,
+  StaleSessionGroupError,
 } from '@pact/persistence'
 
 import { DefaultSessionSettings } from '../default-session-settings/default-session-settings'
 
 export class SessionWorkspace {
+  private pendingCreation: SessionCreationStateInput | undefined
+
   constructor(
     private readonly projects: ProjectCatalogRepository,
     private readonly sessions: SessionRepository,
@@ -97,6 +117,142 @@ export class SessionWorkspace {
     }
   }
 
+  loadPage(input: SessionPageInput): RpcResult<SessionPage> {
+    try {
+      return { ok: true, value: this.sessions.readSessionPage(input) }
+    } catch (error) {
+      if (error instanceof StaleCatalogCursorError) {
+        return { ok: false, error: { code: 'CONFLICT', message: error.message } }
+      }
+      if (error instanceof OversizedCatalogSessionError) {
+        return { ok: false, error: { code: 'VALIDATION', message: error.message } }
+      }
+      return { ok: false, error: { code: 'INTERNAL', message: 'Sessions could not be loaded.' } }
+    }
+  }
+
+  loadGroups(input: SessionGroupPageInput): RpcResult<SessionGroupPage> {
+    try {
+      return { ok: true, value: this.sessions.readSessionGroups(input) }
+    } catch (error) {
+      if (error instanceof StaleSessionGroupError) {
+        return { ok: false, error: { code: 'CONFLICT', message: error.message } }
+      }
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'Session groups could not be loaded.' },
+      }
+    }
+  }
+
+  loadGroup(input: SessionGroupDetailInput): RpcResult<SessionGroupDetail> {
+    try {
+      return { ok: true, value: this.sessions.readSessionGroup(input) }
+    } catch {
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'The Session group could not be loaded.' },
+      }
+    }
+  }
+
+  loadMembership(input: SessionMembershipInput): RpcResult<SessionMembership> {
+    try {
+      return { ok: true, value: this.sessions.readSessionMembership(input) }
+    } catch {
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'Session membership could not be loaded.' },
+      }
+    }
+  }
+
+  locate(input: LocateSessionNavigationInput): RpcResult<LocatedSessionNavigation> {
+    try {
+      return { ok: true, value: this.sessions.locateSessionNavigation(input) }
+    } catch {
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'The Session could not be located.' },
+      }
+    }
+  }
+
+  loadCreationState(input: SessionCreationStateInput): RpcResult<SessionCreationState> {
+    try {
+      const current = this.sessions.readSessionCreationState(input)
+      return {
+        ok: true,
+        value:
+          this.pendingCreation?.sessionId === input.sessionId &&
+          this.pendingCreation.projectId === input.projectId
+            ? {
+                state: 'pending',
+                revision: current.revision,
+                catalogRevision: current.catalogRevision,
+              }
+            : current,
+      }
+    } catch {
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'The Session creation state could not be loaded.' },
+      }
+    }
+  }
+
+  createGroup(input: CreateSessionGroupInput): RpcResult<SessionGroupMutation> {
+    try {
+      return { ok: true, value: this.sessions.createSessionGroup(input) }
+    } catch (error) {
+      return SessionWorkspace.groupMutationFailure(error, 'The Session group could not be created.')
+    } finally {
+      this.nativeMetadataChanged()
+    }
+  }
+
+  updateGroup(input: UpdateSessionGroupInput): RpcResult<SessionGroupMutation> {
+    try {
+      return { ok: true, value: this.sessions.updateSessionGroup(input) }
+    } catch (error) {
+      return SessionWorkspace.groupMutationFailure(error, 'The Session group could not be updated.')
+    }
+  }
+
+  moveGroup(input: MoveSessionGroupInput): RpcResult<SessionGroupMutation> {
+    try {
+      return { ok: true, value: this.sessions.moveSessionGroup(input) }
+    } catch (error) {
+      return SessionWorkspace.groupMutationFailure(error, 'The Session group could not be moved.')
+    }
+  }
+
+  dissolveGroup(input: DissolveSessionGroupInput): RpcResult<SessionGroupMutation> {
+    try {
+      return { ok: true, value: this.sessions.dissolveSessionGroup(input) }
+    } catch (error) {
+      return SessionWorkspace.groupMutationFailure(
+        error,
+        'The Session group could not be dissolved.',
+      )
+    } finally {
+      this.nativeMetadataChanged()
+    }
+  }
+
+  setGroup(input: SetSessionGroupInput): RpcResult<SessionGroupMutation> {
+    try {
+      return { ok: true, value: this.sessions.setSessionGroup(input) }
+    } catch (error) {
+      return SessionWorkspace.groupMutationFailure(
+        error,
+        'The Session could not be moved to that group.',
+      )
+    } finally {
+      this.nativeMetadataChanged()
+    }
+  }
+
   async prepareCreation(projectId: string): Promise<RpcResult<DefaultSessionSettingsEditorState>> {
     const project = this.projects.find(projectId)
     if (!project) {
@@ -121,30 +277,47 @@ export class SessionWorkspace {
     if (!project) {
       return { ok: false, error: { code: 'VALIDATION', message: 'Project no longer exists.' } }
     }
-
-    const validation = await this.defaultSettings.validateSettings(
-      input.settings,
-      project.directoryPath,
-    )
-    if (!validation.ok) return validation
-
+    if (this.pendingCreation !== undefined) {
+      return {
+        ok: false,
+        error: { code: 'CONFLICT', message: 'Another Session is still being created.' },
+      }
+    }
+    this.pendingCreation = { sessionId: input.sessionId, projectId: input.projectId }
     try {
+      if (this.sessions.find(input.sessionId)) {
+        return {
+          ok: false,
+          error: {
+            code: 'CONFLICT',
+            message: 'This Session already exists. Read its current state before retrying.',
+          },
+        }
+      }
+      const validation = await this.defaultSettings.validateSettings(
+        input.settings,
+        project.directoryPath,
+      )
+      if (!validation.ok) return validation
       const createdAt = new Date().toISOString()
       return {
         ok: true,
         value: this.sessions.create(
           {
-            id: randomUUID(),
+            id: input.sessionId,
             projectId: input.projectId,
             title: 'New session',
             createdAt,
           },
           input.settings,
+          input.groupId ?? null,
+          input.expectedGroupRevision,
         ),
       }
     } catch (error) {
       return SessionWorkspace.catalogMutationFailure(error, 'Session could not be created.')
     } finally {
+      this.pendingCreation = undefined
       this.nativeMetadataChanged()
     }
   }
@@ -204,6 +377,17 @@ export class SessionWorkspace {
       return SessionWorkspace.catalogMutationFailure(error, 'Session could not be restored.')
     } finally {
       this.nativeMetadataChanged()
+    }
+  }
+
+  setSidebarHidden(input: SessionSidebarHiddenInput): RpcResult<SessionCatalogChange> {
+    try {
+      return { ok: true, value: this.sessions.setSidebarHidden(input) }
+    } catch (error) {
+      return SessionWorkspace.catalogMutationFailure(
+        error,
+        'Sidebar visibility could not be saved.',
+      )
     }
   }
 
@@ -311,13 +495,40 @@ export class SessionWorkspace {
   private static catalogMutationFailure(
     error: unknown,
     fallback: string,
-  ): { ok: false; error: { code: 'INTERNAL' | 'UNCERTAIN'; message: string } } {
+  ): {
+    ok: false
+    error: { code: 'CONFLICT' | 'INTERNAL' | 'UNCERTAIN'; message: string }
+  } {
+    if (error instanceof StaleSessionGroupError) {
+      return { ok: false, error: { code: 'CONFLICT', message: error.message } }
+    }
     return error instanceof OversizedCatalogSessionError
       ? {
           ok: false,
           error: {
             code: 'UNCERTAIN',
             message: `${error.message} The change may have been saved; refresh the Catalog before retrying.`,
+          },
+        }
+      : { ok: false, error: { code: 'INTERNAL', message: fallback } }
+  }
+
+  private static groupMutationFailure(
+    error: unknown,
+    fallback: string,
+  ): {
+    ok: false
+    error: { code: 'CONFLICT' | 'INTERNAL' | 'UNCERTAIN'; message: string }
+  } {
+    if (error instanceof StaleSessionGroupError) {
+      return { ok: false, error: { code: 'CONFLICT', message: error.message } }
+    }
+    return error instanceof OversizedCatalogSessionError
+      ? {
+          ok: false,
+          error: {
+            code: 'UNCERTAIN',
+            message: `${error.message} The change may have been saved; reload before retrying.`,
           },
         }
       : { ok: false, error: { code: 'INTERNAL', message: fallback } }

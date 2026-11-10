@@ -62,6 +62,7 @@ import type {
   NativeSessionRow,
   NativeQuitOperationInput,
   NativeQuitPreparation,
+  NativeQuitSessionRow,
   DecisionInput,
   DecisionEvaluationOutcome,
   RelayDecisionMaterial,
@@ -1562,15 +1563,16 @@ export class Conversation {
         Number(otherPreparationActive && identities.size === 0 && unsettled.count === 0)
       const listed = [...new Set([...identities, ...unsettled.sessionIds])]
         .slice(0, 5)
-        .flatMap((id) => {
+        .flatMap<NativeQuitSessionRow>((id) => {
           const row = this.sessions.findNativeRow(id)
           return row
             ? [
                 {
                   ...row,
                   state:
+                    rows.attention.find((item) => item.sessionId === id)?.state ??
                     rows.running.find((item) => item.sessionId === id)?.state ??
-                    ('recovering' as const),
+                    (this.nativeLogicalPreparation(id) ? 'preparing' : 'unsettled'),
                 },
               ]
             : []

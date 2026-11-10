@@ -600,6 +600,47 @@ describe('Workspace archive through durable repository interfaces', () => {
     expect(start(f).sessionId).toBe(f.sessionId)
   })
 
+  it.each(['stopping', 'unresolved'] as const)(
+    'keeps Project navigation readable during a %s archive while fencing group writes',
+    async (state) => {
+      const f = await fixture()
+      const repo = f.db.sessionRepository
+      const groupId = randomUUID()
+      const group = repo.createSessionGroup({
+        projectId: f.projectId,
+        groupId,
+        expectedRevision: 0,
+        name: 'Planning',
+        color: 'blue',
+        sessionId: f.sessionId,
+      })
+      const p = preview(f, { kind: 'project', projectId: f.projectId })
+      claim(f, p)
+      if (state === 'unresolved') f.archives.fail(p.operationId, [], 'Stop not confirmed', true)
+      expect(f.archives.read(p.operationId)?.state).toBe(state)
+      expect(repo.readSessionGroups({ projectId: f.projectId }).groups).toMatchObject([
+        { id: groupId },
+      ])
+      expect(
+        repo.readSessionPage({ projectId: f.projectId, scope: { kind: 'ungrouped' } }).sessions,
+      ).toMatchObject([{ id: f.siblingId }])
+      expect(
+        repo.readSessionPage({ projectId: f.projectId, scope: { kind: 'group', groupId } })
+          .sessions,
+      ).toMatchObject([{ id: f.sessionId }])
+      expect(
+        repo.locateSessionNavigation({ projectId: f.projectId, sessionId: f.sessionId }),
+      ).toMatchObject({ membership: { exists: true, groupId }, sessions: [{ id: f.sessionId }] })
+      expect(() =>
+        repo.dissolveSessionGroup({
+          projectId: f.projectId,
+          groupId,
+          expectedRevision: group.revision,
+        }),
+      ).toThrow(WorkspaceArchiveConflictError)
+    },
+  )
+
   it('leaves a partially failed Project unarchived and preserves individual outcomes', async () => {
     const f = await fixture()
     const p = preview(f, { kind: 'project', projectId: f.projectId }, [

@@ -334,13 +334,16 @@ it.each([true, false])(
       createdAt: initial.createdAt,
     }
     let stored = initial
-    const getSessionCatalog = vi.fn<DesktopBridge['getSessionCatalog']>(async () => ({
+    const getSessionPage = vi.fn<DesktopBridge['getSessionPage']>(async () => ({
       ok: true,
       value: {
         kind: 'page',
         projectId: project.id,
+        scope: { kind: 'ungrouped' },
+        groupRevision: 0,
         revision: stored.settingsRevision,
         sessions: [stored],
+        hasGroups: false,
       },
     }))
     const saveSessionPermission = vi.fn<DesktopBridge['saveSessionPermission']>(async () => {
@@ -376,11 +379,12 @@ it.each([true, false])(
         : { ok: false, error: { code: 'TIMEOUT', message: 'Readback unavailable' } },
     )
     const notice = vi.fn<MenuProps['onNotice']>()
-    vi.stubGlobal('pact', { getSessionCatalog, saveSessionPermission, getSessionSettings })
+    const onUtilityRecovered = vi.fn<() => void>()
+    vi.stubGlobal('pact', { getSessionPage, saveSessionPermission, getSessionSettings })
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const projects = [project]
     function Connected() {
-      const owner = useSessionWorkspace(true, projects)
+      const owner = useSessionWorkspace(true, projects, onUtilityRecovered)
       const current = owner.catalog?.sessions[0]
       return current ? (
         <>
@@ -418,7 +422,10 @@ it.each([true, false])(
           : 'Codex permissions for the next task: Native settings',
       }),
     ).toBeDefined()
-    expect(getSessionCatalog).toHaveBeenCalledTimes(1)
+    expect(getSessionPage).toHaveBeenCalledExactlyOnceWith({
+      projectId: project.id,
+      scope: { kind: 'ungrouped' },
+    })
     expect(getSessionSettings).toHaveBeenCalledExactlyOnceWith(initial.id)
     expect(screen.getByLabelText('Session activity').textContent).toBe('idle:idle')
     expect(saveSessionPermission).toHaveBeenCalledTimes(1)

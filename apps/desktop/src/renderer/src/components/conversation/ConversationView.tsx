@@ -2959,12 +2959,13 @@ export function ConversationView({
         <span>{run.workspaceRecordingUnavailableReason}</span>
       </p>
     ) : null
-  const renderSavedRunResult = (run: AgentRun): React.JSX.Element | null =>
-    run.responseMessageId ? (
+  const renderSavedRunResult = (run: AgentRun): React.JSX.Element | null => {
+    const id = run.responseMessageId
+    if (!id || rows.some((row) => row.message?.id === id)) return null
+    return (
       <button
         type="button"
         onClick={() => {
-          const id = run.responseMessageId!
           cancelPrepend()
           stickToBottomRef.current = false
           scrollIntentRef.current = undefined
@@ -2976,7 +2977,8 @@ export function ConversationView({
       >
         View response
       </button>
-    ) : null
+    )
+  }
   const renderChangeGroup = (run: AgentRun): React.JSX.Element => {
     const group = history.window?.runArtifacts?.find((item) => item.latestRunId === run.id)
     const previousCount = Math.max(0, (group?.totalCount ?? 1) - 1)
@@ -4243,23 +4245,16 @@ export function ConversationView({
                 ) : null}
                 {queue?.returnedInput &&
                 queueActions &&
-                (composerReturnedInputOperationId !== queue.returnedInput.operationId ||
-                  (!composer && !composerImages.length && !draftComments.length)) ? (
-                  <div
-                    className="flex min-h-8 flex-wrap items-center gap-2 px-2 text-caption text-secondary"
-                    role="status"
+                composerReturnedInputOperationId !== queue.returnedInput.operationId ? (
+                  <button
+                    type="button"
+                    className="min-h-7 cursor-pointer self-start rounded-control px-2 text-caption font-medium text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
+                    disabled={composerDisabled || sending || stopping || queueActions.pending}
+                    title="Replace the current draft with the returned message"
+                    onClick={() => void returnQueueMessageToComposer(true)}
                   >
-                    <span>Returned message available</span>
-                    <button
-                      type="button"
-                      className="min-h-7 rounded-control px-2 font-medium text-primary hover:bg-surface-muted disabled:opacity-40"
-                      disabled={composerDisabled || sending || stopping || queueActions.pending}
-                      title="Replace the current draft with the returned message"
-                      onClick={() => void returnQueueMessageToComposer(true)}
-                    >
-                      {history.restoringInput ? 'Restoring message…' : 'Restore returned message'}
-                    </button>
-                  </div>
+                    {history.restoringInput ? 'Restoring…' : 'Restore returned message'}
+                  </button>
                 ) : null}
                 <div
                   ref={composerBoxRef}

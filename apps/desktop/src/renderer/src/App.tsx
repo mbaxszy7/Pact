@@ -33,6 +33,7 @@ import type { ProjectFileTarget } from './components/conversation/MessageMarkdow
 import type { SkillDocumentPanelState } from './components/conversation/SkillDocumentPanel'
 import type { ProjectFilePanelState } from './components/project-file/ProjectFilePanel'
 import type { WorkspaceChangesPanelState } from './components/project-file/WorkspaceChangesPanel'
+import type { NavigationIntent } from './components/workspace/ProjectNavigation'
 import type { SessionCatalogCache } from './components/workspace/session-catalog-cache'
 import type { SettingsPage } from './components/workspace/SettingsNavigation'
 
@@ -67,7 +68,10 @@ import {
   type ArchivedItem,
   type ArchiveResult,
 } from './components/workspace/ArchiveNotice'
-import { acceptSessionCatalogChange } from './components/workspace/session-catalog-cache'
+import {
+  acceptSessionCatalogChange,
+  sessionScope,
+} from './components/workspace/session-catalog-cache'
 import { useProjectCatalog } from './components/workspace/useProjectCatalog'
 import { useSessionWorkspace } from './components/workspace/useSessionWorkspace'
 import { WorkspaceView } from './components/workspace/WorkspaceView'
@@ -151,6 +155,7 @@ function App(): React.JSX.Element {
   >()
   const [selectedProjectId, setSelectedProjectId] = useState<string | undefined>()
   const [creatingProjectId, setCreatingProjectId] = useState<string | undefined>()
+  const [creatingGroupId, setCreatingGroupId] = useState<string | undefined>()
   const [creationEditorState, setCreationEditorState] = useState<
     DefaultSessionSettingsEditorState | undefined
   >()
@@ -214,10 +219,18 @@ function App(): React.JSX.Element {
     showFirstUseDefaults || settingsPage === 'session-defaults',
   )
   const projectCatalog = useProjectCatalog(runtimePreparationQuery.data?.firstUse === false)
+  const [utilityRecovery, setUtilityRecovery] = useState(0)
   const sessionWorkspace = useSessionWorkspace(
     runtimePreparationQuery.data?.firstUse === false,
     projectCatalog.catalog?.projects,
+    () => setUtilityRecovery((current) => current + 1),
   )
+  const retainSelectedNavigation = useEffectEvent((id: string | undefined) => {
+    sessionWorkspace.retainSelected(id)
+  })
+  useEffect(() => {
+    retainSelectedNavigation(selectedSessionId)
+  }, [selectedSessionId])
   const showToast = useCallback((message: string, tone: AppToastTone = 'info'): void => {
     if (toastTimerRef.current !== undefined) window.clearTimeout(toastTimerRef.current)
     setToast({ id: Date.now(), message, tone })
@@ -244,7 +257,12 @@ function App(): React.JSX.Element {
     // its stable opening ID also prevents a later redelivery from reordering MRU.
     void window.pact.acknowledgeNativeNavigation({ navigationId }).catch(() => undefined)
   }, [])
+  const [navigationIntent, setNavigationIntent] = useState<NavigationIntent>()
+  const requestSessionLocation = (projectId: string, sessionId: string): void => {
+    setNavigationIntent({ projectId, sessionId, focus: false })
+  }
   const beginUserSelection = useCallback((): number => {
+    setNavigationIntent(undefined)
     nativeNavigationRequest.current++
     const intent = nativeNavigationIntent.current
     if (intent) acknowledgeNativeNavigation(intent.navigationId)
@@ -370,6 +388,13 @@ function App(): React.JSX.Element {
     showError,
     showToast,
   )
+  const refreshAfterUtilityRecovery = useEffectEvent(() => {
+    void runtimePreparationQuery.refetch()
+    conversation.history.retryRead()
+  })
+  useEffect(() => {
+    if (utilityRecovery > 0) refreshAfterUtilityRecovery()
+  }, [utilityRecovery])
   const selectedChangesRevision =
     workspaceChangesPanel &&
     conversation.snapshot &&
@@ -588,7 +613,7 @@ function App(): React.JSX.Element {
     }
   }
 
-  const startSessionCreation = async (projectId: string): Promise<void> => {
+  const startSessionCreation = async (projectId: string, groupId?: string): Promise<void> => {
     const selectionEpoch = beginUserSelection()
     setNativeAttentionOpen(false)
     invalidateContextRead()
@@ -597,6 +622,7 @@ function App(): React.JSX.Element {
     setSelectedSessionId(undefined)
     setSelectedProjectId(projectId)
     setCreatingProjectId(projectId)
+    setCreatingGroupId(groupId)
     setCreationEditorState(undefined)
     setSessionSettingsOpen(false)
     setProjectFilePanel(undefined)
@@ -616,18 +642,36 @@ function App(): React.JSX.Element {
   ): Promise<void> => {
     const selectionEpoch = beginUserSelection()
     const openingId = crypto.randomUUID()
-    const created = await sessionWorkspace.create(projectId, nextSettings)
-    if (!created || selectionEpoch !== userSelectionEpoch.current) return
+    const created = await sessionWorkspace.create(projectId, nextSettings, creatingGroupId)
+    if (!created || created.status === 'archived') return
+    const currentProjects = queryClient.getQueryData<ProjectCatalogState>(
+      projectCatalogQueryKeys.catalog,
+    )
+    if (!currentProjects?.projects.some((project) => project.id === projectId)) return
+    if (selectionEpoch !== userSelectionEpoch.current) {
+      void sessionWorkspace
+        .loadPage({ projectId, scope: sessionScope(created) })
+        .catch(() => undefined)
+      return
+    }
     setCreatingProjectId(undefined)
+    setCreatingGroupId(undefined)
     setCreationEditorState(undefined)
     setSelectedProjectId(projectId)
+    sessionWorkspace.retainSelected(created.id)
     setSelectedSessionId(created.id)
+    requestSessionLocation(projectId, created.id)
     recordSessionOpened(created.id, openingId)
   }
 
   const selectSession = (
     sessionId: string,
-    options?: { projectId?: string; openingId?: string; native?: boolean },
+    options?: {
+      projectId?: string
+      openingId?: string
+      native?: boolean
+      sidebarHidden?: boolean | undefined
+    },
   ): void => {
     if (!options?.native) beginUserSelection()
     setNativeAttentionOpen(false)
@@ -635,6 +679,7 @@ function App(): React.JSX.Element {
     invalidateContextRead()
     setSettingsPage(null)
     setCreatingProjectId(undefined)
+    setCreatingGroupId(undefined)
     setCreationEditorState(undefined)
     setCreationLoading(false)
     setSessionSettingsEditorState(undefined)
@@ -642,9 +687,13 @@ function App(): React.JSX.Element {
     setProjectFilePanel(undefined)
     setProjectFilePanelExpanded(false)
     const session = sessionWorkspace.catalog?.sessions.find((item) => item.id === sessionId)
-    setSelectedProjectId(options?.projectId ?? session?.projectId)
+    const projectId = options?.projectId ?? session?.projectId
+    setSelectedProjectId(projectId)
+    sessionWorkspace.retainSelected(sessionId)
     setSelectedSessionId(sessionId)
     setMessageNavigation(undefined)
+    if (options?.projectId && !options.sidebarHidden)
+      requestSessionLocation(options.projectId, sessionId)
     recordSessionOpened(sessionId, options?.openingId ?? crypto.randomUUID())
   }
 
@@ -666,6 +715,7 @@ function App(): React.JSX.Element {
       projectId: accepted.projectId,
       openingId,
       native: true,
+      sidebarHidden: accepted.sidebarHidden,
     })
   }
   const acceptNativeSession = useEffectEvent(enterResolvedSession)
@@ -1115,7 +1165,9 @@ function App(): React.JSX.Element {
       setProjectFilePanelExpanded(false)
     }
     if (creatingProjectId === projectId) {
+      beginUserSelection()
       setCreatingProjectId(undefined)
+      setCreatingGroupId(undefined)
       setCreationEditorState(undefined)
     }
     if (selectedProjectId === projectId) setSelectedProjectId(undefined)
@@ -1183,12 +1235,16 @@ function App(): React.JSX.Element {
         : state === 'failed'
           ? 'This item has not been archived. Its tasks changed or the confirmation expired. Review again before archiving.'
           : undefined)
+    const sidebarRemoved = archiveResultsRef.current.find(
+      (entry) => entry.id === id,
+    )?.sidebarRemoved
     recordArchiveResult({
       id,
       item: archiveItem(item),
       state,
       preview: item,
       receipt,
+      ...(state !== 'archived' && sidebarRemoved ? { sidebarRemoved } : {}),
       ...(message ? { message } : {}),
     })
     if (state === 'archived') {
@@ -1306,6 +1362,10 @@ function App(): React.JSX.Element {
       showWarning('This item is already archived. Use Undo to restore it first.')
       return
     }
+    if (existing?.sidebarRemoved) {
+      showWarning('This Session is already removed from the sidebar. Use Undo to bring it back.')
+      return
+    }
     if (!existing && archiveResultsRef.current.length >= ARCHIVE_RESULT_LIMIT) {
       showWarning('Review or dismiss some archive results before archiving more items.')
       return
@@ -1390,6 +1450,40 @@ function App(): React.JSX.Element {
     void requestArchive(scope, id)
   }
 
+  const removeFromSidebar = async (): Promise<void> => {
+    const scope = archivePreview?.scope
+    const result = archiveResultsRef.current.find((item) => item.id === archiveResultId)
+    if (
+      scope?.kind !== 'session' ||
+      !result ||
+      result.state === 'archived' ||
+      result.sidebarRemoved ||
+      archiveStoppingRef.current
+    )
+      return
+    archiveStoppingRef.current = true
+    setArchiveStopping(true)
+    setArchiveAction({ id: result.id, kind: 'removing' })
+    let removed = false
+    try {
+      await sessionWorkspace.setSidebarHidden(scope.sessionId, true)
+      updateArchiveResults((current) => [
+        { ...result, sidebarRemoved: true },
+        ...current.filter((entry) => entry.id !== result.id),
+      ])
+      removed = true
+    } catch {
+      setArchiveError(
+        'Could not confirm removal from the sidebar. Try again to check the saved state.',
+      )
+    } finally {
+      archiveStoppingRef.current = false
+      setArchiveStopping(false)
+      setArchiveAction(undefined)
+    }
+    if (removed) closeArchive()
+  }
+
   const dismissArchiveResults = (id?: string): void => {
     if (archiveBusyRef.current) return
     updateArchiveResults((current) =>
@@ -1403,57 +1497,60 @@ function App(): React.JSX.Element {
   const restoreArchived = async (result: ArchiveResult): Promise<void> => {
     if (
       archiveBusyRef.current ||
-      result.state !== 'archived' ||
+      (result.state !== 'archived' && !result.sidebarRemoved) ||
       !archiveResultsRef.current.some((item) => item.id === result.id)
     )
       return
     const item = result.item
+    const restoreError = result.sidebarRemoved
+      ? 'Could not confirm that the Session is back in the sidebar. Try Undo again.'
+      : 'Could not confirm the restore. Try Undo again to check its saved state.'
     if (
       item.kind === 'session' &&
       !projectCatalog.catalog?.projects.some((project) => project.id === item.projectId)
     ) {
-      setArchiveActionError(
-        result.id,
-        'Restore or re-add its Project first, then undo this Session archive.',
-      )
+      setArchiveActionError(result.id, 'Restore or re-add its Project first, then try Undo again.')
       return
     }
-    const selectionEpoch = beginUserSelection()
-    const openingId = crypto.randomUUID()
+    const selectionEpoch =
+      item.kind === 'project' ? beginUserSelection() : userSelectionEpoch.current
     archiveBusyRef.current = true
     setArchiveAction({ id: result.id, kind: 'restoring' })
     setArchiveActionError(result.id)
     try {
       const restored =
         item.kind === 'session'
-          ? await sessionWorkspace.restore(item.id)
+          ? result.sidebarRemoved
+            ? await sessionWorkspace.setSidebarHidden(item.id, false)
+            : await sessionWorkspace.restore(item.id)
           : await projectCatalog.restore(item.id)
       if (!restored) {
-        setArchiveActionError(
-          result.id,
-          'Could not confirm the restore. Try Undo again to check its saved state.',
-        )
+        setArchiveActionError(result.id, restoreError)
         return
       }
-      updateArchiveResults((current) => current.filter((entry) => entry.id !== result.id))
+      updateArchiveResults((current) =>
+        current.flatMap((entry) => {
+          if (entry.id !== result.id) return [entry]
+          if (entry.state !== 'unresolved') return []
+          const { sidebarRemoved: _removed, ...archive } = entry
+          return [archive]
+        }),
+      )
       if (selectionEpoch !== userSelectionEpoch.current) return
-      invalidateContextRead()
-      setWorkspaceChangesPanel(undefined)
-      setProjectFilePanel(undefined)
-      setSessionSettingsOpen(false)
-      setSettingsPage(null)
       if (item.kind === 'session') {
-        selectSession(item.id, { projectId: item.projectId, openingId, native: true })
+        requestSessionLocation(item.projectId, item.id)
       } else {
+        invalidateContextRead()
+        setWorkspaceChangesPanel(undefined)
+        setProjectFilePanel(undefined)
+        setSessionSettingsOpen(false)
+        setSettingsPage(null)
         setSelectedProjectId(item.id)
         setSelectedSessionId(undefined)
       }
       if (!archiveResultsRef.current.length) settingsButtonRef.current?.focus()
     } catch {
-      setArchiveActionError(
-        result.id,
-        'Could not confirm the restore. Try Undo again to check its saved state.',
-      )
+      setArchiveActionError(result.id, restoreError)
     } finally {
       archiveBusyRef.current = false
       setArchiveAction(undefined)
@@ -1528,21 +1625,28 @@ function App(): React.JSX.Element {
           platform={appInfo?.platform}
           onForkSessionCreated={(change, enter, opening) => {
             acceptSessionCatalogChange(queryClient, change)
-            if (enter && opening?.selectionEpoch === userSelectionEpoch.current)
+            if (enter && opening?.selectionEpoch === userSelectionEpoch.current) {
               selectSession(change.session.id, {
                 projectId: change.session.projectId,
                 openingId: opening.openingId,
               })
+            } else {
+              void sessionWorkspace
+                .loadPage({
+                  projectId: change.session.projectId,
+                  scope: sessionScope(change.session),
+                })
+                .catch(() => undefined)
+            }
           }}
           onSaveSessionPermission={(input) => sessionWorkspace.savePermission(input)}
           onSaveSessionSpeed={(input) => sessionWorkspace.saveSpeed(input)}
           projects={projectCatalog.catalog?.projects ?? []}
           sessions={sessionWorkspace.catalog?.sessions ?? []}
-          sessionProjectPages={sessionWorkspace.catalog?.projectPages ?? {}}
+          sessionWorkspace={sessionWorkspace}
+          navigationIntent={navigationIntent}
           loading={projectCatalog.loading}
           sessionsLoading={sessionWorkspace.loading}
-          loadingMoreProjectId={sessionWorkspace.loadingMoreProjectId}
-          loadMoreErrors={sessionWorkspace.loadMoreErrors}
           adding={projectCatalog.adding}
           creatingSession={sessionWorkspace.creating}
           savingSessionSettings={sessionWorkspace.savingSettings}
@@ -1570,10 +1674,10 @@ function App(): React.JSX.Element {
           onRenameProject={(projectId, name) => projectCatalog.rename(projectId, name)}
           onRetry={() => projectCatalog.retry()}
           onRetrySessions={() => sessionWorkspace.retry()}
-          onLoadMoreSessions={(projectId) => sessionWorkspace.loadMore(projectId)}
           selectedSessionId={selectedSessionId}
           selectedProjectId={selectedProjectId}
           creatingProjectId={creatingProjectId}
+          creatingGroupId={creatingGroupId}
           creationEditorState={creationEditorState}
           creationLoading={creationLoading}
           sessionSettingsEditorState={sessionSettingsEditorState}
@@ -1618,10 +1722,11 @@ function App(): React.JSX.Element {
               setProjectFilePanelExpanded(false)
             }
           }}
-          onStartSession={(projectId) => void startSessionCreation(projectId)}
+          onStartSession={(projectId, groupId) => void startSessionCreation(projectId, groupId)}
           onCancelSessionCreation={() => {
             beginUserSelection()
             setCreatingProjectId(undefined)
+            setCreatingGroupId(undefined)
             setCreationEditorState(undefined)
           }}
           onCreateSession={(projectId, nextSettings) => void createSession(projectId, nextSettings)}
@@ -1712,6 +1817,10 @@ function App(): React.JSX.Element {
                   onConfirm={() => void confirmArchive()}
                   onCheck={() => void checkArchive()}
                   onReview={reviewArchive}
+                  {...(archivePreview.scope.kind === 'session'
+                    ? { onRemove: () => void removeFromSidebar() }
+                    : {})}
+                  removing={archiveAction?.kind === 'removing'}
                 />
               ) : null}
             </>

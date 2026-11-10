@@ -16,6 +16,10 @@ export function NativeQuitConfirmation({ state }: { state: NativeQuitState }): R
   const descriptionId = useId()
   const confirming = state.phase === 'confirming'
   const canRespond = confirming && !pending
+  const onlyUnconfirmedWork =
+    state.sessions.length > 0 &&
+    state.activeCount === state.sessions.length &&
+    state.sessions.every((session) => session.state === 'unsettled')
   useEffect(() => {
     activeRef.current = true
     const trigger = document.activeElement
@@ -96,7 +100,9 @@ export function NativeQuitConfirmation({ state }: { state: NativeQuitState }): R
           {confirming
             ? state.unknown
               ? 'Pact could not confirm the current task status. Exiting may interrupt work that is still active.'
-              : 'Active or unsettled work may be interrupted.'
+              : onlyUnconfirmedWork
+                ? 'Pact couldn’t confirm whether the work below has ended. Exiting may interrupt any work still in progress.'
+                : 'Exiting may interrupt work that’s still in progress.'
             : state.phase === 'cancelling'
               ? 'Waiting for the exit request to be cancelled. Your tasks will stay in Pact.'
               : state.phase === 'unconfirmed'

@@ -822,6 +822,138 @@ async function bootstrap(
         return
       }
 
+      case 'session-page.get.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-page.response',
+            requestId,
+            result: sessionWorkspace.loadPage(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-groups.get.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-groups.response',
+            requestId,
+            result: sessionWorkspace.loadGroups(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-group.get.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-group.response',
+            requestId,
+            result: sessionWorkspace.loadGroup(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-membership.get.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-membership.response',
+            requestId,
+            result: sessionWorkspace.loadMembership(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-navigation.locate.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-navigation.response',
+            requestId,
+            result: sessionWorkspace.locate(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-creation.state.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-creation-state.response',
+            requestId,
+            result: sessionWorkspace.loadCreationState(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-group.create.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-group-change.response',
+            requestId,
+            result: sessionWorkspace.createGroup(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-group.update.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-group-change.response',
+            requestId,
+            result: sessionWorkspace.updateGroup(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-group.move.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-group-change.response',
+            requestId,
+            result: sessionWorkspace.moveGroup(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-group.dissolve.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-group-change.response',
+            requestId,
+            result: sessionWorkspace.dissolveGroup(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-group.set.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-group-change.response',
+            requestId,
+            result: sessionWorkspace.setGroup(input),
+          }),
+        )
+        return
+      }
+
       case 'session-creation.prepare.request': {
         const { input, requestId } = request.data
         runRequest(async () => {
@@ -900,6 +1032,18 @@ async function bootstrap(
             type: 'session-catalog.response',
             requestId,
             result: sessionWorkspace.restore(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-sidebar-hidden.set.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-catalog.response',
+            requestId,
+            result: sessionWorkspace.setSidebarHidden(input),
           }),
         )
         return

@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm'
 import {
+  foreignKey,
   index,
   integer,
   primaryKey,
@@ -8,6 +9,8 @@ import {
   uniqueIndex,
   type AnySQLiteColumn,
 } from 'drizzle-orm/sqlite-core'
+
+import { SESSION_GROUP_COLORS } from '@pact/contracts'
 
 export const pactSchemaMeta = sqliteTable('pact_schema_meta', {
   key: text('key').primaryKey(),
@@ -119,6 +122,8 @@ export const projects = sqliteTable('projects', {
   createdAt: text('created_at').notNull(),
   archivedAt: text('archived_at'),
   needsAttentionCount: integer('needs_attention_count').notNull().default(0),
+  sessionGroupRevision: integer('session_group_revision').notNull().default(0),
+  nextSessionGroupOrdinal: integer('next_session_group_ordinal').notNull().default(1),
 })
 
 export const sessions = sqliteTable(
@@ -152,6 +157,7 @@ export const sessions = sqliteTable(
     lastSeenMessageSequence: integer('last_seen_message_sequence'),
     lastOpenedOrdinal: integer('last_opened_ordinal'),
     workspaceVisible: integer('workspace_visible', { mode: 'boolean' }).notNull().default(true),
+    sidebarHidden: integer('sidebar_hidden', { mode: 'boolean' }).notNull().default(false),
     needsAttention: integer('needs_attention', { mode: 'boolean' }).notNull().default(false),
     jumpListSuppressed: integer('jump_list_suppressed', { mode: 'boolean' })
       .notNull()
@@ -180,6 +186,60 @@ export const sessions = sqliteTable(
     index('sessions_project_created_id_active_idx')
       .on(table.projectId, table.createdAt, table.id)
       .where(sql`${table.status} <> 'archived'`),
+    uniqueIndex('sessions_id_project_unique').on(table.id, table.projectId),
+  ],
+)
+
+export const sessionGroups = sqliteTable(
+  'session_groups',
+  {
+    id: text('id').primaryKey(),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'restrict' }),
+    creationOrdinal: integer('creation_ordinal').notNull(),
+    name: text('name').notNull(),
+    color: text('color', { enum: SESSION_GROUP_COLORS }).notNull(),
+    position: integer('position').notNull(),
+    collapsed: integer('collapsed', { mode: 'boolean' }).notNull().default(false),
+    createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (table) => [
+    uniqueIndex('session_groups_id_project_unique').on(table.id, table.projectId),
+    uniqueIndex('session_groups_project_creation_ordinal_unique').on(
+      table.projectId,
+      table.creationOrdinal,
+    ),
+    uniqueIndex('session_groups_project_position_unique').on(table.projectId, table.position),
+    index('session_groups_project_position_id_idx').on(table.projectId, table.position, table.id),
+  ],
+)
+
+export const sessionGroupMembers = sqliteTable(
+  'session_group_members',
+  {
+    sessionId: text('session_id').primaryKey(),
+    projectId: text('project_id').notNull(),
+    groupId: text('group_id').notNull(),
+    position: integer('position').notNull().default(0),
+  },
+  (table) => [
+    uniqueIndex('session_group_members_position_unique').on(
+      table.groupId,
+      table.projectId,
+      table.position,
+    ),
+    foreignKey({
+      columns: [table.sessionId, table.projectId],
+      foreignColumns: [sessions.id, sessions.projectId],
+      name: 'session_group_members_session_project_fk',
+    }).onDelete('cascade'),
+    foreignKey({
+      columns: [table.groupId, table.projectId],
+      foreignColumns: [sessionGroups.id, sessionGroups.projectId],
+      name: 'session_group_members_group_project_fk',
+    }).onDelete('cascade'),
   ],
 )
 
