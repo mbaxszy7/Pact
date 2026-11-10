@@ -543,8 +543,13 @@ export function serializeAgentPromptEnvelope(
         ? 'Review the attached Pact images and Comments.'
         : 'Review the attached Pact Comments.')
   // Keep the host’s internal reply proof out of the model’s prompt.
-  const { replyIntentBasis: _replyIntentBasis, ...visibleAuthorization } =
-    envelope.collaborationAuthorization ?? {}
+  const {
+    replyIntentBasis: _replyIntentBasis,
+    planRevisionWriteRunId: _planRevisionWriteRunId,
+    supplementPlanReturn: _supplementPlanReturn,
+    supplementPlanAnswerReceiptId: _supplementPlanAnswerReceiptId,
+    ...visibleAuthorization
+  } = envelope.collaborationAuthorization ?? {}
   const context = {
     ...(envelope.sourceGrant ? { sourceGrant: envelope.sourceGrant } : {}),
     ...(envelope.sourceGrant && envelope.inputBatchRef
@@ -567,13 +572,16 @@ export function serializeAgentPromptEnvelope(
             ...(envelope.collaborationAuthorization
               ? [{ kind: 'workflow_inputs', read: navigate({ source: 'inputs' }) }]
               : []),
-            ...(envelope.handoffSourceRefs?.length || envelope.handoffContext?.length
+            ...(envelope.collaborationAuthorization?.planRevisionContextRef ||
+            envelope.handoffSourceRefs?.length ||
+            envelope.handoffContext?.length
               ? [{ kind: 'handoff_sources', read: navigate({ source: 'handoff_sources' }) }]
               : []),
             ...[
               envelope.clarificationAnswer,
               envelope.requiredInputScopeRef,
               envelope.collaboration?.taskDocument,
+              envelope.collaborationAuthorization?.planRevisionContextRef,
               envelope.collaboration?.planReference?.document,
               ...(envelope.handoffSourceRefs ?? []),
               ...Object.values(envelope.collaborationBasis ?? {}).map((entry) => entry.document),

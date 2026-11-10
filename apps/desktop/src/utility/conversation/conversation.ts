@@ -4536,7 +4536,12 @@ export class Conversation {
         throw new RunOperationConflictError(
           'Restore the saved native plan before continuing collaboration.',
         )
-      if (input.action === 'resume' && !task.pendingWork) {
+      if (
+        input.action === 'resume' &&
+        !(task.planRevision
+          ? task.status !== 'running' && collaborationNextStage(task)
+          : task.pendingWork)
+      ) {
         this.conversations.assertRelayDecisionResolved(input.sessionId)
         if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
           return Conversation.nativeRecoveryRequired()

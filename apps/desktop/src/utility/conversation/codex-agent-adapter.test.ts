@@ -90,7 +90,7 @@ import {
 } from './codex-agent-adapter.js'
 import { CODEX_MAX_FRAME_BYTES } from './codex-app-server-connection.js'
 import { codexProcessEnvironment } from './codex-process-environment.js'
-import { planRunInput } from './collaboration-fixture.test-support.js'
+import { planRevisionReplyInput, planRunInput } from './collaboration-fixture.test-support.js'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
 
 describe('owned Codex loopback environment', () => {
@@ -200,6 +200,134 @@ afterAll(async () => {
 import { NATIVE_OWNER_WORKING_BYTES } from './native-working-memory.js'
 
 const nativeHomes: string[] = []
+
+it.each([
+  'revision_first',
+  'processed_first',
+  'failed_tool',
+  'foreign_root',
+  'wrong_receipt',
+  'uncompleted',
+] as const)(
+  'passes raw successful Codex revision observations from the exact root (%s)',
+  async (mode) => {
+    const input = planRevisionReplyInput('codex')
+    const record = vi.fn<NonNullable<AgentRunInput['recordWorkflowInputResult']>>()
+    const calls = Promise.withResolvers<void>()
+    const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
+    let url = '',
+      server = ''
+    const child = fakeCodexProcess((request, respond, notify) => {
+      const id = Reflect.get(request, 'id')
+      const method = Reflect.get(request, 'method')
+      if (method === 'initialize') respond({ id, result: {} })
+      else if (method === 'thread/start') {
+        const config = Reflect.get(Reflect.get(request, 'params'), 'config') as object
+        const [key, value] = Object.entries(config).find(([name]) =>
+          name.startsWith('mcp_servers.'),
+        )!
+        server = key.slice('mcp_servers.'.length)
+        url = Reflect.get(value, 'url') as string
+        respond({ id, result: { thread: { id: 'revision-thread' } } })
+      } else if (method === 'turn/start') {
+        respond({ id, result: { turn: { id: 'revision-turn' } } })
+        const call = async (outcome: 'processed' | 'plan_revision_required') => {
+          const revision = outcome === 'plan_revision_required'
+          const args = { outcome }
+          const rpc = (await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', connection: 'close' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'tools/call',
+              params: { name: 'submit_input_result', arguments: args },
+            }),
+          }).then((response) => response.json())) as object
+          const result = Reflect.get(rpc, 'result') as object
+          if (Reflect.get(result, 'isError') !== false)
+            throw Error('MCP rejected the input result.')
+          if (revision && mode === 'failed_tool') Reflect.set(result, 'isError', true)
+          if (revision && mode === 'wrong_receipt')
+            Reflect.set(
+              Reflect.get(Reflect.get(result, 'structuredContent'), 'pactInputResult'),
+              'receipt',
+              'foreign-receipt',
+            )
+          notify({
+            method: revision && mode === 'uncompleted' ? 'item/started' : 'item/completed',
+            params: {
+              threadId: revision && mode === 'foreign_root' ? 'foreign-thread' : 'revision-thread',
+              turnId: 'revision-turn',
+              item: {
+                id: outcome,
+                type: 'mcpToolCall',
+                server,
+                tool: 'submit_input_result',
+                arguments: args,
+                status: 'completed',
+                error: null,
+                result,
+              },
+            },
+          })
+        }
+        void (async () => {
+          try {
+            if (mode === 'processed_first') {
+              await call('processed')
+              await call('plan_revision_required')
+            } else {
+              await call('plan_revision_required')
+              await call('processed')
+            }
+            calls.resolve()
+          } catch (error) {
+            calls.reject(error)
+          } finally {
+            notify({
+              method: 'item/completed',
+              params: {
+                threadId: 'revision-thread',
+                turnId: 'revision-turn',
+                item: { id: 'answer', type: 'agentMessage', text: 'The scope was checked.' },
+              },
+            })
+            notify({
+              method: 'turn/completed',
+              params: {
+                threadId: 'revision-thread',
+                turn: { id: 'revision-turn', status: 'completed' },
+              },
+            })
+          }
+        })()
+      }
+    })
+    const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child))
+    try {
+      await collectRun(adapter, {
+        ...input,
+        recordWorkflowInputResult: record,
+        recordNativeEvidence: evidence,
+      })
+      await calls.promise
+      expect(record.mock.calls.map(([result]) => result.outcome)).toEqual(
+        mode === 'revision_first'
+          ? ['plan_revision_required', 'processed']
+          : mode === 'processed_first'
+            ? ['processed', 'plan_revision_required']
+            : ['processed'],
+      )
+      const ending = evidence.mock.calls.findLast(([event]) => event.kind === 'ended')?.[0]
+      expect(ending?.kind === 'ended' && ending.output?.inputResult?.outcome).toBe(
+        mode === 'processed_first' || mode === 'revision_first' ? 'incomplete' : 'processed',
+      )
+    } finally {
+      await adapter.dispose()
+    }
+  },
+)
 
 it.each([
   'valid',

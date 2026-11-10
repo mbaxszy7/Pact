@@ -2565,7 +2565,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         return
       try {
         inputResult = mergeWorkflowInput(inputResult, outcome)
-        input.recordWorkflowInputResult?.(inputResult)
+        input.recordWorkflowInputResult?.(outcome)
       } catch (error) {
         workflowProjectionFailed = true
         failProjection(error)
@@ -3776,7 +3776,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 workflowCalls.delete(block.tool_use_id)
                 if (!block.is_error) {
                   if (submission.kind === 'review') captureReview(submission.value)
-                  else captureInputResult(submission.value)
+                  else if (currentRequestMatched && !terminalKnown)
+                    captureInputResult(submission.value)
                 }
                 continue
               }

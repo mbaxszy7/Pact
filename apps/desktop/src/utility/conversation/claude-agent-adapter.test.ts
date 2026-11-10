@@ -47,7 +47,7 @@ import { PactDatabase } from '@pact/persistence'
 import { planRevisionFixture } from '../../../../../packages/persistence/src/plan-revision-guidance.test-support.js'
 import { NativeCapacityError } from './agent-execution-error'
 import { CLAUDE_TITLE_TIMEOUT_MS, ClaudeAgentAdapter } from './claude-agent-adapter.js'
-import { planRunInput } from './collaboration-fixture.test-support.js'
+import { planRevisionReplyInput, planRunInput } from './collaboration-fixture.test-support.js'
 import { FrozenSourceReader } from './frozen-source-reader'
 import { NativeForkFiles } from './native-fork-files'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
@@ -3952,6 +3952,66 @@ function cancellationFixture(
   }
 }
 
+it.each([
+  'revision_first',
+  'processed_first',
+  'failed_tool',
+  'nested_root',
+  'foreign_result',
+  'uncompleted',
+] as const)(
+  'passes raw successful Claude revision observations from the exact root (%s)',
+  async (mode) => {
+    const input = planRevisionReplyInput('claude')
+    const record = vi.fn<NonNullable<AgentRunInput['recordWorkflowInputResult']>>()
+    const f = await nativeRetentionFixture({
+      runId: input.runId,
+      sessionId: input.sessionId,
+      promptEnvelope: input.promptEnvelope,
+      recordWorkflowInputResult: record,
+    })
+    try {
+      const call = async (outcome: 'processed' | 'plan_revision_required') => {
+        const revision = outcome === 'plan_revision_required'
+        const args = { outcome }
+        const name = 'submit_input_result'
+        const result = await f.invoke(args, name)
+        expect(result.isError).not.toBe(true)
+        const parent = revision && mode === 'nested_root' ? 'nested-tool' : null
+        f.assistant(outcome, args, parent, name)
+        if (!revision || mode !== 'uncompleted')
+          await f.result(
+            outcome,
+            revision && mode === 'failed_tool',
+            parent,
+            revision && mode === 'foreign_result' ? randomUUID() : undefined,
+          )
+      }
+      if (mode === 'processed_first' || mode === 'foreign_result') {
+        await call('processed')
+        await call('plan_revision_required')
+      } else {
+        await call('plan_revision_required')
+        await call('processed')
+      }
+      await f.finish()
+      expect(record.mock.calls.map(([result]) => result.outcome)).toEqual(
+        mode === 'revision_first'
+          ? ['plan_revision_required', 'processed']
+          : mode === 'processed_first'
+            ? ['processed', 'plan_revision_required']
+            : ['processed'],
+      )
+      const ending = f.evidence.mock.calls.findLast(([event]) => event.kind === 'ended')?.[0]
+      expect(ending?.kind === 'ended' && ending.output?.inputResult?.outcome).toBe(
+        mode === 'processed_first' || mode === 'revision_first' ? 'incomplete' : 'processed',
+      )
+    } finally {
+      await f.dispose()
+    }
+  },
+)
+
 async function nativeRetentionFixture(
   overrides: Partial<AgentRunInput> = {},
   onEvent?: (event: import('@pact/contracts').NormalizedAgentEvent) => void,
@@ -4166,7 +4226,12 @@ async function nativeRetentionFixture(
     wake?.()
     wake = undefined
   }
-  const assistant = (id: string, args: unknown = {}, parentTool: string | null = null) =>
+  const assistant = (
+    id: string,
+    args: unknown = {},
+    parentTool: string | null = null,
+    toolName = 'retain_current_plan',
+  ) =>
     push({
       type: 'assistant',
       uuid: randomUUID(),
@@ -4175,10 +4240,15 @@ async function nativeRetentionFixture(
       message: {
         id: `assistant-${id}`,
         role: 'assistant',
-        content: [{ type: 'tool_use', id, name, input: args }],
+        content: [{ type: 'tool_use', id, name: `mcp__${serverName}__${toolName}`, input: args }],
       },
     } as SDKMessage)
-  const result = async (id: string, error = false, parentTool: string | null = null) => {
+  const result = async (
+    id: string,
+    error = false,
+    parentTool: string | null = null,
+    echoedRunId?: string,
+  ) => {
     const message = {
       role: 'user',
       content: [
@@ -4196,6 +4266,7 @@ async function nativeRetentionFixture(
       uuid: randomUUID(),
       session_id: input.nativeSessionId,
       parent_tool_use_id: parentTool,
+      ...(echoedRunId ? { user_message_uuid: echoedRunId } : {}),
       message,
     } as SDKMessage)
   }
@@ -4269,8 +4340,8 @@ async function nativeRetentionFixture(
     finish,
     end,
     complete,
-    invoke: (args: unknown = {}) =>
-      exchange('tools/call', { name: 'retain_current_plan', arguments: args }),
+    invoke: (args: unknown = {}, toolName = 'retain_current_plan') =>
+      exchange('tools/call', { name: toolName, arguments: args }),
     dispose: async () => {
       controller.abort()
       closed = true

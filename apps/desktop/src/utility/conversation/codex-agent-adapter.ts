@@ -3288,7 +3288,7 @@ export class CodexAgentAdapter implements AgentAdapter {
         return
       projectOutput(() => {
         inputResult = mergeWorkflowInput(inputResult, outcome)
-        input.recordWorkflowInputResult?.(inputResult)
+        input.recordWorkflowInputResult?.(outcome)
       })
     }
     background.release = () => {

@@ -381,6 +381,54 @@ function witness(
 }
 
 describe('Frozen Fork through ConversationRepository', () => {
+  it('strips a parent Plan revision fence and its reply eligibility from inherited history', async () => {
+    const f = await fixture(':memory:', true, true)
+    const source = f.repo.collaboration(f.sourceId)!
+    const turn = f.db.drizzle
+      .select()
+      .from(workflowTurns)
+      .where(eq(workflowTurns.runId, source.runId))
+      .get()!
+    const authorization = collaborationTurnAuthorizationSchema.parse(
+      JSON.parse(turn.authorizationJson),
+    )
+    f.db.drizzle
+      .update(workflowTurns)
+      .set({
+        stateJson: JSON.stringify({
+          ...source,
+          planRevision: {
+            requestRunId: source.runId,
+            inputSequence: source.inputSequence,
+            writeRunId: f.runIds[0],
+            planReference: source.planReference,
+          },
+        }),
+        authorizationJson: JSON.stringify({
+          ...authorization,
+          planRevisionWriteRunId: f.runIds[0],
+        }),
+      })
+      .where(eq(workflowTurns.runId, source.runId))
+      .run()
+    const child = f.commit()
+    const inherited = f.repo
+      .read(child.sessionId)
+      .runs.find((run) => run.forkSourceRunId === source.runId)!
+    const page = f.repo.readPage({
+      scope: 'collaboration',
+      sessionId: child.sessionId,
+      runId: inherited.id,
+      projection: 'current',
+    })
+    if (page.scope !== 'collaboration') throw Error('Missing inherited collaboration')
+    expect(page.view.actionable).toBe(false)
+    expect(page.view.task?.planRevision).toBeUndefined()
+    expect(
+      f.repo.collaborationTurnAuthorization(inherited.id)?.planRevisionWriteRunId,
+    ).toBeUndefined()
+  })
+
   it.each([false, true])(
     'copies exact plan sources and Batch members as readonly history without dispatch authority (stageRoles=%s)',
     async (withStageRoles) => {

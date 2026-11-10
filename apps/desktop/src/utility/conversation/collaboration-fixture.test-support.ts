@@ -61,3 +61,34 @@ export function planRunInput(actor: RuntimeAgentId): AgentRunInput {
     },
   }
 }
+
+export function planRevisionReplyInput(actor: RuntimeAgentId): AgentRunInput {
+  const input = planRunInput(actor)
+  const { collaboration: task, collaborationAuthorization: auth } = input.promptEnvelope
+  const pending = { inputId: input.promptEnvelope.message.id, inputSequence: 2 }
+  const planReference = {
+    version: 1,
+    sourceRunId: randomUUID(),
+    sourceMessageId: randomUUID(),
+    document: { id: randomUUID(), sha256: 'a'.repeat(64), bytes: 4, chars: 4 },
+  }
+  Object.assign(auth!, {
+    stage: 'reply',
+    replyMode: 'read_only',
+    inputSequence: 2,
+    inputProcessing: { pending },
+    planReference,
+    planRevisionWriteRunId: randomUUID(),
+  })
+  Object.assign(task!, {
+    stage: 'reply',
+    inputSequence: 2,
+    inputProcessing: { pending },
+    planReference,
+    planVersion: 1,
+    codeRunId: auth!.planRevisionWriteRunId,
+    automation: 'paused',
+    authorization: auth,
+  })
+  return input
+}

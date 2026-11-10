@@ -582,6 +582,7 @@ export function commitFork(
       registerDocument(auth.reviewScopeRef, true)
       registerDocument(auth.sourceManifestRef, true)
       registerDocument(auth.relayWorkRef, true)
+      registerDocument(auth.planRevisionContextRef, true)
       if (auth.sourceManifestRef) guidanceDocuments.add(auth.sourceManifestRef.id)
     }
     for (const row of memberRows)
@@ -748,6 +749,7 @@ export function commitFork(
             'codeRunId',
             'sourceChangeSetId',
             'implementationRunId',
+            'originalWriteRunId',
           ].includes(key) &&
           typeof item === 'string'
         )
@@ -815,6 +817,7 @@ export function commitFork(
               handledInputSequence: Math.min(task.handledInputSequence, inputSequence),
               authorization: undefined,
               pendingWork: undefined,
+              planRevision: undefined,
               planAcceptanceCoverage: undefined,
               reviewControlCoverage: undefined,
               nextStage: undefined,
@@ -1062,6 +1065,9 @@ export function commitFork(
         remapMetadata({
           ...originalAuthorization,
           replyIntentBasis: undefined,
+          planRevisionWriteRunId: undefined,
+          supplementPlanReturn: undefined,
+          supplementPlanAnswerReceiptId: undefined,
           ...(originalAuthorization.replyIntentBasis?.kind === 'ask_only'
             ? { historicalInputKind: 'ask_only' }
             : {}),

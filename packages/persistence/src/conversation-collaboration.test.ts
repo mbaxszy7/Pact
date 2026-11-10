@@ -1,4 +1,4 @@
-import { eq, sql } from 'drizzle-orm'
+import { and, eq, sql } from 'drizzle-orm'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -9,6 +9,7 @@ import {
   advanceCollaboration,
   collaborationActor,
   collaborationActionBasisSchema,
+  collaborationDocumentSchema,
   CONVERSATION_PATCH_BYTES,
   conversationPatchSchema,
   collaborationTaskSchema,
@@ -16,8 +17,11 @@ import {
   type CollaborationDocument,
   type ConversationSendInput,
   type CollaborationTask,
+  type FrozenExecutionEnvelope,
   type SchedulingHandoff,
 } from '@pact/contracts'
+
+import type { HandoffSourceRef } from './conversation-repository.js'
 
 import {
   configureDecisionFixtureCredential,
@@ -29,15 +33,18 @@ import {
   agentRuns,
   anchoredComments,
   collaborationInputs,
+  collaborationTasks,
   conversationBodyInputs,
   conversationImageAssets,
   conversationInputBatchMembers,
+  conversationRunSourceRefs,
   schedulingHandoffs,
   schedulingEvaluations,
   schedulingRuntimeOwners,
   schedulingBudgetReservations,
   workflowTurns,
   collaborationActionReceipts,
+  runReexecutionOperations,
   agentEventJournal,
 } from './schema/index.js'
 
@@ -161,7 +168,8 @@ async function fixture(
       plan?: string
       verdict?: 'accepted' | 'changes_requested' | 'needs_user' | 'incomplete'
       questions?: import('@pact/contracts').CollaborationQuestions
-      inputOutcome?: 'processed' | 'needs_user' | 'incomplete'
+      inputOutcome?: import('@pact/contracts').CollaborationInputOutcome
+      inputObservations?: import('@pact/contracts').CollaborationInputOutcome[]
       outcome?: 'completed' | 'interrupted'
       answer?: string
     } = { plan: 'Scope and acceptance.' },
@@ -187,9 +195,10 @@ async function fixture(
         verdict: result.verdict,
         ...(result.questions ? { questions: result.questions } : {}),
       })
-    if (result.inputOutcome)
+    for (const outcome of result.inputObservations ??
+      (result.inputOutcome ? [result.inputOutcome] : []))
       repo.recordWorkflowInputResult(runId, {
-        outcome: result.inputOutcome,
+        outcome,
         ...(result.questions ? { questions: result.questions } : {}),
       })
     repo.applyEvent(sessionId, runId, {
@@ -1264,11 +1273,12 @@ it('receives one hundred explicit legacy draft IDs during a running Turn with du
 
 function advance(
   f: Awaited<ReturnType<typeof fixture>>,
-  action: 'continue' | 'execute' | 'repair' | 'respond' = 'continue',
+  action: 'continue' | 'execute' | 'repair' | 'respond' | 'resume' = 'continue',
+  handoffSourceRefs?: HandoffSourceRef[],
 ) {
   const current = f.repo.collaboration(f.sessionId)!
   const clientMessageId = randomUUID()
-  const prepared = ['execute', 'repair', 'respond'].includes(action)
+  const prepared = ['execute', 'repair', 'respond', 'resume'].includes(action)
     ? f.repo.prepareCollaborationAction(
         {
           sessionId: f.sessionId,
@@ -1293,6 +1303,7 @@ function advance(
     effort: null,
     preserveDraftComments: true,
     expectedCollaborationRevision: current.revision,
+    ...(handoffSourceRefs ? { handoffSourceRefs } : {}),
     collaboration: next,
     ...(prepared
       ? { schedulingHandoff: prepared.handoff, collaborationActionReceiptId: prepared.receipt.id }
@@ -2528,6 +2539,1223 @@ it.each(['direct', 'accepted_reply'] as const)(
         rootReceiptId: original.userAuthority!.rootReceiptId,
       },
     })
+  },
+)
+
+it('keeps a requirement revision through its questions, another Stop and cold recovery', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'pact-plan-revision-'))
+  directories.push(directory)
+  const filePath = join(directory, 'pact.sqlite')
+  const f = await fixture(filePath)
+  f.finish()
+  f.finish(advance(f).id, { verdict: 'accepted' })
+  const write = advance(f, 'execute')
+  f.finish(write.id, { outcome: 'interrupted' })
+  f.receive(f.input('The goal now includes offline cancellation.'))
+  const reply = f.materialize().run
+  f.finish(reply.id, {
+    inputOutcome: 'plan_revision_required',
+    questions: [{ prompt: 'What should cancel while offline?', selection: 'single' }],
+  })
+  const blocked = f.repo.collaboration(f.sessionId)!
+  expect(blocked.inputProcessing?.decision).toMatchObject({ runId: reply.id })
+  expect(() => advance(f, 'resume')).toThrow(/Reply/)
+  f.receive(decisionInput(f, 'Cancel only the in-flight operation.'))
+  const answer = f.materialize().run
+  expect(f.repo.collaborationTurnAuthorization(answer.id)?.replyMode).toBe('read_only')
+  f.finish(answer.id, { inputOutcome: 'processed' })
+  f.repo.pauseCollaboration(f.sessionId, 'stopped')
+  f.receive(f.input('Can you explain the change before I continue?'))
+  const status = f.materialize().run
+  expect(status.agentId).toBe(blocked.owner)
+  f.finish(status.id, { inputOutcome: 'processed' })
+  expect(f.repo.collaboration(f.sessionId)?.planRevision).toEqual(blocked.planRevision)
+  f.db.close()
+  databases.splice(databases.indexOf(f.db), 1)
+  const reopened = await PactDatabase.open({
+    filePath,
+    migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
+  })
+  databases.push(reopened)
+  const repo = reopened.conversationRepository
+  repo.recoverCollaborationTasks()
+  const restored = repo.collaboration(f.sessionId)!
+  expect(restored).toMatchObject({
+    automation: 'paused',
+    pendingWork: { runId: write.id },
+    planRevision: blocked.planRevision,
+  })
+  const resumed = advanceCollaboration(restored, 'resume', settings)
+  expect(() => repo.setCollaborationState({ ...resumed, planRevision: undefined })).toThrow(
+    /changed/,
+  )
+  expect(() =>
+    repo.setCollaborationState({
+      ...resumed,
+      planRevision: { ...restored.planRevision!, writeRunId: randomUUID() },
+    }),
+  ).toThrow(/changed/)
+  expect(
+    repo.prepareCollaborationAction(
+      {
+        sessionId: f.sessionId,
+        taskId: restored.id,
+        revision: restored.revision,
+        clientMessageId: randomUUID(),
+        action: 'resume',
+      },
+      settings,
+    ).next,
+  ).toMatchObject({ stage: 'plan', actor: restored.owner })
+})
+
+it('preserves an authenticated revision observed after a later reply was queued', async () => {
+  const f = await fixture()
+  f.finish()
+  f.finish(advance(f).id, { verdict: 'accepted' })
+  const write = advance(f, 'execute')
+  f.finish(write.id, { outcome: 'interrupted' })
+  f.receive(f.input('Change acceptance to cover offline cancellation.'))
+  const first = f.materialize().run
+  const later = f.receive(f.input('Please also explain the current status.'))
+  f.finish(first.id, { inputOutcome: 'plan_revision_required' })
+  const superseded = f.repo.collaboration(f.sessionId)!
+  expect(superseded).toMatchObject({
+    automation: 'paused',
+    planRevision: { requestRunId: first.id, writeRunId: write.id },
+    inputProcessing: { pending: { inputId: later.send.clientMessageId } },
+  })
+  const followup = f.materialize().run
+  f.finish(followup.id, { inputOutcome: 'processed' })
+  expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+    planRevision: superseded.planRevision,
+    inputProcessing: { settled: { runId: followup.id } },
+  })
+  expect(advance(f, 'resume').collaboration?.stage).toBe('plan')
+})
+
+it.each(['processed', 'plan_revision_required'] as const)(
+  'retains the write fence when successful input outcomes conflict, starting with %s',
+  async (first) => {
+    const f = await fixture()
+    f.finish()
+    f.finish(advance(f).id, { verdict: 'accepted' })
+    const write = advance(f, 'execute')
+    f.finish(write.id, { outcome: 'interrupted' })
+    f.receive(f.input('Use the new acceptance conditions.'))
+    const reply = f.materialize().run
+    f.finish(reply.id, {
+      inputObservations: [first, first === 'processed' ? 'plan_revision_required' : 'processed'],
+    })
+    const current = f.repo.collaboration(f.sessionId)!
+    expect(current).toMatchObject({
+      status: 'failed',
+      automation: 'paused',
+      planRevision: { requestRunId: reply.id, writeRunId: write.id },
+    })
+    expect(current.inputProcessing?.pending).toBeDefined()
+    expect(() => advance(f, 'resume')).toThrow(/Reply/)
+  },
+)
+
+async function collidingPlanSourceGrants() {
+  const f = await fixture()
+  f.finish()
+  f.finish(advance(f).id, { verdict: 'accepted' })
+  const plan = f.repo.collaboration(f.sessionId)!.planReference!
+  const handoff = f.repo.readHandoffPage(f.sessionId, 'claude', -1, Number.MAX_SAFE_INTEGER)
+  const originalMessage = handoff.messages.find((item) => item.messageId === plan.sourceMessageId)!
+  const write = advance(f, 'execute', [
+    {
+      id: originalMessage.messageId,
+      revision: originalMessage.contentRevision,
+      digest: originalMessage.digest,
+    },
+  ])
+  const prior = f.repo
+    .readRunSources(write.id)
+    .items.find((item) => item.messageId === originalMessage.messageId)!
+  expect(prior.documents.length).toBeGreaterThan(1)
+  f.finish(write.id, { outcome: 'interrupted' })
+  f.receive(f.input('Change acceptance to cover offline operation.'))
+  const reply = f.materialize().run
+  f.finish(reply.id, { inputOutcome: 'plan_revision_required' })
+  const planner = advance(f, 'resume')
+  f.repo.recordWorkflowPlanRetained(planner.id, {
+    nativeId: 'retain-accepted-plan-for-new-review',
+    confirmation: 'native_root_settled_v1',
+    sha256: plan.document.sha256,
+    bytes: plan.document.bytes,
+    chars: plan.document.chars,
+  })
+  f.finish(planner.id, { answer: 'The exact Plan already describes offline operation.' })
+  f.finish(advance(f).id, { verdict: 'accepted' })
+  return { f, plan, write, prior, originalMessage }
+}
+
+it('retains every inherited source when a new action also grants the same message', async () => {
+  const { f, prior, originalMessage } = await collidingPlanSourceGrants()
+  const next = advance(f, 'execute')
+  const inherited = f.repo
+    .readRunSources(next.id)
+    .items.find((item) => item.messageId === originalMessage.messageId)!
+  expect(inherited.documents.map((item) => item.source)).toEqual(
+    expect.arrayContaining(prior.documents.map((item) => item.source)),
+  )
+})
+
+it.each(['revision', 'batch', 'document', 'capacity'] as const)(
+  'keeps the old Run and revision fence if frozen source %s cannot be merged',
+  async (failure) => {
+    const { f, plan, write, prior, originalMessage } = await collidingPlanSourceGrants()
+    const before = f.repo.collaboration(f.sessionId)!
+    const authorization = f.repo.collaborationTurnAuthorization(write.id)
+    const key = and(
+      eq(conversationRunSourceRefs.runId, write.id),
+      eq(conversationRunSourceRefs.sourceMessageId, originalMessage.messageId),
+    )
+    const old = f.db.drizzle.select().from(conversationRunSourceRefs).where(key).get()!
+    const report = prior.documents.find((entry) => entry.key === 'message')!.source
+    const item = {
+      messageId: prior.messageId,
+      revision: prior.revision,
+      documents: [{ key: '', source: report }],
+    }
+    const remaining = 48 * 1024 - 2048 - Buffer.byteLength(JSON.stringify(item)) - 16
+    const cases = {
+      revision: { sourceRevision: old.sourceRevision + 1 },
+      batch: { batchId: authorization!.inputBatchRef!.id },
+      document: {
+        documentsJson: JSON.stringify([
+          {
+            key: 'plan',
+            source: { ...plan.document, sha256: '0'.repeat(64) },
+          },
+        ]),
+      },
+      capacity: { documentsJson: JSON.stringify([{ key: 'x'.repeat(remaining), source: report }]) },
+    }
+    f.db.drizzle.update(conversationRunSourceRefs).set(cases[failure]).where(key).run()
+    const perturbed = f.db.drizzle.select().from(conversationRunSourceRefs).where(key).get()!
+    let page = f.repo.readRunSources(write.id)
+    while (
+      page.nextOffset !== null &&
+      !page.items.some((entry) => entry.messageId === prior.messageId)
+    )
+      page = f.repo.readRunSources(write.id, page.nextOffset)
+    expect(page.items.some((entry) => entry.messageId === prior.messageId)).toBe(true)
+    const runCount = f.repo.read(f.sessionId).runs.length
+    expect(() => advance(f, 'execute')).toThrow(/conflicts|does not belong|metadata budget/i)
+    expect(f.repo.read(f.sessionId).runs).toHaveLength(runCount)
+    expect(f.repo.collaboration(f.sessionId)).toEqual(before)
+    expect(f.repo.collaborationTurnAuthorization(write.id)).toEqual(authorization)
+    expect(f.db.drizzle.select().from(conversationRunSourceRefs).where(key).get()).toEqual(
+      perturbed,
+    )
+  },
+)
+
+it('grants exact previous Plan and repair scope after newer documents supersede them', async () => {
+  const f = await fixture()
+  f.repo.recordWorkflowPlan(f.first.run.id, {
+    nativeId: 'unselected-original-plan-draft',
+    text: 'An unselected sibling document that was never part of the accepted Plan.',
+  })
+  f.finish()
+  const unselected = f.db.drizzle.get<{ source: string }>(
+    sql`SELECT json_extract(payload,'$.source') AS source FROM agent_event_journal WHERE run_id=${f.first.run.id} AND event_type='workflow.plan_observed' ORDER BY sequence LIMIT 1`,
+  )
+  const unselectedPlan = collaborationDocumentSchema.parse(JSON.parse(unselected.source))
+  f.finish(advance(f).id, { verdict: 'accepted' })
+  f.finish(advance(f, 'execute').id, { answer: 'Earlier implementation.' })
+  f.finish(advance(f).id, { verdict: 'changes_requested', answer: 'The original repair findings.' })
+  const findings = f.repo.collaboration(f.sessionId)!.review!
+  const repair = advance(f, 'repair')
+  const old = f.repo.collaborationTurnAuthorization(repair.id)!
+  const originalGrants = f.repo.readRunSources(repair.id)
+  expect(
+    originalGrants.items.flatMap((item) => item.documents.map((entry) => entry.source.id)),
+  ).toContain(findings.document.id)
+  f.finish(repair.id, { outcome: 'interrupted' })
+  f.receive(f.input('Change acceptance to include operation cancellation while offline.'))
+  const reply = f.materialize().run
+  f.finish(reply.id, { inputOutcome: 'plan_revision_required' })
+  const planner = advance(f, 'resume')
+  f.finish(planner.id, { plan: 'P2 is different and covers offline cancellation.' })
+  const planReview = advance(f)
+  f.finish(planReview.id, { verdict: 'accepted' })
+  const implementation = advance(f, 'execute')
+  f.finish(implementation.id, { answer: 'Revised implementation.' })
+  const codeReview = advance(f)
+  const current = f.repo.collaborationTurnAuthorization(codeReview.id)!
+  expect(current.planReference?.document.sha256).not.toBe(old.planReference?.document.sha256)
+  expect(current.reviewScopeRef?.sha256).not.toBe(old.reviewScopeRef?.sha256)
+  for (const run of [planner, planReview, implementation, codeReview]) {
+    expect(f.repo.sourceDocumentAuthorized(run.id, unselectedPlan)).toBe(false)
+    expect(f.repo.sourceDocumentAuthorized(run.id, findings.document)).toBe(true)
+    expect(
+      f.repo
+        .readRunSources(run.id)
+        .items.flatMap((item) => item.documents.map((entry) => entry.source.id)),
+    ).toContain(findings.document.id)
+    for (const document of [old.planReference!.document, old.reviewScopeRef!]) {
+      const source = f.repo
+        .readRunSources(run.id)
+        .items.find((item) => item.messageId === repair.userMessageId)
+      expect(source?.documents.some((entry) => entry.source.id === document.id)).toBe(true)
+      expect(f.repo.sourceDocumentAuthorized(run.id, document)).toBe(true)
+      expect(readDocument(f, document)).not.toBe('')
+    }
+  }
+  expect(f.repo.readRunSources(repair.id)).toEqual(originalGrants)
+})
+
+it('keeps the original write sources in a verified native planning answer', async () => {
+  const f = await fixture()
+  f.finish()
+  f.finish(advance(f).id, { verdict: 'accepted' })
+  f.finish(advance(f, 'execute').id, { answer: 'The earlier implementation completed.' })
+  f.finish(advance(f).id, { verdict: 'changes_requested' })
+  const write = advance(f, 'repair')
+  const original = f.repo.collaborationTurnAuthorization(write.id)!
+  f.finish(write.id, { outcome: 'interrupted' })
+  f.receive(f.input('Change the target to offline cancellation.'))
+  const reply = f.materialize().run
+  f.finish(reply.id, { inputOutcome: 'plan_revision_required' })
+  const planner = advance(f, 'resume')
+  f.finish(planner.id, {
+    inputOutcome: 'needs_user',
+    questions: [{ prompt: 'Which offline cases?', selection: 'single' }],
+  })
+  f.receive(decisionInput(f, 'Cover requests already in progress.'))
+  const answer = f.materialize().run
+  const auth = f.repo.collaborationTurnAuthorization(answer.id)!
+  expect(auth).toMatchObject({ actor: planner.agentId, replyMode: 'plan' })
+  expect(auth.planRevisionContextRef).toBeDefined()
+  expect(f.repo.sourceDocumentAuthorized(answer.id, auth.planRevisionContextRef!)).toBe(true)
+  const exact = f.repo
+    .readRunSources(answer.id)
+    .items.find((item) => item.messageId === write.userMessageId)
+  expect(exact?.documents.map((item) => item.source.id)).toEqual(
+    expect.arrayContaining([original.planReference!.document.id, original.reviewScopeRef!.id]),
+  )
+  expect(f.repo.readFrozenInputBatch(answer.id, original.inputBatchRef!.id).batch).toMatchObject(
+    original.inputBatchRef!,
+  )
+  f.finish(answer.id, { plan: 'Handle in-progress requests when offline.' })
+  expect(advance(f).collaboration?.stage).toBe('plan_review')
+})
+
+it('keeps the revision fence and input gate while the native reply effects are unknown', async () => {
+  const f = await fixture()
+  f.finish()
+  f.finish(advance(f).id, { verdict: 'accepted' })
+  const write = advance(f, 'execute')
+  f.finish(write.id, { outcome: 'interrupted' })
+  f.receive(f.input('Change the acceptance to require offline operation.'))
+  const reply = f.materialize().run
+  f.repo.recordNativeEffects(reply.id, 'pending')
+  f.finish(reply.id, { inputOutcome: 'plan_revision_required' }, false)
+  f.repo.recordNativeEffects(reply.id, 'unknown')
+  const current = f.repo.collaboration(f.sessionId)!
+  expect(current).toMatchObject({
+    automation: 'paused',
+    planRevision: { requestRunId: reply.id, writeRunId: write.id },
+    inputProcessing: { pending: { inputId: reply.userMessageId } },
+  })
+  expect(() => advance(f, 'resume')).toThrow(/reply|native recovery/i)
+  expect(f.repo.collaboration(f.sessionId)?.planRevision).toEqual(current.planRevision)
+})
+
+it('rolls back a revised Implement when the original frozen write source is missing', async () => {
+  const f = await fixture()
+  f.finish()
+  f.finish(advance(f).id, { verdict: 'accepted' })
+  const original = advance(f, 'execute')
+  const originalBatch = f.repo.collaborationTurnAuthorization(original.id)!.inputBatchRef!
+  const source = f.repo.readFrozenInputBatch(original.id, originalBatch.id).body!
+  f.finish(original.id, { outcome: 'interrupted' })
+  f.receive(f.input('Revise the acceptance to cover offline cancellation.'))
+  const reply = f.materialize().run
+  f.finish(reply.id, { inputOutcome: 'plan_revision_required' })
+  const planner = advance(f, 'resume')
+  f.finish(planner.id, { plan: 'An updated Plan for offline cancellation.' })
+  f.finish(advance(f).id, { verdict: 'accepted' })
+  const ready = f.repo.collaboration(f.sessionId)!
+  const prepared = f.repo.prepareCollaborationAction(
+    {
+      sessionId: f.sessionId,
+      taskId: ready.id,
+      revision: ready.revision,
+      clientMessageId: randomUUID(),
+      action: 'execute',
+    },
+    settings,
+  )
+  const input = {
+    sessionId: f.sessionId,
+    clientMessageId: prepared.receipt.clientNonce,
+    content: 'Implement the newly accepted scope.',
+    commentIds: [],
+    expectedCommentsRevision: f.drafts().commentsRevision,
+    agentId: prepared.next!.actor,
+    settingsRevision: 1,
+    model: null,
+    effort: null,
+    preserveDraftComments: true,
+    expectedCollaborationRevision: ready.revision,
+    collaboration: prepared.next!,
+    schedulingHandoff: prepared.handoff,
+    collaborationActionReceiptId: prepared.receipt.id,
+  }
+  f.db.drizzle
+    .update(conversationBodyInputs)
+    .set({ sealed: false })
+    .where(eq(conversationBodyInputs.id, source.id))
+    .run()
+  expect(() => f.repo.beginRun(input)).toThrow(/source|document/i)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(ready)
+  expect(
+    f.repo.collaborationActionReceipt({
+      sessionId: f.sessionId,
+      taskId: ready.id,
+      revision: ready.revision,
+      clientMessageId: prepared.receipt.clientNonce,
+      action: 'execute',
+    }),
+  ).toMatchObject({ state: 'available', boundRunId: null })
+  f.db.drizzle
+    .update(conversationBodyInputs)
+    .set({ sealed: true })
+    .where(eq(conversationBodyInputs.id, source.id))
+    .run()
+  const admitted = f.repo.beginRun(input)
+  expect(admitted.created).toBe(true)
+  expect(f.repo.collaboration(f.sessionId)?.planRevision).toBeUndefined()
+  expect(f.repo.beginRun(input)).toMatchObject({ created: false, run: { id: admitted.run.id } })
+})
+
+async function legacyPlanSupplement() {
+  const { f, original, retained } = await legacyRetainedPlan()
+  f.repo.setCollaborationState(advanceCollaboration(retained, 'resume', settings))
+  for (let index = 0; index < 2; index++) {
+    f.finish(advance(f).id, { verdict: 'changes_requested' })
+    f.finish(advance(f).id, {
+      plan: `A reviewed Plan update before the supplement, pass ${index + 1}.`,
+    })
+  }
+  const supplement = await confirmedSupplement(f, 'supplement_plan')
+  const extra = startConfirmedSupplement(f, supplement)
+  f.repo.pauseCollaboration(f.sessionId, 'stopped')
+  return { f, original, supplement, extra }
+}
+
+it('returns a legacy unfinished Plan supplement to its fixed reviewer before revising the requirements', async () => {
+  const { f, original, supplement, extra } = await legacyPlanSupplement()
+  f.finish(extra.id, { plan: 'The completed supplementary Plan needs its fixed review.' })
+
+  f.receive(f.input('Change acceptance to add offline cancellation.'))
+  const reply = f.materialize().run
+  expect(f.repo.collaborationTurnAuthorization(reply.id)?.replyMode).toBe('read_only')
+  f.finish(reply.id, { inputOutcome: 'plan_revision_required' })
+  expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+    planRevision: {
+      requestRunId: reply.id,
+      writeRunId: original.runId,
+      returnReview: { receiptId: supplement.receipt.id, stage: 'plan_review' },
+    },
+  })
+  const review = advance(f, 'resume')
+  expect(review).toMatchObject({
+    agentId: supplement.next.reviewer,
+    collaboration: { stage: 'plan_review' },
+  })
+  f.finish(review.id, { verdict: 'accepted' })
+  const afterReturn = f.repo.collaboration(f.sessionId)!
+  expect(afterReturn.planRevision?.returnReview).toBeUndefined()
+  expect(afterReturn.review?.runId).toBe(review.id)
+  const planner = advance(f)
+  expect(planner.collaboration?.stage).toBe('plan')
+  const { document } = afterReturn.planReference!
+  f.repo.recordWorkflowPlanRetained(planner.id, {
+    nativeId: 'retain-supplemented-plan-for-new-review',
+    confirmation: 'native_root_settled_v1',
+    sha256: document.sha256,
+    bytes: document.bytes,
+    chars: document.chars,
+  })
+  f.finish(planner.id, { answer: 'The exact Plan already covers offline cancellation.' })
+  expect(() => advance(f, 'execute')).toThrow(/not been accepted/i)
+  const independent = advance(f)
+  expect(independent).toMatchObject({
+    agentId: review.agentId,
+    collaboration: { stage: 'plan_review' },
+  })
+  f.finish(independent.id, { verdict: 'accepted' })
+  const implementation = advance(f, 'execute')
+  expect(
+    f.repo.collaborationTurnAuthorization(implementation.id)?.userAuthority?.rootReceiptId,
+  ).not.toBe(original.userAuthority?.rootReceiptId)
+})
+
+it.each(['direct', 'current_chain', 'historical_chain'] as const)(
+  'keeps the %s native planning answer as the old supplement review source',
+  async (history) => {
+    const { f, supplement, extra } = await legacyPlanSupplement()
+    f.finish(extra.id, {
+      inputOutcome: 'needs_user',
+      questions: [{ prompt: 'Which boundary should the supplement cover?', selection: 'single' }],
+      answer: 'The original supplementary Plan needs an explicit boundary.',
+    })
+    const historicalShape = (runId: string) => {
+      if (history !== 'historical_chain') return
+      f.db.drizzle
+        .update(workflowTurns)
+        .set({
+          authorizationJson: sql`json_remove(authorization_json, '$.supplementPlanAnswerReceiptId', '$.replyMode')`,
+          stateJson: sql`json_remove(state_json, '$.authorization.supplementPlanAnswerReceiptId', '$.authorization.replyMode')`,
+        })
+        .where(eq(workflowTurns.runId, runId))
+        .run()
+      f.db.drizzle
+        .update(collaborationTasks)
+        .set({
+          stateJson: sql`json_remove(state_json, '$.authorization.supplementPlanAnswerReceiptId', '$.authorization.replyMode')`,
+        })
+        .where(eq(collaborationTasks.id, f.repo.collaboration(f.sessionId)!.id))
+        .run()
+    }
+    if (history !== 'direct') {
+      f.receive(decisionInput(f, 'Cover requests received before the shutdown signal.'))
+      const intermediate = f.materialize().run
+      f.finish(intermediate.id, {
+        inputOutcome: 'needs_user',
+        questions: [{ prompt: 'Should draining requests stay in scope?', selection: 'single' }],
+      })
+      historicalShape(intermediate.id)
+    }
+    f.receive(decisionInput(f, 'Cover requests still draining from before shutdown.'))
+    const answer = f.materialize().run
+    expect(f.repo.collaborationTurnAuthorization(answer.id)?.replyMode).toBe('plan')
+    f.finish(answer.id, { plan: 'Cover requests received before shutdown.' })
+    historicalShape(answer.id)
+    const settled = f.repo.collaboration(f.sessionId)!
+    expect(settled.planReference?.sourceRunId).toBe(answer.id)
+    const originalReturn = f.repo.prepareCollaborationAction(
+      {
+        sessionId: f.sessionId,
+        taskId: settled.id,
+        revision: settled.revision,
+        clientMessageId: randomUUID(),
+        action: 'resume',
+      },
+      settings,
+    )
+    expect(originalReturn.next?.stage).toBe('plan_review')
+    f.repo.cancelPreparedCollaborationAction(originalReturn.receipt.id)
+
+    f.receive(f.input('Change the requested acceptance to cancellation while offline.'))
+    const later = f.materialize().run
+    expect(f.repo.collaborationTurnAuthorization(later.id)?.replyMode).toBe('read_only')
+    f.finish(later.id, { inputOutcome: 'plan_revision_required' })
+    const review = advance(f, 'resume')
+    expect(review.collaboration?.stage).toBe('plan_review')
+    expect(f.repo.collaborationTurnAuthorization(review.id)?.supplementPlanReturn).toMatchObject({
+      receiptId: supplement.receipt.id,
+      sourceRunId: answer.id,
+    })
+    f.finish(review.id, { verdict: 'accepted' })
+    expect(f.repo.collaboration(f.sessionId)?.planRevision?.returnReview).toBeUndefined()
+    expect(advance(f).collaboration?.stage).toBe('plan')
+  },
+)
+
+it.each(['direct', 'processed_status', 'decision_status', 'interrupted_status'] as const)(
+  'preserves a legacy ordinary planner reply as the Plan source (%s)',
+  async (history) => {
+    const { f, supplement, extra } = await legacyPlanSupplement()
+    f.finish(extra.id, { plan: 'The original supplementary Plan.' })
+    const statusSources: string[] = []
+    const statusAnchor = () => {
+      f.receive(
+        {
+          ...f.input('Give me the status of the supplementary Plan.'),
+          route: { type: 'agent', agentId: 'claude' },
+        },
+        'claude',
+      )
+      const status = f.materialize().run
+      expect(f.repo.workflowPlanSourceExpected(status.id)).toBe(false)
+      statusSources.push(status.id)
+      if (history === 'decision_status') {
+        f.finish(status.id, {
+          inputOutcome: 'needs_user',
+          questions: [{ prompt: 'Which progress should I report?', selection: 'single' }],
+        })
+        f.receive(decisionInput(f, 'Summarize just the shutdown sequencing.'))
+        const answer = f.materialize().run
+        f.finish(answer.id, { inputOutcome: 'processed' })
+        statusSources.push(answer.id)
+        return answer.id
+      }
+      f.finish(
+        status.id,
+        history === 'interrupted_status'
+          ? { outcome: 'interrupted', answer: 'The status response was interrupted.' }
+          : { inputOutcome: 'processed' },
+      )
+      return status.id
+    }
+    const anchorRunId = history === 'direct' ? extra.id : statusAnchor()
+    const statusHistory = () =>
+      statusSources.map((id) => {
+        const { updatedAt: _activity, ...run } = f.repo.findRun(id)!
+        return {
+          run,
+          turn: f.db.drizzle.select().from(workflowTurns).where(eq(workflowTurns.runId, id)).get(),
+          input: f.db.drizzle
+            .select()
+            .from(collaborationInputs)
+            .where(eq(collaborationInputs.id, run.userMessageId))
+            .get(),
+          inputResults: f.db.drizzle
+            .select()
+            .from(agentEventJournal)
+            .where(sql`run_id=${id} AND event_type='workflow.input_result_observed'`)
+            .all(),
+        }
+      })
+    const before = statusHistory()
+    f.receive(
+      {
+        ...f.input('Clarify the current shutdown sequencing in the Plan.'),
+        route: { type: 'agent', agentId: 'codex' },
+      },
+      'codex',
+    )
+    const historical = f.materialize().run
+    f.db.drizzle
+      .update(workflowTurns)
+      .set({
+        authorizationJson: sql`json_remove(authorization_json, '$.replyMode', '$.planRevisionWriteRunId')`,
+        stateJson: sql`json_remove(state_json, '$.authorization.replyMode', '$.authorization.planRevisionWriteRunId')`,
+      })
+      .where(eq(workflowTurns.runId, historical.id))
+      .run()
+    f.db.drizzle
+      .update(collaborationTasks)
+      .set({
+        stateJson: sql`json_remove(state_json, '$.authorization.replyMode', '$.authorization.planRevisionWriteRunId')`,
+      })
+      .where(eq(collaborationTasks.id, f.repo.collaboration(f.sessionId)!.id))
+      .run()
+    expect(f.repo.workflowPlanSourceExpected(historical.id)).toBe(true)
+    f.finish(historical.id, { plan: 'The supplementary Plan with exact shutdown sequencing.' })
+    const settled = f.repo.collaboration(f.sessionId)!
+    expect(settled.planReference?.sourceRunId).toBe(historical.id)
+    const prepared = f.repo.prepareCollaborationAction(
+      {
+        sessionId: f.sessionId,
+        taskId: settled.id,
+        revision: settled.revision,
+        clientMessageId: randomUUID(),
+        action: 'resume',
+      },
+      settings,
+    )
+    expect(prepared.next?.stage).toBe('plan_review')
+    f.repo.cancelPreparedCollaborationAction(prepared.receipt.id)
+
+    f.receive(f.input('Change acceptance to cancellation while offline.'))
+    f.finish(f.materialize().run.id, { inputOutcome: 'plan_revision_required' })
+    const originalInput = f.db.drizzle
+      .select()
+      .from(collaborationInputs)
+      .where(eq(collaborationInputs.id, historical.userMessageId))
+      .get()!
+    expect(originalInput.anchorRunId).toBe(anchorRunId)
+    f.db.drizzle
+      .update(collaborationInputs)
+      .set({ anchorRunId: f.first.run.id })
+      .where(eq(collaborationInputs.id, historical.userMessageId))
+      .run()
+    expect(() => advance(f, 'resume')).toThrow(/original reviewer/)
+    f.db.drizzle
+      .update(collaborationInputs)
+      .set({ anchorRunId: originalInput.anchorRunId })
+      .where(eq(collaborationInputs.id, historical.userMessageId))
+      .run()
+    const assertUnchangedCarrier = () => {
+      const filter = eq(workflowTurns.runId, anchorRunId)
+      const carrier = f.db.drizzle.select().from(workflowTurns).where(filter).get()!
+      f.db.drizzle
+        .update(workflowTurns)
+        .set({
+          stateJson: sql`json_set(state_json, '$.planReference.sourceRunId', ${f.first.run.id})`,
+        })
+        .where(filter)
+        .run()
+      expect(() => advance(f, 'resume')).toThrow(/original reviewer/)
+      f.db.drizzle.update(workflowTurns).set({ stateJson: carrier.stateJson }).where(filter).run()
+      const effectsFilter = eq(agentRuns.id, anchorRunId)
+      const priorEffects = f.db.drizzle
+        .select({ state: agentRuns.nativeEffectsState })
+        .from(agentRuns)
+        .where(effectsFilter)
+        .get()!.state
+      f.db.drizzle
+        .update(agentRuns)
+        .set({ nativeEffectsState: 'unknown' })
+        .where(effectsFilter)
+        .run()
+      expect(() => advance(f, 'resume')).toThrow(/original reviewer|native recovery/i)
+      f.db.drizzle
+        .update(agentRuns)
+        .set({ nativeEffectsState: priorEffects })
+        .where(effectsFilter)
+        .run()
+    }
+    if (history !== 'direct') assertUnchangedCarrier()
+    const exactAuth = f.repo.collaborationTurnAuthorization(historical.id)!
+    for (const invalid of [
+      { ...exactAuth, replyMode: 'read_only' },
+      { ...exactAuth, planReference: { ...exactAuth.planReference!, sourceRunId: f.first.run.id } },
+    ]) {
+      f.db.drizzle
+        .update(workflowTurns)
+        .set({ authorizationJson: JSON.stringify(invalid) })
+        .where(eq(workflowTurns.runId, historical.id))
+        .run()
+      expect(() => advance(f, 'resume')).toThrow(/original reviewer/)
+    }
+    f.db.drizzle
+      .update(workflowTurns)
+      .set({ authorizationJson: JSON.stringify(exactAuth) })
+      .where(eq(workflowTurns.runId, historical.id))
+      .run()
+    const review = advance(f, 'resume')
+    expect(f.repo.collaborationTurnAuthorization(review.id)?.supplementPlanReturn).toMatchObject({
+      receiptId: supplement.receipt.id,
+      sourceRunId: historical.id,
+    })
+    f.finish(review.id, { verdict: 'accepted' })
+    expect(statusHistory()).toEqual(before)
+    expect(advance(f).collaboration?.stage).toBe('plan')
+  },
+)
+
+it('keeps a legacy planner source anchored after the interrupted exact Plan return review', async () => {
+  const { f, supplement, extra } = await legacyPlanSupplement()
+  f.finish(extra.id, { plan: 'The supplementary Plan before the return review.' })
+  const originalPlan = f.repo.collaboration(f.sessionId)!.planReference!
+  const interrupted = advance(f, 'resume')
+  expect(interrupted.collaboration?.stage).toBe('plan_review')
+  expect(f.repo.collaborationTurnAuthorization(interrupted.id)?.planReference).toEqual(originalPlan)
+  f.finish(interrupted.id, { outcome: 'interrupted', answer: 'The original review was stopped.' })
+  expect(f.repo.findRun(interrupted.id)).toMatchObject({
+    dispatchPhase: 'ended',
+    nativeOutcome: 'interrupted',
+    nativeEffectsState: 'settled',
+  })
+  expect(
+    f.db.drizzle
+      .select()
+      .from(collaborationActionReceipts)
+      .where(eq(collaborationActionReceipts.id, supplement.receipt.id))
+      .get(),
+  ).toMatchObject({ reviewState: 'pending', reviewRunId: interrupted.id, boundRunId: extra.id })
+
+  f.receive(
+    {
+      ...f.input('Clarify the current Plan after the interrupted review.'),
+      route: { type: 'agent', agentId: 'codex' },
+    },
+    'codex',
+  )
+  const historical = f.materialize().run
+  expect(
+    f.db.drizzle
+      .select()
+      .from(collaborationInputs)
+      .where(eq(collaborationInputs.id, historical.userMessageId))
+      .get(),
+  ).toMatchObject({ state: 'materialized', anchorRunId: interrupted.id })
+  expect(f.repo.collaborationTurnAuthorization(historical.id)?.planReference).toEqual(originalPlan)
+  f.db.drizzle
+    .update(workflowTurns)
+    .set({
+      authorizationJson: sql`json_remove(authorization_json, '$.replyMode', '$.planRevisionWriteRunId')`,
+      stateJson: sql`json_remove(state_json, '$.authorization.replyMode', '$.authorization.planRevisionWriteRunId')`,
+    })
+    .where(eq(workflowTurns.runId, historical.id))
+    .run()
+  f.db.drizzle
+    .update(collaborationTasks)
+    .set({
+      stateJson: sql`json_remove(state_json, '$.authorization.replyMode', '$.authorization.planRevisionWriteRunId')`,
+    })
+    .where(eq(collaborationTasks.id, f.repo.collaboration(f.sessionId)!.id))
+    .run()
+  expect(f.repo.workflowPlanSourceExpected(historical.id)).toBe(true)
+  f.finish(historical.id, { plan: 'The exact clarified Plan after the stopped review.' })
+  const settled = f.repo.collaboration(f.sessionId)!
+  expect(settled.planReference?.sourceRunId).toBe(historical.id)
+  const prepared = f.repo.prepareCollaborationAction(
+    {
+      sessionId: f.sessionId,
+      taskId: settled.id,
+      revision: settled.revision,
+      clientMessageId: randomUUID(),
+      action: 'resume',
+    },
+    settings,
+  )
+  expect(prepared.next?.stage).toBe('plan_review')
+  f.repo.cancelPreparedCollaborationAction(prepared.receipt.id)
+
+  f.receive(f.input('Change acceptance to cancellation while offline.'))
+  f.finish(f.materialize().run.id, { inputOutcome: 'plan_revision_required' })
+  const before = f.repo.collaboration(f.sessionId)!
+  const handoffFilter = eq(schedulingHandoffs.runId, interrupted.id)
+  const originalHandoff = f.db.drizzle.select().from(schedulingHandoffs).where(handoffFilter).get()!
+  expect(originalHandoff).toMatchObject({
+    sessionId: f.sessionId,
+    budgetSubjectId: `task:${before.id}`,
+    eventId: extra.id,
+    slot: 'workflow_next',
+    action: 'workflow:plan_review',
+  })
+  const otherSession = randomUUID()
+  const session = f.db.sessionRepository.find(f.sessionId)!
+  f.db.sessionRepository.create(
+    {
+      id: otherSession,
+      projectId: session.projectId,
+      title: 'Unrelated session',
+      createdAt: f.now,
+    },
+    settings,
+  )
+  for (const invalid of [
+    { action: 'workflow:implement' },
+    { slot: 'input_dispatch' },
+    { sessionId: otherSession },
+    { budgetSubjectId: `task:${randomUUID()}` },
+    { eventId: historical.id },
+  ]) {
+    f.db.drizzle.update(schedulingHandoffs).set(invalid).where(handoffFilter).run()
+    expect(() => advance(f, 'resume')).toThrow(/original reviewer/)
+    f.db.drizzle
+      .update(schedulingHandoffs)
+      .set({
+        action: originalHandoff.action,
+        slot: originalHandoff.slot,
+        sessionId: originalHandoff.sessionId,
+        budgetSubjectId: originalHandoff.budgetSubjectId,
+        eventId: originalHandoff.eventId,
+      })
+      .where(handoffFilter)
+      .run()
+  }
+  const reviewFilter = eq(workflowTurns.runId, interrupted.id)
+  const historicalReview = f.db.drizzle.select().from(workflowTurns).where(reviewFilter).get()!
+  f.db.drizzle
+    .update(workflowTurns)
+    .set({
+      authorizationJson: sql`json_set(authorization_json, '$.planReference.sourceRunId', ${f.first.run.id})`,
+    })
+    .where(reviewFilter)
+    .run()
+  expect(() => advance(f, 'resume')).toThrow(/original reviewer/)
+  f.db.drizzle
+    .update(workflowTurns)
+    .set({ authorizationJson: historicalReview.authorizationJson })
+    .where(reviewFilter)
+    .run()
+  const effectsFilter = eq(agentRuns.id, interrupted.id)
+  f.db.drizzle.update(agentRuns).set({ nativeEffectsState: 'unknown' }).where(effectsFilter).run()
+  expect(() => advance(f, 'resume')).toThrow(/original reviewer|native recovery/i)
+  f.db.drizzle.update(agentRuns).set({ nativeEffectsState: 'settled' }).where(effectsFilter).run()
+  expect(f.repo.collaboration(f.sessionId)).toEqual(before)
+
+  const review = advance(f, 'resume')
+  const receiptFilter = eq(collaborationActionReceipts.id, supplement.receipt.id)
+  expect(
+    f.db.drizzle.select().from(collaborationActionReceipts).where(receiptFilter).get(),
+  ).toMatchObject({ reviewState: 'pending', reviewRunId: review.id, boundRunId: extra.id })
+  expect(f.repo.collaborationTurnAuthorization(review.id)?.supplementPlanReturn).toMatchObject({
+    receiptId: supplement.receipt.id,
+    sourceRunId: historical.id,
+  })
+  f.finish(review.id, { verdict: 'accepted' })
+  expect(
+    f.db.drizzle.select().from(collaborationActionReceipts).where(receiptFilter).get(),
+  ).toMatchObject({ reviewState: 'fulfilled', reviewRunId: review.id, boundRunId: extra.id })
+  const planner = advance(f)
+  expect(planner.collaboration?.stage).toBe('plan')
+  f.finish(planner.id, { plan: 'The newly revised Plan for cancellation while offline.' })
+  const independent = advance(f)
+  expect(independent.collaboration?.stage).toBe('plan_review')
+  expect(
+    f.repo.collaborationTurnAuthorization(independent.id)?.supplementPlanReturn,
+  ).toBeUndefined()
+  f.finish(independent.id, { verdict: 'accepted' })
+  expect(f.repo.collaboration(f.sessionId)).toMatchObject({ status: 'ready' })
+  expect(f.db.drizzle.select().from(schedulingHandoffs).where(handoffFilter).get()).toEqual(
+    originalHandoff,
+  )
+  expect(f.db.drizzle.select().from(workflowTurns).where(reviewFilter).get()).toEqual(
+    historicalReview,
+  )
+})
+
+it('returns the verified Plan published by an exact unsent answer replacement to the original reviewer', async () => {
+  const { f, supplement, extra } = await legacyPlanSupplement()
+  f.finish(extra.id, {
+    inputOutcome: 'needs_user',
+    questions: [
+      { prompt: 'Which cleanup boundary should the supplement cover?', selection: 'single' },
+    ],
+    answer: 'The supplementary Plan needs an explicit cleanup boundary.',
+  })
+  const content = 'Keep requests received before shutdown in scope.'
+  f.receive(decisionInput(f, content))
+  const original = f.materialize().run
+  const originalAuth = f.repo.collaborationTurnAuthorization(original.id)!
+  expect(originalAuth.replyMode).toBe('plan')
+  const nativeGeneration = randomUUID()
+  const nativeSessionId = 'fixture-codex'
+  const executorId = randomUUID()
+  f.repo.beginSchedulingRecoveryEpoch(randomUUID())
+  f.repo.recordExecutor(original.id, executorId)
+  f.repo.applyEvent(f.sessionId, original.id, {
+    type: 'session.started',
+    agentId: 'codex',
+    nativeSessionId,
+  })
+  f.repo.setContinuation(f.sessionId, 'codex', 'ready')
+  const envelope: FrozenExecutionEnvelope = {
+    version: 'pact-agent-prompt-v1',
+    sessionId: f.sessionId,
+    message: { id: original.userMessageId, content },
+    comments: [],
+    inputBatchRef: originalAuth.inputBatchRef,
+    collaboration: f.repo.collaborationPromptState(f.repo.collaboration(f.sessionId)!),
+    collaborationAuthorization: originalAuth,
+  }
+  const capture = await f.repo.captureExecutionInput({
+    runId: original.id,
+    nativeGeneration,
+    requested: {
+      provider: 'codex',
+      model: null,
+      effort: null,
+      speed: 'standard',
+      permissionMode: 'native',
+    },
+    source: (async function* () {
+      yield new TextEncoder().encode(JSON.stringify(envelope))
+    })(),
+    signal: new AbortController().signal,
+  })
+  expect(capture).toBeDefined()
+  f.repo.recordEffectiveExecutionSettings(
+    original.id,
+    nativeGeneration,
+    {
+      version: 1,
+      provider: 'codex',
+      model: 'fixture-effective-model',
+      effort: { known: true, value: null },
+      speed: 'standard',
+      permissionMode: 'native',
+      configurationSha256: 'a'.repeat(64),
+      provenance: 'codex_thread_configuration',
+    },
+    { executorId, nativeSessionId },
+  )
+  f.repo.recordDispatch(original.id, 'rejected', nativeSessionId, executorId)
+  f.repo.recordConfirmedUnsent(
+    original.id,
+    nativeGeneration,
+    {
+      kind: 'codex_root_frame_not_written',
+      requestId: 19,
+    },
+    { executorId, nativeSessionId },
+  )
+  f.repo.failRun(original.id, 'transient_transport', 'The exact root frame was not sent.')
+  f.repo.recordNativeEffects(original.id, 'not_dispatched')
+  f.repo.finishCollaboration(original.id, false)
+  f.repo.armSchedulingRecoveryFaults(f.sessionId)
+  const candidate = f.repo
+    .takeSchedulingRecoveryFaults()
+    .find((item) => item.fault.runId === original.id)!
+  const reexecution = {
+    operationId: randomUUID(),
+    faultId: candidate.fault.id,
+    handoff: f.repo.recoveryHandoff({ kind: 'run', id: original.id }),
+  }
+  const replacement = f.repo.beginConfirmedUnsentReexecution(reexecution).run
+  expect(replacement.reexecutedFromRunId).toBe(original.id)
+  f.repo.recordExecutor(replacement.id, executorId)
+  f.repo.recordDispatch(replacement.id, 'possibly_sent', nativeSessionId, executorId)
+  f.repo.recordDispatch(replacement.id, 'accepted', nativeSessionId, executorId)
+  f.finish(replacement.id, { plan: 'Complete cleanup for requests received before shutdown.' })
+  expect(
+    f.db.drizzle
+      .select()
+      .from(runReexecutionOperations)
+      .where(eq(runReexecutionOperations.id, reexecution.operationId))
+      .get(),
+  ).toMatchObject({ result: 'completed', replacementRunId: replacement.id })
+  const settled = f.repo.collaboration(f.sessionId)!
+  expect(settled.planReference?.sourceRunId).toBe(replacement.id)
+  const originalReturn = f.repo.prepareCollaborationAction(
+    {
+      sessionId: f.sessionId,
+      taskId: settled.id,
+      revision: settled.revision,
+      clientMessageId: randomUUID(),
+      action: 'resume',
+    },
+    settings,
+  )
+  expect(originalReturn.next?.stage).toBe('plan_review')
+  f.repo.cancelPreparedCollaborationAction(originalReturn.receipt.id)
+  f.receive(f.input('Change the acceptance to require offline operation.'))
+  f.finish(f.materialize().run.id, { inputOutcome: 'plan_revision_required' })
+  const pending = f.repo.collaboration(f.sessionId)!
+  f.db.drizzle
+    .update(runReexecutionOperations)
+    .set({ result: 'possibly_sent' })
+    .where(eq(runReexecutionOperations.id, reexecution.operationId))
+    .run()
+  expect(() => advance(f, 'resume')).toThrow(/original reviewer/)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(pending)
+  f.db.drizzle
+    .update(runReexecutionOperations)
+    .set({ result: 'completed' })
+    .where(eq(runReexecutionOperations.id, reexecution.operationId))
+    .run()
+  expect(f.repo.inputBatchForRun(original.id)).toEqual(originalAuth.inputBatchRef)
+  const review = advance(f, 'resume')
+  expect(f.repo.collaborationTurnAuthorization(review.id)?.supplementPlanReturn).toMatchObject({
+    receiptId: supplement.receipt.id,
+    sourceRunId: replacement.id,
+  })
+  f.finish(review.id, { verdict: 'accepted' })
+  expect(advance(f).collaboration?.stage).toBe('plan')
+})
+
+it('does not settle an interrupted Plan return and keeps newer input when its retry fulfills the old receipt', async () => {
+  const { f, supplement, extra } = await legacyPlanSupplement()
+  f.finish(extra.id, { plan: 'The supplementary Plan to return to the original reviewer.' })
+  f.receive(f.input('Revise acceptance to include offline cancellation.'))
+  f.finish(f.materialize().run.id, { inputOutcome: 'plan_revision_required' })
+  const first = advance(f, 'resume')
+  const historical = f.repo.collaborationTurnAuthorization(first.id)?.supplementPlanReturn
+  expect(historical).toMatchObject({ receiptId: supplement.receipt.id, sourceRunId: extra.id })
+  f.finish(first.id, { outcome: 'interrupted' })
+  f.repo.recoverCollaborationTasks()
+  expect(f.repo.collaboration(f.sessionId)?.planRevision?.returnReview?.receiptId).toBe(
+    supplement.receipt.id,
+  )
+  const second = advance(f, 'resume')
+  expect(f.repo.collaborationTurnAuthorization(second.id)?.supplementPlanReturn).toEqual(historical)
+  f.repo.pauseCollaboration(f.sessionId, 'user')
+  const queued = f.receive(f.input('Also keep the cleanup log.')).send.clientMessageId
+  f.finish(second.id, { verdict: 'accepted' })
+  const fulfilled = f.repo.collaboration(f.sessionId)!
+  expect(fulfilled).toMatchObject({
+    automation: 'paused',
+    inputProcessing: { pending: { inputId: queued } },
+    review: { runId: second.id, supplementPlanReturn: true },
+  })
+  expect(fulfilled.planRevision?.returnReview).toBeUndefined()
+  f.repo.finishCollaboration(second.id, true)
+  expect(f.repo.collaboration(f.sessionId)).toEqual(fulfilled)
+  expect(
+    f.db.drizzle
+      .select()
+      .from(collaborationActionReceipts)
+      .where(eq(collaborationActionReceipts.id, supplement.receipt.id))
+      .get(),
+  ).toMatchObject({ reviewState: 'fulfilled', reviewRunId: second.id })
+  const answer = f.materialize().run
+  f.finish(answer.id, { inputOutcome: 'processed' })
+  expect(advance(f, 'resume').collaboration?.stage).toBe('plan')
+})
+
+it.each(['receipt', 'settlement', 'report', 'effects'] as const)(
+  'blocks the historical Plan return when its exact %s cannot be proved',
+  async (failure) => {
+    const { f, supplement, extra } = await legacyPlanSupplement()
+    f.finish(extra.id, { plan: 'A completed supplementary Plan.' })
+    f.receive(f.input('Revise acceptance to include offline cancellation.'))
+    f.finish(f.materialize().run.id, { inputOutcome: 'plan_revision_required' })
+    const before = f.repo.collaboration(f.sessionId)!
+    if (failure === 'receipt') {
+      f.db.drizzle
+        .update(collaborationActionReceipts)
+        .set({ budgetReservationId: null })
+        .where(eq(collaborationActionReceipts.id, supplement.receipt.id))
+        .run()
+    } else if (failure === 'settlement') {
+      f.db.drizzle
+        .delete(agentEventJournal)
+        .where(sql`run_id=${extra.id} AND event_type='workflow.plan_settled'`)
+        .run()
+    } else if (failure === 'report') {
+      f.db.drizzle
+        .update(workflowTurns)
+        .set({ reportBodyId: null })
+        .where(eq(workflowTurns.runId, extra.id))
+        .run()
+    } else {
+      f.db.drizzle
+        .update(agentRuns)
+        .set({ nativeEffectsState: 'unknown' })
+        .where(eq(agentRuns.id, extra.id))
+        .run()
+    }
+    expect(() => advance(f, 'resume')).toThrow(/supplement|recovery/i)
+    expect(f.repo.collaboration(f.sessionId)).toEqual(before)
+  },
+)
+
+it('finishes the exact outstanding code supplement review before revising the Plan', async () => {
+  const f = await fixture(':memory:', undefined, { primary: 'codex', split: true })
+  f.finish()
+  f.finish(advance(f).id, { verdict: 'accepted' })
+  const write = advance(f, 'execute')
+  f.finish(write.id, { answer: 'The earlier implementation is complete.' })
+  f.finish(advance(f).id, { verdict: 'changes_requested' })
+  f.finish(advance(f, 'respond').id, { answer: 'Response to the original findings.' })
+  f.finish(advance(f).id, { verdict: 'changes_requested' })
+  const supplement = await confirmedSupplement(f, 'supplement_code_response')
+  const extra = startConfirmedSupplement(f, supplement)
+  f.repo.pauseCollaboration(f.sessionId, 'stopped')
+  f.finish(extra.id, { answer: 'Complete supplementary response.' })
+
+  f.receive(f.input('Expand the Plan to cover offline cancellation.'))
+  const reply = f.materialize().run
+  f.finish(reply.id, { inputOutcome: 'plan_revision_required' })
+  expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+    planRevision: {
+      requestRunId: reply.id,
+      writeRunId: write.id,
+      returnReview: { receiptId: supplement.receipt.id, stage: 'code_review' },
+    },
+    automation: 'paused',
+  })
+  const review = advance(f, 'resume')
+  expect(review).toMatchObject({ agentId: 'codex', collaboration: { stage: 'code_review' } })
+  f.finish(review.id, { verdict: 'accepted' })
+  const reviewed = f.repo.collaboration(f.sessionId)!
+  expect(reviewed).toMatchObject({
+    status: 'waiting',
+    codeRunId: write.id,
+    reviewCycles: 3,
+    planRevision: { requestRunId: reply.id, writeRunId: write.id },
+  })
+  expect(reviewed.planRevision?.returnReview).toBeUndefined()
+  expect(
+    f.db.drizzle
+      .select()
+      .from(collaborationActionReceipts)
+      .where(eq(collaborationActionReceipts.id, supplement.receipt.id))
+      .get(),
+  ).toMatchObject({ reviewState: 'fulfilled', reviewRunId: review.id })
+  const planner = advance(f)
+  expect(planner).toMatchObject({ agentId: 'codex', collaboration: { stage: 'plan' } })
+})
+
+it.each(['codex', 'claude'] as const)(
+  'routes a changed requirement through the fixed plan roles and a new authorization with %s as Primary',
+  async (primary) => {
+    const f = await fixture(':memory:', undefined, { primary, split: true })
+    f.finish()
+    f.finish(advance(f).id, { verdict: 'accepted' })
+    const original = advance(f, 'execute')
+    const originalAuth = f.repo.collaborationTurnAuthorization(original.id)!
+    f.finish(original.id, { outcome: 'interrupted', answer: 'Partial implementation remains.' })
+    const interrupted = f.repo.collaboration(f.sessionId)!
+    const originalContinuation = f.repo.prepareCollaborationAction(
+      {
+        sessionId: f.sessionId,
+        taskId: interrupted.id,
+        revision: interrupted.revision,
+        clientMessageId: randomUUID(),
+        action: 'resume',
+      },
+      settings,
+    )
+
+    f.receive(f.input('Change the acceptance criterion to durable cancellation.'))
+    const request = f.materialize().run
+    f.finish(request.id, { inputOutcome: 'plan_revision_required' })
+    const pending = f.repo.collaboration(f.sessionId)!
+    expect(pending).toMatchObject({
+      automation: 'paused',
+      pendingWork: { runId: original.id },
+      planRevision: { requestRunId: request.id, writeRunId: original.id },
+    })
+    expect(() =>
+      f.repo.beginRun({
+        sessionId: f.sessionId,
+        clientMessageId: originalContinuation.receipt.clientNonce,
+        content: 'Stale resume before changed requirements.',
+        commentIds: [],
+        expectedCommentsRevision: f.drafts().commentsRevision,
+        agentId: original.agentId,
+        settingsRevision: 1,
+        model: null,
+        effort: null,
+        preserveDraftComments: true,
+        expectedCollaborationRevision: interrupted.revision,
+        collaboration: originalContinuation.next!,
+        schedulingHandoff: originalContinuation.handoff,
+        collaborationActionReceiptId: originalContinuation.receipt.id,
+      }),
+    ).toThrow(/changed|current|handoff/i)
+    const planner = advance(f, 'resume')
+    expect(planner).toMatchObject({ agentId: primary, collaboration: { stage: 'plan' } })
+    expect(
+      f.repo.readFrozenInputBatch(planner.id, originalAuth.inputBatchRef!.id).batch,
+    ).toMatchObject(originalAuth.inputBatchRef!)
+    if (primary === 'claude') {
+      const { document } = pending.planReference!
+      f.repo.recordWorkflowPlanRetained(planner.id, {
+        nativeId: 'unchanged-current-plan',
+        confirmation: 'native_root_settled_v1',
+        sha256: document.sha256,
+        bytes: document.bytes,
+        chars: document.chars,
+      })
+      f.finish(planner.id, { answer: 'The current Plan covers the revised requirement.' })
+    } else f.finish(planner.id, { plan: 'Scope and acceptance.' })
+    const review = advance(f)
+    expect(review).toMatchObject({
+      agentId: original.agentId,
+      collaboration: { stage: 'plan_review' },
+    })
+    f.finish(review.id, { verdict: 'accepted' })
+    const ready = f.repo.collaboration(f.sessionId)!
+    expect(ready.status).toBe('ready')
+    expect(ready.pendingWork).toEqual(pending.pendingWork)
+    expect(ready.planVersion).toBe(pending.planVersion)
+    const revised = advance(f, 'execute')
+    const authorization = f.repo.collaborationTurnAuthorization(revised.id)!
+    expect(authorization.userAuthority?.purpose).toBe('action')
+    expect(authorization.userAuthority?.rootReceiptId).not.toBe(
+      originalAuth.userAuthority?.rootReceiptId,
+    )
+    expect(f.repo.collaboration(f.sessionId)?.planRevision).toBeUndefined()
+    expect(f.repo.collaborationTurnAuthorization(original.id)).toEqual(originalAuth)
+    expect(
+      f.repo.readFrozenInputBatch(revised.id, originalAuth.inputBatchRef!.id).batch,
+    ).toMatchObject(originalAuth.inputBatchRef!)
   },
 )
 

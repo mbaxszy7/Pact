@@ -7,6 +7,7 @@ import { expect, vi } from 'vitest'
 import type { AgentRunInput } from '@pact/agent-runtime'
 import type {
   CollaborationAction,
+  CollaborationInputObservation,
   CollaborationReviewObservation,
   DecisionInput,
   DecisionRemoteOutcome,
@@ -42,6 +43,9 @@ export interface WorkflowNativeState {
   candidate: string | null | undefined
   interruptNextWrite: boolean
   holdNextWrite?: boolean
+  replyOutcome?: CollaborationInputObservation | undefined
+  holdStage?: { stage: 'plan' | 'plan_review'; until: Promise<void> } | undefined
+  planText?: string | undefined
   loseObservation: boolean
   rebuilds: string[]
   sourceReads: WorkflowSourceRead[]
@@ -122,6 +126,7 @@ function readWorkflowSources(
     input.promptEnvelope.collaboration?.planReference?.document,
     input.promptEnvelope.collaboration?.reviewScopeRef,
     input.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
+    input.promptEnvelope.collaborationAuthorization?.planRevisionContextRef,
   ].filter((value) => value !== undefined))
     documentText(document)
   for (const source of ['inputs', 'handoff_sources'] as const) {
@@ -178,6 +183,11 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
           true,
         )
       if (phase) state.sourceReads.push(readWorkflowSources(input, state.forbiddenDocuments))
+      const held = state.holdStage
+      if (held && phase?.stage === held.stage) {
+        state.holdStage = undefined
+        await held.until
+      }
       if (state.holdNextWrite && (phase?.stage === 'implement' || phase?.stage === 'repair')) {
         if (!signal) throw Error('A held write requires its native cancellation signal')
         state.holdNextWrite = false
@@ -219,13 +229,14 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
             })
           input.recordWorkflowPlan?.({
             nativeId: `plan-${input.runId}`,
-            text: 'Complete accepted plan: preserve the original cancellation scope.',
+            text:
+              state.planText ?? 'Complete accepted plan: preserve the original cancellation scope.',
           })
         } else if (
           phase.stage === 'reply' &&
           !collaborationPlanMode(phase, input.promptEnvelope.collaborationAuthorization)
         )
-          input.recordWorkflowInputResult?.({ outcome: 'processed' })
+          input.recordWorkflowInputResult?.(state.replyOutcome ?? { outcome: 'processed' })
         else if (phase.stage === 'plan_review' || phase.stage === 'code_review')
           input.recordWorkflowReview?.(state.reviews.shift() ?? { verdict: 'accepted' })
       }

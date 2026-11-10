@@ -244,6 +244,8 @@ export const collaborationReviewSchema = z.strictObject({
   actor: agent,
   stage: z.enum(['plan_review', 'code_review']),
   verdict: collaborationReviewVerdictSchema,
+  /** This result discharges an older Plan review obligation only. */
+  supplementPlanReturn: z.literal(true).optional(),
   inputSequence: z.number().int().nonnegative(),
   planReference: collaborationPlanReferenceSchema.optional(),
   scopeRef: collaborationDocumentSchema.optional(),
@@ -305,6 +307,7 @@ export const collaborationInputOutcomeSchema = z.enum([
   'incomplete',
   'explanation_only',
   'repair_role_request',
+  'plan_revision_required',
 ])
 export type CollaborationInputOutcome = z.infer<typeof collaborationInputOutcomeSchema>
 export const collaborationInputObservationSchema = z.strictObject({
@@ -314,11 +317,13 @@ export const collaborationInputObservationSchema = z.strictObject({
 export type CollaborationInputObservation = z.infer<typeof collaborationInputObservationSchema>
 export const collaborationInputResultSchema = collaborationInputObservationSchema
   .extend({
-    outcome: z.enum(['processed', 'needs_user', 'repair_role_request']),
+    outcome: z.enum(['processed', 'needs_user', 'repair_role_request', 'plan_revision_required']),
   })
   .refine(
-    (value) => (value.outcome === 'needs_user') === Boolean(value.questions),
-    'Provide questions exactly when the outcome is needs_user.',
+    (value) =>
+      value.outcome === 'plan_revision_required' ||
+      (value.outcome === 'needs_user') === Boolean(value.questions),
+    'Questions are required for needs_user and optional for plan_revision_required.',
   )
 const collaborationInputProcessingSchema = z.strictObject({
   decision: z
@@ -339,6 +344,19 @@ const collaborationInputProcessingSchema = z.strictObject({
 })
 export type CollaborationInputProcessing = z.infer<typeof collaborationInputProcessingSchema>
 
+const collaborationPlanRevisionSchema = z.strictObject({
+  requestRunId: z.string().uuid(),
+  inputSequence: z.number().int().nonnegative(),
+  writeRunId: z.string().uuid(),
+  planReference: collaborationPlanReferenceSchema,
+  returnReview: z
+    .strictObject({
+      receiptId: z.string().uuid(),
+      stage: z.enum(['plan_review', 'code_review']),
+    })
+    .optional(),
+})
+
 /** Frozen at Run admission. Native tools never get to choose these identities. */
 export const collaborationTurnAuthorizationSchema = z.strictObject({
   runId: z.string().uuid(),
@@ -349,6 +367,19 @@ export const collaborationTurnAuthorizationSchema = z.strictObject({
   stageRoles: taskStageRolesSchema.optional(),
   /** Host-frozen reply execution mode. Missing on historical Runs retains their original policy. */
   replyMode: z.enum(['plan', 'read_only']).optional(),
+  /** Host-verified original write source for an ordinary reply's revision intent. */
+  planRevisionWriteRunId: z.string().uuid().optional(),
+  /** Read access to evidence retained from an earlier authorized write. */
+  planRevisionContextRef: collaborationDocumentSchema.optional(),
+  /** Verified continuation of a pending supplementary Plan's user decision. */
+  supplementPlanAnswerReceiptId: z.string().uuid().optional(),
+  supplementPlanReturn: z
+    .strictObject({
+      receiptId: z.string().uuid(),
+      sourceRunId: z.string().uuid(),
+      inputSequence: z.number().int().nonnegative(),
+    })
+    .optional(),
   inputSequence: z.number().int().nonnegative(),
   planReference: collaborationPlanReferenceSchema.optional(),
   reviewScopeRef: collaborationDocumentSchema.optional(),
@@ -425,6 +456,8 @@ export const collaborationTaskSchema = z
         repairReservationReleased: z.boolean().optional(),
       })
       .optional(),
+    /** A material scope change fences off prior write authority until a new Implement admission. */
+    planRevision: collaborationPlanRevisionSchema.optional(),
     nextStage: collaborationWorkStageSchema.optional(),
     discussionRounds: z.number().int().nonnegative(),
     reviewCycles: z.number().int().nonnegative(),
@@ -457,7 +490,7 @@ export function collaborationPlanMode(
   const planningReply = authorization
     ? authorization.replyMode === 'plan' ||
       (authorization.replyMode === undefined && task?.kind === 'plan' && !task.codeRunId)
-    : task?.kind === 'plan' && !task.codeRunId && !task.pendingWork
+    : task?.kind === 'plan' && !task.codeRunId && !task.pendingWork && !task.planRevision
   return Boolean(
     task &&
     actor === collaborationActor(task, 'plan') &&
@@ -563,6 +596,7 @@ export const collaborationActionBasisSchema = z.strictObject({
   review: collaborationReviewSchema.nullable(),
   reviewScopeRef: collaborationDocumentSchema.nullable(),
   previousRunId: z.string().uuid().nullable(),
+  planRevision: collaborationPlanRevisionSchema.optional(),
   actorBinding: z.strictObject({
     generation: z.number().int().positive(),
     nativeSessionId: z.string().max(1024).nullable(),
@@ -580,6 +614,7 @@ export const otherAgent = (id: 'claude' | 'codex'): 'claude' | 'codex' =>
   id === 'claude' ? 'codex' : 'claude'
 
 export function collaborationRequiresPlan(task: CollaborationTask): boolean {
+  if (task.planRevision) return true
   if (task.kind !== 'plan' || task.codeRunId) return false
   const pending = task.pendingWork
   if (pending?.stage !== 'implement') return true
@@ -610,6 +645,7 @@ function acceptedPlanReview(task: CollaborationTask) {
   if (
     !plan ||
     review?.stage !== 'plan_review' ||
+    review.supplementPlanReturn ||
     review.actor !== collaborationActor(task, 'plan_review') ||
     review.verdict !== 'accepted' ||
     reference?.version !== plan.version ||
@@ -624,6 +660,11 @@ export function collaborationPlanAccepted(task: CollaborationTask): boolean {
   if (!accepted || collaborationInputGate(task) || task.planInputSequence !== task.inputSequence)
     return false
   const { plan, review, reference } = accepted
+  if (
+    task.planRevision &&
+    (task.planRevision.returnReview || review.inputSequence < task.planRevision.inputSequence)
+  )
+    return false
   if (review.inputSequence === task.inputSequence) return true
 
   const coverage = task.planAcceptanceCoverage
@@ -664,6 +705,7 @@ export function collaborationAskAvailable(task: CollaborationTask): boolean {
     task.status === 'ready' &&
     task.automation === 'active' &&
     !task.pendingWork &&
+    !task.planRevision &&
     collaborationRequiresPlan(task) &&
     collaborationPlanAccepted(task)
   )
@@ -673,6 +715,7 @@ export function collaborationAskAvailable(task: CollaborationTask): boolean {
 export function collaborationCodeReviewCurrent(task: CollaborationTask): boolean {
   const { review, reviewScopeRef, reviewControlCoverage: coverage } = task
   if (
+    task.planRevision ||
     collaborationInputGate(task) ||
     review?.stage !== 'code_review' ||
     review.verdict !== 'changes_requested'
@@ -700,6 +743,15 @@ export function collaborationInputOutcomeAllowed(
 ): boolean {
   if (collaborationAskMode(task, auth) || outcome === 'explanation_only') return false
   const planning = collaborationPlanMode(task, auth)
+  if (outcome === 'plan_revision_required')
+    return Boolean(
+      task.kind === 'plan' &&
+      auth?.stage === 'reply' &&
+      auth.replyMode === 'read_only' &&
+      auth.planRevisionWriteRunId &&
+      auth.inputProcessing?.pending?.inputSequence === auth.inputSequence &&
+      !planning,
+    )
   if (outcome === 'repair_role_request')
     return (
       auth?.stage === 'reply' &&
@@ -769,6 +821,7 @@ export function collaborationInputGate(
 export function collaborationNextStage(task: CollaborationTask): CollaborationStage | undefined {
   if (task.status === 'complete') return undefined
   if (collaborationInputGate(task)) return undefined
+  if (task.planRevision?.returnReview) return task.planRevision.returnReview.stage
   if (collaborationRequiresPlan(task)) {
     if (!task.planReference || task.planInputSequence !== task.inputSequence) return 'plan'
     if (collaborationPlanAccepted(task)) return undefined
@@ -796,11 +849,19 @@ export function collaborationNextStage(task: CollaborationTask): CollaborationSt
 export function collaborationActor(
   task: Pick<
     CollaborationTask,
-    'owner' | 'reviewer' | 'rolePolicy' | 'stageRoles' | 'kind' | 'codeRunId' | 'pendingWork'
+    | 'owner'
+    | 'reviewer'
+    | 'rolePolicy'
+    | 'stageRoles'
+    | 'kind'
+    | 'codeRunId'
+    | 'pendingWork'
+    | 'planRevision'
   >,
   stage: CollaborationStage,
 ) {
   const roles = task.stageRoles
+  if (stage === 'reply' && task.planRevision) return collaborationActor(task, 'plan')
   if (roles) {
     if (stage === 'plan') return roles.planAuthor
     if (stage === 'plan_review') return roles.planReviewer
@@ -929,6 +990,7 @@ export function advanceCollaboration(
         collaborationRequiresPlan(next) && collaborationPlanAccepted(next)
           ? 'ready'
           : !stage &&
+              !next.planRevision &&
               next.review?.stage === 'code_review' &&
               next.review.verdict === 'accepted' &&
               next.review.inputSequence === next.inputSequence
