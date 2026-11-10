@@ -612,16 +612,26 @@ function enableRelay(f: Awaited<ReturnType<typeof fixture>>, requestedRevisions 
 async function completedPlanRevision(
   f: Awaited<ReturnType<typeof fixture>>,
   requestedRevisions = 2,
-  timeout = 1_000,
 ) {
-  await vi.waitFor(
-    () => {
-      expect(native.inputs).toHaveLength(2 + requestedRevisions * 2)
-      expect(f.db.conversationRepository.collaboration(f.sessionId)?.status).toBe('ready')
-    },
-    { timeout },
-  )
-  return f.settled()
+  const expectedInputs = 2 + requestedRevisions * 2
+  const isReady = () =>
+    native.inputs.length >= expectedInputs &&
+    f.db.conversationRepository.collaboration(f.sessionId)?.status === 'ready'
+  if (!isReady()) {
+    const ready = Promise.withResolvers<void>()
+    const unsubscribe = f.flow.subscribe((patch, progress) => {
+      if (!progress && patch.sessionId === f.sessionId && isReady()) ready.resolve()
+    })
+    try {
+      await ready.promise
+    } finally {
+      unsubscribe()
+    }
+  }
+  const task = await f.settled()
+  expect(native.inputs).toHaveLength(expectedInputs)
+  expect(task.status).toBe('ready')
+  return task
 }
 
 function decisionsForProducer(runId: string) {
@@ -649,7 +659,7 @@ describe('Decisions choices through the original workflow owner', () => {
     expect((await f.flow.send(f.input('/plan Keep disabled Relay free of inference.'))).ok).toBe(
       true,
     )
-    await completedPlanRevision(f, 2, 5_000)
+    await completedPlanRevision(f)
     expect(native.decisions).toEqual([])
     expect(native.guidanceBodies).toEqual([])
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM scheduling_evaluations`)).toEqual({
@@ -699,7 +709,12 @@ describe('Decisions choices through the original workflow owner', () => {
       },
     })
     const consultation = Promise.withResolvers<void>()
+    const roleConsulted = Promise.withResolvers<void>()
     native.decisionHold = consultation.promise
+    native.decisionStarted = (input) => {
+      if (input.candidates.some((candidate) => candidate.id === 'propose_reassign_roles'))
+        roleConsulted.resolve()
+    }
     const goal = 'Keep the complete original goal and final acceptance.\n'.repeat(120)
     expect((await f.flow.send(f.input(`/plan ${goal}`))).ok).toBe(true)
     await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
@@ -714,7 +729,15 @@ describe('Decisions choices through the original workflow owner', () => {
     ])
     consultation.resolve()
     const task = await completedPlanRevision(f)
-    expect(native.decisions).toHaveLength(2)
+    await roleConsulted.promise
+    await vi.waitFor(() => expect(f.db.conversationRepository.activeEvaluation()).toBeUndefined())
+    expect(
+      native.decisions.map((input) => input.candidates.map((candidate) => candidate.id)),
+    ).toEqual([
+      ['propose_supplement_plan'],
+      ['propose_supplement_plan'],
+      ['propose_reassign_roles'],
+    ])
     expect(native.inputs).toHaveLength(6)
     expect(
       f.db.drizzle.get(
@@ -745,7 +768,7 @@ describe('Decisions choices through the original workflow owner', () => {
     for (const input of native.inputs)
       expect(input.promptEnvelope.collaborationAuthorization?.sourceManifestRef).toBeUndefined()
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM scheduling_evaluations`)).toEqual({
-      count: 2,
+      count: 3,
     })
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM agent_runs`)).toEqual({ count: 6 })
     expect(f.db.conversationRepository.schedulingBudget(`task:${task.id}`)?.extraPlanTurns).toBe(0)
@@ -760,7 +783,7 @@ describe('Decisions choices through the original workflow owner', () => {
       expect(
         (await f.flow.send(f.input('/plan Continue after an undecided auxiliary result.'))).ok,
       ).toBe(true)
-      await completedPlanRevision(f, 2, 5_000)
+      await completedPlanRevision(f)
       // Abstention and failure both preserve the default and permit distinct later handoffs.
       const expectedConsults = 3
       await vi.waitFor(() => expect(native.decisions).toHaveLength(expectedConsults))
@@ -803,7 +826,7 @@ describe('Decisions choices through the original workflow owner', () => {
     })
     expect(result.ok).toBe(true)
     hold.resolve()
-    await completedPlanRevision(f, 2, 5_000)
+    await completedPlanRevision(f)
     expectNoRepeatedConsultation(handoffId)
     expect(native.guidanceBodies).toEqual([])
     expect(
@@ -941,7 +964,7 @@ describe('Decisions choices through the original workflow owner', () => {
     const goal = 'The durable original objective remains complete.\n'.repeat(3200)
     expect((await f.flow.send(f.input(`/plan ${goal}`))).ok).toBe(true)
     // All six full-source stages share the test's existing five-second total deadline.
-    await completedPlanRevision(f, 2, 5_000)
+    await completedPlanRevision(f)
     expect(native.decisions).toEqual([])
     expect(native.guidanceBodies).toEqual([])
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM scheduling_evaluations`)).toEqual({
@@ -984,27 +1007,10 @@ describe('Decisions choices through the original workflow owner', () => {
     ).toBe(true)
     native.next = { plan: 'Current v2 Plan.' }
     enableRelay(f)
-    const reviewReady = Promise.withResolvers<void>()
-    const unsubscribe = f.flow.subscribe((patch, progress) => {
-      if (
-        !progress &&
-        patch.sessionId === f.sessionId &&
-        native.inputs.length >= 8 &&
-        f.db.conversationRepository.collaboration(f.sessionId)?.status === 'ready'
-      )
-        reviewReady.resolve()
-    })
-    try {
-      expect(
-        (await f.flow.send({ ...f.input('Revise after this Comment.'), commentIds: [commentId] }))
-          .ok,
-      ).toBe(true)
-      await reviewReady.promise
-    } finally {
-      unsubscribe()
-    }
-    expect((await f.settled()).status).toBe('ready')
-    expect(native.inputs).toHaveLength(8)
+    expect(
+      (await f.flow.send({ ...f.input('Revise after this Comment.'), commentIds: [commentId] })).ok,
+    ).toBe(true)
+    await completedPlanRevision(f, 3)
     expect(native.inputs[6]!.promptEnvelope.collaboration?.actor).toBe('codex')
     expect(native.inputs[6]!.promptEnvelope.collaboration?.stage).toBe('plan')
     expect(
