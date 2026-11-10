@@ -7,6 +7,7 @@ import {
   serializeAgentPromptEnvelope,
   type AgentPromptEnvelope,
   type AgentPromptImage,
+  type AgentSourceNavigation,
 } from '@pact/agent-runtime'
 
 import { AgentExecutionError } from './agent-execution-error'
@@ -83,13 +84,13 @@ export async function nativeImageBlock(
   }
 }
 
-export function codexPromptInput(envelope: AgentPromptEnvelope) {
+export function codexPromptInput(envelope: AgentPromptEnvelope, navigate?: AgentSourceNavigation) {
   type Input =
     | { type: 'text'; text: string; text_elements: never[] }
     | { type: 'localImage'; path: string }
     | { type: 'skill'; name: string; path: string | undefined }
   const input: Input[] = [
-    { type: 'text', text: serializeAgentPromptEnvelope(envelope), text_elements: [] },
+    { type: 'text', text: serializeAgentPromptEnvelope(envelope, navigate), text_elements: [] },
   ]
   for (const group of agentPromptImageGroups(envelope)) {
     input.push({
@@ -120,8 +121,15 @@ export function requireNativeImageReference(
     )
 }
 
-export async function claudePromptContent(envelope: AgentPromptEnvelope, signal?: AbortSignal) {
-  const text = serializeAgentPromptEnvelope(envelope)
+export async function claudePromptContent(
+  envelope: AgentPromptEnvelope,
+  signal?: AbortSignal,
+  navigate?: AgentSourceNavigation,
+) {
+  const serialized = serializeAgentPromptEnvelope(envelope, navigate)
+  // Pact already owns workflow commands and the Adapter selects native Plan mode.
+  // Keep the original request as text, not a headless Claude slash-command invocation.
+  const text = envelope.collaboration ? `Pact user request:\n${serialized}` : serialized
   const groups = agentPromptImageGroups(envelope)
   if (!groups.length) return text
   const blocks: Array<{ type: 'text'; text: string } | NativeImageBlock> = [{ type: 'text', text }]

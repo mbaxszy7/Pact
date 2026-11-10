@@ -1,8 +1,15 @@
 import { Buffer } from 'node:buffer'
+import { randomUUID } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import {
+  conversationSendInputSchema,
+  utilityRequestSchema,
+  utilityResponseSchema,
+} from '@pact/contracts'
 
 const harness = vi.hoisted(() => {
   type Listener = (...args: unknown[]) => void
@@ -66,10 +73,17 @@ const harness = vi.hoisted(() => {
   }
 
   const children: InstanceType<typeof FakeUtilityProcess>[] = []
-  return { FakeUtilityProcess, children }
+  const storage = {
+    isAsyncEncryptionAvailable: vi.fn<() => Promise<boolean>>(),
+    encryptStringAsync: vi.fn<(key: string) => Promise<Buffer>>(),
+    decryptStringAsync:
+      vi.fn<(cipher: Buffer) => Promise<{ result: string; shouldReEncrypt: boolean }>>(),
+  }
+  return { FakeUtilityProcess, children, storage }
 })
 
 vi.mock('electron', () => ({
+  app: { isPackaged: false },
   utilityProcess: {
     fork: () => {
       const child = new harness.FakeUtilityProcess()
@@ -77,8 +91,12 @@ vi.mock('electron', () => ({
       return child
     },
   },
+  safeStorage: harness.storage,
 }))
 
+import type { UtilityProcessStartOptions } from './client.js'
+
+import { LogicalIpcWorkerTraffic } from '../../shared/logical-ipc-traffic'
 import {
   createAppearanceController,
   type NativeThemeSource,
@@ -89,6 +107,154 @@ const startOptions = {
   databaseFile: ':memory:',
   migrationsFolder: '/tmp/pact-migrations',
 }
+
+describe('Relay RPC deadlines without automatic resend', () => {
+  it.each([
+    {
+      name: 'settings read',
+      deadline: 5_000,
+      code: 'TIMEOUT',
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.getSchedulingSettings(),
+    },
+    {
+      name: 'intent save',
+      deadline: 5_000,
+      code: 'TIMEOUT',
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.saveSchedulingSettings({ expectedRevision: 0, enabled: true }),
+    },
+    {
+      name: 'activity read',
+      deadline: 5_000,
+      code: 'TIMEOUT',
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.readSchedulingActivity({}),
+    },
+    {
+      name: 'state read',
+      deadline: 5_000,
+      code: 'TIMEOUT',
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.getSchedulingState({}),
+    },
+    {
+      name: 'credential remove',
+      deadline: 5_000,
+      code: 'UNCERTAIN',
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.removeRelayApiKey({
+          nonce: randomUUID(),
+          expectedRevision: 0,
+          deadlineAt: Date.now() + 5000,
+        }),
+    },
+    {
+      name: 'credential receipt read',
+      deadline: 5_000,
+      code: 'TIMEOUT',
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.readRelayCredentialReceipt(randomUUID()),
+    },
+  ])(
+    'retains $deadline ms for $name and sends once on uncertain delivery',
+    async ({ deadline, code, invoke }) => {
+      vi.useFakeTimers()
+      const client = createUtilityProcessClient()
+      client.start(startOptions)
+      const child = harness.children.at(-1)!
+      child.emit('message', { type: 'runtime.ready.event' })
+      let settled = false
+      const operation = invoke(client).then((result) => {
+        settled = true
+        return result
+      })
+      await vi.advanceTimersByTimeAsync(deadline - 1)
+      expect(settled).toBe(false)
+      expect(child.posted).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(await operation).toMatchObject({ ok: false, error: { code } })
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(child.posted).toHaveLength(1)
+      client.dispose()
+    },
+  )
+})
+
+it.each([
+  { body: false, responseAt: 23_000 },
+  { body: true, responseAt: 33_000 },
+])(
+  'keeps Send pending through 12 seconds and accepts its correlated response at $responseAt ms (sealed body: $body)',
+  async ({ body, responseAt }) => {
+    vi.useFakeTimers()
+    const client = createUtilityProcessClient()
+    let operation: ReturnType<typeof client.sendConversationMessage> | undefined
+    try {
+      client.start(startOptions)
+      const child = harness.children.at(-1)!
+      child.emit('message', { type: 'runtime.ready.event' })
+      const sessionId = crypto.randomUUID()
+      const input = conversationSendInputSchema.parse({
+        sessionId,
+        clientMessageId: crypto.randomUUID(),
+        ...(body
+          ? { inputId: crypto.randomUUID(), content: '' }
+          : { content: 'Send after bounded Relay advice and normal business preparation.' }),
+        expectedCommentsRevision: 1,
+        commentIds: [crypto.randomUUID()],
+        routeIntent: 'implicit',
+        composerRevision: 1,
+      })
+      const startedAt = Date.now()
+      let completion: unknown
+      operation = client.sendConversationMessage(input).then((result) => {
+        completion = { afterMs: Date.now() - startedAt, result }
+        return result
+      })
+      const expected = {
+        ok: true,
+        value: {
+          version: 'conversation-patch-v1',
+          sessionId,
+          observation: { incarnation: crypto.randomUUID(), sequence: 1 },
+          session: {
+            id: sessionId,
+            title: 'Delayed Send',
+            titleSource: 'user',
+            status: 'idle',
+            activity: { state: 'idle' },
+            hasUnread: false,
+            updatedAt: new Date().toISOString(),
+          },
+          messages: [],
+          runs: [],
+          activities: [],
+          activityStates: [],
+        },
+      }
+      const response = utilityResponseSchema.parse({
+        type: 'conversation.patch.response',
+        requestId: postedRequest(child).requestId,
+        result: expected,
+      })
+      await vi.advanceTimersByTimeAsync(11_999)
+      expect(completion).toBeUndefined()
+      await vi.advanceTimersByTimeAsync(1)
+      expect.soft(completion, 'Send must remain pending at 12 seconds').toBeUndefined()
+      // Preserve the independent body-read, advice and business preparation bounds.
+      await vi.advanceTimersByTimeAsync(responseAt - 12_000)
+      child.emit('message', response)
+      await expect(operation).resolves.toEqual(expected)
+      expect(child.posted).toHaveLength(1)
+    } finally {
+      client.dispose()
+      await operation
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  },
+)
 
 afterEach(() => {
   // Simulated children always deliver physical exit before a test releases the transport fixture.
@@ -119,6 +285,10 @@ function shutdownAck(child: (typeof harness.children)[number], index = 0): void 
 
 async function turn(): Promise<void> {
   await vi.advanceTimersByTimeAsync(0)
+}
+
+async function flush(): Promise<void> {
+  await new Promise((resolve) => setImmediate(resolve))
 }
 
 describe('Utility startup readiness and quit delivery', () => {
@@ -477,6 +647,7 @@ describe('UtilityProcessClient', () => {
       runtime.start(startOptions)
       const child = harness.children.at(-1)!
       const pending = runtime.request({ type: 'appearance.get.request' }, 'appearance.response')
+      const startedAt = Date.now()
       const shutdown = runtime.shutdown()
       expect(runtime.shutdown()).toBe(shutdown)
       expect(child.killed).toBe(false)
@@ -493,6 +664,10 @@ describe('UtilityProcessClient', () => {
       })
       await expect(shutdown).resolves.toEqual({ ok: true, value: { flushed: true } })
       await expect(pending).resolves.toMatchObject({ kind: 'unknown-delivery' })
+      expect(child.posted[1]).toMatchObject({
+        type: 'runtime.shutdown.request',
+        flushDeadlineAt: startedAt + 4_000,
+      })
       expect(child.killed).toBe(true)
       expect(vi.getTimerCount()).toBe(0)
     } finally {
@@ -598,14 +773,21 @@ describe('UtilityProcessClient', () => {
     runtime.start(startOptions)
     const child = harness.children.at(-1)!
     child.exitOnKill = false
+    const startedAt = Date.now()
     const shutdown = runtime.shutdown()
     await vi.advanceTimersByTimeAsync(3_900)
+    expect(runtime.shutdown()).toBe(shutdown)
+    expect(child.posted).toHaveLength(1)
     expect(child.killed).toBe(false)
     shutdownAck(child)
     await turn()
     expect(child.killed).toBe(true)
     await vi.advanceTimersByTimeAsync(1_100)
     await expect(shutdown).resolves.toMatchObject({ ok: false, error: { code: 'UNCERTAIN' } })
+    expect(child.posted[0]).toMatchObject({
+      type: 'runtime.shutdown.request',
+      flushDeadlineAt: startedAt + 4_000,
+    })
     expect(vi.getTimerCount()).toBe(0)
     runtime.start(startOptions)
     expect(harness.children.at(-1)).toBe(child)
@@ -928,3 +1110,595 @@ describe('UtilityProcessClient', () => {
     }
   })
 })
+
+describe('Relay credential mutation delivery', () => {
+  it('reports a sent remove unanswered at 5s as UNCERTAIN, never resends, and keeps the explicit receipt read', async () => {
+    vi.useFakeTimers()
+    const client = createUtilityProcessClient()
+    try {
+      client.start(startOptions)
+      const child = harness.children.at(-1)!
+      child.emit('message', { type: 'runtime.ready.event' })
+      const nonce = randomUUID()
+      let settled = false
+      const removed = client
+        .removeRelayApiKey({ nonce, expectedRevision: 1, deadlineAt: Date.now() + 5_000 })
+        .then((result) => {
+          settled = true
+          return result
+        })
+      await vi.advanceTimersByTimeAsync(4_999)
+      expect(settled).toBe(false)
+      expect(child.posted).toHaveLength(1)
+      const packet = utilityRequestSchema.parse(child.posted[0])
+      if (packet.type !== 'relay.credential.write.request')
+        throw new Error(`Unexpected packet type ${packet.type}`)
+      expect(packet.input).toMatchObject({
+        operation: 'remove',
+        nonce,
+        expectedRevision: 1,
+      })
+      await vi.advanceTimersByTimeAsync(1)
+      await expect(removed).resolves.toEqual({
+        ok: false,
+        error: {
+          code: 'UNCERTAIN',
+          message: 'The key change could not be confirmed. Check its status.',
+        },
+      })
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(child.posted).toHaveLength(1)
+      const read = client.readRelayCredentialReceipt(nonce)
+      await vi.waitFor(() => expect(child.posted).toHaveLength(2))
+      const receipt = utilityRequestSchema.parse(child.posted[1])
+      expect(receipt).toMatchObject({
+        type: 'relay.credential.receipt.read.request',
+        input: { nonce },
+      })
+      child.emit('message', {
+        type: 'relay.credential.receipt.read.response',
+        requestId: receipt.requestId,
+        result: {
+          ok: true,
+          value: { nonce, operation: 'remove', revision: 2, configured: false },
+        },
+      })
+      await expect(read).resolves.toEqual({
+        ok: true,
+        value: { nonce, operation: 'remove', revision: 2, configured: false },
+      })
+    } finally {
+      client.dispose()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['exit', 'dispose'] as const)(
+    'reports a sent remove lost to child %s as UNCERTAIN',
+    async (lost) => {
+      const client = createUtilityProcessClient()
+      client.start(startOptions)
+      const child = harness.children.at(-1)!
+      child.emit('message', { type: 'runtime.ready.event' })
+      const nonce = randomUUID()
+      const removed = client.removeRelayApiKey({
+        nonce,
+        expectedRevision: 1,
+        deadlineAt: Date.now() + 5_000,
+      })
+      expect(child.posted).toHaveLength(1)
+      if (lost === 'exit') child.emit('exit', 1)
+      else client.dispose()
+      await expect(removed).resolves.toEqual({
+        ok: false,
+        error: {
+          code: 'UNCERTAIN',
+          message: 'The key change could not be confirmed. Check its status.',
+        },
+      })
+      client.dispose()
+    },
+  )
+
+  it.each([
+    {
+      name: 'a runtime that never started',
+      arrange: (client: ReturnType<typeof createUtilityProcessClient>) => {
+        void client
+      },
+      deadlineAt: () => Date.now() + 5_000,
+      posted: 0,
+    },
+    {
+      name: 'an already expired deadline',
+      arrange: (client: ReturnType<typeof createUtilityProcessClient>) => {
+        client.start(startOptions)
+      },
+      deadlineAt: () => Date.now() - 1,
+      posted: 0,
+    },
+    {
+      name: 'a post failure before any send',
+      arrange: (client: ReturnType<typeof createUtilityProcessClient>) => {
+        client.start(startOptions)
+        harness.children.at(-1)!.throwOnPost = true
+      },
+      deadlineAt: () => Date.now() + 5_000,
+      posted: 0,
+    },
+  ])(
+    'keeps $name deterministically unavailable without inventing uncertainty',
+    async ({ arrange, deadlineAt, posted }) => {
+      const client = createUtilityProcessClient()
+      arrange(client)
+      const child = harness.children.at(-1)
+      await expect(
+        client.removeRelayApiKey({
+          nonce: randomUUID(),
+          expectedRevision: 1,
+          deadlineAt: deadlineAt(),
+        }),
+      ).resolves.toMatchObject({ ok: false, error: { code: 'RUNTIME_UNAVAILABLE' } })
+      expect(child?.posted ?? []).toHaveLength(posted)
+      client.dispose()
+    },
+  )
+
+  it('returns an acknowledged VALIDATION unchanged', async () => {
+    const client = createUtilityProcessClient()
+    client.start(startOptions)
+    const child = harness.children.at(-1)!
+    child.emit('message', { type: 'runtime.ready.event' })
+    const nonce = randomUUID()
+    const removed = client.removeRelayApiKey({
+      nonce,
+      expectedRevision: 1,
+      deadlineAt: Date.now() + 5_000,
+    })
+    expect(child.posted).toHaveLength(1)
+    child.emit('message', {
+      type: 'relay.credential.write.response',
+      requestId: postedRequest(child).requestId,
+      result: {
+        ok: false,
+        error: { code: 'VALIDATION', message: 'revision mismatch' },
+      },
+    })
+    await expect(removed).resolves.toEqual({
+      ok: false,
+      error: { code: 'VALIDATION', message: 'revision mismatch' },
+    })
+    client.dispose()
+  })
+
+  it('keeps a save requested after the child exited deterministically unavailable', async () => {
+    const client = createUtilityProcessClient()
+    client.start(startOptions)
+    const child = harness.children.at(-1)!
+    child.emit('message', { type: 'runtime.ready.event' })
+    child.emit('exit', 1)
+    await expect(
+      client.saveRelayApiKey({
+        nonce: randomUUID(),
+        expectedRevision: 0,
+        deadlineAt: Date.now() + 5_000,
+        key: IPC_KEY,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: 'RUNTIME_UNAVAILABLE' } })
+    expect(child.posted).toHaveLength(0)
+    client.dispose()
+  })
+})
+
+describe('Utility client physical settlement', () => {
+  it('resolves immediately when no child and no OS work remain', async () => {
+    const client = createUtilityProcessClient()
+    await expect(client.settlement()).resolves.toBeUndefined()
+  })
+
+  it('waits only for the running child when no OS work is pending', async () => {
+    const client = createUtilityProcessClient()
+    client.start(startOptions)
+    const child = harness.children.at(-1)!
+    const joined = vi.fn<() => void>()
+    const settleJoin = client.settlement().then(() => joined())
+    await flush()
+    expect(joined).not.toHaveBeenCalled()
+    child.emit('exit', 0)
+    await settleJoin
+    expect(joined).toHaveBeenCalledOnce()
+    client.dispose()
+  })
+})
+
+const IPC_KEY = 'OWNED_IPC_CREDENTIAL'
+const IPC_CIPHER = Buffer.from('owned encrypted IPC bytes')
+
+function diagnostics() {
+  const spy = vi.fn<NonNullable<UtilityProcessStartOptions['diagnostics']>['record']>()
+  return {
+    identity: {
+      launchId: randomUUID(),
+      appVersion: '0.0.0',
+      process: 'main' as const,
+      pid: process.pid,
+    },
+    record: spy,
+    attachUtility: vi.fn<NonNullable<UtilityProcessStartOptions['diagnostics']>['attachUtility']>(),
+    acceptUtility: vi
+      .fn<NonNullable<UtilityProcessStartOptions['diagnostics']>['acceptUtility']>()
+      .mockReturnValue(false),
+  } satisfies NonNullable<UtilityProcessStartOptions['diagnostics']>
+}
+
+describe.skipIf(!['darwin', 'win32'].includes(process.platform))(
+  'Relay credential wiring through the actual main crypto owner',
+  () => {
+    beforeEach(() => {
+      for (const mock of [
+        harness.storage.isAsyncEncryptionAvailable,
+        harness.storage.encryptStringAsync,
+        harness.storage.decryptStringAsync,
+      ])
+        mock.mockReset()
+      harness.storage.isAsyncEncryptionAvailable.mockResolvedValue(true)
+      harness.storage.encryptStringAsync.mockResolvedValue(IPC_CIPHER)
+      harness.storage.decryptStringAsync.mockResolvedValue({
+        result: IPC_KEY,
+        shouldReEncrypt: false,
+      })
+    })
+    it('encrypts the public key before the generic Utility write and resolves the receipt', async () => {
+      const diag = diagnostics()
+      const client = createUtilityProcessClient()
+      try {
+        client.start({ ...startOptions, diagnostics: diag })
+        const child = harness.children.at(-1)!
+        child.emit('message', { type: 'runtime.ready.event' })
+        const nonce = randomUUID(),
+          deadlineAt = Date.now() + 5000
+        const saved = client.saveRelayApiKey({
+          nonce,
+          expectedRevision: 0,
+          deadlineAt,
+          key: IPC_KEY,
+        })
+        await vi.waitFor(() => expect(child.posted).toHaveLength(1))
+        const packet = utilityRequestSchema.parse(child.posted[0])
+        if (packet.type !== 'relay.credential.write.request')
+          throw new Error(`Unexpected packet type ${packet.type}`)
+        expect(packet.input).toEqual({
+          operation: 'save',
+          nonce,
+          expectedRevision: 0,
+          deadlineAt,
+          ciphertext: IPC_CIPHER.toString('base64'),
+        })
+        expect(harness.storage.encryptStringAsync).toHaveBeenCalledExactlyOnceWith(IPC_KEY)
+        child.emit('message', {
+          type: 'relay.credential.write.response',
+          requestId: packet.requestId,
+          result: {
+            ok: true,
+            value: { nonce, operation: 'save', revision: 1, configured: true },
+          },
+        })
+        await expect(saved).resolves.toEqual({
+          ok: true,
+          value: { nonce, operation: 'save', revision: 1, configured: true },
+        })
+        // The plaintext key never reaches a posted packet; diagnostics see neither value.
+        for (const posted of child.posted) expect(JSON.stringify(posted)).not.toContain(IPC_KEY)
+        for (const call of diag.record.mock.calls) {
+          expect(JSON.stringify(call)).not.toContain(IPC_KEY)
+          expect(JSON.stringify(call)).not.toContain(IPC_CIPHER.toString('base64'))
+        }
+      } finally {
+        client.dispose()
+      }
+    })
+
+    it('reveals through two generic reads with plaintext only in the typed reply', async () => {
+      const diag = diagnostics()
+      const client = createUtilityProcessClient()
+      try {
+        client.start({ ...startOptions, diagnostics: diag })
+        const child = harness.children.at(-1)!
+        child.emit('message', { type: 'runtime.ready.event' })
+        const revealed = client.revealRelayApiKey({
+          expectedRevision: 1,
+          deadlineAt: Date.now() + 5000,
+        })
+        await vi.waitFor(() => expect(child.posted).toHaveLength(1))
+        const first = utilityRequestSchema.parse(child.posted[0])
+        if (first.type !== 'relay.credential.read.request')
+          throw new Error(`Unexpected packet type ${first.type}`)
+        expect(first.input.expectedRevision).toBe(1)
+        expect('key' in first.input || 'ciphertext' in first.input).toBe(false)
+        child.emit('message', {
+          type: 'relay.credential.read.response',
+          requestId: first.requestId,
+          result: { ok: true, value: { revision: 1, ciphertext: IPC_CIPHER.toString('base64') } },
+        })
+        await vi.waitFor(() => expect(child.posted).toHaveLength(2))
+        const second = utilityRequestSchema.parse(child.posted[1])
+        if (second.type !== 'relay.credential.read.request')
+          throw new Error(`Unexpected packet type ${second.type}`)
+        child.emit('message', {
+          type: 'relay.credential.read.response',
+          requestId: second.requestId,
+          result: { ok: true, value: { revision: 1, ciphertext: IPC_CIPHER.toString('base64') } },
+        })
+        await expect(revealed).resolves.toEqual({
+          ok: true,
+          value: { revision: 1, key: IPC_KEY },
+        })
+        // Plaintext never reaches a posted packet or a diagnostic record.
+        for (const posted of child.posted) expect(JSON.stringify(posted)).not.toContain(IPC_KEY)
+        for (const call of diag.record.mock.calls) {
+          expect(JSON.stringify(call)).not.toContain(IPC_KEY)
+          expect(JSON.stringify(call)).not.toContain(IPC_CIPHER.toString('base64'))
+        }
+      } finally {
+        client.dispose()
+      }
+    })
+
+    it('does not resend an uncertain encrypted write and requires an explicit receipt read', async () => {
+      vi.useFakeTimers()
+      harness.storage.isAsyncEncryptionAvailable.mockResolvedValue(true)
+      harness.storage.encryptStringAsync.mockResolvedValue(IPC_CIPHER)
+      const client = createUtilityProcessClient()
+      try {
+        client.start(startOptions)
+        const child = harness.children.at(-1)!
+        child.emit('message', { type: 'runtime.ready.event' })
+        const nonce = randomUUID(),
+          deadlineAt = Date.now() + 5000
+        let settled = false
+        const saved = client
+          .saveRelayApiKey({ nonce, expectedRevision: 0, deadlineAt, key: IPC_KEY })
+          .then((result) => {
+            settled = true
+            return result
+          })
+        await vi.advanceTimersByTimeAsync(4999)
+        expect(settled).toBe(false)
+        expect(child.posted).toHaveLength(1)
+        const first = utilityRequestSchema.parse(child.posted[0])
+        if (first.type !== 'relay.credential.write.request')
+          throw new Error(`Unexpected packet type ${first.type}`)
+        expect(first.input).toEqual({
+          operation: 'save',
+          nonce,
+          expectedRevision: 0,
+          deadlineAt,
+          ciphertext: IPC_CIPHER.toString('base64'),
+        })
+        expect(JSON.stringify(first)).not.toContain(IPC_KEY)
+        await vi.advanceTimersByTimeAsync(1)
+        await expect(saved).resolves.toMatchObject({
+          ok: false,
+          error: { code: 'UNCERTAIN' },
+        })
+        expect(settled).toBe(true)
+        await vi.advanceTimersByTimeAsync(30_000)
+        expect(child.posted).toHaveLength(1)
+        const read = client.readRelayCredentialReceipt(nonce)
+        await vi.waitFor(() => expect(child.posted).toHaveLength(2))
+        const packet = utilityRequestSchema.parse(child.posted[1])
+        expect(packet).toMatchObject({
+          type: 'relay.credential.receipt.read.request',
+          input: { nonce },
+        })
+        child.emit('message', {
+          type: 'relay.credential.receipt.read.response',
+          requestId: packet.requestId,
+          result: {
+            ok: true,
+            value: { nonce, operation: 'save', revision: 1, configured: true },
+          },
+        })
+        await expect(read).resolves.toEqual({
+          ok: true,
+          value: { nonce, operation: 'save', revision: 1, configured: true },
+        })
+      } finally {
+        try {
+          client.dispose()
+          expect(vi.getTimerCount()).toBe(0)
+        } finally {
+          vi.useRealTimers()
+        }
+      }
+    })
+
+    it('binds the private decrypt source to the current Utility and bypasses generic traffic', async () => {
+      const first = Promise.withResolvers<{ result: string; shouldReEncrypt: boolean }>()
+      let calls = 0
+      harness.storage.isAsyncEncryptionAvailable.mockResolvedValue(true)
+      harness.storage.decryptStringAsync.mockImplementation(() => {
+        calls += 1
+        return calls === 1
+          ? first.promise
+          : Promise.resolve({ result: IPC_KEY, shouldReEncrypt: false })
+      })
+      const traffic = new LogicalIpcWorkerTraffic(['main-utility', 'main-directory'], randomUUID())
+      const record = vi.spyOn(traffic.collector('main-utility')!, 'record')
+      const diag = diagnostics()
+      const client = createUtilityProcessClient()
+      try {
+        client.start({ ...startOptions, diagnostics: diag, traffic })
+        const child = harness.children.at(-1)!
+        child.emit('message', { type: 'runtime.ready.event' })
+        record.mockClear()
+        diag.acceptUtility.mockClear()
+        const requestId = randomUUID()
+        child.emit('message', {
+          type: 'relay.credential.decrypt.request',
+          requestId,
+          deadlineAt: Date.now() + 5000,
+          ciphertext: IPC_CIPHER.toString('base64'),
+        })
+        await vi.waitFor(() => expect(harness.storage.decryptStringAsync).toHaveBeenCalledTimes(1))
+        // Private packets never reach generic traffic accounting or utility acceptance.
+        expect(record).not.toHaveBeenCalled()
+        expect(diag.acceptUtility).not.toHaveBeenCalled()
+        const oldPosted = [...child.posted]
+        child.emit('exit', 0)
+        client.start({ ...startOptions, diagnostics: diag, traffic })
+        const next = harness.children.at(-1)!
+        next.emit('message', { type: 'runtime.ready.event' })
+        record.mockClear()
+        diag.acceptUtility.mockClear()
+        const busyId = randomUUID()
+        next.emit('message', {
+          type: 'relay.credential.decrypt.request',
+          requestId: busyId,
+          deadlineAt: Date.now() + 5000,
+          ciphertext: IPC_CIPHER.toString('base64'),
+        })
+        await vi.waitFor(() => expect(next.posted).toHaveLength(1))
+        // The old child's outstanding native decrypt keeps the new source busy.
+        expect(next.posted[0]).toEqual({
+          type: 'relay.credential.decrypt.response',
+          requestId: busyId,
+          result: { ok: false, reason: 'busy' },
+        })
+        expect(harness.storage.decryptStringAsync).toHaveBeenCalledTimes(1)
+        first.resolve({ result: IPC_KEY, shouldReEncrypt: false })
+        await new Promise((resolve) => setImmediate(resolve))
+        // No plaintext was delivered to the exited child.
+        expect(child.posted).toEqual(oldPosted)
+        // The current source's explicit new request gets the positive private reply.
+        const requestId2 = randomUUID()
+        next.emit('message', {
+          type: 'relay.credential.decrypt.request',
+          requestId: requestId2,
+          deadlineAt: Date.now() + 5000,
+          ciphertext: IPC_CIPHER.toString('base64'),
+        })
+        await vi.waitFor(() => expect(next.posted).toHaveLength(2))
+        expect(next.posted[1]).toEqual({
+          type: 'relay.credential.decrypt.response',
+          requestId: requestId2,
+          result: { ok: true, key: IPC_KEY },
+        })
+        expect(harness.storage.decryptStringAsync).toHaveBeenCalledTimes(2)
+        expect(record).not.toHaveBeenCalled()
+        expect(diag.acceptUtility).not.toHaveBeenCalled()
+        // A malformed private packet is consumed without forwarding or logging.
+        next.emit('message', { type: 'relay.credential.decrypt.request', key: IPC_KEY })
+        await vi.waitFor(() => expect(harness.storage.decryptStringAsync).toHaveBeenCalledTimes(2))
+        for (const call of diag.record.mock.calls) {
+          expect(JSON.stringify(call)).not.toContain(IPC_KEY)
+          expect(JSON.stringify(call)).not.toContain(IPC_CIPHER.toString('base64'))
+        }
+        expect(record).not.toHaveBeenCalled()
+        expect(diag.acceptUtility).not.toHaveBeenCalled()
+      } finally {
+        first.resolve({ result: IPC_KEY, shouldReEncrypt: false })
+        await new Promise((resolve) => setImmediate(resolve))
+        client.dispose()
+        record.mockRestore()
+      }
+    })
+
+    it('reports shutdown UNCERTAIN at 5s while hung OS work still fences the physical join', async () => {
+      vi.useFakeTimers()
+      const cryptoWork = Promise.withResolvers<boolean>()
+      harness.storage.isAsyncEncryptionAvailable.mockImplementation(() => cryptoWork.promise)
+      const client = createUtilityProcessClient()
+      try {
+        client.start(startOptions)
+        const child = harness.children.at(-1)!
+        child.exitOnKill = false
+        child.emit('message', { type: 'runtime.ready.event' })
+        const baseline = child.listenerCount('exit')
+        const saved = client.saveRelayApiKey({
+          nonce: randomUUID(),
+          expectedRevision: 0,
+          deadlineAt: Date.now() + 5_000,
+          key: IPC_KEY,
+        })
+        await vi.waitFor(() =>
+          expect(harness.storage.isAsyncEncryptionAvailable).toHaveBeenCalledOnce(),
+        )
+        const shutdown = client.shutdown()
+        const joined = vi.fn<() => void>()
+        const settleJoin = client.settlement().then(() => joined())
+        shutdownAck(child)
+        await vi.advanceTimersByTimeAsync(5_000)
+        await expect(shutdown).resolves.toMatchObject({
+          ok: false,
+          error: { code: 'UNCERTAIN' },
+        })
+        await expect(saved).resolves.toMatchObject({ ok: false })
+        expect(joined).not.toHaveBeenCalled()
+        child.emit('exit', 0)
+        await turn()
+        expect(joined).not.toHaveBeenCalled()
+        cryptoWork.resolve(true)
+        await settleJoin
+        expect(joined).toHaveBeenCalledOnce()
+        for (const posted of child.posted) {
+          const text = JSON.stringify(posted)
+          expect(text).not.toContain('relay.credential.write.request')
+          expect(text).not.toContain(IPC_KEY)
+          expect(text).not.toContain(IPC_CIPHER.toString('base64'))
+        }
+        expect(child.listenerCount('exit')).toBe(baseline)
+      } finally {
+        cryptoWork.resolve(true)
+        client.dispose()
+        vi.useRealTimers()
+      }
+    })
+
+    it.each(['crypto-first', 'exit-first'] as const)(
+      'fences the physical join on both hung OS work and child exit (%s)',
+      async (order) => {
+        const cryptoWork = Promise.withResolvers<boolean>()
+        harness.storage.isAsyncEncryptionAvailable.mockImplementation(() => cryptoWork.promise)
+        const client = createUtilityProcessClient()
+        try {
+          client.start(startOptions)
+          const child = harness.children.at(-1)!
+          child.exitOnKill = false
+          child.emit('message', { type: 'runtime.ready.event' })
+          const saved = client.saveRelayApiKey({
+            nonce: randomUUID(),
+            expectedRevision: 0,
+            deadlineAt: Date.now() + 5_000,
+            key: IPC_KEY,
+          })
+          await vi.waitFor(() =>
+            expect(harness.storage.isAsyncEncryptionAvailable).toHaveBeenCalledOnce(),
+          )
+          const shutdown = client.shutdown()
+          const joined = vi.fn<() => void>()
+          const settleJoin = client.settlement().then(() => joined())
+          shutdownAck(child)
+          await flush()
+          expect(joined).not.toHaveBeenCalled()
+          if (order === 'crypto-first') {
+            cryptoWork.resolve(true)
+            await saved
+          } else {
+            child.emit('exit', 0)
+          }
+          await flush()
+          expect(joined).not.toHaveBeenCalled()
+          if (order === 'crypto-first') child.emit('exit', 0)
+          else cryptoWork.resolve(true)
+          await settleJoin
+          expect(joined).toHaveBeenCalledOnce()
+          await expect(shutdown).resolves.toEqual({ ok: true, value: { flushed: true } })
+        } finally {
+          cryptoWork.resolve(true)
+          client.dispose()
+        }
+      },
+    )
+  },
+)

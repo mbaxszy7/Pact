@@ -35,7 +35,6 @@ test(
         primaryAgentId: 'codex' as const,
         agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
         maxDiscussionRounds: 6,
-        runningMessagePolicy: 'immediate_safe_point' as const,
         maxReviewCycles: 3,
         maxRepairAttempts: 3,
       }

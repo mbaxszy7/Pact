@@ -12,12 +12,31 @@ import {
   ipcTrafficSchema,
   monacoIpcObservationSchema,
   nativeMemoryDiagnosticsSchema,
+  utilityRequestSchema,
 } from './index.js'
 
 const uuid = (index: number): string =>
   `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`
 
 describe('foundation contracts', () => {
+  it('preserves a bounded shutdown epoch deadline while accepting legacy requests without one', () => {
+    const legacy = { type: 'runtime.shutdown.request', requestId: uuid(1) }
+    expect(utilityRequestSchema.parse(legacy)).toEqual(legacy)
+    const request = { ...legacy, flushDeadlineAt: 1_794_268_804_000 }
+    expect(utilityRequestSchema.parse(request)).toEqual(request)
+  })
+  it.each([0, -1, 0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, null, '4000'])(
+    'rejects invalid shutdown deadline %s at the process boundary',
+    (flushDeadlineAt) => {
+      expect(
+        utilityRequestSchema.safeParse({
+          type: 'runtime.shutdown.request',
+          requestId: uuid(1),
+          flushDeadlineAt,
+        }).success,
+      ).toBe(false)
+    },
+  )
   it('requires truthful, bounded Native reservation scalars and accepts explicit unknown counts', () => {
     const observed = {
       unit: 'native-working-reservations-v1',

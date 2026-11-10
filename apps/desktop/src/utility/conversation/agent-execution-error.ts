@@ -12,6 +12,16 @@ export class AgentExecutionError extends Error {
   }
 }
 
+/** The live workflow admission fence withheld the root input before native I/O. */
+export class NativeInputWithheldError extends AgentExecutionError {
+  constructor(
+    message = 'Collaboration paused before this input was sent. Continue collaboration when ready.',
+  ) {
+    super('user_stopped', message, false)
+    this.name = 'NativeInputWithheldError'
+  }
+}
+
 /** The binding was resumed, but its next-task permissions were not confirmed; no model input was sent. */
 export class PermissionModeRejectedError extends AgentExecutionError {
   constructor(message: string) {

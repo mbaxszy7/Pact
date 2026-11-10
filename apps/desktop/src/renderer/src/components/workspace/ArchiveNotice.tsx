@@ -23,6 +23,7 @@ export interface ArchiveResult {
   id: string
   item: ArchivedItem
   state: 'archived' | 'failed' | 'unresolved'
+  sidebarRemoved?: true
   preview?: WorkspaceArchivePreview
   receipt?: WorkspaceArchiveReceipt
   message?: string
@@ -31,7 +32,7 @@ export interface ArchiveResult {
 
 export interface ArchiveAction {
   id: string
-  kind: 'preparing' | 'archiving' | 'restoring' | 'checking'
+  kind: 'preparing' | 'archiving' | 'restoring' | 'checking' | 'removing'
 }
 
 interface ArchiveNoticeProps {
@@ -58,13 +59,19 @@ export function ArchiveNotice({
   const [pageIndex, setPageIndex] = useState(0)
   const listId = useId()
   const toggleRef = useRef<HTMLButtonElement>(null)
+  const removalUndoRef = useRef<HTMLButtonElement>(null)
   const noticeRef = useRef<HTMLElement>(null)
   const focusedResultRef = useRef<string | undefined>(undefined)
   const archived = results.filter((result) => result.state === 'archived').length
-  const failed = results.filter((result) => result.state === 'failed').length
-  const unresolved = results.length - archived - failed
+  const removals = results.filter((result) => result.sidebarRemoved)
+  const recentRemoval = removals[0]
+  const failed = results.filter(
+    (result) => result.state === 'failed' && !result.sidebarRemoved,
+  ).length
+  const unresolved = results.filter((result) => result.state === 'unresolved').length
   const summary = [
     archived ? `${archived} archived` : undefined,
+    removals.length ? `${removals.length} removed from sidebar` : undefined,
     failed ? `${failed} failed` : undefined,
     unresolved ? `${unresolved} to check` : undefined,
   ]
@@ -76,6 +83,10 @@ export function ArchiveNotice({
     page * ARCHIVE_RESULT_PAGE_SIZE,
     (page + 1) * ARCHIVE_RESULT_PAGE_SIZE,
   )
+  useEffect(() => {
+    if (recentRemoval?.id && document.activeElement === document.body)
+      (removalUndoRef.current ?? toggleRef.current)?.focus()
+  }, [recentRemoval?.id])
   useEffect(() => {
     if (
       focusedResultRef.current &&
@@ -112,6 +123,18 @@ export function ArchiveNotice({
         >
           {summary}
         </output>
+        {!expanded && recentRemoval ? (
+          <button
+            ref={removalUndoRef}
+            type="button"
+            className="pact-archive-notice-button text-caption font-medium text-primary hover:bg-surface-muted disabled:opacity-55"
+            aria-label={`Undo sidebar removal of ${recentRemoval.item.title}`}
+            disabled={blocked}
+            onClick={() => onUndo(recentRemoval)}
+          >
+            {action?.id === recentRemoval.id && action.kind === 'restoring' ? 'Restoring…' : 'Undo'}
+          </button>
+        ) : null}
         <button
           ref={toggleRef}
           className="pact-archive-notice-button text-caption text-primary hover:bg-surface-muted"
@@ -139,18 +162,24 @@ export function ArchiveNotice({
               ? 'Dismiss resolved results; items to check stay available'
               : 'Dismiss archive results'
           }
-          disabled={blocked || archived + failed === 0}
+          disabled={blocked || results.length === unresolved}
           onClick={() => onDismiss()}
         >
           <X aria-hidden="true" className="size-4" strokeWidth={1.75} />
         </button>
       </div>
+      {!expanded && recentRemoval?.actionError ? (
+        <p className="mx-panel mb-group break-words text-caption text-danger" role="alert">
+          {recentRemoval.actionError}
+        </p>
+      ) : null}
       <div id={listId} hidden={!expanded} className="pact-archive-notice-expanded">
         <ul className="pact-archive-result-list" aria-label="Individual archive results">
           {visible.map((result) => {
             const subject = result.item.kind === 'session' ? 'Session' : 'Project'
             const KindIcon = result.item.kind === 'session' ? MessageSquare : Folder
             const active = action?.id === result.id ? action.kind : undefined
+            const canUndo = result.state === 'archived' || result.sidebarRemoved
             const detailsOpen = detailId === result.id && result.state !== 'archived'
             const detailDomId = `${listId}-${result.id}`
             const tasks = result.preview?.tasks ?? []
@@ -172,7 +201,7 @@ export function ArchiveNotice({
                     <p className="pact-archive-result-status text-caption text-secondary">
                       {subject}
                       <span aria-hidden="true">·</span>
-                      {result.state === 'failed' ? (
+                      {result.state === 'failed' && !result.sidebarRemoved ? (
                         <CircleAlert
                           aria-hidden="true"
                           className="size-3 text-danger"
@@ -187,31 +216,36 @@ export function ArchiveNotice({
                       ) : null}
                       <span
                         className={
-                          result.state === 'failed'
+                          result.state === 'failed' && !result.sidebarRemoved
                             ? 'text-danger'
                             : result.state === 'unresolved'
                               ? 'text-status-warning'
                               : undefined
                         }
                       >
-                        {result.state === 'archived'
-                          ? 'Archived'
-                          : result.state === 'failed'
-                            ? 'Archive failed'
-                            : 'Result to check'}
+                        {result.sidebarRemoved
+                          ? 'Removed from sidebar'
+                          : result.state === 'archived'
+                            ? 'Archived'
+                            : result.state === 'failed'
+                              ? 'Archive failed'
+                              : 'Result to check'}
                       </span>
+                      {result.sidebarRemoved && result.state === 'unresolved' ? (
+                        <span className="text-status-warning">Archive result to check</span>
+                      ) : null}
                     </p>
                   </div>
                   <button
                     className="pact-archive-notice-button pact-archive-result-action text-caption font-medium text-primary hover:bg-surface-muted disabled:cursor-wait disabled:opacity-55"
                     type="button"
                     disabled={blocked}
-                    aria-label={`${result.state === 'archived' ? 'Undo archive of' : result.state === 'failed' ? 'View archive failure for' : 'Check archive status of'} ${result.item.title}`}
-                    {...(result.state === 'failed'
+                    aria-label={`${result.sidebarRemoved ? 'Undo sidebar removal of' : result.state === 'archived' ? 'Undo archive of' : result.state === 'failed' ? 'View archive failure for' : 'Check archive status of'} ${result.item.title}`}
+                    {...(result.state === 'failed' && !canUndo
                       ? { 'aria-expanded': detailsOpen, 'aria-controls': detailDomId }
                       : {})}
                     onClick={() => {
-                      if (result.state === 'archived') onUndo(result)
+                      if (canUndo) onUndo(result)
                       else if (result.state === 'unresolved') onCheck(result)
                       else setDetailId(detailsOpen ? undefined : result.id)
                     }}
@@ -229,7 +263,7 @@ export function ArchiveNotice({
                         ? 'Checking…'
                         : active === 'preparing' || active === 'archiving'
                           ? 'Working…'
-                          : result.state === 'archived'
+                          : canUndo
                             ? 'Undo'
                             : result.state === 'failed'
                               ? 'View reason'
@@ -291,6 +325,16 @@ export function ArchiveNotice({
                         )
                       })}
                     </ul>
+                  ) : null}
+                  {result.sidebarRemoved && result.state === 'unresolved' ? (
+                    <button
+                      className="pact-archive-notice-button text-caption font-medium bg-surface-inverse text-inverse disabled:opacity-55"
+                      type="button"
+                      disabled={blocked}
+                      onClick={() => onCheck(result)}
+                    >
+                      Check status
+                    </button>
                   ) : null}
                   {result.state === 'failed' ? (
                     <button

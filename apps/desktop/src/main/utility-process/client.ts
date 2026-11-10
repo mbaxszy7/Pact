@@ -1,4 +1,4 @@
-import { utilityProcess, type UtilityProcess } from 'electron'
+import { app, utilityProcess, type UtilityProcess } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import { dirname, isAbsolute, join } from 'node:path'
@@ -42,10 +42,29 @@ import type {
   RuntimeHealth,
   RuntimePreparation,
   SessionArchiveInput,
+  SessionSidebarHiddenInput,
   SessionCatalogChange,
   SessionCatalogPage,
   SessionCatalogPageInput,
   SessionCreateInput,
+  SessionPage,
+  SessionPageInput,
+  SessionGroupPage,
+  SessionGroupPageInput,
+  SessionGroupDetail,
+  SessionGroupDetailInput,
+  SessionMembership,
+  SessionMembershipInput,
+  LocateSessionNavigationInput,
+  LocatedSessionNavigation,
+  SessionCreationState,
+  SessionCreationStateInput,
+  CreateSessionGroupInput,
+  UpdateSessionGroupInput,
+  MoveSessionGroupInput,
+  DissolveSessionGroupInput,
+  SetSessionGroupInput,
+  SessionGroupMutation,
   SessionForkInput,
   SessionForkResult,
   SessionCreationPrepareInput,
@@ -64,9 +83,23 @@ import type {
   WorkspaceChangesPage,
   WorkspaceChangesReadInput,
   WorkspaceChangesUndoInput,
+  SchedulingSettings,
+  SchedulingSettingsSave,
+  SchedulingState,
+  SchedulingStateInput,
+  SchedulingActivityRead,
+  SchedulingActivityPage,
+  RelayCredentialReceipt,
+  RelayCredentialRemove,
+  RelayCredentialReveal,
+  RelayCredentialRevealed,
+  RelayCredentialSave,
+  RelayCredentialStored,
+  RelayCredentialWrite,
 } from '@pact/contracts'
 
 import {
+  RELAY_CREDENTIAL_TIMEOUT_MS,
   rpcResultSchema,
   nativePresenceSnapshotSchema,
   nativeAttentionPageSchema,
@@ -105,11 +138,16 @@ import {
   LogicalIpcWorkerTraffic,
   logicalIpcTrafficSnapshot,
 } from '../../shared/logical-ipc-traffic'
+import { RelayCredentialCrypto } from '../modules/settings/relay-credential-crypto'
 import { DirectoryFileOperations } from './directory-file-operations'
 
 const REQUEST_TIMEOUT_MS = 2_000
 const STARTUP_TIMEOUT_MS = 10_000
 const RUNTIME_PREPARATION_TIMEOUT_MS = 12_000
+// Send composes optional 15s advice with existing 10s preparation and 2s transport margin.
+const CONVERSATION_SEND_TIMEOUT_MS = 15_000 + RUNTIME_PREPARATION_TIMEOUT_MS
+// A sealed input may first use the existing bounded 10s complete body read.
+const CONVERSATION_SEND_BODY_READ_MS = 10_000
 const DEFAULT_SESSION_SETTINGS_TIMEOUT_MS = 25_000
 const WORKSPACE_OPERATION_TIMEOUT_MS = 5_000
 const WORKSPACE_FILE_READ_TIMEOUT_MS = 15_000
@@ -144,6 +182,17 @@ export type NativeQuitPreparationAttempt =
   | { kind: 'attempted'; result: RpcResult<NativeQuitPreparation> }
 
 export interface UtilityProcessClient {
+  getSchedulingState(input: SchedulingStateInput): Promise<RpcResult<SchedulingState>>
+  getSchedulingSettings(): Promise<RpcResult<SchedulingSettings>>
+  saveSchedulingSettings(input: SchedulingSettingsSave): Promise<RpcResult<SchedulingSettings>>
+  /** Encrypted write only; the plaintext key is handled by the Main crypto module. */
+  /** Composes Main-side OS crypto with the durable Utility write. */
+  saveRelayApiKey(input: RelayCredentialSave): Promise<RpcResult<RelayCredentialReceipt>>
+  removeRelayApiKey(input: RelayCredentialRemove): Promise<RpcResult<RelayCredentialReceipt>>
+  revealRelayApiKey(input: RelayCredentialReveal): Promise<RpcResult<RelayCredentialRevealed>>
+  readRelayCredentialReceipt(nonce: string): Promise<RpcResult<RelayCredentialReceipt | null>>
+  readSchedulingActivity(input: SchedulingActivityRead): Promise<RpcResult<SchedulingActivityPage>>
+  subscribeSchedulingChanges(listener: () => void): () => void
   getNativePresence(): Promise<RpcResult<NativePresenceSnapshot>>
   readNativeAttention(input: NativeAttentionReadInput): Promise<RpcResult<NativeAttentionPage>>
   resolveNativeSession(input: NativeSessionResolveInput): Promise<RpcResult<SessionCatalogChange>>
@@ -202,6 +251,22 @@ export interface UtilityProcessClient {
   restoreProject(input: ProjectArchiveInput): Promise<RpcResult<ProjectCatalogState>>
   renameProject(input: ProjectNameChange): Promise<RpcResult<ProjectNameChange>>
   getSessionCatalog(input: SessionCatalogPageInput): Promise<RpcResult<SessionCatalogPage>>
+  getSessionPage(input: SessionPageInput): Promise<RpcResult<SessionPage>>
+  getSessionGroups(input: SessionGroupPageInput): Promise<RpcResult<SessionGroupPage>>
+  getSessionGroup(input: SessionGroupDetailInput): Promise<RpcResult<SessionGroupDetail>>
+  getSessionMembership(input: SessionMembershipInput): Promise<RpcResult<SessionMembership>>
+  locateSessionNavigation(
+    input: LocateSessionNavigationInput,
+  ): Promise<RpcResult<LocatedSessionNavigation>>
+  recoverSessionOrganization(): Promise<RpcResult<{ ready: true }>>
+  getSessionCreationState(
+    input: SessionCreationStateInput,
+  ): Promise<RpcResult<SessionCreationState>>
+  createSessionGroup(input: CreateSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
+  updateSessionGroup(input: UpdateSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
+  moveSessionGroup(input: MoveSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
+  dissolveSessionGroup(input: DissolveSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
+  setSessionGroup(input: SetSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
   prepareSessionCreation(
     input: SessionCreationPrepareInput,
   ): Promise<RpcResult<DefaultSessionSettingsEditorState>>
@@ -210,6 +275,9 @@ export interface UtilityProcessClient {
   markSessionRead(input: SessionMarkReadInput): Promise<RpcResult<SessionCatalogChange>>
   archiveSession(input: SessionArchiveInput): Promise<RpcResult<SessionCatalogChange>>
   restoreSession(input: SessionArchiveInput): Promise<RpcResult<SessionCatalogChange>>
+  setSessionSidebarHidden(
+    input: SessionSidebarHiddenInput,
+  ): Promise<RpcResult<SessionCatalogChange>>
   getSessionSettings(input: SessionSettingsInput): Promise<RpcResult<SessionSettingsEditorState>>
   saveSessionSettings(
     input: SessionSettingsSaveInput,
@@ -225,6 +293,15 @@ export interface UtilityProcessClient {
   actOnCollaboration(
     input: import('@pact/contracts').CollaborationActionInput,
   ): Promise<RpcResult<ConversationPatch>>
+  answerRelayDecision(
+    input: import('@pact/contracts').RelayDecisionAnswer,
+  ): Promise<RpcResult<import('@pact/contracts').RelayDecisionReceipt>>
+  continuePreparedConversationInput(
+    input: import('@pact/contracts').PreparedInputContinue,
+  ): Promise<RpcResult<ConversationPatch>>
+  getRelayDecisionReceipt(
+    input: import('@pact/contracts').RelayDecisionReceiptRead,
+  ): Promise<RpcResult<import('@pact/contracts').RelayDecisionReceipt>>
   getConversation(input: ConversationGetInput): Promise<RpcResult<ConversationPage>>
   writeConversationImage(
     input: import('@pact/contracts').ImageWriteInput,
@@ -293,6 +370,7 @@ export interface UtilityProcessClient {
   dispose(): void
   isRunning(): boolean
   shutdown(): Promise<RpcResult<{ flushed: true }>>
+  settlement(): Promise<void>
 }
 
 interface InFlightRequest {
@@ -346,15 +424,35 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     | undefined
   private terminatingChild: UtilityProcess | undefined
   private startupFailure: import('@pact/contracts').RuntimeStartupFailure | undefined
+  private restartOptions: UtilityProcessStartOptions | undefined
+  private sessionOrganizationRecovery:
+    | { kind: 'creation'; projectId: string; sessionId: string }
+    | {
+        kind: 'group'
+        projectId: string
+        groupId?: string | undefined
+        sessionId?: string | undefined
+      }
+    | undefined
   private startupFailureCallback: UtilityProcessStartOptions['onStartupFailed']
   private diagnostics: UtilityProcessStartOptions['diagnostics']
   private traffic: LogicalIpcTrafficCollector | undefined
   private workerTraffic: LogicalIpcWorkerTraffic | undefined
+  private navigationRead:
+    | {
+        child: UtilityProcess
+        id: string
+        type: UtilityResponse['type']
+        barrierIds: string[]
+      }
+    | undefined
   private readonly inFlightRequests = new Map<string, InFlightRequest>()
   private readonly conversationListeners = new Set<
     (patch: ConversationPatch, progress: boolean) => void
   >()
   private readonly nativePresenceListeners = new Set<(version: NativePresenceVersion) => void>()
+  private readonly schedulingListeners = new Set<() => void>()
+  private readonly relayCrypto = new RelayCredentialCrypto()
   private readonly nativeQuitRecentListeners = new Set<
     (version: NativePresenceVersion, sessions: NativeSessionRow[]) => void
   >()
@@ -493,6 +591,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       throw new TypeError('Workspace storage must be an absolute private path.')
     if (options.workspaceStorageRoot) workspaceStorageRootSchema.parse(options.workspaceStorageRoot)
 
+    this.restartOptions = options
     this.diagnostics = options.diagnostics
     this.shutdownTask = undefined
     this.terminatingChild = undefined
@@ -508,6 +607,13 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         options.simulateAppearanceWriteFailure ? '1' : '0',
         options.workspaceStorageRoot ?? '',
         options.diagnostics ? JSON.stringify(options.diagnostics.identity) : '',
+        process.platform === 'win32'
+          ? join(
+              app.isPackaged ? process.resourcesPath : dirname(__dirname),
+              'native',
+              `owned-process-group-win32-${process.arch}.exe`,
+            )
+          : '',
       ],
       { serviceName: 'Pact Utility Process' },
     )
@@ -545,7 +651,9 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         level: this.shutdownTask ? 'info' : 'error',
         exitCode: code,
       })
+      if (this.navigationRead?.child === startedChild) this.navigationRead = undefined
       this.cancelDirectoryRequests(startedChild)
+      this.relayCrypto.cancelSource(startedChild)
       if (this.child !== startedChild) return
       this.child = undefined
       this.readyChild = undefined
@@ -614,6 +722,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     payload: UtilityRequestPayload,
     expectedResponseType: UtilityResponse['type'],
     timeoutMs = REQUEST_TIMEOUT_MS,
+    navigationBarrierFor?: NonNullable<ElectronUtilityProcessClient['navigationRead']>,
   ): Promise<UtilityTransportResult> {
     const startupError = this.startupFailureError()
     if (startupError) return Promise.resolve({ kind: 'not-sent', error: startupError })
@@ -631,6 +740,43 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       return Promise.resolve({
         kind: 'not-sent',
         error: ElectronUtilityProcessClient.unavailable('Utility runtime is not running.'),
+      })
+    }
+
+    const navigationRead =
+      payload.type === 'session-page.get.request' ||
+      payload.type === 'session-groups.get.request' ||
+      payload.type === 'session-navigation.locate.request'
+    const prior = this.navigationRead
+    if (navigationRead && prior) {
+      const busy: UtilityTransportResult = {
+        kind: 'not-sent',
+        error: { code: 'CONFLICT', message: 'The previous navigation read is still settling.' },
+      }
+      if (
+        this.inFlightRequests.has(prior.id) ||
+        prior.barrierIds.length >= 2 ||
+        prior.barrierIds.some((id) => this.inFlightRequests.has(id))
+      )
+        return Promise.resolve(busy)
+      // Navigation reads and this health reply execute synchronously on the same
+      // Utility message port. The reply proves that an earlier lost read settled.
+      const deadline = performance.now() + timeoutMs
+      return this.request(
+        { type: 'runtime.health.request' },
+        'runtime.health.response',
+        Math.min(timeoutMs, REQUEST_TIMEOUT_MS),
+        prior,
+      ).then((settlement) => {
+        const remaining = deadline - performance.now()
+        if (
+          settlement.kind !== 'response' ||
+          this.child !== target ||
+          this.navigationRead === prior ||
+          remaining <= 0
+        )
+          return busy
+        return this.request(payload, expectedResponseType, remaining)
       })
     }
 
@@ -662,6 +808,14 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
 
       try {
         const packet = { ...payload, requestId }
+        if (navigationRead)
+          this.navigationRead = {
+            child: target,
+            id: requestId,
+            type: expectedResponseType,
+            barrierIds: [],
+          }
+        if (navigationBarrierFor) navigationBarrierFor.barrierIds.push(requestId)
         target.postMessage(packet)
         request.sent = true
         const traffic = this.traffic
@@ -683,6 +837,9 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
           }
         }
       } catch {
+        if (this.navigationRead?.id === requestId) this.navigationRead = undefined
+        if (navigationBarrierFor?.barrierIds.at(-1) === requestId)
+          navigationBarrierFor.barrierIds.pop()
         this.traffic?.invalidate('transport_error')
         this.finishRequest(requestId, {
           kind: 'not-sent',
@@ -753,6 +910,194 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         DEFAULT_SESSION_SETTINGS_TIMEOUT_MS,
       ),
     )
+  }
+
+  subscribeSchedulingChanges(listener: () => void): () => void {
+    if (this.schedulingListeners.size >= 1)
+      throw new Error('Scheduling already has its Main subscriber.')
+    this.schedulingListeners.add(listener)
+    return () => {
+      this.schedulingListeners.delete(listener)
+    }
+  }
+
+  async getSchedulingState(input: SchedulingStateInput): Promise<RpcResult<SchedulingState>> {
+    const result = await this.request(
+      { type: 'scheduling.state.get.request', input },
+      'scheduling.state.response',
+      5_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'scheduling.state.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected scheduling state response.' } }
+  }
+
+  async getSchedulingSettings(): Promise<RpcResult<SchedulingSettings>> {
+    const result = await this.request(
+      { type: 'scheduling.settings.get.request' },
+      'scheduling.settings.response',
+      5_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'scheduling.settings.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error: { code: 'INTERNAL', message: 'Unexpected scheduling settings response.' },
+        }
+  }
+
+  async saveSchedulingSettings(
+    input: SchedulingSettingsSave,
+  ): Promise<RpcResult<SchedulingSettings>> {
+    const result = await this.request(
+      { type: 'scheduling.settings.save.request', input },
+      'scheduling.settings.response',
+      5_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'scheduling.settings.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error: { code: 'INTERNAL', message: 'Unexpected scheduling settings response.' },
+        }
+  }
+
+  async saveRelayApiKey(input: RelayCredentialSave): Promise<RpcResult<RelayCredentialReceipt>> {
+    const target = this.child
+    if (!target || this.terminatingChild || this.shutdownTask)
+      return {
+        ok: false,
+        error: {
+          code: 'RUNTIME_UNAVAILABLE',
+          message: 'Secure credential storage is unavailable.',
+        },
+      }
+    return this.relayCrypto.save(input, {
+      source: target,
+      deadlineAt: Math.min(input.deadlineAt, Date.now() + RELAY_CREDENTIAL_TIMEOUT_MS),
+      isCurrent: () => this.child === target && !this.terminatingChild && !this.shutdownTask,
+      write: (encrypted) => this.writeRelayCredential(encrypted),
+    })
+  }
+
+  async removeRelayApiKey(
+    input: RelayCredentialRemove,
+  ): Promise<RpcResult<RelayCredentialReceipt>> {
+    return this.writeRelayCredential({
+      operation: 'remove',
+      nonce: input.nonce,
+      expectedRevision: input.expectedRevision,
+      deadlineAt: Math.min(input.deadlineAt, Date.now() + RELAY_CREDENTIAL_TIMEOUT_MS),
+    })
+  }
+
+  async revealRelayApiKey(
+    input: RelayCredentialReveal,
+  ): Promise<RpcResult<RelayCredentialRevealed>> {
+    const target = this.child
+    if (!target || this.terminatingChild || this.shutdownTask)
+      return {
+        ok: false,
+        error: {
+          code: 'RUNTIME_UNAVAILABLE',
+          message: 'Secure credential storage is unavailable.',
+        },
+      }
+    return this.relayCrypto.reveal(input, {
+      source: target,
+      isCurrent: () => this.child === target && !this.terminatingChild && !this.shutdownTask,
+      read: (request) => this.readRelayCredential(request),
+    })
+  }
+
+  private async readRelayCredential(
+    input: RelayCredentialReveal,
+  ): Promise<RpcResult<RelayCredentialStored>> {
+    const deadlineAt = Math.min(input.deadlineAt, Date.now() + RELAY_CREDENTIAL_TIMEOUT_MS)
+    if (deadlineAt <= Date.now())
+      return {
+        ok: false,
+        error: {
+          code: 'RUNTIME_UNAVAILABLE',
+          message: 'Secure credential storage is unavailable.',
+        },
+      }
+    const result = await this.request(
+      {
+        type: 'relay.credential.read.request',
+        input: { expectedRevision: input.expectedRevision, deadlineAt },
+      },
+      'relay.credential.read.response',
+      Math.min(RELAY_CREDENTIAL_TIMEOUT_MS, deadlineAt - Date.now()),
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'relay.credential.read.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected credential response.' } }
+  }
+
+  private async writeRelayCredential(
+    input: RelayCredentialWrite,
+  ): Promise<RpcResult<RelayCredentialReceipt>> {
+    if (input.deadlineAt <= Date.now())
+      return {
+        ok: false,
+        error: {
+          code: 'RUNTIME_UNAVAILABLE',
+          message: 'Secure credential storage is unavailable.',
+        },
+      }
+    const result = await this.request(
+      { type: 'relay.credential.write.request', input },
+      'relay.credential.write.response',
+      Math.min(RELAY_CREDENTIAL_TIMEOUT_MS, input.deadlineAt - Date.now()),
+    )
+    if (result.kind === 'unknown-delivery')
+      return {
+        ok: false,
+        error: {
+          code: 'UNCERTAIN',
+          message: 'The key change could not be confirmed. Check its status.',
+        },
+      }
+    if (result.kind === 'not-sent') return { ok: false, error: result.error }
+    return result.response.type === 'relay.credential.write.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected credential response.' } }
+  }
+
+  async readRelayCredentialReceipt(
+    nonce: string,
+  ): Promise<RpcResult<RelayCredentialReceipt | null>> {
+    const result = await this.request(
+      { type: 'relay.credential.receipt.read.request', input: { nonce } },
+      'relay.credential.receipt.read.response',
+      5_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'relay.credential.receipt.read.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected credential response.' } }
+  }
+
+  async readSchedulingActivity(
+    input: SchedulingActivityRead,
+  ): Promise<RpcResult<SchedulingActivityPage>> {
+    const result = await this.request(
+      { type: 'scheduling.activity.read.request', input },
+      'scheduling.activity.response',
+      5_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'scheduling.activity.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error: { code: 'INTERNAL', message: 'Unexpected scheduling activity response.' },
+        }
   }
 
   async saveDefaultSessionSettings(
@@ -901,6 +1246,310 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     )
   }
 
+  async getSessionPage(input: SessionPageInput): Promise<RpcResult<SessionPage>> {
+    const result = await this.request(
+      { type: 'session-page.get.request', input },
+      'session-page.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    return result.kind !== 'response'
+      ? { ok: false, error: result.error }
+      : result.response.type === 'session-page.response'
+        ? result.response.result
+        : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected Session page.' } }
+  }
+
+  async getSessionGroups(input: SessionGroupPageInput): Promise<RpcResult<SessionGroupPage>> {
+    const result = await this.request(
+      { type: 'session-groups.get.request', input },
+      'session-groups.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    return result.kind !== 'response'
+      ? { ok: false, error: result.error }
+      : result.response.type === 'session-groups.response'
+        ? result.response.result
+        : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected Session group page.' } }
+  }
+
+  async getSessionGroup(input: SessionGroupDetailInput): Promise<RpcResult<SessionGroupDetail>> {
+    const result = await this.request(
+      { type: 'session-group.get.request', input },
+      'session-group.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    if (result.response.type === 'session-group.response') {
+      const reply = result.response.result
+      if (!reply.ok) return reply
+      if (
+        !reply.value.exists ||
+        (reply.value.group.id === input.groupId && reply.value.group.projectId === input.projectId)
+      ) {
+        const pending = this.sessionOrganizationRecovery
+        if (
+          pending?.kind === 'group' &&
+          pending.projectId === input.projectId &&
+          pending.groupId === input.groupId &&
+          (!pending.sessionId || !reply.value.exists)
+        )
+          this.sessionOrganizationRecovery = undefined
+        return reply
+      }
+    }
+    return {
+      ok: false,
+      error: { code: 'INTERNAL', message: 'The readback identity could not be verified.' },
+    }
+  }
+
+  async getSessionMembership(input: SessionMembershipInput): Promise<RpcResult<SessionMembership>> {
+    const result = await this.request(
+      { type: 'session-membership.get.request', input },
+      'session-membership.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    if (result.response.type === 'session-membership.response') {
+      const reply = result.response.result
+      if (!reply.ok) return reply
+      if (reply.value.sessionId === input.sessionId && reply.value.projectId === input.projectId) {
+        const pending = this.sessionOrganizationRecovery
+        if (
+          pending?.kind === 'group' &&
+          pending.projectId === input.projectId &&
+          pending.sessionId === input.sessionId
+        )
+          this.sessionOrganizationRecovery = undefined
+        return reply
+      }
+    }
+    return {
+      ok: false,
+      error: { code: 'INTERNAL', message: 'The readback identity could not be verified.' },
+    }
+  }
+
+  async locateSessionNavigation(
+    input: LocateSessionNavigationInput,
+  ): Promise<RpcResult<LocatedSessionNavigation>> {
+    const result = await this.request(
+      { type: 'session-navigation.locate.request', input },
+      'session-navigation.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    return result.kind !== 'response'
+      ? { ok: false, error: result.error }
+      : result.response.type === 'session-navigation.response'
+        ? result.response.result
+        : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected Session location.' } }
+  }
+
+  async recoverSessionOrganization(): Promise<RpcResult<{ ready: true }>> {
+    if (this.child) return this.waitUntilReady()
+    const options = this.restartOptions
+    if (!this.sessionOrganizationRecovery || this.shutdownTask || !options) {
+      return {
+        ok: false,
+        error: ElectronUtilityProcessClient.unavailable(
+          'Restart Pact to recover the local runtime.',
+        ),
+      }
+    }
+    // The exit handler alone clears the child. The new Utility still has to
+    // acquire the writer reservation and finish ordinary startup recovery.
+    this.sessionOrganizationRecovery = undefined
+    try {
+      this.start(options)
+    } catch {
+      return {
+        ok: false,
+        error: ElectronUtilityProcessClient.unavailable(
+          'Pact could not recover the local runtime.',
+        ),
+      }
+    }
+    return this.waitUntilReady()
+  }
+
+  async getSessionCreationState(
+    input: SessionCreationStateInput,
+  ): Promise<RpcResult<SessionCreationState>> {
+    const result = await this.request(
+      { type: 'session-creation.state.request', input },
+      'session-creation-state.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    if (result.response.type === 'session-creation-state.response') {
+      const reply = result.response.result
+      if (!reply.ok) return reply
+      if (
+        reply.value.state !== 'present' ||
+        (reply.value.session.id === input.sessionId &&
+          reply.value.session.projectId === input.projectId &&
+          reply.value.groupId === (reply.value.session.groupId ?? null))
+      ) {
+        const pending = this.sessionOrganizationRecovery
+        if (
+          reply.value.state !== 'pending' &&
+          pending?.kind === 'creation' &&
+          pending.projectId === input.projectId &&
+          pending.sessionId === input.sessionId
+        )
+          this.sessionOrganizationRecovery = undefined
+        return reply
+      }
+    }
+    return {
+      ok: false,
+      error: { code: 'INTERNAL', message: 'The readback identity could not be verified.' },
+    }
+  }
+
+  async createSessionGroup(
+    input: CreateSessionGroupInput,
+  ): Promise<RpcResult<SessionGroupMutation>> {
+    return this.sessionGroupMutation({ type: 'session-group.create.request', input })
+  }
+
+  async updateSessionGroup(
+    input: UpdateSessionGroupInput,
+  ): Promise<RpcResult<SessionGroupMutation>> {
+    return this.sessionGroupMutation({ type: 'session-group.update.request', input })
+  }
+
+  async moveSessionGroup(input: MoveSessionGroupInput): Promise<RpcResult<SessionGroupMutation>> {
+    return this.sessionGroupMutation({ type: 'session-group.move.request', input })
+  }
+
+  async dissolveSessionGroup(
+    input: DissolveSessionGroupInput,
+  ): Promise<RpcResult<SessionGroupMutation>> {
+    return this.sessionGroupMutation({ type: 'session-group.dissolve.request', input })
+  }
+
+  async setSessionGroup(input: SetSessionGroupInput): Promise<RpcResult<SessionGroupMutation>> {
+    return this.sessionGroupMutation({ type: 'session-group.set.request', input })
+  }
+
+  private async sessionGroupMutation(
+    request: Extract<
+      UtilityRequestPayload,
+      {
+        type:
+          | 'session-group.create.request'
+          | 'session-group.update.request'
+          | 'session-group.move.request'
+          | 'session-group.dissolve.request'
+          | 'session-group.set.request'
+      }
+    >,
+  ): Promise<RpcResult<SessionGroupMutation>> {
+    const armRecovery = (): void => {
+      const { input } = request
+      this.sessionOrganizationRecovery = {
+        kind: 'group',
+        projectId: input.projectId,
+        groupId: input.groupId ?? undefined,
+        sessionId: 'sessionId' in input ? input.sessionId : undefined,
+      }
+    }
+    const result = await this.request(
+      request,
+      'session-group-change.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind === 'not-sent') return { ok: false, error: result.error }
+    if (result.kind === 'unknown-delivery') {
+      armRecovery()
+      return { ok: false, error: { code: 'UNCERTAIN', message: result.error.message } }
+    }
+    if (result.response.type === 'session-group-change.response') {
+      const reply = result.response.result
+      if (!reply.ok) {
+        if (reply.error.code === 'UNCERTAIN') armRecovery()
+        return reply
+      }
+      const { input } = request
+      const { group, session, dissolvedGroupId, sourceScope, targetScope, revision } = reply.value
+      const matchesGroup = group?.id === input.groupId && group?.projectId === input.projectId
+      const matchesTarget =
+        targetScope?.kind === 'group'
+          ? targetScope.groupId === input.groupId
+          : targetScope?.kind === 'ungrouped' && input.groupId === null
+      const matchesSession =
+        session?.projectId === input.projectId &&
+        (session.groupId ?? null) === input.groupId &&
+        Boolean(sourceScope) &&
+        matchesTarget
+      const changed = revision === input.expectedRevision + 1
+      const unchanged = revision === input.expectedRevision
+      const onlyGroup =
+        matchesGroup && !dissolvedGroupId && !session && !sourceScope && !targetScope
+      let matches: boolean
+      switch (request.type) {
+        case 'session-group.create.request':
+          matches =
+            changed &&
+            !dissolvedGroupId &&
+            matchesGroup &&
+            (request.input.sessionId
+              ? matchesSession &&
+                session?.id === request.input.sessionId &&
+                sourceScope?.kind === 'ungrouped'
+              : onlyGroup)
+          break
+        case 'session-group.update.request':
+          matches =
+            changed &&
+            onlyGroup &&
+            (request.input.name === undefined || group?.name === request.input.name) &&
+            (request.input.color === undefined || group?.color === request.input.color) &&
+            (request.input.collapsed === undefined || group?.collapsed === request.input.collapsed)
+          break
+        case 'session-group.move.request':
+          matches = (changed || unchanged) && onlyGroup
+          break
+        case 'session-group.dissolve.request':
+          matches =
+            changed &&
+            !group &&
+            !session &&
+            dissolvedGroupId === input.groupId &&
+            sourceScope?.kind === 'group' &&
+            sourceScope.groupId === input.groupId &&
+            targetScope?.kind === 'ungrouped'
+          break
+        case 'session-group.set.request': {
+          const sameScope =
+            sourceScope?.kind === 'group'
+              ? sourceScope.groupId === input.groupId
+              : sourceScope?.kind === 'ungrouped' && input.groupId === null
+          const matchesDissolve =
+            dissolvedGroupId === undefined ||
+            (changed &&
+              !sameScope &&
+              sourceScope?.kind === 'group' &&
+              dissolvedGroupId === sourceScope.groupId)
+          matches =
+            !group &&
+            matchesDissolve &&
+            matchesSession &&
+            session?.id === request.input.sessionId &&
+            (sameScope ? unchanged || (changed && Boolean(request.input.placement)) : changed)
+          break
+        }
+      }
+      if (matches) return reply
+    }
+    armRecovery()
+    return {
+      ok: false,
+      error: { code: 'UNCERTAIN', message: 'The Session group receipt could not be verified.' },
+    }
+  }
+
   async prepareSessionCreation(
     input: SessionCreationPrepareInput,
   ): Promise<RpcResult<DefaultSessionSettingsEditorState>> {
@@ -914,13 +1563,46 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   }
 
   async createSession(input: SessionCreateInput): Promise<RpcResult<SessionCatalogChange>> {
-    return ElectronUtilityProcessClient.toSessionCatalogChangeResult(
-      await this.request(
-        { type: 'session.create.request', input },
-        'session-catalog.response',
-        DEFAULT_SESSION_SETTINGS_TIMEOUT_MS,
-      ),
+    const armRecovery = (): void => {
+      this.sessionOrganizationRecovery = {
+        kind: 'creation',
+        projectId: input.projectId,
+        sessionId: input.sessionId,
+      }
+    }
+    const result = await this.request(
+      { type: 'session.create.request', input },
+      'session-catalog.response',
+      DEFAULT_SESSION_SETTINGS_TIMEOUT_MS,
     )
+    if (result.kind === 'not-sent') return { ok: false, error: result.error }
+    if (result.kind === 'unknown-delivery') {
+      armRecovery()
+      return { ok: false, error: { code: 'UNCERTAIN', message: result.error.message } }
+    }
+    if (result.response.type === 'session-catalog.response') {
+      const reply = result.response.result
+      if (!reply.ok) {
+        if (reply.error.code === 'UNCERTAIN') armRecovery()
+        return reply
+      }
+      if (reply.value.kind === 'change') {
+        const { session, groupRevision } = reply.value
+        if (
+          session.id === input.sessionId &&
+          session.projectId === input.projectId &&
+          (session.groupId ?? null) === (input.groupId ?? null) &&
+          (input.expectedGroupRevision === undefined ||
+            groupRevision === input.expectedGroupRevision + 1)
+        )
+          return { ok: true, value: reply.value }
+      }
+    }
+    armRecovery()
+    return {
+      ok: false,
+      error: { code: 'UNCERTAIN', message: 'The Session creation receipt could not be verified.' },
+    }
   }
 
   async renameSession(input: SessionRenameInput): Promise<RpcResult<SessionCatalogChange>> {
@@ -968,6 +1650,19 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         WORKSPACE_OPERATION_TIMEOUT_MS,
       ),
     )
+  }
+
+  async setSessionSidebarHidden(
+    input: SessionSidebarHiddenInput,
+  ): Promise<RpcResult<SessionCatalogChange>> {
+    const result = await this.request(
+      { type: 'session-sidebar-hidden.set.request', input },
+      'session-catalog.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind === 'unknown-delivery')
+      return { ok: false, error: { code: 'UNCERTAIN', message: result.error.message } }
+    return ElectronUtilityProcessClient.toSessionCatalogChangeResult(result)
   }
 
   async getSessionSettings(
@@ -1074,6 +1769,64 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         }
   }
 
+  async answerRelayDecision(
+    input: import('@pact/contracts').RelayDecisionAnswer,
+  ): Promise<RpcResult<import('@pact/contracts').RelayDecisionReceipt>> {
+    const result = await this.request(
+      { type: 'relay.decision.answer.request', input },
+      'relay.decision.receipt.response',
+      CONVERSATION_SEND_TIMEOUT_MS,
+    )
+    return result.kind === 'response' && result.response.type === 'relay.decision.receipt.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error:
+            result.kind === 'response'
+              ? { code: 'INTERNAL', message: 'Unexpected Relay receipt response.' }
+              : result.error,
+        }
+  }
+
+  async continuePreparedConversationInput(
+    input: import('@pact/contracts').PreparedInputContinue,
+  ): Promise<RpcResult<ConversationPatch>> {
+    const result = await this.request(
+      { type: 'conversation.prepared-input.continue.request', input },
+      'conversation.prepared-input.continue.response',
+      CONVERSATION_SEND_TIMEOUT_MS,
+    )
+    return result.kind === 'response' &&
+      result.response.type === 'conversation.prepared-input.continue.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error:
+            result.kind === 'response'
+              ? { code: 'INTERNAL', message: 'Unexpected saved input response.' }
+              : result.error,
+        }
+  }
+
+  async getRelayDecisionReceipt(
+    input: import('@pact/contracts').RelayDecisionReceiptRead,
+  ): Promise<RpcResult<import('@pact/contracts').RelayDecisionReceipt>> {
+    const result = await this.request(
+      { type: 'relay.decision.receipt.request', input },
+      'relay.decision.receipt.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    return result.kind === 'response' && result.response.type === 'relay.decision.receipt.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error:
+            result.kind === 'response'
+              ? { code: 'INTERNAL', message: 'Unexpected Relay receipt response.' }
+              : result.error,
+        }
+  }
+
   async actOnCollaboration(
     input: import('@pact/contracts').CollaborationActionInput,
   ): Promise<RpcResult<ConversationPatch>> {
@@ -1081,7 +1834,17 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       await this.request(
         { type: 'collaboration.action.request', input },
         'conversation.patch.response',
-        WORKSPACE_OPERATION_TIMEOUT_MS,
+        [
+          'continue',
+          'execute',
+          'respond',
+          'repair',
+          'resume',
+          'retry',
+          'confirm_supplement',
+        ].includes(input.action)
+          ? CONVERSATION_SEND_TIMEOUT_MS
+          : WORKSPACE_OPERATION_TIMEOUT_MS,
       ),
     )
   }
@@ -1174,7 +1937,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       await this.request(
         { type: 'conversation.send.request', input, ...(ownerKey ? { ownerKey } : {}) },
         'conversation.patch.response',
-        RUNTIME_PREPARATION_TIMEOUT_MS,
+        CONVERSATION_SEND_TIMEOUT_MS + (input.inputId ? CONVERSATION_SEND_BODY_READ_MS : 0),
       ),
     )
   }
@@ -1468,9 +2231,13 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         ok: false,
         error: ElectronUtilityProcessClient.unavailable('Utility runtime is shutting down.'),
       })
+    if (this.shutdownTask) return this.shutdownTask
     const deadline = performance.now() + WORKSPACE_OPERATION_TIMEOUT_MS
-    this.shutdownTask ??= this.request(
-      { type: 'runtime.shutdown.request' },
+    const flushDeadlineAt = Date.now() + WORKSPACE_OPERATION_TIMEOUT_MS - 1_000
+    this.relayCrypto.dispose()
+    const cryptoJoined = this.relayCrypto.settlement(deadline)
+    this.shutdownTask = this.request(
+      { type: 'runtime.shutdown.request', flushDeadlineAt },
       'runtime.shutdown.response',
       WORKSPACE_OPERATION_TIMEOUT_MS - 1_000,
     ).then(async (result): Promise<RpcResult<{ flushed: true }>> => {
@@ -1484,6 +2251,14 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
                 error: { code: 'INTERNAL', message: 'Unexpected shutdown acknowledgement.' },
               }
       this.dispose()
+      if (!(await cryptoJoined))
+        return {
+          ok: false,
+          error: {
+            code: 'UNCERTAIN',
+            message: 'Utility runtime exit could not be confirmed. Its ownership is retained.',
+          },
+        }
       if (target && !(await this.waitForExit(target, deadline)))
         return {
           ok: false,
@@ -1495,6 +2270,17 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       return acknowledged
     })
     return this.shutdownTask
+  }
+
+  async settlement(): Promise<void> {
+    const target = this.child
+    await Promise.all([
+      this.relayCrypto.settlement(),
+      this.directoryOperations.settlement(),
+      target
+        ? new Promise<void>((resolve) => target.once('exit', () => resolve()))
+        : Promise.resolve(),
+    ])
   }
 
   isRunning(): boolean {
@@ -1516,6 +2302,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   }
 
   dispose(): void {
+    this.relayCrypto.dispose()
     // Main's measurement lives through child shutdown and diagnostic-log close. Its fixed
     // counters survive late deliveries/restarts; disposing this client must not reset them.
     this.conversationListeners.clear()
@@ -1730,6 +2517,14 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   }
 
   private receiveResponse(source: UtilityProcess, message: unknown): void {
+    if (
+      this.relayCrypto.receive(
+        source,
+        message,
+        () => source === this.child && !this.terminatingChild,
+      )
+    )
+      return
     let diagnosticAccepted = false
     if (this.traffic) {
       const diagnostic = diagnosticPacketSchema.safeParse(message)
@@ -1858,6 +2653,9 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       if (event.data.type === 'native-presence.changed.event') {
         for (const listener of this.nativePresenceListeners) listener(event.data.version)
       }
+      if (event.data.type === 'scheduling.changed.event') {
+        for (const listener of this.schedulingListeners) listener()
+      }
       if (event.data.type === 'conversation.patch.event') {
         for (const listener of this.conversationListeners)
           listener(event.data.patch, event.data.progress)
@@ -1878,6 +2676,15 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       message,
     )
     if (this.child !== source) return
+
+    const navigationRead = this.navigationRead
+    if (
+      navigationRead?.child === source &&
+      ((navigationRead.id === parsed.data.requestId && navigationRead.type === parsed.data.type) ||
+        (navigationRead.barrierIds.includes(parsed.data.requestId) &&
+          parsed.data.type === 'runtime.health.response'))
+    )
+      this.navigationRead = undefined
 
     const request = this.inFlightRequests.get(parsed.data.requestId)
     if (!request || request.child !== source || request.expectedResponseType !== parsed.data.type)

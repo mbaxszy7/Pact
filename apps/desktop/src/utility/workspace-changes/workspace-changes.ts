@@ -1343,7 +1343,7 @@ export class WorkspaceChanges {
   private async directoryJob(
     reservation: WorkspaceReservation,
     rawPath: string,
-    operation: DirectoryFileOperationInput['operation'],
+    operation: Exclude<DirectoryFileOperationInput['operation'], 'preview'>,
     signal: AbortSignal,
     auxiliaryPath?: string,
     linkedCandidatePath?: string,

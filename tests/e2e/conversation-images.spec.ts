@@ -47,7 +47,6 @@ async function createImageSession(
           primaryAgentId: 'claude',
           agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
           maxDiscussionRounds: 3,
-          runningMessagePolicy: 'next_round',
           maxReviewCycles: 3,
           maxRepairAttempts: 3,
         },
@@ -438,6 +437,28 @@ test(
         'data-visible',
         'true',
       )
+
+      const original = gallery.getByRole('img', { name: files[0]!.name, exact: true })
+      await original.click()
+      await expect(gallery).toBeVisible()
+      const imageBounds = await original.boundingBox()
+      const dialogBounds = await gallery.boundingBox()
+      if (!imageBounds || !dialogBounds || dialogBounds.x <= 0 || dialogBounds.y <= 0)
+        throw new Error('Image preview and its outside backdrop must be reachable.')
+      const outside = { x: dialogBounds.x / 2, y: dialogBounds.y / 2 }
+      await page.mouse.move(
+        imageBounds.x + imageBounds.width / 2,
+        imageBounds.y + imageBounds.height / 2,
+      )
+      await page.mouse.down()
+      await page.mouse.move(outside.x, outside.y)
+      await page.mouse.up()
+      await expect(gallery).toBeVisible()
+      await page.mouse.click(outside.x, outside.y)
+      await expect(gallery).toHaveCount(0)
+      await expect(trigger).toBeFocused()
+      await trigger.click()
+      await expect(original).toBeVisible()
 
       await close.click()
       await trigger.click()

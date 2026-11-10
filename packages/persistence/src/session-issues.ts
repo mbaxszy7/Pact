@@ -15,10 +15,12 @@ export type SessionIssueRun = Pick<
   | 'dispatchPhase'
   | 'nativeOutcome'
   | 'nativeEffectsState'
+  | 'nativeEffectsReason'
   | 'bindingGeneration'
   | 'failureKind'
   | 'failureMessage'
->
+> &
+  Partial<Pick<AgentRun, 'nativeSessionId' | 'executorId' | 'controlDisposition'>>
 export type SessionIssueRebuild = Pick<
   NativeRebuildOperation,
   'id' | 'stage' | 'provisionalNativeSessionId' | 'checkAction' | 'failureReason'
@@ -34,7 +36,10 @@ export type SessionIssueContext = Pick<
   | 'recoveryAction'
   | 'recoveryReason'
   | 'recoveryFailureMessage'
-> & { rebuildOperation?: SessionIssueRebuild | undefined }
+> &
+  Partial<Pick<NativeAgentContext, 'lastRunId' | 'executorId'>> & {
+    rebuildOperation?: SessionIssueRebuild | undefined
+  }
 
 /** Pure, bounded projection of durable facts; never dispatches or infers an ending. */
 export function projectSessionIssues(
@@ -55,7 +60,21 @@ export function projectSessionIssues(
   let inputGate: SessionIssues['inputGate'] = 'open'
   for (const agentId of ['codex', 'claude'] as const) {
     const context = contexts.find((item) => item.agentId === agentId)
-    const run = runs.find((item) => item?.agentId === agentId)
+    const latest = runs.find((item) => item?.agentId === agentId)
+    const cursor = cursors.find((item) => item?.agentId === agentId)
+    const retainedCursor =
+      cursor &&
+      context?.lastRunId === cursor.id &&
+      context.nativeSessionId === cursor.nativeSessionId &&
+      context.bindingGeneration === cursor.bindingGeneration &&
+      cursor.controlDisposition !== 'abandoned' &&
+      ['pending', 'unknown'].includes(cursor.nativeEffectsState ?? '') &&
+      (!latest ||
+        latest.id === cursor.id ||
+        (['failed', 'interrupted'].includes(latest.status) &&
+          ['not_sent', 'rejected'].includes(latest.dispatchPhase ?? '') &&
+          latest.bindingGeneration === cursor.bindingGeneration))
+    const run = retainedCursor ? cursor : latest
     const savedOperation =
       context?.rebuildOperation ?? operations.find((item) => item.agentId === agentId)?.operation
     const operation =
@@ -65,8 +84,25 @@ export function projectSessionIssues(
     const pending =
       operation && ['preparing', 'creating', 'seeding', 'unconfirmed'].includes(operation.stage)
     const state = context?.continuationState
+    const uncertainWork =
+      state === 'responding' ||
+      state === 'waiting_user' ||
+      [run, cursor].some(
+        (item) =>
+          item &&
+          ((!['not_sent', 'rejected', 'ended'].includes(item.dispatchPhase ?? '') &&
+            !item.nativeOutcome) ||
+            item.nativeEffectsState === 'pending' ||
+            item.nativeEffectsState === 'unknown'),
+      )
+    const backgroundRecovery =
+      retainedCursor &&
+      run?.dispatchPhase === 'ended' &&
+      context?.state === 'active' &&
+      context.recoveryFailureKind !== 'native_session_occupied' &&
+      !pending
     const blocked =
-      state === 'recovery_required' ||
+      (state === 'recovery_required' && !backgroundRecovery) ||
       state === 'rebuilding' ||
       state === 'checking' ||
       Boolean(pending)
@@ -122,13 +158,15 @@ export function projectSessionIssues(
     // Display a cause, not the transport's follow-up instructions or repeated assurances.
     reason =
       reason.replace(/^Native state check failed:\s*/u, '').split(/(?<=[.!?])\s+/u)[0] ?? reason
+    if (state === 'recovery_required' && backgroundRecovery && inputGate === 'open')
+      inputGate = 'send_blocked'
     if (state === 'checking' && run?.dispatchPhase === 'ended' && context?.state === 'active') {
       if (inputGate === 'open') inputGate = 'send_blocked'
     } else if (blocked || lostForeground) inputGate = 'read_only'
     if (state === 'checking') {
-      phase = 'checking'
+      phase = unsettledEffects ? 'background_checking' : 'checking'
       action = 'none'
-      title = `Checking ${name} session`
+      title = phase === 'background_checking' ? 'Checking…' : `Checking ${name} session`
       reason = ''
     } else if (pending && ['preparing', 'creating', 'seeding'].includes(operation.stage)) {
       phase = 'rebuilding'
@@ -156,6 +194,29 @@ export function projectSessionIssues(
       reason = 'Pact couldn’t confirm which session received this request.'
     } else if (!context && !pending) {
       action = 'none'
+    } else if (
+      unsettledEffects &&
+      !blocked &&
+      !lostForeground &&
+      (!failed || (retainedCursor && run.dispatchPhase === 'ended'))
+    ) {
+      // Live ownership may refine the projection; pending alone proves no activity.
+      // A failed root does not establish that its current background work ended.
+      phase = 'background_check'
+      const checked =
+        run.nativeEffectsReason === 'background_check_unconfirmed' ||
+        context?.recoveryAction === 'rebuild'
+      action = context ? (checked ? 'rebuild' : 'retry_check') : 'none'
+      title = checked
+        ? 'Session needs recovery'
+        : incomplete
+          ? 'Task status unknown and response incomplete'
+          : 'Task status unknown'
+      reason = checked
+        ? 'The original request ended. Rebuild to continue while earlier background work remains unconfirmed.'
+        : run.nativeEffectsReason === 'pact_restarted'
+          ? 'Pact restarted before confirming that the background work ended.'
+          : 'Pact could not confirm that the background work ended.'
     } else if (operation?.stage === 'failed' && context?.recoveryAction !== 'rebuild') {
       action = context ? 'retry_check' : 'none'
       title = `${name} session setup couldn’t start`
@@ -187,18 +248,31 @@ export function projectSessionIssues(
         title = `${name} session not found`
         reason = 'The saved session could not be found.'
       } else title = `${name} session check failed`
+    } else if (
+      run?.dispatchPhase === 'ended' &&
+      run.nativeOutcome === 'interrupted' &&
+      run.nativeEffectsState === 'settled' &&
+      !uncertainWork &&
+      context?.state === 'active' &&
+      state === 'ready' &&
+      !context.recoveryReason &&
+      !context.recoveryFailureKind &&
+      !context.recoveryFailureMessage &&
+      (!run.failureKind || run.failureKind === 'user_stopped') &&
+      (!run.failureMessage || run.failureKind === 'user_stopped')
+    ) {
+      // An interrupted task may never produce a final answer. Preserve that
+      // fact without offering another check of an already resolved session.
+      phase = 'resolved'
+      action = 'none'
+      title = `${name} task stopped`
+      reason = 'The task was interrupted. This session is ready.'
     } else if (context?.recoveryAction === 'none') {
       action = 'none'
     } else if (incomplete && !blocked) {
       phase = 'resolved'
       title = `${name} response incomplete`
       reason = 'The task has ended, but its full response is unavailable.'
-    } else if (unsettledEffects && !blocked && !lostForeground && !failed) {
-      // Historical effects uncertainty is not a new Session-wide admission rule.
-      // Native continuation and the live Adapter still own current work admission.
-      action = 'none'
-      title = `${name} earlier background work unconfirmed`
-      reason = 'The reply is complete. Some earlier background work could not be verified.'
     }
     // A just-failed setup reports its own cause, even when the old binding still needs replacement.
     if (
@@ -240,18 +314,6 @@ export function projectSessionIssues(
     }
     if (/connection reset|ECONNRESET/iu.test(reason))
       reason = 'The connection was reset during the session check.'
-    const cursor = cursors.find((item) => item?.agentId === agentId)
-    const uncertainWork =
-      state === 'responding' ||
-      state === 'waiting_user' ||
-      [run, cursor].some(
-        (item) =>
-          item &&
-          ((!['not_sent', 'rejected', 'ended'].includes(item.dispatchPhase ?? '') &&
-            !item.nativeOutcome) ||
-            item.nativeEffectsState === 'pending' ||
-            item.nativeEffectsState === 'unknown'),
-      )
     agents.push({
       agentId,
       generation: context?.bindingGeneration ?? run?.bindingGeneration ?? 1,

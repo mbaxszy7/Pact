@@ -26,6 +26,9 @@ const issueRunColumns = {
   nativeEffectsState: agentRuns.nativeEffectsState,
   bindingGeneration: agentRuns.bindingGeneration,
   failureKind: agentRuns.failureKind,
+  nativeSessionId: agentRuns.nativeSessionId,
+  executorId: agentRuns.executorId,
+  controlDisposition: agentRuns.controlDisposition,
 }
 
 function projectNativeIssueRun(
@@ -37,6 +40,8 @@ function projectNativeIssueRun(
         nativeOutcome: row.nativeOutcome ?? undefined,
         nativeEffectsState: row.nativeEffectsState ?? undefined,
         failureKind: row.failureKind ?? undefined,
+        nativeSessionId: row.nativeSessionId ?? undefined,
+        executorId: row.executorId ?? undefined,
       }
     : undefined
 }
@@ -52,6 +57,8 @@ export function nativeSessionIssueMetadata(database: PactDrizzleDatabase, sessio
       state: nativeAgentContexts.state,
       recoveryFailureKind: nativeAgentContexts.recoveryFailureKind,
       recoveryAction: nativeAgentContexts.recoveryAction,
+      lastRunId: nativeAgentContexts.lastRunId,
+      executorId: nativeAgentContexts.executorId,
     })
     .from(nativeAgentContexts)
     .where(eq(nativeAgentContexts.sessionId, sessionId))
@@ -65,6 +72,8 @@ export function nativeSessionIssueMetadata(database: PactDrizzleDatabase, sessio
       state: row.state,
       recoveryFailureKind: row.recoveryFailureKind ?? undefined,
       recoveryAction: row.recoveryAction ?? undefined,
+      lastRunId: row.lastRunId ?? undefined,
+      executorId: row.executorId ?? undefined,
     }))
   const readRun = (agentId: 'claude' | 'codex', generation?: number, unacknowledged = false) =>
     database
@@ -94,6 +103,34 @@ export function nativeSessionIssueMetadata(database: PactDrizzleDatabase, sessio
     return projectNativeIssueRun(
       (!context ? readRun(agentId, undefined, true) : undefined) ??
         readRun(agentId, context?.bindingGeneration),
+    )
+  })
+  const cursors = contexts.map((context) => {
+    if (!context.lastRunId || context.bindingGeneration === undefined) return undefined
+    return projectNativeIssueRun(
+      database
+        .select(issueRunColumns)
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.id, context.lastRunId),
+            eq(agentRuns.sessionId, sessionId),
+            eq(agentRuns.agentId, context.agentId),
+            eq(agentRuns.nativeSessionId, context.nativeSessionId),
+            eq(agentRuns.bindingGeneration, context.bindingGeneration),
+            ne(agentRuns.controlDisposition, 'abandoned'),
+            isNull(agentRuns.forkSourceRunId),
+            sql`NOT EXISTS (
+              SELECT 1 FROM agent_runs AS later
+              WHERE later.session_id=${sessionId} AND later.agent_id=${context.agentId}
+                AND later.binding_generation=${context.bindingGeneration}
+                AND later.rowid > (SELECT rowid FROM agent_runs WHERE id=${context.lastRunId})
+                AND (later.status NOT IN ('failed','interrupted')
+                  OR later.dispatch_phase NOT IN ('not_sent','rejected'))
+            )`,
+          ),
+        )
+        .get(),
     )
   })
   const operations = (['codex', 'claude'] as const).flatMap((agentId) => {
@@ -136,7 +173,7 @@ export function nativeSessionIssueMetadata(database: PactDrizzleDatabase, sessio
       : [],
   )
   return {
-    issues: projectSessionIssues(sessionId, contexts, runs, [], incomplete, operations),
+    issues: projectSessionIssues(sessionId, contexts, runs, cursors, incomplete, operations),
     bindings: contexts.length,
   }
 }

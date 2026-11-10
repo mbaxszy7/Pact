@@ -3,6 +3,10 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type { DesktopBridge } from '@pact/contracts'
 
 import {
+  relayDecisionAnswerSchema,
+  preparedInputContinueSchema,
+  relayDecisionReceiptReadSchema,
+  relayDecisionReceiptSchema,
   appearanceSnapshotSchema,
   updateStateSchema,
   updateNoticeResultSchema,
@@ -32,6 +36,19 @@ import {
   nativeQuitDecisionResultSchema,
   nativeSessionOpenedResultSchema,
   sessionCatalogChangeSchema,
+  schedulingSettingsSchema,
+  schedulingStateSchema,
+  schedulingStateInputSchema,
+  schedulingSettingsSaveSchema,
+  relayCredentialSaveSchema,
+  relayCredentialRemoveSchema,
+  relayCredentialReceiptReadSchema,
+  relayCredentialReceiptSchema,
+  relayCredentialRevealSchema,
+  relayCredentialRevealedSchema,
+  schedulingActivityReadSchema,
+  schedulingActivityPageSchema,
+  schedulingChangedSchema,
 } from '@pact/contracts'
 
 import {
@@ -146,6 +163,11 @@ const onUpdateStateChanged = eventSubscription(
 const onAppearanceSettingsChanged = eventSubscription(
   IPC_CHANNELS.appearanceChanged,
   appearanceSnapshotSchema,
+  'business',
+)
+const onSchedulingChanged = eventSubscription(
+  IPC_CHANNELS.schedulingChanged,
+  schedulingChangedSchema,
   'business',
 )
 
@@ -312,6 +334,42 @@ const bridge: DesktopBridge = {
   },
   getRuntimePreparation: () => invoke(IPC_CHANNELS.runtimePreparationGet),
   chooseRuntimeExecutable: (agentId) => invoke(IPC_CHANNELS.runtimeExecutableChoose, agentId),
+  getSchedulingState: async (input) =>
+    rpcResultSchema(schedulingStateSchema).parse(
+      await invoke(IPC_CHANNELS.schedulingStateGet, schedulingStateInputSchema.parse(input)),
+    ),
+  getSchedulingSettings: async () =>
+    rpcResultSchema(schedulingSettingsSchema).parse(
+      await invoke(IPC_CHANNELS.schedulingSettingsGet),
+    ),
+  saveSchedulingSettings: async (input) =>
+    rpcResultSchema(schedulingSettingsSchema).parse(
+      await invoke(IPC_CHANNELS.schedulingSettingsSave, schedulingSettingsSaveSchema.parse(input)),
+    ),
+  saveRelayApiKey: async (input) =>
+    rpcResultSchema(relayCredentialReceiptSchema).parse(
+      await invoke(IPC_CHANNELS.relayCredentialSave, relayCredentialSaveSchema.parse(input)),
+    ),
+  removeRelayApiKey: async (input) =>
+    rpcResultSchema(relayCredentialReceiptSchema).parse(
+      await invoke(IPC_CHANNELS.relayCredentialRemove, relayCredentialRemoveSchema.parse(input)),
+    ),
+  revealRelayApiKey: async (input) =>
+    rpcResultSchema(relayCredentialRevealedSchema).parse(
+      await invoke(IPC_CHANNELS.relayCredentialReveal, relayCredentialRevealSchema.parse(input)),
+    ),
+  readRelayCredentialReceipt: async (input) =>
+    rpcResultSchema(relayCredentialReceiptSchema.nullable()).parse(
+      await invoke(
+        IPC_CHANNELS.relayCredentialReceiptRead,
+        relayCredentialReceiptReadSchema.parse(input),
+      ),
+    ),
+  readSchedulingActivity: async (input) =>
+    rpcResultSchema(schedulingActivityPageSchema).parse(
+      await invoke(IPC_CHANNELS.schedulingActivityRead, schedulingActivityReadSchema.parse(input)),
+    ),
+  onSchedulingChanged: (listener) => onSchedulingChanged(() => listener()),
   getDefaultSessionSettingsEditorState: () => invoke(IPC_CHANNELS.defaultSessionSettingsGet),
   saveDefaultSessionSettings: (input) => invoke(IPC_CHANNELS.defaultSessionSettingsSave, input),
   getProjectCatalog: () => invoke(IPC_CHANNELS.projectCatalogGet),
@@ -345,6 +403,18 @@ const bridge: DesktopBridge = {
   },
   getSessionCatalog: (projectId, cursor) =>
     invoke(IPC_CHANNELS.sessionCatalogGet, projectId, cursor),
+  getSessionPage: (input) => invoke(IPC_CHANNELS.sessionPageGet, input),
+  getSessionGroups: (input) => invoke(IPC_CHANNELS.sessionGroupsGet, input),
+  getSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupGet, input),
+  getSessionMembership: (input) => invoke(IPC_CHANNELS.sessionMembershipGet, input),
+  locateSessionNavigation: (input) => invoke(IPC_CHANNELS.sessionNavigationLocate, input),
+  recoverSessionOrganization: () => invoke(IPC_CHANNELS.sessionOrganizationRecover),
+  getSessionCreationState: (input) => invoke(IPC_CHANNELS.sessionCreationState, input),
+  createSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupCreate, input),
+  updateSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupUpdate, input),
+  moveSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupMove, input),
+  dissolveSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupDissolve, input),
+  setSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupSet, input),
   prepareSessionCreation: (projectId) => invoke(IPC_CHANNELS.sessionCreationPrepare, projectId),
   createSession: (input) => invoke(IPC_CHANNELS.sessionCreate, input),
   renameSession: (input) => invoke(IPC_CHANNELS.sessionRename, input),
@@ -352,6 +422,7 @@ const bridge: DesktopBridge = {
   archiveSession: (sessionId, operationId) =>
     invoke(IPC_CHANNELS.sessionArchive, sessionId, operationId),
   restoreSession: (sessionId) => invoke(IPC_CHANNELS.sessionRestore, sessionId),
+  setSessionSidebarHidden: (input) => invoke(IPC_CHANNELS.sessionSidebarHiddenSet, input),
   getSessionSettings: (sessionId) => invoke(IPC_CHANNELS.sessionSettingsGet, sessionId),
   saveSessionSettings: (input) => invoke(IPC_CHANNELS.sessionSettingsSave, input),
   saveSessionPermission: (input) => invoke(IPC_CHANNELS.sessionPermissionSave, input),
@@ -361,6 +432,21 @@ const bridge: DesktopBridge = {
   readSkillDocument: (input) => invoke(IPC_CHANNELS.skillDocumentRead, input),
   cancelSkillDocument: (requestId) => invoke(IPC_CHANNELS.skillDocumentCancel, requestId),
   actOnCollaboration: (input) => invoke(IPC_CHANNELS.collaborationAction, input),
+  answerRelayDecision: async (input) =>
+    rpcResultSchema(relayDecisionReceiptSchema).parse(
+      await invoke(IPC_CHANNELS.relayDecisionAnswer, relayDecisionAnswerSchema.parse(input)),
+    ),
+  continuePreparedConversationInput: async (input) =>
+    rpcResultSchema(conversationPatchSchema).parse(
+      await invoke(IPC_CHANNELS.preparedInputContinue, preparedInputContinueSchema.parse(input)),
+    ),
+  getRelayDecisionReceipt: async (input) =>
+    rpcResultSchema(relayDecisionReceiptSchema).parse(
+      await invoke(
+        IPC_CHANNELS.relayDecisionReceiptRead,
+        relayDecisionReceiptReadSchema.parse(input),
+      ),
+    ),
   getConversation: (input) => invoke(IPC_CHANNELS.conversationGet, input),
   setConversationInterest: (sessionId, generation) =>
     invoke(IPC_CHANNELS.conversationInterest, { sessionId, generation }),

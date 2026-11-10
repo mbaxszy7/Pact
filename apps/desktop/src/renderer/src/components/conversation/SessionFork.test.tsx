@@ -27,6 +27,19 @@ import { NativeForkRecovery, SessionForkDialog } from './SessionFork'
 const showDescriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, 'showModal')
 const closeDescriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, 'close')
 beforeEach(() => {
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  )
+  vi.stubGlobal('matchMedia', () => ({
+    matches: true,
+    addEventListener: vi.fn<() => void>(),
+    removeEventListener: vi.fn<() => void>(),
+  }))
   vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
     window.setTimeout(() => callback(0), 0),
   )
@@ -76,7 +89,7 @@ function fixture() {
       },
       permissionModes: { claude: 'full', codex: 'ask' },
       maxDiscussionRounds: 3,
-      runningMessagePolicy: 'next_round',
+
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
     },

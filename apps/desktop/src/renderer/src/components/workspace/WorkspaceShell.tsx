@@ -28,12 +28,15 @@ export interface WorkspaceShellProps {
   contextPanelOpen?: boolean | undefined
   onContextPanelOpenChange?: ((open: boolean) => void) | undefined
   contextPanelExpanded?: boolean | undefined
+  contextPanelWidthLimited?: boolean | undefined
   contextPanelRestoreFocusRef?: React.RefObject<HTMLElement | null> | undefined
   showContextToggle?: boolean
   initialState?: WorkspaceLayoutState
 }
 
 type WorkspaceViewport = 'wide' | 'compact' | 'narrow'
+
+const wideNavigationDefaultSize = '23%'
 
 const defaultLayoutState: WorkspaceLayoutState = {
   navigationPanel: 'open',
@@ -128,6 +131,7 @@ export function WorkspaceShell({
   contextPanelOpen,
   onContextPanelOpenChange,
   contextPanelExpanded = false,
+  contextPanelWidthLimited = true,
   contextPanelRestoreFocusRef,
   showContextToggle = true,
   initialState = defaultLayoutState,
@@ -148,6 +152,7 @@ export function WorkspaceShell({
   const [contextPanelElement, setContextPanelElement] = useState<HTMLDivElement | null>(null)
   const navigationPanelRef = usePanelRef()
   const contextPanelRef = usePanelRef()
+  const openedWideNavigationPanelRef = useRef<HTMLDivElement | null>(null)
   const lastNavigationPanelWidthRef = useRef(0)
   const lastContextPanelWidthRef = useRef(0)
   const navigationToggleRef = useRef<HTMLButtonElement>(null)
@@ -212,9 +217,26 @@ export function WorkspaceShell({
   }, [])
 
   useEffect(() => {
-    if (isNavigationVisible) navigationPanelRef.current?.expand()
-    else navigationPanelRef.current?.collapse()
-  }, [isNavigationVisible, navigationPanelRef])
+    const panel = navigationPanelRef.current
+    if (!panel) return
+    if (!isNavigationVisible) {
+      panel.collapse()
+      return
+    }
+    if (viewport === 'wide' && navigationPanelElement) {
+      const previousWidth =
+        openedWideNavigationPanelRef.current === navigationPanelElement
+          ? lastNavigationPanelWidthRef.current
+          : 0
+      openedWideNavigationPanelRef.current = navigationPanelElement
+      if (panel.isCollapsed()) {
+        // The panel may have mounted at zero before Projects arrived.
+        panel.resize(previousWidth > 1 ? previousWidth : wideNavigationDefaultSize)
+        return
+      }
+    }
+    panel.expand()
+  }, [isNavigationVisible, navigationPanelElement, navigationPanelRef, viewport])
 
   useEffect(() => {
     if (viewport !== 'wide') return
@@ -440,70 +462,77 @@ export function WorkspaceShell({
           subtitle={shellSubtitle}
         />
         {workspaceNotice}
-        {isContextExpanded ? (
-          <div className="workspace-context-expanded min-h-0 flex-1 overflow-hidden bg-surface-raised">
-            {contextPanel}
-          </div>
-        ) : (
-          <Group
-            className="workspace-layout min-h-0 min-w-0 flex-1 bg-surface"
-            data-animating={isLayoutAnimating}
-            id="workspace-shell"
-            onLayoutChanged={handleWideLayoutChanged}
-            orientation="horizontal"
-            resizeTargetMinimumSize={{ coarse: 28, fine: 16 }}
+        <Group
+          className="workspace-layout relative min-h-0 min-w-0 flex-1 bg-surface"
+          data-context-expanded={isContextExpanded}
+          data-animating={isLayoutAnimating}
+          id="workspace-shell"
+          onLayoutChanged={handleWideLayoutChanged}
+          orientation="horizontal"
+          resizeTargetMinimumSize={{ coarse: 28, fine: 16 }}
+        >
+          <Panel
+            className="workspace-panel-content min-w-0 overflow-hidden bg-surface-muted"
+            collapsedSize="0%"
+            collapsible
+            data-open={isNavigationVisible}
+            defaultSize={isNavigationVisible ? wideNavigationDefaultSize : '0%'}
+            elementRef={setNavigationPanelElement}
+            id="workspace-navigation"
+            maxSize="30%"
+            minSize="12rem"
+            panelRef={navigationPanelRef}
+            style={{ maxWidth: 'none' }}
           >
-            <Panel
-              className="workspace-panel-content min-w-0 overflow-hidden bg-surface-muted"
-              collapsedSize="0%"
-              collapsible
-              data-open={isNavigationVisible}
-              defaultSize={isNavigationVisible ? '21%' : '0%'}
-              elementRef={setNavigationPanelElement}
-              id="workspace-navigation"
-              maxSize="30%"
-              minSize="12rem"
-              panelRef={navigationPanelRef}
-              style={{ maxWidth: 'none' }}
+            <aside
+              className="h-full overflow-auto"
+              aria-hidden={!isNavigationVisible || isContextExpanded}
+              aria-label="Navigation"
+              inert={!isNavigationVisible || isContextExpanded}
             >
-              <aside
-                className="h-full overflow-auto"
-                aria-hidden={!isNavigationVisible}
-                aria-label="Navigation"
-                inert={!isNavigationVisible}
-              >
-                {navigation}
-              </aside>
-            </Panel>
-            <ResizeSeparator isVisible={isNavigationVisible} label="Resize navigation" />
-            <Panel className="min-w-0 bg-surface" id="workspace-center" minSize="24rem">
-              <PrimaryPane>{workspace}</PrimaryPane>
-            </Panel>
-            <ResizeSeparator isVisible={isContextVisible} label="Resize context panel" />
-            <Panel
-              className="workspace-panel-content min-w-0 overflow-hidden bg-surface-raised"
-              collapsedSize="0%"
-              collapsible
-              data-open={isContextVisible}
-              defaultSize="27%"
-              elementRef={setContextPanelElement}
-              id="workspace-context"
-              maxSize="36%"
-              minSize="18rem"
-              panelRef={contextPanelRef}
-              style={{ maxWidth: 'none' }}
+              {navigation}
+            </aside>
+          </Panel>
+          <ResizeSeparator
+            isVisible={isNavigationVisible && !isContextExpanded}
+            label="Resize navigation"
+          />
+          <Panel
+            className="min-w-0 bg-surface"
+            id="workspace-center"
+            minSize="24rem"
+            aria-hidden={isContextExpanded}
+            inert={isContextExpanded}
+          >
+            <PrimaryPane>{workspace}</PrimaryPane>
+          </Panel>
+          <ResizeSeparator
+            isVisible={isContextVisible && !isContextExpanded}
+            label="Resize context panel"
+          />
+          <Panel
+            className="workspace-panel-content min-w-0 overflow-hidden bg-surface-raised"
+            collapsedSize="0%"
+            collapsible
+            data-open={isContextVisible}
+            defaultSize="27%"
+            elementRef={setContextPanelElement}
+            id="workspace-context"
+            maxSize={contextPanelWidthLimited ? '36%' : undefined}
+            minSize="18rem"
+            panelRef={contextPanelRef}
+            style={{ maxWidth: 'none' }}
+          >
+            <aside
+              className="h-full overflow-auto"
+              aria-hidden={!isContextVisible}
+              aria-label="Context panel"
+              inert={!isContextVisible}
             >
-              <aside
-                className="h-full overflow-auto"
-                aria-hidden={!isContextVisible}
-                aria-label="Context panel"
-                inert={!isContextVisible}
-              >
-                {contextPanel}
-              </aside>
-            </Panel>
-          </Group>
-        )}
+              {contextPanel}
+            </aside>
+          </Panel>
+        </Group>
       </section>
     )
   }
@@ -534,68 +563,72 @@ export function WorkspaceShell({
         subtitle={shellSubtitle}
       />
       {workspaceNotice}
-      {isContextExpanded ? (
-        <div className="workspace-context-expanded min-h-0 flex-1 overflow-hidden bg-surface-raised">
-          {contextPanel}
-        </div>
-      ) : (
-        <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden bg-surface">
-          <Group
-            className="workspace-layout h-full"
-            data-animating={isLayoutAnimating}
-            id="workspace-constrained-shell"
-            onLayoutChanged={handleConstrainedLayoutChanged}
-            orientation="horizontal"
-            resizeTargetMinimumSize={{ coarse: 28, fine: 16 }}
+      <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden bg-surface">
+        <Group
+          className="workspace-layout h-full"
+          data-animating={isLayoutAnimating}
+          id="workspace-constrained-shell"
+          onLayoutChanged={handleConstrainedLayoutChanged}
+          orientation="horizontal"
+          resizeTargetMinimumSize={{ coarse: 28, fine: 16 }}
+        >
+          <Panel
+            className="workspace-panel-content min-w-0 overflow-hidden bg-surface-muted"
+            collapsedSize="0%"
+            collapsible
+            data-open={isNavigationVisible}
+            defaultSize={isNavigationVisible ? '28%' : '0%'}
+            elementRef={setNavigationPanelElement}
+            id="workspace-navigation"
+            maxSize="34%"
+            minSize="12rem"
+            panelRef={navigationPanelRef}
+            style={{ maxWidth: 'none' }}
           >
-            <Panel
-              className="workspace-panel-content min-w-0 overflow-hidden bg-surface-muted"
-              collapsedSize="0%"
-              collapsible
-              data-open={isNavigationVisible}
-              defaultSize={isNavigationVisible ? '28%' : '0%'}
-              elementRef={setNavigationPanelElement}
-              id="workspace-navigation"
-              maxSize="34%"
-              minSize="12rem"
-              panelRef={navigationPanelRef}
-              style={{ maxWidth: 'none' }}
+            <aside
+              className="h-full overflow-auto"
+              aria-hidden={!isNavigationVisible || isContextExpanded}
+              aria-label="Navigation"
+              inert={!isNavigationVisible || isContextExpanded}
             >
-              <aside
-                className="h-full overflow-auto"
-                aria-hidden={!isNavigationVisible}
-                aria-label="Navigation"
-                inert={!isNavigationVisible}
-              >
-                {navigation}
-              </aside>
-            </Panel>
-            <ResizeSeparator isVisible={isNavigationVisible} label="Resize navigation" />
-            <Panel className="min-w-0 bg-surface" id="workspace-center" minSize="24rem">
-              <PrimaryPane>{workspace}</PrimaryPane>
-            </Panel>
-          </Group>
-          {isContextOverlayRendered && !isSettingsView ? (
-            <div
-              className="workspace-context-overlay absolute inset-0 z-10 overflow-hidden bg-canvas/55"
+              {navigation}
+            </aside>
+          </Panel>
+          <ResizeSeparator
+            isVisible={isNavigationVisible && !isContextExpanded}
+            label="Resize navigation"
+          />
+          <Panel
+            className="min-w-0 bg-surface"
+            id="workspace-center"
+            minSize="24rem"
+            aria-hidden={isContextExpanded}
+            inert={isContextExpanded}
+          >
+            <PrimaryPane>{workspace}</PrimaryPane>
+          </Panel>
+        </Group>
+        {isContextOverlayRendered && !isSettingsView ? (
+          <div
+            className="workspace-context-overlay absolute inset-0 z-10 overflow-hidden bg-canvas/55"
+            data-open={isContextOpen}
+            role="presentation"
+          >
+            <dialog
+              className="workspace-context-dialog border-border bg-surface-raised text-primary shadow-dialog"
+              data-expanded={isContextExpanded}
               data-open={isContextOpen}
-              role="presentation"
+              aria-label="Context panel"
+              aria-modal="true"
+              inert={!isContextOpen}
+              open
+              ref={contextDialogRef}
             >
-              <dialog
-                className="workspace-context-dialog border-border bg-surface-raised text-primary shadow-dialog"
-                data-open={isContextOpen}
-                aria-label="Context panel"
-                aria-modal="true"
-                inert={!isContextOpen}
-                open
-                ref={contextDialogRef}
-              >
-                {contextPanel}
-              </dialog>
-            </div>
-          ) : null}
-        </div>
-      )}
+              {contextPanel}
+            </dialog>
+          </div>
+        ) : null}
+      </div>
     </section>
   )
 }

@@ -52,7 +52,7 @@ const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
   agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
   maxDiscussionRounds: 6,
-  runningMessagePolicy: 'immediate_safe_point',
+
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
 }
@@ -217,7 +217,7 @@ function settledRebuildCandidate(f: Fixture, agentId: RuntimeAgentId) {
     expectedGeneration: 7,
     abandon: false,
   })
-  repo.freezeNativeRebuildSource(id, [])
+  repo.freezeNativeRebuildSource(id, [], new Map())
   repo.markNativeRebuildDispatched(id, executorId)
   repo.recordNativeRebuildIdentity(id, nativeSessionId)
   repo.recordNativeRebuildWork(id, executorId, nativeSessionId, 'settled')
@@ -600,6 +600,47 @@ describe('Workspace archive through durable repository interfaces', () => {
     expect(start(f).sessionId).toBe(f.sessionId)
   })
 
+  it.each(['stopping', 'unresolved'] as const)(
+    'keeps Project navigation readable during a %s archive while fencing group writes',
+    async (state) => {
+      const f = await fixture()
+      const repo = f.db.sessionRepository
+      const groupId = randomUUID()
+      const group = repo.createSessionGroup({
+        projectId: f.projectId,
+        groupId,
+        expectedRevision: 0,
+        name: 'Planning',
+        color: 'blue',
+        sessionId: f.sessionId,
+      })
+      const p = preview(f, { kind: 'project', projectId: f.projectId })
+      claim(f, p)
+      if (state === 'unresolved') f.archives.fail(p.operationId, [], 'Stop not confirmed', true)
+      expect(f.archives.read(p.operationId)?.state).toBe(state)
+      expect(repo.readSessionGroups({ projectId: f.projectId }).groups).toMatchObject([
+        { id: groupId },
+      ])
+      expect(
+        repo.readSessionPage({ projectId: f.projectId, scope: { kind: 'ungrouped' } }).sessions,
+      ).toMatchObject([{ id: f.siblingId }])
+      expect(
+        repo.readSessionPage({ projectId: f.projectId, scope: { kind: 'group', groupId } })
+          .sessions,
+      ).toMatchObject([{ id: f.sessionId }])
+      expect(
+        repo.locateSessionNavigation({ projectId: f.projectId, sessionId: f.sessionId }),
+      ).toMatchObject({ membership: { exists: true, groupId }, sessions: [{ id: f.sessionId }] })
+      expect(() =>
+        repo.dissolveSessionGroup({
+          projectId: f.projectId,
+          groupId,
+          expectedRevision: group.revision,
+        }),
+      ).toThrow(WorkspaceArchiveConflictError)
+    },
+  )
+
   it('leaves a partially failed Project unarchived and preserves individual outcomes', async () => {
     const f = await fixture()
     const p = preview(f, { kind: 'project', projectId: f.projectId }, [
@@ -703,23 +744,22 @@ describe('Workspace archive through durable repository interfaces', () => {
         sessionId: f.sessionId,
         kind: 'plan',
         revision: 0,
-        primary: 'codex',
-        drafter: 'codex',
-        implementer: 'claude',
-        reviewer: 'codex',
+        protocol: 'native-workflow-v1',
+        owner: 'codex',
+        reviewer: 'claude',
+        automation: 'active',
+        inputSequence: 0,
+        handledInputSequence: 0,
         task: 'Archive fence fixture',
         taskMessageId: clientMessageId,
-        stage: 'draft',
+        stage: 'plan',
         actor: 'codex',
         status: 'running',
         runId: clientMessageId,
         planVersion: 0,
         discussionRounds: 0,
-        discussionHalf: false,
         reviewCycles: 0,
         repairAttempts: 0,
-        rereview: false,
-        nextCycle: false,
       })
       const run = repo.beginRun({
         sessionId: f.sessionId,

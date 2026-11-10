@@ -36,7 +36,6 @@ async function seed(fixture: RuntimeFixture) {
         primaryAgentId: 'claude',
         agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
         maxDiscussionRounds: 3,
-        runningMessagePolicy: 'next_round',
         maxReviewCycles: 2,
         maxRepairAttempts: 2,
       },
@@ -44,7 +43,7 @@ async function seed(fixture: RuntimeFixture) {
   } finally {
     database.close()
   }
-  return sessionId
+  return { sessionId, projectId }
 }
 
 for (const keepNewDraft of [false, true]) {
@@ -56,7 +55,7 @@ for (const keepNewDraft of [false, true]) {
       const fixture = await createRuntimeFixture({ codexAppServer: 'writer_rejected_once' })
       let app: Awaited<ReturnType<typeof fixture.launch>> | undefined
       try {
-        const sessionId = await seed(fixture)
+        const { sessionId, projectId } = await seed(fixture)
         app = await fixture.launch()
         let page = await app.firstWindow()
         await page.getByRole('button', { name: 'Input return Session', exact: true }).click()
@@ -156,12 +155,19 @@ for (const keepNewDraft of [false, true]) {
         expect(restored.commentIds).not.toContain(comment)
         expect(restored.bodies).toEqual(['Retain this anchored instruction'])
         if (!keepNewDraft) {
-          const title = await page.evaluate(async (id) => {
-            const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
-            const settings = await bridge.getSessionSettings(id)
-            if (!settings.ok) throw new Error('Session unavailable')
-            return settings.value.session.title
-          }, sessionId)
+          // The catalog owns the title; opening Settings also probes native models,
+          // which is unrelated to returning the original input across restart.
+          const title = await page.evaluate(
+            async ({ projectId: projectKey, sessionId: sessionKey }) => {
+              const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+              const catalog = await bridge.getSessionCatalog(projectKey)
+              if (!catalog.ok) throw new Error(`Session catalog unavailable: ${catalog.error.code}`)
+              const session = catalog.value.sessions.find((entry) => entry.id === sessionKey)
+              if (!session) throw new Error('Restored Session missing from its catalog')
+              return session.title
+            },
+            { projectId, sessionId },
+          )
           await quitPact(app)
           app = await fixture.launch()
           page = await app.firstWindow()
@@ -213,3 +219,97 @@ for (const keepNewDraft of [false, true]) {
     },
   )
 }
+
+test(
+  'native question replaces Message and restores its unsent draft without an extra Stop footer',
+  { tag: '@deterministic' },
+  async () => {
+    const fixture = await createRuntimeFixture({ codexAppServer: 'native_question' })
+    let app: Awaited<ReturnType<typeof fixture.launch>> | undefined
+    try {
+      await seed(fixture)
+      app = await fixture.launch()
+      const page = await app.firstWindow()
+      await page.getByRole('button', { name: 'Input return Session', exact: true }).click()
+      const composer = page.getByRole('combobox', { name: 'Message', exact: true })
+      await composer.fill('@codex Ask for a cancellation scope')
+      await composer.press('Enter')
+      await expect.poll(() => composer.textContent()).toBe('')
+      await composer.fill('Keep this ordinary message draft')
+      await expect(page.getByText('Codex needs your input', { exact: true })).toBeVisible()
+      await expect(composer).toHaveCount(0)
+      await expect(
+        page.getByText('Your message draft is kept while you answer.', { exact: true }),
+      ).toHaveCount(0)
+      await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0)
+      await expect(page.getByRole('button', { name: 'Cancel', exact: true })).toBeVisible()
+      await page.getByRole('radio', { name: /Current request/ }).check()
+      await page.getByRole('button', { name: 'Submit answers', exact: true }).click()
+      await expect(page.getByText('Bounded lifecycle response.', { exact: true })).toBeVisible()
+      await expect(composer).toBeVisible()
+      await expect.poll(() => composer.textContent()).toBe('Keep this ordinary message draft')
+      expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(1)
+    } finally {
+      if (app) await quitPact(app)
+      await fixture.dispose()
+    }
+  },
+)
+
+test(
+  'asks for missing information without a manual Composer setup',
+  { tag: '@deterministic' },
+  async ({ runtimeOwnership: _owned }, testInfo) => {
+    const fixture = await createRuntimeFixture({ codexAppServer: 'native_question' })
+    let app: Awaited<ReturnType<typeof fixture.launch>> | undefined
+    try {
+      await seed(fixture)
+      app = await fixture.launch()
+      const page = await app.firstWindow()
+      await page.getByRole('button', { name: 'Input return Session', exact: true }).click()
+      const composer = page.getByRole('combobox', { name: 'Message', exact: true })
+      await expect(composer).toBeVisible()
+      await page.screenshot({ path: testInfo.outputPath('composer.png') })
+      await expect(page.getByRole('button', { name: 'Reserve a detail', exact: true })).toHaveCount(
+        0,
+      )
+      await expect(
+        page.getByRole('textbox', { name: 'Question to ask me', exact: true }),
+      ).toHaveCount(0)
+      const appearance = await page.evaluate(async () => {
+        const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+        const current = await bridge.getAppearanceSettings()
+        if (!current.ok) return current
+        return bridge.updateAppearanceSettings({
+          expectedRevision: current.value.requested.revision,
+          theme: 'dark',
+        })
+      })
+      expect(appearance.ok).toBe(true)
+      await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+      await page.screenshot({
+        path: testInfo.outputPath('composer-dark.png'),
+        animations: 'disabled',
+      })
+      await composer.fill('@codex Ask for a cancellation scope')
+      await composer.press('Enter')
+      await expect(page.getByText('Codex needs your input', { exact: true })).toBeVisible()
+      await expect(composer).toHaveCount(0)
+      await expect(page.locator('.input-replacement[data-transitioning="true"]')).toHaveCount(0)
+      await page.screenshot({ path: testInfo.outputPath('question.png') })
+      await page.getByRole('radio', { name: /Current request/ }).check()
+      await page.getByRole('button', { name: 'Submit answers', exact: true }).click()
+      await expect(page.getByText('Bounded lifecycle response.', { exact: true })).toBeVisible()
+      await expect(page.getByText('Codex needs your input', { exact: true })).toHaveCount(0)
+      await expect(composer).toBeVisible()
+      await expect(page.getByRole('button', { name: 'Reserve a detail', exact: true })).toHaveCount(
+        0,
+      )
+      expect((await fixture.readCodexFacts()).modelStarts).toHaveLength(1)
+      await page.screenshot({ path: testInfo.outputPath('continued.png') })
+    } finally {
+      if (app) await quitPact(app)
+      await fixture.dispose()
+    }
+  },
+)

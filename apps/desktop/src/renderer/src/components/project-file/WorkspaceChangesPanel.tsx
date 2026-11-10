@@ -1,7 +1,16 @@
-import { AlertTriangle, FileDiff, Maximize2, Minimize2, RotateCcw, X } from 'lucide-react'
-import { Component, lazy, Suspense, useEffect, useState, type ReactNode } from 'react'
+import {
+  AlertTriangle,
+  ChevronRight,
+  FileDiff,
+  Maximize2,
+  Minimize2,
+  RotateCcw,
+  X,
+} from 'lucide-react'
+import { Component, lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react'
 
 import {
+  WORKSPACE_CHANGE_PAGE_FILES,
   WORKSPACE_OPERATION_TIMEOUT_MS,
   WORKSPACE_PREVIEW_BYTES,
   type WorkspaceChangeFilePreview,
@@ -150,6 +159,99 @@ function useSavedPreview(
   }
 }
 
+function useNextSavedFile(
+  { sessionId, changeSetId, path, revision }: WorkspaceChangesPanelState,
+  enabled: boolean,
+): {
+  path?: string | null | undefined
+  loading: boolean
+  error?: string | undefined
+  retry: () => void
+} {
+  const [attempt, setAttempt] = useState(0)
+  const [settlement, setSettlement] = useState(0)
+  const [pending, setPending] = useState(false)
+  const pendingRef = useRef(false)
+  const completedKey = useRef<string | undefined>(undefined)
+  const mounted = useRef(true)
+  const key = JSON.stringify([sessionId, changeSetId, path, revision ?? 0, attempt])
+  const [read, setRead] = useState<{ key: string; nextPath?: string | null; error?: string }>({
+    key: '',
+  })
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
+  useEffect(() => {
+    if (!enabled || pendingRef.current || completedKey.current === key) return undefined
+    let retired = false
+    pendingRef.current = true
+    completedKey.current = undefined
+    setPending(true)
+    setRead({ key })
+    const fail = (message: string): void => {
+      if (retired) return
+      completedKey.current = key
+      setRead({ key, error: message })
+    }
+    const timeout = window.setTimeout(() => {
+      fail('Loading the next file took too long. Try again.')
+      retired = true
+    }, WORKSPACE_OPERATION_TIMEOUT_MS)
+    const load = async (): Promise<void> => {
+      const result = await window.pact.readWorkspaceChanges({ changeSetId, afterPath: path })
+      if (retired) return
+      if (!result.ok) {
+        fail(result.error.message || 'Could not load the next file. Try again.')
+        return
+      }
+      const page = result.value
+      if (page.changeSet.id !== changeSetId || page.changeSet.sessionId !== sessionId)
+        throw new Error('These files do not belong to the selected changes.')
+      if ((page.changeSet.revision ?? 0) !== (revision ?? 0))
+        throw new Error('The recorded changes changed. Reopen this card.')
+      const next = page.files[0]
+      if (
+        page.files.length > WORKSPACE_CHANGE_PAGE_FILES ||
+        next?.path === path ||
+        next?.hidden ||
+        (!next && page.nextPath !== null)
+      )
+        throw new Error('The saved file list did not advance. Reopen this card.')
+      completedKey.current = key
+      setRead({ key, nextPath: next?.path ?? null })
+    }
+    void load()
+      .catch((failure: unknown) =>
+        fail(
+          failure instanceof Error ? failure.message : 'Could not load the next file. Try again.',
+        ),
+      )
+      .finally(() => {
+        window.clearTimeout(timeout)
+        pendingRef.current = false
+        if (mounted.current) {
+          setPending(false)
+          setSettlement((value) => value + 1)
+        }
+      })
+    return () => {
+      retired = true
+      window.clearTimeout(timeout)
+    }
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Settlement retries the current key after a retired request releases pendingRef.
+  }, [sessionId, changeSetId, path, revision, key, enabled, settlement])
+  const current = read.key === key ? read : undefined
+  return {
+    path: current?.nextPath,
+    error: current?.error,
+    loading: enabled && (pending || !current || (current.nextPath === undefined && !current.error)),
+    retry: () => setAttempt((value) => value + 1),
+  }
+}
+
 function readError(read: PreviewReadState): { message: string; retryable: boolean } | undefined {
   if (read.error) return read.error
   return read.preview?.status === 'unavailable'
@@ -178,12 +280,13 @@ interface WorkspaceChangesPanelProps {
   expanded: boolean
   onClose: () => void
   onExpandedChange: (expanded: boolean) => void
+  onSelectFile?: ((path: string) => void) | undefined
 }
 
 export function WorkspaceChangesPanel(props: WorkspaceChangesPanelProps): React.JSX.Element {
   return (
     <SavedChangesPanel
-      key={JSON.stringify([props.state.sessionId, props.state.changeSetId, props.state.path])}
+      key={JSON.stringify([props.state.sessionId, props.state.changeSetId])}
       {...props}
     />
   )
@@ -194,8 +297,10 @@ function SavedChangesPanel({
   expanded,
   onClose,
   onExpandedChange,
+  onSelectFile,
 }: WorkspaceChangesPanelProps): React.JSX.Element {
   const [mode, setMode] = useState<'diff' | 'after'>('diff')
+  const nextFile = useNextSavedFile(state, Boolean(onSelectFile))
   const beforeRead = useSavedPreview(state, 'before')
   const afterRead = useSavedPreview(state, 'after')
   const before = beforeRead.preview?.status === 'available' ? beforeRead.preview.file : undefined
@@ -298,7 +403,6 @@ function SavedChangesPanel({
           </button>
         ))}
         <div className="ml-auto flex items-center gap-1 text-caption text-secondary">
-          <span>{needsPatch && mode === 'diff' ? 'Recorded changes' : 'Saved version'}</span>
           {mode === 'diff' &&
           previewFile &&
           (readError(beforeRead)?.retryable || readError(afterRead)?.retryable) ? (
@@ -315,8 +419,42 @@ function SavedChangesPanel({
               <RotateCcw aria-hidden="true" className="size-3.5" />
             </button>
           ) : null}
+          <button
+            type="button"
+            aria-label="Next changed file"
+            aria-busy={nextFile.loading}
+            title={
+              nextFile.error ??
+              (nextFile.loading
+                ? 'Loading the next file…'
+                : nextFile.path
+                  ? `Next: ${nextFile.path}`
+                  : 'Last changed file')
+            }
+            disabled={!onSelectFile || nextFile.loading || (!nextFile.error && !nextFile.path)}
+            className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-control px-2 text-caption font-medium text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
+            onClick={() => {
+              if (nextFile.error) nextFile.retry()
+              else if (nextFile.path) onSelectFile?.(nextFile.path)
+            }}
+          >
+            Next
+            {nextFile.loading ? (
+              <span className="primary-action-spinner" aria-hidden="true" />
+            ) : (
+              <ChevronRight aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
+            )}
+          </button>
         </div>
       </div>
+      {nextFile.error ? (
+        <p
+          role="alert"
+          className="shrink-0 border-b border-border px-panel py-2 text-caption text-status-warning-foreground"
+        >
+          {nextFile.error}
+        </p>
+      ) : null}
       {previewLoading ? (
         <div
           className="grid min-h-0 flex-1 place-items-center text-caption text-secondary"

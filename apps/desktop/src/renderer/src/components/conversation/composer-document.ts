@@ -1,4 +1,9 @@
-import type { ConversationSendInput, RuntimeAgentId, SkillSelection } from '@pact/contracts'
+import type {
+  ConversationSendInput,
+  PactSkill,
+  RuntimeAgentId,
+  SkillSelection,
+} from '@pact/contracts'
 
 import { parseComposerCommandPrefix } from '@pact/contracts'
 
@@ -31,12 +36,53 @@ export interface ComposerReplacement extends ComposerRange {
   text: string
 }
 
+export interface ComposerPactCommand extends ComposerRange {
+  kind: 'pact'
+  name: PactSkill
+}
+export type ComposerAtom = SkillSelection | ComposerPactCommand
+
+/** A completed Pact prefix is a local text projection, never a native Skill selection. */
+export function composerPactCommand(value: ComposerDocument): ComposerPactCommand | undefined {
+  const prefix = parseComposerCommandPrefix(value.text, value.skills)
+  if (!prefix.pact || prefix.error) return undefined
+  const leading = value.text.slice(0, prefix.argumentsStart)
+  for (const match of leading.matchAll(/(?:^|\s)\/(plan|review|build)(?=\s)/gu)) {
+    if (match[1] !== prefix.pact) continue
+    const start = match.index + match[0].lastIndexOf('/')
+    return { kind: 'pact', name: prefix.pact, start, end: start + prefix.pact.length + 1 }
+  }
+  return undefined
+}
+
 export function releaseComposerRoute(route: ComposerRoute | undefined): ComposerRoute | undefined {
   return route?.type === 'primary'
     ? { type: 'primary' }
     : route?.type === 'all'
       ? { type: 'all' }
       : route
+}
+
+/** Preserve the user's original routing facts before a default Primary is resolved. */
+export function composerRouteIntent(
+  value: Pick<
+    ComposerDocument,
+    'text' | 'skills' | 'mention' | 'route' | 'returnedInputOperationId'
+  > & {
+    queueReturnOperationId?: string | undefined
+  },
+): NonNullable<ConversationSendInput['routeIntent']> {
+  if (
+    value.route ||
+    value.mention ||
+    value.returnedInputOperationId ||
+    value.queueReturnOperationId
+  )
+    return 'explicit'
+  const prefix = parseComposerCommandPrefix(value.text, value.skills)
+  return prefix.error || prefix.pact || prefix.route || prefix.skills.length || value.skills.length
+    ? 'explicit'
+    : 'implicit'
 }
 
 /** One edit transforms all canonical range facts together, never the displayed chip text. */
@@ -129,7 +175,8 @@ export function composerDifference(before: string, after: string): ComposerRepla
 
 export function wholeComposerAtoms(value: ComposerDocument, range: ComposerRange): ComposerRange {
   const next = { ...range }
-  for (const skill of value.skills) {
+  const pact = composerPactCommand(value)
+  for (const skill of pact ? [...value.skills, pact] : value.skills) {
     if (next.start < skill.end && next.end > skill.start) {
       next.start = Math.min(next.start, skill.start)
       next.end = Math.max(next.end, skill.end)

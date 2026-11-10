@@ -3,6 +3,7 @@
 @import './theme-light.css';
 @import './theme-dark.css';
 @import './base.css';
+@import '../components/scheduling/relay-input.css';
 @import '../components/workspace/archive-confirmation.css';
 @import '../components/workspace/archive-notice.css';
 @import '../components/native-presence/native-presence.css';

@@ -405,13 +405,15 @@ it.each(['append', 'same-count-replace'] as const)(
         expectedCommentsRevision: value.revision(),
       })
     const foreignId = randomUUID()
+    const draftAnchor = value.drafts()[0]!.anchor
+    if (draftAnchor.type === 'unavailable') throw new Error('Fixture requires a live anchor')
     value.repo.saveCommentDraft({
       mode: 'create',
       sessionId: value.sessionId,
       commentId: foreignId,
       expectedCommentsRevision: value.revision(),
       body: 'A new independent user draft.',
-      anchor: value.drafts()[0]!.anchor,
+      anchor: draftAnchor,
     })
     const before = activeDraftRows(value.db, value.sessionId),
       revision = value.revision()

@@ -84,6 +84,81 @@ function beforeInput(
 }
 
 describe('native Composer editing boundary', () => {
+  it.each(['plan', 'review', 'build'])(
+    'projects pact:%s while preserving typing, original clipboard text and atom deletion',
+    (name) => {
+      const original = `/${name} `
+      const value = mount({ text: original, skills: [] })
+      expect(value.editor.querySelector(`[data-pact-command="${name}"]`)?.textContent).toBe(
+        `pact:${name}`,
+      )
+      expect(value.ref.current!.document()).toEqual({ text: original, skills: [] })
+      expect(screen.queryByRole('button', { name: /Open .* Skill/ })).toBeNull()
+
+      value.select(original.length)
+      beforeInput(value.editor, 'insertText', true, '中文 task')
+      expect(value.ref.current!.document().text).toBe(original + '中文 task')
+      expect(value.ref.current!.document().skills).toEqual([])
+      expect(value.ref.current!.selection()).toEqual({
+        start: original.length + 7,
+        end: original.length + 7,
+      })
+
+      value.select(0, original.length + 7)
+      const setData = vi.fn<(type: string, text: string) => void>()
+      fireEvent.copy(value.editor, { clipboardData: { setData } })
+      expect(setData.mock.calls).toEqual([['text/plain', original + '中文 task']])
+      value.select(0, original.length + 7)
+      beforeInput(value.editor, 'deleteContentForward')
+      value.paste(original + '中文 task')
+      expect(value.editor.querySelector(`[data-pact-command="${name}"]`)).not.toBeNull()
+      expect(value.ref.current!.document().skills).toEqual([])
+
+      value.select(name.length + 1)
+      beforeInput(value.editor, 'deleteContentBackward')
+      expect(value.ref.current!.document().text).toBe(' 中文 task')
+      expect(value.editor.querySelector('[data-pact-command]')).toBeNull()
+      fireEvent.keyDown(value.editor, { key: 'z', ctrlKey: true })
+      expect(value.ref.current!.document().text).toBe(original + '中文 task')
+      expect(value.editor.querySelector(`[data-pact-command="${name}"]`)).not.toBeNull()
+      fireEvent.keyDown(value.editor, { key: 'z', ctrlKey: true, shiftKey: true })
+      expect(value.ref.current!.document().text).toBe(' 中文 task')
+      expect(value.onNotice).not.toHaveBeenCalled()
+    },
+  )
+
+  it('leaves partial command input editable and projects it only after the delimiter is typed', () => {
+    const value = mount({ text: '/pla', skills: [] })
+    value.select(4)
+    beforeInput(value.editor, 'insertText', true, 'n')
+    expect(value.editor.textContent).toBe('/plan')
+    expect(value.editor.querySelector('[data-pact-command]')).toBeNull()
+    beforeInput(value.editor, 'insertText', true, ' ')
+    expect(value.editor.querySelector('[data-pact-command="plan"]')).not.toBeNull()
+    expect(value.ref.current!.document().text).toBe('/plan ')
+  })
+
+  it('reconstructs a Pact atom from native DOM edits without creating native Skill selections', () => {
+    const value = mount({ text: '/plan ', skills: [] })
+    value.select(6)
+    beforeInput(value.editor, 'insertText', false, 'body')
+    value.editor.appendChild(window.document.createTextNode('body'))
+    fireEvent.input(value.editor)
+    expect(value.ref.current!.document().text).toBe('/plan body')
+    expect(value.ref.current!.document().skills).toEqual([])
+    expect(value.editor.querySelector('[data-pact-command="plan"]')).not.toBeNull()
+  })
+
+  it('keeps an explicitly selected native plan Skill distinct from the Pact badge', () => {
+    const skill = { id: 'a'.repeat(64), agentId: 'codex' as const, name: 'plan', start: 0, end: 5 }
+    const value = mount({ text: '/plan task', skills: [skill] })
+    const button = screen.getByRole('button', { name: 'Open Codex Skill plan' })
+    expect(value.editor.querySelector('[data-pact-command]')).toBeNull()
+    fireEvent.click(button)
+    expect(value.onSkillOpen).toHaveBeenCalledWith(skill)
+    expect(value.ref.current!.document().skills).toEqual([skill])
+  })
+
   it('publishes an empty draft after native Delete leaves BR with an empty Text sibling', () => {
     const value = mount()
     value.select(0, 4)

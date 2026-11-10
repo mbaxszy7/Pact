@@ -1,13 +1,20 @@
 /* oxlint-disable typescript/no-unsafe-type-assertion, typescript/no-unnecessary-type-assertion, vitest/require-mock-type-parameters -- The SDK protocol stubs intentionally provide only fields consumed by the Adapter. */
 import type { SDKMessage, SDKUserMessage, query as sdkQuery } from '@anthropic-ai/claude-agent-sdk'
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve as resolveSourceFixturePath } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+
+import { diagnosticEventSchema, type DiagnosticEvent } from '@pact/contracts/diagnostics'
+
+const planDiagnostics = vi.hoisted(() => ({ events: [] as DiagnosticEvent[] }))
+vi.mock('../../diagnostics/utility-log', () => ({
+  recordDiagnostic: (event: DiagnosticEvent) => planDiagnostics.events.push(event),
+}))
 
 const forkWorker = vi.hoisted(() => ({ path: '' }))
 vi.mock('node:worker_threads', async (original) => {
@@ -34,10 +41,22 @@ import type {
   AgentRunInput,
 } from '@pact/agent-runtime'
 
+import { collaborationSourceWireResultSchema } from '@pact/contracts'
+import { PactDatabase } from '@pact/persistence'
+
+import { planRevisionFixture } from '../../../../../packages/persistence/src/plan-revision-guidance.test-support.js'
 import { NativeCapacityError } from './agent-execution-error'
 import { CLAUDE_TITLE_TIMEOUT_MS, ClaudeAgentAdapter } from './claude-agent-adapter.js'
-import { planEnvelope, planRunInput } from './collaboration-fixture.test-support.js'
+import { planRevisionReplyInput, planRunInput } from './collaboration-fixture.test-support.js'
+import { FrozenSourceReader } from './frozen-source-reader'
+import { NativeForkFiles } from './native-fork-files'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
+import {
+  NativeWorkingMemory,
+  NATIVE_OWNER_WORKING_BYTES,
+  nativeWorkingMemoryDiagnostics,
+} from './native-working-memory'
+import { PactPeerToolServer } from './pact-peer-tool-server'
 
 let workerFixture: Awaited<ReturnType<typeof nativeWorkerFixture>>
 beforeAll(async () => {
@@ -48,15 +67,1380 @@ afterAll(async () => {
   await workerFixture?.dispose()
 })
 
-afterEach(() => {
+const bootstrapDirectories: string[] = []
+afterEach(async () => {
   vi.useRealTimers()
   vi.unstubAllEnvs()
+  await Promise.all(
+    bootstrapDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
+  )
+})
+
+describe('Claude plan submission diagnostics', () => {
+  it.each([
+    'valid',
+    'missing_prompt',
+    'wrong_prompt',
+    'missing_history',
+    'pending',
+    'binding_missing',
+    'receipt_unavailable',
+    'old_failure',
+    'recovered_prompt',
+  ] as const)('preserves plan authorization and identifies %s', async (mode) => {
+    planDiagnostics.events.length = 0
+    const directory = await mkdtemp(join(tmpdir(), 'pact-plan-diagnostic-'))
+    const cwd = await realpath(directory)
+    const profile = join(cwd, 'profile')
+    const project = join(profile, 'projects', cwd.replace(/[^a-z0-9]/giu, '-'))
+    await mkdir(project, { recursive: true })
+    vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
+    const input = { ...planRunInput('claude'), cwd, nativeSessionId: randomUUID() }
+    const promptId = randomUUID(),
+      attachmentId = randomUUID(),
+      callId = randomUUID(),
+      receiptId = randomUUID()
+    const path = join(profile, 'private-path-not-for-diagnostics.md')
+    const operation = { file_path: path, content: 'private-plan-body-not-for-diagnostics' }
+    const recordPlan = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlan']>>()
+    const transcript = join(project, `${input.nativeSessionId}.jsonl`)
+    const append = async (record: Record<string, unknown>) =>
+      appendFile(
+        transcript,
+        JSON.stringify({
+          ...record,
+          cwd,
+          sessionId: input.nativeSessionId,
+          timestamp: new Date().toISOString(),
+        }) + '\n',
+      )
+    await append({
+      type: 'user',
+      uuid: input.runId,
+      parentUuid: null,
+      promptId,
+      message: { role: 'user', content: 'Plan' },
+    })
+    await append({
+      type: 'attachment',
+      uuid: attachmentId,
+      parentUuid: input.runId,
+      attachment: {
+        type: mode === 'binding_missing' ? 'unknown' : 'plan_mode',
+        isSubAgent: false,
+        planFilePath: path,
+      },
+    })
+    const writeRecord = {
+      type: 'assistant',
+      uuid: callId,
+      parentUuid: attachmentId,
+      message: {
+        id: 'write-message',
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'write-plan', name: 'Write', input: operation }],
+      },
+    }
+    if (mode !== 'missing_history') await append(writeRecord)
+    const f = cancellationFixture(undefined, { ...input, recordWorkflowPlan: recordPlan })
+    try {
+      await f.ready()
+      const hook = {
+        session_id: input.nativeSessionId,
+        transcript_path: transcript,
+        cwd,
+        ...(['missing_prompt', 'old_failure', 'recovered_prompt'].includes(mode)
+          ? {}
+          : { prompt_id: mode === 'wrong_prompt' ? randomUUID() : promptId }),
+        tool_use_id: 'write-plan',
+        tool_name: 'Write',
+        tool_input: operation,
+      }
+      const options = { signal: f.options().abortController!.signal }
+      const pre = f.options().hooks!.PreToolUse![0]!.hooks[0]!
+      const post = f.options().hooks!.PostToolUse![0]!.hooks[0]!
+      await pre({ ...hook, hook_event_name: 'PreToolUse' }, 'write-plan', options)
+      if (mode !== 'pending' && mode !== 'missing_history') {
+        const response = {
+          filePath: path,
+          content: operation.content,
+          userModified: mode === 'receipt_unavailable',
+        }
+        await append({
+          type: 'user',
+          uuid: receiptId,
+          parentUuid: callId,
+          message: {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'write-plan', content: 'Written' }],
+          },
+          toolUseResult: response,
+        })
+        await post(
+          { ...hook, hook_event_name: 'PostToolUse', tool_response: response },
+          'write-plan',
+          options,
+        )
+      }
+      if (mode !== 'missing_history')
+        await append({
+          type: 'assistant',
+          uuid: randomUUID(),
+          parentUuid: mode === 'pending' ? callId : receiptId,
+          message: {
+            id: 'exit-message',
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'exit-plan', name: 'ExitPlanMode', input: {} }],
+          },
+        })
+      if (mode !== 'old_failure')
+        await pre(
+          {
+            ...hook,
+            ...(mode === 'recovered_prompt' ? { prompt_id: promptId } : {}),
+            hook_event_name: 'PreToolUse',
+            tool_use_id: 'exit-plan',
+            tool_name: 'ExitPlanMode',
+            tool_input: {},
+          },
+          'exit-plan',
+          options,
+        )
+      const result = await f.options().canUseTool!(
+        'ExitPlanMode',
+        {},
+        { ...options, toolUseID: 'exit-plan', requestId: 'exit-request' },
+      )
+      expect(result?.behavior).toBe('deny')
+      const message = result?.behavior === 'deny' ? result.message : ''
+      const expected = {
+        valid: 'submitted to Pact',
+        missing_prompt: 'hook_prompt_missing',
+        wrong_prompt: 'hook_prompt_mismatch',
+        missing_history: 'history_operation_missing',
+        pending: 'plan_pending',
+        binding_missing: 'history_binding_missing',
+        receipt_unavailable: 'plan_unavailable',
+        old_failure: 'Pact diagnostic: submission_hook_unverified.',
+        recovered_prompt: 'submitted to Pact',
+      }[mode]
+      expect(message).toContain(expected)
+      expect(message).not.toContain('private-path')
+      expect(message).not.toContain(operation.content)
+      expect(message).not.toContain(input.runId)
+      expect(message).not.toContain(promptId)
+      expect(message.includes('Latest capture: hook_prompt_missing/Write/success.')).toBe(
+        mode === 'old_failure',
+      )
+      expect(message.includes('Latest capture')).toBe(
+        [
+          'missing_prompt',
+          'wrong_prompt',
+          'missing_history',
+          'binding_missing',
+          'old_failure',
+        ].includes(mode),
+      )
+      const successful = mode === 'valid' || mode === 'recovered_prompt'
+      const events = planDiagnostics.events.filter((event) => event.operation === 'claude_plan')
+      expect(events.length).toBeGreaterThan(0)
+      for (const event of events) {
+        expect(diagnosticEventSchema.safeParse(event).success).toBe(true)
+        expect(event).toMatchObject({
+          sessionId: input.sessionId,
+          runId: input.runId,
+          agentId: 'claude',
+        })
+        expect(['info', 'warn']).toContain(event.level)
+      }
+      expect(events.at(-1)).toMatchObject({
+        planStage: 'submission',
+        planReason: successful
+          ? 'submitted'
+          : mode === 'old_failure'
+            ? 'submission_hook_unverified'
+            : expected,
+        level: successful ? 'info' : 'warn',
+      })
+      expect(events.at(-1)?.planCapture).toEqual(
+        mode === 'old_failure'
+          ? { code: 'hook_prompt_missing', tool: 'Write', phase: 'success' }
+          : ['missing_prompt', 'wrong_prompt', 'missing_history', 'binding_missing'].includes(mode)
+            ? { code: expected, tool: 'ExitPlanMode', phase: 'begin' }
+            : undefined,
+      )
+      const serialized = JSON.stringify(events)
+      for (const sensitive of [path, operation.content, promptId, 'write-plan', 'exit-plan', cwd])
+        expect(serialized).not.toContain(sensitive)
+      // Repeated permission callbacks must not flood the default log or change authorization.
+      for (let attempt = 0; attempt < 70; attempt++) {
+        // oxlint-disable-next-line no-await-in-loop -- Exercise sequential SDK callback retries.
+        await f.options().canUseTool!(
+          'ExitPlanMode',
+          {},
+          {
+            ...options,
+            toolUseID: 'exit-plan',
+            requestId: 'exit-request',
+          },
+        )
+      }
+      expect(planDiagnostics.events).toHaveLength(events.length)
+      expect(recordPlan.mock.calls.length > 0).toBe(mode === 'valid' || mode === 'recovered_prompt')
+      expect(
+        recordPlan.mock.calls.every(
+          ([plan]) => plan.nativeId === 'write-plan' && plan.text === operation.content,
+        ),
+      ).toBe(true)
+    } finally {
+      await f.dispose()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Claude explicit unchanged plan retention', () => {
+  it.each([
+    'valid',
+    'late_native_call',
+    'missing_post',
+    'duplicate_native',
+    'duplicate_sdk',
+    'cancel',
+    'wrong_prompt',
+    'foreign_root',
+    'child',
+    'missing_hook',
+    'missing_native_call',
+    'extra_native_args',
+    'error_result',
+    'missing_root_tool',
+  ] as const)(
+    'requires the owned Hook, native prefix and successful root result: %s',
+    async (mode) => {
+      const f = await nativeRetentionFixture()
+      try {
+        const id = 'retain-plan'
+        if (mode !== 'missing_native_call' && mode !== 'late_native_call')
+          await f.nativeCall(id, mode === 'extra_native_args' ? { planVersion: 2 } : {})
+        if (mode !== 'missing_hook')
+          await f.pre(
+            id,
+            mode === 'wrong_prompt'
+              ? { prompt_id: randomUUID() }
+              : mode === 'foreign_root'
+                ? { session_id: randomUUID() }
+                : mode === 'child'
+                  ? { agent_id: 'child' }
+                  : {},
+          )
+        if (mode !== 'missing_root_tool')
+          f.assistant(id, {}, mode === 'child' ? 'parent-tool' : null)
+        const invoked = await f.invoke()
+        expect(invoked.isError).not.toBe(true)
+        if (mode !== 'missing_post') await f.post(id)
+        if (mode === 'late_native_call' || mode === 'duplicate_native') await f.nativeCall(id)
+        if (mode === 'duplicate_sdk') f.assistant(id)
+        expect(f.record).not.toHaveBeenCalled()
+        await f.result(id, mode === 'error_result', mode === 'child' ? 'parent-tool' : null)
+        if (mode === 'cancel') f.cancel()
+        await f.end()
+        expect(f.record.mock.calls).toEqual(
+          ['valid', 'late_native_call'].includes(mode)
+            ? [
+                [
+                  {
+                    nativeId: id,
+                    confirmation: 'native_root_settled_v1',
+                    sha256: f.basis.document.sha256,
+                    bytes: f.basis.document.bytes,
+                    chars: f.basis.document.chars,
+                  },
+                ],
+              ]
+            : [],
+        )
+        expect(
+          f.evidence.mock.calls.some(
+            ([value]) =>
+              value.kind === 'ended' &&
+              value.outcome === 'completed' &&
+              value.output?.retainedPlan?.nativeId === id,
+          ),
+        ).toBe(['valid', 'late_native_call'].includes(mode))
+      } finally {
+        await f.dispose()
+      }
+    },
+  )
+
+  it.each([
+    'pending',
+    'failed',
+    'identical-write',
+    'pending-edit',
+    'failed-edit',
+    'identical-edit',
+  ] as const)(
+    'refuses retention when the real current native prefix includes %s plan work',
+    async (mode) => {
+      const f = await nativeRetentionFixture()
+      try {
+        const edit = mode.endsWith('-edit')
+        const operation = edit
+          ? { file_path: f.path, old_string: f.text, new_string: f.text }
+          : { file_path: f.path, content: f.text }
+        await f.append({
+          type: 'assistant',
+          message: {
+            id: 'current-write',
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'current-write',
+                name: edit ? 'Edit' : 'Write',
+                input: operation,
+              },
+            ],
+          },
+        })
+        if (!mode.startsWith('pending'))
+          await f.append({
+            type: 'user',
+            message: {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'current-write',
+                  is_error: mode.startsWith('failed'),
+                  content: 'Write outcome',
+                },
+              ],
+            },
+            toolUseResult: edit
+              ? {
+                  filePath: f.path,
+                  oldString: f.text,
+                  newString: f.text,
+                  replaceAll: false,
+                  originalFile: f.text,
+                  userModified: false,
+                }
+              : { filePath: f.path, content: f.text, userModified: false },
+          })
+        await f.nativeCall('retain-plan')
+        await f.pre('retain-plan')
+        f.assistant('retain-plan')
+        await f.invoke()
+        await f.post('retain-plan')
+        await f.result('retain-plan')
+        await f.finish()
+        expect(f.record).not.toHaveBeenCalled()
+        expect(f.unavailable).toHaveBeenCalled()
+      } finally {
+        await f.dispose()
+      }
+    },
+  )
+
+  it('invalidates candidate retention on a later write and cannot clear that fact with another retain call', async () => {
+    const f = await nativeRetentionFixture()
+    try {
+      await f.nativeCall('retain-plan')
+      await f.pre('retain-plan')
+      f.assistant('retain-plan')
+      await f.invoke()
+      await f.post('retain-plan')
+      await f.result('retain-plan')
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(f.record).not.toHaveBeenCalled()
+      await f.pre('later-write', {
+        tool_name: 'Write',
+        tool_input: { file_path: f.path, content: 'Changed' },
+      })
+      expect(f.unavailable).toHaveBeenCalled()
+      expect(await f.invoke()).toMatchObject({ isError: true })
+      await f.finish()
+      expect(f.record).not.toHaveBeenCalled()
+      const ended = f.evidence.mock.calls.flatMap(([value]) =>
+        value.kind === 'ended' ? [value] : [],
+      )
+      expect(ended.at(-1)?.output?.retainedPlan).toBeUndefined()
+    } finally {
+      await f.dispose()
+    }
+  })
+
+  it.each(['write-hook', 'error-tool-result'] as const)(
+    'fails closed if retaining-plan invalidation cannot be persisted after %s',
+    async (trigger) => {
+      const f = await nativeRetentionFixture()
+      try {
+        await f.nativeCall('retain-plan')
+        await f.pre('retain-plan')
+        f.assistant('retain-plan')
+        await f.invoke()
+        await f.post('retain-plan')
+        await f.result('retain-plan')
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        expect(f.record).not.toHaveBeenCalled()
+        f.unavailable.mockImplementation(() => {
+          throw new Error('Fixture persistence rejected plan invalidation.')
+        })
+        if (trigger === 'write-hook') {
+          await f
+            .pre('later-write', {
+              tool_name: 'Write',
+              tool_input: { file_path: f.path, content: 'Changed after retention' },
+            })
+            .catch(() => undefined)
+        } else await f.result('retain-plan', true)
+        await f.end()
+        const ended = f.evidence.mock.calls.flatMap(([value]) =>
+          value.kind === 'ended' ? [value] : [],
+        )
+        expect({
+          retainedCandidates: f.record.mock.calls.length,
+          invalidationAttempts: f.unavailable.mock.calls.length > 0,
+          outputFailures: f.outputFailure.mock.calls.length,
+          usableRetainedTerminal: Boolean(ended.at(-1)?.output?.retainedPlan),
+        }).toEqual({
+          retainedCandidates: 0,
+          invalidationAttempts: true,
+          outputFailures: 0,
+          usableRetainedTerminal: false,
+        })
+        expect(ended.at(-1)).toMatchObject({
+          outcome: 'completed',
+          output: {
+            text: 'The existing plan remains appropriate.',
+            completeness: 'complete',
+          },
+        })
+        expect(f.report).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'settled' }))
+      } finally {
+        await f.dispose()
+      }
+    },
+  )
+
+  it.each(['Write', 'Edit'] as const)(
+    'cannot retain after a failed %s before plan-state initialization',
+    async (toolName) => {
+      const f = await nativeRetentionFixture()
+      try {
+        await f.pre('unverified-write', {
+          tool_name: toolName,
+          tool_input: {
+            file_path: f.path,
+            content: 'Different',
+            old_string: f.text,
+            new_string: 'Different',
+          },
+        })
+        await f.nativeCall('retain-plan')
+        expect(await f.pre('retain-plan')).toMatchObject({
+          hookSpecificOutput: { permissionDecision: 'deny' },
+        })
+        expect(await f.invoke()).toMatchObject({ isError: true })
+        f.assistant('retain-plan')
+        await f.post('retain-plan')
+        await f.result('retain-plan')
+        await f.finish()
+        expect(f.record).not.toHaveBeenCalled()
+        expect(f.unavailable).toHaveBeenCalled()
+      } finally {
+        await f.dispose()
+      }
+    },
+  )
+
+  it('joins a started source authentication before releasing terminal work', async () => {
+    const f = await nativeRetentionFixture()
+    const gate = Promise.withResolvers<void>(),
+      started = Promise.withResolvers<void>()
+    // oxlint-disable-next-line typescript/unbound-method -- Called with the actual NativeForkFiles receiver below.
+    const read = NativeForkFiles.prototype.readAnswer
+    const inspect = vi
+      .spyOn(NativeForkFiles.prototype, 'readAnswer')
+      .mockImplementation(async function (this: NativeForkFiles, input, signal) {
+        if (input.terminalPlanRetention?.id === 'retain-plan') {
+          started.resolve()
+          await gate.promise
+        }
+        return read.call(this, input, signal)
+      })
+    try {
+      await f.nativeCall('retain-plan')
+      await f.pre('retain-plan')
+      f.assistant('retain-plan')
+      await f.invoke()
+      await f.post('retain-plan')
+      await f.result('retain-plan')
+      const ending = f.finish()
+      await started.promise
+      await vi.waitFor(() =>
+        expect(
+          f.evidence.mock.calls.some(
+            ([value]) => value.kind === 'ended' && value.outcome === 'completed',
+          ),
+        ).toBe(true),
+      )
+      expect(f.record).not.toHaveBeenCalled()
+      expect(f.report.mock.calls.some(([value]) => value.state === 'settled')).toBe(false)
+      gate.resolve()
+      await ending
+      await vi.waitFor(() => expect(f.record).toHaveBeenCalledOnce())
+      expect(
+        f.evidence.mock.calls.some(
+          ([value]) =>
+            value.kind === 'ended' && value.output?.retainedPlan?.nativeId === 'retain-plan',
+        ),
+      ).toBe(true)
+    } finally {
+      gate.resolve()
+      inspect.mockRestore()
+      await f.dispose()
+    }
+  })
+
+  it('does not cache final retention when its durable callback fails', async () => {
+    const f = await nativeRetentionFixture()
+    try {
+      await f.pre('retain-plan')
+      f.assistant('retain-plan')
+      await f.invoke()
+      await f.post('retain-plan')
+      await f.nativeCall('retain-plan')
+      await f.result('retain-plan')
+      f.record.mockImplementation(() => {
+        throw new Error('Controlled retained persistence failure')
+      })
+      await f.end()
+      expect(f.record).toHaveBeenCalledOnce()
+      expect(f.outputFailure).not.toHaveBeenCalled()
+      expect(f.report).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'settled' }))
+      const ended = f.evidence.mock.calls.flatMap(([value]) =>
+        value.kind === 'ended' ? [value] : [],
+      )
+      expect(ended.at(-1)).toMatchObject({
+        outcome: 'completed',
+        output: { text: 'The existing plan remains appropriate.', completeness: 'complete' },
+      })
+      expect(ended.every((value) => !value.output?.retainedPlan)).toBe(true)
+    } finally {
+      await f.dispose()
+    }
+  })
+
+  it('does not accept prose or model-selected identities as retention', async () => {
+    const f = await nativeRetentionFixture()
+    try {
+      expect(await f.invoke({ planVersion: 2 })).toMatchObject({ isError: true })
+      await f.finish()
+      expect(f.record).not.toHaveBeenCalled()
+    } finally {
+      await f.dispose()
+    }
+  })
+})
+
+it.each([false, true])(
+  'settles a new plan after retained intent only with intact publication: late invalidation failure=%s',
+  async (lateInvalidation) => {
+    const nativeSessionId = randomUUID()
+    const db = await planRevisionFixture({ owner: 'claude', nativeSessionId })
+    const repo = db.repo,
+      sessionId = db.sessionId
+    const clientMessageId = randomUUID(),
+      bodyOwner = randomUUID()
+    const drafts = repo.readPage({ scope: 'drafts', sessionId })
+    if (drafts.scope !== 'drafts') throw new Error('Missing drafts')
+    const content = 'Recheck the current plan.'
+    const body = repo.writeConversationInput(
+      { type: 'begin', sessionId, clientMessageId },
+      bodyOwner,
+    )
+    repo.writeConversationInput(
+      { type: 'append', sessionId, inputId: body.inputId, offset: 0, text: content },
+      bodyOwner,
+    )
+    repo.writeConversationInput({ type: 'seal', sessionId, inputId: body.inputId }, bodyOwner)
+    repo.receiveCollaborationInput(
+      {
+        sessionId,
+        clientMessageId,
+        content,
+        commentIds: [],
+        expectedCommentsRevision: drafts.commentsRevision,
+      },
+      body.inputId,
+      'claude',
+      'immediate_safe_point',
+      bodyOwner,
+    )
+    const received = repo.readReceivedInput(sessionId)!,
+      task = repo.collaboration(sessionId)!
+    const next = repo.workflowReply(task, 'claude')
+    next.latestUserMessageId = received.id
+    const { run } = repo.beginRun({
+      sessionId,
+      clientMessageId: received.id,
+      content: received.content,
+      commentIds: [],
+      expectedCommentsRevision: drafts.commentsRevision,
+      agentId: 'claude',
+      settingsRevision: 1,
+      model: null,
+      effort: null,
+      preserveDraftComments: true,
+      receivedInputId: received.id,
+      expectedCollaborationRevision: task.revision,
+      collaboration: next,
+    })
+    let rejectInvalidation = false
+    const capturedPlans: string[] = []
+    const f = await nativeRetentionFixture(
+      {
+        sessionId,
+        runId: run.id,
+        nativeSessionId,
+        bindingGeneration: run.bindingGeneration ?? 1,
+        promptEnvelope: {
+          version: 'pact-agent-prompt-v1',
+          sessionId,
+          message: { id: run.userMessageId, content },
+          comments: [],
+          collaboration: repo.collaborationPromptState(repo.collaboration(sessionId)!),
+          collaborationAuthorization: repo.collaborationTurnAuthorization(run.id)!,
+        },
+        recordExecutor: (id) => {
+          repo.recordExecutor(run.id, id)
+        },
+        recordDispatch: (phase, id, executor) => {
+          repo.recordDispatch(run.id, phase, id, executor)
+        },
+        recordWorkflowPlan: (plan) => {
+          capturedPlans.push(plan.text)
+          repo.recordWorkflowPlan(run.id, plan)
+        },
+        recordWorkflowPlanRetained: (plan) => repo.recordWorkflowPlanRetained(run.id, plan),
+        recordWorkflowPlanUnavailable: () => {
+          if (rejectInvalidation) throw new Error('Controlled late plan invalidation failure')
+          repo.recordWorkflowPlanUnavailable(run.id)
+        },
+        recordOutputFailure: () =>
+          repo.recordOutputFailure(run.id, {
+            kind: 'protocol_error',
+            message: 'Plan capture failed',
+          }),
+        recordNativeEvidence: (evidence) => {
+          repo.recordNativeEvidence(evidence, 'retry')
+        },
+        reportNativeEffects: (report) => {
+          repo.recordNativeEffects(run.id, report.state, report.reason)
+          if (report.state === 'settled') repo.reconcileCompletedCollaboration(run.id)
+        },
+      },
+      (event) => {
+        repo.applyEvent(sessionId, run.id, event)
+      },
+    )
+    try {
+      await f.nativeCall('retain-plan')
+      await f.pre('retain-plan')
+      f.assistant('retain-plan')
+      await f.invoke()
+      await f.post('retain-plan')
+      await f.result('retain-plan')
+      const writeInput = { file_path: f.path, content: 'New complete plan after reconsideration.' }
+      await f.append({
+        type: 'assistant',
+        message: {
+          id: 'write-message',
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'write-plan', name: 'Write', input: writeInput }],
+        },
+      })
+      await f.pre('write-plan', { tool_name: 'Write', tool_input: writeInput })
+      await f.post('write-plan', {
+        tool_name: 'Write',
+        tool_input: writeInput,
+        tool_response: { filePath: f.path, content: writeInput.content, userModified: false },
+      })
+      await f.pre('exit-plan', { tool_name: 'ExitPlanMode', tool_input: {} })
+      await f.options.canUseTool!(
+        'ExitPlanMode',
+        {},
+        {
+          signal: new AbortController().signal,
+          toolUseID: 'exit-plan',
+          requestId: 'exit-permission',
+        },
+      )
+      expect(capturedPlans).toContain(writeInput.content)
+      f.complete()
+      await vi.waitFor(() =>
+        expect(
+          repo
+            .read(sessionId)
+            .messages.some(
+              (message) =>
+                message.runId === run.id &&
+                message.role === 'assistant' &&
+                message.state === 'complete',
+            ),
+        ).toBe(true),
+      )
+      expect(repo.workflowPlanSettled(run.id)).toBe(false)
+      const ending = f.evidence.mock.calls
+        .map(([value]) => value)
+        .findLast((value) => value.kind === 'ended' && value.output)
+      expect(ending?.kind === 'ended' ? ending.output?.plan?.text : undefined).toBe(
+        writeInput.content,
+      )
+      if (lateInvalidation) {
+        rejectInvalidation = true
+        await f
+          .pre('late-write', {
+            tool_name: 'Write',
+            tool_input: { file_path: f.path, content: 'Unfinished late change' },
+          })
+          .catch(() => undefined)
+      }
+      await f.end()
+      repo.settleKnownNativeEnding(run.id)
+      repo.reconcileCompletedCollaboration(run.id)
+      expect(f.record).not.toHaveBeenCalled()
+      expect(repo.workflowPlanSettled(run.id)).toBe(!lateInvalidation)
+      expect(Boolean(repo.collaboration(sessionId)!.inputProcessing?.pending)).toBe(
+        lateInvalidation,
+      )
+      expect(repo.findRun(run.id)?.nativeEffectsState).toBe(
+        lateInvalidation ? 'unknown' : 'settled',
+      )
+      expect(repo.findRun(run.id)?.nativeOutcome).toBe('completed')
+      expect(
+        repo
+          .read(sessionId)
+          .messages.find((message) => message.runId === run.id && message.role === 'assistant')
+          ?.state,
+      ).toBe('complete')
+    } finally {
+      await f.dispose()
+      db.db.close()
+    }
+  },
+)
+
+describe('Claude terminated plan authentication', () => {
+  it.each([
+    'valid',
+    'live_submitted',
+    'live_pending_write',
+    'live_failed_write',
+    'retained',
+    'retained_live',
+    'no_permission',
+    'changed_permission',
+    'changed_hook',
+    'wrong_prompt',
+    'cancel',
+    'failed',
+    'question',
+    'missing_terminal',
+    'live_changed_permission',
+    'retained_recording_failure',
+  ] as const)(
+    'joins one terminal read for the exact permission intent after actor and reader drain: %s',
+    async (mode) => {
+      const directory = await mkdtemp(join(tmpdir(), 'pact-terminal-plan-')),
+        cwd = await realpath(directory)
+      const profile = join(cwd, 'profile'),
+        project = join(profile, 'projects', cwd.replace(/[^a-z0-9]/giu, '-'))
+      await mkdir(project, { recursive: true })
+      vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
+      const input = { ...planRunInput('claude'), cwd, nativeSessionId: randomUUID() },
+        promptId = randomUUID()
+      const path = join(profile, 'private-plan.md'),
+        text = 'Authenticated original native plan.'
+      const transcript = join(project, `${input.nativeSessionId}.jsonl`)
+      let parent: string | null = null
+      const append = async (
+        type: string,
+        fields: Record<string, unknown>,
+        id: string = randomUUID(),
+      ): Promise<void> => {
+        await appendFile(
+          transcript,
+          JSON.stringify({
+            type,
+            uuid: id,
+            parentUuid: parent,
+            sessionId: input.nativeSessionId,
+            cwd,
+            timestamp: new Date().toISOString(),
+            ...fields,
+          }) + '\n',
+        )
+        parent = id
+      }
+      await append(
+        'user',
+        { promptId, message: { role: 'user', content: 'Plan' } },
+        mode.startsWith('retained') ? randomUUID() : input.runId,
+      )
+      await append('attachment', {
+        attachment: { type: 'plan_mode', isSubAgent: false, planFilePath: path },
+      })
+      await append('assistant', {
+        message: {
+          id: 'write',
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'write-plan',
+              name: 'Write',
+              input: { file_path: path, content: text },
+            },
+          ],
+        },
+      })
+      await append('user', {
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'write-plan', content: 'Written' }],
+        },
+        toolUseResult: { filePath: path, content: text, userModified: false },
+      })
+      if (mode.startsWith('retained')) {
+        const basis = {
+          version: 1,
+          sourceRunId: randomUUID(),
+          sourceMessageId: randomUUID(),
+          document: {
+            id: randomUUID(),
+            sha256: createHash('sha256').update(text).digest('hex'),
+            bytes: Buffer.byteLength(text),
+            chars: text.length,
+          },
+        }
+        input.promptEnvelope.collaborationAuthorization!.planReference = basis
+        input.promptEnvelope.collaboration!.planReference = basis
+        input.promptEnvelope.collaboration!.planVersion = 1
+        await append(
+          'user',
+          { promptId, message: { role: 'user', content: 'Retain this plan.' } },
+          input.runId,
+        )
+        await append('attachment', {
+          attachment: { type: 'plan_mode', isSubAgent: false, planFilePath: path },
+        })
+      }
+      let availablePlan: { nativeId: string; text: string } | undefined,
+        failStore = false
+      const plan = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlan']>>((value) => {
+        availablePlan = value
+      })
+      const unavailable = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlanUnavailable']>>(() => {
+        if (failStore) throw new Error('Controlled unavailable source storage failure')
+        availablePlan = undefined
+      })
+      const retain = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlanRetained']>>(() => {
+        if (mode === 'retained_recording_failure')
+          throw new Error('Controlled retained source storage failure')
+      })
+      const sourceFailure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
+      const settled = Promise.withResolvers<void>()
+      const reports = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>((report) => {
+        if (report.state !== 'pending') settled.resolve()
+      })
+      // oxlint-disable-next-line typescript/unbound-method -- Forward the real method with its original instance through call(this).
+      const readAnswer = NativeForkFiles.prototype.readAnswer
+      const reads = vi
+        .spyOn(NativeForkFiles.prototype, 'readAnswer')
+        .mockImplementation(function (this: NativeForkFiles, request, signal) {
+          if (mode === 'live_submitted' && request.terminalPlanSubmission)
+            return Promise.reject(new Error('Terminal history temporarily unavailable'))
+          return readAnswer.call(this, request, signal)
+        })
+      const f = cancellationFixture(
+        undefined,
+        {
+          ...input,
+          recordWorkflowPlan: plan,
+          recordWorkflowPlanUnavailable: unavailable,
+          recordWorkflowPlanRetained: retain,
+          recordOutputFailure: sourceFailure,
+          reportNativeEffects: reports,
+        },
+        undefined,
+        true,
+      )
+      try {
+        await f.ready()
+        const intent = { plan: text, planFilePath: path }
+        const hook = {
+          hook_event_name: 'PreToolUse' as const,
+          session_id: input.nativeSessionId,
+          transcript_path: transcript,
+          cwd,
+          prompt_id: mode === 'wrong_prompt' ? randomUUID() : promptId,
+          tool_name: 'ExitPlanMode',
+          tool_use_id: 'exit-plan',
+          tool_input: intent,
+        }
+        const options = { signal: f.options().abortController!.signal }
+        const pre = f.options().hooks!.PreToolUse![0]!.hooks[0]!
+        if (mode.startsWith('live_')) {
+          const writeHook = {
+            ...hook,
+            tool_name: 'Write',
+            tool_use_id: 'write-plan',
+            tool_input: { file_path: path, content: text },
+          }
+          await pre(writeHook, 'write-plan', options)
+          await f.options().hooks!.PostToolUse![0]!.hooks[0]!(
+            {
+              ...writeHook,
+              hook_event_name: 'PostToolUse',
+              tool_response: { filePath: path, content: text, userModified: false },
+            },
+            'write-plan',
+            options,
+          )
+        }
+        if (mode === 'retained_live')
+          await append('assistant', {
+            message: {
+              id: 'exit',
+              role: 'assistant',
+              content: [{ type: 'tool_use', id: 'exit-plan', name: 'ExitPlanMode', input: intent }],
+            },
+          })
+        // The ordinary live Hook precedes persistence; retained_live covers the already-readable prefix.
+        await pre(hook, 'exit-plan', options)
+        expect(plan).toHaveBeenCalledTimes(mode.startsWith('live_') ? 1 : 0)
+        if (mode === 'changed_hook')
+          await pre({ ...hook, tool_input: { ...intent, plan: 'Changed' } }, 'exit-plan', options)
+        const decisions: Array<string | undefined> = []
+        if (mode !== 'no_permission') {
+          for (let index = 0; index < 3; index++) {
+            // oxlint-disable-next-line no-await-in-loop -- Repeated actual SDK callback identities must not authorize a second proof.
+            const decision = await f.options().canUseTool!(
+              'ExitPlanMode',
+              ['changed_permission', 'live_changed_permission'].includes(mode)
+                ? { ...intent, plan: 'Changed' }
+                : intent,
+              { ...options, toolUseID: 'exit-plan', requestId: 'same-permission' },
+            )
+            decisions.push(decision?.behavior)
+          }
+        }
+        expect(decisions).toEqual(mode === 'no_permission' ? [] : ['deny', 'deny', 'deny'])
+        expect(retain).not.toHaveBeenCalled()
+        if (mode !== 'missing_terminal' && mode !== 'retained_live')
+          await append('assistant', {
+            message: {
+              id: 'exit',
+              role: 'assistant',
+              content: [{ type: 'tool_use', id: 'exit-plan', name: 'ExitPlanMode', input: intent }],
+            },
+          })
+        if (mode === 'live_pending_write' || mode === 'live_failed_write') {
+          const lateInput = { file_path: path, content: 'Later plan edit' }
+          await append('assistant', {
+            message: {
+              role: 'assistant',
+              content: [{ type: 'tool_use', id: 'late-write', name: 'Write', input: lateInput }],
+            },
+          })
+          const lateHook = {
+            ...hook,
+            tool_name: 'Write',
+            tool_use_id: 'late-write',
+            tool_input: lateInput,
+          }
+          await pre(lateHook, 'late-write', options)
+          if (mode === 'live_failed_write') {
+            await append('user', {
+              message: {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: 'late-write',
+                    is_error: true,
+                    content: 'Failed',
+                  },
+                ],
+              },
+            })
+            await f.options().hooks!.PostToolUseFailure![0]!.hooks[0]!(
+              {
+                ...lateHook,
+                hook_event_name: 'PostToolUseFailure',
+                error: 'Failed',
+              },
+              'late-write',
+              options,
+            )
+          }
+        }
+        if (mode === 'question')
+          await pre(
+            {
+              ...hook,
+              tool_name: 'AskUserQuestion',
+              tool_use_id: 'question',
+              tool_input: { questions: [] },
+            },
+            'question',
+            options,
+          )
+        if (mode === 'cancel') f.controller.abort()
+        if (mode === 'retained_recording_failure') failStore = true
+        f.finishResult({
+          done: false,
+          value: {
+            type: 'result',
+            subtype: mode === 'failed' ? 'error_during_execution' : 'success',
+            is_error: mode === 'failed',
+            session_id: input.nativeSessionId,
+            user_message_uuids: [input.runId],
+            result: 'Plan ready.',
+          } as SDKMessage,
+        })
+        // EOF without actor close is insufficient; actor close and drain race into one owner.
+        await f.outcome
+        expect(plan).toHaveBeenCalledTimes(
+          mode.startsWith('live_') ? (mode === 'live_changed_permission' ? 1 : 4) : 0,
+        )
+        expect(availablePlan).toEqual(
+          mode === 'live_submitted' ? { nativeId: 'write-plan', text } : undefined,
+        )
+        expect(retain).not.toHaveBeenCalled()
+        f.child.emit('close', 0, null)
+        f.child.emit('close', 0, null)
+        await settled.promise
+        expect(reports).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            state: 'settled',
+          }),
+        )
+        const terminalReads = reads.mock.calls.filter(([request]) => request.terminalPlanSubmission)
+        expect(terminalReads).toHaveLength(
+          [
+            'valid',
+            'retained',
+            'retained_live',
+            'wrong_prompt',
+            'missing_terminal',
+            'retained_recording_failure',
+          ].includes(mode)
+            ? 1
+            : 0,
+        )
+        expect(plan.mock.calls).toEqual(
+          mode.startsWith('live_') && mode !== 'live_changed_permission'
+            ? Array.from({ length: 4 }, () => [{ nativeId: 'write-plan', text }])
+            : ['valid', 'live_changed_permission'].includes(mode)
+              ? [[{ nativeId: 'write-plan', text }]]
+              : [],
+        )
+        expect(
+          mode !== 'valid' ||
+            reports.mock.invocationCallOrder.at(-1)! > plan.mock.invocationCallOrder[0]!,
+        ).toBe(true)
+        expect(availablePlan).toEqual(
+          ['valid', 'live_submitted'].includes(mode) ? { nativeId: 'write-plan', text } : undefined,
+        )
+        expect(retain).toHaveBeenCalledTimes(mode.startsWith('retained') ? 1 : 0)
+        expect(retain.mock.calls[0]?.[0]).toEqual(
+          mode.startsWith('retained')
+            ? {
+                nativeId: 'exit-plan',
+                confirmation: 'native_root_settled_v1',
+                sha256: createHash('sha256').update(text).digest('hex'),
+                bytes: Buffer.byteLength(text),
+                chars: text.length,
+              }
+            : undefined,
+        )
+        expect(
+          !mode.startsWith('retained') ||
+            reports.mock.invocationCallOrder.at(-1)! > retain.mock.invocationCallOrder[0]!,
+        ).toBe(true)
+        expect(sourceFailure).not.toHaveBeenCalled()
+        const status =
+          mode === 'valid'
+            ? await f.adapter.probeNativeStatus(
+                {
+                  sessionId: input.sessionId,
+                  agentId: 'claude',
+                  runId: input.runId,
+                  requestId: input.runId,
+                  nativeSessionId: input.nativeSessionId,
+                  nativeTurnId: input.runId,
+                  bindingGeneration: input.bindingGeneration ?? 1,
+                  executorId: f.adapter.executorId,
+                  cwd,
+                  model: null,
+                  effort: null,
+                  planSource: true,
+                },
+                new AbortController().signal,
+              )
+            : undefined
+        expect(status?.kind).toBe(mode === 'valid' ? 'ended' : undefined)
+        expect(status && status.kind === 'ended' ? status.outcome : undefined).toBe(
+          mode === 'valid' ? 'completed' : undefined,
+        )
+        expect(
+          status && status.kind === 'ended' ? status.planUnavailable : undefined,
+        ).toBeUndefined()
+      } finally {
+        await f.dispose()
+        reads.mockRestore()
+        await rm(directory, { recursive: true, force: true })
+      }
+    },
+  )
 })
 
 describe('Claude Agent lifecycle', () => {
+  it.each([
+    { pendingSteer: false, publicationFails: false, background: false },
+    { pendingSteer: true, publicationFails: false, background: false },
+    { pendingSteer: false, publicationFails: true, background: false },
+    { pendingSteer: true, publicationFails: true, background: false },
+    { pendingSteer: true, publicationFails: false, background: true },
+    { pendingSteer: true, publicationFails: true, background: true },
+  ])(
+    'preserves exact terminal control when body sealing fails with pending Steer=$pendingSteer and publication failure=$publicationFails in background=$background',
+    async ({ pendingSteer, publicationFails, background }) => {
+      planDiagnostics.events.length = 0
+      const base = runInput(),
+        sessionId = randomUUID()
+      const input = {
+        ...base,
+        sessionId,
+        promptEnvelope: { ...base.promptEnvelope, sessionId },
+        nativeGeneration: 'finish-failure',
+        bindingGeneration: 1,
+      }
+      const steerId = randomUUID()
+      const started = Promise.withResolvers<void>()
+      const bodyDelivered = Promise.withResolvers<void>()
+      const controller = new AbortController()
+      const deliverResult = Promise.withResolvers<void>()
+      const consumeSteer = Promise.withResolvers<void>()
+      const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
+      const failure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
+      failure.mockImplementation(() => {
+        if (publicationFails) throw new NativeCapacityError('Fixture output publication failed.')
+      })
+      const workflowPlan = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlan']>>()
+      const consumption = vi.fn<(inputId: string) => void>()
+      let reachedEof = false
+      let inputDrain: Promise<void> | undefined
+      const query = ((request: { prompt: AsyncIterable<SDKUserMessage> }) => {
+        const root = Promise.withResolvers<void>()
+        inputDrain = (async () => {
+          for await (const message of request.prompt)
+            if (message.uuid === input.runId) root.resolve()
+        })()
+        const output = (async function* () {
+          await root.promise
+          yield {
+            type: 'system',
+            subtype: 'init',
+            session_id: input.nativeSessionId,
+            capabilities: ['interrupt_cancel_queued_v1'],
+          } as SDKMessage
+          yield {
+            type: 'user',
+            uuid: input.runId,
+            user_message_uuid: input.runId,
+            session_id: input.nativeSessionId,
+            parent_tool_use_id: null,
+            message: { role: 'user', content: 'Request' },
+          } as SDKMessage
+          for (const event of [
+            { type: 'message_start', message: { id: 'unfinished-api', model: 'fixture' } },
+            { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+            {
+              type: 'content_block_delta',
+              index: 0,
+              delta: { type: 'text_delta', text: 'Partial body' },
+            },
+          ])
+            yield {
+              type: 'stream_event',
+              uuid: randomUUID(),
+              session_id: input.nativeSessionId,
+              parent_tool_use_id: null,
+              event,
+            } as SDKMessage
+          await deliverResult.promise
+          yield {
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            session_id: input.nativeSessionId,
+            user_message_uuid: input.runId,
+            result: 'Unsealed body',
+          } as SDKMessage
+          if (pendingSteer) {
+            await consumeSteer.promise
+            yield {
+              type: 'user',
+              uuid: steerId,
+              user_message_uuid: steerId,
+              session_id: input.nativeSessionId,
+              parent_tool_use_id: null,
+              message: { role: 'user', content: 'Supplement consumed' },
+            } as SDKMessage
+            yield {
+              type: 'result',
+              subtype: 'success',
+              is_error: false,
+              session_id: input.nativeSessionId,
+              user_message_uuid: steerId,
+              result: 'Complete',
+            } as SDKMessage
+          }
+          reachedEof = true
+        })()
+        return {
+          [Symbol.asyncIterator]: () => output,
+          initializationResult: vi.fn(async () => ({ current_permission_mode: 'default' })),
+          setPermissionMode: vi.fn(async () => undefined),
+          cancelAsyncMessage: vi.fn(async () => false),
+          interrupt: vi.fn(async () => ({ cancelled: [], still_queued: [] })),
+          close: vi.fn(),
+          return: () => output.return(undefined),
+        }
+      }) as never
+      const adapter = new ClaudeAgentAdapter('/fake/claude', {
+        query,
+        getSessionInfo: vi.fn() as never,
+      })
+      const events: import('@pact/contracts').NormalizedAgentEvent[] = []
+      const outcome = (async () => {
+        for await (const event of adapter.run(
+          {
+            ...input,
+            recordNativeEvidence: evidence,
+            recordOutputFailure: failure,
+            recordWorkflowPlan: workflowPlan,
+          },
+          controller.signal,
+        )) {
+          events.push(event)
+          if (event.type === 'turn.started') started.resolve()
+          if (event.type === 'text.delta') bodyDelivered.resolve()
+        }
+      })().catch((error: unknown) => error)
+      try {
+        await started.promise
+        const steering = pendingSteer
+          ? await adapter.steer(
+              {
+                runId: input.runId,
+                inputId: steerId,
+                nativeSessionId: input.nativeSessionId,
+                nativeTurnId: input.runId,
+                nativeGeneration: input.nativeGeneration,
+                bindingGeneration: 1,
+                promptEnvelope: {
+                  ...input.promptEnvelope,
+                  message: { id: steerId, content: 'Supplement' },
+                },
+                recordDispatch: () => undefined,
+                recordConsumption: consumption,
+              },
+              new AbortController().signal,
+            )
+          : undefined
+        expect(steering?.status).toBe(pendingSteer ? 'submitted' : undefined)
+        if (background) {
+          await bodyDelivered.promise
+          controller.abort()
+          await outcome
+        }
+        deliverResult.resolve()
+        await expect(outcome).resolves.toMatchObject({
+          kind: background
+            ? 'unknown_delivery'
+            : publicationFails
+              ? 'runtime_incompatible'
+              : pendingSteer
+                ? 'unknown_delivery'
+                : 'protocol_error',
+        })
+        await vi.waitFor(() => expect(failure).toHaveBeenCalledTimes(1))
+        expect(failure).toHaveBeenCalledWith(expect.objectContaining({ kind: 'protocol_error' }))
+        const diagnostics = planDiagnostics.events.filter((event) => event.operation === 'send')
+        expect(diagnostics).toHaveLength(Number(publicationFails))
+        for (const event of diagnostics) {
+          expect(diagnosticEventSchema.parse(event)).toMatchObject({
+            scope: 'run',
+            phase: 'failed',
+            level: 'error',
+            runtimeBoundary: 'projection',
+            failureSource: 'classified_error',
+            code: 'runtime_incompatible',
+            runId: input.runId,
+          })
+          expect(JSON.stringify(event)).not.toContain('Fixture output publication failed')
+        }
+        expect(
+          events.some((event) => event.type === 'text.delta' && event.text === 'Partial body'),
+        ).toBe(true)
+        expect(
+          events.some(
+            (event) => event.type === 'text.completed' || event.type === 'turn.completed',
+          ),
+        ).toBe(false)
+        expect(workflowPlan).not.toHaveBeenCalled()
+        expect(evidence.mock.calls.some(([fact]) => fact.kind === 'ended')).toBe(!pendingSteer)
+        consumeSteer.resolve()
+        await vi.waitFor(() =>
+          expect(evidence).toHaveBeenCalledWith(
+            expect.objectContaining({
+              kind: 'ended',
+              source: 'live_terminal',
+              outcome: 'completed',
+            }),
+          ),
+        )
+        expect(consumption.mock.calls.map(([id]) => id)).toEqual(pendingSteer ? [steerId] : [])
+        await vi.waitFor(() => expect(reachedEof).toBe(true))
+        await vi.waitFor(() => expect(adapter.hasActiveBackgroundWork()).toBe(false))
+        expect(
+          evidence.mock.calls.some(
+            ([fact]) => fact.kind === 'ended' && fact.output?.completeness === 'complete',
+          ),
+        ).toBe(false)
+      } finally {
+        deliverResult.resolve()
+        consumeSteer.resolve()
+        await adapter.dispose()
+        await outcome
+        await inputDrain
+      }
+    },
+  )
+
   it.each([false, true])(
-    'keeps reading Steer consumption and final control receipts with background carrier failure=%s',
-    async (carrierFails) => {
+    'keeps Steer consumption and terminal receipts after projection overflow with legacy structured output=%s',
+    async (legacyStructured) => {
       const input = {
         ...planRunInput('claude'),
         nativeSessionId: 'claude-carrier-failure',
@@ -64,16 +1448,17 @@ describe('Claude Agent lifecycle', () => {
         bindingGeneration: 1,
       }
       const steerId = randomUUID(),
-        carrier = planEnvelope('Exact plan carrier')
+        carrier = {
+          version: 'pact-collaboration-envelope-v5',
+          answer: 'Old carrier',
+          result: { plan: 'Untrusted old plan' },
+        }
       const overflow = Promise.withResolvers<void>(),
         deliverCarrier = Promise.withResolvers<void>()
       const rootPrompt = Promise.withResolvers<void>()
       const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
       const failure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
       const consumption = vi.fn<(inputId: string) => void>()
-      const persistCarrier = vi.fn<NonNullable<AgentRunInput['recordCollaborationCarrier']>>(() => {
-        if (carrierFails) throw new Error('The final-proof working reservation is unavailable.')
-      })
       const prompts: SDKUserMessage[] = []
       let reachedEof = false,
         inputDrain: Promise<void> | undefined
@@ -122,7 +1507,7 @@ describe('Claude Agent lifecycle', () => {
             is_error: false,
             session_id: input.nativeSessionId,
             user_message_uuid: input.runId,
-            structured_output: carrier,
+            ...(legacyStructured ? { structured_output: carrier } : {}),
             result: JSON.stringify(carrier),
           } as SDKMessage
           yield {
@@ -139,13 +1524,15 @@ describe('Claude Agent lifecycle', () => {
             is_error: false,
             session_id: input.nativeSessionId,
             user_message_uuid: steerId,
-            structured_output: carrier,
+            ...(legacyStructured ? { structured_output: carrier } : {}),
             result: JSON.stringify(carrier),
           } as SDKMessage
           reachedEof = true
         })()
         return {
           [Symbol.asyncIterator]: () => output,
+          initializationResult: vi.fn(async () => ({ current_permission_mode: 'plan' })),
+          setPermissionMode: vi.fn(async () => undefined),
           cancelAsyncMessage: vi.fn(async () => false),
           interrupt: vi.fn(async () => ({ cancelled: [], still_queued: [] })),
           close: vi.fn(),
@@ -163,7 +1550,6 @@ describe('Claude Agent lifecycle', () => {
             ...input,
             recordNativeEvidence: evidence,
             recordOutputFailure: failure,
-            recordCollaborationCarrier: persistCarrier,
           },
           new AbortController().signal,
         ))
@@ -195,7 +1581,6 @@ describe('Claude Agent lifecycle', () => {
         expect(await outcome).toMatchObject({ kind: 'response_too_large' })
         expect(failure).toHaveBeenCalledTimes(1)
         deliverCarrier.resolve()
-        await vi.waitFor(() => expect(persistCarrier).toHaveBeenCalled())
         await vi.waitFor(() =>
           expect({
             consumedIds: consumption.mock.calls.map(([id]) => id),
@@ -289,76 +1674,143 @@ describe('Claude Agent lifecycle', () => {
     },
   )
 
-  it.each([true, false])(
-    'keeps the complete native carrier private with valid submission=%s and enforces the readonly source-reader route',
-    async (valid) => {
-      const input = planRunInput('claude'),
-        source = planEnvelope('Detailed plan\n'.repeat(5000)),
-        carrier = valid ? source : { ...source, result: { ...source.result, submission: 'wrong' } },
-        record = vi.fn<NonNullable<AgentRunInput['recordCollaborationCarrier']>>(),
-        query = vi.fn(
-          fakeQuery([
-            {
-              type: 'result',
-              subtype: 'success',
-              is_error: false,
-              session_id: 'claude-envelope',
-              user_message_uuid: input.runId,
-              result: JSON.stringify(carrier),
-              structured_output: carrier,
-            } as SDKMessage,
-          ]),
-        ),
-        adapter = new ClaudeAgentAdapter('/fake/claude', {
-          query: query as never,
-          getSessionInfo: vi.fn() as never,
-        }),
-        events: import('@pact/contracts').NormalizedAgentEvent[] = []
-      try {
-        for await (const event of adapter.run(
+  it('keeps native prose literal and refuses legacy structured output as workflow authority', async () => {
+    const input = planRunInput('claude')
+    const text = JSON.stringify({
+      version: 'pact-collaboration-envelope-v5',
+      answer: 'Literal prose',
+      result: { plan: 'Not a native plan' },
+    })
+    const record = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlan']>>()
+    const query = vi.fn(
+      fakeQuery([
+        {
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          session_id: 'claude-native-plan',
+          user_message_uuid: input.runId,
+          result: text,
+          structured_output: { plan: 'Untrusted plan' },
+        } as SDKMessage,
+      ]),
+    )
+    const adapter = new ClaudeAgentAdapter('/fake/claude', {
+      query: query as never,
+      getSessionInfo: vi.fn() as never,
+    })
+    const events: import('@pact/contracts').NormalizedAgentEvent[] = []
+    try {
+      for await (const event of adapter.run(
+        {
+          ...input,
+          nativeSessionId: 'claude-native-plan',
+          recordWorkflowPlan: record,
+          readCollaborationSourcePart: () => ({
+            source: 'document',
+            offset: 0,
+            text: 'Complete source',
+            nextOffset: null,
+          }),
+        },
+        new AbortController().signal,
+      ))
+        events.push(event)
+      expect(record).not.toHaveBeenCalled()
+      expect(
+        events.filter((event) => event.type === 'text.completed').map((event) => event.text),
+      ).toEqual([text])
+      expect(events.filter((event) => event.type === 'collaboration.plan')).toEqual([])
+      const options = query.mock.calls[0]![0].options!
+      const server = Object.keys(options.mcpServers!)[0]!
+      expect(options.allowedTools).toContain(`mcp__${server}__read_collaboration_source`)
+      expect(options.allowedTools).not.toContain(`mcp__${server}__publish_collaboration_result`)
+      expect(options.allowedTools).not.toContain(`mcp__${server}__request_peer_assistance`)
+      expect(options.permissionMode).toBe('plan')
+      expect(options.canUseTool).toBeTypeOf('function')
+      expect(options.outputFormat).toBeUndefined()
+      expect(query).toHaveBeenCalledOnce()
+    } finally {
+      await adapter.dispose()
+    }
+  })
+  it.each(['default', 'plan'] as const)(
+    'confirms native planning before dispatch when initialized in %s',
+    async (mode) => {
+      const input = planRunInput('claude')
+      const received: SDKUserMessage[] = []
+      const acknowledge = Promise.withResolvers<void>()
+      const setPermissionMode = vi.fn<(mode: string) => Promise<void>>(() => acknowledge.promise)
+      const query = fakeQuery(
+        [
           {
-            ...input,
-            nativeSessionId: 'claude-envelope',
-            recordCollaborationCarrier: record,
-            readCollaborationSourcePart: () => ({
-              source: 'document',
-              offset: 0,
-              text: 'Complete source',
-              nextOffset: null,
-            }),
-          },
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            session_id: 'plan-mode',
+            user_message_uuid: input.runId,
+            result: 'Planning complete.',
+          } as SDKMessage,
+        ],
+        {
+          initializationResult: async () => ({ current_permission_mode: mode }),
+          setPermissionMode,
+          onInput: (message) => received.push(message),
+        },
+      )
+      const adapter = new ClaudeAgentAdapter('/fake/claude', {
+        query,
+        getSessionInfo: vi.fn() as never,
+      })
+      const running = (async () => {
+        for await (const event of adapter.run(
+          { ...input, nativeSessionId: 'plan-mode', permissionMode: 'full' },
           new AbortController().signal,
-        ))
-          events.push(event)
-        expect(record).toHaveBeenCalledOnce()
-        expect(record).toHaveBeenCalledWith(carrier)
-        expect(
-          events.filter((event) => event.type === 'text.completed').map((event) => event.text),
-        ).toEqual([source.answer])
-        expect(
-          events.filter(
-            (event) =>
-              event.type === (valid ? 'collaboration.result' : 'collaboration.result_incomplete'),
+        )) {
+          void event
+        }
+      })()
+      try {
+        await vi.waitFor(() =>
+          expect(mode === 'default' ? setPermissionMode.mock.calls.length : received.length).toBe(
+            1,
           ),
-        ).toHaveLength(1)
-        const submitted = events.find((event) => event.type === 'collaboration.result')
-        expect(submitted?.result.plan).toBe(valid ? source.result.plan : undefined)
-        const options = query.mock.calls[0]![0].options!,
-          server = Object.keys(options.mcpServers!)[0]!
-        expect(options.allowedTools).toContain(`mcp__${server}__read_collaboration_source`)
-        expect(options.allowedTools).not.toContain(`mcp__${server}__publish_collaboration_result`)
-        expect(options.allowedTools).not.toContain(`mcp__${server}__request_peer_assistance`)
-        expect(options.canUseTool).toBeTypeOf('function')
-        const instructions = JSON.stringify(options.systemPrompt)
-        expect(instructions).toContain('source=required_inputs')
-        expect(instructions).toContain('$body')
-        expect(instructions).not.toContain('If the user body is directly present')
-        expect(query).toHaveBeenCalledOnce()
+        )
+        expect(received).toHaveLength(mode === 'default' ? 0 : 1)
+        expect(setPermissionMode.mock.calls).toEqual(mode === 'default' ? [['plan']] : [])
+        acknowledge.resolve()
+        await running
+        expect(received.map((message) => message.uuid)).toEqual([input.runId])
       } finally {
+        acknowledge.resolve()
         await adapter.dispose()
+        await running
       }
     },
   )
+  it('refuses an unknown native planning mode before exposing the user input', async () => {
+    const input = planRunInput('claude'),
+      received = vi.fn<(message: SDKUserMessage) => void>()
+    const query = fakeQuery([], {
+      initializationResult: async () => ({ current_permission_mode: 'unrecognized' }),
+      onInput: received,
+    })
+    const adapter = new ClaudeAgentAdapter('/fake/claude', {
+      query,
+      getSessionInfo: vi.fn() as never,
+    })
+    try {
+      const run = (async () => {
+        for await (const event of adapter.run(input, new AbortController().signal)) {
+          void event
+        }
+      })()
+      await expect(run).rejects.toMatchObject({ kind: 'runtime_incompatible' })
+      expect(received).not.toHaveBeenCalled()
+    } finally {
+      await adapter.dispose()
+    }
+  })
   it('allows only the registered internal title publisher without broadening native tool permissions', async () => {
     const query = vi.fn(
       fakeQuery([
@@ -734,6 +2186,99 @@ describe('Claude Agent lifecycle', () => {
       await f.dispose()
     }
   })
+
+  it.each(['completed-root', 'unfinished-hook'] as const)(
+    'does not treat an actor exit error as a complete background drain: %s',
+    async (mode) => {
+      const tail =
+        mode === 'unfinished-hook'
+          ? [
+              {
+                type: 'system',
+                subtype: 'hook_started',
+                session_id: runInput().nativeSessionId,
+                hook_id: 'unfinished',
+              } as SDKMessage,
+            ]
+          : []
+      const f = cancellationFixture(undefined, {}, undefined, false, tail)
+      try {
+        await f.ready()
+        f.controller.abort()
+        await f.outcome
+        f.child.emit('close', 1, null)
+        f.finishResult({
+          done: false,
+          value: {
+            type: 'result',
+            subtype: mode === 'completed-root' ? 'success' : 'error_during_execution',
+            is_error: mode !== 'completed-root',
+            ...(mode === 'unfinished-hook'
+              ? { terminal_reason: 'aborted_tools', errors: ['Interrupted'] }
+              : { result: 'Completed' }),
+            session_id: runInput().nativeSessionId,
+            user_message_uuid: runInput().runId,
+          } as SDKMessage,
+        })
+        await vi.waitFor(() =>
+          expect(f.adapter.diagnostics()).toEqual({ activeQueries: 0, activeSessions: 0 }),
+        )
+        expect(f.adapter.hasActiveBackgroundWork()).toBe(true)
+        expect(f.report).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'unknown' }))
+      } finally {
+        await f.dispose()
+      }
+    },
+  )
+
+  it('does not confuse a post-interruption observation failure with the SDK actor-exit error', async () => {
+    const changed = vi
+      .fn<NonNullable<AgentRunInput['backgroundWorkChanged']>>()
+      .mockImplementationOnce(() => {})
+      .mockImplementationOnce(() => {
+        throw new Error('Controlled work projection failure')
+      })
+    const f = cancellationFixture(undefined, { backgroundWorkChanged: changed }, undefined, false, [
+      {
+        type: 'system',
+        subtype: 'hook_started',
+        session_id: runInput().nativeSessionId,
+        hook_id: 'work',
+      } as SDKMessage,
+      {
+        type: 'system',
+        subtype: 'hook_response',
+        session_id: runInput().nativeSessionId,
+        hook_id: 'work',
+      } as SDKMessage,
+    ])
+    try {
+      await f.ready()
+      f.controller.abort()
+      await f.outcome
+      f.finishResult({
+        done: false,
+        value: {
+          type: 'result',
+          subtype: 'error_during_execution',
+          is_error: true,
+          terminal_reason: 'aborted_tools',
+          errors: ['Interrupted'],
+          session_id: runInput().nativeSessionId,
+          user_message_uuid: runInput().runId,
+        } as SDKMessage,
+      })
+      await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(2))
+      f.child.emit('close', 1, null)
+      await vi.waitFor(() =>
+        expect(f.adapter.diagnostics()).toEqual({ activeQueries: 0, activeSessions: 0 }),
+      )
+      expect(f.report).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'unknown' }))
+      expect(f.adapter.hasActiveBackgroundWork()).toBe(true)
+    } finally {
+      await f.dispose()
+    }
+  })
   it.each(['reject', 'deadline'] as const)(
     'does not retry or fabricate an ending after interruption %s',
     async (fault) => {
@@ -883,34 +2428,14 @@ describe('Claude Agent lifecycle', () => {
   it.each(['user', 'tool', 'changed-hash'] as const)(
     'does not unlock a cold binding after additional native work: %s',
     async (fault) => {
-      const f = bootstrapFixture()
+      const f = await bootstrapFixture()
       try {
         await f.adapter.rebuildNativeContext(
           rebuildInput(),
           rebuildSource(),
           new AbortController().signal,
         )
-        const original = f.getSessionMessages.getMockImplementation()!
-        if (fault !== 'changed-hash')
-          f.getSessionMessages.mockImplementation(
-            async () =>
-              [
-                ...(await original()),
-                {
-                  type: fault === 'user' ? 'user' : 'assistant',
-                  uuid: 'later-work',
-                  session_id: rebuildInput().nativeSessionId,
-                  parent_tool_use_id: null,
-                  message: {
-                    role: fault === 'user' ? 'user' : 'assistant',
-                    content:
-                      fault === 'user'
-                        ? 'Later request'
-                        : [{ type: 'tool_use', name: 'Bash', input: { command: 'echo changed' } }],
-                  },
-                },
-              ] as never,
-          )
+        if (fault !== 'changed-hash') await f.appendNativeWork(fault)
         const cold = f.cold()
         try {
           const input = initializedInput()
@@ -963,17 +2488,18 @@ describe('Claude Agent lifecycle', () => {
       await expect(
         adapter.probeNativeStatus(input, new AbortController().signal),
       ).resolves.toMatchObject({ kind: 'ended', outcome: 'completed' })
-      expect(info).toHaveBeenCalledOnce()
+      expect(info).not.toHaveBeenCalled()
       expect(read).not.toHaveBeenCalled()
       await expect(
         adapter.probeNativeStatus({ ...input, executorId: 'other' }, new AbortController().signal),
       ).resolves.toMatchObject({ kind: 'no_evidence' })
-      info.mockResolvedValue(undefined as never)
+      expect(await readFile(source.path, 'utf8')).toBe(source.original)
+      await rm(source.path)
       await expect(
         adapter.probeNativeStatus(input, new AbortController().signal),
       ).resolves.toMatchObject({ kind: 'no_evidence' })
       expect(query).not.toHaveBeenCalled()
-      expect(await readFile(source.path, 'utf8')).toBe(source.original)
+      await expect(readFile(source.path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
       await adapter.dispose()
       await source.dispose()
@@ -1079,42 +2605,41 @@ describe('Claude Agent lifecycle', () => {
   it.each(['unreadable', 'duplicate', 'oversized'] as const)(
     'retains known Claude termination when response readback is %s',
     async (fault) => {
+      const source = await savedClaudeAnswerFixture()
       const identity = {
         sessionId: 'session-1',
         agentId: 'claude' as const,
         runId: runInput().runId,
         requestId: runInput().runId,
-        nativeSessionId: 'claude-session-1',
+        nativeSessionId: source.nativeSessionId,
         nativeTurnId: runInput().runId,
         bindingGeneration: 1,
         executorId: 'executor-1',
       }
       const query = vi.fn(),
         read = vi.fn(async () => {
-          if (fault === 'unreadable') throw new Error('Read unavailable')
-          const user = {
-            type: 'user',
-            uuid: runInput().runId,
-            session_id: 'claude-session-1',
-            message: { role: 'user', content: 'Original' },
-            parent_tool_use_id: null,
-          }
-          return fault === 'duplicate'
-            ? [user, user]
-            : [
-                user,
-                {
-                  type: 'assistant',
-                  uuid: 'answer',
-                  session_id: 'claude-session-1',
-                  message: {
-                    role: 'assistant',
-                    content: [{ type: 'text', text: 'x'.repeat(8 * 1024 * 1024 + 1) }],
-                  },
-                  parent_tool_use_id: null,
-                },
-              ]
+          throw new Error('No unbounded SDK transcript fallback is allowed.')
         })
+      const original =
+        fault === 'unreadable'
+          ? 'Invalid JSON\n'
+          : fault === 'duplicate'
+            ? source.original + source.original
+            : source.original +
+              JSON.stringify({
+                type: 'assistant',
+                uuid: randomUUID(),
+                parentUuid: runInput().runId,
+                sessionId: source.nativeSessionId,
+                cwd: source.cwd,
+                timestamp: new Date().toISOString(),
+                message: {
+                  role: 'assistant',
+                  content: [{ type: 'text', text: 'x'.repeat(8 * 1024 * 1024 + 1) }],
+                },
+              }) +
+              '\n'
+      await writeFile(source.path, original)
       const adapter = new ClaudeAgentAdapter('/fake/claude', {
         query: query as never,
         getSessionInfo: vi.fn(async () => ({ sessionId: 'claude-session-1' })) as never,
@@ -1124,7 +2649,7 @@ describe('Claude Agent lifecycle', () => {
         const result = await adapter.probeNativeStatus(
           {
             ...identity,
-            cwd: '/project',
+            cwd: source.cwd,
             model: null,
             effort: null,
             confirmedTerminal: {
@@ -1139,14 +2664,17 @@ describe('Claude Agent lifecycle', () => {
         expect(result).toMatchObject({ kind: 'ended', outcome: 'completed' })
         expect('output' in result).toBe(false)
         expect(query).not.toHaveBeenCalled()
+        expect(read).not.toHaveBeenCalled()
+        expect(await readFile(source.path, 'utf8')).toBe(original)
       } finally {
         await adapter.dispose()
+        await source.dispose()
       }
     },
   )
 
   it('settles naturally ended startup work after Auto refusal without declaring initialized history', async () => {
-    const f = bootstrapFixture('permission-refused')
+    const f = await bootstrapFixture('permission-refused')
     const report = vi.fn<NonNullable<AgentNativeContextRebuildInput['reportNativeWork']>>()
     try {
       await expect(
@@ -1174,7 +2702,7 @@ describe('Claude Agent lifecycle', () => {
   })
 
   it('does not declare known unfinished startup Hooks settled from CLI exit alone', async () => {
-    const f = bootstrapFixture('open-hook')
+    const f = await bootstrapFixture('open-hook')
     const report = vi.fn<NonNullable<AgentNativeContextRebuildInput['reportNativeWork']>>()
     try {
       await expect(
@@ -1191,7 +2719,7 @@ describe('Claude Agent lifecycle', () => {
   })
 
   it('records natural initialization settlement independently of later history readback failure', async () => {
-    const f = bootstrapFixture('changed')
+    const f = await bootstrapFixture('changed')
     const report = vi.fn<NonNullable<AgentNativeContextRebuildInput['reportNativeWork']>>()
     const dispatched = vi.fn<
       NonNullable<AgentNativeContextRebuildInput['onNativeCreationDispatched']>
@@ -1303,7 +2831,7 @@ describe('Claude Agent lifecycle', () => {
   })
 
   it('rebuilds using false-only input, complete readback and actual natural child exit', async () => {
-    const f = bootstrapFixture()
+    const f = await bootstrapFixture()
     try {
       await expect(
         f.adapter.rebuildNativeContext(
@@ -1341,7 +2869,7 @@ describe('Claude Agent lifecycle', () => {
   it.each(['missing', 'changed', 'duplicate'] as const)(
     'rejects %s historical seed readback without creating another Session',
     async (fault) => {
-      const f = bootstrapFixture(fault)
+      const f = await bootstrapFixture(fault)
       try {
         await expect(
           f.adapter.rebuildNativeContext(
@@ -1460,6 +2988,555 @@ describe('Claude Agent lifecycle', () => {
         expect(report.mock.calls.map(([value]) => value.state)).not.toContain('settled')
         expect(report).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'unknown' }))
       } finally {
+        await adapter.dispose()
+      }
+    },
+  )
+
+  it.each([
+    'terminal-seal',
+    'earlier-body',
+    'foreign-request',
+    'unconfirmed-identity',
+    'unobserved-work',
+  ] as const)(
+    'keeps background report attribution and native drain separate from root body failure: %s',
+    async (mode) => {
+      const input = { ...runInput(), bindingGeneration: 7 }
+      const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
+      const outputFailure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
+      const report = vi.fn<NonNullable<AgentRunInput['recordBackgroundReport']>>(async () => {})
+      const unavailable = vi.fn<NonNullable<AgentRunInput['recordBackgroundReportUnavailable']>>()
+      const effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+      const earlier = mode === 'earlier-body' || mode === 'unconfirmed-identity'
+      const assistant = (id: string, text: string, echo = false): SDKMessage =>
+        ({
+          type: 'assistant',
+          uuid: randomUUID(),
+          session_id: input.nativeSessionId,
+          parent_tool_use_id: null,
+          ...(echo ? { user_message_uuid: input.runId } : {}),
+          message: { id, model: 'fixture', content: [{ type: 'text', text }] },
+        }) as SDKMessage
+      const messages: SDKMessage[] = []
+      if (mode !== 'unobserved-work')
+        messages.push({
+          type: 'system',
+          subtype: 'background_tasks_changed',
+          session_id: input.nativeSessionId,
+          tasks: [{ task_id: 'owned-task', ambient: false }],
+        } as SDKMessage)
+      for (const event of [
+        { type: 'message_start', message: { id: 'root-api', model: 'fixture' } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: 'Partial root' },
+        },
+        ...(earlier ? [{ type: 'content_block_stop', index: 0 }] : []),
+      ])
+        messages.push({
+          type: 'stream_event',
+          uuid: randomUUID(),
+          session_id: input.nativeSessionId,
+          user_message_uuid: input.runId,
+          parent_tool_use_id: null,
+          event,
+        } as SDKMessage)
+      if (earlier) messages.push(assistant('unprojected-root-api', 'Unprojected root', true))
+      if (mode === 'unconfirmed-identity')
+        messages.push(assistant('x'.repeat(513), 'Unconfirmed root item', true))
+      messages.push({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        session_id: input.nativeSessionId,
+        user_message_uuid: input.runId,
+        result: 'Unsealed root body',
+      } as SDKMessage)
+      messages.push(assistant('root-api', 'Replayed root'))
+      if (earlier) messages.push(assistant('unprojected-root-api', 'Replayed unprojected root'))
+      if (mode === 'foreign-request')
+        messages.push({
+          type: 'user',
+          uuid: randomUUID(),
+          user_message_uuid: randomUUID(),
+          session_id: input.nativeSessionId,
+          parent_tool_use_id: null,
+          message: { role: 'user', content: 'A different explicit request' },
+        } as SDKMessage)
+      messages.push(assistant('background-api', 'Complete independently attributed update'), {
+        type: 'system',
+        uuid: randomUUID(),
+        subtype: 'background_tasks_changed',
+        session_id: input.nativeSessionId,
+        tasks: [],
+      } as SDKMessage)
+      const adapter = new ClaudeAgentAdapter('/fake/claude', {
+        getSessionInfo: vi.fn() as never,
+        query: fakeQuery(messages),
+      })
+      const events: string[] = []
+      try {
+        const outcome = (async () => {
+          for await (const event of adapter.run(
+            {
+              ...input,
+              recordNativeEvidence: evidence,
+              recordOutputFailure: outputFailure,
+              recordBackgroundReport: report,
+              recordBackgroundReportUnavailable: unavailable,
+              reportNativeEffects: effects,
+            },
+            new AbortController().signal,
+          ))
+            events.push(event.type)
+        })()
+        await expect(outcome).rejects.toMatchObject({
+          kind: earlier ? 'unknown_delivery' : 'protocol_error',
+        })
+        await vi.waitFor(() =>
+          expect(adapter.diagnostics()).toEqual({ activeQueries: 0, activeSessions: 0 }),
+        )
+        expect(outputFailure).toHaveBeenCalledTimes(1)
+        expect(outputFailure).toHaveBeenCalledWith(
+          expect.objectContaining({ kind: 'protocol_error' }),
+        )
+        expect(events).not.toContain('turn.completed')
+        expect(events).not.toContain('text.completed')
+        expect(evidence).toHaveBeenCalledWith(
+          expect.objectContaining({ kind: 'ended', outcome: 'completed' }),
+        )
+        const reportable = mode === 'terminal-seal' || mode === 'earlier-body'
+        expect(report).toHaveBeenCalledTimes(Number(reportable))
+        const expectedReport = {
+          agentId: 'claude',
+          runId: input.runId,
+          nativeSessionId: input.nativeSessionId,
+          nativeTurnId: input.runId,
+          bindingGeneration: 7,
+          executorId: adapter.executorId,
+          frameId: expect.any(String),
+          nativeMessageId: 'background-api',
+          text: 'Complete independently attributed update',
+        }
+        expect(report.mock.calls).toEqual(reportable ? [[expectedReport]] : [])
+        expect(unavailable).not.toHaveBeenCalled()
+        expect(effects).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'settled' }))
+        expect(adapter.hasActiveBackgroundWork(input.runId)).toBe(false)
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  )
+
+  it('hands off a large root before admitting a report under the same Query budget and retains it through persistence', async () => {
+    const input = runInput(),
+      rootText = 'r'.repeat(8 * 1024 * 1024)
+    const reportText = 'b'.repeat(8 * 1024 * 1024)
+    const rootStored = Promise.withResolvers<void>(),
+      reportStored = Promise.withResolvers<void>()
+    const reportEntered = Promise.withResolvers<void>(),
+      allowEof = Promise.withResolvers<void>()
+    const effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+    const unavailable = vi.fn<NonNullable<AgentRunInput['recordBackgroundReportUnavailable']>>()
+    const waitForRootOutput = vi.fn(() => rootStored.promise)
+    let readReport = false,
+      reportDrained = false,
+      completedLength = 0
+    const before = nativeWorkingMemoryDiagnostics().chargedBytes
+    const query = ((request: { prompt: AsyncIterable<SDKUserMessage> }) => ({
+      async *[Symbol.asyncIterator]() {
+        await request.prompt[Symbol.asyncIterator]().next()
+        yield {
+          type: 'system',
+          subtype: 'task_started',
+          session_id: input.nativeSessionId,
+          task_id: 'task',
+        } as SDKMessage
+        yield {
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          session_id: input.nativeSessionId,
+          user_message_uuid: input.runId,
+          result: rootText,
+        } as SDKMessage
+        readReport = true
+        yield {
+          type: 'assistant',
+          uuid: randomUUID(),
+          session_id: input.nativeSessionId,
+          parent_tool_use_id: null,
+          message: {
+            id: 'large-report',
+            model: 'fixture',
+            content: [
+              { type: 'text', text: reportText.slice(0, reportText.length / 2) },
+              { type: 'text', text: reportText.slice(reportText.length / 2) },
+            ],
+          },
+        } as SDKMessage
+        reportDrained = true
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          session_id: input.nativeSessionId,
+          task_id: 'task',
+        } as SDKMessage
+        await allowEof.promise
+      },
+      initializationResult: vi.fn(async () => ({ current_permission_mode: 'default' })),
+      setPermissionMode: vi.fn(async () => {}),
+      close: vi.fn(),
+      return: vi.fn(async () => ({ done: true, value: undefined })),
+    })) as unknown as typeof sdkQuery
+    const adapter = new ClaudeAgentAdapter('/fake/claude', {
+      query,
+      getSessionInfo: vi.fn() as never,
+    })
+    const owners = new Set<NativeWorkingMemory>()
+    // oxlint-disable-next-line typescript/unbound-method -- Delegate every observed reservation with its original allocator as this.
+    const reserve = NativeWorkingMemory.prototype.reserve
+    const reservationProbe = vi
+      .spyOn(NativeWorkingMemory.prototype, 'reserve')
+      .mockImplementation(function (this: NativeWorkingMemory, bytes) {
+        owners.add(this)
+        return reserve.call(this, bytes)
+      })
+    const held = () => [...owners].reduce((total, owner) => total + owner.bytes, 0)
+    const report = vi.fn<NonNullable<AgentRunInput['recordBackgroundReport']>>(async (value) => {
+      expect(value.text.length).toBe(reportText.length)
+      expect(createHash('sha256').update(value.text).digest('hex')).toBe(
+        createHash('sha256').update(reportText).digest('hex'),
+      )
+      reportEntered.resolve()
+      await reportStored.promise
+    })
+    try {
+      for await (const event of adapter.run(
+        {
+          ...input,
+          waitForRootOutput,
+          recordBackgroundReport: report,
+          recordBackgroundReportUnavailable: unavailable,
+          reportNativeEffects: effects,
+        },
+        new AbortController().signal,
+      ))
+        if (event.type === 'text.completed') completedLength = event.text.length
+      await vi.waitFor(() => expect(waitForRootOutput).toHaveBeenCalledOnce())
+      expect(completedLength).toBe(rootText.length)
+      expect(readReport).toBe(false)
+      expect(held()).toBeGreaterThanOrEqual(rootText.length * 12)
+      const rootPendingBytes = held()
+      const queryOwner = [...owners].find((owner) => owner.bytes >= rootText.length * 12)!
+      rootStored.resolve()
+      await reportEntered.promise
+      expect(readReport).toBe(true)
+      expect(reportDrained).toBe(false)
+      expect(queryOwner.bytes).toBeGreaterThanOrEqual(reportText.length * 12)
+      expect(held()).toBeLessThanOrEqual(NATIVE_OWNER_WORKING_BYTES)
+      expect(queryOwner.diagnostics().highWaterBytes).toBeLessThanOrEqual(
+        NATIVE_OWNER_WORKING_BYTES,
+      )
+      const reportPendingBytes = held()
+      reportStored.resolve()
+      await vi.waitFor(() => expect(reportDrained).toBe(true))
+      expect(held()).toBeLessThan(1024 * 1024)
+      expect(effects.mock.calls.some(([value]) => value.state === 'settled')).toBe(false)
+      expect(adapter.diagnostics()).toEqual({ activeQueries: 1, activeSessions: 1 })
+      console.info(
+        '[pact-claude-query-body-budget]',
+        JSON.stringify({
+          unit: 'native-working-reservations-v1',
+          ownerLimitBytes: NATIVE_OWNER_WORKING_BYTES,
+          rootPendingBytes,
+          reportPendingBytes,
+          afterPersistenceBytes: held(),
+          queryHighWaterBytes: queryOwner.diagnostics().highWaterBytes,
+        }),
+      )
+      allowEof.resolve()
+      await vi.waitFor(() =>
+        expect(effects).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'settled' })),
+      )
+      expect(unavailable).not.toHaveBeenCalled()
+    } finally {
+      rootStored.resolve()
+      reportStored.resolve()
+      allowEof.resolve()
+      await adapter.dispose()
+      reservationProbe.mockRestore()
+    }
+    expect(nativeWorkingMemoryDiagnostics().chargedBytes).toBe(before)
+  })
+
+  it.each(['capacity', 'live-input', 'invalid-text'] as const)(
+    'retains only the attributable unavailable report on local materialization failure: %s',
+    async (fault) => {
+      const base = runInput()
+      const input = {
+        ...base,
+        promptEnvelope: {
+          ...base.promptEnvelope,
+          message: {
+            ...base.promptEnvelope.message,
+            content:
+              fault === 'live-input'
+                ? 'q'.repeat(4 * 1024 * 1024)
+                : base.promptEnvelope.message.content,
+          },
+        },
+      }
+      const failedFrameId = randomUUID()
+      const report = vi.fn<NonNullable<AgentRunInput['recordBackgroundReport']>>(async () => {})
+      const unavailable = vi.fn<NonNullable<AgentRunInput['recordBackgroundReportUnavailable']>>()
+      const outputFailure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
+      const effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+      const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
+      const adapter = new ClaudeAgentAdapter('/fake/claude', {
+        getSessionInfo: vi.fn() as never,
+        query: fakeQuery([
+          {
+            type: 'system',
+            subtype: 'task_started',
+            session_id: input.nativeSessionId,
+            task_id: 'task',
+          } as SDKMessage,
+          {
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            session_id: input.nativeSessionId,
+            user_message_uuid: input.runId,
+            result: 'Complete root',
+          } as SDKMessage,
+          {
+            type: 'assistant',
+            uuid: failedFrameId,
+            session_id: input.nativeSessionId,
+            parent_tool_use_id: null,
+            message: {
+              id: 'unavailable-report',
+              model: 'fixture',
+              content: [
+                {
+                  type: 'text',
+                  text:
+                    fault === 'invalid-text'
+                      ? 42
+                      : 'x'.repeat((fault === 'capacity' ? 12 : 8) * 1024 * 1024),
+                },
+              ],
+            },
+          } as unknown as SDKMessage,
+          {
+            type: 'assistant',
+            uuid: randomUUID(),
+            session_id: input.nativeSessionId,
+            parent_tool_use_id: null,
+            message: {
+              id: 'next-report',
+              model: 'fixture',
+              content: [{ type: 'text', text: 'A later valid report' }],
+            },
+          } as SDKMessage,
+          {
+            type: 'system',
+            subtype: 'task_notification',
+            session_id: input.nativeSessionId,
+            task_id: 'task',
+          } as SDKMessage,
+        ]),
+      })
+      try {
+        const events: string[] = []
+        for await (const event of adapter.run(
+          {
+            ...input,
+            recordBackgroundReport: report,
+            recordBackgroundReportUnavailable: unavailable,
+            recordOutputFailure: outputFailure,
+            reportNativeEffects: effects,
+            recordNativeEvidence: evidence,
+          },
+          new AbortController().signal,
+        ))
+          events.push(event.type)
+        await vi.waitFor(() =>
+          expect(adapter.diagnostics()).toEqual({ activeQueries: 0, activeSessions: 0 }),
+        )
+        expect(events).toContain('turn.completed')
+        expect(outputFailure).not.toHaveBeenCalled()
+        expect(unavailable.mock.calls).toEqual([
+          [
+            {
+              agentId: 'claude',
+              runId: input.runId,
+              nativeSessionId: input.nativeSessionId,
+              nativeTurnId: input.runId,
+              bindingGeneration: 1,
+              executorId: adapter.executorId,
+              frameId: failedFrameId,
+              nativeMessageId: 'unavailable-report',
+            },
+          ],
+        ])
+        expect(report).toHaveBeenCalledTimes(1)
+        expect(report).toHaveBeenCalledWith(
+          expect.objectContaining({ nativeMessageId: 'next-report', text: 'A later valid report' }),
+        )
+        expect(evidence).toHaveBeenCalledWith(
+          expect.objectContaining({
+            kind: 'ended',
+            outcome: 'completed',
+            output: expect.objectContaining({ text: 'Complete root', completeness: 'complete' }),
+          }),
+        )
+        expect(effects).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'settled' }))
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  )
+
+  it.each(
+    (['edge', 'level'] as const).flatMap((kind) =>
+      (['items', 'bytes'] as const).flatMap((budget) =>
+        [false, true].map((overflow) => ({ kind, budget, overflow })),
+      ),
+    ),
+  )(
+    'shares the Hook and task observation budget: $kind $budget overflow=$overflow',
+    async ({ kind, budget, overflow }) => {
+      const input = runInput(),
+        effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+      const hooks = Array.from(
+        { length: budget === 'items' ? 32 : 11 },
+        (_, index) => `h${index}-${budget === 'bytes' ? '界'.repeat(1000) : 'hook'}`,
+      )
+      const tasks = Array.from(
+        { length: (budget === 'items' ? 32 : 10) + Number(overflow) },
+        (_, index) => `t${index}-${budget === 'bytes' ? '界'.repeat(1000) : 'task'}`,
+      )
+      const system = (fields: object): SDKMessage =>
+        ({ type: 'system', session_id: input.nativeSessionId, ...fields }) as SDKMessage
+      const hookStarts = hooks.map((hook_id) => system({ subtype: 'hook_started', hook_id }))
+      const taskStarts = tasks.map((task_id) => system({ subtype: 'task_started', task_id }))
+      const messages =
+        kind === 'edge'
+          ? [...taskStarts, ...hookStarts]
+          : [
+              ...hookStarts,
+              system({
+                subtype: 'background_tasks_changed',
+                tasks: tasks.map((task_id) => ({ task_id })),
+              }),
+            ]
+      messages.push({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        session_id: input.nativeSessionId,
+        user_message_uuid: input.runId,
+        result: 'Root reply',
+      } as SDKMessage)
+      messages.push(...hooks.map((hook_id) => system({ subtype: 'hook_response', hook_id })))
+      messages.push(
+        ...(kind === 'edge'
+          ? tasks.map((task_id) => system({ subtype: 'task_notification', task_id }))
+          : [system({ subtype: 'background_tasks_changed', tasks: [] })]),
+      )
+      const adapter = new ClaudeAgentAdapter('/fake/claude', {
+        getSessionInfo: vi.fn() as never,
+        query: fakeQuery(messages),
+      })
+      try {
+        for await (const event of adapter.run(
+          { ...input, reportNativeEffects: effects },
+          new AbortController().signal,
+        ))
+          void event
+        await vi.waitFor(() =>
+          expect(adapter.diagnostics()).toEqual({ activeQueries: 0, activeSessions: 0 }),
+        )
+        expect(effects).toHaveBeenLastCalledWith(
+          expect.objectContaining({ state: overflow ? 'unknown' : 'settled' }),
+        )
+        expect(adapter.hasActiveBackgroundWork(input.runId)).toBe(overflow)
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  )
+
+  it.each(['edge', 'level'] as const)(
+    'does not offer an ambient task as an owned Stop target: %s',
+    async (kind) => {
+      const input = runInput(),
+        drain = Promise.withResolvers<void>()
+      const stopTask = vi.fn(async () => {})
+      const effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+      const query = ((request: { prompt: AsyncIterable<SDKUserMessage> }) => ({
+        async *[Symbol.asyncIterator]() {
+          await request.prompt[Symbol.asyncIterator]().next()
+          yield {
+            type: 'system',
+            session_id: input.nativeSessionId,
+            ...(kind === 'edge'
+              ? { subtype: 'task_started', task_id: 'ambient-task', ambient: true }
+              : {
+                  subtype: 'background_tasks_changed',
+                  tasks: [{ task_id: 'ambient-task', ambient: true }],
+                }),
+          } as SDKMessage
+          yield {
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            session_id: input.nativeSessionId,
+            user_message_uuid: input.runId,
+            result: 'Root reply',
+          } as SDKMessage
+          await drain.promise
+          yield {
+            type: 'system',
+            session_id: input.nativeSessionId,
+            ...(kind === 'edge'
+              ? { subtype: 'task_notification', task_id: 'ambient-task', ambient: true }
+              : { subtype: 'background_tasks_changed', tasks: [] }),
+          } as SDKMessage
+        },
+        initializationResult: vi.fn(async () => ({ current_permission_mode: 'default' })),
+        setPermissionMode: vi.fn(async () => {}),
+        stopTask,
+        close: vi.fn(),
+        return: vi.fn(async () => ({ done: true, value: undefined })),
+      })) as unknown as typeof sdkQuery
+      const adapter = new ClaudeAgentAdapter('/fake/claude', {
+        query,
+        getSessionInfo: vi.fn() as never,
+      })
+      try {
+        for await (const event of adapter.run(
+          { ...input, reportNativeEffects: effects },
+          new AbortController().signal,
+        ))
+          void event
+        const executor = adapter.executorId!
+        expect(adapter.backgroundWork(input.runId, executor)).toBeUndefined()
+        await expect(
+          adapter.stopBackgroundWork(input.runId, executor, new AbortController().signal),
+        ).rejects.toThrow('The original Claude background work is no longer available to stop.')
+        expect(stopTask).not.toHaveBeenCalled()
+        drain.resolve()
+        await vi.waitFor(() =>
+          expect(effects).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'settled' })),
+        )
+      } finally {
+        drain.resolve()
         await adapter.dispose()
       }
     },
@@ -1758,7 +3835,10 @@ function cancellationFixture(
   interruptFailure?: 'reject' | 'deadline',
   input: Partial<AgentRunInput> = {},
   beforePrompt?: Promise<void>,
+  naturalEof = false,
+  afterResult: SDKMessage[] = [],
 ) {
+  const effectiveInput = { ...runInput(), ...input }
   const child = Object.assign(new EventEmitter(), {
     stdin: new PassThrough(),
     stdout: new PassThrough(),
@@ -1810,18 +3890,24 @@ function cancellationFixture(
               done: false,
               value: {
                 type: 'user',
-                uuid: runInput().runId,
-                session_id: 'claude-session-1',
+                uuid: effectiveInput.runId,
+                session_id: effectiveInput.nativeSessionId,
                 parent_tool_use_id: null,
                 message: { role: 'user', content: 'accepted' },
               } as SDKMessage,
             }
           }
           if (reads === 2) return read
+          const tail = afterResult[reads - 3]
+          if (tail) return { done: false, value: tail }
+          if (naturalEof) return { done: true, value: undefined }
           throw new Error('Actor exited with code 1')
         },
       }),
       interrupt,
+      initializationResult: vi.fn(async () => ({
+        current_permission_mode: request.options?.permissionMode ?? 'default',
+      })),
       close: vi.fn(),
       return: vi.fn(async () => ({ done: true, value: undefined })),
     }
@@ -1866,6 +3952,410 @@ function cancellationFixture(
   }
 }
 
+it.each([
+  'revision_first',
+  'processed_first',
+  'failed_tool',
+  'nested_root',
+  'foreign_result',
+  'uncompleted',
+] as const)(
+  'passes raw successful Claude revision observations from the exact root (%s)',
+  async (mode) => {
+    const input = planRevisionReplyInput('claude')
+    const record = vi.fn<NonNullable<AgentRunInput['recordWorkflowInputResult']>>()
+    const f = await nativeRetentionFixture({
+      runId: input.runId,
+      sessionId: input.sessionId,
+      promptEnvelope: input.promptEnvelope,
+      recordWorkflowInputResult: record,
+    })
+    try {
+      const call = async (outcome: 'processed' | 'plan_revision_required') => {
+        const revision = outcome === 'plan_revision_required'
+        const args = { outcome }
+        const name = 'submit_input_result'
+        const result = await f.invoke(args, name)
+        expect(result.isError).not.toBe(true)
+        const parent = revision && mode === 'nested_root' ? 'nested-tool' : null
+        f.assistant(outcome, args, parent, name)
+        if (!revision || mode !== 'uncompleted')
+          await f.result(
+            outcome,
+            revision && mode === 'failed_tool',
+            parent,
+            revision && mode === 'foreign_result' ? randomUUID() : undefined,
+          )
+      }
+      if (mode === 'processed_first' || mode === 'foreign_result') {
+        await call('processed')
+        await call('plan_revision_required')
+      } else {
+        await call('plan_revision_required')
+        await call('processed')
+      }
+      await f.finish()
+      expect(record.mock.calls.map(([result]) => result.outcome)).toEqual(
+        mode === 'revision_first'
+          ? ['plan_revision_required', 'processed']
+          : mode === 'processed_first'
+            ? ['processed', 'plan_revision_required']
+            : ['processed'],
+      )
+      const ending = f.evidence.mock.calls.findLast(([event]) => event.kind === 'ended')?.[0]
+      expect(ending?.kind === 'ended' && ending.output?.inputResult?.outcome).toBe(
+        mode === 'processed_first' || mode === 'revision_first' ? 'incomplete' : 'processed',
+      )
+    } finally {
+      await f.dispose()
+    }
+  },
+)
+
+async function nativeRetentionFixture(
+  overrides: Partial<AgentRunInput> = {},
+  onEvent?: (event: import('@pact/contracts').NormalizedAgentEvent) => void,
+) {
+  const directory = await mkdtemp(join(tmpdir(), 'pact-claude-retain-'))
+  const cwd = await realpath(directory),
+    profile = join(cwd, 'profile')
+  const project = join(profile, 'projects', cwd.replace(/[^a-z0-9]/giu, '-'))
+  await mkdir(project, { recursive: true })
+  vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
+  const input = { ...planRunInput('claude'), cwd, nativeSessionId: randomUUID() }
+  const text = 'An existing complete plan.\nKeep the original owner and acceptance.'
+  const basis = {
+    version: 2,
+    sourceRunId: randomUUID(),
+    sourceMessageId: randomUUID(),
+    document: {
+      id: randomUUID(),
+      sha256: createHash('sha256').update(text).digest('hex'),
+      bytes: Buffer.byteLength(text),
+      chars: text.length,
+    },
+  }
+  const auth = input.promptEnvelope.collaborationAuthorization!
+  auth.stage = 'reply'
+  auth.inputSequence = 1
+  auth.planReference = basis
+  auth.inputProcessing = { pending: { inputId: input.promptEnvelope.message.id, inputSequence: 1 } }
+  Object.assign(input.promptEnvelope.collaboration!, {
+    stage: 'reply',
+    inputSequence: 1,
+    planVersion: 2,
+    planReference: basis,
+    inputProcessing: auth.inputProcessing,
+    authorization: auth,
+  })
+  Object.assign(input, overrides)
+  const promptId = randomUUID(),
+    path = join(profile, 'plans', 'retained.md')
+  const transcript = join(project, `${input.nativeSessionId}.jsonl`)
+  let parent: string | null = null
+  const append = async (record: Record<string, unknown>) => {
+    const uuid = typeof record.uuid === 'string' ? record.uuid : randomUUID()
+    await appendFile(
+      transcript,
+      JSON.stringify({
+        ...record,
+        uuid,
+        parentUuid: parent,
+        cwd,
+        sessionId: input.nativeSessionId,
+        timestamp: new Date().toISOString(),
+      }) + '\n',
+    )
+    parent = uuid
+  }
+  await append({
+    type: 'user',
+    uuid: input.runId,
+    promptId,
+    message: {
+      role: 'user',
+      content: 'Consider the supplementary review and retain this plan if no change is needed.',
+    },
+  })
+  await append({
+    type: 'attachment',
+    attachment: { type: 'plan_mode', isSubAgent: false, planFilePath: path },
+  })
+  const child = Object.assign(new EventEmitter(), {
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    pid: 12346,
+    killed: false,
+    exitCode: null,
+    kill: vi.fn(),
+  })
+  child.on('error', () => undefined)
+  const controller = new AbortController(),
+    ready = Promise.withResolvers<void>()
+  const messages: SDKMessage[] = []
+  let closed = false,
+    wake: (() => void) | undefined,
+    captured: Parameters<typeof sdkQuery>[0] | undefined
+  const record = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlanRetained']>>(
+    overrides.recordWorkflowPlanRetained,
+  )
+  const unavailable = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlanUnavailable']>>(
+    overrides.recordWorkflowPlanUnavailable,
+  )
+  const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>(
+    overrides.recordNativeEvidence,
+  )
+  const outputFailure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>(
+    overrides.recordOutputFailure,
+  )
+  const report = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>(
+    overrides.reportNativeEffects,
+  )
+  const query = ((request: Parameters<typeof sdkQuery>[0]) => {
+    captured = request
+    request.options!.spawnClaudeCodeProcess!({
+      command: '/fake/claude',
+      args: [],
+      env: {},
+      signal: request.options!.abortController!.signal,
+    })
+    return {
+      async *[Symbol.asyncIterator]() {
+        try {
+          const source = request.prompt as AsyncIterable<SDKUserMessage>
+          const first = await source[Symbol.asyncIterator]().next()
+          if (first.done) return
+          yield {
+            type: 'user',
+            uuid: input.runId,
+            user_message_uuid: input.runId,
+            session_id: input.nativeSessionId,
+            parent_tool_use_id: null,
+            message: { role: 'user', content: 'accepted' },
+          } as SDKMessage
+          ready.resolve()
+          for (;;) {
+            if (closed && !messages.length) break
+            const message = messages.shift()
+            if (message) yield message
+            else
+              // oxlint-disable-next-line no-await-in-loop -- One owned native stream is consumed in order.
+              await new Promise<void>((resolve) => {
+                wake = resolve
+              })
+          }
+        } finally {
+          child.emit('close', 0, null)
+        }
+      },
+      initializationResult: async () => ({
+        current_permission_mode: request.options?.permissionMode,
+      }),
+      setPermissionMode: vi.fn(async () => undefined),
+      interrupt: vi.fn(async () => undefined),
+      close: vi.fn(),
+      return: vi.fn(async () => ({ done: true, value: undefined })),
+    }
+  }) as unknown as typeof sdkQuery
+  const adapter = new ClaudeAgentAdapter('/fake/claude', {
+    query,
+    getSessionInfo: vi.fn() as never,
+    spawn: (() => child) as never,
+  })
+  const outcome = (async () => {
+    for await (const event of adapter.run(
+      {
+        ...input,
+        recordWorkflowPlanRetained: record,
+        recordWorkflowPlanUnavailable: unavailable,
+        recordNativeEvidence: evidence,
+        recordOutputFailure: outputFailure,
+        reportNativeEffects: report,
+      },
+      controller.signal,
+    ))
+      onEvent?.(event)
+  })().catch((error: unknown) => error)
+  await ready.promise
+  const options = captured!.options!
+  const serverName = Object.keys(options.mcpServers!)[0]!
+  const server = options.mcpServers![serverName]!
+  if (server.type !== 'sdk') throw Error('Expected real SDK MCP server')
+  const replies: object[] = []
+  const transport: Parameters<typeof server.instance.connect>[0] = {
+    start: async () => undefined,
+    close: async () => undefined,
+    send: async (message) => {
+      replies.push(message)
+      expect(replies.length).toBeLessThanOrEqual(128)
+    },
+  }
+  await server.instance.connect(transport)
+  let requestId = 0
+  const exchange = async (method: string, params: Record<string, unknown>) => {
+    const id = ++requestId
+    transport.onmessage?.({ jsonrpc: '2.0', id, method, params })
+    await vi.waitFor(() =>
+      expect(replies.some((reply) => Reflect.get(reply, 'id') === id)).toBe(true),
+    )
+    return Reflect.get(
+      replies.find((reply) => Reflect.get(reply, 'id') === id)!,
+      'result',
+    ) as Record<string, unknown>
+  }
+  await exchange('initialize', {
+    protocolVersion: '2025-06-18',
+    capabilities: {},
+    clientInfo: { name: 'retention-boundary', version: '1' },
+  })
+  transport.onmessage?.({ jsonrpc: '2.0', method: 'notifications/initialized' })
+  const name = `mcp__${serverName}__retain_current_plan`
+  const hook = (id: string, extra: object = {}) => ({
+    session_id: input.nativeSessionId,
+    transcript_path: transcript,
+    cwd,
+    prompt_id: promptId,
+    tool_use_id: id,
+    tool_name: name,
+    tool_input: {},
+    ...extra,
+  })
+  const push = (message: SDKMessage) => {
+    messages.push(message)
+    wake?.()
+    wake = undefined
+  }
+  const assistant = (
+    id: string,
+    args: unknown = {},
+    parentTool: string | null = null,
+    toolName = 'retain_current_plan',
+  ) =>
+    push({
+      type: 'assistant',
+      uuid: randomUUID(),
+      session_id: input.nativeSessionId,
+      parent_tool_use_id: parentTool,
+      message: {
+        id: `assistant-${id}`,
+        role: 'assistant',
+        content: [{ type: 'tool_use', id, name: `mcp__${serverName}__${toolName}`, input: args }],
+      },
+    } as SDKMessage)
+  const result = async (
+    id: string,
+    error = false,
+    parentTool: string | null = null,
+    echoedRunId?: string,
+  ) => {
+    const message = {
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: id,
+          is_error: error,
+          content: error ? 'Rejected' : 'Retention intent validated',
+        },
+      ],
+    }
+    await append({ type: 'user', message, ...(parentTool ? { isSidechain: true } : {}) })
+    push({
+      type: 'user',
+      uuid: randomUUID(),
+      session_id: input.nativeSessionId,
+      parent_tool_use_id: parentTool,
+      ...(echoedRunId ? { user_message_uuid: echoedRunId } : {}),
+      message,
+    } as SDKMessage)
+  }
+  const pre = (id: string, extra: object = {}) =>
+    options.hooks!.PreToolUse![0]!.hooks[0]!(
+      { ...hook(id, extra), hook_event_name: 'PreToolUse' },
+      id,
+      { signal: controller.signal },
+    )
+  const post = (id: string, extra: object = {}) =>
+    options.hooks!.PostToolUse![0]!.hooks[0]!(
+      { tool_response: {}, ...hook(id, extra), hook_event_name: 'PostToolUse' },
+      id,
+      { signal: controller.signal },
+    )
+  const nativeCall = (id: string, args: unknown = {}) =>
+    append({
+      type: 'assistant',
+      message: {
+        id: `native-${id}`,
+        role: 'assistant',
+        content: [{ type: 'tool_use', id, name, input: args }],
+      },
+    })
+  let resultSent = false
+  const complete = () => {
+    if (resultSent) return
+    resultSent = true
+    push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      session_id: input.nativeSessionId,
+      user_message_uuid: input.runId,
+      result: 'The existing plan remains appropriate.',
+    } as SDKMessage)
+  }
+  const end = async () => {
+    complete()
+    closed = true
+    wake?.()
+    wake = undefined
+    const completed = await outcome
+    await vi.waitFor(() => expect(adapter.hasActiveBackgroundWork(input.runId)).toBe(false))
+    return completed
+  }
+  const finish = async () => {
+    expect(await end()).toBeUndefined()
+  }
+  return {
+    input,
+    cancel: () => controller.abort(),
+    basis,
+    text,
+    path,
+    promptId,
+    append,
+    hook,
+    pre,
+    post,
+    nativeCall,
+    assistant,
+    result,
+    record,
+    unavailable,
+    evidence,
+    outputFailure,
+    report,
+    options,
+    adapter,
+    finish,
+    end,
+    complete,
+    invoke: (args: unknown = {}, toolName = 'retain_current_plan') =>
+      exchange('tools/call', { name: toolName, arguments: args }),
+    dispose: async () => {
+      controller.abort()
+      closed = true
+      wake?.()
+      wake = undefined
+      child.emit('close', 0, null)
+      await outcome
+      await server.instance.close()
+      await adapter.dispose()
+      await rm(directory, { recursive: true, force: true })
+    },
+  }
+}
+
 function fakeQuery(
   messages: SDKMessage[],
   controls: {
@@ -1883,7 +4373,11 @@ function fakeQuery(
       if (!first.done) controls.onInput?.(first.value)
       yield* messages
     },
-    initializationResult: controls.initializationResult ?? vi.fn(async () => ({})),
+    initializationResult:
+      controls.initializationResult ??
+      vi.fn(async () => ({
+        current_permission_mode: request.options?.permissionMode ?? 'default',
+      })),
     setPermissionMode: controls.setPermissionMode ?? vi.fn(async () => undefined),
     close: vi.fn(),
     return: vi.fn(async () => ({ done: true, value: undefined })),
@@ -1896,7 +4390,7 @@ function rebuildInput() {
     sessionId: 'session-1',
     nativeSessionId: '3b222d47-fd99-48b9-9b6e-c23428710e41',
     sourceHash: 'a'.repeat(64),
-    cwd: '/project',
+    cwd: resolveSourceFixturePath('/project'),
     model: null,
     effort: null,
   }
@@ -1909,7 +4403,7 @@ function initializedInput() {
     sessionId: 'session-1',
     bindingGeneration: 2,
     nativeSessionId: rebuildInput().nativeSessionId,
-    cwd: '/project',
+    cwd: resolveSourceFixturePath('/project'),
     model: null,
     effort: null,
     confirmedInitialization: {
@@ -1919,9 +4413,15 @@ function initializedInput() {
     source: rebuildSource(),
   }
 }
-function bootstrapFixture(
+async function bootstrapFixture(
   fault?: 'missing' | 'changed' | 'duplicate' | 'permission-refused' | 'open-hook',
 ) {
+  const profile = await mkdtemp(join(tmpdir(), 'pact-claude-seed-test-'))
+  bootstrapDirectories.push(profile)
+  const project = join(profile, 'projects', rebuildInput().cwd.replace(/[^a-z0-9]/giu, '-')),
+    path = join(project, rebuildInput().nativeSessionId + '.jsonl')
+  await mkdir(project, { recursive: true })
+  vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
   const prompts: SDKUserMessage[] = []
   const child = new EventEmitter()
   const query = vi.fn(
@@ -1932,12 +4432,32 @@ function bootstrapFixture(
       request.options.spawnClaudeCodeProcess({
         command: '/fake/claude',
         args: [],
-        cwd: '/project',
+        cwd: rebuildInput().cwd,
         env: {},
       })
       return {
         async *[Symbol.asyncIterator]() {
           for await (const message of request.prompt) prompts.push(message)
+          const rows =
+            fault === 'missing'
+              ? []
+              : prompts.map((message, index) => ({
+                  ...message,
+                  sessionId: rebuildInput().nativeSessionId,
+                  cwd: rebuildInput().cwd,
+                  parentUuid: index ? prompts[index - 1]!.uuid : null,
+                  timestamp: new Date().toISOString(),
+                  message: {
+                    ...message.message,
+                    content: fault === 'changed' ? 'Changed' : message.message.content,
+                  },
+                }))
+          await writeFile(
+            path,
+            (fault === 'duplicate' ? [...rows, ...rows] : rows)
+              .map((row) => JSON.stringify(row) + '\n')
+              .join(''),
+          )
           yield {
             type: 'system',
             subtype: 'init',
@@ -1998,6 +4518,32 @@ function bootstrapFixture(
     prompts,
     query,
     getSessionMessages,
+    appendNativeWork: async (kind: 'user' | 'tool') =>
+      appendFile(
+        path,
+        JSON.stringify({
+          type: kind === 'user' ? 'user' : 'assistant',
+          uuid: randomUUID(),
+          parentUuid: prompts.at(-1)!.uuid,
+          sessionId: rebuildInput().nativeSessionId,
+          cwd: rebuildInput().cwd,
+          timestamp: new Date().toISOString(),
+          message: {
+            role: kind === 'user' ? 'user' : 'assistant',
+            content:
+              kind === 'user'
+                ? 'Later request'
+                : [
+                    {
+                      type: 'tool_use',
+                      id: randomUUID(),
+                      name: 'Bash',
+                      input: { command: 'echo changed' },
+                    },
+                  ],
+          },
+        }) + '\n',
+      ),
     adapter: new ClaudeAgentAdapter('/fake/claude', dependencies),
     cold: () => new ClaudeAgentAdapter('/fake/claude', dependencies),
   }
@@ -2037,3 +4583,742 @@ async function* rebuildSource() {
     },
   }
 }
+
+it('registers the complete strict source schema on the actual SDK before native dispatch', async () => {
+  const input = runInput(),
+    identity = { runId: input.runId, grant: randomUUID() }
+  const text = 'Controlled SDK source.',
+    document = {
+      id: randomUUID(),
+      sha256: createHash('sha256').update(text).digest('hex'),
+      bytes: Buffer.byteLength(text),
+      chars: text.length,
+    }
+  const reference = { ...identity, source: 'document' as const, document, offset: 0 }
+  const read = vi.fn<NonNullable<AgentRunInput['collaborationSourceReader']>['read']>((raw) => {
+    expect(raw).toEqual(reference)
+    return {
+      submitted: 'legacy',
+      request: { ...identity, source: 'document', document, offset: 0 },
+      page: {
+        source: 'document',
+        document,
+        text,
+        offset: 0,
+        nextOffset: null,
+        binding: {
+          submitted: 'legacy',
+          callerRunId: identity.runId,
+          grantSha256: createHash('sha256').update(identity.grant).digest('hex'),
+          referenceSha256: null,
+        },
+      },
+    }
+  })
+  const f = cancellationFixture(undefined, {
+    ...input,
+    promptEnvelope: { ...input.promptEnvelope, sourceGrant: identity },
+    readCollaborationSourcePart: () => {
+      throw Error('The borrowed owner handles source requests')
+    },
+    collaborationSourceReader: {
+      identity,
+      read,
+      navigation: () => reference,
+      retire: () => undefined,
+    },
+  })
+  try {
+    await f.ready()
+    const server = Object.values(f.options().mcpServers!)[0]!
+    if (server.type !== 'sdk') throw Error('Expected the owned SDK MCP server')
+    const replies: object[] = []
+    const transport: Parameters<typeof server.instance.connect>[0] = {
+      start: async () => undefined,
+      close: async () => undefined,
+      send: async (message) => {
+        replies.push(message)
+      },
+    }
+    await server.instance.connect(transport)
+    let nextId = 0
+    const exchange = async (method: string, params: Record<string, unknown>) => {
+      const id = ++nextId
+      transport.onmessage?.({ jsonrpc: '2.0', id, method, params })
+      await vi.waitFor(() =>
+        expect(replies.some((reply) => Reflect.get(reply, 'id') === id)).toBe(true),
+      )
+      return replies.find((reply) => Reflect.get(reply, 'id') === id)!
+    }
+    await exchange('initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'source-schema-test', version: '1' },
+    })
+    transport.onmessage?.({ jsonrpc: '2.0', method: 'notifications/initialized' })
+    const listed = await exchange('tools/list', {})
+    const source = Reflect.get(listed, 'result') as {
+      tools: Array<{ name: string; inputSchema: { required: string[]; properties: object } }>
+    }
+    const schema = source.tools.find(
+      (tool) => tool.name === 'read_collaboration_source',
+    )!.inputSchema
+    expect(schema.required).toEqual(expect.arrayContaining(['runId', 'grant', 'offset']))
+    expect(schema.properties).not.toHaveProperty('sourceReference')
+    expect(JSON.stringify(listed)).toContain('anthropic/alwaysLoad')
+    const valid = await exchange('tools/call', {
+      name: 'read_collaboration_source',
+      arguments: reference,
+    })
+    expect(valid).toMatchObject({ result: { content: [{ type: 'text' }] } })
+    const extra = await exchange('tools/call', {
+      name: 'read_collaboration_source',
+      arguments: { ...reference, unexpected: true },
+    })
+    expect(extra).toMatchObject({ result: { isError: true } })
+    const nested = await exchange('tools/call', {
+      name: 'read_collaboration_source',
+      arguments: { ...identity, offset: 0, document: { ...document, unexpected: true } },
+    })
+    expect(nested).toMatchObject({ result: { isError: true } })
+    const missing = await exchange('tools/call', {
+      name: 'read_collaboration_source',
+      arguments: { ...identity, source: 'document', document },
+    })
+    expect(missing).toMatchObject({ result: { isError: true } })
+    expect(read).toHaveBeenCalledTimes(1)
+    await server.instance.close()
+  } finally {
+    await f.dispose()
+  }
+})
+
+it('encodes Claude Steer with exact legacy arguments and keeps ordinary root references', async () => {
+  const input = runInput(),
+    grant = randomUUID(),
+    rootBatch = randomUUID(),
+    nextBatch = randomUUID(),
+    steerId = randomUUID()
+  const prompts: SDKUserMessage[] = [],
+    rootPrompt = Promise.withResolvers<void>(),
+    finish = Promise.withResolvers<void>(),
+    started = Promise.withResolvers<void>()
+  const navigation = vi.fn<NonNullable<AgentRunInput['collaborationSourceReader']>['navigation']>(
+    (target, form) => {
+      if (target.batchId === nextBatch && form !== 'legacy')
+        throw Error('Prepared Batch is not reference-authorized')
+      return form === 'sourceReference'
+        ? { sourceReference: 'controlled-root-reference', offset: 0 }
+        : { ...target, runId: input.runId, grant, offset: 0 }
+    },
+  )
+  let drain: Promise<void> | undefined
+  const query = ((request: Parameters<typeof sdkQuery>[0]) => {
+    if (typeof request.prompt === 'string') throw Error('Expected native streaming input')
+    const stream = request.prompt
+    drain = (async () => {
+      for await (const message of stream) {
+        prompts.push(message)
+        if (prompts.length === 1) rootPrompt.resolve()
+      }
+    })()
+    void drain.catch(() => undefined)
+    const output = (async function* () {
+      await rootPrompt.promise
+      yield {
+        type: 'system',
+        subtype: 'init',
+        session_id: input.nativeSessionId,
+        capabilities: ['interrupt_cancel_queued_v1'],
+      } as SDKMessage
+      yield {
+        type: 'assistant',
+        session_id: input.nativeSessionId,
+        parent_tool_use_id: null,
+        user_message_uuid: input.runId,
+        uuid: randomUUID(),
+        message: { id: 'initial', model: 'fixture', content: [] },
+      } as unknown as SDKMessage
+      await finish.promise
+      yield {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        session_id: input.nativeSessionId,
+        user_message_uuid: input.runId,
+        result: 'Original native round complete.',
+      } as SDKMessage
+      yield {
+        type: 'user',
+        session_id: input.nativeSessionId,
+        uuid: steerId,
+        user_message_uuid: steerId,
+        parent_tool_use_id: null,
+        message: { role: 'user', content: 'Supplement incorporated.' },
+      } as SDKMessage
+      yield {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        session_id: input.nativeSessionId,
+        user_message_uuid: steerId,
+        result: 'Supplement complete.',
+      } as SDKMessage
+    })()
+    return {
+      [Symbol.asyncIterator]: () => output,
+      initializationResult: vi.fn(async () => ({ current_permission_mode: 'default' })),
+      setPermissionMode: vi.fn(async () => undefined),
+      cancelAsyncMessage: vi.fn(async () => false),
+      interrupt: vi.fn(async () => ({ cancelled: [], still_queued: [] })),
+      close: vi.fn(),
+      return: () => output.return(undefined),
+    }
+  }) as never
+  const adapter = new ClaudeAgentAdapter('/fake/claude', {
+      query,
+      getSessionInfo: vi.fn() as never,
+    }),
+    controller = new AbortController()
+  const envelope = {
+    ...input.promptEnvelope,
+    sourceGrant: { runId: input.runId, grant },
+    inputBatchRef: { id: rootBatch, revision: 0, memberCount: 0 },
+  }
+  const outcome = (async () => {
+    for await (const event of adapter.run(
+      {
+        ...input,
+        nativeGeneration: grant,
+        bindingGeneration: 1,
+        peerAssistanceAllowed: false,
+        promptEnvelope: envelope,
+        collaborationSourceReader: {
+          identity: { runId: input.runId, grant },
+          navigation,
+          read: () => {
+            throw Error('Encoding fixture does not read sources')
+          },
+          retire: () => undefined,
+        },
+      },
+      controller.signal,
+    ))
+      if (event.type === 'turn.started') started.resolve()
+  })().catch((error: unknown) => error)
+  try {
+    await started.promise
+    const result = await adapter.steer(
+      {
+        runId: input.runId,
+        inputId: steerId,
+        nativeSessionId: input.nativeSessionId!,
+        nativeTurnId: input.runId,
+        nativeGeneration: grant,
+        bindingGeneration: 1,
+        promptEnvelope: {
+          ...envelope,
+          message: { id: steerId, content: 'Supplement.' },
+          inputBatchRef: { id: nextBatch, revision: 0, memberCount: 0 },
+        },
+        recordDispatch: () => undefined,
+        recordConsumption: () => undefined,
+      },
+      new AbortController().signal,
+    )
+    expect(result).toEqual({ status: 'submitted' })
+    expect(prompts).toHaveLength(2)
+    const rootText = prompts[0]!.message.content,
+      steerText = prompts[1]!.message.content
+    if (typeof rootText !== 'string' || typeof steerText !== 'string')
+      throw Error('Expected text-only native input')
+    const rootStart =
+      rootText.indexOf('\n', rootText.indexOf('Pact context (JSON reference data;')) + 1
+    const rootContext: { sourceReadArguments: unknown } = JSON.parse(rootText.slice(rootStart))
+    expect(rootContext.sourceReadArguments).toEqual({
+      source: 'batch',
+      runId: input.runId,
+      grant,
+      batchId: rootBatch,
+      offset: 0,
+    })
+    const start =
+      steerText.indexOf('\n', steerText.indexOf('Pact context (JSON reference data;')) + 1
+    const context: { sourceReadArguments: unknown } = JSON.parse(steerText.slice(start))
+    expect(context.sourceReadArguments).toEqual({
+      source: 'batch',
+      runId: input.runId,
+      grant,
+      batchId: nextBatch,
+      offset: 0,
+    })
+    expect(
+      navigation.mock.calls
+        .filter(([target]) => target.batchId === nextBatch)
+        .map(([, form]) => form),
+    ).toEqual(['legacy'])
+    finish.resolve()
+    expect(await outcome).toBeUndefined()
+  } finally {
+    finish.resolve()
+    controller.abort()
+    await adapter.dispose()
+    await outcome
+    await drain?.catch(() => undefined)
+  }
+})
+
+it.each([true, false])(
+  'retains both Claude SDK text-frame UUIDs in one API item with partial=%s',
+  async (partial) => {
+    const input = runInput(),
+      sid = input.nativeSessionId,
+      messages: SDKMessage[] = []
+    const stream = (event: unknown, parent_tool_use_id: string | null = null) =>
+      ({
+        type: 'stream_event',
+        uuid: randomUUID(),
+        session_id: sid,
+        parent_tool_use_id,
+        event,
+      }) as SDKMessage
+    const assistant = (
+      id: string,
+      uuid: string,
+      text: string,
+      parent_tool_use_id: string | null = null,
+    ) =>
+      ({
+        type: 'assistant',
+        uuid,
+        session_id: sid,
+        parent_tool_use_id,
+        message: { id, role: 'assistant', model: 'fixture', content: [{ type: 'text', text }] },
+      }) as SDKMessage
+    messages.push({
+      type: 'user',
+      uuid: input.runId,
+      user_message_uuid: input.runId,
+      session_id: sid,
+      parent_tool_use_id: null,
+      message: { role: 'user', content: 'Request' },
+    } as SDKMessage)
+    if (partial)
+      messages.push(stream({ type: 'message_start', message: { id: 'api-1', model: 'fixture' } }))
+    for (const [index, text] of ['First.', ' Second.'].entries()) {
+      if (partial)
+        messages.push(
+          stream({ type: 'content_block_start', index, content_block: { type: 'text', text: '' } }),
+          stream({ type: 'content_block_delta', index, delta: { type: 'text_delta', text } }),
+        )
+      messages.push(assistant('api-1', randomUUID(), text))
+      if (partial) messages.push(stream({ type: 'content_block_stop', index }))
+    }
+    messages.push(
+      stream({ type: 'message_start', message: { id: 'child-api', model: 'child' } }, 'child-tool'),
+      stream(
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: 'Child text must stay outside the root.' },
+        },
+        'child-tool',
+      ),
+      assistant('child-api', randomUUID(), 'Child text must stay outside the root.', 'child-tool'),
+    )
+    if (partial) messages.push(stream({ type: 'message_stop' }))
+    messages.push(assistant('api-2', randomUUID(), 'Final.'), {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      session_id: sid,
+      user_message_uuid: input.runId,
+      result: 'Final.',
+    } as SDKMessage)
+    const adapter = new ClaudeAgentAdapter('/fake/claude', {
+        query: fakeQuery(messages),
+        getSessionInfo: vi.fn() as never,
+      }),
+      events: import('@pact/contracts').NormalizedAgentEvent[] = []
+    try {
+      for await (const event of adapter.run(input, new AbortController().signal)) events.push(event)
+      expect(events.findLast((event) => event.type === 'text.completed')).toMatchObject({
+        text: 'First. Second.\n\nFinal.',
+      })
+      expect(
+        events
+          .filter((event) => event.type === 'text.delta')
+          .map((event) => event.text)
+          .join(''),
+      ).toBe('First. Second.\n\nFinal.')
+      expect(events.findLast((event) => event.type === 'turn.completed')).toMatchObject({
+        outcome: 'completed',
+      })
+    } finally {
+      await adapter.dispose()
+    }
+  },
+)
+
+it('roundtrips actual immutable current and historical Sources through SDK and native HTTP', async () => {
+  const db = await PactDatabase.open({
+    filePath: ':memory:',
+    migrationsFolder: resolveSourceFixturePath(
+      import.meta.dirname,
+      '../../../../../packages/persistence/drizzle',
+    ),
+  })
+  const projectId = randomUUID(),
+    sessionId = randomUUID(),
+    createdAt = new Date().toISOString()
+  let fixture: ReturnType<typeof cancellationFixture> | undefined
+  let reader: FrozenSourceReader | undefined
+  let peer: PactPeerToolServer | undefined
+  let sdkServer: { close: () => Promise<void> } | undefined
+  try {
+    db.projectCatalogRepository.add({
+      id: projectId,
+      name: 'SDK source seam',
+      directoryPath: '/project',
+      kind: 'directory',
+      createdAt,
+    })
+    db.sessionRepository.create(
+      { id: sessionId, projectId, title: 'SDK source seam', createdAt },
+      {
+        primaryAgentId: 'claude',
+        agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+        maxDiscussionRounds: 6,
+        maxReviewCycles: 3,
+        maxRepairAttempts: 3,
+      },
+    )
+    const repo = db.conversationRepository
+    const old = repo.beginRun({
+      sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Historical question without optional declaration.',
+      expectedCommentsRevision: 0,
+      commentIds: [],
+      agentId: 'codex',
+      settingsRevision: 1,
+      model: null,
+      effort: null,
+    }).run
+    repo.applyEvent(sessionId, old.id, {
+      type: 'turn.started',
+      agentId: 'codex',
+      turnId: 'history-turn',
+    })
+    repo.applyEvent(sessionId, old.id, {
+      type: 'text.completed',
+      agentId: 'codex',
+      turnId: 'history-turn',
+      outputId: randomUUID(),
+      text: 'Historical agreed scope.',
+    })
+    repo.applyEvent(sessionId, old.id, {
+      type: 'turn.completed',
+      agentId: 'codex',
+      turnId: 'history-turn',
+      outcome: 'completed',
+    })
+    const history = repo.internalMessage(old.userMessageId, sessionId)!
+    const commentId = randomUUID(),
+      comment = 'Preserve the agreed cancellation boundary.'
+    const beforeComment = repo.readPage({ scope: 'drafts', sessionId })
+    if (beforeComment.scope !== 'drafts') throw Error('Missing source draft headers')
+    repo.saveCommentDraft({
+      mode: 'create',
+      sessionId,
+      commentId,
+      expectedCommentsRevision: beforeComment.commentsRevision,
+      body: comment,
+      anchor: {
+        type: 'message',
+        messageId: history.id,
+        contentHash: createHash('sha256').update(history.content).digest('hex'),
+        textBasis: 'markdown-visible-v2',
+        startOffset: 0,
+        endOffset: 10,
+        quote: history.content.slice(0, 10),
+      },
+    })
+    const drafts = repo.readPage({ scope: 'drafts', sessionId })
+    if (drafts.scope !== 'drafts') throw Error('Missing actual draft revision')
+    const content = 'Current release note: 2027-04-12. Unicode source αβ🐈.\n'.repeat(200)
+    const started = repo.beginRun({
+      sessionId,
+      clientMessageId: randomUUID(),
+      content,
+      expectedCommentsRevision: drafts.commentsRevision,
+      commentIds: [commentId],
+      agentId: 'claude',
+      settingsRevision: db.sessionRepository.find(sessionId)!.settingsRevision,
+      model: null,
+      effort: null,
+      handoffSourceRefs: [
+        {
+          id: history.id,
+          revision: history.contentRevision,
+          digest: createHash('sha256').update(history.content).digest('hex'),
+        },
+      ],
+      userInformation: {
+        version: 'user-information-v1',
+        id: randomUUID(),
+        kind: 'user_supplied_value',
+        question: 'What launch date should be used?',
+        input: 'text',
+        options: [],
+        state: { status: 'answered', value: '2027-04-12' },
+      },
+    }).run
+    const batch = repo.inputBatchForRun(started.id)!,
+      identity = { runId: started.id, grant: randomUUID() }
+    reader = new FrozenSourceReader(
+      identity,
+      sessionId,
+      repo,
+      () => true,
+      () => batch.id,
+      undefined,
+      undefined,
+      batch.id,
+    )
+    const input: AgentRunInput = {
+      ...runInput(),
+      runId: started.id,
+      sessionId,
+      promptEnvelope: {
+        version: 'pact-agent-prompt-v1',
+        targetAgentId: 'claude',
+        sessionId,
+        sourceGrant: identity,
+        inputBatchRef: batch,
+        message: { id: started.userMessageId, content },
+        comments: [],
+      },
+      collaborationSourceReader: reader,
+    }
+    fixture = cancellationFixture(undefined, input)
+    await fixture.ready()
+    const server = Object.values(fixture.options().mcpServers!)[0]!
+    if (server.type !== 'sdk') throw Error('Expected actual owned SDK MCP server')
+    sdkServer = server.instance
+    const replies: object[] = []
+    const transport: Parameters<typeof server.instance.connect>[0] = {
+      start: async () => undefined,
+      close: async () => undefined,
+      send: async (message) => {
+        replies.push(message)
+        expect(replies.length).toBeLessThanOrEqual(128)
+      },
+    }
+    await server.instance.connect(transport)
+    let nextId = 0
+    const sdk = async (method: string, params: Record<string, unknown>) => {
+      const id = ++nextId
+      transport.onmessage?.({ jsonrpc: '2.0', id, method, params })
+      await vi.waitFor(() =>
+        expect(replies.some((reply) => Reflect.get(reply, 'id') === id)).toBe(true),
+      )
+      return Reflect.get(
+        replies.find((reply) => Reflect.get(reply, 'id') === id)!,
+        'result',
+      ) as Record<string, unknown>
+    }
+    await sdk('initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'actual-source-seam', version: '1' },
+    })
+    transport.onmessage?.({ jsonrpc: '2.0', method: 'notifications/initialized' })
+    const prompt = fixture.prompts[0]!.message.content
+    const text =
+      typeof prompt === 'string'
+        ? prompt
+        : prompt
+            .filter((part) => part.type === 'text')
+            .map((part) => ('text' in part ? part.text : ''))
+            .join('\n')
+    const marker = text.indexOf('Pact context (JSON reference data;')
+    const context = JSON.parse(text.slice(text.indexOf('\n', marker) + 1)) as Record<
+      string,
+      unknown
+    >
+    const call = async (args: unknown) =>
+      sdk('tools/call', { name: 'read_collaboration_source', arguments: args })
+    const root = { threadId: randomUUID(), turnId: randomUUID() }
+    peer = new PactPeerToolServer()
+    peer.beginTurn('claude', false, undefined, false, undefined, identity, reader)
+    peer.bindNativeSourceRoot(identity, { ...root, executorId: randomUUID() }, () => true)
+    const url = await peer.start()
+    const httpReply = async (args: unknown, turnId = root.turnId) => {
+      const response = await fetch(url, {
+        method: 'POST',
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: {
+            name: 'read_collaboration_source',
+            arguments: args,
+            _meta: {
+              threadId: root.threadId,
+              'x-codex-turn-metadata': { thread_id: root.threadId, turn_id: turnId },
+            },
+          },
+        }),
+      })
+      const responseBody: unknown = await response.json()
+      if (responseBody === null || typeof responseBody !== 'object')
+        throw Error('Missing actual Source HTTP result')
+      return responseBody
+    }
+    const http = async (args: unknown, turnId = root.turnId) =>
+      Reflect.get(await httpReply(args, turnId), 'result') as Record<string, unknown>
+    // oxlint-disable-next-line unicorn/consistent-function-scoping -- This decoder belongs to the single Source transport seam fixture.
+    const decode = (reply: Record<string, unknown>) => {
+      expect(reply['isError']).not.toBe(true)
+      const parts = reply['content'] as Array<{ text: string }>
+      return collaborationSourceWireResultSchema.parse(JSON.parse(parts[0]!.text))
+    }
+    const traverse = async (
+      read: (args: unknown) => Promise<Record<string, unknown>>,
+      initial: unknown,
+      form: 'legacy' | 'sourceReference' | 'nativeRoot',
+    ) => {
+      const pending: unknown[] = [initial, reader!.navigation({ source: 'handoff_sources' }, form)]
+      const seen = new Set<string>(),
+        documents = new Map<string, { text: string; sha256: string; chars: number }>()
+      const batches: Array<Record<string, unknown>> = []
+      let calls = 0
+      for (let i = 0; i < pending.length; i++) {
+        expect(i).toBeLessThan(64)
+        const args = pending[i],
+          key = JSON.stringify(args)
+        if (seen.has(key)) continue
+        seen.add(key)
+        // oxlint-disable-next-line no-await-in-loop -- Each immutable page supplies the next authorized navigation.
+        const value = decode(await read(args))
+        calls++
+        expect(Buffer.byteLength(JSON.stringify(value))).toBeLessThanOrEqual(48 * 1024)
+        if (value.nextOffset !== null) {
+          if (value.nextRead === undefined) throw Error('Missing Source continuation navigation')
+          pending.push(value.nextRead)
+        }
+        if (value.source === 'document') {
+          const document = value.document!,
+            assembled = documents.get(document.id) ?? {
+              text: '',
+              sha256: document.sha256,
+              chars: document.chars,
+            }
+          if (value.offset !== assembled.text.length)
+            throw Error('Source document cursor is not contiguous')
+          assembled.text += value.text
+          documents.set(document.id, assembled)
+        } else {
+          const index = JSON.parse(value.text) as Record<string, unknown>
+          if (value.source === 'batch') {
+            batches.push(index)
+            for (const field of ['bodyRead', 'userInformationRead', 'clarificationAnswerRead'])
+              if (index[field] !== undefined) pending.push(index[field])
+            for (const member of (index['members'] ?? []) as Array<Record<string, unknown>>)
+              pending.push(member['bodyRead'])
+          } else
+            for (const item of (index['items'] ?? []) as Array<Record<string, unknown>>) {
+              if (item['batchRead'] !== undefined) pending.push(item['batchRead'])
+              for (const entry of (item['documents'] ?? []) as Array<Record<string, unknown>>)
+                pending.push(entry['read'])
+            }
+        }
+      }
+      for (const item of documents.values()) {
+        expect(item.text.length).toBe(item.chars)
+        expect(createHash('sha256').update(item.text).digest('hex')).toBe(item.sha256)
+      }
+      expect([...documents.values()].some((value) => value.text === content)).toBe(true)
+      expect([...documents.values()].some((value) => value.text === comment)).toBe(true)
+      expect([...documents.values()].some((value) => value.text === history.content)).toBe(true)
+      expect(batches.some((value) => value['userInformationRead'] !== undefined)).toBe(true)
+      const historical = batches.find((value) => value['userInformationRead'] === undefined)!
+      expect(historical).toBeDefined()
+      expect(historical['clarificationAnswerRead']).toBeUndefined()
+      return { calls, documents: documents.size, historical }
+    }
+    const batchPage = decode(await call(context['sourceReadArguments']))
+    expect(batchPage.source).toBe('batch')
+    const directMembers = Reflect.get(batchPage, 'members') as
+      | Array<{ bodyRead: unknown }>
+      | undefined
+    expect(directMembers?.[0]?.bodyRead).toBeDefined()
+    expect(Reflect.get(batchPage, 'bodyRead')).toBeDefined()
+    expect(decode(await call(directMembers![0]!.bodyRead)).text).toBe(comment)
+    const batchIndex = JSON.parse(batchPage.text) as Record<string, unknown>
+    const actualBodyPage = decode(await call(batchIndex['bodyRead']))
+    expect(actualBodyPage.source).toBe('document')
+    expect(() => JSON.parse(actualBodyPage.text)).toThrow(SyntaxError)
+    const handoffPage = decode(
+      await call(reader.navigation({ source: 'handoff_sources' }, 'legacy')),
+    )
+    expect(handoffPage.source).toBe('handoff_sources')
+    const handoffIndex = JSON.parse(handoffPage.text) as Record<string, unknown>
+    expect(handoffIndex['bodyRead']).toBeUndefined()
+    const missingHandoffBody = await http(handoffIndex['bodyRead'])
+    expect(missingHandoffBody['isError']).toBe(true)
+    expect(() =>
+      JSON.parse((missingHandoffBody['content'] as Array<{ text: string }>)[0]!.text),
+    ).toThrow(SyntaxError)
+    const sdkResult = await traverse(call, context['sourceReadArguments'], 'legacy')
+    const referenceResult = await traverse(
+      http,
+      reader.navigation({ source: 'batch', batchId: batch.id }, 'sourceReference'),
+      'sourceReference',
+    )
+    const nativeResult = await traverse(
+      http,
+      reader.navigation({ source: 'batch', batchId: batch.id }, 'nativeRoot'),
+      'nativeRoot',
+    )
+    expect(nativeResult.documents).toBe(sdkResult.documents)
+    expect(referenceResult.documents).toBe(sdkResult.documents)
+    const literal = reader.navigation({ source: 'batch', batchId: batch.id }, 'sourceReference')
+    if (!('sourceReference' in literal) || typeof literal.sourceReference !== 'string')
+      throw Error('Expected actual host-signed reference')
+    const token = literal.sourceReference
+    const tampered = {
+      ...literal,
+      sourceReference: token.slice(0, -1) + (token.endsWith('A') ? 'B' : 'A'),
+    }
+    expect(await httpReply(tampered)).toMatchObject({ error: { code: -32603 } })
+    expect(decode(await http(literal)).source).toBe('batch')
+    expect((await call(literal))['isError']).toBe(true)
+    expect((await call({ ...literal, runId: identity.runId }))['isError']).toBe(true)
+    expect(await httpReply({ ...literal, runId: identity.runId })).toMatchObject({
+      error: { code: -32603 },
+    })
+    const missing = await http(sdkResult.historical['clarificationAnswerRead'])
+    expect(missing['isError']).toBe(true)
+    expect(() => JSON.parse((missing['content'] as Array<{ text: string }>)[0]!.text)).toThrow(
+      SyntaxError,
+    )
+    expect(
+      (
+        await http(
+          reader.navigation({ source: 'batch', batchId: batch.id }, 'nativeRoot'),
+          randomUUID(),
+        )
+      )['isError'],
+    ).toBe(true)
+    reader.retire()
+    expect(await httpReply(literal)).toMatchObject({ error: { code: -32603 } })
+  } finally {
+    await sdkServer?.close()
+    await peer?.dispose()
+    reader?.retire()
+    await fixture?.dispose()
+    db.close()
+  }
+})

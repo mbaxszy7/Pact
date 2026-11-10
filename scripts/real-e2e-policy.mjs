@@ -12,6 +12,66 @@ import { isScriptEntry } from './script-entry.mjs'
 
 // Exact business cases, independent of a candidate's mutable tags or test outcome.
 export const realCases = [
+  ...['codex', 'claude'].map((primary) => ({
+    path: 'tests/e2e/collaboration-stage-roles-real.spec.ts',
+    title: `real Primary ${primary} plans and reviews code while Secondary reviews the plan and implements`,
+    tier: 'extended',
+    scenario: 'collaboration',
+  })),
+  ...['codex', 'claude'].map((owner) => ({
+    path: 'tests/e2e/collaboration-result-real.spec.ts',
+    title: `real ${owner} retains an unchanged plan and settles its reply without implementation authority`,
+    tier: 'extended',
+    scenario: 'collaboration',
+  })),
+  {
+    path: 'tests/e2e/skill-composer.spec.ts',
+    title:
+      'real Skill menu stays outside the Composer, dismisses, and preserves Pact command badges',
+    tier: 'extended',
+    scenario: 'additional-regression',
+  },
+  {
+    path: 'tests/e2e/skill-composer.spec.ts',
+    title: 'real Skill menu keeps Plan at its original click position while native catalogs load',
+    tier: 'extended',
+    scenario: 'additional-regression',
+  },
+  {
+    path: 'tests/e2e/relay-information-real.spec.ts',
+    title:
+      'real Claude completes a confirmed user value and an already-answered release note without repeated questions',
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'additional-regression',
+  },
+  ...['codex_luna', 'claude_haiku_5_5'].map((target) => ({
+    path: 'tests/e2e/relay-information-real.spec.ts',
+    title: `real Relay ${target} preserves necessary information through Cancel and a fresh Send without inventing user questions`,
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'additional-regression',
+  })),
+  ...['codex_luna', 'claude_haiku_5_5'].map((target) => ({
+    path: 'tests/e2e/relay-routing-benefit-real.spec.ts',
+    title: `real Relay ${target} saves one source-author route correction against the legal default`,
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'routing',
+  })),
+  ...['codex_luna', 'claude_haiku_5_5'].map((target) => ({
+    path: 'tests/e2e/relay-real-handoff.spec.ts',
+    title: `real Relay ${target} compares Off and On through the fixed native reviewer`,
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'collaboration',
+  })),
+  {
+    path: 'tests/e2e/relay-native-comparison.spec.ts',
+    title: 'real ordinary Pact Session completes one exact Codex Luna task',
+    tier: 'extended',
+    scenario: 'additional-regression',
+  },
   {
     path: 'tests/e2e/real-stop.spec.ts',
     title:

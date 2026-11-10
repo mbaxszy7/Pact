@@ -54,7 +54,7 @@ export async function createInputReturnFixture(
       primaryAgentId: 'codex' as const,
       agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
       maxDiscussionRounds: 3,
-      runningMessagePolicy: 'next_round' as const,
+
       maxReviewCycles: 2,
       maxRepairAttempts: 2,
     }
@@ -176,14 +176,16 @@ export async function createInputReturnFixture(
         abandon: rebuildOptions.abandon ?? false,
       })
       rebuildOptions.onPatch?.(beginning)
+      const sourceRevisions = new Map<string, number>()
       const chunks: NativeContextRebuildChunk[] = []
       for await (const chunk of repo.nativeContextRebuildSource(
         sessionId,
         new AbortController().signal,
         operationId,
+        sourceRevisions,
       ))
         chunks.push(chunk)
-      repo.freezeNativeRebuildSource(operationId, chunks)
+      repo.freezeNativeRebuildSource(operationId, chunks, sourceRevisions)
       repo.markNativeRebuildDispatched(operationId)
       repo.recordNativeRebuildIdentity(operationId, candidateId)
       const patch = repo.completeNativeRebuild(

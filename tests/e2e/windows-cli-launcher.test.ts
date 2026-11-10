@@ -35,6 +35,8 @@ import {
   writeWindowsObservedLauncher,
 } from './windows-cli-launcher.js'
 
+await import('../native/windows-process-owner-setup.js')
+
 afterAll(() => {
   if (process.platform !== 'win32') return
   disposeWindowsLauncherImage()
@@ -378,18 +380,72 @@ it.skipIf(process.platform !== 'win32').each(['cancelled', 'disposed', 'already-
   },
 )
 
+it.skipIf(process.platform !== 'win32').each([30_000, 30_001])(
+  'checks the startup deadline at a fractional clock without extending its bound: %s',
+  async (duration) => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-fractional-startup-test-'))
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(15_001.3)
+    let owner: Awaited<ReturnType<typeof writeWindowsObservedLauncher>> | undefined
+    try {
+      owner = await writeWindowsObservedLauncher(root, process.execPath, 10_000)
+      let failure: unknown
+      try {
+        owner.armStartup(performance.now() + duration)
+      } catch (error) {
+        failure = error
+      }
+      expect(failure instanceof Error ? failure.message : failure).toBe(
+        duration === 30_000
+          ? undefined
+          : 'Windows Job startup requires one live bounded caller deadline',
+      )
+      expect(owner.diagnostic().stages.armed).toBe(duration === 30_000 ? 0 : undefined)
+      expect(owner.diagnostic().startupDeadlineMs).toBe(duration === 30_000 ? 30_000 : undefined)
+    } finally {
+      clock.mockRestore()
+      await owner?.disposeControl()
+      await rm(root, { recursive: true, force: true })
+    }
+  },
+)
+
 it.skipIf(process.platform !== 'win32')(
-  'uses the caller startup deadline when the genuine Job host connects after eleven seconds',
+  'refuses startup authorization after expired-preparation',
   async () => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-expired-preparation-test-'))
+    const owner = await writeWindowsObservedLauncher(root, process.execPath, 10_000)
+    // Move beyond the prepared lease without delivering its timer callback.
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(performance.now() + 15_001)
+    try {
+      expect(() => owner.armStartup(performance.now() + 30_000)).toThrow(
+        'one live bounded caller deadline',
+      )
+      expect(owner.diagnostic().stages.armed).toBeUndefined()
+      await expect(owner.started).rejects.toThrow('preparation expired')
+      await expect(owner.empty).rejects.toThrow('preparation expired')
+    } finally {
+      clock.mockRestore()
+      await owner.disposeControl()
+      await rm(root, { recursive: true, force: true })
+    }
+  },
+)
+
+it.skipIf(process.platform !== 'win32').each([
+  { delay: 11_000, lifetime: 15_000, label: 'after eleven seconds' },
+  { delay: 11_000, lifetime: 5_000, label: 'after the prepared owner lease expires' },
+])(
+  'uses the caller startup deadline when the genuine Job host connects $label',
+  async ({ delay, lifetime }) => {
     const root = await mkdtemp(join(tmpdir(), 'pact-delayed-job-test-'))
-    const owner = await writeWindowsObservedLauncher(root, process.execPath, 15_000)
+    const owner = await writeWindowsObservedLauncher(root, process.execPath, lifetime)
     let child: ReturnType<typeof spawn> | undefined
     let closed: Promise<unknown> | undefined
     try {
       const delayedEntry = join(root, 'delayed-main.cs')
       await writeFile(
         delayedEntry,
-        'public static class DelayedMain { public static int Main(string[] args) { System.Threading.Thread.Sleep(11000); return PactFixtureLauncher.Main(args); } }',
+        `public static class DelayedMain { public static int Main(string[] args) { System.Threading.Thread.Sleep(${delay}); return PactFixtureLauncher.Main(args); } }`,
       )
       // This fixture intentionally replaces Main; detach it from the shared immutable image.
       await unlink(owner.executablePath)
@@ -425,7 +481,7 @@ it.skipIf(process.platform !== 'win32')(
       child.stdout?.resume()
       child.stderr?.resume()
       const started = await owner.started
-      expect(performance.now() - armedAt).toBeGreaterThanOrEqual(11_000)
+      expect(performance.now() - armedAt).toBeGreaterThanOrEqual(delay)
       expect(await owner.empty).toEqual({ generation: owner.generation, active: 0, exitCode: 0 })
       await closed
       expect(Number(await readFile(marker, 'utf8'))).toBe(started.pid)

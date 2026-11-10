@@ -45,7 +45,6 @@ async function seed(fixture: RuntimeFixture) {
         primaryAgentId: 'codex',
         agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
         maxDiscussionRounds: 3,
-        runningMessagePolicy: 'next_round',
         maxReviewCycles: 3,
         maxRepairAttempts: 3,
       },
@@ -208,8 +207,12 @@ test(
         .sync()
       expect(receipt?.state).toBe('archived')
       await undo(page, archivedTitle)
-      await expect(page.getByRole('heading', { name: archivedTitle, exact: true })).toBeVisible()
-      await expect(sessionRow.locator('button[data-nav-primary]')).toBeVisible()
+      const restoredSession = sessionRow.locator('button[data-nav-primary]')
+      await expect(restoredSession).toBeVisible()
+      const heading = page.getByRole('heading', { name: archivedTitle, exact: true })
+      await expect(heading).toHaveCount(0)
+      await restoredSession.click()
+      await expect(heading).toBeVisible()
       expect(f.database.conversationRepository.read(f.first).runs.map((item) => item.id)).toEqual([
         run.id,
       ])
@@ -286,7 +289,7 @@ test(
       ).toBe(true)
       await undo(page, 'Second archive Session')
       await expect(results.getByRole('alert')).toHaveText(
-        'Restore or re-add its Project first, then undo this Session archive.',
+        'Restore or re-add its Project first, then try Undo again.',
       )
       expect(f.database.sessionRepository.find(f.second)?.status).toBe('archived')
       await undo(page, 'Archive Project')

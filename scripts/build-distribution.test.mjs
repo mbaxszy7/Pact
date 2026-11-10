@@ -1,10 +1,16 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
+import beforePack from '../apps/desktop/build/before-pack.mjs'
+import {
+  inspectWindowsOwnedProcessResource,
+  validateWindowsOwnedProcessManifest,
+} from '../apps/desktop/build/windows-owned-process-resource.mjs'
 import {
   applicationContent,
   distributionBuilderArguments,
@@ -20,6 +26,7 @@ const { createYargs, configureBuildCommand, normalizeOptions } = desktopRequire(
 )
 const { Platform } = builderRequire('app-builder-lib')
 const { Arch, deepAssign } = builderRequire('builder-util')
+const { FileMatcher } = builderRequire('app-builder-lib/out/fileMatcher.js')
 const { computeArchToTargetNamesMap } = builderRequire(
   'app-builder-lib/out/targets/targetFactory.js',
 )
@@ -199,3 +206,151 @@ for (const [platform, arch] of [
     })
   }
 }
+
+async function helperFixture(context, arch) {
+  const app = await mkdtemp(join(tmpdir(), 'pact-helper-packaging-'))
+  context.after(() => rm(app, { recursive: true, force: true }))
+  const directory = join(app, 'resources/native')
+  await mkdir(directory, { recursive: true })
+  // PE/header and manifest admission only. These bytes are never executed as Windows proof.
+  const pe = Buffer.alloc(128)
+  pe.write('MZ')
+  pe.writeUInt32LE(64, 60)
+  pe.writeUInt32LE(0x4550, 64)
+  pe.writeUInt16LE(arch === 'arm64' ? 0xaa64 : 0x8664, 68)
+  const executable = join(directory, `owned-process-group-win32-${arch}.exe`)
+  const metadata = {
+    version: 1,
+    platform: 'win32',
+    architecture: arch,
+    protocolVersion: 1,
+    sourceSha256: 'c'.repeat(64),
+    executableSha256: createHash('sha256').update(pe).digest('hex'),
+    executableBytes: pe.length,
+  }
+  await writeFile(executable, pe)
+  await writeFile(`${executable}.json`, JSON.stringify(metadata))
+  return { app, directory, executable, metadata, pe }
+}
+
+for (const arch of ['x64', 'arm64']) {
+  void test(`Windows ${arch} helper packaging binds exact PE bytes, protocol/source identity and both resource entries`, async (context) => {
+    const fixture = await helperFixture(context, arch)
+    const record = await inspectWindowsOwnedProcessResource(
+      fixture.directory,
+      arch,
+      fixture.metadata.sourceSha256,
+    )
+    const content = await applicationContent(fixture.app, 'win32')
+    const manifest = {
+      platform: 'win32',
+      arch,
+      windowsOwnedProcess: record,
+      application: { entries: content.entries },
+    }
+    assert.deepEqual(validateWindowsOwnedProcessManifest(manifest), record)
+    assert.throws(
+      () => validateWindowsOwnedProcessManifest({ ...manifest, windowsOwnedProcess: null }),
+      /identity or inventory/u,
+    )
+    assert.throws(
+      () => validateWindowsOwnedProcessManifest({ ...manifest, platform: 'darwin' }),
+      /non-Windows/u,
+    )
+    assert.throws(
+      () =>
+        validateWindowsOwnedProcessManifest({
+          ...manifest,
+          windowsOwnedProcess: { ...record, protocolVersion: 2 },
+        }),
+      /identity or inventory/u,
+    )
+    assert.throws(
+      () =>
+        validateWindowsOwnedProcessManifest({
+          ...manifest,
+          application: {
+            entries: [
+              ...content.entries,
+              { path: 'resources/native/owned-process-group-win32-other.exe', type: 'file' },
+            ],
+          },
+        }),
+      /inventory/u,
+    )
+    await assert.rejects(
+      inspectWindowsOwnedProcessResource(fixture.directory, arch, 'd'.repeat(64)),
+      /target\/source\/protocol/u,
+    )
+    fixture.pe.writeUInt16LE(arch === 'arm64' ? 0x8664 : 0xaa64, 68)
+    await writeFile(fixture.executable, fixture.pe)
+    await assert.rejects(
+      inspectWindowsOwnedProcessResource(fixture.directory, arch, fixture.metadata.sourceSha256),
+      /PE architecture/u,
+    )
+  })
+}
+
+void test('helper resources reject changed bytes and oversized metadata, while macOS packaging needs no Windows toolchain', async (context) => {
+  const fixture = await helperFixture(context, 'x64')
+  fixture.pe[100] = 1
+  await writeFile(fixture.executable, fixture.pe)
+  await assert.rejects(
+    inspectWindowsOwnedProcessResource(fixture.directory, 'x64', fixture.metadata.sourceSha256),
+    /recorded digest/u,
+  )
+  await writeFile(`${fixture.executable}.json`, ' '.repeat(4097))
+  await assert.rejects(
+    inspectWindowsOwnedProcessResource(fixture.directory, 'x64', fixture.metadata.sourceSha256),
+    /byte bound/u,
+  )
+  assert.equal(
+    validateWindowsOwnedProcessManifest({ platform: 'darwin', application: { entries: [] } }),
+    null,
+  )
+  await beforePack({ electronPlatformName: 'darwin', arch: 3 })
+  assert.equal(base.beforePack, 'build/before-pack.mjs')
+  assert.equal(base.afterPack, 'build/after-pack.mjs')
+  assert.equal(base.asar, true)
+  assert(base.files.includes('!out/native/**'))
+  assert.deepEqual(
+    base.win.extraResources.map((item) => item.to),
+    [
+      'native/owned-process-group-win32-${arch}.exe',
+      'native/owned-process-group-win32-${arch}.exe.json',
+    ],
+  )
+  assert.equal(base.win.signExecutable, false)
+})
+
+void test('the actual builder matcher excludes every Windows helper from ASAR and expands only the requested resource architecture', async () => {
+  const source = join(tmpdir(), 'pact-builder-matcher-source')
+  const destination = join(tmpdir(), 'pact-builder-matcher-destination')
+  const filter = new FileMatcher(source, destination, (value) => value, base.files).createFilter()
+  const stat = { isDirectory: () => false }
+  assert(filter(join(source, 'out/main/index.js'), stat))
+  for (const arch of ['x64', 'arm64']) {
+    const filename = `owned-process-group-win32-${arch}.exe`
+    assert.equal(filter(join(source, 'out/native', filename), stat), false)
+    assert.equal(filter(join(source, 'out/native', `${filename}.json`), stat), false)
+    for (const resource of base.win.extraResources) {
+      const matcher = new FileMatcher(
+        join(source, resource.from),
+        join(destination, resource.to),
+        (value) => value.replaceAll('${arch}', arch),
+      )
+      assert(matcher.from.endsWith(filename) || matcher.from.endsWith(`${filename}.json`))
+      assert(matcher.to.endsWith(filename) || matcher.to.endsWith(`${filename}.json`))
+    }
+  }
+  const preview = builderRequire('js-yaml').load(
+    await readFile(
+      new URL('../apps/desktop/electron-builder.win-preview.yml', import.meta.url),
+      'utf8',
+    ),
+  )
+  assert.equal(preview.extends, './electron-builder.yml')
+  const inherited = deepAssign({}, base, preview)
+  assert.equal(inherited.beforePack, base.beforePack)
+  assert.deepEqual(inherited.win.extraResources, base.win.extraResources)
+})

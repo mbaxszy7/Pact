@@ -23,7 +23,7 @@ async function fixture() {
     primaryAgentId: 'codex',
     agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
     maxDiscussionRounds: 6,
-    runningMessagePolicy: 'immediate_safe_point',
+
     maxReviewCycles: 3,
     maxRepairAttempts: 3,
   } as const
@@ -234,15 +234,17 @@ it('returns image-only undelivered input durably without replaying its images in
     expectedGeneration: 1,
     abandon: false,
   })
+  const sourceRevisions = new Map<string, number>()
   const source = []
   for await (const chunk of f.repo.nativeContextRebuildSource(
     f.sessionId,
     new AbortController().signal,
     operationId,
+    sourceRevisions,
   ))
     source.push(chunk)
   expect(source.some((chunk) => chunk.kind === 'image')).toBe(false)
-  f.repo.freezeNativeRebuildSource(operationId, source)
+  f.repo.freezeNativeRebuildSource(operationId, source, sourceRevisions)
   f.repo.markNativeRebuildDispatched(operationId)
   f.repo.recordNativeRebuildIdentity(operationId, nativeId)
   f.repo.completeNativeRebuild(operationId, nativeId, undefined, {

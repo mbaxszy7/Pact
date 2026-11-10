@@ -61,11 +61,14 @@ export const nativeSessionOpenedResultSchema = z.strictObject({ recorded: z.lite
 export const nativeJumpListSuppressionResultSchema = z.strictObject({ updated: z.literal(true) })
 
 export const nativeQuitOperationInputSchema = z.strictObject({ operationId: z.string().uuid() })
+const nativeQuitSessionRowSchema = nativeSessionRowSchema.extend({
+  state: nativeSessionRowSchema.shape.state.or(z.literal('unsettled')),
+})
 export const nativeQuitPreparationSchema = z.strictObject({
   operationId: z.string().uuid(),
   state: z.enum(['idle_prepared', 'confirmation_required']),
   activeCount: z.number().int().nonnegative(),
-  sessions: z.array(nativeSessionRowSchema).max(NATIVE_MENU_ITEMS),
+  sessions: z.array(nativeQuitSessionRowSchema).max(NATIVE_MENU_ITEMS),
 })
 export const nativeQuitCancelledResultSchema = z.strictObject({
   operationId: z.string().uuid(),
@@ -76,7 +79,7 @@ export const nativeQuitStateSchema = z.strictObject({
   phase: z.enum(['confirming', 'cancelling', 'closing', 'unconfirmed']),
   unknown: z.boolean(),
   activeCount: z.number().int().nonnegative(),
-  sessions: z.array(nativeSessionRowSchema).max(NATIVE_MENU_ITEMS),
+  sessions: z.array(nativeQuitSessionRowSchema).max(NATIVE_MENU_ITEMS),
   message: z.string().max(1024).optional(),
 })
 export const nativeQuitDecisionInputSchema = z.strictObject({
@@ -107,6 +110,7 @@ export type NativeSessionResolveInput = z.infer<typeof nativeSessionResolveInput
 export type NativeSessionOpenInput = z.infer<typeof nativeSessionOpenInputSchema>
 export type NativeJumpListSuppressionInput = z.infer<typeof nativeJumpListSuppressionInputSchema>
 export type NativeQuitOperationInput = z.infer<typeof nativeQuitOperationInputSchema>
+export type NativeQuitSessionRow = z.infer<typeof nativeQuitSessionRowSchema>
 export type NativeQuitPreparation = z.infer<typeof nativeQuitPreparationSchema>
 export type NativeQuitState = z.infer<typeof nativeQuitStateSchema>
 export type NativeQuitDecisionInput = z.infer<typeof nativeQuitDecisionInputSchema>

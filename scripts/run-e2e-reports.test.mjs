@@ -80,7 +80,7 @@ await test('local core execution keeps a safe immutable report, restores environ
   }
 })
 
-await test('configuration admission failure still gets 63 case statuses without exposing its exception or spawning', async () => {
+await test('configuration admission failure still reports every reviewed case without exposing its exception or spawning', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pact-local-e2e-admission-test-'))
   try {
     await assert.rejects(
@@ -96,7 +96,11 @@ await test('configuration admission failure still gets 63 case statuses without 
       /unsafe exception details/,
     )
     const report = await saved(root)
-    assert.equal(report.cases.length, 63)
+    assert.equal(report.cases.length, realCases.length)
+    assert.deepEqual(
+      report.cases.map(({ path, title }) => ({ path, title })),
+      realCases.map(({ path, title }) => ({ path, title })),
+    )
     assert.equal(report.gatePassed, false)
     assert.equal(report.tiers.core.notRun, 1)
     assert.equal(

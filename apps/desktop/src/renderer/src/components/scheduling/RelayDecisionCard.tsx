@@ -1,0 +1,197 @@
+import { Check, Workflow } from 'lucide-react'
+import { useId } from 'react'
+
+import type { RelayDecisionAnswer, RelaySchedulingDecision } from '@pact/contracts'
+
+/**
+ * Presentation of one scheduling action admitted by the Conversation owner.
+ * This is not a native/Agent question, a model recommendation, or an authority proof.
+ * The owner must revalidate it after higher-priority interactions before publishing it again.
+ * Necessary scheduling information has its own typed branch and answer. Agent/native
+ * questions never enter this component or its answer interface.
+ */
+export interface RelayDecisionPresentation {
+  request: RelaySchedulingDecision
+  status: 'awaiting_confirmation' | 'submitting' | 'checking_receipt' | 'receipt_unconfirmed'
+  answerValue: string
+  onChangeAnswer: (value: string) => void
+  cancelling?: boolean | undefined
+  error?: string | undefined
+  onConfirm: (answer: RelayDecisionAnswer['answer']) => void
+  onCheckReceipt?: (() => void) | undefined
+  onCancel: () => void
+}
+
+export function RelayDecisionCard({
+  decision,
+  visible,
+}: {
+  decision: RelayDecisionPresentation
+  visible: boolean
+}): React.JSX.Element {
+  const titleId = useId()
+  const actionId = `${titleId}-action`
+  const locked = decision.status !== 'awaiting_confirmation' || Boolean(decision.cancelling)
+  const { request } = decision
+  const field =
+    request.request.category === 'necessary_information' ? request.request.field : undefined
+  const operation =
+    request.request.category === 'necessary_information' ? undefined : request.request.operation
+  const extendedReview = operation?.kind === 'extend_plan_review' ? operation : undefined
+  const pactRepair = operation?.kind === 'repair_role_request' ? operation : undefined
+  const repairer = pactRepair?.actor === 'codex' ? 'Codex' : 'Claude Code'
+  const confirmLabel = pactRepair
+    ? `Repair with ${repairer}`
+    : field
+      ? 'Continue scheduling'
+      : operation?.kind === 'rebuild_native_context'
+        ? 'Confirm rebuild'
+        : operation?.kind === 'reassign_roles'
+          ? 'Use suggested roles'
+          : operation?.kind === 'repair'
+            ? 'Allow repair'
+            : extendedReview
+              ? 'Add one review'
+              : 'Allow one read-only turn'
+  const answer: RelayDecisionAnswer['answer'] | undefined = !field
+    ? { kind: 'confirm' }
+    : field.input.kind === 'single'
+      ? field.input.options.some((option) => option.id === decision.answerValue)
+        ? { kind: 'selection', fieldId: field.fieldId, optionId: decision.answerValue }
+        : undefined
+      : decision.answerValue.trim() && decision.answerValue.length <= field.input.maxLength
+        ? { kind: 'text', fieldId: field.fieldId, text: decision.answerValue }
+        : undefined
+  return (
+    <section
+      className={pactRepair ? 'pact-repair-card relay-decision' : 'relay-edge relay-decision'}
+      data-motion-active={visible}
+      aria-labelledby={titleId}
+      aria-describedby={actionId}
+      aria-busy={locked}
+    >
+      <header className="relay-decision-heading">
+        <Workflow aria-hidden="true" size={18} strokeWidth={1.75} />
+        <h3 id={titleId}>{pactRepair ? 'Switch repair agent' : 'Relay decision'}</h3>
+      </header>
+      <div className="relay-decision-body">
+        <p id={actionId} className="relay-action-title">
+          {decision.cancelling
+            ? 'Cancellation pending'
+            : pactRepair
+              ? `For the rest of this task, ${repairer} repairs and ${pactRepair.returnActor === 'codex' ? 'Codex' : 'Claude Code'} reviews.`
+              : extendedReview
+                ? `Have ${extendedReview.actor === 'codex' ? 'Codex' : 'Claude Code'} review plan v${extendedReview.planReference.version} once more.`
+                : request.title}
+        </p>
+        {!pactRepair && operation?.kind !== 'extend_plan_review' ? (
+          <p className="relay-action-target">
+            {operation?.kind === 'rebuild_native_context'
+              ? `${operation.agentId === 'codex' ? 'Codex' : 'Claude Code'} · Current session`
+              : operation?.kind === 'reassign_roles'
+                ? `Current: ${operation.previousRoles.codeAuthor === 'codex' ? 'Codex' : 'Claude Code'} implements · ${operation.previousRoles.codeReviewer === 'codex' ? 'Codex' : 'Claude Code'} reviews`
+                : operation
+                  ? `${operation.actor === 'codex' ? 'Codex' : 'Claude Code'} · ${operation.kind === 'repair' ? 'One repair' : 'One read-only turn'}, then ${operation.returnActor === 'codex' ? 'Codex' : 'Claude Code'} reviews`
+                  : 'Scheduling information'}
+          </p>
+        ) : null}
+        {pactRepair?.fullAccess && !decision.cancelling ? (
+          <p className="relay-action-explanation">Runs with Full access.</p>
+        ) : null}
+        {(!pactRepair && !extendedReview) || decision.cancelling ? (
+          <p className="relay-action-explanation">
+            {decision.cancelling
+              ? 'Check this decision to confirm the cancellation before sending again.'
+              : request.reason}
+          </p>
+        ) : null}
+        {(!pactRepair && !extendedReview && operation?.kind !== 'reassign_roles') ||
+        decision.cancelling ? (
+          <p className="relay-action-explanation">
+            {decision.cancelling
+              ? 'This check does not send your draft. Your current draft and Comments are kept.'
+              : request.consequence}
+          </p>
+        ) : null}
+        {field && !decision.cancelling ? (
+          <div className="relay-scheduling-field">
+            <label htmlFor={`${titleId}-field`}>{field.prompt}</label>
+            {field.input.kind === 'single' ? (
+              <select
+                id={`${titleId}-field`}
+                value={decision.answerValue}
+                disabled={locked}
+                onChange={(event) => decision.onChangeAnswer(event.target.value)}
+              >
+                <option value="">Choose an option</option>
+                {field.input.options.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                id={`${titleId}-field`}
+                value={decision.answerValue}
+                maxLength={field.input.maxLength}
+                disabled={locked}
+                onChange={(event) => decision.onChangeAnswer(event.target.value)}
+              />
+            )}
+          </div>
+        ) : null}
+        {!pactRepair && !extendedReview && operation?.kind !== 'reassign_roles' ? (
+          <p className="relay-action-source">
+            Source: {request.sources.map((source) => source.label).join(' · ')}
+          </p>
+        ) : null}
+      </div>
+      {decision.error ? (
+        <p role="alert" className="relay-decision-error">
+          {decision.error}
+        </p>
+      ) : null}
+      <footer className="relay-decision-footer">
+        <button
+          type="button"
+          className="relay-cancel"
+          disabled={locked}
+          onClick={decision.onCancel}
+        >
+          {decision.cancelling
+            ? decision.status === 'submitting'
+              ? 'Cancelling…'
+              : 'Cancel requested'
+            : operation?.kind === 'reassign_roles' || pactRepair
+              ? 'Keep current roles'
+              : extendedReview
+                ? 'Keep paused'
+                : 'Cancel this scheduling action'}
+        </button>
+        <button
+          className="relay-submit"
+          type="button"
+          disabled={
+            decision.status === 'receipt_unconfirmed' ? !decision.onCheckReceipt : locked || !answer
+          }
+          onClick={() => {
+            if (decision.status === 'receipt_unconfirmed') decision.onCheckReceipt?.()
+            else if (answer) decision.onConfirm(answer)
+          }}
+        >
+          <span>
+            {decision.status === 'receipt_unconfirmed'
+              ? 'Check decision'
+              : decision.status === 'checking_receipt'
+                ? 'Checking decision…'
+                : decision.status === 'submitting'
+                  ? 'Confirming…'
+                  : confirmLabel}
+          </span>
+          <Check aria-hidden="true" size={15} strokeWidth={1.8} />
+        </button>
+      </footer>
+    </section>
+  )
+}

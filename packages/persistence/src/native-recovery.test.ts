@@ -29,7 +29,7 @@ const settings: DefaultSessionSettings = {
     codex: { model: 'frozen-model', effort: 'high' },
   },
   maxDiscussionRounds: 6,
-  runningMessagePolicy: 'immediate_safe_point',
+
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
 }
@@ -77,7 +77,7 @@ function seed(f: Fixture, agentId: RuntimeAgentId = 'codex', abandon = false) {
     expectedGeneration: generation,
     abandon,
   })
-  const sourceHash = f.repo.freezeNativeRebuildSource(id, [])
+  const sourceHash = f.repo.freezeNativeRebuildSource(id, [], new Map())
   f.repo.markNativeRebuildDispatched(id)
   f.repo.recordNativeRebuildIdentity(id, nativeSessionId)
   const witness = {
@@ -609,7 +609,7 @@ describe('Durable Native recovery ownership', () => {
           expectedGeneration: 1,
           abandon: false,
         })
-        f.repo.freezeNativeRebuildSource(id, [])
+        f.repo.freezeNativeRebuildSource(id, [], new Map())
         f.repo.markNativeRebuildDispatched(id)
         expect(() => f.repo.recordNativeRebuildIdentity(id, nativeSessionId)).toThrow(/string/iu)
         expect(f.repo.nativeRebuildOperation(id)).toMatchObject({ stage: 'creating' })
@@ -1012,6 +1012,7 @@ it('uses partial unsettled-work indexes without scanning a thousand ended histor
     const runPlan = explain('agent_runs')
     const creationPlan = explain('native_rebuild_operations')
     expect(production.sessionHasNativeWork(f.sessionId)).toBe(false)
+    expect(production.bindingHasUnsettledWork(f.sessionId, 'codex', 1)).toBe(false)
     const capturePlans = () =>
       queries
         .filter(
@@ -1026,7 +1027,7 @@ it('uses partial unsettled-work indexes without scanning a thousand ended histor
     const partialStats = () =>
       sqlite
         .prepare<unknown[], { name: string; cells: number; bytes: number }>(
-          `SELECT name, sum(ncell) AS cells, sum(pgsize) AS bytes FROM dbstat WHERE name IN ('agent_runs_session_unsettled_work_idx','native_rebuild_operations_unsettled_work_idx','agent_runs_native_generation_latest_idx') GROUP BY name ORDER BY name`,
+          `SELECT name, sum(ncell) AS cells, sum(pgsize) AS bytes FROM dbstat WHERE name IN ('agent_runs_session_unsettled_work_idx','native_rebuild_operations_unsettled_work_idx','agent_runs_native_quit_unsettled_idx','agent_runs_native_generation_latest_idx') GROUP BY name ORDER BY name`,
         )
         .all()
     const before = capturePlans(),
@@ -1035,6 +1036,7 @@ it('uses partial unsettled-work indexes without scanning a thousand ended histor
     queries.length = 0
     expect(production.projectHasNativeWork(f.projectId)).toBe(false)
     expect(production.sessionHasNativeWork(f.sessionId)).toBe(false)
+    expect(production.bindingHasUnsettledWork(f.sessionId, 'codex', 1)).toBe(false)
     const after = capturePlans(),
       afterStats = partialStats()
     expect(after).toEqual(before)
@@ -1048,7 +1050,9 @@ it('uses partial unsettled-work indexes without scanning a thousand ended histor
       after
         .filter((item) => item.query.includes('FROM "agent_runs"'))
         .every((item) =>
-          JSON.stringify(item.plan).includes('agent_runs_session_unsettled_work_idx'),
+          /agent_runs_(session_unsettled_work|native_quit_unsettled)_idx/u.test(
+            JSON.stringify(item.plan),
+          ),
         ),
     ).toBe(true)
     expect(
@@ -1058,8 +1062,13 @@ it('uses partial unsettled-work indexes without scanning a thousand ended histor
           JSON.stringify(item.plan).includes('native_rebuild_operations_unsettled_work_idx'),
         ),
     ).toBe(true)
-    expect(afterStats.filter((item) => item.name.endsWith('_unsettled_work_idx'))).toEqual(
-      beforeStats.filter((item) => item.name.endsWith('_unsettled_work_idx')),
+    const bindingPlans = after.filter((item) =>
+      JSON.stringify(item.plan).includes('agent_runs_native_quit_unsettled_idx'),
+    )
+    expect(bindingPlans).toHaveLength(1)
+    expect(bindingPlans[0]?.rows).toBe(0)
+    expect(afterStats.filter((item) => item.name.includes('_unsettled'))).toEqual(
+      beforeStats.filter((item) => item.name.includes('_unsettled')),
     )
     expect(
       afterStats.find((item) => item.name === 'agent_runs_native_generation_latest_idx')!.cells,

@@ -34,6 +34,84 @@ afterEach(async () => {
 })
 
 describe('Pact database migrations', () => {
+  it('adds scheduling receipts to the previous complete schema without rewriting workflow or journal facts', async () => {
+    const directory = await createTemporaryDirectory(),
+      filePath = join(directory, 'previous.sqlite')
+    const legacy = new Database(filePath),
+      migrations = readMigrationFiles({ migrationsFolder })
+    legacy.exec(
+      'CREATE TABLE __drizzle_migrations (id INTEGER PRIMARY KEY NOT NULL, hash TEXT NOT NULL, created_at NUMERIC)',
+    )
+    legacy.transaction(() => {
+      // 0075 adds receipts; 0076 adds only global settings/activity indexes.
+      for (const [index, migration] of migrations
+        .slice(
+          0,
+          migrations.findIndex((candidate) =>
+            candidate.sql.join('\n').includes('CREATE TABLE `scheduling_handoffs`'),
+          ),
+        )
+        .entries()) {
+        for (const statement of migration.sql) legacy.exec(statement)
+        legacy
+          .prepare('INSERT INTO __drizzle_migrations (id, hash, created_at) VALUES (?, ?, ?)')
+          .run(index + 1, migration.hash, migration.folderMillis)
+      }
+    })()
+    const sessionId = randomUUID(),
+      projectId = randomUUID(),
+      taskId = randomUUID(),
+      runId = randomUUID(),
+      now = new Date().toISOString()
+    const state = JSON.stringify({
+      protocol: 'native-workflow-v1',
+      originalSource: 'preserve-complete-saved-source',
+      unknownDelivery: true,
+    })
+    legacy
+      .prepare(
+        'INSERT INTO projects (id, name, directory_path, kind, created_at) VALUES (?, ?, ?, ?, ?)',
+      )
+      .run(projectId, 'Migration fixture', '/migration-fixture', 'directory', now)
+    legacy
+      .prepare(
+        'INSERT INTO sessions (id, project_id, title, status, settings_revision, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(sessionId, projectId, 'Saved workflow', 'paused', 1, now, now)
+    legacy
+      .prepare(
+        'INSERT INTO collaboration_tasks (id, session_id, state_json, updated_at) VALUES (?, ?, ?, ?)',
+      )
+      .run(taskId, sessionId, state, now)
+    legacy
+      .prepare(
+        'INSERT INTO agent_event_journal (session_id, sequence, run_id, event_type, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run(sessionId, 0, runId, 'native.dispatch_observed', '{"phase":"possibly_sent"}', now)
+    legacy.close()
+    const db = await PactDatabase.open({ filePath, migrationsFolder })
+    try {
+      expect(
+        db.drizzle.get(
+          sql`SELECT state_json AS state FROM collaboration_tasks WHERE id = ${taskId}`,
+        ),
+      ).toEqual({ state })
+      expect(
+        db.drizzle.get(
+          sql`SELECT payload FROM agent_event_journal WHERE session_id = ${sessionId} AND sequence = 0`,
+        ),
+      ).toEqual({ payload: '{"phase":"possibly_sent"}' })
+      expect(db.drizzle.get(sql`SELECT count(*) AS count FROM scheduling_handoffs`)).toEqual({
+        count: 0,
+      })
+      expect(db.drizzle.get(sql`SELECT count(*) AS count FROM __drizzle_migrations`)).toEqual({
+        count: migrations.length,
+      })
+    } finally {
+      db.close()
+    }
+  })
+
   it('applies all migrations to a fresh database', async () => {
     const database = await PactDatabase.open({
       filePath: ':memory:',
@@ -213,7 +291,7 @@ describe('Pact database migrations', () => {
         codex: { model: null, effort: null },
       },
       maxDiscussionRounds: 6,
-      runningMessagePolicy: 'immediate_safe_point' as const,
+
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
     }
@@ -1001,7 +1079,7 @@ function createConversationSession(database: PactDatabase): { sessionId: string 
         codex: { model: 'gpt-5.6-sol', effort: 'high' },
       },
       maxDiscussionRounds: 6,
-      runningMessagePolicy: 'immediate_safe_point',
+
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
     },

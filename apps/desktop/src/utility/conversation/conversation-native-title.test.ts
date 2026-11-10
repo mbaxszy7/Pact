@@ -1,3 +1,4 @@
+import { eq } from 'drizzle-orm'
 import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -13,14 +14,16 @@ import type {
   DefaultSessionSettings as Settings,
   NormalizedAgentEvent,
   NativeContextRebuildChunk,
+  NativeProbeResult,
 } from '@pact/contracts'
 
-import { PactDatabase } from '@pact/persistence'
+import { agentRuns, PactDatabase } from '@pact/persistence'
 
 import { DefaultSessionSettings } from '../default-session-settings/default-session-settings.js'
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
 import { SessionWorkspace } from '../session-workspace/session-workspace.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { Conversation } from './conversation.js'
 
 const native = vi.hoisted(() => ({
@@ -29,6 +32,8 @@ const native = vi.hoisted(() => ({
   titleRequests: [] as boolean[],
   enrichTitle: 'Codex generated title' as string | undefined,
   probeTitle: undefined as string | undefined,
+  probeOutcome: 'completed' as 'completed' | 'interrupted',
+  liveBackground: false,
   enrichment: undefined as
     | ((input: AgentTitleEnrichmentInput, signal: AbortSignal) => Promise<string | undefined>)
     | undefined,
@@ -50,6 +55,12 @@ class NativeFixture {
   private naming = 0
   constructor(readonly id: 'codex' | 'claude') {
     native.created += 1
+  }
+  hasActiveBackgroundWork() {
+    return native.liveBackground
+  }
+  backgroundWork() {
+    return native.liveBackground ? ('working' as const) : undefined
   }
   async *run(input: AgentRunInput): AsyncIterable<NormalizedAgentEvent> {
     native.runs += 1
@@ -83,6 +94,13 @@ class NativeFixture {
       text: 'Fixture reply',
     }
     yield { agentId: this.id, type: 'turn.completed', turnId: input.runId, outcome: 'completed' }
+    // Optional title work has its own owner; this completed mock has no remaining business work.
+    if (!native.liveBackground)
+      input.reportNativeEffects?.({
+        runId: input.runId,
+        generation: input.nativeGeneration!,
+        state: 'settled',
+      })
   }
   async enrichTitle(input: AgentTitleEnrichmentInput, signal: AbortSignal) {
     if (this.id !== 'codex') return undefined
@@ -92,7 +110,7 @@ class NativeFixture {
     if (title) input.observeNativeTitle?.(input.nativeSessionId, logical)
     return logical
   }
-  async probeNativeStatus(input: AgentNativeProbeInput) {
+  async probeNativeStatus(this: void, input: AgentNativeProbeInput): Promise<NativeProbeResult> {
     const title = native.probeTitle ?? native.names.get(input.nativeSessionId)
     if (title)
       input.observeNativeTitle?.(
@@ -102,7 +120,7 @@ class NativeFixture {
     return {
       kind: 'ended' as const,
       source: 'stored_terminal' as const,
-      outcome: 'completed' as const,
+      outcome: native.probeOutcome,
       identity: {
         sessionId: input.sessionId,
         agentId: input.agentId,
@@ -113,6 +131,16 @@ class NativeFixture {
         bindingGeneration: input.bindingGeneration,
         executorId: input.executorId,
       },
+    }
+  }
+  beginNativeStatusCheck(input: AgentNativeProbeInput) {
+    const result = this.probeNativeStatus(input)
+    return {
+      result,
+      physicalCompletion: result.then(
+        () => undefined,
+        () => undefined,
+      ),
     }
   }
   async setNativeTitle(input: AgentNativeTitleInput, signal: AbortSignal) {
@@ -191,6 +219,8 @@ afterEach(async () => {
   native.titleRequests = []
   native.enrichTitle = 'Codex generated title'
   native.probeTitle = undefined
+  native.probeOutcome = 'completed'
+  native.liveBackground = false
   native.enrichment = undefined
   native.names.clear()
   native.writes = []
@@ -210,7 +240,7 @@ const settings: Settings = {
   primaryAgentId: 'codex',
   agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
   maxDiscussionRounds: 3,
-  runningMessagePolicy: 'next_round',
+
   maxReviewCycles: 2,
   maxRepairAttempts: 2,
 }
@@ -253,7 +283,7 @@ async function fixture() {
     db.sessionRepository,
     db.projectCatalogRepository,
     preparation,
-    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
   )
   owned.push({ db, flow })
   const workspace = new SessionWorkspace(
@@ -262,7 +292,11 @@ async function fixture() {
     new DefaultSessionSettings(preparation, db.defaultSessionSettingsRepository),
     (id) => flow.sessionTitleChanged(id),
   )
-  const send = async (agentId: 'codex' | 'claude' = 'codex', targetSessionId = sessionId) => {
+  const send = async (
+    agentId: 'codex' | 'claude' = 'codex',
+    targetSessionId = sessionId,
+    content = 'Hello',
+  ) => {
     const drafts = db.conversationRepository.readPage({
       scope: 'drafts',
       sessionId: targetSessionId,
@@ -271,7 +305,7 @@ async function fixture() {
     const result = await flow.send({
       sessionId: targetSessionId,
       clientMessageId: randomUUID(),
-      content: 'Hello',
+      content,
       expectedCommentsRevision: drafts.commentsRevision,
       commentIds: [],
       route: { type: 'agent', agentId },
@@ -293,6 +327,399 @@ async function fixture() {
 }
 
 describe('Conversation Native display title ownership', () => {
+  it('keeps a stale explicit Check on its original Run after a newer same-binding Run', async () => {
+    native.enrichTitle = undefined
+    const f = await fixture()
+    const original = await f.send()
+    const replacement = await f.send()
+    const probe = vi.spyOn(NativeFixture.prototype, 'probeNativeStatus')
+    const phases: string[] = []
+    const unsubscribe = f.flow.subscribe((patch) => {
+      const context = patch.nativeContexts?.find((entry) => entry.agentId === 'codex')
+      if (context?.continuationState) phases.push(context.continuationState)
+    })
+    try {
+      const result = await f.flow.retry({
+        runId: original.id,
+        sessionId: f.sessionId,
+        agentId: 'codex',
+        intent: 'inspect',
+      })
+      expect(result.ok).toBe(true)
+      expect(probe).toHaveBeenCalledOnce()
+      expect(probe.mock.calls[0]![0].runId).toBe(original.id)
+      expect(phases).not.toContain('checking')
+      expect(f.db.conversationRepository.nativeContext(f.sessionId, 'codex')).toMatchObject({
+        lastRunId: replacement.id,
+        continuationState: 'ready',
+      })
+      expect(native.runs).toBe(2)
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it.each(['session', 'agent', 'missing-run'] as const)(
+    'refuses an explicit Check with a mismatched %s instead of selecting a current binding',
+    async (mismatch) => {
+      native.enrichTitle = undefined
+      const f = await fixture()
+      const original = await f.send()
+      const probe = vi.spyOn(NativeFixture.prototype, 'probeNativeStatus')
+      const result = await f.flow.retry({
+        runId: mismatch === 'missing-run' ? randomUUID() : original.id,
+        sessionId: mismatch === 'session' ? randomUUID() : f.sessionId,
+        agentId: mismatch === 'agent' ? 'claude' : 'codex',
+        intent: 'inspect',
+      })
+      expect(result.ok).toBe(false)
+      expect(probe).not.toHaveBeenCalled()
+      expect(native.runs).toBe(1)
+    },
+  )
+
+  it('does not apply an old Check failure after another same-generation Run becomes current', async () => {
+    native.enrichTitle = undefined
+    const f = await fixture()
+    const original = await f.send()
+    let replacementId: string | undefined
+    vi.spyOn(NativeFixture.prototype, 'probeNativeStatus').mockImplementation(async () => {
+      // Publish another admitted scope at the native-read boundary, before its
+      // stale result returns. The read may not change that replacement's state.
+      const repo = f.db.conversationRepository
+      repo.setContinuation(f.sessionId, 'codex', 'ready')
+      const drafts = repo.readPage({ scope: 'drafts', sessionId: f.sessionId })
+      if (drafts.scope !== 'drafts') throw new Error('Missing draft revision')
+      const next = repo.beginRun({
+        sessionId: f.sessionId,
+        clientMessageId: randomUUID(),
+        content: 'A newer admitted request.',
+        expectedCommentsRevision: drafts.commentsRevision,
+        commentIds: [],
+        agentId: 'codex',
+        settingsRevision: 1,
+        model: null,
+        effort: null,
+      })
+      replacementId = next.run.id
+      repo.recordExecutor(next.run.id, original.executorId!)
+      repo.recordDispatch(next.run.id, 'accepted', original.nativeSessionId, original.executorId)
+      repo.applyEvent(f.sessionId, next.run.id, {
+        agentId: 'codex',
+        type: 'session.started',
+        nativeSessionId: original.nativeSessionId!,
+      })
+      repo.applyEvent(f.sessionId, next.run.id, {
+        agentId: 'codex',
+        type: 'turn.started',
+        turnId: next.run.id,
+      })
+      repo.applyEvent(f.sessionId, next.run.id, {
+        agentId: 'codex',
+        type: 'text.completed',
+        turnId: next.run.id,
+        outputId: 'replacement',
+        text: 'New owner response.',
+      })
+      repo.applyEvent(f.sessionId, next.run.id, {
+        agentId: 'codex',
+        type: 'turn.completed',
+        turnId: next.run.id,
+        outcome: 'completed',
+      })
+      repo.recordNativeEffects(next.run.id, 'settled')
+      throw new Error('The old native read failed after replacement.')
+    })
+    const checked = await f.flow.retry({
+      runId: original.id,
+      sessionId: f.sessionId,
+      agentId: 'codex',
+      intent: 'inspect',
+    })
+    expect(checked.ok).toBe(false)
+    expect(replacementId).toBeDefined()
+    expect(f.db.conversationRepository.nativeContext(f.sessionId, 'codex')).toMatchObject({
+      lastRunId: replacementId,
+      nativeSessionId: original.nativeSessionId,
+      bindingGeneration: original.bindingGeneration,
+      continuationState: 'ready',
+    })
+    expect(native.runs).toBe(1)
+  })
+
+  it('finishes an exact Check when background effects settle during its read', async () => {
+    native.enrichTitle = undefined
+    const f = await fixture()
+    const original = await f.send()
+    f.db.conversationRepository.recordNativeEffects(original.id, 'unknown', 'observation_lost')
+    const probe = NativeFixture.prototype.probeNativeStatus
+    vi.spyOn(NativeFixture.prototype, 'probeNativeStatus').mockImplementation(async function (
+      this: NativeFixture,
+      input: AgentNativeProbeInput,
+    ) {
+      f.db.conversationRepository.recordNativeEffects(original.id, 'settled')
+      return probe(input)
+    })
+    expect(
+      (
+        await f.flow.retry({
+          runId: original.id,
+          sessionId: f.sessionId,
+          agentId: 'codex',
+          intent: 'inspect',
+        })
+      ).ok,
+    ).toBe(true)
+    expect(f.db.conversationRepository.nativeContext(f.sessionId, 'codex')).toMatchObject({
+      lastRunId: original.id,
+      continuationState: 'ready',
+    })
+    expect(f.db.conversationRepository.findRun(original.id)?.nativeEffectsState).toBe('settled')
+    expect(native.runs).toBe(1)
+  })
+
+  it('offers recovery after the first exact Check confirms an interrupted root but not its work', async () => {
+    native.enrichTitle = undefined
+    const f = await fixture()
+    const original = await f.send()
+    const repo = f.db.conversationRepository
+    f.db.drizzle
+      .update(agentRuns)
+      .set({
+        status: 'interrupted',
+        dispatchPhase: 'accepted',
+        nativeOutcome: null,
+        failureKind: 'unknown_delivery',
+      })
+      .where(eq(agentRuns.id, original.id))
+      .run()
+    repo.recordNativeEffects(original.id, 'unknown', 'pact_restarted')
+    repo.setContinuation(
+      f.sessionId,
+      'codex',
+      'recovery_required',
+      'Check the original task after restart.',
+    )
+    native.probeOutcome = 'interrupted'
+    const checked = await f.flow.retry({
+      runId: original.id,
+      sessionId: f.sessionId,
+      agentId: 'codex',
+      intent: 'inspect',
+    })
+    expect(checked.ok).toBe(true)
+    expect(repo.findRun(original.id)).toMatchObject({
+      dispatchPhase: 'ended',
+      nativeOutcome: 'interrupted',
+      nativeEffectsState: 'unknown',
+      nativeEffectsReason: 'background_check_unconfirmed',
+    })
+    const page = await f.flow.load({ scope: 'messages', sessionId: f.sessionId })
+    if (!page.ok || page.value.scope !== 'messages') throw new Error('Missing message view')
+    expect(page.value.header.sessionIssues).toMatchObject({
+      inputGate: 'send_blocked',
+      agents: [
+        expect.objectContaining({
+          runId: original.id,
+          phase: 'background_check',
+          action: 'rebuild',
+        }),
+      ],
+    })
+    expect(native.runs).toBe(1)
+  })
+
+  it('does not overwrite a Rebuild started while a Check waits for output persistence', async () => {
+    native.enrichTitle = undefined
+    const f = await fixture()
+    const original = await f.send()
+    const repo = f.db.conversationRepository
+    const probe = NativeFixture.prototype.probeNativeStatus
+    vi.spyOn(NativeFixture.prototype, 'probeNativeStatus').mockImplementation(async (input) => ({
+      ...(await probe(input)),
+      output: {
+        outputId: 'checked-answer',
+        text: 'Fixture reply',
+        completeness: 'complete' as const,
+      },
+    }))
+    const seal = Promise.withResolvers<void>()
+    const rebuild = Promise.withResolvers<void>()
+    const persist = vi.spyOn(repo, 'recordNativeOutputComplete').mockImplementation(async () => {
+      await seal.promise
+      return repo.metadataPatch(f.sessionId)
+    })
+    // oxlint-disable-next-line typescript/unbound-method -- Invoked with the original fixture receiver via call below.
+    const create = NativeFixture.prototype.rebuildNativeContext
+    vi.spyOn(NativeFixture.prototype, 'rebuildNativeContext').mockImplementation(
+      async function (this: NativeFixture, input, source) {
+        await rebuild.promise
+        return create.call(this, input, source)
+      },
+    )
+    const checking = f.flow.retry({
+      runId: original.id,
+      sessionId: f.sessionId,
+      agentId: 'codex',
+      intent: 'inspect',
+    })
+    try {
+      await vi.waitFor(() => expect(persist).toHaveBeenCalledOnce())
+      const result = await f.flow.rebuildNativeContext({
+        sessionId: f.sessionId,
+        agentId: 'codex',
+        intent: 'create',
+        abandon: true,
+        clientOperationId: randomUUID(),
+        expectedGeneration: 1,
+        expectedRunId: original.id,
+        expectedNativeSessionId: original.nativeSessionId!,
+      })
+      expect(result.ok).toBe(true)
+      const candidate = repo.nativeContext(f.sessionId, 'codex')
+      expect(candidate?.continuationState).toBe('rebuilding')
+      seal.resolve()
+      expect((await checking).ok).toBe(false)
+      expect(repo.nativeContext(f.sessionId, 'codex')).toEqual(candidate)
+    } finally {
+      seal.resolve()
+      rebuild.resolve()
+      await checking
+    }
+    await vi.waitFor(() =>
+      expect(repo.lastNativeRebuild(f.sessionId, 'codex')?.stage).toBe('completed'),
+    )
+  })
+
+  it.each([
+    ['no_evidence', 'unknown'],
+    ['timeout', 'unknown'],
+    ['missing', 'unknown'],
+    ['no_evidence', 'pending'],
+    ['timeout', 'pending'],
+    ['missing', 'pending'],
+  ] as const)(
+    'keeps a known ended background draft editable after %s with %s effects except a missing binding',
+    async (kind, effects) => {
+      native.enrichTitle = undefined
+      const f = await fixture()
+      native.liveBackground = effects === 'pending'
+      const original = await f.send()
+      const repo = f.db.conversationRepository
+      repo.recordNativeEffects(original.id, effects, 'observation_lost')
+      const probe = NativeFixture.prototype.probeNativeStatus
+      vi.spyOn(NativeFixture.prototype, 'probeNativeStatus').mockImplementation(async (input) => {
+        if (kind === 'timeout') throw new Error('Native check deadline expired.')
+        const { identity } = await probe(input)
+        return kind === 'missing'
+          ? { kind, identity, source: 'native_error' }
+          : { kind, identity, reason: 'No exact background status is available.' }
+      })
+      expect(
+        (
+          await f.flow.retry({
+            runId: original.id,
+            sessionId: f.sessionId,
+            agentId: 'codex',
+            intent: 'inspect',
+          })
+        ).ok,
+      ).toBe(false)
+      const page = await f.flow.load({ scope: 'messages', sessionId: f.sessionId })
+      if (!page.ok || page.value.scope !== 'messages') throw new Error('Missing message view')
+      expect(page.value.header.sessionIssues?.inputGate).toBe(
+        kind === 'missing' ? 'read_only' : 'send_blocked',
+      )
+      expect(repo.findRun(original.id)).toMatchObject({
+        dispatchPhase: 'ended',
+        nativeEffectsState: effects,
+      })
+      expect(native.runs).toBe(1)
+    },
+  )
+
+  it('rebuilds the checked background cursor and returns a later unsent request separately', async () => {
+    native.enrichTitle = undefined
+    const f = await fixture()
+    const original = await f.send()
+    const repo = f.db.conversationRepository
+    repo.recordNativeEffects(original.id, 'unknown', 'observation_lost')
+    const drafts = repo.readPage({ scope: 'drafts', sessionId: f.sessionId })
+    if (drafts.scope !== 'drafts') throw new Error('Missing draft revision')
+    const refused = repo.beginRun({
+      sessionId: f.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Keep this separate unsent request.',
+      expectedCommentsRevision: drafts.commentsRevision,
+      commentIds: [],
+      agentId: 'codex',
+      settingsRevision: 1,
+      model: null,
+      effort: null,
+    }).run
+    repo.recordDispatch(refused.id, 'rejected')
+    repo.recordNativeEffects(refused.id, 'not_dispatched')
+    repo.failRun(refused.id, 'native_session_occupied', 'No input was sent')
+    vi.spyOn(NativeFixture.prototype, 'probeNativeStatus').mockRejectedValue(
+      new Error('The background work cannot be confirmed.'),
+    )
+    const checked = await f.flow.retry({
+      runId: original.id,
+      sessionId: f.sessionId,
+      agentId: 'codex',
+      intent: 'inspect',
+    })
+    expect(checked.ok).toBe(false)
+    const request = {
+      sessionId: f.sessionId,
+      agentId: 'codex' as const,
+      intent: 'create' as const,
+      abandon: true,
+      clientOperationId: randomUUID(),
+      expectedGeneration: 1,
+      expectedRunId: original.id,
+      expectedNativeSessionId: original.nativeSessionId!,
+    }
+    const rebuilt = await f.flow.rebuildNativeContext(request)
+    expect(rebuilt.ok).toBe(true)
+    await vi.waitFor(() =>
+      expect(repo.lastNativeRebuild(f.sessionId, 'codex')?.stage).toBe('completed'),
+    )
+    expect(repo.findRun(original.id)?.controlDisposition).toBe('abandoned')
+    expect(repo.findRun(refused.id)?.controlDisposition).toBe('retained')
+    expect(repo.rebuildInputRecovery(f.sessionId)).toMatchObject({
+      operationId: request.clientOperationId,
+      messageId: refused.userMessageId,
+      state: 'pending',
+    })
+    expect((await f.flow.rebuildNativeContext(request)).ok).toBe(true)
+    expect((await f.flow.rebuildNativeContext({ ...request, expectedRunId: refused.id })).ok).toBe(
+      false,
+    )
+    expect(native.runs).toBe(1)
+  })
+
+  it.each([
+    [
+      '你帮我评估一下目前 relay 的功能以及更合适的实现方案',
+      '你帮我评估一下目前 relay 的功能以及更合适的实现方案',
+    ],
+    [
+      'Review the current relay implementation and explain the remaining design tradeoffs clearly',
+      'Review the current relay implementation and explain the remaining design tradeoffs clearly',
+    ],
+    ['界'.repeat(150), '界'.repeat(120)],
+    ['x'.repeat(118) + '👩‍💻', 'x'.repeat(118)],
+    ['x'.repeat(118) + '😀', 'x'.repeat(118) + '😀'],
+  ])('preserves the full local title within its existing limit: %s', async (content, expected) => {
+    native.enrichTitle = undefined
+    const f = await fixture()
+    await f.send('codex', f.sessionId, content)
+    expect(f.title()).toBe(expected)
+    expect(f.title().length).toBeLessThanOrEqual(120)
+    expect(f.db.sessionRepository.find(f.sessionId)?.titleSource).toBe('local')
+  })
+
   it('adopts same-Turn metadata without a Native name and retains it through stale native readback and resume', async () => {
     native.enrichTitle = undefined
     native.reportedTitle = 'Metadata from the first task'

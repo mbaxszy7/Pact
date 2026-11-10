@@ -8,13 +8,13 @@ import type {
   DefaultSessionSettings,
   DefaultSessionSettingsEditorState,
   Project,
-  ConversationSendInput,
   SessionSettingsEditorState,
   SessionPermissionSaveInput,
   SessionSpeedSaveInput,
   SessionCatalogChange,
   ProjectNameChange,
   RpcResult,
+  SchedulingState,
 } from '@pact/contracts'
 
 import type { ComposerDocument } from '../conversation/composer-document'
@@ -26,7 +26,9 @@ import type {
   ConversationHistoryControls,
   ConversationFlow,
 } from '../conversation/useConversation'
-import type { SessionCatalogCache } from './session-catalog-cache'
+import type { RelayDecisionPresentation } from '../scheduling/RelayDecisionCard'
+import type { NavigationIntent } from './ProjectNavigation'
+import type { SessionWorkspaceFlow } from './useSessionWorkspace'
 
 import { nativeRecoveryTargets } from '../conversation/conversation-window'
 import { ConversationView } from '../conversation/ConversationView'
@@ -61,11 +63,10 @@ interface WorkspaceViewProps {
   onSaveSessionSpeed: (input: SessionSpeedSaveInput) => Promise<boolean>
   projects: Project[]
   sessions: CollaborationSession[]
-  sessionProjectPages: SessionCatalogCache['projectPages']
+  sessionWorkspace: SessionWorkspaceFlow
+  navigationIntent?: NavigationIntent | undefined
   loading: boolean
   sessionsLoading: boolean
-  loadingMoreProjectId?: string | undefined
-  loadMoreErrors: Record<string, string>
   adding: boolean
   creatingSession: boolean
   savingSessionSettings: boolean
@@ -77,6 +78,8 @@ interface WorkspaceViewProps {
   sessionError?: string | undefined
   updateAvailable?: boolean
   settingsPage: SettingsPage
+  schedulingState?: SchedulingState | undefined
+  relayDecision?: RelayDecisionPresentation | undefined
   settingsView?: ReactNode
   runtimeNotice?: ReactNode
   archiveNotice?: ReactNode
@@ -86,6 +89,7 @@ interface WorkspaceViewProps {
   selectedSessionId?: string | undefined
   selectedProjectId?: string | undefined
   creatingProjectId?: string | undefined
+  creatingGroupId?: string | undefined
   creationEditorState?: DefaultSessionSettingsEditorState | undefined
   creationLoading: boolean
   sessionSettingsEditorState?: SessionSettingsEditorState | undefined
@@ -115,10 +119,9 @@ interface WorkspaceViewProps {
   onRenameProject: (projectId: string, name: string) => Promise<RpcResult<ProjectNameChange>>
   onRetry: () => void
   onRetrySessions: () => void
-  onLoadMoreSessions: (projectId: string) => Promise<number>
   onOpenSettings: (page: Exclude<SettingsPage, null>) => void
   onBackToApp: () => void
-  onStartSession: (projectId: string) => void
+  onStartSession: (projectId: string, groupId?: string) => void
   onCancelSessionCreation: () => void
   onCreateSession: (projectId: string, settings: DefaultSessionSettings) => void
   onSelectSession: (sessionId: string) => void
@@ -128,13 +131,7 @@ interface WorkspaceViewProps {
   onSaveSessionSettings: (sessionId: string, settings: DefaultSessionSettings) => void
   onArchiveSession: (sessionId: string) => void
   onRenameSession: (sessionId: string, title: string) => Promise<boolean>
-  onSendMessage: (
-    content: string,
-    commentIds: string[],
-    route?: NonNullable<ConversationSendInput['route']>,
-    skills?: SkillSelection[],
-    planningAction?: ConversationSendInput['planningAction'],
-  ) => Promise<boolean>
+  onSendMessage: ConversationFlow['send']
   onSaveCommentDraft: ConversationFlow['saveCommentDraft']
   onRemoveCommentDraft: (commentId: string) => Promise<boolean>
   onOpenComment: (comment: AnchoredComment) => void
@@ -159,16 +156,7 @@ interface WorkspaceViewProps {
         report?: import('@pact/contracts').MessageCommentAnchor['report']
       }
     | undefined
-  todoNavigation?:
-    | {
-        taskId: string
-        todoId: string
-        todoRevision: number
-        navigationId: string
-        selection?: import('@pact/contracts').TodoCommentAnchor['selection']
-      }
-    | undefined
-  onStopRun: () => Promise<boolean>
+  onStopRun: ConversationFlow['stop']
   onRebuildNativeContext: ConversationFlow['rebuildNativeContext']
   onCheckNativeContext: ConversationFlow['checkNativeContext']
   onAcceptPeerProposal: (proposalId: string) => Promise<boolean>
@@ -206,7 +194,12 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
     props.projects.find((project) => project.id === props.selectedProjectId) ??
     selectedProject ??
     props.projects.at(0)
-  const [planPane, setPlanPane] = useState<{ sessionId: string; taskId: string; open: boolean }>()
+  const [planPane, setPlanPane] = useState<{
+    sessionId: string
+    taskId: string
+    open: boolean
+    expanded: boolean
+  }>()
   const [planHost, setPlanHost] = useState<HTMLDivElement | null>(null)
   const planRestoreFocusRef = useRef<HTMLButtonElement>(null)
   const sessionSettingsFocusRef = useRef<HTMLButtonElement>(null)
@@ -217,7 +210,7 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
       taskId
         ? current?.sessionId === sessionId && current.taskId === taskId
           ? current
-          : { sessionId, taskId, open: true }
+          : { sessionId, taskId, open: true, expanded: false }
         : current?.sessionId === sessionId
           ? undefined
           : current,
@@ -229,9 +222,14 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
     setPlanPane((current) => (current ? { ...current, open: true } : current))
   }, [onSessionSettingsOpenChange])
   const closePlan = useCallback(
-    (): void => setPlanPane((current) => (current ? { ...current, open: false } : current)),
+    (): void =>
+      setPlanPane((current) => (current ? { ...current, open: false, expanded: false } : current)),
     [],
   )
+
+  const setPlanExpanded = useCallback((expanded: boolean): void => {
+    setPlanPane((current) => (current ? { ...current, expanded } : current))
+  }, [])
 
   return (
     <WorkspaceShell
@@ -252,11 +250,10 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
             updateAvailable={props.updateAvailable ?? false}
             projects={props.projects}
             sessions={props.sessions}
-            projectPages={props.sessionProjectPages}
+            workspace={props.sessionWorkspace}
+            navigationIntent={props.navigationIntent}
             loading={props.loading || props.sessionsLoading}
-            loadingMoreProjectId={props.loadingMoreProjectId}
-            loadMoreErrors={props.loadMoreErrors}
-            error={selectedSession ? props.sessionError : undefined}
+            error={props.sessionError}
             adding={props.adding}
             archivingProjectId={props.archivingProjectId}
             renamingProjectId={props.renamingProjectId}
@@ -268,7 +265,6 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
             onRenameProject={props.onRenameProject}
             onOpenSettings={props.onOpenSettings}
             onRetrySessions={props.onRetrySessions}
-            onLoadMoreSessions={props.onLoadMoreSessions}
             onStartSession={props.onStartSession}
             onSelectSession={props.onSelectSession}
             onArchiveSession={props.onArchiveSession}
@@ -277,14 +273,18 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
       }
       workspaceHeader={
         selectedSession && !props.settingsPage && !creatingProject ? (
-          <SessionHeader
-            session={selectedSession}
-            projectName={selectedProject?.name}
-            saving={props.renamingSessionId === selectedSession.id}
-            onSave={(title) => props.onRenameSession(selectedSession.id, title)}
-            onOpenSettings={() => props.onOpenSessionSettings(selectedSession.id)}
-            settingsButtonRef={sessionSettingsFocusRef}
-          />
+          <div className="flex h-full min-w-0 items-center gap-group">
+            <div className="min-w-0 flex-1">
+              <SessionHeader
+                session={selectedSession}
+                projectName={selectedProject?.name}
+                saving={props.renamingSessionId === selectedSession.id}
+                onSave={(title) => props.onRenameSession(selectedSession.id, title)}
+                onOpenSettings={() => props.onOpenSessionSettings(selectedSession.id)}
+                settingsButtonRef={sessionSettingsFocusRef}
+              />
+            </div>
+          </div>
         ) : undefined
       }
       workspaceNotice={
@@ -297,7 +297,8 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
       agentActionsEnabled={props.agentActionsEnabled}
       isSettingsView={Boolean(props.settingsPage)}
       contextPanelOpen={props.sessionSettingsOpen || planOpen}
-      contextPanelExpanded={props.projectFilePanelExpanded}
+      contextPanelExpanded={planOpen ? planPane?.expanded : props.projectFilePanelExpanded}
+      contextPanelWidthLimited={!planOpen}
       contextPanelRestoreFocusRef={
         planOpen
           ? planRestoreFocusRef
@@ -312,7 +313,9 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
         if (props.sessionSettingsOpen) props.onSessionSettingsOpenChange(open)
         else if (planAvailable)
           setPlanPane((current) =>
-            current && current.open !== open ? { ...current, open } : current,
+            current && current.open !== open
+              ? { ...current, open, expanded: open && current.expanded }
+              : current,
           )
       }}
       showContextToggle={false}
@@ -333,6 +336,8 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
             host: planHost,
             available: planAvailable,
             open: planOpen,
+            expanded: Boolean(planOpen && planPane?.expanded),
+            onExpandedChange: setPlanExpanded,
             onAvailable: acceptPlanTask,
             onOpen: openPlan,
             onClose: closePlan,
@@ -361,13 +366,17 @@ function contextPanel(
       />
     )
   if (props.workspaceChangesPanel) {
+    const state = props.workspaceChangesPanel
     return (
       <WorkspaceChangesPanel
-        key={`${props.workspaceChangesPanel.sessionId}:${props.workspaceChangesPanel.changeSetId}:${props.workspaceChangesPanel.path}`}
-        state={props.workspaceChangesPanel}
+        key={`${state.sessionId}:${state.changeSetId}`}
+        state={state}
         expanded={props.projectFilePanelExpanded}
         onClose={() => props.onSessionSettingsOpenChange(false)}
         onExpandedChange={props.onProjectFilePanelExpandedChange}
+        onSelectFile={(path) =>
+          props.onOpenWorkspaceChanges(state.changeSetId, path, undefined, state.revision)
+        }
       />
     )
   }
@@ -413,6 +422,8 @@ function WorkspaceContent({
     host: HTMLElement | null
     available: boolean
     open: boolean
+    expanded: boolean
+    onExpandedChange: (expanded: boolean) => void
     onAvailable: (sessionId: string, taskId?: string) => void
     onOpen: () => void
     onClose: () => void
@@ -431,7 +442,7 @@ function WorkspaceContent({
         creating={props.creatingSession}
         error={props.sessionError}
         onCancel={props.onCancelSessionCreation}
-        onRetry={() => props.onStartSession(creatingProject.id)}
+        onRetry={() => props.onStartSession(creatingProject.id, props.creatingGroupId)}
         onCreate={(settings) => props.onCreateSession(creatingProject.id, settings)}
         onOpenAppDefaults={() => props.onOpenSettings('session-defaults')}
       />
@@ -445,16 +456,17 @@ function WorkspaceContent({
         ) : null}
         <div
           className="h-full"
-          style={{ visibility: props.settingsPage ? 'hidden' : 'visible' }}
+          style={{ opacity: props.settingsPage ? 0 : 1 }}
           inert={Boolean(props.settingsPage)}
         >
           <ConversationErrorBoundary key={selectedSession.id}>
             <ConversationView
               planPanelHost={planPane.host}
               planPanelOpen={planPane.open}
+              planPanelExpanded={planPane.expanded}
+              onPlanPanelExpandedChange={planPane.onExpandedChange}
               planAvailable={planPane.available}
               planRestoreFocusRef={planPane.restoreFocusRef}
-              todoNavigation={props.todoNavigation}
               onPlanAvailable={planPane.onAvailable}
               onOpenPlan={planPane.onOpen}
               onClosePlan={planPane.onClose}
@@ -466,6 +478,10 @@ function WorkspaceContent({
               onSaveSessionSpeed={props.onSaveSessionSpeed}
               sessionSettingsSaving={props.savingSessionSettings}
               session={selectedSession}
+              schedulingState={props.schedulingState}
+              relayDecision={props.relayDecision}
+              onOpenRelaySettings={() => props.onOpenSettings('decision-scheduling')}
+              onOpenSessionSettings={() => props.onOpenSessionSettings(selectedSession.id)}
               visible={props.conversationVisible}
               snapshot={props.conversation}
               history={props.conversationHistory}

@@ -4,6 +4,8 @@ import type { WindowsJobMembers, WindowsLaunchOwner } from './windows-cli-launch
 
 type ReadJobDiagnostic = () => ReturnType<WindowsLaunchOwner['diagnostic']> | undefined
 
+const completedQuits = new WeakSet<ElectronApplication>()
+
 function emitQuitDiagnostic(output: string): void {
   try {
     console.error('[pact-e2e-quit]', output)
@@ -87,13 +89,17 @@ export async function quitPact(
   page?: Page,
   readJobDiagnostic?: ReadJobDiagnostic,
 ): Promise<void> {
+  if (completedQuits.has(app)) return
   try {
     const child = app.process()
     if (child.exitCode !== null || child.signalCode !== null) {
       expect(child.exitCode).toBe(0)
+      expect(child.signalCode).toBeNull()
+      completedQuits.add(app)
       return
     }
     const currentPage = page ?? (await app.firstWindow())
+    const deadline = Date.now() + 15_000
     const closed = app.waitForEvent('close', { timeout: 15_000 })
     const exit = currentPage.getByRole('button', { name: 'Exit Pact', exact: true })
     await app.evaluate(({ app: nativeApp }) => {
@@ -109,11 +115,24 @@ export async function quitPact(
           throw error
         }),
     ])
-    if (confirm) await exit.click()
+    if (confirm) {
+      try {
+        await Promise.race([closed, exit.click({ timeout: Math.max(1, deadline - Date.now()) })])
+      } catch (error) {
+        // The confirmation can disappear while the already-requested native quit
+        // completes. Only actual closure, within the original deadline, supersedes
+        // a failed click; a missing or forced exit still fails below.
+        await closed.catch(() => {
+          throw error
+        })
+      }
+    }
     await closed
     expect(child.exitCode).toBe(0)
+    expect(child.signalCode).toBeNull()
+    completedQuits.add(app)
   } catch (error) {
-    if (readJobDiagnostic) recordQuitFailure(app, readJobDiagnostic, 'before-dispose')
+    recordQuitFailure(app, readJobDiagnostic ?? (() => undefined), 'before-dispose')
     throw error
   }
 }

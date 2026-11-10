@@ -18,6 +18,7 @@ import type { AgentPromptEnvelope, AgentPromptImage } from '@pact/agent-runtime'
 
 import { serializeAgentPromptEnvelope } from '@pact/agent-runtime'
 
+import { planRunInput } from './collaboration-fixture.test-support.js'
 import {
   claudePromptContent,
   codexPromptInput,
@@ -80,6 +81,53 @@ function prompt(images: AgentPromptImage[]): AgentPromptEnvelope {
 }
 
 describe('Native image input', () => {
+  it.each([false, true])(
+    'sends Pact planning text without exposing a native slash command; images=%s',
+    async (withImage) => {
+      const envelope = planRunInput('claude').promptEnvelope
+      const original = '/plan 保留用户原文\nInspect cancellation ownership.'
+      envelope.message.content = original
+      if (withImage) envelope.message.images = [await savedImage()]
+      const before = structuredClone(envelope)
+      const content = await claudePromptContent(envelope)
+      const text =
+        typeof content === 'string' ? content : content.find((block) => block.type === 'text')?.text
+      expect(text).not.toMatch(/^\s*\/plan(?:\s|$)/u)
+      expect(text).toContain(original)
+      expect(text).toContain('"stage":"plan"')
+      expect(envelope).toEqual(before)
+      expect(codexPromptInput(envelope)[0]).toMatchObject({
+        text: serializeAgentPromptEnvelope(envelope),
+      })
+    },
+  )
+
+  it('preserves ordinary native command and explicit Skill serialization', async () => {
+    const envelope = prompt([])
+    envelope.message.content = '/native-command exact arguments'
+    expect(await claudePromptContent(envelope)).toBe(serializeAgentPromptEnvelope(envelope))
+    envelope.targetAgentId = 'claude'
+    envelope.skillInvocation = {
+      version: 'pact-skills-v1',
+      arguments: 'exact arguments',
+      selections: [],
+      bindings: [
+        {
+          id: 'a'.repeat(64),
+          agentId: 'claude',
+          name: 'plan',
+          description: '',
+          argumentHint: '',
+          source: 'user',
+          path: '/skills/plan/SKILL.md',
+        },
+      ],
+    }
+    const content = await claudePromptContent(envelope)
+    expect(content).toBe(serializeAgentPromptEnvelope(envelope))
+    expect(content).toContain('Explicit native Skill request: use /plan.')
+  })
+
   it.skipIf(process.platform !== 'win32')(
     'refuses a named Windows image replaced during its opened read',
     async () => {

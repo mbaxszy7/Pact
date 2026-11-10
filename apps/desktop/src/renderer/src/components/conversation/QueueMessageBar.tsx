@@ -18,11 +18,14 @@ interface QueueMessageBarProps {
   pending: boolean
   disabled: boolean
   canSteer: boolean
+  canResume?: boolean
+  showSteer?: boolean
+  backgroundStatus?: 'waiting' | 'waiting_incomplete' | 'stopping' | undefined
   steerUnavailableReason: string
   respondingAgentId?: RuntimeAgentId | undefined
   onSteer: () => Promise<boolean>
   onRemove: () => Promise<boolean>
-  onEdit: () => Promise<boolean>
+  onEdit?: (() => Promise<boolean>) | undefined
   onResume: () => Promise<boolean>
   onSetEnabled: (enabled: boolean) => Promise<boolean>
   onCheckStatus?: (() => Promise<boolean>) | undefined
@@ -34,6 +37,9 @@ export function QueueMessageBar({
   pending,
   disabled,
   canSteer,
+  canResume = true,
+  showSteer = true,
+  backgroundStatus,
   steerUnavailableReason,
   respondingAgentId,
   onSteer,
@@ -132,8 +138,10 @@ export function QueueMessageBar({
       ? `${respondingAgentId === 'claude' ? 'Claude Code' : 'Codex'} is responding, but this message targets ${name}. Steer is only available for the Agent currently responding.`
       : undefined
   const steerInfoId = `queue-steer-info-${id}`
-  const stateLabel =
-    entry.state === 'dispatching'
+  const stoppingBackground = backgroundStatus === 'stopping'
+  const stateLabel = stoppingBackground
+    ? 'Stopping…'
+    : entry.state === 'dispatching'
       ? 'Delivering message…'
       : entry.state === 'unknown'
         ? 'Delivery not confirmed'
@@ -141,7 +149,11 @@ export function QueueMessageBar({
           ? 'Queue paused'
           : !queue.enabled
             ? 'Queue disabled'
-            : 'Queued'
+            : backgroundStatus === 'waiting_incomplete'
+              ? 'Waiting for background work. Response incomplete.'
+              : backgroundStatus === 'waiting'
+                ? 'Waiting for background work'
+                : 'Queued'
   const attachments = [
     entry.imageCount ? `${entry.imageCount} ${entry.imageCount === 1 ? 'image' : 'images'}` : '',
     entry.commentCount
@@ -177,21 +189,23 @@ export function QueueMessageBar({
           {entry.preview || attachments || 'Message'}
         </span>
         <div className="flex shrink-0 items-center gap-0.5">
-          <button
-            type="button"
-            disabled={busy || locked || !canSteer}
-            title={
-              canSteer
-                ? 'Send to the current response'
-                : (agentMismatchReason ?? steerUnavailableReason)
-            }
-            className="inline-flex min-h-8 items-center gap-1.5 rounded-control px-2 font-medium text-secondary hover:bg-surface-raised hover:text-primary disabled:cursor-default disabled:opacity-40"
-            onClick={() => void onSteer()}
-          >
-            <CornerDownRight aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
-            Steer
-          </button>
-          {!canSteer && agentMismatchReason ? (
+          {showSteer ? (
+            <button
+              type="button"
+              disabled={busy || locked || !canSteer}
+              title={
+                canSteer
+                  ? 'Send to the current response'
+                  : (agentMismatchReason ?? steerUnavailableReason)
+              }
+              className="inline-flex min-h-8 items-center gap-1.5 rounded-control px-2 font-medium text-secondary hover:bg-surface-raised hover:text-primary disabled:cursor-default disabled:opacity-40"
+              onClick={() => void onSteer()}
+            >
+              <CornerDownRight aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
+              Steer
+            </button>
+          ) : null}
+          {showSteer && !canSteer && agentMismatchReason ? (
             <span className="group relative inline-flex shrink-0">
               <button
                 type="button"
@@ -243,20 +257,32 @@ export function QueueMessageBar({
           </button>
         </div>
       </div>
-      {entry.state !== 'queued' || !queue.enabled || entry.reason || attachments ? (
+      {backgroundStatus ||
+      entry.state !== 'queued' ||
+      !queue.enabled ||
+      entry.reason ||
+      attachments ? (
         <div
           className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pl-6 text-secondary"
           role="status"
         >
+          {stoppingBackground ? (
+            <LoaderCircle
+              aria-hidden="true"
+              className="size-3.5 shrink-0 animate-spin motion-reduce:animate-none"
+            />
+          ) : null}
           <span>
             {stateLabel}
-            {removableDelivery
-              ? ' · The original execution was rebuilt. You can remove this item from the Pact queue; its delivery remains unconfirmed.'
-              : entry.reason
-                ? ` · ${entry.reason}`
-                : ''}
+            {stoppingBackground
+              ? ''
+              : removableDelivery
+                ? ' · The original execution was rebuilt. You can remove this item from the Pact queue; its delivery remains unconfirmed.'
+                : entry.reason
+                  ? ` · ${entry.reason}`
+                  : ''}
           </span>
-          {entry.state === 'paused' ? (
+          {entry.state === 'paused' && !stoppingBackground && canResume ? (
             <button
               type="button"
               disabled={busy || !queue.enabled}
@@ -306,10 +332,10 @@ export function QueueMessageBar({
           type="button"
           role="menuitem"
           className="pact-composer-menu-item disabled:opacity-40"
-          disabled={busy || locked}
+          disabled={busy || locked || !onEdit}
           onClick={() => {
             close()
-            void onEdit()
+            void onEdit?.()
           }}
         >
           <Pencil aria-hidden="true" className="size-4" strokeWidth={1.75} />

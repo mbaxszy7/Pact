@@ -10,12 +10,13 @@ import { PactDatabase } from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { Conversation } from './conversation.js'
 
 const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
   agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
-  runningMessagePolicy: 'next_round',
+
   maxDiscussionRounds: 3,
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
@@ -50,7 +51,7 @@ async function fixture(filePath = ':memory:') {
     db.sessionRepository,
     db.projectCatalogRepository,
     new RuntimePreparation(db.runtimePreparationRepository),
-    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
   )
   owners.push({ db, flow })
   await flow.initializeNativePresence()
