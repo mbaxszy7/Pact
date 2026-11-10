@@ -542,6 +542,9 @@ export function serializeAgentPromptEnvelope(
       ((envelope.message.images?.length ?? 0) > 0
         ? 'Review the attached Pact images and Comments.'
         : 'Review the attached Pact Comments.')
+  // Keep the host’s internal reply proof out of the model’s prompt.
+  const { replyIntentBasis: _replyIntentBasis, ...visibleAuthorization } =
+    envelope.collaborationAuthorization ?? {}
   const context = {
     ...(envelope.sourceGrant ? { sourceGrant: envelope.sourceGrant } : {}),
     ...(envelope.sourceGrant && envelope.inputBatchRef
@@ -607,7 +610,7 @@ export function serializeAgentPromptEnvelope(
         }
       : {}),
     ...(envelope.collaborationAuthorization
-      ? { collaborationAuthorization: envelope.collaborationAuthorization }
+      ? { collaborationAuthorization: visibleAuthorization }
       : {}),
     ...(envelope.inputBatchRef ? { inputBatchRef: envelope.inputBatchRef } : {}),
     ...(envelope.requiredInputScopeRef

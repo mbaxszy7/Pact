@@ -51,6 +51,7 @@ import {
   collaborationSourceReadSchema,
   collaborationReviewInputSchema,
   collaborationInputResultSchema,
+  collaborationInputOutcomeAllowed,
   collaborationPlanRetentionInputSchema,
   collaborationPlanRetentionAllowed,
   nativeBackgroundReportIdentitySchema,
@@ -89,6 +90,9 @@ import {
   collaborationPlanMode,
   collaborationReviewMode,
   collaborationInputResultAllowed,
+  collaborationInputResultDescription,
+  collaborationInputResultReceiptText,
+  collaborationPlanRetentionReceiptText,
   collaborationPlanningInstructions,
   frozenSourceInstructions,
   collaborationToolAllowed,
@@ -2009,21 +2013,22 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           ? [
               tool(
                 'submit_input_result',
-                'Report whether this root has fully handled the supplied user input and resolved all necessary choices, or still needs user input. needs_user requires up to three questions with optional choices; processed must omit questions. Planners may only submit needs_user. This does not approve code, repair or implementation.',
+                collaborationInputResultDescription,
                 collaborationInputResultSchema.shape,
                 async (raw) => {
                   if (this.disposed || transportReleased || terminalKnown || signal.aborted)
                     throw new Error('This input result belongs to a retired root.')
                   const result = collaborationInputResultSchema.parse(raw)
-                  if (nativePlanning && result.outcome !== 'needs_user')
-                    throw new Error(
-                      'A planner can only submit questions; a native plan settles processed input.',
-                    )
+                  if (
+                    !workflow ||
+                    !collaborationInputOutcomeAllowed(workflow, authorization, result.outcome)
+                  )
+                    throw new Error('This root is not authorized to submit that input result.')
                   return {
                     content: [
                       {
                         type: 'text' as const,
-                        text: 'Result validated. Finish this root response; Pact will settle it after normal completion.',
+                        text: collaborationInputResultReceiptText,
                       },
                     ],
                   }
@@ -2181,7 +2186,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             content: [
               {
                 type: 'text' as const,
-                text: 'Retention intent validated. Complete this root response; Pact will verify the native plan source and settle it after normal completion.',
+                text: collaborationPlanRetentionReceiptText,
               },
             ],
           }
@@ -2556,7 +2561,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       }
     }
     const captureInputResult = (outcome: CollaborationInputObservation): void => {
-      if (nativePlanning && outcome.outcome === 'processed') return
+      if (!workflow || !collaborationInputOutcomeAllowed(workflow, authorization, outcome.outcome))
+        return
       try {
         inputResult = mergeWorkflowInput(inputResult, outcome)
         input.recordWorkflowInputResult?.(inputResult)
@@ -2873,7 +2879,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           currentRequestMatched &&
           !recordingFailed &&
           !rootObservationUnknown &&
-          !inputResult &&
           terminalOutcome === 'completed' &&
           readerEof &&
           !signal.aborted &&
@@ -2893,6 +2898,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             intent &&
             !intent.invalid &&
             intent.permissionMatched &&
+            !inputResult &&
             settledRoot(),
           )
         let terminalPlanProjectionFailed = recordingFailed
@@ -2937,6 +2943,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             retention[1].succeeded &&
             retention[1].promptId &&
             authorization?.planReference &&
+            !inputResult &&
             settledRoot(),
           )
         if (retention && eligibleRetention()) {

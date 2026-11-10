@@ -1,7 +1,12 @@
 import { z } from 'zod'
 
 import { collaborationDocumentSchema } from './collaboration-documents.js'
-import { taskStageRolesSchema, collaborationPlanReferenceSchema } from './collaboration.js'
+import {
+  taskStageRolesSchema,
+  collaborationPlanReferenceSchema,
+  collaborationReviewControlCoverageSchema,
+  collaborationReviewSchema,
+} from './collaboration.js'
 import { schedulingHandoffSchema } from './scheduling.js'
 
 export const RELAY_DECISION_BYTES = 4 * 1024
@@ -38,6 +43,10 @@ export const relayRebuildOperationSchema = z.strictObject({
 })
 export const relayRepairOperationSchema = relaySupplementOperationSchema.extend({
   kind: z.literal('repair'),
+})
+export const pactRepairRoleOperationSchema = relaySupplementOperationSchema.extend({
+  kind: z.literal('repair_role_request'),
+  fullAccess: z.boolean().optional(),
 })
 export const relayPlanReviewExtensionOperationSchema = z.strictObject({
   kind: z.literal('extend_plan_review'),
@@ -137,6 +146,7 @@ export const relaySchedulingDecisionSchema = relayDecisionReferenceSchema
         operation: z.discriminatedUnion('kind', [
           relaySupplementOperationSchema,
           relayRepairOperationSchema,
+          pactRepairRoleOperationSchema,
           relayPlanReviewExtensionOperationSchema,
         ]),
       }),
@@ -241,6 +251,12 @@ export const relaySchedulingDecisionProofSchema = z
       Boolean(value.informationEvidence),
     'Necessary information requires its exact current user-source evidence.',
   )
+  .refine(
+    (value) =>
+      value.card.request.category !== 'new_authorization' ||
+      value.card.request.operation.kind !== 'repair_role_request',
+    'A Pact repair confirmation requires native workflow evidence.',
+  )
   .refine(withinRecordBudget, 'The complete Relay proof exceeds its metadata budget.')
 export type RelaySchedulingDecisionProof = z.infer<typeof relaySchedulingDecisionProofSchema>
 
@@ -260,6 +276,35 @@ export const relayNativeRecoveryProofSchema = z
   })
   .refine(withinRecordBudget, 'The complete native recovery proof exceeds its metadata budget.')
 export type RelayNativeRecoveryProof = z.infer<typeof relayNativeRecoveryProofSchema>
+
+/** A repair role confirmation uses a native result or an explicit user choice. */
+const pactRepairRoleProofBasis = z.strictObject({
+  card: relaySchedulingDecisionSchema.refine(
+    (card) =>
+      card.request.category === 'new_authorization' &&
+      card.request.operation.kind === 'repair_role_request',
+  ),
+  expectedTaskRevision: z.number().int().nonnegative(),
+  settingsRevision: z.number().int().nonnegative(),
+  previousRoles: taskStageRolesSchema,
+  bindings: digest,
+})
+export const pactRepairRoleProofSchema = z
+  .discriminatedUnion('version', [
+    pactRepairRoleProofBasis.extend({
+      version: z.literal('pact-repair-role-v1'),
+      coverage: collaborationReviewControlCoverageSchema,
+    }),
+    pactRepairRoleProofBasis.extend({
+      version: z.literal('pact-repair-role-direct-v1'),
+      requestDigest: digest,
+      inputSequence: z.number().int().nonnegative(),
+      review: collaborationReviewSchema,
+      coverage: collaborationReviewControlCoverageSchema.optional(),
+    }),
+  ])
+  .refine(withinRecordBudget, 'The complete Pact repair proof exceeds its metadata budget.')
+export type PactRepairRoleProof = z.infer<typeof pactRepairRoleProofSchema>
 
 export const relayDecisionReceiptReadSchema = z.strictObject({
   sessionId: uuid,

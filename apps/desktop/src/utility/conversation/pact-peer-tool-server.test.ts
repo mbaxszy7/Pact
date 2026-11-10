@@ -717,6 +717,66 @@ describe('workflow tool root capabilities', () => {
     )
   })
 
+  it('accepts a repair intent only on the exact frozen reply and rejects model-supplied authority', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start()
+    const inputId = randomUUID()
+    const task = workflowTask({
+      kind: 'build',
+      stage: 'reply',
+      inputSequence: 1,
+      inputProcessing: { pending: { inputId, inputSequence: 1 } },
+    })
+    const bare = server.beginTurn('claude', false, task)
+    const intent = { outcome: 'repair_role_request' }
+    expect(await workflowCall(`${url}/${bare}`, 'submit_input_result', intent)).toMatchObject({
+      isError: true,
+    })
+    const receipt = server.beginTurn(
+      'claude',
+      false,
+      task,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      {
+        ...task.authorization!,
+        stage: 'reply',
+        inputSequence: 1,
+        inputProcessing: task.inputProcessing,
+        replyIntentBasis: {
+          kind: 'repair_role_request',
+          inputId,
+          inputDigest: 'a'.repeat(64),
+          priorInputSequence: 0,
+          taskRevision: 0,
+          review: {
+            runId: randomUUID(),
+            actor: 'codex',
+            stage: 'code_review',
+            verdict: 'changes_requested',
+            inputSequence: 0,
+            document: { id: randomUUID(), sha256: 'b'.repeat(64), bytes: 1, chars: 1 },
+          },
+        },
+      },
+    )
+    expect(await workflowCall(`${url}/${receipt}`, 'submit_input_result', intent)).toEqual({
+      isError: false,
+      structuredContent: { pactInputResult: { ...intent, receipt: server.capabilityReceipt } },
+    })
+    expect(
+      await workflowCall(`${url}/${receipt}`, 'submit_input_result', {
+        ...intent,
+        actor: 'claude',
+        scope: 'different work',
+      }),
+    ).toMatchObject({ isError: true })
+    expect(server.acceptInputResult({ outcome: 'explanation_only' }, receipt)).toBeUndefined()
+  })
+
   it('preserves repeated and conflicting observations for the durable settlement owner instead of consuming a one-shot quota', async () => {
     const server = new PactPeerToolServer()
     servers.push(server)

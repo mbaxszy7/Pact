@@ -24,6 +24,8 @@ import {
   collaborationInputOutcomeSchema,
   collaborationReviewObservationSchema,
   collaborationInputObservationSchema,
+  collaborationReplyIntentBasisSchema,
+  collaborationAskRefSchema,
 } from './collaboration.js'
 export * from './collaboration.js'
 export * from './scheduling-settings.js'
@@ -2348,6 +2350,7 @@ export const conversationSendInputSchema = z
     queueReturnOperationId: z.string().uuid().optional(),
     /** The Composer preserves whether the user chose a recipient explicitly. */
     routeIntent: z.enum(['implicit', 'explicit']).optional(),
+    askOnly: collaborationAskRefSchema.optional(),
     composerRevision: z.number().int().nonnegative().optional(),
     userInformation: userInformationDeclarationSchema.optional(),
     replyToDecision: z
@@ -2375,6 +2378,23 @@ export const conversationSendInputSchema = z
       .optional(),
   })
   .superRefine((input, context) => {
+    if (
+      input.askOnly &&
+      (input.freezeDrafts !== false ||
+        input.route ||
+        input.userInformation ||
+        input.replyToDecision ||
+        input.returnedInputOperationId ||
+        input.queueReturnOperationId ||
+        input.skills?.length ||
+        input.imageIds?.length ||
+        input.commentIds.length)
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Ask only sends the question text and preserves other drafts.',
+        path: ['askOnly'],
+      })
     if (input.routeIntent === 'implicit' && input.route && input.route.type !== 'primary')
       context.addIssue({
         code: 'custom',
@@ -2411,6 +2431,7 @@ export const conversationSendInputSchema = z
 export type ConversationSendInput = z.infer<typeof conversationSendInputSchema>
 export const collaborationReceivedMetadataSchema = z.strictObject({
   steerSkillInvocation: collaborationDocumentSchema.optional(),
+  replyIntentBasis: collaborationReplyIntentBasisSchema.optional(),
   workflowCommand: z.boolean().default(false),
   rolePolicy: z.literal('split-stages-v1').optional(),
   skills: skillSelectionsSchema.default([]),

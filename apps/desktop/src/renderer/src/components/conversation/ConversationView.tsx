@@ -65,6 +65,7 @@ import {
   WORKSPACE_OPERATION_TIMEOUT_MS,
   collaborationInputGate,
   collaborationActor,
+  collaborationAskAvailable,
   collaborationInputProcessing,
 } from '@pact/contracts'
 
@@ -2502,6 +2503,36 @@ export function ConversationView({
     } else if (decisionReply) setPlanRefresh((value) => value + 1)
   }
 
+  const submitPlanQuestion = async (): Promise<void> => {
+    if (!planningTask || !collaborationAskAvailable(planningTask) || disabled || responseInProgress)
+      return
+    const document = composerRef.current?.document() ?? editorValue
+    const prefix = parseComposerCommandPrefix(document.text, document.skills)
+    if (
+      !document.text.trim() ||
+      prefix.error ||
+      prefix.pact ||
+      prefix.route ||
+      document.skills.length ||
+      document.mention ||
+      document.returnedInputOperationId
+    )
+      return
+    stickToBottomRef.current = true
+    cancelPrepend()
+    scrollIntentRef.current = undefined
+    if (
+      await onSend(document.text, [], undefined, undefined, undefined, {
+        taskId: planningTask.id,
+        expectedRevision: planningTask.revision,
+      })
+    ) {
+      setPlanRefresh((value) => value + 1)
+      skillComposer.close()
+      setMentionQuery(undefined)
+    }
+  }
+
   const returnQueueMessageToComposer = async (restore: boolean): Promise<boolean> => {
     const restored = await (restore
       ? queueActions?.restoreReturned()
@@ -4733,6 +4764,31 @@ export function ConversationView({
                       </button>
                     ) : null}
                     <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                      {planningTask &&
+                      collaborationAskAvailable(planningTask) &&
+                      !responseInProgress ? (
+                        <button
+                          type="button"
+                          className="shrink-0 rounded-control border border-border px-2 py-1.5 text-caption text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-40"
+                          title="Send only the question to the Plan author. Comments and attachments stay in the draft."
+                          disabled={
+                            disabled ||
+                            !composer.trim() ||
+                            Boolean(composerReturnedInputOperationId) ||
+                            Boolean(editorValue.mention) ||
+                            composerSkills.length > 0 ||
+                            Boolean(
+                              parseComposerCommandPrefix(composer, composerSkills).pact ||
+                              parseComposerCommandPrefix(composer, composerSkills).route,
+                            )
+                          }
+                          onClick={() => void submitPlanQuestion()}
+                        >
+                          {draftComments.length || composerImages.length
+                            ? 'Ask only (text)'
+                            : 'Ask only'}
+                        </button>
+                      ) : null}
                       {showStop ? (
                         <button
                           type="button"

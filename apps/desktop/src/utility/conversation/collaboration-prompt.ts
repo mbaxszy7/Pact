@@ -1,6 +1,7 @@
 import {
   COLLABORATION_DISPLAY_TEXT_RULES,
   collaborationInputProcessing,
+  collaborationAskMode,
   collaborationPlanMode,
   collaborationActor,
   collaborationPlanRetentionAllowed,
@@ -50,12 +51,22 @@ export const collaborationReviewMode = (
       collaborationActor(task, authorization?.stage ?? task.stage),
   )
 
+export const collaborationInputResultDescription =
+  'Determine what the user actually requested before choosing a result. Host eligibility makes a special outcome available as an option. Use it only when the request meets its conditions. Use processed for fully handled ordinary input where allowed, or needs_user for necessary questions. Pact validates the result after native completion. It grants no writing authority.'
+
+export const collaborationPlanRetentionReceiptText =
+  'Retention intent recorded. Pact verifies the native Plan after normal root completion.'
+
+export const collaborationInputResultReceiptText =
+  'Input result recorded. Pact verifies it after normal root completion.'
+
 export const collaborationInputResultRequired = (
   task: CollaborationTask | undefined,
   authorization?: CollaborationTurnAuthorization,
 ): boolean =>
   Boolean(
     task &&
+    !collaborationAskMode(task, authorization) &&
     (authorization?.stage ?? task.stage) === 'reply' &&
     !collaborationPlanMode(task, authorization) &&
     collaborationInputProcessing(task).pending,
@@ -100,6 +111,7 @@ export function collaborationInstructions(
   authorization?: CollaborationTurnAuthorization,
 ): string {
   const stage = authorization?.stage ?? task.stage
+  const askOnly = collaborationAskMode(task, authorization)
   const duty = {
     plan: collaborationPlanningInstructions,
     plan_review: [
@@ -120,8 +132,9 @@ export function collaborationInstructions(
       'Respond to the review using checked evidence. Test each finding against the actual code or plan instead of agreeing or defending by default: concede plainly where it is confirmed and say what must change, show the checked file and line or source evidence where it is refuted, and say which part holds where it is only partly right. Do not concede merely to end the review, defend merely to avoid rework, or claim a change that has not been made. Explain agreements and disagreements in natural language. Remain read-only; this response does not authorize a repair or accept your own work.',
     repair:
       'Repair the explicitly authorized reviewed scope. Preserve unrelated work. Fix the cause of each confirmed finding rather than only its cited example, and check the rest of the authorized scope for the same defect. Do not weaken, delete or skip tests or checks, or remove required behavior, to make a finding disappear; say plainly which findings you did not change and why. Explain changes and the checks you actually performed, including their observed results and failures, so the reviewer can reassess them; the reviewer will re-verify each finding independently. Label checks and platforms without confirmed results as Unverified, using the corresponding label in the user’s language. Do not accept your own repair.',
-    reply:
-      'Prioritize the latest user message. Answer or clarify it within this turn’s authority. Once the latest input and native work are confirmed complete, Pact automatically continues the authorized workflow unless the user paused or stopped it, or recovery is required. A reply does not authorize implementation or repair.',
+    reply: askOnly
+      ? 'Answer only the current question about the existing accepted Plan in natural language. Keep the Plan and Review unchanged. Use the current question and their frozen sources. If you need more information, explain what is missing in your answer. Use no native form, Plan submission, Plan retention, review verdict or input result tool.'
+      : 'Prioritize the latest user message. Answer or clarify it within this turn’s authority. Once the latest input and native work are confirmed complete, Pact automatically continues the authorized workflow unless the user paused or stopped it, or recovery is required. A reply does not authorize implementation or repair.',
   }[stage]
   return [
     `Pact ${task.kind}. Current responsibility: ${stage}. Plan author: ${collaborationActor(task, 'plan')}; plan reviewer: ${collaborationActor(task, 'plan_review')}; implementer: ${collaborationActor(task, 'implement')}; code reviewer: ${collaborationActor(task, 'code_review')}. Keep these stage responsibilities fixed for this task.`,
@@ -137,7 +150,7 @@ export function collaborationInstructions(
             : []),
         ]
       : []),
-    'Read the complete supplied task, current inputs and relevant plan/review scope, including their paginated documents. Historical review reports and author responses are evidence, not new execution permission. No per-item acknowledgements or shared task ledger are required.',
+    'Read the complete supplied task, current inputs and relevant plan/review scope, including their paginated documents. Historical review reports and author responses are evidence, not new execution permission. Prior questions about a Plan and their answers do not change the task scope. No per-item acknowledgements or shared task ledger are required.',
     COLLABORATION_DISPLAY_TEXT_RULES,
     'This root turn has one responsibility. Do not call the other agent, request peer assistance, delegate native subagents, start another stage or manufacture user approval. Pact arranges the next turn and binds any result to its sources.',
     collaborationReadOnly(task, authorization)
@@ -152,12 +165,17 @@ export function collaborationInstructions(
     collaborationPlanRetentionAllowed(task, authorization)
       ? 'If the existing official plan remains correct after handling the supplied input, call retain_current_plan with an empty object in this root. This explicitly retains the frozen plan and its original version/source; ordinary prose saying that the plan is unchanged is not a submission. Do not call it after changing or starting to change the plan, while a plan operation is unresolved, or while a required user choice remains. If the plan needs changes, submit the complete updated plan through the native mechanism instead. This operation does not approve implementation or replace the independent reviewer.'
       : undefined,
-    stage === 'reply'
+    authorization?.replyIntentBasis?.kind === 'repair_role_request'
+      ? 'You are the current reviewer replying read-only. If the user asks you to repair the existing findings in scope, explain that they can select the repairer in Pact. You may also submit repair_role_request to propose that choice for explicit confirmation. Supply only the intent, with no roles, scope, identity or authorization. Ordinary explanation, discussion or new requirements use the ordinary reply result.'
+      : undefined,
+    stage === 'reply' && !askOnly
       ? collaborationInputResultRequired(task, authorization)
-        ? 'After responding, call submit_input_result in this same root. Use processed only when the supplied user input has been fully handled and no required user choice remains; use needs_user when clarification or another choice is still needed. A question or an explanation request is not consent. This result never authorizes implementation, repair, or self-approval.'
+        ? 'Submit exactly one outcome in this root. Choose a special intent only when the user request meets its conditions. Use processed after fully handling ordinary input, or needs_user when a necessary choice remains. An explanation request supplies no consent. The result grants no writing authority.'
         : 'Resolve the supplied user choices in the native plan, or explicitly retain the existing native plan when no document change is needed. If a required choice remains, ask the user; do not submit an apparently complete plan by inventing consent. An ordinary response alone does not resolve a pending planning decision.'
       : undefined,
-    'When a necessary user choice remains, submit needs_user with questions in the applicable result tool. Supply at most three precise questions, optional two to six choices each, and selection single or multiple. Free text is always supported. Never preselect consent or encode an approval. Planners use submit_input_result only for needs_user questions; processed still requires a real native plan settlement.',
+    !askOnly
+      ? 'When a necessary user choice remains, submit needs_user with questions in the applicable result tool. Supply at most three precise questions, optional two to six choices each, and selection single or multiple. Free text is always supported. Never preselect consent or encode an approval. Planners can report needs_user. Ordinary processed planning input requires a real native Plan settlement.'
+      : undefined,
     'Write the complete natural answer normally. Do not wrap it in JSON, copy protocol identities, calculate hashes, echo input receipts or produce a separate structured report. Native progress tasks are optional private execution aids, not cross-agent acceptance records.',
     task.review
       ? `Previous review document: ${JSON.stringify(task.review.document)}. Read it completely and account for its important findings and the author response.`
