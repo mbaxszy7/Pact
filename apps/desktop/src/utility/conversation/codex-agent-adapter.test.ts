@@ -5369,7 +5369,15 @@ it('keeps Codex root and Steer source arguments bound to the exact current owner
   }
 })
 
-it.each(['pact/0.163.0', 'codex_cli_rs/0.163.0', 'pact/0.162.1', 'pact/0.164.0', 'unknown'])(
+it.each([
+  'pact/0.163.0',
+  'codex_cli_rs/0.163.0',
+  'pact/0.167.0',
+  'codex_cli_rs/0.167.0',
+  'pact/0.162.1',
+  'pact/0.164.0',
+  'unknown',
+])(
   'selects the source contract from the initialized native actor without a probe: %s',
   async (version) => {
     const {
@@ -5377,7 +5385,7 @@ it.each(['pact/0.163.0', 'codex_cli_rs/0.163.0', 'pact/0.162.1', 'pact/0.164.0',
       collaborationAuthorization: _authorization,
       ...prompt
     } = planRunInput('codex').promptEnvelope
-    const supported = /^(?:pact|codex_cli_rs)\/0\.163\.0$/u.test(version)
+    const supported = /^(?:pact|codex_cli_rs)\/0\.(?:163|167)\.0$/u.test(version)
     const runId = randomUUID(),
       grant = randomUUID(),
       batchId = randomUUID(),

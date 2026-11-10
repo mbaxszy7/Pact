@@ -1,6 +1,7 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { parse as parseToml } from 'smol-toml'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { loadProviderConfiguration, prepareProviderEnvironment } from './provider-environment.js'
@@ -69,6 +70,56 @@ describe('E2E provider configuration boundary', () => {
   afterEach(async () => {
     await rm(root, { recursive: true, force: true })
   })
+
+  it.each(['absent', 'enabled', 'disabled'] as const)(
+    'isolates optional Codex downloads while preserving all other native settings: %s',
+    async (plugins) => {
+      const original =
+        'approval_policy = "on-request"\nsandbox_mode = "workspace-write"\n' +
+        defaultToml +
+        (plugins === 'absent'
+          ? ''
+          : `\n[features]\nplugins = ${plugins === 'enabled'}\nother_native_feature = true\n`)
+      await writeFile(join(configRoot, 'codex/config.toml'), original)
+      const config = await loadProviderConfiguration(configRoot, environment)
+      const prepared = await prepareProviderEnvironment(join(root, 'scene'), config, environment, {
+        disableCodexPlugins: true,
+      })
+      const expected = parseToml(original)
+      expect(parseToml(await readFile(join(prepared.codexHome, 'config.toml'), 'utf8'))).toEqual({
+        ...expected,
+        features: {
+          ...(plugins === 'absent' ? {} : { other_native_feature: true }),
+          plugins: false,
+        },
+      })
+      expect(await readFile(join(configRoot, 'codex/config.toml'), 'utf8')).toBe(original)
+      const [claudeSource, claudeCopy, authSource, authCopy] = await Promise.all([
+        readFile(join(configRoot, 'claude/settings.json')),
+        readFile(join(prepared.claudeHome, 'settings.json')),
+        readFile(join(configRoot, 'codex/auth.json')),
+        readFile(join(prepared.codexHome, 'auth.json')),
+      ])
+      expect(claudeCopy).toEqual(claudeSource)
+      expect(authCopy).toEqual(authSource)
+      await expect(config.assertSourceIntegrity()).resolves.toBeUndefined()
+    },
+  )
+
+  it.each(['true', '2026-11-10'])(
+    'refuses to replace a non-table Codex features value: %s',
+    async (value) => {
+      const original = `features = ${value}\n${defaultToml}`
+      await writeFile(join(configRoot, 'codex/config.toml'), original)
+      const config = await loadProviderConfiguration(configRoot, environment)
+      await expect(
+        prepareProviderEnvironment(join(root, 'scene'), config, environment, {
+          disableCodexPlugins: true,
+        }),
+      ).rejects.toThrow('Codex features must be a table')
+      await expect(config.assertSourceIntegrity()).resolves.toBeUndefined()
+    },
+  )
 
   it('copies complete native bytes privately and keeps the sources unchanged', async () => {
     const originals = await Promise.all([

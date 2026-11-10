@@ -228,6 +228,13 @@ test(
       ).toBeVisible({
         timeout: 45_000,
       })
+      // The recovery card can precede the interrupted Run projection by one patch.
+      await expect
+        .poll(async () => (await readRealConversation(ctx)).runs[0]?.status, {
+          timeout: 45_000,
+          intervals: [250, 500, 1000],
+        })
+        .toBe('interrupted')
       const failed = await readRealConversation(ctx)
       expect(failed.runs).toHaveLength(1)
       expect(failed.runs[0]?.status).toBe('interrupted')

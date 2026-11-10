@@ -12,7 +12,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path'
-import { parse as parseToml } from 'smol-toml'
+import { parse as parseToml, stringify as stringifyToml } from 'smol-toml'
 
 /* oxlint-disable eslint/no-await-in-loop -- Bounded reads, ordered executable discovery and ancestor checks settle before advancing; owned files are prepared before any process starts. */
 
@@ -557,6 +557,7 @@ export async function prepareProviderEnvironment(
   root: string,
   config?: ProviderConfiguration,
   sourceEnvironment: NodeJS.ProcessEnv = process.env,
+  options: { disableCodexPlugins?: boolean } = {},
 ): Promise<ProviderEnvironment> {
   assertEnvironmentBounds(sourceEnvironment, 'input environment', true)
   const requestedDirectory = resolve(root)
@@ -636,13 +637,27 @@ export async function prepareProviderEnvironment(
   if (contents && config) {
     await config.assertSourceIntegrity()
     for (const source of contents.sources) {
+      let copy = source.bytes
+      if (options.disableCodexPlugins && source.destination === 'codex/config.toml') {
+        // Real business fixtures do not exercise optional marketplace downloads.
+        // Keep the source bytes untouched and preserve every other native setting.
+        const parsed = parseToml(source.bytes.toString('utf8'))
+        if (
+          parsed.features !== undefined &&
+          (!isRecord(parsed.features) || parsed.features instanceof Date)
+        )
+          fail('Codex features must be a table')
+        parsed.features = { ...parsed.features, plugins: false }
+        copy = Buffer.from(stringifyToml(parsed))
+        if (copy.length > fileLimit) fail('isolated Codex configuration exceeds its byte bound')
+      }
       const destination = join(
         source.destination.startsWith('claude/') ? claudeHome : codexHome,
         source.destination.slice(source.destination.indexOf('/') + 1),
       )
-      await writeFile(destination, source.bytes, { mode: 0o600, flag: 'wx' })
+      await writeFile(destination, copy, { mode: 0o600, flag: 'wx' })
       await chmod(destination, 0o600)
-      if (hash(await readFile(destination)) !== source.sha256)
+      if (hash(await readFile(destination)) !== hash(copy))
         fail('native configuration copy failed integrity check')
     }
   }

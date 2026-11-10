@@ -6152,10 +6152,14 @@ export class CodexAgentAdapter implements AgentAdapter {
           Number(version[2]) > 159 ||
           (Number(version[2]) === 159 && Number(version[3]) >= 2)),
       )
-      // Only this observed Native generation proves immutable request-level Thread/Turn metadata.
+      // Only an observed Native generation proves immutable request-level Thread/Turn
+      // metadata. 0.167.0 retains that contract; keep the list exact rather than a range.
       // Unknown versions select legacy before dispatch; a refused new request is never retried.
       this.nativeSourceContextSupported = Boolean(
-        version && version[1] === '0' && version[2] === '163' && version[3] === '0',
+        version &&
+        version[1] === '0' &&
+        ((version[2] === '163' && version[3] === '0') ||
+          (version[2] === '167' && version[3] === '0')),
       )
       this.initialized = true
     } catch (error) {

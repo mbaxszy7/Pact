@@ -63,7 +63,7 @@ function nativeEntry(value: RecordValue): SessionStoreEntry {
 const claudeAccountingNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1e15
 
-/** Claude 2.1.292 writes this bookkeeping on empty-input Windows resume as well as real Turns. */
+/** Claude writes this bookkeeping on an empty-input resume as well as real Turns. */
 function isClaudeCostState(entry: RecordValue, nativeSessionId: string): boolean {
   const totals = [
     'totalCostUSD',
@@ -781,17 +781,10 @@ async function claude(
         ['hook_success', 'hook_additional_context', 'hook_stderr', 'hook_blocking_error'].includes(
           String(entry.attachment.type),
         )
-      const windowsAccounting =
-        process.platform === 'win32' &&
-        type === 'cost-state' &&
-        isClaudeCostState(entry, input.nativeSessionId)
-      if (
-        !harmlessMetadata &&
-        !hookSystem &&
-        !hookProgress &&
-        !hookAttachment &&
-        !windowsAccounting
-      )
+      // Current Claude records standalone cost accounting after the frozen cutoff.
+      // Validated accounting is not a conversation turn on any platform.
+      const costState = type === 'cost-state' && isClaudeCostState(entry, input.nativeSessionId)
+      if (!harmlessMetadata && !hookSystem && !hookProgress && !hookAttachment && !costState)
         throw new Error(
           'The Native Fork candidate contains an additional turn or unsupported context change after its frozen cutoff.',
         )
@@ -1108,13 +1101,19 @@ async function claude(
     })
     const use = uses[0],
       receipt = receipts[0]
+    // Current Claude may write the tool result beside the main message chain while
+    // still linking it to the exact authenticated Write/Edit operation.
+    const receiptAnchored =
+      receipt !== undefined &&
+      use !== undefined &&
+      (ancestorIds.has(receipt.entry.uuid) || receipt.entry.parentUuid === use.entry.uuid)
     if (
       uses.length !== 1 ||
       receipts.length !== 1 ||
       !use ||
       !receipt ||
       !ancestorIds.has(use.entry.uuid) ||
-      !ancestorIds.has(receipt.entry.uuid) ||
+      !receiptAnchored ||
       use.entry.sessionId !== input.nativeSessionId ||
       receipt.entry.sessionId !== input.nativeSessionId ||
       use.entry.agentId ||
@@ -1179,7 +1178,9 @@ async function claude(
     for (let index = 0; index < rawEnd; index++) {
       const entry = sourceEntries[index]!,
         content = isObject(entry.message) ? entry.message.content : undefined
-      if (!Array.isArray(content)) continue
+      // Current Claude snapshots the API request beside the transcript. Its message
+      // blocks repeat earlier operations; only native transcript events own work.
+      if (entry.type === 'api-request-blob' || !Array.isArray(content)) continue
       for (const value of content) {
         const block = object(value)
         if (

@@ -7,6 +7,8 @@ import { beforeEach, expect, it, vi } from 'vitest'
 
 import type { ProviderConfiguration } from './provider-environment.js'
 
+import { quitPact } from './native-quit.js'
+
 const failureProbe = vi.hoisted(() => ({
   missingReceipt: false,
   creation: false,
@@ -186,6 +188,85 @@ function controlledQuitApp(code: number, alreadyClosed: boolean) {
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Controlled lifecycle boundaries verify diagnostics, not Windows kernel behavior.
   return app as unknown as Awaited<ReturnType<typeof electron.launch>>
 }
+
+function quitConfirmationRace() {
+  const closed = Promise.withResolvers<void>()
+  const clicked = Promise.withResolvers<void>()
+  const child: { pid: number; exitCode: number | null; signalCode: NodeJS.Signals | null } = {
+    pid: 1337,
+    exitCode: null,
+    signalCode: null,
+  }
+  const click = vi.fn<() => Promise<void>>(() => clicked.promise)
+  const evaluate = vi.fn<() => Promise<void>>(async () => undefined)
+  const app = {
+    process: () => child,
+    firstWindow: async () => ({
+      isClosed: () => child.exitCode !== null || child.signalCode !== null,
+      getByRole: () => ({ waitFor: async () => undefined, click }),
+    }),
+    waitForEvent: () => closed.promise,
+    evaluate,
+  }
+  return {
+    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Replay independent UI and physical-close events at the helper's Electron boundary.
+    app: app as unknown as Awaited<ReturnType<typeof electron.launch>>,
+    click,
+    evaluate,
+    clicked,
+    closed,
+    close(signal: NodeJS.Signals | null = null) {
+      child.exitCode = signal ? null : 0
+      child.signalCode = signal
+      closed.resolve()
+    },
+  }
+}
+
+it.each(['close-first', 'click-error-first'] as const)(
+  'accepts confirmed natural exit when the quit button disappears: %s',
+  async (order) => {
+    const f = quitConfirmationRace()
+    const result = quitPact(f.app)
+    const settled = result.then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    await vi.waitFor(() => expect(f.click).toHaveBeenCalledOnce())
+    if (order === 'close-first') f.close()
+    f.clicked.reject(new Error('The quit button detached during click'))
+    if (order === 'click-error-first') {
+      await Promise.resolve()
+      f.close()
+    }
+    expect(await settled).toBeUndefined()
+    await quitPact(f.app)
+    expect(f.evaluate).toHaveBeenCalledOnce()
+  },
+)
+
+it('keeps a failed quit click fatal when physical exit is not confirmed', async () => {
+  const f = quitConfirmationRace()
+  const failure = new Error('The exit control could not be clicked')
+  const result = quitPact(f.app).catch((error: unknown) => error)
+  await vi.waitFor(() => expect(f.click).toHaveBeenCalledOnce())
+  f.clicked.reject(failure)
+  await Promise.resolve()
+  f.closed.reject(new Error('Physical exit was not observed before its deadline'))
+  expect(await result).toBe(failure)
+})
+
+it('does not turn a forced exit during quit confirmation into successful cleanup', async () => {
+  const f = quitConfirmationRace()
+  const result = quitPact(f.app).then(
+    () => false,
+    () => true,
+  )
+  await vi.waitFor(() => expect(f.click).toHaveBeenCalledOnce())
+  f.close('SIGTERM')
+  f.clicked.reject(new Error('The quit button detached during click'))
+  expect(await result).toBe(true)
+})
 
 it.each([true, false])(
   'keeps wrapper exit 1 fatal and records both observation phases; already closed=%s',

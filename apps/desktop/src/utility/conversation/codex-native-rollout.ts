@@ -144,6 +144,14 @@ export async function readCodexInitializationRollout(
           throw invalid('An unclassified native record follows the confirmed initialization.')
         return
       }
+      // Current Codex announces its dynamic tool catalog in a developer record that
+      // precedes the imported seed. It is runtime metadata, not model or tool work.
+      if (
+        Reflect.get(payload, 'type') === 'additional_tools' &&
+        Reflect.get(payload, 'role') === 'developer' &&
+        inPrefix
+      )
+        return
       if (Reflect.get(payload, 'type') !== 'message')
         throw invalid('Native model or tool work contradicts the initialization readback.')
       const role = Reflect.get(payload, 'role')

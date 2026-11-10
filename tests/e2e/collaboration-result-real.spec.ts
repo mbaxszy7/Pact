@@ -349,6 +349,7 @@ async function waitForRequiredPlan(
   maxReviews: number,
 ) {
   const database = ReadonlyFixtureDatabase.open(ctx.fixture)
+  let lastObservation: unknown
   try {
     await expect
       .poll(
@@ -362,7 +363,13 @@ async function waitForRequiredPlan(
           const rows = database.drizzle.query.agentRuns
             .findMany({
               where: (fields, { eq }) => eq(fields.sessionId, ctx.sessionId),
-              columns: { id: true, status: true, nativeOutcome: true, nativeEffectsState: true },
+              columns: {
+                id: true,
+                status: true,
+                nativeOutcome: true,
+                nativeEffectsState: true,
+                updatedAt: true,
+              },
               limit: maxReviews * 2 + 1,
             })
             .sync()
@@ -372,6 +379,19 @@ async function waitForRequiredPlan(
             throw Error('A required native plan/review root failed')
           if (!taskRow) return false
           const task = collaborationTaskSchema.parse(JSON.parse(taskRow.stateJson))
+          lastObservation = {
+            observedAt: new Date().toISOString(),
+            task: {
+              status: task.status,
+              stage: task.stage,
+              automation: task.automation,
+              pauseReason: task.pauseReason,
+              planVersion: task.planVersion,
+              discussionRounds: task.discussionRounds,
+              verdict: task.review?.verdict,
+            },
+            runs: rows,
+          }
           return (
             task.status === 'ready' &&
             task.review?.verdict === 'accepted' &&
@@ -387,6 +407,12 @@ async function waitForRequiredPlan(
         { timeout: 300_000, intervals: [250, 500, 1000] },
       )
       .toBe(true)
+      .catch((error: unknown) => {
+        throw new Error(
+          `Required plan settlement: ${JSON.stringify(lastObservation)}; ${error instanceof Error ? error.message : 'observation failed'}`,
+          { cause: error },
+        )
+      })
     const snapshot = await readRealConversation(ctx)
     const runs = snapshot.runs.toSorted((a, b) => a.createdAt.localeCompare(b.createdAt))
     const turns = database.drizzle
@@ -613,6 +639,12 @@ async function visitRequiredPlanCards(
       if ((await historyStatus.innerText()) === 'Beginning of conversation.') break
       expect(page, 'All earlier result rows must remain reachable').toBeLessThan(31)
     }
+    // Home is a key event; reset the owned viewport explicitly so the scan starts
+    // at the first page even when focus remained in a child control.
+    await transcript.evaluate((host) => {
+      host.scrollTop = 0
+    })
+    await settle()
     for (let step = 0; step < 512; step++) {
       remaining()
       // oxlint-disable-next-line eslint/no-await-in-loop -- Async result reads may change this viewport's measurements.
@@ -744,7 +776,7 @@ for (const actor of ['codex', 'claude'] as const)
       const acceptanceDeadline = Date.now() + 300_000
       const ctx = await launchRealWorkspace(`real-required-plan-${actor}`)
       try {
-        await selectRealConfiguredEffort(ctx, ['codex', 'claude'])
+        await selectRealConfiguredEffort(ctx, ['codex', 'claude'], actor)
         const maxReviews = await ctx.page.evaluate(async (sessionId) => {
           const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
           const settings = await bridge.getSessionSettings(sessionId)
@@ -936,7 +968,125 @@ for (const actor of ['codex', 'claude'] as const)
         await expect(panel.locator('[data-pact-plan-run-id]')).toContainText(
           markdownVisibleProjection(plan).trim().slice(0, 40),
         )
-        await expect(panel).toContainText('Select text to add a Comment')
+        await expect(panel.getByRole('textbox', { name: 'Plan text' })).toHaveAttribute(
+          'aria-readonly',
+          'true',
+        )
+        await panel.getByRole('button', { name: 'Expand plan panel', exact: true }).click()
+        await expect(
+          panel.getByRole('button', { name: 'Restore plan panel', exact: true }),
+        ).toBeVisible()
+        const planText = panel.getByRole('textbox', { name: 'Plan text' })
+        await expect(ctx.page.locator('.workspace-layout[data-animating="true"]')).toHaveCount(0)
+        // Complete Playwright's scroll/stability checks before reading mouse coordinates.
+        await planText.click({ trial: true })
+        const gesture = await planText.evaluate((host) => {
+          const viewport = host.closest('[data-pact-context-scroll]')?.getBoundingClientRect()
+          if (!viewport) throw new Error('The plan scroll viewport is unavailable')
+          for (const span of host.querySelectorAll('[data-pact-projection-start]')) {
+            if (span.closest('button,a,input,textarea,select')) continue
+            const node = span.firstChild
+            if (!node || node.nodeType !== Node.TEXT_NODE) continue
+            const text = node.textContent ?? ''
+            const start = text.search(/\S/u)
+            if (start < 0 || text.length - start < 4) continue
+            const range = document.createRange()
+            range.setStart(node, start)
+            range.setEnd(node, Math.min(text.length, start + 12))
+            const boxes = [...range.getClientRects()]
+            const box = boxes[0]
+            if (
+              boxes.length !== 1 ||
+              !box ||
+              box.width < 8 ||
+              // Keep an ordinary selection outside the document's 32px auto-scroll bands.
+              box.top < Math.max(48, viewport.top + 40) ||
+              box.bottom > Math.min(window.innerHeight - 24, viewport.bottom - 40)
+            )
+              continue
+            const startPoint = { x: box.left + 1, y: box.top + box.height / 2 }
+            const endPoint = { x: box.right - 1, y: box.top + box.height / 2 }
+            if (
+              !span.contains(document.elementFromPoint(startPoint.x, startPoint.y)) ||
+              !span.contains(document.elementFromPoint(endPoint.x, endPoint.y))
+            )
+              continue
+            return { start: startPoint, end: endPoint }
+          }
+          throw new Error('A visible native plan text range is unavailable')
+        })
+        await ctx.page.mouse.move(gesture.start.x, gesture.start.y)
+        await ctx.page.mouse.down()
+        await ctx.page.mouse.move(gesture.end.x, gesture.end.y, { steps: 12 })
+        await ctx.page.mouse.up()
+        try {
+          await panel.getByRole('button', { name: 'Comment on selected text', exact: true }).click()
+        } catch (error) {
+          const boundary = await planText.evaluate((host, points) => {
+            const selection = window.getSelection()
+            const hit = (point: { x: number; y: number }) => {
+              const node = document.elementFromPoint(point.x, point.y)
+              return {
+                tag: node?.tagName,
+                inPlan: Boolean(node && host.contains(node)),
+                interactive: Boolean(node?.closest('button,a,input,textarea,select')),
+              }
+            }
+            const scroller = host.closest('[data-pact-context-scroll]')
+            return {
+              points,
+              viewport: scroller
+                ? {
+                    top: scroller.getBoundingClientRect().top,
+                    bottom: scroller.getBoundingClientRect().bottom,
+                    scrollTop: scroller.scrollTop,
+                  }
+                : undefined,
+              start: hit(points.start),
+              end: hit(points.end),
+              selectionChars: selection?.toString().length ?? 0,
+              collapsed: selection?.isCollapsed,
+              projectionSpans: host.querySelectorAll('[data-pact-projection-start]').length,
+              statuses: [...host.querySelectorAll('output')].map((node) =>
+                node.textContent?.slice(0, 300),
+              ),
+            }
+          }, gesture)
+          const control = await ctx.page.evaluate(async (sessionId) => {
+            const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+            const result = await bridge.getConversation({ scope: 'messages', sessionId })
+            if (!result.ok || result.value.scope !== 'messages') return { available: false }
+            return {
+              available: true,
+              inputGate: result.value.header.sessionIssues?.inputGate,
+              issues: result.value.header.sessionIssues?.agents.map((issue) => ({
+                agentId: issue.agentId,
+                phase: issue.phase,
+                action: issue.action,
+              })),
+            }
+          }, ctx.sessionId)
+          const diagnostic = ctx.fixture.redactDiagnostic(
+            JSON.stringify({ version: 1, boundary, control }),
+          )
+          if (Buffer.byteLength(diagnostic) <= 8192)
+            await test.info().attach('plan-comment-boundary', {
+              body: diagnostic,
+              contentType: 'application/json',
+            })
+          const screenshot = test.info().outputPath('plan-comment-panel.png')
+          await panel.screenshot({ path: screenshot })
+          await test
+            .info()
+            .attach('plan-comment-panel', { path: screenshot, contentType: 'image/png' })
+          throw error
+        }
+        await expect(panel.getByRole('heading', { name: 'New comment', exact: true })).toBeVisible()
+        await expect(panel.locator('[data-pact-comment-editor] p[title]')).toHaveAttribute(
+          'title',
+          /\S/u,
+        )
+        await panel.getByRole('button', { name: 'Close Comment editor', exact: true }).click()
         await expect(card.locator('[data-pact-plan-run-id]')).toHaveCount(0)
         expect(completion.initial).toHaveLength(2)
         expect(

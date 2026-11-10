@@ -58,6 +58,7 @@ interface NativeCall {
   nativeRootObserved?: true
 }
 interface SourceReceipt {
+  callId: string
   request: CollaborationSourceRead
   page: CollaborationSourceReadResult
   reader: string
@@ -68,6 +69,163 @@ interface NativeCallShapeDiagnostic {
   shapes: string[]
   readerHashes: string[]
   omittedReaderOccurrences: number
+}
+
+/** Failure diagnostics only; no script, identifier, stack or argument survives this projection. */
+function failedWrapperCall(script: unknown, error: string) {
+  const unknown = {
+    matched: false,
+    calleeSyntax: 'unknown',
+    globalSpelling: 'unknown',
+    sameNameDeclaration: 'unknown',
+    method: 'unknown',
+  }
+  const frame = error
+    .slice(0, 2048)
+    .split(/\r?\n/u)
+    .find((line) => /^\s+at\s/u.test(line))
+  const position = frame
+    ? /^\s+at (?:[^()\r\n]{1,100} \()?exec_main\.mjs:(\d{1,4}):(\d{1,4})\)?$/u.exec(frame)
+    : undefined
+  if (typeof script !== 'string' || Buffer.byteLength(script) > 8192 || !position) return unknown
+  const line = Number(position[1]),
+    column = Number(position[2]) - 1
+  if (line < 1 || column < 0) return unknown
+  try {
+    const pending: unknown[] = [parseNativeExecScript(script)]
+    const bindings = new Map<string, string>()
+    const matches: Record<string, unknown>[] = []
+    let visited = 0
+    const contains = (value: unknown) => {
+      if (!object(value) || !object(value['loc'])) return false
+      const { start, end } = value['loc']
+      if (!object(start) || !object(end)) return false
+      return (
+        typeof start['line'] === 'number' &&
+        typeof start['column'] === 'number' &&
+        typeof end['line'] === 'number' &&
+        typeof end['column'] === 'number' &&
+        (line > start['line'] || (line === start['line'] && column >= start['column'])) &&
+        (line < end['line'] || (line === end['line'] && column < end['column']))
+      )
+    }
+    while (pending.length) {
+      const node = pending.pop()
+      if (!object(node)) continue
+      if (++visited > 10_000 || pending.length > 10_000) return unknown
+      if (
+        node['type'] === 'VariableDeclarator' &&
+        object(node['id']) &&
+        node['id']['type'] === 'Identifier'
+      ) {
+        const name = node['id']['name'],
+          init = node['init']
+        if (typeof name === 'string') {
+          const kind = object(init) ? init['type'] : undefined
+          bindings.set(
+            name,
+            bindings.has(name)
+              ? 'unknown'
+              : kind === 'AwaitExpression'
+                ? 'awaited_result'
+                : kind === 'CallExpression'
+                  ? 'call_result'
+                  : kind === 'Identifier'
+                    ? 'alias'
+                    : [
+                          'ObjectExpression',
+                          'ArrayExpression',
+                          'StringLiteral',
+                          'NumericLiteral',
+                        ].includes(String(kind))
+                      ? 'literal_data'
+                      : 'unknown',
+          )
+        }
+      }
+      if (node['type'] === 'CallExpression' && object(node['callee']) && contains(node['callee']))
+        matches.push(node['callee'])
+      for (const value of Object.values(node)) {
+        if (Array.isArray(value)) pending.push(...value)
+        else if (object(value)) pending.push(value)
+      }
+    }
+    if (matches.length !== 1) return unknown
+    const callee = matches[0]!
+    let root = callee,
+      depth = 0
+    while (root['type'] === 'MemberExpression' && object(root['object'])) {
+      if (++depth > 16) return unknown
+      root = root['object']
+    }
+    const name = root['type'] === 'Identifier' ? root['name'] : undefined
+    const property =
+      callee['type'] === 'MemberExpression' &&
+      callee['computed'] !== true &&
+      object(callee['property'])
+        ? callee['property']['name']
+        : undefined
+    const method = [
+      'parse',
+      'stringify',
+      'map',
+      'filter',
+      'find',
+      'forEach',
+      'reduce',
+      'flatMap',
+      'includes',
+      'slice',
+      'join',
+      'split',
+      'trim',
+      'at',
+      'then',
+      'read_collaboration_source',
+    ].includes(String(property))
+      ? String(property)
+      : 'unknown'
+    return {
+      matched: true,
+      // Syntax hints only: a same-name declaration in another scope is not ownership proof.
+      calleeSyntax:
+        callee['type'] === 'Identifier'
+          ? 'identifier'
+          : callee['type'] === 'MemberExpression'
+            ? 'member'
+            : 'unknown',
+      globalSpelling: ['text', 'JSON', 'tools'].includes(String(name)) ? String(name) : 'other',
+      sameNameDeclaration: typeof name === 'string' ? (bindings.get(name) ?? 'unknown') : 'unknown',
+      method,
+    }
+  } catch {
+    return unknown
+  }
+}
+
+function sourceLeafShape(value: unknown) {
+  const raw = parsed(value)
+  const content =
+    object(raw) && raw['isError'] !== true && Array.isArray(raw['content'])
+      ? raw['content']
+      : undefined
+  const text =
+    content && object(content[0]) && content[0]['type'] === 'text' ? content[0]['text'] : undefined
+  const decoded = typeof text === 'string' ? parsed(text) : undefined
+  const wire = collaborationSourceWireResultSchema.safeParse(decoded)
+  const legacy = collaborationSourceReadResultSchema.safeParse(decoded)
+  const page = wire.success ? wire.data : legacy.success ? legacy.data : undefined
+  const members = wire.success && wire.data.source === 'batch' ? wire.data.members : undefined
+  return {
+    envelope: typeof text === 'string' ? 'content_text' : 'other',
+    source: page?.source ?? 'unknown',
+    navigation: wire.success ? 'wire_page' : legacy.success ? 'compatibility_index' : 'unknown',
+    batchMembersArray: Array.isArray(members),
+    batchBodyReadObject: wire.success && wire.data.source === 'batch' && object(wire.data.bodyRead),
+    memberBodyReadsObjects:
+      Array.isArray(members) &&
+      members.every((member) => object(member) && object(member['bodyRead'])),
+  }
 }
 
 const sourceCapabilityRefusal =
@@ -902,6 +1060,7 @@ export function inspectRoutingSourceRecords(records: unknown[], expected: Expect
       grammar: 'source' | 'metadata' | 'data' | 'rejected' | 'unknown'
       leaves: number
       startOrdinal: number
+      endOrdinal?: number
       completed: boolean
       operations: number
       diagnosticCalls?: NativeCallShapeDiagnostic
@@ -920,6 +1079,7 @@ export function inspectRoutingSourceRecords(records: unknown[], expected: Expect
       outputTurnMatched?: boolean
       outputClass?: string
       error?: ReturnType<typeof nativeErrorShape>
+      failedCall?: ReturnType<typeof failedWrapperCall>
     }> = [],
     failedLeaves: Array<{
       ordinal: number
@@ -1078,6 +1238,12 @@ export function inspectRoutingSourceRecords(records: unknown[], expected: Expect
     // Map entries are visited one at a time. In particular, a long untrusted call ID
     // is counted before any encoded copy is allocated, rather than stringified first.
     count({ wrappers, wrapperDiagnostics, identities: wrapperIds, operationKinds })
+    if (size > limit && wrapperDiagnostics.some((diagnostic) => diagnostic.failedCall)) {
+      for (const diagnostic of wrapperDiagnostics) delete diagnostic.failedCall
+      for (const wrapper of wrappers) delete wrapper.endOrdinal
+      size = 0
+      count({ wrappers, wrapperDiagnostics, identities: wrapperIds, operationKinds })
+    }
     if (size > limit) throw Error('Source script proof metadata exceeds 64 KiB')
     scriptAudit.proofMetadataHighWaterBytes = Math.max(
       scriptAudit.proofMetadataHighWaterBytes,
@@ -1517,6 +1683,8 @@ export function inspectRoutingSourceRecords(records: unknown[], expected: Expect
       record['type'] === 'response_item' &&
       (!object(payload) ||
         (payload['type'] !== 'reasoning' &&
+          // Runtime tool-catalog metadata is not a model/tool operation.
+          payload['type'] !== 'additional_tools' &&
           !(
             payload['type'] === 'message' &&
             ['user', 'assistant', 'system', 'developer'].includes(String(payload['role']))
@@ -1838,6 +2006,9 @@ export function inspectRoutingSourceRecords(records: unknown[], expected: Expect
         'function_call_output',
         'custom_tool_call_output',
         'mcp_tool_call',
+        // Current Codex declares its dynamic tool catalog in a developer record.
+        // It is runtime metadata, never a model/tool operation in this ledger.
+        'additional_tools',
       ].includes(String(payload['type']))
     ) {
       invalidate('unknown_response_item')
@@ -1954,7 +2125,33 @@ export function inspectRoutingSourceRecords(records: unknown[], expected: Expect
                     noPrefixOutput
                   ? 'preexecution_syntax_failure'
                   : 'unclassified_wrapper'
-        if (wrapper.classification === 'unclassified_wrapper') invalidate('wrapper_output_boundary')
+        if (wrapper.classification === 'unclassified_wrapper') {
+          invalidate('wrapper_output_boundary')
+          if (failed && diagnostic) {
+            const tail = Array.isArray(output) ? output.at(-1) : undefined
+            const error =
+              object(tail) &&
+              tail['type'] === 'input_text' &&
+              typeof tail['text'] === 'string' &&
+              /^Script error:\r?\n/u.test(tail['text'])
+                ? tail['text']
+                : ''
+            const start = records[wrapper.startOrdinal - 1]
+            const input =
+              object(start) && object(start['payload']) ? start['payload']['input'] : undefined
+            if (error) {
+              wrapper.endOrdinal = ordinal
+              diagnostic.failedCall = failedWrapperCall(input, error)
+              try {
+                chargeWrapperMetadata()
+              } catch {
+                // Optional diagnostics cannot turn an existing verdict into a budget failure.
+                delete wrapper.endOrdinal
+                delete diagnostic.failedCall
+              }
+            }
+          }
+        }
       }
       chargeWrapperMetadata()
       openWrapper = undefined
@@ -2145,7 +2342,7 @@ export function inspectRoutingSourceRecords(records: unknown[], expected: Expect
         readerSha256: digest(canonicalReader(call.name)),
       })
     submittedForms[submitted]++
-    receipts.push({ request, page, reader: canonicalReader(call.name), submitted })
+    receipts.push({ callId: call.id, request, page, reader: canonicalReader(call.name), submitted })
   }
   const readers = new Set(receipts.map((receipt) => receipt.reader))
   const sourceRejections = allowed
@@ -2491,6 +2688,25 @@ export function inspectRoutingSourceRecords(records: unknown[], expected: Expect
           leaves: wrapper.leaves,
           outputClass: diagnostic.outputClass ?? 'missing',
           error: diagnostic.error,
+          ...(!wrapper.completed && diagnostic.failedCall
+            ? {
+                failedCall: diagnostic.failedCall,
+                sourceLeafShapes: allowed
+                  .filter(
+                    (call) =>
+                      receipts.some((receipt) => receipt.callId === call.id) &&
+                      call.observedAt !== undefined &&
+                      call.observedAt > wrapper.startOrdinal &&
+                      call.observedAt < (wrapper.endOrdinal ?? wrapper.startOrdinal),
+                  )
+                  .slice(0, 4)
+                  // oxlint-disable-next-line oxc/no-map-spread -- Four immutable diagnostic projections retain no Source text.
+                  .map((call) => ({
+                    nativeRootObserved: call.nativeRootObserved === true,
+                    ...sourceLeafShape(call.output ?? outputs.get(call.id)),
+                  })),
+              }
+            : {}),
           ...(!allToolsAllowed
             ? {
                 errorReaderMatchesSuccessfulSource:
@@ -2761,6 +2977,12 @@ export async function retainRoutingNativeSourceEvidence(
     completeDeclaredInformation: evidence.completeDeclaredInformation ?? null,
     completeAnswer: evidence.completeAnswer ?? null,
     boundaryDiagnostics: evidence.boundaryDiagnostics,
+  }
+  if (Buffer.byteLength(JSON.stringify(receipt)) > 16 * 1024) {
+    for (const wrapper of receipt.boundaryDiagnostics.wrappers) {
+      delete wrapper.failedCall
+      delete wrapper.sourceLeafShapes
+    }
   }
   if (Buffer.byteLength(JSON.stringify(receipt)) > 16 * 1024) {
     await retain({

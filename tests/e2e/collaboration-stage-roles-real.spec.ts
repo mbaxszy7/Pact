@@ -58,11 +58,38 @@ test('clamps both bounds and preserves values inside the interval', () => {
             throw new Error('Workflow view unavailable')
           return result.value.view
         }, ctx.sessionId)
+      const workflowFailure = async (phase: string) => {
+        const saved = await readRealConversation(ctx)
+        return new Error(
+          ctx.fixture.redactDiagnostic(
+            JSON.stringify({
+              phase,
+              runs: saved.runs.map((run) => ({
+                agent: run.agentId,
+                stage: run.collaboration?.stage,
+                status: run.status,
+                nativeOutcome: run.nativeOutcome,
+                effects: run.nativeEffectsState,
+                failureKind: run.failureKind,
+                failureMessage: run.failureMessage
+                  ? ctx.fixture.redactDiagnostic(run.failureMessage).slice(0, 1000)
+                  : undefined,
+              })),
+            }),
+          ),
+        )
+      }
       try {
         await writeFile(join(ctx.projectDirectory, 'clamp.mjs'), code)
         await writeFile(join(ctx.projectDirectory, 'clamp.test.mjs'), checks)
         expect(await verify()).toBe(false)
         await selectRealConfiguredEffort(ctx, ['codex', 'claude'], primary)
+        const maxReviews = await ctx.page.evaluate(async (sessionId) => {
+          const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+          const settings = await bridge.getSessionSettings(sessionId)
+          if (!settings.ok) throw new Error('The frozen review limit is unavailable')
+          return settings.value.session.settings.maxDiscussionRounds
+        }, ctx.sessionId)
         await sendRealMessage(
           ctx,
           '/plan Fix only clamp.mjs so clamp(value, min, max) returns min below the lower bound, max above the upper bound, and otherwise value. Inputs are finite numbers with min <= max; no additional validation or dependencies. The supplied clamp.test.mjs is immutable acceptance evidence and must not be edited. Use the native file-edit operation for the one-file change; run exactly node --test clamp.test.mjs from the project directory for verification. Plan this change and verification; do not implement until explicitly authorized. Do not delegate. All scope and choices are specified. Publish the complete plan through the native plan mechanism.',
@@ -73,7 +100,7 @@ test('clamps both bounds and preserves values inside the interval', () => {
             async () => {
               const current = await view()
               if (current.task?.status === 'failed')
-                throw new Error('Real plan or plan review failed')
+                throw await workflowFailure('plan or plan review')
               return current.accepted && current.task?.status === 'ready'
             },
             { timeout: Math.max(1, deadline - Date.now()), intervals: [250, 500, 1000] },
@@ -86,14 +113,18 @@ test('clamps both bounds and preserves values inside the interval', () => {
           reviewer: secondary,
           review: { actor: secondary, stage: 'plan_review', verdict: 'accepted' },
         })
-        expect(
-          (await readRealConversation(ctx)).runs
-            .toSorted((a, b) => a.createdAt.localeCompare(b.createdAt))
-            .map((run) => [run.collaboration?.stage, run.agentId]),
-        ).toEqual([
+        const planningRuns = (await readRealConversation(ctx)).runs.toSorted((a, b) =>
+          a.createdAt.localeCompare(b.createdAt),
+        )
+        expect(ready.discussionRounds).toBeGreaterThanOrEqual(1)
+        expect(ready.discussionRounds).toBeLessThanOrEqual(maxReviews)
+        const planningRoles = Array.from({ length: ready.discussionRounds }, () => [
           ['plan', primary],
           ['plan_review', secondary],
-        ])
+        ]).flat()
+        expect(planningRuns.map((run) => [run.collaboration?.stage, run.agentId])).toEqual(
+          planningRoles,
+        )
         expect(await readFile(join(ctx.projectDirectory, 'clamp.mjs'), 'utf8')).toBe(code)
         const plan = ready.planReference
         await restartRealWorkspace(ctx)
@@ -103,8 +134,11 @@ test('clamps both bounds and preserves values inside the interval', () => {
           exact: true,
         })
         await expect(implement).toBeEnabled()
-        expect((await readRealConversation(ctx)).runs).toHaveLength(2)
+        expect((await readRealConversation(ctx)).runs.map((run) => run.id).toSorted()).toEqual(
+          planningRuns.map((run) => run.id).toSorted(),
+        )
         expect((await view()).task?.planReference).toEqual(plan)
+        expect(await readFile(join(ctx.projectDirectory, 'clamp.mjs'), 'utf8')).toBe(code)
         const approved = new Set<string>()
         await implement.click()
         await expect
@@ -112,7 +146,7 @@ test('clamps both bounds and preserves values inside the interval', () => {
             async () => {
               const current = await view()
               if (current.task?.status === 'failed')
-                throw new Error('Real implementation or code review failed')
+                throw await workflowFailure('implementation or code review')
               const requests = await ctx.page.evaluate(async (sessionId) => {
                 const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
                 const page = await bridge.getConversation({ scope: 'messages', sessionId })
@@ -176,8 +210,7 @@ test('clamps both bounds and preserves values inside the interval', () => {
           a.createdAt.localeCompare(b.createdAt),
         )
         expect(runs.map((run) => [run.collaboration?.stage, run.agentId])).toEqual([
-          ['plan', primary],
-          ['plan_review', secondary],
+          ...planningRoles,
           ['implement', secondary],
           ['code_review', primary],
         ])

@@ -638,7 +638,11 @@ results. It builds actual production Adapters/Workers into a temporary fixture.
 The generated Codex loopback configuration disables optional plugins, so protocol fixtures do not
 start external marketplace downloads or leave their Git children behind after native EOF. The writer
 lifecycle case verifies that no marketplace-sync lock is created and retains its original natural
-exit, takeover and physical cleanup obligations. Real-provider configuration is unchanged.
+exit, takeover and physical cleanup obligations. Real E2E fixtures also disable optional plugins
+in their private Codex configuration copy; the original source files, provider, model, credentials,
+permissions and all other native settings remain unchanged. The sequential-Session case checks
+that actual native execution never creates the marketplace-sync lock. Process ownership and
+physical cleanup budgets remain mandatory.
 
 Claude initializes copied candidates with zero model input, tests effort precedence and null/default
 inheritance, and verifies exact source bytes, candidate identity, initialization manifests, and cold

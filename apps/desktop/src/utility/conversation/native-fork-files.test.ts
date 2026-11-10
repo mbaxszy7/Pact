@@ -164,7 +164,9 @@ async function publishedCheckpointFixture(mode = 'valid') {
     attachment: { type: 'plan_mode', isSubAgent: false, planFilePath: planPath },
   })
   const anchor = edit('source-edit', 'B0', 'B1')
-  call(mode === 'anchor_frame_write' ? [anchor, edit('after-anchor', 'B1', 'changed')] : anchor)
+  const anchorCall = call(
+    mode === 'anchor_frame_write' ? [anchor, edit('after-anchor', 'B1', 'changed')] : anchor,
+  )
   const receipt = ack(anchor, mode === 'failed_receipt' ? { is_error: true } : {})
   if (oldCall) {
     const tail = parent
@@ -199,6 +201,23 @@ async function publishedCheckpointFixture(mode = 'valid') {
       promptId: randomUUID(),
       message: { role: 'user', content: 'Another root.' },
     })
+  // Current Claude may record the tool result beside the main chain while still
+  // linking it to the exact authenticated tool use.
+  if (mode === 'sibling_receipt') parent = String(anchorCall.uuid)
+  if (mode === 'request_blob') {
+    const tail = parent
+    add({
+      type: 'api-request-blob',
+      parentUuid: undefined,
+      message: { role: 'assistant', content: [anchor] },
+    })
+    add({
+      type: 'api-request-blob',
+      parentUuid: undefined,
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: anchor.id }] },
+    })
+    parent = tail
+  }
   add({
     type: 'user',
     uuid: targetRoot,
@@ -283,13 +302,27 @@ it.each([
   'target_unknown_receipt',
   'old_finished_overlap',
   'target_receipt_without_id',
+  'sibling_receipt',
+  'request_blob',
 ] as const)(
   'recovers a published checkpoint through the actual native Worker without trusting disk: %s',
   async (mode) => {
     const f = await publishedCheckpointFixture(mode)
     try {
-      const success = ['valid', 'old_finished_overlap', 'missing_result', 'overlap'].includes(mode)
-      const complete = mode === 'valid' || mode === 'old_finished_overlap'
+      const success = [
+        'valid',
+        'old_finished_overlap',
+        'missing_result',
+        'overlap',
+        'sibling_receipt',
+        'request_blob',
+      ].includes(mode)
+      const complete = [
+        'valid',
+        'old_finished_overlap',
+        'sibling_receipt',
+        'request_blob',
+      ].includes(mode)
       const outcome = await files.readAnswer(f.request, new AbortController().signal).then(
         (value) => ({ value, error: undefined }),
         (error: unknown) => ({ value: undefined, error }),
@@ -483,8 +516,8 @@ async function claudeAccountingFixture() {
   }
 }
 
-it.skipIf(process.platform !== 'win32').each(['empty', 'positive'] as const)(
-  'Windows Claude Fork accepts exact %s accounting without changing its frozen history',
+it.each(['empty', 'positive'] as const)(
+  'Claude Fork accepts exact %s accounting without changing its frozen history',
   async (shape) => {
     try {
       const fixture = await claudeAccountingFixture()
@@ -620,18 +653,6 @@ it.each([
   }
 })
 
-it.skipIf(process.platform === 'win32')(
-  'non-Windows Claude Fork retains its original accounting rejection',
-  async () => {
-    try {
-      const fixture = await claudeAccountingFixture()
-      await appendFile(fixture.candidate.nativePath!, JSON.stringify(fixture.accounting) + '\n')
-      await expect(files.execute(fixture.inspect, fixture.signal)).rejects.toThrow(/cutoff/iu)
-    } finally {
-      vi.unstubAllEnvs()
-    }
-  },
-)
 const claudeForkProof = {
   natural: async (
     preparation: ReturnType<typeof files.execute>,

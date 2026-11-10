@@ -732,7 +732,9 @@ export async function createRuntimeFixture(
     registered = true
     try {
       if (creationCancelled) throw new Error('E2E fixture construction was cancelled')
-      environment = await prepareProviderEnvironment(directory, configuration)
+      environment = await prepareProviderEnvironment(directory, configuration, undefined, {
+        disableCodexPlugins: mode === 'real',
+      })
       if (mode === 'real' && process.platform === 'win32')
         windowsProcessScope = await createWindowsFixtureProcessScope(directory)
       if (creationCancelled) throw new Error('E2E fixture construction was cancelled')

@@ -1,5 +1,7 @@
 import { expect } from '@playwright/test'
 import { createHash, randomUUID } from 'node:crypto'
+import { lstat } from 'node:fs/promises'
+import { join } from 'node:path'
 
 import type {
   ConversationSnapshot,
@@ -217,6 +219,13 @@ test(
         expect(native.codexModelStarts).toBe(1)
         expect(native.containsText(marker)).toBe(true)
         expect(native.containsText(reply.content)).toBe(true)
+        // The isolated fixture must not start optional network/Git work outside its business Turn.
+        // oxlint-disable-next-line no-await-in-loop -- Check the actual native side effect before the next Session is admitted.
+        await expect(
+          lstat(join(ctx.fixture.codexHome, '.tmp/plugins.sync.lock')),
+        ).rejects.toMatchObject({
+          code: 'ENOENT',
+        })
         observed.push({ sessionId, nativeSessionId: run.nativeSessionId, runId: run.id })
         // oxlint-disable-next-line no-await-in-loop -- High-water ownership is checked after every acquisition, not only at the end.
         await expect

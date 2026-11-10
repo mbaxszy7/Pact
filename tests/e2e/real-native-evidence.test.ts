@@ -2686,6 +2686,80 @@ test.each(['SyntaxError', 'TypeError', 'ReferenceError'])(
   },
 )
 
+test.each(['text', 'privateLocalValue'])(
+  'failed Source diagnostics map a stack call without retaining its %s identifier',
+  (name) => {
+    const f = routingCodeModeFixture()
+    const start = requiredEvidenceRecord(f.records[2]!.payload)
+    const end = requiredEvidenceRecord(f.records[5]!.payload)
+    start['input'] = String(start['input']) + `\n{const ${name}=1;${name}("PRIVATE_LITERAL");}`
+    const lines = String(start['input']).split('\n')
+    const column = lines.at(-1)!.lastIndexOf(`${name}(`) + 1
+    end['output'] = [
+      { type: 'input_text', text: 'Script failed\nWall time 0.0 seconds\nOutput:\n' },
+      {
+        type: 'input_text',
+        text: `Script error:\nTypeError: ${name} is not a function\n    at exec_main.mjs:${lines.length}:${column}`,
+      },
+    ]
+    const facts = inspectRoutingSourceRecords(f.records, f.expected)
+    expect(facts.allToolsAllowed).toBe(false)
+    expect(facts.boundaryDiagnostics.wrappers[0]).toMatchObject({
+      completed: false,
+      admissible: false,
+      failedCall: {
+        matched: true,
+        calleeSyntax: 'identifier',
+        sameNameDeclaration: 'literal_data',
+        method: 'unknown',
+      },
+      sourceLeafShapes: expect.arrayContaining([
+        expect.objectContaining({
+          source: 'batch',
+          navigation: 'compatibility_index',
+          batchMembersArray: false,
+        }),
+      ]),
+    })
+    expect(JSON.stringify(facts)).not.toContain('PRIVATE_LITERAL')
+    expect(JSON.stringify(facts)).not.toContain('privateLocalValue')
+    expect(JSON.stringify(facts)).not.toContain('exec_main.mjs')
+    expect(JSON.stringify(facts)).not.toContain(f.grant)
+  },
+)
+
+test.each(['message-coordinate', 'deeper-frame', 'wrong-output', 'index-only'] as const)(
+  'failed Source diagnostics do not overclaim a %s boundary',
+  (variant) => {
+    const f = routingCodeModeFixture()
+    const start = requiredEvidenceRecord(f.records[2]!.payload)
+    const end = requiredEvidenceRecord(f.records[5]!.payload)
+    start['input'] = String(start['input']) + '\n{const privateLocalValue=1;privateLocalValue();}'
+    const lines = String(start['input']).split('\n')
+    const location = `exec_main.mjs:${lines.length}:${lines.at(-1)!.lastIndexOf('privateLocalValue(') + 1}`
+    end['output'] = [
+      { type: 'input_text', text: 'Script failed\nWall time 0.0 seconds\nOutput:\n' },
+      {
+        type: 'input_text',
+        text:
+          variant === 'message-coordinate'
+            ? `Script error:\nTypeError: PRIVATE ${location}`
+            : `Script error:\nTypeError: PRIVATE\n${variant === 'deeper-frame' ? '    at other.mjs:1:1\n' : ''}    at ${location}`,
+      },
+    ]
+    if (variant === 'wrong-output') end['call_id'] = 'unrelated-output'
+    const facts = inspectRoutingSourceRecords(f.records, f.expected)
+    expect(facts.allToolsAllowed).toBe(false)
+    const diagnostic = facts.boundaryDiagnostics.wrappers[0]!
+    expect(diagnostic.failedCall?.matched ?? false).toBe(variant === 'index-only')
+    expect(
+      diagnostic.sourceLeafShapes?.some((shape) => shape.navigation === 'wire_page') ?? false,
+    ).toBe(false)
+    expect(JSON.stringify(facts)).not.toContain('privateLocalValue')
+    expect(JSON.stringify(facts)).not.toContain('other.mjs')
+  },
+)
+
 test('catching a failed source MCP cannot turn it into admissible local data', () => {
   const f = routingCodeModeFixture(),
     item = requiredEvidenceRecord(f.records[3]!.payload['item'])
