@@ -17,6 +17,8 @@ import type {
   DecisionInput,
   DecisionRemoteOutcome,
   DecisionSelectionOutcome,
+  RelayDecisionAnswer,
+  RelaySchedulingDecision,
 } from '@pact/contracts'
 
 import {
@@ -31,7 +33,11 @@ import { PactDatabase } from '@pact/persistence'
 import {
   collaborationActionReceipts,
   conversationBodyInputs,
+  conversationInputBatches,
+  conversationRebuildSourceRefs,
   nativeAgentContexts,
+  schedulingBudgetCounters,
+  schedulingActivity,
 } from '../../../../../packages/persistence/src/schema/index.js'
 import { markdownVisibleProjection } from '../../shared/message-anchor-text.js'
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
@@ -80,8 +86,13 @@ const native = vi.hoisted(() => ({
   next: undefined as
     | {
         plan?: string | null
+        answer?: string
         review?: CollaborationReviewObservation
         input?: CollaborationInputObservation
+        nativeQuestion?: boolean
+        stopBeforeDispatch?: boolean
+        rejectedWithUncertainEffects?: boolean
+        failedNativeEnding?: boolean
       }
     | undefined,
   nextReview: undefined as CollaborationReviewObservation | undefined,
@@ -207,9 +218,31 @@ function adapter(agentId: RuntimeAgentId) {
       native.inputs.push(input)
       const report = native.next
       native.next = undefined
-      input.recordDispatch?.('possibly_sent', `${input.sessionId}-${agentId}`)
-      yield { agentId, type: 'session.started', nativeSessionId: `${input.sessionId}-${agentId}` }
-      input.recordDispatch?.('accepted', `${input.sessionId}-${agentId}`)
+      if (report?.stopBeforeDispatch) {
+        input.reportNativeEffects?.({
+          runId: input.runId,
+          generation: input.nativeGeneration!,
+          state: 'settled',
+          reason: 'workflow_input_withheld',
+        })
+        throw Error('Fixture cancelled before the native request was written.')
+      }
+      if (report?.rejectedWithUncertainEffects) {
+        input.recordDispatch?.('rejected')
+        input.reportNativeEffects?.({
+          runId: input.runId,
+          generation: input.nativeGeneration!,
+          state: 'unknown',
+          reason: 'fixture_uncertain_native_effects',
+        })
+        throw Error('Fixture observed rejection with unresolved native effects.')
+      }
+      const executor = report?.nativeQuestion ? randomUUID() : undefined
+      if (executor) input.recordExecutor?.(executor)
+      const nativeSessionId = input.nativeSessionId ?? randomUUID()
+      input.recordDispatch?.('possibly_sent', nativeSessionId, executor)
+      yield { agentId, type: 'session.started', nativeSessionId }
+      input.recordDispatch?.('accepted', nativeSessionId, executor)
       yield { agentId, type: 'turn.started', turnId: input.runId }
       if (native.hold)
         await Promise.race([
@@ -220,6 +253,15 @@ function adapter(agentId: RuntimeAgentId) {
           }),
         ])
       signal.throwIfAborted()
+      if (report?.failedNativeEnding) {
+        input.reportNativeEffects?.({
+          runId: input.runId,
+          generation: input.nativeGeneration!,
+          state: 'settled',
+        })
+        yield { agentId, type: 'turn.completed', turnId: input.runId, outcome: 'failed' }
+        return
+      }
       if (native.fail) throw Error('Fixture failure after accepted delivery')
       const phase = input.promptEnvelope.collaboration
       const sourceReader = input.collaborationSourceReader
@@ -302,14 +344,21 @@ function adapter(agentId: RuntimeAgentId) {
           largestReply,
         })
       }
+      if (report?.nativeQuestion) {
+        const answered = await input.requestUserInput?.(
+          {
+            kind: 'questions',
+            title: 'Clarify the scope',
+            message: 'Which timeout should the task guarantee?',
+            fields: [{ id: 'timeout', label: 'Timeout', type: 'text', required: true }],
+          },
+          signal,
+        )
+        if (answered?.action !== 'accept') throw Error('The fixture question was not answered.')
+      }
+      const auth = input.promptEnvelope.collaborationAuthorization
       if (report?.input) input.recordWorkflowInputResult?.(report.input)
-      else if (
-        phase.stage === 'plan' ||
-        (phase.stage === 'reply' &&
-          phase.kind === 'plan' &&
-          !phase.codeRunId &&
-          phase.actor === phase.owner)
-      ) {
+      else if (collaborationPlanMode(phase, auth)) {
         if (report?.plan !== null)
           input.recordWorkflowPlan?.({
             nativeId: `plan-${input.runId}`,
@@ -321,14 +370,14 @@ function adapter(agentId: RuntimeAgentId) {
           report?.review ?? native.nextReview ?? native.reviews.shift() ?? { verdict: 'accepted' },
         )
         native.nextReview = undefined
-      } else if (phase.stage === 'reply')
+      } else if (collaborationInputResultRequired(phase, auth))
         input.recordWorkflowInputResult?.({ outcome: 'processed' })
       yield {
         agentId,
         type: 'text.completed',
         turnId: input.runId,
         outputId: input.runId,
-        text: `${phase.stage} complete.`,
+        text: report?.answer ?? `${phase.stage} complete.`,
       }
       yield { agentId, type: 'turn.completed', turnId: input.runId, outcome: 'completed' }
       input.reportNativeEffects?.({
@@ -376,11 +425,13 @@ async function fixture(
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'pact-collaboration-flow-'))
   if (databaseInProject) await mkdir(join(directory, '.pact-data/dev'), { recursive: true })
-  const db = await PactDatabase.open({
-    filePath: databaseInProject ? join(directory, '.pact-data/dev/pact.sqlite') : ':memory:',
-    migrationsFolder: resolve(import.meta.dirname, '../../../../../packages/persistence/drizzle'),
-    measurePerformance,
-  })
+  const open = () =>
+    PactDatabase.open({
+      filePath: databaseInProject ? join(directory, '.pact-data/dev/pact.sqlite') : ':memory:',
+      migrationsFolder: resolve(import.meta.dirname, '../../../../../packages/persistence/drizzle'),
+      measurePerformance,
+    })
+  const db = await open()
   const projectId = randomUUID(),
     sessionId = randomUUID(),
     createdAt = new Date().toISOString()
@@ -401,40 +452,57 @@ async function fixture(
       maxRepairAttempts: 3,
     },
   )
-  const preparation = new RuntimePreparation(db.runtimePreparationRepository)
-  vi.spyOn(preparation, 'findRecoveryExecutable').mockResolvedValue(process.execPath)
-  vi.spyOn(preparation, 'inspectReadiness').mockResolvedValue({
-    ok: true,
-    value: {
-      firstUse: false,
-      agents: [
-        {
-          agentId: 'codex',
-          executablePath: process.execPath,
-          state: 'ready',
-          checkedAt: createdAt,
-        },
-        {
-          agentId: 'claude',
-          executablePath: process.execPath,
-          state: 'ready',
-          checkedAt: createdAt,
-        },
-      ],
-    },
-  })
-  const flow = new Conversation(
-    db.conversationRepository,
-    db.sessionRepository,
-    db.projectCatalogRepository,
-    preparation,
-    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
-    undefined,
-    undefined,
-    undefined,
-    () => 'OWNED_COLLABORATION_CREDENTIAL',
-  )
-  owners.push({ db, flow, directory })
+  const launch = (database: PactDatabase) => {
+    const preparation = new RuntimePreparation(database.runtimePreparationRepository)
+    vi.spyOn(preparation, 'findRecoveryExecutable').mockResolvedValue(process.execPath)
+    vi.spyOn(preparation, 'inspectReadiness').mockResolvedValue({
+      ok: true,
+      value: {
+        firstUse: false,
+        agents: [
+          {
+            agentId: 'codex',
+            executablePath: process.execPath,
+            state: 'ready',
+            checkedAt: createdAt,
+          },
+          {
+            agentId: 'claude',
+            executablePath: process.execPath,
+            state: 'ready',
+            checkedAt: createdAt,
+          },
+        ],
+      },
+    })
+    const flow = new Conversation(
+      database.conversationRepository,
+      database.sessionRepository,
+      database.projectCatalogRepository,
+      preparation,
+      new ProjectFileReader(
+        database.sessionRepository,
+        database.projectCatalogRepository,
+        runDirectoryWorker,
+      ),
+      undefined,
+      undefined,
+      undefined,
+      () => 'OWNED_COLLABORATION_CREDENTIAL',
+    )
+    const owner = { db: database, flow, directory }
+    owners.push(owner)
+    return { owner, flow, preparation }
+  }
+  const { owner, flow, preparation } = launch(db)
+  const restart = async () => {
+    if (!databaseInProject) throw Error('A cold restart requires a durable fixture')
+    await flow.dispose()
+    db.close()
+    owners.splice(owners.indexOf(owner), 1)
+    const reopened = await open()
+    return { db: reopened, flow: launch(reopened).flow, repo: reopened.conversationRepository }
+  }
   const input = (content: string): ConversationSendInput => {
     const page = db.conversationRepository.readPage({ scope: 'drafts', sessionId })
     if (page.scope !== 'drafts') throw Error('Missing draft')
@@ -476,7 +544,7 @@ async function fixture(
     if (page.scope !== 'drafts') throw Error('Missing draft page')
     return page.comments
   }
-  return { db, flow, sessionId, input, settled, act, drafts, preparation }
+  return { db, flow, sessionId, input, settled, act, drafts, preparation, restart }
 }
 
 it('routes bare /plan to default Claude and preserves the exact user message through native serialization', async () => {
@@ -1981,6 +2049,8 @@ describe('Native workflow admission and durable dispatch', () => {
       content = '## Scope\n\nKeep **cancellation ownership** together.'
     native.next = { plan: content }
     expect((await f.flow.send(f.input('/plan Inspect ownership'))).ok).toBe(true)
+    const repo = f.db.conversationRepository
+    await vi.waitFor(() => expect(repo.collaboration(f.sessionId)?.status).toBe('ready'))
     const task = await f.settled(),
       ref = task.planReference!,
       projection = markdownVisibleProjection(content)
@@ -2038,8 +2108,16 @@ describe('Native workflow admission and durable dispatch', () => {
         freezeDrafts: false,
       }),
     ).toMatchObject({ ok: true })
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+    await vi.waitFor(() =>
+      expect(repo.collaboration(f.sessionId)).toMatchObject({ status: 'ready', planVersion: 2 }),
+    )
     const revised = await f.settled()
+    expect(native.inputs.map((turn) => turn.promptEnvelope.collaboration?.stage)).toEqual([
+      'plan',
+      'plan_review',
+      'reply',
+      'plan_review',
+    ])
     expect(revised.planVersion).toBe(2)
     expect(revised.planReference?.document.sha256).not.toBe(ref.document.sha256)
     expect(f.drafts().map((draft) => draft.id)).toContain(commentId)
@@ -2047,12 +2125,20 @@ describe('Native workflow admission and durable dispatch', () => {
       ok: true,
       value: { status: 'resolved', anchor },
     })
-    expect(
-      await f.flow.send({ ...f.input('Preserve the original decision.'), commentIds: [commentId] }),
-    ).toMatchObject({ ok: true })
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(4))
+    const feedback = { ...f.input('Preserve the original decision.'), commentIds: [commentId] }
+    expect(await f.flow.send(feedback)).toMatchObject({ ok: true })
+    await vi.waitFor(() =>
+      expect(repo.collaboration(f.sessionId)).toMatchObject({
+        status: 'ready',
+        inputSequence: revised.inputSequence + 1,
+        review: { inputSequence: revised.inputSequence + 1 },
+      }),
+    )
     await f.settled()
-    expect(native.inputs[3]?.promptEnvelope.inputBatchRef).toBeDefined()
+    const reply = native.inputs.find(
+      (turn) => turn.promptEnvelope.message.id === feedback.clientMessageId,
+    )
+    expect(reply?.promptEnvelope.inputBatchRef).toMatchObject({ memberCount: 1 })
     expect(f.drafts()).toHaveLength(0)
     expect(await f.flow.resolveCommentSource(f.sessionId, commentId)).toMatchObject({
       ok: true,
@@ -2878,6 +2964,1059 @@ describe('Initial role staleness and mutation boundaries', () => {
     })
     expect(native.inputs).toHaveLength(2)
     expect(repo.collaboration(f.sessionId)!.stageRoles).toEqual(before.stageRoles)
+  })
+})
+
+async function answerWorkflowQuestion(f: Awaited<ReturnType<typeof fixture>>) {
+  const repo = f.db.conversationRepository
+  const request = () => repo.nativeContext(f.sessionId, 'codex')?.permissionRequests?.[0]
+  await vi.waitFor(() => expect(request()).toMatchObject({ kind: 'questions' }))
+  const nativeQuestion = request()!
+  expect(
+    f.flow.respondNativeInput({
+      requestId: nativeQuestion.id,
+      operationId: nativeQuestion.operationId!,
+      action: 'accept',
+      values: { timeout: 'Two seconds' },
+    }),
+  ).toMatchObject({ ok: true })
+}
+
+function actionForCard(
+  card: RelaySchedulingDecision,
+  answer: 'cancel' | 'confirm',
+): RelayDecisionAnswer {
+  return {
+    reference: {
+      sessionId: card.sessionId,
+      decisionId: card.decisionId,
+      revision: card.revision,
+    },
+    clientOperationId: randomUUID(),
+    answer: { kind: answer },
+  }
+}
+
+function pactRepairActions(f: { repo: PactDatabase['conversationRepository']; sessionId: string }) {
+  const page = f.repo.readPage({ scope: 'collaboration', sessionId: f.sessionId })
+  if (page.scope !== 'collaboration') throw Error('Expected collaboration actions')
+  return page.view.availableActions
+}
+
+describe('Explicit Plan questions', () => {
+  async function acceptedPlan(author: RuntimeAgentId = 'codex', durable = false) {
+    const f = await fixture(author, durable)
+    const repo = f.db.conversationRepository
+    expect(await f.flow.send(f.input('/plan Describe cancellation ownership.'))).toMatchObject({
+      ok: true,
+    })
+    await vi.waitFor(() => expect(repo.collaboration(f.sessionId)?.status).toBe('ready'))
+    const accepted = await f.settled()
+    const question = {
+      ...f.input('Ask-only question marker: who releases the request handle?'),
+      freezeDrafts: false,
+      askOnly: { taskId: accepted.id, expectedRevision: accepted.revision },
+    }
+    return { ...f, repo, accepted, question }
+  }
+
+  async function answer(f: Awaited<ReturnType<typeof acceptedPlan>>) {
+    native.next = { answer: 'Ask-only answer marker: the requester releases it.' }
+    expect(await f.flow.send(f.question)).toMatchObject({ ok: true })
+    await vi.waitFor(() =>
+      expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+        stage: 'reply',
+        status: 'ready',
+      }),
+    )
+    return f.settled()
+  }
+
+  it.each(['codex', 'claude'] as const)(
+    'answers through a non-task Batch with %s and gives ordinary Send an independent review',
+    async (author) => {
+      const f = await acceptedPlan(author)
+      const answered = await answer(f)
+      expect(answered).toMatchObject({
+        review: f.accepted.review,
+        planReference: f.accepted.planReference,
+        inputSequence: f.accepted.inputSequence,
+        discussionRounds: f.accepted.discussionRounds,
+      })
+      expect(answered.latestUserMessageId).toBe(f.accepted.latestUserMessageId)
+      expect(answered.inputProcessing?.settled).toEqual(f.accepted.inputProcessing?.settled)
+      const batch = f.db.drizzle
+        .select()
+        .from(conversationInputBatches)
+        .where(eq(conversationInputBatches.runId, answered.runId))
+        .get()
+      expect(batch).toMatchObject({ taskId: null, sequence: 0, memberCount: 0 })
+      expect(native.inputs).toHaveLength(3)
+      const question = native.inputs[2]!
+      expect(question.promptEnvelope.collaborationAuthorization?.replyIntentBasis?.kind).toBe(
+        'ask_only',
+      )
+      expect(
+        collaborationPlanMode(
+          question.promptEnvelope.collaboration,
+          question.promptEnvelope.collaborationAuthorization,
+        ),
+      ).toBe(false)
+      expect(collaborationReadOnly(question.promptEnvelope.collaboration)).toBe(true)
+      expect(await f.flow.send(f.question)).toMatchObject({ ok: true })
+      expect(await f.flow.send({ ...f.question, askOnly: undefined })).toMatchObject({
+        ok: false,
+        error: { code: 'CONFLICT' },
+      })
+      expect(
+        await f.flow.send(f.input('Recheck the cancellation design independently.')),
+      ).toMatchObject({
+        ok: true,
+      })
+      await vi.waitFor(() =>
+        expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+          status: 'ready',
+          inputSequence: f.accepted.inputSequence + 1,
+          discussionRounds: f.accepted.discussionRounds + 1,
+          review: { inputSequence: f.accepted.inputSequence + 1 },
+        }),
+      )
+      expect((await f.settled()).review?.runId).not.toBe(f.accepted.review?.runId)
+      expect(native.inputs).toHaveLength(5)
+    },
+  )
+
+  it('keeps an older Ask from reviving acceptance after a later queued input is removed', async () => {
+    const f = await acceptedPlan()
+    const hold = Promise.withResolvers<void>()
+    native.hold = hold.promise
+    try {
+      expect(await f.flow.send(f.question)).toMatchObject({ ok: true })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+      const business = f.input('Change the allowed cancellation scope.')
+      expect(await f.flow.send(business)).toMatchObject({ ok: true })
+      const queued = f.repo.queueState(f.sessionId)
+      expect(queued.input?.id).toBe(business.clientMessageId)
+      expect(
+        f.flow.removeQueuedConversationMessage({
+          sessionId: f.sessionId,
+          inputId: business.clientMessageId,
+          expectedRevision: queued.revision,
+          operationId: randomUUID(),
+        }),
+      ).toMatchObject({ ok: true })
+    } finally {
+      native.hold = undefined
+      hold.resolve()
+    }
+    await vi.waitFor(() => expect(f.flow.diagnostics().activeExecutions).toBe(0))
+    const current = f.repo.collaboration(f.sessionId)!
+    expect(current.status).not.toBe('running')
+    expect(current).toMatchObject({
+      automation: 'paused',
+      inputSequence: f.accepted.inputSequence + 1,
+      review: f.accepted.review,
+    })
+    expect(current.inputProcessing?.pending).toBeUndefined()
+    expect(pactRepairActions(f)).not.toContain('execute')
+    expect(native.inputs).toHaveLength(3)
+  })
+
+  it('keeps Ask messages in Chat and out of the next business source grant', async () => {
+    const f = await acceptedPlan()
+    const answered = await answer(f)
+    const run = f.repo.findRun(answered.runId)!
+    const askIds = [run.userMessageId, run.responseMessageId]
+    expect(f.repo.read(f.sessionId).messages.map((message) => message.id)).toEqual(
+      expect.arrayContaining(askIds),
+    )
+    await f.act('execute')
+    const implementation = native.inputs[3]!
+    expect(implementation.promptEnvelope.collaboration).toMatchObject({
+      stage: 'implement',
+      actor: 'claude',
+    })
+    const sources = f.repo
+      .readRunSources(implementation.runId)
+      .items.map((source) => source.messageId)
+    for (const id of askIds) {
+      expect(
+        implementation.promptEnvelope.handoffContext?.some((source) => source.messageId === id),
+      ).not.toBe(true)
+      expect(sources).not.toContain(id)
+    }
+  })
+
+  it('refuses forged Ask source refs when admitting an otherwise valid workflow Run', async () => {
+    const f = await acceptedPlan()
+    const answered = await answer(f)
+    const ask = f.repo.findRun(answered.runId)!
+    const refs = f.repo
+      .readHandoffPage(f.sessionId, 'claude', -1, Number.MAX_SAFE_INTEGER)
+      .messages.filter((message) =>
+        [ask.userMessageId, ask.responseMessageId].includes(message.messageId),
+      )
+    expect(refs).toHaveLength(2)
+    const begin = f.repo.beginRun.bind(f.repo)
+    vi.spyOn(f.repo, 'beginRun').mockImplementationOnce((input) =>
+      begin({
+        ...input,
+        handoffSourceRefs: refs.map((source) => ({
+          id: source.messageId,
+          revision: source.contentRevision,
+          digest: source.digest,
+        })),
+      }),
+    )
+    const result = await f.flow.actOnCollaboration({
+      sessionId: f.sessionId,
+      taskId: answered.id,
+      revision: answered.revision,
+      action: 'execute',
+      clientMessageId: randomUUID(),
+    })
+    expect(result).toMatchObject({ ok: false })
+    expect(f.repo.read(f.sessionId).runs).toHaveLength(3)
+  })
+
+  it('retains the complete Rebuild history without inheriting Ask as business source grants', async () => {
+    const f = await acceptedPlan()
+    const answered = await answer(f)
+    const ask = f.repo.findRun(answered.runId)!
+    const id = randomUUID(),
+      nativeSessionId = randomUUID()
+    const generation = f.repo.nativeContext(f.sessionId, 'claude')!.bindingGeneration!
+    f.repo.beginNativeRebuild({
+      id,
+      sessionId: f.sessionId,
+      agentId: 'claude',
+      expectedGeneration: generation,
+      abandon: false,
+    })
+    const chunks: import('@pact/contracts').NativeContextRebuildChunk[] = []
+    for await (const chunk of f.repo.nativeContextRebuildSource(
+      f.sessionId,
+      new AbortController().signal,
+      id,
+    ))
+      chunks.push(chunk)
+    f.repo.freezeNativeRebuildSource(id, chunks)
+    const seeded = f.db.drizzle
+      .select({ id: conversationRebuildSourceRefs.sourceMessageId })
+      .from(conversationRebuildSourceRefs)
+      .where(eq(conversationRebuildSourceRefs.operationId, id))
+      .all()
+    expect(seeded.map((source) => source.id)).toEqual(
+      expect.arrayContaining([ask.userMessageId, ask.responseMessageId]),
+    )
+    f.repo.markNativeRebuildDispatched(id)
+    f.repo.recordNativeRebuildIdentity(id, nativeSessionId)
+    f.repo.completeNativeRebuild(id, nativeSessionId)
+    await f.act('execute')
+    const implementation = native.inputs[3]!
+    expect(implementation.nativeSessionId).toBe(nativeSessionId)
+    const grants = f.repo
+      .readRunSources(implementation.runId)
+      .items.map((source) => source.messageId)
+    expect(grants).toContain(f.accepted.taskMessageId)
+    expect(grants).not.toContain(ask.userMessageId)
+    expect(grants).not.toContain(ask.responseMessageId)
+  })
+
+  it('filters inherited Ask messages without granting the Fork an Ask authorization', async () => {
+    const f = await acceptedPlan()
+    const answered = await answer(f)
+    const snapshot = f.repo.read(f.sessionId)
+    const ask = f.repo.findRun(answered.runId)!
+    const priorReviewer = f.repo.findRun(f.accepted.review!.runId)!
+    const boundary = (run: typeof ask) => ({
+      nativeSessionId: run.nativeSessionId!,
+      nativeCutId: run.nativeTurnId!,
+      nativeTurnId: run.nativeTurnId!,
+      bindingGeneration: run.bindingGeneration!,
+      throughSequence: snapshot.messages.find((message) => message.id === run.responseMessageId)!
+        .sequence,
+      deliveryCursor: snapshot.messages.find((message) => message.id === run.userMessageId)!
+        .sequence,
+      prefixHash: 'a'.repeat(64),
+      prefixRecords: 2,
+      prefixBytes: 100,
+    })
+    const session = f.db.sessionRepository.find(f.sessionId)!
+    const selected = f.repo.selectForkSource(
+      f.sessionId,
+      ask.responseMessageId!,
+      session.settings,
+      session.settingsRevision,
+    )
+    const child = f.repo.commitFork(
+      randomUUID(),
+      selected,
+      {
+        codex: boundary(ask),
+        claude: boundary(priorReviewer),
+      },
+      [],
+    )
+    const history = f.repo.read(child.sessionId)
+    const inherited = history.runs.find((run) => run.forkSourceRunId === ask.id)!
+    expect(f.repo.collaborationTurnAuthorization(inherited.id)?.replyIntentBasis).toBeUndefined()
+    expect(f.repo.collaboration(child.sessionId)).toBeUndefined()
+    expect(history.messages.map((message) => message.content)).toEqual(
+      expect.arrayContaining([
+        f.question.content,
+        'Ask-only answer marker: the requester releases it.',
+      ]),
+    )
+    const { afterSequence, throughSequence } = f.repo.handoffRange(child.sessionId, 'claude')
+    const ordinary = f.repo.readHandoffPage(
+      child.sessionId,
+      'claude',
+      afterSequence,
+      throughSequence,
+    )
+    const inheritedIds = history.messages
+      .filter((message) => message.runId === inherited.id)
+      .map((message) => message.id)
+    expect(inheritedIds).toHaveLength(2)
+    expect(ordinary.messages.map((message) => message.messageId)).toEqual(
+      expect.arrayContaining(inheritedIds),
+    )
+    const workflowIds = []
+    for await (const source of f.repo.readHandoffSources(
+      child.sessionId,
+      'claude',
+      afterSequence,
+      throughSequence,
+      new AbortController().signal,
+      undefined,
+      true,
+    ))
+      workflowIds.push(source.messageId)
+    expect(workflowIds).not.toContain(inheritedIds[0])
+    expect(workflowIds).not.toContain(inheritedIds[1])
+
+    for (const [agentId, source] of [
+      ['codex', boundary(ask)],
+      ['claude', boundary(priorReviewer)],
+    ] as const) {
+      const settings = session.settings.agents[agentId]
+      const evidence = {
+        version: 'pact-native-fork-v1' as const,
+        sourceNativeSessionId: source.nativeSessionId,
+        nativeSessionId: randomUUID(),
+        sourceCutId: source.nativeCutId,
+        sourcePrefixHash: source.prefixHash,
+        candidatePrefixHash: source.prefixHash,
+        idMap: [[source.nativeTurnId, source.nativeTurnId] as [string, string]],
+        model: settings.model,
+        effort: settings.effort,
+        permissionMode: 'ask' as const,
+        initializedAt: new Date().toISOString(),
+        initializedPrefixHash: 'b'.repeat(64),
+        initializedPrefixBytes: 100,
+        initializedPrefixRecords: 2,
+      }
+      f.repo.updateForkIntent(child.sessionId, child.id, agentId, {
+        nativeSessionId: evidence.nativeSessionId,
+        witnessJson: JSON.stringify(evidence),
+        nativeWorkState: 'settled',
+      })
+      f.repo.completeForkSide(
+        child.sessionId,
+        child.id,
+        agentId,
+        evidence.nativeSessionId,
+        evidence,
+      )
+    }
+    f.db.sessionRepository.saveSettings(child.sessionId, {
+      ...session.settings,
+      primaryAgentId: 'claude',
+    })
+    const drafts = f.repo.readPage({ scope: 'drafts', sessionId: child.sessionId })
+    if (drafts.scope !== 'drafts') throw Error('Missing Fork drafts.')
+    expect(
+      await f.flow.send({
+        ...f.input('/review Check the current cancellation implementation.'),
+        sessionId: child.sessionId,
+        expectedCommentsRevision: drafts.commentsRevision,
+      }),
+    ).toMatchObject({ ok: true })
+    await vi.waitFor(() =>
+      expect(f.repo.collaboration(child.sessionId)).toMatchObject({
+        status: 'complete',
+        review: { actor: 'claude' },
+      }),
+    )
+    const newReview = native.inputs.at(-1)!
+    const granted = f.repo.readRunSources(newReview.runId).items.map((source) => source.messageId)
+    for (const id of inheritedIds) {
+      expect(
+        newReview.promptEnvelope.handoffContext?.some((source) => source.messageId === id),
+      ).not.toBe(true)
+      expect(granted).not.toContain(id)
+    }
+  })
+
+  it('preserves a failed Ask pause when a newer business input stays queued', async () => {
+    const f = await acceptedPlan()
+    const hold = Promise.withResolvers<void>()
+    native.hold = hold.promise
+    native.next = { failedNativeEnding: true }
+    try {
+      expect(await f.flow.send(f.question)).toMatchObject({ ok: true })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+      const business = f.input('New requirement: a timeout.')
+      expect(await f.flow.send(business)).toMatchObject({ ok: true })
+      expect(f.repo.queueState(f.sessionId).input?.id).toBe(business.clientMessageId)
+    } finally {
+      native.hold = undefined
+      hold.resolve()
+    }
+    await vi.waitFor(() => expect(f.flow.diagnostics().activeExecutions).toBe(0))
+    const ask = f.repo
+      .read(f.sessionId)
+      .runs.find((run) => run.userMessageId === f.question.clientMessageId)
+    expect(ask).toMatchObject({ nativeOutcome: 'failed', nativeEffectsState: 'settled' })
+    expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+      automation: 'paused',
+      pauseReason: 'failure',
+      inputSequence: f.accepted.inputSequence + 1,
+    })
+  })
+
+  it.each(['starting', 'failed', 'interrupted', 'unknown'] as const)(
+    'reconciles cold Ask delivery by durable facts when the original Run is %s',
+    async (state) => {
+      const f = await acceptedPlan('codex', true)
+      const beginRun = f.repo.beginRun.bind(f.repo)
+      const boundary = vi.spyOn(f.repo, 'beginRun').mockImplementationOnce((input) => {
+        beginRun(input)
+        throw Error('Lost Utility after Run admission, before dispatch.')
+      })
+      expect(await f.flow.send(f.question)).toMatchObject({ ok: true })
+      await vi.waitFor(() => expect(boundary).toHaveBeenCalledTimes(1))
+      const before = f.repo.collaboration(f.sessionId)!
+      expect(f.repo.findRun(before.runId)).toMatchObject({
+        status: 'starting',
+        dispatchPhase: 'not_sent',
+        nativeEffectsState: 'not_dispatched',
+      })
+      expect(before.inputProcessing?.pending?.inputId).toBe(f.question.clientMessageId)
+      if (state === 'unknown') {
+        f.repo.recordDispatch(
+          before.runId,
+          'possibly_sent',
+          f.repo.nativeContext(f.sessionId, 'codex')!.nativeSessionId,
+        )
+        f.repo.recordNativeEffects(before.runId, 'unknown')
+      }
+      if (state !== 'starting')
+        f.repo.failRun(
+          before.runId,
+          'transient_transport',
+          'Original Utility stopped.',
+          state === 'interrupted',
+        )
+      const reopened = await f.restart()
+      const recovered = reopened.repo.collaboration(f.sessionId)!
+      expect(recovered).toMatchObject({
+        automation: 'paused',
+        pauseReason: 'restart',
+        review: f.accepted.review,
+        planReference: f.accepted.planReference,
+        inputSequence: f.accepted.inputSequence,
+      })
+      const delivery =
+        state === 'unknown'
+          ? {
+              pendingId: recovered.inputProcessing?.pending?.inputId,
+              effects: reopened.repo.findRun(before.runId)?.nativeEffectsState,
+            }
+          : {
+              running: recovered.status === 'running',
+              pending: recovered.inputProcessing?.pending,
+              blocksInput: reopened.repo.nativeRecoveryBlocksInput(f.sessionId),
+            }
+      expect(delivery).toEqual(
+        state === 'unknown'
+          ? { pendingId: f.question.clientMessageId, effects: 'unknown' }
+          : { running: false, pending: undefined, blocksInput: false },
+      )
+      expect(native.inputs).toHaveLength(2)
+    },
+  )
+
+  it('omits the pre-Ask Claude Plan checkpoint from the next planning root', async () => {
+    const f = await acceptedPlan('claude')
+    await answer(f)
+    const hold = Promise.withResolvers<void>()
+    native.hold = hold.promise
+    try {
+      expect(await f.flow.send(f.input('Revise the Plan to add a bounded timeout.'))).toMatchObject(
+        {
+          ok: true,
+        },
+      )
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(4))
+      const revision = native.inputs[3]!
+      expect(
+        collaborationPlanMode(
+          revision.promptEnvelope.collaboration,
+          revision.promptEnvelope.collaborationAuthorization,
+        ),
+      ).toBe(true)
+      expect(revision.getPlanCheckpoint?.(revision.nativeSessionId!)).toBeUndefined()
+    } finally {
+      native.hold = undefined
+      hold.resolve()
+    }
+    await f.settled()
+  })
+})
+
+function directChoice(f: { repo: PactDatabase['conversationRepository']; sessionId: string }) {
+  const task = f.repo.collaboration(f.sessionId)!
+  return {
+    sessionId: f.sessionId,
+    taskId: task.id,
+    revision: task.revision,
+    clientMessageId: randomUUID(),
+    action: 'request_repair_role_switch' as const,
+    repairActor: 'codex' as const,
+  }
+}
+
+describe('Native repair role confirmations', () => {
+  async function reviewedCode(priorRepair = false, command: '/build' | '/review' = '/build') {
+    const f = await fixture('codex', true)
+    const repo = f.db.conversationRepository
+    native.nextReview = { verdict: 'changes_requested' }
+    expect(await f.flow.send(f.input(command + ' Preserve cancellation ownership.'))).toMatchObject(
+      {
+        ok: true,
+      },
+    )
+    await vi.waitFor(() =>
+      expect(repo.collaboration(f.sessionId)).toMatchObject({
+        stage: 'code_review',
+        status: 'waiting',
+        review: { verdict: 'changes_requested' },
+      }),
+    )
+    await f.settled()
+    if (priorRepair) {
+      native.nextReview = { verdict: 'changes_requested' }
+      await f.act('repair')
+    }
+    await vi.waitFor(() =>
+      expect(repo.collaboration(f.sessionId)).toMatchObject({
+        stage: 'code_review',
+        status: 'waiting',
+        reviewCycles: priorRepair ? 2 : 1,
+        repairAttempts: priorRepair ? 1 : 0,
+      }),
+    )
+    const reviewed = await f.settled()
+    return { ...f, repo, reviewed }
+  }
+
+  it('supersedes an unused Relay suggestion for this review with the direct choice', async () => {
+    const f = await repairDecisionFlow('codex', 'propose_repair')
+    const repo = f.db.conversationRepository
+    const before = repo.collaboration(f.sessionId)!
+    const old = repo.relaySchedulingDecision(f.sessionId)!
+    expect(old.request).toMatchObject({ operation: { kind: 'repair' } })
+    const request = directChoice({ repo, sessionId: f.sessionId })
+    expect(await f.flow.actOnCollaboration(request)).toMatchObject({ ok: true })
+    const card = repo.relaySchedulingDecision(f.sessionId)!
+    expect(card).toMatchObject({
+      decisionId: request.clientMessageId,
+      request: { operation: { kind: 'repair_role_request', actor: 'codex' } },
+    })
+    expect(repo.collaboration(f.sessionId)).toMatchObject({
+      inputSequence: before.inputSequence,
+      runId: before.runId,
+      review: before.review,
+      stageRoles: before.stageRoles,
+    })
+    expect(native.inputs).toHaveLength(4)
+    expect(await f.flow.answerRelayDecision(actionForCard(old, 'confirm'))).toMatchObject({
+      ok: false,
+    })
+    expect(await f.flow.actOnCollaboration(request)).toMatchObject({ ok: true })
+    expect(await f.flow.actOnCollaboration({ ...request, repairActor: 'claude' })).toMatchObject({
+      ok: false,
+      error: { code: 'CONFLICT' },
+    })
+    expect(await f.flow.answerRelayDecision(actionForCard(card, 'cancel'))).toMatchObject({
+      ok: true,
+    })
+    expect(await f.flow.actOnCollaboration(request)).toMatchObject({ ok: true })
+    expect(repo.relaySchedulingDecision(f.sessionId)).toBeNull()
+  })
+
+  it.each([
+    { settings: { maxReviewCycles: 2 }, limit: 'review' },
+    { settings: { maxRepairAttempts: 1 }, limit: 'repair' },
+  ])(
+    'projects the exhausted normal $limit allowance for a direct choice',
+    async ({ settings, limit }) => {
+      const f = await reviewedCode(true)
+      const session = f.db.sessionRepository.find(f.sessionId)!
+      f.db.sessionRepository.saveSettings(f.sessionId, { ...session.settings, ...settings })
+      const view = f.repo.readPage({ scope: 'collaboration', sessionId: f.sessionId })
+      if (view.scope !== 'collaboration') throw Error('Expected current workflow projection.')
+      expect(view.view).toMatchObject({
+        repairChoiceUnavailable: expect.stringContaining('Session ' + limit + ' limit'),
+      })
+      expect(view.view.availableActions).toContain('respond')
+      expect(await f.flow.actOnCollaboration(directChoice(f))).toMatchObject({
+        ok: false,
+        error: { message: expect.stringContaining('Session ' + limit + ' limit') },
+      })
+      expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
+      expect(native.inputs).toHaveLength(4)
+    },
+  )
+
+  it('records a confirmed Pact repair as not sent when the bound receipt proves no native write', async () => {
+    const f = await reviewedCode(false, '/review')
+    const request = directChoice(f)
+    expect(await f.flow.actOnCollaboration(request)).toMatchObject({ ok: true })
+    const card = f.repo.relaySchedulingDecision(f.sessionId)!
+    native.next = { stopBeforeDispatch: true }
+    expect(await f.flow.answerRelayDecision(actionForCard(card, 'confirm'))).toMatchObject({
+      ok: true,
+    })
+    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('failed'))
+    await vi.waitFor(() => expect(f.flow.diagnostics().activeExecutions).toBe(0))
+    const current = f.repo.collaboration(f.sessionId)!
+    expect(f.repo.findRun(current.runId)).toMatchObject({
+      dispatchPhase: 'not_sent',
+      nativeEffectsState: 'settled',
+    })
+    const receipt = f.db.drizzle
+      .select()
+      .from(collaborationActionReceipts)
+      .where(eq(collaborationActionReceipts.boundRunId, current.runId))
+      .get()
+    expect(receipt).toMatchObject({ state: 'not_sent', decisionId: card.decisionId })
+    const activity = f.repo
+      .readSchedulingActivity({})
+      .rows.find((row) => row.id === card.decisionId)
+    expect(activity).toMatchObject({ actionResult: 'not_sent', called: false })
+    expect(
+      f.db.drizzle
+        .select({ unresolved: schedulingActivity.unresolved })
+        .from(schedulingActivity)
+        .where(eq(schedulingActivity.id, card.decisionId))
+        .get(),
+    ).toEqual({ unresolved: false })
+  })
+
+  it('keeps the Pact repair unresolved when native rejection has uncertain effects', async () => {
+    const f = await reviewedCode(false, '/review')
+    expect(await f.flow.actOnCollaboration(directChoice(f))).toMatchObject({ ok: true })
+    const card = f.repo.relaySchedulingDecision(f.sessionId)!
+    native.next = { rejectedWithUncertainEffects: true }
+    expect(await f.flow.answerRelayDecision(actionForCard(card, 'confirm'))).toMatchObject({
+      ok: true,
+    })
+    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('failed'))
+    await vi.waitFor(() => expect(f.flow.diagnostics().activeExecutions).toBe(0))
+    const runId = f.repo.collaboration(f.sessionId)!.runId
+    expect(f.repo.findRun(runId)).toMatchObject({
+      dispatchPhase: 'rejected',
+      nativeEffectsState: 'unknown',
+    })
+    const receipt = f.db.drizzle
+      .select()
+      .from(collaborationActionReceipts)
+      .where(eq(collaborationActionReceipts.boundRunId, runId))
+      .get()
+    expect(receipt).toMatchObject({ state: 'unknown', decisionId: card.decisionId })
+    const activity = f.db.drizzle
+      .select()
+      .from(schedulingActivity)
+      .where(eq(schedulingActivity.id, card.decisionId))
+      .get()
+    expect(activity).toMatchObject({ actionResult: 'unconfirmed', unresolved: true })
+  })
+
+  async function requestRepair(f: Awaited<ReturnType<typeof reviewedCode>>) {
+    native.next = {
+      input: { outcome: 'repair_role_request' },
+      answer: 'Pact can confirm who repairs this review.',
+    }
+    expect(
+      await f.flow.send({
+        ...f.input('Please repair the existing findings yourself.'),
+        route: { type: 'agent', agentId: 'codex' },
+      }),
+    ).toMatchObject({ ok: true })
+  }
+
+  async function pendingCard(f: Awaited<ReturnType<typeof reviewedCode>>) {
+    await requestRepair(f)
+    await vi.waitFor(() =>
+      expect(f.repo.relaySchedulingDecision(f.sessionId)).toMatchObject({
+        request: {
+          category: 'new_authorization',
+          operation: {
+            kind: 'repair_role_request',
+            actor: 'codex',
+            returnActor: 'claude',
+          },
+        },
+      }),
+    )
+    await f.settled()
+    return f.repo.relaySchedulingDecision(f.sessionId)!
+  }
+
+  it('cancels and reopens a scoped role request, then starts one normal repair with exhausted Relay allowance', async () => {
+    const f = await reviewedCode(true)
+    const taskBudget = 'task:' + f.reviewed.id
+    // The earlier extra allowance is a fixture prerequisite. Every new action uses the live host path.
+    f.db.drizzle
+      .insert(schedulingBudgetCounters)
+      .values({ subjectId: taskBudget, sessionId: f.sessionId, extraCodeTurns: 1 })
+      .onConflictDoUpdate({
+        target: schedulingBudgetCounters.subjectId,
+        set: { extraCodeTurns: 1 },
+      })
+      .run()
+    const first = await pendingCard(f)
+    const prior = f.repo.collaboration(f.sessionId)!
+    expect(prior).toMatchObject({
+      review: f.reviewed.review,
+      reviewCycles: 2,
+      repairAttempts: 1,
+      reviewControlCoverage: {
+        reviewRunId: f.reviewed.review!.runId,
+        inputSequence: prior.inputSequence,
+      },
+      handledInputSequence: prior.inputSequence,
+    })
+    expect(f.repo.handoffReceipt(first.handoffId)?.action).toBeNull()
+    expect(pactRepairActions(f)).toEqual(['pause'])
+    expect(await f.flow.answerRelayDecision(actionForCard(first, 'cancel'))).toMatchObject({
+      ok: true,
+      value: { disposition: 'cancelled', runId: null },
+    })
+    expect(pactRepairActions(f)).toEqual([
+      'respond',
+      'repair',
+      'pause',
+      'request_repair_role_switch',
+    ])
+    expect(f.repo.collaboration(f.sessionId)?.stageRoles).toEqual(prior.stageRoles)
+    expect(f.repo.read(f.sessionId).runs).toHaveLength(5)
+
+    const second = await pendingCard(f)
+    expect(second.decisionId).not.toBe(first.decisionId)
+    const current = f.repo.collaboration(f.sessionId)!
+    expect(current.review).toEqual(f.reviewed.review)
+    expect(current.reviewControlCoverage).toMatchObject({
+      inputSequence: prior.inputSequence + 1,
+      priorInputSequence: prior.inputSequence,
+      reviewRunId: f.reviewed.review!.runId,
+    })
+    expect(await f.flow.answerRelayDecision(actionForCard(first, 'confirm'))).toMatchObject({
+      ok: false,
+    })
+    const confirmation = actionForCard(second, 'confirm')
+    const confirmed = await f.flow.answerRelayDecision(confirmation)
+    expect(confirmed).toMatchObject({
+      ok: true,
+      value: {
+        disposition: 'confirmed',
+        runId: expect.any(String),
+        roleChange: { stageRoles: { revision: 1, codeAuthor: 'codex', codeReviewer: 'claude' } },
+      },
+    })
+    expect(await f.flow.answerRelayDecision(confirmation)).toEqual(confirmed)
+    expect(
+      await f.flow.answerRelayDecision({ ...confirmation, clientOperationId: randomUUID() }),
+    ).toEqual(confirmed)
+    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete'))
+    const done = await f.settled()
+    expect(done).toMatchObject({ reviewCycles: 3, repairAttempts: 2, review: { actor: 'claude' } })
+    const repair = native.inputs[6]!
+    expect(repair.promptEnvelope.collaboration).toMatchObject({
+      stage: 'repair',
+      actor: 'codex',
+      reviewScopeRef: f.reviewed.reviewScopeRef,
+      review: f.reviewed.review,
+    })
+    expect(repair.promptEnvelope.collaborationAuthorization).toMatchObject({
+      userAuthority: { purpose: 'action' },
+    })
+    expect(repair.promptEnvelope.collaborationAuthorization?.relayWorkRef).toBeUndefined()
+    expect(native.inputs[7]!.promptEnvelope.collaboration?.stage).toBe('code_review')
+    expect(native.inputs).toHaveLength(8)
+    expect(f.repo.schedulingBudget(taskBudget)?.extraCodeTurns).toBe(1)
+    expect(f.repo.schedulingSettings().enabled).toBe(false)
+    expect(native.decisions).toHaveLength(0)
+  })
+  it('initializes the independent reviewer after the first direct Review without a peer binding', async () => {
+    const f = await reviewedCode(false, '/review')
+    expect(f.repo.nativeContext(f.sessionId, 'claude')).toBeUndefined()
+    expect(native.inputs).toHaveLength(1)
+    const card = await pendingCard(f)
+    expect(await f.flow.answerRelayDecision(actionForCard(card, 'confirm'))).toMatchObject({
+      ok: true,
+    })
+    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete'))
+    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
+      'code_review',
+      'reply',
+      'repair',
+      'code_review',
+    ])
+    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.actor)).toEqual([
+      'codex',
+      'codex',
+      'codex',
+      'claude',
+    ])
+    expect(f.repo.nativeContext(f.sessionId, 'claude')?.nativeSessionId).toBeDefined()
+    expect(native.decisions).toHaveLength(0)
+  })
+
+  it('keeps the declined card cancelled when the ordinary Respond claims the same handoff', async () => {
+    const f = await reviewedCode()
+    const card = await pendingCard(f)
+    expect(await f.flow.answerRelayDecision(actionForCard(card, 'cancel'))).toMatchObject({
+      ok: true,
+    })
+    const activity = () =>
+      f.repo.readSchedulingActivity({}).rows.find((row) => row.id === card.decisionId)
+    expect(activity()).toMatchObject({ actionResult: 'cancelled', called: false })
+    await f.act('respond')
+    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete'))
+    expect(f.repo.handoffReceipt(card.handoffId)?.runId).toBe(native.inputs[3]!.runId)
+    expect(activity()).toMatchObject({ actionResult: 'cancelled', called: false })
+    expect(native.inputs[3]!.promptEnvelope.collaboration?.stage).toBe('respond')
+  })
+  it('uses the native card with Relay on and preserves it across credential changes and disabling Relay', async () => {
+    const f = await reviewedCode()
+    const first = await pendingCard(f)
+    enableRelaySettings(f)
+    expect(await f.flow.answerRelayDecision(actionForCard(first, 'cancel'))).toMatchObject({
+      ok: true,
+    })
+    const card = await pendingCard(f)
+    expect(f.repo.schedulingSettings().enabled).toBe(true)
+    expect(
+      await f.flow.writeRelayCredential({
+        operation: 'save',
+        nonce: randomUUID(),
+        expectedRevision: f.repo.readRelayCredential().revision,
+        deadlineAt: Date.now() + 5000,
+        ciphertext: Buffer.from('rotated owned fixture ciphertext').toString('base64'),
+      }),
+    ).toMatchObject({ ok: true })
+    expect(f.repo.relaySchedulingDecision(f.sessionId)).toEqual(card)
+    expect(
+      await f.flow.saveSchedulingSettings({
+        expectedRevision: f.repo.schedulingSettings().revision,
+        enabled: false,
+      }),
+    ).toMatchObject({ ok: true })
+    expect(f.repo.relaySchedulingDecision(f.sessionId)).toEqual(card)
+    expect(await f.flow.answerRelayDecision(actionForCard(card, 'confirm'))).toMatchObject({
+      ok: true,
+    })
+    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete'))
+    expect(native.decisions).toHaveLength(0)
+  })
+
+  it.each([
+    { allowance: 'review', settings: { maxReviewCycles: 2 } },
+    { allowance: 'repair', settings: { maxRepairAttempts: 1 } },
+  ])(
+    'retains the original review when the normal $allowance allowance is exhausted',
+    async ({ allowance, settings }) => {
+      const f = await reviewedCode(true)
+      const session = f.db.sessionRepository.find(f.sessionId)!
+      f.db.sessionRepository.saveSettings(f.sessionId, { ...session.settings, ...settings })
+      await requestRepair(f)
+      await vi.waitFor(() =>
+        expect(f.repo.collaboration(f.sessionId)?.notice).toContain(
+          'Session ' + allowance + ' limit',
+        ),
+      )
+      expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
+      const current = await f.settled()
+      expect(current).toMatchObject({
+        review: f.reviewed.review,
+        reviewCycles: 2,
+        repairAttempts: 1,
+      })
+      expect(pactRepairActions(f)).toContain('respond')
+      expect(native.inputs).toHaveLength(5)
+    },
+  )
+
+  it('retires a pending confirmation and its control coverage when new business input arrives', async () => {
+    const f = await reviewedCode()
+    const card = await pendingCard(f)
+    expect(await f.flow.send(f.input('Also require a new timeout guarantee.'))).toMatchObject({
+      ok: true,
+    })
+    expect(await f.flow.answerRelayDecision(actionForCard(card, 'confirm'))).toMatchObject({
+      ok: false,
+    })
+    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.reviewCycles).toBe(2))
+    const current = await f.settled()
+    expect(current.reviewControlCoverage).toBeUndefined()
+    expect(current.stageRoles).toEqual(f.reviewed.stageRoles)
+    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
+      'implement',
+      'code_review',
+      'reply',
+      'reply',
+      'code_review',
+    ])
+    expect(
+      f.repo.readSchedulingActivity({}).rows.find((row) => row.id === card.decisionId),
+    ).toMatchObject({ actionResult: 'not_sent', called: false })
+  })
+
+  it.each(['stop', 'binding', 'scope'] as const)(
+    'refuses a stale card after %s changes',
+    async (change) => {
+      const f = await reviewedCode()
+      const card = await pendingCard(f)
+      const task = f.repo.collaboration(f.sessionId)!
+      if (change === 'stop') f.flow.stop({ sessionId: f.sessionId })
+      else if (change === 'binding') f.repo.markNativeContextsMissing(f.sessionId, ['claude'])
+      else
+        f.repo.setCollaborationState({
+          ...task,
+          revision: task.revision + 1,
+          reviewScopeRef: task.review!.document,
+        })
+      expect(await f.flow.answerRelayDecision(actionForCard(card, 'confirm'))).toMatchObject({
+        ok: false,
+      })
+      expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
+      expect(f.repo.collaboration(f.sessionId)?.stageRoles).toEqual(f.reviewed.stageRoles)
+      expect(native.inputs).toHaveLength(3)
+    },
+  )
+
+  it('publishes a definitive stale-card dismissal and refreshed original actions after Session settings change', async () => {
+    const f = await reviewedCode()
+    const card = await pendingCard(f)
+    const task = f.repo.collaboration(f.sessionId)!
+    const before = f.repo.findRun(task.runId)!
+    const session = f.db.sessionRepository.find(f.sessionId)!
+    f.db.sessionRepository.saveSettings(f.sessionId, {
+      ...session.settings,
+      maxReviewCycles: session.settings.maxReviewCycles + 1,
+    })
+    const published = vi.fn<Parameters<Conversation['subscribe']>[0]>()
+    const unsubscribe = f.flow.subscribe(published)
+    try {
+      expect(await f.flow.answerRelayDecision(actionForCard(card, 'confirm'))).toMatchObject({
+        ok: false,
+        error: { code: 'CONFLICT' },
+      })
+    } finally {
+      unsubscribe()
+    }
+    expect(published).toHaveBeenCalledWith(
+      expect.objectContaining({
+        relaySchedulingDecision: null,
+        runs: [expect.objectContaining({ id: before.id })],
+      }),
+      false,
+    )
+    expect(f.repo.findRun(before.id)!.updatedAt > before.updatedAt).toBe(true)
+    expect(pactRepairActions(f)).toEqual([
+      'respond',
+      'repair',
+      'pause',
+      'request_repair_role_switch',
+    ])
+    expect(native.inputs).toHaveLength(3)
+  })
+
+  it.each([false, true])(
+    'does not replay a Pact repair across a cold restart (confirmed=%s)',
+    async (confirmed) => {
+      const f = await reviewedCode()
+      const card = await pendingCard(f)
+      const answer = actionForCard(card, 'confirm')
+      const original = confirmed ? f.repo.answerRelaySchedulingDecision(answer) : undefined
+      expect(original?.result.runId).toBe(confirmed ? null : undefined)
+      const restarted = await f.restart()
+      const current = restarted.repo.collaboration(f.sessionId)!
+      expect(current).toMatchObject({
+        automation: 'paused',
+        pauseReason: 'restart',
+        repairAttempts: 0,
+      })
+      expect(current.stageRoles?.revision).toBe(confirmed ? 1 : 0)
+      expect(current.notice?.includes('Repair did not start')).toBe(confirmed)
+      expect(restarted.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
+      const duplicate = await restarted.flow.answerRelayDecision({
+        ...answer,
+        clientOperationId: randomUUID(),
+      })
+      expect(duplicate.ok).toBe(confirmed)
+      expect(duplicate.ok ? duplicate.value.runId : undefined).toBe(confirmed ? null : undefined)
+      expect(native.inputs).toHaveLength(3)
+    },
+  )
+
+  it('does not request a role switch after the reviewer took new input through a native question', async () => {
+    const f = await reviewedCode()
+    native.next = { nativeQuestion: true, input: { outcome: 'repair_role_request' } }
+    expect(
+      await f.flow.send({
+        ...f.input('Please repair the existing findings yourself.'),
+        route: { type: 'agent', agentId: 'codex' },
+      }),
+    ).toMatchObject({ ok: true })
+    await answerWorkflowQuestion(f)
+    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.reviewCycles).toBe(2))
+    expect((await f.settled()).reviewControlCoverage).toBeUndefined()
+    expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
+    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
+      'implement',
+      'code_review',
+      'reply',
+      'code_review',
+    ])
+  })
+
+  it('retains one bound repair and refuses replay when accepted native delivery is uncertain', async () => {
+    const f = await reviewedCode()
+    const card = await pendingCard(f)
+    native.fail = true
+    const answer = actionForCard(card, 'confirm')
+    const confirmation = await f.flow.answerRelayDecision(answer)
+    if (!confirmation.ok || !confirmation.value.runId) throw Error('Expected a bound repair')
+    const runId = confirmation.value.runId
+    await vi.waitFor(() => expect(f.repo.nativeRecoveryBlocksInput(f.sessionId)).toBe(true))
+    expect(f.repo.findRun(runId)).toMatchObject({
+      dispatchPhase: 'accepted',
+      nativeEffectsState: 'pending',
+    })
+    expect(
+      await f.flow.answerRelayDecision({ ...answer, clientOperationId: randomUUID() }),
+    ).toEqual(confirmation)
+    expect(native.inputs).toHaveLength(4)
+    const restarted = await f.restart()
+    expect(await restarted.flow.answerRelayDecision(answer)).toEqual(confirmation)
+    expect(restarted.repo.nativeRecoveryBlocksInput(f.sessionId)).toBe(true)
+    expect(restarted.repo.findRun(runId)?.nativeEffectsState).toBe('unknown')
+    expect(native.inputs).toHaveLength(4)
   })
 })
 

@@ -344,6 +344,16 @@ recovery row. Cancel preserves the underlying recovery facts. Activity distingui
 context from a completed business task, and displays historical model identity only for actual
 inference. Suggestions, acceptance and real execution results remain separate readable facts.
 
+Place **Ask only** beside the ordinary Send control for an idle, accepted Plan. With image or
+Comment drafts, label it **Ask only (text)**. Leave those drafts available for a later Send.
+
+Keep the current author's Repair action. Offer **Choose repairer** with the other Agent's name
+when they can repair the current findings. Both this choice and an eligible request from the
+reviewer's reply use **Switch repair agent** in the existing InputReplacement. Keep the neutral border and raised surface with a static edge.
+Name who repairs and who reviews for the rest of the task in one sentence. Use **Repair with Codex**
+or **Repair with Claude Code**, and **Keep current roles**. State Full access when applicable.
+Keep cancellation, focus, error and receipt behavior. The confirmation also appears with Relay off.
+
 A future code-role change uses the same card and **Confirm role change** action. Name the proposed
 implementation recipient, show both old-to-new code responsibilities, and state that the accepted
 Plan and completed reviews remain unchanged. Keep the consequence explicit: no new write access;

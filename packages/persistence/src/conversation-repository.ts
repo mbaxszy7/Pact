@@ -16,6 +16,7 @@ import {
   notInArray,
   or,
   sql,
+  type SQLWrapper,
 } from 'drizzle-orm'
 import { createHash, randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
@@ -100,6 +101,14 @@ import {
   collaborationStageLabel,
   collaborationRequiresPlan,
   collaborationPlanAccepted,
+  collaborationAskAvailable,
+  type CollaborationAskRef,
+  collaborationInputOutcomeAllowed,
+  collaborationCodeReviewCurrent,
+  collaborationReviewControlCoverageSchema,
+  pactRepairRoleProofSchema,
+  type PactRepairRoleProof,
+  type CollaborationReplyIntentBasis,
   advanceCollaboration,
   relayDecisionSchema,
   relayDecisionProofSchema,
@@ -2647,12 +2656,20 @@ export class ConversationRepository {
     }
   }
 
+  private askOnlyRun(runId: SQLWrapper) {
+    return sql`EXISTS (SELECT 1 FROM workflow_turns question
+      WHERE question.run_id = ${runId}
+      AND (json_extract(question.authorization_json, '$.replyIntentBasis.kind') = 'ask_only'
+        OR json_extract(question.authorization_json, '$.historicalInputKind') = 'ask_only'))`
+  }
+
   private handoffRows(
     sessionId: string,
     targetAgentId: RuntimeAgentId,
     afterSequence: number,
     throughSequence: number,
     excludeMessageId?: string,
+    workflow = false,
   ): HandoffRow[] {
     return this.database
       .select({
@@ -2670,6 +2687,7 @@ export class ConversationRepository {
           eq(conversationMessages.sessionId, sessionId),
           eq(conversationMessages.isVisible, true),
           ...(excludeMessageId ? [ne(conversationMessages.id, excludeMessageId)] : []),
+          ...(workflow ? [sql`NOT ${this.askOnlyRun(conversationMessages.runId)}`] : []),
           gt(conversationMessages.sequence, afterSequence),
           lte(conversationMessages.sequence, throughSequence),
           or(
@@ -2741,6 +2759,7 @@ export class ConversationRepository {
     throughSequence: number,
     signal: AbortSignal,
     excludeMessageId?: string,
+    workflow = false,
   ): AsyncIterable<HandoffBundle> {
     const deadline = Date.now() + HANDOFF_READ_DEADLINE_MS
     let cursor = afterSequence,
@@ -2754,6 +2773,7 @@ export class ConversationRepository {
         cursor,
         throughSequence,
         excludeMessageId,
+        workflow,
       )
       if (!rows.length) return
       for (const row of rows.slice(0, HANDOFF_PAGE_ITEMS)) {
@@ -5316,6 +5336,43 @@ export class ConversationRepository {
       }
       task.reviewScopeRef = this.saveCollaborationDocument(runId, JSON.stringify(scope))
     }
+    const received =
+      task.stage === 'reply' ? this.receivedCollaborationInput(task.sessionId) : undefined
+    const intent =
+      received?.id === run.userMessageId
+        ? storedReceivedMetadata(received.metadataJson).replyIntentBasis
+        : undefined
+    const askOnly = intent?.kind === 'ask_only'
+    const binding = askOnly ? this.nativeContext(task.sessionId, task.actor) : undefined
+    const replyIntentBasis =
+      intent &&
+      intent.kind !== 'explanation_only' &&
+      task.revision === intent.taskRevision + 2 &&
+      task.inputSequence === intent.priorInputSequence + (askOnly ? 0 : 1) &&
+      received?.actor === task.actor &&
+      received.digest === intent.inputDigest &&
+      isDeepStrictEqual(task.review, intent.review) &&
+      isDeepStrictEqual(task.stageRoles, intent.stageRoles) &&
+      isDeepStrictEqual(task.planReference, intent.planReference) &&
+      (!askOnly ||
+        (intent.askBinding &&
+          binding?.nativeSessionId === intent.askBinding.nativeSessionId &&
+          binding.bindingGeneration === intent.askBinding.generation &&
+          collaborationInputProcessing(task).pending?.inputId === intent.inputId &&
+          batch.memberCount === 0 &&
+          collaborationPlanAccepted({
+            ...task,
+            inputProcessing: {
+              ...collaborationInputProcessing(task),
+              pending: undefined,
+            },
+          })))
+        ? intent
+        : undefined
+    if (askOnly && !replyIntentBasis)
+      throw new RunOperationConflictError(
+        'The queued Plan question no longer matches its accepted Plan.',
+      )
     const authorization: CollaborationTurnAuthorization = {
       runId,
       taskId: task.id,
@@ -5328,6 +5385,7 @@ export class ConversationRepository {
       ...(task.reviewScopeRef ? { reviewScopeRef: task.reviewScopeRef } : {}),
       inputBatchRef: { id: batch.id, revision: batch.revision, memberCount: batch.memberCount },
       inputProcessing: collaborationInputProcessing(task),
+      ...(replyIntentBasis ? { replyIntentBasis } : {}),
       ...(sourceManifestRef ? { sourceManifestRef } : {}),
       ...(relayWorkRef ? { relayWorkRef } : {}),
       ...(userAuthority ? { userAuthority } : {}),
@@ -5754,6 +5812,16 @@ export class ConversationRepository {
       : undefined
   }
 
+  private workflowNativeUserInputRequested(runId: string): boolean {
+    return Boolean(
+      this.database.get(sql`SELECT 1 FROM agent_event_journal AS requested
+      JOIN json_each(requested.payload, '$.requests') AS request
+      WHERE requested.run_id = ${runId}
+        AND requested.event_type = 'native.permission_requested'
+        AND json_extract(request.value, '$.kind') <> 'approval' LIMIT 1`),
+    )
+  }
+
   private workflowPlanHasUnansweredInput(runId: string): boolean {
     return (
       this.workflowInputResult(runId)?.outcome === 'needs_user' ||
@@ -5848,6 +5916,17 @@ export class ConversationRepository {
       sourceTurn.planBodyId !== basis.document.id
     )
       return undefined
+    // A positively observed intervening root rules out the checkpoint shortcut.
+    // Native readback still verifies the full ancestor chain and all Plan operations.
+    const intervening = this.database.get(sql`SELECT 1 FROM conversation_messages m
+      CROSS JOIN agent_runs r ON r.user_message_id=m.id
+      WHERE m.session_id=${run.sessionId} AND m.role='user'
+      AND m.sequence>(SELECT sequence FROM conversation_messages WHERE id=${source.userMessageId})
+      AND m.sequence<(SELECT sequence FROM conversation_messages WHERE id=${run.userMessageId})
+      AND r.agent_id='claude' AND r.native_session_id=${nativeSessionId}
+      AND r.binding_generation=${run.bindingGeneration} AND r.native_turn_id IS NOT NULL
+      AND r.fork_source_run_id IS NULL LIMIT 1`)
+    if (intervening) return undefined
     const document = this.collaborationDocumentRow(run.sessionId, basis.document)
     if (
       document.sourceRunId !== source.id ||
@@ -5962,7 +6041,6 @@ export class ConversationRepository {
       run.nativeOutcome !== 'completed' ||
       run.nativeEffectsState !== 'settled' ||
       !this.hasCompleteResponse(run.id) ||
-      Boolean(this.workflowInputResult(run.id)) ||
       this.workflowPlanHasUnansweredInput(run.id) ||
       !context ||
       context.nativeSessionId !== run.nativeSessionId ||
@@ -5975,7 +6053,10 @@ export class ConversationRepository {
       ? this.documentReference(run.sessionId, turn.planBodyId)
       : undefined
     const retained = !document ? this.workflowPlanRetention(run.id, turn.planNativeId) : undefined
+    const result = this.workflowInputResult(run.id)
+    if (result && !(result.outcome === 'explanation_only' && retained)) return false
     if (document) {
+      task.planAcceptanceCoverage = undefined
       const changed = task.planReference?.document.sha256 !== document.sha256
       task.planVersion = changed ? task.planVersion + 1 : Math.max(1, task.planVersion)
       task.planReference = {
@@ -6026,6 +6107,14 @@ export class ConversationRepository {
     const task = this.collaboration(run.sessionId),
       auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson)),
       frozen = this.decodedCollaboration(turn.stateJson)
+    if (auth.replyIntentBasis?.kind === 'ask_only') {
+      if (
+        task &&
+        collaborationInputProcessing(task).pending?.inputId === auth.replyIntentBasis.inputId
+      )
+        this.finishAskOnly(task, run, auth, run.nativeOutcome === 'completed')
+      return
+    }
     if (task && auth.stage === 'reply' && !collaborationPlanMode(frozen, auth)) {
       if (!this.workflowInputResult(runId) || !collaborationInputProcessing(task).pending) return
       const before = { input: task.inputProcessing, status: task.status, notice: task.notice }
@@ -6049,6 +6138,7 @@ export class ConversationRepository {
         .set({ stateJson: JSON.stringify(this.storedCollaboration(task)) })
         .where(eq(workflowTurns.runId, runId))
         .run()
+      if (task.reviewControlCoverage?.producerRunId === runId) this.publishRepairRoleDecision(task)
       return
     }
     if (
@@ -6058,7 +6148,8 @@ export class ConversationRepository {
       task.runId !== runId ||
       task.stage !== auth.stage ||
       !collaborationPlanMode(frozen, auth) ||
-      task.inputSequence !== auth.inputSequence
+      task.inputSequence !== auth.inputSequence ||
+      (task.planAcceptanceCoverage?.producerRunId === runId && collaborationPlanAccepted(task))
     )
       return
     if (
@@ -6162,9 +6253,9 @@ export class ConversationRepository {
       const parsed = collaborationInputObservationSchema.parse(result)
       if (
         auth.actor !== run.agentId ||
-        (planner
-          ? parsed.outcome === 'processed'
-          : auth.stage !== 'reply' || !pending || pending.inputSequence !== auth.inputSequence)
+        !collaborationInputOutcomeAllowed(frozen, auth, parsed.outcome) ||
+        (!planner &&
+          (auth.stage !== 'reply' || !pending || pending.inputSequence !== auth.inputSequence))
       )
         throw new RunOperationConflictError('This Turn does not own this input result.')
       const old = this.workflowInputResult(runId)
@@ -6180,6 +6271,234 @@ export class ConversationRepository {
         old ? { outcome: 'incomplete' } : parsed,
       )
     })
+  }
+
+  /** A replacement may use the original Batch or grant only through its admitted unsent lineage. */
+  private originalPactUnsentTurn(run: AgentRun, auth: CollaborationTurnAuthorization) {
+    if (!run.reexecutedFromRunId) return undefined
+    const replacement = this.database
+      .select({ operationId: agentRuns.reexecutionOperationId })
+      .from(agentRuns)
+      .where(eq(agentRuns.id, run.id))
+      .get()
+    const operation = this.database
+      .select()
+      .from(runReexecutionOperations)
+      .where(eq(runReexecutionOperations.replacementRunId, run.id))
+      .get()
+    const original = operation && this.findRun(operation.originalRunId)
+    const originalAuth = original && this.collaborationTurnAuthorization(original.id)
+    const capture = original && this.executionInput(original.id)
+    if (
+      !operation ||
+      operation.id !== replacement?.operationId ||
+      operation.originalRunId !== run.reexecutedFromRunId ||
+      !original ||
+      original.reexecutedFromRunId ||
+      !originalAuth ||
+      !capture?.proof ||
+      !this.workflowInputWasNotSent(original) ||
+      original.sessionId !== run.sessionId ||
+      original.agentId !== run.agentId ||
+      original.userMessageId !== run.userMessageId ||
+      original.settingsRevision !== run.settingsRevision ||
+      capture.proof.runId !== original.id ||
+      capture.proof.inputSha256 !== capture.input.inputSha256 ||
+      capture.proof.nativeSessionId !== run.nativeSessionId ||
+      capture.proof.bindingGeneration !== run.bindingGeneration ||
+      !isDeepStrictEqual(
+        {
+          ...auth,
+          runId: original.id,
+          taskRevision: originalAuth.taskRevision,
+        },
+        originalAuth,
+      )
+    )
+      return undefined
+    return { run: original, auth: originalAuth }
+  }
+
+  private currentReplyIntent(
+    task: CollaborationTask,
+    run: AgentRun,
+    auth: CollaborationTurnAuthorization,
+  ): CollaborationReplyIntentBasis | undefined {
+    const intent = auth.replyIntentBasis
+    if (
+      !intent ||
+      intent.inputId !== run.userMessageId ||
+      auth.inputSequence !== intent.priorInputSequence + (intent.kind === 'ask_only' ? 0 : 1) ||
+      task.inputSequence !== auth.inputSequence ||
+      !isDeepStrictEqual(task.review, intent.review) ||
+      !isDeepStrictEqual(task.stageRoles, intent.stageRoles) ||
+      !isDeepStrictEqual(task.planReference, intent.planReference)
+    )
+      return undefined
+    const predecessor = this.originalPactUnsentTurn(run, auth)
+    if (run.reexecutedFromRunId && !predecessor) return undefined
+    const received = this.database
+      .select({ digest: collaborationInputs.digest, metadata: collaborationInputs.metadataJson })
+      .from(collaborationInputs)
+      .where(
+        and(
+          eq(collaborationInputs.id, intent.inputId),
+          eq(collaborationInputs.sessionId, task.sessionId),
+          eq(collaborationInputs.taskId, task.id),
+          eq(collaborationInputs.state, 'materialized'),
+          eq(collaborationInputs.materializedRunId, predecessor?.run.id ?? run.id),
+        ),
+      )
+      .get()
+    return received?.digest === intent.inputDigest &&
+      isDeepStrictEqual(storedReceivedMetadata(received.metadata).replyIntentBasis, intent)
+      ? intent
+      : undefined
+  }
+
+  private priorRepairControlMatches(
+    task: CollaborationTask,
+    basis: CollaborationReplyIntentBasis,
+  ): boolean {
+    const prior = basis.priorReviewControl
+    if (!prior) return basis.priorInputSequence === basis.review.inputSequence
+    const event = this.database
+      .select({ payload: agentEventJournal.payload })
+      .from(agentEventJournal)
+      .where(
+        and(
+          eq(agentEventJournal.sessionId, task.sessionId),
+          eq(agentEventJournal.runId, prior.producerRunId),
+          eq(agentEventJournal.eventType, 'workflow.review_control_settled'),
+        ),
+      )
+      .orderBy(desc(agentEventJournal.sequence))
+      .limit(1)
+      .get()
+    if (!event) return false
+    const coverage = collaborationReviewControlCoverageSchema.safeParse(JSON.parse(event.payload))
+    return (
+      coverage.success &&
+      scheduling.fingerprint(coverage.data) === prior.fingerprint &&
+      coverage.data.producerRunId === prior.producerRunId &&
+      coverage.data.inputSequence === basis.priorInputSequence &&
+      coverage.data.reviewRunId === basis.review.runId &&
+      coverage.data.reviewInputSequence === basis.review.inputSequence &&
+      isDeepStrictEqual(coverage.data.report, basis.review.document) &&
+      isDeepStrictEqual(coverage.data.scope, basis.review.scopeRef)
+    )
+  }
+
+  private finishAskOnly(
+    task: CollaborationTask,
+    run: AgentRun,
+    auth: CollaborationTurnAuthorization,
+    nativeCompleted: boolean,
+    notice?: string,
+  ): void {
+    const intent = auth.replyIntentBasis
+    const state = collaborationInputProcessing(task)
+    const pending = state.pending
+    if (intent?.kind !== 'ask_only' || task.runId !== run.id) return
+    const own = pending?.inputId === intent.inputId && pending.inputSequence === auth.inputSequence
+    const newer =
+      task.inputSequence > auth.inputSequence &&
+      (!pending || pending.inputSequence > auth.inputSequence)
+    if (!own && !newer) return
+    const ended =
+      run.dispatchPhase === 'ended' &&
+      Boolean(run.nativeOutcome) &&
+      run.nativeEffectsState === 'settled'
+    const unstarted = this.workflowInputWasNotSent(run)
+    if (!ended && !unstarted) {
+      if (!nativeCompleted || run.nativeEffectsState === 'unknown') {
+        task.status = 'failed'
+        task.automation = 'paused'
+        task.pauseReason ??= 'failure'
+        task.notice = (notice ?? 'Check the original Plan question before continuing.').slice(
+          0,
+          512,
+        )
+        task.revision++
+        this.saveCollaboration(task)
+      }
+      return
+    }
+    if (nativeCompleted && !this.hasCompleteResponse(run.id) && run.status !== 'completed') return
+    const report =
+      nativeCompleted && run.responseMessageId && this.hasCompleteResponse(run.id)
+        ? this.messageDocument(run.sessionId, run.id, run.responseMessageId)
+        : undefined
+    if (newer) {
+      task.status = 'waiting'
+      if (ended && run.nativeOutcome !== 'completed' && task.automation === 'active') {
+        task.automation = 'paused'
+        task.pauseReason = run.nativeOutcome === 'interrupted' ? 'stopped' : 'failure'
+        task.notice = (notice ?? 'The Plan question did not complete.').slice(0, 512)
+      }
+    } else {
+      const batch =
+        auth.inputBatchRef &&
+        this.database
+          .select()
+          .from(conversationInputBatches)
+          .where(eq(conversationInputBatches.id, auth.inputBatchRef.id))
+          .get()
+      const binding = this.nativeContext(run.sessionId, run.agentId)
+      const settled = Boolean(
+        report &&
+        report.chars &&
+        auth.stage === 'reply' &&
+        auth.actor === run.agentId &&
+        task.id === auth.taskId &&
+        run.id === auth.runId &&
+        this.currentReplyIntent(task, run, auth) &&
+        batch &&
+        batch.sessionId === task.sessionId &&
+        batch.taskId === null &&
+        batch.sequence === 0 &&
+        batch.memberCount === 0 &&
+        batch.runId === run.id &&
+        batch.messageId === intent.inputId &&
+        batch.bodyState !== 'withdrawn' &&
+        intent.askBinding &&
+        binding &&
+        binding.nativeSessionId === run.nativeSessionId &&
+        binding.bindingGeneration === run.bindingGeneration &&
+        binding.nativeSessionId === intent.askBinding.nativeSessionId &&
+        binding.bindingGeneration === intent.askBinding.generation &&
+        this.isCurrentNativeCursor(run, binding) &&
+        collaborationPlanAccepted({ ...task, inputProcessing: { ...state, pending: undefined } }),
+      )
+      task.inputProcessing = { ...state, pending: undefined }
+      task.status = settled ? 'ready' : 'failed'
+      if (settled) {
+        task.sourceMessageId = run.responseMessageId
+        task.notice = task.automation === 'paused' ? task.notice : undefined
+        this.nativeFact(run.id, 'workflow.plan_question_answered', {
+          inputId: intent.inputId,
+          reviewRunId: intent.review.runId,
+        })
+      } else {
+        task.automation = 'paused'
+        task.pauseReason ??= run.nativeOutcome === 'interrupted' ? 'stopped' : 'failure'
+        task.notice = (
+          notice ?? 'The Plan question did not complete with its original sources.'
+        ).slice(0, 512)
+      }
+    }
+    task.nextStage = undefined
+    task.revision++
+    this.saveCollaboration(task)
+    this.database
+      .update(workflowTurns)
+      .set({
+        applied: true,
+        reportBodyId: report ? report.id : null,
+        stateJson: JSON.stringify(this.storedCollaboration(task)),
+      })
+      .where(eq(workflowTurns.runId, run.id))
+      .run()
   }
 
   /** Only this frozen reply can acknowledge its real input, after native and source settlement. */
@@ -6246,12 +6565,45 @@ export class ConversationRepository {
         return false
       }
     }
+    const observed = this.workflowInputResult(run.id)?.outcome
     const outcome = planner
       ? planSettled
         ? 'processed'
         : undefined
-      : this.workflowInputResult(run.id)?.outcome
+      : observed === 'repair_role_request' && this.workflowNativeUserInputRequested(run.id)
+        ? 'processed'
+        : observed
     const unanswered = this.workflowPlanHasUnansweredInput(run.id)
+    if (!unanswered && outcome === 'repair_role_request') {
+      const basis = this.currentReplyIntent(task, run, auth)
+      if (
+        basis?.kind === 'repair_role_request' &&
+        outcome === basis.kind &&
+        basis.review.scopeRef &&
+        isDeepStrictEqual(task.reviewScopeRef, basis.review.scopeRef) &&
+        this.priorRepairControlMatches(task, basis)
+      ) {
+        const coverage = collaborationReviewControlCoverageSchema.parse({
+          kind: basis.kind,
+          reviewRunId: basis.review.runId,
+          reviewInputSequence: basis.review.inputSequence,
+          report: basis.review.document,
+          scope: basis.review.scopeRef,
+          producerRunId: run.id,
+          priorInputSequence: basis.priorInputSequence,
+          inputSequence: task.inputSequence,
+          inputId: basis.inputId,
+          inputDigest: basis.inputDigest,
+        })
+        task.inputProcessing = {}
+        task.handledInputSequence = auth.inputSequence
+        task.reviewControlCoverage = coverage
+        task.status = 'waiting'
+        task.nextStage = undefined
+        this.nativeFact(run.id, 'workflow.review_control_settled', coverage)
+        return true
+      }
+    }
     if (outcome === 'processed' && !unanswered) {
       task.inputProcessing = { settled: { runId: run.id, inputSequence: auth.inputSequence } }
       task.notice =
@@ -6366,16 +6718,18 @@ export class ConversationRepository {
       .all()
   }
 
-  registerWorkflowInput(sessionId: string, messageId: string): void {
+  registerWorkflowInput(sessionId: string, messageId: string, askOnly = false): void {
     const task = this.collaboration(sessionId)
     if (!task || task.status === 'complete') return
     task.inputProcessing = {
       ...collaborationInputProcessing(task),
       pending: { inputId: messageId, inputSequence: task.inputSequence },
     }
-    task.latestUserMessageId = messageId
+    if (!askOnly) task.latestUserMessageId = messageId
     task.revision++
-    task.notice = 'Your message will be answered before collaboration continues.'
+    task.notice = askOnly
+      ? 'Your Plan question will be answered next.'
+      : 'Your message will be answered before collaboration continues.'
     if (task.status !== 'running') task.status = 'waiting'
     this.saveCollaboration(task)
   }
@@ -6494,9 +6848,26 @@ export class ConversationRepository {
     }
   }
 
-  private freezeRunSources(runId: string, refs: ReadonlyArray<HandoffSourceRef>) {
+  private freezeRunSources(
+    runId: string,
+    refs: ReadonlyArray<HandoffSourceRef>,
+    workflow: boolean,
+  ): void {
     const run = this.findRun(runId)!
     for (const ref of refs) {
+      if (
+        workflow &&
+        this.database
+          .select({ id: conversationMessages.id })
+          .from(conversationMessages)
+          .where(
+            and(eq(conversationMessages.id, ref.id), this.askOnlyRun(conversationMessages.runId)),
+          )
+          .get()
+      )
+        throw new HandoffSourceUnavailableError(
+          'A Plan question is outside the automatic workflow handoff.',
+        )
       const source = this.quotedSource(run.sessionId, ref.id)
       if (source.sourceRevision !== ref.revision)
         throw new HandoffSourceUnavailableError(
@@ -6521,6 +6892,7 @@ export class ConversationRepository {
       AND n.provisional_native_session_id=${context.nativeSessionId} AND n.stage='completed'
       AND n.native_work_state='settled' AND n.source_hash IS NOT NULL AND n.source_chunks_json IS NOT NULL
       AND n.through_sequence=${context.rebuiltThroughSequence ?? -1} AND m.sequence<=n.through_sequence
+      ${workflow ? sql`AND NOT ${this.askOnlyRun(sql`m.run_id`)}` : sql``}
       AND ((n.agent_id='codex' AND n.initialization_witness_json IS NOT NULL)
         OR (n.agent_id='claude' AND n.initialization_witness_json IS NULL))`)
   }
@@ -8627,6 +8999,10 @@ export class ConversationRepository {
     if (!row) return undefined
     if (input) {
       const meta = storedReceivedMetadata(row.metadataJson)
+      const askOnly =
+        meta.replyIntentBasis?.kind === 'ask_only'
+          ? { taskId: row.taskId, expectedRevision: meta.replyIntentBasis.taskRevision }
+          : undefined
       if (
         (input.inputId && input.inputId !== row.inputId) ||
         (!input.inputId &&
@@ -8637,7 +9013,8 @@ export class ConversationRepository {
         JSON.stringify(input.imageIds ?? []) !== JSON.stringify(meta.imageIds) ||
         JSON.stringify(input.skills ?? []) !== JSON.stringify(meta.skills) ||
         JSON.stringify(input.route) !== JSON.stringify(meta.route) ||
-        !isDeepStrictEqual(input.replyToDecision, meta.replyToDecision)
+        !isDeepStrictEqual(input.replyToDecision, meta.replyToDecision) ||
+        !isDeepStrictEqual(input.askOnly, askOnly)
       )
         throw new RunOperationConflictError('This received nonce belongs to different input.')
     }
@@ -8709,6 +9086,101 @@ export class ConversationRepository {
       throw new RunOperationConflictError(
         'Submit only the card answers. Your message, attachments and other drafts must stay separate.',
       )
+  }
+
+  private freezeReplyIntent(
+    task: CollaborationTask,
+    inputId: string,
+    inputDigest: string,
+    actor: RuntimeAgentId,
+    explicitTarget: RuntimeAgentId | undefined,
+    waitingForWork: boolean,
+    askOnly?: CollaborationAskRef,
+  ): CollaborationReplyIntentBasis | undefined {
+    const review = task.review
+    if (
+      !review ||
+      task.automation !== 'active' ||
+      collaborationInputGate(task) ||
+      task.pendingWork ||
+      this.pendingSupplementReview(task) ||
+      this.nativeRecoveryBlocksInput(task.sessionId) ||
+      this.hasPendingRoutedContinuation(task.sessionId)
+    )
+      return undefined
+    const original = this.relayCompletedTurn(
+      task,
+      this.database.select().from(workflowTurns).where(eq(workflowTurns.runId, review.runId)).get(),
+    )
+    if (
+      !original ||
+      original.source.verdict !== review.verdict ||
+      original.source.inputSequence !== review.inputSequence ||
+      original.source.actor !== review.actor ||
+      !isDeepStrictEqual(original.source.document, review.document)
+    )
+      return undefined
+    const binding = askOnly ? this.nativeContext(task.sessionId, actor) : undefined
+    const askBinding =
+      askOnly &&
+      !waitingForWork &&
+      askOnly.taskId === task.id &&
+      askOnly.expectedRevision === task.revision &&
+      collaborationAskAvailable(task) &&
+      actor === collaborationActor(task, 'plan') &&
+      !this.activeRelayDecisionRow(task.sessionId) &&
+      !this.sessionHasNativeWork(task.sessionId) &&
+      binding?.continuationState === 'ready' &&
+      !binding.permissionRequests?.length &&
+      binding.nativeSessionId &&
+      binding.bindingGeneration !== undefined &&
+      isDeepStrictEqual(original.auth.planReference, task.planReference) &&
+      isDeepStrictEqual(review.planReference, task.planReference)
+        ? { nativeSessionId: binding.nativeSessionId, generation: binding.bindingGeneration }
+        : undefined
+    const previousControl =
+      task.reviewControlCoverage && actor === review.actor
+        ? this.repairRoleBasis(task)?.coverage
+        : undefined
+    const repair =
+      !askOnly &&
+      !waitingForWork &&
+      task.rolePolicy === 'split-stages-v1' &&
+      task.status === 'waiting' &&
+      ((task.stage === 'code_review' &&
+        task.runId === review.runId &&
+        task.inputSequence === review.inputSequence) ||
+        previousControl) &&
+      collaborationCodeReviewCurrent(task) &&
+      !task.nextStage &&
+      explicitTarget === actor &&
+      actor === collaborationActor(task, 'code_review') &&
+      actor !== collaborationActor(task, 'repair') &&
+      Boolean(review.scopeRef) &&
+      isDeepStrictEqual(review.scopeRef, task.reviewScopeRef) &&
+      isDeepStrictEqual(original.auth.reviewScopeRef, review.scopeRef) &&
+      !this.workflowHandoffOccupied(this.workflowHandoff(task, actor).id) &&
+      Boolean(this.repairRoleBindings(task))
+    if (!askBinding && !repair) return undefined
+    return {
+      kind: askBinding ? 'ask_only' : 'repair_role_request',
+      ...(askBinding ? { askBinding } : {}),
+      inputId,
+      inputDigest,
+      priorInputSequence: task.inputSequence,
+      taskRevision: task.revision,
+      review,
+      stageRoles: task.stageRoles,
+      planReference: task.planReference,
+      ...(repair && previousControl
+        ? {
+            priorReviewControl: {
+              producerRunId: previousControl.producerRunId,
+              fingerprint: scheduling.fingerprint(previousControl),
+            },
+          }
+        : {}),
+    }
   }
 
   receiveCollaborationInput(
@@ -8793,6 +9265,21 @@ export class ConversationRepository {
       const prefix = parseComposerCommandPrefix(source.text, input.skills)
       if (prefix.error) throw new RunOperationConflictError(prefix.error)
       const workflowCommand = Boolean(prefix.pact)
+      if (
+        input.askOnly &&
+        (workflowCommand ||
+          prefix.route ||
+          input.route ||
+          freezeDrafts ||
+          input.commentIds.length ||
+          input.imageIds?.length ||
+          input.skills?.length ||
+          input.userInformation ||
+          input.replyToDecision ||
+          input.returnedInputOperationId ||
+          input.queueReturnOperationId)
+      )
+        throw new RunOperationConflictError('Ask only sends question text to the Plan author.')
       if (rolePolicy) {
         const settings = this.database
           .select()
@@ -8834,13 +9321,36 @@ export class ConversationRepository {
         !workflowCommand && (!anchor || anchor.collaboration?.taskId === candidate?.id)
           ? candidate
           : undefined
+      if (task && input.route && prefix.route && !isDeepStrictEqual(input.route, prefix.route))
+        throw new RunOperationConflictError(
+          'The explicit Agent recipients conflict. Your draft was preserved.',
+        )
       const images = this.resolveMessageImages(input.sessionId, input.imageIds ?? [], ownerKey)
       if (!commentCount && !images.length && !this.bodyHasText(body))
         throw new RunOperationConflictError(
           'Write a message, add a Comment, or attach an image before sending.',
         )
+      const requestedRoute = input.route ?? prefix.route
+      const intent =
+        task && !input.replyToDecision
+          ? this.freezeReplyIntent(
+              task,
+              input.clientMessageId,
+              body.hash,
+              actor,
+              requestedRoute?.type === 'agent' ? requestedRoute.agentId : undefined,
+              waitingForWork,
+              input.askOnly,
+            )
+          : undefined
+      const askOnly = intent?.kind === 'ask_only'
+      if (input.askOnly && !askOnly)
+        throw new RunOperationConflictError(
+          'Ask only needs the current accepted Plan and an idle author.',
+        )
       const metadata = JSON.stringify({
         workflowCommand,
+        replyIntentBasis: intent,
         ...(rolePolicy ? { rolePolicy } : {}),
         skills: input.skills ?? [],
         imageIds: images.map((v) => v.id),
@@ -8858,7 +9368,7 @@ export class ConversationRepository {
         clientMessageId: input.clientMessageId,
         commentsRevision: session.commentsRevision,
         actor,
-        ...(task ? { taskId: task.id } : {}),
+        ...(task && !askOnly ? { taskId: task.id } : {}),
         inputId,
         preserveDraftComments: !freezeDrafts,
         ...(input.batchId ? { batchId: input.batchId } : {}),
@@ -8945,7 +9455,9 @@ export class ConversationRepository {
         this.requireInstalledQueueReturn(input.sessionId, input.queueReturnOperationId)
         this.consumeQueuedReturn(input.sessionId, input.queueReturnOperationId)
       }
-      this.registerWorkflowInput(input.sessionId, input.clientMessageId)
+      if (this.activeRelayDecisionRow(input.sessionId)?.kind === 'repair_role_request')
+        this.discardUnansweredRelaySchedulingDecision(input.sessionId)
+      this.registerWorkflowInput(input.sessionId, input.clientMessageId, askOnly)
       return this.createPatch(input.sessionId, {
         receivedInputIds: [input.clientMessageId],
         ...(waitingForWork ? { queuedInputIds: [input.clientMessageId] } : {}),
@@ -9174,7 +9686,45 @@ export class ConversationRepository {
         ),
       )
       .run()
+    this.recoverUnsentPlanQuestions()
     this.recoverRelayDecisionGates()
+  }
+
+  private recoverUnsentPlanQuestions(): void {
+    // Only current tasks can still own a pending question. A terminal Run can be
+    // saved just before the Utility settles its workflow input.
+    let afterSession = ''
+    for (;;) {
+      const rows = this.database
+        .select({ sessionId: collaborationTasks.sessionId, runId: agentRuns.id })
+        .from(collaborationTasks)
+        .innerJoin(
+          agentRuns,
+          sql`${agentRuns.id}=json_extract(${collaborationTasks.stateJson}, '$.runId')`,
+        )
+        .innerJoin(workflowTurns, eq(workflowTurns.runId, agentRuns.id))
+        .where(
+          and(
+            sql`${collaborationTasks.active} = 1`,
+            gt(collaborationTasks.sessionId, afterSession),
+            eq(workflowTurns.taskId, collaborationTasks.id),
+            eq(workflowTurns.applied, false),
+            inArray(agentRuns.status, ['failed', 'interrupted']),
+            inArray(agentRuns.dispatchPhase, ['not_sent', 'rejected']),
+            sql`json_extract(${workflowTurns.authorizationJson}, '$.replyIntentBasis.kind') = 'ask_only'`,
+          ),
+        )
+        .orderBy(asc(collaborationTasks.sessionId))
+        .limit(25)
+        .all()
+      if (!rows.length) return
+      for (const { runId } of rows) {
+        const run = this.findRun(runId)
+        if (run && this.workflowInputWasNotSent(run))
+          this.finishCollaboration(runId, false, 'The Plan question was never sent.')
+      }
+      afterSession = rows.at(-1)!.sessionId
+    }
   }
 
   collaboration(
@@ -9510,6 +10060,22 @@ export class ConversationRepository {
       current.inputSequence === auth.inputSequence,
     )
     if (!requestedAfterCurrent) this.assertRelayDecisionResolved(run.sessionId)
+    if (auth?.replyIntentBasis?.kind === 'ask_only') {
+      const intent = auth.replyIntentBasis
+      const binding = this.nativeContext(run.sessionId, run.agentId)
+      if (
+        !current ||
+        current.runId !== runId ||
+        current.inputProcessing?.pending?.inputId !== intent.inputId ||
+        !this.currentReplyIntent(current, run, auth) ||
+        !intent.askBinding ||
+        binding?.nativeSessionId !== intent.askBinding.nativeSessionId ||
+        binding.bindingGeneration !== intent.askBinding.generation
+      )
+        throw new RunOperationConflictError(
+          'The accepted Plan or its author changed before dispatch.',
+        )
+    }
     if (current && auth) {
       if (!isDeepStrictEqual(current.stageRoles, auth.stageRoles))
         throw new RunOperationConflictError('The workflow stage roles changed before dispatch.')
@@ -9537,6 +10103,24 @@ export class ConversationRepository {
         receipt.rootReceiptId !== auth.userAuthority.rootReceiptId
       )
         throw new RunOperationConflictError('The native Turn has no current bound action receipt.')
+      const decision = receipt.decisionId
+        ? this.database
+            .select()
+            .from(relayDecisions)
+            .where(eq(relayDecisions.id, receipt.decisionId))
+            .get()
+        : undefined
+      if (decision?.kind === 'repair_role_request') {
+        if (
+          !current ||
+          auth.stage !== 'repair' ||
+          !isDeepStrictEqual(auth.reviewScopeRef, current.reviewScopeRef) ||
+          this.workflowHandoff(current, auth.actor).freshnessGuard.settingsRevision !==
+            run.settingsRevision
+        )
+          throw new RunOperationConflictError('The current Pact repair scope is unavailable.')
+        this.assertConfirmedPactRepairRole(current, receipt, decision, run.settingsRevision, true)
+      }
       if (receipt.action === 'extend_plan_review') {
         const extension = scheduling.confirmedPlanReviewExtension(this.database, receipt.id),
           session = this.database
@@ -9601,6 +10185,38 @@ export class ConversationRepository {
       .where(eq(conversationInputBatches.id, batchId))
       .run()
     const task = this.collaboration(batch.sessionId)
+    if (
+      task &&
+      !batch.taskId &&
+      collaborationInputProcessing(task).pending?.inputId === batch.clientMessageId
+    ) {
+      const receipt = this.database
+        .select()
+        .from(collaborationInputs)
+        .where(eq(collaborationInputs.id, batch.clientMessageId))
+        .get()
+      if (
+        receipt?.sessionId === task.sessionId &&
+        receipt.taskId === task.id &&
+        storedReceivedMetadata(receipt.metadataJson).replyIntentBasis?.kind === 'ask_only'
+      ) {
+        const run = batch.runId ? this.findRun(batch.runId) : undefined
+        if (
+          !run ||
+          this.workflowInputWasNotSent(run) ||
+          (run.dispatchPhase === 'ended' &&
+            run.nativeOutcome &&
+            run.nativeEffectsState === 'settled')
+        ) {
+          task.inputProcessing = { ...collaborationInputProcessing(task), pending: undefined }
+          task.status = collaborationPlanAccepted(task) ? 'ready' : 'waiting'
+          task.notice = 'The Plan question was withdrawn.'
+          task.revision++
+          this.saveCollaboration(task)
+        }
+        return
+      }
+    }
     if (batch.taskId === task?.id && task.latestUserMessageId === batch.clientMessageId) {
       const latest = this.database
         .select({ messageId: conversationInputBatches.messageId })
@@ -9692,10 +10308,12 @@ export class ConversationRepository {
       .from(collaborationTasks)
       .where(eq(collaborationTasks.id, task.id))
       .get()
-    task = this.storedCollaboration({
-      ...task,
-      inputSequence: persistent?.inputSequence ?? task.inputSequence,
-    })
+    task.inputSequence = persistent?.inputSequence ?? task.inputSequence
+    if (task.planAcceptanceCoverage?.throughInputSequence !== task.inputSequence)
+      task.planAcceptanceCoverage = undefined
+    if (task.reviewControlCoverage?.inputSequence !== task.inputSequence)
+      task.reviewControlCoverage = undefined
+    task = this.storedCollaboration(task)
     const now = new Date().toISOString()
     this.database
       .update(collaborationTasks)
@@ -9836,7 +10454,9 @@ export class ConversationRepository {
         current.owner !== task.owner ||
         current.reviewer !== task.reviewer ||
         current.rolePolicy !== task.rolePolicy ||
-        !isDeepStrictEqual(current.stageRoles, task.stageRoles)
+        !isDeepStrictEqual(current.stageRoles, task.stageRoles) ||
+        !isDeepStrictEqual(current.planAcceptanceCoverage, task.planAcceptanceCoverage) ||
+        !isDeepStrictEqual(current.reviewControlCoverage, task.reviewControlCoverage)
       )
         throw new RunOperationConflictError('The collaboration changed before this action.')
       if (current.automation === 'paused' && task.automation === 'active') {
@@ -9932,6 +10552,10 @@ export class ConversationRepository {
       const frozen = this.decodedCollaboration(turn.stateJson)
       const nativeCompleted =
         complete && run.dispatchPhase === 'ended' && run.nativeOutcome === 'completed'
+      if (auth.replyIntentBasis?.kind === 'ask_only') {
+        this.finishAskOnly(task, run, auth, nativeCompleted, notice)
+        return
+      }
       const unstarted = this.workflowInputWasNotSent(run)
       const effectsSettled =
         run.nativeEffectsState === 'settled' || run.nativeEffectsState === 'not_dispatched'
@@ -10099,6 +10723,8 @@ export class ConversationRepository {
               : 'The Agent ended without a confirmed plan. Ask the plan author to complete it before continuing.'
         }
       } else if (auth.stage === 'plan_review' || auth.stage === 'code_review') {
+        task.planAcceptanceCoverage = undefined
+        task.reviewControlCoverage = undefined
         const verdict =
           !turn.verdictConflict && turn.verdict && report?.chars ? turn.verdict : 'incomplete'
         if (report)
@@ -10186,6 +10812,8 @@ export class ConversationRepository {
         .where(eq(workflowTurns.runId, runId))
         .run()
       this.saveCollaboration(task)
+      if (auth.stage === 'reply' && task.reviewControlCoverage?.producerRunId === run.id)
+        this.publishRepairRoleDecision(task)
       this.settleSupplementReview(run)
       this.publishRequestedRelayDecision(task)
     })
@@ -10378,12 +11006,9 @@ export class ConversationRepository {
             : false,
           reportAvailable: Boolean(turn?.applied && turn.reportBodyId),
           actionable,
-          availableActions:
-            task && actionable
-              ? planRecovery
-                ? ['recover_plan']
-                : this.relayCollaborationActions(task)
-              : [],
+          ...(task && actionable && !planRecovery
+            ? this.collaborationActionProjection(task)
+            : { availableActions: planRecovery && actionable ? ['recover_plan'] : [] }),
           ...(current && this.relayDecision(input.sessionId)
             ? { relayDecision: this.relayDecision(input.sessionId) }
             : {}),
@@ -12511,11 +13136,506 @@ export class ConversationRepository {
     return proof
   }
 
+  private repairRoleBindings(task: CollaborationTask, requireIdle = true): string | undefined {
+    const bindings = this.nativeContexts(task.sessionId)
+    const identities = []
+    for (const agentId of ['claude', 'codex'] as const) {
+      const binding = bindings.find((entry) => entry.agentId === agentId)
+      if (!binding) {
+        // A direct Review may be the first native Run. Only its untouched peer
+        // can initialize after Repair, and the absence is fenced like a binding.
+        const seen = this.database
+          .select({ id: agentRuns.id })
+          .from(agentRuns)
+          .where(and(eq(agentRuns.sessionId, task.sessionId), eq(agentRuns.agentId, agentId)))
+          .limit(1)
+          .get()
+        if (task.review?.actor === agentId || seen) return undefined
+        identities.push({ agentId, generation: null, session: null })
+        continue
+      }
+      if (
+        !binding.nativeSessionId ||
+        binding.bindingGeneration === undefined ||
+        (requireIdle &&
+          (binding.continuationState !== 'ready' ||
+            binding.permissionRequests?.length ||
+            this.bindingHasUnsettledWork(task.sessionId, agentId, binding.bindingGeneration)))
+      )
+        return undefined
+      identities.push({
+        agentId,
+        generation: binding.bindingGeneration,
+        session: binding.nativeSessionId,
+      })
+    }
+    return scheduling.fingerprint(identities)
+  }
+
+  private repairRoleLimit(
+    task: CollaborationTask,
+    limits: CollaborationLimits,
+  ): string | undefined {
+    if (task.repairAttempts >= limits.maxRepairAttempts)
+      return 'The Session repair limit has been reached.'
+    if (task.reviewCycles >= limits.maxReviewCycles)
+      return 'The Session review limit has been reached. There is no allowance for the review after this repair.'
+    return undefined
+  }
+
+  private verifiedRepairReview(task: CollaborationTask): boolean {
+    const review = task.review
+    if (!review || !review.scopeRef || !isDeepStrictEqual(task.reviewScopeRef, review.scopeRef))
+      return false
+    const original = this.relayCompletedTurn(
+      task,
+      this.database.select().from(workflowTurns).where(eq(workflowTurns.runId, review.runId)).get(),
+    )
+    if (
+      !original ||
+      original.auth.stage !== 'code_review' ||
+      original.source.verdict !== 'changes_requested' ||
+      original.source.actor !== review.actor ||
+      original.source.inputSequence !== review.inputSequence ||
+      !isDeepStrictEqual(original.source.document, review.document) ||
+      !isDeepStrictEqual(original.auth.reviewScopeRef, review.scopeRef)
+    )
+      return false
+    this.collaborationDocumentRow(task.sessionId, review.scopeRef)
+    return true
+  }
+
+  private swappedRepairRoles(roles: NonNullable<CollaborationTask['stageRoles']>) {
+    return {
+      ...roles,
+      revision: roles.revision + 1,
+      codeAuthor: roles.codeReviewer,
+      codeReviewer: roles.codeAuthor,
+    }
+  }
+
+  private repairRoleBasis(task: CollaborationTask, source: 'native' | 'direct' = 'native') {
+    const coverage = task.reviewControlCoverage
+    const review = task.review
+    if (
+      !review ||
+      !collaborationCodeReviewCurrent(task) ||
+      !this.verifiedRepairReview(task) ||
+      task.status !== 'waiting' ||
+      task.automation !== 'active' ||
+      task.pendingWork ||
+      task.nextStage ||
+      task.rolePolicy !== 'split-stages-v1' ||
+      this.pendingSupplementReview(task) ||
+      this.receivedCollaborationInput(task.sessionId) ||
+      this.hasPendingRoutedContinuation(task.sessionId) ||
+      this.nativeRecoveryBlocksInput(task.sessionId)
+    )
+      return undefined
+    if (coverage) {
+      if (task.runId !== coverage.producerRunId) return undefined
+      const reply = this.relayCompletedTurn(
+        task,
+        this.database.select().from(workflowTurns).where(eq(workflowTurns.runId, task.runId)).get(),
+      )
+      if (
+        !reply ||
+        reply.source.stage !== 'reply' ||
+        reply.source.inputSequence !== task.inputSequence ||
+        this.workflowInputResult(task.runId)?.outcome !== coverage.kind ||
+        !this.currentReplyIntent(task, reply.run, reply.auth)
+      )
+        return undefined
+    } else if (
+      source === 'native' ||
+      task.stage !== 'code_review' ||
+      task.runId !== review.runId ||
+      task.inputSequence !== review.inputSequence
+    ) {
+      return undefined
+    }
+    const bindings = this.repairRoleBindings(task)
+    if (!bindings) return undefined
+    const handoff = this.workflowHandoff(task, review.actor)
+    const limit = this.repairRoleLimit(task, this.planReviewLimits(task.sessionId))
+    return { coverage, review, handoff, bindings, limit }
+  }
+
+  requestPactRepairRole(
+    input: CollaborationActionInput,
+    waitingForWork: boolean,
+  ): ConversationPatch {
+    const patch = this.database.transaction(() => {
+      assertSessionAvailable(this.database, input.sessionId)
+      const previous = this.database
+        .select()
+        .from(relayDecisions)
+        .where(eq(relayDecisions.id, input.clientMessageId))
+        .get()
+      if (previous) {
+        const proof = pactRepairRoleProofSchema.safeParse(JSON.parse(previous.proofJson))
+        if (
+          previous.sessionId !== input.sessionId ||
+          previous.kind !== 'repair_role_request' ||
+          previous.formatVersion !== 4 ||
+          !proof.success ||
+          proof.data.version !== 'pact-repair-role-direct-v1' ||
+          proof.data.requestDigest !== scheduling.fingerprint(input)
+        )
+          throw new RunOperationConflictError(
+            'This repair choice nonce belongs to another request.',
+          )
+        return this.metadataPatch(input.sessionId)
+      }
+      const task = this.collaboration(input.sessionId)
+      if (
+        input.action !== 'request_repair_role_switch' ||
+        waitingForWork ||
+        !task ||
+        task.id !== input.taskId ||
+        task.revision !== input.revision ||
+        input.repairActor !== collaborationActor(task, 'code_review')
+      )
+        throw new RunOperationConflictError('This repair choice is no longer current.')
+      this.publishRepairRoleDecision(task, input)
+      return this.metadataPatch(input.sessionId)
+    })
+    this.schedulingChanged()
+    return patch
+  }
+
+  private repairRoleScopeFingerprint(proof: PactRepairRoleProof): string {
+    return scheduling.fingerprint(
+      proof.version === 'pact-repair-role-v1'
+        ? proof.coverage
+        : { review: proof.review, inputSequence: proof.inputSequence, coverage: proof.coverage },
+    )
+  }
+
+  private matchesRepairRoleScope(task: CollaborationTask, proof: PactRepairRoleProof): boolean {
+    return (
+      isDeepStrictEqual(task.reviewControlCoverage, proof.coverage) &&
+      (proof.version === 'pact-repair-role-v1'
+        ? isDeepStrictEqual(task.reviewScopeRef, proof.coverage.scope)
+        : proof.inputSequence === task.inputSequence &&
+          isDeepStrictEqual(task.review, proof.review) &&
+          isDeepStrictEqual(task.reviewScopeRef, proof.review.scopeRef))
+    )
+  }
+
+  private publishRepairRoleDecision(
+    task: CollaborationTask,
+    direct?: CollaborationActionInput,
+  ): void {
+    if (!direct && !task.reviewControlCoverage) return
+    const basis = this.repairRoleBasis(task, direct ? 'direct' : 'native')
+    const active = this.activeRelayDecisionRow(task.sessionId)
+    const supersedes =
+      direct &&
+      active?.formatVersion === 2 &&
+      active.state === 'awaiting_answer' &&
+      active.taskId === task.id &&
+      active.afterRunId === task.runId &&
+      active.handoffId === basis?.handoff.id &&
+      (active.kind === 'repair' || active.kind === 'supplement_code_response')
+    if (!basis || (active && !supersedes) || this.workflowHandoffOccupied(basis.handoff.id)) {
+      if (direct)
+        throw new RunOperationConflictError('This review is no longer ready for a repair choice.')
+      return
+    }
+    if (basis.limit) {
+      if (direct) throw new RunOperationConflictError(basis.limit)
+      this.saveCollaboration({ ...task, notice: basis.limit })
+      return
+    }
+    const roles = task.stageRoles ?? defaultTaskStageRoles(task.owner)
+    const actor = roles.codeReviewer
+    const returnActor = roles.codeAuthor
+    if (
+      basis.review.actor !== actor ||
+      task.actor !== actor ||
+      actor === returnActor ||
+      (direct && direct.repairActor !== actor)
+    ) {
+      if (direct) throw new RunOperationConflictError('This review has different code roles.')
+      return
+    }
+    const actorName = actor === 'codex' ? 'Codex' : 'Claude Code'
+    const decisionId = direct?.clientMessageId ?? randomUUID()
+    const directScope = {
+      review: basis.review,
+      inputSequence: task.inputSequence,
+      coverage: basis.coverage,
+    }
+    const fullAccess =
+      this.runSettingsAt(task.sessionId, actor, basis.handoff.freshnessGuard.settingsRevision)
+        .permissionMode === 'full'
+    const card: RelaySchedulingDecision = {
+      version: 'relay-decision-v2',
+      sessionId: task.sessionId,
+      decisionId,
+      revision: 0,
+      handoffId: basis.handoff.id,
+      title: `Have ${actorName} repair the reviewed changes?`,
+      reason: 'You asked the current reviewer to make the repair.',
+      consequence:
+        'Confirms one repair within this review and swaps the code roles for this task.' +
+        (fullAccess ? ' Runs with Full access.' : ''),
+      sources: [{ id: basis.review.runId, label: 'Current code review' }],
+      request: {
+        category: 'new_authorization',
+        operation: {
+          kind: 'repair_role_request',
+          taskId: task.id,
+          afterRunId: task.runId,
+          actor,
+          returnActor,
+          fullAccess,
+          scopeFingerprint: scheduling.fingerprint(direct ? directScope : basis.coverage),
+        },
+      },
+    }
+    const proof = pactRepairRoleProofSchema.parse({
+      ...(direct
+        ? {
+            version: 'pact-repair-role-direct-v1',
+            requestDigest: scheduling.fingerprint(direct),
+            ...directScope,
+          }
+        : { version: 'pact-repair-role-v1', coverage: basis.coverage }),
+      card,
+      expectedTaskRevision: task.revision,
+      settingsRevision: basis.handoff.freshnessGuard.settingsRevision,
+      previousRoles: roles,
+      bindings: basis.bindings,
+    })
+    const now = new Date().toISOString()
+    // Activity refers to the existing handoff row. Leave its action for beginRun.
+    if (supersedes) this.discardUnansweredRelaySchedulingDecision(task.sessionId, false)
+    scheduling.ensureHandoff(this.database, basis.handoff)
+    this.database
+      .insert(relayDecisions)
+      .values({
+        id: decisionId,
+        sessionId: task.sessionId,
+        taskId: task.id,
+        matterKey: `repair_role_request:${task.runId}`,
+        kind: 'repair_role_request',
+        formatVersion: 4,
+        state: 'awaiting_answer',
+        afterRunId: task.runId,
+        handoffId: card.handoffId,
+        proofJson: this.authorityJson(proof),
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run()
+    this.nativeFact(task.runId, 'workflow.repair_role_proposed', { decisionId })
+    if (direct) this.saveCollaboration(task)
+    scheduling.recordRelayDecisionActivity(this.database, decisionId)
+  }
+
+  private assertConfirmedPactRepairRole(
+    task: CollaborationTask,
+    receipt: typeof collaborationActionReceipts.$inferSelect,
+    decision: typeof relayDecisions.$inferSelect,
+    settingsRevision: number,
+    dispatched = false,
+  ): void {
+    const proof = pactRepairRoleProofSchema.parse(JSON.parse(decision.proofJson))
+    const result = relayDecisionReceiptSchema.parse(JSON.parse(decision.resultJson ?? 'null'))
+    const operation =
+      proof.card.request.category === 'new_authorization' &&
+      proof.card.request.operation.kind === 'repair_role_request'
+        ? proof.card.request.operation
+        : undefined
+    const roles = task.stageRoles
+    const limits = this.planReviewLimits(task.sessionId)
+    const run = dispatched ? this.findRun(task.runId) : undefined
+    const auth = run?.reexecutedFromRunId ? this.collaborationTurnAuthorization(run.id) : undefined
+    const predecessor = run && auth ? this.originalPactUnsentTurn(run, auth) : undefined
+    if (
+      (run?.reexecutedFromRunId && (!predecessor || auth?.taskRevision !== task.revision)) ||
+      !operation ||
+      !roles ||
+      decision.formatVersion !== 4 ||
+      decision.state !== (dispatched ? 'bound' : 'available') ||
+      decision.active === dispatched ||
+      decision.answerJson !== this.authorityJson({ kind: 'confirm' }) ||
+      result.disposition !== 'confirmed' ||
+      result.decisionId !== decision.id ||
+      result.sessionId !== task.sessionId ||
+      result.clientOperationId !== receipt.clientNonce ||
+      result.roleChange?.taskId !== task.id ||
+      result.roleChange.taskRevision !== proof.expectedTaskRevision + 1 ||
+      !isDeepStrictEqual(result.roleChange.stageRoles, roles) ||
+      (predecessor?.auth.taskRevision ?? task.revision) !==
+        proof.expectedTaskRevision + (dispatched ? 2 : 1) ||
+      !isDeepStrictEqual(roles, this.swappedRepairRoles(proof.previousRoles)) ||
+      roles.codeAuthor !== operation.actor ||
+      roles.codeReviewer !== operation.returnActor ||
+      operation.taskId !== task.id ||
+      operation.afterRunId !== decision.afterRunId ||
+      receipt.action !== 'repair' ||
+      receipt.actor !== operation.actor ||
+      receipt.decisionId !== decision.id ||
+      receipt.handoffId !== proof.card.handoffId ||
+      settingsRevision !== proof.settingsRevision ||
+      !collaborationCodeReviewCurrent(task) ||
+      !this.verifiedRepairReview(task) ||
+      !this.matchesRepairRoleScope(task, proof) ||
+      this.nativeRecoveryBlocksInput(task.sessionId) ||
+      this.receivedCollaborationInput(task.sessionId) ||
+      this.repairRoleBindings(task, !dispatched) !== proof.bindings ||
+      (dispatched
+        ? task.stage !== 'repair' ||
+          task.runId !== receipt.boundRunId ||
+          task.reviewCycles >= limits.maxReviewCycles ||
+          task.repairAttempts > limits.maxRepairAttempts
+        : task.stage !== (proof.coverage ? 'reply' : 'code_review') ||
+          task.runId !== operation.afterRunId ||
+          this.repairRoleLimit(task, limits))
+    )
+      throw new RunOperationConflictError(
+        'The confirmed Pact repair scope or authorization changed.',
+      )
+  }
+
+  private currentPactRepairRole(row: typeof relayDecisions.$inferSelect) {
+    const proof = pactRepairRoleProofSchema.safeParse(JSON.parse(row.proofJson))
+    const card = proof.data?.card
+    const operation =
+      card?.request.category === 'new_authorization' &&
+      card.request.operation.kind === 'repair_role_request'
+        ? card.request.operation
+        : undefined
+    const task = this.collaboration(row.sessionId)
+    const basis =
+      task &&
+      this.repairRoleBasis(
+        task,
+        proof.data?.version === 'pact-repair-role-direct-v1' ? 'direct' : 'native',
+      )
+    if (
+      !proof.success ||
+      !card ||
+      !operation ||
+      !task ||
+      !basis ||
+      basis.limit ||
+      row.formatVersion !== 4 ||
+      row.kind !== operation.kind ||
+      !row.active ||
+      row.state !== 'awaiting_answer' ||
+      row.id !== card.decisionId ||
+      row.sessionId !== card.sessionId ||
+      row.revision !== card.revision ||
+      row.taskId !== task.id ||
+      operation.taskId !== task.id ||
+      operation.afterRunId !== task.runId ||
+      row.afterRunId !== task.runId ||
+      row.handoffId !== card.handoffId ||
+      basis.handoff.id !== card.handoffId ||
+      this.workflowHandoffOccupied(card.handoffId) ||
+      proof.data.expectedTaskRevision !== task.revision ||
+      proof.data.settingsRevision !== basis.handoff.freshnessGuard.settingsRevision ||
+      !this.matchesRepairRoleScope(task, proof.data) ||
+      operation.scopeFingerprint !== this.repairRoleScopeFingerprint(proof.data) ||
+      operation.actor !== basis.review.actor ||
+      task.actor !== operation.actor ||
+      !isDeepStrictEqual(
+        proof.data.previousRoles,
+        task.stageRoles ?? defaultTaskStageRoles(task.owner),
+      ) ||
+      operation.actor !== proof.data.previousRoles.codeReviewer ||
+      operation.returnActor !== proof.data.previousRoles.codeAuthor ||
+      proof.data.bindings !== basis.bindings
+    )
+      throw new RunOperationConflictError('This Pact repair confirmation is no longer current.')
+    return { proof: proof.data, card, operation, task }
+  }
+
+  private answerPactRepairRole(
+    row: typeof relayDecisions.$inferSelect,
+    input: RelayDecisionAnswer,
+    requestDigest: string,
+  ) {
+    assertSessionAvailable(this.database, row.sessionId)
+    const { proof, card, operation, task } = this.currentPactRepairRole(row)
+    if (!relayAnswerMatchesDecision(card, input))
+      throw new RunOperationConflictError(
+        'The answer does not match this Pact repair confirmation.',
+      )
+    const cancelled = input.answer.kind === 'cancel'
+    const result: RelayDecisionReceipt = {
+      sessionId: row.sessionId,
+      decisionId: row.id,
+      clientOperationId: input.clientOperationId,
+      disposition: cancelled ? 'cancelled' : 'confirmed',
+      runId: null,
+      rebuildId: null,
+    }
+    const now = new Date().toISOString()
+    let receiptId: string | undefined
+    if (!cancelled) {
+      const stageRoles = this.swappedRepairRoles(proof.previousRoles)
+      const current = { ...task, revision: task.revision + 1, stageRoles, notice: undefined }
+      const next = advanceCollaboration(current, 'repair', this.planReviewLimits(row.sessionId))
+      const handoff = this.workflowHandoff(current, operation.actor)
+      receiptId = randomUUID()
+      this.database
+        .insert(collaborationActionReceipts)
+        .values({
+          id: receiptId,
+          sessionId: row.sessionId,
+          taskId: task.id,
+          clientNonce: input.clientOperationId,
+          requestDigest,
+          action: 'repair',
+          actor: operation.actor,
+          handoffId: handoff.id,
+          decisionId: row.id,
+          rootReceiptId: receiptId,
+          basisJson: this.authorityJson(this.actionReceiptBasis(current, next, handoff)),
+          state: 'available',
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run()
+      this.saveCollaboration(current)
+      result.roleChange = { taskId: task.id, taskRevision: current.revision, stageRoles }
+    } else {
+      // Available actions changed even though the review and role grant did not.
+      this.saveCollaboration({ ...task, revision: task.revision + 1 })
+    }
+    this.database
+      .update(relayDecisions)
+      .set({
+        state: cancelled ? 'cancelled' : 'available',
+        active: !cancelled,
+        answerNonce: input.clientOperationId,
+        answerDigest: requestDigest,
+        answerJson: this.authorityJson(input.answer),
+        resultJson: this.authorityJson(result),
+        updatedAt: now,
+      })
+      .where(eq(relayDecisions.id, row.id))
+      .run()
+    this.nativeFact(task.runId, 'workflow.repair_role_answered', {
+      decisionId: row.id,
+      cancelled,
+      receiptId,
+    })
+    scheduling.recordRelayDecisionActivity(this.database, row.id)
+    return { result, created: true, receiptId }
+  }
+
   /** Disposable projection. Native interaction priority is applied by Conversation, not this reader. */
   relaySchedulingDecision(sessionId: string): RelaySchedulingDecision | null {
     const row = this.activeRelayDecisionRow(sessionId)
-    if (!row || row.formatVersion !== 2 || row.state !== 'awaiting_answer') return null
+    if (!row || ![2, 4].includes(row.formatVersion) || row.state !== 'awaiting_answer') return null
     try {
+      if (row.kind === 'repair_role_request') return this.currentPactRepairRole(row).card
       if (row.kind === 'rebuild_native_context')
         return this.currentRelayNativeRecoveryProof(row).card
       return this.currentRelaySchedulingProof(row).card
@@ -12528,25 +13648,32 @@ export class ConversationRepository {
   /** Retire only unused auxiliary intent; no pause, native obligation or budget is cleared. */
   discardStaleRelaySchedulingDecision(sessionId: string): boolean {
     const row = this.activeRelayDecisionRow(sessionId)
-    if (!row || row.formatVersion !== 2 || row.state !== 'awaiting_answer') return false
+    if (!row || ![2, 4].includes(row.formatVersion) || row.state !== 'awaiting_answer') return false
     if (this.relaySchedulingDecision(sessionId)) return false
-    this.database
-      .update(relayDecisions)
-      .set({
-        state: 'invalid',
-        active: false,
-        revision: row.revision + 1,
-        updatedAt: new Date().toISOString(),
-      })
-      .where(and(eq(relayDecisions.id, row.id), eq(relayDecisions.revision, row.revision)))
-      .run()
-    scheduling.recordRelayDecisionActivity(this.database, row.id)
+    this.database.transaction(() => {
+      this.database
+        .update(relayDecisions)
+        .set({
+          state: 'invalid',
+          active: false,
+          revision: row.revision + 1,
+          updatedAt: new Date().toISOString(),
+        })
+        .where(and(eq(relayDecisions.id, row.id), eq(relayDecisions.revision, row.revision)))
+        .run()
+      scheduling.recordRelayDecisionActivity(this.database, row.id)
+      if (row.formatVersion === 4) {
+        const task = this.collaboration(sessionId)
+        if (task?.id === row.taskId && task.runId === row.afterRunId)
+          this.saveCollaboration({ ...task, revision: task.revision + 1 })
+      }
+    })
     this.schedulingChanged()
     return true
   }
 
   /** A concrete existing user action supersedes an unused suggestion, never a bound operation. */
-  discardUnansweredRelaySchedulingDecision(sessionId: string): void {
+  discardUnansweredRelaySchedulingDecision(sessionId: string, includePact = true): void {
     const decisionId = this.activeRelayDecisionRow(sessionId)?.id
     this.database
       .update(relayDecisions)
@@ -12559,7 +13686,7 @@ export class ConversationRepository {
       .where(
         and(
           eq(relayDecisions.sessionId, sessionId),
-          eq(relayDecisions.formatVersion, 2),
+          inArray(relayDecisions.formatVersion, includePact ? [2, 4] : [2]),
           eq(relayDecisions.active, true),
           eq(relayDecisions.state, 'awaiting_answer'),
         ),
@@ -12627,6 +13754,57 @@ export class ConversationRepository {
           throw new RunOperationConflictError('The user answer Run binding is invalid.')
       }
       return result
+    }
+    if (row.formatVersion === 4) {
+      const proof = pactRepairRoleProofSchema.parse(JSON.parse(row.proofJson))
+      const card = proof.card
+      const operation =
+        card.request.category === 'new_authorization' &&
+        card.request.operation.kind === 'repair_role_request'
+          ? card.request.operation
+          : undefined
+      if (
+        !operation ||
+        row.kind !== operation.kind ||
+        card.decisionId !== row.id ||
+        card.sessionId !== row.sessionId ||
+        row.handoffId !== card.handoffId ||
+        row.taskId !== operation.taskId ||
+        row.afterRunId !== operation.afterRunId ||
+        result.rebuildId !== null ||
+        result.runId !== null
+      )
+        throw new RunOperationConflictError('The saved Pact repair confirmation is invalid.')
+      if (result.disposition === 'cancelled' && row.state === 'cancelled' && !result.roleChange)
+        return result
+      const action = this.database
+        .select()
+        .from(collaborationActionReceipts)
+        .where(
+          and(
+            eq(collaborationActionReceipts.sessionId, row.sessionId),
+            eq(collaborationActionReceipts.clientNonce, row.answerNonce),
+          ),
+        )
+        .get()
+      if (
+        result.disposition !== 'confirmed' ||
+        result.roleChange?.taskId !== row.taskId ||
+        result.roleChange.taskRevision !== proof.expectedTaskRevision + 1 ||
+        !isDeepStrictEqual(
+          result.roleChange.stageRoles,
+          this.swappedRepairRoles(proof.previousRoles),
+        ) ||
+        !action ||
+        action.decisionId !== row.id ||
+        action.taskId !== row.taskId ||
+        action.actor !== operation.actor ||
+        action.action !== 'repair' ||
+        action.handoffId !== card.handoffId ||
+        action.requestDigest !== row.answerDigest
+      )
+        throw new RunOperationConflictError('The saved Pact repair authorization is invalid.')
+      return { ...result, runId: action.boundRunId }
     }
     if (row.kind === 'reassign_roles') {
       const proof = relaySchedulingDecisionProofSchema.parse(JSON.parse(row.proofJson))
@@ -12801,9 +13979,65 @@ export class ConversationRepository {
     }
   }
 
-  answerRelaySchedulingDecision(raw: RelayDecisionAnswer) {
+  retiredPactRepairRoleDecision(reference: RelayDecisionAnswer['reference']): boolean {
+    return Boolean(
+      this.database
+        .select({ id: relayDecisions.id })
+        .from(relayDecisions)
+        .where(
+          and(
+            eq(relayDecisions.id, reference.decisionId),
+            eq(relayDecisions.sessionId, reference.sessionId),
+            eq(relayDecisions.formatVersion, 4),
+            eq(relayDecisions.kind, 'repair_role_request'),
+            eq(relayDecisions.active, false),
+          ),
+        )
+        .get(),
+    )
+  }
+
+  confirmedPactRepairRoleDecision(input: RelayDecisionAnswer): RelayDecisionReceipt | undefined {
+    if (input.answer.kind !== 'confirm') return undefined
+    const row = this.database
+      .select()
+      .from(relayDecisions)
+      .where(
+        and(
+          eq(relayDecisions.id, input.reference.decisionId),
+          eq(relayDecisions.sessionId, input.reference.sessionId),
+          eq(relayDecisions.kind, 'repair_role_request'),
+          eq(relayDecisions.formatVersion, 4),
+        ),
+      )
+      .get()
+    if (
+      !row?.answerNonce ||
+      row.answerJson !== this.authorityJson({ kind: 'confirm' }) ||
+      pactRepairRoleProofSchema.parse(JSON.parse(row.proofJson)).card.revision !==
+        input.reference.revision
+    )
+      return undefined
+    return this.relayDecisionReceipt({
+      sessionId: row.sessionId,
+      decisionId: row.id,
+      clientOperationId: row.answerNonce,
+    })
+  }
+
+  answerRelaySchedulingDecision(raw: RelayDecisionAnswer): {
+    result: RelayDecisionReceipt
+    created: boolean
+    receiptId?: string | undefined
+    draftsChanged?: boolean | undefined
+    preparedInput?:
+      | { receipt: PreparedInputDispatch; input: import('@pact/contracts').ConversationSendInput }
+      | undefined
+    nativeRebuild?: { agentId: RuntimeAgentId; operationId: string } | undefined
+  } {
     const input = relayDecisionAnswerSchema.parse(raw)
-    return this.database.transaction(() => {
+    let pactChanged = false
+    const answer = this.database.transaction(() => {
       const row = this.database
         .select()
         .from(relayDecisions)
@@ -12817,6 +14051,10 @@ export class ConversationRepository {
       if (!row) throw new RunOperationConflictError('This Relay decision is unavailable.')
       const requestDigest = scheduling.fingerprint(input)
       if (row.answerNonce) {
+        if (row.kind === 'repair_role_request' && row.answerNonce !== input.clientOperationId) {
+          const prior = this.confirmedPactRepairRoleDecision(input)
+          if (prior) return { result: prior, created: false, receiptId: undefined }
+        }
         if (row.answerNonce !== input.clientOperationId || row.answerDigest !== requestDigest)
           throw new RunOperationConflictError('This Relay decision already has a different answer.')
         return {
@@ -12827,6 +14065,11 @@ export class ConversationRepository {
           })!,
           created: false,
         }
+      }
+      if (row.kind === 'repair_role_request') {
+        const confirmed = this.answerPactRepairRole(row, input, requestDigest)
+        pactChanged = true
+        return confirmed
       }
       if (row.kind === 'scheduling_information')
         return this.answerPreparedInputInformation(row, input, requestDigest)
@@ -13009,7 +14252,12 @@ export class ConversationRepository {
         return { result, created: true, receiptId: undefined }
       }
       const task = row.taskId ? this.collaboration(row.sessionId) : undefined
-      if (!task || proof.card.request.category !== 'new_authorization' || task.id !== row.taskId)
+      if (
+        !task ||
+        proof.card.request.category !== 'new_authorization' ||
+        proof.card.request.operation.kind === 'repair_role_request' ||
+        task.id !== row.taskId
+      )
         throw new RunOperationConflictError('This scheduling operation has no current consumer.')
       const cancelled = input.answer.kind === 'cancel'
       const result: RelayDecisionReceipt = {
@@ -13079,6 +14327,8 @@ export class ConversationRepository {
       scheduling.recordRelayDecisionActivity(this.database, row.id)
       return { result, created: true, receiptId }
     })
+    if (pactChanged) this.schedulingChanged()
+    return answer
   }
 
   private retireRelayDecisionGates(publish?: (patch: ConversationPatch) => void): void {
@@ -13087,7 +14337,7 @@ export class ConversationRepository {
       const rows = this.database
         .select()
         .from(relayDecisions)
-        .where(sql`${relayDecisions.active} = 1`)
+        .where(and(sql`${relayDecisions.active} = 1`, ne(relayDecisions.formatVersion, 4)))
         .orderBy(relayDecisions.sessionId, relayDecisions.matterKey)
         .limit(25)
         .all()
@@ -13179,6 +14429,13 @@ export class ConversationRepository {
               ),
             )
             .run()
+          if (row.kind === 'repair_role_request' && row.state === 'available') {
+            const task = this.collaboration(row.sessionId)
+            if (task?.id === row.taskId && task.runId === row.afterRunId) {
+              task.notice = 'The code roles were changed. Repair did not start before restart.'
+              this.saveCollaboration(task)
+            }
+          }
           if (row.afterRunId)
             appendAgentEvent(this.database, {
               sessionId: row.sessionId,
@@ -13209,9 +14466,13 @@ export class ConversationRepository {
     return Boolean(this.activeRelayDecisionRow(sessionId))
   }
 
-  assertRelayDecisionResolved(sessionId: string, receiptId?: string): void {
+  assertRelayDecisionResolved(sessionId: string, receiptId?: string, newInput = false): void {
     const gate = this.activeRelayDecisionRow(sessionId)
-    if (!gate) return
+    if (
+      !gate ||
+      (newInput && gate.kind === 'repair_role_request' && gate.state === 'awaiting_answer')
+    )
+      return
     const receipt = receiptId
       ? this.database
           .select()
@@ -13672,6 +14933,11 @@ export class ConversationRepository {
         .where(eq(collaborationActionReceipts.id, receiptId))
         .get()
       if (!receipt || receipt.state !== 'available' || !receipt.decisionId) return undefined
+      const decision = this.database
+        .select()
+        .from(relayDecisions)
+        .where(eq(relayDecisions.id, receipt.decisionId))
+        .get()
       this.cancelPreparedCollaborationAction(receiptId)
       this.database
         .update(relayDecisions)
@@ -13695,7 +14961,10 @@ export class ConversationRepository {
           task.pauseReason = 'user'
         }
         task.revision++
-        task.notice = 'The scheduling action did not start. Collaboration remains paused.'
+        task.notice =
+          decision?.kind === 'repair_role_request'
+            ? 'The code roles were changed. Repair did not start. Continue collaboration when ready.'
+            : 'The scheduling action did not start. Collaboration remains paused.'
         this.saveCollaboration(task)
       } else if (
         task &&
@@ -13753,37 +15022,49 @@ export class ConversationRepository {
     })
   }
 
-  private relayCollaborationActions(
-    task: CollaborationTask,
-  ): import('@pact/contracts').CollaborationAction[] {
+  private collaborationActionProjection(task: CollaborationTask): {
+    availableActions: import('@pact/contracts').CollaborationAction[]
+    repairChoiceUnavailable?: string
+  } {
     const decision = this.relayDecision(task.sessionId)
     if (decision)
-      return [
-        'cancel_supplement',
-        ...(task.stage === 'code_review' &&
-        task.review?.verdict === 'changes_requested' &&
-        !task.pendingWork
-          ? ['respond' as const, 'repair' as const]
-          : []),
-      ]
+      return {
+        availableActions: [
+          'cancel_supplement',
+          ...(task.stage === 'code_review' &&
+          task.review?.verdict === 'changes_requested' &&
+          !task.pendingWork
+            ? ['respond' as const, 'repair' as const]
+            : []),
+        ],
+      }
     const actions = collaborationAvailableActions(task)
+    const pauseOnly = actions.filter((action) => action === 'pause')
+    if (this.activeRelayDecisionRow(task.sessionId)?.kind === 'repair_role_request')
+      return { availableActions: pauseOnly }
     try {
       const pending = this.pendingSupplementReview(task)
       if (pending) {
         const ready = this.supplementReviewSourceReady(task, pending)
-        return actions.filter(
-          (action) =>
-            action === 'pause' ||
-            (ready &&
-              ['resume', 'continue', 'retry'].includes(action) &&
-              collaborationNextStage(task) === pending.stage),
-        )
+        return {
+          availableActions: actions.filter(
+            (action) =>
+              action === 'pause' ||
+              (ready &&
+                ['resume', 'continue', 'retry'].includes(action) &&
+                collaborationNextStage(task) === pending.stage),
+          ),
+        }
       }
+      const alternative = actions.includes('repair') && this.repairRoleBasis(task, 'direct')
+      if (!alternative) return { availableActions: actions }
+      return alternative.limit
+        ? { availableActions: actions, repairChoiceUnavailable: alternative.limit }
+        : { availableActions: [...actions, 'request_repair_role_switch'] }
     } catch (error) {
       if (!(error instanceof RunOperationConflictError)) throw error
-      return actions.filter((action) => action === 'pause')
+      return { availableActions: pauseOnly }
     }
-    return actions
   }
 
   private relayWriteContinuation(task: CollaborationTask, scopeId: string) {
@@ -13868,7 +15149,24 @@ export class ConversationRepository {
       throw new RunOperationConflictError('This supplement grant is no longer available.')
     const handoff = collaborationActionBasisSchema.parse(JSON.parse(receipt.basisJson)).handoff
     this.assertSchedulingFreshness(handoff)
-    const next = this.relayWorkflowActionNext(task, receipt.action)
+    const decision = receipt.decisionId
+      ? this.database
+          .select()
+          .from(relayDecisions)
+          .where(eq(relayDecisions.id, receipt.decisionId))
+          .get()
+      : undefined
+    if (decision?.kind === 'repair_role_request')
+      this.assertConfirmedPactRepairRole(
+        task,
+        receipt,
+        decision,
+        handoff.freshnessGuard.settingsRevision,
+      )
+    const next =
+      decision?.kind === 'repair_role_request'
+        ? advanceCollaboration(task, 'repair', this.planReviewLimits(task.sessionId))
+        : this.relayWorkflowActionNext(task, receipt.action)
     if (receipt.basisJson !== this.authorityJson(this.actionReceiptBasis(task, next, handoff)))
       throw new RunOperationConflictError('The supplement scope or actor changed.')
     return { receipt, task, next, handoff }
@@ -14275,6 +15573,7 @@ export class ConversationRepository {
           !review ||
           !task.reviewScopeRef ||
           !isDeepStrictEqual(review.scopeRef, task.reviewScopeRef) ||
+          (task.reviewControlCoverage && !this.verifiedRepairReview(task)) ||
           !run ||
           run.forkSourceRunId ||
           run.nativeEffectsState !== 'settled' ||
@@ -14632,6 +15931,8 @@ export class ConversationRepository {
           .where(eq(relayDecisions.id, receipt.decisionId))
           .get()
       : undefined
+    if (decided?.kind === 'repair_role_request')
+      this.assertConfirmedPactRepairRole(current, receipt, decided, input.settingsRevision)
     const relayAction =
       (receipt.action === 'extend_plan_review' ? 'extend_plan_review' : undefined) ??
       supplement ??
@@ -14834,6 +16135,8 @@ export class ConversationRepository {
         reservation.id,
         state === 'not_sent' ? 'not_sent' : 'settled',
       )
+    if (notSent && receipt.decisionId)
+      scheduling.recordPactRepairBusinessActivity(this.database, run.id)
     if (notSent && receipt.reviewState === 'pending') this.restoreUnsentSupplementSchedule(receipt)
   }
 
@@ -15226,6 +16529,7 @@ export class ConversationRepository {
       taskDocument: task.taskDocument,
       planReference: task.planReference,
       review: task.review,
+      ...(task.reviewControlCoverage ? { reviewControlCoverage: task.reviewControlCoverage } : {}),
       reviewScopeRef: task.reviewScopeRef,
       codeRunId: task.codeRunId,
       pendingWork: task.pendingWork,
@@ -15272,6 +16576,22 @@ export class ConversationRepository {
         }),
       },
     })
+  }
+
+  private workflowHandoffOccupied(handoffId: string): boolean {
+    return Boolean(
+      this.handoffReceipt(handoffId)?.action ||
+      this.database
+        .select({ id: collaborationActionReceipts.id })
+        .from(collaborationActionReceipts)
+        .where(
+          and(
+            eq(collaborationActionReceipts.handoffId, handoffId),
+            sql`${collaborationActionReceipts.active} = 1`,
+          ),
+        )
+        .get(),
+    )
   }
 
   /** Recovery identity/readback only: this does not run Check, retry, resend or create a candidate. */
@@ -15526,7 +16846,7 @@ export class ConversationRepository {
       planSha256: auth.data.planReference?.document.sha256 ?? null,
       scopeId,
     }
-    return { source, state, auth: auth.data, row }
+    return { source, state, auth: auth.data, row, run }
   }
 
   private earlierRelayTurn(
@@ -15621,11 +16941,11 @@ export class ConversationRepository {
       return undefined
     const reviewStage = planning || task.stage === 'plan_review' ? 'plan_review' : 'code_review'
     let previous = this.earlierRelayTurn(task, [reviewStage], producer.source.ordinal)
+    const settlement = planning ? this.workflowPlanSettlement(producer.source.runId) : undefined
     const earlier = previous && this.earlierRelayTurn(task, [reviewStage], previous.source.ordinal)
     let node: RelayWorkflowSnapshot['node']
     let response: ReturnType<ConversationRepository['earlierRelayTurn']>
     let decisionBatch: { id: string; sequence: number; body: string | null } | undefined
-    const settlement = planning ? this.workflowPlanSettlement(producer.source.runId) : undefined
     if (planning && this.planReviewLimitReached(task)) {
       if (
         !settlement ||
@@ -16090,6 +17410,17 @@ export class ConversationRepository {
     }
   }
 
+  private workflowDecisionMessageHasImages(messageId: string): boolean {
+    return Boolean(
+      this.database
+        .select({ id: conversationMessageImages.imageId })
+        .from(conversationMessageImages)
+        .where(eq(conversationMessageImages.messageId, messageId))
+        .limit(1)
+        .get(),
+    )
+  }
+
   /** Existing complete frozen Input Batches serve every workflow advice node. */
   private collectWorkflowDecisionInputSources(
     task: CollaborationTask,
@@ -16132,14 +17463,7 @@ export class ConversationRepository {
       for (const batch of batches) {
         if (!batch.messageId || !batch.body)
           throw new RunOperationConflictError('A complete workflow input source is unavailable.')
-        if (
-          this.database
-            .select({ id: conversationMessageImages.imageId })
-            .from(conversationMessageImages)
-            .where(eq(conversationMessageImages.messageId, batch.messageId))
-            .limit(1)
-            .get()
-        )
+        if (this.workflowDecisionMessageHasImages(batch.messageId))
           throw new RunOperationConflictError('Decision advice does not support required images.')
         const provenance = {
           messageId: batch.messageId,
@@ -16313,14 +17637,7 @@ export class ConversationRepository {
       throw new RunOperationConflictError(
         'The complete immutable Comment target Message is unavailable.',
       )
-    if (
-      this.database
-        .select({ id: conversationMessageImages.imageId })
-        .from(conversationMessageImages)
-        .where(eq(conversationMessageImages.messageId, message.id))
-        .limit(1)
-        .get()
-    )
+    if (this.workflowDecisionMessageHasImages(message.id))
       throw new RunOperationConflictError(
         'Decision advice does not support required target images.',
       )
@@ -16456,7 +17773,7 @@ export class ConversationRepository {
     )
   }
 
-  evaluationIsCurrent(node: import('@pact/contracts').SchedulingHandoff): boolean {
+  evaluationIsCurrent(node: SchedulingHandoff): boolean {
     try {
       this.assertSchedulingFreshness(node)
       return true
@@ -16933,6 +18250,7 @@ export class ConversationRepository {
       raw.automaticRecoveryRevoked ||
       run.reexecutedFromRunId ||
       run.forkSourceRunId ||
+      this.collaborationTurnAuthorization(run.id)?.replyIntentBasis?.kind === 'ask_only' ||
       run.controlDisposition === 'abandoned' ||
       !['failed', 'interrupted'].includes(run.status) ||
       run.nativeTurnId ||
@@ -17909,6 +19227,8 @@ export class ConversationRepository {
               task.reviewer !== current.reviewer ||
               task.rolePolicy !== current.rolePolicy ||
               !isDeepStrictEqual(task.stageRoles, current.stageRoles) ||
+              !isDeepStrictEqual(task.planAcceptanceCoverage, current.planAcceptanceCoverage) ||
+              !isDeepStrictEqual(task.reviewControlCoverage, current.reviewControlCoverage) ||
               current.status === 'running' ||
               (task.stage !== 'reply' &&
                 ((current.automation !== 'active' && !explicitResume) ||
@@ -17925,6 +19245,8 @@ export class ConversationRepository {
           } else {
             if (
               input.expectedCollaborationRevision !== undefined ||
+              task.planAcceptanceCoverage ||
+              task.reviewControlCoverage ||
               task.taskMessageId !== input.clientMessageId
             )
               throw new RunOperationConflictError('This workflow task is no longer current.')
@@ -18021,13 +19343,21 @@ export class ConversationRepository {
           approvedRelayScope,
         )
         const userAuthority = admittedAction?.userAuthority
+        const received = input.receivedInputId
+          ? this.receivedCollaborationInput(input.sessionId)
+          : undefined
+        const askOnly =
+          received?.id === input.receivedInputId &&
+          received &&
+          storedReceivedMetadata(received.metadataJson).replyIntentBasis?.kind === 'ask_only'
         const batch = this.freezeInputBatch({
           sessionId: input.sessionId,
           clientMessageId: input.clientMessageId,
           commentsRevision: session.commentsRevision,
           actor: input.agentId,
           ...(input.batchId ? { batchId: input.batchId } : {}),
-          ...(input.collaboration &&
+          ...(!askOnly &&
+          input.collaboration &&
           (input.collaboration.taskMessageId === input.clientMessageId ||
             input.collaboration.stage === 'reply')
             ? { taskId: input.collaboration.id }
@@ -18039,7 +19369,7 @@ export class ConversationRepository {
           ...(input.userInformation ? { userInformation: input.userInformation } : {}),
         })
         this.sealInputBatchSources(batch.id, runId)
-        this.freezeRunSources(runId, input.handoffSourceRefs ?? [])
+        this.freezeRunSources(runId, input.handoffSourceRefs ?? [], Boolean(input.collaboration))
         if (userAuthority?.purpose === 'write_continuation' && currentTask?.pendingWork) {
           const original = this.unfinishedWriteSource(currentTask, currentTask.pendingWork.runId)
           const source = this.quotedSource(input.sessionId, original.run.userMessageId)
@@ -18351,7 +19681,7 @@ export class ConversationRepository {
           updatedAt: createdAt,
         })
         .run()
-      this.freezeRunSources(runId, input.handoffSourceRefs ?? [])
+      this.freezeRunSources(runId, input.handoffSourceRefs ?? [], false)
       const userSource = this.quotedSource(input.sessionId, input.userMessageId)
       transaction
         .insert(conversationRunSourceRefs)
@@ -19211,28 +20541,19 @@ export class ConversationRepository {
   }
 
   bindingHasUnsettledWork(sessionId: string, agentId: RuntimeAgentId, generation: number): boolean {
-    return (
-      this.database
-        .select({ id: agentRuns.id })
-        .from(agentRuns)
-        .where(
-          and(
-            eq(agentRuns.sessionId, sessionId),
-            eq(agentRuns.agentId, agentId),
-            eq(agentRuns.bindingGeneration, generation),
-            ne(agentRuns.controlDisposition, 'abandoned'),
-            isNull(agentRuns.forkSourceRunId),
-            or(
-              inArray(agentRuns.nativeEffectsState, ['pending', 'unknown']),
-              and(
-                sql`${agentRuns.nativeOutcome} IS NULL`,
-                inArray(agentRuns.dispatchPhase, ['accepted', 'possibly_sent']),
-              ),
-            ),
-          ),
-        )
-        .limit(1)
-        .get() !== undefined
+    return Boolean(
+      this.database.get<{ id: string }>(sql`
+      SELECT id FROM ${agentRuns} INDEXED BY agent_runs_native_quit_unsettled_idx
+      WHERE ${agentRuns.sessionId} = ${sessionId} AND ${agentRuns.forkSourceRunId} IS NULL
+        AND ((${agentRuns.status} IN ('starting', 'running', 'recovering') AND ${agentRuns.controlDisposition} <> 'abandoned')
+          OR ${agentRuns.nativeEffectsState} IN ('pending', 'unknown')
+          OR (${agentRuns.dispatchPhase} IN ('possibly_sent', 'accepted', 'ended') AND ${agentRuns.nativeOutcome} IS NULL))
+        AND ${agentRuns.agentId} = ${agentId} AND ${agentRuns.bindingGeneration} = ${generation}
+        AND ${agentRuns.controlDisposition} <> 'abandoned'
+        AND (${agentRuns.nativeEffectsState} IN ('pending', 'unknown')
+          OR (${agentRuns.nativeOutcome} IS NULL AND ${agentRuns.dispatchPhase} IN ('possibly_sent', 'accepted')))
+      LIMIT 1
+    `),
     )
   }
 

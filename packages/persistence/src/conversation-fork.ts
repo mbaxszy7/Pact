@@ -811,6 +811,8 @@ export function commitFork(
               handledInputSequence: Math.min(task.handledInputSequence, inputSequence),
               authorization: undefined,
               pendingWork: undefined,
+              planAcceptanceCoverage: undefined,
+              reviewControlCoverage: undefined,
               nextStage: undefined,
             }),
           ),
@@ -1051,8 +1053,15 @@ export function commitFork(
           })
           .where(eq(collaborationTasks.id, task.id))
           .run()
+      const originalAuthorization = historicalAuthorizations.get(row.runId)!
       const authorization = collaborationTurnAuthorizationSchema.parse(
-        remapMetadata(historicalAuthorizations.get(row.runId)!),
+        remapMetadata({
+          ...originalAuthorization,
+          replyIntentBasis: undefined,
+          ...(originalAuthorization.replyIntentBasis?.kind === 'ask_only'
+            ? { historicalInputKind: 'ask_only' }
+            : {}),
+        }),
       )
       database
         .insert(workflowTurns)

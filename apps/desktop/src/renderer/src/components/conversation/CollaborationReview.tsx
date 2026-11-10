@@ -189,6 +189,9 @@ export const CollaborationReview = memo(function CollaborationReview({
         revision: task.revision,
         clientMessageId: crypto.randomUUID(),
         action,
+        ...(action === 'request_repair_role_switch'
+          ? { repairActor: collaborationActor(task, 'code_review') }
+          : {}),
         ...(decision ? { decision: { id: decision.id, revision: decision.revision } } : {}),
       })
       if (!response.ok)
@@ -301,11 +304,15 @@ export const CollaborationReview = memo(function CollaborationReview({
           !(action === 'recover_plan' && actionError),
       )
     : []
+  const repairChoiceUnavailable = actionable && view?.repairChoiceUnavailable
+  const canOpenLimitSettings =
+    (continuationLimit || repairChoiceUnavailable) && onOpenSessionSettings
   const actionLabel = (action: DisplayedCollaborationAction): string =>
     ({
       execute: `Implement plan · ${agentName(collaborationActor(task, 'implement'))}`,
       respond: `Respond · ${agentName(collaborationActor(task, 'respond'))}`,
       repair: `Repair · ${agentName(collaborationActor(task, 'repair'))}`,
+      request_repair_role_switch: `Choose repairer · ${agentName(collaborationActor(task, 'code_review'))}`,
       pause: 'Pause collaboration',
       resume: 'Continue collaboration',
       recover_plan: planSync?.kind === 'response' ? 'Restore plan response' : 'Restore saved plan',
@@ -404,7 +411,10 @@ export const CollaborationReview = memo(function CollaborationReview({
       {actionable && view?.received?.state === 'blocked' ? (
         <p className="mt-1 text-secondary">Your message delivery needs attention.</p>
       ) : null}
-      {actions.length || (continuationLimit && onOpenSessionSettings) ? (
+      {repairChoiceUnavailable ? (
+        <p className="mt-1 text-secondary">{repairChoiceUnavailable}</p>
+      ) : null}
+      {actions.length || canOpenLimitSettings ? (
         <div
           aria-label="Pact Proposal"
           className="pact-review-actions mt-2 flex flex-wrap items-center gap-1.5"
@@ -425,7 +435,7 @@ export const CollaborationReview = memo(function CollaborationReview({
               {busy ? (action === 'recover_plan' ? 'Restoring…' : 'Sending…') : actionLabel(action)}
             </button>
           ))}
-          {continuationLimit && onOpenSessionSettings ? (
+          {canOpenLimitSettings ? (
             <button
               type="button"
               disabled={disabled || busy}

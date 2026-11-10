@@ -14,6 +14,7 @@ import type {
 import {
   advanceCollaboration,
   collaborationTaskSchema,
+  collaborationTurnAuthorizationSchema,
   defaultTaskStageRoles,
 } from '@pact/contracts'
 
@@ -21,6 +22,7 @@ import { PactDatabase } from './pact-database.js'
 import {
   agentRuns,
   collaborationInputs,
+  workflowTurns,
   anchoredComments,
   conversationMessages,
   nativeAgentContexts,
@@ -445,6 +447,80 @@ describe('Frozen Fork through ConversationRepository', () => {
       expect(frozen.members.map((item) => item.commentId)).toContain(comment.id)
     },
   )
+  it('does not transfer parent-only Plan acceptance or review control coverage to the historical Fork', async () => {
+    const f = await fixture(':memory:', true)
+    const parent = f.repo.collaboration(f.sourceId)!
+    const frozen = f.db.drizzle
+      .select()
+      .from(workflowTurns)
+      .where(eq(workflowTurns.runId, parent.runId))
+      .get()!
+    const state = collaborationTaskSchema.parse(JSON.parse(frozen.stateJson))
+    const coverage = {
+      reviewRunId: parent.review!.runId,
+      planReference: parent.planReference!,
+      fromInputSequence: 1,
+      throughInputSequence: 2,
+      producerRunId: parent.runId,
+      evaluationId: randomUUID(),
+      handoffId: hash('parent handoff'),
+      sourceFingerprint: hash('parent-only sources'),
+    }
+    const control = {
+      kind: 'repair_role_request' as const,
+      reviewRunId: parent.review!.runId,
+      reviewInputSequence: 1,
+      report: parent.review!.document,
+      scope: parent.planReference!.document,
+      producerRunId: parent.runId,
+      priorInputSequence: 1,
+      inputSequence: 2,
+      inputId: randomUUID(),
+      inputDigest: hash('parent-only control'),
+    }
+    const authorization = collaborationTurnAuthorizationSchema.parse({
+      ...collaborationTurnAuthorizationSchema.parse(JSON.parse(frozen.authorizationJson)),
+      replyIntentBasis: {
+        kind: control.kind,
+        inputId: control.inputId,
+        inputDigest: control.inputDigest,
+        priorInputSequence: 1,
+        taskRevision: parent.revision,
+        review: parent.review,
+      },
+    })
+    f.db.drizzle
+      .update(workflowTurns)
+      .set({
+        stateJson: JSON.stringify(
+          collaborationTaskSchema.parse({
+            ...state,
+            planAcceptanceCoverage: coverage,
+            reviewControlCoverage: control,
+          }),
+        ),
+        authorizationJson: JSON.stringify(authorization),
+      })
+      .where(eq(workflowTurns.runId, parent.runId))
+      .run()
+    const child = f.commit()
+    const inherited = f.repo
+      .read(child.sessionId)
+      .runs.find((run) => run.forkSourceRunId === parent.runId)!
+    expect(
+      f.repo.collaboration(child.sessionId, inherited.id)?.planAcceptanceCoverage,
+    ).toBeUndefined()
+    expect(
+      f.repo.collaboration(child.sessionId, inherited.id)?.reviewControlCoverage,
+    ).toBeUndefined()
+    expect(f.repo.collaborationTurnAuthorization(inherited.id)?.replyIntentBasis).toBeUndefined()
+    expect(f.repo.collaboration(child.sessionId)).toBeUndefined()
+    expect(
+      f.db.drizzle.select().from(workflowTurns).where(eq(workflowTurns.runId, parent.runId)).get()
+        ?.stateJson,
+    ).toContain(coverage.evaluationId)
+  })
+
   it('refuses a plan Comment whose source Run lies outside the frozen prefix', async () => {
     const f = await fixture()
     f.db.drizzle

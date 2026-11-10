@@ -1096,6 +1096,7 @@ export const relayDecisions = sqliteTable(
         'prepared_input_continue',
         'reassign_roles',
         'extend_plan_review',
+        'repair_role_request',
       ],
     }).notNull(),
     formatVersion: integer('format_version').notNull().default(1),

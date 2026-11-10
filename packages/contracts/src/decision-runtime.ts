@@ -11,6 +11,7 @@ export const DECISION_CANCEL_TARGET_MS = 2_000
 export const DECISION_CLEANUP_TARGET_MS = 4_000
 export const DECISION_CANDIDATES = 8
 export const DECISION_SOURCES = 12
+export const PRESERVE_PLAN_ACCEPTANCE = 'preserve_plan_acceptance'
 export const DECISION_HIGHLIGHTS = 8
 export const DECISION_SCHEMA_DEPTH = 4
 export const DECISION_PHYSICAL_RECEIPT_ITEMS = 32

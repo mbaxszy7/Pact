@@ -128,9 +128,13 @@
   border-radius: 12px;
 }
 
-.prepared-input-card {
+.prepared-input-card,
+.pact-repair-card {
   border: 1px solid var(--pact-border);
   background: var(--pact-surface-raised);
+}
+.pact-repair-card {
+  color: var(--pact-text-primary);
 }
 .prepared-input-card .relay-decision-body {
   max-height: min(36vh, 20rem);

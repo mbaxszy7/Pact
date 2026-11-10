@@ -14,6 +14,7 @@ import {
   collaborationReviewInputSchema,
   collaborationActor,
   collaborationInputResultSchema,
+  collaborationInputOutcomeAllowed,
   collaborationPlanRetentionInputSchema,
   collaborationPlanRetentionAllowed,
   type CollaborationInputObservation,
@@ -30,7 +31,9 @@ import {
 import { recordDiagnostic } from '../../diagnostics/utility-log'
 import {
   collaborationInputResultAllowed,
-  collaborationPlanMode,
+  collaborationInputResultDescription,
+  collaborationInputResultReceiptText,
+  collaborationPlanRetentionReceiptText,
   collaborationSourceToolDescription,
 } from './collaboration-prompt'
 import {
@@ -67,6 +70,7 @@ export class PactPeerToolServer {
   private turn: PeerAssistanceTurn | undefined
 
   private collaboration: CollaborationTask | undefined
+  private collaborationAuthorization: CollaborationTurnAuthorization | undefined
   // One exact-root source capability. It can outlive foreground peer/title admission,
   // but a later Run cannot replace it while that root is still live.
   private sourceGrant:
@@ -117,6 +121,7 @@ export class PactPeerToolServer {
         : undefined
     this.peerAllowed = allowed && !collaboration
     this.collaboration = collaboration
+    this.collaborationAuthorization = authorization
     this.planRetentionAllowed = collaborationPlanRetentionAllowed(
       collaboration,
       authorization ?? collaboration?.authorization,
@@ -167,6 +172,7 @@ export class PactPeerToolServer {
     if (this.turn?.receipt !== receipt) return
     this.turn = undefined
     this.collaboration = undefined
+    this.collaborationAuthorization = undefined
     this.planRetentionAllowed = false
     this.planRetentionCurrent = undefined
     this.peerAllowed = false
@@ -197,11 +203,12 @@ export class PactPeerToolServer {
     input: unknown,
     turnReceipt: string,
   ): CollaborationInputObservation | undefined {
-    if (this.turn?.receipt !== turnReceipt || !collaborationInputResultAllowed(this.collaboration))
+    const task = this.collaboration
+    const auth = this.collaborationAuthorization
+    if (this.turn?.receipt !== turnReceipt || !task || !collaborationInputResultAllowed(task, auth))
       return undefined
     const parsed = collaborationInputResultSchema.safeParse(input)
-    return parsed.success &&
-      (!collaborationPlanMode(this.collaboration) || parsed.data.outcome === 'needs_user')
+    return parsed.success && collaborationInputOutcomeAllowed(task, auth, parsed.data.outcome)
       ? parsed.data
       : undefined
   }
@@ -486,8 +493,7 @@ export class PactPeerToolServer {
               },
               {
                 name: 'submit_input_result',
-                description:
-                  'Report processed only when this reply has fully handled the supplied user input and no required user choice remains; otherwise report needs_user with up to three explicit questions and optional choices. Planners may only report needs_user questions. This cannot approve implementation, repair, or code.',
+                description: collaborationInputResultDescription,
                 inputSchema: collaborationInputResultSchema.toJSONSchema(),
                 annotations: {
                   readOnlyHint: true,
@@ -720,7 +726,7 @@ export class PactPeerToolServer {
                 {
                   type: 'text',
                   text: accepted
-                    ? 'Retention intent validated. Finish this root normally; Pact will verify the native result and settle the current input. This is not implementation approval.'
+                    ? collaborationPlanRetentionReceiptText
                     : 'No frozen current plan may be retained by this root.',
                 },
               ],
@@ -745,7 +751,7 @@ export class PactPeerToolServer {
                 {
                   type: 'text',
                   text: outcome
-                    ? 'Input result validated. Finish this root; Pact will settle it after normal completion.'
+                    ? collaborationInputResultReceiptText
                     : 'No pending input response is authorized for this root.',
                 },
               ],

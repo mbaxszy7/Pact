@@ -38,7 +38,11 @@ import {
   type AgentNativeForkInspection,
   type AgentNativeForkWitness,
 } from '@pact/agent-runtime'
-import { nativeCodexSkillListSchema, collaborationPlanRetentionAllowed } from '@pact/contracts'
+import {
+  nativeCodexSkillListSchema,
+  collaborationPlanRetentionAllowed,
+  collaborationInputOutcomeAllowed,
+} from '@pact/contracts'
 import {
   nativePermissionRequestSchema,
   peerRequestToolInputSchema,
@@ -3262,12 +3266,16 @@ export class CodexAgentAdapter implements AgentAdapter {
     }
     const captureInputResult = (outcome: CollaborationInputObservation): void => {
       if (
+        !workflow ||
         !collaborationInputResultAllowed(
           workflow,
           input.promptEnvelope.collaborationAuthorization,
         ) ||
-        (collaborationPlanMode(workflow, input.promptEnvelope.collaborationAuthorization) &&
-          outcome.outcome === 'processed')
+        !collaborationInputOutcomeAllowed(
+          workflow,
+          input.promptEnvelope.collaborationAuthorization,
+          outcome.outcome,
+        )
       )
         return
       projectOutput(() => {
@@ -3712,6 +3720,9 @@ export class CodexAgentAdapter implements AgentAdapter {
                 )
                 if (
                   outcome &&
+                  result &&
+                  typeof result === 'object' &&
+                  Reflect.get(result, 'isError') !== true &&
                   Reflect.get(receipt, 'outcome') === outcome.outcome &&
                   JSON.stringify(Reflect.get(receipt, 'questions')) ===
                     JSON.stringify(outcome.questions)

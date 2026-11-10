@@ -5,7 +5,11 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import type { FrozenExecutionEnvelope, RunEffectiveExecutionSettings } from '@pact/contracts'
+import type {
+  AgentRun,
+  FrozenExecutionEnvelope,
+  RunEffectiveExecutionSettings,
+} from '@pact/contracts'
 
 import {
   configureDecisionFixtureCredential,
@@ -394,6 +398,234 @@ async function stoppedWriteReplacement(
     resume: () => startAction('resume'),
   }
 }
+async function pactRepairCheckpoint() {
+  const f = await planRevisionFixture({ rolePolicy: 'split-stages-v1' })
+  databases.add(f.db)
+  configureDecisionFixtureCredential(f.repo)
+  f.repo.beginSchedulingRecoveryEpoch(randomUUID())
+  const revision = f.repo.beginRun(f.admission()).run
+  f.finish(revision.id, { plan: 'Keep the original scope and repair the cancellation defect.' })
+  const accepted = f.repo.beginRun(f.admission()).run
+  f.finish(accepted.id, { verdict: 'accepted' })
+  const task = f.repo.collaboration(f.sessionId)!
+  const clientMessageId = randomUUID()
+  const action = f.repo.prepareCollaborationAction(
+    {
+      sessionId: f.sessionId,
+      taskId: task.id,
+      revision: task.revision,
+      clientMessageId,
+      action: 'execute',
+    },
+    settings,
+  )
+  const implement = f.repo.beginRun({
+    sessionId: f.sessionId,
+    clientMessageId,
+    content: 'Implement the exact accepted scope.',
+    agentId: action.next!.actor,
+    commentIds: [],
+    expectedCommentsRevision: drafts(f).commentsRevision,
+    settingsRevision: 1,
+    model: null,
+    effort: null,
+    preserveDraftComments: true,
+    collaboration: action.next!,
+    expectedCollaborationRevision: task.revision,
+    collaborationActionReceiptId: action.receipt.id,
+    schedulingHandoff: action.handoff,
+  }).run
+  f.finish(implement.id)
+  const review = f.repo.beginRun(f.admission()).run
+  f.finish(review.id, {
+    verdict: 'changes_requested',
+    answer: 'Repair the original cancellation defect.',
+  })
+  const input = 'Please repair your existing findings yourself.'
+  const nonce = randomUUID(),
+    owner = randomUUID()
+  const { inputId } = f.repo.writeConversationInput(
+    {
+      type: 'begin',
+      sessionId: f.sessionId,
+      clientMessageId: nonce,
+    },
+    owner,
+  )
+  f.repo.writeConversationInput(
+    { type: 'append', sessionId: f.sessionId, inputId, offset: 0, text: input },
+    owner,
+  )
+  f.repo.writeConversationInput({ type: 'seal', sessionId: f.sessionId, inputId }, owner)
+  f.repo.receiveCollaborationInput(
+    {
+      sessionId: f.sessionId,
+      clientMessageId: nonce,
+      content: input,
+      commentIds: [],
+      expectedCommentsRevision: drafts(f).commentsRevision,
+      route: { type: 'agent', agentId: 'codex' },
+    },
+    inputId,
+    'codex',
+    'immediate_safe_point',
+    owner,
+  )
+  const received = f.repo.readReceivedInput(f.sessionId)!
+  const waiting = f.repo.collaboration(f.sessionId)!
+  const reply = f.repo.beginRun({
+    sessionId: f.sessionId,
+    clientMessageId: received.id,
+    content: input,
+    agentId: 'codex',
+    commentIds: [],
+    expectedCommentsRevision: drafts(f).commentsRevision,
+    settingsRevision: 1,
+    model: null,
+    effort: null,
+    preserveDraftComments: true,
+    collaboration: f.repo.workflowReply(waiting, 'codex'),
+    expectedCollaborationRevision: waiting.revision,
+    receivedInputId: received.id,
+  }).run
+  expect(f.repo.collaborationTurnAuthorization(reply.id)?.replyIntentBasis?.kind).toBe(
+    'repair_role_request',
+  )
+  return { ...f, reply, input, review }
+}
+
+async function replaceUnsentPactTurn(
+  f: Awaited<ReturnType<typeof pactRepairCheckpoint>>,
+  original: AgentRun,
+  content: string,
+) {
+  const nativeGeneration = randomUUID(),
+    executorId = randomUUID(),
+    nativeSessionId = 'fixture-codex'
+  f.repo.recordExecutor(original.id, executorId)
+  f.repo.applyEvent(f.sessionId, original.id, {
+    type: 'session.started',
+    agentId: 'codex',
+    nativeSessionId,
+  })
+  f.repo.setContinuation(f.sessionId, 'codex', 'ready')
+  const envelope: FrozenExecutionEnvelope = {
+    version: 'pact-agent-prompt-v1',
+    sessionId: f.sessionId,
+    message: { id: original.userMessageId, content },
+    comments: [],
+    collaboration: f.repo.collaborationPromptState(f.repo.collaboration(f.sessionId)!),
+    collaborationAuthorization: f.repo.collaborationTurnAuthorization(original.id),
+    inputBatchRef: f.repo.inputBatchForRun(original.id),
+  }
+  expect(
+    await f.repo.captureExecutionInput({
+      runId: original.id,
+      nativeGeneration,
+      requested: {
+        ...requested,
+        model: original.model ?? null,
+        permissionMode: original.permissionMode ?? 'native',
+      },
+      source: bytes(JSON.stringify(envelope)),
+      signal: new AbortController().signal,
+    }),
+  ).toBeDefined()
+  f.repo.recordEffectiveExecutionSettings(
+    original.id,
+    nativeGeneration,
+    {
+      ...effective,
+      permissionMode: original.permissionMode ?? 'native',
+    },
+    { executorId, nativeSessionId },
+  )
+  f.repo.recordDispatch(original.id, 'rejected', nativeSessionId, executorId)
+  f.repo.recordConfirmedUnsent(
+    original.id,
+    nativeGeneration,
+    { kind: 'codex_root_frame_not_written', requestId: 9 },
+    { executorId, nativeSessionId },
+  )
+  f.repo.failRun(original.id, 'transient_transport', 'Physical root was not written.')
+  f.repo.finishCollaboration(original.id, false, 'Physical root was not written.')
+  f.repo.armSchedulingRecoveryFaults(f.sessionId)
+  const fault = f.repo
+    .takeSchedulingRecoveryFaults()
+    .find((row) => row.fault.runId === original.id)!
+  return f.repo.beginConfirmedUnsentReexecution({
+    operationId: randomUUID(),
+    faultId: fault.fault.id,
+    handoff: f.repo.recoveryHandoff({ kind: 'run', id: original.id }),
+  }).run
+}
+
+it('settles the original role-control Batch after a positively unsent reply replacement', async () => {
+  const f = await pactRepairCheckpoint()
+  const replacement = await replaceUnsentPactTurn(f, f.reply, f.input)
+  f.repo.assertWorkflowDispatch(replacement.id)
+  f.repo.recordWorkflowInputResult(replacement.id, { outcome: 'repair_role_request' })
+  f.finish(replacement.id, { answer: 'Pact can confirm the requested repair.' })
+  expect(f.repo.collaboration(f.sessionId)?.reviewControlCoverage).toMatchObject({
+    producerRunId: replacement.id,
+    reviewRunId: f.review.id,
+    inputId: f.reply.userMessageId,
+  })
+  expect(f.repo.relaySchedulingDecision(f.sessionId)?.request).toMatchObject({
+    category: 'new_authorization',
+    operation: { kind: 'repair_role_request', actor: 'codex' },
+  })
+})
+
+it('dispatches a positively unsent Pact repair replacement under the same scoped receipt', async () => {
+  const f = await pactRepairCheckpoint()
+  f.repo.recordWorkflowInputResult(f.reply.id, { outcome: 'repair_role_request' })
+  f.finish(f.reply.id, { answer: 'Pact can confirm the requested repair.' })
+  const card = f.repo.relaySchedulingDecision(f.sessionId)!
+  const nonce = randomUUID(),
+    content = 'Repair the reviewed changes.'
+  const confirmation = f.repo.answerRelaySchedulingDecision({
+    reference: { sessionId: f.sessionId, decisionId: card.decisionId, revision: card.revision },
+    clientOperationId: nonce,
+    answer: { kind: 'confirm' },
+  })
+  const prepared = f.repo.preparedRelayWorkflowAction(confirmation.receiptId!)
+  const repair = f.repo.beginRun({
+    sessionId: f.sessionId,
+    clientMessageId: nonce,
+    content,
+    commentIds: [],
+    expectedCommentsRevision: drafts(f).commentsRevision,
+    agentId: prepared.next.actor,
+    settingsRevision: 1,
+    model: null,
+    effort: null,
+    preserveDraftComments: true,
+    collaboration: prepared.next,
+    expectedCollaborationRevision: prepared.task.revision,
+    schedulingHandoff: prepared.handoff,
+    collaborationActionReceiptId: prepared.receipt.id,
+  }).run
+  f.repo.assertWorkflowDispatch(repair.id)
+  const replacement = await replaceUnsentPactTurn(f, repair, content)
+  expect(() => f.repo.assertWorkflowDispatch(replacement.id)).not.toThrow()
+  expect(f.repo.collaborationTurnAuthorization(replacement.id)?.userAuthority).toEqual(
+    f.repo.collaborationTurnAuthorization(repair.id)?.userAuthority,
+  )
+  f.finish(replacement.id, { answer: 'The original defect is repaired.' })
+  expect(
+    f.repo.readSchedulingActivity({}).rows.find((row) => row.id === card.decisionId),
+  ).toMatchObject({ actionResult: 'completed', called: false })
+  const nextReview = f.repo.beginRun(f.admission()).run
+  expect(nextReview.agentId).toBe('claude')
+  f.finish(nextReview.id, { verdict: 'accepted' })
+  expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+    status: 'complete',
+    repairAttempts: 1,
+    reviewCycles: 2,
+  })
+})
+
 function counts(f: Fixture) {
   return {
     runs: f.db.drizzle.select().from(agentRuns).all().length,

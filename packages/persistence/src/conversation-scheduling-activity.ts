@@ -3,12 +3,14 @@ import { createHash } from 'node:crypto'
 
 import {
   SCHEDULING_ACTIVITY_PAGE_ITEMS,
+  PRESERVE_PLAN_ACCEPTANCE,
   confirmedUnsentProofSchema,
   frozenExecutionInputSchema,
   nativeInitializationWitnessSchema,
   runEffectiveExecutionSettingsSchema,
   relaySchedulingDecisionProofSchema,
   relayNativeRecoveryProofSchema,
+  pactRepairRoleProofSchema,
   relayDecisionReceiptSchema,
   preparedInformationControlSchema,
   schedulingActivityActionResultSchema,
@@ -29,6 +31,7 @@ import type { PactDrizzleDatabase } from './drizzle-database.js'
 import { RunOperationConflictError } from './conversation-errors.js'
 import {
   agentRuns,
+  collaborationActionReceipts,
   conversationInputBatches,
   nativeRebuildOperations,
   projects,
@@ -245,12 +248,18 @@ export function syncEvaluationActivity(
     (evaluation.called && evaluation.selectedCandidateId ? 'suggested' : 'none')
   const suggestionState =
     state === 'none' && evaluation.called && evaluation.selectedCandidateId ? 'suggested' : state
-  const action =
-      change.action === undefined ? actionFor(prior?.action ?? handoff.action) : change.action,
-    actionResult =
-      change.actionResult === undefined
-        ? (prior?.actionResult ?? (handoff.runId ? 'reserved' : null))
-        : change.actionResult
+  const coverageAdopted =
+    suggestionState === 'adopted' && evaluation.selectedCandidateId === PRESERVE_PLAN_ACCEPTANCE
+  const action = coverageAdopted
+    ? null
+    : change.action === undefined
+      ? actionFor(prior?.action ?? handoff.action)
+      : change.action
+  const actionResult = coverageAdopted
+    ? null
+    : change.actionResult === undefined
+      ? (prior?.actionResult ?? (handoff.runId ? 'reserved' : null))
+      : change.actionResult
   put(db, {
     id,
     sessionId: evaluation.sessionId,
@@ -445,7 +454,7 @@ function recordNativeDecisionActivity(
 
 export function recordRelayDecisionActivity(db: PactDrizzleDatabase, decisionId: string): void {
   const decision = db.select().from(relayDecisions).where(eq(relayDecisions.id, decisionId)).get()
-  if (!decision || decision.formatVersion !== 2) return
+  if (!decision || ![2, 4].includes(decision.formatVersion)) return
   const value: unknown = (() => {
     try {
       return JSON.parse(decision.proofJson)
@@ -453,6 +462,35 @@ export function recordRelayDecisionActivity(db: PactDrizzleDatabase, decisionId:
       return undefined
     }
   })()
+  if (decision.formatVersion === 4) {
+    if (
+      decision.kind !== 'repair_role_request' ||
+      !pactRepairRoleProofSchema.safeParse(value).success
+    )
+      return
+    const awaiting = decision.state === 'awaiting_answer'
+    const authorized = decision.state === 'available' || decision.state === 'bound'
+    put(db, {
+      id: decision.id,
+      sessionId: decision.sessionId,
+      evaluationId: null,
+      decisionId: decision.id,
+      handoffId: decision.handoffId,
+      reason: 'workflow',
+      action: 'repair',
+      suggestionState: awaiting ? 'awaiting_user' : 'none',
+      actionResult: awaiting
+        ? null
+        : authorized
+          ? 'reserved'
+          : decision.state === 'cancelled'
+            ? 'cancelled'
+            : 'not_sent',
+      unresolved: awaiting || authorized,
+      activityAt: decision.updatedAt,
+    })
+    return
+  }
   const native = relayNativeRecoveryProofSchema.safeParse(value)
   if (native.success) {
     recordNativeDecisionActivity(db, decision, native.data)
@@ -496,7 +534,9 @@ export function recordRelayDecisionActivity(db: PactDrizzleDatabase, decisionId:
   const action = reassign
     ? ('reassign_roles' as const)
     : proof.data.card.request.category === 'new_authorization'
-      ? proof.data.card.request.operation.kind
+      ? proof.data.card.request.operation.kind === 'repair_role_request'
+        ? null
+        : proof.data.card.request.operation.kind
       : proof.data.card.request.category === 'necessary_information'
         ? 'clarify_prepared_input'
         : null
@@ -577,7 +617,10 @@ export function refreshNativeRebuildActivityForRecovery(
 /** A default handoff and an adopted suggestion share the same actual dispatch receipt. */
 export function recordHandoffActivity(db: PactDrizzleDatabase, handoffId: string): void {
   const evaluation = db
-    .select({ id: schedulingEvaluations.id })
+    .select({
+      id: schedulingEvaluations.id,
+      candidate: schedulingEvaluations.selectedCandidateId,
+    })
     .from(schedulingEvaluations)
     .where(eq(schedulingEvaluations.handoffId, handoffId))
     .orderBy(desc(schedulingEvaluations.createdAt), desc(schedulingEvaluations.id))
@@ -589,9 +632,12 @@ export function recordHandoffActivity(db: PactDrizzleDatabase, handoffId: string
     .from(schedulingActivity)
     .where(eq(schedulingActivity.evaluationId, evaluation.id))
     .get()
-  // A later explicit Implement shares the same handoff; it must not rewrite the confirmed
-  // role-change outcome as execution activity.
-  if (previous?.action === 'reassign_roles') return
+  // A later explicit Implement shares the handoff with completed arrangement changes.
+  if (
+    previous?.action === 'reassign_roles' ||
+    (previous?.suggestionState === 'adopted' && evaluation.candidate === PRESERVE_PLAN_ACCEPTANCE)
+  )
+    return
   const handoff = db
     .select({ action: schedulingHandoffs.action })
     .from(schedulingHandoffs)
@@ -658,6 +704,38 @@ export function syncRecoveryActivity(
   })
 }
 
+/** Use the exact bound repair receipt, including after a same-scope reexecution. */
+export function recordPactRepairBusinessActivity(
+  db: PactDrizzleDatabase,
+  runId: string,
+  observed?: SchedulingActivityActionResult,
+): void {
+  const receipt = db
+    .select({ decisionId: relayDecisions.id, state: collaborationActionReceipts.state })
+    .from(collaborationActionReceipts)
+    .innerJoin(relayDecisions, eq(relayDecisions.id, collaborationActionReceipts.decisionId))
+    .where(
+      and(
+        eq(collaborationActionReceipts.boundRunId, runId),
+        eq(relayDecisions.formatVersion, 4),
+        eq(relayDecisions.kind, 'repair_role_request'),
+      ),
+    )
+    .get()
+  if (!receipt) return
+  const result =
+    receipt.state === 'not_sent' ? 'not_sent' : observed === 'not_sent' ? 'unconfirmed' : observed
+  if (!result) return
+  db.update(schedulingActivity)
+    .set({
+      actionResult: result,
+      unresolved: unresolvedAction(result),
+      activityAt: new Date().toISOString(),
+    })
+    .where(eq(schedulingActivity.id, receipt.decisionId))
+    .run()
+}
+
 /** Business completion is supplied by the existing response owner, never inferred from
  * a model's recommendation or a transport ending without its canonical output. */
 export function recordBusinessActivity(
@@ -689,6 +767,7 @@ export function recordBusinessActivity(
         : run.phase === 'rejected'
           ? 'not_sent'
           : 'reserved'
+  recordPactRepairBusinessActivity(db, runId, result)
   const handoff = db
     .select({ id: schedulingHandoffs.id })
     .from(schedulingHandoffs)
@@ -705,6 +784,14 @@ export function recordBusinessActivity(
         and(
           eq(schedulingActivity.handoffId, handoff.id),
           sql`(${schedulingActivity.action} IS NULL OR ${schedulingActivity.action} <> 'reassign_roles')`,
+          sql`NOT EXISTS (SELECT 1 FROM scheduling_evaluations e
+            WHERE e.id = ${schedulingActivity.evaluationId}
+              AND e.selected_candidate_id = ${PRESERVE_PLAN_ACCEPTANCE}
+              AND ${schedulingActivity.suggestionState} = 'adopted')`,
+          sql`NOT EXISTS (
+            SELECT 1 FROM relay_decisions d
+            WHERE d.id = ${schedulingActivity.decisionId} AND d.format_version = 4
+          )`,
         ),
       )
       .run()

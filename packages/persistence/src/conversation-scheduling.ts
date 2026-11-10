@@ -67,6 +67,7 @@ import {
 export {
   readActivity,
   recordBusinessActivity,
+  recordPactRepairBusinessActivity,
   recordGuidanceAdoptionActivity,
   recordNativeRebuildActivity,
   refreshNativeRebuildActivityForRecovery,

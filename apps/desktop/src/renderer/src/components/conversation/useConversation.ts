@@ -324,6 +324,7 @@ export interface ConversationFlow {
     route?: NonNullable<ConversationSendInput['route']>,
     skills?: SkillSelection[],
     decision?: DecisionReplyContext,
+    askOnly?: ConversationSendInput['askOnly'],
   ): Promise<boolean>
   acceptPeerProposal(proposalId: string): Promise<boolean>
   dismissPeerProposal(proposalId: string): Promise<boolean>
@@ -414,6 +415,7 @@ export const commentDraftSaveSucceeded = (value: CommentDraftSaveOutcome): value
 
 interface PendingSubmission {
   kind: 'message' | 'decision'
+  askOnly?: ConversationSendInput['askOnly']
   replyToDecision?: ConversationSendInput['replyToDecision'] | undefined
   userInformation?: import('@pact/contracts').UserInformationDeclaration | undefined
   sourceDocument: ConversationComposerDraft
@@ -557,6 +559,7 @@ export function useConversation(
               composerRevision: value.composerRevision,
               commentIds: value.commentIds,
               replyToDecision: value.replyToDecision,
+              askOnly: value.askOnly,
               userInformation: value.userInformation,
             }),
           ).byteLength
@@ -1444,6 +1447,13 @@ export function useConversation(
       const settleDraft = (
         draft: ConversationComposerDraft | undefined,
       ): ConversationComposerDraft | undefined => {
+        if (pending.askOnly) {
+          return draft &&
+            (draft.revision ?? 0) === (pending.composerRevision ?? 0) &&
+            shouldClearComposerAfterAck(draft.text, pending)
+            ? { ...draft, text: '', revision: (draft.revision ?? 0) + 1 }
+            : draft
+        }
         if (pending.kind === 'decision') {
           return draft?.decisionAnswers &&
             JSON.stringify(draft.decisionAnswers) ===
@@ -2642,6 +2652,7 @@ export function useConversation(
     route?: NonNullable<ConversationSendInput['route']>,
     skills?: SkillSelection[],
     decision?: DecisionReplyContext,
+    askOnly?: ConversationSendInput['askOnly'],
   ): Promise<boolean> => {
     if (
       !sessionId ||
@@ -2668,11 +2679,10 @@ export function useConversation(
         : ''
     if (decision && !answers) return false
     const content = decision ? `**Replies to your questions**\n\n${answers}` : original
-    const submissionSkills = decision ? undefined : skills
-    const selectedRoute = decision ? undefined : route
-    const userInformation = decision
-      ? undefined
-      : composerDraftsRef.current[sessionId]?.userInformation
+    const submissionSkills = decision || askOnly ? undefined : skills
+    const selectedRoute = decision || askOnly ? undefined : route
+    const userInformation =
+      decision || askOnly ? undefined : composerDraftsRef.current[sessionId]?.userInformation
     if (userInformation) {
       const validation = userInformationDeclarationSchema.safeParse(userInformation)
       const prefix = parseComposerCommandPrefix(content, submissionSkills)
@@ -2693,7 +2703,7 @@ export function useConversation(
         return false
       }
     }
-    const images = decision ? [] : (composerDraftsRef.current[sessionId]?.images ?? [])
+    const images = decision || askOnly ? [] : (composerDraftsRef.current[sessionId]?.images ?? [])
     if (images.some((image) => image.status !== 'ready' || !image.image)) {
       onNotice('Wait for images to finish preparing, or remove an image that could not be added.')
       return false
@@ -2716,7 +2726,8 @@ export function useConversation(
         JSON.stringify(pending.userInformation) !== JSON.stringify(userInformation) ||
         JSON.stringify(pending.route) !== JSON.stringify(selectedRoute) ||
         JSON.stringify(pending.skills ?? []) !== JSON.stringify(submissionSkills ?? []) ||
-        !sameDecision(pending.replyToDecision, decision?.reference))
+        !sameDecision(pending.replyToDecision, decision?.reference) ||
+        JSON.stringify(pending.askOnly) !== JSON.stringify(askOnly))
     ) {
       pending.acknowledgementError =
         'Confirm the previous message before sending different content.'
@@ -2728,7 +2739,7 @@ export function useConversation(
     }
     const preserved = pending
     const expectedCommentsRevision = preserved?.expectedCommentsRevision ?? currentRevision
-    const submissionCommentIds = preserved?.commentIds ?? (decision ? [] : commentIds)
+    const submissionCommentIds = preserved?.commentIds ?? (decision || askOnly ? [] : commentIds)
     const submissionRoute = preserved ? preserved.route : selectedRoute
     const clientMessageId = preserved?.clientMessageId ?? crypto.randomUUID()
     const operationId = crypto.randomUUID()
@@ -2738,19 +2749,22 @@ export function useConversation(
         : composerDraftsRef.current[sessionId]
     const sourceDocument = preserved?.sourceDocument ??
       currentDocument ?? { text: composerSnapshot }
-    const returnedInputOperationId = decision
-      ? undefined
-      : preserved
-        ? preserved.returnedInputOperationId
-        : sourceDocument.returnedInputOperationId
-    const queueReturnOperationId = decision
-      ? undefined
-      : preserved
-        ? preserved.queueReturnOperationId
-        : sourceDocument.queueReturnOperationId
+    const returnedInputOperationId =
+      decision || askOnly
+        ? undefined
+        : preserved
+          ? preserved.returnedInputOperationId
+          : sourceDocument.returnedInputOperationId
+    const queueReturnOperationId =
+      decision || askOnly
+        ? undefined
+        : preserved
+          ? preserved.queueReturnOperationId
+          : sourceDocument.queueReturnOperationId
     const routeIntent = preserved
       ? (preserved.routeIntent ?? 'explicit')
       : decision ||
+          askOnly ||
           returnedInputOperationId ||
           queueReturnOperationId ||
           selectedRoute?.type === 'agent' ||
@@ -2761,9 +2775,11 @@ export function useConversation(
         : composerRouteIntent({ ...sourceDocument, skills: sourceDocument.skills ?? [] })
     const frozen: PendingSubmission = {
       kind: decision ? 'decision' : 'message',
-      userInformation: decision
-        ? undefined
-        : (preserved?.userInformation ?? sourceDocument.userInformation),
+      ...(askOnly ? { askOnly } : {}),
+      userInformation:
+        decision || askOnly
+          ? undefined
+          : (preserved?.userInformation ?? sourceDocument.userInformation),
       sourceDocument,
       imageIds: preserved?.imageIds ?? imageIds,
       inputId: preserved?.inputId,
@@ -2807,7 +2823,8 @@ export function useConversation(
       ...(frozen.userInformation ? { userInformation: frozen.userInformation } : {}),
       ...(frozen.replyToDecision ? { replyToDecision: frozen.replyToDecision } : {}),
       commentIds: [],
-      freezeDrafts: frozen.kind !== 'decision',
+      freezeDrafts: frozen.kind !== 'decision' && !frozen.askOnly,
+      ...(frozen.askOnly ? { askOnly: frozen.askOnly } : {}),
       batchId: clientMessageId,
       ...(submissionRoute ? { route: submissionRoute } : {}),
       ...(frozen.skills?.length ? { skills: frozen.skills } : {}),

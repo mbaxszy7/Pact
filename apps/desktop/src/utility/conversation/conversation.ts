@@ -2917,11 +2917,13 @@ export class Conversation {
   }
 
   private projectRelaySchedulingDecision(sessionId: string, issues?: SessionIssues) {
-    if (this.conversations.discardStaleRelaySchedulingDecision(sessionId))
-      this.schedulePendingRoutedContinuations()
-    const task = this.conversations.collaboration(sessionId)
     const card = this.conversations.relaySchedulingDecision(sessionId)
-    if (!card) return null
+    if (!card) {
+      if (this.conversations.discardStaleRelaySchedulingDecision(sessionId))
+        this.schedulePendingRoutedContinuations()
+      return null
+    }
+    const task = this.conversations.collaboration(sessionId)
     const recovery =
       issues ??
       this.sessionIssues(
@@ -2985,12 +2987,17 @@ export class Conversation {
       if (this.disposed) return Conversation.shuttingDown()
       if (this.nativeQuitSealed()) return Conversation.quitPrepared()
       if (this.conversations.archives.blocksSession(sessionId)) return Conversation.archiveBusy()
-      const existing = this.conversations.relayDecisionReceipt({
-        sessionId,
-        decisionId: input.reference.decisionId,
-        clientOperationId: input.clientOperationId,
-      })
+      const existing =
+        this.conversations.relayDecisionReceipt({
+          sessionId,
+          decisionId: input.reference.decisionId,
+          clientOperationId: input.clientOperationId,
+        }) ?? this.conversations.confirmedPactRepairRoleDecision(input)
       const card = !existing ? this.projectRelaySchedulingDecision(sessionId) : null
+      if (!existing && !card && this.conversations.retiredPactRepairRoleDecision(input.reference)) {
+        this.publish(this.conversations.metadataPatch(sessionId))
+        throw new RunOperationConflictError('This Pact repair confirmation is no longer current.')
+      }
       // The Repository checks the original digest even for identical answer readback.
       if (!existing && input.answer.kind !== 'cancel' && !card)
         throw new RunOperationConflictError(
@@ -3000,7 +3007,10 @@ export class Conversation {
         !existing &&
         input.answer.kind !== 'cancel' &&
         (card?.request.category === 'necessary_information' ||
-          (input.answer.kind === 'confirm' && card?.request.category === 'arrangement_change')) &&
+          (input.answer.kind === 'confirm' &&
+            (card?.request.category === 'arrangement_change' ||
+              (card?.request.category === 'new_authorization' &&
+                card.request.operation.kind === 'repair_role_request')))) &&
         (this.hasSessionOperation(sessionId) ||
           this.operationCount() >= MAX_AGENT_OPERATIONS ||
           this.permissions.size >= NATIVE_PERMISSION_REQUESTS)
@@ -3021,9 +3031,10 @@ export class Conversation {
       )
         committedCancellation = answer.result
       this.publish(
-        this.conversations.metadataPatch(sessionId, {
-          draftsChanged: 'draftsChanged' in answer && answer.draftsChanged,
-        }),
+        this.conversations.metadataPatch(
+          sessionId,
+          answer.draftsChanged ? { draftsChanged: true } : {},
+        ),
       )
       if (answer.created && 'preparedInput' in answer && answer.preparedInput) {
         unusedPrepared = answer.preparedInput.receipt
@@ -3243,7 +3254,7 @@ export class Conversation {
         throw new RunOperationConflictError(
           'Reserved information supports a new ordinary message only. Remove it before queueing, steering, replying to a workflow, using Skills, images or @all. Your draft was kept.',
         )
-      this.conversations.assertRelayDecisionResolved(input.sessionId)
+      this.conversations.assertRelayDecisionResolved(input.sessionId, undefined, true)
       this.conversations.assertDecisionInput({ ...input, content })
       if (this.conversations.receivedCollaborationInput(input.sessionId))
         throw new RunOperationConflictError(
@@ -3261,6 +3272,19 @@ export class Conversation {
         releaseImages = this.images.hold(input.imageIds)
       }
       const prefix = parseComposerCommandPrefix(content, input.skills)
+      if (
+        input.askOnly &&
+        (!task ||
+          preparing ||
+          waitingForWork ||
+          this.pendingNativeInteractions(input.sessionId).length ||
+          prefix.route ||
+          prefix.pact ||
+          input.route)
+      )
+        throw new RunOperationConflictError(
+          'Ask only needs the current accepted Plan and an idle author.',
+        )
       if (input.userInformation && (prefix.pact || prefix.skills.length || prefix.error))
         throw new RunOperationConflictError(
           'Remove reserved information before sending a command. Your draft was kept.',
@@ -3938,6 +3962,11 @@ export class Conversation {
     signal: AbortSignal,
   ): Promise<NativeUserInputResult> {
     if (
+      this.conversations.collaborationTurnAuthorization(owner.id)?.replyIntentBasis?.kind ===
+      'ask_only'
+    )
+      return Promise.resolve({ action: 'cancel' })
+    if (
       input.kind === 'questions' &&
       this.conversations.findRun(owner.id)?.collaboration &&
       this.conversations.receivedCollaborationInput(owner.sessionId)
@@ -4373,6 +4402,15 @@ export class Conversation {
     if (this.conversations.archives.blocksSession(input.sessionId))
       return Conversation.archiveBusy()
     try {
+      if (input.action === 'request_repair_role_switch') {
+        const patch = this.conversations.requestPactRepairRole(
+          input,
+          this.hasSessionOperation(input.sessionId, true) ||
+            this.pendingNativeInteractions(input.sessionId).length > 0,
+        )
+        this.publish(patch)
+        return { ok: true, value: patch }
+      }
       const context = this.sessions.find(input.sessionId)
       const task = this.conversations.collaboration(input.sessionId)
       const prior = this.conversations.collaborationActionReceipt(input)
@@ -4421,7 +4459,7 @@ export class Conversation {
         this.publish(patch)
         return { ok: true, value: patch }
       }
-      this.conversations.discardUnansweredRelaySchedulingDecision(input.sessionId)
+      this.conversations.discardUnansweredRelaySchedulingDecision(input.sessionId, false)
       if (this.conversations.receivedCollaborationInput(input.sessionId))
         throw new RunOperationConflictError(
           'Your queued message will be answered before collaboration continues.',
@@ -4750,20 +4788,23 @@ export class Conversation {
     }
   }
 
+  private canDispatchWorkflowContinuation(sessionId: string): boolean {
+    return (
+      !this.disposed &&
+      !this.nativeQuitSealed() &&
+      !this.hasSessionOperation(sessionId, true) &&
+      this.operationCount() < MAX_AGENT_OPERATIONS &&
+      !this.conversations.receivedCollaborationInput(sessionId) &&
+      !this.conversations.nativeRecoveryBlocksInput(sessionId) &&
+      !this.conversations.hasPendingRoutedContinuation(sessionId) &&
+      this.pendingNativeInteractions(sessionId).length === 0 &&
+      !this.conversations.hasRelayDecision(sessionId)
+    )
+  }
+
   private async dispatchWorkflowContinuation(sessionId: string): Promise<void> {
     this.conversations.discardStaleRelaySchedulingDecision(sessionId)
-    if (
-      this.disposed ||
-      this.nativeQuitSealed() ||
-      this.hasSessionOperation(sessionId, true) ||
-      this.operationCount() >= MAX_AGENT_OPERATIONS ||
-      this.conversations.receivedCollaborationInput(sessionId) ||
-      this.conversations.nativeRecoveryBlocksInput(sessionId) ||
-      this.conversations.hasPendingRoutedContinuation(sessionId) ||
-      this.pendingNativeInteractions(sessionId).length > 0 ||
-      this.conversations.hasRelayDecision(sessionId)
-    )
-      return
+    if (!this.canDispatchWorkflowContinuation(sessionId)) return
     const task = this.conversations.collaboration(sessionId)
     const session = this.sessions.find(sessionId)
     if (
@@ -5774,7 +5815,14 @@ export class Conversation {
         context.value.projectDirectory,
       )
       const nativeContext = this.conversations.nativeContext(input.sessionId, agentId)
-      const handoff = await this.collectHandoff(input.sessionId, agentId, controller.signal)
+      const handoff = await this.collectHandoff(
+        input.sessionId,
+        agentId,
+        controller.signal,
+        undefined,
+        undefined,
+        Boolean(options.collaboration || commandPrefix.pact),
+      )
       if (this.disposed) return Conversation.shuttingDown()
       if (controller.signal.aborted)
         return {
@@ -6101,6 +6149,7 @@ export class Conversation {
           ),
         )
       this.conversations.pauseCollaboration(input.sessionId, 'stopped')
+      this.abortPreparedWorkflow(input.sessionId)
       const execution = this.activeExecutions.get(input.sessionId)
       const continuation = this.preparingContinuations.get(input.sessionId)
       const preparingSend = [...this.preparingSends.values()].find(
@@ -7780,6 +7829,7 @@ export class Conversation {
     signal: AbortSignal,
     excludeMessageId?: string,
     throughSequence?: number,
+    workflow = false,
   ): Promise<HandoffBundle[]> {
     const range = this.conversations.handoffRange(sessionId, targetAgentId)
     const deadline = Date.now() + HANDOFF_READ_DEADLINE_MS
@@ -7792,6 +7842,7 @@ export class Conversation {
       Math.min(range.throughSequence, throughSequence ?? range.throughSequence),
       signal,
       excludeMessageId,
+      workflow,
     )) {
       if (signal.aborted || Date.now() >= deadline)
         throw new HandoffSourceUnavailableError('Reading the Agent handoff timed out.')
@@ -8116,9 +8167,26 @@ export class Conversation {
     )
       return
     if (input.taskId && task?.status === 'running') return
+    const intent = input.metadata.replyIntentBasis
+    const askOnly = intent?.kind === 'ask_only'
+    if (
+      askOnly &&
+      (!task ||
+        task.id !== input.taskId ||
+        task.revision !== intent.taskRevision + 1 ||
+        task.inputSequence !== intent.priorInputSequence)
+    ) {
+      this.publish(
+        this.conversations.pauseConversationQueue(
+          sessionId,
+          'The accepted Plan changed. Return your question to the composer.',
+        ),
+      )
+      return
+    }
     const next =
       input.taskId && task ? this.conversations.workflowReply(task, input.actor) : undefined
-    if (next) next.latestUserMessageId = input.id
+    if (next && !askOnly) next.latestUserMessageId = input.id
     const currentDrafts = this.conversations.readPage({ scope: 'drafts', sessionId })
     if (currentDrafts.scope !== 'drafts') return
     const result = await this.enqueueSend(
