@@ -381,7 +381,7 @@ describe('Relay v2 supplement transactions through the existing workflow owner',
     },
   )
 
-  it('cancels only this advancement, preserves the original completed Run and leaves collaboration paused', async () => {
+  it('discards advice while preserving active automation and the original completed Run', async () => {
     const f = await proposed(),
       before = f.repo.findRun(f.response.id)
     const result = f.repo.answerRelaySchedulingDecision({ ...f.answer, answer: { kind: 'cancel' } })
@@ -389,10 +389,8 @@ describe('Relay v2 supplement transactions through the existing workflow owner',
     const after = f.repo.findRun(f.response.id)!
     // The new scheduling audit event may advance the projection timestamp only.
     expect(after).toEqual({ ...before, updatedAt: after.updatedAt })
-    expect(f.repo.collaboration(f.sessionId)).toMatchObject({
-      automation: 'paused',
-      pauseReason: 'user',
-    })
+    expect(f.repo.collaboration(f.sessionId)?.automation).toBe('active')
+    expect(f.repo.collaboration(f.sessionId)?.pauseReason).toBeUndefined()
     expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
     expect(f.repo.schedulingBudget(f.handoff.budgetSubjectId)?.extraPlanTurns).toBe(0)
     expect(f.db.drizzle.select().from(collaborationActionReceipts).all()).toEqual([])

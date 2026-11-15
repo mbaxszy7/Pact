@@ -13,9 +13,10 @@ import {
   unlink,
   writeFile,
 } from 'node:fs/promises'
-import { createServer, type Socket } from 'node:net'
+import { createConnection, createServer, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { createInterface, type Interface } from 'node:readline'
 import { pathToFileURL } from 'node:url'
 import { afterAll, expect, it, vi } from 'vitest'
 
@@ -31,6 +32,7 @@ import { writeNativeTransportFault } from './native-transport-fault.js'
 import {
   disposeWindowsLauncherImage,
   windowsLauncherImageDiagnostic,
+  WindowsProcessTreeError,
   writeWindowsNodeLauncher,
   writeWindowsObservedLauncher,
 } from './windows-cli-launcher.js'
@@ -1261,4 +1263,130 @@ it.skipIf(process.platform !== 'win32')(
     }
   },
   20000,
+)
+
+it.skipIf(process.platform !== 'win32').each<{
+  name: string
+  root: [number, number, string]
+  descendants: Array<[number, number, string]>
+  valid?: true
+}>([
+  { name: 'negative parent', root: [2, -1, '100'], descendants: [] },
+  { name: 'zero birth', root: [2, 0, '0'], descendants: [] },
+  { name: 'missing ancestor', root: [2, 0, '100'], descendants: [[3, 7, '110']] },
+  {
+    name: 'ancestry cycle',
+    root: [2, 0, '100'],
+    descendants: [
+      [3, 4, '110'],
+      [4, 3, '110'],
+    ],
+  },
+  {
+    name: 'four ancestry links',
+    root: [2, 0, '100'],
+    descendants: [
+      [3, 2, '110'],
+      [4, 3, '120'],
+      [5, 4, '130'],
+      [6, 5, '140'],
+    ],
+  },
+  { name: 'child predates parent', root: [2, 0, '100'], descendants: [[3, 2, '90']] },
+  {
+    name: 'coalesced valid frames',
+    root: [2, 0, '100'],
+    descendants: [[3, 2, '110']],
+    valid: true,
+  },
+])(
+  'validates Job tree transport facts on the authenticated control channel: $name',
+  async (row) => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-observed-transport-'))
+    const owner = await writeWindowsObservedLauncher(root, process.execPath, 10_000)
+    let peer: Socket | undefined
+    let lines: Interface | undefined
+    try {
+      const descriptor: { pipe: string; token: string; generation: string } = JSON.parse(
+        await readFile(join(owner.directory, 'owned-launch.json'), 'utf8'),
+      )
+      owner.armStartup(performance.now() + 10_000)
+      peer = createConnection(`\\\\.\\pipe\\${descriptor.pipe}`)
+      await within(once(peer, 'connect'), 5_000, 'Job control peer did not connect')
+      lines = createInterface({ input: peer })
+      const iterator = lines[Symbol.asyncIterator]()
+      const nextLine = (): Promise<string> =>
+        within(
+          iterator.next().then((step) => {
+            if (step.done) throw new Error('Job control peer closed')
+            return step.value
+          }),
+          5_000,
+          'Job control command receipt exceeded its deadline',
+        )
+      peer.write(
+        JSON.stringify({
+          kind: 'hello',
+          token: descriptor.token,
+          generation: descriptor.generation,
+        }) + '\n',
+      )
+      expect(await nextLine()).toBe('go')
+      peer.write(
+        JSON.stringify({
+          kind: 'started',
+          generation: descriptor.generation,
+          pid: 2,
+          active: 1,
+        }) + '\n',
+      )
+      await expect(owner.started).resolves.toMatchObject({
+        generation: descriptor.generation,
+        pid: 2,
+      })
+      const request = owner.observeProcessTree(2, performance.now() + 2_000)
+      expect(await nextLine()).toMatch(/^observe-v1 1 2 \d+$/u)
+      const treeFrame =
+        JSON.stringify({
+          kind: 'tree',
+          version: 1,
+          generation: descriptor.generation,
+          requestId: 1,
+          root: row.root,
+          descendants: row.descendants,
+        }) + '\n'
+      /* oxlint-disable vitest/no-conditional-expect -- Each transport row asserts its distinct valid or malformed receipt contract. */
+      if (row.valid === true) {
+        const countsFrame =
+          JSON.stringify({ kind: 'counts', generation: descriptor.generation, active: 1 }) + '\n'
+        const write = countsFrame.repeat(90) + treeFrame
+        expect(Buffer.byteLength(countsFrame)).toBeLessThanOrEqual(4096)
+        expect(Buffer.byteLength(treeFrame)).toBeLessThanOrEqual(4096)
+        expect(Buffer.byteLength(write)).toBeGreaterThan(4096)
+        peer.write(write)
+        await expect(request).resolves.toEqual({
+          root: { pid: 2, parentPid: 0, started: '100' },
+          descendants: [{ pid: 3, parentPid: 2, started: '110' }],
+        })
+      } else {
+        // oxlint-disable-next-line vitest/valid-expect -- The rejection is attached before the malformed frame is written and awaited below.
+        const requestFailure = expect(request).rejects.toMatchObject({ reason: 'query' })
+        // oxlint-disable-next-line vitest/valid-expect -- The rejection is attached before the malformed frame is written and awaited below.
+        const requestType = expect(request).rejects.toThrow(WindowsProcessTreeError)
+        // oxlint-disable-next-line vitest/valid-expect -- The rejection is attached before the malformed frame is written and awaited below.
+        const emptyFailure = expect(owner.empty).rejects.toThrow('control validation failed')
+        peer.write(treeFrame)
+        await requestFailure
+        await requestType
+        await emptyFailure
+      }
+      /* oxlint-enable vitest/no-conditional-expect */
+    } finally {
+      lines?.close()
+      peer?.destroy()
+      await owner.disposeControl()
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 })
+    }
+  },
+  10_000,
 )

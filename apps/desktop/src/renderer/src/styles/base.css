@@ -104,13 +104,9 @@
   .pact-plan-document li + li {
     margin-top: 0.75em;
   }
-  @container pact-review (width < 480px) {
-    .pact-review-actions {
-      align-items: stretch;
-      flex-direction: column;
-    }
-    .pact-review-actions > button {
-      text-align: left;
+  @container pact-review (width < 720px) {
+    .pact-review-actions[data-compact-targets='true'] .pact-review-action-agent {
+      display: none;
     }
   }
   .pact-composer-editor:empty::before {

@@ -435,7 +435,7 @@ describe('host-originated Relay native recovery decisions', () => {
       label: 'Task authority',
       retired: true,
       mutate: (f) => {
-        f.repo.pauseCollaboration(f.sessionId)
+        f.repo.pauseCollaboration(f.sessionId, 'user')
       },
     },
     {

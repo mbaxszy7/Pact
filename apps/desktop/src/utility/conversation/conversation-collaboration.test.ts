@@ -23,15 +23,19 @@ import type {
 
 import {
   OPENAI_DECISION_MODEL,
-  advanceCollaboration,
   collaborationAvailableActions,
+  collaborationInputGate,
+  collaborationNextStage,
   handoffGuidanceSchema,
   initialTaskRoleCandidates,
+  otherAgent,
 } from '@pact/contracts'
 import { PactDatabase } from '@pact/persistence'
 
 import {
   collaborationActionReceipts,
+  collaborationInputs,
+  collaborationTasks,
   conversationBodyInputs,
   conversationInputBatches,
   conversationRebuildSourceRefs,
@@ -1047,25 +1051,14 @@ describe('Decisions choices through the original workflow owner', () => {
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM agent_runs`)).toEqual({ count: 8 })
   })
 
-  it('cancels a pending consultation on Pause without starting the old continuation or refunding its call', async () => {
+  it('cancels a pending consultation on Stop without starting the old continuation or refunding its call', async () => {
     const f = await fixture()
     enableRelay(f)
     const hold = Promise.withResolvers<void>()
     native.decisionHold = hold.promise
-    expect((await f.flow.send(f.input('/plan Pause must invalidate pending focus.'))).ok).toBe(true)
+    expect((await f.flow.send(f.input('/plan Stop must invalidate pending focus.'))).ok).toBe(true)
     await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
-    const task = f.db.conversationRepository.collaboration(f.sessionId)!
-    expect(
-      (
-        await f.flow.actOnCollaboration({
-          sessionId: f.sessionId,
-          taskId: task.id,
-          revision: task.revision,
-          clientMessageId: randomUUID(),
-          action: 'pause',
-        })
-      ).ok,
-    ).toBe(true)
+    expect(f.flow.stop({ sessionId: f.sessionId })).toMatchObject({ ok: true })
     hold.resolve()
     await vi.waitFor(() => expect(f.db.conversationRepository.activeEvaluation()).toBeUndefined())
     expect(f.db.conversationRepository.collaboration(f.sessionId)?.automation).toBe('paused')
@@ -1311,18 +1304,10 @@ describe('Grounded Repair decisions through the existing Conversation owner', ()
         stage: 'code_review',
         repairAttempts: 0,
         reviewCycles: 2,
-        automation: choice === 'cancel' ? 'paused' : 'active',
+        automation: 'active',
       })
-      expect(current.pauseReason).toBe(choice === 'cancel' ? 'user' : undefined)
-      const resumed =
-        choice === 'cancel'
-          ? advanceCollaboration(
-              current,
-              'resume',
-              f.db.sessionRepository.find(f.sessionId)!.settings,
-            )
-          : current
-      expect(collaborationAvailableActions(resumed)).toEqual(
+      expect(current.pauseReason).toBeUndefined()
+      expect(collaborationAvailableActions(current)).toEqual(
         expect.arrayContaining(['respond', 'repair']),
       )
       expect(native.inputs).toHaveLength(4)
@@ -1573,33 +1558,97 @@ describe('Native workflow admission and durable dispatch', () => {
       actors: ['claude'],
     },
   ] as const)(
-    'admits only the assigned /$kind recipient when Primary is $primary',
-    async ({ primary, kind, first, stages, actors }) => {
+    'admits an explicit /$kind agent and rejects a conflicting route when Primary is $primary',
+    async ({ primary, kind, first, stages }) => {
+      const chosen = otherAgent(first),
+        owner = kind === 'build' ? otherAgent(chosen) : chosen,
+        expectedActors = kind === 'review' ? [chosen] : [chosen, otherAgent(chosen)]
       const f = await fixture(primary)
-      const wrong = first === 'codex' ? 'claude' : 'codex'
-      expect(await f.flow.send(f.input(`@${wrong} /${kind} Verify cancellation`))).toMatchObject({
-        ok: false,
-        error: { code: 'CONFLICT' },
-      })
       expect(
         await f.flow.send({
-          ...f.input(`/${kind} Verify cancellation`),
-          route: { type: 'agent', agentId: wrong },
+          ...f.input(`@${chosen} /${kind} Verify cancellation`),
+          route: { type: 'agent', agentId: otherAgent(chosen) },
         }),
       ).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
       expect(native.inputs).toHaveLength(0)
       expect(f.db.conversationRepository.read(f.sessionId).runs).toHaveLength(0)
-      expect(await f.flow.send(f.input(`@${first} /${kind} Verify cancellation`))).toMatchObject({
-        ok: true,
-      })
+      expect(
+        await f.flow.send({
+          ...f.input(`@${chosen} /${kind} Verify cancellation`),
+          route: { type: 'agent', agentId: chosen },
+        }),
+      ).toMatchObject({ ok: true })
       const task = await f.settled()
-      expect(task).toMatchObject({ owner: primary, rolePolicy: 'split-stages-v1' })
+      expect(task).toMatchObject({ owner, rolePolicy: 'split-stages-v1' })
       expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual(
         stages,
       )
       expect(
         native.inputs.map((input) => f.db.conversationRepository.findRun(input.runId)?.agentId),
-      ).toEqual(actors)
+      ).toEqual(expectedActors)
+      expect(f.db.sessionRepository.find(f.sessionId)?.settings.primaryAgentId).toBe(primary)
+    },
+  )
+
+  it.each([
+    {
+      primary: 'codex',
+      kind: 'plan',
+      first: 'codex',
+      stages: ['plan', 'plan_review'],
+    },
+    {
+      primary: 'claude',
+      kind: 'plan',
+      first: 'claude',
+      stages: ['plan', 'plan_review'],
+    },
+    {
+      primary: 'codex',
+      kind: 'build',
+      first: 'claude',
+      stages: ['implement', 'code_review'],
+    },
+    {
+      primary: 'claude',
+      kind: 'build',
+      first: 'codex',
+      stages: ['implement', 'code_review'],
+    },
+    {
+      primary: 'codex',
+      kind: 'review',
+      first: 'codex',
+      stages: ['code_review'],
+    },
+    {
+      primary: 'claude',
+      kind: 'review',
+      first: 'claude',
+      stages: ['code_review'],
+    },
+  ] as const)(
+    'admits route-only /$kind entry when Primary is $primary',
+    async ({ primary, kind, first, stages }) => {
+      const chosen = otherAgent(first),
+        owner = kind === 'build' ? otherAgent(chosen) : chosen,
+        expectedActors = kind === 'review' ? [chosen] : [chosen, otherAgent(chosen)]
+      const f = await fixture(primary)
+      expect(
+        await f.flow.send({
+          ...f.input(`/${kind} Verify cancellation`),
+          route: { type: 'agent', agentId: chosen },
+        }),
+      ).toMatchObject({ ok: true })
+      const task = await f.settled()
+      expect(task).toMatchObject({ owner, rolePolicy: 'split-stages-v1' })
+      expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual(
+        stages,
+      )
+      expect(
+        native.inputs.map((input) => f.db.conversationRepository.findRun(input.runId)?.agentId),
+      ).toEqual(expectedActors)
+      expect(f.db.sessionRepository.find(f.sessionId)?.settings.primaryAgentId).toBe(primary)
     },
   )
 
@@ -3023,17 +3072,18 @@ function pactRepairActions(f: { repo: PactDatabase['conversationRepository']; se
   return page.view.availableActions
 }
 
-async function rebuildClaude(
+async function rebuildNative(
   f: { repo: PactDatabase['conversationRepository']; sessionId: string },
+  agentId: RuntimeAgentId = 'claude',
   abandon = false,
 ) {
-  const binding = f.repo.nativeContext(f.sessionId, 'claude')!
+  const binding = f.repo.nativeContext(f.sessionId, agentId)!
   const id = randomUUID(),
     nativeSessionId = randomUUID()
   f.repo.beginNativeRebuild({
     id,
     sessionId: f.sessionId,
-    agentId: 'claude',
+    agentId,
     expectedGeneration: binding.bindingGeneration!,
     abandon,
   })
@@ -3049,7 +3099,20 @@ async function rebuildClaude(
   f.repo.freezeNativeRebuildSource(id, chunks, sourceRevisions)
   f.repo.markNativeRebuildDispatched(id)
   f.repo.recordNativeRebuildIdentity(id, nativeSessionId)
-  f.repo.completeNativeRebuild(id, nativeSessionId)
+  f.repo.completeNativeRebuild(
+    id,
+    nativeSessionId,
+    undefined,
+    agentId === 'codex'
+      ? {
+          kind: 'codex_rollout_v1',
+          nativeSessionId,
+          verifiedPrefixBytes: 1,
+          verifiedPrefixSha256: '0'.repeat(64),
+          recordCount: 1,
+        }
+      : undefined,
+  )
   return { id, nativeSessionId, chunks }
 }
 
@@ -3073,13 +3136,14 @@ describe('Explicit Plan questions', () => {
   async function answer(f: Awaited<ReturnType<typeof acceptedPlan>>, nativeExecutor = false) {
     native.next = { answer: 'Ask-only answer marker: the requester releases it.', nativeExecutor }
     expect(await f.flow.send(f.question)).toMatchObject({ ok: true })
-    await vi.waitFor(() =>
-      expect(f.repo.collaboration(f.sessionId)).toMatchObject({
-        stage: 'reply',
-        status: 'ready',
-      }),
-    )
-    return f.settled()
+    await vi.waitFor(() => {
+      const task = f.repo.collaboration(f.sessionId)!
+      expect(task.runId).not.toBe(f.accepted.runId)
+      expect(task).toMatchObject({ stage: f.accepted.stage, status: 'ready' })
+    })
+    const answered = await f.settled()
+    expect(f.repo.findRun(answered.runId)?.collaboration?.stage).toBe('reply')
+    return answered
   }
 
   it.each(['codex', 'claude'] as const)(
@@ -3247,11 +3311,15 @@ describe('Explicit Plan questions', () => {
 
   it('preserves an Ask background report in Rebuild but excludes its next workflow grant', async () => {
     const f = await backgroundQuestion()
-    const rebuilt = await rebuildClaude(f)
+    const rebuilt = await rebuildNative(f)
     expect(rebuilt.chunks.map((chunk) => chunk.messageId)).toContain(f.report.id)
-    expect(await f.flow.send(f.input('/review Check cancellation ownership.'))).toMatchObject({
-      ok: true,
-    })
+    const current = f.repo.collaboration(f.sessionId)!
+    expect(
+      await f.flow.send({
+        ...f.input('/review Check cancellation ownership.'),
+        replaceTask: { taskId: current.id, revision: current.revision },
+      }),
+    ).toMatchObject({ ok: true })
     await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete'))
     const review = native.inputs.at(-1)!
     expect(review.nativeSessionId).toBe(rebuilt.nativeSessionId)
@@ -3332,7 +3400,7 @@ describe('Explicit Plan questions', () => {
     const old = repo.read(f.sessionId).runs[0]!
     expect(old.nativeOutcome).toBe('completed')
     repo.recordNativeEffects(old.id, 'unknown')
-    await rebuildClaude({ repo, sessionId: f.sessionId }, true)
+    await rebuildNative({ repo, sessionId: f.sessionId }, 'claude', true)
     expect(await f.flow.send(f.input('/plan Describe cancellation ownership.'))).toMatchObject({
       ok: true,
     })
@@ -3346,9 +3414,11 @@ describe('Explicit Plan questions', () => {
     }
     native.next = { answer: 'The requester releases the handle.' }
     expect(await f.flow.send(question)).toMatchObject({ ok: true })
-    await vi.waitFor(() =>
-      expect(repo.collaboration(f.sessionId)).toMatchObject({ stage: 'reply', status: 'ready' }),
-    )
+    await vi.waitFor(() => {
+      const current = repo.collaboration(f.sessionId)!
+      expect(current.runId).not.toBe(task.runId)
+      expect(current).toMatchObject({ stage: task.stage, status: 'ready' })
+    })
     expect(repo.findRun(old.id)).toMatchObject({
       nativeEffectsState: 'unknown',
       controlDisposition: 'abandoned',
@@ -3759,6 +3829,173 @@ describe('Native repair role confirmations', () => {
     return { ...f, repo, reviewed }
   }
 
+  it('settles two ordinary explanation replies without changing workflow authority', async () => {
+    const f = await reviewedCode()
+    const original = f.reviewed
+    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
+      'implement',
+      'code_review',
+    ])
+    const sendExplanation = async (content: string) => {
+      native.next = {
+        input: { outcome: 'explanation_only' },
+        answer: 'Read-only explanation; no requirements changed.',
+      }
+      const expectedInputs = native.inputs.length + 1
+      expect(await f.flow.send(f.input(content))).toMatchObject({ ok: true })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(expectedInputs))
+      await vi.waitFor(() =>
+        expect(f.repo.collaboration(f.sessionId)?.inputProcessing?.settled?.runId).toBe(
+          native.inputs.at(-1)!.runId,
+        ),
+      )
+      await f.settled()
+    }
+    await sendExplanation('Explain the first review finding without changing the work.')
+    await sendExplanation('Explain the second review finding without changing the work.')
+    const current = await f.settled()
+    expect(current).toMatchObject({
+      stage: 'code_review',
+      status: 'waiting',
+      automation: 'active',
+      inputSequence: original.inputSequence + 2,
+      review: original.review,
+      stageRoles: original.stageRoles,
+      codeRunId: original.codeRunId,
+      discussionRounds: original.discussionRounds,
+      reviewCycles: original.reviewCycles,
+      repairAttempts: original.repairAttempts,
+    })
+    expect(current.planReference).toBe(original.planReference)
+    expect(current.pendingWork).toBeUndefined()
+    expect(current.inputProcessing?.settled).toMatchObject({
+      inputSequence: original.inputSequence + 2,
+      unchanged: { inputSequence: original.inputSequence },
+    })
+    expect(pactRepairActions(f)).toEqual(expect.arrayContaining(['respond', 'repair']))
+    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
+      'implement',
+      'code_review',
+      'reply',
+      'reply',
+    ])
+  })
+
+  it('restores interrupted implementation work after an explanation reply', async () => {
+    const f = await fixture('codex')
+    const repo = f.db.conversationRepository
+    expect(await f.flow.send(f.input('/plan Describe the implementation scope.'))).toMatchObject({
+      ok: true,
+    })
+    await vi.waitFor(() => expect(repo.collaboration(f.sessionId)?.status).toBe('ready'))
+    const accepted = await f.settled()
+    native.next = { failedNativeEnding: true }
+    const interrupted = await f.act('execute')
+    expect(interrupted).toMatchObject({
+      stage: 'implement',
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'failure',
+      pendingWork: { stage: 'implement', runId: interrupted.runId },
+    })
+    const writeGrant = repo.collaborationTurnAuthorization(interrupted.runId)
+    expect(writeGrant).toMatchObject({
+      stage: 'implement',
+      userAuthority: { purpose: 'action' },
+    })
+    const stagesBefore = native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)
+    expect(stagesBefore).toEqual(['plan', 'plan_review', 'implement'])
+    native.next = {
+      input: { outcome: 'explanation_only' },
+      answer: 'The interrupted write remains pending; this reply changed nothing.',
+    }
+    expect(
+      await f.flow.send(f.input('Explain where the interrupted implementation stopped.')),
+    ).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(stagesBefore.length + 1))
+    await vi.waitFor(() =>
+      expect(repo.collaboration(f.sessionId)?.inputProcessing?.settled?.runId).toBe(
+        native.inputs.at(-1)!.runId,
+      ),
+    )
+    const current = await f.settled()
+    expect(current).toMatchObject({
+      stage: interrupted.stage,
+      actor: interrupted.actor,
+      status: interrupted.status,
+      automation: interrupted.automation,
+      pauseReason: interrupted.pauseReason,
+      pendingWork: interrupted.pendingWork,
+      planReference: interrupted.planReference,
+      review: interrupted.review,
+      stageRoles: interrupted.stageRoles,
+      discussionRounds: interrupted.discussionRounds,
+      reviewCycles: interrupted.reviewCycles,
+      repairAttempts: interrupted.repairAttempts,
+      inputSequence: interrupted.inputSequence + 1,
+    })
+    expect(current.codeRunId).toBe(interrupted.codeRunId)
+    expect(current.inputProcessing?.settled?.unchanged?.inputSequence).toBe(
+      interrupted.inputSequence,
+    )
+    expect(repo.collaborationTurnAuthorization(interrupted.runId)).toEqual(writeGrant)
+    expect(accepted.review).toEqual(interrupted.review)
+    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
+      ...stagesBefore,
+      'reply',
+    ])
+  })
+
+  it('classifies an exhausted workflow allowance by its typed transition reason', async () => {
+    const f = await fixture('codex')
+    const repo = f.db.conversationRepository
+    const session = f.db.sessionRepository.find(f.sessionId)!
+    f.db.sessionRepository.saveSettings(f.sessionId, {
+      ...session.settings,
+      maxDiscussionRounds: 0,
+    })
+    const contracts = await import('@pact/contracts')
+    const originalAdvance = contracts.advanceCollaboration
+    const advance = vi
+      .spyOn(contracts, 'advanceCollaboration')
+      .mockImplementation((task, action, limits) => {
+        try {
+          return originalAdvance(task, action, limits)
+        } catch (error) {
+          if (
+            error instanceof contracts.CollaborationTransitionError &&
+            error.reason.kind === 'limit'
+          )
+            error.message = 'The Session discussion allowance has been reached.'
+          throw error
+        }
+      })
+    try {
+      expect(
+        await f.flow.send(f.input('/plan Keep typed pause classification exact.')),
+      ).toMatchObject({ ok: true })
+      await vi.waitFor(() =>
+        expect(repo.collaboration(f.sessionId)).toMatchObject({
+          automation: 'paused',
+          pauseReason: 'limit',
+          notice: 'The Session discussion allowance has been reached.',
+        }),
+      )
+      const current = await f.settled()
+      expect(current).toMatchObject({
+        stage: 'plan',
+        status: 'waiting',
+        discussionRounds: 0,
+        nextStage: 'plan_review',
+      })
+      expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
+        'plan',
+      ])
+    } finally {
+      advance.mockRestore()
+    }
+  })
+
   it('supersedes an unused Relay suggestion for this review with the direct choice', async () => {
     const f = await repairDecisionFlow('codex', 'propose_repair')
     const repo = f.db.conversationRepository
@@ -3938,17 +4175,12 @@ describe('Native repair role confirmations', () => {
       handledInputSequence: prior.inputSequence,
     })
     expect(f.repo.handoffReceipt(first.handoffId)?.action).toBeNull()
-    expect(pactRepairActions(f)).toEqual(['pause'])
+    expect(pactRepairActions(f)).toEqual([])
     expect(await f.flow.answerRelayDecision(actionForCard(first, 'cancel'))).toMatchObject({
       ok: true,
       value: { disposition: 'cancelled', runId: null },
     })
-    expect(pactRepairActions(f)).toEqual([
-      'respond',
-      'repair',
-      'pause',
-      'request_repair_role_switch',
-    ])
+    expect(pactRepairActions(f)).toEqual(['respond', 'repair', 'request_repair_role_switch'])
     expect(f.repo.collaboration(f.sessionId)?.stageRoles).toEqual(prior.stageRoles)
     expect(f.repo.read(f.sessionId).runs).toHaveLength(5)
 
@@ -4038,6 +4270,105 @@ describe('Native repair role confirmations', () => {
     expect(activity()).toMatchObject({ actionResult: 'cancelled', called: false })
     expect(native.inputs[3]!.promptEnvelope.collaboration?.stage).toBe('respond')
   })
+
+  it('offers Respond and Repair again after an unfinished Respond is continued', async () => {
+    const f = await reviewedCode()
+    const reviewed = f.repo.collaboration(f.sessionId)!
+    native.next = { failedNativeEnding: true }
+    expect(
+      await f.flow.actOnCollaboration({
+        sessionId: f.sessionId,
+        taskId: reviewed.id,
+        revision: reviewed.revision,
+        clientMessageId: randomUUID(),
+        action: 'respond',
+      }),
+    ).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('failed'))
+    const interrupted = await f.settled()
+    expect(interrupted).toMatchObject({ stage: 'respond', automation: 'paused' })
+    expect(interrupted.nextStage).toBeUndefined()
+    expect(interrupted.review).toEqual(reviewed.review)
+    expect(pactRepairActions(f)).toEqual(['resume'])
+    expect(
+      await f.flow.actOnCollaboration({
+        sessionId: f.sessionId,
+        taskId: interrupted.id,
+        revision: interrupted.revision,
+        clientMessageId: randomUUID(),
+        action: 'resume',
+      }),
+    ).toMatchObject({ ok: true })
+    expect(pactRepairActions(f)).toEqual(['respond', 'repair'])
+    expect(native.inputs).toHaveLength(3)
+    await f.act('respond')
+    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete'))
+    expect(f.repo.collaboration(f.sessionId)).toMatchObject({ reviewCycles: 2, repairAttempts: 0 })
+    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
+      'implement',
+      'code_review',
+      'respond',
+      'respond',
+      'code_review',
+    ])
+  })
+
+  it('resumes Respond and Repair after a held Respond is stopped and its native root is rebuilt', async () => {
+    const f = await reviewedCode()
+    const reviewed = f.repo.collaboration(f.sessionId)!
+    const hold = Promise.withResolvers<void>()
+    native.hold = hold.promise
+    try {
+      expect(
+        await f.flow.actOnCollaboration({
+          sessionId: f.sessionId,
+          taskId: reviewed.id,
+          revision: reviewed.revision,
+          clientMessageId: randomUUID(),
+          action: 'respond',
+        }),
+      ).toMatchObject({ ok: true })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+      expect(f.flow.stop({ sessionId: f.sessionId })).toMatchObject({ ok: true })
+      hold.resolve()
+    } finally {
+      native.hold = undefined
+      hold.resolve()
+    }
+    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).not.toBe('running'))
+    // The stopped accepted Turn keeps its recovery requirement until the codex root is rebuilt.
+    await vi.waitFor(() => expect(f.repo.nativeRecoveryBlocksInput(f.sessionId)).toBe(true))
+    // The session-wide Stop flagged both physical roots; resolve each through the
+    // established Rebuild path instead of editing recovery flags directly.
+    await rebuildNative({ repo: f.repo, sessionId: f.sessionId }, 'codex', true)
+    await rebuildNative({ repo: f.repo, sessionId: f.sessionId }, 'claude', true)
+    await vi.waitFor(() => expect(f.repo.nativeRecoveryBlocksInput(f.sessionId)).toBe(false))
+    const interrupted = f.repo.collaboration(f.sessionId)!
+    expect(interrupted).toMatchObject({ stage: 'respond', automation: 'paused' })
+    expect(interrupted.review).toEqual(reviewed.review)
+    expect(pactRepairActions(f)).toEqual(['resume'])
+    expect(
+      await f.flow.actOnCollaboration({
+        sessionId: f.sessionId,
+        taskId: interrupted.id,
+        revision: interrupted.revision,
+        clientMessageId: randomUUID(),
+        action: 'resume',
+      }),
+    ).toMatchObject({ ok: true })
+    expect(pactRepairActions(f)).toEqual(['respond', 'repair'])
+    expect(native.inputs).toHaveLength(3)
+    await f.act('respond')
+    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete'))
+    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
+      'implement',
+      'code_review',
+      'respond',
+      'respond',
+      'code_review',
+    ])
+  })
+
   it('uses the native card with Relay on and preserves it across credential changes and disabling Relay', async () => {
     const f = await reviewedCode()
     const first = await pendingCard(f)
@@ -4174,12 +4505,7 @@ describe('Native repair role confirmations', () => {
       false,
     )
     expect(f.repo.findRun(before.id)!.updatedAt > before.updatedAt).toBe(true)
-    expect(pactRepairActions(f)).toEqual([
-      'respond',
-      'repair',
-      'pause',
-      'request_repair_role_switch',
-    ])
+    expect(pactRepairActions(f)).toEqual(['respond', 'repair', 'request_repair_role_switch'])
     expect(native.inputs).toHaveLength(3)
   })
 
@@ -4408,4 +4734,436 @@ describe('Future code-role change through the real Conversation owner', () => {
       expect(repo.read(f.sessionId).runs).toHaveLength(runsBefore)
     },
   )
+})
+
+describe('confirmed task replacement', () => {
+  async function reviewedBuild() {
+    const f = await fixture('codex', true)
+    const repo = f.db.conversationRepository
+    native.nextReview = { verdict: 'changes_requested' }
+    expect(await f.flow.send(f.input('/build Preserve cancellation ownership.'))).toMatchObject({
+      ok: true,
+    })
+    await vi.waitFor(() =>
+      expect(repo.collaboration(f.sessionId)).toMatchObject({
+        stage: 'code_review',
+        status: 'waiting',
+        review: { verdict: 'changes_requested' },
+      }),
+    )
+    return { ...f, repo, reviewed: await f.settled() }
+  }
+
+  it('replaces a reviewed Build only after the exact confirmation and keeps its history readable', async () => {
+    const f = await reviewedBuild()
+    const { repo } = f
+    const before = repo.collaboration(f.sessionId)!
+    const runsBefore = native.inputs.length
+    const next = f.input('/review Review the replacement scope.')
+    expect(await f.flow.send(next)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
+    expect(repo.collaboration(f.sessionId)?.id).toBe(before.id)
+    expect(native.inputs).toHaveLength(runsBefore)
+    const confirmed = { ...next, replaceTask: { taskId: before.id, revision: before.revision } }
+    expect(await f.flow.send(confirmed)).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(repo.collaboration(f.sessionId)?.id).not.toBe(before.id))
+    const replaced = await f.settled()
+    expect(replaced.id).not.toBe(before.id)
+    expect(replaced.kind).toBe('review')
+    const old = repo.collaboration(f.sessionId, before.runId)!
+    expect(old.id).toBe(before.id)
+    expect(old.ending).toMatchObject({
+      reason: 'replaced',
+      replacementMessageId: next.clientMessageId,
+    })
+    expect(collaborationAvailableActions(old)).toEqual([])
+    expect(collaborationNextStage(old)).toBeUndefined()
+    expect(repo.findRun(before.runId)?.collaboration?.taskId).toBe(before.id)
+    expect(old.review).toEqual(before.review)
+  })
+
+  it('requires the same confirmation over a ready Plan', async () => {
+    const f = await fixture('codex')
+    const repo = f.db.conversationRepository
+    expect(await f.flow.send(f.input('/plan Describe the replacement scope.'))).toMatchObject({
+      ok: true,
+    })
+    const before = await f.settled()
+    expect(before.status).not.toBe('complete')
+    const next = f.input('/build Implement the replacement scope.')
+    expect(await f.flow.send(next)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
+    expect(repo.collaboration(f.sessionId)?.id).toBe(before.id)
+    const confirmed = { ...next, replaceTask: { taskId: before.id, revision: before.revision } }
+    expect(await f.flow.send(confirmed)).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(repo.collaboration(f.sessionId)?.id).not.toBe(before.id))
+    const old = repo.collaboration(f.sessionId, before.runId)!
+    expect(old.ending).toMatchObject({
+      reason: 'replaced',
+      replacementMessageId: next.clientMessageId,
+    })
+    expect(collaborationAvailableActions(old)).toEqual([])
+    await f.settled()
+  })
+
+  it('replays a queued replacement receipt while the original Turn is held and rejects a changed reference', async () => {
+    const f = await fixture('codex')
+    const repo = f.db.conversationRepository
+    const hold = Promise.withResolvers<void>()
+    native.hold = hold.promise
+    try {
+      expect(await f.flow.send(f.input('/build Implement the original scope.'))).toMatchObject({
+        ok: true,
+      })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+      const before = repo.collaboration(f.sessionId)!
+      const next = f.input('/review Review the replacement scope.')
+      const confirmed = {
+        ...next,
+        replaceTask: { taskId: before.id, revision: before.revision },
+      }
+      const first = await f.flow.send(confirmed)
+      expect(first).toMatchObject({ ok: true })
+      expect(repo.queueState(f.sessionId).input?.id).toBe(next.clientMessageId)
+      expect(await f.flow.send(confirmed)).toMatchObject({ ok: true })
+      expect(native.inputs).toHaveLength(1)
+      expect(repo.collaboration(f.sessionId)?.id).toBe(before.id)
+      const changed = await f.flow.send({
+        ...next,
+        replaceTask: { taskId: before.id, revision: before.revision + 1 },
+      })
+      expect(changed).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
+      expect(native.inputs).toHaveLength(1)
+    } finally {
+      native.hold = undefined
+      hold.resolve()
+    }
+    await f.settled()
+  })
+
+  it('replays the confirmed receipt after replacement without a second Turn or task', async () => {
+    const f = await reviewedBuild()
+    const { repo } = f
+    const before = repo.collaboration(f.sessionId)!
+    const next = f.input('/review Review the replacement scope.')
+    const confirmed = { ...next, replaceTask: { taskId: before.id, revision: before.revision } }
+    const first = await f.flow.send(confirmed)
+    expect(first).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(repo.collaboration(f.sessionId)?.id).not.toBe(before.id))
+    const replaced = await f.settled()
+    const runs = native.inputs.length
+    expect(await f.flow.send(confirmed)).toMatchObject({ ok: true })
+    expect(repo.collaboration(f.sessionId)?.id).toBe(replaced.id)
+    expect(native.inputs).toHaveLength(runs)
+    const changed = await f.flow.send({
+      ...next,
+      replaceTask: { taskId: before.id, revision: before.revision + 1 },
+    })
+    expect(changed).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
+    expect(repo.collaboration(f.sessionId)?.id).toBe(replaced.id)
+    expect(native.inputs).toHaveLength(runs)
+  })
+
+  it('queues the confirmed replacement while the original Turn is held and cancels it through the queue', async () => {
+    const f = await fixture('codex')
+    const repo = f.db.conversationRepository
+    const hold = Promise.withResolvers<void>()
+    native.hold = hold.promise
+    native.nextReview = { verdict: 'changes_requested' }
+    try {
+      expect(await f.flow.send(f.input('/build Implement the original scope.'))).toMatchObject({
+        ok: true,
+      })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+      const before = repo.collaboration(f.sessionId)!
+      const next = f.input('/review Review the replacement scope.')
+      expect(
+        await f.flow.send({
+          ...next,
+          replaceTask: { taskId: before.id, revision: before.revision },
+        }),
+      ).toMatchObject({ ok: true })
+      const queued = repo.queueState(f.sessionId)
+      expect(queued.input).toMatchObject({
+        id: next.clientMessageId,
+        workflowCommand: true,
+        replacesTask: { kind: 'build' },
+      })
+      // A queued command owns no input state on the task it would replace.
+      const held = repo.collaboration(f.sessionId)!
+      expect(held).toMatchObject({
+        id: before.id,
+        inputSequence: before.inputSequence,
+        inputProcessing: before.inputProcessing,
+      })
+      expect(held.latestUserMessageId).toBe(before.latestUserMessageId)
+      expect(held.ending).toBeUndefined()
+      expect(collaborationInputGate(held)).toBeUndefined()
+      expect(
+        f.flow.removeQueuedConversationMessage({
+          sessionId: f.sessionId,
+          inputId: next.clientMessageId,
+          expectedRevision: queued.revision,
+          operationId: randomUUID(),
+        }),
+      ).toMatchObject({ ok: true })
+      const queue = repo.queueState(f.sessionId)
+      expect(queue.input).toBeNull()
+      // Remove withdraws the draft; only Edit/Return restores it to the composer.
+      expect(queue.returnedInput).toBeNull()
+      native.hold = undefined
+      hold.resolve()
+      // The original workflow resumes its own next stage with no new message.
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+      expect(repo.findRun(native.inputs[1]!.runId)?.collaboration?.taskId).toBe(before.id)
+      await vi.waitFor(() =>
+        expect(repo.collaboration(f.sessionId)).toMatchObject({
+          stage: 'code_review',
+          status: 'waiting',
+          review: { verdict: 'changes_requested' },
+        }),
+      )
+      const task = await f.settled()
+      expect(task.id).toBe(before.id)
+      expect(task.ending).toBeUndefined()
+      expect(collaborationInputGate(task)).toBeUndefined()
+    } finally {
+      native.hold = undefined
+      hold.resolve()
+    }
+  })
+
+  it('clears a legacy command gate on removal without unpausing a stopped task', async () => {
+    const f = await fixture('codex')
+    const repo = f.db.conversationRepository
+    const hold = Promise.withResolvers<void>()
+    native.hold = hold.promise
+    try {
+      expect(await f.flow.send(f.input('/build Implement the original scope.'))).toMatchObject({
+        ok: true,
+      })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+      const before = repo.collaboration(f.sessionId)!
+      const next = f.input('/review Review the replacement scope.')
+      expect(
+        await f.flow.send({
+          ...next,
+          replaceTask: { taskId: before.id, revision: before.revision },
+        }),
+      ).toMatchObject({ ok: true })
+      const queued = repo.queueState(f.sessionId)
+      // Durable fixture from a client that registered the queued command as
+      // pending input on the old task while that task was already stopped.
+      const stored = repo.collaboration(f.sessionId)!
+      f.db.drizzle
+        .update(collaborationTasks)
+        .set({
+          stateJson: JSON.stringify({
+            ...stored,
+            status: 'waiting',
+            automation: 'paused',
+            pauseReason: 'stopped',
+            notice: 'Your message will be answered before collaboration continues.',
+            latestUserMessageId: next.clientMessageId,
+            inputProcessing: {
+              ...stored.inputProcessing,
+              pending: { inputId: next.clientMessageId, inputSequence: stored.inputSequence },
+            },
+            revision: stored.revision + 1,
+          }),
+        })
+        .where(eq(collaborationTasks.id, stored.id))
+        .run()
+      expect(collaborationInputGate(repo.collaboration(f.sessionId)!)).toBe('queued')
+      expect(
+        f.flow.removeQueuedConversationMessage({
+          sessionId: f.sessionId,
+          inputId: next.clientMessageId,
+          expectedRevision: queued.revision,
+          operationId: randomUUID(),
+        }),
+      ).toMatchObject({ ok: true })
+      const cleared = repo.collaboration(f.sessionId)!
+      expect(cleared.id).toBe(before.id)
+      // Removal clears only the obsolete command gate; the explicit stop is retained.
+      expect(cleared.inputProcessing?.pending).toBeUndefined()
+      expect(cleared).toMatchObject({ automation: 'paused', pauseReason: 'stopped' })
+      expect(collaborationInputGate(cleared)).toBeUndefined()
+      native.hold = undefined
+      hold.resolve()
+      const task = await f.settled()
+      expect(task.id).toBe(before.id)
+      expect(task).toMatchObject({ automation: 'paused', pauseReason: 'stopped' })
+      expect(task.ending).toBeUndefined()
+      expect(native.inputs).toHaveLength(1)
+    } finally {
+      native.hold = undefined
+      hold.resolve()
+    }
+  })
+
+  it('dispatches the queued replacement after the held Turn instead of the original review', async () => {
+    const f = await fixture('codex')
+    const repo = f.db.conversationRepository
+    const hold = Promise.withResolvers<void>()
+    native.hold = hold.promise
+    try {
+      expect(await f.flow.send(f.input('/build Implement the original scope.'))).toMatchObject({
+        ok: true,
+      })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+      const before = repo.collaboration(f.sessionId)!
+      const next = f.input('/review Review the replacement scope.')
+      expect(
+        await f.flow.send({
+          ...next,
+          replaceTask: { taskId: before.id, revision: before.revision },
+        }),
+      ).toMatchObject({ ok: true })
+      native.hold = undefined
+      hold.resolve()
+      await vi.waitFor(() => expect(repo.collaboration(f.sessionId)?.id).not.toBe(before.id))
+      const replaced = await f.settled()
+      expect(replaced.kind).toBe('review')
+      const old = repo.collaboration(f.sessionId, before.runId)!
+      expect(old.id).toBe(before.id)
+      expect(old.ending).toMatchObject({
+        reason: 'replaced',
+        replacementMessageId: next.clientMessageId,
+        unreviewedChanges: true,
+      })
+      expect(native.inputs).toHaveLength(2)
+      expect(repo.findRun(native.inputs[1]!.runId)?.collaboration?.taskId).toBe(replaced.id)
+    } finally {
+      native.hold = undefined
+      hold.resolve()
+    }
+  })
+
+  it('rejects stale task references while preserving the input and the current task', async () => {
+    const f = await reviewedBuild()
+    const { repo } = f
+    const before = repo.collaboration(f.sessionId)!
+    const runsBefore = native.inputs.length
+    for (const replaceTask of [
+      { taskId: randomUUID(), revision: before.revision },
+      { taskId: before.id, revision: before.revision + 1 },
+    ]) {
+      const next = f.input('/review Review the replacement scope.')
+      // oxlint-disable-next-line no-await-in-loop -- Each rejected send must settle before the next forges a reference.
+      expect(await f.flow.send({ ...next, replaceTask })).toMatchObject({
+        ok: false,
+        error: { code: 'CONFLICT' },
+      })
+      expect(repo.readReceivedInput(f.sessionId)).toBeUndefined()
+    }
+    expect(repo.collaboration(f.sessionId)).toMatchObject({ id: before.id })
+    expect(repo.collaboration(f.sessionId)?.ending).toBeUndefined()
+    expect(native.inputs).toHaveLength(runsBefore)
+  })
+
+  it('pauses a durable queued command whose replacement reference no longer matches the current task', async () => {
+    const f = await fixture('codex')
+    const repo = f.db.conversationRepository
+    const hold = Promise.withResolvers<void>()
+    native.hold = hold.promise
+    try {
+      expect(await f.flow.send(f.input('/build Implement the original scope.'))).toMatchObject({
+        ok: true,
+      })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+      const before = repo.collaboration(f.sessionId)!
+      const next = f.input('/review Review the replacement scope.')
+      expect(
+        await f.flow.send({
+          ...next,
+          replaceTask: { taskId: before.id, revision: before.revision },
+        }),
+      ).toMatchObject({ ok: true })
+      // Old durable fixture: a command stored by an earlier client whose recorded
+      // reference no longer names the current task.
+      const row = f.db.drizzle
+        .select({ metadataJson: collaborationInputs.metadataJson })
+        .from(collaborationInputs)
+        .where(eq(collaborationInputs.id, next.clientMessageId))
+        .get()!
+      const metadata: { replaceTask: { taskId: string; revision: number } } = JSON.parse(
+        row.metadataJson,
+      )
+      metadata.replaceTask = { taskId: randomUUID(), revision: before.revision }
+      f.db.drizzle
+        .update(collaborationInputs)
+        .set({ metadataJson: JSON.stringify(metadata) })
+        .where(eq(collaborationInputs.id, next.clientMessageId))
+        .run()
+      native.hold = undefined
+      hold.resolve()
+      await vi.waitFor(() =>
+        expect(repo.queueState(f.sessionId).input).toMatchObject({
+          id: next.clientMessageId,
+          state: 'paused',
+          reason:
+            'This command no longer matches the current task. Edit it to confirm the current task, or remove it.',
+        }),
+      )
+      expect(repo.collaboration(f.sessionId)?.id).toBe(before.id)
+      expect(repo.collaboration(f.sessionId)?.ending).toBeUndefined()
+      expect(native.inputs).toHaveLength(1)
+    } finally {
+      native.hold = undefined
+      hold.resolve()
+    }
+  })
+
+  it('keeps a queued replacement paused across a cold restart without hidden native work', async () => {
+    const f = await fixture('codex', true)
+    const repo = f.db.conversationRepository
+    const hold = Promise.withResolvers<void>()
+    native.hold = hold.promise
+    try {
+      expect(await f.flow.send(f.input('/build Implement the original scope.'))).toMatchObject({
+        ok: true,
+      })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+      const before = repo.collaboration(f.sessionId)!
+      const next = f.input('/review Review the replacement scope.')
+      expect(
+        await f.flow.send({
+          ...next,
+          replaceTask: { taskId: before.id, revision: before.revision },
+        }),
+      ).toMatchObject({ ok: true })
+      native.hold = undefined
+      hold.resolve()
+      const restarted = await f.restart()
+      await vi.waitFor(() => expect(restarted.flow.diagnostics().activeExecutions).toBe(0))
+      expect(restarted.repo.queueState(f.sessionId).input).toMatchObject({
+        id: next.clientMessageId,
+        workflowCommand: true,
+        state: 'paused',
+      })
+      expect(restarted.repo.collaboration(f.sessionId)?.id).toBe(before.id)
+      expect(restarted.repo.collaboration(f.sessionId, before.runId)?.ending).toBeUndefined()
+      expect(native.inputs).toHaveLength(1)
+    } finally {
+      native.hold = undefined
+      hold.resolve()
+    }
+  })
+
+  it('follows a completed task without a confirmation and keeps it Complete', async () => {
+    const f = await fixture('codex')
+    const repo = f.db.conversationRepository
+    expect(await f.flow.send(f.input('/review Audit the completed scope.'))).toMatchObject({
+      ok: true,
+    })
+    const done = await f.settled()
+    expect(done.status).toBe('complete')
+    const next = f.input('/plan Draft the next scope.')
+    expect(await f.flow.send(next)).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(repo.collaboration(f.sessionId)?.id).not.toBe(done.id))
+    const old = repo.collaboration(f.sessionId, done.runId)!
+    expect(old.id).toBe(done.id)
+    expect(old.status).toBe('complete')
+    expect(old.ending).toBeUndefined()
+    await f.settled()
+  })
 })

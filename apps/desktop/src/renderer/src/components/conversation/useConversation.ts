@@ -187,6 +187,8 @@ export interface ConversationHistoryControls {
 }
 
 const EMPTY_ACTIVITY_META: ConversationWindow['activityMeta'] = {}
+const EMPTY_COMPOSER_IMAGES: readonly DraftImage[] = []
+const EMPTY_COMPOSER_SKILLS: SkillSelection[] = []
 const bodyTextEncoder = new TextEncoder()
 const MAX_SENT_COMMENTS = CONVERSATION_PAGE_ITEMS * 3
 const MAX_SENT_COMMENT_PAGES = Math.ceil(MAX_SENT_COMMENTS / CONVERSATION_PAGE_ITEMS)
@@ -324,7 +326,7 @@ export interface ConversationFlow {
     route?: NonNullable<ConversationSendInput['route']>,
     skills?: SkillSelection[],
     decision?: DecisionReplyContext,
-    askOnly?: ConversationSendInput['askOnly'],
+    replaceTask?: ConversationSendInput['replaceTask'],
   ): Promise<boolean>
   acceptPeerProposal(proposalId: string): Promise<boolean>
   dismissPeerProposal(proposalId: string): Promise<boolean>
@@ -417,6 +419,7 @@ interface PendingSubmission {
   kind: 'message' | 'decision'
   askOnly?: ConversationSendInput['askOnly']
   replyToDecision?: ConversationSendInput['replyToDecision'] | undefined
+  replaceTask?: ConversationSendInput['replaceTask'] | undefined
   userInformation?: import('@pact/contracts').UserInformationDeclaration | undefined
   sourceDocument: ConversationComposerDraft
   imageIds: string[]
@@ -560,6 +563,7 @@ export function useConversation(
               commentIds: value.commentIds,
               replyToDecision: value.replyToDecision,
               askOnly: value.askOnly,
+              replaceTask: value.replaceTask,
               userInformation: value.userInformation,
             }),
           ).byteLength
@@ -951,9 +955,9 @@ export function useConversation(
       revision: (previous.revision ?? 0) + 1,
     })
   }
-  const composerImages = composerDraft?.images ?? []
+  const composerImages = composerDraft?.images ?? EMPTY_COMPOSER_IMAGES
   const composerMention = composerDraft?.mention
-  const composerSkills = composerDraft?.skills ?? []
+  const composerSkills = composerDraft?.skills ?? EMPTY_COMPOSER_SKILLS
   useLayoutEffect(() => {
     if (
       sessionId &&
@@ -2652,7 +2656,7 @@ export function useConversation(
     route?: NonNullable<ConversationSendInput['route']>,
     skills?: SkillSelection[],
     decision?: DecisionReplyContext,
-    askOnly?: ConversationSendInput['askOnly'],
+    replaceTask?: ConversationSendInput['replaceTask'],
   ): Promise<boolean> => {
     if (
       !sessionId ||
@@ -2679,10 +2683,11 @@ export function useConversation(
         : ''
     if (decision && !answers) return false
     const content = decision ? `**Replies to your questions**\n\n${answers}` : original
-    const submissionSkills = decision || askOnly ? undefined : skills
-    const selectedRoute = decision || askOnly ? undefined : route
-    const userInformation =
-      decision || askOnly ? undefined : composerDraftsRef.current[sessionId]?.userInformation
+    const submissionSkills = decision ? undefined : skills
+    const selectedRoute = decision ? undefined : route
+    const userInformation = decision
+      ? undefined
+      : composerDraftsRef.current[sessionId]?.userInformation
     if (userInformation) {
       const validation = userInformationDeclarationSchema.safeParse(userInformation)
       const prefix = parseComposerCommandPrefix(content, submissionSkills)
@@ -2703,7 +2708,7 @@ export function useConversation(
         return false
       }
     }
-    const images = decision || askOnly ? [] : (composerDraftsRef.current[sessionId]?.images ?? [])
+    const images = decision ? [] : (composerDraftsRef.current[sessionId]?.images ?? [])
     if (images.some((image) => image.status !== 'ready' || !image.image)) {
       onNotice('Wait for images to finish preparing, or remove an image that could not be added.')
       return false
@@ -2727,7 +2732,8 @@ export function useConversation(
         JSON.stringify(pending.route) !== JSON.stringify(selectedRoute) ||
         JSON.stringify(pending.skills ?? []) !== JSON.stringify(submissionSkills ?? []) ||
         !sameDecision(pending.replyToDecision, decision?.reference) ||
-        JSON.stringify(pending.askOnly) !== JSON.stringify(askOnly))
+        pending.askOnly !== undefined ||
+        JSON.stringify(pending.replaceTask) !== JSON.stringify(replaceTask))
     ) {
       pending.acknowledgementError =
         'Confirm the previous message before sending different content.'
@@ -2739,7 +2745,7 @@ export function useConversation(
     }
     const preserved = pending
     const expectedCommentsRevision = preserved?.expectedCommentsRevision ?? currentRevision
-    const submissionCommentIds = preserved?.commentIds ?? (decision || askOnly ? [] : commentIds)
+    const submissionCommentIds = preserved?.commentIds ?? (decision ? [] : commentIds)
     const submissionRoute = preserved ? preserved.route : selectedRoute
     const clientMessageId = preserved?.clientMessageId ?? crypto.randomUUID()
     const operationId = crypto.randomUUID()
@@ -2749,22 +2755,19 @@ export function useConversation(
         : composerDraftsRef.current[sessionId]
     const sourceDocument = preserved?.sourceDocument ??
       currentDocument ?? { text: composerSnapshot }
-    const returnedInputOperationId =
-      decision || askOnly
-        ? undefined
-        : preserved
-          ? preserved.returnedInputOperationId
-          : sourceDocument.returnedInputOperationId
-    const queueReturnOperationId =
-      decision || askOnly
-        ? undefined
-        : preserved
-          ? preserved.queueReturnOperationId
-          : sourceDocument.queueReturnOperationId
+    const returnedInputOperationId = decision
+      ? undefined
+      : preserved
+        ? preserved.returnedInputOperationId
+        : sourceDocument.returnedInputOperationId
+    const queueReturnOperationId = decision
+      ? undefined
+      : preserved
+        ? preserved.queueReturnOperationId
+        : sourceDocument.queueReturnOperationId
     const routeIntent = preserved
       ? (preserved.routeIntent ?? 'explicit')
       : decision ||
-          askOnly ||
           returnedInputOperationId ||
           queueReturnOperationId ||
           selectedRoute?.type === 'agent' ||
@@ -2775,11 +2778,9 @@ export function useConversation(
         : composerRouteIntent({ ...sourceDocument, skills: sourceDocument.skills ?? [] })
     const frozen: PendingSubmission = {
       kind: decision ? 'decision' : 'message',
-      ...(askOnly ? { askOnly } : {}),
-      userInformation:
-        decision || askOnly
-          ? undefined
-          : (preserved?.userInformation ?? sourceDocument.userInformation),
+      userInformation: decision
+        ? undefined
+        : (preserved?.userInformation ?? sourceDocument.userInformation),
       sourceDocument,
       imageIds: preserved?.imageIds ?? imageIds,
       inputId: preserved?.inputId,
@@ -2798,6 +2799,7 @@ export function useConversation(
       clientMessageId,
       route: submissionRoute,
       replyToDecision: preserved?.replyToDecision ?? decision?.reference,
+      replaceTask: preserved?.replaceTask ?? replaceTask,
     }
     if (!admitComposerResidency(composerDraftsRef.current, { sessionId, value: frozen }))
       return false
@@ -2822,6 +2824,7 @@ export function useConversation(
       composerRevision: frozen.composerRevision,
       ...(frozen.userInformation ? { userInformation: frozen.userInformation } : {}),
       ...(frozen.replyToDecision ? { replyToDecision: frozen.replyToDecision } : {}),
+      ...(frozen.replaceTask ? { replaceTask: frozen.replaceTask } : {}),
       commentIds: [],
       freezeDrafts: frozen.kind !== 'decision' && !frozen.askOnly,
       ...(frozen.askOnly ? { askOnly: frozen.askOnly } : {}),

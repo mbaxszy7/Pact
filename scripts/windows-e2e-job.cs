@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -52,6 +54,170 @@ public static class PactE2EJob
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool belongs);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetProcessTimes(IntPtr process, out long created, out long exited, out long kernel, out long user);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags, StringBuilder path, ref uint size);
+    [StructLayout(LayoutKind.Sequential)] struct BasicProcessInformation {
+        public IntPtr Reserved, Peb, Reserved2, Reserved3;
+        public UIntPtr Pid, Parent;
+    }
+    [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(
+        IntPtr process, int kind, out BasicProcessInformation info, uint bytes, out uint received);
+
+    sealed class ObservationFailure : Exception {
+        public readonly string Reason;
+        public ObservationFailure(string reason) { Reason = reason; }
+    }
+    sealed class ObservedProcess {
+        public uint Pid, Parent;
+        public long Created;
+        public string Tuple() {
+            long ticks = DateTime.FromFileTimeUtc(Created).Ticks;
+            ticks = ticks / 10 * 10;
+            return "[" + Pid.ToString(CultureInfo.InvariantCulture) + "," +
+                Parent.ToString(CultureInfo.InvariantCulture) + ",\"" +
+                ticks.ToString(CultureInfo.InvariantCulture) + "\"]";
+        }
+    }
+
+    static string ObserveTree(IntPtr job, uint requestedRoot, int budget, Func<bool> interrupted) {
+        var clock = Stopwatch.StartNew();
+        Action guard = () => {
+            if (clock.ElapsedMilliseconds >= budget || interrupted())
+                throw new ObservationFailure("query");
+        };
+        int bytes = 8 + 256 * IntPtr.Size;
+        IntPtr list = Marshal.AllocHGlobal(bytes);
+        try {
+            guard();
+            if (!QueryInformationJobObject(job, 3, list, (uint)bytes, IntPtr.Zero))
+                throw new ObservationFailure("query");
+            uint assigned = unchecked((uint)Marshal.ReadInt32(list, 0));
+            uint available = unchecked((uint)Marshal.ReadInt32(list, 4));
+            if (assigned != available || available > 256)
+                throw new ObservationFailure("query");
+            var identities = new HashSet<uint>();
+            for (int index = 0; index < available; index++) {
+                long value = Marshal.ReadIntPtr(list, 8 + index * IntPtr.Size).ToInt64();
+                if (value < 2 || value > uint.MaxValue || !identities.Add((uint)value))
+                    throw new ObservationFailure("query");
+            }
+            // A foreign requested root is never opened, inspected or signalled.
+            if (!identities.Contains(requestedRoot)) throw new ObservationFailure("query");
+            var rows = new Dictionary<uint, ObservedProcess>();
+            foreach (uint pid in identities) {
+                guard();
+                IntPtr process = OpenProcess(0x1000 | 0x100000, false, pid);
+                if (process == IntPtr.Zero) throw new ObservationFailure("query");
+                try {
+                    bool belongs;
+                    if (!IsProcessInJob(process, job, out belongs) || !belongs ||
+                        WaitForSingleObject(process, 0) != 0x102)
+                        throw new ObservationFailure("query");
+                    long created, exited, kernel, user;
+                    if (!GetProcessTimes(process, out created, out exited, out kernel, out user) ||
+                        created <= 0) throw new ObservationFailure("query");
+                    BasicProcessInformation basic; uint received;
+                    uint size = (uint)Marshal.SizeOf<BasicProcessInformation>();
+                    if (NtQueryInformationProcess(process, 0, out basic, size, out received) != 0 ||
+                        received != size || basic.Pid.ToUInt64() != pid ||
+                        basic.Parent.ToUInt64() > uint.MaxValue)
+                        throw new ObservationFailure("query");
+                    rows.Add(pid, new ObservedProcess {
+                        Pid = pid, Parent = (uint)basic.Parent.ToUInt64(), Created = created
+                    });
+                } finally { CloseHandle(process); }
+            }
+            var root = rows[requestedRoot];
+            var seen = new HashSet<uint> { requestedRoot };
+            var frontier = new HashSet<uint> { requestedRoot };
+            var descendants = new List<ObservedProcess>();
+            for (int depth = 0; depth < 3 && frontier.Count != 0; depth++) {
+                guard();
+                var next = new HashSet<uint>();
+                foreach (var row in rows.Values) {
+                    if (!frontier.Contains(row.Parent)) continue;
+                    if (!seen.Add(row.Pid) || row.Created < rows[row.Parent].Created)
+                        throw new ObservationFailure("query");
+                    if (descendants.Count == 32) throw new ObservationFailure("tree-limit");
+                    descendants.Add(row);
+                    next.Add(row.Pid);
+                }
+                frontier = next;
+            }
+            guard();
+            var result = new StringBuilder("\"root\":");
+            result.Append(root.Tuple()).Append(",\"descendants\":[");
+            for (int index = 0; index < descendants.Count; index++) {
+                if (index != 0) result.Append(',');
+                result.Append(descendants[index].Tuple());
+            }
+            return result.Append(']').ToString();
+        } finally { Marshal.FreeHGlobal(list); }
+    }
+
+    public sealed class ObservedControl {
+        readonly StreamReader reader;
+        public Task<string> Pending { get; private set; }
+        public bool Cancelled { get; private set; }
+        int lastRequest;
+        public ObservedControl(StreamReader input) {
+            reader = input;
+            Pending = ReadCommand(reader);
+        }
+        public static async Task<string> ReadCommand(StreamReader input) {
+            var chars = new char[128];
+            for (int count = 0; count < chars.Length; count++) {
+                int read = await input.ReadAsync(chars, count, 1).ConfigureAwait(false);
+                if (read == 0) {
+                    if (count == 0) return null;
+                    throw new IOException("Incomplete Job command");
+                }
+                if (chars[count] == '\n') return new string(chars, 0, count);
+            }
+            throw new IOException("Job command exceeds its bound");
+        }
+        bool ParseObservation(string line, out int request, out uint root, out int budget) {
+            request = 0; root = 0; budget = 0;
+            if (line == null) return false;
+            var fields = line.Split(' ');
+            if (fields.Length != 4 || fields[0] != "observe-v1" ||
+                !int.TryParse(fields[1], NumberStyles.None, CultureInfo.InvariantCulture, out request) ||
+                request < 1 || lastRequest == int.MaxValue || request != lastRequest + 1 ||
+                !uint.TryParse(fields[2], NumberStyles.None, CultureInfo.InvariantCulture, out root) ||
+                root < 2 ||
+                !int.TryParse(fields[3], NumberStyles.None, CultureInfo.InvariantCulture, out budget) ||
+                budget < 1 || budget > 2000) return false;
+            lastRequest = request;
+            return true;
+        }
+        // A single already-sent read-only request can race a genuine empty receipt.
+        // Host rejects it as unconfirmed; no tree result may follow "empty".
+        public bool DiscardClosingObservation(string line) {
+            int request, budget; uint root;
+            return ParseObservation(line, out request, out root, out budget);
+        }
+        public bool Poll(IntPtr job, uint launchedRoot, StreamWriter writer, string generation) {
+            if (Cancelled) return true;
+            if (!Pending.IsCompleted) return false;
+            if (Pending.IsFaulted || Pending.IsCanceled) { Cancelled = true; return true; }
+            string line = Pending.Result;
+            if (line == null || line == "cancel") { Cancelled = true; return true; }
+            int request, budget; uint root;
+            if (job == IntPtr.Zero || launchedRoot == 0 ||
+                !ParseObservation(line, out request, out root, out budget))
+                throw new IOException("Invalid Job observation command");
+            Pending = ReadCommand(reader);
+            string result;
+            try {
+                result = ObserveTree(job, root, budget, () => Pending.IsCompleted);
+            } catch (ObservationFailure failure) {
+                result = "\"reason\":\"" + failure.Reason + "\"";
+            } catch {
+                result = "\"reason\":\"query\"";
+            }
+            Emit(writer, "{\"kind\":\"tree\",\"version\":1,\"requestId\":" +
+                request.ToString(CultureInfo.InvariantCulture) + "," + result + "}", generation);
+            return false;
+        }
+    }
 
     // Only the current Job is inspected. Export fixed roles, never paths/arguments.
     // Two snapshots per observed launch; 16 visible rows, 256 real Job members.
@@ -166,8 +332,10 @@ public static class PactE2EJob
     public static int Forward(string executable, string[] args) {
         return RunOwned(executable, args, Environment.CurrentDirectory, 10 * 60 * 1000, null, new TaskCompletionSource<string>().Task, true, null);
     }
-    public static int ForwardObserved(string executable, string[] args, long timeout, StreamWriter writer, Task<string> cancel, string generation) {
-        return RunOwned(executable, args, Environment.CurrentDirectory, timeout, writer, cancel, true, generation);
+    public static int ForwardObserved(string executable, string[] args, long timeout,
+        StreamWriter writer, ObservedControl observation, string generation) {
+        return RunOwned(executable, args, Environment.CurrentDirectory, timeout, writer,
+            null, true, generation, "crt", observation);
     }
     static StringBuilder CommandLine(string executable, string[] args, string argumentMode) {
         var command = new StringBuilder(Quote(executable));
@@ -189,7 +357,7 @@ public static class PactE2EJob
         if (command.Length >= 32767) throw new ArgumentException("Command line limit");
         return command;
     }
-    static int RunOwned(string executable, string[] args, string cwd, long timeout, StreamWriter writer, Task<string> cancel, bool forwardInput, string generation, string argumentMode = "crt") {
+    static int RunOwned(string executable, string[] args, string cwd, long timeout, StreamWriter writer, Task<string> cancel, bool forwardInput, string generation, string argumentMode = "crt", ObservedControl observation = null) {
         IntPtr job = IntPtr.Zero, attributes = IntPtr.Zero, jobs = IntPtr.Zero, handles = IntPtr.Zero;
         IntPtr input = IntPtr.Zero, output = IntPtr.Zero, error = IntPtr.Zero;
         ProcessInfo process = new ProcessInfo(); bool attributesReady = false, empty = false;
@@ -218,7 +386,8 @@ public static class PactE2EJob
             Marshal.WriteIntPtr(handles, 0, input); Marshal.WriteIntPtr(handles, IntPtr.Size, output); Marshal.WriteIntPtr(handles, IntPtr.Size * 2, error);
             Check(UpdateProcThreadAttribute(attributes, 0, new IntPtr(0x2000d), jobs, new IntPtr(IntPtr.Size), IntPtr.Zero, IntPtr.Zero));
             Check(UpdateProcThreadAttribute(attributes, 0, new IntPtr(0x20002), handles, new IntPtr(IntPtr.Size * 3), IntPtr.Zero, IntPtr.Zero));
-            if (cancel.IsCompleted) { empty = true; return 1; }
+            if (observation == null ? cancel.IsCompleted :
+                observation.Poll(job, 0, writer, generation)) { empty = true; return 1; }
             var startup = new StartupEx { Info = new Startup { Size = (uint)Marshal.SizeOf<StartupEx>(), Flags = 0x100, Input = input, Output = output, Error = error }, Attributes = attributes };
             // JOB_LIST assigns ownership in the kernel before the first instruction.
             Check(CreateProcessW(executable, command, IntPtr.Zero, IntPtr.Zero, true, 0x80000 | 0x08000000, IntPtr.Zero, cwd, ref startup, out process));
@@ -227,6 +396,8 @@ public static class PactE2EJob
             var clock = Stopwatch.StartNew(); long exitedAt = -1, stoppedAt = -1, sampledAt = -1000;
             uint lastActive = 1;
             while (true) {
+                bool cancelled = observation == null ? cancel.IsCompleted :
+                    observation.Poll(job, process.Pid, writer, generation);
                 uint active = Active(job);
                 if (WaitForSingleObject(process.Process, 0) == 0 && exitedAt < 0) {
                     uint code; Check(GetExitCodeProcess(process.Process, out code));
@@ -251,7 +422,7 @@ public static class PactE2EJob
                 // NSIS delegates uninstall to an owned temporary child before its root exits.
                 // That operation keeps the original phase deadline; ordinary commands retain
                 // the five-second post-root drain. Job ownership and cancellation never change.
-                string reason = cancel.IsCompleted ? "control-closed" : clock.ElapsedMilliseconds >= timeout ? "deadline" : argumentMode != "nsis" && exitedAt >= 0 && clock.ElapsedMilliseconds - exitedAt >= 5000 ? "descendants-still-running" : null;
+                string reason = cancelled ? "control-closed" : clock.ElapsedMilliseconds >= timeout ? "deadline" : argumentMode != "nsis" && exitedAt >= 0 && clock.ElapsedMilliseconds - exitedAt >= 5000 ? "descendants-still-running" : null;
                 if (stoppedAt < 0 && reason != null) {
                     if (runnerDiagnostic) stopDiagnostic = "{\"reason\":\"" + reason + "\",\"active\":" + active + "}";
                     if (generation != null)

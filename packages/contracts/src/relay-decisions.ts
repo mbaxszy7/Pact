@@ -190,6 +190,20 @@ export const relayDecisionAnswerSchema = z
   .refine(withinRecordBudget, 'The complete Relay answer exceeds its metadata budget.')
 export type RelayDecisionAnswer = z.infer<typeof relayDecisionAnswerSchema>
 
+/**
+ * Optional scheduling suggestions may be skipped without granting additional work.
+ * Necessary information, Pact repair confirmations, native rebuilds and retired
+ * legacy formats are never optional.
+ */
+export function isOptionalRelaySuggestion(card: RelaySchedulingDecision): boolean {
+  const request = card.request
+  return (
+    (request.category === 'new_authorization' &&
+      request.operation.kind !== 'repair_role_request') ||
+    (request.category === 'arrangement_change' && request.operation.kind === 'reassign_roles')
+  )
+}
+
 /** Shape validity never establishes freshness, necessity, permission or dispatch eligibility. */
 export function relayAnswerMatchesDecision(
   decision: RelaySchedulingDecision,

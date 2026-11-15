@@ -2898,7 +2898,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             intent &&
             !intent.invalid &&
             intent.permissionMatched &&
-            !inputResult &&
+            (!inputResult || inputResult.outcome === 'explanation_only') &&
             settledRoot(),
           )
         let terminalPlanProjectionFailed = recordingFailed
@@ -2943,7 +2943,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             retention[1].succeeded &&
             retention[1].promptId &&
             authorization?.planReference &&
-            !inputResult &&
+            (!inputResult || inputResult.outcome === 'explanation_only') &&
             settledRoot(),
           )
         if (retention && eligibleRetention()) {

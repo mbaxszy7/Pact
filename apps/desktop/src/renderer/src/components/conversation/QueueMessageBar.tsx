@@ -163,6 +163,15 @@ export function QueueMessageBar({
   ]
     .filter(Boolean)
     .join(' · ')
+  // Only an ordinary queued wait explains the confirmed replacement; other reasons stay authoritative.
+  const replacementWait =
+    entry.replacesTask &&
+    entry.state === 'queued' &&
+    queue.enabled &&
+    !entry.reason &&
+    !backgroundStatus
+      ? entry.replacesTask
+      : undefined
   const iconButton =
     'grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary disabled:cursor-default disabled:opacity-40'
   return (
@@ -261,6 +270,7 @@ export function QueueMessageBar({
       entry.state !== 'queued' ||
       !queue.enabled ||
       entry.reason ||
+      replacementWait ||
       attachments ? (
         <div
           className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pl-6 text-secondary"
@@ -273,14 +283,24 @@ export function QueueMessageBar({
             />
           ) : null}
           <span>
-            {stateLabel}
-            {stoppingBackground
-              ? ''
-              : removableDelivery
-                ? ' · The original execution was rebuilt. You can remove this item from the Pact queue; its delivery remains unconfirmed.'
-                : entry.reason
-                  ? ` · ${entry.reason}`
-                  : ''}
+            {replacementWait ? (
+              <>
+                {`Waiting for ${replacementWait.actor === 'claude' ? 'Claude Code' : 'Codex'}'s current response.`}
+                <br />
+                {`Then start this task instead of continuing /${replacementWait.kind}.`}
+              </>
+            ) : (
+              <>
+                {stateLabel}
+                {stoppingBackground
+                  ? ''
+                  : removableDelivery
+                    ? ' · The original execution was rebuilt. You can remove this item from the Pact queue; its delivery remains unconfirmed.'
+                    : entry.reason
+                      ? ` · ${entry.reason}`
+                      : ''}
+              </>
+            )}
           </span>
           {entry.state === 'paused' && !stoppingBackground && canResume ? (
             <button

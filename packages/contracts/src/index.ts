@@ -26,6 +26,8 @@ import {
   collaborationInputObservationSchema,
   collaborationReplyIntentBasisSchema,
   collaborationAskRefSchema,
+  collaborationReplacementSchema,
+  pactSkillSchema,
 } from './collaboration.js'
 export * from './collaboration.js'
 export * from './scheduling-settings.js'
@@ -1962,6 +1964,13 @@ export const conversationQueuedInputSchema = z.strictObject({
   state: z.enum(['queued', 'paused', 'dispatching', 'unknown']),
   delivery: z.strictObject({ runId: z.string().uuid(), canRemove: z.boolean() }).optional(),
   reason: z.string().max(512).optional(),
+  /** Display-only projection of the task this queued command confirmed it replaces. */
+  replacesTask: z
+    .strictObject({
+      kind: pactSkillSchema,
+      actor: runtimeAgentIdSchema,
+    })
+    .optional(),
   imageCount: z.number().int().nonnegative().max(128),
   commentCount: z.number().int().nonnegative(),
   skillCount: z.number().int().nonnegative(),
@@ -2672,6 +2681,8 @@ export const conversationSendInputSchema = z
         z.strictObject({ type: z.literal('all') }),
       ])
       .optional(),
+    /** The Composer's confirmed reference to the unfinished task this command replaces. */
+    replaceTask: collaborationReplacementSchema.optional(),
   })
   .superRefine((input, context) => {
     if (
@@ -2696,6 +2707,12 @@ export const conversationSendInputSchema = z
         code: 'custom',
         message: 'Implicit routing must retain the original Primary intent.',
         path: ['routeIntent'],
+      })
+    if (input.replaceTask && (input.askOnly || input.replyToDecision || input.userInformation))
+      context.addIssue({
+        code: 'custom',
+        message: 'A task replacement belongs to an explicit new Pact command only.',
+        path: ['replaceTask'],
       })
     if (
       !input.content &&
@@ -2735,6 +2752,7 @@ export const collaborationReceivedMetadataSchema = z.strictObject({
   commentIds: conversationSendInputSchema.shape.commentIds,
   route: conversationSendInputSchema.shape.route,
   replyToDecision: conversationSendInputSchema.shape.replyToDecision,
+  replaceTask: conversationSendInputSchema.shape.replaceTask,
   batchId: conversationSendInputSchema.shape.batchId,
   freezeDrafts: conversationSendInputSchema.shape.freezeDrafts,
 })

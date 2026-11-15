@@ -19,16 +19,29 @@ public static class PactFixtureLauncher
         Console.Error.WriteLine("Windows fixture launcher failed (" + phase + "; elapsedMs=" + Clock.ElapsedMilliseconds + "; type=" + kind + "; code=" + code + ").");
         return 1;
     }
-    static bool ReceiptAcknowledged(StreamReader reader, Task<string> pending) {
+    // The helper stays alive until the caller explicitly ACKs the final receipt or closes
+    // the socket. A bounded drain still accepts at most one already-sent observation read
+    // plus the original two cancel/ACK lines so an ACK cannot hide trailing commands; EOF
+    // releases only the control connection and is never extra physical-exit proof.
+    static bool ReceiptAcknowledged(StreamReader reader, PactE2EJob.ObservedControl control) {
         var clock = Stopwatch.StartNew();
-        for (int line = 0; line < 2; line++) {
+        var pending = control.Pending;
+        int cancelLines = 0;
+        bool discardedQuery = false;
+        while (cancelLines < 2) {
             long remaining = 1000 - clock.ElapsedMilliseconds;
             if (remaining <= 0 || !pending.Wait((int)remaining)) return false;
-            // EOF releases only the control connection; the actual Job already
-            // supplied its empty receipt. It is never extra physical-exit proof.
-            if (pending.Result == null || pending.Result == "received") return true;
-            if (line != 0 || pending.Result != "cancel") return false;
-            pending = reader.ReadLineAsync();
+            string line = pending.Result;
+            if (line == null || line == "received") return true;
+            if (cancelLines == 0 && !discardedQuery &&
+                control.DiscardClosingObservation(line)) {
+                discardedQuery = true;
+                pending = PactE2EJob.ObservedControl.ReadCommand(reader);
+                continue;
+            }
+            if (cancelLines != 0 || line != "cancel") return false;
+            cancelLines++;
+            pending = PactE2EJob.ObservedControl.ReadCommand(reader);
         }
         return false;
     }
@@ -70,7 +83,7 @@ public static class PactFixtureLauncher
                     var hello = new JavaScriptSerializer().Serialize(new { kind = "hello", token = configuration.token, generation = configuration.generation });
                     if (!writer.WriteLineAsync(hello).Wait(1000)) return Failed("hello-deadline", 0);
                     phase = "admission-read";
-                    var admission = reader.ReadLineAsync();
+                    var admission = PactE2EJob.ObservedControl.ReadCommand(reader);
                     if (!admission.Wait(5000)) return Failed("admission-deadline", 0);
                     if (admission.Result != "go") return Failed("admission-denied", 0);
                     phase = "owned-job";
@@ -84,13 +97,13 @@ public static class PactFixtureLauncher
                         });
                         return PactE2EJob.Run(configuration.executable, configuration.args, configuration.cwd, configuration.timeout, writer, cancellation, configuration.argumentMode);
                     }
-                    var cancel = reader.ReadLineAsync();
-                    int exit = PactE2EJob.ForwardObserved(configuration.executable, forwarded, configuration.timeout, writer, cancel, configuration.generation);
+                    var control = new PactE2EJob.ObservedControl(reader);
+                    int exit = PactE2EJob.ForwardObserved(configuration.executable, forwarded, configuration.timeout, writer, control, configuration.generation);
                     phase = "receipt-ack";
                     Stage(phase);
-                    // Reuse the one pending read; cancellation and ACK are never
+                    // Reuse the one pending control read; cancellation and ACK are never
                     // concurrent reads. The existing caller cleanup deadline stays fixed.
-                    return ReceiptAcknowledged(reader, cancel) ? exit : Failed(phase, 0);
+                    return ReceiptAcknowledged(reader, control) ? exit : Failed(phase, 0);
                 }
             }
         } catch (Exception error) {

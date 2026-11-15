@@ -463,10 +463,8 @@ describe('durable Relay activity facts', () => {
       actionResult: 'cancelled',
       physicalUnconfirmed: false,
     })
-    expect(f.repo.collaboration(f.sessionId)).toMatchObject({
-      automation: 'paused',
-      pauseReason: 'user',
-    })
+    expect(f.repo.collaboration(f.sessionId)?.automation).toBe('active')
+    expect(f.repo.collaboration(f.sessionId)?.pauseReason).toBeUndefined()
     expect(f.db.drizzle.select().from(schedulingActivity).get()?.unresolved).toBe(false)
   })
 

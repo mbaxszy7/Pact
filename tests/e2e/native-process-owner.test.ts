@@ -7,10 +7,13 @@ import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { expect, it, vi } from 'vitest'
 
-import type { WindowsLaunchOwner, WindowsRootExit } from './windows-cli-launcher.js'
-
 import { OwnedProcessGroup } from '../../apps/desktop/src/utility/owned-process-group.js'
 import { NativeProcessOwner } from '../native/native-harness.js'
+import {
+  WindowsProcessTreeError,
+  type WindowsLaunchOwner,
+  type WindowsRootExit,
+} from './windows-cli-launcher.js'
 
 // Real helper closure with controlled Job receipts tests the two-owner ordering.
 // Only Windows CI can establish the corresponding kernel Job facts.
@@ -82,6 +85,7 @@ it.each(scenarios)('joins the inner receipt before outer teardown: $name', async
     empty: empty.promise,
     rootExit: new Promise<WindowsRootExit>(() => undefined),
     armStartup() {},
+    observeProcessTree: () => Promise.reject(new WindowsProcessTreeError('query')),
     cancel() {
       events.push('inner-cancel')
       cancelled = true

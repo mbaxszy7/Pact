@@ -524,7 +524,12 @@ async function findOwnedAgentProcess(
   }
   if (!executable) throw new Error('Selected actual Agent executable is unavailable')
   if (process.platform === 'win32')
-    return findWindowsOwnedAgentProcess(utilityPid, executable, agentId)
+    return findWindowsOwnedAgentProcess(
+      utilityPid,
+      executable,
+      agentId,
+      ctx.fixture.observeWindowsProcessTree,
+    )
   const owner = { pid: utilityPid, executable }
   const pending = [{ pid: owner.pid, chain: [] as OwnedAgentProcess['chain'] }]
   const matches: OwnedAgentProcess[] = []

@@ -135,7 +135,7 @@ export async function createQueueFixture(filePath = ':memory:', directoryPath = 
   const queue = (
     run: QueueRootRun,
     content: string,
-    options: Pick<ConversationSendInput, 'skills'> = {},
+    options: Pick<ConversationSendInput, 'skills' | 'replaceTask' | 'route'> = {},
   ) => {
     const clientMessageId = randomUUID()
     const body = repo().writeConversationInput({ type: 'begin', sessionId, clientMessageId }, owner)

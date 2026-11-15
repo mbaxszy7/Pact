@@ -47,7 +47,9 @@ import {
 import {
   writeWindowsNodeLauncher,
   writeWindowsObservedLauncher,
+  WindowsProcessTreeError,
   type WindowsLaunchOwner,
+  type WindowsProcessTree,
 } from './windows-cli-launcher.js'
 import { windowsFixtureRenameSource } from './windows-fixture-rename.js'
 
@@ -173,6 +175,11 @@ export interface RuntimeFixture {
   ): Promise<{ exitCode: number; stdout: string; stderr: string }>
   readConfigurationModels(): { claude: string | null; codex: string | null }
   appJobDiagnostic(this: void): ReturnType<WindowsLaunchOwner['diagnostic']> | undefined
+  observeWindowsProcessTree(
+    this: void,
+    rootPid: number,
+    deadlineAt: number,
+  ): Promise<WindowsProcessTree>
   databaseFile: string
   claudeHome: string
   codexHome: string
@@ -1124,6 +1131,10 @@ export async function createRuntimeFixture(
           })
         },
         appJobDiagnostic: () => appOwner?.diagnostic(),
+        observeWindowsProcessTree: (rootPid: number, deadlineAt: number) =>
+          appOwner
+            ? appOwner.observeProcessTree(rootPid, deadlineAt)
+            : Promise.reject(new WindowsProcessTreeError('query')),
         dispose,
         readCodexFacts: async () => {
           if (mode === 'real')

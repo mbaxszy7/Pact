@@ -67,14 +67,11 @@ function DecisionQuestions({
           className="size-4 shrink-0 text-secondary"
           strokeWidth={1.75}
         />
-        <h2 className="font-medium text-primary">{speaker} is waiting for your reply</h2>
+        <h2 className="font-medium text-primary">{speaker} needs your input</h2>
       </header>
       {stale ? (
         <div role="alert" className="px-group pb-3 text-secondary">
-          <p>
-            You have saved answers to an earlier request. Keep them in your message draft or discard
-            them before answering these questions.
-          </p>
+          <p>These answers belong to an earlier request.</p>
           <div className="mt-2 flex flex-wrap gap-2">
             <button
               type="button"
@@ -82,7 +79,7 @@ function DecisionQuestions({
               onClick={() => onClearDraft?.(true)}
               className="min-h-8 rounded-control px-2 font-medium text-primary hover:bg-surface-raised focus-visible:outline-2 focus-visible:outline-focus"
             >
-              Keep answers in message draft
+              Keep in draft
             </button>
             <button
               type="button"
@@ -90,7 +87,7 @@ function DecisionQuestions({
               onClick={() => onClearDraft?.(false)}
               className="min-h-8 rounded-control px-2 hover:bg-surface-raised focus-visible:outline-2 focus-visible:outline-focus"
             >
-              Discard saved answers
+              Discard answers
             </button>
           </div>
         </div>
@@ -178,12 +175,10 @@ function DecisionQuestions({
         </p>
       ) : null}
       <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-group py-2">
-        <p className="max-w-[56ch] text-secondary">
-          Only these answers are sent. Your message draft and attachments are kept. Collaboration
-          stays paused.
-        </p>
+        <p className="max-w-[56ch] text-secondary">Answers do not authorize code changes.</p>
         <button
           type="button"
+          title="Sends these answers; your message draft and attachments stay saved."
           disabled={disabled || stale || !canSubmit}
           onClick={onSubmit}
           className="min-h-8 rounded-control bg-surface-inverse px-3 py-1.5 font-medium text-inverse hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:opacity-45"
@@ -261,11 +256,11 @@ function LegacyQuestionCard({
           className="size-4 shrink-0 text-secondary"
           strokeWidth={1.75}
         />
-        <h2 className="font-medium text-primary">{speaker} is waiting for your reply</h2>
+        <h2 className="font-medium text-primary">{speaker} needs your input</h2>
       </header>
       {!expanded ? (
         <p className="px-group pb-3 text-secondary">
-          This earlier request was saved as text. Open the original request, then answer here.
+          Read the original request, then answer below.
         </p>
       ) : (
         <section
@@ -305,14 +300,14 @@ function LegacyQuestionCard({
       )}
       {stale ? (
         <div role="alert" className="px-group pb-3 text-secondary">
-          <p>Saved answers belong to an earlier request.</p>
+          <p>These answers belong to an earlier request.</p>
           <button
             type="button"
             disabled={disabled}
             className="min-h-8 px-2 underline"
             onClick={() => onClearDraft?.(true)}
           >
-            Keep answers in message draft
+            Keep in draft
           </button>
           <button
             type="button"
@@ -320,7 +315,7 @@ function LegacyQuestionCard({
             className="min-h-8 px-2 underline"
             onClick={() => onClearDraft?.(false)}
           >
-            Discard saved answers
+            Discard answers
           </button>
         </div>
       ) : null}

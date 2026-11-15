@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import {
+  parseComposerCommandPrefix,
   skillArguments,
   type ConversationPageMessage,
   type FrozenSkillInvocation,
@@ -117,20 +118,23 @@ describe('queued workflow classification through the sealed body', () => {
     const value = await fixture(),
       root = value.root(true),
       task = value.repo.collaboration(value.sessionId)!,
-      request = value.queue(root, content),
+      route = parseComposerCommandPrefix(content).route ?? {
+        type: 'agent' as const,
+        agentId: 'codex' as const,
+      }
+    expect(() => value.queue(root, content, { route })).toThrow(/Confirm replacing/u)
+    expect(value.repo.queueState(value.sessionId).input).toBeNull()
+    expect(value.repo.collaboration(value.sessionId)).toEqual(task)
+    const replaceTask = { taskId: task.id, revision: task.revision }
+    const request = value.queue(root, content, { route, replaceTask }),
       received = value.repo.readReceivedInput(value.sessionId)!
     expect(received.content).toBe(content)
     expect(received.metadata.workflowCommand).toBe(true)
     expect(received.taskId).toBeNull()
+    expect(received.metadata.replaceTask).toEqual(replaceTask)
     expect(value.repo.queueState(value.sessionId).input?.workflowCommand).toBe(true)
     expect(() => value.prepare(root, request)).toThrow(/answered in the next Turn/)
-    expect(value.repo.collaboration(value.sessionId)).toEqual({
-      ...task,
-      revision: task.revision + 1,
-      latestUserMessageId: request.inputId,
-      inputProcessing: { pending: { inputId: request.inputId, inputSequence: task.inputSequence } },
-      notice: 'Your message will be answered before collaboration continues.',
-    })
+    expect(value.repo.collaboration(value.sessionId)).toEqual(task)
     expect(value.repo.queueState(value.sessionId).input?.state).toBe('queued')
   })
 

@@ -499,7 +499,7 @@ describe('Shared handoff receipts and persistent scheduling budgets', () => {
     expect(changed.factFingerprint).toBe(old.factFingerprint)
     expect(changed.freshnessGuard).not.toEqual(old.freshnessGuard)
     expect(() => admitHandoff(f, task, old)).toThrow('handoff facts changed')
-    f.repo.pauseCollaboration(f.sessionId)
+    f.repo.pauseCollaboration(f.sessionId, 'user')
     const paused = f.repo.collaboration(f.sessionId)!
     expect(f.repo.workflowHandoff(paused, paused.reviewer).id).toBe(old.id)
     f.repo.setCollaborationState({
@@ -1450,9 +1450,7 @@ it('keeps the full natural plan and report in handoff/rebuild sources without an
 
 it('preserves paused native completion and applies the original plan once', async () => {
   const f = await fixture()
-  f.repo.setCollaborationState(
-    advanceCollaboration(f.repo.collaboration(f.sessionId)!, 'pause', settings),
-  )
+  f.repo.pauseCollaboration(f.sessionId, 'stopped')
   f.finish()
   const settled = f.repo.collaboration(f.sessionId)!
   expect(settled).toMatchObject({ automation: 'paused', planVersion: 1, status: 'waiting' })
@@ -1525,7 +1523,9 @@ it('does not hide a failed native plan capture behind newer input', async () => 
   const f = await fixture()
   f.repo.recordWorkflowPlanUnavailable(f.first.run.id)
   f.receive()
+  expect(f.repo.workflowPlanCaptureFailed(f.first.run.id)).toBe(true)
   f.finish(f.first.run.id, { answer: 'The native plan capture failed.' })
+  expect(f.repo.workflowPlanCaptureFailed(f.first.run.id)).toBe(true)
   expect(f.repo.collaboration(f.sessionId)).toMatchObject({
     status: 'failed',
     automation: 'paused',

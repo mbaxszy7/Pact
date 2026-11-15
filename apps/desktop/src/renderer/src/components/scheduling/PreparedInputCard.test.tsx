@@ -66,7 +66,7 @@ it('a receipt read during preparation cannot trap the next explicit paused Conti
         onChanged={onChanged}
       />,
     )
-  await user.click(screen.getByRole('button', { name: 'Continue original request' }))
+  await user.click(screen.getByRole('button', { name: 'Continue request' }))
   await waitFor(() => expect(send).toHaveBeenCalledTimes(1))
   const first = send.mock.calls[0]![0]
   view.rerender(
@@ -83,17 +83,14 @@ it('a receipt read during preparation cannot trap the next explicit paused Conti
       onChanged={onChanged}
     />,
   )
-  await user.click(screen.getByRole('button', { name: 'Check Continue' }))
+  await user.click(screen.getByRole('button', { name: 'Check status' }))
   expect(read).toHaveBeenCalledExactlyOnceWith({
     sessionId,
     decisionId: first.operationId,
     clientOperationId: first.operationId,
   })
   expect(send).toHaveBeenCalledTimes(1)
-  expect(screen.getByRole('button', { name: 'Continue original request' })).toHaveProperty(
-    'disabled',
-    true,
-  )
+  expect(screen.getByRole('button', { name: 'Continue request' })).toHaveProperty('disabled', true)
   view.rerender(
     <PreparedInputCard
       sessionId={sessionId}
@@ -107,7 +104,7 @@ it('a receipt read during preparation cannot trap the next explicit paused Conti
       onChanged={onChanged}
     />,
   )
-  await user.click(screen.getByRole('button', { name: 'Continue original request' }))
+  await user.click(screen.getByRole('button', { name: 'Continue request' }))
   expect(send).toHaveBeenCalledTimes(2)
   expect(send.mock.calls[1]![0]).toMatchObject({
     batchId: input.batchId,
@@ -139,7 +136,7 @@ it('a newer paused projection keeps an uncertain old action on pure Check until 
         onChanged={() => {}}
       />,
     )
-  await user.click(screen.getByRole('button', { name: 'Continue original request' }))
+  await user.click(screen.getByRole('button', { name: 'Continue request' }))
   const old = send.mock.calls[0]![0]
   view.rerender(
     <PreparedInputCard
@@ -149,12 +146,12 @@ it('a newer paused projection keeps an uncertain old action on pure Check until 
       onChanged={() => {}}
     />,
   )
-  await user.click(screen.getByRole('button', { name: 'Check Continue' }))
+  await user.click(screen.getByRole('button', { name: 'Check status' }))
   expect(read).toHaveBeenCalledExactlyOnceWith({
     sessionId,
     decisionId: old.operationId,
     clientOperationId: old.operationId,
   })
   expect(send).toHaveBeenCalledTimes(1)
-  expect(screen.getByRole('button', { name: 'Check Continue' })).toHaveProperty('disabled', false)
+  expect(screen.getByRole('button', { name: 'Check status' })).toHaveProperty('disabled', false)
 })

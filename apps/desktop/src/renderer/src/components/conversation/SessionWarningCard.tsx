@@ -93,11 +93,10 @@ export function SessionWarningCard({
             Rebuild {confirming.agentId === 'codex' ? 'Codex' : 'Claude Code'} session?
           </h3>
           <p className="mt-2 leading-relaxed">
-            Rebuild keeps your history and drafts and switches to a new session. Your previous task
-            won’t run again.
-            {confirming.abandon ? ' Work in the old session may continue making changes.' : null}
+            Starts a new native session. History and drafts stay; the task is not rerun.
+            {confirming.abandon ? ' Old work may still change files.' : null}
             {confirming.previousCreationUnconfirmed
-              ? ' A previous attempt may already have created a session.'
+              ? ' A previous attempt may have created a session.'
               : null}
           </p>
           <div className="mt-3 flex justify-end gap-1.5">

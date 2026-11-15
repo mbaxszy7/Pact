@@ -95,15 +95,15 @@ candidates, and bounded discovery failure is not permission to choose an older t
 
 First-time users remain on Runtime Preparation until both CLIs are Ready, then must complete Default Session Settings. There is no hidden skip or fake-model validation. Saving defaults and completing setup is atomic.
 
-Returning users enter their existing workspace and refresh readiness there. If either CLI is not Ready, **Runtime Degraded** keeps local Projects/history readable and settings available while disabling Agent-start/continue actions with the reason. Recovery restores those actions; each actual execution still checks the runtime, rather than trusting stale Ready state.
+Returning users enter their workspace and refresh readiness there. If either CLI is not Ready, **Runtime Degraded** keeps local Projects/history readable and settings available while disabling Agent-start/continue actions with the reason. Recovery restores those actions; each execution still checks the runtime, rather than trusting stale Ready state.
 
-The existing top yellow warning bar identifies required CLI upgrades during normal use and links to the same Runtime Preparation page. Readiness refreshes on window focus/visibility and once per minute while visible, with no background polling or automatic retry loop. After upgrading, Check again/Retry rechecks the selected installations and clears the warning when both Agents are Ready.
+The top yellow warning bar identifies required CLI upgrades during normal use and links to the Runtime Preparation page. Readiness refreshes on window focus/visibility and once per minute while visible, with no background polling or automatic retry loop. After upgrading, Check again/Retry rechecks the installations and clears the warning when both Agents are Ready.
 
 ### Defaults, Model and Effort
 
 One App Default Session Settings template contains Primary/Secondary, independent Model/Effort for each Agent, discussion rounds (default 6, range 1–20), review cycles (default 3, range 1–10), and repair attempts (default 3, range 1–10). The Composer's explicit Queue and Steer actions govern ordinary running-message delivery. Retired database columns do not select a live behavior. Speed has no App default or setting in the App, Session or creation-time settings forms.
 
-Speed offers Native, Standard and Fast; new Sessions start at Native independently of the App template. Native preserves the selected CLI's speed configuration; Standard explicitly requests ordinary speed; Fast requests compatible native acceleration without changing Model or Effort. Each Session and Agent owns its selection. Composer groups each Agent's independent Permission and Speed menus with a divider, following the Project folder/branch controls. Speed always displays its label and value; dropdown arrows remain neutral even for Full access. Selection saves immediately through a revision-checked single-Agent update, while a Run keeps its frozen settings revision. Changes apply to the next execution. Settings-page saves preserve current Speed and permissions; uncertain replies trigger readback without automatic resend. Fast can increase usage or cost; known incompatibility continues at standard speed with a visible reason. Requested speed and provider-observed state are distinct; an acceptance ACK does not prove acceleration or account entitlement. If an override was not applied and no effective speed was reported, the Run header shows Native speed and an info icon exposes the explanation on hover or keyboard focus. A possibly delivered failure never causes a second standard-speed execution. Unsupported native controls identify their limitation without claiming an override succeeded.
+Speed offers Native, Standard and Fast; new Sessions start at Native independently of the App template. Native preserves the selected CLI's speed configuration; Standard explicitly requests ordinary speed; Fast requests compatible native acceleration without changing Model or Effort. Each Session and Agent owns its selection. Selection saves immediately through a revision-checked single-Agent update, while a Run keeps its frozen settings revision. Changes apply to the next execution. Settings-page saves preserve current Speed and permissions; uncertain replies trigger readback without automatic resend. Fast can increase usage or cost; known incompatibility continues at standard speed with a visible reason. Requested speed and provider-observed state are distinct; an acceptance ACK does not prove acceleration or account entitlement. A possibly delivered failure never causes a second standard-speed execution. Unsupported native controls identify their limitation without claiming an override succeeded.
 
 A new Session copies the current template into its first immutable settings revision; creation-time customization affects only that Session. Later global edits replace the singleton and affect future Sessions only. There is no implicit Project template or hidden save-as-global action.
 
@@ -123,11 +123,11 @@ Collaboration task roles stay frozen even if Primary changes. Limits are checked
 
 A Project is an explicitly added canonical local-directory reference, not a copy or automatic scan. Resolve symlinks/canonical identity, reject filesystem roots and deduplicate. Classify Git from a `.git` file/directory at the selected root; do not silently promote a nested directory or bare repository. Non-Git is valid, and current native edits use the same authorization rules without initialize-Git/snapshot unlocking.
 
-Rename changes only the saved display name: trimmed, nonempty, single-line and at most 120 UTF-16 units. Re-add preserves identity/name/Sessions. Name/Pencil opens the inline editor and selects the current name; Enter saves, Escape cancels, blur preserves the draft. Failures keep the draft with local error. Read back uncertain writes before another mutation. Folder disclosure remains separate.
+Rename changes only the saved display name: trimmed, nonempty, single-line and at most 120 UTF-16 units. Re-add preserves identity/name/Sessions. Name/Pencil opens the inline editor and selects the name; Enter saves, Escape cancels, blur preserves the draft. Failures keep the draft with local error. Read back uncertain writes before another mutation. Folder disclosure remains separate.
 
 Project/Session Archive hides App entries without deleting files, settings, messages or Native histories. Idle items archive directly. Active tasks require a Pact confirmation showing the affected Sessions: Cancel changes no task; Stop and archive requests interruption and waits for actual native settlement and saved output before hiding the item. Project archive confirms its affected tasks once and archives the Project only after all settle; it does not cascade Session archive state. Partial failure, timeout or unconfirmed native work leaves the item unarchived and identifies finished, stopped and unresolved tasks. Unsupported recovery, Rebuild, Fork or detached work must finish or be checked before archive; archive never invents a successful Stop. Confirmation expires or requires review if the task identities change. Immediate Undo restores visibility without restarting tasks; re-adding an archived canonical Project restores its identity and Sessions. Permanent delete and a persistent Archive browser are not exposed.
 
-Archive feedback combines successful, failed and unconfirmed results in one summary with an expandable, paged list. Each entry identifies the Session or Project and its own result; a Project counts as one entry even when its affected Sessions have different Stop outcomes. Undo restores only the selected successful entry and removes that entry after confirmed restoration. Failure details preserve individual Stop outcomes; Review again prepares current task identities and requires confirmation for active work. An unconfirmed entry only checks the original operation; it cannot authorize another Stop or be dismissed until resolved. Retrying a failed item updates its existing entry. Results remain available until explicitly dismissed or the Renderer restarts; new archives do not overwrite earlier Undo actions. At the display capacity, further archives require reviewing or dismissing resolved entries first. Restoring an independently archived Session requires its Project to be visible first. Feedback is a disposable projection; durable archive receipts remain authoritative.
+Archive feedback combines successful, failed and unconfirmed results in one summary with an expandable, paged list. Each entry identifies the Session or Project and its result; a Project counts as one entry even when its affected Sessions have different Stop outcomes. Undo restores only the selected successful entry and removes that entry after confirmed restoration. Failure details preserve individual Stop outcomes; Review again prepares current task identities and requires confirmation for active work. An unconfirmed entry only checks the original operation; it cannot authorize another Stop or be dismissed until resolved. Retrying a failed item updates its entry. Results remain available until explicitly dismissed or the Renderer restarts; new archives do not overwrite earlier Undo actions. At the display capacity, further archives require reviewing or dismissing resolved entries first. Restoring an independently archived Session requires its Project to be visible first. Feedback is a disposable projection; durable archive receipts remain authoritative.
 
 Blocked or unsuccessful Session archives offer **Remove from sidebar**. Removal keeps chat, runs and ongoing work. **Undo** restores visibility, in Ungrouped if the group was deleted. An unconfirmed archive retains **Check status**.
 
@@ -137,9 +137,9 @@ The Composer footer shows the canonical folder basename and current Git branch b
 
 One Project may have multiple Sessions. Each owns transcript, settings, separate native bindings/cursors, Runs, Comments, images and collaboration tasks. No other Session's work may overwrite those facts. Only one admitted Agent Run executes per Session, with App/resource admission in Performance; this is not a filesystem lock against external editors/native background tools.
 
-`New session` is immediate; a local first-message title is fallback. An Agent/native title can arrive within the existing authorized root Turn, without a hidden title-model Turn. User rename always wins. Only successful, current, correctly attributed root/generation evidence can be adopted; foreign/child/failed/expired/duplicate results cannot rename. A Fork preserves its inherited title semantics.
+`New session` is immediate; a local first-message title is fallback. An Agent/native title can arrive within the authorized root Turn, without a hidden title-model Turn. User rename always wins. Only successful, current, correctly attributed root/generation evidence can be adopted; foreign/child/failed/expired/duplicate results cannot rename. A Fork preserves its inherited title semantics.
 
-Local fallback titles retain normalized first-message text within the existing 120 UTF-16-unit title limit without splitting a grapheme or appending a display ellipsis. Header and navigation labels ellipsize only when their rendered width is insufficient and expose the complete saved title on hover. Renaming edits the saved text, never a shortened display label.
+Local fallback titles retain normalized first-message text within the 120 UTF-16-unit title limit without splitting a grapheme or appending a display ellipsis. Header and navigation labels ellipsize only when their rendered width is insufficient and expose the saved title on hover. Renaming edits the saved text, never a shortened display label.
 
 After adopting a native title into Pact, Codex's display name may become `[Pact] Project name · Session title`. Save user renames locally before one-way native synchronization. Failure does not block chat/rename; the next normal connection can reconcile. Never change an old generation, unconfirmed candidate or unrelated client's thread. The prefix is not part of Pact's own title. Users may intentionally open the native thread in another client; Pact does not hide it or migrate authentication to prevent this.
 
@@ -177,9 +177,9 @@ their native behavior without an additional workspace fade. Opaque Solid Windows
 window operations without custom opacity or shape updates. Transparent Windows windows retain their
 current effects and do not promise native scaling animations unavailable to that window style.
 
-On macOS and Windows, closing the workspace hides its window and keeps Pact and its existing work
+On macOS and Windows, closing the workspace hides its window and keeps Pact and its work
 available from the system tray. The tray uses a monochrome version of the shared Pact mark; macOS
-uses a transparent Template image. Clicking the tray icon shows and focuses the existing workspace.
+uses a transparent Template image. Clicking the tray icon shows and focuses the workspace.
 Right-click opens a native menu with Show Pact, Needs attention, Running, Recent Sessions and Exit.
 Window closure does not authorize Stop, archive or another Agent Turn.
 
@@ -196,26 +196,25 @@ The full attention view also retains unread indication.
 Selecting a native entry reveals the workspace and opens that Session without sending input,
 restarting work, restoring an archived entry or initializing a native context. A newer deliberate
 Session choice supersedes an older pending navigation. Archived or unavailable entries report their
-current state and leave the existing selection available. Recent ordering persists across restarts.
+current state and leave the selection available. Recent ordering persists across restarts.
 
 Packaged Windows applications publish the same Session groups in their taskbar JumpList. Entries
-launch that exact application identity with only the Session identifier; a second launch reveals its
-existing instance. A normal confirmed exit retains recent entries for cold launch and removes live
+launch that exact application identity with only the Session identifier; a second launch reveals its instance. A normal confirmed exit retains recent entries for cold launch and removes live
 groups. Windows privacy or policy can disable custom categories, and removing a Session from the
 JumpList suppresses it until a later deliberate App opening. Windows development publishes the same
 groups for its running repository-specific instance, with the Pact development name and icon.
-Development taskbar entries only reveal or navigate that existing instance; after a full exit,
+Development taskbar entries only reveal or navigate that instance; after a full exit,
 start it with `pnpm dev`. They never launch bare Electron or an older Renderer build. Normal
 development exit clears custom categories unless pending Windows removal records must be preserved.
 macOS publishes the groups in its Dock menu while Pact is running.
 
-Exit, the application Quit command and macOS Cmd+Q use the existing safe shutdown owner. Known idle
+Exit, the application Quit command and macOS Cmd+Q use the safe shutdown owner. Known idle
 work exits directly. Active or unsettled work opens a Pact confirmation listing affected Sessions;
 Cancel keeps working, and Exit Pact confirms that work may be interrupted. Unavailable or uncertain
 runtime state requires confirmation rather than assuming idle. Cancellation is confirmed before
-the dialog closes. During shutdown the workspace and tray remain available until the actual runtime
+the dialog closes. During shutdown the workspace and tray remain available until the runtime
 exit is established. Saved conversations and files remain on the device; unsent ordinary drafts
-retain their existing restart behavior. System shutdown or logout does not wait for this user
+retain their restart behavior. System shutdown or logout does not wait for this user
 confirmation. A system dialog is a fallback only when the Pact interface is unavailable.
 
 ## Messages, routing and execution
@@ -244,7 +243,7 @@ Check both required bindings before creating the User Message. Missing context p
 
 ### History and peer assistance
 
-Each Agent retains independent native context and confirmed transcript cursor. The next target receives its consecutive unseen questions/completed answers with speakers, order, sent Comments and managed image/source references; do not duplicate the current request. Advance only on native acceptance. Retry/reconciliation uses its frozen history, not a newer source.
+Each Agent retains independent native context and confirmed transcript cursor. The next target receives its consecutive unseen questions/completed answers with speakers, order, sent Comments and managed image/source references; do not duplicate the request. Advance only on native acceptance. Retry/reconciliation uses its frozen history, not a newer source.
 
 Native compaction keeps that context identity. Pact retains originals/images/Comments, does not synchronize native summaries or automatically Rebuild/replay old images; the user may provide an old image again. Budget failure keeps source/cursor and reports rejection, never truncates, summarizes, switches models or adds an unapproved compaction Turn.
 
@@ -252,7 +251,7 @@ Agents cannot invoke each other directly or trigger routing with prose. Validate
 
 Prompt policy proposes meaningful second-agent assistance for substantial review, design uncertainty, decisive facts, missing perspective or competing explanations, but not simple tasks or already dual-routed `@all`. Both `@all` stages enforce exclusion. The current answer remains independently useful; it must not replace substantive content with descriptions of tools/routing/confirmation or an imagined future review.
 
-Show a compact initiator/target/action row with `Ask <Agent>`/`Not now`; bounded reason is source evidence, not an arbitrary hidden prompt or repetitive UI. Ask authorizes one Turn and creates its visible User Message directly, preserving current body/Comment/image drafts. Not now starts nothing. New User input or accepted Proposal transactionally supersedes pending Proposals; stale clicks fail. Missing native context keeps Proposal pending without message/Run; uncertain delivery never reactivates it.
+Show a compact initiator/target/action row with `Ask <Agent>`/`Not now`; bounded reason is source evidence, not an arbitrary hidden prompt or repetitive UI. Ask authorizes one Turn and creates its visible User Message directly, preserving body/Comment/image drafts. Not now starts nothing. New User input or accepted Proposal transactionally supersedes pending Proposals; stale clicks fail. Missing native context keeps Proposal pending without message/Run; uncertain delivery never reactivates it.
 
 ### Streaming, Stop and drafts
 
@@ -262,17 +261,17 @@ Work Log retains provider-supplied readable reasoning/progress and sanitized Too
 
 Normal response keeps Composer editable and retains Stop. While responding, Enter queues one complete input and Shift+Enter inserts a newline; IME and autocomplete retain their own acceptance rules. A full queue preserves the new draft and reports the occupied slot. With queue disabled, Enter inserts a newline. Idle Enter sends normally. Stop requests native interruption, preserves completed changes and pauses pending input; real settlement is required. Lost observation is not a successful Stop. Recovery/read-only gates remain stronger than editing.
 
-After a reply completes, confirmed native background work remains visible above the Composer or inside the waiting queue. An owned native Stop keeps its button in place while Pact awaits settlement. Drafts stay editable and Send pauses during Stop. Unconfirmed work shows a short status and the current recovery action. Check reads existing facts without starting or authorizing work. Readback of the reply cannot settle background work. If the original reply has ended and Check cannot confirm that background work ended, offer the existing explicit Rebuild confirmation. The old work may continue and the original request is preserved without replay.
+After a reply completes, confirmed native background work remains visible above the Composer or inside the waiting queue. An owned native Stop keeps its button while Pact awaits settlement. Drafts stay editable and Send pauses during Stop. Unconfirmed work shows a short status and the recovery action. Check reads existing facts without starting or authorizing work. Readback of the reply cannot settle background work. If the original reply has ended and Check cannot confirm that background work ended, offer the explicit Rebuild confirmation. The old work may continue and the original request is preserved without replay.
 
-A native Claude report received by the original owned Query after the exact reply ends appears as a separate **Background update** in the Transcript. An observed background task and the same Native Session establish its context. A new explicit request, replayed root text, or an unowned result does not supply a report. Preserve the provider's full text and its immutable Message source for Comments, handoffs and later history. The original input remains the origin link, while the sealed body and journal retain the exact Run. The update is ordinary Agent history and never becomes the original reply, a workflow decision, or a Native Fork cut. A later eligible Fork copies updates inside its cut. Reports for a superseded binding remain historical without updating the current Session's unread state. Report persistence has one in-flight body per Query, the existing managed native memory budget, and the ten-second answer seal deadline. An unavailable report has its own incomplete Message. Work settlement still depends on native facts.
+A native Claude report received by the original owned Query after the reply ends appears as a separate **Background update** in the Transcript. An observed background task and the same Native Session establish its context. A new explicit request, replayed root text, or an unowned result does not supply a report. Preserve the provider's full text and its immutable Message source for Comments, handoffs and later history. The original input remains the origin link, while the sealed body and journal retain the Run. The update is ordinary Agent history and never becomes the original reply, a workflow decision, or a Native Fork cut. A later eligible Fork copies updates inside its cut. Reports for a superseded binding remain historical without updating Session unread state. Report persistence has one in-flight body per Query, the managed native memory budget, and the ten-second answer seal deadline. An unavailable report has its own incomplete Message. Work settlement still depends on native facts.
 
-Each Session holds at most one durable queued message, including complete body, images, Comments and Skills. A compact bar above Composer shows recipient and preview, with Steer, Remove and a menu containing Edit message and Disable queue. Disable queue is Session-scoped: retain the item, pause automatic delivery and keep manual Steer available; an empty disabled queue provides Enable queue. Re-enabling restores otherwise eligible delivery. Edit message atomically removes the unsent item and returns its complete content to Composer, directly overwriting the current draft; the queue is then empty. There is no separate edit mode. A later Send creates a new input. Recoverable return receipts preserve sources through lost ACK/read failure/restart, and explicit restoration cannot overwrite newer input through a stale request.
+Each Session holds at most one durable queued message, including complete body, images, Comments and Skills. A compact bar above Composer shows recipient, preview and queue actions. Disable queue is Session-scoped: retain the item, pause automatic delivery and keep manual Steer available; an empty disabled queue provides Enable queue. Re-enabling restores eligible delivery. Edit message atomically removes the unsent item and returns its complete content to Composer, overwriting the draft; the queue is empty. There is no separate edit mode. A later Send creates a new input. Recoverable return receipts preserve sources through lost ACK/read failure/restart, and explicit restoration cannot overwrite newer input through a stale request.
 
 Normal completion, sealed output and settled side effects permit automatic queue delivery before later collaboration work. An original ordered @all Secondary completes first to preserve independent native history. Stop, failure, disconnect or restart preserve and pause the item until Resume queue. Unknown delivery remains locked for checking its original Run without automatic resend. After a confirmed Rebuild abandons that exact Run and replaces its binding, explicit Remove releases only the Pact queue slot; native delivery, frozen sources and unresolved Batch obligations remain retained. Late receipts belong only to the original Run and cannot affect replacement input. Pending content does not expire merely because execution takes a long time. Submission settings are read at actual execution admission; route and immutable input sources remain frozen.
 
 Steer targets only the same single currently running Agent and keeps its Model/Effort/Speed, native permissions and frozen duty. Ordinary @all and new workflow commands remain queued; workflow feedback remains a single-recipient input. Codex uses an exact current-Turn precondition; Claude uses next at a safe point and can naturally continue into the next native turn in the same Pact Run. Unsupported steering reports its reason without interrupting or starting a replacement task. Native acceptance is distinct from consumption and full handling. Workflow messages use a priority next-turn reply while automatic handoffs are paused; native Steer is available only for ordinary conversation Runs and is rejected for workflow Runs. Known consumed native input identities preserve complete multi-turn reply recovery and Fork boundaries. These capabilities depend on the actual CLI and must pass real-provider verification; SDK field presence or mocked results alone do not establish support.
 
-Accepted Steer freezes the already committed complete output snapshot at its original source identity and position. Subsequent output starts another full snapshot below the supplement in the same Run; repeating earlier text is allowed. Work Log stays in place while responding, then moves into the final answer and resets collapsed on completion, even if previously expanded or being read. Users can explicitly reopen it. After normal native completion, a committed nonblank canonical answer and resolved delivery/recovery, intermediate snapshots are automatically hidden from the main transcript. The main transcript keeps all User inputs in order followed by the final complete answer, including when no new text followed the last Steer. Only display order changes; source sequence, hash, Comment basis and ranges remain exact. Finalization waits for the complete body and bounded gap recovery, then updates the transcript without preserving the preceding reading or expansion layout. There is no dedicated earlier-response or manual collapse control. Jump to latest appears only for genuinely newer history. Exact historical Comment sources remain reachable through bounded pages; contexts and bodies share the existing 25-row page and 100-row window. Failed, interrupted or uncertain Runs retain their snapshots. Native history uses only the canonical answer; Fork copies presentation metadata without duplicating forwarded history. Legacy Runs have no inferred historical cuts.
+Accepted Steer freezes the already committed complete output snapshot at its original source identity and position. Subsequent output starts another full snapshot below the supplement in the same Run; repeating earlier text is allowed. Work Log stays while responding, then moves into the final answer and resets collapsed on completion, even if previously expanded or being read. Users can explicitly reopen it. After normal native completion, a committed nonblank canonical answer and resolved delivery/recovery, intermediate snapshots are automatically hidden from the main transcript. The main transcript keeps all User inputs in order followed by the final complete answer, including when no new text followed the last Steer. Only display order changes; source sequence, hash, Comment basis and ranges remain exact. Finalization waits for the complete body and bounded gap recovery, then updates the transcript without preserving the preceding reading or expansion layout. There is no dedicated earlier-response or manual collapse control. Jump to latest appears only for genuinely newer history. Exact historical Comment sources remain reachable through bounded pages; contexts and bodies share the 25-row page and 100-row window. Failed, interrupted or uncertain Runs retain their snapshots. Native history uses only the canonical answer; Fork copies presentation metadata without duplicating forwarded history. Legacy Runs have no inferred historical cuts.
 
 ## Composer and native Skills
 
@@ -306,7 +305,7 @@ No generation, OCR, region Comments, arbitrary file attachments, background qual
 
 ### Sources and persistent drafts
 
-Anchor a Comment to immutable message, plan or report text, or a versioned Project-file range, retaining identity/hash/projection basis/range/quote. Message ranges use visible projected text; plain fallback has its own explicit basis. File anchors use Project-relative forward-slash paths and content hash/line/column. Unsupported historical anchor formats remain visibly unavailable; they are never converted into a different source.
+Anchor a Comment to immutable message, plan or report text, or a versioned Project-file range, retaining identity/hash/projection basis/range/quote. Message ranges use visible projected text; plain fallback has an explicit basis. File anchors use Project-relative forward-slash paths and content hash/line/column. Unsupported historical anchor formats remain visibly unavailable; they are never converted into a different source.
 
 Add to comment saves without dispatch or implementation authority. Composer collects independent Comment chips with body/images for one Send. Native question answers use their live form and are not persistent question-answer Comments or an alternate workflow dispatcher.
 
@@ -316,20 +315,20 @@ Stable request identity and expected revision govern saves. ACK closes only the 
 
 The accepted Comments revision freezes every valid draft, including unloaded pages, body/images/route/nonce/task source into one durable **Input Batch**. Conflicts reject the whole receipt and preserve inputs. Keep each accepted input atomic; do not split its Comments into additional Send receipts or omit later pages. Workflow handoffs have their separately frozen stage authority. The former ten-Comment Send cap is removed: 24 is a metadata-page bound, not a durable-member bound. Per-comment body/quote and physical page budgets remain.
 
-Ordinary/collaboration Runs use the same bounded frozen-source reader for complete Batch members. Handoff/Rebuild retain references; Rebuild launches no model to read/summarize them. Input return clones identities from original sources; Fork maps them consistently. View-cache eviction never deletes durable members/drafts/sent Comments.
+Ordinary/collaboration Runs use the bounded frozen-source reader for complete Batch members. Handoff/Rebuild retain references; Rebuild launches no model to read/summarize them. Input return clones identities from original sources; Fork maps them consistently. View-cache eviction never deletes durable members/drafts/sent Comments.
 
 Batches preserve complete original input sources and their receiving Run. Workflow settlement binds the completed root to its frozen task input sequence; models do not submit per-member response receipts. A later message cannot be silently covered by an earlier completion, and a Batch does not fan out into additional Agent calls.
 
-A confirmed necessary-information answer is current user information for the same original request.
+A confirmed necessary-information answer is current user information for the original request.
 The dispatched user input includes that exact answer, while the original Batch, declaration and
 answer source remain immutable. Complete the requested result using supplied values instead of
-asking the same answered field again. Answering changes no route, tool authority or permission.
+asking an answered field again. Answering changes no route, tool authority or permission.
 
 ### Return to source
 
-Return to the exact original source/range. Current plan is read in Context Plan, never expanded fully again in Chat. Historical plans and reports remain immutable sources. Unsupported old anchors retain their quote and an unavailable reason instead of reopening removed task-item UI or retargeting the Comment.
+Return to the original source/range. Current plan is read in Context Plan, never expanded fully again in Chat. Historical plans and reports remain immutable sources. Unsupported old anchors retain their quote and an unavailable reason instead of reopening removed task-item UI or retargeting the Comment.
 
-Context Plan reads continuously in both directions without Previous/Next controls. Transport pages do not truncate the document or a valid Comment quote. Selection keeps immutable source coordinates as visible pages change; creating a Comment requires complete quote verification and original selectable text throughout the range. Display aliases are not original quote text. Returning to a source verifies the complete range before acknowledging navigation, while highlighting its currently mounted portion. The existing three-page mount limit and single physical source read also apply during selection; each quote fragment is at most 4096 UTF-16 units/48 KiB. The logical quote remains bounded to 20,000 units with at most 20,000 coverage bytes. Merged/display trees and an in-progress replacement are separate bounded copies, not part of a claim that total memory equals three transport pages.
+Context Plan reads continuously in both directions without Previous/Next controls. Transport pages do not truncate the document or a valid Comment quote. Selection keeps immutable source coordinates as visible pages change; creating a Comment requires complete quote verification and original selectable text throughout the range. Display aliases are not original quote text. Returning to a source verifies the complete range before acknowledging navigation, while highlighting its currently mounted portion. The three-page mount limit and single physical source read apply during selection; each quote fragment is at most 4096 UTF-16 units/48 KiB. The logical quote remains bounded to 20,000 units with at most 20,000 coverage bytes. Merged/display trees and an in-progress replacement are separate bounded copies, not part of a claim that total memory equals three transport pages.
 
 Failure retains the quote with a warning; read/transport failures show errors. Never silently retarget to similar text, open empty Context, rewrite anchors or guess current status. Repeated return gets a new navigation identity and waits for asynchronously loaded body DOM before positioning; preserve keyboard focus, selection and deliberate scroll on refresh.
 
@@ -343,7 +342,7 @@ Pact commands are structured App actions, distinct from installed native Skills 
 
 The Composer displays completed Pact commands as icon-and-`pact:<command>` badges. Copying and sending preserve the original `/plan`, `/build` or `/review` text; these badges never create native Skill selections or change workflow authority.
 
-Pact workflow commands reach Claude as request text, not native slash-command invocations, including bare `/plan` routed to Claude as Primary. Native serialization adds a request heading without changing saved Messages or frozen sources; the Adapter selects native Plan mode. Ordinary native commands and Skill requests retain their existing serialization.
+Pact workflow commands reach Claude as request text, not native slash-command invocations, including bare `/plan` routed to Claude as Primary. Native serialization adds a request heading without changing saved Messages or frozen sources; the Adapter selects native Plan mode. Ordinary native commands and Skill requests retain their serialization.
 
 | Entry              | Initial work                                                                                              | Default stage responsibilities                                                        |
 | ------------------ | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
@@ -351,23 +350,25 @@ Pact workflow commands reach Claude as request text, not native slash-command in
 | `/build [task]`    | Explicit implementation, then automatic independent code review                                           | Secondary implements; Primary reviews code.                                           |
 | `/review [target]` | Read-only review of the specified scope                                                                   | Primary reviews code; Secondary responds and performs explicitly authorized repairs.  |
 
-New tasks freeze their stage roles at the first Run's admission, together with the original objective,
-authorized scope and input. Each Run retains that assignment with its plan/review basis. Without a
-valid Relay choice, the defaults above apply. Later Primary changes do not transfer responsibilities.
+An explicit `@codex`/`@claude` recipient on an entry command selects that stage's responsibility
+instead of the Primary default: `/plan @claude` plans with Claude Code, `/build @codex` implements
+with Codex and `/review @claude` reviews code with Claude Code; the other stage roles follow.
+
+New tasks freeze stage roles at the first Run's admission with the original objective, authorized
+scope and input. Each Run retains that assignment with its plan/review basis. Absent a valid Relay choice the defaults apply. Later Primary changes do not transfer responsibilities.
 The same plan author maintains the plan throughout drafting and revision. Conflicting explicit
 recipients refuse without clearing drafts; ordinary @Agent messages remain explicit. Legacy tasks
-and accepted queued commands retain their frozen role policy. Explicit adoption remains limited to
-an accepted plan with the same planner/reviewer, no unresolved input or native work and no code work
+and accepted queued commands retain their frozen role policy. Explicit adoption requires an accepted plan with the same planner/reviewer, no unresolved input or native work and no code work
 or action authority; it preserves sources and historical authorizations, journals the change and
 starts no Run.
 
 For a new implicit-recipient Pact command, Relay may select the initial plan and code author/reviewer
-pairs before any task or Run exists. Both executors must pass the existing readiness admission.
+pairs before any task or Run exists. Both executors must pass the readiness admission.
 Plan tasks offer the nondefault combinations of both pairs; Build and Review vary only the code
 pair. Each author has a distinct reviewer. Complete frozen task and Comment sources inform the
 choice; provider stereotypes do not establish suitability. Choosing roles changes neither Session
 settings nor execution permissions. Implementing an accepted plan and each new Repair still require
-their existing user authorization.
+their user authorization.
 
 For an existing split-stage Plan task, Relay may propose swapping future implementation and code
 review responsibilities after the current Plan is accepted and before any code stage has started.
@@ -375,7 +376,12 @@ Both native bindings must be ready; pending or unknown work, unprocessed input, 
 existing action authority and claimed handoffs exclude the proposal. Unversioned legacy tasks are
 not automatically upgraded. Plan authorship and completed review facts stay unchanged.
 
-The existing confirmation card compares current and suggested code roles and offers
+In the same safe state, the explicit **Swap code roles** confirmation exchanges the future code
+responsibilities without Relay, preserving plan roles, scope, counters, pause and the current Run.
+It records a settled audit receipt and grants no writing permission; an identical nonce settles
+once and stale task or role revisions refuse.
+
+The confirmation card compares current and suggested code roles and offers
 **Keep current roles** and **Use suggested roles**.
 Confirmation saves the next role version and an audit receipt; it starts no Run, grants no writing
 permission, resets no allowance and resumes no paused workflow. Implement plan remains a separate
@@ -386,8 +392,8 @@ and retains confirmed roles; historical Runs retain their original assignments a
 
 The prepared input and decision receipt bind the choice to the original command, candidate set,
 sources, configuration and native bindings. The first-Run transaction revalidates and saves the
-assignment with the task and original Batch exactly once. Unavailable, declined, invalid or stale
-advice preserves the lawful frozen default without a confirmation card or another inference.
+assignment with task and original Batch exactly once. Unavailable, declined, invalid or stale
+advice preserves the lawful frozen default without a confirmation card or new inference.
 Stop, failed preparation and restart preserve unsent sources and never replay the decision.
 Explicit recipients, accepted queued/returned inputs and existing unfinished tasks are not
 reassigned by initial task routing. Active tasks retain their role map until a user confirms an
@@ -398,11 +404,11 @@ historical Run assignments.
 
 Use Codex and Claude Code native Plan mode with a dependency-aware clarification workflow. Inspect discoverable repository facts first. Ask only decisions that materially affect the goal, scope, acceptance or implementation; resolve upstream choices before dependent details, using at most three material questions at once. Distinct choices may include a recommendation, which never submits an answer automatically.
 
-Necessary questions may precede any plan. Do not fabricate a complete provisional plan to satisfy a result protocol or continue dependent work while required answers are missing. Native question forms replace the ordinary Composer, retain its unsent draft and attachments, and require the user's actual answer to resume the same native root. When the native request clears, restore the pending workflow decision or ordinary Composer. Answering a form does not unpause automatic collaboration or authorize a writing step.
+Necessary questions may precede any plan. Do not fabricate a complete provisional plan to satisfy a result protocol or continue dependent work while required answers are missing. Native question forms replace the ordinary Composer, retain its unsent draft and attachments, and require the user's answer to resume the same native root. When the native request clears, restore the pending workflow decision or ordinary Composer. Answering a form does not unpause automatic collaboration or authorize a writing step.
 
-The owner submits a complete native plan. The reviewer receives the original objective, current decisions and exact plan, supplies a natural review report, and either accepts it, requests changes, needs a user decision or reports incomplete work. The author responds and revises as necessary; the reviewer checks the current version and important responses. A native submission that explicitly retains the authenticated frozen plan preserves its version and source. An ordinary author reply to workflow feedback proceeds to independent review. The separate Ask only action uses a read-only text reply and keeps the previously accepted basis. Failed or pending edits and unresolved native questions cannot be treated as an unchanged plan. Both Agents expose the same empty-input `retain_current_plan` operation. Its successful current-root call becomes a final confirmation only after normal completion and all observed work drains; missing final confirmation keeps the input pending even when the answer is complete. Agreement means the current plan is implementable without unresolved blockers or necessary user decisions, not that every suggestion was adopted or both Agents repeated the same conclusion.
+The owner submits a complete native plan. The reviewer receives the original objective, current decisions and exact plan, supplies a natural review report, and either accepts it, requests changes, needs a user decision or reports incomplete work. The author responds and revises as necessary; the reviewer checks the current version and important responses. A native submission that explicitly retains the authenticated frozen plan preserves its version and source. An ordinary author reply to workflow feedback proceeds to independent review. A proven pure-question reply stays read-only and keeps the previously accepted basis. Failed or pending edits and unresolved native questions cannot be treated as an unchanged plan. Both Agents expose the same empty-input `retain_current_plan` operation. Its successful current-root call becomes final confirmation only after normal completion and all observed work drains; missing confirmation keeps the input pending even when the answer is complete. Agreement means the current plan is implementable without unresolved blockers or necessary user decisions, not that every suggestion was adopted or both Agents repeated one conclusion.
 
-Independent plan and code reviews are adversarial. The reviewer tries to refute the work from the original goal and primary sources instead of confirming the author's report, and accepts only when no evidence-backed blocking finding survives that attempt. A finding blocks only when, in a reachable scenario, it would make the goal or its acceptance fail, violate an explicit requirement, constraint, user decision or repository rule, or cause incorrect behavior, data loss, a security or permission exposure or unbounded resource use. Preferences and unconfirmed concerns remain non-blocking, and claims the reviewer cannot check are reported as unverified. Authors test each finding against checked evidence and concede or rebut it rather than agreeing or defending by default. A re-review independently re-checks earlier findings instead of trusting the author's response. This is review guidance carried by the existing natural reports; it adds no per-finding ledger, round counter or automatic acceptance rule.
+Independent plan and code reviews are adversarial. The reviewer tries to refute the work from the original goal and primary sources instead of confirming the author's report, and accepts only when no evidence-backed blocking finding survives it. A finding blocks only when, in a reachable scenario, it would make the goal or its acceptance fail, violate an explicit requirement, constraint, user decision or repository rule, or cause incorrect behavior, data loss, a security or permission exposure or unbounded resource use. Preferences and unconfirmed concerns remain non-blocking, and claims the reviewer cannot check are reported as unverified. Authors test each finding against checked evidence and concede or rebut it rather than agreeing or defending by default. A re-review independently re-checks earlier findings instead of trusting the author's response. This is review guidance carried by natural reports; it adds no per-finding ledger, round counter or automatic acceptance rule.
 
 Native plan submission never starts implementation. Codex uses native plan items; Claude captures acknowledged writes/edits to its root-bound native plan document; a plan-exit request never approves coding. Reviewers use read-only review execution rather than native Plan mode's authoring workflow. Codex retains native read-only sandbox enforcement for read-only stages; Claude uses native Plan mode or stage-specific tool policy. These controls do not isolate arbitrary native Hooks/MCP effects.
 
@@ -410,19 +416,23 @@ Native plan submission never starts implementation. Codex uses native plan items
 
 Plan ready requires a complete current plan, its fixed independent reviewer's acceptance of that exact version, and coverage of the current input sequence by that review or a valid historical coverage record. Native completion, prose that sounds positive or a progress task list cannot establish acceptance. A changed plan requires a new review. Ordinary workflow input requires review of the current sequence. Temporary admission failure preserves valid review facts while disabling dispatch.
 
-The user clicks Implement plan to authorize the displayed version and implementer. Completion automatically starts independent code review, as does the initial `/build` implementation. Direct `/review` remains read-only and grants no repair permission. Review scope binds its target and available implementation/repair Run, recorded changes and checked evidence; it does not imply a whole-workspace snapshot or automatic external-edit detection.
+The user clicks Implement plan to authorize the displayed version and implementer. Completion automatically starts independent code review, as does initial `/build` implementation. Direct `/review` remains read-only and grants no repair permission. Review scope binds its target and available implementation/repair Run, recorded changes and checked evidence; it implies no whole-workspace snapshot or automatic external-edit detection.
 
-A review requesting changes offers Respond or Repair. Respond lets the implementer explain or challenge findings read-only; Repair authorizes one scoped code-writing attempt. Both automatically return to the fixed code reviewer when their complete sources and native effects settle. A fresh required repair needs a new explicit action. Acceptance ends the task without a third summary Turn. Findings, suggestions, evidence, author responses and unverified scope stay in natural reports rather than a shared per-item state ledger.
+A review requesting changes offers Respond or Repair. Respond lets the implementer explain or challenge findings read-only; Repair authorizes one scoped code-writing attempt. Both automatically return to the fixed code reviewer when their complete sources and native effects settle. A fresh repair needs a new explicit action. Acceptance ends the task without a third summary Turn. Findings, suggestions, evidence, author responses and unverified scope stay in natural reports, not a shared per-item state ledger.
 
-Implementation, repair and code-review reports state confirmed verification results truthfully and explicitly label anything they cannot confirm as **Unverified**, in the user's language. Reviewers distinguish author-reported results from independently checked evidence. A completed Agent Run or tool acknowledgement is not proof that tests passed. Missing evidence is a disclosed limitation; verification explicitly required for acceptance remains unresolved until confirmed. Use the existing natural reports and available sources, without a separate command-execution proof system.
+Implementation, repair and code-review reports state confirmed verification results truthfully and explicitly label anything they cannot confirm **Unverified**, in the user's language. Reviewers distinguish author-reported results from independently checked evidence. A completed Agent Run or tool acknowledgement is not proof that tests passed. Missing evidence is a disclosed limitation; verification explicitly required for acceptance remains unresolved until confirmed. Use natural reports and available sources, with no separate command-execution proof system.
 
-An interrupted implementation or repair retains its unfinished authorized scope and owner. Continuing that same work does not create a new repair attempt. A priority user reply stays read-only; it cannot complete unfinished implementation or substitute for write authorization. A completely processed later reply may advance the input cursor while the original write grant remains bound to its original input. Pre-receipt workflow records retain their verified original grant and complete source access on explicit Continue; migration does not manufacture consent or rewrite historical authorization.
+An interrupted implementation or repair retains its unfinished authorized scope and owner. Its Resume implementation or Resume repair continuation keeps the original grant and does not create a new repair attempt. A priority user reply stays read-only; it cannot complete unfinished implementation or substitute for write authorization. A completely processed later reply may advance the input cursor while the original write grant remains bound to its original input. Pre-receipt records retain their verified original grant and complete source access on explicit Continue; migration does not manufacture consent or rewrite historical authorization.
 
-After interrupted implementation, an ordinary reply defaults to the fixed code author and remains read-only. Explicit recipients and verified question owners retain their routing. Once the reply settles, Continue can resume the original authorized scope.
+After interrupted implementation, an ordinary reply defaults to the fixed code author read-only. Explicit recipients and verified question owners retain routing. Once the reply settles, Continue resumes the original authorized scope.
 
-On an active Plan with prior authorized implementation or repair, a read-only reply can identify a material change to the goal, scope or acceptance and ask any necessary questions. A confirmed revision intent preserves the pause and fences off the old write grant through later replies, Stop and restart. After the input settles, Continue returns to the fixed planner and independent Plan reviewer. An outstanding supplement still goes to its original reviewer first. The Plan author inspects the existing work and accounts for it in the revised Plan. Even if the Plan text stays the same, the user must explicitly select Implement after the new review. Prior inputs, work, reports and counters remain available as evidence. Review distinguishes retained work from the latest Run’s Changes and marks missing evidence unverified.
+On an active Plan with prior authorized implementation or repair, a read-only reply can report a material goal, scope or acceptance change, asking necessary questions. A confirmed revision intent keeps the pause and fences the old write grant through later replies, Stop and restart. **Revise plan** starts this revision explicitly; **Keep current plan** dismisses only that request before its planner starts — starting nothing and keeping the pause and scope. Once input settles, Continue returns to the fixed planner and independent Plan reviewer. An outstanding supplement returns to its original reviewer first. The Plan author accounts for existing work in the revised Plan. The user must explicitly select Implement after the new review even when Plan text is unchanged. Prior inputs, work, reports and counters remain evidence. Review distinguishes retained work from the latest Run’s Changes; missing evidence is unverified.
 
 Context Plan is the sole full-plan reading area. Chat retains complete natural replies and review reports with compact plan-version/status/action footers, not a duplicated full plan or shared Todos tab. Current Implement, Respond, Repair, Continue collaboration and failure actions remain visible independently of historical disclosure.
+
+### Replacing a task
+
+Sending a new `/plan`, `/build` or `/review` while an unfinished task exists needs an explicit Send confirmation bound to the task's identity and revision; queueing does not end it. On admission, one durable transaction revalidates the frozen reference, retires the old task and records the new one; a normally completed old task keeps its Complete outcome. Retirement is terminal and distinct from acceptance: it starts no Run, cancels no native work, clears no recovery barrier, and atomically retires the task's open decision gates and unused action receipts while preserving bound receipts, budgets and complete history. The replaced result footer reads **Ended**, or **Ended before review** for unreviewed last changes. Editing or removing the queued command discards the confirmation; uncertain acknowledgement preserves the pending nonce and reference without re-authorizing.
 
 ### Automatic limits, pause and continuation
 
@@ -434,64 +444,65 @@ Session settings provide three independent limits:
 | Review cycles     | Each code review, including the initial review and every rereview after a response or repair.                                                                                              |
 | Repair attempts   | Each explicitly authorized repair that starts; initial implementation and read-only responses do not count. Resuming the same unfinished authorized work does not consume another attempt. |
 
-Reserve and persist a count before dispatch. Release it only when execution is proven unsent; failure, uncertain delivery, pause, user reply, restart or a new Proposal cannot reset consumed history. Current execution may finish, while the next automatic step must fit the current Session limit. At a limit retain the plan, reports, changes and exact next-step reason; changing settings affects later admission and never silently replays uncertain work.
+Reserve and persist a count before dispatch. Release it only when execution is proven unsent; failure, uncertain delivery, pause, reply, restart or a new Proposal cannot reset consumed history. Current execution may finish, while the next automatic step must fit the Session limit. At a limit retain the plan, reports, changes and exact next-step reason; changing settings affects later admission and never silently replays uncertain work.
 
-At an exhausted Plan-review limit, an otherwise settled planning or planner-reply root may obtain one Relay recommendation for an additional read-only review. The existing bounded continuation scan also discovers paused limit nodes; explicit user/Stop/restart pauses are excluded. The limit decision has its own semantic fact while retaining the original task/producer/handoff identity, so refresh or settings changes cannot repeat an evaluation. Relay may abstain or fail; either keeps the task paused.
+At an exhausted Plan-review limit, an otherwise settled planning or planner-reply root may obtain one Relay recommendation for one more read-only review. The bounded continuation scan also discovers paused limit nodes; user/Stop/restart pauses are excluded. The limit decision keeps its semantic fact and the original task/producer/handoff identity, so refresh or settings changes cannot re-evaluate. Relay may abstain or fail; both keep the task paused.
 
-A selected recommendation uses the existing Relay card with one concrete sentence and **Add one review** / **Keep paused**. Confirmation binds the exact task, Plan version, input sequence, fixed reviewer, used count and current settings. Admission atomically claims that one Run, increments the consumed review count and reserves the existing task-level extra-Plan-turn allowance. Session limits are not edited. The review then follows the original planning chain: acceptance enables the explicit Implement action; requested changes may return to the author, while the next review meets the ordinary limit again. No second review or code-writing permission is granted. Cancellation keeps the task paused. Duplicate answers read the same receipt; only proven-unsent recovery can reacquire the same refunded authorization and count.
+A selected recommendation replaces the Composer through shared input replacement, preserving its draft: **Add review**/**Skip**. Confirmation binds the task, Plan version, input sequence, reviewer, used count and settings. Admission atomically claims one Run, increments the review count and reserves the task-level extra-Plan-turn allowance. Session limits are not edited. The review follows the planning chain: acceptance enables Implement; requested changes return to the author, and the next review meets the ordinary limit. No second review or write permission is granted. Skipping keeps the task paused. Duplicate answers read that receipt; only proven-unsent recovery can reacquire the refunded authorization and count.
 
-Limit recommendations read the complete frozen task/input sources, current Plan, latest review and current author report within the existing decision budget. Earlier Plan bodies are not automatically added; their identities remain available without claiming their contents were evaluated. Missing, oversized or unsupported required sources preserve the pause rather than truncating evidence.
+Limit recommendations read the complete frozen task/input sources, current Plan, latest review and author report within the decision budget. Earlier Plan bodies are not added automatically; their identities stay available without claiming their contents were evaluated. Missing, oversized or unsupported required sources preserve the pause rather than truncating evidence.
 
 Workflow continuations share a durable handoff receipt keyed by the original task, producing Run and
 transition slot. Manual and automatic triggers with different message receipts compete for that one
-Run and its existing collaboration count. Configuration, model, pause and ordinary task revisions
-change freshness checks without creating another dispatch identity. A later business Run creates
+Run and its collaboration count. Configuration, model, pause and ordinary task revisions
+change freshness checks without creating a dispatch identity. A later business Run creates
 the next handoff; continuing unfinished authorized work retains its original writing authorization.
 
 Persistence records same-fact evaluation deduplication, invocation counts and independent budgets
 for extra Turns and recovery. Evaluation calls have no cumulative task, stage, input or fault cap;
-counts and reservations never grant business authorization. Relay defaults off and uses a locally
-encrypted OpenAI API key for the Decisions API. Enabling it, reading its state or changing its key
+counts and reservations never grant authorization. Relay defaults off and uses a locally
+encrypted OpenAI Decisions API key. Enabling it, reading its state or changing its key
 does not start inference. An explicit Settings reveal may return the saved key to the trusted
-field; its transient value is cleared on hide, departure or window blur and never enters ordinary
+field; its transient value clears on hide, departure or blur and never enters ordinary
 settings projections. Automatic checks, positive-unsent replacements and qualified extra-turn
-proposals use the existing Conversation execution owner and durable Repository facts. Existing
-Check session/status and Rebuild retain their controls when Relay is off or unavailable. Native,
+proposals use the Conversation owner and durable Repository facts. Check
+session/status and Rebuild retain their controls when Relay is off or unavailable. Native,
 platform, visual and real-provider acceptance is separate from local fixture tests.
 
 Relay considers only host-admitted candidates at qualified handoffs. Decisions selects a candidate
 or abstains; it does not generate review focus, questions or new actions. Pact supplies the original
-sources and fixed action descriptions. The owner, reviewer, original goal, permissions and required
-review steps remain fixed. Manual Continue does not wait for advice and competes for the same
-durable handoff claim. Further code-review actions still require concrete user authorization.
+sources and fixed descriptions. The owner, reviewer, original goal, permissions and required
+review steps remain fixed. Manual Continue does not wait for advice and competes for the durable handoff claim. Further code-review actions still require concrete user authorization.
 
-Repository provides one current workflow snapshot and its legal alternatives. Conversation uses
-that qualification directly, loads complete sources within the original decision lease and
+Repository provides one current workflow snapshot and legal alternatives. Conversation uses
+that qualification directly, loads complete sources within the original lease and
 revalidates alternatives before consulting. Proposal and confirmation transactions independently
 recheck source identity, scope, authority and budgets. A mandatory next step with no alternative
 does not load decision bodies or call the API. Ordinary routing also skips inference when only
-one recipient remains and there is no admitted information alternative.
+one recipient remains and no admitted information alternative.
 
 Relay decisions use their own request/revision and answer/receipt identities. The only admission
-categories are a concrete arrangement change, genuinely missing new authorization, or necessary
-scheduling information unavailable through existing authorized investigation. The host checks the
-actual operation, source basis, missing authority, versions and duplicate interactions; a model's
+categories are a concrete arrangement change, missing new authorization, or necessary
+scheduling information unavailable through authorized investigation. The host checks the
+operation, source basis, missing authority, versions and duplicates; a model's
 uncertainty or technical disagreement alone cannot open a card. Task requirements and technical
 questions remain with the original Agent. The strict contract represents all three categories;
 native recovery has a deterministic arrangement-change consumer. Users send their task directly;
-the Composer has no manual question, choice or supplied-state configuration. Necessary task questions
-use the existing native forms or workflow decision replies. Confirmed answers remain bound to the
-same original request and follow its owner's existing continuation rules. Frozen information and answer sources remain
-readable for saved requests and recovery. Cancel terminates an unsent information request and returns
-to the current Composer with editable Comment copies; it offers no Continue for that request and
-retains newer draft edits. The next explicit Send sends the current draft under a
-new message identity. Stop, restart and preparation failure retain their existing explicit Continue
-with current execution settings and original frozen sources. An unconfirmed Cancel retains one
+the Composer has no manual question or supplied-state choice. Necessary task questions
+use the native forms or workflow decision replies. Confirmed answers stay bound to the
+original request and follow the owner's continuation rules. Frozen information and answer sources remain
+readable for requests and recovery. Cancel terminates an unsent information request, returns
+to the Composer with editable Comment copies, offers no Continue for it and
+retains newer draft edits. The next Send sends the draft under a
+new message identity. Stop, restart and preparation failure retain explicit Continue
+with current settings and frozen sources. An unconfirmed Cancel retains one
 receipt-check entry in its Session, including after switching Sessions. Until its matching receipt
 confirms cancellation, ordinary Send waits; other Sessions remain usable. Checks never repeat the
 Cancel mutation or resume the old request. Closing Relay uses the
 original legal default once only when the user has not paused and its original admission is current.
 Do not invent business questions or ask for facts available through authorized investigation.
+
+Admitted Relay decisions share the input replacement: the card replaces the Composer, preserving its draft. Optional authorizations (except Pact repair) and role reassignments carry direct Skip/confirm actions; Skip restores the default workflow, preserving automation, pause and counters. Accepted Send atomically retires only an unanswered suggestion.
 
 After the first complete Plan-author response to a changes-requested review, or the first complete
 changes-requested code review, Relay may propose one read-only author supplement and its mandatory
@@ -500,7 +511,7 @@ Plan review still follows its normal author revision without consulting merely t
 required step. The user does not first request or
 preauthorize an evaluation. Confirmation grants that exact extra Turn; no second inference decides
 whether to use it. Its approved responsibility and cited complete originals are frozen for the
-receiving Agent. The existing task-level extra-turn allowance and return-review limit still apply.
+receiving Agent. The task-level extra-turn allowance and return-review limit still apply.
 An existing concrete manual action or Run claim takes priority over a late proposal.
 
 At that current code-review checkpoint, Relay may request one scoped Repair. No
@@ -511,13 +522,13 @@ Repair-to-review behavior, not read-only supplement authority. Continuing an alr
 write never consumes another auxiliary allowance.
 
 Automatic recovery checks only newly qualified faults in the current Utility/configuration epoch:
-the original Run/binding, exact input-delivery receipts, or the same existing Rebuild candidate.
+the original Run/binding, exact input-delivery receipts, or the same Rebuild candidate.
 Substantive changed native facts can permit another check; changed timeout prose, configuration
 ABA, model recovery and restart cannot recreate eligibility. Keep original budgets: at most four
 checks per task or two per ordinary input, and two per fault. Authentication, quota, permission and
 incompatible-runtime failures retain existing controls. One automatic ten-second deadline includes
 preparation and serial reads. Logical expiry retains the App lease, Adapter and physical obligations.
-When a newly qualified fault has no fresh compatibility observation, the existing probe owner may
+When a newly qualified fault has no fresh compatibility observation, the probe owner may
 perform one zero-Turn check before recovery admission. Opening Session settings is not a prerequisite.
 The fault remains consumed if compatibility cannot be proved; there is no deferred retry queue.
 Manual receipt and root/candidate reads have independent ten-second stage budgets; receipt cleanup
@@ -529,7 +540,7 @@ proof. Preserve the complete pathless original prompt, immutable input Batch, Co
 images, Skills, source grants and historical requested/native-effective settings. Optional segmented
 capture is bounded at eight MiB and 4,096 entries; overflow closes replacement eligibility without
 truncating or limiting the original Send. Unknown effective model, effort, speed, permissions or
-configuration closes eligibility. Utility resolves native image/Skill paths through existing owners.
+configuration closes eligibility. Utility resolves native image/Skill paths through owners.
 
 The independent replacement reuses the original user Message, input Batch and duty without
 freezing later drafts, advancing the input cursor or creating fresh authority. Each original fault
@@ -546,7 +557,7 @@ the original fault allowance remains consumed. The proven positive path uses an 
 Session with a completed prior Turn.
 
 After an automatic check physically joins, a current Rebuild action may appear as a Relay arrangement
-decision. Host facts do not fabricate a model evaluation. Confirmation and the existing Rebuild
+decision. Host facts do not fabricate a model evaluation. Confirmation and the Rebuild
 operation commit atomically under one answer nonce. Only a newly created transaction starts native
 work; receipt reads and restart never recreate it. Preserve exact generation, original Run/candidate,
 complete initialization source and binding-switch evidence. Show when old work may continue or an
@@ -573,7 +584,7 @@ grants while retaining committed work, pause, native recovery, budgets and histo
 An ordinary Send may consult about its single recipient only when the Composer explicitly records
 implicit routing and its frozen Comments reference both Agents or only an Agent other than Primary.
 Explicit Primary or Agent choices, commands, Skills, images, `@all`, returned input, queued input and
-workflow replies retain their existing routes. The existing Send owner freezes the complete body,
+workflow replies retain their routes. The Send owner freezes the complete body,
 Comment membership and anchors before asking for advice, under the same 16 MiB auxiliary reservation
 and absolute 15-second deadline. No placeholder Message or Run is created. One real Run transaction
 binds the recipient and consumes only the original Comment set; Primary settings and later drafts
@@ -661,28 +672,34 @@ loads older/newer pages with bounded residency and preserves the reading anchor.
 releases its subscription and display state; pending physical reads settle before a latest intent.
 The activity region has no filters, details, navigation, copy, export, retry or clearing controls.
 
-Ordinary Send immediately blocks later handoffs on the pending input, cancels any undispatched handoff, and queues a priority reply after the current native root, output and effects settle. Waiting for or processing input does not change the task’s automatic-collaboration setting. Once the latest input is positively settled, an active task automatically continues its authorized planning and independent review; it never grants new implementation or repair authority. Explicit Pause, Stop, failure, restart and exhausted limits remain paused through later messages and successful replies until explicit continuation. Historical paused tasks also require explicit continuation. The current root normally finishes; Stop separately requests its interruption. Plan feedback before implementation defaults to the planner; feedback after code work and Build feedback default to the implementer, and direct Review feedback to its code reviewer; an explicit Agent route remains explicit. Workflow feedback is next-turn input and cannot use native Steer.
+Ordinary Send immediately blocks later handoffs on pending input, cancels any undispatched handoff, and queues a priority reply after the native root, output and effects settle. Waiting for or processing input does not change the task’s automatic-collaboration setting. Once the latest input is positively settled, an active task continues its authorized planning and independent review; it never grants new implementation or repair authority. Stop, failure, restart, exhausted limits and historical pauses survive input and replies until explicit continuation. The current root normally finishes; Stop requests its interruption. Plan feedback before implementation defaults to the planner; feedback after code work and Build feedback default to the implementer, and direct Review feedback to its code reviewer; an explicit Agent route remains explicit. Workflow feedback is next-turn input and cannot use native Steer.
 
-Before implementation, **Ask only** sends a text question to the current accepted Plan's author
-in a read-only reply. It leaves images, Comments and other drafts unsent. The complete answer
-appears in Chat without changing the Plan, its original independent acceptance, the task input
-sequence or review counts. The question and answer remain in Chat and are excluded from automatic business handoffs. This action works with Relay on or off. Ordinary Send and Enter
-submit workflow feedback for independent review, including new requirements, changes and requests
-to verify the existing Plan. Implement always requires explicit authorization. A known unsent or
-failed question releases only that question's pending input. Unknown delivery retains recovery,
-and restart pauses collaboration without replaying the question.
+At a settled task checkpoint, an eligible ordinary Send freezes one host reply basis — stage,
+actor, status, automation, pause, next step, notice, native binding and the semantic workflow
+basis. The replying Agent chooses `explanation_only` only for a complete pure question or
+discussion with no task effect; a message mixing a question and a requested change is feedback,
+and consequential ambiguity uses needs_user. A proven explanation stays read-only and restores
+that checkpoint — Plan, acceptance, immutable review, roles, pending work and counters unchanged —
+and a later pause remains. The durable input sequence still advances once and never moves back;
+the settled receipt instead carries one bounded basis at the last material input — consecutive
+pure questions keep that one level, and feedback or a completed business stage clears it. It
+grants no implementation, repair, role or resume authority and no Relay decision. A planning
+reply retains its existing Plan through `retain_current_plan` first; none is created to answer.
+A failed, interrupted or superseded reply never restores the checkpoint. Legacy Ask receipts stay
+readable and recoverable; new input never creates one. Implement always requires explicit
+authorization.
 
 After a settled code review requests changes, **Choose repairer** offers the other Agent while
 the ordinary Repair action still uses the current author. Choosing the other Agent opens the Pact
-confirmation directly, without sending a message, starting a Run or advancing the input sequence.
-The user may also explicitly direct the current reviewer to repair the existing scope. Their
+confirmation without sending a message, starting a Run or advancing the input sequence.
+The user may also explicitly direct the reviewer to repair the scope. Their
 read-only reply may submit `repair_role_request`.
-A complete authenticated result settles only this control input and leaves the original review
+A complete authenticated result settles only this control input and leaves the review
 unchanged. Pact offers a confirmation with the proposed repairer and independent reviewer when
-the current native bindings and normal repair and return-review allowances are available. A
+current native bindings and normal repair and return-review allowances are available. A
 reviewer who has never run in this Session may initialize for the return review. With
-insufficient allowance, show the exhausted limit and keep the existing review actions available
-where allowed. Confirmation swaps the future code roles for the current task and authorizes one
+insufficient allowance, show the exhausted limit and keep existing review actions available
+where allowed. Confirmation swaps future code roles for the task and authorizes one
 ordinary scoped Repair. The Session Primary, plan roles, prior Runs, review and extra Relay
 allowances stay as recorded. Cancel leaves the roles and original Respond and Repair actions in
 place. Another contiguous control reply can request the same change again. A business input,
@@ -691,15 +708,15 @@ an unanswered card. A confirmed role change survives failed preparation or resta
 if the repair never started. A bound Run follows ordinary delivery recovery and receipt readback.
 The confirmation is available independently of Relay.
 
-When a completed review or planning reply needs a user decision, its card replaces the message input, with explicit unselected choices and free-answer fields. Send answers uses the existing Send owner but sends only the card answers: no hidden message text, images, Comments, Skills, routes or return receipts. Keep those ordinary drafts intact. Partial answers and clarification requests remain valid answers. Reject unreferenced new messages and new Pact commands while an unresolved decision exists, including after asynchronous preparation; previously accepted receipts and authorized workflow dispatch retain their original handling. Bind answers to the current task, decision Run and decision/current input sequences before freezing input. Route a decision reply to the verified Agent that asked it, independent of the current Primary or plan owner. Reviewer replies remain read-only and settle through their input result; only owner replies can publish or retain the plan. Show the frozen recipient as an @mention and separate each question and answer in the sent message. Stale references fail without clearing drafts; identical durable receipts remain idempotent. Historical requests without question data show an expandable original-request entry and an in-card free-answer field without inferred choices. Processing keeps ordinary input unavailable. Incomplete replies retain recovery; only a confirmed ended or never-dispatched prior Run may accept an explicit bound follow-up answer. Unknown execution never permits a blind resend. InputReplacement provides the shared input location, focus handoff and reduced-motion-aware transition, with two mounted panels, one observer, one animation and one 220ms exit timer. Successful Send immediately removes editable questions; rejected Send preserves them. While awaiting the result, show answer progress with existing Stop, queue and recovery controls in the same input location. The next completed reply may ask for a new decision or confirm processing and automatically return to the authorized workflow when automation remains active. Receipt, queueing and native completion alone do not resolve the backend decision gate. Until the latest reply is positively settled, Continue and automatic review are unavailable through both UI and dispatch interfaces. Cancellation, failure, missing or conflicting evidence, newer input and restart preserve that gate. After the latest reply is confirmed processed, automatically dispatch the computed next step unless a persistent pause remains. Preserve that pause across input receipt, questions and settlement; offer Continue collaboration only when manual recovery is required. Both automatic continuation and Continue recheck current inputs, plan/code sources, review, unfinished authorized work, limits and runtime admission; neither replays a saved prompt or authorizes new Implement/Repair work. A normally completed plan or reply superseded by newer pending input cannot settle that input or turn supersession alone into a failure. Withdrawing an input cannot silently validate an older plan against the newer input sequence; unresolved source reconciliation requires manual recovery. A plan change requires current-version review; new code requires corresponding review. Answering a native form continues the existing root but leaves an independent automation pause intact.
+When a completed review or planning reply needs a user decision, its card replaces the message input. Send answers uses the Send owner, sending only the card answers: no hidden message text, images, Comments, Skills, routes or return receipts. Ordinary drafts stay intact. Partial answers and clarification requests are valid answers. Reject unreferenced new messages and new Pact commands while an unresolved decision exists, including after asynchronous preparation; previously accepted receipts and authorized workflow dispatch retain their handling. Bind answers to the task, decision Run and decision/current input sequences before freezing input. Route a decision reply to the verified Agent that asked it, independent of Primary or plan owner. Reviewer replies remain read-only and settle through their input result; only owner replies can publish or retain the plan. Stale references fail without clearing drafts; identical durable receipts remain idempotent. Processing keeps ordinary input unavailable. Incomplete replies retain recovery; only a confirmed ended or never-dispatched prior Run may accept an explicit bound follow-up answer. Unknown execution never permits a blind resend. Successful Send immediately removes editable questions; rejected Send preserves them. The next completed reply may ask for a new decision or confirm processing and automatically return to the authorized workflow when automation remains active. Receipt, queueing and native completion alone do not resolve the backend decision gate. Until the latest reply is positively settled, Continue and automatic review stay unavailable through UI and dispatch. Cancellation, failure, missing or conflicting evidence, newer input and restart preserve that gate. After the latest reply is confirmed processed, automatically dispatch the computed next step unless a persistent pause remains. Preserve that pause across input receipt, questions and settlement; offer Continue collaboration only when manual recovery is required. Both automatic continuation and Continue recheck current inputs, plan/code sources, review, unfinished authorized work, limits and runtime admission; neither replays a saved prompt or authorizes new Implement/Repair work. A normally completed plan or reply superseded by newer pending input cannot settle that input or turn supersession alone into a failure. Withdrawing an input cannot silently validate an older plan against the newer input sequence; unresolved source reconciliation requires manual recovery. A plan change requires current-version review; new code requires corresponding review. Answering a native form continues the root but leaves an independent automation pause intact.
 
 Stop, failure and restart preserve work and pause automation. Unknown execution first reconciles its original Run; neither Continue nor restart starts a duplicate root or resets counts. An application restart never automatically resumes the peer chain.
 
 ### Native artifacts and settlement
 
-Plans and reports are complete natural documents. A small host-authenticated `submit_review` tool supplies accepted, changes_requested, needs_user or incomplete; needs_user includes explicit questions and other verdicts omit them; Pact binds actor, root, input sequence and exact source basis. Conflicting result or question submissions cannot become acceptance. Questions are limited to three per request, with two to six options when supplied; prompts are at most 2048 characters, labels 160 and option descriptions 512, with at most 8 KiB of UTF-8 JSON for the complete question set. Individual card answer fields accept up to 4096 UTF-16 units. Questions and answers remain inside the existing view and draft residency budgets. Planners may submit needs_user questions. An explicit Plan question uses a read-only text reply without Plan publication, retention or a structured outcome. Ordinary processed planning input requires authenticated Plan settlement. Live native forms retain their original operation lifecycle. The model copies no identities, hashes, per-member acknowledgements or result envelope.
+Plans and reports are complete natural documents. A small host-authenticated `submit_review` tool supplies accepted, changes_requested, needs_user or incomplete; needs_user includes explicit questions and other verdicts omit them; Pact binds actor, root, input sequence and exact source basis. Conflicting result or question submissions cannot become acceptance. Questions are limited to three per request, with two to six options when supplied; prompts are at most 2048 characters, labels 160 and option descriptions 512, with at most 8 KiB of UTF-8 JSON for the complete question set. Individual card answer fields accept up to 4096 UTF-16 units. Questions and answers remain inside the existing view and draft residency budgets. Planners may submit needs_user questions. Legacy Ask receipts use a read-only text reply without Plan publication, retention or a structured outcome. Ordinary processed planning input requires authenticated Plan settlement. Live native forms retain their original operation lifecycle. The model copies no identities, hashes, per-member acknowledgements or result envelope.
 
-Persist observed native plan/verdict candidates immediately. Promote them only after exact successful root completion, complete source sealing, current task authorization and native-effects settlement. Unique Run admission and source checks make duplicate events/readback idempotent. Stale callbacks remain historical and cannot advance a new input or version. Live and cold readback use the same artifact verification. A later Claude planning root may use only its frozen, host-published plan as a checkpoint, after checking the exact source settlement, document digest/owner, native session/generation and native operation anchor. The source must be the target’s native ancestor with no intervening real input, changed plan binding or later/unknown plan write. A known intervening input, including Ask only, sends native readback through full ancestor verification. The native owner admits memory before loading the complete checkpoint body; cancellation retains capacity until the reader and Worker finish. Earlier ambiguous native history is not replayed over this authenticated source. All target operations still require complete, ordered acknowledgements; unknown overlap remains unavailable. Current disk contents never supply authority. Restore saved plan checks the original successful root and publishes its missing initial or revised version through the normal version transition, preserving earlier versions, review bases, counters and paused automation. Source recovery is separate from Continue; a missing revision shows recovery status and an explicit restore action before business next steps. An actual native plan may have an empty ordinary answer; preserve that canonical source without inventing prose.
+Persist observed native plan/verdict candidates immediately. Promote them only after exact successful root completion, complete source sealing, current task authorization and native-effects settlement. Unique Run admission and source checks make duplicate events/readback idempotent. Stale callbacks remain historical and cannot advance a new input or version. Live and cold readback use the artifact verification. A later Claude planning root may use only its frozen, host-published plan as a checkpoint, after checking the exact source settlement, document digest/owner, native session/generation and native operation anchor. The source must be the target’s native ancestor with no intervening real input, changed plan binding or later/unknown plan write. A known intervening input, including a historical Ask only receipt, sends native readback through full ancestor verification. The native owner admits memory before loading the complete checkpoint body; cancellation retains capacity until the reader and Worker finish. Earlier ambiguous native history is not replayed over this authenticated source. All target operations still require complete, ordered acknowledgements; unknown overlap remains unavailable. Current disk contents never supply authority. Restore saved plan checks the original successful root and publishes its missing initial or revised version through the normal version transition, preserving earlier versions, review bases, counters and paused automation. Source recovery is separate from Continue; a missing revision shows recovery status and an explicit restore action before next steps. An actual native plan may have an empty ordinary answer; preserve that canonical source without inventing prose.
 
 A missing or unconfirmed native plan is not a new user question. Create a decision only from an explicit needs-user result or an unanswered native request. Preserve existing answer receipts and unresolved input gates when plan settlement fails. When saved-plan recovery is available, show recovery ahead of the old question form; do not infer that a missing plan proves a recoverable source exists.
 
@@ -715,7 +732,7 @@ Full access explicitly confirms broad file/network scope in the selected Agent's
 
 Full access produces no tool-approval cards. Native bypass/never executes permitted operations; a residual native request for extra tool permission is explicitly refused without asking the user or widening task authority. Native questions/forms and Implement plan remain separate user decisions. Planning and review retain their project read-only restrictions. Existing permission-menu help distinguishes the next-task selection from the active Run's frozen choice and task restrictions; it does not claim an unobserved native mode.
 
-Pact's frozen-source reader and title-candidate validator declare their actual read-only MCP behavior as well as exact tool allow rules. Native planning evaluates these annotations before its allow list. Source execution still verifies the current root, grant, owner and supplied references; metadata never grants arbitrary MCP or filesystem access.
+Pact's frozen-source reader and title-candidate validator declare their read-only MCP behavior and exact tool allow rules. Native planning evaluates these annotations before its allow list. Source execution still verifies the current root, grant, owner and supplied references; metadata never grants arbitrary MCP or filesystem access.
 
 Show approvals only when requested natively, with exact supported once/session-scope/refuse/cancel actions. No persistent command/network amendment or across-session saved rules. Claude session-allow exists only if all suggestions target the current native Session; do not split/widen mixed suggestions. Preserve native user rules. Record sanitized evidence before returning decision; expired/stopped/restarted/generation-mismatched requests never replay.
 

@@ -532,7 +532,7 @@ describe('Plan revision advice persistence', () => {
       remoteOutcome: 'responded',
     })
     const admission = f.admission()
-    f.repo.pauseCollaboration(f.sessionId)
+    f.repo.pauseCollaboration(f.sessionId, 'user')
     expect(() => f.repo.beginRun(admission)).toThrow(/handoff facts changed/iu)
     expect(f.repo.handoffReceipt(f.handoff.id)!.runId).toBeNull()
     expect(f.db.drizzle.select().from(agentRuns).all()).toHaveLength(2)

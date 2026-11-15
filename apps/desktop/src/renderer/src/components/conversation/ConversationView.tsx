@@ -65,8 +65,9 @@ import {
   WORKSPACE_OPERATION_TIMEOUT_MS,
   collaborationInputGate,
   collaborationActor,
-  collaborationAskAvailable,
   collaborationInputProcessing,
+  defaultTaskStageRoles,
+  pactEntryPrimary,
 } from '@pact/contracts'
 
 import type { ConversationViewProjection } from './conversation-window'
@@ -125,6 +126,7 @@ import { SentComments } from './SentComments'
 import { NativeForkRecovery, SessionForkDialog, type SessionForkOpening } from './SessionFork'
 import { SessionWarningCard } from './SessionWarningCard'
 import { SpeedMenu } from './SpeedMenu'
+import { TaskReplacementConfirmation } from './TaskReplacementConfirmation'
 import { sameDecision, hasDecisionAnswers, type DecisionReplyContext } from './useConversation'
 import { commentDraftSaveSucceeded } from './useConversation'
 import { useSkillComposer, type ComposerEdit } from './useSkillComposer'
@@ -245,6 +247,7 @@ const messageDateTimeFormatter = new Intl.DateTimeFormat(undefined, {
 const TRANSCRIPT_OVERSCAN = 4
 const CONVERSATION_WIDTH = 'w-full max-w-[clamp(56rem,82cqw,80rem)]'
 const OLDER_HISTORY_SCROLL_THRESHOLD = 160
+const agentName = (id: 'claude' | 'codex'): string => (id === 'claude' ? 'Claude Code' : 'Codex')
 
 function hasVisibleChanges(run: AgentRun | undefined): boolean {
   return Boolean(
@@ -696,12 +699,26 @@ export function ConversationView({
   const [currentPlan, setCurrentPlan] = useState<{
     sessionId: string
     task?: CollaborationTask | undefined
+    replacement?:
+      | Extract<ConversationPage, { scope: 'collaboration' }>['view']['replacement']
+      | undefined
     planSync?: Extract<ConversationPage, { scope: 'collaboration' }>['view']['planSync'] | undefined
     source?: { runId: string; messageId: string } | undefined
     error?: string | undefined
   }>()
   const [planRefresh, setPlanRefresh] = useState(0)
   const [answeredDecisionKey, setAnsweredDecisionKey] = useState<string>()
+  const [replacement, setReplacement] = useState<{
+    sessionId: string
+    taskId: string
+    command: 'plan' | 'build' | 'review'
+    draftToken: object
+  }>()
+  const [replacementBusy, setReplacementBusy] = useState(false)
+  const [replacementFailed, setReplacementFailed] = useState(false)
+  // One frozen replacement reference per confirmation; uncertain acknowledgments retry the same proof.
+  const replacementAttempt = useRef<{ taskId: string; revision: number } | undefined>(undefined)
+  const replacementRestoreFocus = useRef(false)
   const planReadOwner = useRef<{
     active: boolean
     pending: boolean
@@ -745,6 +762,7 @@ export function ConversationView({
         setCurrentPlan({
           sessionId: requested.sessionId,
           task,
+          replacement: view.replacement,
           source: view.planSource,
           planSync: view.planSync,
         })
@@ -943,6 +961,43 @@ export function ConversationView({
         : productionRelayDecision
   const inputTakeover =
     decisionTakeover || nativeQuestions.length > 0 || Boolean(currentRelayDecision)
+  // Identity of the current draft contents; any edit invalidates the open confirmation.
+  const replacementDraftToken = useMemo(
+    () => ({}),
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- Deliberate identity token over the draft inputs.
+    [
+      composer,
+      composerSkills,
+      composerMention,
+      composerRoute,
+      composerReturnedInputOperationId,
+      composerImages,
+      snapshot?.commentsRevision,
+    ],
+  )
+  // The confirmation yields to every native/question/Relay takeover above it.
+  const replacementTask =
+    replacement && replacement.sessionId === session.id && unfinishedTask?.id === replacement.taskId
+      ? unfinishedTask
+      : undefined
+  const replacementDetails =
+    replacementTask && currentPlan?.sessionId === session.id ? currentPlan.replacement : undefined
+  useEffect(() => {
+    if (
+      replacement &&
+      (replacement.sessionId !== session.id ||
+        replacement.taskId !== unfinishedTask?.id ||
+        replacement.draftToken !== replacementDraftToken)
+    ) {
+      replacementAttempt.current = undefined
+      setReplacement(undefined)
+    }
+  }, [replacement, session.id, unfinishedTask?.id, replacementDraftToken])
+  useEffect(() => {
+    if (replacement || !replacementRestoreFocus.current) return
+    replacementRestoreFocus.current = false
+    composerRef.current?.focus()
+  }, [replacement])
   const showDecisionNotice = Boolean(
     decisionSource &&
     !planRecovery &&
@@ -1151,8 +1206,9 @@ export function ConversationView({
       commentEditor?.body.trim()),
   )
   const commentDraftId = commentEditor?.draftId
+  const composerPrefix = parseComposerCommandPrefix(composer, composerSkills)
   const defaultRecipient =
-    unfinishedTask && !parseComposerCommandPrefix(composer, composerSkills).pact
+    unfinishedTask && !composerPrefix.pact
       ? collaborationActor(unfinishedTask, 'reply')
       : session.settings.primaryAgentId
   const primaryName = session.settings.primaryAgentId === 'claude' ? 'Claude Code' : 'Codex'
@@ -1580,7 +1636,6 @@ export function ConversationView({
     runsById,
   ])
   // TanStack owns mutable measurements; React Compiler must not memoize its methods.
-  // oxlint-disable-next-line react/incompatible-library
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => transcriptRef.current,
@@ -2309,6 +2364,19 @@ export function ConversationView({
     }),
     [composer, composerSkills, composerMention, composerRoute, composerReturnedInputOperationId],
   )
+  const pactCommandHint = (() => {
+    if (!composerPrefix.pact || composerPrefix.error) return undefined
+    const { route } = resolveComposerRoute(editorValue, session.settings.primaryAgentId)
+    if (route.type !== 'agent') return undefined
+    const roles = defaultTaskStageRoles(
+      pactEntryPrimary(composerPrefix.pact, session.settings.primaryAgentId, route.agentId),
+    )
+    return composerPrefix.pact === 'plan'
+      ? `${agentName(roles.planAuthor)} plans · ${agentName(roles.codeAuthor)} implements · ${agentName(roles.codeReviewer)} reviews code.`
+      : composerPrefix.pact === 'build'
+        ? `${agentName(roles.codeAuthor)} implements · ${agentName(roles.codeReviewer)} reviews code.`
+        : `${agentName(roles.codeReviewer)} reviews code.`
+  })()
   const dismissMentionMenu = (): void => {
     dismissedMention.current = mentionQuery
     setMentionQuery(undefined)
@@ -2380,22 +2448,24 @@ export function ConversationView({
     }
   }
   const chooseSkill = (entry: import('./useSkillComposer').ComposerSkillOption): void => {
-    const replacement = skillComposer.choose(entry)
-    if (!replacement) return
+    const skillReplacement = skillComposer.choose(entry)
+    if (!skillReplacement) return
     const current = composerRef.current?.document() ?? editorValue
     if (
       history.admitComposerEdit?.(
-        current.text.length - (replacement.end - replacement.start) + replacement.text.length,
+        current.text.length -
+          (skillReplacement.end - skillReplacement.start) +
+          skillReplacement.text.length,
       ) === false
     )
       return
     try {
-      const next = replaceComposerDocument(current, replacement)
-      if (replacement.skill)
-        next.skills = [...next.skills, replacement.skill].toSorted((a, b) => a.start - b.start)
-      const cursor = replacement.start + replacement.text.length
+      const next = replaceComposerDocument(current, skillReplacement)
+      if (skillReplacement.skill)
+        next.skills = [...next.skills, skillReplacement.skill].toSorted((a, b) => a.start - b.start)
+      const cursor = skillReplacement.start + skillReplacement.text.length
       composerRef.current?.focus()
-      composerRef.current?.apply(next, { start: cursor, end: cursor }, [replacement])
+      composerRef.current?.apply(next, { start: cursor, end: cursor }, [skillReplacement])
     } catch (editError) {
       composerRef.current?.refuseEdit(
         editError instanceof Error ? editError.message : 'Your draft was kept.',
@@ -2482,6 +2552,17 @@ export function ConversationView({
       onNotice('Send your answers as a reply before starting another Pact command.')
       return
     }
+    if (replacement) return
+    if (prefix.pact && unfinishedTask) {
+      setReplacementFailed(false)
+      setReplacement({
+        sessionId: session.id,
+        taskId: unfinishedTask.id,
+        command: prefix.pact,
+        draftToken: replacementDraftToken,
+      })
+      return
+    }
     const submittedDecisionKey = decisionKey
     const targetRoute =
       unfinishedTask && sendRoute?.type === 'primary' && !prefix.pact
@@ -2503,33 +2584,63 @@ export function ConversationView({
     } else if (decisionReply) setPlanRefresh((value) => value + 1)
   }
 
-  const submitPlanQuestion = async (): Promise<void> => {
-    if (!planningTask || !collaborationAskAvailable(planningTask) || disabled || responseInProgress)
-      return
-    const document = composerRef.current?.document() ?? editorValue
-    const prefix = parseComposerCommandPrefix(document.text, document.skills)
+  const cancelReplacement = (): void => {
+    replacementAttempt.current = undefined
+    replacementRestoreFocus.current = true
+    setReplacementFailed(false)
+    setReplacement(undefined)
+  }
+  const confirmReplacement = async (): Promise<void> => {
+    const task = replacementTask
     if (
-      !document.text.trim() ||
-      prefix.error ||
-      prefix.pact ||
-      prefix.route ||
-      document.skills.length ||
-      document.mention ||
-      document.returnedInputOperationId
+      !replacement ||
+      !task ||
+      replacementBusy ||
+      disabled ||
+      inputTakeover ||
+      queuedInput ||
+      sending
     )
       return
-    stickToBottomRef.current = true
-    cancelPrepend()
-    scrollIntentRef.current = undefined
-    if (
-      await onSend(document.text, [], undefined, undefined, undefined, {
-        taskId: planningTask.id,
-        expectedRevision: planningTask.revision,
-      })
-    ) {
-      setPlanRefresh((value) => value + 1)
-      skillComposer.close()
-      setMentionQuery(undefined)
+    setReplacementBusy(true)
+    setReplacementFailed(false)
+    try {
+      const document = composerRef.current?.document() ?? editorValue
+      const prefix = parseComposerCommandPrefix(document.text, document.skills)
+      if (prefix.pact !== replacement.command || replacement.draftToken !== replacementDraftToken) {
+        cancelReplacement()
+        return
+      }
+      // First confirm freezes the displayed revision; retries reuse the same proof after an
+      // uncertain acknowledgement instead of silently re-authorizing a newer task state.
+      replacementAttempt.current ??= { taskId: task.id, revision: task.revision }
+      const removed = document.text.length - document.text.trimStart().length
+      const { sendRoute } = resolveComposerRoute(document, defaultRecipient)
+      const sent = await onSend(
+        document.text,
+        draftComments.map((comment) => comment.id),
+        sendRoute,
+        document.skills.map((entry) =>
+          Object.assign({}, entry, { start: entry.start - removed, end: entry.end - removed }),
+        ),
+        undefined,
+        // The server rechecks this exact current task identity and revision at receipt.
+        replacementAttempt.current,
+      )
+      if (sent) {
+        replacementAttempt.current = undefined
+        setReplacement(undefined)
+        setPlanRefresh((value) => value + 1)
+        skillComposer.close()
+        setMentionQuery(undefined)
+      } else {
+        setReplacementFailed(true)
+        // Refresh the current projection so a stale revision does not trap the confirmation.
+        setPlanRefresh((value) => value + 1)
+      }
+      // A rejected or uncertain receipt keeps the draft and its pending nonce for an explicit retry.
+    } finally {
+      setReplacementBusy(false)
     }
   }
 
@@ -3124,6 +3235,12 @@ export function ConversationView({
               continuationBlocked={continuationBlocked}
               onOpenPlan={openRecordedPlan}
               onOpenSessionSettings={onOpenSessionSettings}
+              nativePresentationSuspended={
+                nativePresentationSuspended ||
+                nativeQuestions.length > 0 ||
+                Boolean(currentRelayDecision) ||
+                !visible
+              }
               onOpenProjectFile={openProjectFile}
               onCreateReportComment={
                 recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
@@ -3190,6 +3307,12 @@ export function ConversationView({
               continuationBlocked={continuationBlocked}
               onOpenPlan={openRecordedPlan}
               onOpenSessionSettings={onOpenSessionSettings}
+              nativePresentationSuspended={
+                nativePresentationSuspended ||
+                nativeQuestions.length > 0 ||
+                Boolean(currentRelayDecision) ||
+                !visible
+              }
               onOpenProjectFile={openProjectFile}
               onCreateReportComment={
                 recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
@@ -3462,6 +3585,12 @@ export function ConversationView({
             continuationBlocked={continuationBlocked}
             onOpenPlan={openRecordedPlan}
             onOpenSessionSettings={onOpenSessionSettings}
+            nativePresentationSuspended={
+              nativePresentationSuspended ||
+              nativeQuestions.length > 0 ||
+              Boolean(currentRelayDecision) ||
+              !visible
+            }
             onOpenProjectFile={openProjectFile}
             onCreateReportComment={
               recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
@@ -4522,6 +4651,9 @@ export function ConversationView({
                       }}
                     />
                   </div>
+                  {pactCommandHint ? (
+                    <p className="px-2 pb-1 text-caption text-tertiary">{pactCommandHint}</p>
+                  ) : null}
                   <div className="pact-composer-send-row relative flex items-center justify-between">
                     <div
                       ref={skillMenuRef}
@@ -4759,31 +4891,6 @@ export function ConversationView({
                       </button>
                     ) : null}
                     <div className="ml-auto flex shrink-0 items-center gap-1.5">
-                      {planningTask &&
-                      collaborationAskAvailable(planningTask) &&
-                      !responseInProgress ? (
-                        <button
-                          type="button"
-                          className="shrink-0 rounded-control border border-border px-2 py-1.5 text-caption text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-40"
-                          title="Send only the question to the Plan author. Comments and attachments stay in the draft."
-                          disabled={
-                            disabled ||
-                            !composer.trim() ||
-                            Boolean(composerReturnedInputOperationId) ||
-                            Boolean(editorValue.mention) ||
-                            composerSkills.length > 0 ||
-                            Boolean(
-                              parseComposerCommandPrefix(composer, composerSkills).pact ||
-                              parseComposerCommandPrefix(composer, composerSkills).route,
-                            )
-                          }
-                          onClick={() => void submitPlanQuestion()}
-                        >
-                          {draftComments.length || composerImages.length
-                            ? 'Ask only (text)'
-                            : 'Ask only'}
-                        </button>
-                      ) : null}
                       {showStop ? (
                         <button
                           type="button"
@@ -4818,6 +4925,7 @@ export function ConversationView({
                           disabled={
                             disabled ||
                             !hasDraft ||
+                            Boolean(replacement) ||
                             (responseInProgress && !queueEnabled && !unfinishedTask)
                           }
                           onClick={() => void submit()}
@@ -4896,6 +5004,26 @@ export function ConversationView({
           </div>
         </div>
       </div>
+      {replacement && replacementTask ? (
+        <TaskReplacementConfirmation
+          task={replacementTask}
+          command={replacement.command}
+          running={responseInProgress}
+          actor={respondingAgentId ?? collaborationActor(replacementTask, replacementTask.stage)}
+          summary={replacementDetails?.summary}
+          unreviewedChanges={replacementDetails?.unreviewedChanges ?? false}
+          busy={replacementBusy}
+          disabled={disabled || inputTakeover || Boolean(queuedInput) || sending}
+          suspended={nativePresentationSuspended || inputTakeover || !visible}
+          error={
+            replacementFailed
+              ? error || 'The new task could not be started. Your draft is preserved.'
+              : undefined
+          }
+          onCancel={cancelReplacement}
+          onConfirm={() => void confirmReplacement()}
+        />
+      ) : null}
       {forkPoint?.sourceSessionId === session.id && onForkSessionCreated ? (
         <SessionForkDialog
           key={`${forkPoint.sourceSessionId}:${forkPoint.messageId}`}

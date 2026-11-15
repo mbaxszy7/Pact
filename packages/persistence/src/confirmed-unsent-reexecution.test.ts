@@ -1101,7 +1101,7 @@ describe('confirmed-unsent reexecution through the authoritative repository', ()
           expectedRevision: f.repo.schedulingSettings().revision,
           enabled: false,
         })
-      } else f.repo.pauseCollaboration(f.sessionId)
+      } else f.repo.pauseCollaboration(f.sessionId, 'user')
       expect(() => f.repo.assertWorkflowDispatch(started.id)).toThrow('before native dispatch')
     },
   )

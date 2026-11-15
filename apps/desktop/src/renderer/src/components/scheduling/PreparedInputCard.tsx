@@ -140,6 +140,23 @@ export function PreparedInputCard({
       setBusy(false)
     }
   }
+  const explicitSettings = [
+    input.execution.model,
+    input.execution.effort ? `${input.execution.effort} effort` : undefined,
+    input.execution.speed === 'native' ? undefined : input.execution.speed,
+  ].filter((value): value is string => Boolean(value))
+  const permissionLabel =
+    input.execution.permissionMode === 'full'
+      ? 'Full access'
+      : input.execution.permissionMode === 'ask'
+        ? 'Ask for approval'
+        : input.execution.permissionMode === 'auto'
+          ? 'Automatic approvals'
+          : 'Default permissions'
+  const executionLabel =
+    explicitSettings.length === 0 && input.execution.permissionMode === 'native'
+      ? 'Default settings'
+      : [...explicitSettings, permissionLabel].join(' · ')
   return (
     <section
       className="relay-decision prepared-input-card"
@@ -148,38 +165,23 @@ export function PreparedInputCard({
     >
       <div className="prepared-input-content">
         <header className="relay-decision-heading">
-          <h3>Original request saved</h3>
+          <h3>Saved request</h3>
         </header>
         <div className="relay-decision-body">
-          <p className="relay-action-title">
-            {input.phase === 'preparing'
-              ? 'Preparing your original request…'
-              : 'Continue when you are ready'}
-          </p>
-          <p className="relay-action-explanation">
-            {input.preview || 'Your original Comment request is saved.'}
-          </p>
+          {input.phase === 'preparing' ? (
+            <p className="relay-action-title">Preparing saved request…</p>
+          ) : null}
+          {input.preview ? <p className="relay-action-explanation">{input.preview}</p> : null}
           <p className="relay-action-target">
-            {input.agentId === 'codex' ? 'Codex' : 'Claude Code'} ·{' '}
-            {input.execution.model ?? 'Native model'} · {input.execution.effort ?? 'Native effort'}{' '}
-            · {input.execution.speed} ·{' '}
-            {input.execution.permissionMode === 'full'
-              ? 'Full access'
-              : input.execution.permissionMode === 'ask'
-                ? 'Ask for approval'
-                : input.execution.permissionMode === 'auto'
-                  ? 'Automatic approvals'
-                  : 'Native permissions'}
-          </p>
-          <p className="relay-action-explanation">
-            Includes {input.commentCount} original{' '}
-            {input.commentCount === 1 ? 'Comment' : 'Comments'}
-            {input.hasAnswer ? ' and your saved answer' : ''}. Continue uses these displayed
-            settings. Your current draft stays here.
+            {input.agentId === 'codex' ? 'Codex' : 'Claude Code'} · {executionLabel}
+            {input.commentCount > 0
+              ? ` · ${input.commentCount} ${input.commentCount === 1 ? 'Comment' : 'Comments'}`
+              : ''}
+            {input.hasAnswer ? ' · Answer included' : ''}
           </p>
           {input.blockedReason && input.phase === 'paused' ? (
             <p className="relay-action-explanation">
-              Resolve the current Session interaction or recovery before continuing.
+              Resolve the pending interaction or recovery to continue.
             </p>
           ) : null}
           {message ? <output className="relay-decision-error">{message}</output> : null}
@@ -268,19 +270,16 @@ export function PreparedInputCard({
             setViewing(true)
           }}
         >
-          View original request
+          View request
         </button>
         <button
           type="button"
+          title="Uses the displayed settings and saved request. Your current draft stays saved."
           className="relay-submit"
           disabled={busy || (!uncertain && (disabled || !input.canContinue))}
           onClick={() => void act(uncertain)}
         >
-          {busy
-            ? 'Checking original request…'
-            : uncertain
-              ? 'Check Continue'
-              : 'Continue original request'}
+          {busy ? 'Checking…' : uncertain ? 'Check status' : 'Continue request'}
         </button>
       </footer>
     </section>

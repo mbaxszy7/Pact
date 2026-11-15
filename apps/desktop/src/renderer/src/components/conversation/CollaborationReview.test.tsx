@@ -329,7 +329,7 @@ it('omits Pause while preserving the authorized next action and revision receipt
   const bridge = installRead(task)
   bridge.getConversation.mockResolvedValue({
     ok: true,
-    value: reportPage(task, { availableActions: ['resume', 'pause'] }),
+    value: reportPage(task, { availableActions: ['resume'] }),
   })
   bridge.actOnCollaboration.mockResolvedValue({
     ok: false,
@@ -388,3 +388,21 @@ it.each([
     ).toBeNull()
   },
 )
+
+it('ties the draft hint to the disabled advancing actions with aria-describedby', async () => {
+  const { props, task } = collaborationFixture()
+  const bridge = installRead(task)
+  bridge.getConversation.mockResolvedValue({
+    ok: true,
+    value: reportPage(task, { availableActions: ['respond', 'repair'] }),
+  })
+  render(<CollaborationReview {...props} feedbackDraft />)
+  const hint = await screen.findByText('Send or clear your draft before continuing this task.')
+  expect(hint.id).not.toBe('')
+  const respond = screen.getByRole('button', { name: /^Respond/ })
+  const repair = screen.getByRole('button', { name: /^Repair/ })
+  for (const button of [respond, repair]) {
+    expect(button.getAttribute('aria-describedby')).toBe(hint.id)
+    expect(button).toHaveProperty('disabled', true)
+  }
+})

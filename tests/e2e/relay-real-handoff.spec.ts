@@ -17,6 +17,7 @@ import { nativeAgentContexts, workflowTurns } from '../../packages/persistence/s
 import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import {
   closeRealWorkspace,
+  restartRealWorkspace,
   selectRealSession,
   waitForRealCompletion,
   type RealWorkspace,
@@ -29,6 +30,8 @@ import { test, type RuntimeFixture } from './runtime-fixture.js'
 // The five preceding Turns are explicit fixture prerequisites produced through
 // the real Repository, not native/model execution evidence. Only the later
 // Electron Continue, DecisionRuntime and fixed reviewer are real Provider work.
+// The transparent Codex transport holds any following turn before native
+// dispatch. Stop is used only after the genuine reviewer and its effects finish.
 const goal =
   'Draft a conceptual three-step cancellation note. Acceptance: distinguish normal completion, cancellation, and disposal; name one cancellation owner; join that owner before releasing resources. Use only the supplied frozen sources. Do not inspect or modify project files, run commands, delegate, or add implementation. The scope is fully specified.'
 const plan =
@@ -239,7 +242,7 @@ async function seed(
   }
 }
 
-async function act(page: Page, sessionId: string, action: 'resume' | 'pause') {
+async function resume(page: Page, sessionId: string) {
   const actionResult = await page.evaluate(
     async (payload) => {
       const bridge: DesktopBridge = Reflect.get(globalThis, 'pact'),
@@ -255,11 +258,11 @@ async function act(page: Page, sessionId: string, action: 'resume' | 'pause') {
           taskId: task.id,
           revision: task.revision,
           clientMessageId: crypto.randomUUID(),
-          action: payload.action,
+          action: 'resume',
         })
       return actionReply.ok ? { ok: true } : { ok: false, error: actionReply.error.code }
     },
-    { sessionId, action },
+    { sessionId },
   )
   expect(actionResult).toEqual({ ok: true })
 }
@@ -359,6 +362,7 @@ function usageCounts(text: string | null) {
 }
 
 async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) {
+  await ctx.fixture.controlTransportFault('arm')
   ctx.projectId = prepared.projectId
   ctx.sessionId = prepared.sessionId
   ctx.projectDirectory = prepared.projectDirectory
@@ -384,7 +388,7 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
   let cancelledCards = 0
   const answered = new Set<string>()
   try {
-    await act(ctx.page, prepared.sessionId, 'resume')
+    await resume(ctx.page, prepared.sessionId)
     let realRunId: string | undefined
     await expect
       .poll(
@@ -392,14 +396,20 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
           const rows = observation.drizzle.query.agentRuns
             .findMany({
               where: (fields, { eq }) => eq(fields.sessionId, prepared.sessionId),
-              columns: { id: true, nativeTurnId: true, dispatchPhase: true },
+              columns: { id: true, agentId: true, nativeTurnId: true, dispatchPhase: true },
               limit: 8,
             })
             .sync()
           const real = rows.filter((row) => !prepared.fixtureRunIds.includes(row.id))
-          if (real.length > 1) throw Error('Unexpected additional business generation')
-          if (real[0]?.nativeTurnId) {
-            realRunId = real[0].id
+          const reviewers = real.filter((row) => row.agentId === 'claude')
+          if (
+            real.length > 2 ||
+            reviewers.length > 1 ||
+            real.some((row) => row.agentId === 'codex' && row.nativeTurnId)
+          )
+            throw Error('Unexpected additional native business generation')
+          if (reviewers[0]?.nativeTurnId) {
+            realRunId = reviewers[0].id
             return true
           }
           const pending = await ctx.page.evaluate(async (sessionId) => {
@@ -430,23 +440,76 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
             )
             expect(result).toMatchObject({ ok: true, value: { disposition: 'cancelled' } })
             cancelledCards++
-            await act(ctx.page, prepared.sessionId, 'resume')
           }
           return false
         },
         { timeout: 45_000, intervals: [50, 100, 250] },
       )
       .toBe(true)
-    // Bound paid work without changing or interrupting this genuine reviewer:
-    // Pause only following automation after its real Run has been admitted.
-    await act(ctx.page, prepared.sessionId, 'pause')
-    const complete = await waitForRealCompletion(ctx, prepared.fixtureRunIds.length + 1)
+    if (!realRunId) throw Error('The genuine reviewer was not admitted')
+    // The measured advice has already settled. Bound this experiment to that
+    // handoff; later recovery/advice must not add another paid Decision call.
+    const disabled = await ctx.page.evaluate(async () => {
+      const bridge: DesktopBridge = Reflect.get(globalThis, 'pact'),
+        settings = await bridge.getSchedulingSettings()
+      if (!settings.ok) throw Error('Relay settings unavailable')
+      return bridge.saveSchedulingSettings({
+        expectedRevision: settings.value.revision,
+        enabled: false,
+      })
+    })
+    expect(disabled).toMatchObject({ ok: true, value: { enabled: false } })
+    await expect
+      .poll(
+        () => {
+          const row = observation.conversationRepository.findRun(realRunId!)
+          if (row && ['failed', 'interrupted'].includes(row.status))
+            throw Error(`The genuine reviewer failed: ${row.failureKind ?? 'unknown'}`)
+          return row?.status === 'completed' && row.nativeEffectsState === 'settled'
+        },
+        { timeout: 300_000, intervals: [250, 500, 1000] },
+      )
+      .toBe(true)
+    const reviewCompletedAt = Date.now()
+    const stopped = await ctx.page.evaluate(async (sessionId) => {
+      const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+      return bridge.stopConversation({ sessionId })
+    }, prepared.sessionId)
+    expect(stopped).toMatchObject({ ok: true })
+    const following = observation.drizzle.query.agentRuns
+      .findMany({
+        where: (fields, { eq }) => eq(fields.sessionId, prepared.sessionId),
+        columns: { id: true, agentId: true, nativeTurnId: true, status: true },
+        limit: 8,
+      })
+      .sync()
+      .filter((row) => !prepared.fixtureRunIds.includes(row.id) && row.id !== realRunId)
+    expect(following.length).toBeLessThanOrEqual(1)
+    for (const row of following) {
+      expect(row).toMatchObject({ agentId: 'codex', nativeTurnId: null })
+      expect(['failed', 'interrupted']).toContain(row.status)
+    }
+    const transport = await ctx.fixture.readTransportFacts()
+    expect(transport.length).toBeGreaterThan(0)
+    expect(transport.every((entry) => entry.forwardedTurns === 0)).toBe(true)
+    const complete = await waitForRealCompletion(
+      ctx,
+      prepared.fixtureRunIds.length + 1 + following.length,
+      prepared.sessionId,
+      following.map((row) => row.id),
+    )
+    expect(
+      complete.runs.filter(
+        (value) => !prepared.fixtureRunIds.includes(value.id) && value.nativeTurnId,
+      ),
+    ).toHaveLength(1)
     const run = complete.runs.find((value) => value.id === realRunId)!
     expect(run).toMatchObject({
       agentId: 'claude',
       status: 'completed',
       collaboration: { taskId: prepared.taskId, stage: 'plan_review' },
     })
+    expect(observation.conversationRepository.findRun(run.id)?.nativeOutcome).toBe('completed')
     await expect
       .poll(() => observation.conversationRepository.findRun(run.id)?.nativeEffectsState, {
         timeout: 15_000,
@@ -549,14 +612,18 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
     return {
       enabled,
       fixtureBusinessTurns: prepared.fixtureRunIds.length,
+      admittedRuns: 1 + following.length,
       realBusinessTurns: 1,
+      cancelledUnsentFollowups: following.length,
+      codexForwardedTurns: 0,
       requiredReviewRetained: true,
       fixedReviewer: 'claude',
       realReviewerModel: run.model,
       completeReportSha256: createHash('sha256').update(answer.content).digest('hex'),
       nativeRecordSha256: native.sha256,
       reviewFocusCovered: focus.terms.every((term) => answer.content.toLowerCase().includes(term)),
-      elapsedMs: Date.now() - startedAt,
+      elapsedMs: reviewCompletedAt - startedAt,
+      elapsedBoundary: 'resume_to_review_effects_settled',
       preflightObservationElapsedMs: observationElapsedMs,
       decisionCalls: evaluations.filter((value) => value.called).length,
       decisionModel: evaluated?.model ?? null,
@@ -571,11 +638,17 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
       decisionCards: decisions.length,
       manualCheckRequests: 0,
       cancelledCards,
-      pausedOnlyFollowingAutomation: true,
+      stoppedAfterReviewerCompleted: true,
+      relayDisabledAfterAdmission: true,
       generatedGuidance: false,
     }
   } finally {
-    observation.close()
+    try {
+      // Never release a held following model request, including on failed checks.
+      await ctx.fixture.controlTransportFault('cancel')
+    } finally {
+      observation.close()
+    }
   }
 }
 
@@ -590,7 +663,7 @@ for (const target of ['codex_luna', 'claude_haiku_5_5'] as const)
         'This real native collaboration journey is verified on macOS.',
       )
       test.setTimeout(360_000)
-      const fixture = await createRealRelayFixture()
+      const fixture = await createRealRelayFixture('pause-turn')
       let ctx: RealWorkspace | undefined
       try {
         const claudeModel = fixture.readConfigurationModels().claude
@@ -650,7 +723,27 @@ for (const target of ['codex_luna', 'claude_haiku_5_5'] as const)
         }, off.sessionId)
         expect(catalog).toEqual({ codex: true, claude: true })
         const without = await runHandoff(ctx, off, false)
-        const enabled = await page.evaluate(async () => {
+        // Retire the first transport and its held-request state before rearming.
+        await restartRealWorkspace(ctx)
+        await ctx.fixture.controlTransportFault('arm')
+        await expect
+          .poll(
+            () =>
+              ctx!.page.evaluate(async () => {
+                const bridge: DesktopBridge = Reflect.get(globalThis, 'pact'),
+                  state = await bridge.getRuntimePreparation()
+                return state.ok ? state.value.agents.map((value) => value.state) : []
+              }),
+            { timeout: 30_000 },
+          )
+          .toEqual(['ready', 'ready'])
+        expect(
+          await ctx.page.evaluate(async (sessionId) => {
+            const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+            return (await bridge.getSessionSettings(sessionId)).ok
+          }, on.sessionId),
+        ).toBe(true)
+        const enabled = await ctx.page.evaluate(async () => {
           const bridge: DesktopBridge = Reflect.get(globalThis, 'pact'),
             settings = await bridge.getSchedulingSettings()
           if (!settings.ok) throw Error('Relay settings unavailable')

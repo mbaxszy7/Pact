@@ -372,14 +372,11 @@ for (const primary of ['codex', 'claude'] as const)
   test(`@deterministic native plan from ${primary} is independently reviewed before explicit Secondary implementation and repair`, async () => {
     const f = await prepare(primary)
     try {
-      const secondary = primary === 'codex' ? 'claude' : 'codex'
-      await f.send(`@${secondary} /plan Conflicting plan recipient.`)
+      await f.send('@all /plan Conflicting plan recipient.')
       await expect(
-        f.page.getByText(
-          `This Pact plan stage belongs to ${primary}. Remove the conflicting Agent recipient; your draft is preserved.`,
-          { exact: true },
-        ),
+        f.page.getByText('Choose one Agent to start this Pact task.', { exact: true }),
       ).toBeVisible()
+      await expect(f.page.getByRole('button', { name: 'Send message', exact: true })).toBeDisabled()
       await expect(f.page.getByRole('combobox', { name: 'Message', exact: true })).toContainText(
         'Conflicting plan recipient.',
       )
@@ -448,7 +445,7 @@ test('@deterministic structured question answers stay bound to the requesting ac
   try {
     await f.send('@claude /plan unclear cancellation requirement')
     const card = f.page.getByRole('region', { name: 'Collaboration questions', exact: true })
-    await expect(card).toContainText('Claude Code is waiting for your reply')
+    await expect(card).toContainText('Claude Code needs your input')
     await expect(
       card.getByRole('radio', { name: 'Current request', exact: true }),
     ).not.toBeChecked()
@@ -575,7 +572,7 @@ for (const primary of ['codex', 'claude'] as const) {
       await f.send('/plan reviewer decision about cancellation')
       const card = f.page.getByRole('region', { name: 'Collaboration questions', exact: true })
       await expect(card).toContainText(
-        `${reviewer === 'codex' ? 'Codex' : 'Claude Code'} is waiting for your reply`,
+        `${reviewer === 'codex' ? 'Codex' : 'Claude Code'} needs your input`,
       )
       await expect(f.page.getByRole('combobox', { name: 'Message', exact: true })).toHaveCount(0)
       await card.getByRole('radio', { name: 'Current request', exact: true }).check()
@@ -632,12 +629,16 @@ for (const primary of ['codex', 'claude'] as const) {
         f.page.getByRole('region', { name: 'Collaboration questions', exact: true }),
       ).toHaveCount(0)
       await expect(f.page.getByRole('button', { name: /Restore plan/ })).toHaveCount(0)
+      expect(await current(f.page, f.sessionId)).toMatchObject({
+        status: 'failed',
+        automation: 'paused',
+        pauseReason: 'failure',
+        nextStage: 'plan',
+        planVersion: 0,
+      })
       await expect(
-        f.page.getByText(
-          `Next: Update the plan with ${primary === 'codex' ? 'Codex' : 'Claude Code'}.`,
-          { exact: false },
-        ),
-      ).toBeVisible()
+        f.page.getByRole('button', { name: 'Continue collaboration', exact: true }),
+      ).toBeEnabled()
       await expect(f.page.getByRole('combobox', { name: 'Message', exact: true })).toBeVisible()
       expect(await f.counts()).toEqual(
         primary === 'codex' ? { codex: 1, claude: 0 } : { codex: 0, claude: 1 },

@@ -6,7 +6,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 // oxlint-disable-next-line eslint/no-restricted-imports -- jsdom lacks browser SubtleCrypto; this test-only provider verifies the real source hash.
 import { webcrypto } from 'node:crypto'
 import { useState } from 'react'
-import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { AgentRun, ConversationPage, DesktopBridge, WorkspaceChangeSet } from '@pact/contracts'
 
@@ -1641,7 +1641,7 @@ it('checks the candidate named by the backend and requires a fresh confirmation 
   rendered.rerender(<ConversationView {...props} />)
   fireEvent.click(screen.getByRole('button', { name: 'Rebuild…' }))
   expect(screen.queryByText(issue.reason)).toBeNull()
-  expect(screen.getByText(/A previous attempt may already have created a session\./u)).toBeDefined()
+  expect(screen.getByText(/A previous attempt may have created a session\./u)).toBeDefined()
   let resolve!: (accepted: boolean) => void
   props.onRebuildNativeContext = vi.fn<
     ComponentProps<typeof ConversationView>['onRebuildNativeContext']
@@ -2007,7 +2007,7 @@ it('keeps cancellation receipt recovery visible after the host card disappears, 
   props.history.cancelPreparedInformation = cancel
   props.history.checkInformationCancellation = check
   const mounted = render(<ConversationView {...props} />)
-  fireEvent.click(screen.getByRole('button', { name: 'Cancel this scheduling action' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
   await waitFor(() => expect(cancel).toHaveBeenCalledExactlyOnceWith(card))
   props.snapshot!.relaySchedulingDecision = null
   props.history.informationCancellation = {
@@ -2031,7 +2031,7 @@ it('keeps cancellation receipt recovery visible after the host card disappears, 
   mounted.rerender(<ConversationView {...props} />)
   expect(screen.getByRole('button', { name: 'Send message' })).toBeDefined()
   expect(screen.getByRole('combobox', { name: 'Message' }).textContent).toBe(props.composer)
-  expect(screen.queryByRole('button', { name: 'Cancel this scheduling action' })).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull()
   expect(props.onSend).not.toHaveBeenCalled()
 })
 
@@ -2102,4 +2102,187 @@ it.each([
 it('hides the latest-version button when no plan source is shown', () => {
   renderPlanPanel({ source: true, latestVersion: 5, onOpenLatest: vi.fn<() => void>() })
   expect(screen.queryByRole('button', { name: /View latest plan version/ })).toBeNull()
+})
+
+const sendMessage = () => fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+
+describe('task replacement confirmation', () => {
+  const showDescriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, 'showModal')
+  const closeDescriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, 'close')
+
+  beforeEach(() => {
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) {
+        this.open = true
+      },
+    })
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) {
+        this.open = false
+      },
+    })
+  })
+  afterEach(() => {
+    // Unmount before removing the dialog shims the effect cleanup relies on.
+    cleanup()
+    for (const [name, descriptor] of [
+      ['showModal', showDescriptor],
+      ['close', closeDescriptor],
+    ] as const) {
+      if (descriptor) Object.defineProperty(HTMLDialogElement.prototype, name, descriptor)
+      else Reflect.deleteProperty(HTMLDialogElement.prototype, name)
+    }
+  })
+
+  function replacementFixture(composer = '/review Audit the next scope.') {
+    const { task, run } = collaborationFixture()
+    task.task = ''
+    const props = fixture()
+    props.session.id = task.sessionId
+    props.snapshot!.sessionId = task.sessionId
+    props.composer = composer
+    props.onPlanAvailable = vi.fn<NonNullable<typeof props.onPlanAvailable>>()
+    const getConversation = vi
+      .fn<DesktopBridge['getConversation']>()
+      .mockImplementation(async () => ({
+        ok: true,
+        value: reportPage(task, {
+          availableActions: ['respond', 'repair'],
+          planSource: { runId: run.id, messageId: run.userMessageId },
+          replacement: {
+            summary: 'Codex is waiting for your next action on the reviewed changes.',
+            unreviewedChanges: true,
+          },
+        }),
+      }))
+    vi.stubGlobal('pact', { ...composerBridgeFixture(), getConversation })
+    return { props, task, run, getConversation }
+  }
+
+  it('asks to replace the unfinished task before sending a new command', async () => {
+    const { props, task } = replacementFixture()
+    render(<ConversationView {...props} />)
+    await waitFor(() => expect(props.onPlanAvailable).toHaveBeenCalledWith(task.sessionId, task.id))
+    sendMessage()
+    const dialog = await screen.findByRole('dialog', { name: 'Replace the current task?' })
+    expect(props.onSend).not.toHaveBeenCalled()
+    expect(within(dialog).getByText(`Current task · /${task.kind}`)).toBeDefined()
+    expect(within(dialog).getByRole('button', { name: `Replace and start /review` })).toBeDefined()
+    expect(screen.getByRole('combobox', { name: 'Message' }).textContent).toContain(
+      'Audit the next scope.',
+    )
+  })
+
+  it('keeps the current task on cancel, returns Message focus and asks again on Send', async () => {
+    const { props } = replacementFixture()
+    render(<ConversationView {...props} />)
+    await waitFor(() => expect(props.onPlanAvailable).toHaveBeenCalled())
+    const composer = screen.getByRole('combobox', { name: 'Message' })
+    act(() => composer.focus())
+    sendMessage()
+    await screen.findByRole('dialog', { name: 'Replace the current task?' })
+    fireEvent.click(screen.getByRole('button', { name: 'Keep current task' }))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(props.onSend).not.toHaveBeenCalled()
+    expect(document.activeElement).toBe(composer)
+    sendMessage()
+    const reopened = await screen.findByRole('dialog', {
+      name: 'Replace the current task?',
+    })
+    fireEvent(reopened, new Event('cancel', { cancelable: true }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(props.onSend).not.toHaveBeenCalled()
+    expect(document.activeElement).toBe(composer)
+  })
+
+  it('confirms with the frozen task reference and closes on success', async () => {
+    const { props, task } = replacementFixture()
+    render(<ConversationView {...props} />)
+    await waitFor(() => expect(props.onPlanAvailable).toHaveBeenCalled())
+    sendMessage()
+    await screen.findByRole('dialog', { name: 'Replace the current task?' })
+    fireEvent.click(screen.getByRole('button', { name: 'Replace and start /review' }))
+    await waitFor(() => expect(props.onSend).toHaveBeenCalledTimes(1))
+    const call = vi.mocked(props.onSend).mock.calls[0]!
+    expect(call).toHaveLength(6)
+    expect(call[0]).toBe(props.composer)
+    expect(call[5]).toEqual({ taskId: task.id, revision: task.revision })
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  })
+
+  it('keeps the confirmation, draft and error on a rejected send and retries the frozen reference', async () => {
+    const { props, task, getConversation } = replacementFixture()
+    props.error = 'The Session is busy.'
+    vi.mocked(props.onSend).mockResolvedValueOnce(false)
+    render(<ConversationView {...props} />)
+    await waitFor(() => expect(props.onPlanAvailable).toHaveBeenCalled())
+    sendMessage()
+    await screen.findByRole('dialog', { name: 'Replace the current task?' })
+    fireEvent.click(screen.getByRole('button', { name: 'Replace and start /review' }))
+    await waitFor(() => expect(props.onSend).toHaveBeenCalledTimes(1))
+    const dialog = screen.getByRole('dialog', { name: 'Replace the current task?' })
+    expect(within(dialog).getByRole('alert').textContent).toContain('The Session is busy.')
+    expect(screen.getByRole('combobox', { name: 'Message' }).textContent).toContain(
+      'Audit the next scope.',
+    )
+    const confirmedRevision = task.revision
+    // A newer task revision must not silently re-authorize the retry.
+    task.revision += 1
+    await waitFor(() => expect(getConversation.mock.calls.length).toBeGreaterThanOrEqual(2))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Replace and start /review' }))
+    await waitFor(() => expect(props.onSend).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(props.onSend).mock.calls[1]?.[5]).toEqual({
+      taskId: task.id,
+      revision: confirmedRevision,
+    })
+  })
+
+  it('offers to queue the new task while a response is in progress', async () => {
+    const { props, run } = replacementFixture()
+    run.status = 'running'
+    props.snapshot!.runs = [run]
+    props.history.window!.latestRun = run
+    render(<ConversationView {...props} />)
+    await waitFor(() => expect(props.onPlanAvailable).toHaveBeenCalled())
+    sendMessage()
+    const dialog = await screen.findByRole('dialog', {
+      name: 'Queue a new task?',
+    })
+    expect(within(dialog).getByRole('button', { name: 'Queue new task' })).toBeDefined()
+    expect(within(dialog).getByText(/Codex finishes this response first\./u)).toBeDefined()
+    expect(props.onSend).not.toHaveBeenCalled()
+  })
+
+  it('suspends the confirmation during native presentation and clears it on Session change', async () => {
+    const { props } = replacementFixture()
+    const mounted = render(<ConversationView {...props} />)
+    await waitFor(() => expect(props.onPlanAvailable).toHaveBeenCalled())
+    sendMessage()
+    const dialog = await screen.findByRole<HTMLDialogElement>('dialog', {
+      name: 'Replace the current task?',
+    })
+    expect(dialog.open).toBe(true)
+    mounted.rerender(<ConversationView {...props} nativePresentationSuspended />)
+    await waitFor(() => expect(dialog.open).toBe(false))
+    mounted.rerender(<ConversationView {...props} />)
+    await waitFor(() => expect(dialog.open).toBe(true))
+    mounted.rerender(
+      <ConversationView {...props} session={{ ...props.session, id: crypto.randomUUID() }} />,
+    )
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(props.onSend).not.toHaveBeenCalled()
+  })
+
+  it('offers no standalone End task action', async () => {
+    const { props } = replacementFixture()
+    render(<ConversationView {...props} />)
+    await waitFor(() => expect(props.onPlanAvailable).toHaveBeenCalled())
+    sendMessage()
+    const dialog = await screen.findByRole('dialog', { name: 'Replace the current task?' })
+    expect(within(dialog).getByRole('button', { name: 'Replace and start /review' })).toBeDefined()
+    expect(within(dialog).queryByRole('button', { name: /end task/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /\bend task\b/i })).toBeNull()
+  })
 })

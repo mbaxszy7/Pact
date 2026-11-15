@@ -99,9 +99,9 @@ it('preserves stale answers and requires explicit keep or discard before the new
     true,
   )
   expect(screen.getByRole('radio', { name: 'Queue' }).closest('fieldset')?.disabled).toBe(true)
-  fireEvent.click(screen.getByRole('button', { name: 'Keep answers in message draft' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Keep in draft' }))
   expect(props.onClearDraft).toHaveBeenLastCalledWith(true)
-  fireEvent.click(screen.getByRole('button', { name: 'Discard saved answers' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Discard answers' }))
   expect(props.onClearDraft).toHaveBeenLastCalledWith(false)
   expect(props.onSubmit).not.toHaveBeenCalled()
   expect(draft.answers.q1.text).toBe('Saved answer')

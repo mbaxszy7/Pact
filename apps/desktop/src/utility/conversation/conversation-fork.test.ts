@@ -368,17 +368,19 @@ it('releases Fork owners and preserves one committed child through 100 success/f
       const filePath = join(directory, `cycle-${cycle}.sqlite`),
         f = await fixture(filePath)
       const { operation } = await f.create()
-      await vi.waitFor(() =>
-        expect(
-          f.db.conversationRepository
-            .forkOperation(operation.sessionId)!
-            .sides.every(
-              (side) =>
-                side.state === 'ready' ||
-                side.state === 'unconfirmed' ||
-                (native.hold && side.state === 'forking'),
-            ),
-        ).toBe(true),
+      await vi.waitFor(
+        () =>
+          expect(
+            f.db.conversationRepository
+              .forkOperation(operation.sessionId)!
+              .sides.every(
+                (side) =>
+                  side.state === 'ready' ||
+                  side.state === 'unconfirmed' ||
+                  (native.hold && side.state === 'forking'),
+              ),
+          ).toBe(true),
+        { interval: 5 },
       )
       await f.flow.dispose()
       expect(f.flow.diagnostics()).toMatchObject({

@@ -1738,9 +1738,7 @@ function App(): React.JSX.Element {
           }
           onArchiveSession={(sessionId) => void requestArchive({ kind: 'session', sessionId })}
           onRenameSession={(sessionId, title) => sessionWorkspace.rename(sessionId, title)}
-          onSendMessage={(content, commentIds, route, skills, decision, askOnly) =>
-            conversation.send(content, commentIds, route, skills, decision, askOnly)
-          }
+          onSendMessage={(...args) => conversation.send(...args)}
           onSaveCommentDraft={(input) => conversation.saveCommentDraft(input)}
           onRemoveCommentDraft={(commentId) => conversation.removeCommentDraft(commentId)}
           onOpenComment={openSentComment}

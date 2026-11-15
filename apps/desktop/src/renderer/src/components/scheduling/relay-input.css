@@ -173,8 +173,7 @@
   font-weight: 500;
   line-height: 21px;
 }
-.relay-action-target,
-.relay-action-source {
+.relay-action-target {
   margin: 6px 0 0;
   font-size: 12px;
   line-height: 18px;
@@ -184,9 +183,6 @@
   margin: 10px 0 0;
   font-size: 13px;
   line-height: 20px;
-}
-.relay-action-source {
-  margin-top: 10px;
 }
 .relay-scheduling-field {
   display: grid;
@@ -218,7 +214,7 @@
 }
 .relay-decision-footer {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: space-between;
   gap: 8px 16px;
@@ -226,17 +222,20 @@
 }
 .relay-cancel {
   min-height: 34px;
-  margin-left: -6px;
-  padding: 6px;
-  border-radius: 6px;
+  margin-left: 0;
+  padding: 7px 12px;
+  border: 1px solid var(--pact-border);
+  border-radius: 8px;
+  background: var(--pact-surface-muted);
   color: var(--pact-text-secondary);
   font-size: 12px;
   line-height: 18px;
+  white-space: nowrap;
   cursor: pointer;
 }
 .relay-cancel:hover {
   color: var(--pact-text-primary);
-  background: var(--pact-surface-muted);
+  background: var(--pact-surface-raised);
 }
 .relay-submit {
   display: inline-flex;
@@ -252,6 +251,7 @@
   font-size: 12px;
   line-height: 18px;
   font-weight: 500;
+  white-space: nowrap;
   cursor: pointer;
 }
 .relay-submit:disabled,

@@ -3297,7 +3297,7 @@ export class CodexAgentAdapter implements AgentAdapter {
         retainedPlan &&
         !planOperationObserved &&
         !submittedPlan &&
-        !inputResult &&
+        (!inputResult || inputResult.outcome === 'explanation_only') &&
         !projectionFailure &&
         !signal.aborted &&
         background.rootTerminal &&

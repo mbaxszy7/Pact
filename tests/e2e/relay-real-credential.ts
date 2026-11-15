@@ -2,6 +2,7 @@ import { lstat } from 'node:fs/promises'
 import { isAbsolute, resolve } from 'node:path'
 
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
+import type { NativeTransportFault } from './native-transport-fault.js'
 
 import { within } from '../native/native-harness.js'
 import { quitPact } from './native-quit.js'
@@ -15,7 +16,9 @@ const sourceError =
  * Only Main reads the private file. Playwright carries its path and fixed facts,
  * never the key or the script that Main sends to the registered Renderer.
  */
-export async function createRealRelayFixture(): Promise<RuntimeFixture> {
+export async function createRealRelayFixture(
+  transportFault?: NativeTransportFault,
+): Promise<RuntimeFixture> {
   const file =
     process.env['PACT_E2E_RELAY_API_KEY_FILE'] ?? resolve(import.meta.dirname, 'env/codex/.env')
   try {
@@ -34,7 +37,11 @@ export async function createRealRelayFixture(): Promise<RuntimeFixture> {
     // No raw filesystem/parser error or private source data enters test evidence.
     throw Error(sourceError)
   }
-  const fixture = await createRuntimeFixture({ mode: 'real', realRelayCredentialStore: true })
+  const fixture = await createRuntimeFixture({
+    mode: 'real',
+    realRelayCredentialStore: true,
+    ...(transportFault ? { transportFault } : {}),
+  })
   let bootstrap: Promise<{ ok: boolean; phase: string }> | undefined
   let phase = 'launch'
   try {

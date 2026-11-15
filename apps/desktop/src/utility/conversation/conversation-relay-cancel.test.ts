@@ -152,12 +152,10 @@ async function cancel(f: Fixture) {
       clientOperationId: request.clientOperationId,
     }),
   ).toEqual(result)
-  expect(repo.collaboration(f.sessionId)).toMatchObject({
-    id: task.id,
-    runId: task.runId,
-    automation: 'paused',
-    pauseReason: 'user',
-  })
+  const currentTask = repo.collaboration(f.sessionId)!
+  expect(currentTask.id).toBe(task.id)
+  expect(currentTask.automation).toBe(task.automation)
+  expect(currentTask.pauseReason).toBe(task.pauseReason)
   expect(repo.relaySchedulingDecision(f.sessionId)).toBeNull()
   expect(() => repo.assertRelayDecisionResolved(f.sessionId)).not.toThrow()
   const current = repo.findRun(task.runId)!
@@ -403,12 +401,8 @@ describe('Cancel an optional Relay advancement, then continue through the origin
           }),
         ),
       )
-      const state = await cancel(f)
-      expect(native.inputs).toHaveLength(3)
-      await f.settled()
-      expect(native.inputs).toHaveLength(3)
       native.candidate = null
-      expect(await f.act('resume')).toMatchObject({ ok: true })
+      const state = await cancel(f)
       await vi.waitFor(() => expect(native.inputs).toHaveLength(6))
       expect(await f.settled()).toMatchObject({ status: 'ready' })
       expect(native.inputs[5]!.promptEnvelope.collaboration).toMatchObject({
@@ -480,8 +474,6 @@ describe('Cancel an optional Relay advancement, then continue through the origin
       expect(await f.act('respond')).toMatchObject({ ok: true })
       await vi.waitFor(() => expect(repo.relaySchedulingDecision(f.sessionId)).not.toBeNull())
       const state = await cancel(f)
-      expect(native.inputs).toHaveLength(4)
-      expect(await f.act('resume')).toMatchObject({ ok: true })
       await f.settled()
       expect(native.inputs).toHaveLength(4)
       native.candidate = undefined
@@ -775,7 +767,7 @@ it.each([
 )
 
 it.each(['plan', 'plan_review'] as const)(
-  'resumes automation within the running revised %s without admitting a replacement',
+  'resumes a historical automation pause within the running revised %s without admitting a replacement',
   async (stage) => {
     const f = await fixture()
     const repo = f.db.conversationRepository
@@ -802,7 +794,7 @@ it.each(['plan', 'plan_review'] as const)(
       await vi.waitFor(() => expect(native.inputs).toHaveLength(count))
       const running = repo.collaboration(f.sessionId)!
       expect(running).toMatchObject({ stage, status: 'running' })
-      expect(await f.act('pause')).toMatchObject({ ok: true })
+      repo.pauseCollaboration(f.sessionId, 'user')
       expect(await f.act('resume')).toMatchObject({ ok: true })
       expect(repo.collaboration(f.sessionId)).toMatchObject({
         stage,

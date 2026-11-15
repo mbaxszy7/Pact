@@ -96,14 +96,22 @@ import {
   type CollaborationRetainedPlan,
   collaborationTurnAuthorizationSchema,
   collaborationAvailableActions,
+  deriveCollaborationDecision,
+  settleCollaborationStage,
+  collaborationCanKeepPlan,
+  collaborationCanRevisePlan,
+  collaborationCanSwapCodeRoles,
+  pactCommandRouteAllowed,
+  pactEntryPrimary,
   collaborationNextStage,
+  collaborationWorkflowInputBasis,
   collaborationPlanMode,
   collaborationActor,
   collaborationAskMode,
   otherAgent,
   collaborationStageLabel,
-  collaborationRequiresPlan,
   collaborationPlanAccepted,
+  collaborationAskActor,
   collaborationAskAvailable,
   type CollaborationAskRef,
   collaborationInputOutcomeAllowed,
@@ -122,6 +130,7 @@ import {
   relayNativeRecoveryProofSchema,
   relayDecisionAnswerSchema,
   relayDecisionReceiptSchema,
+  isOptionalRelaySuggestion,
   relayAnswerMatchesDecision,
   type RelaySchedulingDecision,
   type RelaySchedulingDecisionProof,
@@ -704,6 +713,7 @@ export interface BeginRunInput {
   initialTaskRoles?: InitialTaskRolesProposal | undefined
   schedulingHandoff?: SchedulingHandoff | undefined
   replyToDecision?: import('@pact/contracts').ConversationSendInput['replyToDecision'] | undefined
+  replaceTask?: import('@pact/contracts').ConversationSendInput['replaceTask'] | undefined
   inputBatchId?: string
   batchId?: string | undefined
   freezeDrafts?: boolean | undefined
@@ -2987,6 +2997,7 @@ export class ConversationRepository {
       ...(input.userInformation ? { userInformation: input.userInformation } : {}),
       freezeDrafts: input.freezeDrafts ?? true,
       replyToDecision: input.replyToDecision ?? null,
+      ...(input.replaceTask ? { replaceTask: input.replaceTask } : {}),
       returnedInputOperationId: input.returnedInputOperationId ?? null,
       queueReturnOperationId: input.queueReturnOperationId ?? null,
     })
@@ -5368,6 +5379,8 @@ export class ConversationRepository {
       .get()
     if (!row) throw new RunOperationConflictError('The workflow task is unavailable.')
     task = { ...task, runId, inputSequence: row.inputSequence }
+    if (task.stage === 'plan' && task.planRevision && !task.planRevision.startedRunId)
+      task.planRevision = { ...task.planRevision, startedRunId: runId }
     const run = this.findRun(runId)!
     if (task.taskMessageId === run.userMessageId && !task.taskDocument) {
       const source = this.database
@@ -5394,10 +5407,34 @@ export class ConversationRepository {
         ? storedReceivedMetadata(received.metadataJson).replyIntentBasis
         : undefined
     const askOnly = intent?.kind === 'ask_only'
-    const binding = askOnly ? this.nativeContext(task.sessionId, task.actor) : undefined
+    const checkpointed =
+      intent?.kind === 'ask_only' ||
+      intent?.kind === 'explanation_only' ||
+      Boolean(intent?.askBinding)
+    const binding = checkpointed ? this.nativeContext(task.sessionId, task.actor) : undefined
+    const checkpointProven = Boolean(
+      intent?.askBinding &&
+      binding?.nativeSessionId === intent.askBinding.nativeSessionId &&
+      binding.bindingGeneration === intent.askBinding.generation &&
+      collaborationInputProcessing(task).pending?.inputId === intent.inputId &&
+      (!askOnly ||
+        (batch.memberCount === 0 &&
+          (intent.askCheckpoint
+            ? this.database
+                .select({ taskId: conversationInputBatches.taskId })
+                .from(conversationInputBatches)
+                .where(eq(conversationInputBatches.id, batch.id))
+                .get()?.taskId === null
+            : collaborationPlanAccepted({
+                ...task,
+                inputProcessing: {
+                  ...collaborationInputProcessing(task),
+                  pending: undefined,
+                },
+              })))),
+    )
     const replyIntentBasis =
       intent &&
-      intent.kind !== 'explanation_only' &&
       task.revision === intent.taskRevision + 2 &&
       task.inputSequence === intent.priorInputSequence + (askOnly ? 0 : 1) &&
       received?.actor === task.actor &&
@@ -5405,24 +5442,12 @@ export class ConversationRepository {
       isDeepStrictEqual(task.review, intent.review) &&
       isDeepStrictEqual(task.stageRoles, intent.stageRoles) &&
       isDeepStrictEqual(task.planReference, intent.planReference) &&
-      (!askOnly ||
-        (intent.askBinding &&
-          binding?.nativeSessionId === intent.askBinding.nativeSessionId &&
-          binding.bindingGeneration === intent.askBinding.generation &&
-          collaborationInputProcessing(task).pending?.inputId === intent.inputId &&
-          batch.memberCount === 0 &&
-          collaborationPlanAccepted({
-            ...task,
-            inputProcessing: {
-              ...collaborationInputProcessing(task),
-              pending: undefined,
-            },
-          })))
+      (!checkpointed || checkpointProven)
         ? intent
         : undefined
     if (askOnly && !replyIntentBasis)
       throw new RunOperationConflictError(
-        'The queued Plan question no longer matches its accepted Plan.',
+        'The queued question no longer matches its task checkpoint.',
       )
     const decision = collaborationInputProcessing(task).decision
     const decisionAuthorization = decision && this.collaborationTurnAuthorization(decision.runId)
@@ -6243,9 +6268,11 @@ export class ConversationRepository {
       if (!this.workflowInputResult(runId) || !collaborationInputProcessing(task).pending) return
       const before = { input: task.inputProcessing, status: task.status, notice: task.notice }
       if (this.settleWorkflowInput(task, run, auth, turn, false)) {
-        task.status = 'waiting'
-        const stage = collaborationNextStage(task)
-        task.nextStage = stage === 'reply' ? undefined : stage
+        const explanationRestored = Boolean(
+          task.inputProcessing?.settled?.runId === run.id && task.inputProcessing.settled.unchanged,
+        )
+        if (!explanationRestored)
+          Object.assign(task, settleCollaborationStage(task, { kind: 'recovered_reply' }))
       }
       if (
         isDeepStrictEqual(before, {
@@ -6286,19 +6313,23 @@ export class ConversationRepository {
         task.status !== 'questions' ||
         task.notice !== 'Your answers are needed before this plan response can be reviewed.'
       ) {
-        task.status = 'questions'
-        task.inputProcessing = {
-          ...collaborationInputProcessing(task),
-          decision: {
-            runId,
-            inputSequence: auth.inputSequence,
-            ...(run.responseMessageId ? { messageId: run.responseMessageId } : {}),
-            questions: bindCollaborationQuestions(this.workflowInputResult(runId)?.questions),
-            actor: auth.actor,
-          },
-        }
-        task.nextStage = 'plan'
-        task.notice = 'Your answers are needed before this plan response can be reviewed.'
+        Object.assign(
+          task,
+          settleCollaborationStage(task, {
+            kind: 'plan',
+            authorization: auth,
+            settled: false,
+            supersededInput: false,
+            observed: false,
+            decision: {
+              runId,
+              inputSequence: auth.inputSequence,
+              ...(run.responseMessageId ? { messageId: run.responseMessageId } : {}),
+              questions: bindCollaborationQuestions(this.workflowInputResult(runId)?.questions),
+              actor: auth.actor,
+            },
+          }),
+        )
         task.revision++
         this.saveCollaboration(task)
         this.database
@@ -6310,20 +6341,16 @@ export class ConversationRepository {
       return
     }
     if (!this.settleWorkflowPlan(task, run, auth, turn)) return
-    task.status = 'waiting'
-    task.nextStage = 'plan_review'
-    task.notice = undefined
-    if (task.pauseReason === 'failure') task.pauseReason = 'user'
+    Object.assign(task, settleCollaborationStage(task, { kind: 'recovered_plan' }))
     if (
       auth.stage === 'reply' &&
       !this.settleWorkflowInput(task, run, auth, turn, true) &&
       task.status === 'waiting'
-    ) {
-      task.status = 'failed'
-      task.automation = 'paused'
-      task.pauseReason = 'failure'
-      task.notice = 'The plan was restored, but your reply has not been confirmed as processed.'
-    }
+    )
+      Object.assign(
+        task,
+        settleCollaborationStage(task, { kind: 'unavailable', reason: 'recovered_reply' }),
+      )
     task.revision++
     this.saveCollaboration(task)
     this.database
@@ -6432,10 +6459,15 @@ export class ConversationRepository {
             throw new RunOperationConflictError('The original Plan write basis changed.')
           const review = this.pendingSupplementReview(current)
           const revision: NonNullable<CollaborationTask['planRevision']> = {
+            origin: 'agent',
             requestRunId: run.id,
             inputSequence: auth.inputSequence,
             writeRunId,
             planReference,
+            ...(current.planInputSequence !== undefined
+              ? { priorPlanInputSequence: current.planInputSequence }
+              : {}),
+            ...(current.review ? { priorReviewRunId: current.review.runId } : {}),
             ...(review
               ? { returnReview: { receiptId: review.receipt.id, stage: review.stage } }
               : {}),
@@ -6547,8 +6579,14 @@ export class ConversationRepository {
     task: CollaborationTask,
     basis: CollaborationReplyIntentBasis,
   ): boolean {
+    const review = basis.review
+    if (!review) return false
     const prior = basis.priorReviewControl
-    if (!prior) return basis.priorInputSequence === basis.review.inputSequence
+    if (!prior)
+      return (
+        (basis.askCheckpoint?.inputBasis?.inputSequence ?? basis.priorInputSequence) ===
+        review.inputSequence
+      )
     const event = this.database
       .select({ payload: agentEventJournal.payload })
       .from(agentEventJournal)
@@ -6568,11 +6606,12 @@ export class ConversationRepository {
       coverage.success &&
       scheduling.fingerprint(coverage.data) === prior.fingerprint &&
       coverage.data.producerRunId === prior.producerRunId &&
-      coverage.data.inputSequence === basis.priorInputSequence &&
-      coverage.data.reviewRunId === basis.review.runId &&
-      coverage.data.reviewInputSequence === basis.review.inputSequence &&
-      isDeepStrictEqual(coverage.data.report, basis.review.document) &&
-      isDeepStrictEqual(coverage.data.scope, basis.review.scopeRef)
+      coverage.data.inputSequence ===
+        (basis.askCheckpoint?.inputBasis?.inputSequence ?? basis.priorInputSequence) &&
+      coverage.data.reviewRunId === review.runId &&
+      coverage.data.reviewInputSequence === review.inputSequence &&
+      isDeepStrictEqual(coverage.data.report, review.document) &&
+      isDeepStrictEqual(coverage.data.scope, review.scopeRef)
     )
   }
 
@@ -6602,10 +6641,7 @@ export class ConversationRepository {
         task.status = 'failed'
         task.automation = 'paused'
         task.pauseReason ??= 'failure'
-        task.notice = (notice ?? 'Check the original Plan question before continuing.').slice(
-          0,
-          512,
-        )
+        task.notice = (notice ?? 'Check the original question before continuing.').slice(0, 512)
         task.revision++
         this.saveCollaboration(task)
       }
@@ -6617,11 +6653,13 @@ export class ConversationRepository {
         ? this.messageDocument(run.sessionId, run.id, run.responseMessageId)
         : undefined
     if (newer) {
+      // Newer ordinary input supersedes this question; never restore its checkpoint over it.
       task.status = 'waiting'
+      task.nextStage = undefined
       if (ended && run.nativeOutcome !== 'completed' && task.automation === 'active') {
         task.automation = 'paused'
         task.pauseReason = run.nativeOutcome === 'interrupted' ? 'stopped' : 'failure'
-        task.notice = (notice ?? 'The Plan question did not complete.').slice(0, 512)
+        task.notice = (notice ?? 'The question did not complete.').slice(0, 512)
       }
     } else {
       const batch =
@@ -6655,26 +6693,30 @@ export class ConversationRepository {
         binding.nativeSessionId === intent.askBinding.nativeSessionId &&
         binding.bindingGeneration === intent.askBinding.generation &&
         this.isCurrentNativeCursor(run, binding) &&
-        collaborationPlanAccepted({ ...task, inputProcessing: { ...state, pending: undefined } }),
+        (intent.askCheckpoint ||
+          collaborationPlanAccepted({
+            ...task,
+            inputProcessing: { ...state, pending: undefined },
+          })),
       )
       task.inputProcessing = { ...state, pending: undefined }
-      task.status = settled ? 'ready' : 'failed'
       if (settled) {
         task.sourceMessageId = run.responseMessageId
-        task.notice = task.automation === 'paused' ? task.notice : undefined
+        this.restoreAskCheckpoint(task, intent, 'restored')
         this.nativeFact(run.id, 'workflow.plan_question_answered', {
           inputId: intent.inputId,
-          reviewRunId: intent.review.runId,
+          ...(intent.review ? { reviewRunId: intent.review.runId } : {}),
         })
       } else {
         task.automation = 'paused'
         task.pauseReason ??= run.nativeOutcome === 'interrupted' ? 'stopped' : 'failure'
-        task.notice = (
-          notice ?? 'The Plan question did not complete with its original sources.'
-        ).slice(0, 512)
+        this.restoreAskCheckpoint(task, intent, 'failed')
+        task.notice = (notice ?? 'The question did not complete with its original sources.').slice(
+          0,
+          512,
+        )
       }
     }
-    task.nextStage = undefined
     task.revision++
     this.saveCollaboration(task)
     this.database
@@ -6686,6 +6728,50 @@ export class ConversationRepository {
       })
       .where(eq(workflowTurns.runId, run.id))
       .run()
+  }
+
+  /**
+   * Return a finished or withdrawn Ask to the checkpoint its host receipt froze. A pause
+   * imposed after the checkpoint stays authoritative over the frozen automation.
+   */
+  private restoreAskCheckpoint(
+    task: CollaborationTask,
+    intent: CollaborationReplyIntentBasis,
+    outcome: 'restored' | 'failed',
+    notice?: string,
+  ): void {
+    const checkpoint = intent.askCheckpoint
+    if (checkpoint) {
+      task.stage = checkpoint.stage
+      task.actor = checkpoint.actor
+      task.nextStage = checkpoint.nextStage
+    } else {
+      task.nextStage = undefined
+    }
+    if (outcome === 'failed') {
+      // Keep the paused/recovery state the caller already set; only the stage returns.
+      task.status = 'failed'
+      return
+    }
+    const laterPause =
+      checkpoint !== undefined &&
+      task.automation === 'paused' &&
+      (checkpoint.automation !== 'paused' || task.pauseReason !== checkpoint.pauseReason)
+    if (laterPause) {
+      task.status = 'waiting'
+      if (notice !== undefined) task.notice = notice
+      return
+    }
+    if (checkpoint) {
+      task.status = checkpoint.status
+      task.automation = checkpoint.automation
+      task.pauseReason = checkpoint.pauseReason
+      task.notice = notice ?? checkpoint.notice
+      return
+    }
+    // Legacy Asks return to the accepted-Plan checkpoint.
+    task.status = collaborationPlanAccepted(task) ? 'ready' : 'waiting'
+    if (notice !== undefined || task.automation !== 'paused') task.notice = notice
   }
 
   /** Only this frozen reply can acknowledge its real input, after native and source settlement. */
@@ -6744,76 +6830,88 @@ export class ConversationRepository {
         return false
       // Withdrawal does not rewrite a planner's frozen source/input authority.
       if (planner) {
-        task.status = 'failed'
-        task.automation = 'paused'
-        task.pauseReason = 'failure'
-        task.notice =
-          'A later message was withdrawn. Send a follow-up to confirm the current plan before continuing.'
+        Object.assign(task, settleCollaborationStage(task, { kind: 'input_plan_withdrawn' }))
         return false
       }
     }
     const result = this.workflowInputResult(run.id)
     const observed = result?.outcome
-    const outcome = planner
-      ? planSettled
-        ? 'processed'
-        : undefined
-      : observed === 'repair_role_request' && this.workflowNativeUserInputRequested(run.id)
-        ? 'processed'
-        : observed
+    const outcome =
+      observed === 'explanation_only'
+        ? 'explanation_only'
+        : planner
+          ? planSettled
+            ? 'processed'
+            : undefined
+          : observed === 'repair_role_request' && this.workflowNativeUserInputRequested(run.id)
+            ? 'processed'
+            : observed
     const unanswered = this.workflowPlanHasUnansweredInput(run.id)
     if (!unanswered && outcome === 'repair_role_request') {
       const basis = this.currentReplyIntent(task, run, auth)
+      const review = basis?.kind === 'repair_role_request' ? basis.review : undefined
       if (
         basis?.kind === 'repair_role_request' &&
         outcome === basis.kind &&
-        basis.review.scopeRef &&
-        isDeepStrictEqual(task.reviewScopeRef, basis.review.scopeRef) &&
+        review?.scopeRef &&
+        isDeepStrictEqual(task.reviewScopeRef, review.scopeRef) &&
         this.priorRepairControlMatches(task, basis)
       ) {
         const coverage = collaborationReviewControlCoverageSchema.parse({
           kind: basis.kind,
-          reviewRunId: basis.review.runId,
-          reviewInputSequence: basis.review.inputSequence,
-          report: basis.review.document,
-          scope: basis.review.scopeRef,
+          reviewRunId: review.runId,
+          reviewInputSequence: review.inputSequence,
+          report: review.document,
+          scope: review.scopeRef,
           producerRunId: run.id,
           priorInputSequence: basis.priorInputSequence,
           inputSequence: task.inputSequence,
           inputId: basis.inputId,
           inputDigest: basis.inputDigest,
         })
-        task.inputProcessing = {}
-        task.handledInputSequence = auth.inputSequence
         task.reviewControlCoverage = coverage
-        task.status = 'waiting'
-        task.nextStage = undefined
+        Object.assign(
+          task,
+          settleCollaborationStage(task, {
+            kind: 'input_control',
+            inputSequence: auth.inputSequence,
+          }),
+        )
         this.nativeFact(run.id, 'workflow.review_control_settled', coverage)
         return true
       }
     }
     if (
       !unanswered &&
+      outcome === 'explanation_only' &&
+      this.settleExplanationOnly(task, run, auth, turn, planSettled)
+    )
+      return true
+    if (
+      !unanswered &&
       (outcome === 'processed' ||
         (outcome === 'plan_revision_required' && task.planRevision && !result?.questions))
     ) {
-      task.inputProcessing = { settled: { runId: run.id, inputSequence: auth.inputSequence } }
-      task.notice = task.planRevision
-        ? 'The requirements need a revised Plan. Continue collaboration to update it.'
-        : task.automation === 'paused'
-          ? 'Your reply has been processed. Continue collaboration when you are ready.'
-          : undefined
+      Object.assign(
+        task,
+        settleCollaborationStage(task, {
+          kind: 'input_processed',
+          runId: run.id,
+          inputSequence: auth.inputSequence,
+        }),
+      )
       this.nativeFact(run.id, 'workflow.input_settled', { inputSequence: auth.inputSequence })
       return true
     }
+    // A newer received input supersedes this unconfirmed root; its own reply settles it.
+    if (this.receivedCollaborationInput(task.sessionId)) return false
     const needsUser =
       unanswered ||
       outcome === 'needs_user' ||
       (outcome === 'plan_revision_required' && Boolean(task.planRevision && result?.questions))
-    task.inputProcessing = needsUser
+    const settlement = needsUser
       ? {
-          ...state,
-          pending: undefined,
+          kind: 'input_needs_user' as const,
           decision: {
             runId: run.id,
             inputSequence: auth.inputSequence,
@@ -6822,16 +6920,66 @@ export class ConversationRepository {
             actor: auth.actor,
           },
         }
-      : state
-    task.status = needsUser ? 'questions' : 'failed'
-    if (!needsUser) {
-      task.automation = 'paused'
-      task.pauseReason = 'failure'
-    }
-    task.notice = needsUser
-      ? 'More input is needed. Read the response and reply in the message box.'
-      : 'Your reply has not been confirmed as processed. Check the response or recovery notice before sending a follow-up.'
+      : { kind: 'input_unconfirmed' as const }
+    Object.assign(task, settleCollaborationStage(task, settlement))
     return false
+  }
+
+  /**
+   * A proven pure explanation keeps the real input receipt and restores the frozen
+   * checkpoint; the settled receipt carries the prior material basis, never the
+   * question itself. No review, Plan, role or pending-work authority follows.
+   */
+  private settleExplanationOnly(
+    task: CollaborationTask,
+    run: AgentRun,
+    auth: CollaborationTurnAuthorization,
+    turn: typeof workflowTurns.$inferSelect,
+    planSettled: boolean,
+  ): boolean {
+    const intent = this.currentReplyIntent(task, run, auth)
+    const checkpoint = intent?.askCheckpoint
+    const frozen = this.decodedCollaboration(turn.stateJson)
+    if (
+      (intent?.kind !== 'explanation_only' && intent?.kind !== 'repair_role_request') ||
+      !checkpoint?.inputBasis ||
+      task.inputSequence !== auth.inputSequence ||
+      this.receivedCollaborationInput(task.sessionId) ||
+      !isDeepStrictEqual(task.pendingWork, frozen.pendingWork) ||
+      !isDeepStrictEqual(task.codeRunId, frozen.codeRunId) ||
+      !isDeepStrictEqual(task.planRevision, frozen.planRevision) ||
+      turn.planBodyId ||
+      this.workflowPlanCaptureFailed(run.id)
+    )
+      return false
+    if (collaborationPlanMode(frozen, auth)) {
+      if (intent.planReference) {
+        // A planning reply with an existing Plan must prove native retention.
+        if (!planSettled || !turn.planNativeId) return false
+      } else if (turn.planNativeId) {
+        return false
+      }
+    } else if (turn.planNativeId) {
+      return false
+    }
+    task.inputProcessing = {
+      settled: {
+        runId: run.id,
+        inputSequence: auth.inputSequence,
+        unchanged: checkpoint.inputBasis,
+      },
+    }
+    task.handledInputSequence = auth.inputSequence
+    task.planInputSequence = checkpoint.planInputSequence
+    task.sourceMessageId = run.responseMessageId ?? run.userMessageId
+    this.restoreAskCheckpoint(task, intent, 'restored')
+    this.nativeFact(run.id, 'workflow.explanation_settled', {
+      inputId: intent.inputId,
+      inputDigest: intent.inputDigest,
+      inputSequence: auth.inputSequence,
+      basis: checkpoint.inputBasis,
+    })
+    return true
   }
 
   private workflowReviewResult(runId: string): CollaborationReviewObservation | undefined {
@@ -6924,7 +7072,7 @@ export class ConversationRepository {
     if (!askOnly) task.latestUserMessageId = messageId
     task.revision++
     task.notice = askOnly
-      ? 'Your Plan question will be answered next.'
+      ? 'Your question will be answered next.'
       : 'Your message will be answered before collaboration continues.'
     if (task.status !== 'running') task.status = 'waiting'
     this.saveCollaboration(task)
@@ -7073,7 +7221,7 @@ export class ConversationRepository {
           .get()
       )
         throw new HandoffSourceUnavailableError(
-          'A Plan question is outside the automatic workflow handoff.',
+          'A question is outside the automatic workflow handoff.',
         )
       const source = this.quotedSource(run.sessionId, ref.id)
       if (source.sourceRevision !== ref.revision)
@@ -7971,6 +8119,13 @@ export class ConversationRepository {
       row && (state === 'unknown' || state === 'dispatching')
         ? this.queuedSteerDelivery(row)
         : undefined
+    // The display-only replacement note reuses the current task when it is still the confirmed one;
+    // the durable pause for a stale confirmation lives in dispatchReceivedInput, not this projection.
+    const activeTask = row ? this.collaboration(sessionId) : undefined
+    const replacedTask =
+      metadata?.workflowCommand && metadata.replaceTask?.taskId === activeTask?.id
+        ? activeTask
+        : undefined
     return {
       enabled: session.enabled,
       revision: session.revision,
@@ -7987,6 +8142,9 @@ export class ConversationRepository {
               : {}),
             ...(row.queueReason || session.reason
               ? { reason: row.queueReason ?? session.reason! }
+              : {}),
+            ...(replacedTask
+              ? { replacesTask: { kind: replacedTask.kind, actor: replacedTask.actor } }
               : {}),
             imageCount: metadata?.imageIds.length ?? 0,
             commentCount: batch?.count ?? 0,
@@ -9241,6 +9399,7 @@ export class ConversationRepository {
         JSON.stringify(input.skills ?? []) !== JSON.stringify(meta.skills) ||
         JSON.stringify(input.route) !== JSON.stringify(meta.route) ||
         !isDeepStrictEqual(input.replyToDecision, meta.replyToDecision) ||
+        !isDeepStrictEqual(input.replaceTask, meta.replaceTask) ||
         !isDeepStrictEqual(input.askOnly, askOnly)
       )
         throw new RunOperationConflictError('This received nonce belongs to different input.')
@@ -9315,6 +9474,38 @@ export class ConversationRepository {
       )
   }
 
+  /** A new Pact command can replace the unfinished current task only with its confirmed reference. */
+  assertTaskReplacement(
+    input: Pick<import('@pact/contracts').ConversationSendInput, 'sessionId' | 'replaceTask'>,
+    workflowCommand: boolean,
+  ): void {
+    const saved = this.collaboration(input.sessionId)
+    const unfinished = saved && saved.status !== 'complete' && !saved.ending ? saved : undefined
+    const reference = input.replaceTask
+    if (!workflowCommand) {
+      if (reference)
+        throw new RunOperationConflictError(
+          'This task replacement no longer matches its command. Send it again.',
+        )
+      return
+    }
+    if (!unfinished) {
+      if (reference && saved?.id !== reference.taskId)
+        throw new RunOperationConflictError(
+          'The confirmed task is no longer current. Review and send this command again.',
+        )
+      return
+    }
+    if (
+      !reference ||
+      reference.taskId !== unfinished.id ||
+      reference.revision !== unfinished.revision
+    )
+      throw new RunOperationConflictError(
+        'Confirm replacing the current task before sending this command. Your draft was preserved.',
+      )
+  }
+
   private freezeReplyIntent(
     task: CollaborationTask,
     inputId: string,
@@ -9324,6 +9515,25 @@ export class ConversationRepository {
     waitingForWork: boolean,
     askOnly?: CollaborationAskRef,
   ): CollaborationReplyIntentBasis | undefined {
+    if (askOnly)
+      return this.freezeReplyCheckpoint(
+        task,
+        inputId,
+        inputDigest,
+        actor,
+        waitingForWork,
+        askOnly,
+        'ask_only',
+      )
+    const auto = this.freezeReplyCheckpoint(
+      task,
+      inputId,
+      inputDigest,
+      actor,
+      waitingForWork,
+      undefined,
+      'explanation_only',
+    )
     const review = task.review
     if (
       !review ||
@@ -9334,7 +9544,7 @@ export class ConversationRepository {
       this.nativeRecoveryBlocksInput(task.sessionId) ||
       this.hasPendingRoutedContinuation(task.sessionId)
     )
-      return undefined
+      return auto
     const original = this.relayCompletedTurn(
       task,
       this.database.select().from(workflowTurns).where(eq(workflowTurns.runId, review.runId)).get(),
@@ -9346,37 +9556,18 @@ export class ConversationRepository {
       original.source.actor !== review.actor ||
       !isDeepStrictEqual(original.source.document, review.document)
     )
-      return undefined
-    const binding = askOnly ? this.nativeContext(task.sessionId, actor) : undefined
-    const askBinding =
-      askOnly &&
-      !waitingForWork &&
-      askOnly.taskId === task.id &&
-      askOnly.expectedRevision === task.revision &&
-      collaborationAskAvailable(task) &&
-      actor === collaborationActor(task, 'plan') &&
-      !this.activeRelayDecisionRow(task.sessionId) &&
-      Boolean(this.workflowRoleBindings(task)) &&
-      binding?.continuationState === 'ready' &&
-      !binding.permissionRequests?.length &&
-      binding.nativeSessionId &&
-      binding.bindingGeneration !== undefined &&
-      isDeepStrictEqual(original.auth.planReference, task.planReference) &&
-      isDeepStrictEqual(review.planReference, task.planReference)
-        ? { nativeSessionId: binding.nativeSessionId, generation: binding.bindingGeneration }
-        : undefined
+      return auto
     const previousControl =
       task.reviewControlCoverage && actor === review.actor
         ? this.repairRoleBasis(task)?.coverage
         : undefined
     const repair =
-      !askOnly &&
       !waitingForWork &&
       task.rolePolicy === 'split-stages-v1' &&
       task.status === 'waiting' &&
       ((task.stage === 'code_review' &&
-        task.runId === review.runId &&
-        task.inputSequence === review.inputSequence) ||
+        (task.runId === review.runId || this.settledReplyPreservesCheckpoint(task)) &&
+        collaborationWorkflowInputBasis(task).inputSequence === review.inputSequence) ||
         previousControl) &&
       collaborationCodeReviewCurrent(task) &&
       !task.nextStage &&
@@ -9388,10 +9579,9 @@ export class ConversationRepository {
       isDeepStrictEqual(original.auth.reviewScopeRef, review.scopeRef) &&
       !this.workflowHandoffOccupied(this.workflowHandoff(task, actor).id) &&
       Boolean(this.workflowRoleBindings(task))
-    if (!askBinding && !repair) return undefined
+    if (!repair) return auto
     return {
-      kind: askBinding ? 'ask_only' : 'repair_role_request',
-      ...(askBinding ? { askBinding } : {}),
+      kind: 'repair_role_request',
       inputId,
       inputDigest,
       priorInputSequence: task.inputSequence,
@@ -9399,7 +9589,9 @@ export class ConversationRepository {
       review,
       stageRoles: task.stageRoles,
       planReference: task.planReference,
-      ...(repair && previousControl
+      ...(auto?.askBinding ? { askBinding: auto.askBinding } : {}),
+      ...(auto?.askCheckpoint ? { askCheckpoint: auto.askCheckpoint } : {}),
+      ...(previousControl
         ? {
             priorReviewControl: {
               producerRunId: previousControl.producerRunId,
@@ -9407,6 +9599,102 @@ export class ConversationRepository {
             },
           }
         : {}),
+    }
+  }
+
+  /**
+   * Freeze a settled checkpoint for a read-only reply. Only the host receipt creates this
+   * record; a missing review is never fabricated and no unrelated native context is initialized.
+   * ask_only keeps its legacy identity checks; explanation_only binds the already-admitted
+   * ordinary input and carries the semantic workflow basis inside the checkpoint.
+   */
+  private freezeReplyCheckpoint(
+    task: CollaborationTask,
+    inputId: string,
+    inputDigest: string,
+    actor: RuntimeAgentId,
+    waitingForWork: boolean,
+    askOnly: CollaborationAskRef | undefined,
+    mode: 'ask_only' | 'explanation_only',
+  ): CollaborationReplyIntentBasis | undefined {
+    const status = task.status
+    const gate = this.activeRelayDecisionRow(task.sessionId)
+    if (
+      waitingForWork ||
+      (mode === 'ask_only' &&
+        (askOnly?.taskId !== task.id || askOnly.expectedRevision !== task.revision)) ||
+      status === 'running' ||
+      status === 'complete' ||
+      (mode === 'ask_only' && actor !== collaborationAskActor(task)) ||
+      !collaborationAskAvailable(task) ||
+      (gate && !this.isUnansweredRelaySuggestion(gate)) ||
+      this.pendingSupplementReview(task) ||
+      this.nativeRecoveryBlocksInput(task.sessionId) ||
+      this.hasPendingRoutedContinuation(task.sessionId)
+    )
+      return undefined
+    const binding = this.nativeContext(task.sessionId, actor)
+    if (
+      !binding?.nativeSessionId ||
+      binding.bindingGeneration === undefined ||
+      binding.continuationState !== 'ready' ||
+      binding.permissionRequests?.length
+    )
+      return undefined
+    const review = task.review
+    if (review) {
+      const original = this.relayCompletedTurn(
+        task,
+        this.database
+          .select()
+          .from(workflowTurns)
+          .where(eq(workflowTurns.runId, review.runId))
+          .get(),
+      )
+      if (
+        !original ||
+        original.source.verdict !== review.verdict ||
+        original.source.inputSequence !== review.inputSequence ||
+        original.source.actor !== review.actor ||
+        !isDeepStrictEqual(original.source.document, review.document) ||
+        !isDeepStrictEqual(original.auth.planReference, review.planReference)
+      )
+        return undefined
+    }
+    if (task.planReference) {
+      const document = this.collaborationDocumentRow(task.sessionId, task.planReference.document)
+      if (document.sourceRunId !== task.planReference.sourceRunId) return undefined
+    }
+    return {
+      kind: mode,
+      askBinding: {
+        nativeSessionId: binding.nativeSessionId,
+        generation: binding.bindingGeneration,
+      },
+      askCheckpoint: {
+        stage: task.stage,
+        actor: task.actor,
+        status,
+        automation: task.automation,
+        ...(task.pauseReason ? { pauseReason: task.pauseReason } : {}),
+        ...(task.nextStage ? { nextStage: task.nextStage } : {}),
+        ...(task.notice ? { notice: task.notice } : {}),
+        ...(mode === 'explanation_only'
+          ? {
+              ...(task.planInputSequence !== undefined
+                ? { planInputSequence: task.planInputSequence }
+                : {}),
+              inputBasis: collaborationWorkflowInputBasis(task),
+            }
+          : {}),
+      },
+      inputId,
+      inputDigest,
+      priorInputSequence: task.inputSequence,
+      taskRevision: task.revision,
+      ...(review ? { review } : {}),
+      stageRoles: task.stageRoles,
+      planReference: task.planReference,
     }
   }
 
@@ -9519,17 +9807,26 @@ export class ConversationRepository {
           )
           .get()
         const requestedRoute = input.route ?? prefix.route
+        const primary =
+          prefix.pact && settings
+            ? pactEntryPrimary(
+                prefix.pact,
+                settings.primaryAgentId,
+                requestedRoute?.type === 'agent' ? requestedRoute.agentId : undefined,
+              )
+            : undefined
         if (
           requestedRoute?.type === 'all' ||
           (requestedRoute?.type === 'agent' && requestedRoute.agentId !== actor) ||
           !prefix.pact ||
           !settings ||
+          !primary ||
           actor !==
             collaborationActor(
               {
                 kind: prefix.pact,
-                owner: settings.primaryAgentId,
-                reviewer: otherAgent(settings.primaryAgentId),
+                owner: primary,
+                reviewer: otherAgent(primary),
                 rolePolicy,
               },
               prefix.pact === 'plan'
@@ -9548,7 +9845,11 @@ export class ConversationRepository {
         !workflowCommand && (!anchor || anchor.collaboration?.taskId === candidate?.id)
           ? candidate
           : undefined
-      if (task && input.route && prefix.route && !isDeepStrictEqual(input.route, prefix.route))
+      this.assertTaskReplacement(input, workflowCommand)
+      if (
+        (task && input.route && prefix.route && !isDeepStrictEqual(input.route, prefix.route)) ||
+        (workflowCommand && !pactCommandRouteAllowed(input.route, prefix.route))
+      )
         throw new RunOperationConflictError(
           'The explicit Agent recipients conflict. Your draft was preserved.',
         )
@@ -9573,7 +9874,7 @@ export class ConversationRepository {
       const askOnly = intent?.kind === 'ask_only'
       if (input.askOnly && !askOnly)
         throw new RunOperationConflictError(
-          'Ask only needs the current accepted Plan and an idle author.',
+          'Ask only needs an idle Agent at the current task checkpoint.',
         )
       const metadata = JSON.stringify({
         workflowCommand,
@@ -9586,6 +9887,7 @@ export class ConversationRepository {
         freezeDrafts,
         route: input.route,
         replyToDecision: input.replyToDecision,
+        replaceTask: input.replaceTask,
       })
       if (Buffer.byteLength(metadata) > 64 * 1024)
         throw new RunOperationConflictError('Received metadata exceeds 64 KiB.')
@@ -9682,9 +9984,13 @@ export class ConversationRepository {
         this.requireInstalledQueueReturn(input.sessionId, input.queueReturnOperationId)
         this.consumeQueuedReturn(input.sessionId, input.queueReturnOperationId)
       }
-      if (this.activeRelayDecisionRow(input.sessionId)?.kind === 'repair_role_request')
+      const relayGate = this.activeRelayDecisionRow(input.sessionId)
+      if (relayGate?.kind === 'repair_role_request')
         this.discardUnansweredRelaySchedulingDecision(input.sessionId)
-      this.registerWorkflowInput(input.sessionId, input.clientMessageId, askOnly)
+      else if (relayGate && this.isUnansweredRelaySuggestion(relayGate))
+        this.discardUnansweredRelaySchedulingDecision(input.sessionId, false)
+      if (!workflowCommand)
+        this.registerWorkflowInput(input.sessionId, input.clientMessageId, askOnly)
       return this.createPatch(input.sessionId, {
         receivedInputIds: [input.clientMessageId],
         ...(waitingForWork ? { queuedInputIds: [input.clientMessageId] } : {}),
@@ -9948,7 +10254,7 @@ export class ConversationRepository {
       for (const { runId } of rows) {
         const run = this.findRun(runId)
         if (run && this.workflowInputWasNotSent(run))
-          this.finishCollaboration(runId, false, 'The Plan question was never sent.')
+          this.finishCollaboration(runId, false, 'The question was never sent.')
       }
       afterSession = rows.at(-1)!.sessionId
     }
@@ -9965,6 +10271,22 @@ export class ConversationRepository {
       const run = this.findRun(runId)
       if (!run || run.sessionId !== sessionId)
         throw new RunOperationConflictError('The workflow source is unavailable.')
+      // An ended task stays readable on its last Run after it leaves the active slot.
+      const taskRow = run.collaboration
+        ? this.database
+            .select()
+            .from(collaborationTasks)
+            .where(
+              and(
+                eq(collaborationTasks.id, run.collaboration.taskId),
+                eq(collaborationTasks.sessionId, sessionId),
+              ),
+            )
+            .get()
+        : undefined
+      const ended = taskRow && this.decodedCollaboration(taskRow.stateJson)
+      if (ended?.ending && ended.runId === runId)
+        return { ...ended, inputSequence: taskRow!.inputSequence }
       const turn = this.database
         .select({ state: workflowTurns.stateJson })
         .from(workflowTurns)
@@ -10300,7 +10622,7 @@ export class ConversationRepository {
         binding.bindingGeneration !== intent.askBinding.generation
       )
         throw new RunOperationConflictError(
-          'The accepted Plan or its author changed before dispatch.',
+          'The task checkpoint or its Agent changed before dispatch.',
         )
     }
     if (current && auth) {
@@ -10437,8 +10759,19 @@ export class ConversationRepository {
         .get()
       if (
         receipt?.sessionId === task.sessionId &&
+        !receipt.taskId &&
+        storedReceivedMetadata(receipt.metadataJson).workflowCommand
+      ) {
+        task.inputProcessing = { ...collaborationInputProcessing(task), pending: undefined }
+        task.revision++
+        this.saveCollaboration(task)
+        return
+      }
+      const intent = receipt ? storedReceivedMetadata(receipt.metadataJson) : undefined
+      if (
+        receipt?.sessionId === task.sessionId &&
         receipt.taskId === task.id &&
-        storedReceivedMetadata(receipt.metadataJson).replyIntentBasis?.kind === 'ask_only'
+        intent?.replyIntentBasis?.kind === 'ask_only'
       ) {
         const run = batch.runId ? this.findRun(batch.runId) : undefined
         if (
@@ -10449,8 +10782,12 @@ export class ConversationRepository {
             run.nativeEffectsState === 'settled')
         ) {
           task.inputProcessing = { ...collaborationInputProcessing(task), pending: undefined }
-          task.status = collaborationPlanAccepted(task) ? 'ready' : 'waiting'
-          task.notice = 'The Plan question was withdrawn.'
+          this.restoreAskCheckpoint(
+            task,
+            intent.replyIntentBasis,
+            'restored',
+            'The question was withdrawn.',
+          )
           task.revision++
           this.saveCollaboration(task)
         }
@@ -10742,7 +11079,7 @@ export class ConversationRepository {
 
   pauseCollaboration(
     sessionId: string,
-    reason: NonNullable<CollaborationTask['pauseReason']> = 'user',
+    reason: NonNullable<CollaborationTask['pauseReason']>,
   ): ConversationPatch {
     return this.database.transaction(() => {
       if (reason !== 'failure') this.cancelSchedulingRecoveryFaults(sessionId)
@@ -10759,6 +11096,169 @@ export class ConversationRepository {
       }
       return this.metadataPatch(sessionId)
     })
+  }
+
+  /** Terminal retirement for confirmed replacement, inside the caller's transaction. */
+  private replaceCollaborationTask(
+    task: CollaborationTask,
+    input: {
+      clientMessageId: string
+      taskRevision: number
+    },
+  ): void {
+    const now = new Date().toISOString()
+    // Only unused task-bound grants retire; bound receipts and native evidence stay fenced by CAS.
+    this.database
+      .update(collaborationActionReceipts)
+      .set({ state: 'cancelled', active: false, updatedAt: now })
+      .where(
+        and(
+          eq(collaborationActionReceipts.taskId, task.id),
+          eq(collaborationActionReceipts.state, 'available'),
+          eq(collaborationActionReceipts.active, true),
+          isNull(collaborationActionReceipts.boundRunId),
+        ),
+      )
+      .run()
+    const gate = this.activeRelayDecisionRow(task.sessionId)
+    if (gate && gate.taskId === task.id) {
+      this.database
+        .update(relayDecisions)
+        .set({ state: 'invalid', active: false, revision: gate.revision + 1, updatedAt: now })
+        .where(eq(relayDecisions.id, gate.id))
+        .run()
+      scheduling.recordRelayDecisionActivity(this.database, gate.id)
+      this.database
+        .update(collaborationActionReceipts)
+        .set({ state: 'cancelled', active: false, updatedAt: now })
+        .where(
+          and(
+            eq(collaborationActionReceipts.decisionId, gate.id),
+            eq(collaborationActionReceipts.state, 'available'),
+            isNull(collaborationActionReceipts.boundRunId),
+          ),
+        )
+        .run()
+      appendAgentEvent(this.database, {
+        sessionId: task.sessionId,
+        runId: task.runId,
+        eventType: 'scheduling.user_decision_invalidated',
+        payload: JSON.stringify({ decisionId: gate.id, reason: 'task_replaced' }),
+        createdAt: now,
+      })
+    }
+    const unreviewedChanges = this.collaborationUnreviewedWrite(task)
+    appendAgentEvent(this.database, {
+      sessionId: task.sessionId,
+      runId: task.runId,
+      eventType: 'collaboration.task_replaced',
+      payload: JSON.stringify({
+        taskId: task.id,
+        nonce: input.clientMessageId,
+        stage: task.stage,
+        status: task.status,
+        pendingWorkStage: task.pendingWork?.stage ?? null,
+        planRevision: Boolean(task.planRevision),
+        unreviewedChanges,
+        inputId: input.clientMessageId,
+      }),
+      createdAt: now,
+    })
+    task.ending = {
+      clientMessageId: input.clientMessageId,
+      taskRevision: input.taskRevision,
+      endedAt: now,
+      reason: 'replaced',
+      replacementMessageId: input.clientMessageId,
+      unreviewedChanges,
+    }
+    task.automation = 'paused'
+    task.nextStage = undefined
+    task.revision++
+    this.saveCollaboration(task)
+    this.database
+      .update(collaborationTasks)
+      .set({ active: false, updatedAt: now })
+      .where(eq(collaborationTasks.id, task.id))
+      .run()
+  }
+
+  /** Whether the latest authorized write lacks a successful settled review of that exact write. */
+  private collaborationUnreviewedWrite(task: CollaborationTask): boolean {
+    // A current or interrupted write is reviewed before an earlier code Run it may supersede.
+    const currentWrite =
+      task.pendingWork?.runId ??
+      (task.stage === 'implement' || task.stage === 'repair' ? task.runId : undefined)
+    const currentRun = currentWrite ? this.findRun(currentWrite) : undefined
+    const lastWrite =
+      currentRun && !this.workflowInputWasNotSent(currentRun) ? currentRun.id : task.codeRunId
+    if (!lastWrite) return false
+    const review = task.review
+    if (
+      !review ||
+      review.stage !== 'code_review' ||
+      review.verdict === 'incomplete' ||
+      !review.scopeRef ||
+      !review.document
+    )
+      return true
+    const reviewRun = this.findRun(review.runId)
+    const turn = this.database
+      .select({ applied: workflowTurns.applied, state: workflowTurns.stateJson })
+      .from(workflowTurns)
+      .where(eq(workflowTurns.runId, review.runId))
+      .get()
+    if (
+      !turn?.applied ||
+      !reviewRun ||
+      reviewRun.dispatchPhase !== 'ended' ||
+      reviewRun.nativeOutcome !== 'completed' ||
+      reviewRun.nativeEffectsState !== 'settled' ||
+      !this.hasCompleteResponse(review.runId)
+    )
+      return true
+    const frozen = this.decodedCollaboration(turn.state)
+    return !(
+      frozen.codeRunId === lastWrite &&
+      frozen.review?.stage === 'code_review' &&
+      frozen.review.verdict !== 'incomplete' &&
+      Boolean(frozen.review.scopeRef) &&
+      Boolean(frozen.review.document)
+    )
+  }
+
+  private collaborationReplacementProjection(
+    task: CollaborationTask,
+  ): NonNullable<import('@pact/contracts').CollaborationView['replacement']> {
+    const agentName = (stage: Parameters<typeof collaborationActor>[1]) =>
+      collaborationActor(task, stage) === 'claude' ? 'Claude Code' : 'Codex'
+    const unreviewedChanges = this.collaborationUnreviewedWrite(task)
+    const review = task.review
+    const summary = task.planRevision
+      ? 'The requirement change has not been re-planned.'
+      : task.pendingWork
+        ? `${agentName(task.pendingWork.stage)}'s ${
+            task.pendingWork.stage === 'implement' ? 'implementation' : 'repair'
+          } was interrupted and will not be resumed.`
+        : task.status === 'running' && (task.stage === 'implement' || task.stage === 'repair')
+          ? `${agentName(task.stage)} is still working. That response finishes first; its changes will not be reviewed.`
+          : unreviewedChanges
+            ? `${agentName('implement')}'s changes have not been reviewed.`
+            : review?.stage === 'code_review' &&
+                review.verdict === 'changes_requested' &&
+                review.inputSequence === collaborationWorkflowInputBasis(task).inputSequence
+              ? `${agentName('code_review')} requested changes that have not been addressed.`
+              : collaborationPlanAccepted(task) && !task.codeRunId
+                ? `Plan v${task.planReference?.version ?? task.planVersion} is accepted but not implemented.`
+                : task.stage === 'plan'
+                  ? 'The plan is still being prepared.'
+                  : task.stage === 'plan_review'
+                    ? `Plan v${task.planReference?.version ?? task.planVersion} is still in review.`
+                    : 'This task is paused.'
+    return {
+      summary: summary.slice(0, 512),
+      unreviewedChanges,
+    }
   }
 
   reconcileCompletedCollaboration(runId: string): ConversationPatch | undefined {
@@ -10830,11 +11330,10 @@ export class ConversationRepository {
           run.nativeEffectsState === 'unknown' &&
           (task.status !== 'failed' || task.automation !== 'paused')
         ) {
-          task.status = 'failed'
-          task.automation = 'paused'
-          task.pauseReason = 'failure'
-          task.notice =
-            'The native Turn ended, but its side effects are not settled. Check the original execution before continuing.'
+          Object.assign(
+            task,
+            settleCollaborationStage(task, { kind: 'unavailable', reason: 'effects' }),
+          )
           task.revision++
           this.saveCollaboration(task)
         }
@@ -10842,48 +11341,40 @@ export class ConversationRepository {
       }
       if (nativeCompleted && !this.hasCompleteResponse(runId) && run.status !== 'completed') return
       if (!nativeCompleted) {
-        task.status = 'failed'
-        task.automation = 'paused'
-        task.pauseReason = run.nativeOutcome === 'interrupted' ? 'stopped' : 'failure'
-        task.notice = (
-          notice ?? 'This Turn did not complete. Check its original delivery before continuing.'
-        ).slice(0, 512)
-        if (auth.stage === 'implement' || auth.stage === 'repair') {
-          if (
-            unstarted ||
-            (run.dispatchPhase === 'ended' &&
-              ['failed', 'interrupted'].includes(run.nativeOutcome ?? ''))
-          )
-            task.pendingWork = {
-              stage: auth.stage,
-              runId,
-              inputSequence: auth.inputSequence,
-              ...(auth.planReference ? { planReference: auth.planReference } : {}),
-              ...(unstarted && turn.reservation === 'repairAttempts'
-                ? { repairReservationReleased: true }
-                : {}),
-            }
-        } else if (auth.stage !== 'reply') task.nextStage = auth.stage
         const supplement = auth.userAuthority?.purpose
-        if (supplement === 'supplement_plan' || supplement === 'supplement_code_response') {
-          const receipt = this.database
-            .select()
-            .from(collaborationActionReceipts)
-            .where(eq(collaborationActionReceipts.id, auth.userAuthority!.receiptId))
-            .get()
-          if (receipt?.reviewState === 'not_required') {
-            task.nextStage = supplement === 'supplement_plan' ? 'plan_review' : undefined
-          } else if (
-            supplement === 'supplement_code_response' &&
-            effectsSettled &&
-            run.dispatchPhase === 'ended' &&
-            this.hasCompleteResponse(runId)
-          ) {
-            task.nextStage = 'code_review'
-          }
-        }
-        if (unstarted && turn.reservation)
-          task[turn.reservation] = Math.max(0, task[turn.reservation] - 1)
+        const supplementReview =
+          supplement === 'supplement_plan' || supplement === 'supplement_code_response'
+            ? this.database
+                .select()
+                .from(collaborationActionReceipts)
+                .where(eq(collaborationActionReceipts.id, auth.userAuthority!.receiptId))
+                .get()
+            : undefined
+        const ended = run.dispatchPhase === 'ended'
+        const completeResponse =
+          supplement === 'supplement_code_response' &&
+          supplementReview?.reviewState !== 'not_required' &&
+          effectsSettled &&
+          ended &&
+          this.hasCompleteResponse(runId)
+        Object.assign(
+          task,
+          settleCollaborationStage(task, {
+            kind: 'interrupted',
+            authorization: auth,
+            stopped: run.nativeOutcome === 'interrupted',
+            unstarted,
+            failed: run.nativeOutcome === 'failed',
+            ended,
+            effectsSettled,
+            completeResponse,
+            ...(turn.reservation ? { reservation: turn.reservation } : {}),
+            ...(supplementReview?.reviewState
+              ? { supplementReviewState: supplementReview.reviewState }
+              : {}),
+            ...(notice !== undefined ? { notice } : {}),
+          }),
+        )
         task.revision++
         this.saveCollaboration(task)
         if (unstarted || run.dispatchPhase === 'ended')
@@ -10909,10 +11400,10 @@ export class ConversationRepository {
           : undefined
       const planner = collaborationPlanMode(frozen, auth)
       if (!report && !plan) {
-        task.status = 'failed'
-        task.automation = 'paused'
-        task.pauseReason = 'failure'
-        task.notice = 'The native Turn ended, but its complete response source is unavailable.'
+        Object.assign(
+          task,
+          settleCollaborationStage(task, { kind: 'unavailable', reason: 'source' }),
+        )
         task.revision++
         this.saveCollaboration(task)
         return
@@ -10920,144 +11411,100 @@ export class ConversationRepository {
       const retained = this.workflowPlanRetention(runId, turn.planNativeId)
       const planSettled = planner && this.settleWorkflowPlan(task, run, auth, turn)
       // A completed older root cannot settle or fail a newer accepted input.
-      // Its native facts remain available; only the latest reply may release the input gate.
+      // A real failed Plan capture still pauses automation when newer input is queued.
       const supersededInput =
-        auth.inputSequence < task.inputSequence &&
-        task.inputProcessing?.pending?.inputSequence === task.inputSequence &&
+        ((auth.inputSequence < task.inputSequence &&
+          task.inputProcessing?.pending?.inputSequence === task.inputSequence) ||
+          Boolean(this.receivedCollaborationInput(task.sessionId))) &&
         (!planner || !this.workflowPlanCaptureFailed(runId))
       task.sourceMessageId = messageId ?? run.userMessageId
       task.authorization = auth
       task.handledInputSequence = Math.max(task.handledInputSequence, auth.inputSequence)
       task.notice = undefined
       if (auth.stage === 'reply') {
-        task.status = 'waiting'
-        if (collaborationRequiresPlan(task))
-          task.nextStage =
-            task.planReference && task.planInputSequence === task.inputSequence
-              ? 'plan_review'
-              : 'plan'
-        else if (!task.pendingWork) task.nextStage = 'code_review'
+        Object.assign(task, settleCollaborationStage(task, { kind: 'reply' }))
         if (
           !supersededInput &&
           !this.settleWorkflowInput(task, run, auth, turn, planSettled) &&
           task.status === 'waiting'
-        ) {
-          task.status = 'failed'
-          task.automation = 'paused'
-          task.pauseReason = 'failure'
-          task.notice =
-            'Your reply has not been confirmed as processed. Check its response before continuing.'
-        }
+        )
+          Object.assign(
+            task,
+            settleCollaborationStage(task, { kind: 'unavailable', reason: 'reply' }),
+          )
       } else if (auth.stage === 'plan') {
-        if (planSettled) {
-          task.status = 'waiting'
-          task.nextStage = 'plan_review'
-        } else if (supersededInput) {
-          task.status = 'waiting'
-          task.nextStage = 'plan'
-        } else {
-          const unanswered = this.workflowPlanHasUnansweredInput(runId)
-          const unavailable =
-            !unanswered &&
-            Boolean(
-              plan ||
-              retained ||
-              this.workflowPlanCaptureFailed(runId) ||
-              this.workflowInputResult(runId),
-            )
-          task.status = unanswered ? 'questions' : 'failed'
-          task.nextStage = 'plan'
-          if (!unanswered) {
-            task.automation = 'paused'
-            task.pauseReason = 'failure'
-          }
-          if (unanswered)
-            task.inputProcessing = {
-              ...collaborationInputProcessing(task),
-              decision: {
-                runId,
-                inputSequence: auth.inputSequence,
-                ...(messageId ? { messageId } : {}),
-                questions: bindCollaborationQuestions(this.workflowInputResult(runId)?.questions),
-                actor: auth.actor,
-              },
-            }
-          task.notice = unanswered
-            ? 'Your answers are needed before this plan response can be reviewed.'
-            : unavailable
-              ? 'The latest plan has not been synced to Pact. Restore its saved native source before continuing.'
-              : 'The Agent ended without a confirmed plan. Ask the plan author to complete it before continuing.'
-        }
+        const unanswered =
+          !planSettled && !supersededInput && this.workflowPlanHasUnansweredInput(runId)
+        const observed =
+          !planSettled &&
+          !supersededInput &&
+          !unanswered &&
+          Boolean(
+            plan ||
+            retained ||
+            this.workflowPlanCaptureFailed(runId) ||
+            this.workflowInputResult(runId),
+          )
+        Object.assign(
+          task,
+          settleCollaborationStage(task, {
+            kind: 'plan',
+            authorization: auth,
+            settled: planSettled,
+            supersededInput,
+            observed,
+            ...(unanswered
+              ? {
+                  decision: {
+                    runId,
+                    inputSequence: auth.inputSequence,
+                    ...(messageId ? { messageId } : {}),
+                    questions: bindCollaborationQuestions(
+                      this.workflowInputResult(runId)?.questions,
+                    ),
+                    actor: auth.actor,
+                  },
+                }
+              : {}),
+          }),
+        )
       } else if (auth.stage === 'plan_review' || auth.stage === 'code_review') {
-        task.planAcceptanceCoverage = undefined
-        task.reviewControlCoverage = undefined
         const verdict =
           !turn.verdictConflict && turn.verdict && report?.chars ? turn.verdict : 'incomplete'
-        if (report)
-          task.review = {
-            runId,
-            actor: auth.actor,
-            stage: auth.stage,
+        const needsDecision =
+          verdict === 'needs_user' && !(auth.supplementPlanReturn && supersededInput)
+        Object.assign(
+          task,
+          settleCollaborationStage(task, {
+            kind: 'review',
+            authorization: { ...auth, stage: auth.stage },
             verdict,
-            ...(auth.supplementPlanReturn ? { supplementPlanReturn: true as const } : {}),
-            inputSequence: auth.inputSequence,
-            ...(auth.planReference ? { planReference: auth.planReference } : {}),
-            ...(auth.reviewScopeRef ? { scopeRef: auth.reviewScopeRef } : {}),
-            document: report,
-          }
-        const currentBasis =
-          auth.inputSequence === task.inputSequence &&
-          (auth.stage !== 'plan_review' ||
-            (auth.planReference?.version === task.planReference?.version &&
-              auth.planReference?.document.sha256 === task.planReference?.document.sha256))
-        if (verdict === 'accepted' && currentBasis) {
-          const resumingUnchangedPlan =
-            auth.stage === 'plan_review' && task.pendingWork && !collaborationRequiresPlan(task)
-          task.status =
-            auth.stage === 'plan_review'
-              ? resumingUnchangedPlan
-                ? 'waiting'
-                : 'ready'
-              : task.planRevision
-                ? 'waiting'
-                : 'complete'
-          task.nextStage = resumingUnchangedPlan ? task.pendingWork!.stage : undefined
-        } else if (verdict === 'changes_requested' && currentBasis) {
-          task.status = 'waiting'
-          task.nextStage = auth.stage === 'plan_review' ? 'plan' : undefined
-        } else if (verdict === 'incomplete') {
-          task.status = 'failed'
-          task.nextStage = auth.stage
-          task.automation = 'paused'
-          task.pauseReason = 'failure'
-          task.notice = turn.verdictConflict
-            ? 'The review returned conflicting conclusions. Start a new review to continue.'
-            : 'The review did not provide a complete conclusion. Start a new review to continue.'
-        } else if (verdict === 'needs_user' && !(auth.supplementPlanReturn && supersededInput)) {
-          task.status = 'questions'
-          task.nextStage = auth.stage === 'plan_review' ? 'plan' : 'code_review'
-          task.inputProcessing = {
-            ...collaborationInputProcessing(task),
-            decision: {
-              runId,
-              inputSequence: auth.inputSequence,
-              ...(messageId ? { messageId } : {}),
-              questions: bindCollaborationQuestions(this.workflowReviewResult(runId)?.questions),
-              actor: auth.actor,
-            },
-          }
-          task.notice = 'The review needs your decision before collaboration can continue.'
-        } else {
-          task.status = 'waiting'
-          task.nextStage = auth.stage === 'plan_review' ? 'plan' : 'code_review'
-        }
+            verdictConflict: turn.verdictConflict,
+            supersededInput,
+            ...(report ? { document: report } : {}),
+            ...(needsDecision
+              ? {
+                  decision: {
+                    runId,
+                    inputSequence: auth.inputSequence,
+                    ...(messageId ? { messageId } : {}),
+                    questions: bindCollaborationQuestions(
+                      this.workflowReviewResult(runId)?.questions,
+                    ),
+                    actor: auth.actor,
+                  },
+                }
+              : {}),
+          }),
+        )
       } else {
-        task.status = 'waiting'
-        task.nextStage = 'code_review'
-        if (auth.stage === 'implement' || auth.stage === 'repair') {
-          task.codeRunId = runId
-          task.pendingWork = undefined
-        }
+        Object.assign(
+          task,
+          settleCollaborationStage(task, {
+            kind: 'work',
+            authorization: { ...auth, stage: auth.stage },
+          }),
+        )
       }
       task.revision++
       const snapshot = this.storedCollaboration({
@@ -11084,11 +11531,17 @@ export class ConversationRepository {
       if (auth.stage === 'reply' && task.reviewControlCoverage?.producerRunId === run.id)
         this.publishRepairRoleDecision(task)
       this.settleSupplementReview(run)
-      this.publishRequestedRelayDecision(task)
+      if (task.inputProcessing?.settled?.runId !== runId || !task.inputProcessing.settled.unchanged)
+        this.publishRequestedRelayDecision(task)
     })
     const settledRun = this.findRun(runId)
     const settledTask = settledRun ? this.collaboration(settledRun.sessionId) : undefined
-    if (settledTask?.runId === runId && settledTask.status !== 'running')
+    if (
+      settledTask?.runId === runId &&
+      settledTask.status !== 'running' &&
+      (settledTask.inputProcessing?.settled?.runId !== runId ||
+        !settledTask.inputProcessing.settled.unchanged)
+    )
       this.database.transaction(() => this.publishRequestedRelayDecision(settledTask))
   }
 
@@ -11270,11 +11723,14 @@ export class ConversationRepository {
             ? collaborationPlanAccepted(task) ||
               (task.review?.stage === 'code_review' &&
                 task.review.verdict === 'accepted' &&
-                task.review.inputSequence === task.inputSequence &&
+                task.review.inputSequence === collaborationWorkflowInputBasis(task).inputSequence &&
                 task.status === 'complete')
             : false,
           reportAvailable: Boolean(turn?.applied && turn.reportBodyId),
           actionable,
+          ...(task && current && !task.ending && task.status !== 'complete'
+            ? { replacement: this.collaborationReplacementProjection(task) }
+            : {}),
           ...(task && actionable && !planRecovery
             ? this.collaborationActionProjection(task)
             : { availableActions: planRecovery && actionable ? ['recover_plan'] : [] }),
@@ -11297,7 +11753,7 @@ export class ConversationRepository {
           ...(stage
             ? {
                 nextStep:
-                  collaborationStageLabel(stage) +
+                  collaborationStageLabel(stage, task!.kind) +
                   ' with ' +
                   (collaborationActor(task!, stage) === 'claude' ? 'Claude Code' : 'Codex'),
               }
@@ -12338,6 +12794,7 @@ export class ConversationRepository {
       | 'preserveDraftComments'
       | 'receivedInputId'
       | 'replyToDecision'
+      | 'replaceTask'
       | 'userInformation'
     >,
   ): BeginRunResult | undefined {
@@ -12392,6 +12849,7 @@ export class ConversationRepository {
         decision: sql<
           string | null
         >`json_extract(${agentEventJournal.payload},'$.replyToDecision')`,
+        replacement: sql<string | null>`json_extract(${agentEventJournal.payload},'$.replaceTask')`,
       })
       .from(agentEventJournal)
       .where(
@@ -12417,6 +12875,10 @@ export class ConversationRepository {
       !isDeepStrictEqual(
         receipt?.decision ? JSON.parse(receipt.decision) : undefined,
         input.replyToDecision,
+      ) ||
+      !isDeepStrictEqual(
+        receipt?.replacement ? JSON.parse(receipt.replacement) : undefined,
+        input.replaceTask,
       )
     )
       throw new RunOperationConflictError(
@@ -12653,36 +13115,21 @@ export class ConversationRepository {
     )
   }
 
-  private relayRoleChangeOperation(
-    snapshot: RelayWorkflowSnapshot,
-    handoff: SchedulingHandoff,
-    existingDecisionId?: string,
-  ): RelayReassignRolesOperation | undefined {
-    const task = snapshot.task
+  /** Shared direct/Relay guards: the Plan and its review settle before any code stage exists. */
+  private codeRoleChangeAvailable(task: CollaborationTask, existingDecisionId?: string): boolean {
     if (
-      task.kind !== 'plan' ||
-      task.rolePolicy !== 'split-stages-v1' ||
-      task.stage !== 'plan_review' ||
-      task.status !== 'ready' ||
-      task.automation !== 'active' ||
-      !collaborationPlanAccepted(task) ||
-      task.pendingWork ||
-      task.codeRunId ||
-      task.reviewCycles !== 0 ||
-      task.repairAttempts !== 0 ||
-      collaborationInputGate(task) ||
+      !collaborationCanSwapCodeRoles(task) ||
       this.receivedCollaborationInput(task.sessionId) ||
       this.nativeRecoveryBlocksInput(task.sessionId) ||
+      this.hasPendingRoutedContinuation(task.sessionId) ||
       !task.planReference ||
       !this.workflowPlanSettled(task.planReference.sourceRunId) ||
-      this.handoffReceipt(handoff.id)?.action
-    )
-      return undefined
-    if (
       this.archives.blocksSession(task.sessionId) ||
       this.archives.hasNativeWork({ kind: 'session', sessionId: task.sessionId })
     )
-      return undefined
+      return false
+    const gate = this.activeRelayDecisionRow(task.sessionId)
+    if (gate && gate.id !== existingDecisionId) return false
     for (const actor of ['codex', 'claude'] as const) {
       const binding = this.nativeContext(task.sessionId, actor)
       if (
@@ -12690,9 +13137,9 @@ export class ConversationRepository {
         binding.continuationState !== 'ready' ||
         (binding.permissionRequests?.length ?? 0) > 0
       )
-        return undefined
+        return false
     }
-    // Any prior code-stage Run, even failed, unsent or abandoned, excludes a proposal.
+    // Any prior code-stage Run, even failed, unsent or abandoned, excludes a change.
     for (const stage of ['implement', 'respond', 'repair', 'code_review'] as const) {
       if (
         this.database
@@ -12702,7 +13149,7 @@ export class ConversationRepository {
           .limit(1)
           .get()
       )
-        return undefined
+        return false
     }
     if (
       this.database
@@ -12717,6 +13164,46 @@ export class ConversationRepository {
         )
         .limit(1)
         .get()
+    )
+      return false
+    const review = task.review
+    const row = review
+      ? this.database
+          .select()
+          .from(workflowTurns)
+          .where(eq(workflowTurns.runId, review.runId))
+          .get()
+      : undefined
+    const reviewed = this.relayCompletedTurn(task, row)
+    if (
+      !review ||
+      !reviewed ||
+      reviewed.row.stage !== 'plan_review' ||
+      reviewed.row.verdict !== 'accepted' ||
+      reviewed.row.actor !== collaborationActor(task, 'plan_review') ||
+      reviewed.auth.inputSequence !== review.inputSequence ||
+      !isDeepStrictEqual(reviewed.source.document, review.document) ||
+      !isDeepStrictEqual(reviewed.auth.planReference, task.planReference)
+    )
+      return false
+    // Projection metadata only; the control action re-verifies complete document bodies.
+    this.collaborationDocumentRow(task.sessionId, task.planReference.document)
+    if (!task.taskDocument) return false
+    this.collaborationDocumentRow(task.sessionId, task.taskDocument)
+    return true
+  }
+
+  private relayRoleChangeOperation(
+    snapshot: RelayWorkflowSnapshot,
+    handoff: SchedulingHandoff,
+    existingDecisionId?: string,
+  ): RelayReassignRolesOperation | undefined {
+    const task = snapshot.task
+    if (
+      task.stage !== 'plan_review' ||
+      task.automation !== 'active' ||
+      this.handoffReceipt(handoff.id)?.action ||
+      !this.codeRoleChangeAvailable(task, existingDecisionId)
     )
       return undefined
     const matterKey = `reassign_roles:${task.id}:${task.runId}`
@@ -12734,7 +13221,8 @@ export class ConversationRepository {
       .get()
     if (prior && prior.id !== existingDecisionId) return undefined
     const previousRoles = task.stageRoles ?? defaultTaskStageRoles(task.owner)
-    if (previousRoles.revision >= Number.MAX_SAFE_INTEGER) return undefined
+    // An explicit role choice already made must not produce an automated swap-back proposal.
+    if (previousRoles.revision > 0) return undefined
     return relayReassignRolesOperationSchema.parse({
       kind: 'reassign_roles',
       taskId: task.id,
@@ -12821,7 +13309,7 @@ export class ConversationRepository {
       !task.codeRunId &&
       !task.pendingWork &&
       Boolean(task.planReference) &&
-      task.planInputSequence === task.inputSequence &&
+      task.planInputSequence === collaborationWorkflowInputBasis(task).inputSequence &&
       !collaborationInputGate(task) &&
       collaborationNextStage(task) === 'plan_review' &&
       task.discussionRounds >= this.planReviewLimits(task.sessionId).maxDiscussionRounds &&
@@ -13490,6 +13978,36 @@ export class ConversationRepository {
     return true
   }
 
+  /**
+   * The current Run is a completed read-only reply that preserved this exact review
+   * checkpoint: host intent and receipt still match, and immutable review/roles/Plan/
+   * inputSequence and any prior control coverage are unchanged. A pure explanation is
+   * proven by the settled receipt's unchanged basis; it never requests a repair role
+   * itself but retains authority the original review or control input established.
+   */
+  private settledReplyPreservesCheckpoint(task: CollaborationTask): boolean {
+    const completed = this.relayCompletedTurn(
+      task,
+      this.database.select().from(workflowTurns).where(eq(workflowTurns.runId, task.runId)).get(),
+    )
+    const intent = completed?.auth.replyIntentBasis
+    return Boolean(
+      completed &&
+      intent?.askCheckpoint &&
+      this.currentReplyIntent(task, completed.run, completed.auth) &&
+      isDeepStrictEqual(completed.state.reviewControlCoverage, task.reviewControlCoverage) &&
+      (intent.kind === 'ask_only' ||
+        Boolean(
+          task.inputProcessing?.settled?.runId === completed.run.id &&
+          task.inputProcessing.settled.unchanged &&
+          isDeepStrictEqual(
+            task.inputProcessing.settled.unchanged,
+            intent.askCheckpoint.inputBasis,
+          ),
+        )),
+    )
+  }
+
   private swappedRepairRoles(roles: NonNullable<CollaborationTask['stageRoles']>) {
     return {
       ...roles,
@@ -13517,25 +14035,35 @@ export class ConversationRepository {
       this.nativeRecoveryBlocksInput(task.sessionId)
     )
       return undefined
+    const afterReply = this.settledReplyPreservesCheckpoint(task)
+    const inputBasis = collaborationWorkflowInputBasis(task)
     if (coverage) {
-      if (task.runId !== coverage.producerRunId) return undefined
+      if (task.runId !== coverage.producerRunId && !afterReply) return undefined
       const reply = this.relayCompletedTurn(
         task,
-        this.database.select().from(workflowTurns).where(eq(workflowTurns.runId, task.runId)).get(),
+        this.database
+          .select()
+          .from(workflowTurns)
+          .where(eq(workflowTurns.runId, coverage.producerRunId))
+          .get(),
       )
       if (
         !reply ||
         reply.source.stage !== 'reply' ||
-        reply.source.inputSequence !== task.inputSequence ||
-        this.workflowInputResult(task.runId)?.outcome !== coverage.kind ||
-        !this.currentReplyIntent(task, reply.run, reply.auth)
+        reply.source.inputSequence !== inputBasis.inputSequence ||
+        this.workflowInputResult(coverage.producerRunId)?.outcome !== coverage.kind ||
+        !this.currentReplyIntent(
+          { ...task, inputSequence: inputBasis.inputSequence },
+          reply.run,
+          reply.auth,
+        )
       )
         return undefined
     } else if (
       source === 'native' ||
       task.stage !== 'code_review' ||
-      task.runId !== review.runId ||
-      task.inputSequence !== review.inputSequence
+      (task.runId !== review.runId && !afterReply) ||
+      inputBasis.inputSequence !== review.inputSequence
     ) {
       return undefined
     }
@@ -13583,6 +14111,213 @@ export class ConversationRepository {
       )
         throw new RunOperationConflictError('This repair choice is no longer current.')
       this.publishRepairRoleDecision(task, input)
+      return this.metadataPatch(input.sessionId)
+    })
+    this.schedulingChanged()
+    return patch
+  }
+
+  /** A recorded metadata action: no Run, budget or write follows a Plan keep. */
+  keepCurrentPlan(input: CollaborationActionInput, waitingForWork: boolean): ConversationPatch {
+    const patch = this.database.transaction(() => {
+      const duplicate = this.collaborationActionReceipt(input)
+      if (duplicate) {
+        if (duplicate.action !== 'keep_current_plan')
+          throw new RunOperationConflictError('This action nonce belongs to another request.')
+        return this.metadataPatch(input.sessionId)
+      }
+      assertSessionAvailable(this.database, input.sessionId)
+      const task = this.collaboration(input.sessionId)
+      if (
+        input.action !== 'keep_current_plan' ||
+        waitingForWork ||
+        !task ||
+        task.id !== input.taskId ||
+        task.revision !== input.revision
+      )
+        throw new RunOperationConflictError('This Plan decision is no longer current.')
+      if (!this.collaborationPlanRevisionSourceAvailable(task, 'keep_current_plan'))
+        throw new RunOperationConflictError('This revision request can no longer be dismissed.')
+      const revision = task.planRevision!
+      const processing = collaborationInputProcessing(task)
+      if (
+        processing.decision?.runId === revision.requestRunId &&
+        processing.decision.inputSequence === revision.inputSequence
+      )
+        task.inputProcessing = {
+          ...processing,
+          decision: undefined,
+          settled: {
+            runId: revision.requestRunId,
+            inputSequence: revision.inputSequence,
+          },
+        }
+      task.handledInputSequence = revision.inputSequence
+      task.planRevision = undefined
+      if (revision.origin === 'user') task.planInputSequence = revision.priorPlanInputSequence
+      task.nextStage = undefined
+      task.status = 'waiting'
+      task.automation = 'paused'
+      task.pauseReason ??= 'user'
+      task.notice = 'The current Plan was kept. Continue only within its original scope.'
+      task.revision++
+      this.saveCollaboration(task)
+      const now = new Date().toISOString()
+      this.database
+        .update(collaborationActionReceipts)
+        .set({ state: 'cancelled', active: false, updatedAt: now })
+        .where(
+          and(
+            eq(collaborationActionReceipts.taskId, task.id),
+            eq(collaborationActionReceipts.state, 'available'),
+            eq(collaborationActionReceipts.active, true),
+            isNull(collaborationActionReceipts.boundRunId),
+          ),
+        )
+        .run()
+      const id = randomUUID()
+      this.database
+        .insert(collaborationActionReceipts)
+        .values({
+          id,
+          sessionId: task.sessionId,
+          taskId: task.id,
+          clientNonce: input.clientMessageId,
+          requestDigest: scheduling.fingerprint(input),
+          action: 'keep_current_plan',
+          actor: collaborationActor(task, 'plan'),
+          handoffId: scheduling.fingerprint({
+            taskId: task.id,
+            revision: input.revision,
+            clientMessageId: input.clientMessageId,
+            action: input.action,
+          }),
+          rootReceiptId: id,
+          basisJson: this.authorityJson({
+            taskId: task.id,
+            inputSequence: task.inputSequence,
+            planRevision: revision,
+          }),
+          state: 'settled',
+          active: false,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run()
+      appendAgentEvent(this.database, {
+        sessionId: task.sessionId,
+        runId: task.runId,
+        eventType: 'collaboration.plan_revision_dismissed',
+        payload: JSON.stringify({
+          clientMessageId: input.clientMessageId,
+          planRevision: revision,
+        }),
+        createdAt: now,
+      })
+      return this.metadataPatch(input.sessionId)
+    })
+    this.schedulingChanged()
+    return patch
+  }
+
+  /** A recorded metadata action: swapping future code roles starts no Run and grants no write. */
+  swapCodeRoles(input: CollaborationActionInput, waitingForWork: boolean): ConversationPatch {
+    const patch = this.database.transaction(() => {
+      const duplicate = this.collaborationActionReceipt(input)
+      if (duplicate) {
+        if (duplicate.action !== 'swap_code_roles')
+          throw new RunOperationConflictError('This action nonce belongs to another request.')
+        return this.metadataPatch(input.sessionId)
+      }
+      assertSessionAvailable(this.database, input.sessionId)
+      const task = this.collaboration(input.sessionId)
+      if (
+        input.action !== 'swap_code_roles' ||
+        waitingForWork ||
+        !task ||
+        task.id !== input.taskId ||
+        task.revision !== input.revision
+      )
+        throw new RunOperationConflictError('This code-role decision is no longer current.')
+      if (!this.codeRoleChangeAvailable(task))
+        throw new RunOperationConflictError(
+          'Code roles can only change before implementation is authorized.',
+        )
+      const previousRoles = task.stageRoles ?? defaultTaskStageRoles(task.owner)
+      const proposedRoles = {
+        ...previousRoles,
+        revision: previousRoles.revision + 1,
+        codeAuthor: previousRoles.codeReviewer,
+        codeReviewer: previousRoles.codeAuthor,
+      }
+      const reviewTurn = this.database
+        .select({ reportBodyId: workflowTurns.reportBodyId })
+        .from(workflowTurns)
+        .where(eq(workflowTurns.runId, task.review!.runId))
+        .get()
+      const reviewDocument = reviewTurn?.reportBodyId
+        ? this.documentReference(task.sessionId, reviewTurn.reportBodyId)
+        : undefined
+      if (!task.taskDocument || !task.planReference || !reviewDocument)
+        throw new RunOperationConflictError('The complete role-change sources are unavailable.')
+      const deadlineAt = Date.now() + HANDOFF_READ_DEADLINE_MS
+      const check = () => {
+        if (Date.now() >= deadlineAt)
+          throw new RunOperationConflictError(
+            'Role-change source verification exceeded its deadline.',
+          )
+      }
+      for (const document of [task.taskDocument, task.planReference.document, reviewDocument])
+        for (const chunk of this.planRevisionDocumentChunks(task.sessionId, document, check))
+          void chunk
+      this.saveCollaboration({ ...task, stageRoles: proposedRoles, revision: task.revision + 1 })
+      const now = new Date().toISOString()
+      const id = randomUUID()
+      this.database
+        .insert(collaborationActionReceipts)
+        .values({
+          id,
+          sessionId: task.sessionId,
+          taskId: task.id,
+          clientNonce: input.clientMessageId,
+          requestDigest: scheduling.fingerprint(input),
+          action: 'swap_code_roles',
+          actor: proposedRoles.codeAuthor,
+          handoffId: scheduling.fingerprint({
+            taskId: task.id,
+            revision: input.revision,
+            clientMessageId: input.clientMessageId,
+            action: input.action,
+          }),
+          rootReceiptId: id,
+          basisJson: this.authorityJson({
+            taskId: task.id,
+            inputSequence: task.inputSequence,
+            planReference: task.planReference,
+            review: task.review,
+            previousRoles,
+            proposedRoles,
+          }),
+          state: 'settled',
+          active: false,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run()
+      appendAgentEvent(this.database, {
+        sessionId: task.sessionId,
+        runId: task.runId,
+        eventType: 'collaboration.code_roles_swapped',
+        payload: JSON.stringify({
+          clientMessageId: input.clientMessageId,
+          taskId: task.id,
+          taskRevision: input.revision,
+          revision: task.revision + 1,
+          previousRoles,
+          proposedRoles,
+        }),
+        createdAt: now,
+      })
       return this.metadataPatch(input.sessionId)
     })
     this.schedulingChanged()
@@ -13958,6 +14693,19 @@ export class ConversationRepository {
   }
 
   /** A concrete existing user action supersedes an unused suggestion, never a bound operation. */
+  private isUnansweredRelaySuggestion(row: typeof relayDecisions.$inferSelect): boolean {
+    if (!row.active || row.formatVersion !== 2 || row.state !== 'awaiting_answer') return false
+    const proof = relaySchedulingDecisionProofSchema.safeParse(JSON.parse(row.proofJson))
+    if (!proof.success) return false
+    const card = proof.data.card
+    return (
+      card.decisionId === row.id &&
+      card.sessionId === row.sessionId &&
+      card.revision === row.revision &&
+      isOptionalRelaySuggestion(card)
+    )
+  }
+
   discardUnansweredRelaySchedulingDecision(sessionId: string, includePact = true): void {
     const decisionId = this.activeRelayDecisionRow(sessionId)?.id
     this.database
@@ -14556,13 +15304,7 @@ export class ConversationRepository {
       }
       const now = new Date().toISOString()
       let receiptId: string | undefined
-      if (cancelled) {
-        // This is an actual cancellation of advancement, owned by the existing workflow pause.
-        task.automation = 'paused'
-        task.pauseReason = 'user'
-        task.revision++
-        this.saveCollaboration(task)
-      } else {
+      if (!cancelled) {
         const operation = proof.card.request.operation
         const next = this.relayWorkflowActionNext(task, operation.kind)
         receiptId = randomUUID()
@@ -14756,7 +15498,8 @@ export class ConversationRepository {
     const gate = this.activeRelayDecisionRow(sessionId)
     if (
       !gate ||
-      (newInput && gate.kind === 'repair_role_request' && gate.state === 'awaiting_answer')
+      (newInput && gate.kind === 'repair_role_request' && gate.state === 'awaiting_answer') ||
+      (newInput && this.isUnansweredRelaySuggestion(gate))
     )
       return
     const receipt = receiptId
@@ -15324,32 +16067,38 @@ export class ConversationRepository {
             : []),
         ],
       }
-    const actions = collaborationAvailableActions(task)
-    const pauseOnly = actions.filter((action) => action === 'pause')
+    const workflowDecision = deriveCollaborationDecision(task)
+    const actions = workflowDecision.availableActions.filter(
+      (action) =>
+        (action !== 'revise_plan' && action !== 'keep_current_plan') ||
+        this.collaborationPlanRevisionSourceAvailable(task, action),
+    )
     if (this.activeRelayDecisionRow(task.sessionId)?.kind === 'repair_role_request')
-      return { availableActions: pauseOnly }
+      return { availableActions: [] }
     try {
+      const projected = actions.filter(
+        (action) => action !== 'swap_code_roles' || this.codeRoleChangeAvailable(task),
+      )
       const pending = this.pendingSupplementReview(task)
       if (pending) {
         const ready = this.supplementReviewSourceReady(task, pending)
         return {
-          availableActions: actions.filter(
+          availableActions: projected.filter(
             (action) =>
-              action === 'pause' ||
-              (ready &&
-                ['resume', 'continue', 'retry'].includes(action) &&
-                collaborationNextStage(task) === pending.stage),
+              ready &&
+              ['resume', 'continue', 'retry'].includes(action) &&
+              workflowDecision.nextStage === pending.stage,
           ),
         }
       }
-      const alternative = actions.includes('repair') && this.repairRoleBasis(task, 'direct')
-      if (!alternative) return { availableActions: actions }
+      const alternative = projected.includes('repair') && this.repairRoleBasis(task, 'direct')
+      if (!alternative) return { availableActions: projected }
       return alternative.limit
-        ? { availableActions: actions, repairChoiceUnavailable: alternative.limit }
-        : { availableActions: [...actions, 'request_repair_role_switch'] }
+        ? { availableActions: projected, repairChoiceUnavailable: alternative.limit }
+        : { availableActions: [...projected, 'request_repair_role_switch'] }
     } catch (error) {
       if (!(error instanceof RunOperationConflictError)) throw error
-      return { availableActions: pauseOnly }
+      return { availableActions: [] }
     }
   }
 
@@ -15989,6 +16738,40 @@ export class ConversationRepository {
     }
   }
 
+  /**
+   * Shared projection/write gate: the pure predicate plus the durable proof that the
+   * original write source and the current Plan document still belong to this task.
+   */
+  private collaborationPlanRevisionSourceAvailable(
+    task: CollaborationTask,
+    action: 'revise_plan' | 'keep_current_plan',
+  ): boolean {
+    const allowed =
+      action === 'revise_plan' ? collaborationCanRevisePlan(task) : collaborationCanKeepPlan(task)
+    if (!allowed) return false
+    if (
+      this.receivedCollaborationInput(task.sessionId) ||
+      this.activeRelayDecisionRow(task.sessionId) ||
+      this.hasPendingRoutedContinuation(task.sessionId) ||
+      this.nativeRecoveryBlocksInput(task.sessionId) ||
+      this.pendingSupplementReview(task)
+    )
+      return false
+    const writeRunId =
+      action === 'revise_plan' ? this.planRevisionWriteRunId(task) : task.planRevision!.writeRunId
+    if (!writeRunId) return false
+    try {
+      const original = this.unfinishedWriteSource(task, writeRunId, true)
+      if (original.auth.userAuthority) this.originalWriteReceipt(task, original, false, true)
+    } catch (error) {
+      if (!(error instanceof RunOperationConflictError)) throw error
+      return false
+    }
+    if (!task.planReference) return false
+    const document = this.collaborationDocumentRow(task.sessionId, task.planReference.document)
+    return document.sourceRunId === task.planReference.sourceRunId
+  }
+
   /** Capture the exact user action synchronously, before any preparation or advice await. */
   prepareCollaborationAction(input: CollaborationActionInput, limits: CollaborationLimits) {
     return this.database.transaction(() => {
@@ -16040,6 +16823,42 @@ export class ConversationRepository {
         task.revision++
         this.saveCollaboration(task)
       } else this.assertRelayDecisionResolved(task.sessionId)
+      if (input.action === 'revise_plan' && !duplicate) {
+        if (
+          !this.collaborationPlanRevisionSourceAvailable(task, 'revise_plan') ||
+          !task.planReference
+        )
+          throw new RunOperationConflictError('The current Plan cannot be revised right now.')
+        const writeRunId = this.planRevisionWriteRunId(task)!
+        task.planRevision = {
+          origin: 'user',
+          requestRunId: task.runId,
+          inputSequence: task.inputSequence,
+          writeRunId,
+          planReference: task.planReference,
+          ...(task.planInputSequence !== undefined
+            ? { priorPlanInputSequence: task.planInputSequence }
+            : {}),
+          ...(task.review ? { priorReviewRunId: task.review.runId } : {}),
+        }
+        task.planInputSequence = undefined
+        task.automation = 'paused'
+        task.pauseReason = 'user'
+        task.status = 'waiting'
+        task.nextStage = 'plan'
+        task.revision++
+        this.saveCollaboration(task)
+        appendAgentEvent(this.database, {
+          sessionId: task.sessionId,
+          runId: task.runId,
+          eventType: 'collaboration.plan_revision_requested',
+          payload: JSON.stringify({
+            clientMessageId: input.clientMessageId,
+            planRevision: task.planRevision,
+          }),
+          createdAt: new Date().toISOString(),
+        })
+      }
       const next =
         input.action === 'resume' &&
         (task.planRevision ? collaborationNextStage(task) : task.pendingWork)
@@ -19699,6 +20518,11 @@ export class ConversationRepository {
       )
     const existing = this.submittedRunReceipt(input)
     if (existing) return existing
+    const commandPrefix = parseComposerCommandPrefix(input.content, input.skills)
+    if (commandPrefix.pact && !pactCommandRouteAllowed(input.route, commandPrefix.route))
+      throw new RunOperationConflictError(
+        'The explicit Agent recipients conflict. Your draft was preserved.',
+      )
     const currentTask =
       input.collaboration && input.expectedCollaborationRevision !== undefined
         ? this.collaboration(input.sessionId)
@@ -19746,6 +20570,7 @@ export class ConversationRepository {
     const routeAgents =
       route.type === 'all' ? [route.firstAgentId, route.secondAgentId] : [route.agentId]
     const supersededProposalRunIds: string[] = []
+    let replacedTaskRunId: string | undefined
     const freezeDrafts = input.receivedInputId
       ? (storedReceivedMetadata(
           this.database
@@ -20090,7 +20915,13 @@ export class ConversationRepository {
                 ? task.kind === 'build'
                   ? otherAgent(queued.actor)
                   : queued.actor
-                : settings?.primaryAgentId)
+                : settings
+                  ? pactEntryPrimary(
+                      task.kind,
+                      settings.primaryAgentId,
+                      input.route?.type === 'agent' ? input.route.agentId : undefined,
+                    )
+                  : undefined)
             if (
               !primary ||
               task.owner !== primary ||
@@ -20174,6 +21005,38 @@ export class ConversationRepository {
               task.taskMessageId !== input.clientMessageId
             )
               throw new RunOperationConflictError('This workflow task is no longer current.')
+            const unfinished = current && current.status !== 'complete' ? current : undefined
+            if (unfinished) {
+              const reference = input.replaceTask
+              if (!reference || reference.taskId !== unfinished.id)
+                throw new RunOperationConflictError(
+                  'The current task changed. Confirm replacing it before sending this command again.',
+                )
+              if (input.receivedInputId) {
+                // The queued command re-proves only identity; the immutable receipt holds the revision.
+                const received = this.receivedCollaborationInput(input.sessionId)
+                const saved = received && storedReceivedMetadata(received.metadataJson).replaceTask
+                if (
+                  !received ||
+                  received.id !== input.receivedInputId ||
+                  !isDeepStrictEqual(saved, reference)
+                )
+                  throw new RunOperationConflictError(
+                    'The original task replacement could not be verified.',
+                  )
+              } else if (unfinished.revision !== reference.revision)
+                throw new RunOperationConflictError(
+                  'The current task changed. Confirm replacing it before sending this command again.',
+                )
+              this.replaceCollaborationTask(unfinished, {
+                clientMessageId: input.clientMessageId,
+                taskRevision: reference.revision,
+              })
+              replacedTaskRunId = unfinished.runId
+            } else if (input.replaceTask && current?.id !== input.replaceTask.taskId)
+              throw new RunOperationConflictError(
+                'The confirmed task replacement is no longer current.',
+              )
             transaction
               .update(collaborationTasks)
               .set({ active: false })
@@ -20470,6 +21333,7 @@ export class ConversationRepository {
             freezeDrafts,
             inputBatchRef: batch,
             ...(input.replyToDecision ? { replyToDecision: input.replyToDecision } : {}),
+            ...(input.replaceTask ? { replaceTask: input.replaceTask } : {}),
           }),
           createdAt,
         })
@@ -20495,7 +21359,10 @@ export class ConversationRepository {
             .all()
             .map((entry) => ConversationRepository.toRun(entry))
         : []
+    // The mounted footer of the replaced task re-reads its ended state from this related Run.
+    const endedRun = replacedTaskRunId ? this.findRun(replacedTaskRunId) : undefined
     const relatedRuns = [
+      ...(endedRun ? [endedRun] : []),
       ...(sourceRun ? [ConversationRepository.toRun(sourceRun)] : []),
       ...supersededRuns,
     ]
