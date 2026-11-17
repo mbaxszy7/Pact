@@ -1,7 +1,4 @@
-import type { ChildProcessWithoutNullStreams } from 'node:child_process'
-
-import { query, type ModelInfo, type Query } from '@anthropic-ai/claude-agent-sdk'
-import { createInterface } from 'node:readline'
+import type { ModelInfo } from '@anthropic-ai/claude-agent-sdk'
 
 import type {
   AgentModelCatalog,
@@ -18,6 +15,7 @@ import type { DiagnosticEvent } from '@pact/contracts/diagnostics'
 import { DefaultSessionSettingsRepository } from '@pact/persistence'
 
 import { recordDiagnostic } from '../../diagnostics/utility-log'
+import { runClaudeInfoProbe, runCodexInfoProbe } from '../native-info-probe'
 import { OwnedProcessGroup, OwnedProcessIdentityError } from '../owned-process-group'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation'
 
@@ -147,13 +145,16 @@ export class DefaultSessionSettings {
     return (await this.collectEditorState(process.cwd())).editorState.modelCatalogs
   }
 
-  private collectEditorState(workingDirectory: string): Promise<CollectedEditorState> {
+  private async collectEditorState(workingDirectory: string): Promise<CollectedEditorState> {
+    const deadline = Date.now() + OPERATION_TIMEOUT_MS
+    await this.runtimePreparation.prepareEnvironment()
+    if (this.disposed) throw new Error('Settings are shutting down.')
     const key = this.runtimePreparation.catalogIdentity(workingDirectory)
     const existing = this.catalogReads.get(key)
     if (existing) return existing
     if (this.catalogReads.size >= 4)
       return Promise.reject(new Error('Catalog capacity is unavailable.'))
-    const task = this.collectEditorStateOnce(workingDirectory).then((result) => {
+    const task = this.collectEditorStateOnce(workingDirectory, deadline).then((result) => {
       if (this.runtimePreparation.catalogIdentity(workingDirectory) !== key)
         throw new Error('The native model catalog configuration changed during discovery.')
       return result
@@ -166,7 +167,10 @@ export class DefaultSessionSettings {
     return task
   }
 
-  private async collectEditorStateOnce(workingDirectory: string): Promise<CollectedEditorState> {
+  private async collectEditorStateOnce(
+    workingDirectory: string,
+    deadline: number,
+  ): Promise<CollectedEditorState> {
     if (this.disposed || this.operations.size >= 4) {
       const error = new Error('The settings catalog capacity is unavailable.')
       DefaultSessionSettings.recordFailure(
@@ -177,7 +181,6 @@ export class DefaultSessionSettings {
       throw error
     }
     const controller = new AbortController()
-    const deadline = Date.now() + OPERATION_TIMEOUT_MS
     let resolveDone!: () => void
     const operation: CatalogOperation = {
       controller,
@@ -186,7 +189,7 @@ export class DefaultSessionSettings {
       }),
     }
     this.operations.add(operation)
-    const timeout = setTimeout(() => controller.abort(), OPERATION_TIMEOUT_MS)
+    const timeout = setTimeout(() => controller.abort(), Math.max(0, deadline - Date.now()))
     let phase: DiagnosticEvent['settingsCatalogPhase'] = 'readiness'
     try {
       // Runtime Preparation remains the single source of truth for executable selection and
@@ -356,60 +359,46 @@ export class DefaultSessionSettings {
   ): Promise<AgentModelCatalog> {
     // supportedModels() still requires an SDK session. Keep its input stream idle so discovery
     // cannot submit a model prompt, then abort and close the session after the catalog resolves.
-    const abortController = new AbortController()
-    let session: Query | undefined
-    const probe = this.ownProbe(signal, async () => {
-      abortController.abort()
-      session?.close()
-      await session?.return(undefined).catch(() => undefined)
-    })
-    try {
-      session = query({
-        prompt: DefaultSessionSettings.idleClaudeInput(abortController.signal),
-        options: {
-          abortController,
-          cwd: workingDirectory,
-          pathToClaudeCodeExecutable: executablePath,
-          permissionMode: 'dontAsk',
-          permissionPrompts: 'none',
-          persistSession: false,
-          settingSources: ['user'],
-          spawnClaudeCodeProcess: (specification) => {
-            const child = probe.spawn(specification.command, specification.args, {
-              cwd: specification.cwd,
-              env: specification.env,
-              signal: specification.signal,
-            })
-            child.stderr.resume()
-            return child
-          },
-        },
-      })
-      const models = await DefaultSessionSettings.withTimeout(session.supportedModels(), timeoutMs)
-      if (models.length > 200 || Buffer.byteLength(JSON.stringify(models)) > 256 * 1024)
-        throw new Error('The Claude model catalog exceeds its discovery capacity.')
-      return {
-        agentId: 'claude',
-        status: 'available',
-        ...(cliVersion ? { cliVersion } : {}),
-        models: models
-          .filter((model) => model.value !== 'default')
-          .map((model) => DefaultSessionSettings.toClaudeModelOption(model)),
-        checkedAt: new Date().toISOString(),
-      }
-    } catch {
-      return DefaultSessionSettings.unavailableCatalog(
-        'claude',
-        'Claude Code did not provide its model list. CLI default remains available.',
-        cliVersion,
-      )
-    } finally {
-      await probe.close().catch((error: unknown) => {
+    return runClaudeInfoProbe<AgentModelCatalog>({
+      executablePath,
+      workingDirectory,
+      signal,
+      timeoutMs,
+      timeoutMessage: 'Model catalog timed out.',
+      queryOptions: {
+        permissionMode: 'dontAsk',
+        permissionPrompts: 'none',
+        persistSession: false,
+        settingSources: ['user'],
+      },
+      ownProbe: (probeSignal, onCloseInput) => this.ownProbe(probeSignal, onCloseInput),
+      inspect: async (session) => {
+        const models = await session.supportedModels()
+        if (models.length > 200 || Buffer.byteLength(JSON.stringify(models)) > 256 * 1024)
+          throw new Error('The Claude model catalog exceeds its discovery capacity.')
+        return {
+          agentId: 'claude',
+          status: 'available',
+          ...(cliVersion ? { cliVersion } : {}),
+          models: models
+            .filter((model) => model.value !== 'default')
+            .map((model) => DefaultSessionSettings.toClaudeModelOption(model)),
+          checkedAt: new Date().toISOString(),
+        }
+      },
+      onFailure: () =>
+        DefaultSessionSettings.unavailableCatalog(
+          'claude',
+          'Claude Code did not provide its model list. CLI default remains available.',
+          cliVersion,
+        ),
+      onCloseError: (error) => {
         DefaultSessionSettings.recordFailure('claude_close', error)
-        throw error
-      })
-      if (probe.released) this.probes.delete(probe)
-    }
+      },
+      onProbeSettled: (probe) => {
+        if (probe.released) this.probes.delete(probe)
+      },
+    })
   }
 
   private async inspectCodexModels(
@@ -421,129 +410,66 @@ export class DefaultSessionSettings {
   ): Promise<AgentModelCatalog> {
     // App Server exposes the catalog over JSONL. Only initialize the connection and request
     // model/list; do not create a Thread or start a Turn while opening Settings.
-    let child: ChildProcessWithoutNullStreams | undefined
-    const probe = this.ownProbe(signal, () => {
-      child?.stdin.end()
-    })
-    let lineReader: ReturnType<typeof createInterface> | undefined
-    try {
-      const runningChild = DefaultSessionSettings.startCodexAppServer(
-        executablePath,
-        workingDirectory,
-        probe,
-      )
-      child = runningChild
-      runningChild.stderr.resume()
-      const lines = createInterface({ input: runningChild.stdout })
-      lineReader = lines
-      const send = (message: unknown): void => {
-        runningChild.stdin.write(`${JSON.stringify(message)}\n`)
-      }
-
-      let requestId = 1
-      const collected: CodexModel[] = []
-      const cursors = new Set<string>()
-      const models = await DefaultSessionSettings.withTimeout(
-        new Promise<CodexModel[]>((resolve, reject) => {
-          runningChild.once('error', reject)
-          runningChild.once('exit', (code) =>
-            reject(new Error(`Codex App Server exited (${code}).`)),
-          )
-          lines.on('line', (line) => {
-            if (line.length > MAX_CODEX_MESSAGE_BYTES) {
-              reject(new Error('Codex App Server returned an oversized message.'))
-              return
-            }
-            let message: unknown
-            try {
-              message = JSON.parse(line)
-            } catch {
-              return
-            }
-
-            if (
-              typeof message === 'object' &&
-              message !== null &&
-              Reflect.get(message, 'id') === 0
-            ) {
-              if (!Reflect.has(message, 'result')) {
-                reject(new Error('Codex App Server initialization failed.'))
-                return
-              }
-              send({ method: 'initialized', params: {} })
-              send({
-                method: 'model/list',
-                id: requestId,
-                params: { limit: 25, includeHidden: false },
-              })
-              return
-            }
-
-            const listed = DefaultSessionSettings.parseCodexModelListResponse(message, requestId)
-            if (listed) {
-              collected.push(...listed)
-              if (
-                collected.length > 200 ||
-                Buffer.byteLength(JSON.stringify(collected)) > 256 * 1024
-              ) {
-                reject(new Error('The Codex model catalog exceeds its discovery capacity.'))
-                return
-              }
-              const result: unknown =
-                typeof message === 'object' && message ? Reflect.get(message, 'result') : undefined
-              const cursor: unknown =
-                result && typeof result === 'object' ? Reflect.get(result, 'nextCursor') : undefined
-              if (cursor === null || cursor === undefined) {
-                resolve(collected)
-                return
-              }
-              if (
-                typeof cursor !== 'string' ||
-                cursor.length > 1024 ||
-                cursors.has(cursor) ||
-                cursors.size >= 8
-              ) {
-                reject(new Error('The Codex model cursor is invalid.'))
-                return
-              }
-              cursors.add(cursor)
-              requestId += 1
-              send({
-                method: 'model/list',
-                id: requestId,
-                params: { limit: 25, includeHidden: false, cursor },
-              })
-            }
+    return runCodexInfoProbe<AgentModelCatalog>({
+      executablePath,
+      workingDirectory,
+      signal,
+      timeoutMs,
+      timeoutMessage: 'Model catalog timed out.',
+      maxFrameBytes: MAX_CODEX_MESSAGE_BYTES,
+      maxTotalBytes: 2 * MAX_CODEX_MESSAGE_BYTES,
+      initializeParams: { clientInfo: { name: 'pact', title: 'Pact', version: '0.0.0' } },
+      ownProbe: (probeSignal, onCloseInput) => this.ownProbe(probeSignal, onCloseInput),
+      inspect: async (transport) => {
+        const collected: CodexModel[] = []
+        const cursors = new Set<string>()
+        const collectPages = async (cursor?: string): Promise<void> => {
+          const result = await transport.request('model/list', {
+            limit: 25,
+            includeHidden: false,
+            ...(cursor ? { cursor } : {}),
           })
-          send({
-            method: 'initialize',
-            id: 0,
-            params: { clientInfo: { name: 'pact', title: 'Pact', version: '0.0.0' } },
-          })
-        }),
-        timeoutMs,
-      )
-      return {
-        agentId: 'codex',
-        status: 'available',
-        ...(cliVersion ? { cliVersion } : {}),
-        models: models.map((model) => DefaultSessionSettings.toCodexModelOption(model)),
-        checkedAt: new Date().toISOString(),
-      }
-    } catch {
-      return DefaultSessionSettings.unavailableCatalog(
-        'codex',
-        'Codex did not provide its model list. CLI default remains available.',
-        cliVersion,
-      )
-    } finally {
-      lineReader?.close()
-      await probe.close().catch((error: unknown) => {
+          const listed = DefaultSessionSettings.parseCodexModelListResult(result)
+          if (!listed) throw new Error('Codex App Server returned an invalid model catalog.')
+          collected.push(...listed)
+          if (collected.length > 200 || Buffer.byteLength(JSON.stringify(collected)) > 256 * 1024)
+            throw new Error('The Codex model catalog exceeds its discovery capacity.')
+          const nextCursor =
+            result && typeof result === 'object' ? Reflect.get(result, 'nextCursor') : undefined
+          if (nextCursor === null || nextCursor === undefined) return
+          if (
+            typeof nextCursor !== 'string' ||
+            nextCursor.length > 1024 ||
+            cursors.has(nextCursor) ||
+            cursors.size >= 8
+          ) {
+            throw new Error('The Codex model cursor is invalid.')
+          }
+          cursors.add(nextCursor)
+          await collectPages(nextCursor)
+        }
+        await collectPages()
+        return {
+          agentId: 'codex',
+          status: 'available',
+          ...(cliVersion ? { cliVersion } : {}),
+          models: collected.map((model) => DefaultSessionSettings.toCodexModelOption(model)),
+          checkedAt: new Date().toISOString(),
+        }
+      },
+      onFailure: () =>
+        DefaultSessionSettings.unavailableCatalog(
+          'codex',
+          'Codex did not provide its model list. CLI default remains available.',
+          cliVersion,
+        ),
+      onCloseError: (error) => {
         DefaultSessionSettings.recordFailure('codex_close', error)
-        throw error
-      })
-      if (probe.released) this.probes.delete(probe)
-    }
+      },
+      onProbeSettled: (probe) => {
+        if (probe.released) this.probes.delete(probe)
+      },
+    })
   }
 
   private static validateAgentSelection(
@@ -603,18 +529,7 @@ export class DefaultSessionSettings {
     return option
   }
 
-  private static parseCodexModelListResponse(
-    message: unknown,
-    requestId = 1,
-  ): CodexModel[] | undefined {
-    if (
-      typeof message !== 'object' ||
-      message === null ||
-      Reflect.get(message, 'id') !== requestId
-    ) {
-      return undefined
-    }
-    const result = Reflect.get(message, 'result')
+  private static parseCodexModelListResult(result: unknown): CodexModel[] | undefined {
     if (typeof result !== 'object' || result === null) return undefined
     const data = Reflect.get(result, 'data')
     return Array.isArray(data) && data.every((model) => DefaultSessionSettings.isCodexModel(model))
@@ -640,47 +555,5 @@ export class DefaultSessionSettings {
               typeof Reflect.get(tier, 'description') === 'string',
           )))
     )
-  }
-
-  private static startCodexAppServer(
-    executablePath: string,
-    workingDirectory: string,
-    probe: OwnedProcessGroup,
-  ): ChildProcessWithoutNullStreams {
-    const isWindowsCommand = process.platform === 'win32' && /\.cmd$/iu.test(executablePath)
-    if (isWindowsCommand && /[&|<>^%!"\r\n]/u.test(executablePath)) {
-      throw new Error('Unsafe Windows executable path.')
-    }
-    const target = isWindowsCommand ? (process.env.ComSpec ?? 'cmd.exe') : executablePath
-    const args = isWindowsCommand
-      ? ['/d', '/s', '/c', `""${executablePath}" app-server"`]
-      : ['app-server']
-    return probe.spawn(target, args, {
-      cwd: workingDirectory,
-      windowsHide: true,
-      windowsVerbatimArguments: isWindowsCommand,
-    })
-  }
-
-  private static async withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
-    let timeout: NodeJS.Timeout | undefined
-    try {
-      return await Promise.race([
-        operation,
-        new Promise<never>((_, reject) => {
-          timeout = setTimeout(() => reject(new Error('Model catalog timed out.')), timeoutMs)
-        }),
-      ])
-    } finally {
-      if (timeout) clearTimeout(timeout)
-    }
-  }
-
-  private static async *idleClaudeInput(signal: AbortSignal): AsyncGenerator<never, void> {
-    if (signal.aborted) return
-    await new Promise<void>((resolve) =>
-      signal.addEventListener('abort', () => resolve(), { once: true }),
-    )
-    yield* []
   }
 }

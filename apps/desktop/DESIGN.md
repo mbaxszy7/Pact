@@ -351,6 +351,42 @@ recovery row. Cancel preserves the underlying recovery facts. Activity distingui
 context from a completed business task, and displays historical model identity only for actual
 inference. Suggestions, acceptance and real execution results remain separate readable facts.
 
+### Session reminders
+
+Show at most one compact raised Session reminder at a time, anchored at the bottom-right edge of the
+workspace: above the Composer when a Conversation is visible, and at the bottom-right corner in
+Settings, Runtime Preparation, or Needs attention so it never covers the Session header,
+operation-error Toasts, or message input. It uses the neutral raised surface, hairline border, 14px
+panel radius, and popover shadow, applying semantic status color strictly to the status icon
+(`Reply`, `CircleAlert`, `CircleCheck`) alongside the plain-text bounded Session title, Agent and
+one of Needs your input, Failed or Finished, with a quiet secondary `View Session` button (`Review`
+or `View workspace` for overflow summaries) and a close button. Native system notifications use only
+the Pact application identity and fixed Agent/status copy; they never contain Session/Project
+titles, user content or dynamic errors. Unacknowledged background Session notifications show a numeric
+count badge (`99+` above 99) on the macOS Dock icon with a gentle single informational bounce when the
+count increases, and on Windows render a numeric taskbar overlay icon paired with an unfocused frame
+flash; both clear when viewed, dismissed, focused/acknowledged in the foreground, or on exit.
+
+Hover or keyboard focus pauses the eight-second in-app dismissal timer; moving away resumes it. When
+multiple reminders queue in the foreground, a subtle motion-safe badge pop highlights the pending
+count pill (`+N`) alongside the status icon entrance without stealing focus. The
+reminder must not cover or replace operation-error Toasts or quit confirmations, and update notices
+wait for the reminder channel to be idle. It remains visible when the target Session is not the
+visible focused Conversation, and clears automatically when that Session becomes visible and focused.
+Clicking `View Session` only opens the Session; it never answers, approves or continues work.
+Reduced motion, light/dark, transparent-backed windows and minimum window sizes preserve the same
+hierarchy, and status never relies on color alone.
+
+In the bottom-left Project Navigation footer above **Settings**, Pact shows a compact **Usage**
+icon trigger (`Gauge`) instead of permanently stacking metrics in the sidebar. Hovering or focusing
+the trigger opens a lightweight compact popover showing available **Codex** and **Claude Code** `5h` and `7d`
+remaining quota bars with `tabular-nums` `% left` labels (omitting absent windows), semantic
+low-quota thresholds (`20%` left warning ochre, `5%` left danger), silent loading bar placeholders, and
+1–3 word status labels for non-window or unauthenticated logins without timestamps. Clicking pins a
+detailed popover that adds per-window reset times and per-provider manual refresh buttons (respecting
+the thirty-second cooldown), dismissible by clicking the trigger, clicking outside, or pressing
+`Escape`.
+
 Send keeps its **Send message** title; there is no separate question control beside it. A pure
 question at a settled checkpoint uses the same ordinary Send; only a proven read-only reply
 restores the frozen checkpoint without changing the task.
@@ -425,7 +461,8 @@ shortcuts retain the selected identity, while Pact remains the product brand. Fu
 and official production have separate reserved identities; no CI release workflow is implied.
 Windows development taskbar entries use the Pact icon and explicit development name rather than
 Electron's executable branding. Their Session groups navigate the running repository instance;
-fully exited development instances still start through `pnpm dev`.
+fully exited development instances still start through `pnpm dev`. macOS development bundles register
+the active checkout instance and exit ownerless cold launches without opening a bare Electron window.
 
 ## Resident window and native navigation
 

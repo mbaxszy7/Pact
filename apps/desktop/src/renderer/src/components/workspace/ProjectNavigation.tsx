@@ -58,6 +58,7 @@ import {
 import type { SettingsPage } from './SettingsNavigation'
 import type { SessionWorkspaceFlow } from './useSessionWorkspace'
 
+import { ProviderUsagePanel } from './ProviderUsagePanel'
 import { scopeKey, UNGROUPED } from './session-catalog-cache'
 import {
   useNavigationRowMotion,
@@ -88,6 +89,7 @@ interface ProjectNavigationProps {
   archivingSessionId?: string | undefined
   selectedSessionId?: string | undefined
   updateAvailable?: boolean
+  navigationVisible?: boolean
   settingsButtonRef: React.RefObject<HTMLButtonElement | null>
   onAddProject: () => void
   onArchiveProject: (projectId: string) => void
@@ -199,6 +201,7 @@ export function ProjectNavigation({
   selectedSessionId,
   settingsButtonRef,
   updateAvailable,
+  navigationVisible = true,
   onAddProject,
   onArchiveProject,
   onRenameProject,
@@ -1476,21 +1479,24 @@ export function ProjectNavigation({
           </div>
         )}
       </div>
-      <button
-        ref={settingsButtonRef}
-        className="mt-auto flex min-h-9 w-full items-center gap-group rounded-control px-group py-2 text-left text-body font-medium text-primary hover:bg-surface-raised"
-        type="button"
-        onClick={() => {
-          drag.cancel()
-          onOpenSettings('session-defaults')
-        }}
-      >
-        <Settings aria-hidden="true" className="size-4 shrink-0" strokeWidth={1.75} />
-        Settings
-        {updateAvailable && (
-          <span className="ml-auto text-caption font-medium text-focus">New</span>
-        )}
-      </button>
+      <div className="mt-auto flex flex-col items-start gap-0.5 pt-1">
+        <ProviderUsagePanel visible={navigationVisible} onInteract={() => drag.cancel()} />
+        <button
+          ref={settingsButtonRef}
+          className="flex min-h-9 w-full items-center gap-group rounded-control px-group py-2 text-left text-body font-medium text-primary hover:bg-surface-raised"
+          type="button"
+          onClick={() => {
+            drag.cancel()
+            onOpenSettings('session-defaults')
+          }}
+        >
+          <Settings aria-hidden="true" className="size-4 shrink-0" strokeWidth={1.75} />
+          <span className="truncate">Settings</span>
+          {updateAvailable && (
+            <span className="ml-auto shrink-0 text-caption font-medium text-focus">New</span>
+          )}
+        </button>
+      </div>
     </div>
   )
 }

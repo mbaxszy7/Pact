@@ -72,6 +72,7 @@ import type {
   SchedulingStateInput,
   SchedulingEligibility,
   DecisionHttpOwner,
+  SessionNotificationEvent,
 } from '@pact/contracts'
 import type {
   ConversationImage,
@@ -215,6 +216,7 @@ import { NativeWorkingMemory, type NativeMemoryAllocator } from './native-workin
 import { OpenAIDecisionRuntime } from './openai-decision-runtime'
 import { evaluateRelayPolicy, type RelayPolicyAdmission } from './relay-policy'
 import { presentSessionIssues } from './session-issues'
+import { SessionNotificationProjector } from './session-notification-projector'
 
 const DELIVERY_RECONCILIATION_TIMEOUT_MS = 10_000
 const MAX_AGENT_OPERATIONS = 5
@@ -422,6 +424,8 @@ export class Conversation {
     }
   >()
   private readonly listeners = new Set<(patch: ConversationPatch, progress: boolean) => void>()
+  private readonly notificationProjector = new SessionNotificationProjector()
+  private readonly notificationListeners = new Set<(event: SessionNotificationEvent) => void>()
   private interestedSessionIds = new Set<string>()
   /** One finite receipt-check intent per interested Session; never rotated by message resync. */
   private readonly steerReceiptChecks = new Map<string, string>()
@@ -5488,6 +5492,9 @@ export class Conversation {
     let held = false
     let handoff: SchedulingHandoff | undefined
     try {
+      const environmentStarted = Date.now()
+      await this.runtimePreparation.prepareEnvironment(controller.signal)
+      const environmentElapsed = Date.now() - environmentStarted
       const session = this.sessions.find(input.sessionId)
       const settings = this.conversations.schedulingSettings()
       const admission = this.decisionRuntimeAdmission()
@@ -5712,6 +5719,8 @@ export class Conversation {
         throw new RunOperationConflictError(
           'This preparation ended without sending. Your draft is preserved.',
         )
+      // PATH preparation shares the existing native-preparation budget, outside advisory time.
+      options.preparationDeadlineAt ??= Date.now() + PREPARATION_TIMEOUT_MS - environmentElapsed
       return await this.sendAdmitted(input, controller, options)
     } catch (error) {
       return Conversation.sendFailure(error)
@@ -7931,6 +7940,11 @@ export class Conversation {
     return () => this.listeners.delete(listener)
   }
 
+  subscribeNotifications(listener: (event: SessionNotificationEvent) => void): () => void {
+    this.notificationListeners.add(listener)
+    return () => this.notificationListeners.delete(listener)
+  }
+
   dispose(shutdown?: { flushDeadlineAt?: number }): Promise<void> {
     clearTimeout(this.nativeQuitPreparation?.timer)
     this.nativeQuitPreparation = undefined
@@ -8133,6 +8147,8 @@ export class Conversation {
     this.nativeForks.clear()
     this.forkPreparations.clear()
     this.listeners.clear()
+    this.notificationProjector.dispose()
+    this.notificationListeners.clear()
     await this.images?.dispose()
     if (
       !flushed ||
@@ -10791,6 +10807,11 @@ export class Conversation {
     if (!progress) patch.forkBlocked = this.forkBlocked(patch.sessionId)
     if (!progress)
       patch.sessionIssues = this.sessionIssues(patch.sessionId, patch.nativeContexts ?? [])
+    if (!progress) {
+      const collaboration = this.conversations.collaboration(patch.sessionId)
+      const notification = collaboration ? this.collaborationNotification(collaboration) : undefined
+      if (notification) patch.collaborationNotification = notification
+    }
     // Interaction changes publish non-progress facts. Do not inflate every
     // high-frequency Delta or leak private details into the stream window.
     if (!progress) patch.pendingNativeInteractions = this.pendingNativeInteractions(patch.sessionId)
@@ -10803,6 +10824,14 @@ export class Conversation {
         patch.sessionId,
         patch.sessionIssues,
       )
+    if (!progress)
+      patch.pendingRoutedContinuation = this.conversations.hasPendingRoutedContinuation(
+        patch.sessionId,
+      )
+    const notificationEvents =
+      !progress && this.notificationListeners.size > 0 && !this.disposed && !this.nativeQuitSealed()
+        ? this.notificationProjector.observe(patch, false)
+        : []
     if (!progress && Buffer.byteLength(JSON.stringify(patch)) > CONVERSATION_PATCH_BYTES) {
       // Recovery projection is mandatory; large durable bodies are read through existing pagination.
       const activityRunIds = [
@@ -10853,12 +10882,73 @@ export class Conversation {
       this.publishedProgress += 1
     }
     for (const listener of this.listeners) listener(patch, progress)
+    if (!this.disposed && !this.nativeQuitSealed()) {
+      for (const event of notificationEvents) {
+        for (const listener of this.notificationListeners) listener(event)
+      }
+    }
   }
 
   private recoveryResult(sessionId: string): RpcResult<ConversationPatch> {
     const patch = this.conversations.contextPatch(sessionId)
     this.publish(patch)
     return { ok: true, value: patch }
+  }
+
+  private collaborationNotification(
+    task: CollaborationTask,
+  ): ConversationPatch['collaborationNotification'] {
+    if (task.ending) return undefined
+    const currentRun = this.conversations.findRun(task.runId)
+    const runSettled =
+      currentRun?.status === 'completed' &&
+      currentRun.outputSnapshots?.settled !== false &&
+      currentRun.nativeEffectsState !== 'pending' &&
+      currentRun.nativeEffectsState !== 'unknown'
+    if (
+      runSettled &&
+      !task.inputProcessing?.pending &&
+      ((task.inputProcessing?.settled?.runId === task.runId &&
+        Boolean(task.inputProcessing.settled.unchanged)) ||
+        (task.authorization?.runId === task.runId &&
+          task.authorization.replyIntentBasis?.kind === 'ask_only' &&
+          Boolean(task.authorization.replyIntentBasis.askCheckpoint)))
+    ) {
+      return {
+        taskId: task.id,
+        revision: task.revision,
+        runId: task.runId,
+        state: 'complete',
+        agentId: currentRun.agentId,
+      }
+    }
+    const decision = deriveCollaborationDecision(task)
+    type Notification = NonNullable<ConversationPatch['collaborationNotification']>
+    let state: Notification['state'] | undefined
+    if (task.status === 'complete') state = currentRun && !runSettled ? 'working' : 'complete'
+    else if (task.status === 'failed') {
+      if (task.pauseReason !== 'stopped') state = 'failure'
+    } else if (decision.inputGate === 'incomplete') state = 'failure'
+    else if (decision.inputGate === 'needs_reply') state = 'needs_user'
+    else if (decision.inputGate === 'processing' || decision.inputGate === 'queued')
+      state = 'working'
+    else if (task.status === 'running') state = 'working'
+    else if (task.status === 'questions' || task.status === 'ready') state = 'needs_user'
+    else if (task.automation === 'paused') {
+      if (task.pauseReason === 'user_message') state = 'working'
+      else if (task.pauseReason !== 'stopped')
+        state = task.pauseReason === 'failure' ? 'failure' : 'needs_user'
+    } else if (decision.nextStage) state = 'auto_continue'
+    else state = 'needs_user'
+    return state
+      ? {
+          taskId: task.id,
+          revision: task.revision,
+          runId: task.runId,
+          state,
+          agentId: task.actor,
+        }
+      : undefined
   }
 
   private sessionIssues(

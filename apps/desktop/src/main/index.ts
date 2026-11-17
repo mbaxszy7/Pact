@@ -219,7 +219,14 @@ async function bootstrap(): Promise<void> {
     () => applicationUpdates?.openFromMenu(),
   )
   appearanceSettings = createAppearanceController(utilityClient, nativeTheme)
-  removeDesktopModules = registerDesktopModules(rendererTrust, utilityClient, appearanceSettings)
+  if (!nativePresence) throw new Error('Pact native presence was not initialized.')
+  removeDesktopModules = registerDesktopModules(
+    rendererTrust,
+    utilityClient,
+    appearanceSettings,
+    nativePresence,
+    (event) => diagnostics?.record(event),
+  )
 
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)

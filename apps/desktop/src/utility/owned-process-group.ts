@@ -141,6 +141,8 @@ export class OwnedProcessGroup {
   private closing = false
   private cleanup: Promise<void> | undefined
   private childClosed = false
+  private inputClosed = false
+  private resolvedRoot: Identity | undefined = undefined
   private readonly ignoreChildError = (): void => undefined
   private didRelease = false
   private readonly signal: AbortSignal | undefined
@@ -179,6 +181,21 @@ export class OwnedProcessGroup {
 
   get released(): boolean {
     return this.didRelease
+  }
+
+  /** Report whether a close-timed-out group has since finished releasing cleanly. */
+  settledAfterCloseTimeout(): boolean {
+    if (this.didRelease) return true
+    if (!this.closing || !this.inputClosed) return false
+    if (this.windows) return this.windows.released
+    if (!this.child) return true
+    if (!this.childClosed || !this.resolvedRoot) return false
+    if (this.resolvedRoot.pid === 0) return true
+    try {
+      return this.groupGone(this.resolvedRoot.pgid)
+    } catch {
+      return false
+    }
   }
 
   spawn(command: string, args: string[], options: Options = {}): ChildProcessWithoutNullStreams {
@@ -247,7 +264,13 @@ export class OwnedProcessGroup {
           })
         })()
     // A failed observation remains visible to close(), without an unhandled rejection.
-    void this.root.catch(() => undefined)
+    void this.root.then(
+      (resolved) => {
+        this.resolvedRoot = resolved
+        return undefined
+      },
+      () => undefined,
+    )
     if (this.startupObservationMs) {
       this.startupDeadline = Date.now() + this.startupObservationMs
       void this.root.then(
@@ -561,7 +584,12 @@ export class OwnedProcessGroup {
   }
 
   private startClosingInput(): Promise<void> {
-    this.inputCloseTask ??= Promise.resolve().then(() => this.onCloseInput?.())
+    this.inputCloseTask ??= Promise.resolve()
+      .then(() => this.onCloseInput?.())
+      .then(() => {
+        this.inputClosed = true
+        return undefined
+      })
     void this.inputCloseTask.catch(() => undefined)
     return this.inputCloseTask
   }

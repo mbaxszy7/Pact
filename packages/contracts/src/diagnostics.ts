@@ -115,10 +115,15 @@ export const diagnosticRequestTypeSchema = z.enum([
   'workspace-changes.read.request',
   'workspace-changes.file-read.request',
   'workspace-changes.undo.request',
+  'provider-usage.get.request',
+  'provider-usage.refresh.request',
+  'provider-usage.cancel.request',
+  'provider-usage.release-owner.request',
 ])
 export const diagnosticNativeMethodSchema = z.enum([
   'initialize',
   'account/read',
+  'account/rateLimits/read',
   'config/read',
   'model/list',
   'thread/start',

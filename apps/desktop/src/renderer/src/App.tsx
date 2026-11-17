@@ -15,6 +15,7 @@ import type {
   RuntimePreparation,
   SessionSettingsEditorState,
   SessionCatalogChange,
+  SessionReminder as SessionReminderModel,
   WindowMaterial,
   SkillSelection,
   WorkspaceArchivePreview,
@@ -72,6 +73,7 @@ import {
   acceptSessionCatalogChange,
   sessionScope,
 } from './components/workspace/session-catalog-cache'
+import { SessionReminder } from './components/workspace/SessionReminder'
 import { useProjectCatalog } from './components/workspace/useProjectCatalog'
 import { useSessionWorkspace } from './components/workspace/useSessionWorkspace'
 import { WorkspaceView } from './components/workspace/WorkspaceView'
@@ -106,8 +108,10 @@ function App(): React.JSX.Element {
   const queryClient = useQueryClient()
   const [settingsPage, setSettingsPage] = useState<SettingsPage>(null)
   const [documentVisible, setDocumentVisible] = useState(() => !document.hidden)
+  const [windowFocused, setWindowFocused] = useState(() => document.hasFocus())
   useEffect(() => {
     const updateVisibility = (): void => setDocumentVisible(!document.hidden)
+    const updateFocus = (): void => setWindowFocused(document.hasFocus())
     const refreshRuntime = (): void => {
       if (document.hidden) return
       void queryClient.refetchQueries(
@@ -116,9 +120,13 @@ function App(): React.JSX.Element {
       )
     }
     document.addEventListener('visibilitychange', updateVisibility)
+    window.addEventListener('focus', updateFocus)
+    window.addEventListener('blur', updateFocus)
     window.addEventListener('focus', refreshRuntime)
     return () => {
       document.removeEventListener('visibilitychange', updateVisibility)
+      window.removeEventListener('focus', updateFocus)
+      window.removeEventListener('blur', updateFocus)
       window.removeEventListener('focus', refreshRuntime)
     }
   }, [queryClient])
@@ -180,6 +188,9 @@ function App(): React.JSX.Element {
   const archiveStoppingRef = useRef(false)
   const [toast, setToast] = useState<
     { id: number; message: string; tone: AppToastTone } | undefined
+  >()
+  const [sessionReminder, setSessionReminder] = useState<
+    { current: SessionReminderModel; pending: number } | undefined
   >()
   const savingRef = useRef(false)
   const toastTimerRef = useRef<number | undefined>(undefined)
@@ -338,6 +349,32 @@ function App(): React.JSX.Element {
     [],
   )
   useEffect(() => {
+    const remove = window.pact.onSessionReminderChanged?.((state) => {
+      setSessionReminder(
+        state.current ? { current: state.current, pending: state.pending } : undefined,
+      )
+    })
+    return () => remove?.()
+  }, [])
+  const viewSessionReminder = useCallback(
+    (reminder: SessionReminderModel): void => {
+      void window.pact
+        .viewSessionReminder({ id: reminder.id })
+        .then((result) => {
+          if (!result.ok)
+            showWarning(
+              'That Session reminder is no longer available. Open the Session from the list.',
+            )
+          return undefined
+        })
+        .catch(() => showWarning('Could not open this Session. Try the Session list.'))
+    },
+    [showWarning],
+  )
+  const dismissSessionReminder = useCallback((reminder: SessionReminderModel): void => {
+    void window.pact.dismissSessionReminder({ id: reminder.id }).catch(() => undefined)
+  }, [])
+  useEffect(() => {
     let active = true
     let notified = false
     const receive = (status: import('@pact/contracts').DiagnosticStatus): void => {
@@ -370,6 +407,18 @@ function App(): React.JSX.Element {
     !nativeQuitState &&
     !isRuntimePreparationOpen &&
     !showFirstUseDefaults
+  useEffect(() => {
+    const reminder = sessionReminder?.current
+    if (!reminder || reminder.summary) return
+    if (selectedSessionId !== reminder.sessionId || !conversationVisible || !windowFocused) return
+    dismissSessionReminder(reminder)
+  }, [
+    conversationVisible,
+    dismissSessionReminder,
+    selectedSessionId,
+    sessionReminder,
+    windowFocused,
+  ])
   const schedulingSettings = useSchedulingSettings(
     runtimePreparationQuery.data?.firstUse === false &&
       documentVisible &&
@@ -549,7 +598,10 @@ function App(): React.JSX.Element {
       setSettingsPage('updates')
     },
     showToast,
-    !toast && !nativeQuitState && runtimePreparationQuery.data?.firstUse === false,
+    !toast &&
+      !sessionReminder &&
+      !nativeQuitState &&
+      runtimePreparationQuery.data?.firstUse === false,
   )
   const aboutUpdatesView = (
     <AboutUpdatesView
@@ -711,6 +763,7 @@ function App(): React.JSX.Element {
       showWarning('This Session is no longer available. Open its Project to review its status.')
       return
     }
+    if (preparation && !preparation.firstUse) setIsRuntimePreparationOpen(false)
     selectSession(accepted.id, {
       projectId: accepted.projectId,
       openingId,
@@ -720,6 +773,7 @@ function App(): React.JSX.Element {
   }
   const acceptNativeSession = useEffectEvent(enterResolvedSession)
   const showNativeAttention = useEffectEvent((): void => setNativeAttentionOpen(true))
+  const showNativeWorkspace = useEffectEvent(backToWorkspace)
   useEffect(() => {
     let active = true
     let changed = false
@@ -775,6 +829,12 @@ function App(): React.JSX.Element {
       if (intent.kind === 'attention') {
         pending = undefined
         showNativeAttention()
+        acknowledgeNativeNavigation(intent.navigationId)
+        return
+      }
+      if (intent.kind === 'workspace') {
+        pending = undefined
+        showNativeWorkspace()
         acknowledgeNativeNavigation(intent.navigationId)
         return
       }
@@ -1560,6 +1620,23 @@ function App(): React.JSX.Element {
   const toastNotice = toast ? (
     <AppToast key={toast.id} message={toast.message} tone={toast.tone} onDismiss={dismissToast} />
   ) : undefined
+  const currentReminder = sessionReminder?.current
+  const sessionReminderNotice =
+    currentReminder &&
+    documentVisible &&
+    windowFocused &&
+    !toast &&
+    !nativeQuitState &&
+    !(selectedSessionId === currentReminder.sessionId && conversationVisible) ? (
+      <SessionReminder
+        key={currentReminder.id}
+        reminder={currentReminder}
+        pendingCount={sessionReminder?.pending ?? 1}
+        aboveComposer={Boolean(selectedSessionId) && conversationVisible && !nativeAttentionOpen}
+        onView={() => viewSessionReminder(currentReminder)}
+        onDismiss={() => dismissSessionReminder(currentReminder)}
+      />
+    ) : undefined
   const quitConfirmation = nativeQuitState ? (
     <NativeQuitConfirmation key={nativeQuitState.operationId} state={nativeQuitState} />
   ) : null
@@ -1584,6 +1661,7 @@ function App(): React.JSX.Element {
           }}
           onChooseExecutable={(agentId) => void chooseRuntimeExecutable(agentId)}
         />
+        {!preparation?.firstUse ? sessionReminderNotice : null}
         {toastNotice}
         {quitConfirmation}
       </>
@@ -1824,6 +1902,7 @@ function App(): React.JSX.Element {
             </>
           }
           toastNotice={toastNotice}
+          sessionReminderNotice={sessionReminderNotice}
           settingsButtonRef={settingsButtonRef}
           agentActionsEnabled={allAgentsReady}
           runtimeNotice={
@@ -1884,6 +1963,7 @@ function App(): React.JSX.Element {
       {nativeAttentionOpen ? (
         <>
           <NativeAttentionView onBack={backToWorkspace} onOpenSession={openAttentionSession} />
+          {sessionReminderNotice}
           {toastNotice}
         </>
       ) : null}

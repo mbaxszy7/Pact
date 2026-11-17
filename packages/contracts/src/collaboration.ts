@@ -562,6 +562,24 @@ export const collaborationTaskSchema = z
   })
 export type CollaborationTask = z.infer<typeof collaborationTaskSchema>
 
+/** Compact notification boundary projected from the current collaboration facts. */
+export const collaborationNotificationStateSchema = z.enum([
+  'working',
+  'auto_continue',
+  'needs_user',
+  'failure',
+  'complete',
+])
+export type CollaborationNotificationState = z.infer<typeof collaborationNotificationStateSchema>
+export const collaborationNotificationSchema = z.strictObject({
+  taskId: z.string().uuid(),
+  revision: z.number().int().nonnegative(),
+  runId: z.string().uuid(),
+  state: collaborationNotificationStateSchema,
+  agentId: agent.optional(),
+})
+export type CollaborationNotification = z.infer<typeof collaborationNotificationSchema>
+
 /**
  * The semantic basis of the workflow's material user input. Pure explanation
  * replies advance the durable input cursor without replacing this basis;

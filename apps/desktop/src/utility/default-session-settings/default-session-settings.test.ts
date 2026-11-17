@@ -235,6 +235,34 @@ describe.skipIf(process.platform === 'win32')(
       },
     )
 
+    it('counts cold PATH preparation inside the original catalog deadline and cleanup reserve', async () => {
+      const f = await protocol()
+      const readiness = await f.runtime.inspectReadiness()
+      let now = Date.now()
+      let environmentReady = false
+      const clock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+      vi.spyOn(f.runtime, 'prepareEnvironment').mockImplementation(async () => {
+        now += 2500
+        environmentReady = true
+      })
+      const identity = f.runtime.catalogIdentity.bind(f.runtime)
+      vi.spyOn(f.runtime, 'catalogIdentity').mockImplementation((directory) => {
+        expect(environmentReady).toBe(true)
+        return identity(directory)
+      })
+      vi.spyOn(f.runtime, 'inspectReadiness').mockImplementation(async () => {
+        // Together with PATH preparation this leaves less than the original 4s cleanup reserve.
+        now += 18_500
+        return readiness
+      })
+      try {
+        expect(await f.catalogs.loadEditorState()).toMatchObject({ ok: false })
+        expect(await f.read()).toEqual([])
+      } finally {
+        clock.mockRestore()
+      }
+    })
+
     it('shares one physical catalog, fences a configuration change and awaits owned process close on disposal', async () => {
       const f = await protocol({ hold: true, slowClose: true })
       const first = f.catalogs.loadEditorState(),

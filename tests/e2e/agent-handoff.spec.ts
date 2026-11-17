@@ -661,9 +661,7 @@ test(
         .info()
         .attach('candidate-check-failed', { path: warningPath, contentType: 'image/png' })
       await card.getByRole('button', { name: 'Rebuild…', exact: true }).click()
-      await expect(
-        card.getByText('A previous attempt may already have created a session.'),
-      ).toBeVisible()
+      await expect(card.getByText('A previous attempt may have created a session.')).toBeVisible()
       await expect(card.getByText('Pact couldn’t confirm the new session.')).toHaveCount(0)
       const confirmationPath = test.info().outputPath('candidate-confirmation.png')
       await window.screenshot({ path: confirmationPath })

@@ -29,6 +29,7 @@ import { DefaultSessionSettings } from './default-session-settings/default-sessi
 import { configureOwnedProcessGroups } from './owned-process-group'
 import { ProjectCatalog } from './project-catalog/project-catalog'
 import { ProjectFileReader } from './project-file/project-file-reader'
+import { ProviderUsage } from './provider-usage/provider-usage'
 import { RuntimePreparation } from './runtime-preparation/runtime-preparation'
 import { SessionWorkspace } from './session-workspace/session-workspace'
 import { UtilityDirectoryFileClient } from './workspace-changes/directory-file-client'
@@ -42,6 +43,8 @@ let database: PactDatabase | undefined
 let conversation: Conversation | undefined
 let workspaceChanges: WorkspaceChanges | undefined
 let directoryFiles: UtilityDirectoryFileClient | undefined
+let runtimePreparationOwner: RuntimePreparation | undefined
+let providerUsageOwner: ProviderUsage | undefined
 let eventLoopProbe: ReturnType<typeof monitorEventLoopDelay> | undefined
 let resourceHighWater = 0
 let workerTraffic: LogicalIpcWorkerTraffic | undefined
@@ -143,7 +146,12 @@ async function bootstrap(
     openedDatabase.conversationRepository.recordWorkspaceChanges(summary)
   }
 
-  const runtimePreparation = new RuntimePreparation(openedDatabase.runtimePreparationRepository)
+  const runtimePreparation = new RuntimePreparation(openedDatabase.runtimePreparationRepository, {
+    discoverShellPath: true,
+  })
+  runtimePreparationOwner = runtimePreparation
+  const providerUsage = new ProviderUsage(runtimePreparation, runtimeWorkspaceStorageRoot)
+  providerUsageOwner = providerUsage
   const defaultSessionSettings = new DefaultSessionSettings(
     runtimePreparation,
     openedDatabase.defaultSessionSettingsRepository,
@@ -208,6 +216,9 @@ async function bootstrap(
   )
   const unsubscribeScheduling = conversation.subscribeSchedulingChanges(() => {
     parentPort.postMessage(utilityEventSchema.parse({ type: 'scheduling.changed.event' }))
+  })
+  const unsubscribeNotifications = conversation.subscribeNotifications((event) => {
+    parentPort.postMessage(utilityEventSchema.parse({ type: 'session.notification.event', event }))
   })
   conversation.subscribe((patch, progress) => {
     parentPort.postMessage(
@@ -560,6 +571,7 @@ async function bootstrap(
         shutdown ??= (async () => {
           closing = true
           unsubscribeScheduling()
+          unsubscribeNotifications()
           await appUpdates.dispose()
           projectCatalog.dispose()
           const drainRequests =
@@ -574,6 +586,8 @@ async function bootstrap(
           // consume route stays alive on parentPort through cleanup.
           relayCredentialClient.dispose()
           const results = await Promise.allSettled([
+            runtimePreparation.dispose(),
+            providerUsage.dispose(),
             flushDeadlineAt === undefined
               ? conversationOwner.dispose()
               : conversationOwner.dispose({ flushDeadlineAt }),
@@ -714,6 +728,63 @@ async function bootstrap(
           parentPort.postMessage(
             utilityResponseSchema.parse({
               type: 'default-session-settings.save.response',
+              requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+
+      case 'provider-usage.get.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'provider-usage.snapshot.response',
+            requestId,
+            result: providerUsage.read(input.provider),
+          }),
+        )
+        return
+      }
+
+      case 'provider-usage.refresh.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = await providerUsage.refresh(input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'provider-usage.snapshot.response',
+              requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+
+      case 'provider-usage.cancel.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = await providerUsage.cancel(input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'provider-usage.cancel.response',
+              requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+
+      case 'provider-usage.release-owner.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = await providerUsage.releaseOwner(input.ownerId)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'provider-usage.release-owner.response',
               requestId,
               result,
             }),
@@ -1687,6 +1758,8 @@ process.on('uncaughtExceptionMonitor', (_error, origin) => {
 process.once('exit', () => {
   eventLoopProbe?.disable()
   void conversation?.dispose()
+  void providerUsageOwner?.dispose().catch(() => undefined)
+  void runtimePreparationOwner?.dispose().catch(() => undefined)
   database?.close()
   directoryFiles?.dispose()
 })
@@ -1714,6 +1787,8 @@ void bootstrap(databaseFile, migrationsFolder, workspaceStorageRoot).catch(
     })
     recordDiagnostic({ operation: 'utility', phase: 'failed', level: 'error', code: failure.code })
     await conversation?.dispose()
+    await providerUsageOwner?.dispose().catch(() => undefined)
+    await runtimePreparationOwner?.dispose().catch(() => undefined)
     database?.close()
     // An explicit bounded ACK prevents an immediate exit from dropping the failure message.
     await new Promise<void>((resolveAck) => {

@@ -43,10 +43,15 @@ import {
 import type { RendererTrust } from '../../renderer-trust'
 import type { UtilityProcessClient } from '../../utility-process/client'
 
+export type ConversationIpcRegistration = (() => void) & {
+  isSessionVisible: (sessionId: string) => boolean
+  subscribeVisibilityChanges: (listener: () => void) => () => void
+}
+
 export function registerConversationIpcHandlers(
   trust: RendererTrust,
   utilityClient: UtilityProcessClient,
-): () => void {
+): ConversationIpcRegistration {
   ipcMain.handle(IPC_CHANNELS.preparedInputContinue, async (event, raw: unknown) => {
     trust.assertTrustedMainFrame(event)
     return rpcResultSchema(conversationPatchSchema).parse(
@@ -181,6 +186,11 @@ export function registerConversationIpcHandlers(
     object,
     { sessionId: string | null; generation: number; visible: () => boolean; release: () => void }
   >()
+  const visibilityListeners = new Set<() => void>()
+  const notifyVisibility = (): void => {
+    if (disposed) return
+    for (const listener of visibilityListeners) listener()
+  }
   ipcMain.handle(IPC_CHANNELS.sessionFork, (event, rawInput: unknown) => {
     trust.assertTrustedMainFrame(event)
     const input = sessionForkInputSchema.safeParse(rawInput)
@@ -262,13 +272,22 @@ export function registerConversationIpcHandlers(
         ownerWindow.removeListener('show', visibilityChanged)
         ownerWindow.removeListener('minimize', visibilityChanged)
         ownerWindow.removeListener('restore', visibilityChanged)
+        ownerWindow.removeListener('focus', focusChanged)
+        ownerWindow.removeListener('blur', focusChanged)
         interests.delete(sender)
         revision += 1
-        if (!disposed) void syncInterests()
+        if (!disposed) {
+          void syncInterests()
+          notifyVisibility()
+        }
+      }
+      const focusChanged = (): void => {
+        notifyVisibility()
       }
       const visibilityChanged = (): void => {
         revision += 1
         void syncInterests()
+        notifyVisibility()
       }
       const navigate = (
         _event: unknown,
@@ -293,10 +312,13 @@ export function registerConversationIpcHandlers(
       ownerWindow.on('show', visibilityChanged)
       ownerWindow.on('minimize', visibilityChanged)
       ownerWindow.on('restore', visibilityChanged)
+      ownerWindow.on('focus', focusChanged)
+      ownerWindow.on('blur', focusChanged)
     }
     entry.sessionId = input.data.sessionId
     entry.generation = input.data.generation
     revision += 1
+    notifyVisibility()
     return syncInterests()
   })
   ipcMain.handle(IPC_CHANNELS.conversationGet, (event, rawInput: unknown) => {
@@ -499,7 +521,7 @@ export function registerConversationIpcHandlers(
     }
   })
 
-  return () => {
+  const dispose = (): void => {
     disposed = true
     for (const entry of interests.values()) entry.release()
     for (const owner of inputOwners.values()) owner.release()
@@ -536,5 +558,15 @@ export function registerConversationIpcHandlers(
     ipcMain.removeHandler(IPC_CHANNELS.commentDraftRemove)
     ipcMain.removeHandler(IPC_CHANNELS.commentSourceResolve)
     unsubscribe()
+    visibilityListeners.clear()
   }
+  const isSessionVisible = (sessionId: string): boolean =>
+    [...interests.values()].some((entry) => entry.sessionId === sessionId && entry.visible())
+  const subscribeVisibilityChanges = (listener: () => void): (() => void) => {
+    visibilityListeners.add(listener)
+    return () => {
+      visibilityListeners.delete(listener)
+    }
+  }
+  return Object.assign(dispose, { isSessionVisible, subscribeVisibilityChanges })
 }

@@ -16,6 +16,7 @@ export interface WorkspaceLayoutState {
 
 export interface WorkspaceShellProps {
   navigation: ReactNode
+  onNavigationVisibilityChange?: ((visible: boolean) => void) | undefined
   workspace: ReactNode
   workspaceHeader?: ReactNode
   workspaceNotice?: ReactNode
@@ -119,6 +120,7 @@ function PrimaryPane({ children }: { children: ReactNode }): React.JSX.Element {
 
 export function WorkspaceShell({
   navigation,
+  onNavigationVisibilityChange,
   workspace,
   workspaceHeader,
   workspaceNotice,
@@ -424,6 +426,13 @@ export function WorkspaceShell({
     return () => dialog.removeEventListener('keydown', keydown)
   }, [isContextVisible, isContextOverlayRendered, isContextExpanded, viewport])
   const contextPanel = providedContextPanel ?? null
+  const isNavigationContentVisible = isNavigationVisible && !isContextExpanded
+  const notifyNavigationVisibility = useEffectEvent((visible: boolean): void => {
+    onNavigationVisibilityChange?.(visible)
+  })
+  useEffect(() => {
+    notifyNavigationVisibility(isNavigationContentVisible)
+  }, [isNavigationContentVisible])
   const contextToggleLabel = isContextOpen ? 'Close context panel' : 'Open context panel'
   const navigationToggleLabel = isNavigationVisible
     ? 'Hide navigation panel'
@@ -486,9 +495,9 @@ export function WorkspaceShell({
           >
             <aside
               className="h-full overflow-auto"
-              aria-hidden={!isNavigationVisible || isContextExpanded}
+              aria-hidden={!isNavigationContentVisible}
               aria-label="Navigation"
-              inert={!isNavigationVisible || isContextExpanded}
+              inert={!isNavigationContentVisible}
             >
               {navigation}
             </aside>
@@ -587,9 +596,9 @@ export function WorkspaceShell({
           >
             <aside
               className="h-full overflow-auto"
-              aria-hidden={!isNavigationVisible || isContextExpanded}
+              aria-hidden={!isNavigationContentVisible}
               aria-label="Navigation"
-              inert={!isNavigationVisible || isContextExpanded}
+              inert={!isNavigationContentVisible}
             >
               {navigation}
             </aside>

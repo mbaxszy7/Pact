@@ -1197,4 +1197,44 @@
         visibility 0s;
     }
   }
+  @keyframes pact-reminder-enter {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @keyframes pact-badge-pop {
+    0% {
+      opacity: 0.35;
+      transform: scale(0.82);
+    }
+    65% {
+      opacity: 1;
+      transform: scale(1.06);
+    }
+    100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+  .pact-session-reminder {
+    animation: pact-reminder-enter 160ms var(--ease-out-pact);
+  }
+  .pact-reminder-icon-pop {
+    animation: pact-badge-pop 180ms var(--ease-out-pact);
+  }
+  .pact-reminder-badge {
+    animation: pact-badge-pop 190ms var(--ease-out-pact);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .pact-session-reminder,
+    .pact-reminder-icon-pop,
+    .pact-reminder-badge {
+      animation: none;
+    }
+  }
 }

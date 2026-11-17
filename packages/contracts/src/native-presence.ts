@@ -95,6 +95,7 @@ export const nativeNavigationIntentSchema = z.discriminatedUnion('kind', [
     sessionId: z.string().uuid(),
   }),
   z.strictObject({ navigationId: z.string().uuid(), kind: z.literal('attention') }),
+  z.strictObject({ navigationId: z.string().uuid(), kind: z.literal('workspace') }),
 ])
 export const nativeNavigationAckInputSchema = z.strictObject({ navigationId: z.string().uuid() })
 export const nativeNavigationAckResultSchema = z.strictObject({ acknowledged: z.literal(true) })

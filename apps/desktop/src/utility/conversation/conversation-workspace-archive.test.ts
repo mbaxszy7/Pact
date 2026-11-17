@@ -1044,6 +1044,7 @@ describe('Conversation workspace archive', () => {
     const scope = { kind: 'session', sessionId: f.sessionIds[0] } as const
     const sending = f.owner.flow.send(f.input(scope.sessionId))
     await vi.waitFor(() => expect(f.owner.flow.diagnostics().preparingExecutions).toBe(1))
+    await vi.waitFor(() => expect(preparationSignal).toBeDefined())
     const first = f.prepare(scope)
     expect(first.tasks[0]?.state).toBe('preparing')
     f.owner.flow.cancelWorkspaceArchive(first.operationId)

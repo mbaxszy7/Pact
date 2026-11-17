@@ -232,7 +232,7 @@ test(
       await expect(
         ctx.page
           .getByRole('region', { name: 'Session recovery' })
-          .getByText('A previous attempt may already have created a session.'),
+          .getByText('A previous attempt may have created a session.'),
       ).toBeVisible()
       expect(await methods(ctx, 'thread/start')).toBe(before)
       await ctx.page.getByRole('button', { name: 'Confirm rebuild', exact: true }).click()

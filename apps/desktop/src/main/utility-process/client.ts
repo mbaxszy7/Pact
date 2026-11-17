@@ -29,6 +29,11 @@ import type {
   DefaultSessionSettingsEditorState,
   DefaultSessionSettingsSaveInput,
   DefaultSessionSettingsState,
+  ProviderUsageCancelResult,
+  ProviderUsageReadInput,
+  ProviderUsageSnapshot,
+  ProviderUsageUtilityCancelInput,
+  ProviderUsageUtilityRefreshInput,
   ProjectArchiveInput,
   ProjectCatalogState,
   ProjectDirectoryAddInput,
@@ -65,6 +70,7 @@ import type {
   DissolveSessionGroupInput,
   SetSessionGroupInput,
   SessionGroupMutation,
+  SessionNotificationEvent,
   SessionForkInput,
   SessionForkResult,
   SessionCreationPrepareInput,
@@ -244,6 +250,14 @@ export interface UtilityProcessClient {
   saveDefaultSessionSettings(
     input: DefaultSessionSettingsSaveInput,
   ): Promise<RpcResult<DefaultSessionSettingsState>>
+  getProviderUsage(input: ProviderUsageReadInput): Promise<RpcResult<ProviderUsageSnapshot>>
+  refreshProviderUsage(
+    input: ProviderUsageUtilityRefreshInput,
+  ): Promise<RpcResult<ProviderUsageSnapshot>>
+  cancelProviderUsage(
+    input: ProviderUsageUtilityCancelInput,
+  ): Promise<RpcResult<ProviderUsageCancelResult>>
+  releaseProviderUsageOwner(ownerId: string): Promise<RpcResult<{ ready: true }>>
   getProjectCatalog(): Promise<RpcResult<ProjectCatalogState>>
   readProjectContext(input: ProjectContextInput): Promise<RpcResult<ProjectContext>>
   addProjectDirectory(input: ProjectDirectoryAddInput): Promise<RpcResult<ProjectCatalogState>>
@@ -356,6 +370,7 @@ export interface UtilityProcessClient {
     timeoutMs?: number,
   ): Promise<RpcResult<{ ready: true }>>
   subscribeConversation(listener: (patch: ConversationPatch, progress: boolean) => void): () => void
+  subscribeSessionNotifications?(listener: (event: SessionNotificationEvent) => void): () => void
   readProjectFile(input: ProjectFileReadInput): Promise<RpcResult<ProjectFile>>
   readWorkspaceChanges(input: WorkspaceChangesReadInput): Promise<RpcResult<WorkspaceChangesPage>>
   readWorkspaceChangeFile(
@@ -449,6 +464,9 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   private readonly inFlightRequests = new Map<string, InFlightRequest>()
   private readonly conversationListeners = new Set<
     (patch: ConversationPatch, progress: boolean) => void
+  >()
+  private readonly sessionNotificationListeners = new Set<
+    (event: SessionNotificationEvent) => void
   >()
   private readonly nativePresenceListeners = new Set<(version: NativePresenceVersion) => void>()
   private readonly schedulingListeners = new Set<() => void>()
@@ -1110,6 +1128,58 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         DEFAULT_SESSION_SETTINGS_TIMEOUT_MS,
       ),
     )
+  }
+
+  async getProviderUsage(input: ProviderUsageReadInput): Promise<RpcResult<ProviderUsageSnapshot>> {
+    const result = await this.request(
+      { type: 'provider-usage.get.request', input },
+      'provider-usage.snapshot.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'provider-usage.snapshot.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected usage response.' } }
+  }
+
+  async refreshProviderUsage(
+    input: ProviderUsageUtilityRefreshInput,
+  ): Promise<RpcResult<ProviderUsageSnapshot>> {
+    const result = await this.request(
+      { type: 'provider-usage.refresh.request', input },
+      'provider-usage.snapshot.response',
+      DEFAULT_SESSION_SETTINGS_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'provider-usage.snapshot.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected usage refresh response.' } }
+  }
+
+  async cancelProviderUsage(
+    input: ProviderUsageUtilityCancelInput,
+  ): Promise<RpcResult<ProviderUsageCancelResult>> {
+    const result = await this.request(
+      { type: 'provider-usage.cancel.request', input },
+      'provider-usage.cancel.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS + 1_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'provider-usage.cancel.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected usage cancel response.' } }
+  }
+
+  async releaseProviderUsageOwner(ownerId: string): Promise<RpcResult<{ ready: true }>> {
+    const result = await this.request(
+      { type: 'provider-usage.release-owner.request', input: { ownerId } },
+      'provider-usage.release-owner.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS + 1_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'provider-usage.release-owner.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected usage cleanup response.' } }
   }
 
   async prepareWorkspaceArchive(
@@ -2171,6 +2241,11 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     return () => this.conversationListeners.delete(listener)
   }
 
+  subscribeSessionNotifications(listener: (event: SessionNotificationEvent) => void): () => void {
+    this.sessionNotificationListeners.add(listener)
+    return () => this.sessionNotificationListeners.delete(listener)
+  }
+
   async readProjectFile(input: ProjectFileReadInput): Promise<RpcResult<ProjectFile>> {
     return ElectronUtilityProcessClient.toProjectFileResult(
       await this.request(
@@ -2306,6 +2381,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     // Main's measurement lives through child shutdown and diagnostic-log close. Its fixed
     // counters survive late deliveries/restarts; disposing this client must not reset them.
     this.conversationListeners.clear()
+    this.sessionNotificationListeners.clear()
     this.nativePresenceListeners.clear()
     this.nativeQuitRecentListeners.clear()
     const target = this.child
@@ -2659,6 +2735,9 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       if (event.data.type === 'conversation.patch.event') {
         for (const listener of this.conversationListeners)
           listener(event.data.patch, event.data.progress)
+      }
+      if (event.data.type === 'session.notification.event') {
+        for (const listener of this.sessionNotificationListeners) listener(event.data.event)
       }
       return
     }

@@ -19,6 +19,7 @@ import {
   collaborationMarkdownTreeWithinBudget,
   collaborationActionInputSchema,
   collaborationStageSchema,
+  collaborationNotificationSchema,
   collaborationReviewVerdictSchema,
   collaborationRetainedPlanSchema,
   collaborationInputOutcomeSchema,
@@ -131,6 +132,21 @@ import {
 export * from './skills.js'
 import { z } from 'zod'
 
+import {
+  providerUsageCancelResultSchema,
+  providerUsageReadInputSchema,
+  providerUsageReadyResultSchema,
+  providerUsageReleaseOwnerInputSchema,
+  providerUsageSnapshotSchema,
+  providerUsageUtilityCancelInputSchema,
+  providerUsageUtilityRefreshInputSchema,
+  type ProviderUsageCancelInput,
+  type ProviderUsageCancelResult,
+  type ProviderUsageReadInput,
+  type ProviderUsageRefreshInput,
+  type ProviderUsageSnapshot,
+} from './provider-usage.js'
+
 export * from './native-permissions.js'
 export * from './native-user-input.js'
 export * from './native-fork.js'
@@ -220,6 +236,9 @@ export const IPC_CHANNELS = {
   nativeSessionOpened: 'pact:native-session:opened',
   nativeAttentionRead: 'pact:native-attention:read',
   nativePresenceChanged: 'pact:native-presence:changed',
+  sessionReminderChanged: 'pact:session-reminder:changed',
+  sessionReminderView: 'pact:session-reminder:view',
+  sessionReminderDismiss: 'pact:session-reminder:dismiss',
   nativeNavigationGet: 'pact:native-navigation:get',
   nativeNavigationAck: 'pact:native-navigation:ack',
   nativeNavigationChanged: 'pact:native-navigation:changed',
@@ -246,6 +265,9 @@ export const IPC_CHANNELS = {
   runtimePreparationGet: 'pact:runtime-preparation:get',
   runtimeExecutableChoose: 'pact:runtime-preparation:choose-executable',
   defaultSessionSettingsGet: 'pact:default-session-settings:get',
+  providerUsageGet: 'pact:provider-usage:get',
+  providerUsageRefresh: 'pact:provider-usage:refresh',
+  providerUsageCancel: 'pact:provider-usage:cancel',
   schedulingSettingsGet: 'pact:scheduling:settings:get',
   schedulingSettingsSave: 'pact:scheduling:settings:save',
   schedulingStateGet: 'pact:scheduling:state:get',
@@ -2074,6 +2096,55 @@ export const conversationInterestsSchema = z
     'Conversation interests exceed their unique-item or byte limit.',
   )
 
+export const SESSION_NOTIFICATION_PRIORITIES = {
+  completed: 1,
+  failure: 2,
+  needs_input: 3,
+} as const
+export const sessionNotificationCategorySchema = z.enum(['needs_input', 'failure', 'completed'])
+export type SessionNotificationCategory = z.infer<typeof sessionNotificationCategorySchema>
+export const sessionNotificationRaiseSchema = z.strictObject({
+  kind: z.literal('raise'),
+  id: z.string().min(1).max(160),
+  sessionId: z.string().uuid(),
+  sessionTitle: z.string().min(1).max(120),
+  agentId: runtimeAgentIdSchema.optional(),
+  category: sessionNotificationCategorySchema,
+  priority: z.number().int().min(1).max(3),
+  createdAt: z.string().datetime(),
+})
+export const sessionNotificationRevokeSchema = z.strictObject({
+  kind: z.literal('revoke'),
+  id: z.string().min(1).max(160),
+  sessionId: z.string().uuid(),
+})
+export const sessionNotificationEventSchema = z.discriminatedUnion('kind', [
+  sessionNotificationRaiseSchema,
+  sessionNotificationRevokeSchema,
+])
+export type SessionNotificationEvent = z.infer<typeof sessionNotificationEventSchema>
+export const sessionReminderSchema = sessionNotificationRaiseSchema.omit({ kind: true }).extend({
+  secondaryCategory: sessionNotificationCategorySchema.optional(),
+  secondaryIsLatest: z.boolean().optional(),
+  summary: z.boolean().optional(),
+  summaryAttention: z.number().int().nonnegative().max(999).optional(),
+  summaryCompleted: z.number().int().nonnegative().max(999).optional(),
+  summaryTarget: z.enum(['attention', 'workspace']).optional(),
+})
+export type SessionReminder = z.infer<typeof sessionReminderSchema>
+export const sessionReminderStateSchema = z.strictObject({
+  revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  current: sessionReminderSchema.nullable(),
+  pending: z.number().int().nonnegative().max(32),
+})
+export type SessionReminderState = z.infer<typeof sessionReminderStateSchema>
+export const sessionReminderActionSchema = z.strictObject({
+  id: z.string().min(1).max(160),
+})
+export type SessionReminderAction = z.infer<typeof sessionReminderActionSchema>
+export const sessionReminderActionResultSchema = z.strictObject({ accepted: z.literal(true) })
+export type SessionReminderActionResult = z.infer<typeof sessionReminderActionResultSchema>
+
 const conversationPageBaseInputSchema = z.strictObject({
   sessionId: z.string().uuid(),
 })
@@ -2567,10 +2638,12 @@ export const conversationPatchSchema = z
     forkOperation: sessionForkOperationSchema.optional(),
     forkBlocked: z.boolean().optional(),
     sessionIssues: sessionIssuesSchema.optional(),
+    collaborationNotification: collaborationNotificationSchema.optional(),
     pendingNativeInteractions: z
       .array(pendingNativeInteractionSchema)
       .max(NATIVE_PERMISSION_REQUESTS)
       .optional(),
+    pendingRoutedContinuation: z.boolean().optional(),
     comments: z
       .strictObject({
         revision: z.number().int().nonnegative(),
@@ -3150,6 +3223,26 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
     requestId: z.string().uuid(),
     input: defaultSessionSettingsSaveInputSchema,
   }),
+  z.strictObject({
+    type: z.literal('provider-usage.get.request'),
+    requestId: z.string().uuid(),
+    input: providerUsageReadInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('provider-usage.refresh.request'),
+    requestId: z.string().uuid(),
+    input: providerUsageUtilityRefreshInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('provider-usage.cancel.request'),
+    requestId: z.string().uuid(),
+    input: providerUsageUtilityCancelInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('provider-usage.release-owner.request'),
+    requestId: z.string().uuid(),
+    input: providerUsageReleaseOwnerInputSchema,
+  }),
   z.object({
     type: z.literal('project-catalog.get.request'),
     requestId: z.string().uuid(),
@@ -3601,6 +3694,21 @@ export const utilityResponseSchema = z.discriminatedUnion('type', [
     requestId: z.string().uuid(),
     result: rpcResultSchema(defaultSessionSettingsStateSchema),
   }),
+  z.strictObject({
+    type: z.literal('provider-usage.snapshot.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(providerUsageSnapshotSchema),
+  }),
+  z.strictObject({
+    type: z.literal('provider-usage.cancel.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(providerUsageCancelResultSchema),
+  }),
+  z.strictObject({
+    type: z.literal('provider-usage.release-owner.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(providerUsageReadyResultSchema),
+  }),
   z.object({
     type: z.literal('project-catalog.response'),
     requestId: z.string().uuid(),
@@ -3775,6 +3883,10 @@ export const utilityEventSchema = z.discriminatedUnion('type', [
     patch: conversationPatchSchema,
     progress: z.boolean(),
   }),
+  z.strictObject({
+    type: z.literal('session.notification.event'),
+    event: sessionNotificationEventSchema,
+  }),
 ])
 export type UtilityEvent = z.infer<typeof utilityEventSchema>
 
@@ -3802,6 +3914,11 @@ export interface DesktopBridge {
   recordNativeSessionOpened(input: NativeSessionOpenInput): Promise<RpcResult<{ recorded: true }>>
   readNativeAttention(input: NativeAttentionReadInput): Promise<RpcResult<NativeAttentionPage>>
   onNativePresenceChanged(listener: (version: NativePresenceVersion) => void): () => void
+  onSessionReminderChanged(listener: (state: SessionReminderState) => void): () => void
+  viewSessionReminder(input: SessionReminderAction): Promise<RpcResult<SessionReminderActionResult>>
+  dismissSessionReminder(
+    input: SessionReminderAction,
+  ): Promise<RpcResult<SessionReminderActionResult>>
   getNativeNavigation(): Promise<RpcResult<NativeNavigationIntent | null>>
   acknowledgeNativeNavigation(
     input: NativeNavigationAckInput,
@@ -3841,6 +3958,11 @@ export interface DesktopBridge {
   saveDefaultSessionSettings(
     input: DefaultSessionSettingsSaveInput,
   ): Promise<RpcResult<DefaultSessionSettingsState>>
+  getProviderUsage(input: ProviderUsageReadInput): Promise<RpcResult<ProviderUsageSnapshot>>
+  refreshProviderUsage(input: ProviderUsageRefreshInput): Promise<RpcResult<ProviderUsageSnapshot>>
+  cancelProviderUsage(
+    input: ProviderUsageCancelInput,
+  ): Promise<RpcResult<ProviderUsageCancelResult>>
   getProjectCatalog(): Promise<RpcResult<ProjectCatalogState>>
   readProjectContext(input: ProjectContextInput): Promise<RpcResult<ProjectContext>>
   openProjectDirectory(input: ProjectContextInput): Promise<RpcResult<{ opened: true }>>
@@ -3968,3 +4090,4 @@ export interface DesktopBridge {
 export * from './handoff-guidance.js'
 export * from './scheduling-recovery.js'
 export * from './claude-plan-checkpoint.js'
+export * from './provider-usage.js'

@@ -35,6 +35,9 @@ import {
   nativeQuitDecisionInputSchema,
   nativeQuitDecisionResultSchema,
   nativeSessionOpenedResultSchema,
+  sessionReminderActionSchema,
+  sessionReminderActionResultSchema,
+  sessionReminderStateSchema,
   sessionCatalogChangeSchema,
   schedulingSettingsSchema,
   schedulingStateSchema,
@@ -49,6 +52,11 @@ import {
   schedulingActivityReadSchema,
   schedulingActivityPageSchema,
   schedulingChangedSchema,
+  providerUsageCancelInputSchema,
+  providerUsageCancelResultSchema,
+  providerUsageReadInputSchema,
+  providerUsageRefreshInputSchema,
+  providerUsageSnapshotSchema,
 } from '@pact/contracts'
 
 import {
@@ -205,6 +213,12 @@ const onNativeQuitStateChanged = eventSubscription(
   'business',
 )
 
+const onSessionReminderChanged = eventSubscription(
+  IPC_CHANNELS.sessionReminderChanged,
+  sessionReminderStateSchema,
+  'business',
+)
+
 const bridge: DesktopBridge = {
   getUpdateState: async () =>
     rpcResultSchema(updateStateSchema).parse(await invoke(IPC_CHANNELS.updatesGet)),
@@ -248,6 +262,15 @@ const bridge: DesktopBridge = {
       await invoke(IPC_CHANNELS.nativeQuitRespond, nativeQuitDecisionInputSchema.parse(input)),
     ),
   onNativeQuitStateChanged,
+  onSessionReminderChanged,
+  viewSessionReminder: async (input) =>
+    rpcResultSchema(sessionReminderActionResultSchema).parse(
+      await invoke(IPC_CHANNELS.sessionReminderView, sessionReminderActionSchema.parse(input)),
+    ),
+  dismissSessionReminder: async (input) =>
+    rpcResultSchema(sessionReminderActionResultSchema).parse(
+      await invoke(IPC_CHANNELS.sessionReminderDismiss, sessionReminderActionSchema.parse(input)),
+    ),
   prepareWorkspaceArchive: async (input) =>
     rpcResultSchema(workspaceArchivePreviewSchema).parse(
       await invoke(IPC_CHANNELS.workspaceArchivePrepare, input),
@@ -482,6 +505,18 @@ const bridge: DesktopBridge = {
   updateAppearanceSettings: (input) => invoke(IPC_CHANNELS.appearanceUpdate, input),
   resetAppearanceSettings: (input) => invoke(IPC_CHANNELS.appearanceReset, input),
   onAppearanceSettingsChanged,
+  getProviderUsage: async (input) =>
+    rpcResultSchema(providerUsageSnapshotSchema).parse(
+      await invoke(IPC_CHANNELS.providerUsageGet, providerUsageReadInputSchema.parse(input)),
+    ),
+  refreshProviderUsage: async (input) =>
+    rpcResultSchema(providerUsageSnapshotSchema).parse(
+      await invoke(IPC_CHANNELS.providerUsageRefresh, providerUsageRefreshInputSchema.parse(input)),
+    ),
+  cancelProviderUsage: async (input) =>
+    rpcResultSchema(providerUsageCancelResultSchema).parse(
+      await invoke(IPC_CHANNELS.providerUsageCancel, providerUsageCancelInputSchema.parse(input)),
+    ),
 }
 
 contextBridge.exposeInMainWorld('pact', bridge)

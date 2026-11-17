@@ -84,6 +84,7 @@ interface WorkspaceViewProps {
   runtimeNotice?: ReactNode
   archiveNotice?: ReactNode
   toastNotice?: ReactNode
+  sessionReminderNotice?: ReactNode
   agentActionsEnabled: boolean
   settingsButtonRef: React.RefObject<HTMLButtonElement | null>
   selectedSessionId?: string | undefined
@@ -230,13 +231,16 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
   const setPlanExpanded = useCallback((expanded: boolean): void => {
     setPlanPane((current) => (current ? { ...current, expanded } : current))
   }, [])
+  const navigationAvailable = Boolean(props.settingsPage || props.projects.length > 0)
+  const [navigationVisible, setNavigationVisible] = useState(navigationAvailable)
 
   return (
     <WorkspaceShell
       workspaceTitle={null}
       workspaceSubtitle={null}
-      navigationAvailable={Boolean(props.settingsPage || props.projects.length > 0)}
+      navigationAvailable={navigationAvailable}
       initialState={{ navigationPanel: 'open', contextPanel: 'closed' }}
+      onNavigationVisibilityChange={setNavigationVisible}
       navigation={
         props.settingsPage ? (
           <SettingsNavigation
@@ -248,6 +252,9 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
         ) : (
           <ProjectNavigation
             updateAvailable={props.updateAvailable ?? false}
+            navigationVisible={
+              navigationAvailable && navigationVisible && !props.nativePresentationSuspended
+            }
             projects={props.projects}
             sessions={props.sessions}
             workspace={props.sessionWorkspace}
@@ -291,6 +298,7 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
         <>
           {props.runtimeNotice}
           {props.archiveNotice}
+          {props.sessionReminderNotice}
           {props.toastNotice}
         </>
       }

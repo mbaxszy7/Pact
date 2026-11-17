@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
-import { access, opendir } from 'node:fs/promises'
+import { access, opendir, realpath } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
 
 import type {
@@ -16,12 +17,16 @@ import type { RuntimePreparationRepository } from '@pact/persistence'
 import { RUNTIME_MINIMUM_VERSIONS } from '@pact/contracts'
 
 import { recordDiagnostic } from '../../diagnostics/utility-log'
+import { OwnedProcessGroup } from '../owned-process-group'
 
 const PROBE_TIMEOUT_MS = 4_000
 const MAX_CAPTURE_BYTES = 64 * 1024
 const INSTALLATION_DISCOVERY_MS = 1_000
 const INSTALLATION_DISCOVERY_ENTRIES = 128
 const INSTALLATION_DISCOVERY_BYTES = 64 * 1024
+const SHELL_EXECUTION_MS = 2_000
+const SHELL_TOTAL_MS = 3_000
+const MAX_PATH_ENTRIES = 128
 
 interface ProbeCommandResult {
   exitCode: number | null
@@ -32,7 +37,152 @@ interface ProbeCommandResult {
 
 export class RuntimePreparation {
   private configurationGeneration = 0
-  constructor(private readonly repository: RuntimePreparationRepository) {}
+  private environmentTask: Promise<void> | undefined
+  private environmentOwner: OwnedProcessGroup | undefined
+  private readonly environmentAbort = new AbortController()
+  private disposed = false
+  private disposal: Promise<void> | undefined
+
+  constructor(
+    private readonly repository: RuntimePreparationRepository,
+    private readonly options: { discoverShellPath?: boolean } = {},
+  ) {}
+
+  /** One Utility-lifetime PATH snapshot; authentication and readiness are always checked afresh. */
+  async prepareEnvironment(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted()
+    if (this.disposed) throw new Error('Runtime preparation is shutting down.')
+    if (!this.options.discoverShellPath || process.platform !== 'darwin') return
+    this.environmentTask ??= this.resolveShellPath()
+    if (!signal) await this.environmentTask
+    else {
+      let abort: (() => void) | undefined
+      try {
+        await Promise.race([
+          this.environmentTask,
+          new Promise<never>((_, reject) => {
+            abort = () => reject(signal.reason)
+            signal.addEventListener('abort', abort, { once: true })
+            if (signal.aborted) abort()
+          }),
+        ])
+      } finally {
+        if (abort) signal.removeEventListener('abort', abort)
+      }
+    }
+    signal?.throwIfAborted()
+    if (this.disposed) throw new Error('Runtime preparation is shutting down.')
+  }
+
+  dispose(): Promise<void> {
+    this.disposed = true
+    this.environmentAbort.abort()
+    // The in-flight owner retains its original absolute cleanup deadline, including on Quit.
+    this.disposal ??= (async () => {
+      await this.environmentTask
+      if (this.environmentOwner) throw new Error('The shell process was not released.')
+    })()
+    return this.disposal
+  }
+
+  private async resolveShellPath(): Promise<void> {
+    const deadline = Date.now() + SHELL_TOTAL_MS
+    const executionDeadline = deadline - (SHELL_TOTAL_MS - SHELL_EXECUTION_MS)
+    const inheritedPath = process.env.PATH ?? ''
+    const marker = `\0PACT_PATH_${randomUUID()}\0`
+    const output: Buffer[] = []
+    let capturedBytes = 0
+    let finished = false
+    let resolveResult!: (value: string | undefined) => void
+    const result = new Promise<string | undefined>((resolve) => {
+      resolveResult = resolve
+    })
+    const settle = (value?: string): void => {
+      if (finished) return
+      finished = true
+      resolveResult(value)
+    }
+    const stop = (): void => settle()
+    const current = (): boolean => !finished && !this.disposed && Date.now() < executionDeadline
+    const timer = setTimeout(stop, SHELL_EXECUTION_MS)
+    const signal = this.environmentAbort.signal
+    signal.addEventListener('abort', stop, { once: true })
+    if (signal.aborted) stop()
+    // Startup output is untrusted and may contain secrets. Count both streams, retain only bounded
+    // stdout in memory for the framed PATH, and never send either stream to diagnostics.
+    const capture = (chunk: Buffer, stdout: boolean): void => {
+      if (!current()) return stop()
+      capturedBytes += chunk.length
+      if (capturedBytes > MAX_CAPTURE_BYTES) return stop()
+      if (stdout) output.push(chunk)
+    }
+    void (async () => {
+      const home = await realpath(homedir())
+      if (!current()) return stop()
+      const environment = { ...process.env }
+      delete environment.ZDOTDIR
+      delete environment.PWD
+      delete environment.OLDPWD
+      const owner = new OwnedProcessGroup()
+      this.environmentOwner = owner
+      const child = owner.spawn(
+        '/bin/zsh',
+        [
+          '-lic',
+          // Keep the shell alive until its process-group identity has been observed. EOF makes
+          // read return 1, so terminate explicitly with zero after clearing exit/history hooks.
+          `unset HISTFILE; unsetopt RCS; builtin printf '\\0${marker.slice(1, -1)}\\0%s\\0' "$PATH"; builtin read -r _pact_path_ack; exit 0`,
+        ],
+        { cwd: home, env: environment },
+      )
+      child.stdout.on('data', (chunk: Buffer) => capture(chunk, true))
+      child.stderr.on('data', (chunk: Buffer) => capture(chunk, false))
+      child.once('error', stop)
+      child.once('close', (code) => {
+        if (!current() || code !== 0) return stop()
+        const text = Buffer.concat(output).toString('utf8')
+        const start = text.indexOf(marker)
+        const end = text.indexOf('\0', start + marker.length)
+        if (start < 0 || end < 0 || text.indexOf(marker, start + marker.length) >= 0) return stop()
+        settle(text.slice(start + marker.length, end))
+      })
+      await owner.observe()
+      if (!current()) return stop()
+      child.stdin.end()
+    })().catch(stop)
+
+    let shellPath: string | undefined
+    try {
+      shellPath = await result
+    } finally {
+      finished = true
+      clearTimeout(timer)
+      signal.removeEventListener('abort', stop)
+      // Cleanup failure rejects the shared gate and retains this owner. No retry or partial PATH
+      // can turn an unconfirmed shell exit into a successful runtime preparation.
+      if (this.environmentOwner) {
+        await this.environmentOwner.close(
+          Math.min(deadline, Date.now() + SHELL_TOTAL_MS - SHELL_EXECUTION_MS),
+        )
+        this.environmentOwner = undefined
+      }
+    }
+    if (shellPath === undefined || this.disposed || Date.now() >= deadline) return
+    const paths = [inheritedPath ? inheritedPath.split(delimiter) : [], shellPath.split(delimiter)]
+    if (
+      paths.some(
+        (entries) =>
+          entries.length > MAX_PATH_ENTRIES || entries.some((entry) => !isAbsolute(entry)),
+      )
+    )
+      return
+    const merged = [...new Set(paths.flat())]
+    const effectivePath = merged.join(delimiter)
+    if (merged.length > MAX_PATH_ENTRIES || Buffer.byteLength(effectivePath) > MAX_CAPTURE_BYTES)
+      return
+    // Probes, model catalogs, recovery and native Agent children all inherit this same snapshot.
+    process.env.PATH = effectivePath
+  }
 
   catalogIdentity(workingDirectory?: string): string {
     return createHash('sha256')
@@ -49,10 +199,25 @@ export class RuntimePreparation {
       .digest('hex')
   }
 
+  providerConfigurationKey(agentId: RuntimeAgentId): string {
+    return createHash('sha256')
+      .update(
+        JSON.stringify([
+          agentId,
+          this.configurationGeneration,
+          this.repository.readSelectedExecutablePath(agentId),
+          process.env.PATH,
+          process.env.LOCALAPPDATA,
+        ]),
+      )
+      .digest('hex')
+  }
+
   async findRecoveryExecutable(
     agentId: RuntimeAgentId,
     signal: AbortSignal,
   ): Promise<string | undefined> {
+    await this.prepareEnvironment(signal)
     signal.throwIfAborted()
     const selected = this.repository.readSelectedExecutablePath(agentId)
     // A read-only history check needs an executable, not auth/version subprocesses.
@@ -67,6 +232,7 @@ export class RuntimePreparation {
 
   async inspectReadiness(signal?: AbortSignal): Promise<RpcResult<RuntimePreparationSnapshot>> {
     try {
+      await this.prepareEnvironment(signal)
       signal?.throwIfAborted()
       return { ok: true, value: await this.collectReadinessSnapshot(signal) }
     } catch {
@@ -80,6 +246,14 @@ export class RuntimePreparation {
   async selectExecutable(
     input: RuntimeExecutablePathUpdate,
   ): Promise<RpcResult<RuntimePreparationSnapshot>> {
+    try {
+      await this.prepareEnvironment()
+    } catch {
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'Runtime preparation could not be completed.' },
+      }
+    }
     // Persist only a validated absolute executable path, then immediately re-run the same
     // readiness path used at startup so manual selection cannot bypass authentication checks.
     if (!(await this.isExecutable(input.executablePath))) {
@@ -342,6 +516,7 @@ export class RuntimePreparation {
       return matches.find(Boolean)
     }
     if (process.platform === 'darwin') {
+      if (this.options.discoverShellPath) return undefined
       const command = agentId === 'claude' ? 'command -v claude' : 'command -v codex'
       const result = await this.runProbeCommand('/bin/zsh', ['-lc', command], signal)
       const candidate = result.output.split(/\r?\n/u).find(Boolean)?.trim()

@@ -81,17 +81,15 @@ It does not implement a global hard Project Writer Lease, arbitrary full-workspa
 
 ### Readiness
 
-Assess Claude Code and Codex independently through executable discovery or a saved manual path, version, the CLI's own authentication status and bounded startup/probe operations. Never read, retain or display credential values. Missing, unauthenticated, unavailable, timed out and unconfirmed are distinct outcomes with installation/login guidance, manual location and retry.
+Check each CLI independently: discovered/manual executable, version, its own auth status and bounded startup probes. Never read, retain or display credentials. Distinguish missing, unauthenticated, unavailable, timeout and unconfirmed states; offer install/login guidance, manual location and retry.
 
-Minimum supported CLI versions are Claude Code **2.1.272** and Codex **0.159.2**. Compare numeric version components, ignoring build metadata; a prerelease of the minimum release is not sufficient. An older version has an explicit Upgrade required warning, showing the detected version and required minimum with upgrade/recheck guidance. Unreadable versions remain unconfirmed, never Ready. Version compatibility is checked before authentication or native execution; Pact does not install or upgrade CLIs automatically.
+Minimums: Claude Code **2.1.272**, Codex **0.159.2**. Compare numeric components, ignore build metadata, reject minimum-version prereleases. Older versions show Upgrade required, detected/minimum versions and upgrade/recheck guidance. Unreadable versions stay unconfirmed. Check compatibility before auth/execution; never install/upgrade CLIs automatically.
 
-An existing manual executable choice takes precedence. Without one, Windows Claude discovery first
-uses the newest completed versioned native runtime installed by Claude Desktop, then inherited PATH
-and platform lookup. Readiness, model catalogs and native recovery use that same selection policy;
-automatic discovery never persists a manual override. Incomplete installations are not executable
-candidates, and bounded discovery failure is not permission to choose an older truncated result.
+Manual paths win. Otherwise Windows Claude tries the newest completed Desktop runtime, then inherited PATH/platform lookup. Readiness, catalogs and recovery share this policy. Automatic discovery never saves a manual override; incomplete installs are excluded. Bounded discovery failure cannot select an older truncated result.
 
-**CLI Ready** means the selected CLI is discoverable, accepts an effective authentication method and can start its control/probe operation. It guarantees neither network, quota, model availability nor future Run success. Claude's accepted local API authentication is valid without a subscription login. GUI processes inherit only the environment available at launch; a later terminal export does not change an already running Pact.
+**CLI Ready** proves discovery, effective auth and control/probe startup, not network, quota, model availability or future Run success. Claude local API auth needs no subscription login. Later terminal exports do not change a running Pact.
+
+macOS supplements inherited PATH once per runtime from the user's interactive login zsh, running in the effective user home, never a Project. Only PATH is imported; other exports/credentials stay private. Discovery, probes, catalogs, recovery and Agent children share it, including Node for npm CLIs. Inherited/manual choices keep priority. Restart after shell configuration changes. Resolution failure retains inherited PATH only after confirmed cleanup; uncertain cleanup blocks runtime preparation.
 
 First-time users remain on Runtime Preparation until both CLIs are Ready, then must complete Default Session Settings. There is no hidden skip or fake-model validation. Saving defaults and completing setup is atomic.
 
@@ -206,7 +204,8 @@ groups for its running repository-specific instance, with the Pact development n
 Development taskbar entries only reveal or navigate that instance; after a full exit,
 start it with `pnpm dev`. They never launch bare Electron or an older Renderer build. Normal
 development exit clears custom categories unless pending Windows removal records must be preserved.
-macOS publishes the groups in its Dock menu while Pact is running.
+macOS publishes the groups in its Dock menu while Pact is running; macOS development bundles
+register the active checkout instance and exit ownerless cold launches rather than opening bare Electron.
 
 Exit, the application Quit command and macOS Cmd+Q use the safe shutdown owner. Known idle
 work exits directly. Active or unsettled work opens a Pact confirmation listing affected Sessions;
@@ -452,261 +451,33 @@ A selected recommendation replaces the Composer through shared input replacement
 
 Limit recommendations read the complete frozen task/input sources, current Plan, latest review and author report within the decision budget. Earlier Plan bodies are not added automatically; their identities stay available without claiming their contents were evaluated. Missing, oversized or unsupported required sources preserve the pause rather than truncating evidence.
 
-Workflow continuations share a durable handoff receipt keyed by the original task, producing Run and
-transition slot. Manual and automatic triggers with different message receipts compete for that one
-Run and its collaboration count. Configuration, model, pause and ordinary task revisions
-change freshness checks without creating a dispatch identity. A later business Run creates
-the next handoff; continuing unfinished authorized work retains its original writing authorization.
+Workflow continuations claim a durable handoff receipt keyed by task, producing Run and transition slot; manual Continue and automatic triggers compete with different receipts for that Run and count. Configuration, model, pause and ordinary edits alter freshness checks without creating a dispatch identity; later business Runs create new handoffs, while unfinished authorized work retains its write grant.
 
-Persistence records same-fact evaluation deduplication, invocation counts and independent budgets
-for extra Turns and recovery. Evaluation calls have no cumulative task, stage, input or fault cap;
-counts and reservations never grant authorization. Relay defaults off and uses a locally
-encrypted OpenAI Decisions API key. Enabling it, reading its state or changing its key
-does not start inference. An explicit Settings reveal may return the saved key to the trusted
-field; its transient value clears on hide, departure or blur and never enters ordinary
-settings projections. Automatic checks, positive-unsent replacements and qualified extra-turn
-proposals use the Conversation owner and durable Repository facts. Check
-session/status and Rebuild retain their controls when Relay is off or unavailable. Native,
-platform, visual and real-provider acceptance is separate from local fixture tests.
+Persistence stores same-fact dedupe, invocation counts and independent extra-turn/recovery budgets, with no cumulative cap on evaluations and no authority from counts/reservations alone. Relay defaults off using a locally encrypted OpenAI Decisions API key. Enabling it, reading state or changing keys starts no inference; an explicit Settings reveal stays transient in the trusted field and clears on hide, departure or blur. Automatic checks, positive-unsent replacements and extra-turn offers use Conversation and Repository facts; Check session/status and Rebuild remain available with Relay off or unavailable. Native, platform, visual and real-provider proof stays separate from fixture tests.
 
-Relay considers only host-admitted candidates at qualified handoffs. Decisions selects a candidate
-or abstains; it does not generate review focus, questions or new actions. Pact supplies the original
-sources and fixed descriptions. The owner, reviewer, original goal, permissions and required
-review steps remain fixed. Manual Continue does not wait for advice and competes for the durable handoff claim. Further code-review actions still require concrete user authorization.
+Relay picks one host-admitted candidate or abstains via immutable task/Batch sources and fixed descriptions; it never invents review focus, questions or actions. Author, reviewer, goal, permissions and required reviews stay fixed; manual Continue never waits on advice, and code-review actions still require explicit approval. Conversation loads complete sources once under the Repository lease and revalidates legal alternatives before consulting; proposal and confirmation recheck source identity, scope, authority and budgets. Mandatory single-choice steps and single-recipient routes skip bodies and inference.
 
-Repository provides one current workflow snapshot and legal alternatives. Conversation uses
-that qualification directly, loads complete sources within the original lease and
-revalidates alternatives before consulting. Proposal and confirmation transactions independently
-recheck source identity, scope, authority and budgets. A mandatory next step with no alternative
-does not load decision bodies or call the API. Ordinary routing also skips inference when only
-one recipient remains and no admitted information alternative.
+Relay decisions keep distinct request/revision and answer/receipt IDs. Host admission allows only concrete role/arrangement changes, missing authorization, or unavailable scheduling facts — checking operations, source basis, versions and duplicates; model uncertainty or technical disagreement alone cannot open cards, and task/technical questions stay with the Agent via native forms or workflow replies (the Composer adds no manual state/question control). Confirmed answers bind the request and continuation rules; frozen info/answer sources stay readable. Cancel closes unsent info requests, returns drafts with editable Comment copies (no Continue) keeping newer edits for a new message Send; Stop, restart and prep failure keep Continue with frozen sources. Unconfirmed Cancel keeps one receipt-check entry per Session across switches, blocking that Session's Send (other Sessions work) without re-mutating Cancel or resuming the old request. Closing Relay uses the original legal default once if unpaused and current. Admitted Relay cards share input replacement and preserve drafts; optional authorizations (except Pact repair) and role changes offer Skip/confirm (restoring default workflow/pauses/counters), while accepted Send retires only unanswered offers.
 
-Relay decisions use their own request/revision and answer/receipt identities. The only admission
-categories are a concrete arrangement change, missing new authorization, or necessary
-scheduling information unavailable through authorized investigation. The host checks the
-operation, source basis, missing authority, versions and duplicates; a model's
-uncertainty or technical disagreement alone cannot open a card. Task requirements and technical
-questions remain with the original Agent. The strict contract represents all three categories;
-native recovery has a deterministic arrangement-change consumer. Users send their task directly;
-the Composer has no manual question or supplied-state choice. Necessary task questions
-use the native forms or workflow decision replies. Confirmed answers stay bound to the
-original request and follow the owner's continuation rules. Frozen information and answer sources remain
-readable for requests and recovery. Cancel terminates an unsent information request, returns
-to the Composer with editable Comment copies, offers no Continue for it and
-retains newer draft edits. The next Send sends the draft under a
-new message identity. Stop, restart and preparation failure retain explicit Continue
-with current settings and frozen sources. An unconfirmed Cancel retains one
-receipt-check entry in its Session, including after switching Sessions. Until its matching receipt
-confirms cancellation, ordinary Send waits; other Sessions remain usable. Checks never repeat the
-Cancel mutation or resume the old request. Closing Relay uses the
-original legal default once only when the user has not paused and its original admission is current.
-Do not invent business questions or ask for facts available through authorized investigation.
+After a Plan author's first complete changes-requested reply or a first complete changes-requested code review, Relay may propose one read-only author supplement and mandatory return to the fixed reviewer (review counts are context, not gates; first Plan reviews revise without consulting; no preauthorization needed). Confirmation grants that single Turn with frozen responsibilities/sources, bounded by task extra-turn and return-review limits; concrete manual actions or Run claims preempt late proposals. At that code-review checkpoint, Relay may also propose one scoped Repair (no pre-confirmation write grant); its receipt freezes scope, sources, owner, permissions and reviewer, charging both extra-code and Repair counts with room for the required review, using Repair-to-review rules while continuing existing write grants costs no auxiliary allowance.
 
-Admitted Relay decisions share the input replacement: the card replaces the Composer, preserving its draft. Optional authorizations (except Pact repair) and role reassignments carry direct Skip/confirm actions; Skip restores the default workflow, preserving automation, pause and counters. Accepted Send atomically retires only an unanswered suggestion.
+Automatic recovery checks only new faults in the current Utility/configuration epoch (original Run/binding, delivery receipts or Rebuild candidate; only substantive native changes unlock another check — never timeout prose, ABA config, model recovery or restart). Budgets: ≤4 checks/task, ≤2/ordinary input, ≤2/fault; 10s shared prep+read deadline; logical expiry retains App lease/Adapter/physical obligations. Unprobed compatible faults allow one zero-Turn probe without opening Session settings (unproven faults stay consumed; no deferred retry queue). Manual receipt and root/candidate reads use separate 10s stage budgets, joining receipt cleanup before root reads. Replacement requires positive typed proof the root never arrived (generic errors, missing output, timeout, EOF or completed reads are not proof), preserving pathless prompt, Batch, Comments/anchors, images, Skills, grants and requested/effective settings (optional 8 MiB/4,096-entry capture closes eligibility on overflow without truncating Send; unknown effective model/effort/speed/permissions/config closes eligibility; Utility resolves image/Skill paths).
 
-After the first complete Plan-author response to a changes-requested review, or the first complete
-changes-requested code review, Relay may propose one read-only author supplement and its mandatory
-return to the fixed reviewer. Review counts are context, not an admission threshold. The first
-Plan review still follows its normal author revision without consulting merely to approve that
-required step. The user does not first request or
-preauthorize an evaluation. Confirmation grants that exact extra Turn; no second inference decides
-whether to use it. Its approved responsibility and cited complete originals are frozen for the
-receiving Agent. The task-level extra-turn allowance and return-review limit still apply.
-An existing concrete manual action or Run claim takes priority over a late proposal.
+Each fault allows ≤1 replacement (within 2/task, 1/ordinary input) reusing original Message, Batch and duty without freezing newer drafts, advancing cursor or granting new authority; duplicate receipts return the same Run, reacquire refunded counters/reservations once, and recheck executor, Session, generation and effective settings (Stop, pause, newer input or scope conflict blocks dispatch; `@all` legs stay independent; Claude stops on new executor; uncertain replacements check against that child Run under the original fault budget, never blindly resending). On Codex 0.163.0, fresh Threads lacking a materialized rollout cannot resume post-preflight failure; rejection ends replacement without another write, inference or executor while consuming the fault (positive path uses an existing Session with a completed prior Turn). Joined checks may expose Rebuild as a Relay arrangement decision (never fabricated from host facts); confirmation/Rebuild commit atomically per answer nonce (restarting/reading receipts never recreates native work), showing generation, Run/candidate, init source, binding-switch evidence and whether old work/earlier sessions may exist without replaying tasks or resuming collaboration (Cancel preserves recovery/dedupe and unhides its row).
 
-At that current code-review checkpoint, Relay may request one scoped Repair. No
-writing grant exists before confirmation. Its normal Repair receipt freezes current review scope,
-complete sources, owner, execution permissions and fixed reviewer. It charges both the extra-code
-allowance and the original Repair count, with room for the required review. Use ordinary
-Repair-to-review behavior, not read-only supplement authority. Continuing an already-authorized
-write never consumes another auxiliary allowance.
+Read-only SQLite Activity projects recent (30-day window) and unresolved inference, user decisions and native check/recovery/Rebuild operations — never normal default handoffs, filters, exports, details, copies, retries, full prompts or credentials. Rows lead with scheduled action and outcome (distinct from API completion), then time and Project/Session, grouping check/replacement rows under their original fault, omitting repeated suggestion prose, showing provider/model only for real inference (never inventing calls for checks/deterministic recovery), and retaining unresolved work/cleanup. Pages hold 25 rows (100 rows/400 KiB Renderer residency, preserving selection/anchor); hiding Settings clears subscriptions/state while joining pending physical reads.
 
-Automatic recovery checks only newly qualified faults in the current Utility/configuration epoch:
-the original Run/binding, exact input-delivery receipts, or the same Rebuild candidate.
-Substantive changed native facts can permit another check; changed timeout prose, configuration
-ABA, model recovery and restart cannot recreate eligibility. Keep original budgets: at most four
-checks per task or two per ordinary input, and two per fault. Authentication, quota, permission and
-incompatible-runtime failures retain existing controls. One automatic ten-second deadline includes
-preparation and serial reads. Logical expiry retains the App lease, Adapter and physical obligations.
-When a newly qualified fault has no fresh compatibility observation, the probe owner may
-perform one zero-Turn check before recovery admission. Opening Session settings is not a prerequisite.
-The fault remains consumed if compatibility cannot be proved; there is no deferred retry queue.
-Manual receipt and root/candidate reads have independent ten-second stage budgets; receipt cleanup
-joins before root inspection begins.
+Native permission/question/OAuth cards take first priority, valid workflow/recovery next, then fresh Relay cards; Relay answers never become ordinary Send, Agent answers or native consent, leaving drafts, images, Comments, Skills and queues intact. Cancel abandons only that advancement and keeps pauses without stopping/replaying native work; disable/config changes discard unused auxiliary intent and recompute defaults; restart drops auxiliary cards/unused grants while retaining committed work, pauses, recovery, budgets and history.
 
-A replacement needs a positive typed boundary proving that the exact original root was not
-delivered. Generic rejection, absent output/history, timeout, EOF or completed inspection is not
-proof. Preserve the complete pathless original prompt, immutable input Batch, Comments/anchors,
-images, Skills, source grants and historical requested/native-effective settings. Optional segmented
-capture is bounded at eight MiB and 4,096 entries; overflow closes replacement eligibility without
-truncating or limiting the original Send. Unknown effective model, effort, speed, permissions or
-configuration closes eligibility. Utility resolves native image/Skill paths through owners.
+An ordinary implicitly routed Send with Comments naming the other Agent or both Agents (not explicit Agent/Primary choices, commands, Skills, images, `@all`, returned/queued input or workflow replies) may consult once under a 16 MiB auxiliary reservation and 15s deadline (covering freeze, complete source loads, native preflight and output validation, followed by 10s prep; 27s outer RPC, or 37s with 10s sealed-body reader, without extending execution/readiness/Steer limits; physical reservation stays until HTTP/credential/cleanup join; no placeholder Message/Run). One Run binds the recipient and original Comments only, leaving Primary/drafts intact; failure/timeout uses the frozen default, queued input invalidates stale advice, Stop/failure leaves terminal unsent receipts (nonces cannot retry cancelled prep; cold restart never auto-sends).
 
-The independent replacement reuses the original user Message, input Batch and duty without
-freezing later drafts, advancing the input cursor or creating fresh authority. Each original fault
-permits at most one replacement, within two per task or one per ordinary input. Duplicate operation
-receipts return the same Run after lost acknowledgments. Reacquire actually refunded business
-counters and extra-turn reservations once, preserving linked history. Recheck native executor,
-session, generation and effective settings at actual delivery. Stop, user pause, newer input and
-conflicting scope prevent dispatch. Each failed `@all` leg is independent; never replay a completed
-leg. Claude replacement stays closed when a new Query has a different executor. Check an uncertain
-replacement against that child Run using the original fault budget, never a fresh fault or blind Send.
-On Codex 0.163.0, a fresh Thread with no materialized rollout cannot resume after a pre-write failure.
-That native rejection ends the replacement without another root write, model request or executor;
-the original fault allowance remains consumed. The proven positive path uses an existing native
-Session with a completed prior Turn.
+Consultations require complete frozen inputs, Comments, anchors and exact target sources (plus task, Plan, reviews, responses and scope — never worktree reads or summaries), skipping when >12 sources, serialized input >128 KiB (HTTP body ≤257 KiB + ≤1 KiB envelope inside 4 MiB workspace), required images or missing sources without truncating business inputs. Output picks a supplied legal candidate or null (no generated highlights); application rechecks receipt, source fingerprint, input hash, config generation, scope and deadline (advice never grants permission or replaces sources; recipient choice saves scalar receipt; historical `handoff-guidance-v2` and `plan-revision-guidance-v1` stay readable without execution authority).
 
-After an automatic check physically joins, a current Rebuild action may appear as a Relay arrangement
-decision. Host facts do not fabricate a model evaluation. Confirmation and the Rebuild
-operation commit atomically under one answer nonce. Only a newly created transaction starts native
-work; receipt reads and restart never recreate it. Preserve exact generation, original Run/candidate,
-complete initialization source and binding-switch evidence. Show when old work may continue or an
-earlier attempt may already have created a session. Rebuild does not repeat the prior task or resume
-collaboration; unsent input keeps its explicit restore/send flow. Cancel preserves recovery and
-same-matter deduplication. Hide only the recovery row represented by the visible Relay card.
+Relay Settings separates enablement, Decisions API config and indicator state from Session model/permission settings; reads are side-effect free (Off hides key/Activity; On reveals Decisions API controls, usage terms, indicator toggle and opaque background). Closing keeps encrypted key/toggle, clears unsent input and keeps pending receipt checks; Activity reads run only while visible. Connection checks persist 60s from real attempts only, never skipping admission or suppressing other Sessions; saving keys updates local status only; config/key edits invalidate active advice; indicators follow live evaluation/cleanup ownership. Relay uses one HTTPS request to OpenAI's Decisions API (fixed model, billed to user key), never Codex/Claude or native fallback; untrusted invalid output, abstention, missing keys, timeouts and stale states keep the lawful default without cards. Main owns OS encryption/decryption with no plaintext fallback; Utility owns encrypted storage/HTTP, isolating keys from projections/activity/diagnostics/agent envs and tracking saves/replaces/removes via credential revisions and durable nonce receipts (uncertain writes require receipt readback, never retry; cancel fences late key use while holding crypto cleanup). Evaluation rows store <4 KiB metadata (never full inputs/unadopted prose); history/Fork retain adopted guidance (Fork remaps standard references while preserving evaluated hashes without dispatch authority). Global enable/key changes (even back to prior values) invalidate old invocations, unlike indicator toggles; restart keeps committed guidance, drops proposals, never replays advice and holds unknown HTTP/native owners until physical absence/release proofs confirm.
 
-Read-only Activity projects actual inference, user decisions and native operations from SQLite.
-Distinguish suggestion, acceptance, dispatch, business completion, readback and rebuilt context.
-Show historical provider/model only when inference ran; native checks and deterministic recovery
-do not invent model calls. One stable original-fault row groups checks and replacement. Unresolved
-facts survive the thirty-day recent window. Pages hold at most 25 rows; Renderer residency is at most
-100 rows/400 KiB, preserving selection and reading anchors. Add no log actions, exports, full prompt
-bodies or credentials.
+Priority User Send blocks subsequent handoffs and queues a read-only next-turn reply (never native Steer) after current execution and effects settle, leaving automation unchanged; once settled, active tasks resume authorized planning/review only (never implementation/repair), preserving pauses, limits and Stop/failure/restart barriers (current root finishes normally unless Stopped; Plan feedback defaults to planner pre-code or implementer post-code, Build feedback to implementer, direct Review feedback to code reviewer, explicit `@Agent` stays explicit). At settled checkpoints, an eligible ordinary Send freezes one reply basis (stage, actor, status, automation, pause, next step, notice, binding and semantic workflow basis); Agents emit `explanation_only` only for pure questions (mixed change requests are feedback; ambiguity uses `needs_user`; planning replies retain Plans via `retain_current_plan` first), staying read-only and restoring the checkpoint/pauses on a one-level settled receipt while advancing `inputSequence` once (consecutive pure questions keep that one level; feedback or stage completion clears it; grants no write/role/resume/Relay authority; failed/interrupted/superseded replies restore nothing; legacy Ask receipts stay readable/recoverable without creating new ones; Implement always requires approval).
 
-Native permission/question/OAuth interactions retain first priority, followed by still-valid
-collaboration decisions and recovery, then a freshly host-validated Relay request. Relay answers
-never become ordinary Send, Agent answers or native consent. Keep message drafts, images, Comments,
-Skills and queued input intact. Cancel abandons only that advancement and preserves the workflow's
-user pause; it does not stop or replay native work. Disable/configuration changes discard unused
-auxiliary intent and recompute the legal default. Restart discards old auxiliary cards and unused
-grants while retaining committed work, pause, native recovery, budgets and history.
-
-An ordinary Send may consult about its single recipient only when the Composer explicitly records
-implicit routing and its frozen Comments reference both Agents or only an Agent other than Primary.
-Explicit Primary or Agent choices, commands, Skills, images, `@all`, returned input, queued input and
-workflow replies retain their routes. The Send owner freezes the complete body,
-Comment membership and anchors before asking for advice, under the same 16 MiB auxiliary reservation
-and absolute 15-second deadline. No placeholder Message or Run is created. One real Run transaction
-binds the recipient and consumes only the original Comment set; Primary settings and later drafts
-remain unchanged. Advice failure or expiry uses the frozen default recipient. New queued input
-invalidates old advice while retaining its original queue path. Stop and preparation failure leave a
-terminal unsent receipt, unlock its Comments and refresh their projection. The same nonce cannot
-restart a cancelled preparation. Cold startup never sends it automatically; ordinary Composer body
-and image restart behavior remains unchanged.
-
-The 15-second auxiliary deadline includes input freezing, complete source loading, native preflight
-and output validation, without renewal. It is followed by the original 10-second business preparation
-window. Send's outer RPC allows 27 seconds, or 37 seconds when it first resolves an existing sealed
-body through the bounded 10-second body reader. These outer deadlines do not extend native execution
-or other readiness and Steer limits. A logically finished consultation retains its physical
-reservation until its HTTP transport, credential reader and cleanup operations have actually joined; default
-business work uses its existing independent capacity.
-
-Consultation requires all relevant complete frozen inputs, Comments, anchors and exact source
-contents, including the complete target of every message anchor. Workflow material also includes the
-original task and applicable Plan, reviews, owner responses and review scope. It never substitutes a
-fresh worktree read or a generated summary for missing facts. More than 12 sources, complete input
-over 128 KiB, required images or unavailable material skip the entire consultation. The 128 KiB
-limit measures the complete serialized decision input, including host metadata and candidate
-descriptions. The HTTP body is separately bounded to 257 KiB: complete input plus copied candidate
-data and at most 1 KiB of fixed envelope overhead, within the existing 4 MiB runtime workspace.
-A processing budget never truncates the original business input or its sources.
-
-A decision result selects a supplied legal candidate or null. It contains no generated highlights.
-The applying transaction rechecks its evaluation receipt, complete source fingerprint, input hash,
-configuration generation, scope and deadline. Advice never becomes permission or a substitute for
-the original sources. Ordinary recipient selection retains its scalar adoption receipt. Historical
-`handoff-guidance-v2` and `plan-revision-guidance-v1` evidence remains readable and cannot authorize
-a new execution.
-
-Settings shows global enable intent, Decisions API configuration and the indicator preference
-independently of Session model and permission choices. State reads are side-effect free and perform
-no native catalog or compatibility probe. Connection observations come from actual attempts, expire
-after 60 seconds and never replace admission checks or suppress subsequent eligible consultations
-in any Session or Project. Saving a key establishes only local storage
-status. Configuration and credential changes invalidate in-flight advice. Indicators reflect actual
-evaluation or cleanup ownership, not merely an enabled preference.
-
-Relay uses one bounded HTTPS request to OpenAI's Decisions API with a fixed model. It does not start
-Codex or Claude Code as decision agents, use their native login, or fall back to a native decision
-engine. Model output is untrusted and can select only a currently admitted candidate. Abstention,
-invalid output, unavailable credentials, timeout and stale state preserve the existing lawful
-default. They do not independently create a confirmation card. Codex and Claude Code retain their
-business execution, permissions and native authentication owners.
-
-OpenAI API usage is billed to the supplied key's account. Main performs OS encryption and decryption;
-Utility owns encrypted persistence and the HTTP request. Plaintext keys do not enter ordinary
-settings projections, activity, diagnostics, business-agent environments or persistent storage.
-There is no plaintext storage fallback when OS encryption is unavailable. Save, replace and remove
-use credential revisions and durable nonce receipts; an uncertain result requires explicit receipt
-readback rather than automatic mutation retry. Cancellation prevents late use of a key while
-physical crypto ownership remains held until the OS operation settles. Platform, packaged and
-real-provider acceptance remain separate requirements.
-
-Evaluation rows record only invocation/outcome/usage and bounded physical identity metadata below
-4 KiB, never complete inputs or unadopted suggestion bodies. Historical adopted guidance remains
-available with its receiving Run in history and Fork. Fork remaps standard references
-while retaining historical evaluated hashes; historical guidance creates no new dispatch authority.
-Restart preserves committed guidance, discards uncommitted proposals and never replays advice.
-Logical timeout/cancellation does not release physical
-reservations or refund possible delivery. Restart performs no replay: unknown owners remain held
-until the recorded HTTP Utility owner is proven absent; historical native owners require their
-original physical-release proofs. Global enable and credential changes permanently invalidate the
-old invocation, including changes back to an earlier value; indicator-only changes remain independent.
-
-The Relay heading and core-function subtitle remain visible. Off reduces configuration to the
-Enable Relay row; On reveals Decisions API key controls, usage terms, indicator preference and
-read-only Activity. Closing retains the encrypted key and indicator choice, clears unsent password
-text, and preserves any pending credential receipt check. Activity reads run only while the expanded
-surface is visible. Relay's workspace background remains opaque in
-translucent windows so background text cannot interfere with its controls and reading area.
-
-Scheduling activity is a read-only SQLite projection of actual auxiliary evaluation records, showing
-recent and unresolved facts. Each row leads with the scheduled action and its outcome, followed by
-time and Project/Session. API completion alone cannot imply business completion: waiting for
-confirmation, adopted advice, requested execution and actual completion remain distinct. Recipient
-names appear only when established by the recorded action; model details and repeated suggestion
-prose are omitted. Unconfirmed original work or cleanup remains visible when relevant. Normal
-default handoffs without an auxiliary record are excluded. Scrolling
-loads older/newer pages with bounded residency and preserves the reading anchor. Hiding Settings
-releases its subscription and display state; pending physical reads settle before a latest intent.
-The activity region has no filters, details, navigation, copy, export, retry or clearing controls.
-
-Ordinary Send immediately blocks later handoffs on pending input, cancels any undispatched handoff, and queues a priority reply after the native root, output and effects settle. Waiting for or processing input does not change the task’s automatic-collaboration setting. Once the latest input is positively settled, an active task continues its authorized planning and independent review; it never grants new implementation or repair authority. Stop, failure, restart, exhausted limits and historical pauses survive input and replies until explicit continuation. The current root normally finishes; Stop requests its interruption. Plan feedback before implementation defaults to the planner; feedback after code work and Build feedback default to the implementer, and direct Review feedback to its code reviewer; an explicit Agent route remains explicit. Workflow feedback is next-turn input and cannot use native Steer.
-
-At a settled task checkpoint, an eligible ordinary Send freezes one host reply basis — stage,
-actor, status, automation, pause, next step, notice, native binding and the semantic workflow
-basis. The replying Agent chooses `explanation_only` only for a complete pure question or
-discussion with no task effect; a message mixing a question and a requested change is feedback,
-and consequential ambiguity uses needs_user. A proven explanation stays read-only and restores
-that checkpoint — Plan, acceptance, immutable review, roles, pending work and counters unchanged —
-and a later pause remains. The durable input sequence still advances once and never moves back;
-the settled receipt instead carries one bounded basis at the last material input — consecutive
-pure questions keep that one level, and feedback or a completed business stage clears it. It
-grants no implementation, repair, role or resume authority and no Relay decision. A planning
-reply retains its existing Plan through `retain_current_plan` first; none is created to answer.
-A failed, interrupted or superseded reply never restores the checkpoint. Legacy Ask receipts stay
-readable and recoverable; new input never creates one. Implement always requires explicit
-authorization.
-
-After a settled code review requests changes, **Choose repairer** offers the other Agent while
-the ordinary Repair action still uses the current author. Choosing the other Agent opens the Pact
-confirmation without sending a message, starting a Run or advancing the input sequence.
-The user may also explicitly direct the reviewer to repair the scope. Their
-read-only reply may submit `repair_role_request`.
-A complete authenticated result settles only this control input and leaves the review
-unchanged. Pact offers a confirmation with the proposed repairer and independent reviewer when
-current native bindings and normal repair and return-review allowances are available. A
-reviewer who has never run in this Session may initialize for the return review. With
-insufficient allowance, show the exhausted limit and keep existing review actions available
-where allowed. Confirmation swaps future code roles for the task and authorizes one
-ordinary scoped Repair. The Session Primary, plan roles, prior Runs, review and extra Relay
-allowances stay as recorded. Cancel leaves the roles and original Respond and Repair actions in
-place. Another contiguous control reply can request the same change again. A business input,
-scope change or gap in control settlement requires fresh review. Pause, Stop and restart retire
-an unanswered card. A confirmed role change survives failed preparation or restart, with a notice
-if the repair never started. A bound Run follows ordinary delivery recovery and receipt readback.
-The confirmation is available independently of Relay.
+After changes-requested code review, **Choose repairer** opens confirmation for the other Agent without messages, Runs or sequence changes, or the user can request reviewer repair (`repair_role_request`), settling only that control input when bindings and repair+review allowances permit (first-time reviewers may initialize for return review; exhausted limits keep valid review actions). Confirmation swaps future code roles and authorizes one scoped Repair while leaving Session Primary, plan roles, history, extra Relay allowances and Relay independence intact (Cancel keeps respond/repair actions; business input, scope changes or settlement gaps require fresh review; pause/Stop/restart retire unanswered cards; confirmed swaps survive prep failure/restart with notices if unstarted).
 
 When a completed review or planning reply needs a user decision, its card replaces the message input. Send answers uses the Send owner, sending only the card answers: no hidden message text, images, Comments, Skills, routes or return receipts. Ordinary drafts stay intact. Partial answers and clarification requests are valid answers. Reject unreferenced new messages and new Pact commands while an unresolved decision exists, including after asynchronous preparation; previously accepted receipts and authorized workflow dispatch retain their handling. Bind answers to the task, decision Run and decision/current input sequences before freezing input. Route a decision reply to the verified Agent that asked it, independent of Primary or plan owner. Reviewer replies remain read-only and settle through their input result; only owner replies can publish or retain the plan. Stale references fail without clearing drafts; identical durable receipts remain idempotent. Processing keeps ordinary input unavailable. Incomplete replies retain recovery; only a confirmed ended or never-dispatched prior Run may accept an explicit bound follow-up answer. Unknown execution never permits a blind resend. Successful Send immediately removes editable questions; rejected Send preserves them. The next completed reply may ask for a new decision or confirm processing and automatically return to the authorized workflow when automation remains active. Receipt, queueing and native completion alone do not resolve the backend decision gate. Until the latest reply is positively settled, Continue and automatic review stay unavailable through UI and dispatch. Cancellation, failure, missing or conflicting evidence, newer input and restart preserve that gate. After the latest reply is confirmed processed, automatically dispatch the computed next step unless a persistent pause remains. Preserve that pause across input receipt, questions and settlement; offer Continue collaboration only when manual recovery is required. Both automatic continuation and Continue recheck current inputs, plan/code sources, review, unfinished authorized work, limits and runtime admission; neither replays a saved prompt or authorizes new Implement/Repair work. A normally completed plan or reply superseded by newer pending input cannot settle that input or turn supersession alone into a failure. Withdrawing an input cannot silently validate an older plan against the newer input sequence; unresolved source reconciliation requires manual recovery. A plan change requires current-version review; new code requires corresponding review. Answering a native form continues the root but leaves an independent automation pause intact.
 
@@ -867,6 +638,37 @@ The pending-restart projection is transient; persisted settings and their revisi
 Use calm dense controls, progressive disclosure and non-color identity/state cues. Target WCAG 2.2 AA, keyboard/focus/scalable text/screen-reader/reduced-motion/light-dark semantics. Code/Diff/permissions stay nearly opaque. Titlebar interaction is no-drag with native safe areas and dragging/resizing elsewhere. Exact visual rules live in Design.
 
 Diagnostics is bounded local metadata JSONL separate for development/production, not Journal/full audit. Default/temporary Debug excludes body/image/source/Diff/command args/raw streams/URLs/credentials/full environment. Explicit Debug ends in 30 minutes or restart. One failure notice cannot block business/streaming; Performance owns quotas/retention/exit. Native rejection is not labeled process crash without exit evidence.
+
+## Session notifications
+
+Session notifications cover completed replies, collaboration stages that need a user action, final collaboration completion, failures/incomplete work, and native questions, approvals or forms. Ordinary starts, token progress, user Stop/Pause and automatic Agent handoffs do not notify. A notification never answers, approves, continues a task or carries reply text, questions, commands, paths, errors or credentials.
+
+When Pact is not the focused visible app, use a bounded native notification with the Pact application identity and fixed Agent/status copy; never show Session/Project titles, user content or dynamic errors there. When Pact is foreground but another Session or Settings is visible, show one bounded in-app reminder with the Session title, Agent/state, View Session and Dismiss actions. Do not notify while the target Session is visible and focused. Settings, the attention page, startup preparation and exit surfaces must not suppress an otherwise eligible reminder just because a Conversation remains mounted in hidden DOM.
+
+Native and in-app reminders use one priority order: needs input/approval, failure/recovery attention, ordinary completion. A lower-priority same-Session event cannot replace an unconfirmed higher-priority reminder; failure then completion may show both as a primary failure and a later completion summary, while completion then failure promotes the failure. Resolved native interactions revoke their reminder. Click or explicit close confirms a reminder; showing a native notification is not confirmation. On
+macOS, unacknowledged background Session notifications display a bounded numeric Dock badge (`99+`
+above 99) with a gentle informational bounce on increment; on Windows, they display a numeric taskbar
+overlay badge (`99+` above 99) paired with an unfocused taskbar flash. Both clear upon click,
+dismissal, foreground focus/Session acknowledgement, or normal exit, and hand unconfirmed background
+notifications to the foreground reminder when Pact is focused on another Session. In-app reminders
+pause their dismissal timer while hovered or keyboard-focused, animate the status icon and overflow
+count badge softly within reduced-motion rules, and never overwrite operation errors or update
+notices.
+
+Bound native objects to five with ten-minute lifetime and deterministic lowest-priority eviction; bound in-app pending reminders to 32 items/64 KiB with ten-minute expiry and a single visible reminder. Dedupe 256 stable event identities/64 KiB for 24 hours. Overflow may open the existing attention page or workspace navigation, never claim a complete completion history. Startup, Renderer reload, history reads and re-subscriptions do not replay old completions. No notification database or unread fact is added; clicking only navigates through the existing Session navigation and does not execute work. Normal exit removes current notifications; stale notifications after an abnormal exit must not execute actions or be treated as cold-start navigation authority.
+
+## Provider usage limits
+
+Pact provides a compact **Usage** icon above **Settings** in Project Navigation that shows a
+lightweight **Codex** and **Claude Code** (`5h` and `7d` remaining plan quota `% left`) summary on hover and a
+detailed popover with per-window reset times and manual refresh controls on click. Reads use zero-input native probes owned
+by Utility inside a private empty working directory with no user files, emails, organization names,
+credentials, paths, or raw CLI output crossing to Main or Renderer. Absent windows are omitted rather
+than shown as `0% left`; API-key, third-party, or non-window logins report short non-applicable labels honestly alongside
+unauthenticated, unsupported-version, unavailable, or unconfirmed-close states.
+Manual refresh enforces a 30-second cooldown, cached snapshots turn stale after five minutes or reset
+expiry, changing authenticated identity clears prior numbers, and hiding, minimizing, navigating, or
+closing the window cancels in-flight probes immediately.
 
 ## Planned scope and open decisions
 
