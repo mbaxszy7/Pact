@@ -97,18 +97,18 @@ import {
   COLLABORATION_PROTOCOL,
   collaborationTaskSchema,
   collaborationActor,
+  collaborationActionPrompt,
   collaborationAskActor,
   collaborationInitialStage,
+  advanceAutomaticCollaboration,
   defaultTaskStageRoles,
   pactCommandRouteAllowed,
   pactEntryPrimary,
   initialTaskRoleCandidateIdSchema,
-  advanceCollaboration,
   CollaborationTransitionError,
   deriveCollaborationDecision,
-  collaborationNextStage,
+  isCollaborationOpenMode,
   collaborationInputGate,
-  collaborationStageLabel,
   otherAgent,
   collaborationMarkdownPageSchema,
   type CollaborationTask,
@@ -440,6 +440,7 @@ export class Conversation {
     { request: string; task: Promise<RpcResult<ConversationPatch>> }
   >()
   private readonly preparingContinuations = new Map<string, PreparingContinuation>()
+  private readonly routingOpenInputs = new Map<string, AbortController>()
   private readonly titleEnrichments = new Map<string, ActiveTitleEnrichment>()
   private readonly nativeTitleSyncs = new Map<string, ActiveNativeTitleSync>()
   private readonly skillCatalogs = new Map<
@@ -1354,6 +1355,7 @@ export class Conversation {
     return (
       [...this.preparingSends.values()].some((owner) => owner.input.sessionId === sessionId) ||
       this.preparingContinuations.has(sessionId) ||
+      this.routingOpenInputs.has(sessionId) ||
       this.nativeRebuilds.has(sessionId) ||
       [...this.nativeChecks.keys()].some((key) => key.startsWith(`${sessionId}:`)) ||
       this.forkPreparations.has(sessionId) ||
@@ -1372,6 +1374,7 @@ export class Conversation {
       this.activeExecutions.size ||
       this.preparingSends.size ||
       this.preparingContinuations.size ||
+      this.routingOpenInputs.size ||
       this.nativeRebuilds.size ||
       this.nativeChecks.size ||
       this.forkPreparations.size ||
@@ -1547,6 +1550,7 @@ export class Conversation {
       for (const sessionId of this.decisionSessionIds()) identities.add(sessionId)
       for (const owner of this.preparingSends.values()) identities.add(owner.input.sessionId)
       for (const owner of this.preparingContinuations.values()) identities.add(owner.sessionId)
+      for (const sessionId of this.routingOpenInputs.keys()) identities.add(sessionId)
       for (const id of this.nativeRebuilds.keys()) identities.add(id)
       for (const key of this.nativeChecks.keys()) identities.add(key.split(':')[0]!)
       for (const id of this.forkPreparations.keys()) identities.add(id)
@@ -1874,6 +1878,7 @@ export class Conversation {
           (sessionId) =>
             this.activeExecutions.has(sessionId) ||
             this.preparingContinuations.has(sessionId) ||
+            this.routingOpenInputs.has(sessionId) ||
             [...this.preparingSends.values()].some((entry) => entry.input.sessionId === sessionId),
         )
         const background = [...this.adapters.values()].some(
@@ -1944,6 +1949,7 @@ export class Conversation {
                 (entry) => entry.input.sessionId === task.sessionId,
               ) ||
               this.preparingContinuations.has(task.sessionId) ||
+              this.routingOpenInputs.has(task.sessionId) ||
               this.workspaceChanges?.hasPendingFinalization({
                 kind: 'session',
                 sessionId: task.sessionId,
@@ -3023,17 +3029,12 @@ export class Conversation {
       if (this.disposed) return Conversation.shuttingDown()
       if (this.nativeQuitSealed()) return Conversation.quitPrepared()
       if (this.conversations.archives.blocksSession(sessionId)) return Conversation.archiveBusy()
-      const existing =
-        this.conversations.relayDecisionReceipt({
-          sessionId,
-          decisionId: input.reference.decisionId,
-          clientOperationId: input.clientOperationId,
-        }) ?? this.conversations.confirmedPactRepairRoleDecision(input)
+      const existing = this.conversations.relayDecisionReceipt({
+        sessionId,
+        decisionId: input.reference.decisionId,
+        clientOperationId: input.clientOperationId,
+      })
       const card = !existing ? this.projectRelaySchedulingDecision(sessionId) : null
-      if (!existing && !card && this.conversations.retiredPactRepairRoleDecision(input.reference)) {
-        this.publish(this.conversations.metadataPatch(sessionId))
-        throw new RunOperationConflictError('This Pact repair confirmation is no longer current.')
-      }
       // The Repository checks the original digest even for identical answer readback.
       if (!existing && input.answer.kind !== 'cancel' && !card)
         throw new RunOperationConflictError(
@@ -3045,8 +3046,7 @@ export class Conversation {
         (card?.request.category === 'necessary_information' ||
           (input.answer.kind === 'confirm' &&
             (card?.request.category === 'arrangement_change' ||
-              (card?.request.category === 'new_authorization' &&
-                card.request.operation.kind === 'repair_role_request')))) &&
+              card?.request.category === 'new_authorization'))) &&
         (this.hasSessionOperation(sessionId) ||
           this.operationCount() >= MAX_AGENT_OPERATIONS ||
           this.permissions.size >= NATIVE_PERMISSION_REQUESTS)
@@ -3330,9 +3330,10 @@ export class Conversation {
         throw new RunOperationConflictError(
           'The explicit Agent recipients conflict. Your draft was preserved.',
         )
-      this.conversations.assertTaskReplacement(input, Boolean(prefix.pact))
+      const inTaskReview = this.conversations.isInTaskReviewCommand(task, prefix.pact)
+      this.conversations.assertTaskReplacement(input, Boolean(prefix.pact) && !inTaskReview)
       if (!preparing && (task || waitingForWork)) {
-        if (task && !prefix.pact && (input.route ?? prefix.route)?.type === 'all')
+        if (task && (!prefix.pact || inTaskReview) && (input.route ?? prefix.route)?.type === 'all')
           throw new RunOperationConflictError(
             '@all is unavailable while a Pact task is unfinished. Choose one Agent.',
           )
@@ -3345,10 +3346,12 @@ export class Conversation {
             ? requestedRoute.agentId
             : input.askOnly && task
               ? collaborationAskActor(task)
-              : task && !prefix.pact
-                ? this.conversations.collaborationReplyActor(task, input.replyToDecision)
-                : session.settings.primaryAgentId
-        if (prefix.pact) {
+              : inTaskReview && task
+                ? collaborationActor(task, 'code_review')
+                : task && !prefix.pact
+                  ? this.conversations.collaborationReplyActor(task, input.replyToDecision)
+                  : session.settings.primaryAgentId
+        if (prefix.pact && !inTaskReview) {
           const primary = pactEntryPrimary(
             prefix.pact,
             session.settings.primaryAgentId,
@@ -3425,7 +3428,7 @@ export class Conversation {
           bodyOwner,
           anchor.id,
           waitingForWork,
-          prefix.pact ? 'split-stages-v1' : undefined,
+          prefix.pact && !inTaskReview ? 'split-stages-v1' : undefined,
         )
         this.publish(patch)
         if (task) {
@@ -4457,24 +4460,6 @@ export class Conversation {
     if (this.conversations.archives.blocksSession(input.sessionId))
       return Conversation.archiveBusy()
     try {
-      if (input.action === 'request_repair_role_switch') {
-        const patch = this.conversations.requestPactRepairRole(
-          input,
-          this.hasSessionOperation(input.sessionId, true) ||
-            this.pendingNativeInteractions(input.sessionId).length > 0,
-        )
-        this.publish(patch)
-        return { ok: true, value: patch }
-      }
-      if (input.action === 'keep_current_plan') {
-        const patch = this.conversations.keepCurrentPlan(
-          input,
-          this.hasSessionOperation(input.sessionId, true) ||
-            this.pendingNativeInteractions(input.sessionId).length > 0,
-        )
-        this.publish(patch)
-        return { ok: true, value: patch }
-      }
       if (input.action === 'swap_code_roles') {
         const patch = this.conversations.swapCodeRoles(
           input,
@@ -4500,32 +4485,6 @@ export class Conversation {
         throw new RunOperationConflictError('This collaboration action is no longer current.')
       if (task.status === 'complete')
         throw new RunOperationConflictError('This collaboration is already complete.')
-      if (
-        ['request_plan_supplement', 'request_code_supplement', 'confirm_supplement'].includes(
-          input.action,
-        )
-      )
-        throw new RunOperationConflictError(
-          'This manual Relay request was retired. Use the current scheduling decision or existing collaboration action.',
-        )
-      if (input.action === 'confirm_supplement' || input.action === 'cancel_supplement') {
-        if (
-          input.action === 'confirm_supplement' &&
-          this.pendingNativeInteractions(input.sessionId).length
-        )
-          return Conversation.capacityFailure()
-        const answer = this.conversations.answerRelaySupplement(input)
-        this.publish(answer.patch)
-        if (input.action === 'cancel_supplement') {
-          const decision = this.decisionRuntime
-          if (decision?.sessionId === input.sessionId) {
-            decision.controller.abort()
-            void decision.runtime?.dispose()
-          }
-          return { ok: true, value: answer.patch }
-        }
-        throw new RunOperationConflictError('This legacy Relay grant cannot start new work.')
-      }
       this.conversations.discardUnansweredRelaySchedulingDecision(input.sessionId, false)
       if (this.conversations.receivedCollaborationInput(input.sessionId))
         throw new RunOperationConflictError(
@@ -4572,29 +4531,8 @@ export class Conversation {
         throw new RunOperationConflictError(
           'Restore the saved native plan before continuing collaboration.',
         )
-      if (
-        input.action === 'resume' &&
-        !(task.planRevision
-          ? task.status !== 'running' && collaborationNextStage(task)
-          : task.pendingWork)
-      ) {
-        this.conversations.assertRelayDecisionResolved(input.sessionId)
-        if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
-          return Conversation.nativeRecoveryRequired()
-        const resumed = advanceCollaboration(task, 'resume', context.settings)
-        const patch = this.conversations.setCollaborationState(resumed)
-        this.publish(patch)
-        this.schedulePendingRoutedContinuations()
-        return { ok: true, value: patch }
-      }
       if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
         return Conversation.nativeRecoveryRequired()
-      if (
-        input.action === 'revise_plan' &&
-        (this.hasSessionOperation(input.sessionId, true) ||
-          this.pendingNativeInteractions(input.sessionId).length > 0)
-      )
-        return Conversation.capacityFailure()
       const prepared = this.conversations.prepareCollaborationAction(input, context.settings)
       if (prepared.receipt.boundRunId)
         return { ok: true, value: this.conversations.runPatch(prepared.receipt.boundRunId) }
@@ -4614,6 +4552,7 @@ export class Conversation {
           input.clientMessageId,
           prepared.receipt.id,
           prepared.handoff,
+          input.action,
         )
         this.releaseDecisionHandoff(consultation)
         return await dispatched
@@ -4643,6 +4582,7 @@ export class Conversation {
     clientMessageId: string = randomUUID(),
     collaborationActionReceiptId?: string,
     schedulingHandoff?: SchedulingHandoff,
+    action?: CollaborationActionInput['action'],
   ): Promise<RpcResult<ConversationPatch>> {
     const options: SendOptions = {
       preserveDraftComments: true,
@@ -4656,7 +4596,7 @@ export class Conversation {
       const drafts = this.conversations.readPage({ scope: 'drafts', sessionId: task.sessionId })
       if (drafts.scope !== 'drafts')
         return Conversation.sendFailure(new Error('Comment drafts are unavailable.'))
-      const content = `@${next.actor} ${collaborationStageLabel(next.stage, next.kind)}.`
+      const content = `@${next.actor} ${collaborationActionPrompt(next, action)}`
       return await this.enqueueSend(
         {
           sessionId: task.sessionId,
@@ -4778,20 +4718,10 @@ export class Conversation {
               id: 'propose_extend_plan_review',
               description: `Propose one additional read-only review of the current plan by ${entry.actor} despite the exhausted plan-review limit. Recommend it only when the complete current plan, latest review and author response establish that another independent check is useful. User confirmation is required. This permits one review only, preserves all consumed counts and Session defaults, and grants no implementation or repair. Abstain when work is not ready for another review.`,
             }
-          : entry.kind === 'reassign_roles'
-            ? {
-                id: 'propose_reassign_roles',
-                description: `Propose swapping future code responsibilities: ${entry.operation.proposedRoles.codeAuthor} implements, responds and repairs; ${entry.operation.proposedRoles.codeReviewer} reviews code. Propose only when the complete accepted Plan and review establish a clear benefit over the current assignment. Preserve the Plan authors, accepted artifacts, original scope and permissions. The user must confirm the role change; this does not start work or grant writing. Choose false when the current assignment remains suitable.`,
-              }
-            : entry.kind === 'repair'
-              ? {
-                  id: 'propose_repair',
-                  description: `Request one scoped repair by ${collaborationActor(task, 'repair')} under a new exact user grant, followed by the fixed ${collaborationActor(task, 'code_review')} review. Propose this only when complete current review sources establish concrete work within the original task. It grants no execution and cannot expand scope or permissions. Return false when no extra work is necessary.`,
-                }
-              : {
-                  id: `propose_${entry.kind}`,
-                  description: `Propose one extra read-only turn by ${entry.actor}, followed by the fixed ${entry.returnActor} review, only if complete sources establish a concrete remaining gap that the normal next step cannot address. This candidate requests the user's specific authorization and grants no execution. Choose false when no extra turn is necessary.`,
-                },
+          : {
+              id: 'propose_reassign_roles',
+              description: `Propose swapping future code responsibilities: ${entry.operation.proposedRoles.codeAuthor} implements, responds and repairs; ${entry.operation.proposedRoles.codeReviewer} reviews code. Propose only when the complete accepted Plan and review establish a clear benefit over the current assignment. Preserve the Plan authors, accepted artifacts, original scope and permissions. The user must confirm the role change; this does not start work or grant writing. Choose false when the current assignment remains suitable.`,
+            },
       )
       const outcome = await this.evaluateDecision(
         {
@@ -4893,6 +4823,7 @@ export class Conversation {
       (task.status !== 'waiting' && task.status !== 'ready')
     )
       return
+    if (isCollaborationOpenMode(task)) return
     const decision = deriveCollaborationDecision(task)
     if (decision.inputGate) return
     if (task.automation === 'paused') {
@@ -4935,7 +4866,7 @@ export class Conversation {
     }
     let next: CollaborationTask
     try {
-      next = advanceCollaboration(task, 'continue', session.settings)
+      next = advanceAutomaticCollaboration(task, session.settings)
     } catch (error) {
       const current = this.conversations.collaboration(sessionId)
       if (current?.id !== task.id || current.revision !== task.revision) return
@@ -5969,6 +5900,9 @@ export class Conversation {
           actor: agentId,
           status: 'running',
           automation: 'active',
+          openMode: kind !== 'plan',
+          ...(kind === 'plan' ? { planAuthor: agentId } : {}),
+          ...(kind === 'build' ? { lastCodeActor: agentId } : {}),
           runId: input.clientMessageId,
           inputSequence: 0,
           handledInputSequence: 0,
@@ -6175,6 +6109,7 @@ export class Conversation {
       this.activeExecutions.size +
       this.preparingSends.size +
       this.preparingContinuations.size +
+      this.routingOpenInputs.size +
       this.nativeRebuilds.size +
       this.nativeChecks.size +
       this.nativeForks.size +
@@ -6199,6 +6134,7 @@ export class Conversation {
       ) ||
       this.activeExecutions.has(sessionId) ||
       this.preparingContinuations.has(sessionId) ||
+      this.routingOpenInputs.has(sessionId) ||
       this.nativeRebuilds.has(sessionId) ||
       (includeBackground &&
         [...this.adapters.entries()].some(
@@ -6371,6 +6307,7 @@ export class Conversation {
       }
       if (continuation) continuation.controller.abort()
       if (preparingSend) preparingSend.controller.abort()
+      this.routingOpenInputs.get(input.sessionId)?.abort()
       if (
         this.conversations
           .nativeContexts(input.sessionId)
@@ -8082,6 +8019,7 @@ export class Conversation {
     for (const execution of executions) execution.abortController.abort()
     for (const admission of preparing) admission.controller.abort()
     for (const continuation of preparingContinuations) continuation.controller.abort()
+    for (const controller of this.routingOpenInputs.values()) controller.abort()
     for (const rebuild of nativeRebuilds) rebuild.abortController.abort()
     for (const enrichment of titleEnrichments) enrichment.abortController.abort()
     // Actual App shutdown releases our waits. Abandon/Rebuild never enters
@@ -8143,6 +8081,7 @@ export class Conversation {
     this.activeExecutions.clear()
     this.preparingSends.clear()
     this.preparingContinuations.clear()
+    this.routingOpenInputs.clear()
     this.nativeRebuilds.clear()
     this.nativeForks.clear()
     this.forkPreparations.clear()
@@ -8427,6 +8366,7 @@ export class Conversation {
     if (
       this.disposed ||
       this.nativeQuitSealed() ||
+      this.routingOpenInputs.has(sessionId) ||
       this.hasSessionOperation(sessionId, true) ||
       this.operationCount() >= MAX_AGENT_OPERATIONS ||
       this.conversations.nativeRecoveryBlocksInput(sessionId)
@@ -8454,10 +8394,15 @@ export class Conversation {
     )
       return
     const prefix = parseComposerCommandPrefix(input.content, input.metadata.skills)
+    const expectedInTaskReview = Boolean(input.metadata.inTaskReview)
+    const actualInTaskReview = Boolean(
+      input.taskId && task && this.conversations.isInTaskReviewCommand(task, prefix.pact),
+    )
     if (
       prefix.error ||
-      Boolean(prefix.pact) !== input.metadata.workflowCommand ||
-      (prefix.pact && input.taskId)
+      expectedInTaskReview !== actualInTaskReview ||
+      (Boolean(prefix.pact) && !expectedInTaskReview) !== input.metadata.workflowCommand ||
+      (prefix.pact && input.taskId && !expectedInTaskReview)
     ) {
       this.publish(
         this.conversations.pauseConversationQueue(
@@ -8538,9 +8483,64 @@ export class Conversation {
         return
       }
     }
-    const next =
-      input.taskId && task ? this.conversations.workflowReply(task, input.actor) : undefined
-    if (next && !askOnly) next.latestUserMessageId = input.id
+    let activeTask = task
+    let targetActor = input.actor
+    let next: CollaborationTask | undefined
+    const requestedRoute = input.metadata.route ?? prefix.route
+    if (expectedInTaskReview && input.taskId && activeTask) {
+      const explicitReviewer = requestedRoute?.type === 'agent' ? requestedRoute.agentId : undefined
+      next = this.conversations.workflowInTaskReview(activeTask, explicitReviewer)
+      next.latestUserMessageId = input.id
+      targetActor = next.actor
+    } else if (input.taskId && activeTask) {
+      const isImplicitOpenMode =
+        isCollaborationOpenMode(activeTask) &&
+        !askOnly &&
+        !input.metadata.replyToDecision &&
+        input.metadata.routeIntent === 'implicit' &&
+        requestedRoute?.type !== 'agent'
+      if (isImplicitOpenMode) {
+        const routingController = new AbortController()
+        this.routingOpenInputs.set(sessionId, routingController)
+        let routingCompleted = false
+        try {
+          targetActor = await this.consultOpenModeInputRouting(
+            sessionId,
+            activeTask,
+            input.id,
+            routingController.signal,
+          )
+          routingCompleted = true
+        } finally {
+          if (this.routingOpenInputs.get(sessionId) === routingController)
+            this.routingOpenInputs.delete(sessionId)
+        }
+        const freshInput = this.conversations.readReceivedInput(sessionId)
+        const freshTask = this.conversations.collaboration(sessionId)
+        if (
+          !routingCompleted ||
+          routingController.signal.aborted ||
+          this.disposed ||
+          this.nativeQuitSealed() ||
+          this.hasSessionOperation(sessionId, true) ||
+          !freshInput ||
+          freshInput.id !== input.id ||
+          freshInput.state !== 'accepted' ||
+          !freshTask ||
+          freshTask.id !== activeTask.id ||
+          freshTask.revision !== activeTask.revision ||
+          freshTask.status === 'running'
+        ) {
+          this.schedulePendingRoutedContinuations()
+          return
+        }
+        activeTask = freshTask
+        if (targetActor !== freshInput.actor)
+          this.conversations.adoptOpenModeInputRecipient(sessionId, freshInput.id, targetActor)
+      }
+      next = this.conversations.workflowReply(activeTask, targetActor)
+      if (!askOnly) next.latestUserMessageId = input.id
+    }
     const currentDrafts = this.conversations.readPage({ scope: 'drafts', sessionId })
     if (currentDrafts.scope !== 'drafts') return
     const result = await this.enqueueSend(
@@ -8555,7 +8555,7 @@ export class Conversation {
         route:
           input.metadata.route?.type === 'all'
             ? { type: 'all' }
-            : { type: 'agent', agentId: input.actor },
+            : { type: 'agent', agentId: targetActor },
         ...(input.metadata.skills.length ? { skills: input.metadata.skills } : {}),
         expectedCommentsRevision: currentDrafts.commentsRevision,
         commentIds: [],
@@ -8564,12 +8564,14 @@ export class Conversation {
         ...(input.metadata.imageIds.length ? { imageIds: input.metadata.imageIds } : {}),
       },
       {
-        ...(next ? { collaboration: next, expectedCollaborationRevision: task!.revision } : {}),
+        ...(next
+          ? { collaboration: next, expectedCollaborationRevision: activeTask!.revision }
+          : {}),
         queuedRolePolicy: input.metadata.rolePolicy,
         queuedRoute:
           input.metadata.route?.type === 'all'
-            ? { type: 'all', firstAgentId: input.actor, secondAgentId: otherAgent(input.actor) }
-            : { type: 'agent', agentId: input.actor },
+            ? { type: 'all', firstAgentId: targetActor, secondAgentId: otherAgent(targetActor) }
+            : { type: 'agent', agentId: targetActor },
         preserveDraftComments: true,
         receivedInputId: input.id,
         receivedComments: input.comments,
@@ -8577,6 +8579,117 @@ export class Conversation {
     )
     if (!result.ok && this.conversations.receivedCollaborationInput(sessionId)?.id === input.id)
       this.publish(this.conversations.pauseConversationQueue(sessionId, result.error.message))
+  }
+
+  private async consultOpenModeInputRouting(
+    sessionId: string,
+    task: CollaborationTask,
+    receivedId: string,
+    signal?: AbortSignal,
+  ): Promise<RuntimeAgentId> {
+    const fallbackActor: RuntimeAgentId =
+      task.lastCodeActor ?? collaborationActor(task, 'implement')
+    const settings = this.conversations.schedulingSettings()
+    const admission = this.decisionRuntimeAdmission()
+    if (
+      !settings.enabled ||
+      !settings.credential.configured ||
+      admission !== 'may_attempt' ||
+      this.pendingNativeInteractions(sessionId).length > 0
+    )
+      return fallbackActor
+    const bothReady = (['codex', 'claude'] as const).every((actor) => {
+      const ctx = this.conversations.nativeContext(sessionId, actor)
+      return !ctx || ctx.continuationState === 'ready'
+    })
+    if (!bothReady) return fallbackActor
+    const handoff = this.conversations.workflowHandoff(task, fallbackActor, receivedId)
+    if (this.conversations.decisionEvaluationReceipt(handoff)) return fallbackActor
+    const candidates = (['codex', 'claude'] as const).map((actor) => ({
+      id: `route_${actor}`,
+      description: `Send this open-mode task message to ${actor}, preserving its current session permissions and task context.`,
+    }))
+    try {
+      const outcome = await this.evaluateDecision(
+        {
+          handoff,
+          load: async (context) => {
+            const read = await this.conversations.readOpenModeRoutingSources(
+              sessionId,
+              task,
+              receivedId,
+              candidates,
+              context,
+            )
+            const policy = evaluateRelayPolicy({
+              node: 'send',
+              openMode: true,
+              ordinary: false,
+              handoffId: read.handoff.id,
+              budgetSubjectId: read.handoff.budgetSubjectId,
+              primary: fallbackActor,
+              route: 'implicit',
+              inputSourceId: 's0',
+              referencedSourceIds: read.sources
+                .filter((source) => source.actor !== null)
+                .map((source) => source.id),
+              materials: {
+                complete: true,
+                inputBytes: decisionJsonBytes(read.input),
+                sources: read.sources.map((source) => ({
+                  id: source.id,
+                  sha256: source.sha256,
+                  bytes: source.bytes,
+                  roles: source.roles,
+                  actor: source.actor,
+                  complete: true,
+                  settled: true,
+                  frozen: true,
+                })),
+              },
+              legalActions: (['codex', 'claude'] as const).map((actor) => ({
+                action: 'route_send',
+                actor,
+                authorizationId: read.handoff.id,
+                authorizationCurrent: true,
+                businessBudgetAvailable: true,
+              })),
+              admission: {
+                enabled: settings.enabled,
+                keyConfigured: settings.credential.configured,
+                runtimeAdmission: admission,
+                evaluationResourcesAvailable: true,
+                factAlreadyEvaluated: false,
+                pendingUserInput: false,
+                nativeInteraction: this.pendingNativeInteractions(sessionId).length > 0,
+                newTaskDispatchProtected: false,
+              },
+            })
+            if (policy.kind !== 'eligible')
+              throw new RunOperationConflictError(
+                'Open-mode input is not eligible for Relay routing.',
+              )
+            return read.input
+          },
+        },
+        signal
+          ? AbortSignal.any([AbortSignal.timeout(15_000), signal])
+          : AbortSignal.timeout(15_000),
+      )
+      if (outcome.kind === 'selection') {
+        if (outcome.selection.candidateId === 'route_claude') return 'claude'
+        if (outcome.selection.candidateId === 'route_codex') return 'codex'
+      }
+      return fallbackActor
+    } catch {
+      return fallbackActor
+    } finally {
+      if (
+        this.decisionRuntime?.kind === 'evaluation' &&
+        this.decisionRuntime.handoff?.id === handoff.id
+      )
+        this.releaseDecisionHandoff(this.decisionRuntime)
+    }
   }
 
   private async resumePendingRoutedContinuations(): Promise<void> {
@@ -10934,12 +11047,18 @@ export class Conversation {
       state = 'working'
     else if (task.status === 'running') state = 'working'
     else if (task.status === 'questions' || task.status === 'ready') state = 'needs_user'
-    else if (task.automation === 'paused') {
+    else if (!isCollaborationOpenMode(task) && task.automation === 'paused') {
       if (task.pauseReason === 'user_message') state = 'working'
       else if (task.pauseReason !== 'stopped')
         state = task.pauseReason === 'failure' ? 'failure' : 'needs_user'
     } else if (decision.nextStage) state = 'auto_continue'
-    else state = 'needs_user'
+    else
+      state =
+        isCollaborationOpenMode(task) && decision.availableActions.length === 0
+          ? runSettled
+            ? 'complete'
+            : 'working'
+          : 'needs_user'
     return state
       ? {
           taskId: task.id,

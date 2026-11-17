@@ -48,28 +48,23 @@ export function RelayDecisionCard({
       : request.consequence
   const operation =
     request.request.category === 'necessary_information' ? undefined : request.request.operation
-  const pactRepair = operation?.kind === 'repair_role_request' ? operation : undefined
   const optional = isOptionalRelaySuggestion(request)
-  const confirmLabel = pactRepair
-    ? `Repair with ${agentName(pactRepair.actor)}`
-    : field
-      ? 'Continue'
-      : operation?.kind === 'rebuild_native_context'
-        ? 'Rebuild context'
-        : operation?.kind === 'reassign_roles'
-          ? 'Use suggested roles'
-          : operation?.kind === 'repair'
-            ? 'Allow repair'
-            : operation?.kind === 'extend_plan_review'
-              ? 'Add review'
-              : 'Add reply'
+  const confirmLabel = field
+    ? 'Continue'
+    : operation?.kind === 'rebuild_native_context'
+      ? 'Rebuild context'
+      : operation?.kind === 'reassign_roles'
+        ? 'Use suggested roles'
+        : operation?.kind === 'extend_plan_review'
+          ? 'Add review'
+          : 'Continue'
   const cancelLabel = decision.cancelling
     ? decision.status === 'submitting'
       ? 'Cancelling…'
       : 'Cancel requested'
     : optional
       ? 'Skip'
-      : operation?.kind === 'reassign_roles' || pactRepair
+      : operation?.kind === 'reassign_roles'
         ? 'Keep current roles'
         : 'Cancel'
   let actionText: string | undefined
@@ -79,11 +74,6 @@ export function RelayDecisionCard({
     detailText = 'Check the result before sending again.'
   } else if (operation) {
     switch (operation.kind) {
-      case 'supplement_plan':
-      case 'supplement_code_response':
-        actionText = request.title
-        detailText = `${agentName(operation.actor)} · 1 read-only reply → ${agentName(operation.returnActor)} review`
-        break
       case 'extend_plan_review':
         actionText = `Review plan v${operation.planReference.version} again?`
         detailText = `${agentName(operation.actor)} · Read-only`
@@ -91,13 +81,6 @@ export function RelayDecisionCard({
       case 'reassign_roles':
         actionText = `${agentName(operation.proposedRoles.codeAuthor)} implements · ${agentName(operation.proposedRoles.codeReviewer)} reviews.`
         detailText = 'Implementation still needs approval.'
-        break
-      case 'repair_role_request':
-        actionText = `${agentName(operation.actor)} repairs this task; ${agentName(operation.returnActor)} reviews.`
-        break
-      case 'repair':
-        actionText = request.title
-        detailText = `${agentName(operation.actor)} repairs once, then ${agentName(operation.returnActor)} reviews.`
         break
       case 'rebuild_native_context':
         actionText = request.title
@@ -122,7 +105,7 @@ export function RelayDecisionCard({
         : undefined
   return (
     <section
-      className={pactRepair ? 'pact-repair-card relay-decision' : 'relay-edge relay-decision'}
+      className="relay-edge relay-decision"
       data-motion-active={visible}
       aria-labelledby={titleId}
       aria-describedby={actionId}
@@ -130,9 +113,7 @@ export function RelayDecisionCard({
     >
       <header className="relay-decision-heading">
         <Workflow aria-hidden="true" size={18} strokeWidth={1.75} />
-        <h3 id={titleId}>
-          {pactRepair ? 'Switch repair agent' : optional ? 'Relay suggestion' : 'Relay decision'}
-        </h3>
+        <h3 id={titleId}>{optional ? 'Relay suggestion' : 'Relay decision'}</h3>
       </header>
       <div className="relay-decision-body">
         {actionText ? (
@@ -141,9 +122,6 @@ export function RelayDecisionCard({
           </p>
         ) : null}
         {detailText ? <p className="relay-action-explanation">{detailText}</p> : null}
-        {pactRepair?.fullAccess && !decision.cancelling ? (
-          <p className="relay-action-explanation">Full access.</p>
-        ) : null}
         {field && !decision.cancelling ? (
           <div className="relay-scheduling-field">
             <label id={actionId} htmlFor={`${titleId}-field`}>

@@ -14,7 +14,7 @@ import { collaborationDocumentSchema } from '@pact/contracts'
 
 import type { WorkflowSourceRead } from './relay-workflow-fixture.test-support.js'
 
-import { collaborationPlanMode, collaborationReadOnly } from './collaboration-prompt.js'
+import { collaborationReadOnly } from './collaboration-prompt.js'
 import { Conversation } from './conversation.js'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
 import { decisionWorkingMemoryDiagnostics } from './native-working-memory.js'
@@ -39,6 +39,8 @@ const native = vi.hoisted(() => ({
   sourceReads: [] as WorkflowSourceRead[],
   unselectedPlan: undefined as string | undefined,
   forbiddenDocuments: [] as CollaborationDocument[],
+  noCodeChanges: false,
+  recordCodeChange: undefined as ((input: AgentRunInput) => void) | undefined,
   workerPath: '',
 }))
 vi.mock('./codex-agent-adapter.js', async () => {
@@ -95,10 +97,12 @@ afterEach(async () => {
   native.sourceReads = []
   native.unselectedPlan = undefined
   native.forbiddenDocuments = []
+  native.noCodeChanges = false
+  native.recordCodeChange = undefined
   vi.restoreAllMocks()
 })
 async function fixture(primary: 'codex' | 'claude' = 'codex') {
-  const f = await workflowConversation(Conversation, primary)
+  const f = await workflowConversation(Conversation, primary, native)
   owned.push(f)
   return f
 }
@@ -312,13 +316,13 @@ describe('Relay confirmation at the Plan review limit', () => {
     expect(f.repo.schedulingBudget(`task:${f.task.id}`)?.extraPlanTurns).toBe(0)
   })
 
-  it.each(['continue', 'settings'] as const)(
+  it.each(['review_plan', 'settings'] as const)(
     'refuses a stale card after %s supersedes the original proposal',
     async (change) => {
       const f = await reachPlanReviewLimit()
-      if (change === 'continue') {
-        const manual = await f.act('continue')
-        if (manual.ok) throw Error('Ordinary Continue bypassed the review limit')
+      if (change === 'review_plan') {
+        const manual = await f.act('review_plan')
+        if (manual.ok) throw Error('Ordinary Review plan bypassed the review limit')
       } else {
         const session = f.db.sessionRepository.find(f.sessionId)!
         f.db.sessionRepository.saveSettings(f.sessionId, {
@@ -370,22 +374,21 @@ describe('Relay confirmation at the Plan review limit', () => {
 
 describe('Cancel an optional Relay advancement, then continue through the original workflow owner', () => {
   it.each(['codex', 'claude'] as const)(
-    'continues the %s Plan through its fixed reviewer and explicit Implement',
+    'continues the %s Plan through explicit Implement and Review code after cancelling role reassignment',
     async (primary) => {
       const f = await fixture(primary),
         repo = f.db.conversationRepository
       const settleEvaluation = vi.spyOn(repo, 'settleEvaluation')
       enableWorkflowRelay(f.db)
-      native.reviews = [{ verdict: 'changes_requested' }, { verdict: 'changes_requested' }]
-      native.candidate = 'propose_supplement_plan'
+      native.candidate = 'propose_reassign_roles'
       expect(
         await f.flow.send(f.input('/plan Preserve the exact original cancellation scope.')),
       ).toMatchObject({ ok: true })
       await vi.waitFor(
         () =>
           expect(repo.relaySchedulingDecision(f.sessionId)?.request).toMatchObject({
-            category: 'new_authorization',
-            operation: { kind: 'supplement_plan' },
+            category: 'arrangement_change',
+            operation: { kind: 'reassign_roles' },
           }),
         { timeout: 5_000 },
       )
@@ -395,7 +398,7 @@ describe('Cancel an optional Relay advancement, then continue through the origin
           expect.objectContaining({
             outcome: 'completed',
             physicalReleased: true,
-            selectedCandidateId: 'propose_supplement_plan',
+            selectedCandidateId: 'propose_reassign_roles',
             httpOwner: expect.objectContaining({ version: 1, kind: 'http' }),
             remoteOutcome: 'responded',
           }),
@@ -403,40 +406,32 @@ describe('Cancel an optional Relay advancement, then continue through the origin
       )
       native.candidate = null
       const state = await cancel(f)
-      await vi.waitFor(() => expect(native.inputs).toHaveLength(6))
       expect(await f.settled()).toMatchObject({ status: 'ready' })
-      expect(native.inputs[5]!.promptEnvelope.collaboration).toMatchObject({
-        stage: 'plan_review',
-        actor: state.task.reviewer,
-      })
-      // Native settlement precedes the optional accepted-plan role consultation.
-      // Wait for both distinct handoffs rather than sampling a transient total.
-      await vi.waitFor(() =>
-        expect(
-          native.decisions.slice(state.decisionCount).map((decision) => ({
-            candidates: decision.candidates.map((candidate) => candidate.id),
-            runId: decision.handoff?.freshnessGuard.runId,
-          })),
-        ).toEqual([
-          { candidates: ['propose_supplement_plan'], runId: native.inputs[4]!.runId },
-          { candidates: ['propose_reassign_roles'], runId: native.inputs[5]!.runId },
-        ]),
-      )
-      expect(native.decisions).toHaveLength(state.decisionCount + 2)
+      expect(native.decisions).toHaveLength(state.decisionCount)
       expect(repo.collaboration(f.sessionId)?.stageRoles).toEqual(state.task.stageRoles)
-      expect(native.inputs).toHaveLength(6)
+      expect(native.inputs).toHaveLength(2)
       expect(await f.act('execute')).toMatchObject({ ok: true })
-      await vi.waitFor(() => expect(native.inputs).toHaveLength(8))
-      expect(await f.settled()).toMatchObject({ status: 'complete' })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+      expect(await f.settled()).toMatchObject({
+        openMode: true,
+        status: 'waiting',
+        unreviewedCodeActor: primary === 'codex' ? 'claude' : 'codex',
+      })
       expect(
-        native.inputs[6]!.promptEnvelope.collaborationAuthorization?.userAuthority,
+        native.inputs[2]!.promptEnvelope.collaborationAuthorization?.userAuthority,
       ).toMatchObject({ purpose: 'action' })
-      expect(native.inputs[7]!.promptEnvelope.collaboration).toMatchObject({
+      expect(await f.act('review_code')).toMatchObject({ ok: true })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(4))
+      expect(await f.settled()).toMatchObject({
+        status: 'waiting',
+        review: { verdict: 'accepted' },
+      })
+      expect(native.inputs[3]!.promptEnvelope.collaboration).toMatchObject({
         stage: 'code_review',
         actor: primary,
       })
       expect(await f.flow.answerRelayDecision(state.request)).toEqual(state.result)
-      expect(native.inputs).toHaveLength(8)
+      expect(native.inputs).toHaveLength(4)
       expect(repo.schedulingBudget(`task:${state.task.id}`)).toMatchObject({
         extraPlanTurns: 0,
         extraCodeTurns: 0,
@@ -444,80 +439,80 @@ describe('Cancel an optional Relay advancement, then continue through the origin
     },
   )
 
-  it.each([
-    {
-      primary: 'codex' as const,
-      candidate: 'propose_supplement_code_response',
-      action: 'respond' as const,
-    },
-    {
-      primary: 'claude' as const,
-      candidate: 'propose_supplement_code_response',
-      action: 'respond' as const,
-    },
-    { primary: 'codex' as const, candidate: 'propose_repair', action: 'repair' as const },
-    { primary: 'claude' as const, candidate: 'propose_repair', action: 'repair' as const },
-  ])(
-    'continues $candidate through explicit $action with the $primary owner',
-    async ({ primary, candidate, action }) => {
+  it('continues past plan-review limit cancellation via Session settings and explicit review_plan without extra Relay quota', async () => {
+    const f = await reachPlanReviewLimit('codex')
+    const state = await cancel(f)
+    const session = f.db.sessionRepository.find(f.sessionId)!
+    f.db.sessionRepository.saveSettings(f.sessionId, {
+      ...session.settings,
+      maxDiscussionRounds: 2,
+    })
+    const current = f.repo.collaboration(f.sessionId)!
+    const manual = {
+      sessionId: f.sessionId,
+      taskId: current.id,
+      revision: current.revision,
+      clientMessageId: randomUUID(),
+      action: 'review_plan' as const,
+    }
+    expect(await f.flow.actOnCollaboration(manual)).toMatchObject({ ok: true })
+    expect(await f.flow.actOnCollaboration(manual)).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(4))
+    expect(await f.settled()).toMatchObject({ status: 'ready', discussionRounds: 2 })
+    expect(native.inputs).toHaveLength(4)
+    expect(f.repo.schedulingBudget(`task:${state.task.id}`)).toMatchObject({
+      extraPlanTurns: 0,
+      extraCodeTurns: 0,
+    })
+    expect(await f.flow.answerRelayDecision(state.request)).toEqual(state.result)
+  })
+
+  it.each(['codex', 'claude'] as const)(
+    'continues %s Open Mode review findings through explicit fix and rereview receipts',
+    async (primary) => {
       const f = await fixture(primary),
         repo = f.db.conversationRepository
-      native.reviews = [{ verdict: 'changes_requested' }]
       expect(
         await f.flow.send(f.input('/build Preserve only the original cancellation scope.')),
       ).toMatchObject({ ok: true })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+      await f.settled()
+      native.reviews = [{ verdict: 'changes_requested' }, { verdict: 'accepted' }]
+      expect(await f.act('review_code')).toMatchObject({ ok: true })
       await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
-      await f.settled()
-      enableWorkflowRelay(f.db)
-      native.candidate = candidate
-      native.reviews = [{ verdict: 'changes_requested' }]
-      expect(await f.act('respond')).toMatchObject({ ok: true })
-      await vi.waitFor(() => expect(repo.relaySchedulingDecision(f.sessionId)).not.toBeNull())
-      const state = await cancel(f)
-      await f.settled()
-      expect(native.inputs).toHaveLength(4)
-      native.candidate = undefined
+      const reviewed = await f.settled()
       const task = repo.collaboration(f.sessionId)!,
-        input = {
+        fixInput = {
           sessionId: f.sessionId,
           taskId: task.id,
           revision: task.revision,
           clientMessageId: randomUUID(),
-          action,
+          action: 'fix' as const,
         }
-      expect(await f.flow.actOnCollaboration(input)).toMatchObject({ ok: true })
-      await vi.waitFor(() => expect(native.inputs).toHaveLength(6))
+      expect(await f.flow.actOnCollaboration(fixInput)).toMatchObject({ ok: true })
+      expect(await f.flow.actOnCollaboration(fixInput)).toMatchObject({ ok: true })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+      await f.settled()
+      expect(native.inputs).toHaveLength(3)
+      expect(native.inputs[2]!.promptEnvelope.collaboration).toMatchObject({
+        stage: 'collaborate',
+        actor: primary === 'codex' ? 'claude' : 'codex',
+        reviewScopeRef: reviewed.reviewScopeRef,
+      })
+      expect(
+        native.inputs[2]!.promptEnvelope.collaborationAuthorization?.userAuthority,
+      ).toMatchObject({ purpose: 'action' })
+      expect(await f.act('review_code')).toMatchObject({ ok: true })
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(4))
       expect(await f.settled()).toMatchObject({
         status: 'complete',
-        repairAttempts: action === 'repair' ? 1 : 0,
+        repairAttempts: 1,
+        reviewCycles: 2,
       })
-      expect(await f.flow.actOnCollaboration(input)).toMatchObject({ ok: true })
-      expect(native.inputs).toHaveLength(6)
-      expect(native.inputs[4]!.promptEnvelope.collaboration).toMatchObject({
-        stage: action,
-        actor: primary === 'codex' ? 'claude' : 'codex',
-        reviewScopeRef: state.task.reviewScopeRef,
-      })
-      expect(
-        native.inputs[4]!.promptEnvelope.collaborationAuthorization?.userAuthority,
-      ).toMatchObject({ purpose: 'action' })
-      expect(
-        native.inputs[4]!.promptEnvelope.collaborationAuthorization?.relayWorkRef,
-      ).toBeUndefined()
-      expect(native.inputs[5]!.promptEnvelope.collaboration).toMatchObject({
+      expect(native.inputs[3]!.promptEnvelope.collaboration).toMatchObject({
         stage: 'code_review',
         actor: primary,
       })
-      expect(
-        native.decisions.filter(
-          (decision) => decision.handoff.freshnessGuard.runId === state.task.runId,
-        ),
-      ).toHaveLength(1)
-      expect(repo.schedulingBudget(`task:${state.task.id}`)).toMatchObject({
-        extraPlanTurns: 0,
-        extraCodeTurns: 0,
-      })
-      expect(await f.flow.answerRelayDecision(state.request)).toEqual(state.result)
     },
   )
 
@@ -575,7 +570,7 @@ describe('Cancel an optional Relay advancement, then continue through the origin
 })
 
 it.each(['codex', 'claude'] as const)(
-  'continues the original plan implementation after two interrupted writes and replies with %s Primary',
+  'continues Open Mode implementation after interrupted writes via retry and collaborate with %s Primary',
   async (primary) => {
     const f = await fixture(primary),
       repo = f.db.conversationRepository,
@@ -589,56 +584,47 @@ it.each(['codex', 'claude'] as const)(
     await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
     expect(f.flow.stop({ sessionId: f.sessionId })).toMatchObject({ ok: true })
     const stopped = await f.settled()
-    const original = repo.collaborationTurnAuthorization(stopped.pendingWork!.runId)!
-    const resumeAfterReply = async (index: number) => {
-      expect(
-        await f.flow.send(f.input('Continue the same implementation without changing its scope.')),
-      ).toMatchObject({ ok: true })
-      await vi.waitFor(() => expect(native.inputs).toHaveLength(4 + index * 2))
-      const replied = await f.settled(),
-        input = native.inputs.at(-1)!
-      expect(replied).toMatchObject({ stage: 'reply', actor: implementer, automation: 'paused' })
-      expect(
-        collaborationPlanMode(
-          input.promptEnvelope.collaboration,
-          input.promptEnvelope.collaborationAuthorization,
-        ),
-      ).toBe(false)
-      expect(
-        collaborationReadOnly(
-          input.promptEnvelope.collaboration,
-          input.promptEnvelope.collaborationAuthorization,
-        ),
-      ).toBe(true)
-      native.holdNextWrite = index === 0
-      expect(await f.act('resume')).toMatchObject({ ok: true })
-      await vi.waitFor(() => expect(native.inputs).toHaveLength(index === 0 ? 5 : 8))
-      const stop = index === 0 ? f.flow.stop({ sessionId: f.sessionId }) : undefined
-      expect(stop?.ok).toBe(index === 0 ? true : undefined)
-      await f.settled()
-      const write = native.inputs.findLast(
-        (value) => value.promptEnvelope.collaboration?.stage === 'implement',
-      )!
-      expect(write.promptEnvelope.collaborationAuthorization).toMatchObject({
-        actor: implementer,
-        stage: 'implement',
-        planReference: original.planReference,
-        userAuthority: {
-          purpose: 'write_continuation',
-          rootReceiptId: original.userAuthority!.rootReceiptId,
-        },
-      })
-      expect(
-        collaborationReadOnly(
-          write.promptEnvelope.collaboration,
-          write.promptEnvelope.collaborationAuthorization,
-        ),
-      ).toBe(false)
-    }
-    await resumeAfterReply(0)
-    await resumeAfterReply(1)
-    expect(repo.collaboration(f.sessionId)).toMatchObject({
-      status: 'complete',
+    expect(stopped).toMatchObject({
+      openMode: true,
+      stage: 'implement',
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'stopped',
+    })
+    const original = repo.collaborationTurnAuthorization(stopped.runId)!
+    native.holdNextWrite = true
+    expect(await f.act('retry')).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(4))
+    expect(f.flow.stop({ sessionId: f.sessionId })).toMatchObject({ ok: true })
+    await f.settled()
+    expect(
+      await f.flow.send(f.input('Continue the same implementation without changing its scope.')),
+    ).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(5))
+    const collaborated = await f.settled(),
+      write = native.inputs.at(-1)!
+    expect(collaborated).toMatchObject({
+      openMode: true,
+      stage: 'collaborate',
+      actor: implementer,
+      status: 'waiting',
+      unreviewedCodeActor: implementer,
+    })
+    expect(write.promptEnvelope.collaborationAuthorization).toMatchObject({
+      actor: implementer,
+      stage: 'collaborate',
+      planReference: original.planReference,
+    })
+    expect(
+      collaborationReadOnly(
+        write.promptEnvelope.collaboration,
+        write.promptEnvelope.collaborationAuthorization,
+      ),
+    ).toBe(false)
+    expect(await f.act('review_code')).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(6))
+    expect(await f.settled()).toMatchObject({
+      status: 'waiting',
       stage: 'code_review',
       actor: primary,
       repairAttempts: 0,
@@ -647,10 +633,8 @@ it.each(['codex', 'claude'] as const)(
       'plan',
       'plan_review',
       'implement',
-      'reply',
       'implement',
-      'reply',
-      'implement',
+      'collaborate',
       'code_review',
     ])
   },
@@ -658,9 +642,9 @@ it.each(['codex', 'claude'] as const)(
 
 it.each([
   { primary: 'codex', stage: 'implement' },
-  { primary: 'claude', stage: 'repair' },
+  { primary: 'claude', stage: 'collaborate' },
 ] as const)(
-  'keeps changed requirements paused after $stage and gives $primary the Plan before a fresh Implement',
+  'updates an Open Mode plan inside collaborate after %s/$stage interruption before review_plan and execute',
   async ({ primary, stage }) => {
     const f = await fixture(primary)
     const repo = f.db.conversationRepository
@@ -668,53 +652,52 @@ it.each([
       await f.flow.send(f.input('/plan Handle cancellation with the original acceptance.')),
     ).toMatchObject({ ok: true })
     expect(await f.settled()).toMatchObject({ status: 'ready' })
-    if (stage === 'repair') native.reviews = [{ verdict: 'changes_requested' }]
+    if (stage === 'collaborate') native.reviews = [{ verdict: 'changes_requested' }]
     native.holdNextWrite = stage === 'implement'
     expect(await f.act('execute')).toMatchObject({ ok: true })
-    const repair = async () => {
-      await vi.waitFor(() => expect(native.inputs).toHaveLength(4))
+    if (stage === 'collaborate') {
+      await vi.waitFor(() => {
+        if (native.inputs.length !== 3) throw Error('Waiting for execute run')
+      })
+      await f.settled()
+      const reviewed = await f.act('review_code')
+      if (!reviewed.ok) throw Error(reviewed.error.message)
+      await vi.waitFor(() => {
+        if (native.inputs.length !== 4) throw Error('Waiting for review_code run')
+      })
       await f.settled()
       native.holdNextWrite = true
-      return f.act('repair')
+      const fixed = await f.act('fix')
+      if (!fixed.ok) throw Error(fixed.error.message)
     }
-    const repairResult = stage === 'repair' ? await repair() : undefined
-    expect(repairResult?.ok).toBe(stage === 'repair' ? true : undefined)
-    const writesBefore = stage === 'repair' ? 5 : 3
+    const writesBefore = stage === 'collaborate' ? 5 : 3
     await vi.waitFor(() => expect(native.inputs).toHaveLength(writesBefore))
     expect(f.flow.stop({ sessionId: f.sessionId })).toMatchObject({ ok: true })
     const stopped = await f.settled()
-    const original = repo.collaborationTurnAuthorization(stopped.pendingWork!.runId)!
-    expect(stopped.pendingWork?.stage).toBe(stage)
-    native.replyOutcome = { outcome: 'plan_revision_required' }
+    const original = repo.collaborationTurnAuthorization(stopped.runId)!
+    expect(stopped).toMatchObject({ openMode: true, stage, status: 'failed' })
     native.planText = 'Updated acceptance includes cancellation while offline.'
     const request = 'Change acceptance to include cancellation while offline.'
     expect(await f.flow.send(f.input(request))).toMatchObject({ ok: true })
     await vi.waitFor(() => expect(native.inputs).toHaveLength(writesBefore + 1))
-    expect(await f.settled()).toMatchObject({
-      stage: 'reply',
-      automation: 'paused',
-      planRevision: { writeRunId: original.runId },
-      pendingWork: stopped.pendingWork,
+    const published = await f.settled()
+    expect(published).toMatchObject({
+      openMode: true,
+      stage: 'collaborate',
+      status: 'waiting',
+      planVersion: 2,
+      unreviewedPlanActor: published.actor,
     })
-    expect(native.inputs).toHaveLength(writesBefore + 1)
-    expect(await f.act('resume')).toMatchObject({ ok: true })
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(writesBefore + 3))
+    native.planText = undefined
+    expect(await f.act('review_plan')).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(writesBefore + 2))
     const ready = await f.settled()
     expect(ready).toMatchObject({
       stage: 'plan_review',
-      status: 'ready',
+      status: 'waiting',
       repairAttempts: stopped.repairAttempts,
-      pendingWork: stopped.pendingWork,
+      review: { verdict: 'accepted' },
     })
-    expect(
-      native.inputs
-        .slice(writesBefore + 1)
-        .map((input) => input.promptEnvelope.collaboration?.stage),
-    ).toEqual(['plan', 'plan_review'])
-    expect(native.inputs[writesBefore + 1]?.promptEnvelope.collaborationAuthorization?.actor).toBe(
-      primary,
-    )
-
     const approval = {
       sessionId: f.sessionId,
       taskId: ready.id,
@@ -724,97 +707,75 @@ it.each([
     }
     expect(await f.flow.actOnCollaboration(approval)).toMatchObject({ ok: true })
     expect(await f.flow.actOnCollaboration(approval)).toMatchObject({ ok: true })
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(writesBefore + 5))
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(writesBefore + 3))
+    await f.settled()
+    expect(await f.act('review_code')).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(writesBefore + 4))
     expect(await f.settled()).toMatchObject({
-      status: 'complete',
+      status: 'waiting',
+      review: { verdict: 'accepted' },
       repairAttempts: stopped.repairAttempts,
     })
     expect(
-      native.inputs
-        .slice(writesBefore + 3)
-        .map((input) => input.promptEnvelope.collaboration?.stage),
-    ).toEqual(['implement', 'code_review'])
-    const implementation = native.inputs[writesBefore + 3]!
+      native.inputs.slice(writesBefore).map((input) => input.promptEnvelope.collaboration?.stage),
+    ).toEqual(['collaborate', 'plan_review', 'implement', 'code_review'])
+    const implementation = native.inputs[writesBefore + 2]!
     expect(implementation.promptEnvelope.collaborationAuthorization?.userAuthority).toMatchObject({
       purpose: 'action',
     })
     expect(
       implementation.promptEnvelope.collaborationAuthorization?.userAuthority?.rootReceiptId,
     ).not.toBe(original.userAuthority?.rootReceiptId)
-    expect(repo.collaboration(f.sessionId)?.planRevision).toBeUndefined()
     for (const run of native.inputs.slice(writesBefore + 1)) {
-      const authorization = run.promptEnvelope.collaborationAuthorization!
       const read = native.sourceReads.find((entry) => entry.runId === run.runId)
-      expect(repo.sourceDocumentAuthorized(run.runId, original.planReference!.document)).toBe(true)
-      expect(read?.documents).toContainEqual(
-        expect.objectContaining({ id: original.planReference!.document.id }),
-      )
-      const scopeAuthorized = original.reviewScopeRef
-        ? repo.sourceDocumentAuthorized(run.runId, original.reviewScopeRef)
-        : undefined
-      expect(scopeAuthorized).toBe(stage === 'repair' ? true : undefined)
       expect(read?.inputBodies).toContain(request)
       expect(read?.documents).toContainEqual(
-        expect.objectContaining({
-          id: authorization.planRevisionContextRef?.id,
-        }),
-      )
-      expect(repo.readFrozenInputBatch(run.runId, original.inputBatchRef!.id).batch).toMatchObject(
-        original.inputBatchRef!,
+        expect.objectContaining({ id: published.planReference!.document.id }),
       )
     }
   },
 )
 
 it.each(['plan', 'plan_review'] as const)(
-  'resumes a historical automation pause within the running revised %s without admitting a replacement',
+  'refuses duplicate dispatch while a paused Phase 1 %s run is running, then advances once settled',
   async (stage) => {
     const f = await fixture()
     const repo = f.db.conversationRepository
-    expect(await f.flow.send(f.input('/plan Preserve the accepted scope.'))).toMatchObject({
-      ok: true,
-    })
-    await f.settled()
-    native.interruptNextWrite = true
-    expect(await f.act('execute')).toMatchObject({ ok: true })
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
-    await f.settled()
-    native.replyOutcome = { outcome: 'plan_revision_required' }
-    expect(await f.flow.send(f.input('Revise the original acceptance criteria.'))).toMatchObject({
-      ok: true,
-    })
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(4))
-    await f.settled()
-
+    if (stage === 'plan_review') {
+      native.reviews = [{ verdict: 'changes_requested' }, { verdict: 'accepted' }]
+    }
     const hold = Promise.withResolvers<void>()
     native.holdStage = { stage, until: hold.promise }
-    const count = stage === 'plan' ? 5 : 6
     try {
-      expect(await f.act('resume')).toMatchObject({ ok: true })
+      expect(await f.flow.send(f.input('/plan Preserve the accepted scope.'))).toMatchObject({
+        ok: true,
+      })
+      const count = stage === 'plan' ? 1 : 2
       await vi.waitFor(() => expect(native.inputs).toHaveLength(count))
       const running = repo.collaboration(f.sessionId)!
       expect(running).toMatchObject({ stage, status: 'running' })
       repo.pauseCollaboration(f.sessionId, 'user')
-      expect(await f.act('resume')).toMatchObject({ ok: true })
+      expect(await f.act('resume')).toMatchObject({ ok: false })
+      expect(await f.act('review_plan')).toMatchObject({ ok: false })
       expect(repo.collaboration(f.sessionId)).toMatchObject({
         stage,
         status: 'running',
         runId: running.runId,
-        automation: 'active',
+        automation: 'paused',
       })
       expect(native.inputs).toHaveLength(count)
     } finally {
       hold.resolve()
     }
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(6))
+    const waiting = await f.settled()
+    expect(waiting).toMatchObject({ status: 'waiting', automation: 'paused', stage })
+    expect(await f.act(stage === 'plan' ? 'review_plan' : 'resume')).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(repo.collaboration(f.sessionId)?.status).toBe('ready'))
     expect(await f.settled()).toMatchObject({ status: 'ready', stage: 'plan_review' })
-    expect(
-      native.inputs.slice(4).map((input) => input.promptEnvelope.collaboration?.stage),
-    ).toEqual(['plan', 'plan_review'])
   },
 )
 
-it('returns an unchanged Plan to the original unfinished write without a redundant plan review', async () => {
+it('retries an unchanged interrupted Plan implementation without a redundant plan review or leaked unselected source', async () => {
   const f = await fixture(),
     repo = f.db.conversationRepository
   native.unselectedPlan =
@@ -835,42 +796,34 @@ it('returns an unchanged Plan to the original unfinished write without a redunda
   expect(await f.act('execute')).toMatchObject({ ok: true })
   await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
   const stopped = await f.settled()
-  expect(stopped.pendingWork).toMatchObject({ stage: 'implement', runId: native.inputs[2]!.runId })
-  const root = repo.collaborationTurnAuthorization(native.inputs[2]!.runId)!.userAuthority!
-    .rootReceiptId
-  expect(
-    await f.flow.send(
-      f.input(
-        'Status only: report where this unchanged accepted plan stopped; keep the original plan and write scope.',
-      ),
-    ),
-  ).toMatchObject({ ok: true })
+  expect(stopped).toMatchObject({ stage: 'implement', status: 'failed', pauseReason: 'stopped' })
+  expect(await f.act('retry')).toMatchObject({ ok: true })
   await vi.waitFor(() => expect(native.inputs).toHaveLength(4))
   await f.settled()
-  expect(repo.collaboration(f.sessionId)?.planReference?.document.sha256).toBe(
-    accepted.document.sha256,
-  )
-  expect(await f.act('resume')).toMatchObject({ ok: true })
-  await vi.waitFor(() => expect(native.inputs).toHaveLength(6))
+  expect(await f.act('review_code')).toMatchObject({ ok: true })
+  await vi.waitFor(() => expect(native.inputs).toHaveLength(5))
   const completed = await f.settled()
-  expect(completed).toMatchObject({ status: 'complete', repairAttempts: 0 })
-  expect(native.inputs.slice(4).map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
+  expect(completed).toMatchObject({
+    status: 'waiting',
+    repairAttempts: 0,
+    review: { verdict: 'accepted' },
+  })
+  expect(native.inputs.slice(3).map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
     'implement',
     'code_review',
   ])
-  expect(native.inputs[4]!.promptEnvelope.collaborationAuthorization?.userAuthority).toMatchObject({
-    purpose: 'write_continuation',
-    rootReceiptId: root,
+  expect(native.inputs[3]!.promptEnvelope.collaborationAuthorization?.userAuthority).toMatchObject({
+    purpose: 'action',
   })
   expect(
-    native.sourceReads.find((read) => read.runId === native.inputs[4]!.runId)?.rejectedDocumentIds,
+    native.sourceReads.find((read) => read.runId === native.inputs[3]!.runId)?.rejectedDocumentIds,
   ).toContain(unselected.id)
-  expect(repo.sourceDocumentAuthorized(native.inputs[4]!.runId, unselected)).toBe(false)
+  expect(repo.sourceDocumentAuthorized(native.inputs[3]!.runId, unselected)).toBe(false)
   expect(decisionWorkingMemoryDiagnostics().chargedBytes).toBe(0)
 })
 
-it.each(['implement', 'repair'] as const)(
-  'reads original bodies, frozen Comments and fixed scope with the new %s caller grant while later drafts remain unsent',
+it.each(['implement', 'collaborate'] as const)(
+  'reads original bodies, frozen Comments and fixed scope with the retried %s grant while later drafts remain unsent',
   async (stage) => {
     const f = await fixture(),
       repo = f.db.conversationRepository
@@ -907,29 +860,31 @@ it.each(['implement', 'repair'] as const)(
       'Preserve only the exact original cancellation scope.\n'.repeat(300) +
       'FINAL ORIGINAL INPUT LINE 🧪'
     native.interruptNextWrite = stage === 'implement'
-    if (stage === 'repair') native.reviews = [{ verdict: 'changes_requested' }]
+    if (stage === 'collaborate')
+      native.reviews = [{ verdict: 'changes_requested' }, { verdict: 'accepted' }]
     expect(await f.flow.send({ ...f.input(originalInput), commentIds: [oldId] })).toMatchObject({
       ok: true,
     })
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(stage === 'implement' ? 2 : 3))
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
     await f.settled()
-    native.interruptNextWrite = stage === 'repair'
-    const repair = stage === 'repair' ? await f.act('repair') : undefined
-    expect(repair?.ok).toBe(stage === 'repair' ? true : undefined)
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(stage === 'repair' ? 4 : 2))
-    await f.settled()
+    if (stage === 'collaborate') {
+      const reviewed = await f.act('review_code')
+      if (!reviewed.ok) throw Error(reviewed.error.message)
+      await vi.waitFor(() => {
+        if (native.inputs.length !== 3) throw Error('Waiting for review_code run')
+      })
+      await f.settled()
+      native.interruptNextWrite = true
+      const fixed = await f.act('fix')
+      if (!fixed.ok) throw Error(fixed.error.message)
+      await vi.waitFor(() => {
+        if (native.inputs.length !== 4) throw Error('Waiting for interrupted fix run')
+      })
+      await f.settled()
+    }
     const interrupted = repo.collaboration(f.sessionId)!,
-      original = repo.collaborationTurnAuthorization(interrupted.pendingWork!.runId)!,
-      originalScope = original.reviewScopeRef ?? interrupted.taskDocument!
-    expect(
-      await f.flow.send(
-        f.input(
-          'Status only: report progress without changing the original scope or accepted authorization.',
-        ),
-      ),
-    ).toMatchObject({ ok: true })
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(stage === 'implement' ? 3 : 5))
-    await f.settled()
+      originalScope = interrupted.reviewScopeRef ?? interrupted.taskDocument!
+    expect(interrupted).toMatchObject({ stage, status: 'failed' })
     drafts = repo.readPage({ scope: 'drafts', sessionId: f.sessionId })
     if (drafts.scope !== 'drafts') throw Error('Missing drafts')
     const laterId = randomUUID()
@@ -941,17 +896,16 @@ it.each(['implement', 'repair'] as const)(
       body: 'A later draft remains local and grants no new scope.',
       anchor,
     })
-    expect(await f.act('resume')).toMatchObject({ ok: true })
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(stage === 'implement' ? 5 : 7))
+    expect(await f.act('retry')).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(stage === 'implement' ? 3 : 5))
+    await f.settled()
+    expect(await f.act('review_code')).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(stage === 'implement' ? 4 : 6))
     expect(await f.settled()).toMatchObject({
       status: 'complete',
       repairAttempts: interrupted.repairAttempts,
     })
-    const continuation = native.inputs.find(
-        (input) =>
-          input.promptEnvelope.collaborationAuthorization?.userAuthority?.purpose ===
-          'write_continuation',
-      )!,
+    const continuation = native.inputs[stage === 'implement' ? 2 : 4]!,
       read = native.sourceReads.find((value) => value.runId === continuation.runId)!
     expect(read.inputBodies).toContain(originalInput)
     expect(read.comments).toContainEqual({ id: oldId, text: oldBody })
@@ -964,16 +918,9 @@ it.each(['implement', 'repair'] as const)(
     const remaining = repo.readPage({ scope: 'drafts', sessionId: f.sessionId })
     if (remaining.scope !== 'drafts') throw Error('Missing retained drafts')
     expect(remaining.comments.map((comment) => comment.id)).toEqual([laterId])
-    expect(
-      repo.readFrozenInputBatch(
-        continuation.runId,
-        continuation.promptEnvelope.collaborationAuthorization!.inputBatchRef!.id,
-      ).members,
-    ).toEqual([])
-    expect(continuation.promptEnvelope.collaborationAuthorization?.userAuthority).toMatchObject({
-      rootReceiptId: original.userAuthority!.rootReceiptId,
-      purpose: 'write_continuation',
-    })
+    expect(continuation.promptEnvelope.collaborationAuthorization?.userAuthority?.purpose).toBe(
+      'action',
+    )
   },
 )
 

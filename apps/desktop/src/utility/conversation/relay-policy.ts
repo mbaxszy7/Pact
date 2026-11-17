@@ -53,8 +53,9 @@ export type RelayPolicyAdmission = {
 
 type RelayNodeFacts = {
   node: 'send'
-  /** Workflow feedback retains its frozen recipient even when its route is implicit. */
+  /** Workflow feedback retains its frozen recipient unless running in open mode. */
   ordinary: boolean | null
+  openMode?: boolean
   primary: RuntimeAgentId
   route: 'implicit' | 'agent' | 'command' | 'all'
   inputSourceId: string
@@ -215,24 +216,39 @@ export function evaluateRelayPolicy(facts: RelayPolicyFacts): RelayPolicyResult 
           requiredSources: material.sources.map(({ id, roles }) => ({ id, roles: [...roles] })),
         }
   const ineligible: RelayPolicyResult = { kind: 'skip', reason: 'ineligible' }
-  if (
-    facts.ordinary !== true ||
-    facts.route !== 'implicit' ||
-    !agentValid(facts.primary) ||
-    !hasSource(facts.inputSourceId, 'input') ||
-    facts.referencedSourceIds.length === 0 ||
-    facts.referencedSourceIds.length > DECISION_SOURCES
-  )
-    return ineligible
-  const referenced = new Set<RuntimeAgentId>()
-  for (const id of facts.referencedSourceIds) {
-    const source = sources.get(id)
-    if (!source || source.actor === null) return ineligible
-    referenced.add(source.actor)
+  if (facts.openMode) {
+    if (
+      facts.route !== 'implicit' ||
+      !agentValid(facts.primary) ||
+      !hasSource(facts.inputSourceId, 'input') ||
+      facts.referencedSourceIds.length > DECISION_SOURCES
+    )
+      return ineligible
+    for (const id of facts.referencedSourceIds) {
+      const source = sources.get(id)
+      if (!source || source.actor === null) return ineligible
+    }
+    for (const actor of ['codex', 'claude'] as const) add('route_send', actor)
+  } else {
+    if (
+      facts.ordinary !== true ||
+      facts.route !== 'implicit' ||
+      !agentValid(facts.primary) ||
+      !hasSource(facts.inputSourceId, 'input') ||
+      facts.referencedSourceIds.length === 0 ||
+      facts.referencedSourceIds.length > DECISION_SOURCES
+    )
+      return ineligible
+    const referenced = new Set<RuntimeAgentId>()
+    for (const id of facts.referencedSourceIds) {
+      const source = sources.get(id)
+      if (!source || source.actor === null) return ineligible
+      referenced.add(source.actor)
+    }
+    if (referenced.size < 2 && referenced.has(facts.primary)) return ineligible
+    for (const actor of ['codex', 'claude'] as const)
+      if (actor === facts.primary || referenced.has(actor)) add('route_send', actor)
   }
-  if (referenced.size < 2 && referenced.has(facts.primary)) return ineligible
-  for (const actor of ['codex', 'claude'] as const)
-    if (actor === facts.primary || referenced.has(actor)) add('route_send', actor)
   const information = facts.informationOpportunity
   if (
     information &&

@@ -230,7 +230,7 @@ it('omits the generic restart reminder only for known settled work', async () =>
   task.notice = notice
   installRead(task)
   const view = render(<CollaborationReview {...props} />)
-  await screen.findByRole('button', { name: 'Continue collaboration' })
+  await screen.findByRole('button', { name: 'Update plan · Codex' })
   expect(screen.queryByText(notice)).toBeNull()
   view.rerender(
     <CollaborationReview {...props} run={{ ...props.run, nativeEffectsState: 'unknown' }} />,
@@ -247,7 +247,7 @@ it('requires explicit Continue after updated Session limits and refreshes the sa
   const bridge = installRead(task)
   bridge.getConversation.mockResolvedValue({
     ok: true,
-    value: reportPage(task, { nextStep: 'Review the current plan with Claude Code' }),
+    value: reportPage(task, { nextStep: 'Update the plan with Codex' }),
   })
   bridge.actOnCollaboration.mockResolvedValue({
     ok: false,
@@ -269,7 +269,7 @@ it('requires explicit Continue after updated Session limits and refreshes the sa
       onOpenSessionSettings={onOpenSessionSettings}
     />,
   )
-  const resume = await screen.findByRole('button', { name: 'Continue to Claude Code plan review' })
+  const resume = await screen.findByRole('button', { name: 'Update plan · Codex' })
   expect(bridge.getConversation).toHaveBeenCalledTimes(2)
   expect(bridge.actOnCollaboration).not.toHaveBeenCalled()
   expect(screen.queryByText(/limit.*reached/i)).toBeNull()
@@ -297,7 +297,7 @@ it('opens the exact current plan without duplicating it in chat or offering hist
     messageId: task.taskMessageId,
     version: 2,
   })
-  expect(screen.getAllByRole('button', { name: 'Continue collaboration' })).toHaveLength(1)
+  expect(screen.getAllByRole('button', { name: 'Update plan · Codex' })).toHaveLength(1)
   view.rerender(
     <CollaborationReview {...props} latestRunId={crypto.randomUUID()} onOpenPlan={onOpenPlan} />,
   )
@@ -313,7 +313,7 @@ it('keeps failed action receipts visible after successful refresh and sends the 
     error: { code: 'CONFLICT', message: 'The action receipt changed.' },
   })
   render(<CollaborationReview {...props} />)
-  fireEvent.click(await screen.findByRole('button', { name: 'Continue collaboration' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Update plan · Codex' }))
   await screen.findByRole('alert')
   await waitFor(() => expect(bridge.getConversation).toHaveBeenCalledTimes(2))
   fireEvent.click(screen.getByRole('button', { name: /^Retry$/ }))
@@ -336,7 +336,7 @@ it('omits Pause while preserving the authorized next action and revision receipt
     error: { code: 'CONFLICT', message: 'Revision changed' },
   })
   render(<CollaborationReview {...props} />)
-  const resume = await screen.findByRole('button', { name: 'Continue collaboration' })
+  const resume = await screen.findByRole('button', { name: 'Update plan · Codex' })
   expect(screen.queryByRole('button', { name: /Pause collaboration/i })).toBeNull()
   fireEvent.click(resume)
   await waitFor(() =>
@@ -347,11 +347,11 @@ it('omits Pause while preserving the authorized next action and revision receipt
 })
 
 it.each([
-  { primary: 'codex', secondary: 'claude', label: 'Claude Code' },
-  { primary: 'claude', secondary: 'codex', label: 'Codex' },
+  { primary: 'codex', secondary: 'claude', label: 'Claude Code', primaryLabel: 'Codex' },
+  { primary: 'claude', secondary: 'codex', label: 'Codex', primaryLabel: 'Claude Code' },
 ] as const)(
-  'labels all writing actions with Secondary when Primary is $primary',
-  async ({ primary, secondary, label }) => {
+  'labels writing actions with their exact target Agent when Primary is $primary',
+  async ({ primary, secondary, label, primaryLabel }) => {
     const { props, task, planReference } = collaborationFixture()
     Object.assign(task, {
       owner: primary,
@@ -375,15 +375,14 @@ it.each([
     const bridge = installRead(task)
     bridge.getConversation.mockResolvedValue({
       ok: true,
-      value: reportPage(task, { availableActions: ['execute', 'respond', 'repair'] }),
+      value: reportPage(task, { availableActions: ['execute', 'fix'] }),
     })
     render(<CollaborationReview {...props} />)
     expect(await screen.findByRole('button', { name: `Implement plan · ${label}` })).toBeDefined()
-    expect(screen.getByRole('button', { name: `Respond · ${label}` })).toBeDefined()
-    expect(screen.getByRole('button', { name: `Repair · ${label}` })).toBeDefined()
+    expect(screen.getByRole('button', { name: `Update plan · ${primaryLabel}` })).toBeDefined()
     expect(
       screen.queryByRole('button', {
-        name: `Implement plan · ${primary === 'codex' ? 'Codex' : 'Claude Code'}`,
+        name: `Implement plan · ${primaryLabel}`,
       }),
     ).toBeNull()
   },
@@ -394,14 +393,14 @@ it('ties the draft hint to the disabled advancing actions with aria-describedby'
   const bridge = installRead(task)
   bridge.getConversation.mockResolvedValue({
     ok: true,
-    value: reportPage(task, { availableActions: ['respond', 'repair'] }),
+    value: reportPage(task, { availableActions: ['fix', 'review_code'] }),
   })
   render(<CollaborationReview {...props} feedbackDraft />)
   const hint = await screen.findByText('Send or clear your draft before continuing this task.')
   expect(hint.id).not.toBe('')
-  const respond = screen.getByRole('button', { name: /^Respond/ })
-  const repair = screen.getByRole('button', { name: /^Repair/ })
-  for (const button of [respond, repair]) {
+  const fix = screen.getByRole('button', { name: /^Fix issues/ })
+  const reviewCode = screen.getByRole('button', { name: /^Review code/ })
+  for (const button of [fix, reviewCode]) {
     expect(button.getAttribute('aria-describedby')).toBe(hint.id)
     expect(button).toHaveProperty('disabled', true)
   }

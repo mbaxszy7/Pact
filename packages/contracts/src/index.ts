@@ -2819,6 +2819,8 @@ export const collaborationReceivedMetadataSchema = z.strictObject({
   steerSkillInvocation: collaborationDocumentSchema.optional(),
   replyIntentBasis: collaborationReplyIntentBasisSchema.optional(),
   workflowCommand: z.boolean().default(false),
+  inTaskReview: z.boolean().optional(),
+  routeIntent: z.enum(['implicit', 'explicit']).optional(),
   rolePolicy: z.literal('split-stages-v1').optional(),
   skills: skillSelectionsSchema.default([]),
   imageIds: conversationSendInputSchema.shape.imageIds.default([]),

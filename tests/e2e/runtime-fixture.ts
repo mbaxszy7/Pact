@@ -1183,7 +1183,7 @@ const collaborationReport = async (prefix, facts, transport) => {
   if(auth.reviewScopeRef)await read({document:auth.reviewScopeRef})
   const plan='1. Keep cancellation with its owner. 2. Verify Stop and restart. 3. Review the resulting code.'
   const questions=[{prompt:'Which cancellation scope should change?',selection:'single',options:[{label:'Current request'},{label:'All pending requests'}]}]
-  const firstQuestion=reference.stage==='plan'&&!reference.plan&&(task.includes('unclear')||task.trim()==='/plan')
+  const firstQuestion=reference.stage==='plan'&&!reference.plan&&!reference.openMode&&(task.includes('unclear')||task.trim()==='/plan')
   if((reference.stage==='plan'||reference.stage==='reply')&&reference.kind==='plan'&&auth.actor===reference.owner) {
     if(task.includes('missing native plan'))return {text:'The native plan was not published.'}
     if(firstQuestion)return {tool:'submit_input_result',args:{outcome:'needs_user',questions},text:'Choose the cancellation scope before preparing the plan.'}
@@ -1196,8 +1196,9 @@ const collaborationReport = async (prefix, facts, transport) => {
     const verdict=facts.reviewCount===1?'changes_requested':'accepted'
     return {tool:'submit_review',args:{verdict},text:verdict==='accepted'?'No unresolved feedback. Cancellation and restart verified.':'Keep cancellation with its owner. Release the pending request when its owner stops.'}
   }
-  if(reference.stage==='reply')return {tool:'submit_input_result',args:{outcome:'processed'},text:'The supplied scope decision has been handled.'}
-  return {text:reference.stage==='respond'?'The cancellation finding is confirmed; an explicit repair is required.':'Cancellation work is complete and ready for independent review.'}
+  if(reference.stage==='reply'&&!reference.openMode)return {tool:'submit_input_result',args:{outcome:'processed'},text:'The supplied scope decision has been handled.'}
+  const fileChange=(reference.stage==='implement'||reference.stage==='collaborate')&&!task.includes('no code change')?{name:'cancellation-'+auth.runId.slice(0,8)+'.ts',content:'export const owner = '+JSON.stringify(auth.runId)+'\\n'}:undefined
+  return {fileChange,text:reference.stage==='respond'?'The cancellation finding is confirmed; an explicit repair is required.':'Cancellation work is complete and ready for independent review.'}
 }
 const readFixtureSource = async (request, call) => {
   let offset=0,text='',pages=[]
@@ -1282,6 +1283,14 @@ const nativePlan = async (sessionId, promptId, plan) => {
   await hook('PreToolUse',exitId,'ExitPlanMode',{})
   await sdkControl({subtype:'can_use_tool',tool_name:'ExitPlanMode',tool_use_id:exitId,input:{}})
 }
+const nativeWrite = async (sessionId, promptId, fileChange) => {
+  const cwd=realpathSync(process.cwd()), filePath=join(cwd,fileChange.name), id=randomUUID(), args={file_path:filePath,content:fileChange.content}
+  const hook=async(event,toolId,name,input,response)=>{for(const group of sdkHooks[event]??[])for(const callback of group.hookCallbackIds??[])await sdkControl({subtype:'hook_callback',callback_id:callback,tool_use_id:toolId,input:{hook_event_name:event,session_id:sessionId,prompt_id:promptId,cwd,transcript_path:'',tool_name:name,tool_use_id:toolId,tool_input:input,...(response?{tool_response:response}:{})}})}
+  await hook('PreToolUse',id,'Write',args)
+  writeFileSync(filePath,fileChange.content)
+  const receipt={type:'create',filePath,content:fileChange.content,originalFile:null,userModified:false}
+  await hook('PostToolUse',id,'Write',args,receipt)
+}
 for (;;) {
   const line=await inputIterator.next();if(line.done)break
   const message = JSON.parse(line.value)
@@ -1324,6 +1333,7 @@ for (;;) {
       const content=typeof message.message.content==='string'?message.message.content:message.message.content.filter(item=>item.type==='text').map(item=>item.text).join('\\n')
       const report = await collaborationReport(collaborationPrefix+'\\n'+content, facts, sdkSource)
       if(report.plan)await nativePlan(sessionId,message.uuid,report.plan)
+      if(report.fileChange)await nativeWrite(sessionId,message.uuid,report.fileChange)
       if(report.tool){
         const own=sdkServers.find(name=>name.startsWith('pact_peer')),id=randomUUID(),name='mcp__'+own+'__'+report.tool
         send({type:'assistant',session_id:sessionId,uuid:randomUUID(),parent_tool_use_id:null,user_message_uuid:message.uuid,message:{id:randomUUID(),role:'assistant',type:'message',model:'claude-fixture',content:[{type:'tool_use',id,name,input:report.args}],stop_reason:'tool_use',stop_sequence:null,usage:{input_tokens:0,output_tokens:0}}})
@@ -1541,6 +1551,7 @@ for await (const line of lines) {
         const call=async(name,args)=>{const rpc=await fetch(own[1].url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:randomUUID(),method:'tools/call',params:{name,arguments:args}}),signal:AbortSignal.timeout(5000)}).then(response=>response.json());if(!rpc.result)throw Error('Source MCP failed');return rpc.result}
         const report = await collaborationReport(prefix, state, request=>readFixtureSource(request,args=>call('read_collaboration_source',args)))
         if(report.plan)send({method:'item/completed',params:{threadId,turnId,item:{id:'plan-'+turnId,type:'plan',text:report.plan}}})
+        if(report.fileChange){const filePath=join(request.params.cwd??process.cwd(),report.fileChange.name);writeFileSync(filePath,report.fileChange.content);send({method:'item/completed',params:{threadId,turnId,item:{id:'fc-'+turnId,type:'fileChange',status:'completed',changes:[{path:filePath,kind:{type:'add'},diff:'@@ -0,0 +1,1 @@\\n+'+report.fileChange.content.trim()}]}}})}
         if(report.tool){const result=await call(report.tool,report.args);send({method:'item/completed',params:{threadId,turnId,item:{id:'workflow-'+turnId,type:'mcpToolCall',server:own[0].slice('mcp_servers.'.length),tool:report.tool,arguments:report.args,result,error:null,status:'completed'}}})}
         text=report.text
         persist();complete()

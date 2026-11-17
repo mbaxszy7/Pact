@@ -121,7 +121,7 @@ for (const command of ['ordinary', '/plan', '/build', '/review'] as const)
       db.sessionRepository.create(
         { id: sessionId, projectId, title: 'New session', createdAt: now },
         {
-          primaryAgentId: 'codex',
+          primaryAgentId: command === '/build' ? 'claude' : 'codex',
           agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
           maxDiscussionRounds: 6,
           maxReviewCycles: 3,

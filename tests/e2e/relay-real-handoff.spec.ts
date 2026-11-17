@@ -8,7 +8,7 @@ import type { CollaborationDocument, DesktopBridge } from '../../packages/contra
 import { diagnosticRecordSchema } from '../../packages/contracts/src/diagnostics.js'
 import {
   collaborationTaskSchema,
-  advanceCollaboration,
+  advanceAutomaticCollaboration,
   OPENAI_DECISION_MODEL,
   collaborationTurnAuthorizationSchema,
 } from '../../packages/contracts/src/index.js'
@@ -72,7 +72,7 @@ async function seed(
       codex: { model: 'gpt-6-luna', effort: 'low' },
       claude: { model: claudeModel, effort: null },
     },
-    maxDiscussionRounds: 6,
+    maxDiscussionRounds: 2,
     maxReviewCycles: 3,
     maxRepairAttempts: 3,
   } as const
@@ -178,7 +178,7 @@ async function seed(
   finish(first.id, true)
   const next = () => {
     const task = repo.collaboration(sessionId)!,
-      candidate = advanceCollaboration(task, 'continue', settings),
+      candidate = advanceAutomaticCollaboration(task, settings),
       agent = settings.agents[candidate.actor]
     return repo.beginRun({
       sessionId,
@@ -205,14 +205,14 @@ async function seed(
   expect(
     repo
       .relayWorkflowAlternatives(handoff)
-      ?.alternatives.find((entry) => entry.kind === 'supplement_plan'),
-  ).toMatchObject({ kind: 'supplement_plan' })
+      ?.alternatives.find((entry) => entry.kind === 'extend_plan_review'),
+  ).toMatchObject({ kind: 'extend_plan_review' })
   const material = await repo.readRelayWorkflowDecisionSources(
     handoff,
     [
       {
-        id: 'continue_plan_review',
-        description: 'Return the complete retained plan to its fixed reviewer.',
+        id: 'propose_extend_plan_review',
+        description: 'Propose one additional read-only review of the current plan.',
       },
     ],
     { signal: new AbortController().signal, deadlineAt: Date.now() + 15_000 },
@@ -226,7 +226,12 @@ async function seed(
       chars: source.document.chars,
     }))
     .toSorted((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
-  repo.pauseCollaboration(sessionId, 'user')
+  repo.setCollaborationState({
+    ...task,
+    revision: task.revision + 1,
+    automation: 'paused',
+    pauseReason: 'limit',
+  })
   return {
     sessionId,
     projectId,
@@ -245,11 +250,21 @@ async function seed(
 async function resume(page: Page, sessionId: string) {
   const actionResult = await page.evaluate(
     async (payload) => {
-      const bridge: DesktopBridge = Reflect.get(globalThis, 'pact'),
-        current = await bridge.getConversation({
-          scope: 'collaboration',
-          sessionId: payload.sessionId,
-        })
+      const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+      const editor = await bridge.getSessionSettings(payload.sessionId)
+      if (!editor.ok) throw Error('Current session settings are unavailable')
+      const saved = await bridge.saveSessionSettings({
+        sessionId: payload.sessionId,
+        settings: {
+          ...editor.value.session.settings,
+          maxDiscussionRounds: editor.value.session.settings.maxDiscussionRounds + 1,
+        },
+      })
+      if (!saved.ok) return { ok: false, error: saved.error.code }
+      const current = await bridge.getConversation({
+        scope: 'collaboration',
+        sessionId: payload.sessionId,
+      })
       if (!current.ok || current.value.scope !== 'collaboration' || !current.value.view.task)
         throw Error('Current workflow is unavailable')
       const task = current.value.view.task,
@@ -258,7 +273,7 @@ async function resume(page: Page, sessionId: string) {
           taskId: task.id,
           revision: task.revision,
           clientMessageId: crypto.randomUUID(),
-          action: 'resume',
+          action: 'review_plan',
         })
       return actionReply.ok ? { ok: true } : { ok: false, error: actionReply.error.code }
     },
@@ -385,10 +400,11 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
   // independently performs every admission/native check again after Continue.
   const observation = ReadonlyFixtureDatabase.open(ctx.fixture)
   const startedAt = Date.now()
-  let cancelledCards = 0
+  let answeredCards = 0
+  let fallbackResumed = false
   const answered = new Set<string>()
   try {
-    await resume(ctx.page, prepared.sessionId)
+    if (!enabled) await resume(ctx.page, prepared.sessionId)
     let realRunId: string | undefined
     await expect
       .poll(
@@ -421,7 +437,7 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
           }, prepared.sessionId)
           if (pending && !answered.has(pending.decisionId)) {
             expect(enabled).toBe(true)
-            expect(pending.request.category).toBe('new_authorization')
+            expect(pending.request.category).toBe('limit_extension')
             answered.add(pending.decisionId)
             const result = await ctx.page.evaluate(
               async (reference) => {
@@ -429,7 +445,7 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
                 return bridge.answerRelayDecision({
                   reference,
                   clientOperationId: crypto.randomUUID(),
-                  answer: { kind: 'cancel' },
+                  answer: { kind: 'confirm' },
                 })
               },
               {
@@ -438,8 +454,24 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
                 revision: pending.revision,
               },
             )
-            expect(result).toMatchObject({ ok: true, value: { disposition: 'cancelled' } })
-            cancelledCards++
+            expect(result).toMatchObject({ ok: true, value: { disposition: 'confirmed' } })
+            answeredCards++
+            return false
+          }
+          if (enabled && !fallbackResumed && answeredCards === 0) {
+            const evaluations = observation.drizzle.query.schedulingEvaluations
+              .findMany({
+                where: (fields, { eq }) => eq(fields.sessionId, prepared.sessionId),
+                limit: 4,
+              })
+              .sync()
+            const settled = evaluations.find(
+              (entry) => entry.called && !entry.active && entry.outcome === 'completed',
+            )
+            if (settled && settled.selectedCandidateId === null) {
+              fallbackResumed = true
+              await resume(ctx.page, prepared.sessionId)
+            }
           }
           return false
         },
@@ -525,7 +557,7 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
       .find((value) => value.runId === run.id)!
     expect(turn.reportBodyId).toBeTruthy()
     const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
-    expect(auth.userAuthority).toBeUndefined()
+    expect(auth.userAuthority?.purpose).toBe('action')
     expect(auth.sourceManifestRef).toBeUndefined()
     // Decisions generates no prose or new document grants. Check the complete frozen
     // source bytes independently of its choice; this is source integrity, not native tool-use evidence.
@@ -600,7 +632,7 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
     const decisions = observation.drizzle.query.relayDecisions
       .findMany({ where: (fields, { eq }) => eq(fields.sessionId, prepared.sessionId), limit: 4 })
       .sync()
-    expect(decisions.length).toBe(cancelledCards)
+    expect(decisions.length).toBe(answeredCards)
     const native = await findNativeRecord(ctx, 'claude', run.nativeSessionId!)
     expect(native.claudeUserInputs).toBe(1)
     expect(native.assistantModels).toContain(run.model)
@@ -637,7 +669,8 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
       decisionPhysicalReleased: !evaluated || !evaluated.active,
       decisionCards: decisions.length,
       manualCheckRequests: 0,
-      cancelledCards,
+      cancelledCards: 0,
+      answeredCards,
       stoppedAfterReviewerCompleted: true,
       relayDisabledAfterAdmission: true,
       generatedGuidance: false,

@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import {
-  advanceCollaboration,
+  advanceAutomaticCollaboration,
   collaborationActor,
   collaborationTaskSchema,
   collaborationDocumentSchema,
@@ -69,7 +69,10 @@ afterEach(async () => {
 })
 
 async function workflow(filePath?: string) {
-  const f = await planRevisionFixture(filePath ? { filePath } : {})
+  const f = await planRevisionFixture({
+    maxDiscussionRounds: 2,
+    ...(filePath ? { filePath } : {}),
+  })
   databases.add(f.db)
   const firstResponse = f.repo.beginRun(f.admission()).run
   f.finish(firstResponse.id, { plan: 'First revised Plan.' })
@@ -92,14 +95,38 @@ async function workflow(filePath?: string) {
     plan: 'Revised complete Plan. Preserve the original cancellation boundary.',
     answer: 'Author response addressing the original review, including its complete final page.',
   })
-  const admission = f.admission(),
-    handoff = admission.schedulingHandoff
+  const current = f.repo.collaboration(f.sessionId)!,
+    handoff = f.repo.workflowHandoff(current, current.owner),
+    defaultAdmission = {
+      sessionId: f.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Implement the current Plan.',
+      commentIds: [],
+      expectedCommentsRevision: 0,
+      agentId: current.owner,
+      settingsRevision: 1,
+      model: null,
+      effort: null,
+      preserveDraftComments: true,
+      expectedCollaborationRevision: current.revision,
+      collaboration: {
+        ...current,
+        openMode: true,
+        stage: 'implement' as const,
+        actor: current.owner,
+        lastCodeActor: current.owner,
+        status: 'running' as const,
+        nextStage: undefined,
+        revision: current.revision + 1,
+      },
+      schedulingHandoff: handoff,
+    }
   expect(
     f.repo
       .relayWorkflowAlternatives(handoff)
-      ?.alternatives.find((e) => e.kind === 'supplement_plan')?.kind,
-  ).toBe('supplement_plan')
-  return { ...f, response, unrelated, handoff, defaultAdmission: admission }
+      ?.alternatives.find((e) => e.kind === 'extend_plan_review')?.kind,
+  ).toBe('extend_plan_review')
+  return { ...f, response, unrelated, handoff, defaultAdmission }
 }
 
 async function evaluated(filePath?: string) {
@@ -112,7 +139,7 @@ async function evaluated(filePath?: string) {
     f.handoff,
     [
       {
-        id: 'propose_supplement_plan',
+        id: 'propose_extend_plan_review',
         description: 'Request one specific read-only clarification.',
       },
     ],
@@ -130,13 +157,13 @@ async function evaluated(filePath?: string) {
   f.repo.settleEvaluation(reserved.evaluation.id, {
     outcome: 'completed',
     physicalReleased: true,
-    selectedCandidateId: 'propose_supplement_plan',
+    selectedCandidateId: 'propose_extend_plan_review',
     httpOwner: owner,
     remoteOutcome: 'responded',
   })
   const proposal = {
     handoff: f.handoff,
-    kind: 'supplement_plan' as const,
+    kind: 'extend_plan_review' as const,
     evaluationId: reserved.evaluation.id,
     configurationGeneration: f.repo.schedulingConfigurationGeneration(),
     configurationFingerprint,
@@ -244,7 +271,7 @@ describe('Relay v2 supplement transactions through the existing workflow owner',
     const f = await evaluated()
     const before = f.material.sources.map((source) => f.readDocument(source.document))
     const card = f.repo.proposeRelayWorkflowAction(f.proposal)
-    expect(card.reason).toBe('Clarify the current Plan before another review.')
+    expect(card.reason).toBe('Review the current revised plan once more.')
     expect(f.repo.relaySchedulingDecision(f.sessionId)).toEqual(card)
     expect(f.material.sources.map((source) => f.readDocument(source.document))).toEqual(before)
   })
@@ -260,7 +287,7 @@ describe('Relay v2 supplement transactions through the existing workflow owner',
         .all(),
     ).toEqual([])
     expect(f.db.drizzle.select().from(schedulingBudgetReservations).all()).toEqual([])
-    expect(() => f.repo.beginRun(f.defaultAdmission)).toThrow('current supplement decision')
+    expect(() => f.repo.beginRun(f.defaultAdmission)).toThrow(/current scheduling decision/u)
     expect(() =>
       f.repo.beginRun({
         sessionId: f.sessionId,
@@ -273,7 +300,7 @@ describe('Relay v2 supplement transactions through the existing workflow owner',
         model: null,
         effort: null,
       }),
-    ).toThrow('current supplement decision')
+    ).toThrow(/current scheduling decision/u)
     expect(f.repo.handoffReceipt(f.handoff.id)?.runId).toBeNull()
     expect(f.db.drizzle.select().from(agentRuns).all()).toHaveLength(5)
     expect(f.db.drizzle.select().from(schedulingEvaluations).all()).toHaveLength(1)
@@ -326,7 +353,7 @@ describe('Relay v2 supplement transactions through the existing workflow owner',
         sessionId: f.sessionId,
         taskId: task.id,
         revision: task.revision,
-        action: 'continue',
+        action: 'execute',
         clientMessageId: randomUUID(),
       },
       settings,
@@ -413,14 +440,14 @@ describe('Relay v2 supplement transactions through the existing workflow owner',
     const f = await proposed(),
       extra = startSupplement(f).run,
       auth = f.repo.collaborationTurnAuthorization(extra.id)!
+    expect(extra.collaboration?.stage).toBe('plan_review')
+    expect(extra.agentId).toBe('claude')
     expect(auth.userAuthority).toMatchObject({
-      purpose: 'supplement_plan',
-      returnActor: 'claude',
-      returnStage: 'plan_review',
+      purpose: 'action',
     })
     expect(auth.relayWorkRef).toBeDefined()
     const work = approvedWork(f.readDocument(auth.relayWorkRef!))
-    expect(work.responsibility).toBe('Clarify the current Plan before another review.')
+    expect(work.responsibility).toBe(f.card.reason)
     expect(work.sources.map((source) => source.document)).toEqual(
       f.material.sources.map((source) => source.document),
     )
@@ -433,43 +460,50 @@ describe('Relay v2 supplement transactions through the existing workflow owner',
     expect(f.repo.sourceDocumentAuthorized(extra.id, f.unrelated)).toBe(false)
   })
 
-  it('carries the original extra report and every frozen original source to mandatory review after the input cursor advances', async () => {
+  it('carries the original extended review scope and completes cleanly after input advances', async () => {
     const f = await proposed(),
       extra = startSupplement(f).run
     f.finish(extra.id, {
-      plan: 'Extra Plan clarification.',
-      answer: 'Exact extra report before the later input.',
+      verdict: 'changes_requested',
+      answer: 'Exact extra Plan review report.',
     })
-    const extraAuth = f.repo.collaborationTurnAuthorization(extra.id)!,
-      report = f.repo.readRunSources(extra.id).items
+    const report = f.repo.readRunSources(extra.id).items
+    expect(report.length).toBeGreaterThan(0)
+    for (const source of f.material.sources)
+      expect(f.repo.sourceDocumentAuthorized(extra.id, source.document)).toBe(true)
+    expect(f.repo.sourceDocumentAuthorized(extra.id, f.unrelated)).toBe(false)
     answerWithNewInput(f)
-    expect(f.repo.collaboration(f.sessionId)!.inputSequence).toBeGreaterThan(
-      extraAuth.inputSequence,
-    )
-    const review = f.repo.beginRun(f.admission()).run
+    const session = f.db.sessionRepository.find(f.sessionId)!
+    const raised = { ...session.settings, maxDiscussionRounds: 4 }
+    f.db.sessionRepository.saveSettings(f.sessionId, raised)
+    const afterInput = f.repo.collaboration(f.sessionId)!
+    const nextReview = advanceAutomaticCollaboration(afterInput, raised)
+    const drafts = f.repo.readPage({ scope: 'drafts', sessionId: f.sessionId })
+    if (drafts.scope !== 'drafts') throw Error('Missing drafts')
+    const review = f.repo.beginRun({
+      sessionId: f.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Continue independent Plan review.',
+      commentIds: [],
+      expectedCommentsRevision: drafts.commentsRevision,
+      agentId: nextReview.actor,
+      settingsRevision: f.db.sessionRepository.find(f.sessionId)!.settingsRevision,
+      model: null,
+      effort: null,
+      preserveDraftComments: true,
+      expectedCollaborationRevision: afterInput.revision,
+      collaboration: nextReview,
+      schedulingHandoff: f.repo.workflowHandoff(afterInput, nextReview.actor),
+    }).run
     expect(review.agentId).toBe('claude')
     expect(review.collaboration?.stage).toBe('plan_review')
-    const grants = f.repo.readRunSources(review.id).items
-    expect(
-      grants.some((source) => source.messageId === f.repo.findRun(extra.id)!.responseMessageId),
-    ).toBe(true)
-    for (const source of report)
-      for (const document of source.documents)
-        expect(f.repo.sourceDocumentAuthorized(review.id, document.source)).toBe(true)
-    expect(
-      f.material.sources
-        .filter((source) => !f.repo.sourceDocumentAuthorized(review.id, source.document))
-        .map((source) => ({ roles: source.roles, document: source.document })),
-    ).toEqual([])
-    expect(f.repo.sourceDocumentAuthorized(review.id, f.unrelated)).toBe(false)
     f.finish(review.id, { verdict: 'accepted' })
-    expect(f.db.drizzle.select().from(collaborationActionReceipts).get()?.reviewState).toBe(
-      'fulfilled',
-    )
+    expect(f.repo.collaboration(f.sessionId)?.status).toBe('ready')
+    expect(f.db.drizzle.select().from(collaborationActionReceipts).get()?.reviewState).toBeNull()
   })
 
   it.each(['awaiting_answer', 'available', 'bound'] as const)(
-    'discards unused %s intent on cold recovery while preserving bound budgets and mandatory review',
+    'discards unused %s intent on cold recovery while preserving bound budgets',
     async (state) => {
       const directory = await mkdtemp(join(tmpdir(), 'pact-relay-v2-restart-'))
       directories.push(directory)
@@ -479,7 +513,7 @@ describe('Relay v2 supplement transactions through the existing workflow owner',
       if (state === 'available') f.repo.answerRelaySchedulingDecision(f.answer)
       if (state === 'bound') {
         boundRunId = startSupplement(f).run.id
-        f.finish(boundRunId, { plan: 'Completed extra clarification.' })
+        f.finish(boundRunId, { verdict: 'accepted', answer: 'Completed extra Plan review.' })
       }
       const budget = f.repo.schedulingBudget(f.handoff.budgetSubjectId)
       databases.delete(f.db)
@@ -492,15 +526,11 @@ describe('Relay v2 supplement transactions through the existing workflow owner',
       const repo = reopened.conversationRepository
       repo.recoverCollaborationTasks()
       expect(repo.relaySchedulingDecision(f.sessionId)).toBeNull()
-      expect(repo.collaboration(f.sessionId)).toMatchObject({
-        automation: 'paused',
-        pauseReason: 'restart',
-      })
       expect(repo.schedulingBudget(f.handoff.budgetSubjectId)).toEqual(budget)
       expect(reopened.drizzle.select().from(schedulingEvaluations).all()).toHaveLength(1)
       const receipt = reopened.drizzle.select().from(collaborationActionReceipts).get()
       if (state === 'bound') {
-        expect(receipt).toMatchObject({ boundRunId, reviewState: 'pending' })
+        expect(receipt).toMatchObject({ boundRunId, reviewState: null })
         expect(receipt?.state).not.toBe('cancelled')
       } else {
         expect(reopened.drizzle.select().from(relayDecisions).get()).toMatchObject({
@@ -516,7 +546,7 @@ describe('Relay v2 supplement transactions through the existing workflow owner',
   it('retains remapped historical approved-work documents after Fork while stripping live authority and decisions', async () => {
     const f = await proposed(),
       extra = startSupplement(f).run
-    f.finish(extra.id, { plan: 'Completed extra clarification.' })
+    f.finish(extra.id, { verdict: 'accepted', answer: 'Completed extra Plan review.' })
     const session = f.db.sessionRepository.find(f.sessionId)!,
       selection = f.repo.selectForkSource(
         f.sessionId,
@@ -699,54 +729,41 @@ function expectedRoleSwap(previous: {
   }
 }
 
-function beginRoleStep(f: Awaited<ReturnType<typeof readyRoles>>, action: 'execute' | 'continue') {
+function beginRoleStep(
+  f: Awaited<ReturnType<typeof readyRoles>>,
+  action: 'execute' | 'review_code',
+) {
   const task = f.repo.collaboration(f.sessionId)!
   const settings = f.db.sessionRepository.find(f.sessionId)!.settings
   const draftsPage = f.repo.readPage({ scope: 'drafts', sessionId: f.sessionId })
   const commentsRevision = draftsPage.scope === 'drafts' ? draftsPage.commentsRevision : 0
-  if (action === 'execute') {
-    const prepared = f.repo.prepareCollaborationAction(
-      {
-        sessionId: f.sessionId,
-        taskId: task.id,
-        revision: task.revision,
-        clientMessageId: randomUUID(),
-        action: 'execute',
-      },
-      settings,
-    )
-    const run = f.repo.beginRun({
+  const clientMessageId = randomUUID()
+  const prepared = f.repo.prepareCollaborationAction(
+    {
       sessionId: f.sessionId,
-      clientMessageId: prepared.receipt.clientNonce,
-      content: 'Implement the accepted Plan.',
-      commentIds: [],
-      expectedCommentsRevision: commentsRevision,
-      agentId: collaborationActor(task, 'implement'),
-      settingsRevision: 1,
-      model: null,
-      effort: null,
-      expectedCollaborationRevision: task.revision,
-      collaboration: prepared.next,
-      schedulingHandoff: prepared.handoff,
-      collaborationActionReceiptId: prepared.receipt.id,
-    }).run
-    return { run, prepared }
-  }
-  const next = advanceCollaboration(task, 'continue', settings)
+      taskId: task.id,
+      revision: task.revision,
+      clientMessageId,
+      action,
+    },
+    settings,
+  )
   const run = f.repo.beginRun({
     sessionId: f.sessionId,
-    clientMessageId: randomUUID(),
-    content: 'Continue authorized work.',
+    clientMessageId,
+    content: action === 'execute' ? 'Implement the accepted Plan.' : 'Review the code changes.',
     commentIds: [],
     expectedCommentsRevision: commentsRevision,
-    agentId: collaborationActor(task, next.stage),
+    agentId: prepared.next!.actor,
     settingsRevision: 1,
     model: null,
     effort: null,
     expectedCollaborationRevision: task.revision,
-    collaboration: next,
+    collaboration: prepared.next!,
+    schedulingHandoff: prepared.handoff!,
+    collaborationActionReceiptId: prepared.receipt.id,
   }).run
-  return { run }
+  return { run, prepared }
 }
 
 describe('Relay v2 future code-role change at accepted plan-ready', () => {
@@ -792,10 +809,13 @@ describe('Relay v2 future code-role change at accepted plan-ready', () => {
       expect(f.repo.collaborationTurnAuthorization(implement.run.id)?.userAuthority?.purpose).toBe(
         'action',
       )
+      f.recordCodeChange(implement.run.id, 'src/role-swap.ts')
       f.finish(implement.run.id, { answer: 'Implemented.' })
-      const review = beginRoleStep(f, 'continue')
+      const review = beginRoleStep(f, 'review_code')
       expect(review.run.agentId).toBe(swapped.codeReviewer)
-      expect(f.repo.collaborationTurnAuthorization(review.run.id)?.userAuthority).toBeUndefined()
+      expect(f.repo.collaborationTurnAuthorization(review.run.id)?.userAuthority?.purpose).toBe(
+        'action',
+      )
       f.finish(review.run.id, { verdict: 'accepted' })
       const endSnap = roleSnapshot(f, f.sessionId)
       // Frozen Plan/review auths and sources retain their original roles.
@@ -986,8 +1006,9 @@ describe('Relay v2 future code-role change at accepted plan-ready', () => {
   it('does not forget admitted code history when a task is restored to its former ready state', async () => {
     const f = await readyRoles()
     const implement = beginRoleStep(f, 'execute')
+    f.recordCodeChange(implement.run.id, 'src/restore.ts')
     f.finish(implement.run.id, { answer: 'Implemented the accepted scope.' })
-    const review = beginRoleStep(f, 'continue')
+    const review = beginRoleStep(f, 'review_code')
     f.finish(review.run.id, { verdict: 'accepted' })
     expect(
       f.db.drizzle
@@ -1142,8 +1163,9 @@ describe('Relay v2 future code-role change at accepted plan-ready', () => {
     const f = await proposedRoles()
     f.repo.answerRelaySchedulingDecision(f.answer)
     const implement = beginRoleStep(f, 'execute')
+    f.recordCodeChange(implement.run.id, 'src/restore.ts')
     f.finish(implement.run.id, { answer: 'Implemented the accepted scope.' })
-    const review = beginRoleStep(f, 'continue')
+    const review = beginRoleStep(f, 'review_code')
     f.finish(review.run.id, { verdict: 'accepted' })
     const original = f.db.drizzle.select().from(agentRuns).all()
     const authorizations = new Map(
@@ -1298,8 +1320,9 @@ describe('Relay v2 future code-role change at accepted plan-ready', () => {
     f.db.drizzle.insert(schedulingActivity).values(clone).run()
     // Settle real implementation and review through the existing interfaces.
     const implement = beginRoleStep(f, 'execute')
+    f.recordCodeChange(implement.run.id, 'src/role-activity.ts')
     f.finish(implement.run.id, { answer: 'Implemented.' })
-    const review = beginRoleStep(f, 'continue')
+    const review = beginRoleStep(f, 'review_code')
     f.finish(review.run.id, { verdict: 'accepted' })
     const after = f.db.drizzle.select().from(schedulingActivity).all()
     const afterRole = after.find((row) => row.action === 'reassign_roles')

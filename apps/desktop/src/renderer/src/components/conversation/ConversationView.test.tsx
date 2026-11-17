@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { AgentRun, ConversationPage, DesktopBridge, WorkspaceChangeSet } from '@pact/contracts'
 
-import { collaborationTaskSchema } from '@pact/contracts'
+import { collaborationActor, collaborationTaskSchema } from '@pact/contracts'
 
 import { collaborationFixture, reportPage, markdownPage } from './collaboration.test-helper'
 import { composerBridgeFixture } from './composer.test-helper'
@@ -389,7 +389,7 @@ it.each(['no-output', 'structured-only', 'changes-only', 'answered-changes'] as 
     )
     expect(
       screen.getAllByRole('button', {
-        name: mode === 'no-output' ? 'Retry · Codex' : 'Continue collaboration',
+        name: mode === 'no-output' ? 'Retry · Codex' : 'Update plan · Codex',
       }),
     ).toHaveLength(1)
   },
@@ -780,6 +780,9 @@ it('keeps a previously accepted code review waiting when a newer input is Receiv
   task.stage = 'code_review'
   task.actor = 'claude'
   task.status = 'waiting'
+  task.openMode = true
+  task.lastCodeActor = 'codex'
+  task.unreviewedCodeActor = 'codex'
   task.planVersion = 0
   task.inputSequence = 2
   task.handledInputSequence = 1
@@ -809,6 +812,7 @@ it('keeps a previously accepted code review waiting when a newer input is Receiv
     getConversation: vi.fn<DesktopBridge['getConversation']>().mockResolvedValue({
       ok: true,
       value: reportPage(task, {
+        availableActions: ['review_code'],
         received: {
           id: crypto.randomUUID(),
           actor: 'claude',
@@ -824,7 +828,7 @@ it('keeps a previously accepted code review waiting when a newer input is Receiv
   await screen.findByRole('region', { name: 'Pact collaboration result' })
   expect(screen.queryByText('· Complete')).toBeNull()
   expect(screen.queryByText('Review complete')).toBeNull()
-  expect(screen.getAllByRole('button', { name: 'Continue to Claude Code review' })).toHaveLength(1)
+  expect(screen.getAllByRole('button', { name: 'Review code · Claude Code' })).toHaveLength(1)
   expect(bridge.actOnCollaboration).not.toHaveBeenCalled()
   expect(task.status).toBe('waiting')
 })
@@ -1109,21 +1113,62 @@ it.each([
 )
 
 it.each([
-  { kind: 'review', rolePolicy: 'split-stages-v1', codeStarted: false, actor: 'claude' },
-  { kind: 'plan', rolePolicy: 'split-stages-v1', codeStarted: false, actor: 'claude' },
-  { kind: 'plan', rolePolicy: 'split-stages-v1', codeStarted: true, actor: 'codex' },
-  { kind: 'build', rolePolicy: 'split-stages-v1', codeStarted: true, actor: 'codex' },
-  { kind: 'review', rolePolicy: undefined, codeStarted: false, actor: 'codex' },
-  { kind: 'build', rolePolicy: undefined, codeStarted: true, actor: 'claude' },
+  {
+    kind: 'review',
+    rolePolicy: 'split-stages-v1',
+    openMode: true,
+    lastCodeActor: undefined,
+    actor: 'claude',
+  },
+  {
+    kind: 'plan',
+    rolePolicy: 'split-stages-v1',
+    openMode: false,
+    lastCodeActor: undefined,
+    actor: 'claude',
+  },
+  {
+    kind: 'plan',
+    rolePolicy: 'split-stages-v1',
+    openMode: true,
+    lastCodeActor: 'codex',
+    actor: 'codex',
+  },
+  {
+    kind: 'build',
+    rolePolicy: 'split-stages-v1',
+    openMode: true,
+    lastCodeActor: 'codex',
+    actor: 'codex',
+  },
+  {
+    kind: 'review',
+    rolePolicy: undefined,
+    openMode: true,
+    lastCodeActor: undefined,
+    actor: 'codex',
+  },
+  {
+    kind: 'build',
+    rolePolicy: undefined,
+    openMode: true,
+    lastCodeActor: 'claude',
+    actor: 'claude',
+  },
 ] as const)(
-  'routes unmentioned $kind feedback to $actor (policy: $rolePolicy, code started: $codeStarted)',
-  async ({ kind, rolePolicy, codeStarted, actor }) => {
+  'preserves implicit primary routing on unmentioned $kind feedback while deriving $actor fallback (open: $openMode)',
+  async ({ kind, rolePolicy, openMode, lastCodeActor, actor }) => {
     const { task, run } = collaborationFixture()
     task.kind = kind
     task.rolePolicy = rolePolicy
+    task.openMode = openMode
     task.owner = 'claude'
     task.reviewer = 'codex'
-    if (codeStarted) task.codeRunId = run.id
+    if (lastCodeActor) {
+      task.codeRunId = run.id
+      task.lastCodeActor = lastCodeActor
+    }
+    expect(collaborationActor(task, 'reply')).toBe(actor)
     const props = fixture()
     props.session.id = task.sessionId
     props.session.settings.primaryAgentId = 'claude'
@@ -1141,12 +1186,7 @@ it.each([
     await waitFor(() => expect(props.onPlanAvailable).toHaveBeenCalledWith(task.sessionId, task.id))
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
     await waitFor(() =>
-      expect(props.onSend).toHaveBeenCalledWith(
-        props.composer,
-        [],
-        { type: 'agent', agentId: actor },
-        [],
-      ),
+      expect(props.onSend).toHaveBeenCalledWith(props.composer, [], { type: 'primary' }, []),
     )
   },
 )
@@ -2104,6 +2144,115 @@ it('hides the latest-version button when no plan source is shown', () => {
   expect(screen.queryByRole('button', { name: /View latest plan version/ })).toBeNull()
 })
 
+it.each([
+  { label: 'Draft (unreviewed)', unreviewedPlanActor: 'codex' as const, verdict: undefined },
+  { label: 'Accepted', unreviewedPlanActor: undefined, verdict: 'accepted' as const },
+  {
+    label: 'Changes requested',
+    unreviewedPlanActor: undefined,
+    verdict: 'changes_requested' as const,
+  },
+])(
+  'shows CurrentPlanPanel status "$label" and Open plan alongside workspace changes',
+  async ({ label, unreviewedPlanActor, verdict }) => {
+    const { props, run } = recordingFixture()
+    const { task, planReference } = collaborationFixture()
+    task.sessionId = props.session.id
+    task.runId = run.id
+    task.taskMessageId = run.userMessageId
+    task.openMode = true
+    task.codeRunId = run.id
+    task.lastCodeActor = 'claude'
+    task.unreviewedCodeActor = 'claude'
+    task.unreviewedPlanActor = unreviewedPlanActor
+    task.planAuthor = 'codex'
+    task.planReference = {
+      ...planReference,
+      sourceRunId: run.id,
+      sourceMessageId: run.userMessageId,
+      author: 'codex',
+    }
+    if (verdict) {
+      task.review = {
+        runId: crypto.randomUUID(),
+        actor: 'claude',
+        stage: 'plan_review',
+        verdict,
+        inputSequence: 0,
+        planReference: task.planReference,
+        document: task.planReference.document,
+      }
+    }
+    run.collaboration = { taskId: task.id, kind: 'plan', stage: 'implement', planVersion: 2 }
+    run.nativeEffectsState = 'settled'
+    props.snapshot!.messages[0]!.runId = run.id
+    props.snapshot!.nativeContexts = []
+    props.history.window!.latestRun = run
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    props.planPanelHost = host
+    props.onOpenPlan = vi.fn<() => void>()
+    vi.stubGlobal('pact', {
+      ...composerBridgeFixture(),
+      getConversation: vi
+        .fn<DesktopBridge['getConversation']>()
+        .mockImplementation(async (req) => ({
+          ok: true,
+          value:
+            req.scope === 'collaboration-markdown'
+              ? markdownPage(task, '# Plan body')
+              : reportPage(task, {
+                  availableActions: ['review_code'],
+                  planSource: { runId: run.id, messageId: run.userMessageId },
+                }),
+        })),
+    })
+    const { unmount } = render(<ConversationView {...props} />)
+    await waitFor(() => expect(host.textContent).toContain(`Codex · ${label}`))
+    expect(screen.getByRole('button', { name: 'Open plan' })).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Review code · Codex' })).toBeDefined()
+    unmount()
+    host.remove()
+  },
+)
+
+it('adapts the /review composer slash hint between new task and Open Mode in-task review', async () => {
+  const newTaskProps = fixture()
+  newTaskProps.composer = '/review Check cancellation'
+  const view = render(<ConversationView {...newTaskProps} />)
+  expect(screen.queryByText(/reviews code\./)).toBeNull()
+  view.rerender(
+    <ConversationView {...newTaskProps} composer="@claude /review Check cancellation" />,
+  )
+  expect(await screen.findByText('Claude Code reviews code.')).toBeDefined()
+  cleanup()
+
+  const { task, run } = collaborationFixture()
+  task.openMode = true
+  task.kind = 'build'
+  task.stage = 'implement'
+  task.lastCodeActor = 'claude'
+  task.unreviewedCodeActor = 'claude'
+  const openProps = fixture()
+  openProps.session.id = task.sessionId
+  openProps.snapshot!.sessionId = task.sessionId
+  openProps.composer = '/review Audit the Open Mode fix'
+  openProps.onPlanAvailable = vi.fn<NonNullable<typeof openProps.onPlanAvailable>>()
+  vi.stubGlobal('pact', {
+    ...composerBridgeFixture(),
+    getConversation: vi.fn<DesktopBridge['getConversation']>().mockResolvedValue({
+      ok: true,
+      value: reportPage(task, { planSource: { runId: run.id, messageId: run.userMessageId } }),
+    }),
+  })
+  const openView = render(<ConversationView {...openProps} />)
+  expect(await screen.findByText('Codex reviews code.')).toBeDefined()
+  openView.rerender(
+    <ConversationView {...openProps} composer="@claude /review Audit the Open Mode fix" />,
+  )
+  expect(await screen.findByText('Claude Code reviews code.')).toBeDefined()
+})
+
 const sendMessage = () => fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
 
 describe('task replacement confirmation', () => {
@@ -2149,7 +2298,7 @@ describe('task replacement confirmation', () => {
       .mockImplementation(async () => ({
         ok: true,
         value: reportPage(task, {
-          availableActions: ['respond', 'repair'],
+          availableActions: ['fix', 'review_code'],
           planSource: { runId: run.id, messageId: run.userMessageId },
           replacement: {
             summary: 'Codex is waiting for your next action on the reviewed changes.',

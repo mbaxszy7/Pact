@@ -1123,7 +1123,7 @@ function relayConfirmedExtraGrantMatches(
 ): boolean {
   if (
     !decision ||
-    (decision.kind !== 'repair' && decision.kind !== 'extend_plan_review') ||
+    decision.kind !== 'extend_plan_review' ||
     decision.formatVersion !== 2 ||
     decision.id !== grant.decisionId ||
     decision.sessionId !== grant.sessionId ||
@@ -1140,7 +1140,7 @@ function relayConfirmedExtraGrantMatches(
       request = proof.card.request
     return (
       request.category === 'new_authorization' &&
-      (request.operation.kind === 'repair' || request.operation.kind === 'extend_plan_review') &&
+      request.operation.kind === 'extend_plan_review' &&
       request.operation.kind === decision.kind &&
       proof.candidateId === `propose_${decision.kind}` &&
       proof.card.decisionId === decision.id &&
@@ -1155,15 +1155,13 @@ function relayConfirmedExtraGrantMatches(
       proof.handoff.budgetSubjectId === `task:${grant.taskId}` &&
       request.operation.taskId === grant.taskId &&
       request.operation.actor === grant.actor &&
-      (request.operation.kind === 'repair'
-        ? request.operation.returnActor !== grant.actor
-        : fingerprint(request.operation.planReference) ===
-            fingerprint(
-              collaborationActionBasisSchema.parse(JSON.parse(grant.basisJson)).planReference,
-            ) &&
-          request.operation.inputSequence ===
-            collaborationActionBasisSchema.parse(JSON.parse(grant.basisJson)).inputSequence &&
-          request.operation.expectedDiscussionRounds >= request.operation.maximum) &&
+      fingerprint(request.operation.planReference) ===
+        fingerprint(
+          collaborationActionBasisSchema.parse(JSON.parse(grant.basisJson)).planReference,
+        ) &&
+      request.operation.inputSequence ===
+        collaborationActionBasisSchema.parse(JSON.parse(grant.basisJson)).inputSequence &&
+      request.operation.expectedDiscussionRounds >= request.operation.maximum &&
       request.operation.afterRunId === proof.handoff.freshnessGuard.runId &&
       request.operation.scopeFingerprint === proof.sourceFingerprint &&
       proof.operationFingerprint === fingerprint(request.operation)

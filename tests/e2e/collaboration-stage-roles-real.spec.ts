@@ -128,7 +128,6 @@ test('clamps both bounds and preserves values inside the interval', () => {
         expect(await readFile(join(ctx.projectDirectory, 'clamp.mjs'), 'utf8')).toBe(code)
         const plan = ready.planReference
         await restartRealWorkspace(ctx)
-        await ctx.page.getByRole('button', { name: 'Continue collaboration', exact: true }).click()
         const implement = ctx.page.getByRole('button', {
           name: `Implement plan · ${secondary === 'claude' ? 'Claude Code' : 'Codex'}`,
           exact: true,

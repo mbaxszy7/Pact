@@ -6,7 +6,7 @@ import { resolve, join } from 'node:path'
 import type { DesktopBridge } from '../../packages/contracts/src/index.js'
 
 import {
-  advanceCollaboration,
+  advanceAutomaticCollaboration,
   collaborationTaskSchema,
 } from '../../packages/contracts/src/index.js'
 import { PactDatabase } from '../../packages/persistence/src/index.js'
@@ -202,18 +202,10 @@ test('@deterministic Restore saved plan uses its authenticated checkpoint and na
     sourceRunId = source.id
     finish(source.id, original)
     let task = repo.collaboration(sessionId)!
-    const review = begin(
-      advanceCollaboration(task, 'continue', settings),
-      randomUUID(),
-      task.revision,
-    )
+    const review = begin(advanceAutomaticCollaboration(task, settings), randomUUID(), task.revision)
     finish(review.id, undefined, true)
     task = repo.collaboration(sessionId)!
-    const target = begin(
-      advanceCollaboration(task, 'continue', settings),
-      randomUUID(),
-      task.revision,
-    )
+    const target = begin(advanceAutomaticCollaboration(task, settings), randomUUID(), task.revision)
     targetRunId = target.id
     finish(target.id)
     sourceMessageId = repo.findRun(target.id)!.responseMessageId!
@@ -338,7 +330,7 @@ test('@deterministic Restore saved plan uses its authenticated checkpoint and na
       f.page.getByRole('button', { name: 'Restore saved plan', exact: true }),
     ).toHaveCount(0)
     await expect(
-      f.page.getByRole('button', { name: 'Continue to Codex plan review', exact: true }),
+      f.page.getByRole('button', { name: 'Review plan · Codex', exact: true }),
     ).toBeVisible()
     expect(after?.sourceMessageId).toBe(sourceMessageId)
     expect(after?.review?.planReference?.sourceRunId).toBe(sourceRunId)
@@ -401,11 +393,18 @@ for (const primary of ['codex', 'claude'] as const)
       )
       await closeContextOverlay(f.page)
       await writeFile(join(f.directory, '.pact-data/dev/pact.sqlite'), 'App state changed')
+      const reviewerLabel = implementer === 'Claude Code' ? 'Codex' : 'Claude Code'
       await f.page
         .getByRole('button', { name: `Implement plan · ${implementer}`, exact: true })
         .click()
       await expect(
-        f.page.getByRole('button', { name: `Repair · ${implementer}`, exact: true }),
+        f.page.getByRole('button', { name: `Review code · ${reviewerLabel}`, exact: true }),
+      ).toBeEnabled()
+      await f.page
+        .getByRole('button', { name: `Review code · ${reviewerLabel}`, exact: true })
+        .click()
+      await expect(
+        f.page.getByRole('button', { name: `Fix issues · ${implementer}`, exact: true }),
       ).toBeEnabled()
       expect(await f.counts()).toEqual({ codex: 2, claude: 2 })
       const reviewed = await current(f.page, f.sessionId)
@@ -415,16 +414,25 @@ for (const primary of ['codex', 'claude'] as const)
         repairAttempts: 0,
       })
       await writeFile(join(f.directory, 'later-change.txt'), 'A real source change')
-      await f.page.getByRole('button', { name: `Repair · ${implementer}`, exact: true }).click()
-      await expect.poll(async () => (await current(f.page, f.sessionId))?.status).toBe('complete')
+      await f.page.getByRole('button', { name: `Fix issues · ${implementer}`, exact: true }).click()
+      await expect(
+        f.page.getByRole('button', { name: `Review code · ${reviewerLabel}`, exact: true }),
+      ).toBeEnabled()
+      await f.page
+        .getByRole('button', { name: `Review code · ${reviewerLabel}`, exact: true })
+        .click()
+      await expect
+        .poll(async () => (await current(f.page, f.sessionId))?.review?.verdict)
+        .toBe('accepted')
       expect(await current(f.page, f.sessionId)).toMatchObject({
+        status: 'waiting',
         repairAttempts: 1,
-        review: { verdict: 'accepted' },
+        review: { stage: 'code_review', verdict: 'accepted' },
       })
       expect(await f.counts()).toEqual({ codex: 3, claude: 3 })
       await expect(
         f.page.getByRole('region', { name: 'Pact collaboration result' }).last(),
-      ).toContainText('Complete')
+      ).toContainText('Accepted')
     } catch (error) {
       const codex = await f.fixture
           .readCodexFacts()
@@ -495,7 +503,7 @@ test('@deterministic direct Review remains read-only until explicit repair and i
   try {
     await f.send('/review Inspect cancellation ownership')
     await expect(
-      f.page.getByRole('button', { name: 'Repair · Claude Code', exact: true }),
+      f.page.getByRole('button', { name: 'Fix issues · Claude Code', exact: true }),
     ).toBeEnabled()
     const task = await current(f.page, f.sessionId)
     expect(task).toMatchObject({
@@ -513,7 +521,11 @@ test('@deterministic direct Review remains read-only until explicit repair and i
         { exact: true },
       ),
     ).toBeVisible()
-    await f.page.getByRole('button', { name: 'Repair · Claude Code', exact: true }).click()
+    await f.page.getByRole('button', { name: 'Fix issues · Claude Code', exact: true }).click()
+    await expect(
+      f.page.getByRole('button', { name: 'Review code · Codex', exact: true }),
+    ).toBeEnabled()
+    await f.page.getByRole('button', { name: 'Review code · Codex', exact: true }).click()
     await expect.poll(async () => (await current(f.page, f.sessionId))?.status).toBe('complete')
     expect(await f.counts()).toEqual({ codex: 2, claude: 1 })
   } catch (error) {
@@ -637,13 +649,21 @@ for (const primary of ['codex', 'claude'] as const) {
         planVersion: 0,
       })
       await expect(
-        f.page.getByRole('button', { name: 'Continue collaboration', exact: true }),
+        f.page.getByRole('button', {
+          name: `Retry · ${primary === 'codex' ? 'Codex' : 'Claude Code'}`,
+          exact: true,
+        }),
       ).toBeEnabled()
       await expect(f.page.getByRole('combobox', { name: 'Message', exact: true })).toBeVisible()
       expect(await f.counts()).toEqual(
         primary === 'codex' ? { codex: 1, claude: 0 } : { codex: 0, claude: 1 },
       )
-      await f.page.getByRole('button', { name: 'Continue collaboration', exact: true }).click()
+      await f.page
+        .getByRole('button', {
+          name: `Retry · ${primary === 'codex' ? 'Codex' : 'Claude Code'}`,
+          exact: true,
+        })
+        .click()
       await expect
         .poll(f.counts)
         .toEqual(primary === 'codex' ? { codex: 2, claude: 0 } : { codex: 0, claude: 2 })

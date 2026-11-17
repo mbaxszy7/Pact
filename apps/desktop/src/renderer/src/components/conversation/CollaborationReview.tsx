@@ -7,7 +7,6 @@ import type {
   CollaborationActionInput,
   CollaborationDocument,
   CollaborationSession,
-  CollaborationTask,
   ConversationPage,
   MessageCommentAnchor,
 } from '@pact/contracts'
@@ -17,8 +16,9 @@ import {
   collaborationActor,
   collaborationInputGate,
   collaborationInputProcessing,
-  collaborationNextStage,
   defaultTaskStageRoles,
+  isCollaborationOpenMode,
+  otherAgent,
 } from '@pact/contracts'
 
 import type { ProjectFileTarget } from './MessageMarkdown'
@@ -39,26 +39,12 @@ export type ReportTextSelection = MessageTextSelection & {
   textBasis?: 'markdown-visible-v2' | 'plain-visible-v1' | undefined
   contentHash?: string | undefined
 }
-type DisplayedCollaborationAction = Exclude<
-  CollaborationAction,
-  'request_plan_supplement' | 'request_code_supplement' | 'confirm_supplement'
->
-
 const agentName = (id: 'claude' | 'codex'): string => (id === 'claude' ? 'Claude Code' : 'Codex')
 const verdictLabel = {
   accepted: 'Accepted',
   changes_requested: 'Changes requested',
   needs_user: 'Waiting for your input',
   incomplete: 'Review incomplete',
-}
-const pauseLabel: Record<NonNullable<CollaborationTask['pauseReason']>, string> = {
-  user_message: 'Collaboration paused',
-  user: 'Collaboration paused',
-  needs_user: 'Waiting for your input',
-  restart: 'Paused after reopening Pact',
-  limit: 'Session limit reached',
-  failure: 'Collaboration needs attention',
-  stopped: 'Collaboration stopped',
 }
 const genericPauseNotice = new Set([
   'Collaboration is paused. Continue when ready.',
@@ -75,7 +61,7 @@ export const CollaborationReview = memo(function CollaborationReview({
   latestRunId,
   disabled,
   continuationBlocked = false,
-  replyBodyComplete = false,
+  replyBodyComplete: _replyBodyComplete = false,
   onOpenProjectFile,
   onCreateReportComment,
   feedbackDraft = false,
@@ -123,9 +109,9 @@ export const CollaborationReview = memo(function CollaborationReview({
   const [refreshing, setRefreshing] = useState(true)
   const [planDecision, setPlanDecision] = useState<
     | {
-        variant: 'revise' | 'keep' | 'swap_roles'
         input: CollaborationActionInput
-        codeRoles?: { author: string; reviewer: string } | undefined
+        currentImplementer: string
+        nextImplementer: string
         scope: object
         error?: string | undefined
       }
@@ -138,7 +124,7 @@ export const CollaborationReview = memo(function CollaborationReview({
   }
   const running = ['starting', 'running', 'recovering'].includes(run.status)
   const historical = run.id !== latestRunId
-  const reportVersion = `${run.updatedAt}:${session.settingsRevision}`
+  const reportVersion = `${run.updatedAt}:${session.settingsRevision}:${run.workspaceChanges?.revision ?? ''}:${run.workspaceChanges?.state ?? ''}`
   const revealKey =
     revealReport?.runId === run.id
       ? `${revealReportRequestId ?? ''}:${revealReportOffset ?? ''}`
@@ -207,9 +193,6 @@ export const CollaborationReview = memo(function CollaborationReview({
   ): Promise<boolean> => {
     if (!task || busy || disabled || (feedbackDraft && action !== 'recover_plan') || !actionable)
       return false
-    // Retired requests may still have durable gates; retain cancellation through the existing actions.
-    const decision = action === 'cancel_supplement' ? view?.relayDecision : undefined
-    if (action === 'cancel_supplement' && !decision) return false
     setBusy(true)
     if (action !== 'recover_plan') setActionError('')
     failedAction.current = { taskId: task.id, revision: task.revision }
@@ -221,10 +204,6 @@ export const CollaborationReview = memo(function CollaborationReview({
           revision: task.revision,
           clientMessageId: crypto.randomUUID(),
           action,
-          ...(action === 'request_repair_role_switch'
-            ? { repairActor: collaborationActor(task, 'code_review') }
-            : {}),
-          ...(decision ? { decision: { id: decision.id, revision: decision.revision } } : {}),
         },
       )
       if (!response.ok) {
@@ -303,13 +282,6 @@ export const CollaborationReview = memo(function CollaborationReview({
     actionable && !planSync && !inputGate
       ? collaborationContinuationLimit(task, session.settings)
       : undefined
-  const limitName = continuationLimit
-    ? {
-        plan_review: { step: 'Plan review', setting: 'Plan reviews' },
-        code_review: { step: 'Code review', setting: 'Code reviews' },
-        repair: { step: 'Repair', setting: 'Repair attempts' },
-      }[continuationLimit.stage]
-    : undefined
   const duplicateLimitNotice = [
     'The Session discussion limit has been reached.',
     'The Session review limit has been reached.',
@@ -326,75 +298,77 @@ export const CollaborationReview = memo(function CollaborationReview({
     session.activity.state === 'idle' &&
     !planSync &&
     !inputGate
-  const replyLabel = planSync
-    ? 'Plan recovery required'
-    : inputState.decision?.runId === run.id
-      ? actionable
-        ? 'Waiting for your answer'
-        : 'Asked for your input'
-      : inputState.settled?.runId === run.id ||
-          (replyBodyComplete && run.dispatchPhase === 'ended' && run.nativeOutcome === 'completed')
-        ? 'Reply complete'
-        : 'Reply to your message'
-  const showStageLabel = (stage !== 'implement' && stage !== 'repair') || paused
-  const label =
-    stage === 'implement'
-      ? 'Implementation'
-      : stage === 'repair'
-        ? 'Repair'
-        : stage === 'plan'
-          ? `Plan${planVersion ? ` · v${planVersion}` : ''}`
-          : stage === 'plan_review'
-            ? `Plan review${planVersion ? ` · v${planVersion}` : ''}`
-            : stage === 'code_review'
-              ? 'Code review'
-              : stage === 'respond'
-                ? 'Review response'
-                : replyLabel
+  const runPublishedPlan =
+    (stage === 'plan' && Boolean(planVersion)) ||
+    (view?.planSource?.runId === run.id && Boolean(planVersion))
+  const runFailedOrStopped =
+    (!historical && task.status === 'failed' && task.runId === run.id) ||
+    ['failed', 'interrupted'].includes(run.status)
+  const runStopped =
+    (task.pauseReason === 'stopped' && task.runId === run.id) || run.failureKind === 'user_stopped'
+  const questionCardActive = Boolean(
+    actionable && inputState.decision && inputGate === 'needs_reply' && !planSync,
+  )
+  const isEndedFinalRun = Boolean(task.ending && run.id === task.runId)
+  const showRestartPaused =
+    !historical &&
+    !isCollaborationOpenMode(task) &&
+    paused &&
+    task.pauseReason === 'restart' &&
+    !planSync &&
+    !inputGate
+  let label: string | undefined
+  if (!historical && planSync) label = 'Plan recovery required'
+  else if (runFailedOrStopped) label = runStopped ? 'Stopped' : 'Failed'
+  else if (stage === 'plan_review') {
+    if (!questionCardActive) label = `Plan review${planVersion ? ` · v${planVersion}` : ''}`
+  } else if (stage === 'code_review') {
+    if (!questionCardActive) label = 'Code review'
+  } else if (runPublishedPlan) {
+    if (!questionCardActive) label = planVersion ? `Plan v${planVersion}` : 'Plan'
+  } else if (showRestartPaused) {
+    label = 'Paused'
+  }
+  const showStageLabel = Boolean(label)
   const actions = actionable
     ? (view?.availableActions ?? []).filter(
-        (action): action is DisplayedCollaborationAction =>
-          action !== 'request_plan_supplement' &&
-          action !== 'request_code_supplement' &&
-          action !== 'confirm_supplement' &&
-          action !== 'continue' &&
+        (action): action is CollaborationAction =>
           (!continuationBlocked || action !== 'resume') &&
           (!continuationLimit || !['resume', 'retry'].includes(action)) &&
-          (!inputGate || action === 'recover_plan' || action === 'keep_current_plan') &&
+          (!inputGate || action === 'recover_plan') &&
           !(action === 'recover_plan' && actionError),
       )
     : []
   const draftBlocksActions = feedbackDraft && actions.some((action) => action !== 'recover_plan')
-  const resumeStage = collaborationNextStage(task)
   const codeRoles = task.stageRoles ?? defaultTaskStageRoles(task.owner)
-  const repairChoiceUnavailable = actionable && view?.repairChoiceUnavailable
-  const canOpenLimitSettings =
-    (continuationLimit || repairChoiceUnavailable) && onOpenSessionSettings
-  const actionLabel = (action: DisplayedCollaborationAction): string =>
+  const canOpenLimitSettings = Boolean(continuationLimit && onOpenSessionSettings)
+  const actionLabel = (action: CollaborationAction): string =>
     ({
-      execute: `Implement plan · ${agentName(collaborationActor(task, 'implement'))}`,
-      respond: `Respond · ${agentName(collaborationActor(task, 'respond'))}`,
-      repair: `Repair · ${agentName(collaborationActor(task, 'repair'))}`,
-      request_repair_role_switch: `Choose repairer · ${agentName(collaborationActor(task, 'code_review'))}`,
-      revise_plan: `Revise plan · ${agentName(collaborationActor(task, 'plan'))}`,
-      keep_current_plan: 'Keep current plan',
-      swap_code_roles: 'Swap code roles',
-      resume:
-        task.planRevision && resumeStage === 'plan'
-          ? `Revise plan · ${agentName(collaborationActor(task, 'plan'))}`
-          : task.pendingWork && resumeStage === 'implement'
-            ? `Resume implementation · ${agentName(collaborationActor(task, 'implement'))}`
-            : task.pendingWork && resumeStage === 'repair'
-              ? `Resume repair · ${agentName(collaborationActor(task, 'repair'))}`
-              : resumeStage === 'code_review'
-                ? `Continue to ${agentName(collaborationActor(task, 'code_review'))} review`
-                : resumeStage === 'plan_review'
-                  ? `Continue to ${agentName(collaborationActor(task, 'plan_review'))} plan review`
-                  : 'Continue collaboration',
+      execute: `Implement plan · ${agentName(
+        isCollaborationOpenMode(task) && task.review
+          ? otherAgent(task.review.actor)
+          : collaborationActor(task, 'implement'),
+      )}`,
+      review_plan: `Review plan · ${agentName(
+        isCollaborationOpenMode(task) && task.unreviewedPlanActor
+          ? otherAgent(task.unreviewedPlanActor)
+          : collaborationActor(task, 'plan_review'),
+      )}`,
+      review_code: `Review code · ${agentName(
+        task.unreviewedCodeActor
+          ? otherAgent(task.unreviewedCodeActor)
+          : collaborationActor(task, 'code_review'),
+      )}`,
+      fix:
+        task.review?.runId === task.runId && task.review.stage === 'plan_review'
+          ? `Update plan · ${agentName(otherAgent(task.review.actor))}`
+          : `Fix issues · ${agentName(
+              task.review ? otherAgent(task.review.actor) : collaborationActor(task, 'repair'),
+            )}`,
+      swap_code_roles: 'Swap implementer',
+      resume: `Update plan · ${agentName(collaborationActor(task, 'plan'))}`,
       recover_plan: planSync?.kind === 'response' ? 'Restore plan response' : 'Restore saved plan',
       retry: `Retry · ${agentName(task.actor)}`,
-      continue: 'Continue collaboration',
-      cancel_supplement: 'Cancel scheduling action',
     })[action]
   const reportDocument =
     view?.documents?.find((entry) => entry.key === 'report')?.source ??
@@ -412,8 +386,10 @@ export const CollaborationReview = memo(function CollaborationReview({
         <div className="flex min-h-7 flex-wrap items-center gap-x-2.5 gap-y-1 text-secondary">
           <FileText aria-hidden="true" className="size-3.5 shrink-0" strokeWidth={1.75} />
           <span>{label}</span>
-          {review ? <span>· {verdictLabel[review.verdict]}</span> : null}
-          {stage === 'plan' && onOpenPlan && view?.planSource && planVersion ? (
+          {review && (stage === 'plan_review' || stage === 'code_review') ? (
+            <span>· {verdictLabel[review.verdict]}</span>
+          ) : null}
+          {runPublishedPlan && onOpenPlan && view?.planSource && planVersion ? (
             <button
               type="button"
               onClick={() => onOpenPlan({ ...view.planSource!, version: planVersion })}
@@ -422,19 +398,12 @@ export const CollaborationReview = memo(function CollaborationReview({
               Open plan
             </button>
           ) : null}
-          {task.ending ? (
-            <span>· {task.ending.unreviewedChanges ? 'Ended before review' : 'Ended'}</span>
-          ) : actionable && task.status === 'complete' ? (
-            <span>· Complete</span>
-          ) : null}
-          {!task.ending && task.status !== 'complete' && paused && !planSync && !inputGate ? (
-            <span title={pauseLabel[task.pauseReason ?? 'user']}>· Paused</span>
-          ) : null}
+          {isEndedFinalRun ? <span>· Ended</span> : null}
         </div>
       ) : null}
-      {task.ending && !showStageLabel ? (
+      {isEndedFinalRun && !showStageLabel ? (
         <div className="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-secondary">
-          <span>{task.ending.unreviewedChanges ? 'Ended before review' : 'Ended'}</span>
+          <span>Ended</span>
         </div>
       ) : null}
       {showReportSource && reportDocument ? (
@@ -458,43 +427,35 @@ export const CollaborationReview = memo(function CollaborationReview({
             ? 'Restore the saved response to continue.'
             : 'Restore the saved plan to continue.'}
         </p>
-      ) : continuationLimit && limitName ? (
+      ) : continuationLimit ? (
         <p className="mt-1 text-secondary">
-          {limitName.step} limit reached (
+          Plan review limit reached (
           {continuationLimit.used > continuationLimit.maximum
             ? `${continuationLimit.used} used; Session limit ${continuationLimit.maximum}`
             : `${continuationLimit.used}/${continuationLimit.maximum}`}
           ).
-          {' Increase '}
-          {limitName.setting} in Session settings to continue.
         </p>
       ) : null}
       {actionable &&
       !planSync &&
-      (!inputGate || inputGate === 'incomplete') &&
+      !inputGate &&
+      !questionCardActive &&
       task.status !== 'complete' &&
+      !runStopped &&
       task.notice &&
       !duplicateLimitNotice &&
       !duplicateRestartNotice &&
       // Retained tasks may contain these older generic confirmations; keep other notices.
-      !genericPauseNotice.has(task.notice) ? (
+      !genericPauseNotice.has(task.notice) &&
+      (!continuationLimit || runFailedOrStopped) ? (
         <p className="mt-1 whitespace-pre-wrap text-secondary">{task.notice}</p>
       ) : null}
       {actionable && view?.received?.state === 'blocked' ? (
         <p className="mt-1 text-secondary">Your message delivery needs attention.</p>
       ) : null}
-      {repairChoiceUnavailable ? (
-        <p className="mt-1 text-secondary">{repairChoiceUnavailable}</p>
-      ) : null}
       {draftBlocksActions ? (
         <p id={draftHintId} className="sr-only">
           Send or clear your draft before continuing this task.
-        </p>
-      ) : null}
-      {actions.includes('swap_code_roles') ? (
-        <p className="mt-1 text-secondary">
-          {agentName(codeRoles.codeAuthor)} implements · {agentName(codeRoles.codeReviewer)} reviews
-          code.
         </p>
       ) : null}
       {actions.length || canOpenLimitSettings ? (
@@ -509,9 +470,7 @@ export const CollaborationReview = memo(function CollaborationReview({
             const draftBlocked = draftBlocksActions && action !== 'recover_plan'
             const title = draftBlocked
               ? `${actionText}. Send or clear your draft first.`
-              : action === 'resume' && task.pendingWork && !task.planRevision
-                ? `${actionText}. Resumes the original scope. Later messages do not expand its authorization.`
-                : actionText
+              : actionText
             return (
               <button
                 key={action}
@@ -523,28 +482,11 @@ export const CollaborationReview = memo(function CollaborationReview({
                 title={title}
                 aria-describedby={draftBlocked ? draftHintId : undefined}
                 onClick={(event) => {
-                  if (
-                    action === 'revise_plan' ||
-                    action === 'keep_current_plan' ||
-                    action === 'swap_code_roles' ||
-                    (action === 'resume' && task.planRevision && resumeStage === 'plan')
-                  ) {
+                  if (action === 'swap_code_roles') {
                     planTrigger.current = event.currentTarget
                     setPlanDecision({
-                      variant:
-                        action === 'keep_current_plan'
-                          ? 'keep'
-                          : action === 'swap_code_roles'
-                            ? 'swap_roles'
-                            : 'revise',
-                      ...(action === 'swap_code_roles'
-                        ? {
-                            codeRoles: {
-                              author: agentName(codeRoles.codeAuthor),
-                              reviewer: agentName(codeRoles.codeReviewer),
-                            },
-                          }
-                        : {}),
+                      currentImplementer: agentName(codeRoles.codeAuthor),
+                      nextImplementer: agentName(codeRoles.codeReviewer),
                       scope: decisionScope,
                       input: {
                         sessionId: session.id,
@@ -566,7 +508,7 @@ export const CollaborationReview = memo(function CollaborationReview({
                   action === 'recover_plan' ? (
                     'Restoring…'
                   ) : action === 'swap_code_roles' ? (
-                    'Swapping…'
+                    'Switching…'
                   ) : (
                     'Sending…'
                   )
@@ -622,10 +564,8 @@ export const CollaborationReview = memo(function CollaborationReview({
       ) : null}
       {currentPlanDecision ? (
         <TaskPlanConfirmation
-          variant={currentPlanDecision.variant}
-          planVersion={planVersion ?? task.planReference?.version}
-          planner={agentName(collaborationActor(task, 'plan'))}
-          codeRoles={currentPlanDecision.codeRoles}
+          currentImplementer={currentPlanDecision.currentImplementer}
+          nextImplementer={currentPlanDecision.nextImplementer}
           busy={busy}
           disabled={disabled || !actionable}
           suspended={nativePresentationSuspended}

@@ -40,8 +40,7 @@ import {
   conversationInputBatches,
   conversationRebuildSourceRefs,
   nativeAgentContexts,
-  schedulingBudgetCounters,
-  schedulingActivity,
+  workspaceChangeSets,
 } from '../../../../../packages/persistence/src/schema/index.js'
 import { markdownVisibleProjection } from '../../shared/message-anchor-text.js'
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
@@ -119,6 +118,8 @@ const native = vi.hoisted(() => ({
   decisionFailure: undefined as 'timeout' | 'invalid_output' | undefined,
   decisionPhysicalHold: undefined as Promise<void> | undefined,
   guidanceBodies: [] as string[],
+  noCodeChanges: false,
+  recordCodeChange: undefined as ((input: AgentRunInput) => void) | undefined,
 }))
 vi.mock('./openai-decision-runtime.js', () => ({
   OpenAIDecisionRuntime: class {
@@ -370,6 +371,16 @@ function adapter(agentId: RuntimeAgentId) {
             text:
               report?.plan ?? native.plans.shift() ?? '1. Implement scope. 2. Verify cancellation.',
           })
+      } else if (phase.stage === 'collaborate') {
+        if (typeof report?.plan === 'string') {
+          input.recordWorkflowPlan?.({
+            nativeId: `plan-${input.runId}`,
+            text: report.plan,
+          })
+        }
+        if (!native.noCodeChanges) native.recordCodeChange?.(input)
+      } else if (phase.stage === 'implement' || phase.stage === 'repair') {
+        if (!native.noCodeChanges) native.recordCodeChange?.(input)
       } else if (phase.stage === 'plan_review' || phase.stage === 'code_review') {
         input.recordWorkflowReview?.(
           report?.review ?? native.nextReview ?? native.reviews.shift() ?? { verdict: 'accepted' },
@@ -420,6 +431,8 @@ afterEach(async () => {
   native.decisionFailure = undefined
   native.decisionPhysicalHold = undefined
   native.guidanceBodies = []
+  native.noCodeChanges = false
+  native.recordCodeChange = undefined
   vi.restoreAllMocks()
 })
 
@@ -458,6 +471,33 @@ async function fixture(
     },
   )
   const launch = (database: PactDatabase) => {
+    native.recordCodeChange = (runInput) => {
+      const run = database.conversationRepository.findRun(runInput.runId)
+      if (!run) return
+      const now = new Date().toISOString()
+      database.drizzle
+        .insert(workspaceChangeSets)
+        .values({
+          id: runInput.runId,
+          runId: runInput.runId,
+          sessionId: runInput.sessionId,
+          projectId,
+          agentId: run.agentId,
+          root: directory,
+          rootDevice: '1',
+          rootInode: '1',
+          stagingRoot: join(directory, '.staging'),
+          state: 'ready',
+          fileCount: 1,
+          additions: 1,
+          deletions: 0,
+          createdAt: now,
+          finalizedAt: now,
+          projectionPending: false,
+          revision: 1,
+        })
+        .run()
+    }
     const preparation = new RuntimePreparation(database.runtimePreparationRepository)
     vi.spyOn(preparation, 'findRecoveryExecutable').mockResolvedValue(process.execPath)
     vi.spyOn(preparation, 'inspectReadiness').mockResolvedValue({
@@ -642,12 +682,13 @@ function decisionsForProducer(runId: string) {
   return native.decisions.filter((decision) => decision.handoff.freshnessGuard.runId === runId)
 }
 
-function expectNoRepeatedConsultation(handoffId: string) {
+function expectNoRepeatedConsultation(
+  handoffId: string,
+  expectedCandidate = 'propose_reassign_roles',
+) {
   const forHandoff = native.decisions.filter((decision) => decision.handoff.id === handoffId)
   expect(forHandoff).toHaveLength(1)
-  expect(forHandoff[0]!.candidates.map((candidate) => candidate.id)).toEqual([
-    'propose_supplement_plan',
-  ])
+  expect(forHandoff[0]!.candidates.map((candidate) => candidate.id)).toEqual([expectedCandidate])
 }
 
 describe('Decisions choices through the original workflow owner', () => {
@@ -671,12 +712,26 @@ describe('Decisions choices through the original workflow owner', () => {
     })
   })
 
-  it('consults once at the first owner response and keeps the default on a null selection', async () => {
+  it('consults once at plan_review_limit and keeps paused state on a null selection', async () => {
     const f = await fixture()
+    const session = f.db.sessionRepository.find(f.sessionId)!
+    f.db.sessionRepository.saveSettings(f.sessionId, {
+      ...session.settings,
+      maxDiscussionRounds: 1,
+    })
     enableRelay(f, 1)
+    native.decisionCandidate = null
     expect((await f.flow.send(f.input('/plan Preserve the complete original goal.'))).ok).toBe(true)
-    await completedPlanRevision(f, 1)
-    await vi.waitFor(() => expect(native.decisions).toHaveLength(2))
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+    const paused = await f.settled()
+    expect(paused).toMatchObject({
+      stage: 'plan',
+      status: 'waiting',
+      automation: 'paused',
+      pauseReason: 'limit',
+      discussionRounds: 1,
+    })
+    await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
     expect(f.flow.getSchedulingSettings()).toMatchObject({
       ok: true,
       value: {
@@ -686,22 +741,23 @@ describe('Decisions choices through the original workflow owner', () => {
         credential: { configured: true },
       },
     })
-    expect(native.decisions).toHaveLength(2)
     expect(native.decisions[0]!.candidates.map((candidate) => candidate.id)).toEqual([
-      'propose_supplement_plan',
-    ])
-    expect(native.decisions[1]!.candidates.map((candidate) => candidate.id)).toEqual([
-      'propose_reassign_roles',
+      'propose_extend_plan_review',
     ])
     expect(native.guidanceBodies).toEqual([])
     expect(f.db.conversationRepository.relaySchedulingDecision(f.sessionId)).toBeNull()
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM scheduling_evaluations`)).toEqual({
-      count: 2,
+      count: 1,
     })
   })
 
   it('consults only a real alternative and keeps the complete default workflow without generated focus', async () => {
     const f = await fixture()
+    const session = f.db.sessionRepository.find(f.sessionId)!
+    f.db.sessionRepository.saveSettings(f.sessionId, {
+      ...session.settings,
+      maxDiscussionRounds: 2,
+    })
     enableRelay(f)
     expect(f.flow.getSchedulingSettings()).toMatchObject({
       ok: true,
@@ -713,39 +769,42 @@ describe('Decisions choices through the original workflow owner', () => {
       },
     })
     const consultation = Promise.withResolvers<void>()
+    const limitConsulted = Promise.withResolvers<void>()
     const roleConsulted = Promise.withResolvers<void>()
     native.decisionHold = consultation.promise
     native.decisionStarted = (input) => {
+      if (input.candidates.some((candidate) => candidate.id === 'propose_extend_plan_review'))
+        limitConsulted.resolve()
       if (input.candidates.some((candidate) => candidate.id === 'propose_reassign_roles'))
         roleConsulted.resolve()
     }
     const goal = 'Keep the complete original goal and final acceptance.\n'.repeat(120)
     expect((await f.flow.send(f.input(`/plan ${goal}`))).ok).toBe(true)
-    await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
-    // The owner->review handoff holds the first real consult at the third input.
-    expect(native.inputs).toHaveLength(3)
-    expect(decisionsForProducer(native.inputs[0]!.runId)).toEqual([])
-    expect(decisionsForProducer(native.inputs[1]!.runId)).toEqual([])
-    const reviewDecisions = decisionsForProducer(native.inputs[2]!.runId)
-    expect(reviewDecisions).toHaveLength(1)
-    expect(reviewDecisions[0]!.candidates.map((candidate) => candidate.id)).toEqual([
-      'propose_supplement_plan',
+    await limitConsulted.promise
+    expect(native.inputs).toHaveLength(5)
+    expect(decisionsForProducer(native.inputs[4]!.runId)).toHaveLength(1)
+    expect(decisionsForProducer(native.inputs[4]!.runId)[0]!.candidates.map((c) => c.id)).toEqual([
+      'propose_extend_plan_review',
     ])
     consultation.resolve()
-    const task = await completedPlanRevision(f)
+    await vi.waitFor(() => expect(f.db.conversationRepository.activeEvaluation()).toBeUndefined())
+    const paused = await f.settled()
+    expect(paused).toMatchObject({ pauseReason: 'limit', discussionRounds: 2 })
+    f.db.sessionRepository.saveSettings(f.sessionId, {
+      ...f.db.sessionRepository.find(f.sessionId)!.settings,
+      maxDiscussionRounds: 6,
+    })
+    native.reviews = [{ verdict: 'accepted' }]
+    await f.act('review_plan')
     await roleConsulted.promise
     await vi.waitFor(() => expect(f.db.conversationRepository.activeEvaluation()).toBeUndefined())
     expect(
       native.decisions.map((input) => input.candidates.map((candidate) => candidate.id)),
-    ).toEqual([
-      ['propose_supplement_plan'],
-      ['propose_supplement_plan'],
-      ['propose_reassign_roles'],
-    ])
+    ).toEqual([['propose_extend_plan_review'], ['propose_reassign_roles']])
     expect(native.inputs).toHaveLength(6)
     expect(
       f.db.drizzle.get(
-        sql`SELECT count(*) AS count FROM collaboration_action_receipts WHERE action='supplement_plan'`,
+        sql`SELECT count(*) AS count FROM collaboration_action_receipts WHERE action='extend_plan_review'`,
       ),
     ).toEqual({ count: 0 })
     expect(f.db.conversationRepository.relaySchedulingDecision(f.sessionId)).toBeNull()
@@ -772,45 +831,41 @@ describe('Decisions choices through the original workflow owner', () => {
     for (const input of native.inputs)
       expect(input.promptEnvelope.collaborationAuthorization?.sourceManifestRef).toBeUndefined()
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM scheduling_evaluations`)).toEqual({
-      count: 3,
+      count: 2,
     })
     expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM agent_runs`)).toEqual({ count: 6 })
-    expect(f.db.conversationRepository.schedulingBudget(`task:${task.id}`)?.extraPlanTurns).toBe(0)
+    expect(f.db.conversationRepository.schedulingBudget(`task:${paused.id}`)?.extraPlanTurns).toBe(
+      0,
+    )
   })
 
   it.each([null, 'unsupported_candidate'] as const)(
     'keeps recommendation %s separate from the original revision Run',
     async (candidate) => {
       const f = await fixture()
-      enableRelay(f)
+      enableRelay(f, 0)
+      native.reviews = [{ verdict: 'accepted' }]
       native.decisionCandidate = candidate
       expect(
         (await f.flow.send(f.input('/plan Continue after an undecided auxiliary result.'))).ok,
       ).toBe(true)
-      await completedPlanRevision(f)
-      // Abstention and failure both preserve the default and permit distinct later handoffs.
-      const expectedConsults = 3
-      await vi.waitFor(() => expect(native.decisions).toHaveLength(expectedConsults))
-      expect(new Set(native.decisions.map((input) => input.handoff.id)).size).toBe(expectedConsults)
-      expect(
-        native.decisions.filter((input) => input.candidates[0]?.id === 'propose_reassign_roles'),
-      ).toHaveLength(1)
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+      await f.settled()
+      await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
+      expect(native.decisions[0]!.candidates.map((c) => c.id)).toEqual(['propose_reassign_roles'])
       expect(native.guidanceBodies).toEqual([])
       for (const input of native.inputs)
         expect(input.promptEnvelope.collaborationAuthorization?.sourceManifestRef).toBeUndefined()
-      expect(f.db.drizzle.all(sql`SELECT called,outcome FROM scheduling_evaluations`)).toEqual(
-        // The fixture abstains from role reassignment even when its earlier choices are invalid.
-        (candidate === null
-          ? ['completed', 'completed', 'completed']
-          : ['failed', 'failed', 'completed']
-        ).map((outcome) => ({ called: 1, outcome })),
-      )
+      expect(f.db.drizzle.all(sql`SELECT called,outcome FROM scheduling_evaluations`)).toEqual([
+        { called: 1, outcome: 'completed' },
+      ])
     },
   )
 
-  it('lets manual Continue claim the same handoff while consultation is pending and discards late advice', async () => {
+  it('lets manual Execute claim the same handoff while consultation is pending and discards late advice', async () => {
     const f = await fixture()
-    enableRelay(f)
+    enableRelay(f, 0)
+    native.reviews = [{ verdict: 'accepted' }]
     const hold = Promise.withResolvers<void>()
     native.decisionHold = hold.promise
     expect((await f.flow.send(f.input('/plan Keep the manual continuation responsive.'))).ok).toBe(
@@ -819,27 +874,28 @@ describe('Decisions choices through the original workflow owner', () => {
     await vi.waitFor(() => expect(native.decisions).toHaveLength(1), { timeout: 5_000 })
     const task = f.db.conversationRepository.collaboration(f.sessionId)!
     const handoffId = native.decisions[0]!.handoff.id
-    expect(native.inputs).toHaveLength(3)
-    expect(native.decisions[0]!.handoff.freshnessGuard.runId).toBe(native.inputs[2]!.runId)
+    expect(native.inputs).toHaveLength(2)
+    expect(native.decisions[0]!.handoff.freshnessGuard.runId).toBe(native.inputs[1]!.runId)
     const result = await f.flow.actOnCollaboration({
       sessionId: f.sessionId,
       taskId: task.id,
       revision: task.revision,
       clientMessageId: randomUUID(),
-      action: 'continue',
+      action: 'execute',
     })
     expect(result.ok).toBe(true)
     hold.resolve()
-    await completedPlanRevision(f)
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+    await f.settled()
     expectNoRepeatedConsultation(handoffId)
     expect(native.guidanceBodies).toEqual([])
     expect(
-      native.inputs[3]!.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
+      native.inputs[2]!.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
     ).toBeUndefined()
     expect(
       f.db.drizzle.get(sql`SELECT run_id FROM scheduling_handoffs WHERE id = ${handoffId}`),
-    ).toEqual({ run_id: native.inputs[3]!.runId })
-    expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM agent_runs`)).toEqual({ count: 6 })
+    ).toEqual({ run_id: native.inputs[2]!.runId })
+    expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM agent_runs`)).toEqual({ count: 3 })
     expect(
       f.db.drizzle.get(
         sql`SELECT count(*) AS count FROM scheduling_evaluations WHERE handoff_id = ${handoffId}`,
@@ -851,31 +907,31 @@ describe('Decisions choices through the original workflow owner', () => {
 
   it('does not start another owner Run while automatic wakes share a pending consultation', async () => {
     const f = await fixture()
-    enableRelay(f)
+    enableRelay(f, 0)
+    native.reviews = [{ verdict: 'accepted' }]
     const hold = Promise.withResolvers<void>()
     native.decisionHold = hold.promise
     expect((await f.flow.send(f.input('/plan Keep one consultation per handoff.'))).ok).toBe(true)
     await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
     await new Promise<void>((done) => setTimeout(done, 30))
     const handoffId = native.decisions[0]!.handoff.id
-    expect(native.inputs).toHaveLength(3)
+    expect(native.inputs).toHaveLength(2)
     expect(native.decisions).toHaveLength(1)
     hold.resolve()
-    await completedPlanRevision(f)
+    await f.settled()
     expectNoRepeatedConsultation(handoffId)
     expect(native.guidanceBodies).toEqual([])
   })
 
   it.each(['succeeds', 'fails', 'is cancelled'] as const)(
-    'yields to manual Continue whose preparation %s after consultation ends',
+    'yields to manual Execute whose preparation %s after consultation ends',
     async (outcome) => {
       const f = await fixture()
-      enableRelay(f)
+      enableRelay(f, 0)
+      native.reviews = [{ verdict: 'accepted' }]
       const decision = Promise.withResolvers<void>()
       native.decisionHold = decision.promise
-      expect((await f.flow.send(f.input('/plan Preserve the manual Continue claim.'))).ok).toBe(
-        true,
-      )
+      expect((await f.flow.send(f.input('/plan Preserve the manual Execute claim.'))).ok).toBe(true)
       await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
       const handoffId = native.decisions[0]!.handoff.id
       const task = f.db.conversationRepository.collaboration(f.sessionId)!
@@ -897,7 +953,7 @@ describe('Decisions choices through the original workflow owner', () => {
         taskId: task.id,
         revision: task.revision,
         clientMessageId: randomUUID(),
-        action: 'continue',
+        action: 'execute',
       })
       try {
         await entered.promise
@@ -916,36 +972,37 @@ describe('Decisions choices through the original workflow owner', () => {
           revision: task.revision,
           automation: 'active',
         })
-        expect(native.inputs).toHaveLength(3)
+        expect(native.inputs).toHaveLength(2)
         const cancellation =
           outcome === 'is cancelled' ? f.flow.stop({ sessionId: f.sessionId }) : undefined
         expect(cancellation?.ok ?? true).toBe(true)
         preparation.resolve()
         const result = await manual
         expect(result.ok).toBe(outcome === 'succeeds')
-        const settled =
-          outcome === 'is cancelled' ? await f.settled() : await completedPlanRevision(f)
+        const settled = await f.settled()
         expect(settled).toMatchObject(
           outcome === 'is cancelled'
-            ? { automation: 'paused', pauseReason: 'stopped' }
-            : { status: 'ready' },
+            ? { automation: 'paused', pauseReason: 'stopped', status: 'ready' }
+            : outcome === 'succeeds'
+              ? { openMode: true, stage: 'implement', status: 'waiting' }
+              : { status: 'ready', stage: 'plan_review' },
         )
         expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual(
-          outcome === 'is cancelled'
-            ? ['plan', 'plan_review', 'plan']
-            : ['plan', 'plan_review', 'plan', 'plan_review', 'plan', 'plan_review'],
+          outcome === 'succeeds' ? ['plan', 'plan_review', 'implement'] : ['plan', 'plan_review'],
         )
         expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM agent_runs`)).toEqual({
-          count: outcome === 'is cancelled' ? 3 : 6,
+          count: outcome === 'succeeds' ? 3 : 2,
         })
         expectNoRepeatedConsultation(handoffId)
         expect(native.guidanceBodies).toEqual([])
         expect(
-          native.inputs[3]?.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
+          native.inputs[2]?.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
         ).toBeUndefined()
         expect(
           f.db.drizzle.get(sql`SELECT run_id FROM scheduling_handoffs WHERE id = ${handoffId}`),
-        ).toEqual({ run_id: native.inputs[3]?.runId ?? null })
+        ).toEqual({
+          run_id: outcome === 'succeeds' ? (native.inputs[2]?.runId ?? null) : null,
+        })
         expect(
           f.db.drizzle.get(
             sql`SELECT count(*) AS count FROM scheduling_evaluations WHERE handoff_id = ${handoffId}`,
@@ -1053,7 +1110,8 @@ describe('Decisions choices through the original workflow owner', () => {
 
   it('cancels a pending consultation on Stop without starting the old continuation or refunding its call', async () => {
     const f = await fixture()
-    enableRelay(f)
+    enableRelay(f, 0)
+    native.reviews = [{ verdict: 'accepted' }]
     const hold = Promise.withResolvers<void>()
     native.decisionHold = hold.promise
     expect((await f.flow.send(f.input('/plan Stop must invalidate pending focus.'))).ok).toBe(true)
@@ -1062,7 +1120,7 @@ describe('Decisions choices through the original workflow owner', () => {
     hold.resolve()
     await vi.waitFor(() => expect(f.db.conversationRepository.activeEvaluation()).toBeUndefined())
     expect(f.db.conversationRepository.collaboration(f.sessionId)?.automation).toBe('paused')
-    expect(native.inputs).toHaveLength(3)
+    expect(native.inputs).toHaveLength(2)
     expect(native.guidanceBodies).toEqual([])
     expect(f.db.drizzle.get(sql`SELECT called,outcome FROM scheduling_evaluations`)).toEqual({
       called: 1,
@@ -1072,7 +1130,8 @@ describe('Decisions choices through the original workflow owner', () => {
 
   it('drops enable ABA advice and recomputes the original workflow without replaying that handoff', async () => {
     const f = await fixture()
-    enableRelay(f)
+    enableRelay(f, 0)
+    native.reviews = [{ verdict: 'accepted' }]
     const hold = Promise.withResolvers<void>()
     native.decisionHold = hold.promise
     const decisionStarted = Promise.withResolvers<DecisionInput>()
@@ -1093,12 +1152,10 @@ describe('Decisions choices through the original workflow owner', () => {
       })
       repository.saveSchedulingSettings({ expectedRevision: settings.revision, enabled: true })
       hold.resolve()
-      await completedPlanRevision(f)
+      await f.settled()
       expectNoRepeatedConsultation(handoffId)
       expect(native.guidanceBodies).toEqual([])
-      expect(
-        native.inputs[3]!.promptEnvelope.collaborationAuthorization?.sourceManifestRef,
-      ).toBeUndefined()
+      expect(native.inputs).toHaveLength(2)
       expect(
         f.db.drizzle.get(
           sql`SELECT count(*) AS count FROM scheduling_evaluations WHERE handoff_id = ${handoffId}`,
@@ -1112,343 +1169,168 @@ describe('Decisions choices through the original workflow owner', () => {
   })
 })
 
-async function repairDecisionFlow(primary: RuntimeAgentId, candidate: 'propose_repair' | null) {
-  const f = await fixture(primary)
-  native.nextReview = { verdict: 'changes_requested' }
-  expect(
-    (await f.flow.send(f.input('/build Repair only the complete current cancellation scope.'))).ok,
-  ).toBe(true)
-  await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
-  await f.settled()
-  expect(native.decisions).toEqual([])
-  enableRelaySettings(f)
-  native.decisionCandidate = candidate
-  native.nextReview = { verdict: 'changes_requested' }
-  await f.act('respond')
-  await vi.waitFor(() => {
-    expect(native.inputs).toHaveLength(4)
-    expect(native.decisions).toHaveLength(1)
-  })
-  await f.settled()
-  return f
-}
+describe('Open Mode collaboration, routing, and notification invariants', () => {
+  it('routes implicit Open Mode messages via Relay route_message and falls back to lastCodeActor on abstention', async () => {
+    const f = await fixture('codex')
+    expect(await f.flow.send(f.input('/build Implement cancellation safety.'))).toMatchObject({
+      ok: true,
+    })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+    expect(await f.settled()).toMatchObject({
+      openMode: true,
+      stage: 'implement',
+      status: 'waiting',
+      lastCodeActor: 'claude',
+      unreviewedCodeActor: 'claude',
+    })
 
-describe('Grounded Repair decisions through the existing Conversation owner', () => {
-  it.each(['codex', 'claude'] as const)(
-    'requires a fresh Secondary repair grant and returns to Primary code review when Primary is %s',
-    async (primary) => {
-      const f = await repairDecisionFlow(primary, 'propose_repair'),
-        repo = f.db.conversationRepository,
-        before = repo.collaboration(f.sessionId)!,
-        card = repo.relaySchedulingDecision(f.sessionId)!
-      expect(before).toMatchObject({
-        stage: 'code_review',
-        status: 'waiting',
-        repairAttempts: 0,
-        reviewCycles: 2,
+    enableRelaySettings(f)
+    native.decisionCandidate = 'route_codex'
+    expect(
+      await f.flow.send({
+        ...f.input('Double check edge cases and update tests if needed.'),
+        routeIntent: 'implicit',
+        composerRevision: 0,
+      }),
+    ).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+    await f.settled()
+    expect(native.inputs[1]!.promptEnvelope.collaboration).toMatchObject({
+      stage: 'collaborate',
+      actor: 'codex',
+    })
+    expect(collaborationReadOnly(native.inputs[1]!.promptEnvelope.collaboration)).toBe(false)
+
+    native.decisionCandidate = null
+    expect(
+      await f.flow.send({
+        ...f.input('Follow up again with the same team.'),
+        routeIntent: 'implicit',
+        composerRevision: 0,
+      }),
+    ).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+    await f.settled()
+    expect(native.inputs[2]!.promptEnvelope.collaboration).toMatchObject({
+      stage: 'collaborate',
+      actor: 'codex',
+    })
+  })
+
+  it('aborts in-flight routingOpenInputs cleanly on Stop so no stale routed turn starts', async () => {
+    const f = await fixture('codex')
+    expect(await f.flow.send(f.input('/build Prepare Open Mode session.'))).toMatchObject({
+      ok: true,
+    })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+    await f.settled()
+
+    enableRelaySettings(f)
+    const hold = Promise.withResolvers<void>()
+    native.decisionHold = hold.promise
+    const started = Promise.withResolvers<DecisionInput>()
+    native.decisionStarted = started.resolve
+    try {
+      expect(
+        await f.flow.send({
+          ...f.input('Route this open-mode message while Stop arrives.'),
+          routeIntent: 'implicit',
+          composerRevision: 0,
+        }),
+      ).toMatchObject({ ok: true })
+      const evalInput = await started.promise
+      expect(evalInput.candidates.map((c) => c.id)).toEqual(['route_codex', 'route_claude'])
+      expect(f.flow.stop({ sessionId: f.sessionId })).toMatchObject({ ok: true })
+      hold.resolve()
+      await vi.waitFor(() => expect(f.flow.diagnostics().activeExecutions).toBe(0))
+      await vi.waitFor(() => expect(f.db.conversationRepository.activeEvaluation()).toBeUndefined())
+      expect(native.inputs).toHaveLength(1)
+    } finally {
+      hold.resolve()
+    }
+  })
+
+  it('keeps Open Mode collaborate writable on /review tasks while keeping review stages read-only', async () => {
+    const f = await fixture('codex')
+    native.reviews = [{ verdict: 'changes_requested' }, { verdict: 'accepted' }]
+    expect(await f.flow.send(f.input('/review Audit cancellation paths.'))).toMatchObject({
+      ok: true,
+    })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+    await f.settled()
+    expect(collaborationReadOnly(native.inputs[0]!.promptEnvelope.collaboration)).toBe(true)
+
+    await f.act('fix')
+    expect(native.inputs[1]!.promptEnvelope.collaboration).toMatchObject({
+      kind: 'review',
+      stage: 'collaborate',
+      openMode: true,
+    })
+    expect(
+      collaborationReadOnly(
+        native.inputs[1]!.promptEnvelope.collaboration,
+        native.inputs[1]!.promptEnvelope.collaborationAuthorization,
+      ),
+    ).toBe(false)
+
+    await f.act('review_code')
+    expect(collaborationReadOnly(native.inputs[2]!.promptEnvelope.collaboration)).toBe(true)
+    expect(await f.settled()).toMatchObject({ status: 'complete', review: { verdict: 'accepted' } })
+  })
+
+  it('emits SessionNotification completed on Open Mode waiting settlement and suppresses on Stop or quit-seal', async () => {
+    const f = await fixture('codex')
+    native.noCodeChanges = true
+    const events: Array<{ sessionId: string; category: string }> = []
+    const unsubscribe = f.flow.subscribeNotifications((event) => {
+      if (event.kind === 'raise')
+        events.push({ sessionId: event.sessionId, category: event.category })
+    })
+    try {
+      expect(await f.flow.send(f.input('/build Finish first Open Mode turn.'))).toMatchObject({
+        ok: true,
       })
-      expect(native.decisions[0]!.candidates.map(({ id }) => id)).toEqual([
-        'propose_supplement_code_response',
-        'propose_repair',
-      ])
-      expect(card.request).toMatchObject({
-        category: 'new_authorization',
-        operation: {
-          kind: 'repair',
-          actor: primary === 'codex' ? 'claude' : 'codex',
-          returnActor: primary,
-          afterRunId: before.runId,
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+      await f.settled()
+      expect(events.map((e) => e.category)).toContain('completed')
+
+      events.length = 0
+      const quitOp = randomUUID()
+      expect(f.flow.prepareNativeQuit({ operationId: quitOp })).toMatchObject({
+        ok: true,
+        value: { state: 'idle_prepared' },
+      })
+      expect(events).toEqual([])
+      f.flow.cancelNativeQuit({ operationId: quitOp })
+      expect(await f.flow.send(f.input('Follow-up completed after quit cancelled.'))).toMatchObject(
+        {
+          ok: true,
         },
-      })
-      expect(
-        f.db.drizzle.get(
-          sql`SELECT count(*) AS count FROM collaboration_action_receipts WHERE action='repair'`,
-        ),
-      ).toEqual({ count: 0 })
-      expect(
-        f.db.drizzle.get(
-          sql`SELECT count(*) AS count FROM scheduling_budget_reservations WHERE budget='extra_code_turn'`,
-        ),
-      ).toEqual({ count: 0 })
-      expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
-        'implement',
-        'code_review',
-        'respond',
-        'code_review',
-      ])
-      const answer = {
-        reference: { sessionId: f.sessionId, decisionId: card.decisionId, revision: card.revision },
-        clientOperationId: randomUUID(),
-        answer: { kind: 'confirm' as const },
-      }
+      )
+      await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+      await f.settled()
+      expect(events.map((e) => e.category)).toContain('completed')
+
+      events.length = 0
       const hold = Promise.withResolvers<void>()
       native.hold = hold.promise
-      const accepted = await f.flow.answerRelayDecision(answer)
       try {
-        await vi.waitFor(() => expect(native.inputs).toHaveLength(5))
-        expect(accepted).toMatchObject({
-          ok: true,
-          value: { disposition: 'confirmed', runId: native.inputs[4]!.runId },
-        })
-        expect(native.decisions).toHaveLength(1)
-        expect(repo.schedulingBudget(`task:${before.id}`)).toMatchObject({
-          extraCodeTurns: 1,
-          evaluationCalls: 1,
-        })
-        expect(await f.flow.answerRelayDecision(answer)).toEqual(accepted)
-        expect(
-          await f.flow.answerRelayDecision({ ...answer, clientOperationId: randomUUID() }),
-        ).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
-        expect(native.inputs).toHaveLength(5)
-        expect(native.decisions).toHaveLength(1)
+        expect(await f.flow.send(f.input('Follow-up stopped by user.'))).toMatchObject({ ok: true })
+        await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+        expect(f.flow.stop({ sessionId: f.sessionId })).toMatchObject({ ok: true })
       } finally {
-        native.decisionCandidate = null
         native.hold = undefined
         hold.resolve()
       }
-      await vi.waitFor(() => expect(native.inputs).toHaveLength(6))
-      const completed = await f.settled(),
-        repair = native.inputs[4]!,
-        fixedReview = native.inputs[5]!
-      expect(repair.promptEnvelope.collaboration).toMatchObject({
-        stage: 'repair',
-        actor: primary === 'codex' ? 'claude' : 'codex',
-        reviewScopeRef: before.reviewScopeRef,
-      })
-      expect(repair.promptEnvelope.collaborationAuthorization?.userAuthority).toMatchObject({
-        purpose: 'action',
-      })
-      expect(repair.promptEnvelope.collaborationAuthorization?.relayWorkRef).toBeDefined()
-      expect(
-        collaborationReadOnly(
-          repair.promptEnvelope.collaboration,
-          repair.promptEnvelope.collaborationAuthorization,
-        ),
-      ).toBe(false)
-      expect(fixedReview.promptEnvelope.collaboration).toMatchObject({
-        stage: 'code_review',
-        actor: primary,
-      })
-      expect(
-        collaborationReadOnly(
-          fixedReview.promptEnvelope.collaboration,
-          fixedReview.promptEnvelope.collaborationAuthorization,
-        ),
-      ).toBe(true)
-      expect(completed).toMatchObject({
-        id: before.id,
-        status: 'complete',
-        repairAttempts: 1,
-        reviewCycles: 3,
-      })
-      expect(repo.schedulingBudget(`task:${before.id}`)).toMatchObject({
-        extraCodeTurns: 1,
-        evaluationCalls: 1,
-      })
-      // The fixed review needs no model call; answer readback does not re-evaluate the original handoff.
-      expect(
-        native.decisions.map((decision) => ({
-          producer: decision.handoff.freshnessGuard.runId,
-          candidates: decision.candidates.map(({ id }) => id),
-        })),
-      ).toEqual([
-        {
-          producer: before.runId,
-          candidates: ['propose_supplement_code_response', 'propose_repair'],
-        },
-      ])
-      expect(new Set(native.decisions.map((decision) => decision.handoff.id)).size).toBe(1)
-      expect(await f.flow.answerRelayDecision(answer)).toEqual(accepted)
-      expect(
-        f.flow.getRelayDecisionReceipt({
-          sessionId: f.sessionId,
-          decisionId: card.decisionId,
-          clientOperationId: answer.clientOperationId,
-        }),
-      ).toEqual(accepted)
-      expect(
-        await f.flow.answerRelayDecision({ ...answer, clientOperationId: randomUUID() }),
-      ).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
-      expect(native.inputs).toHaveLength(6)
-      expect(native.decisions).toHaveLength(1)
-      expect(
-        f.db.drizzle.get(
-          sql`SELECT count(*) AS count FROM collaboration_action_receipts WHERE action='repair'`,
-        ),
-      ).toEqual({ count: 1 })
-    },
-  )
-
-  it.each(['no recommendation', 'cancel'] as const)(
-    'preserves the original zero-extra-Turn path after %s',
-    async (choice) => {
-      const f = await repairDecisionFlow('codex', choice === 'cancel' ? 'propose_repair' : null),
-        repo = f.db.conversationRepository,
-        before = repo.collaboration(f.sessionId)!
-      if (choice === 'cancel') {
-        const card = repo.relaySchedulingDecision(f.sessionId)!
-        await f.flow.answerRelayDecision({
-          reference: {
-            sessionId: f.sessionId,
-            decisionId: card.decisionId,
-            revision: card.revision,
-          },
-          clientOperationId: randomUUID(),
-          answer: { kind: 'cancel' },
-        })
-      }
-      const current = await f.settled()
-      expect(current).toMatchObject({
-        id: before.id,
-        runId: before.runId,
-        stage: 'code_review',
-        repairAttempts: 0,
-        reviewCycles: 2,
-        automation: 'active',
-      })
-      expect(current.pauseReason).toBeUndefined()
-      expect(collaborationAvailableActions(current)).toEqual(
-        expect.arrayContaining(['respond', 'repair']),
+      await vi.waitFor(() =>
+        expect(f.db.conversationRepository.collaboration(f.sessionId)?.status).not.toBe('running'),
       )
-      expect(native.inputs).toHaveLength(4)
-      expect(native.decisions).toHaveLength(1)
-      expect(repo.relaySchedulingDecision(f.sessionId)).toBeNull()
-      expect(repo.schedulingBudget(`task:${before.id}`)).toMatchObject({
-        extraCodeTurns: 0,
-        evaluationCalls: 1,
-      })
-      expect(
-        f.db.drizzle.get(
-          sql`SELECT count(*) AS count FROM collaboration_action_receipts WHERE action='repair'`,
-        ),
-      ).toEqual({ count: 0 })
-    },
-  )
-
-  it.each(['codex', 'claude'] as const)(
-    'consults and admits a repair at the very first review when Primary is %s',
-    async (primary) => {
-      const f = await fixture(primary)
-      enableRelaySettings(f)
-      native.decisionCandidate = 'propose_repair'
-      native.nextReview = { verdict: 'changes_requested' }
-      expect((await f.flow.send(f.input('/build Preserve the current review scope.'))).ok).toBe(
-        true,
-      )
-      await vi.waitFor(() => {
-        expect(native.inputs).toHaveLength(2)
-        expect(native.decisions).toHaveLength(1)
-      })
-      await f.settled()
-      const repo = f.db.conversationRepository,
-        before = repo.collaboration(f.sessionId)!,
-        card = repo.relaySchedulingDecision(f.sessionId)!
-      expect(before).toMatchObject({
-        stage: 'code_review',
-        status: 'waiting',
-        repairAttempts: 0,
-        reviewCycles: 1,
-      })
-      expect(native.decisions[0]!.candidates.map(({ id }) => id)).toEqual([
-        'propose_supplement_code_response',
-        'propose_repair',
-      ])
-      expect(card.request).toMatchObject({
-        category: 'new_authorization',
-        operation: {
-          kind: 'repair',
-          actor: primary === 'codex' ? 'claude' : 'codex',
-          returnActor: primary,
-          afterRunId: before.runId,
-        },
-      })
-      // The objective records durable progress facts; no synthetic prior review or
-      // owner response is manufactured for a first-review consult.
-      const envelope = JSON.parse(native.decisions[0]!.objective.split('\n').pop()!)
-      expect(envelope.progress).toEqual({
-        discussionRounds: 0,
-        reviewCycles: 1,
-        repairAttempts: 0,
-      })
-      expect(envelope.reviews).toEqual([])
-      expect(envelope.responses).toEqual([])
-      const answer = {
-        reference: {
-          sessionId: f.sessionId,
-          decisionId: card.decisionId,
-          revision: card.revision,
-        },
-        clientOperationId: randomUUID(),
-        answer: { kind: 'confirm' as const },
-      }
-      const accepted = await f.flow.answerRelayDecision(answer)
-      expect(accepted).toMatchObject({ ok: true, value: { disposition: 'confirmed' } })
-      await vi.waitFor(() => expect(native.inputs).toHaveLength(4))
-      const completed = await f.settled(),
-        repair = native.inputs[2]!,
-        fixedReview = native.inputs[3]!
-      expect(repair.promptEnvelope.collaboration).toMatchObject({
-        stage: 'repair',
-        actor: primary === 'codex' ? 'claude' : 'codex',
-        reviewScopeRef: before.reviewScopeRef,
-      })
-      expect(repair.promptEnvelope.collaborationAuthorization?.userAuthority).toMatchObject({
-        purpose: 'action',
-      })
-      expect(
-        collaborationReadOnly(
-          repair.promptEnvelope.collaboration,
-          repair.promptEnvelope.collaborationAuthorization,
-        ),
-      ).toBe(false)
-      expect(fixedReview.promptEnvelope.collaboration).toMatchObject({
-        stage: 'code_review',
-        actor: primary,
-      })
-      expect(
-        collaborationReadOnly(
-          fixedReview.promptEnvelope.collaboration,
-          fixedReview.promptEnvelope.collaborationAuthorization,
-        ),
-      ).toBe(true)
-      expect(completed).toMatchObject({ repairAttempts: 1, reviewCycles: 2 })
-      expect(native.decisions).toHaveLength(1)
-      expect(
-        f.db.drizzle.get(
-          sql`SELECT count(*) AS count FROM collaboration_action_receipts WHERE action='repair'`,
-        ),
-      ).toEqual({ count: 1 })
-    },
-  )
-
-  it.each(['codex', 'claude'] as const)(
-    'keeps the waiting task unchanged when the first-review selection is null for %s',
-    async (primary) => {
-      const f = await fixture(primary)
-      enableRelaySettings(f)
-      native.decisionCandidate = null
-      native.nextReview = { verdict: 'changes_requested' }
-      expect((await f.flow.send(f.input('/build Preserve the current review scope.'))).ok).toBe(
-        true,
-      )
-      await vi.waitFor(() => {
-        expect(native.inputs).toHaveLength(2)
-        expect(native.decisions).toHaveLength(1)
-      })
-      const repo = f.db.conversationRepository
-      expect(await f.settled()).toMatchObject({
-        stage: 'code_review',
-        status: 'waiting',
-        repairAttempts: 0,
-        reviewCycles: 1,
-      })
-      expect(repo.relaySchedulingDecision(f.sessionId)).toBeNull()
-      expect(native.inputs).toHaveLength(2)
-      expect(f.db.drizzle.get(sql`SELECT count(*) AS count FROM scheduling_evaluations`)).toEqual({
-        count: 1,
-      })
-    },
-  )
+      await vi.waitFor(() => expect(f.flow.diagnostics().activeExecutions).toBe(0))
+      expect(events).toEqual([])
+    } finally {
+      unsubscribe()
+    }
+  })
 })
 
 describe('Native workflow admission and durable dispatch', () => {
@@ -1499,11 +1381,15 @@ describe('Native workflow admission and durable dispatch', () => {
         })
         native.hold = undefined
         hold.resolve()
-        await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
-        const task = await f.settled()
-        expect(task.rolePolicy).toBeUndefined()
-        expect(task.owner).toBe(primary)
+        await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+        const implemented = await f.settled()
+        expect(implemented.rolePolicy).toBeUndefined()
+        expect(implemented.owner).toBe(primary)
+        expect(implemented.stage).toBe('implement')
+        expect(implemented.status).toBe('waiting')
         expect(f.db.conversationRepository.findRun(native.inputs[1]!.runId)?.agentId).toBe(primary)
+        await f.act('review_code')
+        await f.settled()
         expect(f.db.conversationRepository.findRun(native.inputs[2]!.runId)?.agentId).toBe(
           primary === 'codex' ? 'claude' : 'codex',
         )
@@ -1533,15 +1419,15 @@ describe('Native workflow admission and durable dispatch', () => {
       primary: 'codex',
       kind: 'build',
       first: 'claude',
-      stages: ['implement', 'code_review'],
-      actors: ['claude', 'codex'],
+      stages: ['implement'],
+      actors: ['claude'],
     },
     {
       primary: 'claude',
       kind: 'build',
       first: 'codex',
-      stages: ['implement', 'code_review'],
-      actors: ['codex', 'claude'],
+      stages: ['implement'],
+      actors: ['codex'],
     },
     {
       primary: 'codex',
@@ -1562,7 +1448,7 @@ describe('Native workflow admission and durable dispatch', () => {
     async ({ primary, kind, first, stages }) => {
       const chosen = otherAgent(first),
         owner = kind === 'build' ? otherAgent(chosen) : chosen,
-        expectedActors = kind === 'review' ? [chosen] : [chosen, otherAgent(chosen)]
+        expectedActors = stages.length === 1 ? [chosen] : [chosen, otherAgent(chosen)]
       const f = await fixture(primary)
       expect(
         await f.flow.send({
@@ -1607,13 +1493,13 @@ describe('Native workflow admission and durable dispatch', () => {
       primary: 'codex',
       kind: 'build',
       first: 'claude',
-      stages: ['implement', 'code_review'],
+      stages: ['implement'],
     },
     {
       primary: 'claude',
       kind: 'build',
       first: 'codex',
-      stages: ['implement', 'code_review'],
+      stages: ['implement'],
     },
     {
       primary: 'codex',
@@ -1632,7 +1518,7 @@ describe('Native workflow admission and durable dispatch', () => {
     async ({ primary, kind, first, stages }) => {
       const chosen = otherAgent(first),
         owner = kind === 'build' ? otherAgent(chosen) : chosen,
-        expectedActors = kind === 'review' ? [chosen] : [chosen, otherAgent(chosen)]
+        expectedActors = stages.length === 1 ? [chosen] : [chosen, otherAgent(chosen)]
       const f = await fixture(primary)
       expect(
         await f.flow.send({
@@ -1655,8 +1541,8 @@ describe('Native workflow admission and durable dispatch', () => {
   it.each([
     { primary: 'codex', kind: 'plan', actor: 'codex', count: 2 },
     { primary: 'claude', kind: 'plan', actor: 'claude', count: 2 },
-    { primary: 'codex', kind: 'build', actor: 'claude', count: 2 },
-    { primary: 'claude', kind: 'build', actor: 'codex', count: 2 },
+    { primary: 'codex', kind: 'build', actor: 'claude', count: 1 },
+    { primary: 'claude', kind: 'build', actor: 'codex', count: 1 },
     { primary: 'codex', kind: 'review', actor: 'codex', count: 1 },
     { primary: 'claude', kind: 'review', actor: 'claude', count: 1 },
   ] as const)(
@@ -1796,7 +1682,17 @@ describe('Native workflow admission and durable dispatch', () => {
           ),
         ),
       ).toBe(true)
-      expect(await f.act('execute')).toMatchObject({ status: 'complete', stage: 'code_review' })
+      expect(await f.act('execute')).toMatchObject({
+        openMode: true,
+        status: 'waiting',
+        stage: 'implement',
+        unreviewedCodeActor: primary === 'codex' ? 'claude' : 'codex',
+      })
+      expect(await f.act('review_code')).toMatchObject({
+        status: 'waiting',
+        stage: 'code_review',
+        review: { verdict: 'accepted' },
+      })
       expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
         'plan',
         'plan_review',
@@ -1989,7 +1885,7 @@ describe('Native workflow admission and durable dispatch', () => {
       ])
     },
   )
-  it('receives a user message during a native turn once and automatically reviews after its reply', async () => {
+  it('receives a user message during an Open Mode native turn once and allows explicit review_code after collaboration', async () => {
     const f = await fixture(),
       held = Promise.withResolvers<void>()
     native.hold = held.promise
@@ -2003,17 +1899,25 @@ describe('Native workflow admission and durable dispatch', () => {
     expect(await f.flow.send(send)).toMatchObject({ ok: true })
     native.hold = undefined
     held.resolve()
-    await vi.waitFor(() =>
-      expect(f.db.conversationRepository.collaboration(f.sessionId)?.status).toBe('complete'),
-    )
-    const task = await f.settled()
-    expect(native.inputs).toHaveLength(3)
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+    const waiting = await f.settled()
     expect(native.inputs[1]!.promptEnvelope.message).toMatchObject({
       id: send.clientMessageId,
       content: send.content,
     })
-    expect(task).toMatchObject({ automation: 'active', stage: 'code_review', status: 'complete' })
-    expect(collaborationReadOnly(native.inputs[1]!.promptEnvelope.collaboration)).toBe(true)
+    expect(waiting).toMatchObject({
+      openMode: true,
+      automation: 'active',
+      stage: 'collaborate',
+      status: 'waiting',
+      unreviewedCodeActor: 'claude',
+    })
+    expect(collaborationReadOnly(native.inputs[1]!.promptEnvelope.collaboration)).toBe(false)
+    expect(await f.act('review_code')).toMatchObject({
+      status: 'complete',
+      stage: 'code_review',
+      review: { verdict: 'accepted' },
+    })
     expect(native.inputs).toHaveLength(3)
   })
   it('rejects stale actions and keeps missing native plans failed without inventing questions or a document', async () => {
@@ -2102,7 +2006,7 @@ describe('Native workflow admission and durable dispatch', () => {
         taskId: recovered.id,
         revision: recovered.revision,
         clientMessageId: randomUUID(),
-        action: 'resume',
+        action: 'review_plan',
       })
       expect(resume.ok).toBe(pendingPresent)
       await vi.waitFor(() => expect(native.inputs).toHaveLength(pendingPresent ? 4 : 3))
@@ -2690,8 +2594,17 @@ describe('Initial stage-role assignment through the modern Composer', () => {
       await f.act('execute')
       await vi.waitFor(() =>
         expect(f.db.conversationRepository.collaboration(f.sessionId)).toMatchObject({
+          openMode: true,
+          stage: 'implement',
+          status: 'waiting',
+        }),
+      )
+      await f.act('review_code')
+      await vi.waitFor(() =>
+        expect(f.db.conversationRepository.collaboration(f.sessionId)).toMatchObject({
           stage: 'code_review',
-          status: 'complete',
+          status: 'waiting',
+          review: { verdict: 'accepted' },
         }),
       )
       await f.settled()
@@ -2730,7 +2643,7 @@ describe('Initial stage-role assignment through the modern Composer', () => {
 })
 
 describe('Initial role assignment boundaries', () => {
-  it('assigns roles_codex_codex for /build through implement and review with exact write authority', async () => {
+  it('assigns roles_codex_codex for /build through implement and explicit review_code with exact write authority', async () => {
     const f = await fixture('codex')
     enableRelaySettings(f)
     native.decisionCandidate = 'roles_codex_codex'
@@ -2740,6 +2653,15 @@ describe('Initial role assignment boundaries', () => {
       composerRevision: 0,
     }
     expect((await f.flow.send(input)).ok).toBe(true)
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+    const implemented = await f.settled()
+    expect(implemented).toMatchObject({
+      openMode: true,
+      status: 'waiting',
+      stage: 'implement',
+      unreviewedCodeActor: 'codex',
+    })
+    await f.act('review_code')
     await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
     const task = await f.settled()
     expect(
@@ -2764,13 +2686,18 @@ describe('Initial role assignment boundaries', () => {
     expect(reviewAuth.stageRoles).toEqual(task.stageRoles)
     expect(writeAuth.userAuthority?.purpose).toBe('action')
     const receipts = f.db.drizzle.select().from(collaborationActionReceipts).all()
-    expect(receipts).toHaveLength(1)
+    expect(receipts).toHaveLength(2)
     expect(receipts[0]).toMatchObject({ action: 'build', actor: 'codex', boundRunId: runs[0]!.id })
+    expect(receipts[1]).toMatchObject({
+      action: 'review_code',
+      actor: 'claude',
+      boundRunId: runs[1]!.id,
+    })
     expect(JSON.parse(receipts[0]!.basisJson).stageRoles).toEqual(task.stageRoles)
     expect(f.db.sessionRepository.find(f.sessionId)!.settings.primaryAgentId).toBe('codex')
   })
 
-  it('assigns roles_codex_codex for /review as a read-only turn then repairs as code author', async () => {
+  it('assigns roles_codex_codex for /review as a read-only turn then fixes in collaborate and reviews again', async () => {
     const f = await fixture('codex')
     enableRelaySettings(f)
     native.decisionStarted = (decision) => {
@@ -2801,7 +2728,10 @@ describe('Initial role assignment boundaries', () => {
     expect(reviewAuth.userAuthority).toBeUndefined()
     expect(f.db.drizzle.select().from(collaborationActionReceipts).all()).toHaveLength(0)
     expect(f.db.conversationRepository.relaySchedulingDecision(f.sessionId)).toBeNull()
-    await f.act('repair')
+    await f.act('fix')
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+    await f.settled()
+    await f.act('review_code')
     await vi.waitFor(() =>
       expect(f.db.conversationRepository.collaboration(f.sessionId)).toMatchObject({
         stage: 'code_review',
@@ -2817,16 +2747,21 @@ describe('Initial role assignment boundaries', () => {
       })),
     ).toEqual([
       { stage: 'code_review', actor: 'claude' },
-      { stage: 'repair', actor: 'codex' },
+      { stage: 'collaborate', actor: 'codex' },
       { stage: 'code_review', actor: 'claude' },
     ])
     const runs = f.db.conversationRepository.read(f.sessionId).runs
-    const repairAuth = f.db.conversationRepository.collaborationTurnAuthorization(runs[1]!.id)!
-    expect(collaborationReadOnly(task, repairAuth)).toBe(false)
-    expect(repairAuth.userAuthority?.purpose).toBe('action')
+    const fixAuth = f.db.conversationRepository.collaborationTurnAuthorization(runs[1]!.id)!
+    expect(collaborationReadOnly(task, fixAuth)).toBe(false)
+    expect(fixAuth.userAuthority?.purpose).toBe('action')
     const receipts = f.db.drizzle.select().from(collaborationActionReceipts).all()
-    expect(receipts).toHaveLength(1)
-    expect(receipts[0]).toMatchObject({ action: 'repair', actor: 'codex', boundRunId: runs[1]!.id })
+    expect(receipts).toHaveLength(2)
+    expect(receipts[0]).toMatchObject({ action: 'fix', actor: 'codex', boundRunId: runs[1]!.id })
+    expect(receipts[1]).toMatchObject({
+      action: 'review_code',
+      actor: 'claude',
+      boundRunId: runs[2]!.id,
+    })
     // The initial-role consult is the only input_dispatch evaluation; workflow consults return null.
     expect(native.decisions.filter((d) => d.handoff.slot === 'input_dispatch')).toHaveLength(1)
     expect(task.stageRoles).toMatchObject({
@@ -3036,21 +2971,6 @@ describe('Initial role staleness and mutation boundaries', () => {
   })
 })
 
-async function answerWorkflowQuestion(f: Awaited<ReturnType<typeof fixture>>) {
-  const repo = f.db.conversationRepository
-  const request = () => repo.nativeContext(f.sessionId, 'codex')?.permissionRequests?.[0]
-  await vi.waitFor(() => expect(request()).toMatchObject({ kind: 'questions' }))
-  const nativeQuestion = request()!
-  expect(
-    f.flow.respondNativeInput({
-      requestId: nativeQuestion.id,
-      operationId: nativeQuestion.operationId!,
-      action: 'accept',
-      values: { timeout: 'Two seconds' },
-    }),
-  ).toMatchObject({ ok: true })
-}
-
 function actionForCard(
   card: RelaySchedulingDecision,
   answer: 'cancel' | 'confirm',
@@ -3066,8 +2986,13 @@ function actionForCard(
   }
 }
 
-function pactRepairActions(f: { repo: PactDatabase['conversationRepository']; sessionId: string }) {
-  const page = f.repo.readPage({ scope: 'collaboration', sessionId: f.sessionId })
+function pactRepairActions(
+  f:
+    | { repo: PactDatabase['conversationRepository']; sessionId: string }
+    | { db: PactDatabase; sessionId: string },
+) {
+  const repo = 'repo' in f ? f.repo : f.db.conversationRepository
+  const page = repo.readPage({ scope: 'collaboration', sessionId: f.sessionId })
   if (page.scope !== 'collaboration') throw Error('Expected collaboration actions')
   return page.view.availableActions
 }
@@ -3783,28 +3708,19 @@ describe('Explicit Plan questions', () => {
   })
 })
 
-function directChoice(f: { repo: PactDatabase['conversationRepository']; sessionId: string }) {
-  const task = f.repo.collaboration(f.sessionId)!
-  return {
-    sessionId: f.sessionId,
-    taskId: task.id,
-    revision: task.revision,
-    clientMessageId: randomUUID(),
-    action: 'request_repair_role_switch' as const,
-    repairActor: 'codex' as const,
-  }
-}
-
-describe('Native repair role confirmations', () => {
-  async function reviewedCode(priorRepair = false, command: '/build' | '/review' = '/build') {
+describe('Open Mode actions, swap_code_roles, and failure recovery', () => {
+  async function reviewedCode(priorFix = false, command: '/build' | '/review' = '/build') {
     const f = await fixture('codex', true)
     const repo = f.db.conversationRepository
     native.nextReview = { verdict: 'changes_requested' }
     expect(await f.flow.send(f.input(command + ' Preserve cancellation ownership.'))).toMatchObject(
-      {
-        ok: true,
-      },
+      { ok: true },
     )
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+    if (command === '/build') {
+      await f.settled()
+      await f.act('review_code')
+    }
     await vi.waitFor(() =>
       expect(repo.collaboration(f.sessionId)).toMatchObject({
         stage: 'code_review',
@@ -3813,138 +3729,14 @@ describe('Native repair role confirmations', () => {
       }),
     )
     await f.settled()
-    if (priorRepair) {
+    if (priorFix) {
       native.nextReview = { verdict: 'changes_requested' }
-      await f.act('repair')
+      await f.act('fix')
+      await f.act('review_code')
     }
-    await vi.waitFor(() =>
-      expect(repo.collaboration(f.sessionId)).toMatchObject({
-        stage: 'code_review',
-        status: 'waiting',
-        reviewCycles: priorRepair ? 2 : 1,
-        repairAttempts: priorRepair ? 1 : 0,
-      }),
-    )
     const reviewed = await f.settled()
     return { ...f, repo, reviewed }
   }
-
-  it('settles two ordinary explanation replies without changing workflow authority', async () => {
-    const f = await reviewedCode()
-    const original = f.reviewed
-    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
-      'implement',
-      'code_review',
-    ])
-    const sendExplanation = async (content: string) => {
-      native.next = {
-        input: { outcome: 'explanation_only' },
-        answer: 'Read-only explanation; no requirements changed.',
-      }
-      const expectedInputs = native.inputs.length + 1
-      expect(await f.flow.send(f.input(content))).toMatchObject({ ok: true })
-      await vi.waitFor(() => expect(native.inputs).toHaveLength(expectedInputs))
-      await vi.waitFor(() =>
-        expect(f.repo.collaboration(f.sessionId)?.inputProcessing?.settled?.runId).toBe(
-          native.inputs.at(-1)!.runId,
-        ),
-      )
-      await f.settled()
-    }
-    await sendExplanation('Explain the first review finding without changing the work.')
-    await sendExplanation('Explain the second review finding without changing the work.')
-    const current = await f.settled()
-    expect(current).toMatchObject({
-      stage: 'code_review',
-      status: 'waiting',
-      automation: 'active',
-      inputSequence: original.inputSequence + 2,
-      review: original.review,
-      stageRoles: original.stageRoles,
-      codeRunId: original.codeRunId,
-      discussionRounds: original.discussionRounds,
-      reviewCycles: original.reviewCycles,
-      repairAttempts: original.repairAttempts,
-    })
-    expect(current.planReference).toBe(original.planReference)
-    expect(current.pendingWork).toBeUndefined()
-    expect(current.inputProcessing?.settled).toMatchObject({
-      inputSequence: original.inputSequence + 2,
-      unchanged: { inputSequence: original.inputSequence },
-    })
-    expect(pactRepairActions(f)).toEqual(expect.arrayContaining(['respond', 'repair']))
-    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
-      'implement',
-      'code_review',
-      'reply',
-      'reply',
-    ])
-  })
-
-  it('restores interrupted implementation work after an explanation reply', async () => {
-    const f = await fixture('codex')
-    const repo = f.db.conversationRepository
-    expect(await f.flow.send(f.input('/plan Describe the implementation scope.'))).toMatchObject({
-      ok: true,
-    })
-    await vi.waitFor(() => expect(repo.collaboration(f.sessionId)?.status).toBe('ready'))
-    const accepted = await f.settled()
-    native.next = { failedNativeEnding: true }
-    const interrupted = await f.act('execute')
-    expect(interrupted).toMatchObject({
-      stage: 'implement',
-      status: 'failed',
-      automation: 'paused',
-      pauseReason: 'failure',
-      pendingWork: { stage: 'implement', runId: interrupted.runId },
-    })
-    const writeGrant = repo.collaborationTurnAuthorization(interrupted.runId)
-    expect(writeGrant).toMatchObject({
-      stage: 'implement',
-      userAuthority: { purpose: 'action' },
-    })
-    const stagesBefore = native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)
-    expect(stagesBefore).toEqual(['plan', 'plan_review', 'implement'])
-    native.next = {
-      input: { outcome: 'explanation_only' },
-      answer: 'The interrupted write remains pending; this reply changed nothing.',
-    }
-    expect(
-      await f.flow.send(f.input('Explain where the interrupted implementation stopped.')),
-    ).toMatchObject({ ok: true })
-    await vi.waitFor(() => expect(native.inputs).toHaveLength(stagesBefore.length + 1))
-    await vi.waitFor(() =>
-      expect(repo.collaboration(f.sessionId)?.inputProcessing?.settled?.runId).toBe(
-        native.inputs.at(-1)!.runId,
-      ),
-    )
-    const current = await f.settled()
-    expect(current).toMatchObject({
-      stage: interrupted.stage,
-      actor: interrupted.actor,
-      status: interrupted.status,
-      automation: interrupted.automation,
-      pauseReason: interrupted.pauseReason,
-      pendingWork: interrupted.pendingWork,
-      planReference: interrupted.planReference,
-      review: interrupted.review,
-      stageRoles: interrupted.stageRoles,
-      discussionRounds: interrupted.discussionRounds,
-      reviewCycles: interrupted.reviewCycles,
-      repairAttempts: interrupted.repairAttempts,
-      inputSequence: interrupted.inputSequence + 1,
-    })
-    expect(current.codeRunId).toBe(interrupted.codeRunId)
-    expect(current.inputProcessing?.settled?.unchanged?.inputSequence).toBe(
-      interrupted.inputSequence,
-    )
-    expect(repo.collaborationTurnAuthorization(interrupted.runId)).toEqual(writeGrant)
-    expect(accepted.review).toEqual(interrupted.review)
-    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
-      ...stagesBefore,
-      'reply',
-    ])
-  })
 
   it('classifies an exhausted workflow allowance by its typed transition reason', async () => {
     const f = await fixture('codex')
@@ -3955,12 +3747,12 @@ describe('Native repair role confirmations', () => {
       maxDiscussionRounds: 0,
     })
     const contracts = await import('@pact/contracts')
-    const originalAdvance = contracts.advanceCollaboration
+    const originalAdvance = contracts.advanceAutomaticCollaboration
     const advance = vi
-      .spyOn(contracts, 'advanceCollaboration')
-      .mockImplementation((task, action, limits) => {
+      .spyOn(contracts, 'advanceAutomaticCollaboration')
+      .mockImplementation((task, limits) => {
         try {
-          return originalAdvance(task, action, limits)
+          return originalAdvance(task, limits)
         } catch (error) {
           if (
             error instanceof contracts.CollaborationTransitionError &&
@@ -3996,74 +3788,79 @@ describe('Native repair role confirmations', () => {
     }
   })
 
-  it('supersedes an unused Relay suggestion for this review with the direct choice', async () => {
-    const f = await repairDecisionFlow('codex', 'propose_repair')
+  it('supersedes an unused reassign_roles card with direct swap_code_roles and uses the swapped implementer', async () => {
+    const f = await fixture('codex')
     const repo = f.db.conversationRepository
-    const before = repo.collaboration(f.sessionId)!
-    const old = repo.relaySchedulingDecision(f.sessionId)!
-    expect(old.request).toMatchObject({ operation: { kind: 'repair' } })
-    const request = directChoice({ repo, sessionId: f.sessionId })
-    expect(await f.flow.actOnCollaboration(request)).toMatchObject({ ok: true })
-    const card = repo.relaySchedulingDecision(f.sessionId)!
-    expect(card).toMatchObject({
-      decisionId: request.clientMessageId,
-      request: { operation: { kind: 'repair_role_request', actor: 'codex' } },
-    })
-    expect(repo.collaboration(f.sessionId)).toMatchObject({
-      inputSequence: before.inputSequence,
-      runId: before.runId,
-      review: before.review,
-      stageRoles: before.stageRoles,
-    })
-    expect(native.inputs).toHaveLength(4)
-    expect(await f.flow.answerRelayDecision(actionForCard(old, 'confirm'))).toMatchObject({
-      ok: false,
-    })
-    expect(await f.flow.actOnCollaboration(request)).toMatchObject({ ok: true })
-    expect(await f.flow.actOnCollaboration({ ...request, repairActor: 'claude' })).toMatchObject({
-      ok: false,
-      error: { code: 'CONFLICT' },
-    })
-    expect(await f.flow.answerRelayDecision(actionForCard(card, 'cancel'))).toMatchObject({
-      ok: true,
-    })
-    expect(await f.flow.actOnCollaboration(request)).toMatchObject({ ok: true })
+    enableRelaySettings(f)
+    native.decisionCandidate = 'propose_reassign_roles'
+    native.reviews = [{ verdict: 'accepted' }]
+    expect((await f.flow.send(f.input('/plan Preserve the accepted scope.'))).ok).toBe(true)
+    await vi.waitFor(() =>
+      expect(repo.relaySchedulingDecision(f.sessionId)?.request).toMatchObject({
+        category: 'arrangement_change',
+        operation: { kind: 'reassign_roles' },
+      }),
+    )
+    const oldCard = repo.relaySchedulingDecision(f.sessionId)!
+    const ready = await f.settled()
+    expect(pactRepairActions(f)).toContain('swap_code_roles')
+    expect(
+      await f.flow.actOnCollaboration({
+        sessionId: f.sessionId,
+        taskId: ready.id,
+        revision: ready.revision,
+        clientMessageId: randomUUID(),
+        action: 'swap_code_roles',
+      }),
+    ).toMatchObject({ ok: true })
     expect(repo.relaySchedulingDecision(f.sessionId)).toBeNull()
+    expect(await f.flow.answerRelayDecision(actionForCard(oldCard, 'confirm'))).toMatchObject({
+      ok: false,
+    })
+    const swapped = repo.collaboration(f.sessionId)!
+    expect(swapped.stageRoles).toMatchObject({
+      planAuthor: 'codex',
+      planReviewer: 'claude',
+      codeAuthor: 'codex',
+      codeReviewer: 'claude',
+      revision: 1,
+    })
+    native.decisionCandidate = null
+    await f.act('execute')
+    expect(native.inputs[2]!.promptEnvelope.collaboration).toMatchObject({
+      stage: 'implement',
+      actor: 'codex',
+    })
+    const started = repo.collaboration(f.sessionId)!
+    expect(
+      await f.flow.actOnCollaboration({
+        sessionId: f.sessionId,
+        taskId: started.id,
+        revision: started.revision,
+        clientMessageId: randomUUID(),
+        action: 'swap_code_roles',
+      }),
+    ).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
+    await f.act('review_code')
+    expect(native.inputs[3]!.promptEnvelope.collaboration).toMatchObject({
+      stage: 'code_review',
+      actor: 'claude',
+    })
   })
 
-  it.each([
-    { settings: { maxReviewCycles: 2 }, limit: 'review' },
-    { settings: { maxRepairAttempts: 1 }, limit: 'repair' },
-  ])(
-    'projects the exhausted normal $limit allowance for a direct choice',
-    async ({ settings, limit }) => {
-      const f = await reviewedCode(true)
-      const session = f.db.sessionRepository.find(f.sessionId)!
-      f.db.sessionRepository.saveSettings(f.sessionId, { ...session.settings, ...settings })
-      const view = f.repo.readPage({ scope: 'collaboration', sessionId: f.sessionId })
-      if (view.scope !== 'collaboration') throw Error('Expected current workflow projection.')
-      expect(view.view).toMatchObject({
-        repairChoiceUnavailable: expect.stringContaining('Session ' + limit + ' limit'),
-      })
-      expect(view.view.availableActions).toContain('respond')
-      expect(await f.flow.actOnCollaboration(directChoice(f))).toMatchObject({
-        ok: false,
-        error: { message: expect.stringContaining('Session ' + limit + ' limit') },
-      })
-      expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
-      expect(native.inputs).toHaveLength(4)
-    },
-  )
-
-  it('records a confirmed Pact repair as not sent when the bound receipt proves no native write', async () => {
+  it('records an Open Mode fix as not_sent on stopBeforeDispatch and retries cleanly', async () => {
     const f = await reviewedCode(false, '/review')
-    const request = directChoice(f)
-    expect(await f.flow.actOnCollaboration(request)).toMatchObject({ ok: true })
-    const card = f.repo.relaySchedulingDecision(f.sessionId)!
     native.next = { stopBeforeDispatch: true }
-    expect(await f.flow.answerRelayDecision(actionForCard(card, 'confirm'))).toMatchObject({
-      ok: true,
-    })
+    const task = f.repo.collaboration(f.sessionId)!
+    expect(
+      await f.flow.actOnCollaboration({
+        sessionId: f.sessionId,
+        taskId: task.id,
+        revision: task.revision,
+        clientMessageId: randomUUID(),
+        action: 'fix',
+      }),
+    ).toMatchObject({ ok: true })
     await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('failed'))
     await vi.waitFor(() => expect(f.flow.diagnostics().activeExecutions).toBe(0))
     const current = f.repo.collaboration(f.sessionId)!
@@ -4071,33 +3868,29 @@ describe('Native repair role confirmations', () => {
       dispatchPhase: 'not_sent',
       nativeEffectsState: 'settled',
     })
-    const receipt = f.db.drizzle
-      .select()
-      .from(collaborationActionReceipts)
-      .where(eq(collaborationActionReceipts.boundRunId, current.runId))
-      .get()
-    expect(receipt).toMatchObject({ state: 'not_sent', decisionId: card.decisionId })
-    const activity = f.repo
-      .readSchedulingActivity({})
-      .rows.find((row) => row.id === card.decisionId)
-    expect(activity).toMatchObject({ actionResult: 'not_sent', called: false })
-    expect(
-      f.db.drizzle
-        .select({ unresolved: schedulingActivity.unresolved })
-        .from(schedulingActivity)
-        .where(eq(schedulingActivity.id, card.decisionId))
-        .get(),
-    ).toEqual({ unresolved: false })
+    expect(pactRepairActions(f)).toContain('retry')
+    await f.act('retry')
+    await f.act('review_code')
+    expect(await f.settled()).toMatchObject({
+      status: 'complete',
+      repairAttempts: 1,
+      reviewCycles: 2,
+    })
   })
 
-  it('keeps the Pact repair unresolved when native rejection has uncertain effects', async () => {
+  it('keeps an Open Mode fix unresolved across cold restart on rejectedWithUncertainEffects', async () => {
     const f = await reviewedCode(false, '/review')
-    expect(await f.flow.actOnCollaboration(directChoice(f))).toMatchObject({ ok: true })
-    const card = f.repo.relaySchedulingDecision(f.sessionId)!
     native.next = { rejectedWithUncertainEffects: true }
-    expect(await f.flow.answerRelayDecision(actionForCard(card, 'confirm'))).toMatchObject({
-      ok: true,
-    })
+    const task = f.repo.collaboration(f.sessionId)!
+    expect(
+      await f.flow.actOnCollaboration({
+        sessionId: f.sessionId,
+        taskId: task.id,
+        revision: task.revision,
+        clientMessageId: randomUUID(),
+        action: 'fix',
+      }),
+    ).toMatchObject({ ok: true })
     await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('failed'))
     await vi.waitFor(() => expect(f.flow.diagnostics().activeExecutions).toBe(0))
     const runId = f.repo.collaboration(f.sessionId)!.runId
@@ -4105,215 +3898,16 @@ describe('Native repair role confirmations', () => {
       dispatchPhase: 'rejected',
       nativeEffectsState: 'unknown',
     })
-    const receipt = f.db.drizzle
-      .select()
-      .from(collaborationActionReceipts)
-      .where(eq(collaborationActionReceipts.boundRunId, runId))
-      .get()
-    expect(receipt).toMatchObject({ state: 'unknown', decisionId: card.decisionId })
-    const activity = f.db.drizzle
-      .select()
-      .from(schedulingActivity)
-      .where(eq(schedulingActivity.id, card.decisionId))
-      .get()
-    expect(activity).toMatchObject({ actionResult: 'unconfirmed', unresolved: true })
+    const restarted = await f.restart()
+    expect(restarted.repo.collaboration(f.sessionId)).toMatchObject({
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'restart',
+    })
+    expect(restarted.repo.findRun(runId)?.nativeEffectsState).toBe('unknown')
   })
 
-  async function requestRepair(f: Awaited<ReturnType<typeof reviewedCode>>) {
-    native.next = {
-      input: { outcome: 'repair_role_request' },
-      answer: 'Pact can confirm who repairs this review.',
-    }
-    expect(
-      await f.flow.send({
-        ...f.input('Please repair the existing findings yourself.'),
-        route: { type: 'agent', agentId: 'codex' },
-      }),
-    ).toMatchObject({ ok: true })
-  }
-
-  async function pendingCard(f: Awaited<ReturnType<typeof reviewedCode>>) {
-    await requestRepair(f)
-    await vi.waitFor(() =>
-      expect(f.repo.relaySchedulingDecision(f.sessionId)).toMatchObject({
-        request: {
-          category: 'new_authorization',
-          operation: {
-            kind: 'repair_role_request',
-            actor: 'codex',
-            returnActor: 'claude',
-          },
-        },
-      }),
-    )
-    await f.settled()
-    return f.repo.relaySchedulingDecision(f.sessionId)!
-  }
-
-  it('cancels and reopens a scoped role request, then starts one normal repair with exhausted Relay allowance', async () => {
-    const f = await reviewedCode(true)
-    const taskBudget = 'task:' + f.reviewed.id
-    // The earlier extra allowance is a fixture prerequisite. Every new action uses the live host path.
-    f.db.drizzle
-      .insert(schedulingBudgetCounters)
-      .values({ subjectId: taskBudget, sessionId: f.sessionId, extraCodeTurns: 1 })
-      .onConflictDoUpdate({
-        target: schedulingBudgetCounters.subjectId,
-        set: { extraCodeTurns: 1 },
-      })
-      .run()
-    const first = await pendingCard(f)
-    const prior = f.repo.collaboration(f.sessionId)!
-    expect(prior).toMatchObject({
-      review: f.reviewed.review,
-      reviewCycles: 2,
-      repairAttempts: 1,
-      reviewControlCoverage: {
-        reviewRunId: f.reviewed.review!.runId,
-        inputSequence: prior.inputSequence,
-      },
-      handledInputSequence: prior.inputSequence,
-    })
-    expect(f.repo.handoffReceipt(first.handoffId)?.action).toBeNull()
-    expect(pactRepairActions(f)).toEqual([])
-    expect(await f.flow.answerRelayDecision(actionForCard(first, 'cancel'))).toMatchObject({
-      ok: true,
-      value: { disposition: 'cancelled', runId: null },
-    })
-    expect(pactRepairActions(f)).toEqual(['respond', 'repair', 'request_repair_role_switch'])
-    expect(f.repo.collaboration(f.sessionId)?.stageRoles).toEqual(prior.stageRoles)
-    expect(f.repo.read(f.sessionId).runs).toHaveLength(5)
-
-    const second = await pendingCard(f)
-    expect(second.decisionId).not.toBe(first.decisionId)
-    const current = f.repo.collaboration(f.sessionId)!
-    expect(current.review).toEqual(f.reviewed.review)
-    expect(current.reviewControlCoverage).toMatchObject({
-      inputSequence: prior.inputSequence + 1,
-      priorInputSequence: prior.inputSequence,
-      reviewRunId: f.reviewed.review!.runId,
-    })
-    expect(await f.flow.answerRelayDecision(actionForCard(first, 'confirm'))).toMatchObject({
-      ok: false,
-    })
-    const confirmation = actionForCard(second, 'confirm')
-    const confirmed = await f.flow.answerRelayDecision(confirmation)
-    expect(confirmed).toMatchObject({
-      ok: true,
-      value: {
-        disposition: 'confirmed',
-        runId: expect.any(String),
-        roleChange: { stageRoles: { revision: 1, codeAuthor: 'codex', codeReviewer: 'claude' } },
-      },
-    })
-    expect(await f.flow.answerRelayDecision(confirmation)).toEqual(confirmed)
-    expect(
-      await f.flow.answerRelayDecision({ ...confirmation, clientOperationId: randomUUID() }),
-    ).toEqual(confirmed)
-    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete'))
-    const done = await f.settled()
-    expect(done).toMatchObject({ reviewCycles: 3, repairAttempts: 2, review: { actor: 'claude' } })
-    const repair = native.inputs[6]!
-    expect(repair.promptEnvelope.collaboration).toMatchObject({
-      stage: 'repair',
-      actor: 'codex',
-      reviewScopeRef: f.reviewed.reviewScopeRef,
-      review: f.reviewed.review,
-    })
-    expect(repair.promptEnvelope.collaborationAuthorization).toMatchObject({
-      userAuthority: { purpose: 'action' },
-    })
-    expect(repair.promptEnvelope.collaborationAuthorization?.relayWorkRef).toBeUndefined()
-    expect(native.inputs[7]!.promptEnvelope.collaboration?.stage).toBe('code_review')
-    expect(native.inputs).toHaveLength(8)
-    expect(f.repo.schedulingBudget(taskBudget)?.extraCodeTurns).toBe(1)
-    expect(f.repo.schedulingSettings().enabled).toBe(false)
-    expect(native.decisions).toHaveLength(0)
-  })
-  it('initializes the independent reviewer after the first direct Review without a peer binding', async () => {
-    const f = await reviewedCode(false, '/review')
-    expect(f.repo.nativeContext(f.sessionId, 'claude')).toBeUndefined()
-    expect(native.inputs).toHaveLength(1)
-    const card = await pendingCard(f)
-    expect(await f.flow.answerRelayDecision(actionForCard(card, 'confirm'))).toMatchObject({
-      ok: true,
-    })
-    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete'))
-    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
-      'code_review',
-      'reply',
-      'repair',
-      'code_review',
-    ])
-    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.actor)).toEqual([
-      'codex',
-      'codex',
-      'codex',
-      'claude',
-    ])
-    expect(f.repo.nativeContext(f.sessionId, 'claude')?.nativeSessionId).toBeDefined()
-    expect(native.decisions).toHaveLength(0)
-  })
-
-  it('keeps the declined card cancelled when the ordinary Respond claims the same handoff', async () => {
-    const f = await reviewedCode()
-    const card = await pendingCard(f)
-    expect(await f.flow.answerRelayDecision(actionForCard(card, 'cancel'))).toMatchObject({
-      ok: true,
-    })
-    const activity = () =>
-      f.repo.readSchedulingActivity({}).rows.find((row) => row.id === card.decisionId)
-    expect(activity()).toMatchObject({ actionResult: 'cancelled', called: false })
-    await f.act('respond')
-    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete'))
-    expect(f.repo.handoffReceipt(card.handoffId)?.runId).toBe(native.inputs[3]!.runId)
-    expect(activity()).toMatchObject({ actionResult: 'cancelled', called: false })
-    expect(native.inputs[3]!.promptEnvelope.collaboration?.stage).toBe('respond')
-  })
-
-  it('offers Respond and Repair again after an unfinished Respond is continued', async () => {
-    const f = await reviewedCode()
-    const reviewed = f.repo.collaboration(f.sessionId)!
-    native.next = { failedNativeEnding: true }
-    expect(
-      await f.flow.actOnCollaboration({
-        sessionId: f.sessionId,
-        taskId: reviewed.id,
-        revision: reviewed.revision,
-        clientMessageId: randomUUID(),
-        action: 'respond',
-      }),
-    ).toMatchObject({ ok: true })
-    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('failed'))
-    const interrupted = await f.settled()
-    expect(interrupted).toMatchObject({ stage: 'respond', automation: 'paused' })
-    expect(interrupted.nextStage).toBeUndefined()
-    expect(interrupted.review).toEqual(reviewed.review)
-    expect(pactRepairActions(f)).toEqual(['resume'])
-    expect(
-      await f.flow.actOnCollaboration({
-        sessionId: f.sessionId,
-        taskId: interrupted.id,
-        revision: interrupted.revision,
-        clientMessageId: randomUUID(),
-        action: 'resume',
-      }),
-    ).toMatchObject({ ok: true })
-    expect(pactRepairActions(f)).toEqual(['respond', 'repair'])
-    expect(native.inputs).toHaveLength(3)
-    await f.act('respond')
-    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete'))
-    expect(f.repo.collaboration(f.sessionId)).toMatchObject({ reviewCycles: 2, repairAttempts: 0 })
-    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
-      'implement',
-      'code_review',
-      'respond',
-      'respond',
-      'code_review',
-    ])
-  })
-
-  it('resumes Respond and Repair after a held Respond is stopped and its native root is rebuilt', async () => {
+  it('retries Open Mode fix after Stop and native root rebuild', async () => {
     const f = await reviewedCode()
     const reviewed = f.repo.collaboration(f.sessionId)!
     const hold = Promise.withResolvers<void>()
@@ -4325,7 +3919,7 @@ describe('Native repair role confirmations', () => {
           taskId: reviewed.id,
           revision: reviewed.revision,
           clientMessageId: randomUUID(),
-          action: 'respond',
+          action: 'fix',
         }),
       ).toMatchObject({ ok: true })
       await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
@@ -4336,250 +3930,27 @@ describe('Native repair role confirmations', () => {
       hold.resolve()
     }
     await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).not.toBe('running'))
-    // The stopped accepted Turn keeps its recovery requirement until the codex root is rebuilt.
     await vi.waitFor(() => expect(f.repo.nativeRecoveryBlocksInput(f.sessionId)).toBe(true))
-    // The session-wide Stop flagged both physical roots; resolve each through the
-    // established Rebuild path instead of editing recovery flags directly.
     await rebuildNative({ repo: f.repo, sessionId: f.sessionId }, 'codex', true)
     await rebuildNative({ repo: f.repo, sessionId: f.sessionId }, 'claude', true)
     await vi.waitFor(() => expect(f.repo.nativeRecoveryBlocksInput(f.sessionId)).toBe(false))
     const interrupted = f.repo.collaboration(f.sessionId)!
-    expect(interrupted).toMatchObject({ stage: 'respond', automation: 'paused' })
-    expect(interrupted.review).toEqual(reviewed.review)
-    expect(pactRepairActions(f)).toEqual(['resume'])
-    expect(
-      await f.flow.actOnCollaboration({
-        sessionId: f.sessionId,
-        taskId: interrupted.id,
-        revision: interrupted.revision,
-        clientMessageId: randomUUID(),
-        action: 'resume',
-      }),
-    ).toMatchObject({ ok: true })
-    expect(pactRepairActions(f)).toEqual(['respond', 'repair'])
-    expect(native.inputs).toHaveLength(3)
-    await f.act('respond')
-    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete'))
+    expect(interrupted).toMatchObject({ stage: 'collaborate', status: 'failed', openMode: true })
+    expect(pactRepairActions(f)).toEqual(['retry'])
+    await f.act('retry')
+    await f.act('review_code')
+    expect(await f.settled()).toMatchObject({
+      status: 'complete',
+      repairAttempts: 1,
+      reviewCycles: 2,
+    })
     expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
       'implement',
       'code_review',
-      'respond',
-      'respond',
+      'collaborate',
+      'collaborate',
       'code_review',
     ])
-  })
-
-  it('uses the native card with Relay on and preserves it across credential changes and disabling Relay', async () => {
-    const f = await reviewedCode()
-    const first = await pendingCard(f)
-    enableRelaySettings(f)
-    expect(await f.flow.answerRelayDecision(actionForCard(first, 'cancel'))).toMatchObject({
-      ok: true,
-    })
-    const card = await pendingCard(f)
-    expect(f.repo.schedulingSettings().enabled).toBe(true)
-    expect(
-      await f.flow.writeRelayCredential({
-        operation: 'save',
-        nonce: randomUUID(),
-        expectedRevision: f.repo.readRelayCredential().revision,
-        deadlineAt: Date.now() + 5000,
-        ciphertext: Buffer.from('rotated owned fixture ciphertext').toString('base64'),
-      }),
-    ).toMatchObject({ ok: true })
-    expect(f.repo.relaySchedulingDecision(f.sessionId)).toEqual(card)
-    expect(
-      await f.flow.saveSchedulingSettings({
-        expectedRevision: f.repo.schedulingSettings().revision,
-        enabled: false,
-      }),
-    ).toMatchObject({ ok: true })
-    expect(f.repo.relaySchedulingDecision(f.sessionId)).toEqual(card)
-    expect(await f.flow.answerRelayDecision(actionForCard(card, 'confirm'))).toMatchObject({
-      ok: true,
-    })
-    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.status).toBe('complete'))
-    expect(native.decisions).toHaveLength(0)
-  })
-
-  it.each([
-    { allowance: 'review', settings: { maxReviewCycles: 2 } },
-    { allowance: 'repair', settings: { maxRepairAttempts: 1 } },
-  ])(
-    'retains the original review when the normal $allowance allowance is exhausted',
-    async ({ allowance, settings }) => {
-      const f = await reviewedCode(true)
-      const session = f.db.sessionRepository.find(f.sessionId)!
-      f.db.sessionRepository.saveSettings(f.sessionId, { ...session.settings, ...settings })
-      await requestRepair(f)
-      await vi.waitFor(() =>
-        expect(f.repo.collaboration(f.sessionId)?.notice).toContain(
-          'Session ' + allowance + ' limit',
-        ),
-      )
-      expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
-      const current = await f.settled()
-      expect(current).toMatchObject({
-        review: f.reviewed.review,
-        reviewCycles: 2,
-        repairAttempts: 1,
-      })
-      expect(pactRepairActions(f)).toContain('respond')
-      expect(native.inputs).toHaveLength(5)
-    },
-  )
-
-  it('retires a pending confirmation and its control coverage when new business input arrives', async () => {
-    const f = await reviewedCode()
-    const card = await pendingCard(f)
-    expect(await f.flow.send(f.input('Also require a new timeout guarantee.'))).toMatchObject({
-      ok: true,
-    })
-    expect(await f.flow.answerRelayDecision(actionForCard(card, 'confirm'))).toMatchObject({
-      ok: false,
-    })
-    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.reviewCycles).toBe(2))
-    const current = await f.settled()
-    expect(current.reviewControlCoverage).toBeUndefined()
-    expect(current.stageRoles).toEqual(f.reviewed.stageRoles)
-    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
-      'implement',
-      'code_review',
-      'reply',
-      'reply',
-      'code_review',
-    ])
-    expect(
-      f.repo.readSchedulingActivity({}).rows.find((row) => row.id === card.decisionId),
-    ).toMatchObject({ actionResult: 'not_sent', called: false })
-  })
-
-  it.each(['stop', 'binding', 'scope'] as const)(
-    'refuses a stale card after %s changes',
-    async (change) => {
-      const f = await reviewedCode()
-      const card = await pendingCard(f)
-      const task = f.repo.collaboration(f.sessionId)!
-      if (change === 'stop') f.flow.stop({ sessionId: f.sessionId })
-      else if (change === 'binding') f.repo.markNativeContextsMissing(f.sessionId, ['claude'])
-      else
-        f.repo.setCollaborationState({
-          ...task,
-          revision: task.revision + 1,
-          reviewScopeRef: task.review!.document,
-        })
-      expect(await f.flow.answerRelayDecision(actionForCard(card, 'confirm'))).toMatchObject({
-        ok: false,
-      })
-      expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
-      expect(f.repo.collaboration(f.sessionId)?.stageRoles).toEqual(f.reviewed.stageRoles)
-      expect(native.inputs).toHaveLength(3)
-    },
-  )
-
-  it('publishes a definitive stale-card dismissal and refreshed original actions after Session settings change', async () => {
-    const f = await reviewedCode()
-    const card = await pendingCard(f)
-    const task = f.repo.collaboration(f.sessionId)!
-    const before = f.repo.findRun(task.runId)!
-    const session = f.db.sessionRepository.find(f.sessionId)!
-    f.db.sessionRepository.saveSettings(f.sessionId, {
-      ...session.settings,
-      maxReviewCycles: session.settings.maxReviewCycles + 1,
-    })
-    const published = vi.fn<Parameters<Conversation['subscribe']>[0]>()
-    const unsubscribe = f.flow.subscribe(published)
-    try {
-      expect(await f.flow.answerRelayDecision(actionForCard(card, 'confirm'))).toMatchObject({
-        ok: false,
-        error: { code: 'CONFLICT' },
-      })
-    } finally {
-      unsubscribe()
-    }
-    expect(published).toHaveBeenCalledWith(
-      expect.objectContaining({
-        relaySchedulingDecision: null,
-        runs: [expect.objectContaining({ id: before.id })],
-      }),
-      false,
-    )
-    expect(f.repo.findRun(before.id)!.updatedAt > before.updatedAt).toBe(true)
-    expect(pactRepairActions(f)).toEqual(['respond', 'repair', 'request_repair_role_switch'])
-    expect(native.inputs).toHaveLength(3)
-  })
-
-  it.each([false, true])(
-    'does not replay a Pact repair across a cold restart (confirmed=%s)',
-    async (confirmed) => {
-      const f = await reviewedCode()
-      const card = await pendingCard(f)
-      const answer = actionForCard(card, 'confirm')
-      const original = confirmed ? f.repo.answerRelaySchedulingDecision(answer) : undefined
-      expect(original?.result.runId).toBe(confirmed ? null : undefined)
-      const restarted = await f.restart()
-      const current = restarted.repo.collaboration(f.sessionId)!
-      expect(current).toMatchObject({
-        automation: 'paused',
-        pauseReason: 'restart',
-        repairAttempts: 0,
-      })
-      expect(current.stageRoles?.revision).toBe(confirmed ? 1 : 0)
-      expect(current.notice?.includes('Repair did not start')).toBe(confirmed)
-      expect(restarted.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
-      const duplicate = await restarted.flow.answerRelayDecision({
-        ...answer,
-        clientOperationId: randomUUID(),
-      })
-      expect(duplicate.ok).toBe(confirmed)
-      expect(duplicate.ok ? duplicate.value.runId : undefined).toBe(confirmed ? null : undefined)
-      expect(native.inputs).toHaveLength(3)
-    },
-  )
-
-  it('does not request a role switch after the reviewer took new input through a native question', async () => {
-    const f = await reviewedCode()
-    native.next = { nativeQuestion: true, input: { outcome: 'repair_role_request' } }
-    expect(
-      await f.flow.send({
-        ...f.input('Please repair the existing findings yourself.'),
-        route: { type: 'agent', agentId: 'codex' },
-      }),
-    ).toMatchObject({ ok: true })
-    await answerWorkflowQuestion(f)
-    await vi.waitFor(() => expect(f.repo.collaboration(f.sessionId)?.reviewCycles).toBe(2))
-    expect((await f.settled()).reviewControlCoverage).toBeUndefined()
-    expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
-    expect(native.inputs.map((input) => input.promptEnvelope.collaboration?.stage)).toEqual([
-      'implement',
-      'code_review',
-      'reply',
-      'code_review',
-    ])
-  })
-
-  it('retains one bound repair and refuses replay when accepted native delivery is uncertain', async () => {
-    const f = await reviewedCode()
-    const card = await pendingCard(f)
-    native.fail = true
-    const answer = actionForCard(card, 'confirm')
-    const confirmation = await f.flow.answerRelayDecision(answer)
-    if (!confirmation.ok || !confirmation.value.runId) throw Error('Expected a bound repair')
-    const runId = confirmation.value.runId
-    await vi.waitFor(() => expect(f.repo.nativeRecoveryBlocksInput(f.sessionId)).toBe(true))
-    expect(f.repo.findRun(runId)).toMatchObject({
-      dispatchPhase: 'accepted',
-      nativeEffectsState: 'pending',
-    })
-    expect(
-      await f.flow.answerRelayDecision({ ...answer, clientOperationId: randomUUID() }),
-    ).toEqual(confirmation)
-    expect(native.inputs).toHaveLength(4)
-    const restarted = await f.restart()
-    expect(await restarted.flow.answerRelayDecision(answer)).toEqual(confirmation)
-    expect(restarted.repo.nativeRecoveryBlocksInput(f.sessionId)).toBe(true)
-    expect(restarted.repo.findRun(runId)?.nativeEffectsState).toBe('unknown')
-    expect(native.inputs).toHaveLength(4)
   })
 })
 
@@ -4624,6 +3995,9 @@ describe('Future code-role change through the real Conversation owner', () => {
     // Explicit Implement plan uses the confirmed map.
     native.decisionCandidate = null
     await f.act('execute')
+    await vi.waitFor(() => expect(repo.read(f.sessionId).runs).toHaveLength(3))
+    await f.settled()
+    await f.act('review_code')
     await vi.waitFor(() => expect(repo.read(f.sessionId).runs).toHaveLength(4))
     await f.settled()
     const executed = repo.read(f.sessionId).runs
@@ -4659,6 +4033,9 @@ describe('Future code-role change through the real Conversation owner', () => {
     expect(repo.collaboration(f.sessionId)).toEqual(before)
     native.decisionCandidate = null
     await f.act('execute')
+    await vi.waitFor(() => expect(repo.read(f.sessionId).runs).toHaveLength(3))
+    await f.settled()
+    await f.act('review_code')
     await vi.waitFor(() => expect(repo.read(f.sessionId).runs).toHaveLength(4))
     await f.settled()
     const runs = repo.read(f.sessionId).runs
@@ -4744,6 +4121,9 @@ describe('confirmed task replacement', () => {
     expect(await f.flow.send(f.input('/build Preserve cancellation ownership.'))).toMatchObject({
       ok: true,
     })
+    await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
+    await f.settled()
+    await f.act('review_code')
     await vi.waitFor(() =>
       expect(repo.collaboration(f.sessionId)).toMatchObject({
         stage: 'code_review',
@@ -4759,7 +4139,7 @@ describe('confirmed task replacement', () => {
     const { repo } = f
     const before = repo.collaboration(f.sessionId)!
     const runsBefore = native.inputs.length
-    const next = f.input('/review Review the replacement scope.')
+    const next = f.input('/plan Plan the replacement scope.')
     expect(await f.flow.send(next)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
     expect(repo.collaboration(f.sessionId)?.id).toBe(before.id)
     expect(native.inputs).toHaveLength(runsBefore)
@@ -4768,7 +4148,7 @@ describe('confirmed task replacement', () => {
     await vi.waitFor(() => expect(repo.collaboration(f.sessionId)?.id).not.toBe(before.id))
     const replaced = await f.settled()
     expect(replaced.id).not.toBe(before.id)
-    expect(replaced.kind).toBe('review')
+    expect(replaced.kind).toBe('plan')
     const old = repo.collaboration(f.sessionId, before.runId)!
     expect(old.id).toBe(before.id)
     expect(old.ending).toMatchObject({
@@ -4815,7 +4195,7 @@ describe('confirmed task replacement', () => {
       })
       await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
       const before = repo.collaboration(f.sessionId)!
-      const next = f.input('/review Review the replacement scope.')
+      const next = f.input('/plan Plan the replacement scope.')
       const confirmed = {
         ...next,
         replaceTask: { taskId: before.id, revision: before.revision },
@@ -4843,7 +4223,7 @@ describe('confirmed task replacement', () => {
     const f = await reviewedBuild()
     const { repo } = f
     const before = repo.collaboration(f.sessionId)!
-    const next = f.input('/review Review the replacement scope.')
+    const next = f.input('/plan Plan the replacement scope.')
     const confirmed = { ...next, replaceTask: { taskId: before.id, revision: before.revision } }
     const first = await f.flow.send(confirmed)
     expect(first).toMatchObject({ ok: true })
@@ -4874,7 +4254,7 @@ describe('confirmed task replacement', () => {
       })
       await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
       const before = repo.collaboration(f.sessionId)!
-      const next = f.input('/review Review the replacement scope.')
+      const next = f.input('/plan Plan the replacement scope.')
       expect(
         await f.flow.send({
           ...next,
@@ -4911,7 +4291,17 @@ describe('confirmed task replacement', () => {
       expect(queue.returnedInput).toBeNull()
       native.hold = undefined
       hold.resolve()
-      // The original workflow resumes its own next stage with no new message.
+      // The original Open Mode implementation settles to waiting without auto-reviewing.
+      await vi.waitFor(() =>
+        expect(repo.collaboration(f.sessionId)).toMatchObject({
+          stage: 'implement',
+          status: 'waiting',
+          openMode: true,
+          unreviewedCodeActor: 'claude',
+        }),
+      )
+      await f.settled()
+      await f.act('review_code')
       await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
       expect(repo.findRun(native.inputs[1]!.runId)?.collaboration?.taskId).toBe(before.id)
       await vi.waitFor(() =>
@@ -4937,12 +4327,12 @@ describe('confirmed task replacement', () => {
     const hold = Promise.withResolvers<void>()
     native.hold = hold.promise
     try {
-      expect(await f.flow.send(f.input('/build Implement the original scope.'))).toMatchObject({
+      expect(await f.flow.send(f.input('/plan Implement the original scope.'))).toMatchObject({
         ok: true,
       })
       await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
       const before = repo.collaboration(f.sessionId)!
-      const next = f.input('/review Review the replacement scope.')
+      const next = f.input('/build Implement the replacement scope.')
       expect(
         await f.flow.send({
           ...next,
@@ -5011,7 +4401,7 @@ describe('confirmed task replacement', () => {
       })
       await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
       const before = repo.collaboration(f.sessionId)!
-      const next = f.input('/review Review the replacement scope.')
+      const next = f.input('/build Implement the replacement scope.')
       expect(
         await f.flow.send({
           ...next,
@@ -5022,7 +4412,7 @@ describe('confirmed task replacement', () => {
       hold.resolve()
       await vi.waitFor(() => expect(repo.collaboration(f.sessionId)?.id).not.toBe(before.id))
       const replaced = await f.settled()
-      expect(replaced.kind).toBe('review')
+      expect(replaced.kind).toBe('build')
       const old = repo.collaboration(f.sessionId, before.runId)!
       expect(old.id).toBe(before.id)
       expect(old.ending).toMatchObject({
@@ -5047,7 +4437,7 @@ describe('confirmed task replacement', () => {
       { taskId: randomUUID(), revision: before.revision },
       { taskId: before.id, revision: before.revision + 1 },
     ]) {
-      const next = f.input('/review Review the replacement scope.')
+      const next = f.input('/plan Plan the replacement scope.')
       // oxlint-disable-next-line no-await-in-loop -- Each rejected send must settle before the next forges a reference.
       expect(await f.flow.send({ ...next, replaceTask })).toMatchObject({
         ok: false,
@@ -5071,7 +4461,7 @@ describe('confirmed task replacement', () => {
       })
       await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
       const before = repo.collaboration(f.sessionId)!
-      const next = f.input('/review Review the replacement scope.')
+      const next = f.input('/plan Plan the replacement scope.')
       expect(
         await f.flow.send({
           ...next,
@@ -5124,7 +4514,7 @@ describe('confirmed task replacement', () => {
       })
       await vi.waitFor(() => expect(native.inputs).toHaveLength(1))
       const before = repo.collaboration(f.sessionId)!
-      const next = f.input('/review Review the replacement scope.')
+      const next = f.input('/plan Plan the replacement scope.')
       expect(
         await f.flow.send({
           ...next,

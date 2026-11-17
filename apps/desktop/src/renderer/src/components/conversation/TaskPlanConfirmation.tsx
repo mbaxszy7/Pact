@@ -2,10 +2,8 @@ import { X } from 'lucide-react'
 import { useEffect, useId, useRef } from 'react'
 
 interface TaskPlanConfirmationProps {
-  variant: 'revise' | 'keep' | 'swap_roles'
-  planVersion?: number | undefined
-  planner: string
-  codeRoles?: { author: string; reviewer: string } | undefined
+  currentImplementer: string
+  nextImplementer: string
   busy: boolean
   disabled?: boolean | undefined
   suspended: boolean
@@ -16,10 +14,8 @@ interface TaskPlanConfirmationProps {
 
 /** One application dialog; owns show/close/focus while CollaborationReview owns the frozen action. */
 export function TaskPlanConfirmation({
-  variant,
-  planVersion,
-  planner,
-  codeRoles,
+  currentImplementer,
+  nextImplementer,
   busy,
   disabled = false,
   suspended,
@@ -51,8 +47,6 @@ export function TaskPlanConfirmation({
       element?.close()
     }
   }, [suspended])
-  const keep = variant === 'keep'
-  const swap = variant === 'swap_roles'
   return (
     <dialog
       ref={dialogRef}
@@ -68,11 +62,11 @@ export function TaskPlanConfirmation({
     >
       <div className="pact-archive-heading">
         <h2 id={headingId} className="text-subtitle font-medium">
-          {swap ? 'Swap code roles?' : keep ? 'Keep the current plan?' : 'Revise the current plan?'}
+          Switch initial implementer?
         </h2>
         <button
           type="button"
-          aria-label={swap ? 'Cancel role change' : 'Cancel plan decision'}
+          aria-label="Cancel"
           disabled={busy}
           onClick={onCancel}
           className="pact-archive-close text-secondary hover:bg-surface-muted hover:text-primary disabled:opacity-45"
@@ -81,32 +75,10 @@ export function TaskPlanConfirmation({
         </button>
       </div>
       <div className="pact-archive-content">
-        <div id={descriptionId} className="space-y-2 text-body text-secondary">
-          {swap ? (
-            <>
-              {codeRoles ? (
-                <>
-                  <p>
-                    Implementation: {codeRoles.author} → {codeRoles.reviewer}
-                  </p>
-                  <p>
-                    Code review: {codeRoles.reviewer} → {codeRoles.author}
-                  </p>
-                </>
-              ) : null}
-              <p>Implementation still needs approval.</p>
-            </>
-          ) : keep ? (
-            <p>
-              Keep Plan{planVersion ? ` v${planVersion}` : ''} and dismiss this revision. Work stays
-              paused in the original scope.
-            </p>
-          ) : (
-            <p>
-              {planner} revises Plan{planVersion ? ` v${planVersion}` : ''} from your feedback.
-              Review and a new Implement approval are required.
-            </p>
-          )}
+        <div id={descriptionId} className="text-body text-secondary">
+          <p>
+            Start implementation with {nextImplementer} instead of {currentImplementer}.
+          </p>
         </div>
         {error ? (
           <p role="alert" className="pact-archive-error text-body text-danger">
@@ -122,7 +94,7 @@ export function TaskPlanConfirmation({
           onClick={onCancel}
           className="h-9 rounded-control border border-border bg-surface-muted px-panel text-body font-medium text-primary hover:bg-surface-raised disabled:opacity-45"
         >
-          {swap ? 'Keep current roles' : 'Cancel'}
+          Cancel
         </button>
         <button
           type="button"
@@ -130,17 +102,7 @@ export function TaskPlanConfirmation({
           onClick={onConfirm}
           className="h-9 rounded-control bg-surface-inverse px-panel text-body font-medium text-inverse disabled:cursor-wait disabled:opacity-60"
         >
-          {busy
-            ? swap
-              ? 'Swapping…'
-              : keep
-                ? 'Keeping…'
-                : 'Starting…'
-            : swap
-              ? 'Swap code roles'
-              : keep
-                ? 'Keep current plan'
-                : 'Revise plan'}
+          {busy ? 'Switching…' : `Switch to ${nextImplementer}`}
         </button>
       </div>
     </dialog>

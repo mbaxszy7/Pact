@@ -2,6 +2,7 @@ const randomUUID = () => crypto.randomUUID()
 import { describe, expect, it } from 'vitest'
 
 import {
+  advanceAutomaticCollaboration,
   advanceCollaboration,
   collaborationActor,
   collaborationActionBasisSchema,
@@ -166,15 +167,32 @@ function interruptedPlanImplementation() {
   return collaborationTaskSchema.parse(current)
 }
 
-it('continues interrupted plan implementation after a processed status reply', () => {
-  const current = interruptedPlanImplementation()
-  expect(collaborationNextStage(current)).toBe('implement')
-  const next = advanceCollaboration(
-    advanceCollaboration(current, 'resume', limits),
-    'continue',
-    limits,
-  )
-  expect(next).toMatchObject({ stage: 'implement', actor: 'claude', repairAttempts: 0 })
+it('enters open collaboration on execute and disables Phase 1 auto-advancement', () => {
+  const ready = accepted()
+  const executing = advanceCollaboration(ready, 'execute', limits)
+  expect(executing).toMatchObject({
+    stage: 'implement',
+    actor: 'codex',
+    openMode: true,
+    lastCodeActor: 'codex',
+    status: 'running',
+  })
+  const stoppedOpen = {
+    ...executing,
+    status: 'failed' as const,
+    automation: 'paused' as const,
+    pauseReason: 'stopped' as const,
+  }
+  expect(collaborationNextStage(stoppedOpen)).toBeUndefined()
+  expect(collaborationAvailableActions(stoppedOpen)).toEqual(['retry'])
+  expect(() => advanceAutomaticCollaboration(stoppedOpen, limits)).toThrow(/Open collaboration/)
+  expect(advanceCollaboration(stoppedOpen, 'retry', limits)).toMatchObject({
+    stage: 'implement',
+    actor: 'codex',
+    status: 'running',
+    automation: 'active',
+    openMode: true,
+  })
 })
 
 it.each(['codex', 'claude'] as const)(
@@ -187,7 +205,7 @@ it.each(['codex', 'claude'] as const)(
 )
 
 it.each(['pending', 'decision', 'changed_plan'] as const)(
-  'does not resume an interrupted implementation with %s',
+  'blocks open execution or review while input or plan basis has %s',
   (change) => {
     const current = interruptedPlanImplementation()
     if (change === 'pending')
@@ -199,8 +217,10 @@ it.each(['pending', 'decision', 'changed_plan'] as const)(
         decision: { runId: current.runId, inputSequence: current.inputSequence },
       }
     else current.planReference = { ...current.planReference!, version: 2, document: document() }
-    expect(collaborationNextStage(current)).not.toBe('implement')
     expect(collaborationPlanAccepted(current)).toBe(false)
+    expect(
+      change === 'pending' || change === 'decision' ? collaborationAvailableActions(current) : [],
+    ).toEqual([])
   },
 )
 
@@ -222,19 +242,20 @@ it('preserves historical native Plan replies while new read-only replies cannot 
   ).toBe(false)
 })
 
-it('reviews a genuinely retained Plan before continuing its unfinished implementation', () => {
-  const current = interruptedPlanImplementation()
-  current.planInputSequence = current.inputSequence
-  expect(collaborationNextStage(current)).toBe('plan_review')
-})
-
-it('recovers the unfinished implementation after a historical mistaken planning Run was stopped', () => {
-  const current = interruptedPlanImplementation()
-  current.stage = 'plan'
-  current.actor = current.owner
-  current.status = 'failed'
-  current.runId = randomUUID()
-  expect(collaborationNextStage(current)).toBe('implement')
+it('resumes a paused Phase 1 planning stage explicitly', () => {
+  const pausedPlan = task({
+    automation: 'paused',
+    pauseReason: 'stopped',
+    stage: 'plan',
+    status: 'waiting',
+  })
+  expect(collaborationNextStage(pausedPlan)).toBe('plan')
+  expect(collaborationAvailableActions(pausedPlan)).toEqual(['resume'])
+  expect(advanceCollaboration(pausedPlan, 'resume', limits)).toMatchObject({
+    stage: 'plan',
+    automation: 'active',
+    status: 'running',
+  })
 })
 
 function accepted(): CollaborationTask {
@@ -297,6 +318,16 @@ function transitionReason(
   throw new Error('Expected a collaboration transition failure.')
 }
 
+function autoTransitionReason(current: CollaborationTask): CollaborationTransitionReason {
+  try {
+    advanceAutomaticCollaboration(current, limits)
+  } catch (error) {
+    if (error instanceof CollaborationTransitionError) return error.reason
+    throw error
+  }
+  throw new Error('Expected an automatic collaboration transition failure.')
+}
+
 describe('shared workflow decisions and typed transitions', () => {
   it.each([
     {
@@ -311,76 +342,75 @@ describe('shared workflow decisions and typed transitions', () => {
       },
     },
     {
-      name: 'failed Respond with an unchanged changes_requested review',
+      name: 'failed collaborate turn in open mode',
+      current: () =>
+        task({
+          openMode: true,
+          stage: 'collaborate',
+          status: 'failed',
+          codeRunId: randomUUID(),
+          lastCodeActor: 'claude',
+        }),
+      expected: {
+        inputGate: undefined,
+        nextStage: undefined,
+        nextActor: undefined,
+        availableActions: ['retry'],
+        continuationLimit: undefined,
+      },
+    },
+    {
+      name: 'open mode changes_requested code review',
       current: () => {
-        const current = accepted()
-        current.codeRunId = randomUUID()
-        current.stage = 'respond'
-        current.status = 'failed'
-        current.review = {
-          runId: randomUUID(),
-          actor: 'claude',
+        const reviewRunId = randomUUID()
+        return task({
+          kind: 'build',
+          openMode: true,
           stage: 'code_review',
-          verdict: 'changes_requested',
-          inputSequence: 0,
-          document: document(),
-        }
-        return current
+          status: 'waiting',
+          runId: reviewRunId,
+          codeRunId: randomUUID(),
+          lastCodeActor: 'claude',
+          review: {
+            runId: reviewRunId,
+            actor: 'codex',
+            stage: 'code_review',
+            verdict: 'changes_requested',
+            inputSequence: 0,
+            document: document(),
+          },
+        })
       },
       expected: {
         inputGate: undefined,
         nextStage: undefined,
         nextActor: undefined,
-        availableActions: ['retry', 'revise_plan'],
+        availableActions: ['fix'],
         continuationLimit: undefined,
       },
     },
     {
-      name: 'stopped Respond with an unchanged changes_requested review',
+      name: 'open mode unreviewed code and unreviewed Plan v2 (code newest)',
       current: () => {
-        const current = accepted()
-        current.codeRunId = randomUUID()
-        current.stage = 'respond'
-        current.status = 'failed'
-        current.automation = 'paused'
-        current.pauseReason = 'stopped'
-        current.review = {
-          runId: randomUUID(),
-          actor: 'claude',
-          stage: 'code_review',
-          verdict: 'changes_requested',
-          inputSequence: 0,
-          document: document(),
-        }
-        return current
+        const runId = randomUUID()
+        return task({
+          openMode: true,
+          stage: 'collaborate',
+          status: 'waiting',
+          runId,
+          codeRunId: runId,
+          lastCodeActor: 'codex',
+          unreviewedCodeActor: 'codex',
+          unreviewedPlanActor: 'codex',
+          planVersion: 2,
+          planReference: { ...plan(), version: 2, sourceRunId: randomUUID() },
+        })
       },
       expected: {
         inputGate: undefined,
         nextStage: undefined,
         nextActor: undefined,
-        availableActions: ['resume', 'revise_plan'],
-        continuationLimit: undefined,
-      },
-    },
-    {
-      name: 'pending authorized repair',
-      current: () => {
-        const current = accepted()
-        current.codeRunId = randomUUID()
-        current.status = 'waiting'
-        current.review = undefined
-        current.pendingWork = {
-          stage: 'repair',
-          runId: randomUUID(),
-          inputSequence: 0,
-        }
-        return current
-      },
-      expected: {
-        inputGate: undefined,
-        nextStage: 'repair',
-        nextActor: 'codex',
-        availableActions: ['continue', 'revise_plan'],
+        availableActions: ['review_code', 'review_plan'],
         continuationLimit: undefined,
       },
     },
@@ -424,46 +454,32 @@ describe('shared workflow decisions and typed transitions', () => {
 
   it.each([
     {
-      name: 'input_pending',
-      reason: 'input_pending' as const,
-      action: 'continue' as const,
-      current: () =>
-        task({
-          inputProcessing: { pending: { inputId: randomUUID(), inputSequence: 0 } },
-        }),
-      message: 'Reply to the questions',
-    },
-    {
-      name: 'paused',
-      reason: 'paused' as const,
-      action: 'execute' as const,
-      current: () => {
-        const current = accepted()
-        current.automation = 'paused'
-        return current
-      },
-      message: 'Continue collaboration',
-    },
-    {
       name: 'plan_not_accepted',
       reason: 'plan_not_accepted' as const,
       action: 'execute' as const,
       current: () => task({ planReference: plan(), planInputSequence: 0, planVersion: 1 }),
-      message: 'not been accepted',
+      message: 'not ready for implementation',
     },
     {
-      name: 'no_next_step',
-      reason: 'no_next_step' as const,
-      action: 'continue' as const,
+      name: 'review_not_current',
+      reason: 'review_not_current' as const,
+      action: 'fix' as const,
+      current: () => task({ kind: 'build', openMode: true }),
+      message: 'no review requesting changes',
+    },
+    {
+      name: 'recovery_only',
+      reason: 'recovery_only' as const,
+      action: 'recover_plan' as const,
       current: () => accepted(),
-      message: 'no next automatic step',
+      message: 'original source',
     },
     {
-      name: 'write_authorization_required',
-      reason: 'write_authorization_required' as const,
-      action: 'continue' as const,
-      current: () => task({ kind: 'build', nextStage: 'implement' }),
-      message: 'explicit authorization',
+      name: 'recorded_control_action',
+      reason: 'recorded_control_action' as const,
+      action: 'swap_code_roles' as const,
+      current: () => accepted(),
+      message: 'recorded control action',
     },
   ])('reports a typed $name transition failure with its display text', (fixture) => {
     const current = fixture.current()
@@ -473,122 +489,69 @@ describe('shared workflow decisions and typed transitions', () => {
     expect(current).toEqual(original)
   })
 
-  it.each(['plan_review', 'code_review', 'repair'] as const)(
-    'reports the exact exhausted %s allowance',
-    (stage) => {
-      const current =
-        stage === 'plan_review'
-          ? task({
-              planReference: plan(),
-              planInputSequence: 0,
-              planVersion: 1,
-              discussionRounds: limits.maxDiscussionRounds,
-            })
-          : task({
-              kind: 'build',
-              nextStage: stage,
-              reviewCycles: limits.maxReviewCycles,
-              repairAttempts: limits.maxRepairAttempts,
-              ...(stage === 'repair'
-                ? {
-                    pendingWork: {
-                      stage: 'repair' as const,
-                      runId: randomUUID(),
-                      inputSequence: 0,
-                      repairReservationReleased: true,
-                    },
-                  }
-                : {}),
-            })
-      expect(transitionReason(current, 'continue')).toEqual({
-        kind: 'limit',
-        limit: {
-          stage,
-          used:
-            stage === 'plan_review'
-              ? limits.maxDiscussionRounds
-              : stage === 'code_review'
-                ? limits.maxReviewCycles
-                : limits.maxRepairAttempts,
-          maximum:
-            stage === 'plan_review'
-              ? limits.maxDiscussionRounds
-              : stage === 'code_review'
-                ? limits.maxReviewCycles
-                : limits.maxRepairAttempts,
-        },
-      })
-    },
-  )
+  it('rejects automatic advancement for input_pending, paused, open mode, and Phase 1 no_next_step', () => {
+    const pending = task({
+      inputProcessing: { pending: { inputId: randomUUID(), inputSequence: 0 } },
+    })
+    expect(autoTransitionReason(pending)).toEqual({ kind: 'input_pending' })
+    expect(autoTransitionReason(task({ automation: 'paused', pauseReason: 'stopped' }))).toEqual({
+      kind: 'paused',
+    })
+    expect(autoTransitionReason(accepted())).toEqual({ kind: 'no_next_step' })
+    expect(autoTransitionReason(task({ kind: 'build', openMode: true }))).toEqual({
+      kind: 'no_next_step',
+    })
+  })
+
+  it('reports the exact exhausted Phase 1 plan_review allowance', () => {
+    const current = task({
+      planReference: plan(),
+      planInputSequence: 0,
+      planVersion: 1,
+      discussionRounds: limits.maxDiscussionRounds,
+    })
+    expect(autoTransitionReason(current)).toEqual({
+      kind: 'limit',
+      limit: {
+        stage: 'plan_review',
+        used: limits.maxDiscussionRounds,
+        maximum: limits.maxDiscussionRounds,
+      },
+    })
+  })
 })
 
 describe('native workflow authorization and progression', () => {
-  it.each(['plan_review', 'code_review', 'repair'] as const)(
-    'projects the same %s limit that prevents a new stage and preserves consumed counts',
-    (stage) => {
-      const current =
-        stage === 'plan_review'
-          ? task({
-              planReference: plan(),
-              planInputSequence: 0,
-              planVersion: 1,
-              discussionRounds: limits.maxDiscussionRounds,
-            })
-          : task({
-              kind: 'build',
-              nextStage: stage,
-              reviewCycles: limits.maxReviewCycles,
-              repairAttempts: limits.maxRepairAttempts,
-              ...(stage === 'repair'
-                ? {
-                    pendingWork: {
-                      stage: 'repair' as const,
-                      runId: randomUUID(),
-                      inputSequence: 0,
-                      repairReservationReleased: true,
-                    },
-                  }
-                : {}),
-            })
-      current.automation = 'paused'
-      current.pauseReason = 'limit'
-      const original = structuredClone(current)
-      expect(collaborationContinuationLimit(current, limits)).toMatchObject({ stage })
-      const resumed = advanceCollaboration(current, 'resume', limits)
-      expect(() => advanceCollaboration(resumed, 'continue', limits)).toThrow(/limit/)
-      const raised = {
-        ...limits,
-        ...(stage === 'plan_review'
-          ? { maxDiscussionRounds: limits.maxDiscussionRounds + 1 }
-          : stage === 'code_review'
-            ? { maxReviewCycles: limits.maxReviewCycles + 1 }
-            : { maxRepairAttempts: limits.maxRepairAttempts + 1 }),
-      }
-      expect(collaborationContinuationLimit(current, raised)).toBeUndefined()
-      expect(
-        advanceCollaboration(advanceCollaboration(current, 'resume', raised), 'continue', raised),
-      ).toMatchObject({ stage, status: 'running' })
-      expect(current).toEqual(original)
-    },
-  )
-  it('does not block an already reserved repair or active work at the repair limit', () => {
+  it('projects the Phase 1 plan_review limit and unlocks on limit increase without losing discussionRounds', () => {
     const current = task({
-      kind: 'build',
-      repairAttempts: limits.maxRepairAttempts,
+      planReference: plan(),
+      planInputSequence: 0,
+      planVersion: 1,
+      discussionRounds: limits.maxDiscussionRounds,
       automation: 'paused',
       pauseReason: 'limit',
-      pendingWork: { stage: 'repair', runId: randomUUID(), inputSequence: 0 },
     })
-    expect(collaborationContinuationLimit(current, limits)).toBeUndefined()
-    const resumed = advanceCollaboration(current, 'resume', limits)
-    const next = advanceCollaboration(resumed, 'continue', limits)
-    expect(next.repairAttempts).toBe(limits.maxRepairAttempts)
-    expect(collaborationContinuationLimit(next, limits)).toBeUndefined()
+    const original = structuredClone(current)
+    expect(collaborationContinuationLimit(current, limits)).toMatchObject({ stage: 'plan_review' })
+    expect(deriveCollaborationDecision(current, limits).availableActions).toEqual(['execute'])
+    expect(() =>
+      advanceAutomaticCollaboration({ ...current, automation: 'active' }, limits),
+    ).toThrow(/limit/)
+    const raised = { ...limits, maxDiscussionRounds: limits.maxDiscussionRounds + 1 }
+    expect(collaborationContinuationLimit(current, raised)).toBeUndefined()
+    expect(
+      advanceAutomaticCollaboration({ ...current, automation: 'active' }, raised),
+    ).toMatchObject({
+      stage: 'plan_review',
+      status: 'running',
+      discussionRounds: limits.maxDiscussionRounds + 1,
+    })
+    expect(current).toEqual(original)
   })
-  it('keeps planning and review read-only until explicit execution', () => {
+  it('keeps Phase 1 planning read-only until explicit Implement plan enters open mode', () => {
     expect(collaborationNextStage(task())).toBe('plan')
     const planned = task({ planReference: plan(), planInputSequence: 0, planVersion: 1 })
-    const review = advanceCollaboration(planned, 'continue', limits)
+    const review = advanceAutomaticCollaboration(planned, limits)
     expect(review).toMatchObject({
       stage: 'plan_review',
       actor: 'claude',
@@ -596,14 +559,17 @@ describe('native workflow authorization and progression', () => {
       status: 'running',
     })
     expect(planned.discussionRounds).toBe(0)
-    expect(() => advanceCollaboration(planned, 'execute', limits)).toThrow(/not been accepted/)
+    expect(() => advanceCollaboration(planned, 'execute', limits)).toThrow(
+      /not ready for implementation/,
+    )
     const ready = accepted()
     expect(collaborationAvailableActions(ready)).toEqual(['execute'])
     expect(collaborationNextStage(ready)).toBeUndefined()
-    expect(() => advanceCollaboration(ready, 'continue', limits)).toThrow(/no next/)
+    expect(() => advanceAutomaticCollaboration(ready, limits)).toThrow(/no next/)
     expect(advanceCollaboration(ready, 'execute', limits)).toMatchObject({
       stage: 'implement',
       actor: 'codex',
+      openMode: true,
     })
   })
   it('requires exact plan, reviewer, input basis and a cleared input gate', () => {
@@ -625,23 +591,22 @@ describe('native workflow authorization and progression', () => {
     ])
       expect(collaborationPlanAccepted({ ...ready, ...changed })).toBe(false)
   })
-  it('resumes paused facts without dispatching a write or consuming another reservation', () => {
-    const ready = accepted(),
-      paused = collaborationTaskSchema.parse({
-        ...ready,
-        automation: 'paused',
-        pauseReason: 'stopped',
-        revision: ready.revision + 1,
-      })
-    expect(paused).toMatchObject({ automation: 'paused', pauseReason: 'stopped', revision: 1 })
-    expect(() => advanceCollaboration(paused, 'execute', limits)).toThrow(/Continue collaboration/)
-    expect(advanceCollaboration(paused, 'resume', limits)).toMatchObject({
-      status: 'ready',
+  it('resumes paused Phase 1 planning without skipping plan review', () => {
+    const waitingPlan = task({
+      automation: 'paused',
+      pauseReason: 'stopped',
+      revision: 1,
+    })
+    expect(waitingPlan).toMatchObject({ automation: 'paused', pauseReason: 'stopped', revision: 1 })
+    expect(advanceCollaboration(waitingPlan, 'resume', limits)).toMatchObject({
+      status: 'running',
       automation: 'active',
       stage: 'plan',
       discussionRounds: 0,
     })
-    expect(() => advanceCollaboration(ready, 'recover_plan', limits)).toThrow(/original source/)
+    expect(() => advanceCollaboration(accepted(), 'recover_plan', limits)).toThrow(
+      /original source/,
+    )
   })
   it('rejects the retired standalone Pause action', () => {
     expect(
@@ -654,9 +619,10 @@ describe('native workflow authorization and progression', () => {
       }).success,
     ).toBe(false)
   })
-  it('requires an explicit repair action for current code review findings', () => {
-    const current = task({
+  it('offers Fix issues in open mode for code_review and plan_review changes_requested', () => {
+    const codeReview = task({
       kind: 'build',
+      openMode: true,
       stage: 'code_review',
       review: {
         runId: randomUUID(),
@@ -667,71 +633,47 @@ describe('native workflow authorization and progression', () => {
         document: document(),
       },
     })
-    expect(collaborationAvailableActions(current)).toEqual(['respond', 'repair'])
-    expect(advanceCollaboration(current, 'respond', limits)).toMatchObject({
-      stage: 'respond',
+    codeReview.runId = codeReview.review!.runId
+    expect(collaborationAvailableActions(codeReview)).toEqual(['fix'])
+    expect(advanceCollaboration(codeReview, 'fix', limits)).toMatchObject({
+      stage: 'collaborate',
       actor: 'codex',
+      repairAttempts: 1,
+      lastCodeActor: 'codex',
+      openMode: true,
+    })
+
+    const planReview = task({
+      openMode: true,
+      stage: 'plan_review',
+      planVersion: 2,
+      planReference: { ...plan(), version: 2 },
+      review: {
+        runId: randomUUID(),
+        actor: 'codex',
+        stage: 'plan_review',
+        verdict: 'changes_requested',
+        inputSequence: 0,
+        document: document(),
+      },
+    })
+    planReview.runId = planReview.review!.runId
+    expect(collaborationAvailableActions(planReview)).toEqual(['fix'])
+    expect(advanceCollaboration(planReview, 'fix', limits)).toMatchObject({
+      stage: 'collaborate',
+      actor: 'claude',
       repairAttempts: 0,
+      openMode: true,
     })
-    expect(advanceCollaboration(current, 'repair', limits)).toMatchObject({
-      stage: 'repair',
-      actor: 'codex',
-      repairAttempts: 1,
-    })
-    expect(() => advanceCollaboration({ ...current, inputSequence: 1 }, 'repair', limits)).toThrow(
-      /no current/,
-    )
-    expect(() =>
-      advanceCollaboration(
-        { ...current, nextStage: 'repair', review: undefined },
-        'continue',
-        limits,
-      ),
-    ).toThrow(/explicit authorization/)
   })
-  it.each(['plan_review', 'code_review', 'repair'] as const)(
-    'enforces the %s reservation budget',
-    (stage) => {
-      const ready = accepted()
-      const base =
-        stage === 'plan_review'
-          ? { ...ready, review: undefined, discussionRounds: 3 }
-          : task({
-              kind: 'build',
-              nextStage: stage,
-              reviewCycles: 2,
-              repairAttempts: 2,
-              review: {
-                runId: randomUUID(),
-                actor: 'claude',
-                stage: 'code_review',
-                verdict: 'changes_requested',
-                inputSequence: 0,
-                document: document(),
-              },
-            })
-      expect(() =>
-        advanceCollaboration(base, stage === 'repair' ? 'repair' : 'continue', limits),
-      ).toThrow(/limit/)
-    },
-  )
-  it('retains authorized interrupted work and re-reserves only proven-unsent repairs', () => {
-    const pending = task({
-      kind: 'build',
-      repairAttempts: 1,
-      pendingWork: { stage: 'repair', runId: randomUUID(), inputSequence: 0 },
+  it('allows Phase 1 execute when discussionRounds reaches limit and rejects complete tasks', () => {
+    const ready = accepted()
+    const atLimit = { ...ready, review: undefined, discussionRounds: limits.maxDiscussionRounds }
+    expect(deriveCollaborationDecision(atLimit, limits).availableActions).toEqual(['execute'])
+    expect(advanceCollaboration(atLimit, 'execute', limits)).toMatchObject({
+      stage: 'implement',
+      openMode: true,
     })
-    expect(advanceCollaboration(pending, 'continue', limits)).toMatchObject({
-      stage: 'repair',
-      repairAttempts: 1,
-    })
-    expect(
-      advanceCollaboration(
-        { ...pending, pendingWork: { ...pending.pendingWork!, repairReservationReleased: true } },
-        'continue',
-        limits,
-      ).repairAttempts,
-    ).toBe(2)
     expect(collaborationAvailableActions(task({ status: 'complete' }))).toEqual([])
     expect(() => advanceCollaboration(task({ status: 'complete' }), 'resume', limits)).toThrow(
       /already complete/,
@@ -773,7 +715,7 @@ describe('pure verified stage and input settlement', () => {
     expect(next.nextStage).toBeUndefined()
   })
 
-  it('retains an interrupted started repair without refunding its reservation', () => {
+  it('settles interrupted work and open-mode turns cleanly without auto-chaining', () => {
     const current = task({
       kind: 'build',
       stage: 'repair',
@@ -792,16 +734,14 @@ describe('pure verified stage and input settlement', () => {
       completeResponse: false,
       reservation: 'repairAttempts',
     })
+    expect(next.openMode).toBe(true)
     expect(next.repairAttempts).toBe(1)
-    expect(next.pendingWork).toEqual({
-      stage: 'repair',
-      runId: auth.runId,
-      inputSequence: auth.inputSequence,
-    })
+    expect(next.pendingWork).toBeUndefined()
+    expect(next.nextStage).toBeUndefined()
     expect(next.pauseReason).toBe('stopped')
   })
 
-  it('refunds a proven-unsent repair once and marks its released reservation', () => {
+  it('refunds a proven-unsent repair reservation without fabricating open-mode pendingWork', () => {
     const current = task({
       kind: 'build',
       stage: 'repair',
@@ -821,15 +761,11 @@ describe('pure verified stage and input settlement', () => {
       reservation: 'repairAttempts',
     })
     expect(next.repairAttempts).toBe(0)
-    expect(next.pendingWork).toEqual({
-      stage: 'repair',
-      runId: auth.runId,
-      inputSequence: auth.inputSequence,
-      repairReservationReleased: true,
-    })
+    expect(next.pendingWork).toBeUndefined()
+    expect(next.nextStage).toBeUndefined()
   })
 
-  it('returns a physically ended complete supplemental response to code review', () => {
+  it('settles an interrupted respond turn as paused without scheduling nextStage', () => {
     const current = task({
       kind: 'build',
       stage: 'respond',
@@ -839,31 +775,24 @@ describe('pure verified stage and input settlement', () => {
     })
     const next = settlePure(current, {
       kind: 'interrupted',
-      authorization: turnAuthorization(current, 'respond', {
-        userAuthority: {
-          receiptId: randomUUID(),
-          rootReceiptId: randomUUID(),
-          purpose: 'supplement_code_response',
-        },
-      }),
+      authorization: turnAuthorization(current, 'respond'),
       stopped: false,
       unstarted: false,
       failed: false,
       ended: true,
       effectsSettled: true,
       completeResponse: true,
-      supplementReviewState: 'fulfilled',
       notice: '',
     })
     expect(next).toMatchObject({
       status: 'failed',
       automation: 'paused',
       pauseReason: 'failure',
-      nextStage: 'code_review',
       notice: '',
       reviewCycles: 1,
       repairAttempts: 1,
     })
+    expect(next.nextStage).toBeUndefined()
     expect(next.pendingWork).toBeUndefined()
   })
 
@@ -897,11 +826,8 @@ describe('pure verified stage and input settlement', () => {
   })
 
   it.each([
-    ['source' as const, 'The native Turn ended, but its complete response source is unavailable.'],
-    [
-      'effects' as const,
-      'The native Turn ended, but its side effects are not settled. Check the original execution before continuing.',
-    ],
+    ['source' as const, 'Complete response source is unavailable.'],
+    ['effects' as const, 'Turn side effects did not settle.'],
   ])('pauses with the exact %s failure notice', (reason, notice) => {
     const next = settlePure(task(), { kind: 'unavailable', reason })
     expect(next).toMatchObject({
@@ -922,19 +848,11 @@ describe('pure verified stage and input settlement', () => {
       supersededInput: false,
       document: document(),
     })
-    expect(next).toMatchObject({ status: 'waiting', nextStage: 'code_review' })
+    expect(next).toMatchObject({ status: 'waiting', nextStage: undefined })
   })
 
-  it('keeps an accepted review waiting while a Plan revision exists', () => {
-    const current = task({
-      kind: 'build',
-      planRevision: {
-        requestRunId: randomUUID(),
-        inputSequence: 0,
-        writeRunId: randomUUID(),
-        planReference: plan(),
-      },
-    })
+  it('settles a current accepted code review for a build task as complete', () => {
+    const current = task({ kind: 'build', openMode: true, stage: 'code_review' })
     const next = settlePure(current, {
       kind: 'review',
       authorization: turnAuthorization(current, 'code_review'),
@@ -943,18 +861,19 @@ describe('pure verified stage and input settlement', () => {
       supersededInput: false,
       document: document(),
     })
-    expect(next).toMatchObject({ status: 'waiting', nextStage: undefined })
+    expect(next).toMatchObject({ status: 'complete', nextStage: undefined })
   })
 
-  it('resumes retained pending work after its exact accepted Plan review', () => {
-    const current = accepted()
-    current.status = 'waiting'
-    current.pendingWork = {
-      stage: 'implement',
-      runId: randomUUID(),
-      inputSequence: 0,
-      planReference: current.planReference,
-    }
+  it('keeps an accepted plan review waiting in open mode and resets automation', () => {
+    const current = task({
+      openMode: true,
+      stage: 'plan_review',
+      automation: 'paused',
+      pauseReason: 'failure',
+      planVersion: 2,
+      planReference: { ...plan(), version: 2 },
+      unreviewedPlanActor: 'codex',
+    })
     const next = settlePure(current, {
       kind: 'review',
       authorization: turnAuthorization(current, 'plan_review'),
@@ -965,8 +884,10 @@ describe('pure verified stage and input settlement', () => {
     })
     expect(next).toMatchObject({
       status: 'waiting',
-      nextStage: 'implement',
-      pendingWork: current.pendingWork,
+      nextStage: undefined,
+      automation: 'active',
+      pauseReason: undefined,
+      unreviewedPlanActor: undefined,
     })
   })
 
@@ -974,6 +895,7 @@ describe('pure verified stage and input settlement', () => {
     const current = task({
       kind: 'build',
       inputSequence: 1,
+      unreviewedCodeActor: 'codex',
       inputProcessing: {
         pending: { inputId: randomUUID(), inputSequence: 1 },
       },
@@ -994,35 +916,40 @@ describe('pure verified stage and input settlement', () => {
     })
     expect(next).toMatchObject({
       status: 'questions',
-      nextStage: 'code_review',
+      nextStage: undefined,
+      unreviewedCodeActor: 'codex',
       inputProcessing: {
         pending: current.inputProcessing?.pending,
         decision,
       },
-      notice: 'The review needs your decision before collaboration can continue.',
+      notice: undefined,
     })
   })
 
   it.each([
-    [false, 'The review did not provide a complete conclusion. Start a new review to continue.'],
-    [true, 'The review returned conflicting conclusions. Start a new review to continue.'],
-  ])('pauses an incomplete review with conflict=%s', (verdictConflict, notice) => {
-    const current = task({ kind: 'build' })
-    const next = settlePure(current, {
-      kind: 'review',
-      authorization: turnAuthorization(current, 'code_review'),
-      verdict: 'incomplete',
-      verdictConflict,
-      supersededInput: false,
-    })
-    expect(next).toMatchObject({
-      status: 'failed',
-      nextStage: 'code_review',
-      automation: 'paused',
-      pauseReason: 'failure',
-      notice,
-    })
-  })
+    [false, 'The review did not provide a complete conclusion.'],
+    [true, 'The review returned conflicting conclusions.'],
+  ])(
+    'pauses an incomplete review with conflict=%s and preserves unreviewed flags',
+    (verdictConflict, notice) => {
+      const current = task({ kind: 'build', openMode: true, unreviewedCodeActor: 'codex' })
+      const next = settlePure(current, {
+        kind: 'review',
+        authorization: turnAuthorization(current, 'code_review'),
+        verdict: 'incomplete',
+        verdictConflict,
+        supersededInput: false,
+      })
+      expect(next).toMatchObject({
+        status: 'failed',
+        nextStage: undefined,
+        automation: 'paused',
+        pauseReason: 'failure',
+        unreviewedCodeActor: 'codex',
+        notice,
+      })
+    },
+  )
 
   it('applies pure input processing without clearing an existing pause', () => {
     const current = task({
@@ -1044,15 +971,18 @@ describe('pure verified stage and input settlement', () => {
       automation: 'paused',
       pauseReason: 'user',
       inputProcessing: { settled: { runId, inputSequence: 0 } },
-      notice: 'Your reply has been processed. Continue collaboration when you are ready.',
+      notice: undefined,
     })
   })
 
-  it('clears the flat unchanged basis on verified business completion', () => {
+  it('clears the flat unchanged basis and sets openMode on verified work completion', () => {
     const unchangedRunId = randomUUID()
     const current = task({
       kind: 'build',
       inputSequence: 1,
+      automation: 'paused',
+      pauseReason: 'failure',
+      unreviewedPlanActor: 'codex',
       inputProcessing: {
         settled: {
           runId: unchangedRunId,
@@ -1067,11 +997,48 @@ describe('pure verified stage and input settlement', () => {
     const auth = turnAuthorization(current, 'implement')
     const next = settlePure(current, { kind: 'work', authorization: auth })
     expect(next).toMatchObject({
+      openMode: true,
+      automation: 'active',
+      pauseReason: undefined,
       status: 'waiting',
-      nextStage: 'code_review',
+      nextStage: undefined,
       codeRunId: auth.runId,
+      unreviewedCodeActor: auth.actor,
+      unreviewedPlanActor: 'codex',
       inputProcessing: {
         settled: { runId: unchangedRunId, inputSequence: 1 },
+      },
+    })
+  })
+
+  it('preserves newer pending input, resets paused automation, and keeps unreviewedPlanActor on collaborate settlement', () => {
+    const current = task({
+      openMode: true,
+      stage: 'collaborate',
+      inputSequence: 2,
+      automation: 'paused',
+      pauseReason: 'failure',
+      unreviewedPlanActor: 'claude',
+      inputProcessing: {
+        pending: { inputId: randomUUID(), inputSequence: 2 },
+      },
+    })
+    const auth = turnAuthorization(current, 'collaborate', { inputSequence: 1 })
+    const settled = settlePure(current, {
+      kind: 'collaborate',
+      authorization: auth,
+      hasCodeChanges: true,
+      hasPublishedPlan: false,
+    })
+    expect(settled).toMatchObject({
+      status: 'waiting',
+      automation: 'active',
+      pauseReason: undefined,
+      unreviewedCodeActor: auth.actor,
+      unreviewedPlanActor: 'claude',
+      inputProcessing: {
+        pending: current.inputProcessing?.pending,
+        settled: { runId: auth.runId, inputSequence: 1 },
       },
     })
   })
@@ -1152,7 +1119,7 @@ describe('pure verified stage and input settlement', () => {
       },
       {
         status: 'questions' as const,
-        notice: 'More input is needed. Read the response and reply in the message box.',
+        notice: undefined,
       },
     ],
     [
@@ -1160,8 +1127,7 @@ describe('pure verified stage and input settlement', () => {
       { kind: 'input_unconfirmed' as const },
       {
         status: 'failed' as const,
-        notice:
-          'Your reply has not been confirmed as processed. Check the response or recovery notice before sending a follow-up.',
+        notice: 'Your reply could not be confirmed.',
       },
     ],
     [
@@ -1169,8 +1135,7 @@ describe('pure verified stage and input settlement', () => {
       { kind: 'input_plan_withdrawn' as const },
       {
         status: 'failed' as const,
-        notice:
-          'A later message was withdrawn. Send a follow-up to confirm the current plan before continuing.',
+        notice: 'A later message was withdrawn.',
       },
     ],
   ])('applies %s with its exact lifecycle state', (_name, settlement, expected) => {
@@ -1284,10 +1249,13 @@ describe('question and input processing boundaries', () => {
       expect(collaborationInputGate(current)).toBe(gate)
       expect(collaborationNextStage(current)).toBeUndefined()
       expect(collaborationAvailableActions(current)).toEqual([])
-      for (const action of ['resume', 'continue', 'execute', 'repair', 'retry'] as const)
+      for (const action of ['resume', 'execute', 'fix', 'retry'] as const)
         expect(() => advanceCollaboration(current, action, limits)).toThrow(
           /Reply to the questions/,
         )
+      expect(() => advanceAutomaticCollaboration(current, limits)).toThrow(
+        gate === 'processing' ? /still working/ : /Continue collaboration/,
+      )
     },
   )
   it('preserves legacy unresolved decisions until processed and respects explicit cleared state', () => {
@@ -1379,8 +1347,11 @@ describe('failed reply settlement identity', () => {
       expect(collaborationInputGate(current)).toBe('incomplete')
       {
         expect(collaborationAvailableActions(current)).toEqual([])
-        for (const action of ['resume', 'continue', 'execute', 'retry'] as const)
+        for (const action of ['resume', 'execute', 'fix', 'retry'] as const)
           expect(() => advanceCollaboration(current, action, limits)).toThrow(/Reply/)
+        expect(() => advanceAutomaticCollaboration(current, limits)).toThrow(
+          /Continue collaboration/,
+        )
       }
     },
   )

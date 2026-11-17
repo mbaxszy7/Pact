@@ -346,8 +346,8 @@ Pact workflow commands reach Claude as request text, not native slash-command in
 | Entry              | Initial work                                                                                              | Default stage responsibilities                                                        |
 | ------------------ | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | `/plan [task]`     | Native planning and necessary clarification, followed by automatic independent review and author revision | Primary authors the plan and reviews code. Secondary reviews the plan and implements. |
-| `/build [task]`    | Explicit implementation, then automatic independent code review                                           | Secondary implements; Primary reviews code.                                           |
-| `/review [target]` | Read-only review of the specified scope                                                                   | Primary reviews code; Secondary responds and performs explicitly authorized repairs.  |
+| `/build [task]`    | Explicit Open Mode implementation settling to waiting until Review code is clicked                        | Secondary implements; Primary reviews code.                                           |
+| `/review [target]` | Read-only Open Mode review (or in-task code review over an unfinished `/plan` or `/build` task)           | Primary reviews code; Secondary fixes reviewed issues when explicitly authorized.     |
 
 An explicit `@codex`/`@claude` recipient on an entry command selects that stage's responsibility
 instead of the Primary default: `/plan @claude` plans with Claude Code, `/build @codex` implements
@@ -375,7 +375,7 @@ Both native bindings must be ready; pending or unknown work, unprocessed input, 
 existing action authority and claimed handoffs exclude the proposal. Unversioned legacy tasks are
 not automatically upgraded. Plan authorship and completed review facts stay unchanged.
 
-In the same safe state, the explicit **Swap code roles** confirmation exchanges the future code
+In the same safe state, the explicit **Swap implementer** confirmation exchanges the future code
 responsibilities without Relay, preserving plan roles, scope, counters, pause and the current Run.
 It records a settled audit receipt and grants no writing permission; an identical nonce settles
 once and stale task or role revisions refuse.
@@ -415,9 +415,22 @@ Native plan submission never starts implementation. Codex uses native plan items
 
 Plan ready requires a complete current plan, its fixed independent reviewer's acceptance of that exact version, and coverage of the current input sequence by that review or a valid historical coverage record. Native completion, prose that sounds positive or a progress task list cannot establish acceptance. A changed plan requires a new review. Ordinary workflow input requires review of the current sequence. Temporary admission failure preserves valid review facts while disabling dispatch.
 
-The user clicks Implement plan to authorize the displayed version and implementer. Completion automatically starts independent code review, as does initial `/build` implementation. Direct `/review` remains read-only and grants no repair permission. Review scope binds its target and available implementation/repair Run, recorded changes and checked evidence; it implies no whole-workspace snapshot or automatic external-edit detection.
+The user clicks **Implement plan** to authorize the displayed version and implementer, entering
+**Open Mode** (`openMode: true`). Initial `/build` implementation and direct `/review` also run in
+Open Mode, where every next workflow turn requires an explicit Proposal action instead of
+automatic code-review or repair chaining: **Implement plan**, **Review plan**, **Review code**,
+**Update plan**, **Fix issues**, **Retry**, or **Swap implementer** (pre-code `/plan`). Open Mode
+turns may update Context Plan via `publish_plan` (marking it unreviewed until independent review)
+and recorded `workspaceChangeSets` mark changed code unreviewed (**Review code**). Direct `/review`
+starts a new task when idle or triggers an in-task code review over an unfinished Open Mode `/plan`
+or `/build` task without task replacement. Implicit Composer messages during an active Open Mode
+task may consult Relay `route_message`, falling back to `lastCodeActor` (or default implementer).
 
-A review requesting changes offers Respond or Repair. Respond lets the implementer explain or challenge findings read-only; Repair authorizes one scoped code-writing attempt. Both automatically return to the fixed code reviewer when their complete sources and native effects settle. A fresh repair needs a new explicit action. Acceptance ends the task without a third summary Turn. Findings, suggestions, evidence, author responses and unverified scope stay in natural reports, not a shared per-item state ledger.
+A review requesting changes offers **Fix issues** (after `code_review`) or **Update plan** (after
+`plan_review`), both running explicitly without automatic return review until the user clicks
+**Review code** or **Review plan**. Acceptance ends Open Mode `/build` and `/review` tasks
+complete, while settled `/plan` code reviews return to waiting. Findings, suggestions, evidence,
+author responses and unverified scope stay in natural reports, not a shared per-item state ledger.
 
 Implementation, repair and code-review reports state confirmed verification results truthfully and explicitly label anything they cannot confirm **Unverified**, in the user's language. Reviewers distinguish author-reported results from independently checked evidence. A completed Agent Run or tool acknowledgement is not proof that tests passed. Missing evidence is a disclosed limitation; verification explicitly required for acceptance remains unresolved until confirmed. Use natural reports and available sources, with no separate command-execution proof system.
 
@@ -427,11 +440,11 @@ After interrupted implementation, an ordinary reply defaults to the fixed code a
 
 On an active Plan with prior authorized implementation or repair, a read-only reply can report a material goal, scope or acceptance change, asking necessary questions. A confirmed revision intent keeps the pause and fences the old write grant through later replies, Stop and restart. **Revise plan** starts this revision explicitly; **Keep current plan** dismisses only that request before its planner starts — starting nothing and keeping the pause and scope. Once input settles, Continue returns to the fixed planner and independent Plan reviewer. An outstanding supplement returns to its original reviewer first. The Plan author accounts for existing work in the revised Plan. The user must explicitly select Implement after the new review even when Plan text is unchanged. Prior inputs, work, reports and counters remain evidence. Review distinguishes retained work from the latest Run’s Changes; missing evidence is unverified.
 
-Context Plan is the sole full-plan reading area. Chat retains complete natural replies and review reports with compact plan-version/status/action footers, not a duplicated full plan or shared Todos tab. Current Implement, Respond, Repair, Continue collaboration and failure actions remain visible independently of historical disclosure.
+Context Plan is the sole full-plan reading area with an explicit status badge (`Unreviewed`, `Needs update`, `Ready`). Chat retains complete natural replies and review reports with compact plan-version/status/action footers, not a duplicated full plan or shared Todos tab. Current **Implement plan**, **Review plan**, **Review code**, **Update plan**, **Fix issues**, and **Retry** actions remain visible independently of historical disclosure.
 
 ### Replacing a task
 
-Sending a new `/plan`, `/build` or `/review` while an unfinished task exists needs an explicit Send confirmation bound to the task's identity and revision; queueing does not end it. On admission, one durable transaction revalidates the frozen reference, retires the old task and records the new one; a normally completed old task keeps its Complete outcome. Retirement is terminal and distinct from acceptance: it starts no Run, cancels no native work, clears no recovery barrier, and atomically retires the task's open decision gates and unused action receipts while preserving bound receipts, budgets and complete history. The replaced result footer reads **Ended**, or **Ended before review** for unreviewed last changes. Editing or removing the queued command discards the confirmation; uncertain acknowledgement preserves the pending nonce and reference without re-authorizing.
+Sending a new `/plan`, `/build` (or `/review` when not targeting an unfinished Open Mode `/plan` or `/build` task) while an unfinished task exists needs an explicit Send confirmation bound to the task's identity and revision; queueing does not end it. On admission, one durable transaction revalidates the frozen reference, retires the old task and records the new one; a normally completed old task keeps its Complete outcome. Retirement is terminal and distinct from acceptance: it starts no Run, cancels no native work, clears no recovery barrier, and atomically retires the task's open decision gates and unused action receipts while preserving bound receipts, budgets and complete history. The replaced result footer reads **Ended**, or **Ended before review** for unreviewed last changes. Editing or removing the queued command discards the confirmation; uncertain acknowledgement preserves the pending nonce and reference without re-authorizing.
 
 ### Automatic limits, pause and continuation
 

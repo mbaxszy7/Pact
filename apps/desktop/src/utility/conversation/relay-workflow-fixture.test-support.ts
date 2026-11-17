@@ -18,7 +18,7 @@ import type {
 
 import {
   OPENAI_DECISION_MODEL,
-  advanceCollaboration,
+  advanceAutomaticCollaboration,
   collaborationTaskSchema,
   collaborationDocumentSchema,
   collaborationInputBatchReferenceSchema,
@@ -29,6 +29,7 @@ import type { Conversation } from './conversation.js'
 import type { DecisionInputLoader } from './decision-runtime.js'
 import type { OpenAIDecisionRuntime } from './openai-decision-runtime.js'
 
+import { workspaceChangeSets } from '../../../../../packages/persistence/src/schema/index.js'
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
 import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
@@ -52,6 +53,8 @@ export interface WorkflowNativeState {
   unselectedPlan?: string | undefined
   forbiddenDocuments?: import('@pact/contracts').CollaborationDocument[]
   information?: import('@pact/contracts').DecisionInformation | undefined
+  noCodeChanges?: boolean | undefined
+  recordCodeChange?: ((input: AgentRunInput) => void) | undefined
 }
 
 export interface WorkflowSourceRead {
@@ -188,7 +191,12 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
         state.holdStage = undefined
         await held.until
       }
-      if (state.holdNextWrite && (phase?.stage === 'implement' || phase?.stage === 'repair')) {
+      if (
+        state.holdNextWrite &&
+        (phase?.stage === 'implement' ||
+          phase?.stage === 'collaborate' ||
+          phase?.stage === 'repair')
+      ) {
         if (!signal) throw Error('A held write requires its native cancellation signal')
         state.holdNextWrite = false
         await new Promise<void>((done) => {
@@ -218,7 +226,10 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
         signal.throwIfAborted()
       }
       const interrupted =
-        state.interruptNextWrite && (phase?.stage === 'implement' || phase?.stage === 'repair')
+        state.interruptNextWrite &&
+        (phase?.stage === 'implement' ||
+          phase?.stage === 'collaborate' ||
+          phase?.stage === 'repair')
       if (interrupted) state.interruptNextWrite = false
       if (!interrupted && phase) {
         if (phase.stage === 'plan') {
@@ -232,6 +243,16 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
             text:
               state.planText ?? 'Complete accepted plan: preserve the original cancellation scope.',
           })
+        } else if (phase.stage === 'collaborate') {
+          if (state.planText) {
+            input.recordWorkflowPlan?.({
+              nativeId: `plan-${input.runId}`,
+              text: state.planText,
+            })
+          }
+          if (!state.noCodeChanges) state.recordCodeChange?.(input)
+        } else if (phase.stage === 'implement' || phase.stage === 'repair') {
+          if (!state.noCodeChanges) state.recordCodeChange?.(input)
         } else if (
           phase.stage === 'reply' &&
           !collaborationPlanMode(phase, input.promptEnvelope.collaborationAuthorization)
@@ -382,6 +403,7 @@ export function workflowDecisionRuntime(state: WorkflowNativeState) {
 export async function workflowConversation(
   Owner: typeof Conversation,
   primaryAgentId: RuntimeAgentId = 'codex',
+  state?: WorkflowNativeState,
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'pact-relay-workflow-'))
   const db = await PactDatabase.open({
@@ -391,6 +413,35 @@ export async function workflowConversation(
   const projectId = randomUUID(),
     sessionId = randomUUID(),
     createdAt = new Date().toISOString()
+  if (state) {
+    state.recordCodeChange = (runInput) => {
+      const run = db.conversationRepository.findRun(runInput.runId)
+      if (!run) return
+      const now = new Date().toISOString()
+      db.drizzle
+        .insert(workspaceChangeSets)
+        .values({
+          id: runInput.runId,
+          runId: runInput.runId,
+          sessionId: runInput.sessionId,
+          projectId,
+          agentId: run.agentId,
+          root: directory,
+          rootDevice: '1',
+          rootInode: '1',
+          stagingRoot: join(directory, '.staging'),
+          state: 'ready',
+          fileCount: 1,
+          additions: 1,
+          deletions: 0,
+          createdAt: now,
+          finalizedAt: now,
+          projectionPending: false,
+          revision: 1,
+        })
+        .run()
+    }
+  }
   db.projectCatalogRepository.add({
     id: projectId,
     name: 'Relay workflow',
@@ -503,19 +554,20 @@ export function enableWorkflowRelay(db: PactDatabase) {
 
 /** Reuses genuine Run publication and review producers within one shared authoritative database. */
 export async function proposeWorkflowPlanOn(db: PactDatabase, index: number) {
-  const f = sharedPlanFixture(db, index)
+  const f = sharedPlanFixture(db, index, 2)
   enableWorkflowRelay(db)
   const response = f.repo.beginRun(f.admission()).run
-  f.finish(response.id, { plan: 'Complete current scope.' })
+  f.finish(response.id, { plan: 'First revision preserving scope.' })
   const review = f.repo.beginRun(f.admission()).run
   f.finish(review.id, { verdict: 'changes_requested' })
   const revised = f.repo.beginRun(f.admission()).run
   f.finish(revised.id, { plan: 'Complete response preserving the exact current scope.' })
-  const handoff = f.admission().schedulingHandoff,
+  const current = f.repo.collaboration(f.sessionId)!,
+    handoff = f.repo.workflowHandoff(current, current.owner),
     deadlineAt = Date.now() + 15_000
   const material = await f.repo.readRelayWorkflowDecisionSources(
     handoff,
-    [{ id: 'propose_supplement_plan', description: 'Request one exact read-only clarification.' }],
+    [{ id: 'propose_extend_plan_review', description: 'Request one exact read-only extension.' }],
     { signal: new AbortController().signal, deadlineAt },
   )
   const httpOwner = {
@@ -537,13 +589,13 @@ export async function proposeWorkflowPlanOn(db: PactDatabase, index: number) {
   f.repo.settleEvaluation(reserved.evaluation.id, {
     outcome: 'completed',
     physicalReleased: true,
-    selectedCandidateId: 'propose_supplement_plan',
+    selectedCandidateId: 'propose_extend_plan_review',
     httpOwner,
     remoteOutcome: 'responded',
   })
   const card = f.repo.proposeRelayWorkflowAction({
     handoff,
-    kind: 'supplement_plan',
+    kind: 'extend_plan_review',
     evaluationId: reserved.evaluation.id,
     configurationGeneration: f.repo.schedulingConfigurationGeneration(),
     configurationFingerprint: f.repo.schedulingConfigurationFingerprint(),
@@ -670,7 +722,7 @@ function sharedPlanFixture(db: PactDatabase, index: number, maxDiscussionRounds 
   }
   const admission = () => {
     const task = repo.collaboration(sessionId)!,
-      next = advanceCollaboration(task, 'continue', settings)
+      next = advanceAutomaticCollaboration(task, settings)
     return {
       sessionId,
       clientMessageId: randomUUID(),

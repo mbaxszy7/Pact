@@ -596,7 +596,16 @@ export const agentRuns = sqliteTable(
     }),
     collaborationKind: text('collaboration_kind', { enum: ['plan', 'build', 'review'] }),
     collaborationStage: text('collaboration_stage', {
-      enum: ['plan', 'plan_review', 'implement', 'code_review', 'respond', 'repair', 'reply'],
+      enum: [
+        'plan',
+        'plan_review',
+        'implement',
+        'code_review',
+        'collaborate',
+        'respond',
+        'repair',
+        'reply',
+      ],
     }),
     id: text('id').primaryKey(),
     sessionId: text('session_id')
@@ -1309,7 +1318,16 @@ export const workflowTurns = sqliteTable(
       .notNull()
       .references(() => collaborationTasks.id, { onDelete: 'cascade' }),
     stage: text('stage', {
-      enum: ['plan', 'plan_review', 'implement', 'code_review', 'respond', 'repair', 'reply'],
+      enum: [
+        'plan',
+        'plan_review',
+        'implement',
+        'code_review',
+        'collaborate',
+        'respond',
+        'repair',
+        'reply',
+      ],
     }).notNull(),
     actor: text('actor', { enum: ['claude', 'codex'] }).notNull(),
     inputSequence: integer('input_sequence').notNull(),

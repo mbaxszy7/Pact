@@ -12,7 +12,7 @@ import type {
 } from '@pact/contracts'
 
 import {
-  advanceCollaboration,
+  advanceAutomaticCollaboration,
   collaborationTaskSchema,
   collaborationTurnAuthorizationSchema,
   defaultTaskStageRoles,
@@ -291,7 +291,7 @@ async function fixture(filePath = ':memory:', withCollaboration = false, withSta
         quote: 'Draft',
       },
     })
-    const next = advanceCollaboration(draft, 'continue', settings)
+    const next = advanceAutomaticCollaboration(draft, settings)
     const second = repo.beginRun({
       sessionId: sourceId,
       clientMessageId: messageIds[2]!,

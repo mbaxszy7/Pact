@@ -103,7 +103,7 @@ export function CurrentPlanPanel({
           </div>
           {plan ? (
             <p className="mt-2 text-caption text-secondary">
-              Plan by {plan.author === 'claude' ? 'Claude Code' : 'Codex'} · {plan.status}
+              {plan.author === 'claude' ? 'Claude Code' : 'Codex'} · {plan.status}
             </p>
           ) : null}
         </div>

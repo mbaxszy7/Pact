@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import {
-  advanceCollaboration,
+  advanceAutomaticCollaboration,
   collaborationDocumentSchema,
   handoffGuidanceV2Schema,
 } from '@pact/contracts'
@@ -251,22 +251,23 @@ describe('current workflow sources and historical handoff guidance', () => {
     const f = await planRevisionFixture()
     fixtures.push(f)
     const settings = f.db.sessionRepository.find(f.sessionId)!.settings
-    const admission = (action: import('@pact/contracts').CollaborationAction) => {
+    const admission = (action: 'plan_auto' | import('@pact/contracts').CollaborationAction) => {
       const task = f.repo.collaboration(f.sessionId)!,
         clientMessageId = randomUUID(),
-        prepared = ['execute', 'repair', 'respond'].includes(action)
-          ? f.repo.prepareCollaborationAction(
-              {
-                sessionId: f.sessionId,
-                taskId: task.id,
-                revision: task.revision,
-                clientMessageId,
-                action,
-              },
-              settings,
-            )
-          : undefined,
-        next = prepared?.next ?? advanceCollaboration(task, action, settings)
+        prepared =
+          action !== 'plan_auto'
+            ? f.repo.prepareCollaborationAction(
+                {
+                  sessionId: f.sessionId,
+                  taskId: task.id,
+                  revision: task.revision,
+                  clientMessageId,
+                  action,
+                },
+                settings,
+              )
+            : undefined,
+        next = prepared?.next ?? advanceAutomaticCollaboration(task, settings)
       const drafts = f.repo.readPage({ scope: 'drafts', sessionId: f.sessionId })
       if (drafts.scope !== 'drafts') throw Error('Missing drafts')
       return {
@@ -286,47 +287,71 @@ describe('current workflow sources and historical handoff guidance', () => {
         ...(prepared ? { collaborationActionReceiptId: prepared.receipt.id } : {}),
       }
     }
-    let run = f.repo.beginRun(admission('continue')).run
+    let run = f.repo.beginRun(admission('plan_auto')).run
     f.finish(run.id, { plan: 'Accepted implementation scope.' })
-    run = f.repo.beginRun(admission('continue')).run
+    run = f.repo.beginRun(admission('plan_auto')).run
     f.finish(run.id, { verdict: 'accepted' })
     const implementation = f.repo.beginRun(admission('execute')).run
+    f.recordCodeChange(implementation.id, 'src/impl.ts')
     f.finish(implementation.id, { answer: 'Implementation completed.' })
-    run = f.repo.beginRun(admission('continue')).run
+    run = f.repo.beginRun(admission('review_code')).run
     f.finish(run.id, { verdict: 'changes_requested' })
-    run = f.repo.beginRun(admission('respond')).run
-    f.finish(run.id, { answer: 'Complete response to the first code review.' })
-    run = f.repo.beginRun(admission('continue')).run
-    f.finish(run.id, { verdict: 'changes_requested' })
-    run = f.repo.beginRun(admission('repair')).run
-    f.finish(run.id, { answer: 'Repair completed within the original scope.' })
-    const input = admission('continue'),
-      handoff = input.schedulingHandoff,
-      deadlineAt = Date.now() + 15_000
-    const material = await f.repo.readRelayWorkflowDecisionSources(
-      handoff,
-      [{ id: 'continue_code_review', description: 'Fixed independent review.' }],
-      {
-        signal: new AbortController().signal,
-        deadlineAt,
-      },
-    )
-    expect(material.snapshot.node).toBe('execution_to_review')
+    run = f.repo.beginRun(admission('fix')).run
+    f.recordCodeChange(run.id, 'src/fix.ts')
+    f.finish(run.id, { answer: 'Fixed the review issues within the original scope.' })
+    const task = f.repo.collaboration(f.sessionId)!,
+      input = admission('review_code'),
+      handoff = input.schedulingHandoff
     const guidance = handoffGuidanceV2Schema.parse({
       version: 'handoff-guidance-v2',
       evaluationId: randomUUID(),
       handoffId: handoff.id,
-      inputSha256: material.inputSha256,
-      sourceFingerprint: material.sourceFingerprint,
-      basis: material.basis,
-      sources: material.sources,
-      candidateId: 'continue_code_review',
-      highlights: [
-        { text: 'Verify the same repair scope.', sourceIds: [material.snapshot.scopeSourceId] },
+      inputSha256: createHash('sha256').update(task.reviewScopeRef!.sha256).digest('hex'),
+      sourceFingerprint: createHash('sha256').update(handoff.id).digest('hex'),
+      basis: {
+        kind: 'workflow',
+        task: { id: task.id, inputSequence: task.inputSequence },
+        producerRunId: run.id,
+        plan: task.planReference!,
+        input: null,
+      },
+      sources: [
+        {
+          id: 's0',
+          roles: ['task'],
+          document: task.taskDocument!,
+          evaluatedSha256: task.taskDocument!.sha256,
+          messageId: f.first.run.userMessageId,
+        },
+        {
+          id: 's1',
+          roles: ['plan'],
+          document: task.planReference!.document,
+          evaluatedSha256: task.planReference!.document.sha256,
+          sourceRunId: task.planReference!.sourceRunId,
+          messageId: task.planReference!.sourceMessageId,
+          planVersion: task.planReference!.version,
+        },
+        {
+          id: 's2',
+          roles: ['review_scope'],
+          document: task.reviewScopeRef!,
+          evaluatedSha256: task.reviewScopeRef!.sha256,
+        },
       ],
+      candidateId: 'continue_code_review',
+      highlights: [{ text: 'Verify the same fix scope.', sourceIds: ['s2'] }],
     })
     const adopted = f.repo.beginRun(input).run
-    seedHistoricalGuidance(f, adopted.id, handoff, guidance, material.snapshot.sourceGrants)
+    const sourceGrants = f.repo.readRunSources(adopted.id).items.flatMap((item) =>
+      item.documents.map((doc) => ({
+        messageId: item.messageId,
+        revision: item.revision,
+        sourceRunId: adopted.id,
+        document: doc.source,
+      })),
+    )
+    seedHistoricalGuidance(f, adopted.id, handoff, guidance, sourceGrants)
     f.finish(adopted.id, { verdict: 'accepted' })
     const session = f.db.sessionRepository.find(f.sessionId)!
     const selection = f.repo.selectForkSource(
@@ -378,7 +403,7 @@ describe('current workflow sources and historical handoff guidance', () => {
     })
     expect(createHash('sha256').update(text).digest('hex')).toBe(scope.document.sha256)
     expect(scope.evaluatedSha256).toBe(
-      material.sources.find((entry) => entry.id === scope.id)!.evaluatedSha256,
+      guidance.sources.find((entry) => entry.id === scope.id)!.evaluatedSha256,
     )
   })
 })

@@ -62,7 +62,7 @@ export function planRunInput(actor: RuntimeAgentId): AgentRunInput {
   }
 }
 
-export function planRevisionReplyInput(actor: RuntimeAgentId): AgentRunInput {
+export function phase1ReplyInput(actor: RuntimeAgentId): AgentRunInput {
   const input = planRunInput(actor)
   const { collaboration: task, collaborationAuthorization: auth } = input.promptEnvelope
   const pending = { inputId: input.promptEnvelope.message.id, inputSequence: 2 }
@@ -78,7 +78,6 @@ export function planRevisionReplyInput(actor: RuntimeAgentId): AgentRunInput {
     inputSequence: 2,
     inputProcessing: { pending },
     planReference,
-    planRevisionWriteRunId: randomUUID(),
   })
   Object.assign(task!, {
     stage: 'reply',
@@ -86,7 +85,6 @@ export function planRevisionReplyInput(actor: RuntimeAgentId): AgentRunInput {
     inputProcessing: { pending },
     planReference,
     planVersion: 1,
-    codeRunId: auth!.planRevisionWriteRunId,
     automation: 'paused',
     authorization: auth,
   })

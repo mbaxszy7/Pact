@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 
 import {
-  advanceCollaboration,
+  advanceAutomaticCollaboration,
   collaborationDocumentSchema,
   collaborationTaskSchema,
   collaborationTurnAuthorizationSchema,
@@ -54,10 +54,17 @@ export async function planRevisionFixture(
     inputs?: string[]
     rolePolicy?: 'split-stages-v1'
     stageRoles?: TaskStageRoles
+    maxDiscussionRounds?: number
   } = {},
 ) {
   const planOwner = options.owner ?? 'codex'
-  const selectedSettings = { ...settings, primaryAgentId: planOwner }
+  const selectedSettings = {
+    ...settings,
+    primaryAgentId: planOwner,
+    ...(options.maxDiscussionRounds !== undefined
+      ? { maxDiscussionRounds: options.maxDiscussionRounds }
+      : {}),
+  }
   const nativeSessionId = (agent: 'codex' | 'claude') =>
     agent === planOwner && options.nativeSessionId ? options.nativeSessionId : `fixture-${agent}`
   const db = await PactDatabase.open({
@@ -166,7 +173,7 @@ export async function planRevisionFixture(
   }
   const admission = (clientMessageId = randomUUID()) => {
     const task = repo.collaboration(sessionId)!,
-      next = advanceCollaboration(task, 'continue', selectedSettings)
+      next = advanceAutomaticCollaboration(task, selectedSettings)
     const drafts = repo.readPage({ scope: 'drafts', sessionId })
     if (drafts.scope !== 'drafts') throw Error('Missing drafts')
     return {
@@ -316,6 +323,51 @@ export async function planRevisionFixture(
       offset = page.nextOffset
     }
   }
+  const recordCodeChange = (runId: string, path = 'src/change.ts', after = `after-${runId}`) => {
+    const run = repo.findRun(runId)!
+    const ws = db.workspaceChangesRepository
+    ws.begin({
+      runId,
+      sessionId,
+      projectId,
+      agentId: run.agentId,
+      root: '/fixture',
+      rootDevice: '1',
+      rootInode: '2',
+      stagingRoot: '/private-fixture',
+    })
+    const beforeVer = {
+      hash: createHash('sha256').update('before').digest('hex'),
+      bytes: 6,
+      mode: 0o644,
+    }
+    const afterVer = {
+      hash: createHash('sha256').update(after).digest('hex'),
+      bytes: Buffer.byteLength(after),
+      mode: 0o644,
+    }
+    ws.recordBlob(beforeVer.hash, beforeVer.bytes)
+    ws.recordBlob(afterVer.hash, afterVer.bytes)
+    ws.recordFiles(runId, [
+      {
+        path,
+        previousPath: null,
+        kind: 'modified',
+        before: beforeVer,
+        after: afterVer,
+        beforeAvailable: true,
+        afterAvailable: true,
+        modeKnown: false,
+        undoStrategy: 'three_way',
+        additions: 1,
+        deletions: 1,
+        hidden: false,
+        reason: null,
+      },
+    ])
+    const summary = ws.finalize(runId)
+    repo.recordWorkspaceChanges(summary)
+  }
   return {
     db,
     repo,
@@ -327,6 +379,7 @@ export async function planRevisionFixture(
     task,
     handoff,
     finish,
+    recordCodeChange,
     admission,
     readDocument,
   }

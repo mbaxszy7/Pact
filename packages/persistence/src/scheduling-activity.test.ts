@@ -74,7 +74,7 @@ async function nativeProposal(withOrigin = false) {
 }
 
 async function proposal() {
-  const f = await planRevisionFixture()
+  const f = await planRevisionFixture({ maxDiscussionRounds: 2 })
   databases.add(f.db)
   const response = f.repo.beginRun(f.admission()).run
   f.finish(response.id, { plan: 'First revised Plan.' })
@@ -87,12 +87,13 @@ async function proposal() {
   f.finish(revised.id, { plan: 'Current Plan with the original cancellation boundary.' })
   const owner = decisionHttpOwnerFixture()
   configureDecisionFixtureCredential(f.repo)
-  const handoff = f.admission().schedulingHandoff,
+  const current = f.repo.collaboration(f.sessionId)!,
+    handoff = f.repo.workflowHandoff(current, current.owner),
     deadlineAt = Date.now() + 15_000,
     configurationFingerprint = f.repo.schedulingConfigurationFingerprint()
   const material = await f.repo.readRelayWorkflowDecisionSources(
     handoff,
-    [{ id: 'propose_supplement_plan', description: 'Request one read-only clarification.' }],
+    [{ id: 'propose_extend_plan_review', description: 'Add one independent Plan review.' }],
     { signal: new AbortController().signal, deadlineAt },
   )
   const reserved = f.repo.reserveEvaluation({
@@ -107,13 +108,13 @@ async function proposal() {
   f.repo.settleEvaluation(reserved.evaluation.id, {
     outcome: 'completed',
     physicalReleased: true,
-    selectedCandidateId: 'propose_supplement_plan',
+    selectedCandidateId: 'propose_extend_plan_review',
     httpOwner: owner,
     remoteOutcome: 'responded',
   })
   const card = f.repo.proposeRelayWorkflowAction({
     handoff,
-    kind: 'supplement_plan',
+    kind: 'extend_plan_review',
     evaluationId: reserved.evaluation.id,
     configurationGeneration: f.repo.schedulingConfigurationGeneration(),
     configurationFingerprint,
@@ -137,11 +138,18 @@ async function proposal() {
 }
 
 function beginExtra(f: Awaited<ReturnType<typeof proposal>>) {
-  const prepared = f.confirm()
+  const prepared = f.confirm(),
+    session = f.db.sessionRepository.find(f.sessionId)!
   return f.repo.beginRun({
-    ...f.admission(),
+    sessionId: f.sessionId,
     clientMessageId: prepared.receipt.clientNonce,
-    content: 'Perform only the approved read-only clarification.',
+    content: 'Perform one additional independent Plan review.',
+    commentIds: [],
+    expectedCommentsRevision: 0,
+    settingsRevision: session.settingsRevision,
+    model: null,
+    effort: null,
+    preserveDraftComments: true,
     collaboration: prepared.next,
     agentId: prepared.next.actor,
     expectedCollaborationRevision: prepared.task.revision,
@@ -381,7 +389,7 @@ describe('durable Relay activity facts', () => {
     expect(f.repo.readSchedulingActivity({}).rows[0]).toMatchObject({
       id: f.evaluationId,
       suggestionState: 'awaiting_user',
-      action: 'supplement_plan',
+      action: 'extend_plan_review',
       actionResult: null,
       result: 'completed',
     })
@@ -389,14 +397,14 @@ describe('durable Relay activity facts', () => {
     expect(f.repo.readSchedulingActivity({}).rows[0]).toMatchObject({
       id: f.evaluationId,
       suggestionState: 'adopted',
-      action: 'supplement_plan',
+      action: 'extend_plan_review',
       actionResult: 'reserved',
     })
-    f.repo.recordDispatch(extra.id, 'possibly_sent', 'fixture-codex')
+    f.repo.recordDispatch(extra.id, 'possibly_sent', 'fixture-claude')
     expect(f.repo.readSchedulingActivity({}).rows[0]?.actionResult).toBe('dispatched')
     f.finish(extra.id, {
-      plan: 'Completed approved clarification.',
-      answer: 'The complete exact author response.',
+      verdict: 'accepted',
+      answer: 'The complete exact review response.',
     })
     expect(f.repo.readSchedulingActivity({}).rows[0]).toMatchObject({
       id: f.evaluationId,
@@ -411,16 +419,16 @@ describe('durable Relay activity facts', () => {
   it('keeps a terminal native receipt unconfirmed until the actual sealed visible answer is restored', async () => {
     const f = await proposal(),
       extra = beginExtra(f),
-      nativeSessionId = 'fixture-codex',
+      nativeSessionId = 'fixture-claude',
       nativeTurnId = `turn-${extra.id}`
     f.repo.applyEvent(f.sessionId, extra.id, {
       type: 'session.started',
-      agentId: 'codex',
+      agentId: 'claude',
       nativeSessionId,
     })
     f.repo.applyEvent(f.sessionId, extra.id, {
       type: 'turn.started',
-      agentId: 'codex',
+      agentId: 'claude',
       turnId: nativeTurnId,
     })
     f.repo.recordNativeEvidence({
@@ -429,7 +437,7 @@ describe('durable Relay activity facts', () => {
       outcome: 'completed',
       identity: {
         sessionId: f.sessionId,
-        agentId: 'codex',
+        agentId: 'claude',
         requestId: extra.id,
         runId: extra.id,
         nativeSessionId,
@@ -468,22 +476,50 @@ describe('durable Relay activity facts', () => {
     expect(f.db.drizzle.select().from(schedulingActivity).get()?.unresolved).toBe(false)
   })
 
-  it('records the actual default review after unused advice is discarded, without relabeling it as an extra authorized Turn', async () => {
+  it('records the actual default action after unused advice is discarded, without relabeling it as an extra authorized Turn', async () => {
     const f = await proposal()
     f.repo.saveSchedulingSettings({
       expectedRevision: f.repo.schedulingSettings().revision,
       enabled: false,
     })
-    const review = f.repo.beginRun(f.admission()).run
-    expect(review.agentId).toBe('claude')
+    const current = f.repo.collaboration(f.sessionId)!,
+      settings = f.db.sessionRepository.find(f.sessionId)!.settings,
+      clientMessageId = randomUUID(),
+      prepared = f.repo.prepareCollaborationAction(
+        {
+          sessionId: f.sessionId,
+          taskId: current.id,
+          revision: current.revision,
+          action: 'execute',
+          clientMessageId,
+        },
+        settings,
+      )
+    const execution = f.repo.beginRun({
+      sessionId: f.sessionId,
+      clientMessageId,
+      content: 'Implement the current Plan.',
+      commentIds: [],
+      expectedCommentsRevision: 0,
+      settingsRevision: f.db.sessionRepository.find(f.sessionId)!.settingsRevision,
+      agentId: prepared.next!.actor,
+      model: null,
+      effort: null,
+      preserveDraftComments: true,
+      expectedCollaborationRevision: current.revision,
+      collaboration: prepared.next!,
+      schedulingHandoff: prepared.handoff!,
+      collaborationActionReceiptId: prepared.receipt.id,
+    }).run
+    expect(execution.agentId).toBe('codex')
     expect(f.repo.readSchedulingActivity({}).rows[0]).toMatchObject({
       id: f.evaluationId,
       suggestionState: 'fallback',
-      action: 'plan_review',
+      action: 'implementation',
       actionResult: 'reserved',
     })
     expect(f.repo.schedulingBudget(f.handoff.budgetSubjectId)?.extraPlanTurns).toBe(0)
-    f.finish(review.id, { verdict: 'accepted' })
+    f.finish(execution.id, { answer: 'Implemented without extra review.' })
     expect(f.repo.readSchedulingActivity({}).rows[0]?.actionResult).toBe('completed')
   })
 

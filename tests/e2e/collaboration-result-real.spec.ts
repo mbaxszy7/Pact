@@ -167,7 +167,6 @@ for (const owner of ['codex', 'claude'] as const)
         expect(cold.task?.inputProcessing).toEqual(retained.task?.inputProcessing)
         expect(cold.task?.automation).toBe('paused')
         expect((await readRealConversation(ctx)).runs).toHaveLength(initialRuns + 2)
-        await ctx.page.getByRole('button', { name: 'Continue collaboration', exact: true }).click()
         await expect
           .poll(
             async () => {
@@ -187,7 +186,7 @@ for (const owner of ['codex', 'claude'] as const)
         expect(reviewed.availableActions).toContain('execute')
         expect(
           (await readRealConversation(ctx)).runs.some((run) =>
-            ['implement', 'repair'].includes(run.collaboration?.stage ?? ''),
+            ['implement', 'collaborate', 'repair'].includes(run.collaboration?.stage ?? ''),
           ),
         ).toBe(false)
       } catch (error) {

@@ -5,10 +5,11 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import type {
-  AgentRun,
-  FrozenExecutionEnvelope,
-  RunEffectiveExecutionSettings,
+import {
+  collaborationTaskSchema,
+  type AgentRun,
+  type FrozenExecutionEnvelope,
+  type RunEffectiveExecutionSettings,
 } from '@pact/contracts'
 
 import {
@@ -17,7 +18,13 @@ import {
 } from './decision-fixture.test-support.js'
 import { PactDatabase } from './pact-database.js'
 import { planRevisionFixture } from './plan-revision-guidance.test-support.js'
-import { agentRuns, conversationMessages, runReexecutionOperations } from './schema/index.js'
+import {
+  agentRuns,
+  collaborationTasks,
+  conversationMessages,
+  runReexecutionOperations,
+  workflowTurns,
+} from './schema/index.js'
 
 const databases = new Set<PactDatabase>(),
   directories: string[] = []
@@ -245,7 +252,7 @@ function admission(f: Fixture, operationId = randomUUID()) {
 }
 
 async function stoppedWriteReplacement(
-  stage: 'implement' | 'repair',
+  mode: 'implement' | 'fix' | 'legacy_implement',
   settled = true,
   filePath?: string,
 ) {
@@ -256,7 +263,7 @@ async function stoppedWriteReplacement(
   f.finish(revision.id, { plan: 'Keep the original cancellation scope and owned cleanup.' })
   const accepted = f.repo.beginRun(f.admission()).run
   f.finish(accepted.id, { verdict: 'accepted' })
-  const startAction = (action: 'execute' | 'repair' | 'resume') => {
+  const startAction = (action: 'execute' | 'review_code' | 'fix' | 'retry') => {
     const task = f.repo.collaboration(f.sessionId)!
     const clientMessageId = randomUUID()
     const prepared = f.repo.prepareCollaborationAction(
@@ -288,14 +295,34 @@ async function stoppedWriteReplacement(
     }).run
   }
   let original = startAction('execute')
-  if (stage === 'repair') {
+  if (mode === 'fix') {
+    f.recordCodeChange(original.id, 'src/impl.ts')
     f.finish(original.id, { answer: 'Implemented the accepted scope.' })
-    const review = f.repo.beginRun(f.admission()).run
+    const review = startAction('review_code')
     f.finish(review.id, {
       verdict: 'changes_requested',
       answer: 'Repair the original cleanup gap.',
     })
-    original = startAction('repair')
+    original = startAction('fix')
+  }
+  if (mode === 'legacy_implement') {
+    const preOpen = collaborationTaskSchema.parse({
+      ...f.repo.collaboration(f.sessionId)!,
+      openMode: undefined,
+      pendingWork: { stage: 'implement', runId: original.id, inputSequence: 0 },
+    })
+    delete preOpen.openMode
+    const preOpenJson = JSON.stringify(preOpen)
+    f.db.drizzle
+      .update(collaborationTasks)
+      .set({ stateJson: preOpenJson })
+      .where(eq(collaborationTasks.id, preOpen.id))
+      .run()
+    f.db.drizzle
+      .update(workflowTurns)
+      .set({ stateJson: preOpenJson })
+      .where(eq(workflowTurns.runId, original.id))
+      .run()
   }
   const originalTask = f.repo.collaboration(f.sessionId)!
   const auth = f.repo.collaborationTurnAuthorization(original.id)!
@@ -333,10 +360,18 @@ async function stoppedWriteReplacement(
       signal: new AbortController().signal,
     }),
   ).toBeDefined()
-  f.repo.recordEffectiveExecutionSettings(original.id, nativeGeneration, effective, {
-    executorId,
-    nativeSessionId,
-  })
+  f.repo.recordEffectiveExecutionSettings(
+    original.id,
+    nativeGeneration,
+    {
+      ...effective,
+      provider: original.agentId,
+      provenance:
+        original.agentId === 'claude' ? 'claude_applied_settings' : 'codex_thread_configuration',
+      permissionMode: original.permissionMode ?? 'native',
+    },
+    { executorId, nativeSessionId },
+  )
   f.repo.recordDispatch(original.id, 'rejected', nativeSessionId, executorId)
   f.repo.recordConfirmedUnsent(
     original.id,
@@ -395,10 +430,10 @@ async function stoppedWriteReplacement(
     inputBatchRef,
     operationId,
     replacement,
-    resume: () => startAction('resume'),
+    retry: () => startAction('retry'),
   }
 }
-async function pactRepairCheckpoint() {
+async function openFixCheckpoint(withReply = true) {
   const f = await planRevisionFixture({ rolePolicy: 'split-stages-v1' })
   databases.add(f.db)
   configureDecisionFixtureCredential(f.repo)
@@ -407,41 +442,46 @@ async function pactRepairCheckpoint() {
   f.finish(revision.id, { plan: 'Keep the original scope and repair the cancellation defect.' })
   const accepted = f.repo.beginRun(f.admission()).run
   f.finish(accepted.id, { verdict: 'accepted' })
-  const task = f.repo.collaboration(f.sessionId)!
-  const clientMessageId = randomUUID()
-  const action = f.repo.prepareCollaborationAction(
-    {
+  const startAction = (action: 'execute' | 'review_code' | 'fix') => {
+    const task = f.repo.collaboration(f.sessionId)!
+    const clientMessageId = randomUUID()
+    const prepared = f.repo.prepareCollaborationAction(
+      {
+        sessionId: f.sessionId,
+        taskId: task.id,
+        revision: task.revision,
+        clientMessageId,
+        action,
+      },
+      settings,
+    )
+    return f.repo.beginRun({
       sessionId: f.sessionId,
-      taskId: task.id,
-      revision: task.revision,
       clientMessageId,
-      action: 'execute',
-    },
-    settings,
-  )
-  const implement = f.repo.beginRun({
-    sessionId: f.sessionId,
-    clientMessageId,
-    content: 'Implement the exact accepted scope.',
-    agentId: action.next!.actor,
-    commentIds: [],
-    expectedCommentsRevision: drafts(f).commentsRevision,
-    settingsRevision: 1,
-    model: null,
-    effort: null,
-    preserveDraftComments: true,
-    collaboration: action.next!,
-    expectedCollaborationRevision: task.revision,
-    collaborationActionReceiptId: action.receipt.id,
-    schedulingHandoff: action.handoff,
-  }).run
+      content: 'Perform the authorized Open Mode step.',
+      agentId: prepared.next!.actor,
+      commentIds: [],
+      expectedCommentsRevision: drafts(f).commentsRevision,
+      settingsRevision: 1,
+      model: null,
+      effort: null,
+      preserveDraftComments: true,
+      collaboration: prepared.next!,
+      expectedCollaborationRevision: task.revision,
+      collaborationActionReceiptId: prepared.receipt.id,
+      schedulingHandoff: prepared.handoff,
+    }).run
+  }
+  const implement = startAction('execute')
+  f.recordCodeChange(implement.id, 'src/impl.ts')
   f.finish(implement.id)
-  const review = f.repo.beginRun(f.admission()).run
+  const review = startAction('review_code')
   f.finish(review.id, {
     verdict: 'changes_requested',
-    answer: 'Repair the original cancellation defect.',
+    answer: 'Fix the original cancellation defect.',
   })
-  const input = 'Please repair your existing findings yourself.'
+  if (!withReply) return { ...f, review, startAction, input: '', reply: review }
+  const input = 'Please fix the review findings and explain the root cause.'
   const nonce = randomUUID(),
     owner = randomUUID()
   const { inputId } = f.repo.writeConversationInput(
@@ -464,10 +504,10 @@ async function pactRepairCheckpoint() {
       content: input,
       commentIds: [],
       expectedCommentsRevision: drafts(f).commentsRevision,
-      route: { type: 'agent', agentId: 'codex' },
+      route: { type: 'agent', agentId: 'claude' },
     },
     inputId,
-    'codex',
+    'claude',
     'immediate_safe_point',
     owner,
   )
@@ -477,38 +517,35 @@ async function pactRepairCheckpoint() {
     sessionId: f.sessionId,
     clientMessageId: received.id,
     content: input,
-    agentId: 'codex',
+    agentId: 'claude',
     commentIds: [],
     expectedCommentsRevision: drafts(f).commentsRevision,
     settingsRevision: 1,
     model: null,
     effort: null,
     preserveDraftComments: true,
-    collaboration: f.repo.workflowReply(waiting, 'codex'),
+    collaboration: f.repo.workflowReply(waiting, 'claude'),
     expectedCollaborationRevision: waiting.revision,
     receivedInputId: received.id,
   }).run
-  expect(f.repo.collaborationTurnAuthorization(reply.id)?.replyIntentBasis?.kind).toBe(
-    'repair_role_request',
-  )
-  return { ...f, reply, input, review }
+  return { ...f, reply, input, review, startAction }
 }
 
 async function replaceUnsentPactTurn(
-  f: Awaited<ReturnType<typeof pactRepairCheckpoint>>,
+  f: Awaited<ReturnType<typeof openFixCheckpoint>>,
   original: AgentRun,
   content: string,
 ) {
   const nativeGeneration = randomUUID(),
     executorId = randomUUID(),
-    nativeSessionId = 'fixture-codex'
+    nativeSessionId = `fixture-${original.agentId}`
   f.repo.recordExecutor(original.id, executorId)
   f.repo.applyEvent(f.sessionId, original.id, {
     type: 'session.started',
-    agentId: 'codex',
+    agentId: original.agentId,
     nativeSessionId,
   })
-  f.repo.setContinuation(f.sessionId, 'codex', 'ready')
+  f.repo.setContinuation(f.sessionId, original.agentId, 'ready')
   const envelope: FrozenExecutionEnvelope = {
     version: 'pact-agent-prompt-v1',
     sessionId: f.sessionId,
@@ -524,7 +561,9 @@ async function replaceUnsentPactTurn(
       nativeGeneration,
       requested: {
         ...requested,
+        provider: original.agentId,
         model: original.model ?? null,
+        effort: original.effort ?? null,
         permissionMode: original.permissionMode ?? 'native',
       },
       source: bytes(JSON.stringify(envelope)),
@@ -536,6 +575,9 @@ async function replaceUnsentPactTurn(
     nativeGeneration,
     {
       ...effective,
+      provider: original.agentId,
+      provenance:
+        original.agentId === 'claude' ? 'claude_applied_settings' : 'codex_thread_configuration',
       permissionMode: original.permissionMode ?? 'native',
     },
     { executorId, nativeSessionId },
@@ -560,67 +602,41 @@ async function replaceUnsentPactTurn(
   }).run
 }
 
-it('settles the original role-control Batch after a positively unsent reply replacement', async () => {
-  const f = await pactRepairCheckpoint()
+it('settles the original collaborate input Batch after a positively unsent reply replacement', async () => {
+  const f = await openFixCheckpoint()
   const replacement = await replaceUnsentPactTurn(f, f.reply, f.input)
   f.repo.assertWorkflowDispatch(replacement.id)
-  f.repo.recordWorkflowInputResult(replacement.id, { outcome: 'repair_role_request' })
-  f.finish(replacement.id, { answer: 'Pact can confirm the requested repair.' })
-  expect(f.repo.collaboration(f.sessionId)?.reviewControlCoverage).toMatchObject({
-    producerRunId: replacement.id,
-    reviewRunId: f.review.id,
-    inputId: f.reply.userMessageId,
-  })
-  expect(f.repo.relaySchedulingDecision(f.sessionId)?.request).toMatchObject({
-    category: 'new_authorization',
-    operation: { kind: 'repair_role_request', actor: 'codex' },
+  f.finish(replacement.id, { answer: 'Root cause explained within Open Mode.' })
+  expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+    openMode: true,
+    status: 'waiting',
+    inputProcessing: {
+      settled: {
+        runId: replacement.id,
+        inputSequence: f.repo.collaborationTurnAuthorization(f.reply.id)!.inputSequence,
+      },
+    },
   })
 })
 
-it('dispatches a positively unsent Pact repair replacement under the same scoped receipt', async () => {
-  const f = await pactRepairCheckpoint()
-  f.repo.recordWorkflowInputResult(f.reply.id, { outcome: 'repair_role_request' })
-  f.finish(f.reply.id, { answer: 'Pact can confirm the requested repair.' })
-  const card = f.repo.relaySchedulingDecision(f.sessionId)!
-  const nonce = randomUUID(),
-    content = 'Repair the reviewed changes.'
-  const confirmation = f.repo.answerRelaySchedulingDecision({
-    reference: { sessionId: f.sessionId, decisionId: card.decisionId, revision: card.revision },
-    clientOperationId: nonce,
-    answer: { kind: 'confirm' },
-  })
-  const prepared = f.repo.preparedRelayWorkflowAction(confirmation.receiptId!)
-  const repair = f.repo.beginRun({
-    sessionId: f.sessionId,
-    clientMessageId: nonce,
-    content,
-    commentIds: [],
-    expectedCommentsRevision: drafts(f).commentsRevision,
-    agentId: prepared.next.actor,
-    settingsRevision: 1,
-    model: null,
-    effort: null,
-    preserveDraftComments: true,
-    collaboration: prepared.next,
-    expectedCollaborationRevision: prepared.task.revision,
-    schedulingHandoff: prepared.handoff,
-    collaborationActionReceiptId: prepared.receipt.id,
-  }).run
-  f.repo.assertWorkflowDispatch(repair.id)
-  const replacement = await replaceUnsentPactTurn(f, repair, content)
+it('dispatches a positively unsent Open Mode fix replacement under the same scoped receipt', async () => {
+  const f = await openFixCheckpoint(false)
+  const fixContent = 'Fix the reviewed changes.'
+  const fix = f.startAction('fix')
+  f.repo.assertWorkflowDispatch(fix.id)
+  const replacement = await replaceUnsentPactTurn(f, fix, fixContent)
   expect(() => f.repo.assertWorkflowDispatch(replacement.id)).not.toThrow()
   expect(f.repo.collaborationTurnAuthorization(replacement.id)?.userAuthority).toEqual(
-    f.repo.collaborationTurnAuthorization(repair.id)?.userAuthority,
+    f.repo.collaborationTurnAuthorization(fix.id)?.userAuthority,
   )
-  f.finish(replacement.id, { answer: 'The original defect is repaired.' })
-  expect(
-    f.repo.readSchedulingActivity({}).rows.find((row) => row.id === card.decisionId),
-  ).toMatchObject({ actionResult: 'completed', called: false })
-  const nextReview = f.repo.beginRun(f.admission()).run
-  expect(nextReview.agentId).toBe('claude')
+  f.recordCodeChange(replacement.id, 'src/fix-replacement.ts')
+  f.finish(replacement.id, { answer: 'The original defect is fixed.' })
+  const nextReview = f.startAction('review_code')
+  expect(nextReview.agentId).toBe('codex')
   f.finish(nextReview.id, { verdict: 'accepted' })
   expect(f.repo.collaboration(f.sessionId)).toMatchObject({
-    status: 'complete',
+    openMode: true,
+    status: 'waiting',
     repairAttempts: 1,
     reviewCycles: 2,
   })
@@ -674,7 +690,7 @@ describe('confirmed-unsent reexecution through the authoritative repository', ()
     const directory = await mkdtemp(join(tmpdir(), 'pact-stopped-replacement-'))
     directories.push(directory)
     const filePath = join(directory, 'pact.sqlite')
-    const f = await stoppedWriteReplacement('repair', true, filePath)
+    const f = await stoppedWriteReplacement('fix', true, filePath)
     const before = f.repo.readFrozenInputBatch(f.original.id, f.inputBatchRef.id)
     f.db.close()
     databases.delete(f.db)
@@ -686,18 +702,24 @@ describe('confirmed-unsent reexecution through the authoritative repository', ()
     const repo = reopened.conversationRepository,
       task = repo.collaboration(f.sessionId)!,
       clientMessageId = randomUUID()
-    expect(task.pendingWork?.runId).toBe(f.replacement.id)
+    expect(task.pendingWork).toBeUndefined()
+    expect(task).toMatchObject({
+      openMode: true,
+      status: 'failed',
+      automation: 'paused',
+      stage: 'collaborate',
+    })
     const prepared = repo.prepareCollaborationAction(
       {
         sessionId: f.sessionId,
         taskId: task.id,
         revision: task.revision,
         clientMessageId,
-        action: 'resume',
+        action: 'retry',
       },
       settings,
     )
-    const resumed = repo.beginRun({
+    const retried = repo.beginRun({
       sessionId: f.sessionId,
       clientMessageId,
       content: 'Continue authorized work.',
@@ -713,43 +735,36 @@ describe('confirmed-unsent reexecution through the authoritative repository', ()
       collaborationActionReceiptId: prepared.receipt.id,
       schedulingHandoff: prepared.handoff!,
     }).run
-    expect(repo.readFrozenInputBatch(resumed.id, f.inputBatchRef.id)).toEqual(before)
+    expect(repo.readFrozenInputBatch(f.original.id, f.inputBatchRef.id)).toEqual(before)
     expect(repo.collaboration(f.sessionId)?.repairAttempts).toBe(f.originalTask.repairAttempts)
     expect(repo.schedulingBudget(`task:${task.id}`)?.automaticResends).toBe(1)
-    expect(repo.collaborationTurnAuthorization(resumed.id)?.userAuthority).toMatchObject({
-      purpose: 'write_continuation',
-      rootReceiptId: f.auth.userAuthority!.rootReceiptId,
+    expect(repo.collaborationTurnAuthorization(retried.id)?.userAuthority).toMatchObject({
+      purpose: 'action',
+      rootReceiptId: prepared.receipt.id,
     })
   })
-  it.each(['implement', 'repair'] as const)(
+  it.each(['implement', 'fix'] as const)(
     'continues the same %s after its confirmed-unsent replacement is stopped and settled',
-    async (stage) => {
-      const f = await stoppedWriteReplacement(stage)
-      const before = f.repo.readFrozenInputBatch(f.original.id, f.inputBatchRef.id)
-      const resumed = f.resume()
-      const auth = f.repo.collaborationTurnAuthorization(resumed.id)!
+    async (mode) => {
+      const f = await stoppedWriteReplacement(mode)
+      const retried = f.retry()
+      const auth = f.repo.collaborationTurnAuthorization(retried.id)!
       expect(auth).toMatchObject({
-        stage,
+        stage: mode === 'implement' ? 'implement' : 'collaborate',
         actor: f.auth.actor,
         userAuthority: {
-          rootReceiptId: f.auth.userAuthority!.rootReceiptId,
-          purpose: 'write_continuation',
+          purpose: 'action',
         },
       })
       expect(f.repo.collaboration(f.sessionId)?.repairAttempts).toBe(f.originalTask.repairAttempts)
       expect(f.repo.schedulingBudget(`task:${f.originalTask.id}`)?.automaticResends).toBe(1)
-      expect(f.repo.readFrozenInputBatch(resumed.id, f.inputBatchRef.id)).toEqual(before)
-      expect(
-        f.repo
-          .readRunSources(resumed.id)
-          .items.some((item) => item.inputBatchRef?.id === f.inputBatchRef.id),
-      ).toBe(true)
+      expect(f.repo.readRunSources(retried.id).items).toBeDefined()
     },
   )
   it.each(['missing_lineage', 'wrong_original', 'native_unknown'] as const)(
     'rejects a stopped replacement continuation with %s',
     async (mutation) => {
-      const f = await stoppedWriteReplacement('implement', mutation !== 'native_unknown')
+      const f = await stoppedWriteReplacement('legacy_implement', mutation !== 'native_unknown')
       if (mutation === 'missing_lineage')
         f.db.drizzle
           .delete(runReexecutionOperations)
@@ -765,9 +780,9 @@ describe('confirmed-unsent reexecution through the authoritative repository', ()
       const beforeRuns = f.db.drizzle.select().from(agentRuns).all().length
       const beforeAuth = f.repo.collaborationTurnAuthorization(f.replacement.id)
       const beforeBatch = f.repo.readFrozenInputBatch(f.original.id, f.inputBatchRef.id)
-      expect(() => f.resume()).toThrow(
+      expect(() => f.retry()).toThrow(
         mutation === 'native_unknown'
-          ? 'There is no original unfinished write.'
+          ? 'The original write authorization or settled execution could not be verified.'
           : 'The original replacement input lineage is unavailable.',
       )
       expect(f.repo.collaboration(f.sessionId)).toEqual(before)

@@ -195,16 +195,16 @@ it('keeps five Relay decisions waiting while an independent sixth Session comple
   expect(native.inputs).toHaveLength(0)
   expect(
     await f.flow.send(
-      f.input('/build Complete the independent sixth Session and its fixed code review.'),
+      f.input('/plan Complete the independent sixth Session and its fixed review.'),
     ),
   ).toMatchObject({ ok: true })
   await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
   const complete = await f.settled()
   expect(complete).toMatchObject({
-    kind: 'build',
-    status: 'complete',
+    kind: 'plan',
+    status: 'ready',
     rolePolicy: 'split-stages-v1',
-    review: { actor: 'codex', stage: 'code_review' },
+    review: { actor: 'claude', stage: 'plan_review' },
   })
   expect(
     native.inputs.map((input) => ({
@@ -213,8 +213,8 @@ it('keeps five Relay decisions waiting while an independent sixth Session comple
       actor: input.promptEnvelope.collaboration?.actor,
     })),
   ).toEqual([
-    { sessionId: f.sessionId, stage: 'implement', actor: 'claude' },
-    { sessionId: f.sessionId, stage: 'code_review', actor: 'codex' },
+    { sessionId: f.sessionId, stage: 'plan', actor: 'codex' },
+    { sessionId: f.sessionId, stage: 'plan_review', actor: 'claude' },
   ])
   for (const { sessionId, card } of cards) {
     expect(repo.relaySchedulingDecision(sessionId)).toEqual(card)
@@ -334,14 +334,14 @@ describe.each([32, 100])('%i independently waiting Relay cards', (count) => {
     expect(details).not.toContain('USE TEMP B-TREE')
     expect(
       await representative.flow.send(
-        representative.input('/build Review this independent task after every waiting card.'),
+        representative.input('/plan Review this independent task after every waiting card.'),
       ),
     ).toMatchObject({ ok: true })
     await vi.waitFor(
       () => expect(native.inputs).toHaveLength(2),
       count === 100 ? { timeout: 5_000 } : undefined,
     )
-    expect(await representative.settled()).toMatchObject({ status: 'complete', reviewer: 'claude' })
+    expect(await representative.settled()).toMatchObject({ status: 'ready', reviewer: 'claude' })
     expect(native.inputs.map((input) => input.sessionId)).toEqual([
       representative.sessionId,
       representative.sessionId,
@@ -377,21 +377,26 @@ it('rescans earlier candidates when Relay gates become stale while a later page 
   })
   expect(
     await f.flow.send(
-      f.input('/build Keep this independent task progressing while other waits change.'),
+      f.input('/plan Keep this independent task progressing while other waits change.'),
     ),
   ).toMatchObject({ ok: true })
   await vi.waitFor(() => expect(disabled).toBeDefined())
   expect(await disabled).toMatchObject({ ok: true, value: { enabled: false } })
-  await vi.waitFor(() => expect(native.inputs).toHaveLength(8))
-  expect(await f.settled()).toMatchObject({ status: 'complete' })
+  await vi.waitFor(() => expect(native.inputs).toHaveLength(2))
+  expect(await f.settled()).toMatchObject({ status: 'ready' })
+  await Promise.all(
+    cards.map(({ sessionId }) =>
+      vi.waitFor(() => expect(repo.relaySchedulingDecision(sessionId)).toBeNull()),
+    ),
+  )
   for (const { sessionId } of cards) {
-    expect(repo.relaySchedulingDecision(sessionId)).toBeNull()
     const task = repo.collaboration(sessionId)!
-    expect(task.notice).toBeUndefined()
-    expect({ status: task.status, automation: task.automation, notice: task.notice }).toMatchObject(
-      { status: 'ready', automation: 'active' },
-    )
-    expect(native.inputs.filter((input) => input.sessionId === sessionId)).toHaveLength(1)
+    expect({
+      status: task.status,
+      automation: task.automation,
+      pauseReason: task.pauseReason,
+    }).toMatchObject({ status: 'waiting', automation: 'paused', pauseReason: 'limit' })
+    expect(native.inputs.filter((input) => input.sessionId === sessionId)).toHaveLength(0)
   }
   expect(pages.every((length) => length <= 5)).toBe(true)
   expect(native.decisions).toEqual([])

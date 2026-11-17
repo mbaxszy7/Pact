@@ -78,9 +78,9 @@ const sourceCandidates = [
 
 describe('Plan revision advice persistence', () => {
   it.each(['retained', 'revised'] as const)(
-    'offers a supplement after the first complete Plan response while preserving the fixed review',
+    'offers an extra Plan review at the discussion limit after the %s Plan response while preserving the fixed review',
     async (outcome) => {
-      const f = await fixture(),
+      const f = await fixture({ maxDiscussionRounds: 1 }),
         response = f.repo.beginRun(f.admission()).run,
         plan = f.repo.collaboration(f.sessionId)!.planReference!.document
       if (outcome === 'retained')
@@ -96,28 +96,28 @@ describe('Plan revision advice persistence', () => {
         outcome === 'revised' ? { plan: 'Complete revised scope and verification.' } : {},
       )
       const current = f.repo.collaboration(f.sessionId)!,
-        handoff = f.repo.workflowHandoff(current, current.reviewer),
+        handoff = f.repo.workflowHandoff(current, current.owner),
         alternatives = f.repo.relayWorkflowAlternatives(handoff)
-      expect(alternatives?.snapshot.node).toBe('owner_to_review')
+      expect(alternatives?.snapshot.node).toBe('plan_review_limit')
       expect(alternatives?.snapshot.producer.runId).toBe(response.id)
       expect(alternatives?.snapshot.reviews.map((review) => review.runId)).toEqual([f.reviewRun.id])
       expect(alternatives?.snapshot.responses).toEqual([])
       expect(alternatives?.alternatives).toEqual([
         expect.objectContaining({
-          kind: 'supplement_plan',
-          actor: current.owner,
-          returnActor: current.reviewer,
+          kind: 'extend_plan_review',
+          actor: current.reviewer,
         }),
       ])
       expect(f.db.drizzle.select().from(schedulingEvaluations).all().length).toBe(0)
       expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
       expect(f.repo.findRun(response.id)?.status).toBe('completed')
-      expect(f.admission().agentId).toBe(current.reviewer)
+      expect(current.stage).toBe('plan')
+      expect(current.discussionRounds).toBe(1)
     },
   )
 
   it('rejects an offer when the durable Plan settlement no longer matches the current reference', async () => {
-    const f = await fixture(),
+    const f = await fixture({ maxDiscussionRounds: 1 }),
       response = f.repo.beginRun(f.admission()).run,
       plan = f.repo.collaboration(f.sessionId)!.planReference!.document
     f.repo.recordWorkflowPlanRetained(response.id, {
@@ -136,16 +136,16 @@ describe('Plan revision advice persistence', () => {
       planReference: { ...current.planReference!, document: current.taskDocument! },
     })
     const next = f.repo.collaboration(f.sessionId)!,
-      handoff = f.repo.workflowHandoff(next, next.reviewer)
+      handoff = f.repo.workflowHandoff(next, next.owner)
     expect(f.repo.relayWorkflowAlternatives(handoff)).toBeUndefined()
     expect(f.db.drizzle.select().from(schedulingEvaluations).all()).toHaveLength(0)
     expect(f.repo.relaySchedulingDecision(f.sessionId)).toBeNull()
   })
 
   it.each(['retained', 'revised'] as const)(
-    'projects the complete repeated review chain after the owner %s the Plan',
+    'projects the complete repeated review chain after the owner %s the Plan at the discussion limit',
     async (outcome) => {
-      const f = await fixture(),
+      const f = await fixture({ maxDiscussionRounds: 2 }),
         firstResponse = f.repo.beginRun(f.admission()).run
       f.finish(firstResponse.id, {
         plan: 'Preserve the original scope and address the first review.',
@@ -167,26 +167,22 @@ describe('Plan revision advice persistence', () => {
         outcome === 'revised' ? { plan: 'Complete final scope and verification.' } : {},
       )
       const current = f.repo.collaboration(f.sessionId)!,
-        handoff = f.repo.workflowHandoff(current, current.reviewer)
+        handoff = f.repo.workflowHandoff(current, current.owner)
       expect(f.repo.relayWorkflowAlternatives(handoff)?.alternatives).toHaveLength(1)
       const material = await f.repo.readRelayWorkflowDecisionSources(
         handoff,
-        [{ id: 'continue_plan_review', description: 'Keep the fixed independent review.' }],
+        [{ id: 'propose_extend_plan_review', description: 'Add one independent Plan review.' }],
         { signal: new AbortController().signal, deadlineAt: Date.now() + 15_000 },
       )
-      expect(material.snapshot.node).toBe('owner_to_review')
+      expect(material.snapshot.node).toBe('plan_review_limit')
       expect(material.snapshot.producer.runId).toBe(response.id)
-      expect(material.snapshot.reviews.map((review) => review.runId)).toEqual([
-        secondReview.id,
-        f.reviewRun.id,
-      ])
-      expect(material.snapshot.responses.map((reply) => reply.runId)).toEqual([firstResponse.id])
+      expect(material.snapshot.reviews.map((review) => review.runId)).toEqual([secondReview.id])
+      expect(material.snapshot.responses).toEqual([])
       expect(
         material.input.sources.every(
           (source) => source.digest === createHash('sha256').update(source.text).digest('hex'),
         ),
       ).toBe(true)
-      expect(f.admission().agentId).toBe(current.reviewer)
     },
   )
 

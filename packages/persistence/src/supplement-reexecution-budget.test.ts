@@ -34,40 +34,8 @@ afterEach(() => {
   databases.clear()
 })
 
-function beginManualAction(
-  f: Awaited<ReturnType<typeof planRevisionFixture>>,
-  action: 'execute' | 'respond',
-) {
-  const task = f.repo.collaboration(f.sessionId)!,
-    clientMessageId = randomUUID(),
-    settings = f.db.sessionRepository.find(f.sessionId)!.settings,
-    prepared = f.repo.prepareCollaborationAction(
-      { sessionId: f.sessionId, taskId: task.id, revision: task.revision, clientMessageId, action },
-      settings,
-    ),
-    drafts = f.repo.readPage({ scope: 'drafts', sessionId: f.sessionId })
-  if (drafts.scope !== 'drafts') throw Error('Missing action drafts')
-  if (!prepared.next) throw Error('Missing prepared action transition')
-  return f.repo.beginRun({
-    sessionId: f.sessionId,
-    clientMessageId,
-    content: 'Perform the explicitly authorized workflow action.',
-    commentIds: [],
-    expectedCommentsRevision: drafts.commentsRevision,
-    agentId: prepared.next.actor,
-    settingsRevision: 1,
-    model: null,
-    effort: null,
-    preserveDraftComments: true,
-    expectedCollaborationRevision: task.revision,
-    collaboration: prepared.next,
-    schedulingHandoff: prepared.handoff,
-    collaborationActionReceiptId: prepared.receipt.id,
-  }).run
-}
-
-async function originalSupplement(kind: 'supplement_plan' | 'repair' = 'supplement_plan') {
-  const f = await planRevisionFixture()
+async function originalExtension() {
+  const f = await planRevisionFixture({ owner: 'claude', maxDiscussionRounds: 2 })
   databases.add(f.db)
   const epoch = randomUUID()
   f.repo.beginSchedulingRecoveryEpoch(epoch)
@@ -75,28 +43,11 @@ async function originalSupplement(kind: 'supplement_plan' | 'repair' = 'suppleme
   f.finish(firstResponse.id, { plan: 'First revised Plan.' })
   const review = f.repo.beginRun(f.admission()).run
   f.finish(review.id, {
-    verdict: kind === 'repair' ? 'accepted' : 'changes_requested',
-    answer: 'The complete fixed review of the current Plan.',
+    verdict: 'changes_requested',
+    answer: 'The second full review still requires an independent Plan check.',
   })
-  if (kind === 'repair') {
-    const implementation = beginManualAction(f, 'execute')
-    f.finish(implementation.id, { answer: 'Complete implementation within the accepted scope.' })
-    const codeReview = f.repo.beginRun(f.admission()).run
-    f.finish(codeReview.id, {
-      verdict: 'changes_requested',
-      answer: 'The first full code review requires cancellation repair.',
-    })
-    const response = beginManualAction(f, 'respond')
-    f.finish(response.id, { answer: 'The original author’s complete read-only response.' })
-    const repeated = f.repo.beginRun(f.admission()).run
-    f.finish(repeated.id, {
-      verdict: 'changes_requested',
-      answer: 'The second full review still requires the exact cancellation repair.',
-    })
-  } else {
-    const response = f.repo.beginRun(f.admission()).run
-    f.finish(response.id, { plan: 'The current complete Plan before the extra clarification.' })
-  }
+  const revised = f.repo.beginRun(f.admission()).run
+  f.finish(revised.id, { plan: 'The current complete Plan at the discussion limit.' })
   const task = f.repo.collaboration(f.sessionId)!,
     owner = decisionHttpOwnerFixture()
   configureDecisionFixtureCredential(f.repo)
@@ -105,15 +56,7 @@ async function originalSupplement(kind: 'supplement_plan' | 'repair' = 'suppleme
     configurationFingerprint = f.repo.schedulingConfigurationFingerprint()
   const material = await f.repo.readRelayWorkflowDecisionSources(
     originalHandoff,
-    [
-      {
-        id: kind === 'repair' ? 'propose_repair' : 'propose_supplement_plan',
-        description:
-          kind === 'repair'
-            ? 'Request one exact authorized repair before the fixed review.'
-            : 'Request one original read-only clarification.',
-      },
-    ],
+    [{ id: 'propose_extend_plan_review', description: 'Request one additional Plan review.' }],
     { signal: new AbortController().signal, deadlineAt },
   )
   const evaluation = f.repo.reserveEvaluation({
@@ -128,13 +71,13 @@ async function originalSupplement(kind: 'supplement_plan' | 'repair' = 'suppleme
   f.repo.settleEvaluation(evaluation.evaluation.id, {
     outcome: 'completed',
     physicalReleased: true,
-    selectedCandidateId: kind === 'repair' ? 'propose_repair' : 'propose_supplement_plan',
+    selectedCandidateId: 'propose_extend_plan_review',
     httpOwner: owner,
     remoteOutcome: 'responded',
   })
   const card = f.repo.proposeRelayWorkflowAction({
     handoff: originalHandoff,
-    kind,
+    kind: 'extend_plan_review',
     evaluationId: evaluation.evaluation.id,
     configurationGeneration: f.repo.schedulingConfigurationGeneration(),
     configurationFingerprint,
@@ -150,10 +93,7 @@ async function originalSupplement(kind: 'supplement_plan' | 'repair' = 'suppleme
   })
   if (!('receiptId' in answer) || !answer.receiptId) throw Error('Missing original user grant')
   const prepared = f.repo.preparedRelayWorkflowAction(answer.receiptId),
-    content =
-      kind === 'repair'
-        ? 'Perform only the exact separately approved repair.'
-        : 'Perform only the exact approved read-only Plan clarification.'
+    content = 'Perform only the exact approved additional Plan review.'
   const original = f.repo.beginRun({
     sessionId: f.sessionId,
     commentIds: [],
@@ -255,7 +195,7 @@ async function originalSupplement(kind: 'supplement_plan' | 'repair' = 'suppleme
   expect(grant).toMatchObject({
     state: 'not_sent',
     active: false,
-    reviewState: kind === 'repair' ? null : 'not_required',
+    reviewState: null,
   })
   expect(budget).toMatchObject({ state: 'not_sent', replacesReservationId: null })
   expect(f.repo.schedulingBudget(originalHandoff.budgetSubjectId)).toMatchObject({
@@ -265,8 +205,8 @@ async function originalSupplement(kind: 'supplement_plan' | 'repair' = 'suppleme
   return { ...f, original, grant, budget, candidate, epoch, envelope }
 }
 
-async function operationFixture(kind: 'supplement_plan' | 'repair' = 'supplement_plan') {
-  const f = await originalSupplement(kind),
+async function operationFixture() {
+  const f = await originalExtension(),
     operationId = randomUUID(),
     replacementId = randomUUID()
   const node = handoff({
@@ -326,67 +266,10 @@ async function operationFixture(kind: 'supplement_plan' | 'repair' = 'supplement
 }
 
 describe('refunded supplemental allowance during exact unsent reexecution', () => {
-  it('reacquires only the proven-unsent Relay repair allowance while preserving ordinary action authority and fixed code review', async () => {
-    const f = await originalSupplement('repair'),
-      before = f.repo.collaboration(f.sessionId)!
-    expect(f.repo.collaborationTurnAuthorization(f.original.id)?.userAuthority).toEqual({
-      receiptId: f.grant.id,
-      rootReceiptId: f.grant.rootReceiptId,
-      purpose: 'action',
-    })
-    expect(f.budget.budget).toBe('extra_code_turn')
-    const replacement = f.repo.beginConfirmedUnsentReexecution({
-        operationId: randomUUID(),
-        faultId: f.candidate.fault.id,
-        handoff: f.repo.recoveryHandoff({ kind: 'run', id: f.original.id }),
-      }),
-      grant = f.db.drizzle
-        .select()
-        .from(collaborationActionReceipts)
-        .where(eq(collaborationActionReceipts.id, f.grant.id))
-        .get()!,
-      budget = f.db.drizzle
-        .select()
-        .from(schedulingBudgetReservations)
-        .where(eq(schedulingBudgetReservations.id, grant.budgetReservationId!))
-        .get()!
-    expect(grant).toMatchObject({
-      action: 'repair',
-      state: 'bound',
-      boundRunId: replacement.run.id,
-      reviewState: null,
-      reviewRunId: null,
-      handoffId: f.grant.handoffId,
-    })
-    expect(budget).toMatchObject({
-      budget: 'extra_code_turn',
-      handoffId: f.budget.handoffId,
-      authorizationId: f.grant.id,
-      replacesReservationId: f.budget.id,
-    })
-    expect(f.repo.collaborationTurnAuthorization(replacement.run.id)?.userAuthority).toEqual({
-      receiptId: f.grant.id,
-      rootReceiptId: f.grant.rootReceiptId,
-      purpose: 'action',
-    })
-    expect(f.repo.collaboration(f.sessionId)?.repairAttempts).toBe(before.repairAttempts + 1)
-    expect(f.repo.schedulingBudget(f.budget.budgetSubjectId)).toMatchObject({
-      extraPlanTurns: 0,
-      extraCodeTurns: 1,
-    })
-    f.finish(replacement.run.id, {
-      answer: 'The exact repair completed with complete native output.',
-    })
-    const review = f.repo.beginRun(f.admission()).run
-    expect(review.collaboration?.stage).toBe('code_review')
-    expect(review.agentId).toBe('claude')
-    expect(f.repo.schedulingBudget(f.budget.budgetSubjectId)?.extraCodeTurns).toBe(1)
-  })
-
   it.each(['legacy', 'nonce', 'operation'] as const)(
-    'refuses unsent repair reacquisition after %s provenance changes without spending code allowance',
+    'refuses unsent plan-review extension reacquisition after %s provenance changes without spending plan allowance',
     async (change) => {
-      const f = await operationFixture('repair'),
+      const f = await operationFixture(),
         decision = f.db.drizzle
           .select()
           .from(relayDecisions)
@@ -409,7 +292,7 @@ describe('refunded supplemental allowance during exact unsent reexecution', () =
         .where(eq(relayDecisions.id, decision.id))
         .run()
       expect(f.reacquire).toThrow('no longer eligible')
-      expect(f.repo.schedulingBudget(f.budget.budgetSubjectId)?.extraCodeTurns).toBe(0)
+      expect(f.repo.schedulingBudget(f.budget.budgetSubjectId)?.extraPlanTurns).toBe(0)
       expect(
         f.db.drizzle
           .select()
@@ -546,8 +429,8 @@ describe('refunded supplemental allowance during exact unsent reexecution', () =
     ).toEqual([])
   })
 
-  it('allows the actual Repository replacement to retain mandatory review authority with the linked original handoff', async () => {
-    const f = await originalSupplement()
+  it('allows the actual Repository replacement to retain extended Plan review authority with the linked original handoff', async () => {
+    const f = await originalExtension()
     const replacement = f.repo.beginConfirmedUnsentReexecution({
       operationId: randomUUID(),
       faultId: f.candidate.fault.id,
@@ -560,7 +443,7 @@ describe('refunded supplemental allowance during exact unsent reexecution', () =
       .get()!
     expect(grant).toMatchObject({
       boundRunId: replacement.run.id,
-      reviewState: 'pending',
+      reviewState: null,
       handoffId: f.grant.handoffId,
       state: 'bound',
     })
@@ -574,10 +457,13 @@ describe('refunded supplemental allowance during exact unsent reexecution', () =
       handoffId: f.grant.handoffId,
       authorizationId: f.grant.id,
     })
-    f.finish(replacement.run.id, { plan: 'The exact completed replacement Plan clarification.' })
-    const review = f.repo.beginRun(f.admission()).run
-    expect(review.collaboration?.stage).toBe('plan_review')
-    expect(review.agentId).toBe('claude')
+    expect(replacement.run.collaboration?.stage).toBe('plan_review')
+    expect(replacement.run.agentId).toBe('codex')
+    f.finish(replacement.run.id, {
+      verdict: 'accepted',
+      answer: 'The exact completed replacement Plan review.',
+    })
+    expect(f.repo.collaboration(f.sessionId)?.status).toBe('ready')
     expect(f.repo.schedulingBudget(f.budget.budgetSubjectId)?.extraPlanTurns).toBe(1)
   })
 })

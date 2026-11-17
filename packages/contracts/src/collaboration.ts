@@ -24,12 +24,35 @@ export const collaborationStageSchema = z.enum([
   'plan_review',
   'implement',
   'code_review',
+  'collaborate',
   'respond',
   'repair',
   'reply',
 ])
 export type CollaborationStage = z.infer<typeof collaborationStageSchema>
 export const collaborationWorkStageSchema = collaborationStageSchema.exclude(['reply'])
+
+const utf8Bytes = (value: string): number => new TextEncoder().encode(value).byteLength
+export const COLLABORATION_PLAN_CHUNK_BYTES = 48 * 1024
+export const COLLABORATION_PUBLISHED_PLAN_MAX_BYTES = 2 * 1024 * 1024
+export const collaborationPublishPlanInputShape = {
+  text: z
+    .string()
+    .max(COLLABORATION_PLAN_CHUNK_BYTES)
+    .refine(
+      (value) => utf8Bytes(value) <= COLLABORATION_PLAN_CHUNK_BYTES,
+      'Plan chunk exceeds 48 KiB.',
+    ),
+  offset: z.number().int().nonnegative().optional(),
+  complete: z.boolean().optional(),
+}
+export const collaborationPublishPlanInputSchema = z
+  .strictObject(collaborationPublishPlanInputShape)
+  .refine(
+    (value) => (value.offset ?? 0) !== 0 || value.complete === false || Boolean(value.text.trim()),
+    'Provide non-empty plan text.',
+  )
+export type CollaborationPublishPlanInput = z.infer<typeof collaborationPublishPlanInputSchema>
 
 export const taskStageRolesSchema = z
   .strictObject({
@@ -217,6 +240,7 @@ export const collaborationPlanRetentionInputSchema = z.strictObject({})
 
 export const collaborationPlanReferenceSchema = z.strictObject({
   version: z.number().int().positive(),
+  author: agent.optional(),
   sourceRunId: z.string().uuid(),
   sourceMessageId: z.string().uuid(),
   document: collaborationDocumentSchema,
@@ -375,19 +399,11 @@ export const collaborationInputObservationSchema = z.strictObject({
 export type CollaborationInputObservation = z.infer<typeof collaborationInputObservationSchema>
 export const collaborationInputResultSchema = collaborationInputObservationSchema
   .extend({
-    outcome: z.enum([
-      'processed',
-      'needs_user',
-      'repair_role_request',
-      'plan_revision_required',
-      'explanation_only',
-    ]),
+    outcome: z.enum(['processed', 'needs_user', 'explanation_only']),
   })
   .refine(
-    (value) =>
-      value.outcome === 'plan_revision_required' ||
-      (value.outcome === 'needs_user') === Boolean(value.questions),
-    'Questions are required for needs_user and optional for plan_revision_required.',
+    (value) => (value.outcome === 'needs_user') === Boolean(value.questions),
+    'Questions are required for needs_user and forbidden otherwise.',
   )
 const collaborationInputProcessingSchema = z.strictObject({
   decision: z
@@ -542,6 +558,11 @@ export const collaborationTaskSchema = z
     reviewCycles: z.number().int().nonnegative(),
     repairAttempts: z.number().int().nonnegative(),
     notice: z.string().max(512).optional(),
+    openMode: z.boolean().optional(),
+    planAuthor: agent.optional(),
+    unreviewedCodeActor: agent.optional(),
+    unreviewedPlanActor: agent.optional(),
+    lastCodeActor: agent.optional(),
     /** Terminal lifecycle record; distinct from a successful Complete outcome. */
     ending: z
       .strictObject({
@@ -602,6 +623,12 @@ export function collaborationWorkflowInputBasis(task: CollaborationTask): Collab
   }
 }
 
+export function isCollaborationOpenMode(
+  task: Pick<CollaborationTask, 'openMode' | 'kind' | 'codeRunId'>,
+): boolean {
+  return task.openMode ?? (task.kind !== 'plan' || Boolean(task.codeRunId))
+}
+
 export function collaborationAskMode(
   task: CollaborationTask | undefined,
   authorization: CollaborationTurnAuthorization | undefined = task?.authorization,
@@ -609,23 +636,36 @@ export function collaborationAskMode(
   return authorization?.stage === 'reply' && authorization.replyIntentBasis?.kind === 'ask_only'
 }
 
-/** Only the assigned plan author may publish or retain a native plan for this root. */
+/** Only the assigned Phase 1 plan author may publish or retain a native plan for this root. */
 export function collaborationPlanMode(
   task: CollaborationTask | undefined,
   authorization?: CollaborationTurnAuthorization,
 ): boolean {
-  if (collaborationAskMode(task, authorization ?? task?.authorization)) return false
-  const stage = authorization?.stage ?? task?.stage
-  const actor = authorization?.actor ?? task?.actor
+  if (!task || collaborationAskMode(task, authorization ?? task.authorization)) return false
+  if (isCollaborationOpenMode(task)) return false
+  const stage = authorization?.stage ?? task.stage
+  const actor = authorization?.actor ?? task.actor
   const planningReply = authorization
     ? authorization.replyMode === 'plan' ||
-      (authorization.replyMode === undefined && task?.kind === 'plan' && !task.codeRunId)
-    : task?.kind === 'plan' && !task.codeRunId && !task.pendingWork && !task.planRevision
-  return Boolean(
-    task &&
+      (authorization.replyMode === undefined && task.kind === 'plan' && !task.codeRunId)
+    : task.kind === 'plan' && !task.codeRunId && !task.pendingWork && !task.planRevision
+  return (
     actor === collaborationActor(task, 'plan') &&
-    (stage === 'plan' || (stage === 'reply' && planningReply)),
+    (stage === 'plan' || (stage === 'reply' && planningReply))
   )
+}
+
+/** In Open Mode, the active agent may publish a new plan version when not in a read-only stage. */
+export function collaborationOpenPlanPublishAllowed(
+  task: CollaborationTask | undefined,
+  authorization: CollaborationTurnAuthorization | undefined = task?.authorization,
+): boolean {
+  if (!task || !isCollaborationOpenMode(task) || collaborationAskMode(task, authorization))
+    return false
+  const stage = authorization?.stage ?? task.stage
+  if (['plan', 'plan_review', 'code_review'].includes(stage)) return false
+  const actor = authorization?.actor ?? task.actor
+  return actor === task.actor
 }
 
 /** Shared by both providers; only the assigned plan author with an existing plan may retain it. */
@@ -648,73 +688,24 @@ export function collaborationPlanRetentionAllowed(
 }
 
 export const collaborationActionSchema = z.enum([
-  'continue',
   'execute',
-  'respond',
-  'repair',
-  'request_repair_role_switch',
+  'review_code',
+  'review_plan',
+  'fix',
+  'swap_code_roles',
   'resume',
   'retry',
   'recover_plan',
-  'request_plan_supplement',
-  'request_code_supplement',
-  'confirm_supplement',
-  'cancel_supplement',
-  'revise_plan',
-  'keep_current_plan',
-  'swap_code_roles',
 ])
 export type CollaborationAction = z.infer<typeof collaborationActionSchema>
-export const collaborationActionInputSchema = z
-  .strictObject({
-    sessionId: z.string().uuid(),
-    taskId: z.string().uuid(),
-    revision: z.number().int().nonnegative(),
-    action: collaborationActionSchema,
-    clientMessageId: z.string().uuid(),
-    repairActor: agent.optional(),
-    decision: z
-      .strictObject({ id: z.string().uuid(), revision: z.number().int().nonnegative() })
-      .optional(),
-  })
-  .refine(
-    (input) => (input.action === 'request_repair_role_switch') === Boolean(input.repairActor),
-    'A repair role choice requires the selected Agent.',
-  )
-export type CollaborationActionInput = z.infer<typeof collaborationActionInputSchema>
-
-/** Repository-proved arrangement and permission changes, originating in an explicit user request. */
-export const relayDecisionSchema = z.strictObject({
-  id: z.string().uuid(),
-  revision: z.number().int().nonnegative(),
+export const collaborationActionInputSchema = z.strictObject({
+  sessionId: z.string().uuid(),
   taskId: z.string().uuid(),
-  afterRunId: z.string().uuid(),
-  kind: z.enum(['supplement_plan', 'supplement_code_response']),
-  state: z.enum(['requested', 'awaiting_answer', 'available']),
-  actor: agent,
-  returnActor: agent,
-  planReference: collaborationPlanReferenceSchema.optional(),
-  reviewRunId: z.string().uuid().optional(),
-  reviewDocument: collaborationDocumentSchema.optional(),
-  reviewScopeRef: collaborationDocumentSchema.optional(),
+  revision: z.number().int().nonnegative(),
+  action: collaborationActionSchema,
+  clientMessageId: z.string().uuid(),
 })
-export type RelayDecision = z.infer<typeof relayDecisionSchema>
-
-/** Bounded durable proof references, produced and rechecked only by the existing host owner. */
-export const relayDecisionProofSchema = z.strictObject({
-  card: relayDecisionSchema,
-  request: z.strictObject({
-    taskRevision: z.number().int().nonnegative(),
-    inputSequence: z.number().int().nonnegative(),
-    configurationGeneration: z.number().int().nonnegative(),
-    wasRunning: z.boolean(),
-  }),
-  handoff: schedulingHandoffSchema.optional(),
-  sourceFingerprint: z
-    .string()
-    .regex(/^[a-f0-9]{64}$/u)
-    .optional(),
-})
+export type CollaborationActionInput = z.infer<typeof collaborationActionInputSchema>
 
 export const collaborationActionBasisSchema = z.strictObject({
   handoff: schedulingHandoffSchema,
@@ -747,7 +738,7 @@ export const otherAgent = (id: 'claude' | 'codex'): 'claude' | 'codex' =>
 
 export function collaborationRequiresPlan(task: CollaborationTask): boolean {
   if (task.planRevision) return true
-  if (task.kind !== 'plan' || task.codeRunId) return false
+  if (isCollaborationOpenMode(task) || task.kind !== 'plan' || task.codeRunId) return false
   const pending = task.pendingWork
   if (pending?.stage !== 'implement') return true
   const unchangedPlan =
@@ -868,54 +859,9 @@ function samePlanReference(
   )
 }
 
-/** A finished /plan with a verified write and no pending revision can be revised explicitly. */
-export function collaborationCanRevisePlan(task: CollaborationTask): boolean {
-  return (
-    task.kind === 'plan' &&
-    !task.ending &&
-    task.status !== 'complete' &&
-    task.status !== 'running' &&
-    !task.planRevision &&
-    !!task.planReference &&
-    !!(task.pendingWork?.runId ?? task.codeRunId) &&
-    !collaborationInputGate(task)
-  )
-}
-
-/**
- * Dismissal applies only to the exact still-current revision request: same input cursor,
- * untouched Plan, no admitted planner Run, and at most its own necessary-decision gate.
- */
-export function collaborationCanKeepPlan(task: CollaborationTask): boolean {
-  const revision = task.planRevision
-  if (
-    !revision ||
-    task.ending ||
-    task.status === 'complete' ||
-    task.status === 'running' ||
-    revision.startedRunId ||
-    revision.returnReview ||
-    !samePlanReference(task.planReference, revision.planReference)
-  )
-    return false
-  const input = collaborationInputProcessing(task)
-  if (
-    input.pending ||
-    collaborationWorkflowInputBasis(task).inputSequence !== revision.inputSequence
-  )
-    return false
-  if (!revision.origin && task.runId !== revision.requestRunId) return false
-  const gate = collaborationInputGate(task)
-  return (
-    !gate ||
-    (gate === 'needs_reply' &&
-      input.decision?.runId === revision.requestRunId &&
-      input.decision.inputSequence === revision.inputSequence)
-  )
-}
-
 export function collaborationCanSwapCodeRoles(task: CollaborationTask): boolean {
   return (
+    !isCollaborationOpenMode(task) &&
     task.kind === 'plan' &&
     task.rolePolicy === 'split-stages-v1' &&
     !task.ending &&
@@ -956,12 +902,13 @@ export function collaborationCodeReviewCurrent(task: CollaborationTask): boolean
   )
 }
 
-/** Only the frozen reply can make either structured intent available to the native tool. */
+/** Only Phase 1 frozen replies can submit a structured input result. */
 export function collaborationInputOutcomeAllowed(
   task: CollaborationTask,
   auth: CollaborationTurnAuthorization | undefined,
   outcome: CollaborationInputOutcome,
 ): boolean {
+  if (isCollaborationOpenMode(task) || (auth?.stage ?? task.stage) === 'collaborate') return false
   if (collaborationAskMode(task, auth)) return false
   if (outcome === 'explanation_only')
     return Boolean(
@@ -974,24 +921,8 @@ export function collaborationInputOutcomeAllowed(
       auth.inputProcessing?.pending?.inputId === auth.replyIntentBasis.inputId &&
       auth.inputProcessing?.pending?.inputSequence === auth.inputSequence,
     )
+  if (outcome === 'plan_revision_required' || outcome === 'repair_role_request') return false
   const planning = collaborationPlanMode(task, auth)
-  if (outcome === 'plan_revision_required')
-    return Boolean(
-      task.kind === 'plan' &&
-      auth?.stage === 'reply' &&
-      auth.replyMode === 'read_only' &&
-      auth.planRevisionWriteRunId &&
-      auth.inputProcessing?.pending?.inputSequence === auth.inputSequence &&
-      !planning,
-    )
-  if (outcome === 'repair_role_request')
-    return (
-      auth?.stage === 'reply' &&
-      auth.inputProcessing?.pending?.inputId === auth.replyIntentBasis?.inputId &&
-      auth.inputProcessing?.pending?.inputSequence === auth.inputSequence &&
-      auth.replyIntentBasis?.kind === outcome &&
-      !planning
-    )
   return outcome !== 'processed' || !planning
 }
 
@@ -1036,7 +967,9 @@ export function collaborationInputGate(
   task: CollaborationTask,
 ): 'needs_reply' | 'queued' | 'processing' | 'incomplete' | undefined {
   const input = collaborationInputProcessing(task)
+  const open = isCollaborationOpenMode(task)
   if (
+    !open &&
     task.stage === 'reply' &&
     task.status === 'failed' &&
     !(collaborationAskMode(task) && !input.pending) &&
@@ -1044,13 +977,19 @@ export function collaborationInputGate(
   )
     return 'incomplete'
   if (!input.pending) return input.decision ? 'needs_reply' : undefined
-  if (task.status === 'failed') return 'incomplete'
-  if (task.stage === 'reply' && task.status === 'running') return 'processing'
+  if (task.status === 'failed') return open ? undefined : 'incomplete'
+  if ((task.stage === 'reply' || task.stage === 'collaborate') && task.status === 'running')
+    return 'processing'
   return 'queued'
 }
 
-/** Recompute from current facts; no queued prompt or old action is an authority to resume. */
+function hasCurrentUnreviewedPlan(task: CollaborationTask): boolean {
+  return Boolean(task.unreviewedPlanActor && task.planReference)
+}
+
+/** Recompute Phase 1 automatic step from current facts; Open Mode never auto-chains. */
 function collaborationResolvedNextStage(task: CollaborationTask): CollaborationStage | undefined {
+  if (isCollaborationOpenMode(task)) return undefined
   if (task.planRevision?.returnReview) return task.planRevision.returnReview.stage
   const basis = collaborationWorkflowInputBasis(task)
   if (collaborationRequiresPlan(task)) {
@@ -1066,21 +1005,14 @@ function collaborationResolvedNextStage(task: CollaborationTask): CollaborationS
       return 'plan'
     return 'plan_review'
   }
-  if (task.pendingWork) return task.pendingWork.stage
-  if (
-    task.review &&
-    task.review.inputSequence < basis.inputSequence &&
-    !collaborationCodeReviewCurrent(task)
-  )
-    return 'code_review'
-  return task.nextStage
+  return undefined
 }
 
 export function collaborationNextStage(task: CollaborationTask): CollaborationStage | undefined {
   return deriveCollaborationDecision(task).nextStage
 }
 
-/** The one role resolver for both frozen legacy tasks and split-stage tasks. */
+/** Resolve the acting Agent for both Phase 1 split stages and Open Mode collaboration. */
 export function collaborationActor(
   task: Pick<
     CollaborationTask,
@@ -1092,10 +1024,64 @@ export function collaborationActor(
     | 'codeRunId'
     | 'pendingWork'
     | 'planRevision'
-  >,
+  > &
+    Partial<
+      Pick<
+        CollaborationTask,
+        | 'openMode'
+        | 'lastCodeActor'
+        | 'unreviewedCodeActor'
+        | 'unreviewedPlanActor'
+        | 'planAuthor'
+        | 'review'
+        | 'status'
+        | 'runId'
+      >
+    >,
   stage: CollaborationStage,
 ) {
   const roles = task.stageRoles
+  const defaultCodeAuthor = roles
+    ? roles.codeAuthor
+    : task.rolePolicy === 'split-stages-v1'
+      ? task.reviewer
+      : task.owner
+  const defaultCodeReviewer = roles
+    ? roles.codeReviewer
+    : task.rolePolicy === 'split-stages-v1'
+      ? task.owner
+      : task.reviewer
+  const defaultPlanAuthor = roles ? roles.planAuthor : task.owner
+  const defaultPlanReviewer = roles ? roles.planReviewer : task.reviewer
+
+  if (isCollaborationOpenMode(task)) {
+    if (stage === 'collaborate' || stage === 'reply' || stage === 'respond' || stage === 'repair')
+      return task.kind === 'review' && !task.lastCodeActor && stage === 'reply'
+        ? defaultCodeReviewer
+        : (task.lastCodeActor ?? defaultCodeAuthor)
+    if (stage === 'code_review')
+      return task.unreviewedCodeActor
+        ? otherAgent(task.unreviewedCodeActor)
+        : task.lastCodeActor
+          ? otherAgent(task.lastCodeActor)
+          : defaultCodeReviewer
+    if (stage === 'plan_review')
+      return task.unreviewedPlanActor
+        ? otherAgent(task.unreviewedPlanActor)
+        : task.planAuthor
+          ? otherAgent(task.planAuthor)
+          : defaultPlanReviewer
+    if (stage === 'implement')
+      return task.status === 'running'
+        ? (task.lastCodeActor ?? defaultCodeAuthor)
+        : task.review?.stage === 'plan_review' &&
+            task.review.verdict === 'accepted' &&
+            (!task.runId || task.review.runId === task.runId)
+          ? otherAgent(task.review.actor)
+          : (task.lastCodeActor ?? defaultCodeAuthor)
+    return task.planAuthor ?? defaultPlanAuthor
+  }
+
   if (stage === 'reply' && task.planRevision) return collaborationActor(task, 'plan')
   if (roles) {
     if (stage === 'plan') return roles.planAuthor
@@ -1131,10 +1117,34 @@ export function collaborationStageLabel(stage: CollaborationStage, kind?: PactSk
     plan_review: 'Review the current plan',
     implement: kind === 'build' ? 'Implement the task' : 'Implement the accepted plan',
     code_review: 'Review the current changes',
+    collaborate: 'Continue collaboration',
     respond: 'Respond to the review',
     repair: 'Repair the reviewed changes',
     reply: 'Reply to your message',
   }[stage]
+}
+
+export function collaborationActionPrompt(
+  task: Pick<CollaborationTask, 'stage' | 'kind' | 'planVersion' | 'review'>,
+  action?: CollaborationAction,
+): string {
+  if (task.stage === 'plan_review')
+    return task.planVersion > 0 ? `Review Plan v${task.planVersion}.` : 'Review the current plan.'
+  if (task.stage === 'plan')
+    return task.planVersion > 0
+      ? `Update Plan v${task.planVersion} based on the review.`
+      : 'Draft the plan.'
+  if (task.stage === 'implement')
+    return task.planVersion > 0 ? `Implement Plan v${task.planVersion}.` : 'Implement the task.'
+  if (task.stage === 'code_review') return 'Review the latest code changes.'
+  if (task.stage === 'collaborate') {
+    if (action === 'fix')
+      return task.review?.stage === 'plan_review' && task.planVersion > 0
+        ? `Update Plan v${task.planVersion} based on the review.`
+        : 'Fix the issues from code review.'
+    return 'Continue with the previous request.'
+  }
+  return `${collaborationStageLabel(task.stage, task.kind)}.`
 }
 
 export interface CollaborationStageLimit {
@@ -1170,47 +1180,65 @@ export interface CollaborationDecision {
   continuationLimit: CollaborationStageLimit | undefined
 }
 
-/** Resolve the bounded task's next step and legal controls from one fact set. */
+/** Resolve next step and available user Proposal actions from current task facts. */
 export function deriveCollaborationDecision(
   task: CollaborationTask,
   limits?: CollaborationLimits,
 ): CollaborationDecision {
   const inputGate = collaborationInputGate(task)
+  const open = isCollaborationOpenMode(task)
   const gated = Boolean(task.ending || task.status === 'complete' || inputGate)
-  const nextStage = gated ? undefined : collaborationResolvedNextStage(task)
+  const nextStage = gated || open ? undefined : collaborationResolvedNextStage(task)
+  const continuationLimit =
+    limits && !open && !gated && task.status !== 'running' && task.status !== 'failed'
+      ? collaborationStageLimit(task, nextStage, limits)
+      : undefined
   const availableActions: CollaborationAction[] = []
-  if (!task.ending && task.status !== 'complete') {
-    if (!inputGate) {
-      if (task.status === 'running') {
-        if (task.automation === 'paused') availableActions.push('resume')
-      } else if (task.automation === 'paused') {
-        availableActions.push('resume')
-      } else if (collaborationRequiresPlan(task) && collaborationPlanAccepted(task)) {
+
+  if (!task.ending && task.status !== 'complete' && !inputGate) {
+    if (task.status === 'failed') {
+      if (!continuationLimit) availableActions.push('retry')
+    } else if (task.status !== 'running') {
+      if (open) {
+        const latestReview = task.review?.runId === task.runId ? task.review : undefined
+        if (latestReview?.stage === 'code_review') {
+          if (latestReview.verdict === 'changes_requested') availableActions.push('fix')
+        } else if (latestReview?.stage === 'plan_review') {
+          if (latestReview.verdict === 'accepted') availableActions.push('execute')
+          else if (latestReview.verdict === 'changes_requested') availableActions.push('fix')
+        } else {
+          const hasPlan = hasCurrentUnreviewedPlan(task)
+          const hasCode = Boolean(task.unreviewedCodeActor)
+          if (
+            hasCode &&
+            task.codeRunId === task.runId &&
+            task.planReference?.sourceRunId !== task.runId
+          ) {
+            availableActions.push('review_code')
+            if (hasPlan) availableActions.push('review_plan')
+          } else {
+            if (hasPlan) availableActions.push('review_plan')
+            if (hasCode) availableActions.push('review_code')
+          }
+        }
+      } else if (collaborationPlanAccepted(task)) {
         availableActions.push('execute')
-      } else if (task.status === 'failed') {
-        availableActions.push('retry')
-      } else if (collaborationCodeReviewCurrent(task) && !task.nextStage && !task.pendingWork) {
-        availableActions.push('respond', 'repair')
-      } else if (nextStage) {
-        availableActions.push('continue')
+        if (collaborationCanSwapCodeRoles(task)) availableActions.push('swap_code_roles')
+      } else if (nextStage === 'plan_review') {
+        if (continuationLimit) availableActions.push('execute')
+        else availableActions.push('review_plan')
+      } else if (nextStage === 'plan' && task.automation === 'paused') {
+        availableActions.push('resume')
       }
     }
-    // Keep dismisses its own exact decision gate even while it still waits for an answer.
-    if (!inputGate || collaborationCanKeepPlan(task)) {
-      if (collaborationCanRevisePlan(task)) availableActions.push('revise_plan')
-      if (collaborationCanKeepPlan(task)) availableActions.push('keep_current_plan')
-      if (collaborationCanSwapCodeRoles(task)) availableActions.push('swap_code_roles')
-    }
   }
+
   return {
     inputGate,
     nextStage,
     nextActor: nextStage ? collaborationActor(task, nextStage) : undefined,
     availableActions,
-    continuationLimit:
-      limits && !gated && task.status !== 'running'
-        ? collaborationStageLimit(task, nextStage, limits)
-        : undefined,
+    continuationLimit,
   }
 }
 
@@ -1232,9 +1260,7 @@ export type CollaborationTransitionReason =
         | 'ended'
         | 'complete'
         | 'recorded_control_action'
-        | 'plan_revision_unavailable'
         | 'recovery_only'
-        | 'supplement_receipt_required'
         | 'input_pending'
         | 'not_paused'
         | 'running'
@@ -1242,7 +1268,6 @@ export type CollaborationTransitionReason =
         | 'plan_not_accepted'
         | 'review_not_current'
         | 'no_next_step'
-        | 'write_authorization_required'
         | 'unavailable_action'
     }
 
@@ -1254,6 +1279,65 @@ export class CollaborationTransitionError extends Error {
     super(message)
     this.name = 'CollaborationTransitionError'
   }
+}
+
+/** Advance Phase 1 automatically between plan and plan_review. Open Mode never auto-chains. */
+export function advanceAutomaticCollaboration(
+  task: CollaborationTask,
+  limits: CollaborationLimits,
+): CollaborationTask {
+  if (isCollaborationOpenMode(task))
+    throw new CollaborationTransitionError(
+      { kind: 'no_next_step' },
+      'Open collaboration does not auto-advance.',
+    )
+  if (task.ending)
+    throw new CollaborationTransitionError(
+      { kind: 'ended' },
+      'This task has already ended. Start a new task instead.',
+    )
+  if (task.status === 'complete')
+    throw new CollaborationTransitionError(
+      { kind: 'complete' },
+      'This collaboration is already complete.',
+    )
+  if (task.status === 'running')
+    throw new CollaborationTransitionError(
+      { kind: 'running' },
+      'The current Agent is still working.',
+    )
+  if (task.automation === 'paused')
+    throw new CollaborationTransitionError(
+      { kind: 'paused' },
+      'Continue collaboration before starting its next action.',
+    )
+  const decision = deriveCollaborationDecision(task, limits)
+  if (decision.inputGate)
+    throw new CollaborationTransitionError(
+      { kind: 'input_pending' },
+      'Reply to the questions and wait until your reply has been processed before continuing collaboration.',
+    )
+  if (decision.continuationLimit)
+    throw new CollaborationTransitionError(
+      { kind: 'limit', limit: decision.continuationLimit },
+      'Plan review limit reached.',
+    )
+  const stage = decision.nextStage
+  if (stage !== 'plan' && stage !== 'plan_review')
+    throw new CollaborationTransitionError(
+      { kind: 'no_next_step' },
+      'This task has no next automatic step.',
+    )
+  const next = structuredClone(task)
+  if (stage === 'plan_review') next.discussionRounds++
+  next.stage = stage
+  next.actor = collaborationActor(next, stage)
+  next.status = 'running'
+  next.nextStage = undefined
+  next.authorization = undefined
+  next.notice = undefined
+  next.revision++
+  return collaborationTaskSchema.parse(next)
 }
 
 /** Reserve counters before dispatch; proven-unsent reservations alone may be released. */
@@ -1272,146 +1356,165 @@ export function advanceCollaboration(
       { kind: 'complete' },
       'This collaboration is already complete.',
     )
-  if (action === 'keep_current_plan' || action === 'swap_code_roles')
+  if (action === 'swap_code_roles')
     throw new CollaborationTransitionError(
       { kind: 'recorded_control_action' },
-      action === 'keep_current_plan'
-        ? 'Keeping a Plan is a recorded control action, not a workflow turn.'
-        : 'Swapping code roles is a recorded control action, not a workflow turn.',
+      'Swapping initial implementer is a recorded control action, not a workflow turn.',
     )
-  if (action === 'revise_plan') {
-    if (
-      task.planRevision?.origin !== 'user' ||
-      task.planRevision.startedRunId ||
-      task.planInputSequence !== undefined
-    )
-      throw new CollaborationTransitionError(
-        { kind: 'plan_revision_unavailable' },
-        'The explicit Plan revision is no longer current.',
-      )
-    return advanceCollaboration(
-      { ...task, automation: 'active', pauseReason: undefined },
-      'continue',
-      limits,
-    )
-  }
   if (action === 'recover_plan')
     throw new CollaborationTransitionError(
       { kind: 'recovery_only' },
       'Plan recovery checks the original source; it cannot advance collaboration.',
     )
-  if (
-    [
-      'request_plan_supplement',
-      'request_code_supplement',
-      'confirm_supplement',
-      'cancel_supplement',
-    ].includes(action)
-  )
-    throw new CollaborationTransitionError(
-      { kind: 'supplement_receipt_required' },
-      'A supplement requires its current user decision receipt.',
-    )
   const decision = deriveCollaborationDecision(task, limits)
   const next = structuredClone(task)
+  const open = isCollaborationOpenMode(next)
   if (decision.inputGate)
     throw new CollaborationTransitionError(
       { kind: 'input_pending' },
       'Reply to the questions and wait until your reply has been processed before continuing collaboration.',
     )
-  if (action === 'resume') {
-    if (task.automation !== 'paused')
-      throw new CollaborationTransitionError(
-        { kind: 'not_paused' },
-        'This collaboration is not paused.',
-      )
-    next.automation = 'active'
-    next.pauseReason = undefined
-    next.notice = undefined
-    next.revision++
-    if (task.status !== 'running') {
-      const stage = deriveCollaborationDecision(next).nextStage
-      next.status =
-        collaborationRequiresPlan(next) && collaborationPlanAccepted(next)
-          ? 'ready'
-          : !stage &&
-              !next.planRevision &&
-              next.review?.stage === 'code_review' &&
-              next.review.verdict === 'accepted' &&
-              next.review.inputSequence === collaborationWorkflowInputBasis(next).inputSequence
-            ? 'complete'
-            : 'waiting'
-      if (stage && stage !== 'reply') next.nextStage = stage
-    }
-    return collaborationTaskSchema.parse(next)
-  }
   if (task.status === 'running')
     throw new CollaborationTransitionError(
       { kind: 'running' },
       'The current Agent is still working.',
     )
-  if (task.automation === 'paused')
-    throw new CollaborationTransitionError(
-      { kind: 'paused' },
-      'Continue collaboration before starting its next action.',
+
+  if (action === 'retry') {
+    const legacyPendingAfterReply =
+      !next.openMode &&
+      Boolean(next.pendingWork) &&
+      (next.pendingWork?.stage === 'implement' || next.pendingWork?.stage === 'repair') &&
+      (task.status === 'waiting' || task.status === 'ready') &&
+      !decision.inputGate
+    if (task.status !== 'failed' && !legacyPendingAfterReply)
+      throw new CollaborationTransitionError(
+        { kind: 'unavailable_action' },
+        'Only a stopped or failed turn can be retried.',
+      )
+    if (legacyPendingAfterReply && next.pendingWork) {
+      next.stage = next.pendingWork.stage
+      next.actor = collaborationActor(next, next.pendingWork.stage)
+    } else if (
+      !open &&
+      next.stage === 'plan_review' &&
+      next.discussionRounds < limits.maxDiscussionRounds
     )
+      next.discussionRounds++
+    if (open && next.stage === 'reply') next.stage = 'collaborate'
+    next.automation = 'active'
+    next.pauseReason = undefined
+    next.status = 'running'
+    next.nextStage = undefined
+    next.authorization = undefined
+    next.notice = undefined
+    next.revision++
+    return collaborationTaskSchema.parse(next)
+  }
+
   let stage: CollaborationStage | undefined
-  if (action === 'execute') {
-    if (!collaborationRequiresPlan(task) || !collaborationPlanAccepted(task))
+  let actor: AgentId | undefined
+
+  if (action === 'resume') {
+    if (task.automation !== 'paused' || open || decision.nextStage !== 'plan')
+      throw new CollaborationTransitionError(
+        { kind: 'unavailable_action' },
+        'No paused plan update can be resumed here.',
+      )
+    stage = 'plan'
+    actor = collaborationActor(next, 'plan')
+    next.automation = 'active'
+    next.pauseReason = undefined
+  } else if (action === 'execute') {
+    const phase1AtLimit =
+      !open &&
+      Boolean(next.planReference) &&
+      next.planInputSequence === collaborationWorkflowInputBasis(next).inputSequence &&
+      next.discussionRounds >= limits.maxDiscussionRounds
+    const openPlanAccepted =
+      open &&
+      next.review?.runId === next.runId &&
+      next.review.stage === 'plan_review' &&
+      next.review.verdict === 'accepted'
+    if (!((!open && (collaborationPlanAccepted(next) || phase1AtLimit)) || openPlanAccepted))
       throw new CollaborationTransitionError(
         { kind: 'plan_not_accepted' },
-        'The current plan has not been accepted.',
+        'The current plan is not ready for implementation.',
       )
+    actor = open ? otherAgent(next.review!.actor) : collaborationActor(next, 'implement')
     stage = 'implement'
+    next.openMode = true
+    next.lastCodeActor = actor
+    next.unreviewedPlanActor = undefined
     next.pendingWork = undefined
-  } else if (action === 'respond' || action === 'repair') {
-    if (!collaborationCodeReviewCurrent(task) || task.pendingWork)
+    next.automation = 'active'
+    next.pauseReason = undefined
+  } else if (action === 'review_plan') {
+    if (!next.planReference)
+      throw new CollaborationTransitionError(
+        { kind: 'unavailable_action' },
+        'No plan version is available to review.',
+      )
+    if (open) {
+      if (!hasCurrentUnreviewedPlan(next))
+        throw new CollaborationTransitionError(
+          { kind: 'unavailable_action' },
+          'The current plan revision does not need review.',
+        )
+      actor = otherAgent(next.unreviewedPlanActor!)
+      next.automation = 'active'
+      next.pauseReason = undefined
+    } else {
+      const limit = collaborationStageLimit(next, 'plan_review', limits)
+      if (limit)
+        throw new CollaborationTransitionError(
+          { kind: 'limit', limit },
+          'Plan review limit reached.',
+        )
+      actor = collaborationActor(next, 'plan_review')
+      next.discussionRounds++
+      next.automation = 'active'
+      next.pauseReason = undefined
+    }
+    stage = 'plan_review'
+  } else if (action === 'review_code') {
+    if (!next.unreviewedCodeActor)
       throw new CollaborationTransitionError(
         { kind: 'review_not_current' },
-        'This review has no current response or repair action.',
+        'There are no unreviewed code changes.',
       )
-    stage = action
-  } else if (action === 'retry' || action === 'continue') {
-    stage = decision.nextStage
-    if (!stage)
+    actor = otherAgent(next.unreviewedCodeActor)
+    stage = 'code_review'
+    next.openMode = true
+    next.reviewCycles++
+    next.automation = 'active'
+    next.pauseReason = undefined
+  } else if (action === 'fix') {
+    const latestReview = next.review?.runId === next.runId ? next.review : undefined
+    if (!latestReview || latestReview.verdict !== 'changes_requested')
       throw new CollaborationTransitionError(
-        { kind: 'no_next_step' },
-        'This task has no next automatic step.',
+        { kind: 'review_not_current' },
+        'There is no review requesting changes.',
       )
-    if (stage === 'implement' || stage === 'repair') {
-      if (!task.pendingWork)
-        throw new CollaborationTransitionError(
-          { kind: 'write_authorization_required' },
-          'This writing action requires explicit authorization.',
-        )
+    actor = otherAgent(latestReview.actor)
+    stage = 'collaborate'
+    next.openMode = true
+    if (latestReview.stage === 'code_review') {
+      next.repairAttempts++
+      next.lastCodeActor = actor
     }
+    next.automation = 'active'
+    next.pauseReason = undefined
   }
-  if (!stage || stage === 'reply')
+
+  if (!stage || !actor)
     throw new CollaborationTransitionError(
       { kind: 'unavailable_action' },
       'This collaboration action is unavailable.',
     )
-  const limit = collaborationStageLimit(next, stage, limits)
-  if (limit)
-    throw new CollaborationTransitionError(
-      { kind: 'limit', limit },
-      {
-        plan_review: 'The Session discussion limit has been reached.',
-        code_review: 'The Session review limit has been reached.',
-        repair: 'The Session repair limit has been reached.',
-      }[limit.stage],
-    )
-  if (stage === 'plan_review') {
-    next.discussionRounds++
-  }
-  if (stage === 'code_review') {
-    next.reviewCycles++
-  }
-  if (stage === 'repair' && (!task.pendingWork || task.pendingWork.repairReservationReleased)) {
-    next.repairAttempts++
-  }
+
   next.stage = stage
-  next.actor = collaborationActor(next, stage)
+  next.actor = actor
   next.status = 'running'
   next.nextStage = undefined
   next.authorization = undefined
@@ -1464,7 +1567,19 @@ export type CollaborationStageSettlement =
       document?: CollaborationDocument
       decision?: CollaborationSettlementDecision
     }
-  | { kind: 'work'; authorization: CollaborationWorkAuthorization }
+  | {
+      kind: 'work'
+      authorization: CollaborationWorkAuthorization
+      hasCodeChanges?: boolean
+      hasPublishedPlan?: boolean
+    }
+  | {
+      kind: 'collaborate'
+      authorization: CollaborationTurnAuthorization
+      hasCodeChanges: boolean
+      hasPublishedPlan: boolean
+      decision?: CollaborationSettlementDecision
+    }
   | { kind: 'input_processed'; runId: string; inputSequence: number }
   | { kind: 'input_control'; inputSequence: number }
   | { kind: 'input_needs_user'; decision: CollaborationSettlementDecision }
@@ -1484,49 +1599,42 @@ export function settleCollaborationStage(
       next.pauseReason = 'failure'
       next.notice =
         settlement.reason === 'effects'
-          ? 'The native Turn ended, but its side effects are not settled. Check the original execution before continuing.'
+          ? 'Turn side effects did not settle.'
           : settlement.reason === 'source'
-            ? 'The native Turn ended, but its complete response source is unavailable.'
-            : settlement.reason === 'reply'
-              ? 'Your reply has not been confirmed as processed. Check its response before continuing.'
-              : 'The plan was restored, but your reply has not been confirmed as processed.'
+            ? 'Complete response source is unavailable.'
+            : 'Turn state could not be confirmed.'
       break
     }
     case 'interrupted': {
       const auth = settlement.authorization
+      const legacyStage =
+        !next.openMode &&
+        Boolean(next.pendingWork) &&
+        (auth.stage === 'implement' || auth.stage === 'repair')
+          ? auth.stage
+          : undefined
+      const open = isCollaborationOpenMode(next) || auth.stage === 'collaborate'
       next.status = 'failed'
       next.automation = 'paused'
       next.pauseReason = settlement.stopped ? 'stopped' : 'failure'
-      next.notice = (
-        settlement.notice ??
-        'This Turn did not complete. Check its original delivery before continuing.'
-      ).slice(0, 512)
-      if (auth.stage === 'implement' || auth.stage === 'repair') {
-        if (settlement.unstarted || (settlement.ended && (settlement.failed || settlement.stopped)))
-          next.pendingWork = {
-            stage: auth.stage,
-            runId: auth.runId,
-            inputSequence: auth.inputSequence,
-            ...(auth.planReference ? { planReference: auth.planReference } : {}),
-            ...(settlement.unstarted && settlement.reservation === 'repairAttempts'
-              ? { repairReservationReleased: true }
-              : {}),
-          }
-      } else if (auth.stage !== 'reply' && auth.stage !== 'respond') {
-        next.nextStage = auth.stage
-      }
-      const supplement = auth.userAuthority?.purpose
-      if (supplement === 'supplement_plan' || supplement === 'supplement_code_response') {
-        if (settlement.supplementReviewState === 'not_required') {
-          next.nextStage = supplement === 'supplement_plan' ? 'plan_review' : undefined
-        } else if (
-          supplement === 'supplement_code_response' &&
-          settlement.effectsSettled &&
-          settlement.ended &&
-          settlement.completeResponse
-        ) {
-          next.nextStage = 'code_review'
+      next.notice = settlement.stopped ? undefined : settlement.notice?.slice(0, 512)
+      if (legacyStage) {
+        next.openMode = next.codeRunId ? false : undefined
+        next.nextStage = undefined
+        next.pendingWork = {
+          ...next.pendingWork!,
+          stage: legacyStage,
+          runId: auth.runId,
+          inputSequence: auth.inputSequence,
         }
+        next.inputProcessing = { ...collaborationInputProcessing(next), pending: undefined }
+      } else if (open) {
+        next.openMode = true
+        next.nextStage = undefined
+        next.pendingWork = undefined
+        next.inputProcessing = { ...collaborationInputProcessing(next), pending: undefined }
+      } else {
+        if (auth.stage !== 'reply' && auth.stage !== 'respond') next.nextStage = auth.stage
       }
       if (settlement.unstarted && settlement.reservation)
         next[settlement.reservation] = Math.max(0, next[settlement.reservation] - 1)
@@ -1534,12 +1642,12 @@ export function settleCollaborationStage(
     }
     case 'reply': {
       next.status = 'waiting'
-      if (collaborationRequiresPlan(next))
+      if (isCollaborationOpenMode(next)) next.nextStage = undefined
+      else if (collaborationRequiresPlan(next))
         next.nextStage =
           next.planReference && next.planInputSequence === next.inputSequence
             ? 'plan_review'
             : 'plan'
-      else if (!next.pendingWork) next.nextStage = 'code_review'
       break
     }
     case 'recovered_reply': {
@@ -1550,7 +1658,7 @@ export function settleCollaborationStage(
     }
     case 'recovered_plan': {
       next.status = 'waiting'
-      next.nextStage = 'plan_review'
+      next.nextStage = isCollaborationOpenMode(next) ? undefined : 'plan_review'
       next.notice = undefined
       if (next.pauseReason === 'failure') next.pauseReason = 'user'
       break
@@ -1559,6 +1667,8 @@ export function settleCollaborationStage(
       if (settlement.settled) {
         next.status = 'waiting'
         next.nextStage = 'plan_review'
+        next.unreviewedPlanActor = undefined
+        next.notice = undefined
       } else if (settlement.supersededInput) {
         next.status = 'waiting'
         next.nextStage = 'plan'
@@ -1569,29 +1679,37 @@ export function settleCollaborationStage(
           ...collaborationInputProcessing(next),
           decision: settlement.decision,
         }
-        next.notice = 'Your answers are needed before this plan response can be reviewed.'
+        next.notice = undefined
       } else {
         next.status = 'failed'
         next.nextStage = 'plan'
         next.automation = 'paused'
         next.pauseReason = 'failure'
         next.notice = settlement.observed
-          ? 'The latest plan has not been synced to Pact. Restore its saved native source before continuing.'
-          : 'The Agent ended without a confirmed plan. Ask the plan author to complete it before continuing.'
+          ? 'The latest plan has not been synced to Pact.'
+          : 'The Agent ended without a confirmed plan.'
       }
       break
     }
     case 'review': {
       const auth = settlement.authorization
+      const open = isCollaborationOpenMode(next)
       next.planAcceptanceCoverage = undefined
       next.reviewControlCoverage = undefined
+      if (
+        open &&
+        !settlement.supersededInput &&
+        next.inputProcessing?.pending?.inputSequence === auth.inputSequence &&
+        settlement.verdict !== 'needs_user'
+      ) {
+        next.inputProcessing = { settled: { runId: auth.runId, inputSequence: auth.inputSequence } }
+      }
       if (settlement.document)
         next.review = {
           runId: auth.runId,
           actor: auth.actor,
           stage: auth.stage,
           verdict: settlement.verdict,
-          ...(auth.supplementPlanReturn ? { supplementPlanReturn: true as const } : {}),
           inputSequence: auth.inputSequence,
           ...(auth.planReference ? { planReference: auth.planReference } : {}),
           ...(auth.reviewScopeRef ? { scopeRef: auth.reviewScopeRef } : {}),
@@ -1602,57 +1720,113 @@ export function settleCollaborationStage(
         (auth.stage !== 'plan_review' ||
           (auth.planReference?.version === next.planReference?.version &&
             auth.planReference?.document.sha256 === next.planReference?.document.sha256))
+      if (
+        currentBasis &&
+        ((auth.stage === 'plan_review' && settlement.verdict === 'accepted') ||
+          (auth.stage === 'code_review' &&
+            (settlement.verdict === 'accepted' || settlement.verdict === 'changes_requested')))
+      ) {
+        if (auth.stage === 'plan_review') next.unreviewedPlanActor = undefined
+        if (auth.stage === 'code_review') next.unreviewedCodeActor = undefined
+      }
+      if (open && settlement.verdict !== 'incomplete') {
+        next.automation = 'active'
+        next.pauseReason = undefined
+      }
       if (settlement.verdict === 'accepted' && currentBasis) {
-        const resumingUnchangedPlan =
-          auth.stage === 'plan_review' && next.pendingWork && !collaborationRequiresPlan(next)
-        next.status =
-          auth.stage === 'plan_review'
-            ? resumingUnchangedPlan
-              ? 'waiting'
-              : 'ready'
-            : next.planRevision
-              ? 'waiting'
-              : 'complete'
-        next.nextStage = resumingUnchangedPlan ? next.pendingWork!.stage : undefined
+        if (auth.stage === 'plan_review') {
+          next.status = open ? 'waiting' : 'ready'
+        } else {
+          next.status = next.kind === 'plan' ? 'waiting' : 'complete'
+        }
+        next.nextStage = undefined
+        next.notice = undefined
       } else if (settlement.verdict === 'changes_requested' && currentBasis) {
         next.status = 'waiting'
-        next.nextStage = auth.stage === 'plan_review' ? 'plan' : undefined
+        next.nextStage = auth.stage === 'plan_review' && !open ? 'plan' : undefined
+        next.notice = undefined
       } else if (settlement.verdict === 'incomplete') {
         next.status = 'failed'
-        next.nextStage = auth.stage
+        next.nextStage = open ? undefined : auth.stage
         next.automation = 'paused'
         next.pauseReason = 'failure'
         next.notice = settlement.verdictConflict
-          ? 'The review returned conflicting conclusions. Start a new review to continue.'
-          : 'The review did not provide a complete conclusion. Start a new review to continue.'
-      } else if (
-        settlement.verdict === 'needs_user' &&
-        !(auth.supplementPlanReturn && settlement.supersededInput)
-      ) {
+          ? 'The review returned conflicting conclusions.'
+          : 'The review did not provide a complete conclusion.'
+      } else if (settlement.verdict === 'needs_user') {
         if (!settlement.decision)
           throw new Error('A needs_user review requires a supplied decision.')
+        const priorInput = collaborationInputProcessing(next)
+        const newerPending =
+          priorInput.pending && priorInput.pending.inputSequence > auth.inputSequence
+            ? priorInput.pending
+            : undefined
         next.status = 'questions'
-        next.nextStage = auth.stage === 'plan_review' ? 'plan' : 'code_review'
+        next.nextStage = open ? undefined : auth.stage === 'plan_review' ? 'plan' : 'code_review'
         next.inputProcessing = {
-          ...collaborationInputProcessing(next),
+          ...priorInput,
+          pending: newerPending,
           decision: settlement.decision,
         }
-        next.notice = 'The review needs your decision before collaboration can continue.'
+        next.notice = undefined
       } else {
         next.status = 'waiting'
-        next.nextStage = auth.stage === 'plan_review' ? 'plan' : 'code_review'
+        next.nextStage = auth.stage === 'plan_review' && !open ? 'plan' : undefined
       }
       break
     }
     case 'work': {
+      next.openMode = true
+      next.automation = 'active'
+      next.pauseReason = undefined
       next.status = 'waiting'
-      next.nextStage = 'code_review'
-      if (
-        settlement.authorization.stage === 'implement' ||
-        settlement.authorization.stage === 'repair'
-      ) {
+      next.nextStage = undefined
+      next.pendingWork = undefined
+      next.notice = undefined
+      next.lastCodeActor = settlement.authorization.actor
+      if (settlement.hasCodeChanges !== false) {
         next.codeRunId = settlement.authorization.runId
-        next.pendingWork = undefined
+        next.unreviewedCodeActor = settlement.authorization.actor
+      }
+      if (settlement.hasPublishedPlan) {
+        next.unreviewedPlanActor = settlement.authorization.actor
+      }
+      break
+    }
+    case 'collaborate': {
+      const auth = settlement.authorization
+      const priorInput = collaborationInputProcessing(next)
+      const newerPending =
+        priorInput.pending && priorInput.pending.inputSequence > auth.inputSequence
+          ? priorInput.pending
+          : undefined
+      next.openMode = true
+      next.automation = 'active'
+      next.pauseReason = undefined
+      next.pendingWork = undefined
+      next.nextStage = undefined
+      next.notice = undefined
+      if (settlement.decision) {
+        next.status = 'questions'
+        next.inputProcessing = {
+          ...priorInput,
+          pending: newerPending,
+          decision: settlement.decision,
+        }
+      } else {
+        next.status = 'waiting'
+        next.inputProcessing = {
+          ...(newerPending ? { pending: newerPending } : {}),
+          settled: { runId: auth.runId, inputSequence: auth.inputSequence },
+        }
+        if (settlement.hasCodeChanges) {
+          next.codeRunId = auth.runId
+          next.lastCodeActor = auth.actor
+          next.unreviewedCodeActor = auth.actor
+        }
+        if (settlement.hasPublishedPlan) {
+          next.unreviewedPlanActor = auth.actor
+        }
       }
       break
     }
@@ -1660,11 +1834,7 @@ export function settleCollaborationStage(
       next.inputProcessing = {
         settled: { runId: settlement.runId, inputSequence: settlement.inputSequence },
       }
-      next.notice = next.planRevision
-        ? 'The requirements need a revised Plan. Continue collaboration to update it.'
-        : next.automation === 'paused'
-          ? 'Your reply has been processed. Continue collaboration when you are ready.'
-          : undefined
+      next.notice = undefined
       break
     }
     case 'input_control': {
@@ -1682,7 +1852,7 @@ export function settleCollaborationStage(
         pending: undefined,
         decision: settlement.decision,
       }
-      next.notice = 'More input is needed. Read the response and reply in the message box.'
+      next.notice = undefined
       break
     }
     case 'input_unconfirmed': {
@@ -1690,16 +1860,14 @@ export function settleCollaborationStage(
       next.status = 'failed'
       next.automation = 'paused'
       next.pauseReason = 'failure'
-      next.notice =
-        'Your reply has not been confirmed as processed. Check the response or recovery notice before sending a follow-up.'
+      next.notice = 'Your reply could not be confirmed.'
       break
     }
     case 'input_plan_withdrawn': {
       next.status = 'failed'
       next.automation = 'paused'
       next.pauseReason = 'failure'
-      next.notice =
-        'A later message was withdrawn. Send a follow-up to confirm the current plan before continuing.'
+      next.notice = 'A later message was withdrawn.'
       break
     }
   }
@@ -1708,7 +1876,8 @@ export function settleCollaborationStage(
     settled?.unchanged &&
     ((settlement.kind === 'plan' && settlement.settled) ||
       (settlement.kind === 'review' && next.review?.runId === settlement.authorization.runId) ||
-      settlement.kind === 'work')
+      settlement.kind === 'work' ||
+      settlement.kind === 'collaborate')
   ) {
     if (
       settlement.kind === 'review' &&
@@ -1733,14 +1902,12 @@ export const collaborationViewSchema = z
     accepted: z.boolean().default(false),
     actionable: z.boolean().default(false),
     availableActions: z.array(collaborationActionSchema).max(7).default([]),
-    repairChoiceUnavailable: z.string().min(1).max(160).optional(),
     replacement: z
       .strictObject({
         summary: z.string().max(512),
         unreviewedChanges: z.boolean(),
       })
       .optional(),
-    relayDecision: relayDecisionSchema.optional(),
     nextStep: z.string().max(160).optional(),
     planSync: z
       .strictObject({

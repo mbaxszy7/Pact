@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { advanceCollaboration, collaborationTaskSchema } from '@pact/contracts'
+import { collaborationTaskSchema } from '@pact/contracts'
 
 import { PactDatabase } from './pact-database.js'
 import { agentRuns, workflowTurns, collaborationTasks } from './schema/index.js'
@@ -88,8 +88,9 @@ function finish(
   db: PactDatabase,
   runId: string,
   outcome: 'completed' | 'interrupted' = 'completed',
-  verdict?: 'changes_requested',
+  verdict?: 'changes_requested' | 'accepted',
   processed = false,
+  plan?: string,
 ) {
   const repo = db.conversationRepository,
     run = repo.findRun(runId)!,
@@ -107,6 +108,7 @@ function finish(
     nativeSessionId,
   })
   repo.applyEvent(run.sessionId, runId, { type: 'turn.started', agentId: run.agentId, turnId })
+  if (plan) repo.recordWorkflowPlan(runId, { nativeId: `plan-${runId}`, text: plan })
   if (verdict) repo.recordWorkflowReview(runId, { verdict })
   if (processed) repo.recordWorkflowInputResult(runId, { outcome: 'processed' })
   repo.applyEvent(run.sessionId, runId, {
@@ -142,29 +144,29 @@ function finish(
   repo.reconcileCompletedCollaboration(runId)
 }
 
-async function fresh(stage: 'implement' | 'repair', filePath = ':memory:') {
+async function freshLegacyPlanImplement(filePath = ':memory:') {
   const db = await PactDatabase.open({ filePath, migrationsFolder })
   databases.push(db)
   const repo = db.conversationRepository,
     projectId = randomUUID(),
     sessionId = randomUUID(),
-    taskMessageId = randomUUID(),
+    planMsgId = randomUUID(),
     now = new Date().toISOString()
   db.projectCatalogRepository.add({
     id: projectId,
-    name: 'Original authority',
-    directoryPath: '/fixture/original-authority',
+    name: 'Legacy plan implement authority',
+    directoryPath: '/fixture/legacy-plan-implement',
     kind: 'directory',
     createdAt: now,
   })
   db.sessionRepository.create(
-    { id: sessionId, projectId, title: 'Original authority', createdAt: now },
+    { id: sessionId, projectId, title: 'Legacy plan implement authority', createdAt: now },
     settings,
   )
-  const task = collaborationTaskSchema.parse({
+  const initial = collaborationTaskSchema.parse({
     id: randomUUID(),
     sessionId,
-    kind: 'build',
+    kind: 'plan',
     revision: 0,
     protocol: 'native-workflow-v1',
     owner: 'codex',
@@ -173,86 +175,128 @@ async function fresh(stage: 'implement' | 'repair', filePath = ':memory:') {
     inputSequence: 0,
     handledInputSequence: 0,
     task: 'Implement the bounded original cancellation cleanup only.',
-    taskMessageId,
-    stage: 'implement',
+    taskMessageId: planMsgId,
+    stage: 'plan',
     actor: 'codex',
     status: 'running',
-    runId: taskMessageId,
+    runId: planMsgId,
     planVersion: 0,
     discussionRounds: 0,
     reviewCycles: 0,
     repairAttempts: 0,
   })
-  let write = repo.beginRun({
+  const first = repo.beginRun({
     sessionId,
-    clientMessageId: taskMessageId,
-    content: '/build Implement the bounded original cancellation cleanup only.',
+    clientMessageId: planMsgId,
+    content: '/plan Implement the bounded original cancellation cleanup only.',
     commentIds: [],
     expectedCommentsRevision: 0,
     agentId: 'codex',
     settingsRevision: 1,
     model: null,
     effort: null,
-    collaboration: task,
+    collaboration: initial,
   }).run
-  if (stage === 'repair') {
-    finish(db, write.id)
-    const current = repo.collaboration(sessionId)!,
-      next = advanceCollaboration(current, 'continue', settings)
-    const review = repo.beginRun({
-      sessionId,
-      clientMessageId: randomUUID(),
-      content: 'Review the exact original implementation.',
-      commentIds: [],
-      expectedCommentsRevision: 0,
-      agentId: next.actor,
-      settingsRevision: 1,
-      model: null,
-      effort: null,
-      preserveDraftComments: true,
-      expectedCollaborationRevision: current.revision,
-      collaboration: next,
-      schedulingHandoff: repo.workflowHandoff(current, next.actor),
-    }).run
-    finish(db, review.id, 'completed', 'changes_requested')
-    const prepared = repo.prepareCollaborationAction(
+  finish(db, first.id, 'completed', undefined, false, 'Bounded original cancellation cleanup.')
+  const reviewTask = repo.collaboration(sessionId)!,
+    reviewClientId = randomUUID(),
+    nextReview = {
+      ...reviewTask,
+      stage: 'plan_review' as const,
+      actor: reviewTask.reviewer,
+      status: 'running' as const,
+      discussionRounds: reviewTask.discussionRounds + 1,
+      nextStage: undefined,
+      revision: reviewTask.revision + 1,
+    }
+  const reviewDrafts = repo.readPage({ scope: 'drafts', sessionId })
+  const review = repo.beginRun({
+    sessionId,
+    clientMessageId: reviewClientId,
+    content: 'Review the Plan.',
+    commentIds: [],
+    expectedCommentsRevision: reviewDrafts.scope === 'drafts' ? reviewDrafts.commentsRevision : 0,
+    agentId: nextReview.actor,
+    settingsRevision: 1,
+    model: null,
+    effort: null,
+    preserveDraftComments: true,
+    collaboration: nextReview,
+    expectedCollaborationRevision: reviewTask.revision,
+    schedulingHandoff: repo.workflowHandoff(reviewTask, nextReview.actor),
+  }).run
+  finish(db, review.id, 'completed', 'accepted')
+  const acceptedTask = repo.collaboration(sessionId)!,
+    writeDrafts = repo.readPage({ scope: 'drafts', sessionId })
+  const clientMessageId = randomUUID(),
+    prepared = repo.prepareCollaborationAction(
       {
         sessionId,
-        taskId: task.id,
-        revision: repo.collaboration(sessionId)!.revision,
-        clientMessageId: randomUUID(),
-        action: 'repair',
+        taskId: acceptedTask.id,
+        revision: acceptedTask.revision,
+        clientMessageId,
+        action: 'execute',
       },
       settings,
     )
-    if (!prepared.task || !prepared.next || !prepared.handoff)
-      throw Error('Missing explicit Repair admission')
-    write = repo.beginRun({
-      sessionId,
-      clientMessageId: prepared.receipt.clientNonce,
-      content: 'Repair only the current accepted scope.',
-      commentIds: [],
-      expectedCommentsRevision: 0,
-      agentId: prepared.next.actor,
-      settingsRevision: 1,
-      model: null,
-      effort: null,
-      preserveDraftComments: true,
-      expectedCollaborationRevision: prepared.task.revision,
-      collaboration: prepared.next,
-      schedulingHandoff: prepared.handoff,
-      collaborationActionReceiptId: prepared.receipt.id,
-    }).run
-  }
+  const write = repo.beginRun({
+    sessionId,
+    clientMessageId,
+    content: 'Implement the bounded original cancellation cleanup only.',
+    commentIds: [],
+    expectedCommentsRevision: writeDrafts.scope === 'drafts' ? writeDrafts.commentsRevision : 0,
+    agentId: prepared.next!.actor,
+    settingsRevision: 1,
+    model: null,
+    effort: null,
+    preserveDraftComments: true,
+    collaboration: prepared.next!,
+    expectedCollaborationRevision: acceptedTask.revision,
+    schedulingHandoff: prepared.handoff,
+    collaborationActionReceiptId: prepared.receipt.id,
+  }).run
+  // Simulate pre-open-mode implement state before interruption so Phase 1 reply & pendingWork semantics apply.
+  const preOpen = collaborationTaskSchema.parse({
+    ...repo.collaboration(sessionId)!,
+    openMode: undefined,
+    pendingWork: { stage: 'implement', runId: write.id, inputSequence: 0 },
+  })
+  delete preOpen.openMode
+  const preOpenJson = JSON.stringify(preOpen)
+  db.drizzle
+    .update(collaborationTasks)
+    .set({ stateJson: preOpenJson })
+    .where(eq(collaborationTasks.id, preOpen.id))
+    .run()
+  db.drizzle
+    .update(workflowTurns)
+    .set({ stateJson: preOpenJson })
+    .where(eq(workflowTurns.runId, write.id))
+    .run()
   finish(db, write.id, 'interrupted')
   expect(repo.collaboration(sessionId)).toMatchObject({
     automation: 'paused',
-    pendingWork: { stage, runId: write.id },
+    pendingWork: { stage: 'implement', runId: write.id },
   })
   return { db, repo, sessionId, write }
 }
 
-type Fixture = Awaited<ReturnType<typeof fresh>>
+async function legacyRepairFixture() {
+  const directory = await mkdtemp(join(tmpdir(), 'pact-legacy-repair-'))
+  directories.push(directory)
+  const filePath = join(directory, 'pact.sqlite'),
+    legacy = historical074(filePath, 'repair'),
+    db = await PactDatabase.open({ filePath, migrationsFolder })
+  databases.push(db)
+  return {
+    db,
+    repo: db.conversationRepository,
+    sessionId: legacy.sessionId,
+    writeId: legacy.originalRunId,
+  }
+}
+
+type Fixture = Awaited<ReturnType<typeof freshLegacyPlanImplement>>
 function resume(
   f: { db: PactDatabase; repo: Fixture['repo']; sessionId: string },
   clientMessageId = randomUUID(),
@@ -263,7 +307,7 @@ function resume(
     taskId: task.id,
     revision: task.revision,
     clientMessageId,
-    action: 'resume' as const,
+    action: 'retry' as const,
   }
   const prepared = f.repo.prepareCollaborationAction(input, settings)
   if (!prepared.task || !prepared.next || !prepared.handoff)
@@ -446,68 +490,62 @@ describe('the original explicit unfinished write authority', () => {
     },
   )
 
-  it.each(['implement', 'repair'] as const)(
-    'continues receipt-backed %s after a fully processed read-only status reply',
-    async (stage) => {
-      const f = await fresh(stage),
-        before = f.repo.collaboration(f.sessionId)!,
-        original = f.repo.collaborationTurnAuthorization(f.write.id)!,
-        sources = sourceHashes(f, f.write.id)
-      processedStatus(f)
-      const current = f.repo.collaboration(f.sessionId)!
-      expect(current.inputSequence).toBeGreaterThan(before.inputSequence)
-      expect(current.pendingWork).toEqual(before.pendingWork)
-      expect(current.planReference).toEqual(before.planReference)
-      expect(current.reviewScopeRef).toEqual(before.reviewScopeRef)
-      const continued = resume(f),
-        auth = f.repo.collaborationTurnAuthorization(continued.result.run.id)!
-      expect(auth).toMatchObject({
-        stage,
-        actor: before.owner,
-        userAuthority: {
-          purpose: 'write_continuation',
-          rootReceiptId: original.userAuthority!.rootReceiptId,
-        },
-      })
-      expect(f.repo.collaboration(f.sessionId)?.repairAttempts).toBe(before.repairAttempts)
-      expect(sourceHashes(f, f.write.id)).toEqual(sources)
-    },
-  )
-
-  it.each(['implement', 'repair'] as const)(
-    'keeps the %s root across a second interruption, cold restart and nonce readback',
-    async (stage) => {
-      const directory = await mkdtemp(join(tmpdir(), 'pact-authority-restart-'))
-      directories.push(directory)
-      const filePath = join(directory, 'pact.sqlite'),
-        f = await fresh(stage, filePath),
-        before = f.repo.collaboration(f.sessionId)!,
-        root = f.repo.collaborationTurnAuthorization(f.write.id)!.userAuthority!.rootReceiptId
-      const first = resume(f)
-      expect(f.repo.beginRun(first.admission)).toMatchObject({ created: false })
-      finish(f.db, first.result.run.id, 'interrupted')
-      f.db.close()
-      databases.splice(databases.indexOf(f.db), 1)
-      const db = await PactDatabase.open({ filePath, migrationsFolder })
-      databases.push(db)
-      db.conversationRepository.recoverCollaborationTasks()
-      const resumed = resume({ db, repo: db.conversationRepository, sessionId: f.sessionId }),
-        auth = db.conversationRepository.collaborationTurnAuthorization(resumed.result.run.id)!
-      expect(auth.userAuthority).toMatchObject({
-        rootReceiptId: root,
+  it('continues receipt-backed implement after a fully processed read-only status reply', async () => {
+    const f = await freshLegacyPlanImplement(),
+      before = f.repo.collaboration(f.sessionId)!,
+      original = f.repo.collaborationTurnAuthorization(f.write.id)!,
+      sources = sourceHashes(f, f.write.id)
+    processedStatus(f)
+    const current = f.repo.collaboration(f.sessionId)!
+    expect(current.inputSequence).toBeGreaterThan(before.inputSequence)
+    expect(current.pendingWork).toEqual(before.pendingWork)
+    expect(current.planReference).toEqual(before.planReference)
+    expect(current.reviewScopeRef).toEqual(before.reviewScopeRef)
+    const continued = resume(f),
+      auth = f.repo.collaborationTurnAuthorization(continued.result.run.id)!
+    expect(auth).toMatchObject({
+      stage: 'implement',
+      actor: before.owner,
+      userAuthority: {
         purpose: 'write_continuation',
-      })
-      expect(db.conversationRepository.collaboration(f.sessionId)?.repairAttempts).toBe(
-        before.repairAttempts,
-      )
-      expect(db.conversationRepository.beginRun(resumed.admission)).toMatchObject({
-        created: false,
-      })
-    },
-  )
+        rootReceiptId: original.userAuthority!.rootReceiptId,
+      },
+    })
+    expect(f.repo.collaboration(f.sessionId)?.repairAttempts).toBe(before.repairAttempts)
+    expect(sourceHashes(f, f.write.id)).toEqual(sources)
+  })
+
+  it('keeps the implement root across a second interruption, cold restart and nonce readback', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'pact-authority-restart-'))
+    directories.push(directory)
+    const filePath = join(directory, 'pact.sqlite'),
+      f = await freshLegacyPlanImplement(filePath),
+      before = f.repo.collaboration(f.sessionId)!,
+      root = f.repo.collaborationTurnAuthorization(f.write.id)!.userAuthority!.rootReceiptId
+    const first = resume(f)
+    expect(f.repo.beginRun(first.admission)).toMatchObject({ created: false })
+    finish(f.db, first.result.run.id, 'interrupted')
+    f.db.close()
+    databases.splice(databases.indexOf(f.db), 1)
+    const db = await PactDatabase.open({ filePath, migrationsFolder })
+    databases.push(db)
+    db.conversationRepository.recoverCollaborationTasks()
+    const resumed = resume({ db, repo: db.conversationRepository, sessionId: f.sessionId }),
+      auth = db.conversationRepository.collaborationTurnAuthorization(resumed.result.run.id)!
+    expect(auth.userAuthority).toMatchObject({
+      rootReceiptId: root,
+      purpose: 'write_continuation',
+    })
+    expect(db.conversationRepository.collaboration(f.sessionId)?.repairAttempts).toBe(
+      before.repairAttempts,
+    )
+    expect(db.conversationRepository.beginRun(resumed.admission)).toMatchObject({
+      created: false,
+    })
+  })
 
   it('refuses public role or policy changes while preserving an unfinished write', async () => {
-    const f = await fresh('repair'),
+    const f = await legacyRepairFixture(),
       task = f.repo.collaboration(f.sessionId)!
     expect(() =>
       f.repo.setCollaborationState({
@@ -530,7 +568,7 @@ describe('the original explicit unfinished write authority', () => {
   it.each(['scope', 'owner', 'unsettled'] as const)(
     'rejects the %s negative control without granting a broader continuation',
     async (change) => {
-      const f = await fresh('repair'),
+      const f = await legacyRepairFixture(),
         task = f.repo.collaboration(f.sessionId)!
       if (change === 'scope')
         f.repo.setCollaborationState({
@@ -552,16 +590,16 @@ describe('the original explicit unfinished write authority', () => {
           })
           .where(eq(collaborationTasks.id, task.id))
           .run()
-      if (change === 'unsettled') f.repo.recordNativeEffects(f.write.id, 'unknown')
+      if (change === 'unsettled') f.repo.recordNativeEffects(f.writeId, 'unknown')
       expect(() => resume(f)).toThrow(/original write authorization|native recovery/u)
-      expect(f.repo.findRun(f.write.id)?.dispatchPhase).toBe('ended')
+      expect(f.repo.findRun(f.writeId)?.dispatchPhase).toBe('ended')
     },
   )
 
   it.each(['missing_batch', 'revision', 'member_count'] as const)(
     'rejects a persisted %s input-Batch authority mismatch',
     async (change) => {
-      const f = await fresh('implement'),
+      const f = await freshLegacyPlanImplement(),
         auth = f.repo.collaborationTurnAuthorization(f.write.id)!
       const original = auth.inputBatchRef!
       const changed = {
@@ -583,20 +621,92 @@ describe('the original explicit unfinished write authority', () => {
   )
 
   it('rejects newer input without a completed processed-input result', async () => {
-    const f = await fresh('implement')
+    const f = await freshLegacyPlanImplement()
     processedStatus(f, false)
     expect(() => resume(f)).toThrow(/input|processed/u)
   })
 
   it('rejects Fork provenance even when the projected write otherwise looks settled', async () => {
-    const f = await fresh('repair'),
+    const f = await legacyRepairFixture(),
       source = f.repo.collaboration(f.sessionId)!.codeRunId!
     // Imported Fork provenance cannot promote a projected historical Turn into native authority.
     f.db.drizzle
       .update(agentRuns)
       .set({ forkSourceRunId: source })
-      .where(eq(agentRuns.id, f.write.id))
+      .where(eq(agentRuns.id, f.writeId))
       .run()
     expect(() => resume(f)).toThrow(/authorization|input/u)
+  })
+
+  it('settles interrupted Open Mode work without pendingWork and retries with a fresh action receipt', async () => {
+    const db = await PactDatabase.open({ filePath: ':memory:', migrationsFolder })
+    databases.push(db)
+    const repo = db.conversationRepository,
+      projectId = randomUUID(),
+      sessionId = randomUUID(),
+      taskMessageId = randomUUID(),
+      now = new Date().toISOString()
+    db.projectCatalogRepository.add({
+      id: projectId,
+      name: 'Open mode retry',
+      directoryPath: '/fixture/open-retry',
+      kind: 'directory',
+      createdAt: now,
+    })
+    db.sessionRepository.create(
+      { id: sessionId, projectId, title: 'Open mode retry', createdAt: now },
+      settings,
+    )
+    const initial = collaborationTaskSchema.parse({
+      id: randomUUID(),
+      sessionId,
+      kind: 'build',
+      openMode: true,
+      revision: 0,
+      protocol: 'native-workflow-v1',
+      owner: 'codex',
+      reviewer: 'claude',
+      automation: 'active',
+      inputSequence: 0,
+      handledInputSequence: 0,
+      task: 'Implement Open Mode cleanup.',
+      taskMessageId,
+      stage: 'implement',
+      actor: 'codex',
+      status: 'running',
+      runId: taskMessageId,
+      planVersion: 0,
+      discussionRounds: 0,
+      reviewCycles: 0,
+      repairAttempts: 0,
+    })
+    const first = repo.beginRun({
+      sessionId,
+      clientMessageId: taskMessageId,
+      content: '/build Implement Open Mode cleanup.',
+      commentIds: [],
+      expectedCommentsRevision: 0,
+      agentId: 'codex',
+      settingsRevision: 1,
+      model: null,
+      effort: null,
+      collaboration: initial,
+    }).run
+    finish(db, first.id, 'interrupted')
+    const afterInterrupt = repo.collaboration(sessionId)!
+    expect(afterInterrupt).toMatchObject({
+      openMode: true,
+      status: 'failed',
+      automation: 'paused',
+      stage: 'implement',
+    })
+    expect(afterInterrupt.pendingWork).toBeUndefined()
+    const retried = resume({ db, repo, sessionId })
+    expect(retried.result.created).toBe(true)
+    expect(repo.collaborationTurnAuthorization(retried.result.run.id)?.userAuthority).toMatchObject(
+      {
+        purpose: 'action',
+      },
+    )
   })
 })

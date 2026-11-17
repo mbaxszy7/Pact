@@ -90,7 +90,7 @@ import {
 } from './codex-agent-adapter.js'
 import { CODEX_MAX_FRAME_BYTES } from './codex-app-server-connection.js'
 import { codexProcessEnvironment } from './codex-process-environment.js'
-import { planRevisionReplyInput, planRunInput } from './collaboration-fixture.test-support.js'
+import { phase1ReplyInput, planRunInput } from './collaboration-fixture.test-support.js'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
 
 describe('owned Codex loopback environment', () => {
@@ -202,16 +202,23 @@ import { NATIVE_OWNER_WORKING_BYTES } from './native-working-memory.js'
 const nativeHomes: string[] = []
 
 it.each([
-  'revision_first',
+  'needs_user_first',
   'processed_first',
   'failed_tool',
   'foreign_root',
   'wrong_receipt',
   'uncompleted',
 ] as const)(
-  'passes raw successful Codex revision observations from the exact root (%s)',
+  'passes raw successful Codex input observations from the exact root (%s)',
   async (mode) => {
-    const input = planRevisionReplyInput('codex')
+    const input = phase1ReplyInput('codex')
+    const questions = [
+      {
+        prompt: 'Which cancellation scope should apply?',
+        selection: 'single' as const,
+        options: [{ label: 'Current request' }, { label: 'All pending requests' }],
+      },
+    ]
     const record = vi.fn<NonNullable<AgentRunInput['recordWorkflowInputResult']>>()
     const calls = Promise.withResolvers<void>()
     const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
@@ -231,9 +238,9 @@ it.each([
         respond({ id, result: { thread: { id: 'revision-thread' } } })
       } else if (method === 'turn/start') {
         respond({ id, result: { turn: { id: 'revision-turn' } } })
-        const call = async (outcome: 'processed' | 'plan_revision_required') => {
-          const revision = outcome === 'plan_revision_required'
-          const args = { outcome }
+        const call = async (outcome: 'processed' | 'needs_user') => {
+          const needsUser = outcome === 'needs_user'
+          const args = needsUser ? { outcome, questions } : { outcome }
           const rpc = (await fetch(url, {
             method: 'POST',
             headers: { 'content-type': 'application/json', connection: 'close' },
@@ -247,17 +254,17 @@ it.each([
           const result = Reflect.get(rpc, 'result') as object
           if (Reflect.get(result, 'isError') !== false)
             throw Error('MCP rejected the input result.')
-          if (revision && mode === 'failed_tool') Reflect.set(result, 'isError', true)
-          if (revision && mode === 'wrong_receipt')
+          if (needsUser && mode === 'failed_tool') Reflect.set(result, 'isError', true)
+          if (needsUser && mode === 'wrong_receipt')
             Reflect.set(
               Reflect.get(Reflect.get(result, 'structuredContent'), 'pactInputResult'),
               'receipt',
               'foreign-receipt',
             )
           notify({
-            method: revision && mode === 'uncompleted' ? 'item/started' : 'item/completed',
+            method: needsUser && mode === 'uncompleted' ? 'item/started' : 'item/completed',
             params: {
-              threadId: revision && mode === 'foreign_root' ? 'foreign-thread' : 'revision-thread',
+              threadId: needsUser && mode === 'foreign_root' ? 'foreign-thread' : 'revision-thread',
               turnId: 'revision-turn',
               item: {
                 id: outcome,
@@ -276,9 +283,9 @@ it.each([
           try {
             if (mode === 'processed_first') {
               await call('processed')
-              await call('plan_revision_required')
+              await call('needs_user')
             } else {
-              await call('plan_revision_required')
+              await call('needs_user')
               await call('processed')
             }
             calls.resolve()
@@ -313,15 +320,15 @@ it.each([
       })
       await calls.promise
       expect(record.mock.calls.map(([result]) => result.outcome)).toEqual(
-        mode === 'revision_first'
-          ? ['plan_revision_required', 'processed']
+        mode === 'needs_user_first'
+          ? ['needs_user', 'processed']
           : mode === 'processed_first'
-            ? ['processed', 'plan_revision_required']
+            ? ['processed', 'needs_user']
             : ['processed'],
       )
       const ending = evidence.mock.calls.findLast(([event]) => event.kind === 'ended')?.[0]
       expect(ending?.kind === 'ended' && ending.output?.inputResult?.outcome).toBe(
-        mode === 'processed_first' || mode === 'revision_first' ? 'incomplete' : 'processed',
+        mode === 'processed_first' || mode === 'needs_user_first' ? 'incomplete' : 'processed',
       )
     } finally {
       await adapter.dispose()

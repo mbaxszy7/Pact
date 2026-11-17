@@ -58,6 +58,7 @@ import {
   compareConversationDisplayOrder,
   conversationMessageOrder,
   isConversationBackgroundReport,
+  otherAgent,
   CONVERSATION_MARKDOWN_BYTES,
   parseComposerCommandPrefix,
   CONVERSATION_WINDOW_MESSAGES,
@@ -67,6 +68,7 @@ import {
   collaborationActor,
   collaborationInputProcessing,
   defaultTaskStageRoles,
+  isCollaborationOpenMode,
   pactEntryPrimary,
 } from '@pact/contracts'
 
@@ -786,7 +788,10 @@ export function ConversationView({
     void read()
   }, [session.id, planReadKey, visible])
   const currentTask = currentPlan?.sessionId === session.id ? currentPlan.task : undefined
-  const planningTask = currentTask?.kind === 'plan' ? currentTask : undefined
+  const planningTask =
+    currentTask && (currentTask.kind === 'plan' || Boolean(currentTask.planReference))
+      ? currentTask
+      : undefined
   const unfinishedTask = currentTask?.status === 'complete' ? undefined : currentTask
   const inputGateState = unfinishedTask ? collaborationInputGate(unfinishedTask) : undefined
   const planRecovery =
@@ -2366,15 +2371,35 @@ export function ConversationView({
   )
   const pactCommandHint = (() => {
     if (!composerPrefix.pact || composerPrefix.error) return undefined
+    const inTaskReviewHint =
+      composerPrefix.pact === 'review' &&
+      unfinishedTask &&
+      !unfinishedTask.ending &&
+      isCollaborationOpenMode(unfinishedTask) &&
+      (unfinishedTask.kind === 'plan' || unfinishedTask.kind === 'build')
+    if (inTaskReviewHint) {
+      const explicit =
+        composerPrefix.route?.type === 'agent'
+          ? composerPrefix.route.agentId
+          : composerRoute?.type === 'agent'
+            ? composerRoute.agentId
+            : undefined
+      const fallbackReviewer = otherAgent(
+        unfinishedTask.unreviewedCodeActor ??
+          unfinishedTask.lastCodeActor ??
+          collaborationActor(unfinishedTask, 'implement'),
+      )
+      return `${agentName(explicit ?? fallbackReviewer)} reviews code.`
+    }
     const { route } = resolveComposerRoute(editorValue, session.settings.primaryAgentId)
     if (route.type !== 'agent') return undefined
     const roles = defaultTaskStageRoles(
       pactEntryPrimary(composerPrefix.pact, session.settings.primaryAgentId, route.agentId),
     )
     return composerPrefix.pact === 'plan'
-      ? `${agentName(roles.planAuthor)} plans · ${agentName(roles.codeAuthor)} implements · ${agentName(roles.codeReviewer)} reviews code.`
+      ? `${agentName(roles.planAuthor)} drafts plan · ${agentName(roles.planReviewer)} reviews plan.`
       : composerPrefix.pact === 'build'
-        ? `${agentName(roles.codeAuthor)} implements · ${agentName(roles.codeReviewer)} reviews code.`
+        ? `${agentName(roles.codeAuthor)} implements.`
         : `${agentName(roles.codeReviewer)} reviews code.`
   })()
   const dismissMentionMenu = (): void => {
@@ -2553,7 +2578,14 @@ export function ConversationView({
       return
     }
     if (replacement) return
-    if (prefix.pact && unfinishedTask) {
+    const inTaskReview = Boolean(
+      prefix.pact === 'review' &&
+      unfinishedTask &&
+      !unfinishedTask.ending &&
+      isCollaborationOpenMode(unfinishedTask) &&
+      (unfinishedTask.kind === 'plan' || unfinishedTask.kind === 'build'),
+    )
+    if (prefix.pact && unfinishedTask && !inTaskReview) {
       setReplacementFailed(false)
       setReplacement({
         sessionId: session.id,
@@ -2564,10 +2596,7 @@ export function ConversationView({
       return
     }
     const submittedDecisionKey = decisionKey
-    const targetRoute =
-      unfinishedTask && sendRoute?.type === 'primary' && !prefix.pact
-        ? { type: 'agent' as const, agentId: defaultRecipient }
-        : sendRoute
+    const targetRoute = sendRoute
     const sent = await onSend(
       document.text,
       draftComments.map((comment) => comment.id),
@@ -2901,7 +2930,8 @@ export function ConversationView({
             runId: requested.runId,
             messageId: source.messageId,
             version: requested.version,
-            author: collaborationActor(task, 'plan'),
+            author:
+              task.planReference.author ?? task.planAuthor ?? collaborationActor(task, 'plan'),
             content: '',
             document: task.planReference.document,
             sessionId: requested.sessionId,
@@ -3842,33 +3872,39 @@ export function ConversationView({
                         runId: currentPlan.source.runId,
                         messageId: currentPlan.source.messageId,
                         version: planningTask.planVersion,
-                        author: collaborationActor(planningTask, 'plan'),
+                        author:
+                          planningTask.planReference.author ??
+                          planningTask.planAuthor ??
+                          collaborationActor(planningTask, 'plan'),
                         content: '',
                         document: planningTask.planReference.document,
                         sessionId: session.id,
                         status: currentPlan.planSync
-                          ? currentPlan.planSync.kind === 'response'
-                            ? 'Response awaiting recovery'
-                            : 'Newer revision not synced'
-                          : planningTask.status === 'running'
-                            ? {
-                                plan: 'Updating plan',
-                                plan_review: 'Under review',
-                                implement: 'Implementing',
-                                code_review: 'Reviewing changes',
-                                respond: 'Responding to review',
-                                repair: 'Repairing changes',
-                                reply: 'Replying to your message',
-                              }[planningTask.stage]
-                            : planningTask.status === 'complete'
-                              ? 'Completed'
-                              : planningTask.automation === 'paused'
-                                ? 'Paused'
-                                : planningTask.status === 'ready'
-                                  ? 'Ready to implement'
-                                  : planningTask.stage === 'plan_review'
-                                    ? 'Awaiting revision'
-                                    : 'Awaiting review',
+                          ? 'Sync recovery required'
+                          : planningTask.status === 'running' && planningTask.stage === 'plan'
+                            ? 'Drafting'
+                            : planningTask.status === 'running' &&
+                                planningTask.stage === 'plan_review'
+                              ? 'In review'
+                              : planningTask.review?.stage === 'plan_review' &&
+                                  planningTask.review.planReference?.version ===
+                                    planningTask.planVersion &&
+                                  planningTask.review.planReference?.document.sha256 ===
+                                    planningTask.planReference.document.sha256
+                                ? planningTask.review.verdict === 'accepted'
+                                  ? 'Accepted'
+                                  : planningTask.review.verdict === 'changes_requested'
+                                    ? 'Changes requested'
+                                    : isCollaborationOpenMode(planningTask)
+                                      ? 'Draft (unreviewed)'
+                                      : 'In review'
+                                : planningTask.unreviewedPlanActor
+                                  ? 'Draft (unreviewed)'
+                                  : isCollaborationOpenMode(planningTask)
+                                    ? 'Accepted'
+                                    : planningTask.stage === 'plan_review'
+                                      ? 'In review'
+                                      : 'Drafting',
                       }
                     : undefined
               }

@@ -11,6 +11,10 @@ import {
   collaborationSourceNativeRootSchema,
   collaborationSourceNativeProofSchema,
   COLLABORATION_PAGE_BYTES,
+  COLLABORATION_PLAN_CHUNK_BYTES,
+  COLLABORATION_PUBLISHED_PLAN_MAX_BYTES,
+  collaborationPublishPlanInputSchema,
+  collaborationOpenPlanPublishAllowed,
   collaborationReviewInputSchema,
   collaborationActor,
   collaborationInputResultSchema,
@@ -92,6 +96,15 @@ export class PactPeerToolServer {
   private titleAccepted = false
   private planRetentionAllowed = false
   private planRetentionCurrent: (() => boolean) | undefined
+  private planPublishState:
+    | { chunks: Buffer[]; byteLength: number; completedMarkdown?: string }
+    | undefined
+
+  acceptPublishedPlan(receipt: string): string | undefined {
+    if (this.turn?.receipt !== receipt) return undefined
+    const markdown = this.planPublishState?.completedMarkdown
+    return markdown && markdown.trim() ? markdown : undefined
+  }
 
   acceptSessionTitle(input: unknown, receipt: string): string | undefined {
     if (!this.titleAllowed || this.titleAccepted || this.turn?.receipt !== receipt) return undefined
@@ -127,6 +140,12 @@ export class PactPeerToolServer {
       authorization ?? collaboration?.authorization,
     )
     this.planRetentionCurrent = planRetentionCurrent
+    this.planPublishState = collaborationOpenPlanPublishAllowed(
+      collaboration,
+      authorization ?? collaboration?.authorization,
+    )
+      ? { chunks: [], byteLength: 0 }
+      : undefined
     this.titleAllowed = requestSessionTitle
     this.titleAccepted = false
     this.turn = new PeerAssistanceTurn(expectedTarget, this.peerAllowed)
@@ -175,6 +194,7 @@ export class PactPeerToolServer {
     this.collaborationAuthorization = undefined
     this.planRetentionAllowed = false
     this.planRetentionCurrent = undefined
+    this.planPublishState = undefined
     this.peerAllowed = false
     this.titleAllowed = false
     this.titleAccepted = false
@@ -442,6 +462,7 @@ export class PactPeerToolServer {
   async dispose(): Promise<void> {
     this.origin = undefined
     if (this.turn) this.endTurn(this.turn.receipt)
+    this.planPublishState = undefined
     this.sourceGrant?.sourceReader?.retire()
     this.sourceGrant = undefined
     const http = this.http
@@ -479,6 +500,18 @@ export class PactPeerToolServer {
           result: {
             // Loaded native Threads cache this catalog. The current Turn validates every capability.
             tools: [
+              {
+                name: 'publish_plan',
+                description:
+                  'Publish an updated Plan Markdown version in open collaboration mode. Pass text (<= 48 KiB UTF-8 per call), optional byte offset, and complete=true on the final chunk (or omit complete/offset to send a small plan in one call). Only available during open collaboration mode; do not use for ordinary Q&A.',
+                inputSchema: collaborationPublishPlanInputSchema.toJSONSchema(),
+                annotations: {
+                  readOnlyHint: false,
+                  destructiveHint: false,
+                  idempotentHint: false,
+                  openWorldHint: false,
+                },
+              },
               {
                 name: 'retain_current_plan',
                 description:
@@ -788,6 +821,77 @@ export class PactPeerToolServer {
                     },
                   }
                 : {}),
+            },
+          }
+        }
+        if (name === 'publish_plan') {
+          let error: string | undefined
+          let published:
+            | { receipt: string; final: boolean; offset: number; byteLength: number }
+            | undefined
+          if (!turn || !this.planPublishState) {
+            error = 'Publishing a Plan update is not enabled for this root turn.'
+          } else if (this.planPublishState.completedMarkdown !== undefined) {
+            error = 'A published Plan has already been finalized in this root turn.'
+          } else {
+            const parsed = collaborationPublishPlanInputSchema.safeParse(args)
+            if (!parsed.success) {
+              error = parsed.error.issues[0]?.message ?? 'Invalid publish_plan arguments.'
+            } else {
+              const expectedOffset = this.planPublishState.byteLength
+              const offset = parsed.data.offset ?? expectedOffset
+              if (offset !== expectedOffset) {
+                error = `Expected Plan byte offset ${expectedOffset}, got ${offset}.`
+              } else {
+                const chunk = Buffer.from(parsed.data.text, 'utf8')
+                const nextByteLength = this.planPublishState.byteLength + chunk.byteLength
+                if (chunk.byteLength > COLLABORATION_PLAN_CHUNK_BYTES) {
+                  error = 'Plan chunk exceeds 48 KiB.'
+                } else if (nextByteLength > COLLABORATION_PUBLISHED_PLAN_MAX_BYTES) {
+                  error = 'Published Plan exceeds the 2 MiB size limit.'
+                } else {
+                  const final = parsed.data.complete ?? true
+                  this.planPublishState.chunks.push(chunk)
+                  this.planPublishState.byteLength = nextByteLength
+                  if (final) {
+                    const markdown = Buffer.concat(this.planPublishState.chunks).toString('utf8')
+                    if (!markdown.trim()) {
+                      this.planPublishState.chunks.pop()
+                      this.planPublishState.byteLength = expectedOffset
+                      error = 'Provide non-empty plan text.'
+                    } else {
+                      this.planPublishState.completedMarkdown = markdown
+                      this.planPublishState.chunks = []
+                    }
+                  }
+                  if (!error) {
+                    published = {
+                      receipt: this.capabilityReceipt,
+                      final,
+                      offset,
+                      byteLength: this.planPublishState.byteLength,
+                    }
+                  }
+                }
+              }
+            }
+          }
+          return {
+            jsonrpc: '2.0',
+            id: request.id,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: error
+                    ? error
+                    : published?.final
+                      ? 'Plan accepted. Finish this root turn normally so Pact records the new Plan version.'
+                      : `Plan chunk recorded (${published?.byteLength ?? 0} bytes). Continue with the next byte offset.`,
+                },
+              ],
+              isError: Boolean(error),
+              ...(published ? { structuredContent: { pactPublishedPlan: published } } : {}),
             },
           }
         }

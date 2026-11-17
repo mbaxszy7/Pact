@@ -41,6 +41,7 @@ import {
 } from '@pact/agent-runtime'
 import {
   nativeCodexSkillListSchema,
+  collaborationOpenPlanPublishAllowed,
   collaborationPlanRetentionAllowed,
   collaborationInputOutcomeAllowed,
 } from '@pact/contracts'
@@ -3215,7 +3216,14 @@ export class CodexAgentAdapter implements AgentAdapter {
       }
     }
     const capturePlan = (nativeId: string, text: string): void => {
-      if (!collaborationPlanMode(workflow, input.promptEnvelope.collaborationAuthorization)) return
+      if (
+        !collaborationPlanMode(workflow, input.promptEnvelope.collaborationAuthorization) &&
+        !collaborationOpenPlanPublishAllowed(
+          workflow,
+          input.promptEnvelope.collaborationAuthorization,
+        )
+      )
+        return
       projectOutput(() => {
         planMemory.resize(4096 + Buffer.byteLength(text) * 4 + text.length * 2)
         submittedPlan = { nativeId, text }
@@ -3685,9 +3693,12 @@ export class CodexAgentAdapter implements AgentAdapter {
           } else if (
             Reflect.get(item, 'type') === 'mcpToolCall' &&
             Reflect.get(item, 'server') === this.peerServerName &&
-            ['submit_review', 'submit_input_result', 'retain_current_plan'].includes(
-              String(Reflect.get(item, 'tool')),
-            ) &&
+            [
+              'submit_review',
+              'submit_input_result',
+              'retain_current_plan',
+              'publish_plan',
+            ].includes(String(Reflect.get(item, 'tool'))) &&
             Reflect.get(item, 'status') === 'completed' &&
             Reflect.get(item, 'error') === null
           ) {
@@ -3698,15 +3709,18 @@ export class CodexAgentAdapter implements AgentAdapter {
                 : undefined
             const inputResultCall = Reflect.get(item, 'tool') === 'submit_input_result'
             const retentionCall = Reflect.get(item, 'tool') === 'retain_current_plan'
+            const publishPlanCall = Reflect.get(item, 'tool') === 'publish_plan'
             const receipt =
               structured && typeof structured === 'object'
                 ? Reflect.get(
                     structured,
-                    retentionCall
-                      ? 'pactPlanRetention'
-                      : inputResultCall
-                        ? 'pactInputResult'
-                        : 'pactReview',
+                    publishPlanCall
+                      ? 'pactPublishedPlan'
+                      : retentionCall
+                        ? 'pactPlanRetention'
+                        : inputResultCall
+                          ? 'pactInputResult'
+                          : 'pactReview',
                   )
                 : undefined
             if (
@@ -3715,7 +3729,17 @@ export class CodexAgentAdapter implements AgentAdapter {
               Reflect.get(receipt, 'receipt') === this.peerToolServer.capabilityReceipt &&
               peerReceipt
             ) {
-              if (retentionCall) {
+              if (publishPlanCall) {
+                if (
+                  result &&
+                  typeof result === 'object' &&
+                  Reflect.get(result, 'isError') !== true &&
+                  Reflect.get(receipt, 'final') === true
+                ) {
+                  const markdown = this.peerToolServer.acceptPublishedPlan(peerReceipt)
+                  if (markdown) capturePlan(`pact-plan-${input.runId}`, markdown)
+                }
+              } else if (retentionCall) {
                 if (
                   result &&
                   typeof result === 'object' &&
@@ -4722,6 +4746,7 @@ export class CodexAgentAdapter implements AgentAdapter {
                 'submit_review',
                 'submit_input_result',
                 'retain_current_plan',
+                'publish_plan',
               ].includes(String(Reflect.get(item, 'tool'))))
           )
             continue
@@ -4853,9 +4878,12 @@ export class CodexAgentAdapter implements AgentAdapter {
             Reflect.get(item, 'type') === 'plan' ||
             (Reflect.get(item, 'type') === 'mcpToolCall' &&
               Reflect.get(item, 'server') === this.peerServerName &&
-              ['submit_review', 'submit_input_result', 'retain_current_plan'].includes(
-                String(Reflect.get(item, 'tool')),
-              ))
+              [
+                'submit_review',
+                'submit_input_result',
+                'retain_current_plan',
+                'publish_plan',
+              ].includes(String(Reflect.get(item, 'tool'))))
           ) {
             // Root plan/review metadata was captured by the owned native observer.
           } else if (CodexAgentAdapter.isPeerTool(item, this.peerServerName)) {

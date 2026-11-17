@@ -10,7 +10,6 @@ import {
   runEffectiveExecutionSettingsSchema,
   relaySchedulingDecisionProofSchema,
   relayNativeRecoveryProofSchema,
-  pactRepairRoleProofSchema,
   relayDecisionReceiptSchema,
   preparedInformationControlSchema,
   schedulingActivityActionResultSchema,
@@ -463,32 +462,6 @@ export function recordRelayDecisionActivity(db: PactDrizzleDatabase, decisionId:
     }
   })()
   if (decision.formatVersion === 4) {
-    if (
-      decision.kind !== 'repair_role_request' ||
-      !pactRepairRoleProofSchema.safeParse(value).success
-    )
-      return
-    const awaiting = decision.state === 'awaiting_answer'
-    const authorized = decision.state === 'available' || decision.state === 'bound'
-    put(db, {
-      id: decision.id,
-      sessionId: decision.sessionId,
-      evaluationId: null,
-      decisionId: decision.id,
-      handoffId: decision.handoffId,
-      reason: 'workflow',
-      action: 'repair',
-      suggestionState: awaiting ? 'awaiting_user' : 'none',
-      actionResult: awaiting
-        ? null
-        : authorized
-          ? 'reserved'
-          : decision.state === 'cancelled'
-            ? 'cancelled'
-            : 'not_sent',
-      unresolved: awaiting || authorized,
-      activityAt: decision.updatedAt,
-    })
     return
   }
   const native = relayNativeRecoveryProofSchema.safeParse(value)
@@ -534,9 +507,7 @@ export function recordRelayDecisionActivity(db: PactDrizzleDatabase, decisionId:
   const action = reassign
     ? ('reassign_roles' as const)
     : proof.data.card.request.category === 'new_authorization'
-      ? proof.data.card.request.operation.kind === 'repair_role_request'
-        ? null
-        : proof.data.card.request.operation.kind
+      ? proof.data.card.request.operation.kind
       : proof.data.card.request.category === 'necessary_information'
         ? 'clarify_prepared_input'
         : null

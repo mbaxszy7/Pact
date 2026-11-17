@@ -690,12 +690,30 @@ describe('workflow tool root capabilities', () => {
     const server = new PactPeerToolServer()
     servers.push(server)
     const url = await server.start(),
+      inputProcessing = { pending: { inputId: randomUUID(), inputSequence: 1 } },
       task = workflowTask({
-        kind: 'build',
+        kind: 'plan',
         stage: 'reply',
-        inputProcessing: { pending: { inputId: randomUUID(), inputSequence: 1 } },
-      })
-    const receipt = server.beginTurn('claude', false, task)
+        inputSequence: 1,
+        inputProcessing,
+      }),
+      replyAuth = {
+        ...task.authorization!,
+        stage: 'reply' as const,
+        replyMode: 'read_only' as const,
+        inputSequence: 1,
+        inputProcessing,
+      }
+    const receipt = server.beginTurn(
+      'claude',
+      false,
+      task,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      replyAuth,
+    )
     expect(await workflowCall(url, 'submit_input_result', { outcome: 'processed' })).toEqual({
       isError: false,
       structuredContent: {
@@ -708,7 +726,16 @@ describe('workflow tool root capabilities', () => {
       { outcome: 'processed', runId: task.runId },
     ])
       expect(server.acceptInputResult(invalid, receipt)).toBeUndefined()
-    const noPending = server.beginTurn('claude', false, { ...task, inputProcessing: {} })
+    const noPending = server.beginTurn(
+      'claude',
+      false,
+      { ...task, inputProcessing: {} },
+      false,
+      undefined,
+      undefined,
+      undefined,
+      { ...replyAuth, inputProcessing: {} },
+    )
     expect(server.acceptInputResult({ outcome: 'processed' }, noPending)).toBeUndefined()
     const notReply = server.beginTurn('claude', false, { ...task, stage: 'implement' })
     expect(server.acceptInputResult({ outcome: 'processed' }, notReply)).toBeUndefined()
@@ -717,20 +744,22 @@ describe('workflow tool root capabilities', () => {
     )
   })
 
-  it('accepts a repair intent only on the exact frozen reply and rejects model-supplied authority', async () => {
+  it('accepts explanation_only on a frozen Phase 1 reply and rejects Open Mode or retired outcomes', async () => {
     const server = new PactPeerToolServer()
     servers.push(server)
     const url = await server.start()
     const inputId = randomUUID()
+    const inputProcessing = { pending: { inputId, inputSequence: 1 } }
     const task = workflowTask({
-      kind: 'build',
+      kind: 'plan',
       stage: 'reply',
       inputSequence: 1,
-      inputProcessing: { pending: { inputId, inputSequence: 1 } },
+      inputProcessing,
     })
     const bare = server.beginTurn('claude', false, task)
-    const intent = { outcome: 'repair_role_request' }
-    expect(await workflowCall(`${url}/${bare}`, 'submit_input_result', intent)).toMatchObject({
+    expect(
+      await workflowCall(`${url}/${bare}`, 'submit_input_result', { outcome: 'explanation_only' }),
+    ).toMatchObject({
       isError: true,
     })
     const receipt = server.beginTurn(
@@ -744,37 +773,65 @@ describe('workflow tool root capabilities', () => {
       {
         ...task.authorization!,
         stage: 'reply',
+        replyMode: 'read_only',
         inputSequence: 1,
-        inputProcessing: task.inputProcessing,
+        inputProcessing,
         replyIntentBasis: {
-          kind: 'repair_role_request',
+          kind: 'explanation_only',
           inputId,
           inputDigest: 'a'.repeat(64),
           priorInputSequence: 0,
           taskRevision: 0,
-          review: {
-            runId: randomUUID(),
+          askCheckpoint: {
+            stage: 'plan',
             actor: 'codex',
-            stage: 'code_review',
-            verdict: 'changes_requested',
-            inputSequence: 0,
-            document: { id: randomUUID(), sha256: 'b'.repeat(64), bytes: 1, chars: 1 },
+            status: 'waiting',
+            automation: 'paused',
+            pauseReason: 'user',
+            inputBasis: {
+              inputSequence: 0,
+            },
           },
         },
       },
     )
-    expect(await workflowCall(`${url}/${receipt}`, 'submit_input_result', intent)).toEqual({
+    expect(
+      await workflowCall(`${url}/${receipt}`, 'submit_input_result', {
+        outcome: 'explanation_only',
+      }),
+    ).toEqual({
       isError: false,
-      structuredContent: { pactInputResult: { ...intent, receipt: server.capabilityReceipt } },
+      structuredContent: {
+        pactInputResult: { outcome: 'explanation_only', receipt: server.capabilityReceipt },
+      },
     })
     expect(
       await workflowCall(`${url}/${receipt}`, 'submit_input_result', {
-        ...intent,
-        actor: 'claude',
-        scope: 'different work',
+        outcome: 'repair_role_request',
       }),
     ).toMatchObject({ isError: true })
-    expect(server.acceptInputResult({ outcome: 'explanation_only' }, receipt)).toBeUndefined()
+    expect(
+      await workflowCall(`${url}/${receipt}`, 'submit_input_result', {
+        outcome: 'plan_revision_required',
+      }),
+    ).toMatchObject({ isError: true })
+    const openTask = workflowTask({
+      kind: 'build',
+      openMode: true,
+      stage: 'collaborate',
+      inputSequence: 1,
+      inputProcessing,
+    })
+    const openReceipt = server.beginTurn('claude', false, openTask)
+    expect(
+      server.acceptInputResult(
+        { outcome: 'needs_user', questions: workflowQuestions },
+        openReceipt,
+      ),
+    ).toBeUndefined()
+    expect(
+      await workflowCall(`${url}/${openReceipt}`, 'submit_input_result', { outcome: 'processed' }),
+    ).toMatchObject({ isError: true })
   })
 
   it('preserves repeated and conflicting observations for the durable settlement owner instead of consuming a one-shot quota', async () => {
@@ -794,14 +851,28 @@ describe('workflow tool root capabilities', () => {
     expect((await workflowCall(url, 'submit_review', conflict)).structuredContent).toEqual({
       pactReview: { ...conflict, receipt: server.capabilityReceipt },
     })
+    const replyProcessing = { pending: { inputId: randomUUID(), inputSequence: 1 } }
+    const replyTask = workflowTask({
+      kind: 'plan',
+      stage: 'reply',
+      inputSequence: 1,
+      inputProcessing: replyProcessing,
+    })
     const reply = server.beginTurn(
       'claude',
       false,
-      workflowTask({
-        kind: 'build',
+      replyTask,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      {
+        ...replyTask.authorization!,
         stage: 'reply',
-        inputProcessing: { pending: { inputId: randomUUID(), inputSequence: 1 } },
-      }),
+        replyMode: 'read_only',
+        inputSequence: 1,
+        inputProcessing: replyProcessing,
+      },
     )
     expect(server.acceptInputResult({ outcome: 'processed' }, reply)).toEqual({
       outcome: 'processed',

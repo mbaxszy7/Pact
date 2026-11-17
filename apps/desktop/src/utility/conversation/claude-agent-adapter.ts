@@ -48,10 +48,15 @@ import {
   type AgentNativeForkWitness,
 } from '@pact/agent-runtime'
 import {
+  COLLABORATION_PLAN_CHUNK_BYTES,
+  COLLABORATION_PUBLISHED_PLAN_MAX_BYTES,
   collaborationSourceReadSchema,
   collaborationReviewInputSchema,
   collaborationInputResultSchema,
   collaborationInputOutcomeAllowed,
+  collaborationPublishPlanInputShape,
+  collaborationPublishPlanInputSchema,
+  collaborationOpenPlanPublishAllowed,
   collaborationPlanRetentionInputSchema,
   collaborationPlanRetentionAllowed,
   nativeBackgroundReportIdentitySchema,
@@ -1791,11 +1796,17 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     }
     const nativePlanning = collaborationPlanMode(workflow, authorization)
     const nativeRetention = collaborationPlanRetentionAllowed(workflow, authorization)
+    const nativeOpenPlanPublish = collaborationOpenPlanPublishAllowed(workflow, authorization)
     const nativeReview = collaborationReviewMode(workflow, authorization)
     const planMemory = queryMemory.reserve(0)
     const metadataMemory = queryMemory.reserve(0)
     const planProofMemory = queryMemory.reserve(0)
     const planPublication = new ClaudePlanPublication()
+    const openPlanPublish: {
+      chunks: Buffer[]
+      byteLength: number
+      completedMarkdown?: string
+    } = { chunks: [], byteLength: 0 }
     let workflowProjectionFailed = false
     let nativePlan: ClaudeNativePlan | undefined
     let planBindingTask: Promise<ClaudeNativePlan | undefined> | undefined
@@ -1977,6 +1988,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     const reviewToolName = `mcp__${this.peerServerName}__submit_review`
     const inputResultToolName = `mcp__${this.peerServerName}__submit_input_result`
     const retentionToolName = `mcp__${this.peerServerName}__retain_current_plan`
+    const publishPlanToolName = `mcp__${this.peerServerName}__publish_plan`
     const nativeInputResult = collaborationInputResultAllowed(workflow, authorization)
     let iterator: AsyncIterator<SDKMessage> | undefined
     const speedInput = input.speed === 'fast' ? Promise.withResolvers<boolean>() : undefined
@@ -2146,6 +2158,125 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                     readOnlyHint: true,
                     destructiveHint: false,
                     idempotentHint: true,
+                    openWorldHint: false,
+                  },
+                },
+              ),
+            ]
+          : []),
+        ...(nativeOpenPlanPublish
+          ? [
+              tool(
+                'publish_plan',
+                'Publish an updated Plan Markdown version in open collaboration mode. Pass text (<= 48 KiB UTF-8 per call), optional byte offset, and complete=true on the final chunk (or omit complete/offset to send a small plan in one call). Only use when revising or updating the Plan itself.',
+                collaborationPublishPlanInputShape,
+                async (raw) => {
+                  if (
+                    this.disposed ||
+                    transportReleased ||
+                    terminalKnown ||
+                    signal.aborted ||
+                    permissionWait.waiting
+                  ) {
+                    return {
+                      content: [
+                        {
+                          type: 'text' as const,
+                          text: 'Publishing a Plan update is currently unavailable.',
+                        },
+                      ],
+                      isError: true,
+                    }
+                  }
+                  if (openPlanPublish.completedMarkdown !== undefined) {
+                    return {
+                      content: [
+                        {
+                          type: 'text' as const,
+                          text: 'A published Plan has already been finalized in this root turn.',
+                        },
+                      ],
+                      isError: true,
+                    }
+                  }
+                  const parsed = collaborationPublishPlanInputSchema.safeParse(raw)
+                  if (!parsed.success) {
+                    return {
+                      content: [
+                        {
+                          type: 'text' as const,
+                          text:
+                            parsed.error.issues[0]?.message ?? 'Invalid publish_plan arguments.',
+                        },
+                      ],
+                      isError: true,
+                    }
+                  }
+                  const expectedOffset = openPlanPublish.byteLength
+                  const offset = parsed.data.offset ?? expectedOffset
+                  if (offset !== expectedOffset) {
+                    return {
+                      content: [
+                        {
+                          type: 'text' as const,
+                          text: `Expected Plan byte offset ${expectedOffset}, got ${offset}.`,
+                        },
+                      ],
+                      isError: true,
+                    }
+                  }
+                  const chunk = Buffer.from(parsed.data.text, 'utf8')
+                  const nextByteLength = openPlanPublish.byteLength + chunk.byteLength
+                  if (chunk.byteLength > COLLABORATION_PLAN_CHUNK_BYTES) {
+                    return {
+                      content: [{ type: 'text' as const, text: 'Plan chunk exceeds 48 KiB.' }],
+                      isError: true,
+                    }
+                  }
+                  if (nextByteLength > COLLABORATION_PUBLISHED_PLAN_MAX_BYTES) {
+                    return {
+                      content: [
+                        {
+                          type: 'text' as const,
+                          text: 'Published Plan exceeds the 2 MiB size limit.',
+                        },
+                      ],
+                      isError: true,
+                    }
+                  }
+                  const final = parsed.data.complete ?? true
+                  openPlanPublish.chunks.push(chunk)
+                  openPlanPublish.byteLength = nextByteLength
+                  if (final) {
+                    const markdown = Buffer.concat(openPlanPublish.chunks).toString('utf8')
+                    if (!markdown.trim()) {
+                      openPlanPublish.chunks.pop()
+                      openPlanPublish.byteLength = expectedOffset
+                      return {
+                        content: [{ type: 'text' as const, text: 'Provide non-empty plan text.' }],
+                        isError: true,
+                      }
+                    }
+                    openPlanPublish.completedMarkdown = markdown
+                    openPlanPublish.chunks = []
+                  }
+                  return {
+                    content: [
+                      {
+                        type: 'text' as const,
+                        text: final
+                          ? 'Plan accepted. Finish your root turn normally so Pact records the new Plan version.'
+                          : `Plan chunk recorded (${openPlanPublish.byteLength} bytes). Continue with the next byte offset.`,
+                      },
+                    ],
+                  }
+                },
+                {
+                  alwaysLoad: true,
+                  annotations: {
+                    readOnlyHint: false,
+                    destructiveHint: false,
+                    idempotentHint: false,
                     openWorldHint: false,
                   },
                 },
@@ -3681,6 +3812,22 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 }
                 continue
               }
+              if (nativeOpenPlanPublish && block.name === publishPlanToolName) {
+                if (
+                  !block.id ||
+                  block.id.length > 1024 ||
+                  (!planCalls.has(block.id) && planCalls.size >= 64)
+                ) {
+                  workflowProjectionFailed = true
+                  throw new AgentExecutionError(
+                    'response_too_large',
+                    'Native plan submission activity exceeded its bounded owner.',
+                    false,
+                  )
+                }
+                planCalls.add(block.id)
+                continue
+              }
               if (nativePlanning && block.name === 'ExitPlanMode') {
                 if (
                   !block.id ||
@@ -3781,7 +3928,22 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 }
                 continue
               }
-              if (planCalls.delete(block.tool_use_id)) continue
+              if (planCalls.delete(block.tool_use_id)) {
+                if (
+                  nativeOpenPlanPublish &&
+                  !block.is_error &&
+                  currentRequestMatched &&
+                  !terminalKnown &&
+                  openPlanPublish.completedMarkdown &&
+                  !planPublication.plan
+                ) {
+                  capturePlan({
+                    nativeId: block.tool_use_id,
+                    text: openPlanPublish.completedMarkdown,
+                  })
+                }
+                continue
+              }
               if (peerToolCallIds.delete(block.tool_use_id)) continue
               const activity = tools.get(block.tool_use_id) ?? {
                 toolName: 'tool',
@@ -4047,7 +4209,11 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       }
     }.bind(this)
     try {
-      metadataMemory.resize(nativePlanning || nativeReview || nativeInputResult ? 256 * 1024 : 0)
+      metadataMemory.resize(
+        nativePlanning || nativeReview || nativeInputResult || nativeOpenPlanPublish
+          ? 256 * 1024
+          : 0,
+      )
       input.recordExecutor?.(nativeExecutorId)
       if (!permissionInput && !speedInput) {
         sessionStarted = true
@@ -4200,6 +4366,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                   ...(nativeReview ? [reviewToolName] : []),
                   ...(nativeInputResult ? [inputResultToolName] : []),
                   ...(nativeRetention ? [retentionToolName] : []),
+                  ...(nativeOpenPlanPublish ? [publishPlanToolName] : []),
                   ...(hasSourceReader
                     ? [`mcp__${this.peerServerName}__read_collaboration_source`]
                     : []),
@@ -4343,6 +4510,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                       hook.tool_name !== reviewToolName &&
                       hook.tool_name !== inputResultToolName &&
                       hook.tool_name !== retentionToolName &&
+                      hook.tool_name !== publishPlanToolName &&
                       ![
                         'Read',
                         'Grep',

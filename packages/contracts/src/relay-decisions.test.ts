@@ -28,11 +28,19 @@ function card(): RelaySchedulingDecision {
     request: {
       category: 'new_authorization',
       operation: {
-        kind: 'supplement_plan',
+        kind: 'extend_plan_review',
         taskId: randomUUID(),
         afterRunId: randomUUID(),
-        actor: 'codex',
-        returnActor: 'claude',
+        actor: 'claude',
+        inputSequence: 0,
+        planReference: {
+          version: 1,
+          sourceRunId: randomUUID(),
+          sourceMessageId: randomUUID(),
+          document: { id: randomUUID(), sha256: 'c'.repeat(64), bytes: 12, chars: 12 },
+        },
+        expectedDiscussionRounds: 3,
+        maximum: 3,
         scopeFingerprint: 'b'.repeat(64),
       },
     },

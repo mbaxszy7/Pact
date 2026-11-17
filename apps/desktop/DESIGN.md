@@ -289,7 +289,7 @@ Composer permission, Project-folder and branch popovers share one presentation: 
 
 The right panel is contextual, resizable and closable. Diff uses dedicated add/remove tokens in both themes and becomes nearly opaque under translucency. Documents preserve comfortable prose measure; Comments retain a visible anchor without obscuring code.
 
-The current full plan is read only in Context's Plan tab. Plan headers expose Expand/Restore beside Close. The Plan pane resizes within the available workspace without a percentage cap or document-width ceiling. In-app expansion keeps the same document, scroll position, Conversation owner and Comment state mounted; its Comment editor and attached drafts remain usable inside the expanded pane. Restoring returns them to the Composer without sending or discarding drafts. Chat preserves complete natural replies and review reports, with a compact footer for the native plan version, review state and next action. Avoid a second full plan or a separate structured-feedback disclosure. A native plan with no ordinary answer still has its compact source/footer and opens the saved plan document. Current Implement, Respond, Repair, Continue collaboration and failure actions remain visible independently of historical folding. Task action rows place one primary action first and bordered secondary actions after it on a single horizontal row that scrolls rather than wraps; at narrow widths repeated Agent suffixes compact while complete accessible names and tooltips remain. A paused task shows one inline `· Paused` status in its header while actual errors and limits stay visible. There is no standalone Pause action. A replaced task's result footer reads Ended, or Ended before review when its last changes were not reviewed.
+The current full plan is read only in Context's Plan tab with one status badge (`Unreviewed`, `Needs update`, `Ready`). Plan headers expose Expand/Restore beside Close. The Plan pane resizes within the available workspace without a percentage cap or document-width ceiling. In-app expansion keeps the same document, scroll position, Conversation owner and Comment state mounted; its Comment editor and attached drafts remain usable inside the expanded pane. Restoring returns them to the Composer without sending or discarding drafts. Chat preserves complete natural replies and review reports, with a compact footer for the native plan version, review state and next action. Avoid a second full plan or a separate structured-feedback disclosure. A native plan with no ordinary answer still has its compact source/footer and opens the saved plan document. Current **Implement plan**, **Review plan**, **Review code**, **Update plan**, **Fix issues**, and **Retry** actions remain visible independently of historical folding. Task action rows place one primary action first and bordered secondary actions after it on a single horizontal row that scrolls rather than wraps; at narrow widths repeated Agent suffixes compact while complete accessible names and tooltips remain. There is no standalone Pause or Continue collaboration action. A replaced task's result footer reads Ended, or Ended before review when its last changes were not reviewed.
 
 The context pane contains Plan, files, Changes and Session settings; findings and author responses live in natural review reports. Native question, form and browser-authorization cards use the same InputReplacement location as workflow decisions, taking priority while their native operation is waiting. Their scrollable content keeps submission and cancellation reachable. Do not add a separate draft-retention caption or Stop row beneath the native card. Ordinary draft state stays mounted and inert until the native request clears, then the workflow decision or ordinary Composer resumes. Tool-approval cards retain their transcript placement. Native question forms present actual provider choices and free input, preserve keyboard/focus/cancellation behavior, and do not create shared task rows or persistent answer chips. Recommendations remain labels rather than submitted answers.
 
@@ -407,14 +407,16 @@ needs approval. Cancellation retains the existing pause semantics and button.
 Activity records the saved arrangement separately from any later implementation result. Layout,
 input replacement, focus, motion and indicator treatment remain unchanged.
 
-An accepted Plan also offers **Swap code roles** directly, beside a quiet line naming who implements
+An accepted Phase 1 Plan also offers **Swap implementer** beside a quiet line naming who implements
 and who reviews code. Its confirmation reuses the task-replacement application dialog under the
-title `Swap code roles?`: list both old-to-new code responsibilities, then state that
-implementation still needs approval. **Keep current roles** takes initial focus; **Swap code
-roles** confirms with `Swapping…` busy text; the close control is `Cancel role change`; Escape or
-cancel returns focus to the Swap action. It saves only the next role version with a settled audit
-receipt: no Run, scope, counter or pause change, and no implementation authorization. The control
-stays available with Relay off; Relay advice never controls it.
+title `Swap implementer?`: list both old-to-new code responsibilities, then state that
+implementation still needs approval. **Keep current roles** takes initial focus; **Swap implementer**
+confirms with `Swapping…` busy text; the close control is `Cancel role change`; Escape or cancel
+returns focus to the Swap action. It saves only the next role version with a settled audit receipt:
+no Run, scope, counter or pause change, and no implementation authorization. The control stays
+available with Relay off and can supersede an unused Relay suggestion card. Sending `/review` over an
+unfinished Open Mode `/plan` or `/build` task shows a quiet in-task review hint rather than a task
+replacement confirmation.
 
 **Revise plan** and **Keep current plan** reuse the task-replacement application dialog: raised
 surface, static edge, a title question, Cancel left and the confirming action right, default focus
