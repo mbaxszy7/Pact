@@ -723,6 +723,8 @@ describe('Decisions choices through the original workflow owner', () => {
     native.decisionCandidate = null
     expect((await f.flow.send(f.input('/plan Preserve the complete original goal.'))).ok).toBe(true)
     await vi.waitFor(() => expect(native.inputs).toHaveLength(3))
+    await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
+    await vi.waitFor(() => expect(f.db.conversationRepository.activeEvaluation()).toBeUndefined())
     const paused = await f.settled()
     expect(paused).toMatchObject({
       stage: 'plan',
@@ -731,7 +733,6 @@ describe('Decisions choices through the original workflow owner', () => {
       pauseReason: 'limit',
       discussionRounds: 1,
     })
-    await vi.waitFor(() => expect(native.decisions).toHaveLength(1))
     expect(f.flow.getSchedulingSettings()).toMatchObject({
       ok: true,
       value: {

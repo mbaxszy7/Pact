@@ -139,65 +139,84 @@ test('clamps both bounds and preserves values inside the interval', () => {
         expect((await view()).task?.planReference).toEqual(plan)
         expect(await readFile(join(ctx.projectDirectory, 'clamp.mjs'), 'utf8')).toBe(code)
         const approved = new Set<string>()
+        const approvePending = async (current: Awaited<ReturnType<typeof view>>) => {
+          const requests = await ctx.page.evaluate(async (sessionId) => {
+            const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+            const page = await bridge.getConversation({ scope: 'messages', sessionId })
+            if (!page.ok || page.value.scope !== 'messages')
+              throw new Error('Native approval state unavailable')
+            const pending = page.value.header.pendingNativeInteractions ?? []
+            if (pending.length > 8)
+              throw new Error('Native approvals exceed the existing interaction bound')
+            return Promise.all(
+              pending.map(async ({ agentId, request }) => {
+                if (!request.operationId)
+                  throw new Error('Native approval has no owned operation identity')
+                const details = await bridge.readNativeInput({
+                  operationId: request.operationId,
+                  requestId: request.id,
+                })
+                return {
+                  agentId,
+                  id: request.id,
+                  details: details.ok ? details.value : undefined,
+                }
+              }),
+            )
+          }, ctx.sessionId)
+          for (const request of requests) {
+            if (!request.details || approved.has(request.id)) continue
+            const details = request.details
+            if (details.kind !== 'approval' || approved.size >= 8)
+              throw new Error('Unexpected native input; no decision was supplied')
+            const label = stageRoleApprovalLabel(details, {
+              directory: ctx.projectDirectory,
+              stage: current.task?.stage,
+              actor: current.task?.actor,
+              secondary,
+              requestedAgent: request.agentId,
+            })
+            if (!label)
+              throw new Error(
+                'Native approval exceeded the exact owned file or verification command scope',
+              )
+            approved.add(request.id)
+            // oxlint-disable-next-line no-await-in-loop -- Inspect and approve one exact live request; never persist a Session rule or change permission settings.
+            await ctx.page
+              .locator(`[data-pact-native-permission=${JSON.stringify(request.id)}]`)
+              .getByRole('button', { name: label, exact: true })
+              .click()
+          }
+        }
         await implement.click()
         await expect
           .poll(
             async () => {
               const current = await view()
-              if (current.task?.status === 'failed')
-                throw await workflowFailure('implementation or code review')
-              const requests = await ctx.page.evaluate(async (sessionId) => {
-                const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
-                const page = await bridge.getConversation({ scope: 'messages', sessionId })
-                if (!page.ok || page.value.scope !== 'messages')
-                  throw new Error('Native approval state unavailable')
-                const pending = page.value.header.pendingNativeInteractions ?? []
-                if (pending.length > 8)
-                  throw new Error('Native approvals exceed the existing interaction bound')
-                return Promise.all(
-                  pending.map(async ({ agentId, request }) => {
-                    if (!request.operationId)
-                      throw new Error('Native approval has no owned operation identity')
-                    const details = await bridge.readNativeInput({
-                      operationId: request.operationId,
-                      requestId: request.id,
-                    })
-                    return {
-                      agentId,
-                      id: request.id,
-                      details: details.ok ? details.value : undefined,
-                    }
-                  }),
-                )
-              }, ctx.sessionId)
-              for (const request of requests) {
-                if (!request.details || approved.has(request.id)) continue
-                const details = request.details
-                if (details.kind !== 'approval' || approved.size >= 8)
-                  throw new Error('Unexpected native input; no decision was supplied')
-                const label = stageRoleApprovalLabel(details, {
-                  directory: ctx.projectDirectory,
-                  stage: current.task?.stage,
-                  actor: current.task?.actor,
-                  secondary,
-                  requestedAgent: request.agentId,
-                })
-                if (!label)
-                  throw new Error(
-                    'Native approval exceeded the exact owned file or verification command scope',
-                  )
-                approved.add(request.id)
-                // oxlint-disable-next-line no-await-in-loop -- Inspect and approve one exact live request; never persist a Session rule or change permission settings.
-                await ctx.page
-                  .locator(`[data-pact-native-permission=${JSON.stringify(request.id)}]`)
-                  .getByRole('button', { name: label, exact: true })
-                  .click()
-              }
-              return current.task?.status
+              if (current.task?.status === 'failed') throw await workflowFailure('implementation')
+              await approvePending(current)
+              return current.task?.stage === 'implement' && current.task.status === 'waiting'
             },
             { timeout: Math.max(1, deadline - Date.now()), intervals: [250, 500, 1000] },
           )
-          .toBe('complete')
+          .toBe(true)
+        const reviewCode = ctx.page.getByRole('button', {
+          name: `Review code · ${primary === 'claude' ? 'Claude Code' : 'Codex'}`,
+          exact: true,
+        })
+        await expect(reviewCode).toBeEnabled()
+        await reviewCode.click()
+        await expect
+          .poll(
+            async () => {
+              const current = await view()
+              if (current.task?.status === 'failed') throw await workflowFailure('code review')
+              await approvePending(current)
+              return current.task?.stage === 'code_review' && current.task.status === 'waiting'
+            },
+            { timeout: Math.max(1, deadline - Date.now()), intervals: [250, 500, 1000] },
+          )
+          .toBe(true)
         const completed = await view()
         expect(completed.task?.review).toMatchObject({
           actor: primary,
