@@ -563,7 +563,8 @@ async function findOwnedAgentProcess(
       const chain = [...parent.chain, child]
       if (
         basename(child.executable) === basename(owner.executable) ||
-        basename(child.executable) === agentId
+        basename(child.executable) === agentId ||
+        basename(child.executable) === `${agentId}.exe`
       )
         matches.push({
           pid,

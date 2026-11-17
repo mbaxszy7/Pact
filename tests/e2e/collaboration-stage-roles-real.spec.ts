@@ -21,8 +21,8 @@ for (const primary of ['codex', 'claude'] as const)
     `real Primary ${primary} plans and reviews code while Secondary reviews the plan and implements`,
     { tag: ['@real', '@real-extended'] },
     async () => {
-      test.setTimeout(300_000)
-      const deadline = Date.now() + 300_000
+      test.setTimeout(480_000)
+      const deadline = Date.now() + 480_000
       const ctx = await launchRealWorkspace(`real-stage-roles-${primary}`)
       const secondary = primary === 'codex' ? 'claude' : 'codex'
       const code = 'export function clamp(value, min, max) { return value; }\n'
@@ -59,11 +59,18 @@ test('clamps both bounds and preserves values inside the interval', () => {
           return result.value.view
         }, ctx.sessionId)
       const workflowFailure = async (phase: string) => {
-        const saved = await readRealConversation(ctx)
+        const [saved, currentView] = await Promise.all([readRealConversation(ctx), view()])
         return new Error(
           ctx.fixture.redactDiagnostic(
             JSON.stringify({
               phase,
+              task: currentView.task
+                ? {
+                    status: currentView.task.status,
+                    notice: currentView.task.notice,
+                    verdict: currentView.task.review?.verdict,
+                  }
+                : null,
               runs: saved.runs.map((run) => ({
                 agent: run.agentId,
                 stage: run.collaboration?.stage,

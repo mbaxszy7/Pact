@@ -27,7 +27,11 @@ export function releaseNoteBusinessOutcome(text: string, date: string | null) {
   const content = text.trim(),
     dates = calendarDates(content),
     question = /[?\uFF1F]/u.test(content),
-    questionCount = (content.match(/[?\uFF1F]/gu) ?? []).length,
+    questionCount = new Set(
+      (content.match(/[^.!?\n\u3002\uFF01\uFF1F]*[?\uFF1F]/gu) ?? []).map((clause) =>
+        clause.trim().replace(/\s+/gu, ' ').toLowerCase(),
+      ),
+    ).size,
     asksForDate =
       /\b(?:what|which|when)\b[^\n.!]{0,90}\b(?:date|launch)\b|\b(?:please|could you|can you)\b[^\n.!]{0,90}\b(?:date|launch)\b|\b(?:need|awaiting|waiting for)\b[^\n.!]{0,40}\b(?:your|the)\s+(?:launch\s+)?date\b/iu.test(
         content,

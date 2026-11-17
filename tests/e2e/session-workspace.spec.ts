@@ -52,12 +52,17 @@ test(
       await expect(window.getByText(/Session in project-two/)).toBeVisible()
       await window.getByRole('button', { name: 'Create Session' }).click()
 
-      const firstProjectGroup = window
+      const firstProjectId = await window
         .getByRole('button', { name: 'Rename Project project-one', exact: true })
         .locator('../..')
-      const secondProjectGroup = window
+        .getAttribute('data-project-menu')
+      const secondProjectId = await window
         .getByRole('button', { name: 'Rename Project project-two', exact: true })
         .locator('../..')
+        .getAttribute('data-project-menu')
+      if (!firstProjectId || !secondProjectId) throw new Error('Expected Project navigation rows.')
+      const firstProjectGroup = window.locator(`[data-drop-project="${firstProjectId}"]`)
+      const secondProjectGroup = window.locator(`[data-drop-project="${secondProjectId}"]`)
       await expect(
         firstProjectGroup.getByRole('button', { name: 'New session', exact: true }),
       ).toHaveCount(0)

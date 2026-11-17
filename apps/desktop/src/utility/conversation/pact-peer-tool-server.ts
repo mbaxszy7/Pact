@@ -809,7 +809,7 @@ export class PactPeerToolServer {
                 {
                   type: 'text',
                   text: verdict
-                    ? 'Verdict validated. Finish this root turn; Pact will bind the conclusion to the reviewed sources after normal completion.'
+                    ? 'Verdict validated. Include a non-empty natural-language review report in your assistant response before ending this root turn; Pact will bind the conclusion to the reviewed sources after normal completion.'
                     : 'No independent review is active for this root turn.',
                 },
               ],

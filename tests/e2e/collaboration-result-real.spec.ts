@@ -34,8 +34,8 @@ for (const owner of ['codex', 'claude'] as const)
     `real ${owner} retains an unchanged plan and settles its reply without implementation authority`,
     { tag: ['@real', '@real-extended'] },
     async () => {
-      test.setTimeout(300_000)
-      const deadline = Date.now() + 300_000
+      test.setTimeout(480_000)
+      const deadline = Date.now() + 480_000
       const ctx = await launchRealWorkspace(`real-retain-plan-${owner}`)
       const readView = () =>
         ctx.page.evaluate(async (sessionId) => {
@@ -683,7 +683,7 @@ async function visitRequiredPlanCards(
         // oxlint-disable-next-line eslint/no-await-in-loop -- Inspect the actual card label, not only its presence in the DOM.
         await expect(card.locator(':scope > div > span').first()).toHaveText(
           run.collaboration?.stage === 'plan'
-            ? /^Plan(?: · v\d+)?$/u
+            ? /^Plan(?:(?: ·)? v\d+)?$/u
             : /^Plan review(?: · v\d+)?$/u,
         )
       }

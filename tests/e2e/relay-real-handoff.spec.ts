@@ -256,8 +256,11 @@ async function resume(page: Page, sessionId: string) {
       const saved = await bridge.saveSessionSettings({
         sessionId: payload.sessionId,
         settings: {
-          ...editor.value.session.settings,
+          primaryAgentId: editor.value.session.settings.primaryAgentId,
+          agents: editor.value.session.settings.agents,
           maxDiscussionRounds: editor.value.session.settings.maxDiscussionRounds + 1,
+          maxReviewCycles: editor.value.session.settings.maxReviewCycles,
+          maxRepairAttempts: editor.value.session.settings.maxRepairAttempts,
         },
       })
       if (!saved.ok) return { ok: false, error: saved.error.code }

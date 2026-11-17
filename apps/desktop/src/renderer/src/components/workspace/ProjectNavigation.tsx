@@ -257,6 +257,7 @@ export function ProjectNavigation({
   }, [dissolving])
   const highlightTimer = useRef<number | undefined>(undefined)
   const pendingFocus = useRef<string | undefined>(undefined)
+  const scrollFocusIndex = useRef<number | undefined>(undefined)
   const readInFlight = useRef(false)
   const intentGeneration = useRef(0)
   const lastExternalIntent = useRef<NavigationIntent | undefined>(undefined)
@@ -599,6 +600,8 @@ export function ProjectNavigation({
     useFlushSync: false,
   })
   const visibleRows = virtualizer.getVirtualItems()
+  const firstVirtualIndex = visibleRows[0]?.index
+  const lastVirtualIndex = visibleRows.at(-1)?.index
   const mountedRows = visibleRows.flatMap((item) => rows[item.index] ?? [])
   const viewKey = mountedRows.map((row) => row.key).join(',')
   const recordDrop = useNavigationRowMotion(scrollRef, rows, viewKey, updateDropRows)
@@ -628,6 +631,25 @@ export function ProjectNavigation({
       pendingFocus.current = undefined
     }
   }, [viewKey, jump])
+
+  useLayoutEffect(() => {
+    const index = scrollFocusIndex.current
+    if (
+      index === undefined ||
+      firstVirtualIndex === undefined ||
+      lastVirtualIndex === undefined ||
+      document.activeElement !== document.body
+    )
+      return
+    const nearest = Math.max(firstVirtualIndex, Math.min(index, lastVirtualIndex))
+    const button = scrollRef.current?.querySelector<HTMLElement>(
+      `[data-nav-index="${nearest}"] [data-nav-primary]`,
+    )
+    if (button) {
+      button.focus({ preventScroll: true })
+      scrollFocusIndex.current = undefined
+    }
+  }, [firstVirtualIndex, lastVirtualIndex])
 
   useEffect(() => {
     if (!highlight) return
@@ -1110,8 +1132,8 @@ export function ProjectNavigation({
         <button
           className={ACTION}
           type="button"
-          aria-label="Add Project"
-          title="Add Project"
+          aria-label="Add project"
+          title="Add project"
           disabled={adding}
           onClick={onAddProject}
         >
@@ -1170,6 +1192,15 @@ export function ProjectNavigation({
         className="relative mt-group min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
         aria-label="Projects and Sessions"
         onScroll={() => {
+          const focused = document.activeElement
+          if (focused instanceof HTMLElement && scrollRef.current?.contains(focused)) {
+            const index = Number(
+              focused.closest('[data-nav-index]')?.getAttribute('data-nav-index'),
+            )
+            scrollFocusIndex.current = Number.isInteger(index) ? index : undefined
+          } else if (focused !== document.body) {
+            scrollFocusIndex.current = undefined
+          }
           if (menu) closeMenu(false)
           if (editorAnchor) closeEditor(false)
         }}

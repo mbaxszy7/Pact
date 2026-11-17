@@ -3,11 +3,22 @@
 import type { ComponentProps } from 'react'
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useState } from 'react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
+import type {
+  CollaborationSession,
+  Project,
+  RpcResult,
+  SessionPage,
+  SessionPageInput,
+} from '@pact/contracts'
+
+import { SESSION_CATALOG_PAGE_ITEMS } from '@pact/contracts'
+
 import type { DecisionAnswerDraft } from '../conversation/useConversation'
+import type { SessionWorkspaceFlow } from './useSessionWorkspace'
 
 import { CollaborationQuestionCard } from '../conversation/CollaborationQuestionCard'
 import { InputReplacement } from '../ui/InputReplacement'
@@ -270,4 +281,282 @@ it('hides pending input on every settings page and preserves both drafts when re
     expect(message.value).toBe('Ordinary message draft')
   }
   expect(props.onSendMessage).not.toHaveBeenCalled()
+})
+
+it('renders Add project and preserves keyboard focus across ProjectNavigation virtual scroll', async () => {
+  const rect = {
+    top: 0,
+    left: 0,
+    right: 240,
+    bottom: 200,
+    width: 240,
+    height: 200,
+    x: 0,
+    y: 0,
+    toJSON: () => ({}),
+  }
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(rect)
+  vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(200)
+  vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(240)
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      private callback: ResizeObserverCallback
+      constructor(callback: ResizeObserverCallback) {
+        this.callback = callback
+      }
+      observe(target: Element) {
+        this.callback(
+          [
+            // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Test ResizeObserver entry shape in jsdom.
+            {
+              target,
+              contentRect: rect,
+              borderBoxSize: [{ inlineSize: 240, blockSize: 200 }],
+            } as unknown as ResizeObserverEntry,
+          ],
+          this,
+        )
+      }
+      unobserve() {}
+      disconnect() {}
+    },
+  )
+
+  const { ProjectNavigation } =
+    await vi.importActual<typeof import('./ProjectNavigation')>('./ProjectNavigation')
+  const projects: Project[] = Array.from({ length: 60 }, (_, index) => ({
+    id: crypto.randomUUID(),
+    name: `Project ${String(index).padStart(2, '0')}`,
+    directoryPath: `/tmp/project-${index}`,
+    kind: 'directory',
+    createdAt: new Date(Date.parse('2026-10-23T00:00:00.000Z') + index).toISOString(),
+  }))
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Controlled workspace stub for ProjectNavigation virtual scroll verification.
+  const workspace = {
+    catalog: {
+      navigation: {
+        projects: Object.fromEntries(
+          projects.map((project) => [
+            project.id,
+            {
+              hasGroups: false,
+              revision: 0,
+              windows: {
+                ungrouped: {
+                  kind: 'page' as const,
+                  projectId: project.id,
+                  scope: { kind: 'ungrouped' as const },
+                  groupRevision: 0,
+                  revision: 0,
+                  ids: [],
+                  hasGroups: false,
+                  touched: 0,
+                },
+              },
+            },
+          ]),
+        ),
+      },
+      sessions: [],
+    },
+    creating: false,
+    writingOrganization: false,
+    checkingWrite: false,
+    setVisibleWindows: vi.fn<() => void>(),
+    loadPage: vi.fn<SessionWorkspaceFlow['loadPage']>().mockResolvedValue(true),
+    loadGroups: vi.fn<SessionWorkspaceFlow['loadGroups']>().mockResolvedValue(true),
+  } as unknown as SessionWorkspaceFlow
+  const base = fixture()
+  render(
+    <ProjectNavigation
+      projects={projects}
+      sessions={[]}
+      workspace={workspace}
+      loading={false}
+      adding={false}
+      navigationVisible={false}
+      settingsButtonRef={base.settingsButtonRef}
+      onAddProject={base.onAddProject}
+      onArchiveProject={base.onArchiveProject}
+      onRenameProject={base.onRenameProject}
+      onOpenSettings={base.onOpenSettings}
+      onRetrySessions={base.onRetrySessions}
+      onStartSession={base.onStartSession}
+      onSelectSession={base.onSelectSession}
+      onArchiveSession={base.onArchiveSession}
+    />,
+  )
+
+  try {
+    expect(screen.getByRole('button', { name: /^Add project$/u })).toBeTruthy()
+    const nav = screen.getByRole('navigation', { name: 'Projects and Sessions' })
+    Object.defineProperty(nav, 'clientHeight', { value: 200, configurable: true })
+    Object.defineProperty(nav, 'scrollHeight', { value: 2400, configurable: true })
+
+    const firstProjectButton = screen.getByRole('button', {
+      name: /^Rename Project Project 00$/u,
+    })
+    firstProjectButton.focus()
+    expect(nav.contains(document.activeElement)).toBe(true)
+
+    nav.scrollTop = 1400
+    fireEvent.scroll(nav)
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: /^Rename Project Project 00$/u })).toBeNull(),
+    )
+    expect(nav.contains(document.activeElement)).toBe(true)
+  } finally {
+    vi.restoreAllMocks()
+  }
+})
+
+it('rebases loadPage after CONFLICT on explicit older page to load five unseen sessions', async () => {
+  const projectId = crypto.randomUUID()
+  const project: Project = {
+    id: projectId,
+    name: 'Catalog scale',
+    directoryPath: '/tmp/catalog-scale',
+    kind: 'git',
+    createdAt: '2026-10-23T00:00:00.000Z',
+  }
+  const baseSettings: CollaborationSession['settings'] = {
+    primaryAgentId: 'codex',
+    agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+    maxDiscussionRounds: 6,
+    maxReviewCycles: 3,
+    maxRepairAttempts: 3,
+  }
+  const makeSession = (index: number): CollaborationSession => {
+    const createdAt = new Date(Date.parse('2026-10-23T00:00:00.000Z') + index).toISOString()
+    return {
+      id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+      projectId,
+      title: `Session ${index}`,
+      titleSource: 'user',
+      status: 'idle',
+      activity: { state: 'idle' },
+      hasUnread: false,
+      settings: baseSettings,
+      settingsRevision: 1,
+      createdAt,
+      updatedAt: createdAt,
+    }
+  }
+  const firstBatch = [990, 980, 970, 960, 950].map(makeSession)
+  const secondBatch = [940, 930, 920, 910, 900].map(makeSession)
+  const pageCursor = (last: CollaborationSession, revision: number): SessionPage['nextCursor'] => ({
+    projectId,
+    scope: { kind: 'ungrouped' },
+    revision,
+    direction: 'older',
+    createdAt: last.createdAt,
+    id: last.id,
+  })
+  const firstCursor = pageCursor(firstBatch.at(-1)!, 1)
+  const rebasedCursor1 = pageCursor(firstBatch.at(-1)!, 2)
+  const rebasedCursor2 = pageCursor(secondBatch.at(-1)!, 2)
+
+  const getSessionPage = vi.fn<(input: SessionPageInput) => Promise<RpcResult<SessionPage>>>(
+    async (input: SessionPageInput) => {
+      if (!input.cursor && getSessionPage.mock.calls.length === 1) {
+        return {
+          ok: true as const,
+          value: {
+            kind: 'page' as const,
+            projectId,
+            scope: { kind: 'ungrouped' as const },
+            groupRevision: 0,
+            revision: 1,
+            sessions: firstBatch,
+            nextCursor: firstCursor,
+            hasGroups: false,
+          },
+        }
+      }
+      if (input.cursor?.revision === 1) {
+        return {
+          ok: false as const,
+          error: { code: 'CONFLICT' as const, message: 'Revision changed.' },
+        }
+      }
+      if (!input.cursor) {
+        return {
+          ok: true as const,
+          value: {
+            kind: 'page' as const,
+            projectId,
+            scope: { kind: 'ungrouped' as const },
+            groupRevision: 0,
+            revision: 2,
+            sessions: firstBatch,
+            nextCursor: rebasedCursor1,
+            hasGroups: false,
+          },
+        }
+      }
+      return {
+        ok: true as const,
+        value: {
+          kind: 'page' as const,
+          projectId,
+          scope: { kind: 'ungrouped' as const },
+          groupRevision: 0,
+          revision: 2,
+          sessions: secondBatch,
+          nextCursor: rebasedCursor2,
+          hasGroups: false,
+        },
+      }
+    },
+  )
+
+  vi.stubGlobal('pact', { getSessionPage })
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  function Harness() {
+    const workspace = useSessionWorkspace(true, [project], () => {})
+    const [loadedState, setLoadedState] = useState('idle')
+    const ids = workspace.catalog?.navigation?.projects[projectId]?.windows.ungrouped?.ids ?? []
+    return (
+      <>
+        <button
+          type="button"
+          onClick={() => {
+            void workspace
+              .loadPage({
+                projectId,
+                scope: { kind: 'ungrouped' },
+                cursor: firstCursor,
+              })
+              .then((result) => setLoadedState(String(result)))
+          }}
+        >
+          Load older
+        </button>
+        <output aria-label="Loaded state">{loadedState}</output>
+        <output aria-label="Window ids">{JSON.stringify(ids)}</output>
+      </>
+    )
+  }
+  render(
+    <QueryClientProvider client={client}>
+      <Harness />
+    </QueryClientProvider>,
+  )
+
+  await waitFor(() =>
+    expect(JSON.parse(screen.getByLabelText('Window ids').textContent ?? '[]')).toEqual(
+      firstBatch.map((item) => item.id),
+    ),
+  )
+
+  fireEvent.click(screen.getByRole('button', { name: 'Load older' }))
+  await waitFor(() => expect(screen.getByLabelText('Loaded state').textContent).toBe('true'))
+  expect(getSessionPage).toHaveBeenCalledTimes(4)
+  await waitFor(() =>
+    expect(JSON.parse(screen.getByLabelText('Window ids').textContent ?? '[]')).toEqual(
+      [...firstBatch, ...secondBatch].map((item) => item.id),
+    ),
+  )
+  expect(secondBatch).toHaveLength(SESSION_CATALOG_PAGE_ITEMS)
 })

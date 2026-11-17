@@ -2071,7 +2071,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                     content: [
                       {
                         type: 'text' as const,
-                        text: 'Verdict validated. Finish this root turn; Pact will bind it after normal completion.',
+                        text: 'Verdict validated. Include a non-empty natural-language review report in your assistant response before ending this root turn; Pact will bind it after normal completion.',
                       },
                     ],
                     structuredContent: { pactReview: parsed },

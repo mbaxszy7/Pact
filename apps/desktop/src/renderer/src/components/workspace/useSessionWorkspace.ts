@@ -28,6 +28,8 @@ import type {
   SessionGroupMutation,
 } from '@pact/contracts'
 
+import { SESSION_CATALOG_PAGE_ITEMS } from '@pact/contracts'
+
 import { RpcError, sessionWorkspaceQueryKeys, unwrapRpcResult } from '../../query-client'
 import {
   acceptSessionCatalogChange,
@@ -46,6 +48,7 @@ const INITIAL_CATALOG_BATCH_ITEMS = 20
 const INITIAL_CATALOG_BATCH_MS = 100
 const INITIAL_CATALOG_DEADLINE_MS = 30_000
 const LOAD_MORE_DEADLINE_MS = 10_000
+const MAX_LOAD_MORE_PAGES = Math.ceil(20_000 / SESSION_CATALOG_PAGE_ITEMS) + 1
 
 type ReadPriority = 'startup' | 'visible' | 'explicit'
 type QueuedRead = { run: () => void; cancel: () => void }
@@ -266,6 +269,13 @@ export function useSessionWorkspace(
   const loadPage = async (input: SessionPageInput, automatic = false): Promise<boolean> => {
     let request = input
     const deadline = performance.now() + LOAD_MORE_DEADLINE_MS
+    const priorIds =
+      !automatic && input.cursor?.direction === 'older'
+        ? new Set(
+            getCache()?.navigation?.projects[input.projectId]?.windows[scopeKey(input.scope)]
+              ?.ids ?? [],
+          )
+        : undefined
     for (let attempt = 0; attempt <= 2; attempt++) {
       try {
         // oxlint-disable-next-line eslint/no-await-in-loop
@@ -277,14 +287,62 @@ export function useSessionWorkspace(
         )
         if (!page) return false
         if (performance.now() >= deadline) throw new Error('Loading Sessions timed out.')
+        const pages: { page: SessionPage; direction?: 'newer' | 'older' | undefined }[] = [
+          { page, direction: request.cursor?.direction },
+        ]
+        if (priorIds && priorIds.size > 0 && !request.cursor) {
+          const seen = new Set(priorIds)
+          let unseen = 0
+          for (const session of page.sessions) {
+            if (!seen.has(session.id)) {
+              seen.add(session.id)
+              unseen++
+            }
+          }
+          let cursor = page.nextCursor
+          for (
+            let pageIndex = 0;
+            unseen < SESSION_CATALOG_PAGE_ITEMS && cursor && pageIndex < MAX_LOAD_MORE_PAGES;
+            pageIndex++
+          ) {
+            if (performance.now() >= deadline) throw new Error('Loading Sessions timed out.')
+            const nextRequest: SessionPageInput = {
+              projectId: input.projectId,
+              scope: input.scope,
+              cursor,
+            }
+            // oxlint-disable-next-line eslint/no-await-in-loop
+            const older = await readPage(nextRequest, 'explicit', JSON.stringify(nextRequest), () =>
+              window.pact.getSessionPage(nextRequest),
+            )
+            if (!older) return false
+            if (performance.now() >= deadline) throw new Error('Loading Sessions timed out.')
+            if (older.revision !== page.revision || older.groupRevision !== page.groupRevision)
+              throw new RpcError({
+                code: 'CONFLICT',
+                message: 'Session catalog changed while loading.',
+              })
+            pages.push({ page: older, direction: 'older' })
+            for (const session of older.sessions) {
+              if (!seen.has(session.id)) {
+                seen.add(session.id)
+                unseen++
+              }
+            }
+            cursor = older.nextCursor
+            if (
+              unseen < SESSION_CATALOG_PAGE_ITEMS &&
+              cursor &&
+              pageIndex === MAX_LOAD_MORE_PAGES - 1
+            )
+              throw new Error('Too many Session pages were needed to load more.')
+          }
+        }
         const current = getCache()
         const existing = current?.navigation?.projects[input.projectId]
         if (existing && existing.revision > page.groupRevision)
           throw new RpcError({ code: 'CONFLICT', message: 'Session groups changed while loading.' })
-        publish(
-          installNavigationPages(current, [{ page, direction: request.cursor?.direction }]),
-          input.projectId,
-        )
+        publish(installNavigationPages(current, pages), input.projectId)
         return true
       } catch (error) {
         if (!(error instanceof RpcError) || error.code !== 'CONFLICT' || attempt === 2) throw error

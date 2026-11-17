@@ -58,6 +58,11 @@ test.each([
   ['What permission mode should I use?', false],
   ['What launch date should I use? Which permission mode should I select?', false],
   [
+    'What launch date should I use for the release note?\n\nWhat launch date should I use for the release note?',
+    true,
+  ],
+  ['What launch date should I use? What release title should I use?', false],
+  [
     'What launch date should I use? Release note: We improved the existing cancellation boundary.',
     false,
   ],
