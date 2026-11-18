@@ -99,7 +99,7 @@ it('preserves stale answers and requires explicit keep or discard before the new
     true,
   )
   expect(screen.getByRole('radio', { name: 'Queue' }).closest('fieldset')?.disabled).toBe(true)
-  fireEvent.click(screen.getByRole('button', { name: 'Keep in draft' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Move to message box' }))
   expect(props.onClearDraft).toHaveBeenLastCalledWith(true)
   fireEvent.click(screen.getByRole('button', { name: 'Discard answers' }))
   expect(props.onClearDraft).toHaveBeenLastCalledWith(false)
@@ -116,7 +116,7 @@ it('surfaces a rejected draft edit while keeping the controlled saved answer', (
     />,
   )
   fireEvent.change(screen.getAllByRole('textbox')[0]!, { target: { value: 'Rejected edit' } })
-  expect(screen.getByRole('alert').textContent).toContain('Existing answers have been kept')
+  expect(screen.getByRole('alert').textContent).toContain('Earlier answers are kept')
   expect(screen.getAllByRole<HTMLTextAreaElement>('textbox')[0]!.value).toBe('Saved')
 })
 it('keeps legacy requests lazy, retries unavailable source reads, and saves free text through the draft owner', async () => {

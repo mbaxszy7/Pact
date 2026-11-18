@@ -105,7 +105,7 @@ describe('Native attention view through DesktopBridge', () => {
       })
     })
     await screen.findByText('Attention 8')
-    expect(screen.getByText('1 Session needs attention')).not.toBeNull()
+    expect(screen.getByText('1 session needs attention')).not.toBeNull()
     expect(f.read).toHaveBeenLastCalledWith({})
   })
 

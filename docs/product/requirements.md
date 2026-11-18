@@ -306,7 +306,7 @@ No generation, OCR, region Comments, arbitrary file attachments, background qual
 
 Anchor a Comment to immutable message, plan or report text, or a versioned Project-file range, retaining identity/hash/projection basis/range/quote. Message ranges use visible projected text; plain fallback has an explicit basis. File anchors use Project-relative forward-slash paths and content hash/line/column. Unsupported historical anchor formats remain visibly unavailable; they are never converted into a different source.
 
-Add to comment saves without dispatch or implementation authority. Composer collects independent Comment chips with body/images for one Send. Native question answers use their live form and are not persistent question-answer Comments or an alternate workflow dispatcher.
+Add comment saves without dispatch or implementation authority. Composer collects independent Comment chips with body/images for one Send. Native question answers use their live form and are not persistent question-answer Comments or an alternate workflow dispatcher.
 
 Stable request identity and expected revision govern saves. ACK closes only the matching editor/revision; later edits stay open. Frozen/sent members are immutable, so subsequent edits become new drafts. Add/cancel a dirty source editor before changing its source/group/page. Recovery freezes mutations and retains drafts.
 
@@ -623,7 +623,7 @@ an in-flight check. Respect GitHub rate-limit backoff for automatic and manual r
 Failures retain the last successful result/time and never claim the App is current. Background
 failures remain quiet; the page provides checking, unavailable, last-known and retry states.
 
-Settings keeps a New marker while a higher version is available. A durable per-version receipt
+Settings keeps an Update marker while a higher version is available. A durable per-version receipt
 allows at most one proactive light notice, including Latest returning to a previously seen version.
 Present only in a visible trusted workspace after Conversation can confirm app-wide inactivity;
 active/preparing/recovering/background work and unavailable state defer it. Do not poll, steal

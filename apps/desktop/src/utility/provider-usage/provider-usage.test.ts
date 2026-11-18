@@ -758,11 +758,11 @@ describe.skipIf(process.platform === 'win32')('ProviderUsage utility owner', () 
       await f.usage.refresh({ ownerId, provider: 'codex', requestId: crypto.randomUUID() }),
     ).toMatchObject({
       ok: true,
-      value: { status: 'close_unconfirmed', message: 'Cleanup pending', identityConfirmed: false },
+      value: { status: 'close_unconfirmed', message: 'Wait to retry', identityConfirmed: false },
     })
     expect(f.usage.read('codex')).toMatchObject({
       ok: true,
-      value: { status: 'close_unconfirmed', message: 'Cleanup pending' },
+      value: { status: 'close_unconfirmed', message: 'Wait to retry' },
     })
 
     releaseDeferred()

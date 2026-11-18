@@ -48,7 +48,7 @@ export function PreparedInputCard({
       if (active && epoch.current === current) {
         active = false
         setReadFailure(readKey)
-        setMessage('The saved source could not be loaded. Open it again.')
+        setMessage('Couldn’t load the saved message. Try opening it again.')
       }
     }, 10_000)
     void window.pact
@@ -67,7 +67,7 @@ export function PreparedInputCard({
           else {
             setReadFailure(readKey)
             setMessage(
-              result.ok ? 'The saved source changed. Open it again.' : result.error.message,
+              result.ok ? 'The saved message changed. Open it again.' : result.error.message,
             )
           }
           return undefined
@@ -75,7 +75,7 @@ export function PreparedInputCard({
         () => {
           if (active && epoch.current === current) {
             setReadFailure(readKey)
-            setMessage('The saved source could not be loaded.')
+            setMessage('Couldn’t load the saved message.')
           }
           return undefined
         },
@@ -118,8 +118,8 @@ export function PreparedInputCard({
           setUncertain(false)
           setMessage(
             result.value.runId
-              ? 'The original request has a Run.'
-              : 'The action is recorded. No Run is confirmed yet.',
+              ? 'Your message has started.'
+              : 'Action confirmed, though no reply has started yet.',
           )
         } else setMessage(result.error.message)
       } else {
@@ -134,7 +134,7 @@ export function PreparedInputCard({
       onChanged()
     } catch {
       setUncertain(true)
-      setMessage('The Continue receipt is not confirmed. Check it before another action.')
+      setMessage('Couldn’t confirm whether this message continued. Click Check status first.')
     } finally {
       pending.current = false
       setBusy(false)
@@ -157,19 +157,33 @@ export function PreparedInputCard({
     explicitSettings.length === 0 && input.execution.permissionMode === 'native'
       ? 'Default settings'
       : [...explicitSettings, permissionLabel].join(' · ')
+  const blockedHint =
+    input.blockedReason === 'session_unavailable'
+      ? 'Finish setting up or restoring this session before continuing.'
+      : input.blockedReason === 'native_interaction'
+        ? 'Respond to the pending prompt above first.'
+        : input.blockedReason === 'native_recovery'
+          ? 'Finish session recovery above before continuing.'
+          : input.blockedReason === 'collaboration_active'
+            ? 'Finish or pause the active workflow first.'
+            : input.blockedReason === 'preparation_active'
+              ? 'Wait for active agent work to finish first.'
+              : input.blockedReason === 'queue_changed'
+                ? 'Handle the queued message first.'
+                : undefined
   return (
     <section
       className="relay-decision prepared-input-card"
-      aria-label="Saved original request"
+      aria-label="Pending message"
       aria-busy={busy}
     >
       <div className="prepared-input-content">
         <header className="relay-decision-heading">
-          <h3>Saved request</h3>
+          <h3>Pending message</h3>
         </header>
         <div className="relay-decision-body">
           {input.phase === 'preparing' ? (
-            <p className="relay-action-title">Preparing saved request…</p>
+            <p className="relay-action-title">Preparing pending message…</p>
           ) : null}
           {input.preview ? <p className="relay-action-explanation">{input.preview}</p> : null}
           <p className="relay-action-target">
@@ -179,10 +193,8 @@ export function PreparedInputCard({
               : ''}
             {input.hasAnswer ? ' · Answer included' : ''}
           </p>
-          {input.blockedReason && input.phase === 'paused' ? (
-            <p className="relay-action-explanation">
-              Resolve the pending interaction or recovery to continue.
-            </p>
+          {blockedHint && input.phase === 'paused' ? (
+            <p className="relay-action-explanation">{blockedHint}</p>
           ) : null}
           {message ? <output className="relay-decision-error">{message}</output> : null}
           {viewing ? (
@@ -265,12 +277,16 @@ export function PreparedInputCard({
           type="button"
           className="relay-cancel"
           onClick={() => {
+            if (viewing) {
+              setViewing(false)
+              return
+            }
             setOffset(0)
             setSourceId(undefined)
             setViewing(true)
           }}
         >
-          View request
+          {viewing ? 'Hide request' : 'View request'}
         </button>
         <button
           type="button"

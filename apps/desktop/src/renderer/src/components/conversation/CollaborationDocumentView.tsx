@@ -507,7 +507,14 @@ function ContinuousDocumentView({
         : moveViewport(failedMove.current, controller.signal)
     void pending.catch((error: unknown) => {
       if (!controller.signal.aborted && owner.current.key === sourceKey)
-        setState((old) => (old.key === sourceKey ? { ...old, error: String(error) } : old))
+        setState((old) =>
+          old.key === sourceKey
+            ? {
+                ...old,
+                error: error instanceof Error ? error.message : 'Couldn’t load this section.',
+              }
+            : old,
+        )
     })
     return () => controller.abort()
     // oxlint-disable-next-line react-hooks/exhaustive-deps
@@ -739,7 +746,7 @@ function PagedDocumentView({
           setState({
             key,
             pages: [],
-            error: error instanceof Error ? error.message : 'Document could not be read.',
+            error: error instanceof Error ? error.message : 'Couldn’t read document.',
           })
       }
     }
@@ -853,7 +860,7 @@ function PagedDocumentView({
             className="inline-flex min-h-8 items-center gap-1 rounded-control px-2 hover:bg-surface-muted disabled:opacity-40"
             onClick={() => setOffset(next ?? offset)}
           >
-            Continue
+            Next
             <ChevronRight aria-hidden="true" className="size-4" />
           </button>
         </nav>

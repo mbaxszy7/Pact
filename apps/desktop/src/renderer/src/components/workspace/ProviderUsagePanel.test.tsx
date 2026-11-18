@@ -247,7 +247,7 @@ describe('ProviderUsagePanel & useProviderUsage', () => {
       name: 'Refresh Codex',
     })
     expect(refreshCodex.disabled).toBe(true)
-    expect(refreshCodex.title).toBe('25s')
+    expect(refreshCodex.title).toBe('Refresh available in 25s')
     expect(
       within(detailed).getByRole<HTMLButtonElement>('button', { name: 'Refresh Claude Code' })
         .disabled,
@@ -474,8 +474,8 @@ describe('ProviderUsagePanel & useProviderUsage', () => {
     // Verify close_unconfirmed uses exponential backoff and clears once resolved.
     cleanup()
     const closeQueue: ProviderUsageSnapshot[] = [
-      makeSnapshot('codex', { status: 'close_unconfirmed', message: 'Cleanup pending' }),
-      makeSnapshot('codex', { status: 'close_unconfirmed', message: 'Cleanup pending' }),
+      makeSnapshot('codex', { status: 'close_unconfirmed', message: 'Wait to retry' }),
+      makeSnapshot('codex', { status: 'close_unconfirmed', message: 'Wait to retry' }),
       makeSnapshot('codex', { status: 'idle' }),
     ]
     const getClose = vi.fn<DesktopBridge['getProviderUsage']>(async ({ provider }) => ({

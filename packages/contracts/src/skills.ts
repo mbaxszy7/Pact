@@ -197,7 +197,7 @@ export function parseComposerCommandPrefix(
 ): ComposerCommandPrefix {
   const result: ComposerCommandPrefix = { skills: [], argumentsStart: 0 }
   if (selections.length > SKILL_CATALOG_ITEMS || !fits(selections, SKILL_INVOCATION_BYTES))
-    return { ...result, error: 'The Skill command area exceeds its capacity.' }
+    return { ...result, error: 'Too many skills selected at once (over capacity).' }
   const atoms = new Map<number, Pick<SkillSelection, 'name' | 'start' | 'end'>>()
   let previousEnd = 0
   for (const entry of selections.toSorted((a, b) => a.start - b.start)) {
@@ -210,7 +210,7 @@ export function parseComposerCommandPrefix(
       !nameSchema.safeParse(entry.name).success ||
       content.slice(entry.start, entry.end) !== `/${entry.name}`
     )
-      return { ...result, error: 'The selected Skill token changed. Select it again.' }
+      return { ...result, error: 'The selected skill command changed. Select it again.' }
     atoms.set(entry.start, entry)
     previousEnd = entry.end
   }
@@ -221,7 +221,7 @@ export function parseComposerCommandPrefix(
     const atom = atoms.get(offset)
     if (atom) {
       if (result.skills.length >= SKILL_CATALOG_ITEMS) {
-        result.error = 'The Skill command area exceeds its capacity.'
+        result.error = 'Too many skills selected at once (over capacity).'
         break
       }
       result.skills.push({ name: atom.name, start: atom.start, end: atom.end })
@@ -277,7 +277,7 @@ export function skillArguments(content: string, selections: SkillSelection[]): s
     offset = prefix.argumentsStart
   for (const entry of ranges.toSorted((a, b) => a.start - b.start)) {
     if (entry.start < offset || content.slice(entry.start, entry.end) !== `/${entry.name}`)
-      throw new Error('The selected Skill token changed. Select it again.')
+      throw new Error('The selected skill command changed. Select it again.')
     result += content.slice(offset, entry.start)
     offset = entry.end
   }

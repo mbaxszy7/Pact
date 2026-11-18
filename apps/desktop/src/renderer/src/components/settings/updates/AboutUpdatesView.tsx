@@ -34,7 +34,7 @@ export function AboutUpdatesView({
       : state?.updateAvailable
         ? 'Update available'
         : currentVersion && isNewerRelease(currentVersion, latest.version)
-          ? 'Current version is newer'
+          ? 'Newer than latest release'
           : 'Up to date'
 
   return (
@@ -76,7 +76,7 @@ export function AboutUpdatesView({
         </dl>
         {state && !state.enabled ? (
           <p className="mt-group text-caption text-secondary">
-            Update checks are available in the official Stable app.
+            Automatic update checks are only available in official releases.
           </p>
         ) : null}
         <div className="mt-section flex flex-wrap items-center gap-group">
@@ -101,7 +101,7 @@ export function AboutUpdatesView({
             rel="noreferrer"
             className="inline-flex min-h-9 items-center gap-1.5 text-body font-medium text-focus underline decoration-current/40 underline-offset-4 hover:decoration-current"
           >
-            Download on GitHub{' '}
+            View releases on GitHub{' '}
             <ExternalLink aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
           </a>
         </div>

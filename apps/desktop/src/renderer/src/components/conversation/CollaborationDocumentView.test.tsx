@@ -75,7 +75,7 @@ it.each(['markdown-visible-v2', 'plain-visible-v1'] as const)(
       textBasis: basis,
     })
 
-    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
     await waitFor(() =>
       expect(projectionSpans(container)[0]?.dataset.pactProjectionStart).toBe('12288'),
     )
@@ -102,7 +102,7 @@ it('uses a reverse-navigation offset only for the initial read, then follows ret
   )
   expect(fixture.read.mock.calls.filter(([request]) => 'aroundOffset' in request)).toHaveLength(1)
   expect(projectionSpans(container)).toHaveLength(3)
-  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Next' }))
   await waitFor(() =>
     expect(projectionSpans(container)[0]?.dataset.pactProjectionStart).toBe('20480'),
   )

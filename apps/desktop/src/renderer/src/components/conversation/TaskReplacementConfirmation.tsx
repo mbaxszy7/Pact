@@ -94,13 +94,13 @@ export function TaskReplacementConfirmation({
             <p>
               {actor === 'claude' ? 'Claude Code' : 'Codex'} finishes this response first.{' '}
               {unreviewedChanges
-                ? 'The current changes will not be reviewed.'
-                : 'The current task will not continue.'}
+                ? 'Current changes won’t be reviewed.'
+                : 'The current task will end.'}
             </p>
           ) : (
             <>
               <p>{summary}</p>
-              <p>Replacing this task ends its workflow; history stays available.</p>
+              <p>Replacing this task ends the current workflow. Your chat history stays saved.</p>
             </>
           )}
         </div>

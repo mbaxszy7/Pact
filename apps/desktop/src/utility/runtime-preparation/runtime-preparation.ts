@@ -303,7 +303,7 @@ export class RuntimePreparation {
         agentId,
         state: 'missing',
         detail: selectedPath
-          ? 'The saved executable is no longer available.'
+          ? 'Saved executable path was not found. Choose a valid path or reinstall.'
           : 'No executable was found.',
         checkedAt,
       }
@@ -367,8 +367,8 @@ export class RuntimePreparation {
         ...(versionText ? { version: versionText } : {}),
         detail:
           agentId === 'claude'
-            ? 'Claude Code needs a login or compatible API configuration available to Pact.'
-            : 'Codex reports that sign-in is required.',
+            ? 'Run claude auth login in your terminal, or set up a login or compatible API configuration.'
+            : 'Run codex login in your terminal, then check again.',
         checkedAt,
       }
     }

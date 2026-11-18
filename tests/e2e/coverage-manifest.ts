@@ -513,6 +513,14 @@ function journey(
       ? {
           contractUpdates: [
             {
+              originalLine: 31,
+              reason:
+                'Updated UI terminology from Primary LLM to Primary agent while keeping Codex selected as primary.',
+              replacementAssertions: [
+                "expect(window.getByRole('radio', { name: 'Codex Primary agent' })).toBeChecked()",
+              ],
+            },
+            {
               originalLine: 32,
               reason:
                 'The accepted collaboration-limit terminology labels the same maxDiscussionRounds field Plan reviews. Preserve the exact saved value 4 after cold restart, Codex primary, repair attempts 3, unchanged-default save disabling and cursor obligations.',
@@ -647,6 +655,53 @@ function journey(
                 'The background recovery card combines its warnings in one paragraph and says A previous attempt instead of The previous attempt. Preserve the visible warning that a candidate may already exist; all confirmation, native creation count, old-task non-replay and cold-recovery assertions remain unchanged.',
               replacementAssertions: [
                 `expect(card.getByText('A previous attempt may have created a session.')).toBeVisible()`,
+              ],
+            },
+          ],
+        }
+      : {}),
+    ...(file === 'agent-handoff.spec.ts' &&
+    title === 'supplies every intervening peer question and answer to the next Agent'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 209,
+              reason:
+                'ContextReceipt uses clearer human phrasing ("Shared N earlier messages from ...") instead of internal "Context supplied · ... involving ...". Preserve verifying that all 4 intervening messages involving Claude Code were shared.',
+              replacementAssertions: [
+                `expect(window.getByText('Shared 4 earlier messages from Claude Code')).toBeVisible()`,
+              ],
+            },
+          ],
+        }
+      : {}),
+    ...(file === 'session-fork.spec.ts' &&
+    title ===
+      'a committed fork survives startup with sidebar error, readable history and a locked Composer'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 346,
+              reason:
+                'SessionFork action button renamed from Continue native fork to Finish fork setup for clarity while keeping both sides awaiting setup.',
+              replacementAssertions: [
+                `expect(page.getByRole('button', { name: 'Finish fork setup', exact: true })).toHaveCount(2)`,
+              ],
+            },
+          ],
+        }
+      : {}),
+    ...(file === 'session-fork.spec.ts' &&
+    title ===
+      'failed initialization closes the create dialog and restart recovers the same candidate once'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 470,
+              reason:
+                'SessionFork action buttons renamed from Check original candidate / Continue initialization to Check status / Complete setup while preserving candidate reuse and settings read count.',
+              replacementAssertions: [
+                `expect(recovery.getByRole('button', { name: 'Complete setup', exact: true })).toBeEnabled()`,
               ],
             },
           ],

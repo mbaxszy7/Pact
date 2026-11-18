@@ -38,7 +38,7 @@ function GalleryImage({
       (error: unknown) => {
         if (!controller.signal.aborted)
           setOriginal({
-            error: error instanceof Error ? error.message : 'Image could not load.',
+            error: error instanceof Error ? error.message : 'Couldn’t load image.',
           })
       },
     )

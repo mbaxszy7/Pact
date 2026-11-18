@@ -1204,7 +1204,7 @@ export class Conversation {
         ok: false,
         error: {
           code: 'UNCERTAIN',
-          message: 'The key change could not be confirmed. Check its status.',
+          message: 'Couldn’t confirm the API key change. Check its current status.',
         },
       }
     } finally {
@@ -1750,7 +1750,7 @@ export class Conversation {
       ...(unsupported
         ? {
             blockedReason:
-              'Native work is still recovering, rebuilding, forking, running in the background, or has an unconfirmed ending. Check or finish that work before archiving. Nothing was stopped.',
+              'Wait for active agent work (recovery, fork, rebuild, background tasks, or unconfirmed endings) to finish before archiving. Nothing was stopped.',
           }
         : {}),
     }
@@ -1914,7 +1914,7 @@ export class Conversation {
         this.archiveWork(scope).tasks.length
       )
         throw new WorkspaceArchiveConflictError(
-          'Not archived. Some tasks were stopped, but other work or saved output could not be confirmed. Check the task results; stopped tasks will not restart automatically.',
+          'Not archived. Some tasks stopped, but active work couldn’t be confirmed finished. Stopped tasks will not restart automatically.',
         )
       for (const runId of runIds) {
         // Joining the existing owner also joins background-triggered finalization.
@@ -1928,7 +1928,7 @@ export class Conversation {
         )
       if (this.disposed || performance.now() >= deadline)
         throw new WorkspaceArchiveConflictError(
-          'Pact closed or archive settlement timed out. Nothing was archived.',
+          'Pact closed or timed out before archiving finished. Nothing was archived.',
         )
       return this.conversations.archives.finish(id, outcomes, () => {
         const result = commit(id)

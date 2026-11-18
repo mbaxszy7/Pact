@@ -83,8 +83,10 @@ export function CurrentPlanPanel({
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="flex items-baseline gap-2 text-body font-medium text-primary">
-              {source ? 'Plan source' : 'Current plan'}
-              {plan ? <span className="font-normal text-secondary">· v{plan.version}</span> : null}
+              {source ? 'Earlier version' : plan ? `Plan v${plan.version}` : 'Current plan'}
+              {source && plan ? (
+                <span className="font-normal text-secondary">· v{plan.version}</span>
+              ) : null}
             </h2>
             {source &&
             plan &&
@@ -141,7 +143,7 @@ export function CurrentPlanPanel({
       >
         {error ? (
           <div role="alert" className="max-w-[70ch] text-caption text-secondary">
-            <p>Plan could not be loaded.</p>
+            <p>{error || 'Couldn’t load the plan.'}</p>
             <button
               type="button"
               onClick={onRetry}
@@ -225,7 +227,7 @@ export function CurrentPlanPanel({
         ) : (
           <div className="mt-section text-caption text-secondary">
             <FileText aria-hidden="true" className="mb-group size-5" strokeWidth={1.75} />
-            Awaiting first plan
+            No plan yet
           </div>
         )}
       </div>

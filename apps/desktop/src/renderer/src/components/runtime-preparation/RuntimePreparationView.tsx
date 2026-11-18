@@ -43,9 +43,17 @@ function statusCopy(
       : { label: 'Not checked', detail: 'Pact could not check this agent.', tone: 'warning' }
   switch (agent.state) {
     case 'ready':
-      return { label: 'Ready', detail: 'Authenticated and available to Pact.', tone: 'ready' }
+      return { label: 'Ready', detail: 'Signed in and ready to use.', tone: 'ready' }
     case 'missing':
-      return { label: 'Not installed', detail: agentCopy[agent.agentId].install, tone: 'danger' }
+      return {
+        label: 'Not installed',
+        detail: agent.executablePath
+          ? (agent.detail ?? agentCopy[agent.agentId].install)
+          : agent.detail && agent.detail !== 'No executable was found.'
+            ? agent.detail
+            : agentCopy[agent.agentId].install,
+        tone: 'danger',
+      }
     case 'unsupported_version':
       return {
         label: 'Upgrade required',
@@ -185,7 +193,7 @@ function RuntimeRow({
             onClick={() => onChooseExecutable(agentId)}
           >
             <FolderOpen aria-hidden="true" className="size-4" strokeWidth={1.75} />
-            {choosing ? 'Opening file picker…' : 'Locate manually…'}
+            {choosing ? 'Opening…' : 'Locate manually…'}
           </button>
         ) : null}
 
@@ -241,8 +249,7 @@ export function RuntimePreparationView({
                 Connect your coding agents
               </h1>
               <p className="mt-group max-w-[60ch] text-body leading-relaxed text-secondary">
-                Pact works through the Claude Code and Codex installations on this device. Your
-                credentials stay with each CLI.
+                Uses Claude Code and Codex installed on this device.
               </p>
             </div>
             <div className="justify-self-start sm:justify-self-end">
@@ -295,11 +302,9 @@ export function RuntimePreparationView({
               <span className={ready ? 'text-status-ready-foreground' : 'text-secondary'}>
                 {ready
                   ? canReturnToWorkspace
-                    ? 'Both agents are ready. Agent actions can resume.'
-                    : 'Both agents are ready. Default collaboration setup comes next.'
-                  : canReturnToWorkspace
-                    ? 'Resolve the issues above, then check again to resume agent actions.'
-                    : 'Both agents must be ready before first-time setup can continue.'}
+                    ? 'Ready to use in your sessions.'
+                    : 'Next: choose your default session settings.'
+                  : 'Finish setting up both agents, then click Check again.'}
               </span>
             </output>
             <button
@@ -371,8 +376,7 @@ export function RuntimeDegradedNotice({
             <>
               {unavailableNames} {attentionVerb} attention.
             </>
-          )}{' '}
-          Existing work remains available.
+          )}
         </p>
       </div>
       <div className="flex items-center gap-2">

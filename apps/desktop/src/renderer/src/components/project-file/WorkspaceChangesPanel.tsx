@@ -51,13 +51,13 @@ function unavailableMessage(
   reason: Extract<WorkspaceChangeFilePreview, { status: 'unavailable' }>['reason'],
 ): string {
   const messages = {
-    not_recorded: 'The Agent did not provide this complete historical version.',
-    not_final: 'This saved change has not been finalized.',
-    blob_missing: 'The recorded version is missing from saved storage.',
-    blob_corrupt: 'The recorded version failed its integrity check.',
-    too_large: 'This recorded version is too large to preview.',
-    unsupported_encoding: 'This recorded version is not supported UTF-8 text.',
-    temporary_io: 'Pact could not read this saved version. Try again.',
+    not_recorded: 'Full file versions weren’t recorded by the agent.',
+    not_final: 'This change isn’t finalized yet.',
+    blob_missing: 'The saved file version is missing.',
+    blob_corrupt: 'The saved file version failed integrity verification.',
+    too_large: 'This file version is too large to preview.',
+    unsupported_encoding: 'Only UTF-8 text files can be previewed.',
+    temporary_io: 'Couldn’t read this saved version. Try again.',
   }
   return messages[reason]
 }
@@ -87,7 +87,7 @@ function useSavedPreview(
       if (!cancelled) setRead({ key, error: { message, retryable } })
     }
     const timeout = window.setTimeout(() => {
-      fail('Loading this saved preview took too long. Try again.', true)
+      fail('Loading this preview took too long. Try again.', true)
       cancelled = true
     }, WORKSPACE_OPERATION_TIMEOUT_MS)
     const load = async (): Promise<void> => {
@@ -121,11 +121,11 @@ function useSavedPreview(
           identity.sessionId !== sessionId ||
           identity.relativePath !== path
         ) {
-          fail('This preview does not belong to the requested saved change.', false)
+          fail('This preview doesn’t match the selected changes.', false)
           return undefined
         }
         if (side === 'patch' && preview.patchCount !== patchCount) {
-          fail('The saved changes changed while loading. Open this file again.', true)
+          fail('These file changes were updated. Reopen this file.', true)
           return
         }
         first ??= preview
@@ -136,7 +136,7 @@ function useSavedPreview(
         if (side === 'patch') {
           bytes += new TextEncoder().encode(preview.file.content).byteLength
           if (bytes > WORKSPACE_PREVIEW_BYTES) {
-            fail('The recorded changes are too large for this preview.', false)
+            fail('This change is too large to preview.', false)
             return
           }
           patches.push(preview.file.content)
@@ -145,7 +145,7 @@ function useSavedPreview(
       if (first) setRead({ key, preview: first, ...(side === 'patch' ? { patches } : {}) })
     }
     void load()
-      .catch(() => fail('Pact could not load this saved preview. Try again.', true))
+      .catch(() => fail('Couldn’t load this preview. Try again.', true))
       .finally(() => window.clearTimeout(timeout))
     return () => {
       cancelled = true
@@ -204,14 +204,14 @@ function useNextSavedFile(
       const result = await window.pact.readWorkspaceChanges({ changeSetId, afterPath: path })
       if (retired) return
       if (!result.ok) {
-        fail(result.error.message || 'Could not load the next file. Try again.')
+        fail(result.error.message || 'Couldn’t load the next file. Try again.')
         return
       }
       const page = result.value
       if (page.changeSet.id !== changeSetId || page.changeSet.sessionId !== sessionId)
-        throw new Error('These files do not belong to the selected changes.')
+        throw new Error('These files don’t match the selected changes.')
       if ((page.changeSet.revision ?? 0) !== (revision ?? 0))
-        throw new Error('The recorded changes changed. Reopen this card.')
+        throw new Error('The file changes were updated. Reopen this card.')
       const next = page.files[0]
       if (
         page.files.length > WORKSPACE_CHANGE_PAGE_FILES ||
@@ -219,14 +219,14 @@ function useNextSavedFile(
         next?.hidden ||
         (!next && page.nextPath !== null)
       )
-        throw new Error('The saved file list did not advance. Reopen this card.')
+        throw new Error('Couldn’t load the next file. Reopen this card.')
       completedKey.current = key
       setRead({ key, nextPath: next?.path ?? null })
     }
     void load()
       .catch((failure: unknown) =>
         fail(
-          failure instanceof Error ? failure.message : 'Could not load the next file. Try again.',
+          failure instanceof Error ? failure.message : 'Couldn’t load the next file. Try again.',
         ),
       )
       .finally(() => {
@@ -325,7 +325,7 @@ function SavedChangesPanel({
     (mode === 'after' ? afterRead.loading : !versionsSettled || selectedRead.loading)
   const unavailable =
     !previewFile && !error && !previewLoading
-      ? 'Complete historical versions and recorded patches are unavailable for this file.'
+      ? 'Before/after versions and patch details aren’t available for this file.'
       : undefined
 
   const label = state.path.split(/[\\/]/u).at(-1) ?? state.path
@@ -497,7 +497,7 @@ function SavedChangesPanel({
                 <PlainFileViewer file={previewFile} wrapLines />
               ) : (
                 <div className="p-panel text-caption text-secondary" role="alert">
-                  Diff could not be displayed. Choose After to read the saved code.
+                  Couldn’t display diff. Choose After to read the saved code.
                 </div>
               )
             }
@@ -508,7 +508,7 @@ function SavedChangesPanel({
                   className="grid h-full place-items-center text-caption text-secondary"
                   aria-busy="true"
                 >
-                  Preparing code view…
+                  Loading code view…
                 </div>
               }
             >

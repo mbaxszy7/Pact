@@ -62,7 +62,7 @@ export function TaskPlanConfirmation({
     >
       <div className="pact-archive-heading">
         <h2 id={headingId} className="text-subtitle font-medium">
-          Switch initial implementer?
+          Swap implementer?
         </h2>
         <button
           type="button"
@@ -77,7 +77,7 @@ export function TaskPlanConfirmation({
       <div className="pact-archive-content">
         <div id={descriptionId} className="text-body text-secondary">
           <p>
-            Start implementation with {nextImplementer} instead of {currentImplementer}.
+            Use {nextImplementer} instead of {currentImplementer} to implement this plan.
           </p>
         </div>
         {error ? (
@@ -94,7 +94,7 @@ export function TaskPlanConfirmation({
           onClick={onCancel}
           className="h-9 rounded-control border border-border bg-surface-muted px-panel text-body font-medium text-primary hover:bg-surface-raised disabled:opacity-45"
         >
-          Cancel
+          Keep current roles
         </button>
         <button
           type="button"
@@ -102,7 +102,7 @@ export function TaskPlanConfirmation({
           onClick={onConfirm}
           className="h-9 rounded-control bg-surface-inverse px-panel text-body font-medium text-inverse disabled:cursor-wait disabled:opacity-60"
         >
-          {busy ? 'Switching…' : `Switch to ${nextImplementer}`}
+          {busy ? 'Swapping…' : 'Swap implementer'}
         </button>
       </div>
     </dialog>

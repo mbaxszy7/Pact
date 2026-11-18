@@ -288,7 +288,7 @@ function App(): React.JSX.Element {
       // durable Utility receipt, rather than this queue, owns saved MRU order.
       owner.pending = owner.pending.filter((item) => item.sessionId !== sessionId)
       if (owner.pending.length >= NATIVE_RECENT_CANDIDATES) {
-        showWarning('This Session was not added to your recent list. You can keep reading it.')
+        showWarning('Couldn’t update your recent sessions list.')
         return
       }
       owner.pending.push({
@@ -307,9 +307,7 @@ function App(): React.JSX.Element {
         const next = owner.pending.shift()
         if (!next) return
         if (performance.now() >= next.deadline) {
-          showWarning(
-            'A Session was not added to your recent list. Open it again to update the list.',
-          )
+          showWarning('Couldn’t update your recent sessions list.')
           drain()
           return
         }
@@ -361,13 +359,10 @@ function App(): React.JSX.Element {
       void window.pact
         .viewSessionReminder({ id: reminder.id })
         .then((result) => {
-          if (!result.ok)
-            showWarning(
-              'That Session reminder is no longer available. Open the Session from the list.',
-            )
+          if (!result.ok) showWarning(result.error.message)
           return undefined
         })
-        .catch(() => showWarning('Could not open this Session. Try the Session list.'))
+        .catch(() => showWarning('Couldn’t open this session. Open it from the sidebar.'))
     },
     [showWarning],
   )
@@ -380,7 +375,7 @@ function App(): React.JSX.Element {
     const receive = (status: import('@pact/contracts').DiagnosticStatus): void => {
       if (active && !notified && status.state === 'unavailable') {
         notified = true
-        showWarning('Logs could not be saved. You can continue using Pact.')
+        showWarning('Diagnostic logs couldn’t be saved. Pact will keep running normally.')
       }
     }
     const remove = window.pact.onDiagnosticStatusChanged?.(receive)
@@ -1291,9 +1286,9 @@ function App(): React.JSX.Element {
     const message =
       receipt.message ??
       (state === 'unresolved'
-        ? 'The archive result is not confirmed. Check this operation before trying again.'
+        ? 'Couldn’t confirm whether archiving finished. Check its status before trying again.'
         : state === 'failed'
-          ? 'This item has not been archived. Its tasks changed or the confirmation expired. Review again before archiving.'
+          ? 'Not archived. Tasks changed or this confirmation expired—review again.'
           : undefined)
     const sidebarRemoved = archiveResultsRef.current.find(
       (entry) => entry.id === id,
@@ -1310,10 +1305,7 @@ function App(): React.JSX.Element {
     if (state === 'archived') {
       // Only durable success permits this idempotent catalog read; it never repeats Stop.
       if (!(await completeArchive(item))) {
-        setArchiveActionError(
-          id,
-          'Archived, but the workspace could not refresh. Reload the workspace to show its saved state.',
-        )
+        setArchiveActionError(id, 'Archived, but the sidebar couldn’t refresh. Reload to update.')
         sessionWorkspace.retry()
         projectCatalog.retry()
       }
@@ -1346,7 +1338,7 @@ function App(): React.JSX.Element {
       }
     } catch {
       const message =
-        'The archive result could not be confirmed. Check its status before trying again.'
+        'Couldn’t confirm whether archiving finished. Check its status before trying again.'
       recordArchiveResult({
         id,
         item: archiveItem(item),
@@ -1396,8 +1388,7 @@ function App(): React.JSX.Element {
       )
       await acceptArchiveReceipt(result.id, result.preview, receipt, inDialog)
     } catch {
-      const message =
-        'Could not check this archive. Try Check status again; its result is still unconfirmed.'
+      const message = 'Couldn’t check status. Try Check status again.'
       setArchiveActionError(result.id, message)
       if (inDialog) setArchiveError(message)
     } finally {
@@ -1419,15 +1410,15 @@ function App(): React.JSX.Element {
       return
     }
     if (existing?.state === 'archived') {
-      showWarning('This item is already archived. Use Undo to restore it first.')
+      showWarning('Already archived. Click Undo to restore it first.')
       return
     }
     if (existing?.sidebarRemoved) {
-      showWarning('This Session is already removed from the sidebar. Use Undo to bring it back.')
+      showWarning('Already removed from the sidebar. Click Undo to bring it back.')
       return
     }
     if (!existing && archiveResultsRef.current.length >= ARCHIVE_RESULT_LIMIT) {
-      showWarning('Review or dismiss some archive results before archiving more items.')
+      showWarning('Dismiss or review older archive results before archiving more items.')
       return
     }
     const id = existing?.id ?? resultId ?? crypto.randomUUID()
@@ -1455,7 +1446,7 @@ function App(): React.JSX.Element {
               : undefined
           })()
     if (fallback && fallback.title.length > 4096) {
-      showError('This item name exceeds the archive display limit. Rename it before archiving.')
+      showError('This name is too long to archive. Rename it first.')
       return
     }
     archiveBusyRef.current = true
@@ -1481,7 +1472,7 @@ function App(): React.JSX.Element {
       const message =
         error instanceof Error && error.message.length <= 2048
           ? error.message
-          : 'Could not prepare this archive. Review the item and try again.'
+          : 'Couldn’t prepare archive. Review the item and try again.'
       if (fallback || existing)
         recordArchiveResult({ id, item: fallback ?? existing!.item, state: 'failed', message })
       else showError(message)

@@ -87,12 +87,12 @@ export function ArchiveConfirmation({
           {blocked
             ? preview.blockedReason
             : result
-              ? 'This item is still in your workspace. Tasks already stopped will not restart automatically.'
+              ? 'Not archived yet. Already stopped tasks stay stopped.'
               : busy
-                ? 'Waiting for the tasks to end and their latest output to be saved.'
+                ? 'Stopping active tasks and saving work.'
                 : subject === 'Project'
-                  ? `Archiving this Project will stop its ${preview.tasks.length === 1 ? 'active Session' : `${preview.tasks.length} active Sessions`} first.`
-                  : 'This Session is still active. Pact will stop its task before archiving it.'}
+                  ? `Archiving this project will stop its ${preview.tasks.length === 1 ? 'active session' : `${preview.tasks.length} active sessions`} first.`
+                  : 'This session is still active. Pact will stop its task before archiving it.'}
         </p>
         {preview.tasks.length > 0 ? (
           <ul className="pact-archive-tasks" aria-label="Affected Sessions">
@@ -153,14 +153,13 @@ export function ArchiveConfirmation({
         ) : null}
         {!blocked && !result ? (
           <p className="text-caption text-secondary">
-            Messages and completed file changes stay saved. Undo restores the{' '}
-            {subject.toLowerCase()} without restarting its tasks.
+            Conversation history and saved files are kept. You can undo archiving without restarting
+            tasks.
           </p>
         ) : null}
         {canRemove ? (
           <p className="text-caption text-secondary">
-            Removing from the sidebar keeps your chat and run history. Any ongoing work can
-            continue.
+            Removing from the sidebar only hides this item while history stays saved.
           </p>
         ) : null}
       </div>

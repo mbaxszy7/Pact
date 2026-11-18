@@ -81,10 +81,10 @@ export function NativeInputCard({
     setBusy(true)
     void onRespond({ ...identity, action, ...(action === 'accept' ? { values } : {}) })
       .then((ok) => {
-        if (!ok) setError('Check your answers and the notification, then try again.')
+        if (!ok) setError('Couldn’t submit your response. Check your entries and try again.')
         return undefined
       })
-      .catch(() => setError('The native answer could not be sent. Try again.'))
+      .catch(() => setError('Couldn’t send your response. Try again.'))
       .finally(() => setBusy(false))
   }
   const open = (): void => {
@@ -96,7 +96,7 @@ export function NativeInputCard({
         if (!result.ok) setError(result.error.message)
         return undefined
       })
-      .catch(() => setError('The native authorization page could not open.'))
+      .catch(() => setError('Couldn’t open the sign-in page.'))
       .finally(() => setBusy(false))
   }
   const fieldControl = (field: NativeInputField): React.JSX.Element => {
@@ -345,7 +345,7 @@ export function NativeInputCard({
                   className="size-3.5 transition-transform group-open:rotate-180"
                   strokeWidth={1.75}
                 />
-                Full authorization URL
+                View sign-in URL
               </summary>
               <p className="mt-1 max-h-24 overflow-auto break-all font-mono text-code text-primary">
                 {details.url}

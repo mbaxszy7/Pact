@@ -61,7 +61,7 @@ export function NativePermissionCard({
           {!confirmation ? (
             <p className="mt-1 break-words text-primary">
               {details?.title ??
-                (reader.loading ? 'Loading native request…' : 'Native request unavailable')}
+                (reader.loading ? 'Loading request details…' : 'Request details unavailable')}
             </p>
           ) : null}
           {!confirmation && details?.detail ? (
@@ -79,7 +79,7 @@ export function NativePermissionCard({
             className="ml-2 cursor-pointer rounded-control px-2 font-medium text-primary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
             onClick={reader.retry}
           >
-            Retry loading
+            Try again
           </button>
         </p>
       ) : null}

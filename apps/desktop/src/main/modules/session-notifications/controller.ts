@@ -88,9 +88,9 @@ function summaryReminder(attention: number, completed: number): SessionReminder 
   const sessionTitle =
     completed > 0
       ? attention > 0
-        ? 'More Session updates'
+        ? 'More session updates'
         : 'More replies are ready'
-      : 'More Sessions need attention'
+      : 'More sessions need attention'
   return {
     id: 'summary:attention',
     sessionId: randomUUID(),

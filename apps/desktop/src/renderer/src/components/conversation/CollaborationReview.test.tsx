@@ -316,7 +316,7 @@ it('keeps failed action receipts visible after successful refresh and sends the 
   fireEvent.click(await screen.findByRole('button', { name: 'Update plan · Codex' }))
   await screen.findByRole('alert')
   await waitFor(() => expect(bridge.getConversation).toHaveBeenCalledTimes(2))
-  fireEvent.click(screen.getByRole('button', { name: /^Retry$/ }))
+  fireEvent.click(screen.getByRole('button', { name: /^Try again$/ }))
   await waitFor(() => expect(bridge.getConversation).toHaveBeenCalledTimes(3))
   expect(screen.getByRole('alert').textContent).toContain('The action receipt changed.')
   expect(bridge.actOnCollaboration).toHaveBeenCalledExactlyOnceWith(

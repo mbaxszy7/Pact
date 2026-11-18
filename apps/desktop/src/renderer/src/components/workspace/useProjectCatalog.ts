@@ -50,7 +50,7 @@ export function useProjectCatalog(enabled: boolean): ProjectCatalogFlow {
       const refreshed = await catalogQuery.refetch()
       if (refreshed.isError) {
         owner.pending = false
-        setActionError('Couldn’t reload Projects to check the last saved name. Try again.')
+        setActionError('Couldn’t reload projects to check the saved name. Try again.')
         return false
       }
     }
@@ -94,7 +94,7 @@ export function useProjectCatalog(enabled: boolean): ProjectCatalogFlow {
         setActionError(result.error.message)
       }
     } catch {
-      setActionError('Couldn’t archive the Project. Try again.')
+      setActionError('Couldn’t archive the project. Try again.')
     } finally {
       mutationOwner.current.pending = false
       setArchivingProjectId(undefined)
@@ -114,7 +114,7 @@ export function useProjectCatalog(enabled: boolean): ProjectCatalogFlow {
       }
       setActionError(result.error.message)
     } catch {
-      setActionError('Couldn’t restore the Project. Try again.')
+      setActionError('Couldn’t restore the project. Try again.')
     } finally {
       mutationOwner.current.pending = false
       setRestoringProjectId(undefined)
@@ -134,7 +134,7 @@ export function useProjectCatalog(enabled: boolean): ProjectCatalogFlow {
     if (owner.pending) {
       return {
         ok: false,
-        error: { code: 'CONFLICT', message: 'Wait for the current Project action to finish.' },
+        error: { code: 'CONFLICT', message: 'Wait for the current project action to finish.' },
       }
     }
     owner.pending = true
@@ -148,7 +148,7 @@ export function useProjectCatalog(enabled: boolean): ProjectCatalogFlow {
             ok: false,
             error: {
               code: 'UNCERTAIN',
-              message: 'Couldn’t reload Projects. Try again to check the saved name.',
+              message: 'Couldn’t reload projects to check the saved name. Try again.',
             },
           }
         }
@@ -192,7 +192,7 @@ export function useProjectCatalog(enabled: boolean): ProjectCatalogFlow {
         ok: false,
         error: {
           code: 'UNCERTAIN',
-          message: 'Couldn’t confirm the saved name. Try again to reload Projects first.',
+          message: 'Couldn’t confirm the saved name. Reload projects and try again.',
         },
       }
     } finally {

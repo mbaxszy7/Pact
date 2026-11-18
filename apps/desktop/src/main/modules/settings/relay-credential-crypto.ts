@@ -38,7 +38,10 @@ const unavailable = (): Extract<SaveResult, { ok: false }> => ({
 })
 const uncertain = (): SaveResult => ({
   ok: false,
-  error: { code: 'UNCERTAIN', message: 'The key change could not be confirmed. Check its status.' },
+  error: {
+    code: 'UNCERTAIN',
+    message: 'Couldn’t confirm the API key change. Check its current status.',
+  },
 })
 const isPrivate = (message: unknown): boolean =>
   typeof message === 'object' &&

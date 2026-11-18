@@ -52,8 +52,7 @@ export function DefaultSessionSettingsView({
           {firstUse ? 'Set your collaboration defaults' : 'Default session settings'}
         </h1>
         <p className="mt-group max-w-[68ch] text-body leading-relaxed text-secondary">
-          Choose how new Sessions begin. Each Session receives its own copy and can change it
-          without changing this App default.
+          Applied to new sessions. Existing sessions keep their own settings.
         </p>
       </header>
 
@@ -90,7 +89,7 @@ export function DefaultSessionSettingsView({
             type="button"
             onClick={onRetry}
           >
-            Retry
+            Try again
           </button>
         </div>
       ) : null}
@@ -119,9 +118,7 @@ export function DefaultSessionSettingsView({
                 <p className="text-danger" role="alert">
                   {saveError}
                 </p>
-              ) : (
-                <p>Only Sessions created after this save use the updated defaults.</p>
-              )}
+              ) : null}
             </div>
             <button
               className="primary-action-button"

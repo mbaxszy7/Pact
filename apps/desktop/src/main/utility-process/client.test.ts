@@ -1143,7 +1143,7 @@ describe('Relay credential mutation delivery', () => {
         ok: false,
         error: {
           code: 'UNCERTAIN',
-          message: 'The key change could not be confirmed. Check its status.',
+          message: 'Couldn’t confirm the API key change. Check its current status.',
         },
       })
       await vi.advanceTimersByTimeAsync(30_000)
@@ -1193,7 +1193,7 @@ describe('Relay credential mutation delivery', () => {
         ok: false,
         error: {
           code: 'UNCERTAIN',
-          message: 'The key change could not be confirmed. Check its status.',
+          message: 'Couldn’t confirm the API key change. Check its current status.',
         },
       })
       client.dispose()

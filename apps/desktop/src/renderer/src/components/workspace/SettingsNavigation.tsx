@@ -69,7 +69,7 @@ export function SettingsNavigation({
           >
             About &amp; updates
             {updateAvailable ? (
-              <span className="text-caption font-medium text-focus">New</span>
+              <span className="text-caption font-medium text-focus">Update</span>
             ) : null}
           </button>
         </nav>

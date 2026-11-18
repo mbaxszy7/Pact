@@ -111,7 +111,7 @@ export function SkillDocumentPanel({
         </div>
       ) : document?.status === 'unavailable' ? (
         <div className="space-y-group p-panel text-caption leading-relaxed text-secondary">
-          <p>The native runtime has not exposed this Skill’s Markdown source.</p>
+          <p>The agent didn’t provide Markdown documentation for this skill.</p>
           <p>{document.description}</p>
           {document.argumentHint ? <p>Arguments: {document.argumentHint}</p> : null}
         </div>

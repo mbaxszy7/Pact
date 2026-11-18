@@ -207,7 +207,7 @@ export function SpeedMenu({
             </>
           ) : (
             <>
-              <p>Next run · This Session</p>
+              <p>Next run · This session</p>
               {pending ? <p className="mt-1">Current work keeps its original speed.</p> : null}
               {fallback ? <p className="mt-1 text-status-warning-foreground">{fallback}</p> : null}
             </>

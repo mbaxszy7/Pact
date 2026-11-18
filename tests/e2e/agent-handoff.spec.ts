@@ -255,9 +255,7 @@ test(
           'Handoff received: user:First question | claude:First answer | user:Second question | claude:Second answer',
         ),
       ).toBeVisible({ timeout: 10_000 })
-      await expect(
-        window.getByText('Context supplied · 4 messages involving Claude Code'),
-      ).toBeVisible()
+      await expect(window.getByText('Shared 4 earlier messages from Claude Code')).toBeVisible()
     } finally {
       await quitPact(app)
       await fixture.dispose()

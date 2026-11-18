@@ -109,7 +109,7 @@ test(
         checkedState.forkOperation?.sides.find((side) => side.agentId === 'codex')?.nativeSessionId,
       ).toBe(candidate)
       if (!checkedState.forkOperation?.ready) {
-        await ctx.page.getByRole('button', { name: 'Continue initialization', exact: true }).click()
+        await ctx.page.getByRole('button', { name: 'Complete setup', exact: true }).click()
       }
       await expect(ctx.page.getByRole('region', { name: 'Native fork confirmation' })).toHaveCount(
         0,

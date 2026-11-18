@@ -12,25 +12,21 @@ export function relayActivity(state: SchedulingState):
   const { decision, check } = state.activity
   const descriptions: string[] = []
   const elsewhere = (sessionId: string | null): string =>
-    sessionId && sessionId !== state.context?.sessionId ? ' in another Session' : ''
+    sessionId && sessionId !== state.context?.sessionId ? ' in another session' : ''
   if (decision.status === 'cleanup_unconfirmed')
-    descriptions.push(
-      `Decision resources are still being released${elsewhere(decision.sessionId)}.`,
-    )
+    descriptions.push(`Finishing an earlier Relay check${elsewhere(decision.sessionId)}.`)
   else if (decision.status === 'inspecting')
     descriptions.push(
       decision.sessionId
-        ? `Checking native compatibility${elsewhere(decision.sessionId)}.`
-        : 'Checking host native compatibility.',
+        ? `Checking agent compatibility${elsewhere(decision.sessionId)}.`
+        : 'Checking agent compatibility.',
     )
   else if (decision.status === 'evaluating')
     descriptions.push(`Evaluating a Relay decision${elsewhere(decision.sessionId)}.`)
   if (check.status === 'cleanup_unconfirmed')
-    descriptions.push(
-      `Session check resources are still being released${elsewhere(check.sessionId)}.`,
-    )
+    descriptions.push(`Finishing an earlier session check${elsewhere(check.sessionId)}.`)
   else if (check.status === 'checking')
-    descriptions.push(`Checking native Session state${elsewhere(check.sessionId)}.`)
+    descriptions.push(`Checking session status${elsewhere(check.sessionId)}.`)
   if (!descriptions.length) return undefined
   const releasing =
     (decision.status === 'idle' || decision.status === 'cleanup_unconfirmed') &&

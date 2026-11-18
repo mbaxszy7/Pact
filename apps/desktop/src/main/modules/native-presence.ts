@@ -668,11 +668,11 @@ export class NativePresence {
       const running = this.utility.isRunning()
       const choice = await dialog.showMessageBox({
         type: 'error',
-        title: 'Pact could not start',
-        message: 'Pact could not load your window settings.',
+        title: 'Pact couldn’t start',
+        message: 'Pact couldn’t load your window settings.',
         detail: running
-          ? 'Your saved settings have not been changed. Choose Retry to wait for the local runtime and read them again.'
-          : 'The local runtime has stopped. Exit Pact, then open it again. Your saved settings have not been changed.',
+          ? 'Your saved settings are intact. Click Retry to wait for the background service and try again.'
+          : 'The background service has stopped. Your saved settings are intact—exit Pact and open it again.',
         buttons: running ? ['Retry', 'Exit Pact'] : ['Exit Pact'],
         defaultId: 0,
         cancelId: running ? 1 : 0,
@@ -732,7 +732,7 @@ export class NativePresence {
         ...(!known
           ? {
               message:
-                'Pact could not confirm whether work is still active. Exiting may interrupt tasks.',
+                'Pact couldn’t confirm whether work is still active. Exiting may interrupt active tasks.',
             }
           : {}),
       })
@@ -749,8 +749,7 @@ export class NativePresence {
       ...state,
       phase: 'unconfirmed',
       unknown: true,
-      message:
-        'Runtime exit has not been confirmed. Pact is keeping its workspace open while cleanup finishes.',
+      message: 'Waiting for background tasks to close. Pact will exit once cleanup finishes.',
     })
     this.updateMenu()
   }
@@ -783,9 +782,8 @@ export class NativePresence {
           dialog.showMessageBox({
             type: 'warning',
             title: 'Pact is still closing',
-            message: 'Pact is waiting for its local runtime to exit.',
-            detail:
-              'Cleanup has not been confirmed. Pact will remain running until the runtime exits.',
+            message: 'Pact is waiting for background tasks to exit.',
+            detail: 'Cleanup is still finishing. Pact will close automatically when done.',
             buttons: ['OK'],
             noLink: true,
           }),
@@ -1010,7 +1008,7 @@ export class NativePresence {
     if (this.tray && this.isClosing()) this.tray.setToolTip(`${this.identity.name}\nExiting…`)
     else if (this.tray && snapshot)
       this.tray.setToolTip(
-        `${this.identity.name}\n${snapshot.running.length} running · ${snapshot.attentionTotal} need attention`,
+        `${this.identity.name}\n${snapshot.running.length} running · ${snapshot.attentionTotal} ${snapshot.attentionTotal === 1 ? 'needs' : 'need'} attention`,
       )
   }
 
@@ -1130,21 +1128,21 @@ export class NativePresence {
       const parsed = nativeSessionResolveInputSchema.safeParse(raw)
       return parsed.success && !this.isClosing()
         ? this.utility.resolveNativeSession(parsed.data)
-        : unavailable('This session cannot be opened right now.')
+        : unavailable('This session can’t be opened right now.')
     })
     ipcMain.handle(IPC_CHANNELS.nativeSessionOpened, (event, raw: unknown) => {
       this.trust.assertTrustedMainFrame(event)
       const parsed = nativeSessionOpenInputSchema.safeParse(raw)
       return parsed.success && !this.isClosing()
         ? this.utility.recordNativeSessionOpened(parsed.data)
-        : unavailable('The recent session could not be recorded.')
+        : unavailable('Couldn’t update recent sessions.')
     })
     ipcMain.handle(IPC_CHANNELS.nativeAttentionRead, (event, raw: unknown) => {
       this.trust.assertTrustedMainFrame(event)
       const parsed = nativeAttentionReadInputSchema.safeParse(raw)
       return parsed.success && !this.isClosing()
         ? this.utility.readNativeAttention(parsed.data)
-        : unavailable('Session status could not be read.')
+        : unavailable('Couldn’t load sessions needing attention.')
     })
     ipcMain.handle(IPC_CHANNELS.nativeNavigationGet, (event) => {
       this.trust.assertTrustedMainFrame(event)
@@ -1154,7 +1152,7 @@ export class NativePresence {
       this.trust.assertTrustedMainFrame(event)
       const parsed = nativeNavigationAckInputSchema.safeParse(raw)
       if (!parsed.success || parsed.data.navigationId !== this.navigation?.navigationId)
-        return unavailable('A newer navigation request is already active.')
+        return unavailable('A newer session switch is already in progress.')
       this.navigation = undefined
       return { ok: true, value: { acknowledged: true } }
     })
@@ -1171,7 +1169,7 @@ export class NativePresence {
       const parsed = nativeQuitDecisionInputSchema.safeParse(raw)
       return parsed.success
         ? this.decideQuit(parsed.data.operationId, parsed.data.decision)
-        : unavailable('Choose a valid exit action.')
+        : unavailable('Invalid exit action.')
     })
   }
 

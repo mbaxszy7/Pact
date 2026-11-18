@@ -562,7 +562,7 @@ it.each(['answer', 'standalone', 'historical-source'] as const)(
     await waitFor(() =>
       expect(document.activeElement).toBe(screen.getByRole('textbox', { name: 'Comment' })),
     )
-    fireEvent.click(screen.getByRole('button', { name: 'Add to comment' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add comment' }))
     await waitFor(() =>
       expect(props.onSaveCommentDraft).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -958,7 +958,7 @@ it.each([
     const { container } = render(<ConversationView {...props} />)
     await waitFor(() => expect(container.textContent).toContain(visible))
     expect(container.textContent).not.toMatch(/Submit plan_submission|reviewedPlan|verdict:/u)
-    fireEvent.click(screen.getByRole('button', { name: 'Copy You message' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Copy your message' }))
     await waitFor(() => expect(writeText).toHaveBeenCalledWith(visible))
     expect(user.content).toBe(content)
     if (request !== 'Review the current plan and feedback.') return
@@ -970,7 +970,7 @@ it.each([
     fireEvent.change(screen.getByRole('textbox', { name: 'Comment' }), {
       target: { value: 'Preserve this request.' },
     })
-    fireEvent.click(screen.getByRole('button', { name: 'Add to comment' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add comment' }))
     const digest = await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(content))
     const hash = Array.from(new Uint8Array(digest), (byte) =>
       byte.toString(16).padStart(2, '0'),
@@ -2062,7 +2062,7 @@ it('keeps cancellation receipt recovery visible after the host card disappears, 
   expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Cancel requested' }).disabled).toBe(
     true,
   )
-  fireEvent.click(screen.getByRole('button', { name: 'Check decision' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Check status' }))
   expect(check).toHaveBeenCalledTimes(1)
   expect(cancel).toHaveBeenCalledTimes(1)
   props.history.informationCancellation = undefined
@@ -2118,7 +2118,7 @@ it('offers the latest plan version while viewing an older plan source', () => {
   })
   const button = screen.getByRole('button', { name: 'View latest plan version 5' })
   expect(button.textContent).toBe('View latest · v5')
-  expect(screen.getByRole('heading', { name: 'Plan source· v1' })).toBeDefined()
+  expect(screen.getByRole('heading', { name: 'Earlier version· v1' })).toBeDefined()
   fireEvent.click(button)
   expect(onOpenLatest).toHaveBeenCalledTimes(1)
 })
@@ -2145,7 +2145,7 @@ it('hides the latest-version button when no plan source is shown', () => {
 })
 
 it.each([
-  { label: 'Draft (unreviewed)', unreviewedPlanActor: 'codex' as const, verdict: undefined },
+  { label: 'Unreviewed', unreviewedPlanActor: 'codex' as const, verdict: undefined },
   { label: 'Accepted', unreviewedPlanActor: undefined, verdict: 'accepted' as const },
   {
     label: 'Changes requested',

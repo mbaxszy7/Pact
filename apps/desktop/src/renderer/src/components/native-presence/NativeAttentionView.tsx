@@ -63,7 +63,7 @@ export function NativeAttentionView({
         })
         .catch(() => {
           if (active && request.generation === generation)
-            setError('Could not read Sessions needing attention. Try again to refresh the list.')
+            setError('Couldn’t load sessions needing attention. Try again.')
         })
         .finally(() => {
           inFlight = false
@@ -142,14 +142,14 @@ export function NativeAttentionView({
             Needs attention
           </h1>
           <p className="text-body text-secondary">
-            Open a Session to review its pending decision or new result.
+            Open a session to review its pending decision or new result.
           </p>
         </header>
         <output className="pact-native-attention-summary text-body text-secondary">
           <span>
             {page
-              ? `${page.total} ${page.total === 1 ? 'Session needs' : 'Sessions need'} attention`
-              : 'Loading Sessions…'}
+              ? `${page.total} ${page.total === 1 ? 'session needs' : 'sessions need'} attention`
+              : 'Loading sessions…'}
           </span>
           {loading && page ? (
             <span className="pact-native-quit-progress text-caption">
@@ -220,7 +220,7 @@ export function NativeAttentionView({
           </ul>
         ) : !loading && !error ? (
           <p className="pact-native-attention-empty text-body text-secondary">
-            No Sessions need your attention right now.
+            No sessions need your attention right now.
           </p>
         ) : null}
         {page?.total ? (

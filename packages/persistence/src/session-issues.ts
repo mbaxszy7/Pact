@@ -154,7 +154,7 @@ export function projectSessionIssues(
         : undefined) ??
       context?.recoveryReason ??
       run?.failureMessage ??
-      'The session status could not be confirmed.'
+      'Couldn’t confirm the session status.'
     // Display a cause, not the transport's follow-up instructions or repeated assurances.
     reason =
       reason.replace(/^Native state check failed:\s*/u, '').split(/(?<=[.!?])\s+/u)[0] ?? reason
@@ -191,7 +191,7 @@ export function projectSessionIssues(
       phase = 'rebuild_offer'
       action = 'rebuild'
       title = `${name} session not confirmed`
-      reason = 'Pact couldn’t confirm which session received this request.'
+      reason = 'Pact couldn’t confirm whether the session received your message.'
     } else if (!context && !pending) {
       action = 'none'
     } else if (
@@ -210,19 +210,19 @@ export function projectSessionIssues(
       title = checked
         ? 'Session needs recovery'
         : incomplete
-          ? 'Task status unknown and response incomplete'
-          : 'Task status unknown'
+          ? 'Background task status unknown · Reply incomplete'
+          : 'Background task status unknown'
       reason = checked
-        ? 'The original request ended. Rebuild to continue while earlier background work remains unconfirmed.'
+        ? 'The original request ended. Rebuild to continue while earlier background work finishes.'
         : run.nativeEffectsReason === 'pact_restarted'
-          ? 'Pact restarted before confirming that the background work ended.'
-          : 'Pact could not confirm that the background work ended.'
+          ? 'Pact restarted before confirming this background task ended.'
+          : 'Pact couldn’t confirm whether this background task ended.'
     } else if (operation?.stage === 'failed' && context?.recoveryAction !== 'rebuild') {
       action = context ? 'retry_check' : 'none'
       title = `${name} session setup couldn’t start`
       if (/adapter slots/iu.test(reason)) reason = 'All agent slots are currently in use.'
       else if (/interaction slots/iu.test(reason))
-        reason = 'Too many requests are waiting for input.'
+        reason = 'Too many requests are waiting for your response.'
       else if (/history.*(?:exceeds|limit|large)/iu.test(reason))
         reason = 'The saved conversation exceeds the restore limit.'
     } else if (!blocked && !lostForeground && inputDisposition === 'not_submitted') {
@@ -266,13 +266,13 @@ export function projectSessionIssues(
       phase = 'resolved'
       action = 'none'
       title = `${name} task stopped`
-      reason = 'The task was interrupted. This session is ready.'
+      reason = 'This task was stopped. You can continue below.'
     } else if (context?.recoveryAction === 'none') {
       action = 'none'
     } else if (incomplete && !blocked) {
       phase = 'resolved'
       title = `${name} response incomplete`
-      reason = 'The task has ended, but its full response is unavailable.'
+      reason = 'The task finished, but part of its reply wasn’t saved.'
     }
     // A just-failed setup reports its own cause, even when the old binding still needs replacement.
     if (
@@ -283,7 +283,7 @@ export function projectSessionIssues(
       reason = operation.failureReason?.split(/(?<=[.!?])\s+/u)[0] ?? reason
       if (/adapter slots/iu.test(reason)) reason = 'All agent slots are currently in use.'
       else if (/interaction slots/iu.test(reason))
-        reason = 'Too many requests are waiting for input.'
+        reason = 'Too many requests are waiting for your response.'
       else if (/history.*(?:exceeds|limit|large)/iu.test(reason))
         reason = 'The saved conversation exceeds the restore limit.'
     } else if (phase === 'warning' && lostForeground) {
@@ -306,11 +306,11 @@ export function projectSessionIssues(
         reason = 'The response exceeds Pact’s size limit.'
       } else if (/executable.*unavailable/iu.test(reason)) {
         title = `${name} unavailable`
-        reason = `The ${name} executable is unavailable. Check its installation.`
+        reason = `Couldn’t start ${name}. Check that it is installed and available.`
       }
     } else if (phase === 'warning' && /native transport disconnected/iu.test(reason)) {
       title = `${name} connection lost`
-      reason = `The connection to ${name} was interrupted.`
+      reason = `Lost connection to ${name}.`
     }
     if (/connection reset|ECONNRESET/iu.test(reason))
       reason = 'The connection was reset during the session check.'

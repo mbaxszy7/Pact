@@ -112,7 +112,7 @@ describe('Archive result notice', () => {
     const panelId = details.getAttribute('aria-controls')!
     const panel = document.getElementById(panelId)!
     expect(panel.hidden).toBe(false)
-    expect(panel.textContent).toContain('This item has not been archived.')
+    expect(panel.textContent).toContain('Not archived yet.')
 
     view.rerender(<ArchiveNotice {...callbacks} results={[previous, other]} />)
 

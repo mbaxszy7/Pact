@@ -206,7 +206,9 @@ test(
       await expect(userActions.locator('time')).toHaveAttribute('datetime', createdAt)
       const userBubble = await user.locator('[data-pact-message-bubble]').boundingBox()
       const userActionsBox = await userActions.boundingBox()
-      const userCopyBox = await user.getByRole('button', { name: 'Copy You message' }).boundingBox()
+      const userCopyBox = await user
+        .getByRole('button', { name: 'Copy your message' })
+        .boundingBox()
       const assistantBubble = await assistant.locator('[data-pact-message-bubble]').boundingBox()
       if (!userBubble || !userActionsBox || !userCopyBox || !assistantBubble) {
         throw new Error('Message geometry is unavailable.')

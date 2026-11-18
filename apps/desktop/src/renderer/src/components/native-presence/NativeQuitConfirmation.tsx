@@ -49,8 +49,7 @@ export function NativeQuitConfirmation({ state }: { state: NativeQuitState }): R
       accepted = result.ok
       if (activeRef.current && !result.ok) setError(result.error.message)
     } catch {
-      if (activeRef.current)
-        setError('Could not confirm your choice. Try again to check this exit request.')
+      if (activeRef.current) setError('Couldn’t confirm your choice. Try again.')
     } finally {
       if (!accepted) {
         pendingRef.current = false
@@ -99,15 +98,15 @@ export function NativeQuitConfirmation({ state }: { state: NativeQuitState }): R
         <p id={descriptionId} className="text-body text-secondary">
           {confirming
             ? state.unknown
-              ? 'Pact could not confirm the current task status. Exiting may interrupt work that is still active.'
+              ? 'Pact couldn’t check running tasks. Exiting may interrupt active work.'
               : onlyUnconfirmedWork
-                ? 'Pact couldn’t confirm whether the work below has ended. Exiting may interrupt any work still in progress.'
-                : 'Exiting may interrupt work that’s still in progress.'
+                ? 'Pact couldn’t confirm whether the tasks below finished. Exiting may interrupt active work.'
+                : 'Exiting may interrupt work in progress.'
             : state.phase === 'cancelling'
-              ? 'Waiting for the exit request to be cancelled. Your tasks will stay in Pact.'
+              ? 'Cancelling exit. Your sessions will stay open.'
               : state.phase === 'unconfirmed'
-                ? 'Pact is still waiting for its runtime to exit. Tasks may still be active; this window will close when exit is confirmed.'
-                : 'Waiting for tasks to end and saved work to finish closing.'}
+                ? 'Waiting for background tasks to close. This window will close automatically.'
+                : 'Closing active tasks and saving state.'}
         </p>
         {state.sessions.length ? (
           <ul className="pact-native-quit-sessions" aria-label="Affected Sessions">
@@ -134,7 +133,9 @@ export function NativeQuitConfirmation({ state }: { state: NativeQuitState }): R
             be interrupted.
           </p>
         ) : null}
-        {state.message ? <p className="text-body text-secondary">{state.message}</p> : null}
+        {state.message && !confirming && state.phase !== 'unconfirmed' ? (
+          <p className="text-body text-secondary">{state.message}</p>
+        ) : null}
         {error ? (
           <p className="text-body text-danger" role="alert">
             {error}
@@ -142,9 +143,8 @@ export function NativeQuitConfirmation({ state }: { state: NativeQuitState }): R
         ) : null}
         {confirming ? (
           <p className="text-caption text-secondary">
-            Saved conversations and files remain available after you exit. To keep Pact running in
-            the background, choose Cancel, then close the main window. Reopen Pact from the system
-            tray.
+            Saved work stays available next time you open Pact. To keep Pact in the tray instead,
+            click Cancel and close the main window.
           </p>
         ) : null}
       </div>
@@ -177,9 +177,9 @@ export function NativeQuitConfirmation({ state }: { state: NativeQuitState }): R
               strokeWidth={1.75}
             />
             {state.phase === 'cancelling'
-              ? 'Cancelling exit…'
+              ? 'Cancelling…'
               : state.phase === 'unconfirmed'
-                ? 'Waiting for runtime exit…'
+                ? 'Waiting to close…'
                 : 'Exiting…'}
           </output>
         )}

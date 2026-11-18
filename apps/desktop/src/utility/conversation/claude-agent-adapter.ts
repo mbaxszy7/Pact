@@ -5299,25 +5299,25 @@ export class ClaudeAgentAdapter implements AgentAdapter {
   private static fastModeDisabledDetail(reason: unknown): string | undefined {
     switch (reason) {
       case 'free':
-        return 'Fast is unavailable for this account. Continuing at standard speed.'
+        return 'Fast mode isn’t available for this account. Using standard speed.'
       case 'preference':
-        return 'Fast is disabled by native preferences or policy. Continuing at standard speed.'
+        return 'Fast mode is disabled by your settings or policy. Using standard speed.'
       case 'extra_usage_disabled':
-        return 'Fast requires native extra usage to be enabled. Continuing at standard speed.'
+        return 'Fast mode requires extra usage to be enabled. Using standard speed.'
       case 'network_error':
-        return 'Fast is unavailable because of a native connectivity issue. Continuing at standard speed.'
+        return 'Fast mode is unavailable due to a network issue. Using standard speed.'
       case 'not_first_party':
-        return 'Fast is unavailable for this provider. Continuing at standard speed.'
+        return 'Fast mode isn’t available for this provider. Using standard speed.'
       case 'disabled_by_env':
-        return 'Fast is disabled by the native environment. Continuing at standard speed.'
+        return 'Fast mode is disabled by environment settings. Using standard speed.'
       case 'model_not_allowed':
-        return 'The native model policy does not allow Fast. Continuing at standard speed.'
+        return 'This model doesn’t support Fast mode. Using standard speed.'
       case 'sdk_opt_in_required':
-        return 'The native SDK has not enabled Fast for this execution. Continuing at standard speed.'
+        return 'Fast mode isn’t enabled for this run. Using standard speed.'
       case 'pending':
-        return 'Native Fast availability is still being checked. Currently at standard speed.'
+        return 'Checking Fast mode availability. Using standard speed for now.'
       case 'unknown':
-        return 'The native runtime reports that Fast is unavailable. Continuing at standard speed.'
+        return 'Fast mode is unavailable. Using standard speed.'
       default:
         return undefined
     }

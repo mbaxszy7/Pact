@@ -326,7 +326,7 @@ it.each(['begin', 'append'] as const)(
       expect(f.result.current.composer).toBe(f.text)
       expect(f.result.current.sending).toBe(false)
       expect(f.result.current.stopping).toBe(false)
-      expect(f.result.current.error).toContain('Input preparation was cancelled')
+      expect(f.result.current.error).toContain('Sending was cancelled')
       await act(async () => f.releaseUpload())
       await waitFor(() =>
         expect(f.write).toHaveBeenCalledWith({

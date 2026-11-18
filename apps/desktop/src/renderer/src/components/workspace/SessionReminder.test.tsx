@@ -105,7 +105,7 @@ describe('SessionReminder rail UI', () => {
       <SessionReminder
         reminder={makeReminder({
           id: 'summary:attention',
-          sessionTitle: 'More Session updates',
+          sessionTitle: 'More session updates',
           category: 'needs_input',
           summary: true,
           summaryAttention: 2,

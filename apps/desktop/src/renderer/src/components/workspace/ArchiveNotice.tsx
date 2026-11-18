@@ -159,7 +159,7 @@ export function ArchiveNotice({
           aria-label="Dismiss completed archive results"
           title={
             unresolved
-              ? 'Dismiss resolved results; items to check stay available'
+              ? 'Dismiss completed results; items needing a check stay here'
               : 'Dismiss archive results'
           }
           disabled={blocked || results.length === unresolved}
@@ -229,10 +229,10 @@ export function ArchiveNotice({
                             ? 'Archived'
                             : result.state === 'failed'
                               ? 'Archive failed'
-                              : 'Result to check'}
+                              : 'Status unconfirmed'}
                       </span>
                       {result.sidebarRemoved && result.state === 'unresolved' ? (
-                        <span className="text-status-warning">Archive result to check</span>
+                        <span className="text-status-warning">Hidden; archive unconfirmed</span>
                       ) : null}
                     </p>
                   </div>
@@ -298,7 +298,7 @@ export function ArchiveNotice({
                   <p className="text-body text-secondary">
                     {result.message ??
                       result.receipt?.message ??
-                      'This item has not been archived. Review its current tasks before trying again.'}
+                      'Not archived yet. Check active tasks before trying again.'}
                   </p>
                   {tasks.length ? (
                     <ul

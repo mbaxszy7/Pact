@@ -1068,7 +1068,7 @@ describe('Relay activity display', () => {
     ])
     expect(
       els.map((el) => el.querySelector('[data-activity-text="outcome"]')?.textContent),
-    ).toEqual(['Completed', 'Not sent', 'Pending', 'Needs attention', 'Pending', 'Stopped'])
+    ).toEqual(['Completed', 'Not sent', 'Pending', 'Needs attention', 'Pending', 'Replaced'])
     for (const el of els.slice(0, 2)) {
       expect(el.textContent).toContain('Relay failed · Default workflow')
       expect(
@@ -1078,7 +1078,7 @@ describe('Relay activity display', () => {
     }
     expect(els[2]?.textContent).toContain('Relay: Applied')
     expect(els[2]?.textContent).not.toContain('Completed')
-    expect(els[3]?.textContent).toContain('Result unconfirmed')
+    expect(els[3]?.textContent).toContain('Status unconfirmed')
   })
 
   it('outcomes truthfully mark failed runs and omit suggestion prose and provider model text', async () => {
@@ -1114,8 +1114,8 @@ describe('Relay activity display', () => {
     expect(failed?.textContent).toContain('Check agent session')
     expect(failed?.textContent).toContain('Failed')
     expect(failed?.querySelector('.text-danger')).not.toBeNull()
-    expect(failed?.textContent).toContain('Previous work unconfirmed')
-    expect(failed?.textContent).toContain('Cleanup unconfirmed')
+    expect(failed?.textContent).toContain('Earlier run still active or unconfirmed')
+    expect(failed?.textContent).toContain('Background check still closing')
     expect(clarify?.textContent).toContain('Clarify input')
     expect(clarify?.textContent).toContain('Needs attention')
     expect(clarify?.textContent).toContain('Your input is needed')
@@ -1190,7 +1190,7 @@ describe('Saved key reveal', () => {
     const { container } = render(<Surface />)
     await waitFor(() => expect(container.querySelector('#relay-api-key')).not.toBeNull())
     await user.click(screen.getByRole('button', { name: 'Show API key' }))
-    const error = await screen.findByText(/Couldn't show the saved API key/u)
+    const error = await screen.findByText(/Couldn’t show the saved API key/u)
     expect(error.textContent).not.toContain('private-detail')
     await user.click(screen.getByRole('button', { name: 'Show API key' }))
     await waitFor(() =>

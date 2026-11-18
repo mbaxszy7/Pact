@@ -176,7 +176,7 @@ test(
       await expect(window.getByText('Detected: codex-cli 0.159.1', { exact: true })).toBeVisible()
       await expect(window.getByText('Upgrade required', { exact: true })).toHaveCount(1)
       await expect(
-        window.getByText('Resolve the issues above, then check again to resume agent actions.', {
+        window.getByText('Finish setting up both agents, then click Check again.', {
           exact: true,
         }),
       ).toBeVisible()

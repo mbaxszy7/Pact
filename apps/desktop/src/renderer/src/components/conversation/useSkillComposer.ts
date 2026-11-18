@@ -273,7 +273,8 @@ export function useSkillComposer(input: {
         let offset = 0,
           generation: string | undefined
         for (let page = 0; page < 83; page++) {
-          if (Date.now() >= deadline) throw new Error('Skill verification timed out.')
+          if (Date.now() >= deadline)
+            throw new Error('Couldn’t finish checking skills in time. Try again.')
           // oxlint-disable-next-line no-await-in-loop -- One bounded, generation-fenced ordered page reader.
           const result = await window.pact.readSkillCatalog({
             sessionId: input.session.id,

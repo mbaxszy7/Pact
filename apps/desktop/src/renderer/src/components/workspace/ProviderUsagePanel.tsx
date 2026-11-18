@@ -97,7 +97,7 @@ function shortStatusLabel(snapshot: ProviderUsageSnapshot, status: ProviderUsage
     case 'unsupported':
       return snapshot.message ?? 'Update CLI'
     case 'close_unconfirmed':
-      return snapshot.message ?? 'Cleanup pending'
+      return snapshot.message ?? 'Wait to retry'
     case 'unavailable':
       return snapshot.message ?? 'Unavailable'
     default:
@@ -218,14 +218,18 @@ function ProviderUsageSection({
       <div className="flex min-h-5 items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1.5">
           <span className="truncate text-caption font-medium text-primary">{label}</span>
-          {stale ? <span className="text-caption text-tertiary">Stale</span> : null}
+          {stale ? <span className="text-caption text-tertiary">Outdated</span> : null}
         </div>
         {detailed ? (
           <button
             type="button"
             className="grid size-6 shrink-0 place-items-center rounded-control text-tertiary transition-colors hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:pointer-events-none disabled:opacity-40"
             aria-label={`Refresh ${label}`}
-            title={remainingCooldownSeconds > 0 ? `${remainingCooldownSeconds}s` : undefined}
+            title={
+              remainingCooldownSeconds > 0
+                ? `Refresh available in ${remainingCooldownSeconds}s`
+                : undefined
+            }
             disabled={refreshBlocked}
             onClick={onRefresh}
           >

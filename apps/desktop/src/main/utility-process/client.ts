@@ -522,7 +522,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       return {
         kind: 'not-sent',
         error: ElectronUtilityProcessClient.unavailable(
-          'Utility runtime is not ready to prepare exit.',
+          'Pact background service is not ready to exit.',
         ),
       }
     const result = await this.request(
@@ -679,13 +679,15 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       this.settleStartup(startedChild, {
         ok: false,
         error: ElectronUtilityProcessClient.unavailable(
-          'Utility runtime exited before startup completed.',
+          'Pact background service exited before finishing startup.',
         ),
       })
       this.failChildRequests(
         startedChild,
         this.startupFailureError() ??
-          ElectronUtilityProcessClient.unavailable(`Utility runtime exited with code ${code}.`),
+          ElectronUtilityProcessClient.unavailable(
+            `Pact background service exited unexpectedly (code ${code}).`,
+          ),
       )
       options.onExit?.()
     })
@@ -699,7 +701,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       return Promise.resolve({
         ok: false,
         error: ElectronUtilityProcessClient.unavailable(
-          'Utility runtime is not available for startup.',
+          'Pact background service is not available.',
         ),
       })
     if (this.readyChild === target) return Promise.resolve({ ok: true, value: { ready: true } })
@@ -714,7 +716,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         this.startupDeadline = undefined
         this.settleStartup(target, {
           ok: false,
-          error: { code: 'TIMEOUT', message: 'Pact local runtime startup timed out.' },
+          error: { code: 'TIMEOUT', message: 'Pact background service took too long to start.' },
         })
       },
       Math.max(0, this.startupDeadline - performance.now()),
@@ -750,14 +752,16 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     ) {
       return Promise.resolve({
         kind: 'not-sent',
-        error: ElectronUtilityProcessClient.unavailable('Utility runtime is shutting down.'),
+        error: ElectronUtilityProcessClient.unavailable(
+          'Pact background service is shutting down.',
+        ),
       })
     }
     const target = this.child
     if (!target) {
       return Promise.resolve({
         kind: 'not-sent',
-        error: ElectronUtilityProcessClient.unavailable('Utility runtime is not running.'),
+        error: ElectronUtilityProcessClient.unavailable('Pact background service is not running.'),
       })
     }
 
@@ -769,7 +773,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     if (navigationRead && prior) {
       const busy: UtilityTransportResult = {
         kind: 'not-sent',
-        error: { code: 'CONFLICT', message: 'The previous navigation read is still settling.' },
+        error: { code: 'CONFLICT', message: 'Still loading the previous view. Try again.' },
       }
       if (
         this.inFlightRequests.has(prior.id) ||
@@ -862,7 +866,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         this.finishRequest(requestId, {
           kind: 'not-sent',
           error: ElectronUtilityProcessClient.unavailable(
-            'Utility runtime could not receive the request.',
+            'Couldn’t send the request to Pact background service.',
           ),
         })
       }
@@ -1078,7 +1082,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         ok: false,
         error: {
           code: 'UNCERTAIN',
-          message: 'The key change could not be confirmed. Check its status.',
+          message: 'Couldn’t confirm the API key change. Check its current status.',
         },
       }
     if (result.kind === 'not-sent') return { ok: false, error: result.error }
@@ -2304,7 +2308,9 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     if (target)
       this.settleStartup(target, {
         ok: false,
-        error: ElectronUtilityProcessClient.unavailable('Utility runtime is shutting down.'),
+        error: ElectronUtilityProcessClient.unavailable(
+          'Pact background service is shutting down.',
+        ),
       })
     if (this.shutdownTask) return this.shutdownTask
     const deadline = performance.now() + WORKSPACE_OPERATION_TIMEOUT_MS
@@ -2331,7 +2337,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
           ok: false,
           error: {
             code: 'UNCERTAIN',
-            message: 'Utility runtime exit could not be confirmed. Its ownership is retained.',
+            message: 'Couldn’t confirm that background tasks exited cleanly.',
           },
         }
       if (target && !(await this.waitForExit(target, deadline)))
@@ -2339,7 +2345,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
           ok: false,
           error: {
             code: 'UNCERTAIN',
-            message: 'Utility runtime exit could not be confirmed. Its ownership is retained.',
+            message: 'Couldn’t confirm that background tasks exited cleanly.',
           },
         }
       return acknowledged
@@ -2390,7 +2396,9 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     if (target)
       this.settleStartup(target, {
         ok: false,
-        error: ElectronUtilityProcessClient.unavailable('Utility runtime is shutting down.'),
+        error: ElectronUtilityProcessClient.unavailable(
+          'Pact background service is shutting down.',
+        ),
       })
     for (const request of this.directoryRequests.values()) request.controller.abort()
     void this.directoryOperations.dispose().catch(() => undefined)
@@ -2398,7 +2406,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     this.terminatingChild = target
     this.failChildRequests(
       target,
-      ElectronUtilityProcessClient.unavailable('Utility runtime is shutting down.'),
+      ElectronUtilityProcessClient.unavailable('Pact background service is shutting down.'),
     )
     try {
       target.kill()
@@ -2412,7 +2420,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   }
 
   private static timeoutError(): AppError {
-    return { code: 'TIMEOUT', message: 'Utility runtime request timed out.' }
+    return { code: 'TIMEOUT', message: 'Pact background service request timed out.' }
   }
 
   private static requestFailure(request: InFlightRequest, error: AppError): UtilityTransportResult {
@@ -2426,7 +2434,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         ok: false,
         error: {
           code: 'INTERNAL',
-          message: 'Utility runtime returned an unexpected health response.',
+          message: 'Pact background service returned an unexpected status response.',
         },
       }
     }
@@ -2443,14 +2451,17 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
           result.error.code === 'RUNTIME_UNAVAILABLE'
             ? {
                 ...result.error,
-                message: 'Pact cannot reach its local runtime. Restart Pact and try again.',
+                message: 'Pact couldn’t reach its background service. Restart Pact and try again.',
               }
             : result.error,
       }
     if (result.response.type !== 'runtime-preparation.response') {
       return {
         ok: false,
-        error: { code: 'INTERNAL', message: 'Utility runtime returned an unexpected response.' },
+        error: {
+          code: 'INTERNAL',
+          message: 'Pact background service returned an unexpected response.',
+        },
       }
     }
     return result.response.result

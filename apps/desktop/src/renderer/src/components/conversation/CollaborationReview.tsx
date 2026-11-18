@@ -226,7 +226,7 @@ export const CollaborationReview = memo(function CollaborationReview({
       onTaskChange?.()
       return true
     } catch {
-      const message = 'The action receipt is unavailable. Refresh before trying again.'
+      const message = 'Couldn’t complete that action. Refresh and try again.'
       setActionError(message)
       if (confirmedInput)
         setPlanDecision((current) =>
@@ -252,7 +252,7 @@ export const CollaborationReview = memo(function CollaborationReview({
             ? undefined
             : {
                 ...current,
-                error: current.error ?? 'This Plan decision could not be recorded. Try again.',
+                error: current.error ?? 'Couldn’t save your choice. Try again.',
               },
       )
       return undefined
@@ -454,7 +454,7 @@ export const CollaborationReview = memo(function CollaborationReview({
         <p className="mt-1 text-secondary">Your message delivery needs attention.</p>
       ) : null}
       {draftBlocksActions ? (
-        <p id={draftHintId} className="sr-only">
+        <p id={draftHintId} className="mt-1 text-caption text-tertiary">
           Send or clear your draft before continuing this task.
         </p>
       ) : null}
@@ -548,7 +548,9 @@ export const CollaborationReview = memo(function CollaborationReview({
         >
           <AlertCircle aria-hidden="true" className="size-3.5 shrink-0" strokeWidth={1.75} />
           <span>
-            {planSync && actionError ? "Couldn't restore the plan. Your plan is saved." : error}
+            {planSync && actionError
+              ? 'Couldn’t restore that version. Your saved plan is intact.'
+              : error}
           </span>
           <button
             type="button"
@@ -558,7 +560,7 @@ export const CollaborationReview = memo(function CollaborationReview({
             className="min-h-8 rounded-control px-2 text-caption font-medium text-primary underline underline-offset-2 hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
             onClick={() => (planSync && actionError ? void act('recover_plan') : refreshStatus())}
           >
-            {busy ? 'Restoring…' : refreshing ? 'Checking…' : 'Retry'}
+            {busy ? 'Restoring…' : refreshing ? 'Checking…' : 'Try again'}
           </button>
         </div>
       ) : null}

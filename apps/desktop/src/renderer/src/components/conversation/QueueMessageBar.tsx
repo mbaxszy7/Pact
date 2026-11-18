@@ -135,22 +135,22 @@ export function QueueMessageBar({
     entry.recipient !== 'all' &&
     entry.recipient !== respondingAgentId &&
     !entry.workflowCommand
-      ? `${respondingAgentId === 'claude' ? 'Claude Code' : 'Codex'} is responding, but this message targets ${name}. Steer is only available for the Agent currently responding.`
+      ? `${respondingAgentId === 'claude' ? 'Claude Code' : 'Codex'} is replying right now, so this message for ${name} can’t be steered.`
       : undefined
   const steerInfoId = `queue-steer-info-${id}`
   const stoppingBackground = backgroundStatus === 'stopping'
   const stateLabel = stoppingBackground
     ? 'Stopping…'
     : entry.state === 'dispatching'
-      ? 'Delivering message…'
+      ? 'Sending message…'
       : entry.state === 'unknown'
-        ? 'Delivery not confirmed'
+        ? 'Delivery unconfirmed'
         : entry.state === 'paused'
           ? 'Queue paused'
           : !queue.enabled
             ? 'Queue disabled'
             : backgroundStatus === 'waiting_incomplete'
-              ? 'Waiting for background work. Response incomplete.'
+              ? 'Waiting for background work · Response incomplete'
               : backgroundStatus === 'waiting'
                 ? 'Waiting for background work'
                 : 'Queued'
@@ -237,7 +237,7 @@ export function QueueMessageBar({
             type="button"
             className={iconButton}
             aria-label="Remove queued message"
-            title={removableDelivery ? 'Remove from Pact queue' : 'Remove queued message'}
+            title={removableDelivery ? 'Cancel and remove message' : 'Remove queued message'}
             disabled={busy || (locked && !removableDelivery)}
             onClick={() => void onRemove()}
           >

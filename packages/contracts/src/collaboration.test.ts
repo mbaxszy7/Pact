@@ -826,8 +826,8 @@ describe('pure verified stage and input settlement', () => {
   })
 
   it.each([
-    ['source' as const, 'Complete response source is unavailable.'],
-    ['effects' as const, 'Turn side effects did not settle.'],
+    ['source' as const, 'Full response text isn’t available.'],
+    ['effects' as const, 'Background changes from the last turn didn’t finish saving.'],
   ])('pauses with the exact %s failure notice', (reason, notice) => {
     const next = settlePure(task(), { kind: 'unavailable', reason })
     expect(next).toMatchObject({
@@ -927,8 +927,8 @@ describe('pure verified stage and input settlement', () => {
   })
 
   it.each([
-    [false, 'The review did not provide a complete conclusion.'],
-    [true, 'The review returned conflicting conclusions.'],
+    [false, 'The review didn’t return a complete result.'],
+    [true, 'The review returned conflicting results.'],
   ])(
     'pauses an incomplete review with conflict=%s and preserves unreviewed flags',
     (verdictConflict, notice) => {
@@ -1127,7 +1127,7 @@ describe('pure verified stage and input settlement', () => {
       { kind: 'input_unconfirmed' as const },
       {
         status: 'failed' as const,
-        notice: 'Your reply could not be confirmed.',
+        notice: 'Couldn’t confirm your reply.',
       },
     ],
     [
@@ -1135,7 +1135,7 @@ describe('pure verified stage and input settlement', () => {
       { kind: 'input_plan_withdrawn' as const },
       {
         status: 'failed' as const,
-        notice: 'A later message was withdrawn.',
+        notice: 'A newer message was cancelled.',
       },
     ],
   ])('applies %s with its exact lifecycle state', (_name, settlement, expected) => {

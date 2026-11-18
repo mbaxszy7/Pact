@@ -513,9 +513,7 @@ describe('App archive flow through DesktopBridge', () => {
     const operationId = context.bridge.prepareWorkspaceArchive.mock.calls[1]![0].operationId
     expect(within(dialog()).queryByRole('button', { name: 'Review again' })).toBeNull()
     fireEvent.click(within(dialog()).getByRole('button', { name: 'Check status' }))
-    await within(dialog()).findByText(
-      'Could not check this archive. Try Check status again; its result is still unconfirmed.',
-    )
+    await within(dialog()).findByText('Couldn’t check status. Try Check status again.')
     fireEvent.click(within(dialog()).getByRole('button', { name: 'Close' }))
     expandResults()
     const check = screen.getByRole<HTMLButtonElement>('button', {
@@ -630,7 +628,7 @@ describe('App archive flow through DesktopBridge', () => {
     fireEvent.click(details)
     const panel = document.getElementById(details.getAttribute('aria-controls')!)!
     expect(panel.hidden).toBe(false)
-    expect(panel.textContent).toContain('The archive result could not be confirmed.')
+    expect(panel.textContent).toContain('Couldn’t confirm whether archiving finished.')
 
     const operationId = context.bridge.prepareWorkspaceArchive.mock.calls[1]![0].operationId
     context.operations.set(operationId, {
@@ -834,7 +832,7 @@ describe('App archive flow through DesktopBridge', () => {
     }
     expect(screen.getByText('50 archived')).not.toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Archive Project Project 51' }))
-    await screen.findByText('Review or dismiss some archive results before archiving more items.')
+    await screen.findByText('Dismiss or review older archive results before archiving more items.')
     expect(context.bridge.prepareWorkspaceArchive).toHaveBeenCalledTimes(50)
     expect(context.bridge.archiveProject).toHaveBeenCalledTimes(50)
     expect(context.bridge.archiveProject.mock.calls.map(([projectId]) => projectId)).toEqual(

@@ -262,7 +262,7 @@ export function ProjectCodeViewer({
           className="absolute inset-0 grid place-items-center text-caption text-secondary"
           aria-busy="true"
         >
-          Preparing code view…
+          Loading code view…
         </span>
       ) : null}
       {selectionAction?.tooLarge ? (
@@ -415,7 +415,7 @@ export function ProjectDiffViewer({
     <div className="relative flex h-full min-h-0 w-full flex-col">
       {timedOut ? (
         <output className="shrink-0 border-b border-border px-3 py-2 text-caption text-secondary">
-          Diff could not be computed. Choose After to read the saved code.
+          Couldn’t compute diff. Choose After to read the saved code.
         </output>
       ) : null}
       <div ref={hostRef} className="min-h-0 w-full flex-1" />
@@ -424,7 +424,7 @@ export function ProjectDiffViewer({
           className="absolute inset-0 grid place-items-center text-caption text-secondary"
           aria-busy="true"
         >
-          Preparing Diff…
+          Loading diff…
         </span>
       ) : null}
     </div>

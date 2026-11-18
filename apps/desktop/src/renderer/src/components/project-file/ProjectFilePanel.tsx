@@ -92,7 +92,11 @@ export function ProjectFilePanel({
                   : 'Wrap lines and hide line numbers'
               }
               aria-pressed={wrapPlain}
-              title={wrapPlain ? 'Show line numbers' : 'Wrap lines'}
+              title={
+                wrapPlain
+                  ? 'Show line numbers (turns off wrapping)'
+                  : 'Wrap lines (hides line numbers)'
+              }
               onClick={() => setWrapPlain((current) => !current)}
             >
               <TextWrap aria-hidden="true" className="size-4" strokeWidth={1.75} />
@@ -205,7 +209,7 @@ function FileContent({
           key={`${file.relativePath}:${file.updatedAt}`}
           fallback={plainTextFallback}
         >
-          <Suspense fallback={<FileLoadingState label="Preparing code view" />}>
+          <Suspense fallback={<FileLoadingState label="Loading code view" />}>
             <ProjectCodeViewer
               path={file.relativePath}
               content={file.content}
@@ -238,7 +242,9 @@ function FileContent({
       )}
       {selection ? (
         <section className="absolute inset-x-3 bottom-3 rounded-card border border-border bg-surface-raised p-3 shadow-lg">
-          <p className="text-caption text-secondary">Comment on “{selection.quote}”</p>
+          <p className="line-clamp-2 text-caption text-secondary" title={selection.quote}>
+            Comment on “{selection.quote}”
+          </p>
           <textarea
             className="mt-2 min-h-16 w-full resize-y rounded-control bg-surface-muted p-2 text-caption text-primary outline-none focus:outline-2 focus:outline-focus"
             value={selection.body}
@@ -270,7 +276,7 @@ function FileContent({
                 disabled={!selection.body.trim() || commentingDisabled}
                 onClick={() => void saveSelection()}
               >
-                Save Comment
+                Save comment
               </button>
             </div>
           </div>

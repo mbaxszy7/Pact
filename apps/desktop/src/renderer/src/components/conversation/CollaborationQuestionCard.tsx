@@ -53,7 +53,7 @@ function DecisionQuestions({
   const speaker = actor === 'claude' ? 'Claude Code' : actor === 'codex' ? 'Codex' : 'Agent'
   const change = (id: string, value: { optionIds: string[]; text: string }): void => {
     if (!onDraftChange?.({ ...decision, answers: { ...answers, [id]: value } }))
-      setError('Your edit could not be saved. Existing answers have been kept.')
+      setError('Couldn’t save your edit. Earlier answers are kept.')
     else setError(undefined)
   }
   return (
@@ -79,7 +79,7 @@ function DecisionQuestions({
               onClick={() => onClearDraft?.(true)}
               className="min-h-8 rounded-control px-2 font-medium text-primary hover:bg-surface-raised focus-visible:outline-2 focus-visible:outline-focus"
             >
-              Keep in draft
+              Move to message box
             </button>
             <button
               type="button"
@@ -307,7 +307,7 @@ function LegacyQuestionCard({
             className="min-h-8 px-2 underline"
             onClick={() => onClearDraft?.(true)}
           >
-            Keep in draft
+            Move to message box
           </button>
           <button
             type="button"
@@ -334,7 +334,7 @@ function LegacyQuestionCard({
                 originalReply: event.currentTarget.value,
               })
             )
-              setEditError('Your edit could not be saved. Existing answers have been kept.')
+              setEditError('Couldn’t save your edit. Earlier answers are kept.')
             else setEditError(undefined)
           }}
           className="mt-1 block min-h-16 w-full resize-y rounded-control border border-border bg-surface px-3 py-2 text-body text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-50"

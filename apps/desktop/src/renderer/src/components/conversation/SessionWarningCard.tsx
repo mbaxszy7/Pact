@@ -55,7 +55,9 @@ export function SessionWarningCard({
     try {
       await action()
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : 'The request could not be delivered.')
+      setError(
+        failure instanceof Error ? failure.message : 'Couldn’t send that request. Try again.',
+      )
     } finally {
       inFlight.current = false
       setWorking(undefined)
@@ -93,8 +95,9 @@ export function SessionWarningCard({
             Rebuild {confirming.agentId === 'codex' ? 'Codex' : 'Claude Code'} session?
           </h3>
           <p className="mt-2 leading-relaxed">
-            Starts a new native session. History and drafts stay; the task is not rerun.
-            {confirming.abandon ? ' Old work may still change files.' : null}
+            Starts a new agent session. Chat history and drafts stay saved; the earlier task won’t
+            run again.
+            {confirming.abandon ? ' Earlier work may still modify files.' : null}
             {confirming.previousCreationUnconfirmed
               ? ' A previous attempt may have created a session.'
               : null}
@@ -148,11 +151,21 @@ export function SessionWarningCard({
                     ) : (
                       <Clock aria-hidden="true" className="size-3.5 shrink-0" />
                     )}
-                    <span>
+                    <span
+                      className="min-w-0 flex-1 truncate"
+                      title={
+                        !inProgress && issue.phase === 'background_check' && issue.reason
+                          ? issue.reason
+                          : undefined
+                      }
+                    >
                       {value.agents.length > 1
                         ? `${issue.agentId === 'codex' ? 'Codex' : 'Claude Code'} · `
                         : null}
                       {stopping ? 'Stopping…' : checking ? 'Checking…' : issue.title}
+                      {!inProgress && issue.phase === 'background_check' && issue.reason ? (
+                        <span className="font-normal text-tertiary"> — {issue.reason}</span>
+                      ) : null}
                     </span>
                   </output>
                   {!inProgress && (issue.action === 'retry_check' || issue.action === 'rebuild') ? (

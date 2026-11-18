@@ -464,7 +464,8 @@ function DocumentSelectionSurface({
     })().catch((error: unknown) => {
       if (!controller.signal.aborted && logical.current === value) {
         value.phase = 'invalid'
-        value.error = String(error)
+        value.error =
+          error instanceof Error ? error.message : 'Couldn’t locate that selection here.'
         publish()
       }
     })
@@ -584,7 +585,8 @@ function DocumentSelectionSurface({
     } catch (error) {
       if (!controller.signal.aborted && logical.current === active) {
         active.phase = 'invalid'
-        active.error = String(error)
+        active.error =
+          error instanceof Error ? error.message : 'Couldn’t extend that selection here.'
         publish()
       }
     }

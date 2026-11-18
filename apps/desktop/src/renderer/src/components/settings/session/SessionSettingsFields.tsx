@@ -58,8 +58,6 @@ export function SessionSettingsFields({
   onChange,
   onRefresh,
 }: SessionSettingsFieldsProps): React.JSX.Element {
-  const primaryName = settings.primaryAgentId === 'claude' ? 'Claude Code' : 'Codex'
-  const secondaryName = settings.primaryAgentId === 'claude' ? 'Codex' : 'Claude Code'
   const updateAgent = (agentId: RuntimeAgentId, selection: AgentModelSelection): void => {
     onChange({ ...settings, agents: { ...settings.agents, [agentId]: selection } })
   }
@@ -74,11 +72,11 @@ export function SessionSettingsFields({
           id={`${idPrefix}-lead-title`}
           className="text-subtitle font-medium tracking-[-0.015em] text-primary"
         >
-          Choose the primary LLM
+          Default agent
         </h2>
         <p className="mt-1 text-caption text-secondary">
-          The Primary receives ordinary messages and new workflows by default. You can direct either
-          Agent for a specific task.
+          Receives ordinary messages by default. For /plan, it drafts the plan and reviews code
+          while the other agent reviews the plan and implements.
         </p>
         <div
           className={`mt-group grid overflow-hidden rounded-card border border-border ${compact ? 'grid-cols-1' : 'sm:grid-cols-2'}`}
@@ -108,37 +106,13 @@ export function SessionSettingsFields({
                     {agentId === 'claude' ? 'Claude Code' : 'Codex'}
                   </span>
                   <span className="mt-0.5 block text-caption text-secondary">
-                    {selected ? 'Primary LLM' : 'Set as Primary LLM'}
+                    {selected ? 'Primary agent' : 'Set as primary agent'}
                   </span>
                 </label>
               </div>
             )
           })}
         </div>
-        {!compact ? (
-          <dl className="mt-group divide-y divide-border rounded-card bg-surface-muted px-panel text-caption leading-relaxed">
-            <div className="grid gap-1 py-group sm:grid-cols-[10rem_minmax(0,1fr)] sm:gap-section">
-              <dt>
-                <span className="block text-tertiary">Primary LLM</span>
-                <strong className="mt-0.5 block font-medium text-primary">{primaryName}</strong>
-              </dt>
-              <dd className="text-secondary">
-                Default recipient for ordinary messages and new workflows. Each task selects its
-                author, default implementer and peer reviewer.
-              </dd>
-            </div>
-            <div className="grid gap-1 py-group sm:grid-cols-[10rem_minmax(0,1fr)] sm:gap-section">
-              <dt>
-                <span className="block text-tertiary">Secondary LLM</span>
-                <strong className="mt-0.5 block font-medium text-primary">{secondaryName}</strong>
-              </dt>
-              <dd className="text-secondary">
-                Available for explicit routing. The task author is its default implementer, and the
-                other Agent reviews.
-              </dd>
-            </div>
-          </dl>
-        ) : null}
       </section>
 
       <section
@@ -151,11 +125,8 @@ export function SessionSettingsFields({
               id={`${idPrefix}-agents-title`}
               className="text-subtitle font-medium tracking-[-0.015em]"
             >
-              Agent defaults
+              Models &amp; effort
             </h2>
-            <p className="mt-1 text-caption text-secondary">
-              Options come from the CLI versions currently available.
-            </p>
           </div>
           {showRefresh && onRefresh ? (
             <button
@@ -198,9 +169,7 @@ export function SessionSettingsFields({
         >
           Collaboration limits
         </h2>
-        <p className="mt-1 text-caption text-secondary">
-          These bounds prevent open-ended discussion and repeated repair loops.
-        </p>
+        <p className="mt-1 text-caption text-secondary">Caps automatic review and repair loops.</p>
         <div className={`mt-group grid gap-group ${compact ? 'grid-cols-1' : 'sm:grid-cols-2'}`}>
           <NumberSetting
             label="Plan reviews"

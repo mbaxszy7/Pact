@@ -200,7 +200,7 @@ export class ProviderUsage {
           sevenDay: null,
           checkedAt: null,
           identityConfirmed: false,
-          message: 'Cleanup pending',
+          message: 'Wait to retry',
         }),
       }
     }
@@ -457,7 +457,7 @@ export class ProviderUsage {
             sevenDay: null,
             checkedAt: null,
             identityConfirmed: false,
-            message: 'Cleanup pending',
+            message: 'Wait to retry',
           }),
         }
       }
@@ -542,7 +542,7 @@ export class ProviderUsage {
             sevenDay: null,
             checkedAt: null,
             identityConfirmed: false,
-            message: 'Cleanup pending',
+            message: 'Wait to retry',
           }),
         }
       }
@@ -1082,7 +1082,7 @@ export class ProviderUsage {
         sevenDay: null,
         checkedAt: null,
         identityConfirmed: false,
-        message: 'Cleanup pending',
+        message: 'Wait to retry',
       })
     }
     if (slot.active) {

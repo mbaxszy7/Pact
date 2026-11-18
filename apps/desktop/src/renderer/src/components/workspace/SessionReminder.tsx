@@ -138,7 +138,9 @@ export function SessionReminder({
   const secondaryCategory = reminder.secondaryCategory
   const summaryParts = reminder.summary
     ? [
-        reminder.summaryAttention ? `${reminder.summaryAttention} need attention` : undefined,
+        reminder.summaryAttention
+          ? `${reminder.summaryAttention} ${reminder.summaryAttention === 1 ? 'needs' : 'need'} attention`
+          : undefined,
         reminder.summaryCompleted ? `${reminder.summaryCompleted} completed` : undefined,
       ].filter((part): part is string => Boolean(part))
     : []

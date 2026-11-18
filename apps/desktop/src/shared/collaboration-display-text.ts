@@ -34,24 +34,24 @@ export function collaborationDisplayEdits(
   const labels = chinese
     ? {
         task: '当前任务',
-        run: '讨论记录',
-        input: '原输入',
-        comment: '用户评论',
-        item: '相关意见',
+        run: '当前执行',
+        input: '原消息',
+        comment: '批注',
+        item: '相关事项',
         question: '该问题',
-        document: '引用内容',
-        hash: '内容校验',
+        document: '引用文档',
+        hash: '内容版本',
         choice: '所选方案',
       }
     : {
         task: 'task',
-        run: 'run',
-        input: 'input',
+        run: 'attempt',
+        input: 'original message',
         comment: 'comment',
         item: 'item',
         question: 'question',
-        document: 'source',
-        hash: 'checksum',
+        document: 'reference',
+        hash: 'version',
         choice: 'choice',
       }
   const known = new Map<string, string>()
@@ -101,8 +101,8 @@ export function collaborationDisplayEdits(
       const agent = actor.toLowerCase() === 'codex' ? 'Codex' : 'Claude Code'
       label = groups.handler
         ? chinese
-          ? `由 ${agent} 处理答案`
-          : `${agent} handles the answer`
+          ? `由 ${agent} 处理回答`
+          : `${agent} will answer`
         : chinese
           ? `本轮由 ${agent} 处理`
           : `${agent} handles this turn`

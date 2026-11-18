@@ -1524,7 +1524,7 @@ export function ProjectNavigation({
           <Settings aria-hidden="true" className="size-4 shrink-0" strokeWidth={1.75} />
           <span className="truncate">Settings</span>
           {updateAvailable && (
-            <span className="ml-auto shrink-0 text-caption font-medium text-focus">New</span>
+            <span className="ml-auto shrink-0 text-caption font-medium text-focus">Update</span>
           )}
         </button>
       </div>

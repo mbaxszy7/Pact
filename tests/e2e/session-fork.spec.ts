@@ -352,7 +352,7 @@ test(
       await expect(page.getByRole('combobox', { name: 'Message', exact: true })).toBeDisabled()
       await expect(page.getByRole('button', { name: 'Send message', exact: true })).toBeDisabled()
       await expect(
-        page.getByRole('button', { name: 'Continue native fork', exact: true }),
+        page.getByRole('button', { name: 'Finish fork setup', exact: true }),
       ).toHaveCount(2)
       await quitPact(app)
       app = undefined
@@ -485,9 +485,9 @@ test(
       const before = await fixture.readClaudeFacts()
       const candidate = before.resumes?.at(-1)
       expect(candidate).toBeTruthy()
-      await recovery.getByRole('button', { name: 'Check original candidate', exact: true }).click()
+      await recovery.getByRole('button', { name: 'Check status', exact: true }).click()
       await expect(
-        recovery.getByRole('button', { name: 'Continue initialization', exact: true }),
+        recovery.getByRole('button', { name: 'Complete setup', exact: true }),
       ).toBeEnabled()
       expect((await fixture.readClaudeFacts()).settingsReads).toBe(before.settingsReads)
       await quitPact(app)
@@ -497,7 +497,7 @@ test(
       const restored = page.getByRole('region', { name: 'Native fork confirmation' })
       await expect(restored).toHaveCount(1)
       expect((await fixture.readClaudeFacts()).settingsReads).toBe(before.settingsReads)
-      await restored.getByRole('button', { name: 'Continue initialization', exact: true }).click()
+      await restored.getByRole('button', { name: 'Complete setup', exact: true }).click()
       await expect(restored).toHaveCount(0, { timeout: 25_000 })
       await expect(
         page

@@ -142,7 +142,7 @@ export function useSchedulingSettings(
         }
       } catch {
         if (current.mounted && current.active && current.epoch === epoch)
-          setError('Relay status could not be loaded. Reopen Relay settings to try again.')
+          setError('Couldn’t load Relay status. Try again in a moment.')
       } finally {
         current.readingState = false
         const pending = current.pendingRead
@@ -182,7 +182,7 @@ export function useSchedulingSettings(
         )
           return
         if (!result.ok) {
-          setActivityError('Scheduling activity could not be loaded.')
+          setActivityError('Couldn’t load activity.')
           return
         }
         const page: SchedulingActivityPage = result.value
@@ -250,7 +250,7 @@ export function useSchedulingSettings(
         setActivityError(undefined)
       } catch {
         if (current.mounted && current.active && current.details && current.detailsEpoch === epoch)
-          setActivityError('Scheduling activity could not be loaded.')
+          setActivityError('Couldn’t load activity.')
       } finally {
         current.reading = false
         if (current.mounted) setActivityLoading(false)
@@ -402,7 +402,8 @@ export function useSchedulingSettings(
       } catch {
         if (current.mounted) {
           current.changeVersion += 1
-          current.saveFailure = 'Could not confirm the save. Reopen Relay settings to try again.'
+          current.saveFailure =
+            'Couldn’t confirm whether settings were saved. Try again in a moment.'
           if (current.active && current.epoch === epoch) setError(current.saveFailure)
           readbackSettings()
         }
@@ -578,19 +579,19 @@ const activityActions: Record<NonNullable<SchedulingActivityRow['action']>, stri
   supplement_plan: 'Clarify Plan',
   supplement_code_response: 'Clarify review',
   native_check: 'Check agent session',
-  queue_check: 'Check delivery',
-  rebuild_check: 'Check rebuild',
+  queue_check: 'Check message status',
+  rebuild_check: 'Check session rebuild',
   confirmed_resend: 'Retry unsent work',
   rebuild_native_context: 'Rebuild agent session',
   reassign_roles: 'Change code roles',
-  extend_plan_review: 'Add one Plan review',
+  extend_plan_review: 'Add one plan review',
 }
 const activityReasons: Record<SchedulingActivityRow['reason'], string> = {
   workflow: 'Workflow handoff',
   input: 'Message routing',
   native_check: 'Check agent session',
-  queue_check: 'Check delivery',
-  rebuild_check: 'Check rebuild',
+  queue_check: 'Check message status',
+  rebuild_check: 'Check session rebuild',
   native_rebuild: 'Rebuild agent session',
   confirmed_resend: 'Retry unsent work',
 }
@@ -601,8 +602,8 @@ const activityResults: Record<NonNullable<SchedulingActivityRow['actionResult']>
   failed: 'Failed',
   not_sent: 'Not sent',
   unconfirmed: 'Needs attention',
-  cancelled: 'Stopped',
-  superseded: 'Stopped',
+  cancelled: 'Cancelled',
+  superseded: 'Replaced',
 }
 function activityDisplay(row: SchedulingActivityRow): {
   action: string
@@ -625,7 +626,7 @@ function activityDisplay(row: SchedulingActivityRow): {
   else if (check || decisionOnly)
     outcome =
       row.suggestionState === 'discarded'
-        ? 'Stopped'
+        ? 'Replaced'
         : row.result === 'completed'
           ? 'Completed'
           : row.result === 'failed'
@@ -633,7 +634,7 @@ function activityDisplay(row: SchedulingActivityRow): {
             : row.result === 'not_sent'
               ? 'Not sent'
               : 'Pending'
-  else if (row.suggestionState === 'discarded') outcome = 'Stopped'
+  else if (row.suggestionState === 'discarded') outcome = 'Replaced'
   else outcome = 'Pending'
   const terminal = row.actionResult
     ? ['completed', 'failed', 'not_sent', 'cancelled', 'superseded'].includes(row.actionResult)
@@ -644,10 +645,10 @@ function activityDisplay(row: SchedulingActivityRow): {
         ? 'Your input is needed'
         : 'Your confirmation is needed'
       : row.actionResult === 'unconfirmed'
-        ? 'Result unconfirmed'
+        ? 'Status unconfirmed'
         : null,
-    row.originalUnconfirmed ? 'Previous work unconfirmed' : null,
-    terminal && row.physicalUnconfirmed ? 'Cleanup unconfirmed' : null,
+    row.originalUnconfirmed ? 'Earlier run still active or unconfirmed' : null,
+    terminal && row.physicalUnconfirmed ? 'Background check still closing' : null,
   ].filter(Boolean)
   const decisionFailed =
     !check &&
@@ -994,7 +995,7 @@ export function DecisionSchedulingSettings({
         setRevealed(result.value)
         setShowKey(true)
       } else {
-        setRevealError("Couldn't show the saved API key. Try again.")
+        setRevealError('Couldn’t show the saved API key. Try again.')
       }
     }
     void request.then(complete, () => complete())
@@ -1056,7 +1057,7 @@ export function DecisionSchedulingSettings({
         <header className="relay-header">
           <h2 className="text-title font-medium tracking-tight text-primary">Relay</h2>
           <p className="mt-2 max-w-[60ch] text-body leading-[1.6] text-secondary">
-            Smarter orchestration between Codex and Claude Code, powered by Decisions API.
+            Optional routing and workflow suggestions powered by OpenAI’s Decisions API.
           </p>
         </header>
         <RelaySwitch
@@ -1192,7 +1193,7 @@ export function DecisionSchedulingSettings({
                   ) : null}
                   {state.credentialUncertain ? (
                     <p className="mt-2 text-caption text-secondary">
-                      The key change could not be confirmed.
+                      Couldn’t confirm whether the key change was saved.
                     </p>
                   ) : null}
                   {settings.credential.configured || state.credentialUncertain ? (

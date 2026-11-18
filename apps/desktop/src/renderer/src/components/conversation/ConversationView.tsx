@@ -459,7 +459,7 @@ export function ConversationView({
         installWorkspaceFiles({
           ...initial,
           loading: false,
-          error: 'Loading saved files took too long. Try again.',
+          error: 'Loading changed files took too long. Try again.',
         })
       }, WORKSPACE_OPERATION_TIMEOUT_MS)
       try {
@@ -478,18 +478,18 @@ export function ConversationView({
           result.value.changeSet.id !== changeSetId ||
           result.value.changeSet.sessionId !== session.id
         )
-          throw new Error('These changes do not belong to this Session.')
+          throw new Error('These file changes do not belong to this session.')
         if ((result.value.changeSet.revision ?? 0) !== revision)
-          throw new Error('The recorded changes changed while loading. Try again.')
+          throw new Error('Changed files were updated while loading. Try again.')
         const files = [...initial.files, ...result.value.files]
         if (files.length > WORKSPACE_CHANGE_FILES)
-          throw new Error('The saved file list exceeded its supported size.')
+          throw new Error('Too many changed files to display at once.')
         if (new Set(files.map((file) => file.path)).size !== files.length)
-          throw new Error('The saved file list contains duplicate paths.')
+          throw new Error('Changed file list contained duplicate paths.')
         if (!result.value.nextPath && files.length !== result.value.changeSet.fileCount)
-          throw new Error('The saved file list is incomplete. Try again.')
+          throw new Error('Changed file list is incomplete. Try again.')
         if (result.value.nextPath && result.value.nextPath === current?.nextPath)
-          throw new Error('The saved file list did not advance.')
+          throw new Error('Couldn’t load the next page of changed files.')
         installWorkspaceFiles({
           ...initial,
           revision: result.value.changeSet.revision ?? 0,
@@ -506,13 +506,12 @@ export function ConversationView({
               contextGeneration,
               result.value.changeSet.revision,
             )
-          else onNotice('No saved files are available for this round.')
+          else onNotice('No changed files were recorded for this turn.')
         }
       } catch (failure) {
         if (!workspaceOwnerActiveRef.current || generation !== workspaceFilesGenerationRef.current)
           return
-        const message =
-          failure instanceof Error ? failure.message : 'Pact could not load saved files.'
+        const message = failure instanceof Error ? failure.message : 'Couldn’t load changed files.'
         installWorkspaceFiles({ ...initial, loading: false, error: message })
         if (open) onNotice(message)
       } finally {
@@ -1217,6 +1216,7 @@ export function ConversationView({
       ? collaborationActor(unfinishedTask, 'reply')
       : session.settings.primaryAgentId
   const primaryName = session.settings.primaryAgentId === 'claude' ? 'Claude Code' : 'Codex'
+  const secondaryName = session.settings.primaryAgentId === 'claude' ? 'Codex' : 'Claude Code'
   const filteredMentionOptions = mentionOptions.filter(
     (option) =>
       option.token.slice(1).startsWith(mentionQuery?.query ?? '') &&
@@ -2468,7 +2468,9 @@ export function ConversationView({
       composerRef.current?.apply(next, { start: cursor, end: cursor }, replacements)
     } catch (editError) {
       composerRef.current?.refuseEdit(
-        editError instanceof Error ? editError.message : 'Your draft was kept.',
+        editError instanceof Error
+          ? editError.message
+          : 'Couldn’t apply that edit. Your draft was kept.',
       )
     }
   }
@@ -2493,7 +2495,9 @@ export function ConversationView({
       composerRef.current?.apply(next, { start: cursor, end: cursor }, [skillReplacement])
     } catch (editError) {
       composerRef.current?.refuseEdit(
-        editError instanceof Error ? editError.message : 'Your draft was kept.',
+        editError instanceof Error
+          ? editError.message
+          : 'Couldn’t apply that skill. Your draft was kept.',
       )
     }
   }
@@ -2531,7 +2535,9 @@ export function ConversationView({
       composerRef.current?.apply(nextDocument, { start: cursor, end: cursor }, edits)
     } catch (editError) {
       composerRef.current?.refuseEdit(
-        editError instanceof Error ? editError.message : 'Your draft was kept.',
+        editError instanceof Error
+          ? editError.message
+          : 'Couldn’t insert that mention. Your draft was kept.',
       )
       return
     }
@@ -3079,13 +3085,13 @@ export function ConversationView({
       </time>{' '}
       ·{' '}
       {run.controlDisposition === 'abandoned'
-        ? 'Abandoned'
+        ? 'Cancelled'
         : run.status === 'interrupted'
           ? 'Stopped'
           : run.status === 'failed'
             ? 'Failed'
             : run.nativeEffectsState === 'pending' || run.nativeEffectsState === 'unknown'
-              ? 'Reply complete'
+              ? 'Reply finished'
               : 'Completed'}
     </p>
   )
@@ -3162,7 +3168,7 @@ export function ConversationView({
               }
               className="inline-flex min-h-8 cursor-pointer items-center gap-1.5 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
             >
-              Previous {previousCount} {previousCount === 1 ? 'record' : 'records'}
+              Previous {previousCount} {previousCount === 1 ? 'attempt' : 'attempts'}
               <ChevronDown
                 className={`size-3.5 transition-transform ${expanded ? 'rotate-180' : ''}`}
                 aria-hidden="true"
@@ -3182,7 +3188,7 @@ export function ConversationView({
                 ))}
                 {loadingGroup ? (
                   <p className="px-2 text-caption text-secondary" aria-busy="true">
-                    Loading earlier records…
+                    Loading earlier attempts…
                   </p>
                 ) : null}
                 {failure ? (
@@ -3203,7 +3209,7 @@ export function ConversationView({
                     }
                     className="min-h-8 w-fit cursor-pointer rounded-control px-2 text-caption font-medium text-primary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
                   >
-                    {failure ? 'Try again' : 'Load earlier records'}
+                    {failure ? 'Try again' : 'Load earlier attempts'}
                   </button>
                 ) : null}
               </div>
@@ -3717,11 +3723,19 @@ export function ConversationView({
           disabled={!commentEditor.body.trim() || disabled || savingComment}
           onClick={() => void saveComment()}
         >
-          {savingComment ? 'Adding…' : 'Add to comment'}
+          {commentEditor.commentId
+            ? savingComment
+              ? 'Saving…'
+              : 'Save comment'
+            : savingComment
+              ? 'Adding…'
+              : 'Add comment'}
         </button>
       </div>
       <p className="mt-2.5 px-1 text-caption text-tertiary">
-        Enter to add · Shift+Enter for a new line
+        {commentEditor.commentId
+          ? 'Enter to save · Shift+Enter for a new line'
+          : 'Enter to add · Shift+Enter for a new line'}
       </p>
     </section>
   ) : null
@@ -3880,7 +3894,7 @@ export function ConversationView({
                         document: planningTask.planReference.document,
                         sessionId: session.id,
                         status: currentPlan.planSync
-                          ? 'Sync recovery required'
+                          ? 'Needs restore'
                           : planningTask.status === 'running' && planningTask.stage === 'plan'
                             ? 'Drafting'
                             : planningTask.status === 'running' &&
@@ -3896,10 +3910,10 @@ export function ConversationView({
                                   : planningTask.review.verdict === 'changes_requested'
                                     ? 'Changes requested'
                                     : isCollaborationOpenMode(planningTask)
-                                      ? 'Draft (unreviewed)'
+                                      ? 'Unreviewed'
                                       : 'In review'
                                 : planningTask.unreviewedPlanActor
-                                  ? 'Draft (unreviewed)'
+                                  ? 'Unreviewed'
                                   : isCollaborationOpenMode(planningTask)
                                     ? 'Accepted'
                                     : planningTask.stage === 'plan_review'
@@ -4039,30 +4053,28 @@ export function ConversationView({
                 ? 'Scroll up for earlier messages.'
                 : 'Beginning of conversation.'}
           </output>
-          {history.pageError ? (
+          {history.pageError && !hasNewerHistory ? (
             <div
               className="mb-group flex items-center justify-center gap-2 text-caption text-danger"
               role="alert"
             >
               <span>{history.pageError}</span>
-              {history.pageError ? (
-                <button
-                  className="font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
-                  type="button"
-                  onClick={() => {
-                    if (!history.gapRecoveryPending) {
-                      if (historyReadDirectionRef.current === 'latest') void loadLatest()
-                      else void loadOlder()
-                      return
-                    }
-                    const retry = gapRetryRef.current
-                    if (retry.mode === 'around') void history.recoverFromGap(retry.messageId)
-                    else void loadLatestForGap()
-                  }}
-                >
-                  Retry
-                </button>
-              ) : null}
+              <button
+                className="font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
+                type="button"
+                onClick={() => {
+                  if (!history.gapRecoveryPending) {
+                    if (historyReadDirectionRef.current === 'latest') void loadLatest()
+                    else void loadOlder()
+                    return
+                  }
+                  const retry = gapRetryRef.current
+                  if (retry.mode === 'around') void history.recoverFromGap(retry.messageId)
+                  else void loadLatestForGap()
+                }}
+              >
+                Retry
+              </button>
             </div>
           ) : null}
           {loading && !snapshot ? (
@@ -4126,7 +4138,7 @@ export function ConversationView({
                 Start with {primaryName}
               </h2>
               <p className="mx-auto mt-1 max-w-[46ch] text-caption leading-relaxed text-secondary">
-                Work with your Agent in this Project. This conversation will be saved.
+                Ask a question, describe a change, or type @ to mention an agent.
               </p>
             </div>
           )}
@@ -4159,9 +4171,19 @@ export function ConversationView({
             </div>
           ) : null}
           {hasNewerHistory && history.pageError ? (
-            <p className="mt-1 text-center text-caption text-danger" role="alert">
-              {history.pageError}
-            </p>
+            <div
+              className="mt-1 flex items-center justify-center gap-2 text-caption text-danger"
+              role="alert"
+            >
+              <span>{history.pageError}</span>
+              <button
+                className="font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
+                type="button"
+                onClick={() => void loadLatest()}
+              >
+                Retry
+              </button>
+            </div>
           ) : null}
 
           {history.readError ? (
@@ -4527,9 +4549,7 @@ export function ConversationView({
                               composerImages.length ||
                               composerMention ||
                               draftComments.length) ? (
-                              <span>
-                                Keep your current draft. Sending it replaces the previous input.
-                              </span>
+                              <span>Sending your current draft replaces the returned message.</span>
                             ) : null}
                           </>
                         ) : null}
@@ -4571,13 +4591,9 @@ export function ConversationView({
                           : activeMentionId
                       }
                       placeholder={
-                        history.draftError
-                          ? 'Comments unavailable'
-                          : history.draftsLoading
-                            ? 'Loading saved comments…'
-                            : agentActionsEnabled
-                              ? 'What should we tackle next?'
-                              : 'Agent actions are paused'
+                        agentActionsEnabled
+                          ? 'What should we tackle next?'
+                          : 'Agent actions are paused'
                       }
                       disabled={composerDisabled || inputTakeover}
                       onKeyDown={(event) => {
@@ -4894,7 +4910,9 @@ export function ConversationView({
                             <span className="min-w-0 flex-1">
                               <span className="font-medium text-primary">{option.label}</span>
                               <span className="ml-2 text-caption text-tertiary">
-                                {option.description}
+                                {option.token === '@all'
+                                  ? `${primaryName}, then ${secondaryName}`
+                                  : option.description}
                               </span>
                             </span>
                             <span className="font-mono text-caption text-tertiary">
@@ -5100,8 +5118,8 @@ function ContextReceipt({
   const source = target === 'claude' ? 'Codex' : 'Claude Code'
   return (
     <p className="mt-1 text-caption text-tertiary">
-      {accepted ? 'Context supplied' : 'Context prepared'} · {count}{' '}
-      {count === 1 ? 'message' : 'messages'} involving {source}
+      {accepted ? 'Shared' : 'Prepared'} {count} earlier {count === 1 ? 'message' : 'messages'} from{' '}
+      {source}
     </p>
   )
 }
@@ -5293,14 +5311,16 @@ const MessageHoverActions = memo(function MessageHoverActions({
   const date = new Date(createdAt)
   const fullDate = messageDateTimeFormatter.format(date)
   const copyLabel = longMessage
-    ? 'Full copy is unavailable for long Messages'
+    ? 'Copy unavailable for long messages'
     : copyResult === 'copying'
       ? 'Copying message'
       : copyResult === 'copied'
         ? 'Message copied'
         : copyResult === 'failed'
-          ? 'Could not copy message'
-          : `Copy ${speaker} message`
+          ? 'Couldn’t copy message'
+          : isUser
+            ? 'Copy your message'
+            : `Copy ${speaker} message`
 
   return (
     <div

@@ -1599,10 +1599,10 @@ export function settleCollaborationStage(
       next.pauseReason = 'failure'
       next.notice =
         settlement.reason === 'effects'
-          ? 'Turn side effects did not settle.'
+          ? 'Background changes from the last turn didn’t finish saving.'
           : settlement.reason === 'source'
-            ? 'Complete response source is unavailable.'
-            : 'Turn state could not be confirmed.'
+            ? 'Full response text isn’t available.'
+            : 'Couldn’t confirm whether this turn finished.'
       break
     }
     case 'interrupted': {
@@ -1686,8 +1686,8 @@ export function settleCollaborationStage(
         next.automation = 'paused'
         next.pauseReason = 'failure'
         next.notice = settlement.observed
-          ? 'The latest plan has not been synced to Pact.'
-          : 'The Agent ended without a confirmed plan.'
+          ? 'The latest plan hasn’t finished syncing to Pact.'
+          : 'The agent finished without saving a plan.'
       }
       break
     }
@@ -1751,8 +1751,8 @@ export function settleCollaborationStage(
         next.automation = 'paused'
         next.pauseReason = 'failure'
         next.notice = settlement.verdictConflict
-          ? 'The review returned conflicting conclusions.'
-          : 'The review did not provide a complete conclusion.'
+          ? 'The review returned conflicting results.'
+          : 'The review didn’t return a complete result.'
       } else if (settlement.verdict === 'needs_user') {
         if (!settlement.decision)
           throw new Error('A needs_user review requires a supplied decision.')
@@ -1860,14 +1860,14 @@ export function settleCollaborationStage(
       next.status = 'failed'
       next.automation = 'paused'
       next.pauseReason = 'failure'
-      next.notice = 'Your reply could not be confirmed.'
+      next.notice = 'Couldn’t confirm your reply.'
       break
     }
     case 'input_plan_withdrawn': {
       next.status = 'failed'
       next.automation = 'paused'
       next.pauseReason = 'failure'
-      next.notice = 'A later message was withdrawn.'
+      next.notice = 'A newer message was cancelled.'
       break
     }
   }

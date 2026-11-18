@@ -58,7 +58,7 @@ function transportFailure(
       ok: false,
       error: {
         code: 'UNCERTAIN',
-        message: 'Appearance update outcome is unknown; read settings again before retrying.',
+        message: 'Couldn’t confirm the appearance change. Reading saved settings.',
       },
     }
   }
@@ -84,7 +84,7 @@ function blockedMutation(): RpcResult<AppearanceSnapshot> {
     ok: false,
     error: {
       code: 'UNCERTAIN',
-      message: 'Appearance update outcome is unknown; read settings again before retrying.',
+      message: 'Couldn’t confirm the appearance change. Reading saved settings.',
     },
   }
 }
@@ -120,7 +120,7 @@ export function createAppearanceController(
     if (response.type !== 'appearance.response') {
       const error: AppError = {
         code: 'INTERNAL',
-        message: 'Utility runtime returned an unexpected appearance response.',
+        message: 'Couldn’t load appearance settings.',
       }
       return { ok: false, error }
     }

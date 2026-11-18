@@ -232,12 +232,11 @@ export function PermissionMenu({
               Enable Full access for {agent === 'claude' ? 'Claude Code' : 'Codex'}?
             </p>
             <p className="mt-1.5 leading-relaxed text-secondary">
-              Allow files and network access beyond this project without tool-approval prompts. Task
-              limits and native policy still apply. Questions and implementation decisions still
-              need your response.
+              Allow file edits and network access beyond this project without asking first. Built-in
+              safety limits and plan or question prompts still apply.
             </p>
             <p className="mt-1.5 leading-relaxed text-secondary">
-              Only this Agent in this session, including restarts and rebuilds.
+              Applies only to {agent === 'claude' ? 'Claude Code' : 'Codex'} in this session.
             </p>
             <div className="mt-2.5 flex justify-end gap-1.5">
               <button

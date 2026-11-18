@@ -84,7 +84,10 @@ export function RelayDecisionCard({
         break
       case 'rebuild_native_context':
         actionText = request.title
-        detailText = request.consequence
+        detailText =
+          request.reason && request.reason !== request.consequence
+            ? `${request.reason} ${request.consequence}`
+            : request.consequence
         break
       default:
         actionText = request.title
@@ -183,9 +186,9 @@ export function RelayDecisionCard({
         >
           <span>
             {decision.status === 'receipt_unconfirmed'
-              ? 'Check decision'
+              ? 'Check status'
               : decision.status === 'checking_receipt'
-                ? 'Checking decision…'
+                ? 'Checking status…'
                 : decision.status === 'submitting'
                   ? 'Confirming…'
                   : confirmLabel}

@@ -41,7 +41,9 @@ export function SessionSettingsPanel({
           <h2 id="session-settings-title" className="text-subtitle font-medium tracking-[-0.015em]">
             Session settings
           </h2>
-          <p className="mt-1 text-caption text-secondary">Changes stay with this Session.</p>
+          <p className="mt-1 text-caption text-secondary">
+            Applies to new turns in this session; active responses keep their current settings.
+          </p>
         </div>
         <button
           className="grid size-8 place-items-center rounded-control border border-border bg-surface-raised text-primary hover:bg-surface-muted"
@@ -91,8 +93,7 @@ export function SessionSettingsPanel({
       </div>
 
       {editorState && settings ? (
-        <footer className="flex shrink-0 items-center justify-between gap-group border-t border-border bg-surface-raised p-group">
-          <p className="text-caption text-secondary">Only this Session</p>
+        <footer className="flex shrink-0 items-center justify-end gap-group border-t border-border bg-surface-raised p-group">
           <button
             className="primary-action-button"
             type="button"

@@ -62,7 +62,7 @@ export class DefaultSessionSettings {
     } catch {
       return {
         ok: false,
-        error: { code: 'INTERNAL', message: 'Default Session settings could not be loaded.' },
+        error: { code: 'INTERNAL', message: 'Default session settings could not be loaded.' },
       }
     }
   }
@@ -77,7 +77,7 @@ export class DefaultSessionSettings {
           ok: false,
           error: {
             code: 'RUNTIME_UNAVAILABLE',
-            message: 'Both Agents must be ready before saving.',
+            message: 'Both agents must be ready before saving.',
           },
         }
       }
@@ -101,7 +101,7 @@ export class DefaultSessionSettings {
     } catch {
       return {
         ok: false,
-        error: { code: 'INTERNAL', message: 'Default Session settings could not be saved.' },
+        error: { code: 'INTERNAL', message: 'Default session settings could not be saved.' },
       }
     }
   }

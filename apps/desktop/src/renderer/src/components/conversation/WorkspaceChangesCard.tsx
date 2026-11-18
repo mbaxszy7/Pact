@@ -63,9 +63,6 @@ export function WorkspaceChangesCard({
       aria-label="Changes from this response"
       data-pact-workspace-changes={changeSet.id}
     >
-      <p className="px-3 pt-2.5 text-secondary">
-        Undo affects only the changes listed in this card.
-      </p>
       <header className="flex flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2.5">
         <FileDiff
           aria-hidden="true"
@@ -106,6 +103,7 @@ export function WorkspaceChangesCard({
             className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-control px-2 text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:pointer-events-none disabled:cursor-default disabled:opacity-50"
             type="button"
             disabled={undoDisabled}
+            title={!undoDisabled ? 'Undo all changes listed in this card' : undefined}
             onClick={() => onUndo(changeSet.id)}
           >
             {undoing ? (
@@ -183,7 +181,7 @@ export function WorkspaceChangesCard({
         >
           {list?.loading ? (
             <>
-              <span className="primary-action-spinner" aria-hidden="true" /> Loading files
+              <span className="primary-action-spinner" aria-hidden="true" /> Loading files…
             </>
           ) : (
             <>

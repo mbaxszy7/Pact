@@ -204,14 +204,14 @@ async function readActivityBody(
   isCurrent: () => boolean,
 ): Promise<string> {
   if (source.bodyBytes > CONVERSATION_EXPAND_BYTES) {
-    throw new Error('This Work log detail exceeds the inline reading limit.')
+    throw new Error('This work log entry is too large to expand here.')
   }
   const chunks = [source.preview]
   let offset = source.previewChars
   let loadedBytes = bodyTextEncoder.encode(source.preview).byteLength
   const deadline = Date.now() + 30_000
   for (let pageCount = 0; pageCount < 256; pageCount += 1) {
-    if (!isCurrent()) throw new Error('The content request was cancelled.')
+    if (!isCurrent()) throw new Error('Loading was cancelled.')
     if (Date.now() > deadline) throw new Error('Loading took too long. Try again.')
     const page = unwrapRpcResult(
       // oxlint-disable-next-line eslint/no-await-in-loop -- The next offset comes from this bounded page.
@@ -229,23 +229,23 @@ async function readActivityBody(
       page.detailRevision !== source.revision ||
       page.offset !== offset
     )
-      throw new Error('The Work log detail changed or could not load. Try again.')
-    if (!isCurrent()) throw new Error('The content request was cancelled.')
+      throw new Error('Work log details changed. Try again.')
+    if (!isCurrent()) throw new Error('Loading was cancelled.')
     loadedBytes += bodyTextEncoder.encode(page.text).byteLength
     if (loadedBytes > CONVERSATION_EXPAND_BYTES) {
-      throw new Error('This Work log detail exceeds the inline reading limit.')
+      throw new Error('This work log entry is too large to expand here.')
     }
     chunks.push(page.text)
     if (page.nextOffset === undefined) {
       if (loadedBytes !== source.bodyBytes) {
-        throw new Error('The Work log detail changed while loading. Try again.')
+        throw new Error('Work log details changed while loading. Try again.')
       }
       return chunks.join('')
     }
-    if (page.nextOffset <= offset) throw new Error('The content did not advance.')
+    if (page.nextOffset <= offset) throw new Error('Couldn’t load the next part of the work log.')
     offset = page.nextOffset
   }
-  throw new Error('This Work log detail exceeds the inline page limit.')
+  throw new Error('This work log entry is too long to display in full.')
 }
 
 async function readSentComments(
@@ -261,7 +261,7 @@ async function readSentComments(
   let bytes = 0
   for (let pageCount = 0; pageCount <= MAX_SENT_COMMENT_PAGES; pageCount += 1) {
     if (!isCurrent()) return { comments: [], hasMore: false }
-    if (Date.now() > deadline) throw new Error('Comment loading timed out.')
+    if (Date.now() > deadline) throw new Error('Loading comments took too long. Try again.')
     const page = unwrapRpcResult(
       // oxlint-disable-next-line eslint/no-await-in-loop -- Every bounded page supplies the next cursor.
       await window.pact.getConversation({
@@ -272,15 +272,15 @@ async function readSentComments(
       }),
     )
     if (page.scope !== 'comments' || page.sessionId !== sessionId) {
-      throw new Error('The Comment response did not match this Session.')
+      throw new Error('Couldn’t load comments for this session.')
     }
     if (!isCurrent()) return { comments: [], hasMore: false }
     for (const comment of page.comments) {
       if (!comment.sentWithMessageId || !requested.has(comment.sentWithMessageId)) {
-        throw new Error('The Comment response did not match the visible Messages.')
+        throw new Error('Couldn’t match loaded comments to these messages.')
       }
       if (afterPosition !== undefined && comment.position <= afterPosition) {
-        throw new Error('The Comment response did not advance.')
+        throw new Error('Couldn’t load the next page of comments.')
       }
       bytes += encoder.encode(JSON.stringify(comment)).byteLength
       if (comments.length >= MAX_SENT_COMMENTS || bytes > MAX_SENT_COMMENT_BYTES)
@@ -290,9 +290,9 @@ async function readSentComments(
     }
     if (!page.hasMore) return { comments, hasMore: false }
     if (pageCount === MAX_SENT_COMMENT_PAGES - 1) return { comments, hasMore: true }
-    if (page.comments.length === 0) throw new Error('The Comment response did not advance.')
+    if (page.comments.length === 0) throw new Error('Couldn’t load the next page of comments.')
   }
-  throw new Error('Visible Comments exceed the safe page limit.')
+  throw new Error('Too many comments to display at once.')
 }
 
 export interface ConversationFlow {
@@ -1176,7 +1176,7 @@ export function useConversation(
                 ? {
                     ...value,
                     status: 'failed',
-                    error: 'Image preparation took too long. Remove it and try again.',
+                    error: 'Adding this image took too long. Remove it and try again.',
                   }
                 : value,
             ),
@@ -2845,9 +2845,7 @@ export function useConversation(
           new Promise<Awaited<ReturnType<typeof window.pact.writeConversationInput>>>(
             (resolve, reject) => {
               const abort = () =>
-                reject(
-                  new Error('Input preparation was cancelled or timed out. Your draft was kept.'),
-                )
+                reject(new Error('Sending was cancelled or timed out. Your draft was kept.'))
               controller.signal.addEventListener('abort', abort, { once: true })
               if (controller.signal.aborted) {
                 controller.signal.removeEventListener('abort', abort)
@@ -2885,7 +2883,7 @@ export function useConversation(
           )
           frozen.inputId = initial.inputId
           if (initial.offset !== 0 || initial.sealed)
-            throw new Error('Input preparation returned an unexpected source.')
+            throw new Error('Couldn’t start sending this message. Your draft was kept.')
           let offset = 0
           while (offset < content.length) {
             let end = Math.min(content.length, offset + INPUT_UPLOAD_CHARS)
@@ -2910,7 +2908,7 @@ export function useConversation(
               }),
             )
             if (part.inputId !== frozen.inputId || part.offset !== end || part.sealed)
-              throw new Error('Input preparation did not acknowledge the complete segment.')
+              throw new Error('Couldn’t send all of this message. Your draft was kept.')
             offset = end
           }
           const sealed = unwrapRpcResult(
@@ -2922,9 +2920,9 @@ export function useConversation(
             sealed.offset !== content.length ||
             sealed.chars !== content.length
           )
-            throw new Error('Input preparation did not seal the complete text.')
+            throw new Error('Couldn’t finish sending this message. Your draft was kept.')
           if (controller.signal.aborted || pendingBySessionRef.current.get(sessionId) !== frozen)
-            throw new Error('Input preparation was cancelled. Your draft was kept.')
+            throw new Error('Sending was cancelled. Your draft was kept.')
         } finally {
           window.clearTimeout(timeout)
           frozen.inputPreparation = undefined
@@ -3546,7 +3544,7 @@ export function useConversation(
                 image.status === 'preparing' && !imageUploads.current.has(image.id)
                   ? Object.assign({}, image, {
                       status: 'failed',
-                      error: 'Image preparation was cancelled. Remove it and try again.',
+                      error: 'Image upload was cancelled. Remove it and try again.',
                     })
                   : image,
               ),

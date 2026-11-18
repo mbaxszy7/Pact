@@ -62,7 +62,7 @@ describe('Composer command boundary', () => {
     for (const selections of [[selection, selection], [{ ...selection, end: 5 }]]) {
       expect(parseComposerCommandPrefix('/check task', selections).error).toBeDefined()
       expect(() => skillArguments('/check task', selections)).toThrow(
-        'selected Skill token changed',
+        'selected skill command changed',
       )
     }
   })

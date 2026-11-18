@@ -1751,7 +1751,7 @@ export function recoverForkIntents(database: PactDrizzleDatabase): void {
         .set({
           state: 'unconfirmed',
           nativeWorkState: 'unknown',
-          reason: 'App exited before native fork or initialization was confirmed.',
+          reason: 'Pact exited before agent setup finished.',
           updatedAt: new Date().toISOString(),
         })
         .where(and(scope, eq(nativeForkIntents.nativeWorkState, 'pending')))
@@ -1760,8 +1760,7 @@ export function recoverForkIntents(database: PactDrizzleDatabase): void {
         .update(nativeForkIntents)
         .set({
           state: 'unconfirmed',
-          reason:
-            'App exited during native setup. Check this original candidate before continuing.',
+          reason: 'Pact exited during setup. Check status before continuing.',
           updatedAt: new Date().toISOString(),
         })
         .where(and(scope, sql`${nativeForkIntents.state} IN ('forking','initializing')`))
@@ -1770,8 +1769,7 @@ export function recoverForkIntents(database: PactDrizzleDatabase): void {
         .update(nativeForkIntents)
         .set({
           state: 'error',
-          reason:
-            'Native fork was not dispatched before the App exited. Continue this same fork when ready.',
+          reason: 'Agent setup didn’t start before Pact exited. Finish fork setup when ready.',
           updatedAt: new Date().toISOString(),
         })
         .where(
