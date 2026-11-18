@@ -10303,10 +10303,11 @@ export class ConversationRepository {
       )
       .run()
     // Keep native outcome/current work intact; unfinished automation restarts paused.
+    const limitPaused = sql`(json_extract(${collaborationTasks.stateJson}, '$.automation') = 'paused' AND json_extract(${collaborationTasks.stateJson}, '$.pauseReason') = 'limit' AND json_extract(${collaborationTasks.stateJson}, '$.kind') = 'plan' AND json_extract(${collaborationTasks.stateJson}, '$.stage') IN ('plan', 'reply') AND json_extract(${collaborationTasks.stateJson}, '$.status') = 'waiting' AND json_extract(${collaborationTasks.stateJson}, '$.pendingWork') IS NULL AND json_extract(${collaborationTasks.stateJson}, '$.inputProcessing.pending') IS NULL)`
     this.database
       .update(collaborationTasks)
       .set({
-        stateJson: sql`json_set(${collaborationTasks.stateJson}, '$.automation', 'paused', '$.pauseReason', 'restart', '$.revision', json_extract(${collaborationTasks.stateJson}, '$.revision') + 1, '$.notice', CASE WHEN json_extract(${collaborationTasks.stateJson}, '$.inputProcessing.pending') IS NOT NULL THEN coalesce(json_extract(${collaborationTasks.stateJson}, '$.notice'), 'Check the previous reply, then send a follow-up before continuing.') ELSE 'Application restarted. Check the original execution, then continue collaboration.' END)`,
+        stateJson: sql`json_set(${collaborationTasks.stateJson}, '$.automation', 'paused', '$.pauseReason', CASE WHEN ${limitPaused} THEN 'limit' ELSE 'restart' END, '$.revision', json_extract(${collaborationTasks.stateJson}, '$.revision') + 1, '$.notice', CASE WHEN json_extract(${collaborationTasks.stateJson}, '$.inputProcessing.pending') IS NOT NULL THEN coalesce(json_extract(${collaborationTasks.stateJson}, '$.notice'), 'Check the previous reply, then send a follow-up before continuing.') WHEN ${limitPaused} THEN coalesce(json_extract(${collaborationTasks.stateJson}, '$.notice'), 'Plan review limit reached.') ELSE 'Application restarted. Check the original execution, then continue collaboration.' END)`,
       })
       .where(
         and(

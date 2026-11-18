@@ -258,7 +258,7 @@ export function ProjectNavigation({
   const highlightTimer = useRef<number | undefined>(undefined)
   const pendingFocus = useRef<string | undefined>(undefined)
   const scrollFocusIndex = useRef<number | undefined>(undefined)
-  const readInFlight = useRef(false)
+  const readInFlight = useRef<string | null>(null)
   const intentGeneration = useRef(0)
   const lastExternalIntent = useRef<NavigationIntent | undefined>(undefined)
   const menuButtonId = useId()
@@ -658,9 +658,8 @@ export function ProjectNavigation({
   }, [highlight, sessions])
 
   const read = async (row: ReadRow & { key: string }, automatic: boolean): Promise<void> => {
-    if (readInFlight.current && automatic) return
-    if (readInFlight.current && readState?.key === row.key) return
-    readInFlight.current = true
+    if (readInFlight.current && (automatic || readInFlight.current === row.key)) return
+    readInFlight.current = row.key
     setReadState({ key: row.key })
     try {
       const loaded =
@@ -677,7 +676,7 @@ export function ProjectNavigation({
     } catch (failure) {
       setReadState({ key: row.key, error: errorMessage(failure) })
     } finally {
-      readInFlight.current = false
+      if (readInFlight.current === row.key) readInFlight.current = null
     }
   }
 

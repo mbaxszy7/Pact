@@ -110,8 +110,15 @@ test(
         })
         // oxlint-disable-next-line eslint/no-await-in-loop
         await loadMore.click()
+        // oxlint-disable-next-line eslint/no-await-in-loop
+        await window
+          .getByRole('button', { name: `Session ${840 - index * 50}`, exact: true })
+          .waitFor()
       }
       await expect(loadMore).toHaveCount(0)
+      await navigation.evaluate((element) => {
+        element.scrollTop = element.scrollHeight
+      })
       await expect(window.getByRole('button', { name: 'Session 0', exact: true })).toBeVisible()
       const mounted = await navigation.evaluate((element) => ({
         rows: element.querySelectorAll('li[data-session-menu]').length,

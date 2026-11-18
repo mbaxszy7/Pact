@@ -99,8 +99,8 @@ test('clamps both bounds and preserves values inside the interval', () => {
         }, ctx.sessionId)
         await sendRealMessage(
           ctx,
-          '/plan Fix only clamp.mjs so clamp(value, min, max) returns min below the lower bound, max above the upper bound, and otherwise value. Inputs are finite numbers with min <= max; no additional validation or dependencies. The supplied clamp.test.mjs is immutable acceptance evidence and must not be edited. Use the native file-edit operation for the one-file change; run exactly node --test clamp.test.mjs from the project directory for verification. Plan this change and verification; do not implement until explicitly authorized. Do not delegate. All scope and choices are specified. Publish the complete plan through the native plan mechanism.',
-          primary,
+          '/plan Fix only clamp.mjs so clamp(value, min, max) returns min below the lower bound, max above the upper bound, and otherwise value. Inputs are finite numbers with min <= max; no additional validation or dependencies. The supplied clamp.test.mjs is immutable acceptance evidence and must not be edited. Use the native file-edit operation for the one-file change; run exactly node --test clamp.test.mjs from the project directory for verification. Plan this change and verification; do not implement until explicitly authorized. Do not delegate. All scope and choices are specified. Publish the complete official plan through the native plan mechanism (do not call publish_plan or update_plan).',
+          'primary',
         )
         await expect
           .poll(

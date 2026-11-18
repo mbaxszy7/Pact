@@ -270,8 +270,7 @@ export async function sendRealMessage(
       () => new Promise<void>((done) => requestAnimationFrame(() => done())),
     )
     await composer.press('End')
-    if (process.platform === 'win32' && /[\r\n]/u.test(content))
-      await context.page.keyboard.insertText(content)
+    if (/[\r\n]/u.test(content)) await context.page.keyboard.insertText(content)
     else await composer.pressSequentially(content)
   }
   await composer.press('Enter')

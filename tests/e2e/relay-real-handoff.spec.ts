@@ -22,6 +22,7 @@ import {
   waitForRealCompletion,
   type RealWorkspace,
 } from './real-harness.js'
+import { resolveRealConfiguredModel } from './real-model-selection.js'
 import { findNativeRecord } from './real-native-evidence.js'
 import { createRealRelayFixture } from './relay-real-credential.js'
 import { routingSchedulingObservation } from './relay-routing-real-observation.js'
@@ -248,20 +249,44 @@ async function seed(
 }
 
 async function resume(page: Page, sessionId: string) {
+  const editor = await page.evaluate(
+    async (payload) => {
+      const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+      const reply = await bridge.getSessionSettings(payload.sessionId)
+      if (!reply.ok) throw Error('Current session settings are unavailable')
+      return reply.value
+    },
+    { sessionId },
+  )
+  const settings = {
+    primaryAgentId: editor.session.settings.primaryAgentId,
+    agents: {
+      codex: {
+        ...editor.session.settings.agents.codex,
+        model: resolveRealConfiguredModel(
+          editor.modelCatalogs.codex,
+          editor.session.settings.agents.codex.model,
+        ).id,
+      },
+      claude: {
+        ...editor.session.settings.agents.claude,
+        model: resolveRealConfiguredModel(
+          editor.modelCatalogs.claude,
+          editor.session.settings.agents.claude.model,
+          'haiku',
+        ).id,
+      },
+    },
+    maxDiscussionRounds: editor.session.settings.maxDiscussionRounds + 1,
+    maxReviewCycles: editor.session.settings.maxReviewCycles,
+    maxRepairAttempts: editor.session.settings.maxRepairAttempts,
+  }
   const actionResult = await page.evaluate(
     async (payload) => {
       const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
-      const editor = await bridge.getSessionSettings(payload.sessionId)
-      if (!editor.ok) throw Error('Current session settings are unavailable')
       const saved = await bridge.saveSessionSettings({
         sessionId: payload.sessionId,
-        settings: {
-          primaryAgentId: editor.value.session.settings.primaryAgentId,
-          agents: editor.value.session.settings.agents,
-          maxDiscussionRounds: editor.value.session.settings.maxDiscussionRounds + 1,
-          maxReviewCycles: editor.value.session.settings.maxReviewCycles,
-          maxRepairAttempts: editor.value.session.settings.maxRepairAttempts,
-        },
+        settings: payload.settings,
       })
       if (!saved.ok) return { ok: false, error: saved.error.code }
       const current = await bridge.getConversation({
@@ -280,7 +305,7 @@ async function resume(page: Page, sessionId: string) {
         })
       return actionReply.ok ? { ok: true } : { ok: false, error: actionReply.error.code }
     },
-    { sessionId },
+    { sessionId, settings },
   )
   expect(actionResult).toEqual({ ok: true })
 }
@@ -440,7 +465,10 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
           }, prepared.sessionId)
           if (pending && !answered.has(pending.decisionId)) {
             expect(enabled).toBe(true)
-            expect(pending.request.category).toBe('limit_extension')
+            expect(pending.request).toMatchObject({
+              category: 'new_authorization',
+              operation: { kind: 'extend_plan_review' },
+            })
             answered.add(pending.decisionId)
             const result = await ctx.page.evaluate(
               async (reference) => {
@@ -631,7 +659,9 @@ async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) 
     const reservations = observation.drizzle.query.schedulingBudgetReservations
       .findMany({ where: (fields, { eq }) => eq(fields.sessionId, prepared.sessionId), limit: 4 })
       .sync()
-    expect(reservations).toEqual([])
+    expect(reservations).toHaveLength(answeredCards)
+    if (answeredCards === 1)
+      expect(reservations[0]).toMatchObject({ budget: 'extra_plan_turn', state: 'settled' })
     const decisions = observation.drizzle.query.relayDecisions
       .findMany({ where: (fields, { eq }) => eq(fields.sessionId, prepared.sessionId), limit: 4 })
       .sync()

@@ -543,6 +543,48 @@ describe('Relay v2 supplement transactions through the existing workflow owner',
     },
   )
 
+  it('preserves settled Phase 1 pauseReason limit across restart recovery without erasing extend_plan_review eligibility', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'pact-relay-limit-restart-'))
+    directories.push(directory)
+    const filePath = join(directory, 'pact.sqlite')
+    const f = await workflow(filePath)
+    const before = f.repo.collaboration(f.sessionId)!
+    f.repo.setCollaborationState({
+      ...before,
+      revision: before.revision + 1,
+      automation: 'paused',
+      pauseReason: 'limit',
+      notice: 'Discussion round limit reached.',
+    })
+    const paused = f.repo.collaboration(f.sessionId)!
+    databases.delete(f.db)
+    f.db.close()
+    const reopened = await PactDatabase.open({
+      filePath,
+      migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
+    })
+    databases.add(reopened)
+    const repo = reopened.conversationRepository
+    repo.recoverCollaborationTasks()
+    const recovered = repo.collaboration(f.sessionId)!
+    expect(recovered).toMatchObject({
+      id: paused.id,
+      automation: 'paused',
+      pauseReason: 'limit',
+      revision: paused.revision + 1,
+      notice: 'Discussion round limit reached.',
+    })
+    expect(repo.pendingWorkflowTasks().some((entry) => entry.sessionId === f.sessionId)).toBe(true)
+    const alternatives = repo.relayWorkflowAlternatives(
+      repo.workflowHandoff(recovered, recovered.reviewer),
+    )
+    expect(
+      alternatives?.alternatives.find((entry) => entry.kind === 'extend_plan_review'),
+    ).toMatchObject({
+      kind: 'extend_plan_review',
+    })
+  })
+
   it('retains remapped historical approved-work documents after Fork while stripping live authority and decisions', async () => {
     const f = await proposed(),
       extra = startSupplement(f).run

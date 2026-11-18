@@ -97,8 +97,9 @@ test(
       await archiveNotice
         .getByRole('button', { name: 'Undo archive of New session', exact: true })
         .click()
-      await expect(window.getByRole('heading', { name: 'New session' })).toBeVisible()
       await expect(window.getByRole('button', { name: 'New session', exact: true })).toBeVisible()
+      await restoredSession.click()
+      await expect(window.getByRole('heading', { name: 'New session' })).toBeVisible()
     } finally {
       try {
         if (app) await quitPact(app)

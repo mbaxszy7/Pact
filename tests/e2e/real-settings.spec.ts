@@ -1,4 +1,5 @@
 import { expect, type Locator } from '@playwright/test'
+import { randomUUID } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import { open } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -211,7 +212,7 @@ test(
       expect((await readRealConversation(ctx, futureSessionId)).runs).toHaveLength(0)
 
       const codexOld = await sessionSettings(ctx)
-      const codexMarker = authMarker('CODEX_FROZEN_SETTINGS')
+      const codexMarker = `CODEX_FROZEN_SETTINGS_${randomUUID()}`
       const codexFile = 'codex-settings-gate.txt'
       const codexCommand =
         process.platform === 'win32'
@@ -553,9 +554,7 @@ function effortCommand(marker: string, filename: string): string {
 }
 
 function toolPrompt(command: string): string {
-  if (process.platform === 'win32')
-    return `Execute exactly the shell command below once, without adding punctuation:\n\n\`\`\`\n${command}\n\`\`\`\n\nThe destination is outside the project and inside my isolated test directory. Request sandbox escalation with justification when required. Use the Bash/shell tool; do not write a guessed value with a file-edit tool, rewrite the command, inspect other files, or change permissions. After successful execution reply briefly. Do not ask another Agent for help.`
-  return `Execute exactly this shell command once: ${command}. The destination is outside the project and inside my isolated test directory. Request sandbox escalation with justification when required. Use the Bash/shell tool; do not write a guessed value with a file-edit tool, rewrite the command, inspect other files, or change permissions. After successful execution reply briefly. Do not ask another Agent for help.`
+  return `Execute the exact shell command below once, without adding punctuation or changing any characters:\n\n\`\`\`\n${command}\n\`\`\`\n\nThe destination is outside the project and inside my isolated test directory. Request sandbox escalation with justification when required. Use the Bash/shell tool; do not write a guessed value with a file-edit tool, rewrite the command, inspect other files, or change permissions. After successful execution reply briefly. Do not ask another Agent for help.`
 }
 
 async function pendingActualCommand(

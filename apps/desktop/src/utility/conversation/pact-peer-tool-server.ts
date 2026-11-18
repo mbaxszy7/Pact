@@ -503,7 +503,7 @@ export class PactPeerToolServer {
               {
                 name: 'publish_plan',
                 description:
-                  'Publish an updated Plan Markdown version in open collaboration mode. Pass text (<= 48 KiB UTF-8 per call), optional byte offset, and complete=true on the final chunk (or omit complete/offset to send a small plan in one call). Only available during open collaboration mode; do not use for ordinary Q&A.',
+                  'Publish a revised Plan Markdown version during an open post-approval collaboration turn. Pass text (<= 48 KiB UTF-8 per call), optional byte offset, and complete=true on the final chunk (or omit complete/offset to send a small plan in one call). Only available during open collaboration mode; do not call this tool during initial /plan or structured plan-revision turns that use native <proposed_plan>, and do not use for ordinary Q&A.',
                 inputSchema: collaborationPublishPlanInputSchema.toJSONSchema(),
                 annotations: {
                   readOnlyHint: false,
@@ -830,7 +830,8 @@ export class PactPeerToolServer {
             | { receipt: string; final: boolean; offset: number; byteLength: number }
             | undefined
           if (!turn || !this.planPublishState) {
-            error = 'Publishing a Plan update is not enabled for this root turn.'
+            error =
+              'publish_plan is not enabled for this turn. Output the complete Markdown plan inside a native <proposed_plan>...</proposed_plan> block with <proposed_plan> and </proposed_plan> each on its own unindented line (outside Markdown code fences) in your final message.'
           } else if (this.planPublishState.completedMarkdown !== undefined) {
             error = 'A published Plan has already been finalized in this root turn.'
           } else {
