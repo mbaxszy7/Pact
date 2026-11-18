@@ -171,7 +171,9 @@ async function bootstrap(): Promise<void> {
         DATABASE_IN_USE:
           'Another Pact process is using this data. Close that process before opening this copy.',
         DATABASE_INCOMPATIBLE:
-          'This Pact version cannot open your existing data because it was created by a newer version.',
+          failure.reason === 'newer-migration-history'
+            ? 'This version of Pact can’t open your existing data. Try opening it with a newer version of Pact.'
+            : 'This version of Pact can’t open your existing data.',
         DATABASE_BACKUP_FAILED:
           'Pact couldn’t create a backup before upgrading your data. Check free disk space and folder permissions.',
         DATABASE_MIGRATION_FAILED:

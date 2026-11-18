@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { UtilityProcessStartOptions } from './utility-process/client'
+
 const harness = vi.hoisted(() => {
   type Listener = (...args: unknown[]) => void
   const listeners = new Map<string, { listener: Listener; once: boolean }[]>()
@@ -42,15 +44,20 @@ const harness = vi.hoisted(() => {
       listeners.clear()
     },
   }
+  type StartCallbacks = Pick<UtilityProcessStartOptions, 'onExit' | 'onStartupFailed'>
+  const dialog = {
+    showMessageBox: vi.fn<() => Promise<{ response: number }>>(async () => ({ response: 0 })),
+    showErrorBox: vi.fn<() => void>(),
+  }
   const state = {
     requestQuit: Promise.withResolvers<boolean>(),
     shutdown: Promise.withResolvers<unknown>(),
     settlement: Promise.withResolvers<void>(),
     running: false,
-    startOptions: undefined as { onExit?: () => void } | undefined,
+    startOptions: undefined as StartCallbacks | undefined,
   }
   const client = {
-    start: vi.fn<(options: { onExit?: () => void }) => void>((options) => {
+    start: vi.fn<(options: StartCallbacks) => void>((options) => {
       state.startOptions = options
     }),
     waitUntilReady: vi.fn<() => Promise<{ ok: true; value: { ready: true } }>>(async () => ({
@@ -97,16 +104,13 @@ const harness = vi.hoisted(() => {
     })),
     dispose: vi.fn<() => void>(),
   }
-  return { app, state, client, presence, diagnostics, updates, menu, appearance }
+  return { app, dialog, state, client, presence, diagnostics, updates, menu, appearance }
 })
 
 vi.mock('electron', () => ({
   app: harness.app,
   BrowserWindow: vi.fn<() => void>(),
-  dialog: {
-    showMessageBox: vi.fn<() => Promise<unknown>>(),
-    showErrorBox: vi.fn<() => void>(),
-  },
+  dialog: harness.dialog,
   nativeTheme: {},
   shell: {
     showItemInFolder: vi.fn<(path: string) => void>(),
@@ -200,6 +204,37 @@ beforeEach(() => {
 
 afterEach(() => {
   harness.app.removeAllListeners()
+})
+
+describe('Main startup failure dialog', () => {
+  it.each([
+    ['missing-migration-history', 'This version of Pact can’t open your existing data.'],
+    ['invalid-migration-history', 'This version of Pact can’t open your existing data.'],
+    ['divergent-migration-history', 'This version of Pact can’t open your existing data.'],
+    [
+      'newer-migration-history',
+      'This version of Pact can’t open your existing data. Try opening it with a newer version of Pact.',
+    ],
+  ])('shows the appropriate recovery message for %s', async (reason, message) => {
+    await boot()
+    harness.state.startOptions?.onStartupFailed?.({
+      type: 'runtime.startup-failed.event',
+      failureId: '00000000-0000-4000-8000-000000000000',
+      stage: 'persistence',
+      code: 'DATABASE_INCOMPATIBLE',
+      reason,
+      dataFilePath: ':memory:',
+    })
+
+    expect(harness.dialog.showMessageBox).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        message,
+        detail: 'Your data is safe. Pact will quit without changing or clearing it.',
+        buttons: ['Quit'],
+      }),
+    )
+    await vi.waitFor(() => expect(harness.app.quit).toHaveBeenCalledOnce())
+  })
 })
 
 describe('Main quit composition', () => {
