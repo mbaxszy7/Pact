@@ -70,6 +70,7 @@ export class PactPeerToolServer {
   readonly capabilityReceipt = randomUUID()
   private http: HttpServer | undefined
   private activeRequests = 0
+  private activeSourceRequests = 0
   private origin: string | undefined
   private turn: PeerAssistanceTurn | undefined
 
@@ -595,71 +596,7 @@ export class PactPeerToolServer {
             ? Reflect.get(request.params, 'arguments')
             : undefined
         if (name === 'read_collaboration_source') {
-          if (sourceFailure) {
-            sourceFailure.entryOwner =
-              sourceGrant && sourceGrant === this.sourceGrant ? 'passed' : 'rejected'
-            sourceFailure.stage = 'entry_owner'
-          }
-          const nativeForm =
-            args !== null && typeof args === 'object' && Object.hasOwn(args, 'context')
-          const supplied = sourceGrant?.sourceReader
-            ? nativeForm
-              ? collaborationSourceNativeReadSchema.safeParse(args)
-              : collaborationSourceWireReadSchema.safeParse(args)
-            : collaborationSourceReadSchema.safeParse(args)
-          const root = sourceGrant?.nativeRoot
-          const meta =
-            request.params && typeof request.params === 'object'
-              ? Reflect.get(request.params, '_meta')
-              : undefined
-          const inner =
-            meta && typeof meta === 'object'
-              ? Reflect.get(meta, 'x-codex-turn-metadata')
-              : undefined
-          const rootMatches = Boolean(
-            root &&
-            sourceGrant?.sourceReader?.readNativeRoot &&
-            meta &&
-            typeof meta === 'object' &&
-            inner &&
-            typeof inner === 'object' &&
-            Reflect.get(meta, 'threadId') === root.threadId &&
-            Reflect.get(inner, 'thread_id') === root.threadId &&
-            Reflect.get(inner, 'turn_id') === root.turnId,
-          )
-          if (sourceFailure && nativeForm)
-            sourceFailure.rootBinding = rootMatches ? 'passed' : 'rejected'
-          const nativeAuthenticated = Boolean(
-            rootMatches &&
-            root &&
-            (() => {
-              if (sourceFailure && nativeForm) {
-                sourceFailure.stage = 'native_current'
-                sourceFailure.currentBeforeRead = 'rejected'
-              }
-              const current = root.current()
-              if (sourceFailure && nativeForm)
-                sourceFailure.currentBeforeRead = current ? 'passed' : 'rejected'
-              return current
-            })(),
-          )
-          if (
-            !sourceGrant ||
-            sourceGrant !== this.sourceGrant ||
-            !supplied.success ||
-            (nativeForm && !nativeAuthenticated) ||
-            (!sourceGrant.sourceReader &&
-              (Reflect.get(supplied.data, 'runId') !== sourceGrant.runId ||
-                Reflect.get(supplied.data, 'grant') !== sourceGrant.grant))
-          ) {
-            if (sourceFailure && sourceFailure.entryOwner === 'passed')
-              sourceFailure.stage = !supplied.success
-                ? 'request_parse'
-                : nativeForm && !rootMatches
-                  ? 'native_root'
-                  : nativeForm && !nativeAuthenticated
-                    ? 'native_current'
-                    : 'request_parse'
+          if (this.activeSourceRequests >= 1) {
             return {
               jsonrpc: '2.0',
               id: request.id,
@@ -667,62 +604,155 @@ export class PactPeerToolServer {
                 content: [
                   {
                     type: 'text',
-                    text: 'Use the exact sourceGrant from the current root input. This request has no active matching source capability.',
+                    text: 'Another frozen source read is already active. Wait for it to finish; source reads are not queued.',
                   },
                 ],
                 isError: true,
               },
             }
           }
-          if (sourceFailure) sourceFailure.stage = 'native_current'
-          if (
-            sourceGrant !== this.sourceGrant ||
-            (nativeForm &&
-              !(() => {
-                if (sourceFailure) sourceFailure.currentBeforeRead = 'rejected'
-                const current = root?.current()
-                if (sourceFailure) sourceFailure.currentBeforeRead = current ? 'passed' : 'rejected'
+          this.activeSourceRequests += 1
+          try {
+            if (sourceFailure) {
+              sourceFailure.entryOwner =
+                sourceGrant && sourceGrant === this.sourceGrant ? 'passed' : 'rejected'
+              sourceFailure.stage = 'entry_owner'
+            }
+            const nativeForm =
+              args !== null && typeof args === 'object' && Object.hasOwn(args, 'context')
+            const supplied = sourceGrant?.sourceReader
+              ? nativeForm
+                ? collaborationSourceNativeReadSchema.safeParse(args)
+                : collaborationSourceWireReadSchema.safeParse(args)
+              : collaborationSourceReadSchema.safeParse(args)
+            const root = sourceGrant?.nativeRoot
+            const meta =
+              request.params && typeof request.params === 'object'
+                ? Reflect.get(request.params, '_meta')
+                : undefined
+            const inner =
+              meta && typeof meta === 'object'
+                ? Reflect.get(meta, 'x-codex-turn-metadata')
+                : undefined
+            const rootMatches = Boolean(
+              root &&
+              sourceGrant?.sourceReader?.readNativeRoot &&
+              meta &&
+              typeof meta === 'object' &&
+              inner &&
+              typeof inner === 'object' &&
+              Reflect.get(meta, 'threadId') === root.threadId &&
+              Reflect.get(inner, 'thread_id') === root.threadId &&
+              Reflect.get(inner, 'turn_id') === root.turnId,
+            )
+            if (sourceFailure && nativeForm)
+              sourceFailure.rootBinding = rootMatches ? 'passed' : 'rejected'
+            const nativeAuthenticated = Boolean(
+              rootMatches &&
+              root &&
+              (() => {
+                if (sourceFailure && nativeForm) {
+                  sourceFailure.stage = 'native_current'
+                  sourceFailure.currentBeforeRead = 'rejected'
+                }
+                const current = root.current()
+                if (sourceFailure && nativeForm)
+                  sourceFailure.currentBeforeRead = current ? 'passed' : 'rejected'
                 return current
-              })())
-          )
-            throw new Error('The native source owner expired before reading.')
-          const nativeRoot =
-            nativeForm && root ? { threadId: root.threadId, turnId: root.turnId } : undefined
-          if (sourceFailure) {
-            sourceFailure.stage = 'unknown'
-            sourceFailure.readerEntered = null
-          }
-          const value = nativeRoot
-            ? readNativeFrozenSourceTool(sourceGrant, args, sourceGrant.sourceReader!, nativeRoot)
-            : readFrozenSourceTool(sourceGrant, args, sourceGrant.sourceReader, sourceGrant.reader)
-          if (sourceFailure) {
-            sourceFailure.readerEntered = true
-            sourceFailure.stage = 'page_validation'
-          }
-          const proof = nativeRoot
-            ? collaborationSourceNativeProofSchema.parse({
-                version: 'pact-native-source-root-v1',
-                root: nativeRoot,
-                callerRunId: sourceGrant.runId,
-                grantSha256: createHash('sha256').update(sourceGrant.grant).digest('hex'),
-                requestSha256: jsonSha256(collaborationSourceNativeReadSchema.parse(args)),
-                pageSha256: jsonSha256(value),
-              })
-            : undefined
-          if (
-            proof &&
-            Buffer.byteLength(JSON.stringify({ page: value, proof })) > COLLABORATION_PAGE_BYTES
-          ) {
-            if (sourceFailure) sourceFailure.stage = 'page_budget'
-            throw new Error('The source page and its native proof exceed the page budget.')
-          }
-          return {
-            jsonrpc: '2.0',
-            id: request.id,
-            result: {
-              content: [{ type: 'text', text: JSON.stringify(value) }],
-              ...(proof ? { _meta: { pactSourceRoot: proof } } : {}),
-            },
+              })(),
+            )
+            if (
+              !sourceGrant ||
+              sourceGrant !== this.sourceGrant ||
+              !supplied.success ||
+              (nativeForm && !nativeAuthenticated) ||
+              (!sourceGrant.sourceReader &&
+                (Reflect.get(supplied.data, 'runId') !== sourceGrant.runId ||
+                  Reflect.get(supplied.data, 'grant') !== sourceGrant.grant))
+            ) {
+              if (sourceFailure && sourceFailure.entryOwner === 'passed')
+                sourceFailure.stage = !supplied.success
+                  ? 'request_parse'
+                  : nativeForm && !rootMatches
+                    ? 'native_root'
+                    : nativeForm && !nativeAuthenticated
+                      ? 'native_current'
+                      : 'request_parse'
+              return {
+                jsonrpc: '2.0',
+                id: request.id,
+                result: {
+                  content: [
+                    {
+                      type: 'text',
+                      text: 'Use the exact sourceGrant from the current root input. This request has no active matching source capability.',
+                    },
+                  ],
+                  isError: true,
+                },
+              }
+            }
+            if (sourceFailure) sourceFailure.stage = 'native_current'
+            if (
+              sourceGrant !== this.sourceGrant ||
+              (nativeForm &&
+                !(() => {
+                  if (sourceFailure) sourceFailure.currentBeforeRead = 'rejected'
+                  const current = root?.current()
+                  if (sourceFailure)
+                    sourceFailure.currentBeforeRead = current ? 'passed' : 'rejected'
+                  return current
+                })())
+            )
+              throw new Error('The native source owner expired before reading.')
+            const nativeRoot =
+              nativeForm && root ? { threadId: root.threadId, turnId: root.turnId } : undefined
+            if (sourceFailure) {
+              sourceFailure.stage = 'unknown'
+              sourceFailure.readerEntered = null
+            }
+            const value = nativeRoot
+              ? readNativeFrozenSourceTool(sourceGrant, args, sourceGrant.sourceReader!, nativeRoot)
+              : readFrozenSourceTool(
+                  sourceGrant,
+                  args,
+                  sourceGrant.sourceReader,
+                  sourceGrant.reader,
+                )
+            if (sourceFailure) {
+              sourceFailure.readerEntered = true
+              sourceFailure.stage = 'page_validation'
+            }
+            const proof = nativeRoot
+              ? collaborationSourceNativeProofSchema.parse({
+                  version: 'pact-native-source-root-v1',
+                  root: nativeRoot,
+                  callerRunId: sourceGrant.runId,
+                  grantSha256: createHash('sha256').update(sourceGrant.grant).digest('hex'),
+                  requestSha256: jsonSha256(collaborationSourceNativeReadSchema.parse(args)),
+                  pageSha256: jsonSha256(value),
+                })
+              : undefined
+            const reply = {
+              jsonrpc: '2.0' as const,
+              id: request.id,
+              result: {
+                content: [{ type: 'text' as const, text: JSON.stringify(value) }],
+                ...(proof ? { _meta: { pactSourceRoot: proof } } : {}),
+              },
+            }
+            if (
+              (proof &&
+                Buffer.byteLength(JSON.stringify({ page: value, proof })) >
+                  COLLABORATION_PAGE_BYTES) ||
+              Buffer.byteLength(JSON.stringify(reply)) > COLLABORATION_PAGE_BYTES
+            ) {
+              if (sourceFailure) sourceFailure.stage = 'page_budget'
+              throw new Error('The source page and its native proof exceed the page budget.')
+            }
+            return reply
+          } finally {
+            this.activeSourceRequests = Math.max(0, this.activeSourceRequests - 1)
           }
         }
         if (name === 'publish_session_title') {

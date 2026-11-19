@@ -408,6 +408,15 @@ export class SessionWorkspace {
   ): Promise<RpcResult<SessionSettingsSaveResult>> {
     const context = this.findContext(input.sessionId)
     if (!context.ok) return context
+    if (context.value.session.parentSessionId) {
+      return {
+        ok: false,
+        error: {
+          code: 'CONFLICT',
+          message: 'Side chat settings are read-only and inherit from the main chat.',
+        },
+      }
+    }
 
     const validation = await this.defaultSettings.validateSettings(
       input.settings,
@@ -445,6 +454,15 @@ export class SessionWorkspace {
   }
 
   savePermission(input: SessionPermissionSaveInput): RpcResult<SessionCatalogChange> {
+    if (this.sessions.find(input.sessionId)?.parentSessionId) {
+      return {
+        ok: false,
+        error: {
+          code: 'CONFLICT',
+          message: 'Side chat permissions are read-only and inherit from the main chat.',
+        },
+      }
+    }
     try {
       return { ok: true, value: this.sessions.savePermission(input) }
     } catch (error) {
@@ -459,6 +477,15 @@ export class SessionWorkspace {
   }
 
   saveSpeed(input: SessionSpeedSaveInput): RpcResult<SessionCatalogChange> {
+    if (this.sessions.find(input.sessionId)?.parentSessionId) {
+      return {
+        ok: false,
+        error: {
+          code: 'CONFLICT',
+          message: 'Side chat speed is read-only and inherit from the main chat.',
+        },
+      }
+    }
     try {
       return { ok: true, value: this.sessions.saveSpeed(input) }
     } catch (error) {

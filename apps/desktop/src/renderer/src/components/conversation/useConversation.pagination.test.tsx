@@ -16,6 +16,7 @@ import type {
   AgentActivity,
   AgentRun,
   BackgroundStopTarget,
+  CollaborationSession,
   ConversationPage,
   ConversationPatch,
   DesktopBridge,
@@ -2065,4 +2066,168 @@ it('confirmed Cancel preserves a different outstanding Send nonce', async () => 
   )
   expect(send).toHaveBeenCalledTimes(2)
   expect(send.mock.calls[1]![0].clientMessageId).toBe(currentNonce)
+})
+
+it('invokes onSessionRead after markSessionRead succeeds in markSelectedRead and skips it on failure', async () => {
+  const sessionId = crypto.randomUUID()
+  const projectId = crypto.randomUUID()
+  const incarnation = crypto.randomUUID()
+  const timestamp = new Date().toISOString()
+  const firstId = crypto.randomUUID()
+
+  const initialPage: FixturePage = {
+    scope: 'messages',
+    sessionId,
+    observation: { incarnation, sequence: 1 },
+    header: {
+      session: {
+        id: sessionId,
+        title: 'Side chat',
+        titleSource: 'local',
+        status: 'idle',
+        activity: { state: 'idle' },
+        hasUnread: true,
+        updatedAt: timestamp,
+      },
+      commentsRevision: 0,
+    },
+    messages: [
+      {
+        kind: 'complete',
+        message: {
+          id: firstId,
+          sessionId,
+          role: 'user',
+          content: 'Question',
+          contentRevision: 0,
+          state: 'complete',
+          sequence: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        },
+        hasActivities: false,
+        hasComments: false,
+      },
+    ],
+    runs: [],
+    hasOlder: false,
+    hasNewer: false,
+  }
+
+  let listener: ((patch: ConversationPatch) => void) | undefined
+  const readSession: CollaborationSession = {
+    id: sessionId,
+    projectId,
+    parentSessionId: crypto.randomUUID(),
+    sideChatOrigin: 'btw',
+    title: 'Side chat',
+    titleSource: 'local',
+    status: 'idle',
+    activity: { state: 'idle' },
+    hasUnread: false,
+    settings: {
+      primaryAgentId: 'codex',
+      agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+      maxDiscussionRounds: 3,
+      maxReviewCycles: 3,
+      maxRepairAttempts: 3,
+    },
+    settingsRevision: 1,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  }
+
+  const markSessionRead = vi
+    .fn<DesktopBridge['markSessionRead']>()
+    .mockResolvedValueOnce({
+      ok: false,
+      error: { code: 'UNCERTAIN', message: 'Temporary failure' },
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      value: { kind: 'change', revision: 2, session: readSession },
+    })
+
+  vi.stubGlobal('pact', {
+    getConversation: vi.fn<DesktopBridge['getConversation']>(async (input) => {
+      if (input.scope === 'drafts') {
+        return {
+          ok: true,
+          value: {
+            scope: 'drafts',
+            sessionId,
+            observation: { incarnation, sequence: 1 },
+            commentsRevision: 0,
+            comments: [],
+            hasMore: false,
+          },
+        }
+      }
+      return { ok: true, value: initialPage }
+    }),
+    setConversationInterest: vi
+      .fn<DesktopBridge['setConversationInterest']>()
+      .mockResolvedValue({ ok: true, value: { ready: true } }),
+    markSessionRead,
+    onConversationChanged: (callback: (patch: ConversationPatch) => void) => {
+      listener = callback
+      return () => {
+        listener = undefined
+      }
+    },
+  })
+
+  const client = createRendererQueryClient()
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client }, children)
+  const onNotice = vi.fn<(message: string) => void>()
+  const onSessionRead = vi.fn<(session: typeof readSession) => void>()
+
+  const hook = renderHook(
+    () => useConversation(sessionId, onNotice, true, onNotice, onNotice, { onSessionRead }),
+    { wrapper },
+  )
+
+  await waitFor(() => expect(hook.result.current.snapshot).toBeDefined())
+
+  const emitCompleteAssistant = (observationSequence: number, messageSequence: number) => {
+    listener?.({
+      version: 'conversation-patch-v1',
+      sessionId,
+      observation: { incarnation, sequence: observationSequence },
+      session: initialPage.header.session,
+      messages: [
+        {
+          mode: 'replace',
+          text: `Answer ${messageSequence}`,
+          message: {
+            id: crypto.randomUUID(),
+            sessionId,
+            role: 'assistant',
+            agentId: 'codex',
+            contentRevision: 1,
+            state: 'complete',
+            sequence: messageSequence,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          },
+          hasActivities: false,
+          hasComments: false,
+        },
+      ],
+      activities: [],
+      runs: [],
+      activityStates: [],
+    })
+  }
+
+  // First attempt fails -> onSessionRead must not fire, and the failed sequence can be retried.
+  act(() => emitCompleteAssistant(2, 2))
+  await waitFor(() => expect(markSessionRead).toHaveBeenCalledTimes(1))
+  expect(onSessionRead).not.toHaveBeenCalled()
+
+  // Second attempt succeeds -> onSessionRead receives the updated session from markSessionRead.
+  act(() => emitCompleteAssistant(3, 2))
+  await waitFor(() => expect(markSessionRead).toHaveBeenCalledTimes(2))
+  await waitFor(() => expect(onSessionRead).toHaveBeenCalledWith(readSession))
 })

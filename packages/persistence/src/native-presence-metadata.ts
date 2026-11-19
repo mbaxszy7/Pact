@@ -206,12 +206,14 @@ export function updateSessionNativeMetadata(
     .select({
       session: {
         projectId: sessions.projectId,
+        parentSessionId: sessions.parentSessionId,
         archivedAt: sessions.archivedAt,
         status: sessions.status,
         workspaceVisible: sessions.workspaceVisible,
         needsAttention: sessions.needsAttention,
       },
       projectArchivedAt: projects.archivedAt,
+      parentArchived: sql<number>`EXISTS (SELECT 1 FROM sessions p WHERE p.id = ${sessions.parentSessionId} AND (p.archived_at IS NOT NULL OR p.status = 'archived'))`,
     })
     .from(sessions)
     .innerJoin(projects, eq(projects.id, sessions.projectId))
@@ -219,7 +221,10 @@ export function updateSessionNativeMetadata(
     .get()
   if (!row) return
   const visible =
-    !row.session.archivedAt && row.session.status !== 'archived' && !row.projectArchivedAt
+    !row.session.archivedAt &&
+    row.session.status !== 'archived' &&
+    !row.projectArchivedAt &&
+    !row.parentArchived
   const attention = needsAttention ?? row.session.needsAttention
   if (visible === row.session.workspaceVisible && attention === row.session.needsAttention) return
   const delta =
@@ -269,6 +274,7 @@ export function updateProjectNativeVisibility(
           eq(sessions.projectId, projectId),
           isNull(sessions.archivedAt),
           sql`${sessions.status} <> 'archived'`,
+          sql`(${sessions.parentSessionId} IS NULL OR NOT EXISTS (SELECT 1 FROM sessions p WHERE p.id = ${sessions.parentSessionId} AND (p.archived_at IS NOT NULL OR p.status = 'archived')))`,
         ),
       )
       .run()

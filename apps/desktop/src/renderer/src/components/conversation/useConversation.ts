@@ -5,6 +5,7 @@ import type { SkillSelection } from '@pact/contracts'
 import type {
   AnchoredComment,
   CollaborationDecisionQuestions,
+  CollaborationSession,
   ConversationPatch,
   ConversationPage,
   ConversationSendInput,
@@ -197,6 +198,163 @@ const INITIAL_SYNC_TIMEOUT_MS = 15_000
 const INLINE_INPUT_BYTES = 64 * 1024
 const INPUT_UPLOAD_TIMEOUT_MS = 10_000
 const INPUT_UPLOAD_CHARS = 8192
+const MAX_PENDING_SYNC_MAIN_SESSIONS = 32
+
+interface PendingSyncMain {
+  operationId: string
+  content: string
+  imageIds: string[]
+  commentIds: string[]
+  skills: SkillSelection[]
+  userInformation?: import('@pact/contracts').UserInformationDeclaration | undefined
+  expectedRevision: number
+  expectedCommentsRevision: number
+  inputId?: string | undefined
+  contentSha256?: string | undefined
+  inputPreparation?: AbortController | undefined
+}
+
+function sameSyncMainPayload(
+  left: PendingSyncMain,
+  right: Omit<PendingSyncMain, 'operationId' | 'inputPreparation' | 'inputId' | 'contentSha256'>,
+): boolean {
+  return (
+    left.content === right.content &&
+    left.expectedRevision === right.expectedRevision &&
+    left.expectedCommentsRevision === right.expectedCommentsRevision &&
+    left.imageIds.length === right.imageIds.length &&
+    left.imageIds.every((id, index) => id === right.imageIds[index]) &&
+    left.commentIds.length === right.commentIds.length &&
+    left.commentIds.every((id, index) => id === right.commentIds[index]) &&
+    JSON.stringify(left.skills) === JSON.stringify(right.skills) &&
+    JSON.stringify(left.userInformation ?? null) === JSON.stringify(right.userInformation ?? null)
+  )
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', bodyTextEncoder.encode(value))
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+function releasePreparedInput(targetSessionId: string, targetInputId: string): void {
+  void window.pact
+    .writeConversationInput({
+      type: 'release',
+      sessionId: targetSessionId,
+      inputId: targetInputId,
+    })
+    .catch(() => undefined)
+}
+
+/** Uploads oversized conversation text via bounded UTF-16 chunks before submit/sync-back. */
+async function uploadLargeConversationInput(params: {
+  sessionId: string
+  clientMessageId: string
+  content: string
+  controller: AbortController
+  cancelErrorMessage: string
+  startErrorMessage: string
+  appendErrorMessage: string
+  sealErrorMessage: string
+  cancelledCheckErrorMessage: string
+  onInputId?: (inputId: string | undefined) => void
+  isCurrent?: () => boolean
+}): Promise<string> {
+  const { sessionId, clientMessageId, content, controller } = params
+  let preparedInputId: string | undefined
+  const timeout = window.setTimeout(() => controller.abort(), INPUT_UPLOAD_TIMEOUT_MS)
+  const write = (input: Parameters<typeof window.pact.writeConversationInput>[0]) =>
+    new Promise<Awaited<ReturnType<typeof window.pact.writeConversationInput>>>(
+      (resolve, reject) => {
+        const abort = () => reject(new Error(params.cancelErrorMessage))
+        controller.signal.addEventListener('abort', abort, { once: true })
+        if (controller.signal.aborted) {
+          controller.signal.removeEventListener('abort', abort)
+          abort()
+          return
+        }
+        void window.pact.writeConversationInput(input).then(
+          (reply) => {
+            controller.signal.removeEventListener('abort', abort)
+            if (controller.signal.aborted) {
+              if (reply.ok)
+                void window.pact
+                  .writeConversationInput({
+                    type: 'release',
+                    sessionId,
+                    inputId: reply.value.inputId,
+                  })
+                  .catch(() => undefined)
+              return undefined
+            }
+            resolve(reply)
+            return undefined
+          },
+          (writeError: unknown) => {
+            controller.signal.removeEventListener('abort', abort)
+            reject(writeError)
+            return undefined
+          },
+        )
+      },
+    )
+  try {
+    const initial = unwrapRpcResult(await write({ type: 'begin', sessionId, clientMessageId }))
+    preparedInputId = initial.inputId
+    params.onInputId?.(preparedInputId)
+    if (initial.offset !== 0 || initial.sealed) throw new Error(params.startErrorMessage)
+    let offset = 0
+    while (offset < content.length) {
+      let end = Math.min(content.length, offset + INPUT_UPLOAD_CHARS)
+      const high = content.charCodeAt(end - 1),
+        low = content.charCodeAt(end)
+      if (
+        end < content.length &&
+        high >= 0xd800 &&
+        high <= 0xdbff &&
+        low >= 0xdc00 &&
+        low <= 0xdfff
+      )
+        end -= 1
+      const part: import('@pact/contracts').ConversationInputState = unwrapRpcResult(
+        // oxlint-disable-next-line no-await-in-loop -- Each bounded UTF-16 segment follows the acknowledged offset under one deadline.
+        await write({
+          type: 'append',
+          sessionId,
+          inputId: preparedInputId,
+          offset,
+          text: content.slice(offset, end),
+        }),
+      )
+      if (part.inputId !== preparedInputId || part.offset !== end || part.sealed)
+        throw new Error(params.appendErrorMessage)
+      offset = end
+    }
+    const sealed = unwrapRpcResult(
+      await write({ type: 'seal', sessionId, inputId: preparedInputId }),
+    )
+    if (
+      !sealed.sealed ||
+      sealed.inputId !== preparedInputId ||
+      sealed.offset !== content.length ||
+      sealed.chars !== content.length
+    )
+      throw new Error(params.sealErrorMessage)
+    if (controller.signal.aborted || (params.isCurrent && !params.isCurrent()))
+      throw new Error(params.cancelledCheckErrorMessage)
+    return preparedInputId
+  } catch (error) {
+    if (preparedInputId) {
+      params.onInputId?.(undefined)
+      void window.pact
+        .writeConversationInput({ type: 'release', sessionId, inputId: preparedInputId })
+        .catch(() => undefined)
+    }
+    throw error
+  } finally {
+    window.clearTimeout(timeout)
+  }
+}
 
 async function readActivityBody(
   sessionId: string,
@@ -316,6 +474,21 @@ export interface ConversationFlow {
   setComposerSkills(value: SkillSelection[]): void
   composerMention: ConversationComposerMention | undefined
   setComposerMention(value: ConversationComposerMention | undefined): void
+  composerRevision: number
+  seedComposerDraft(
+    targetSessionId: string,
+    value: import('./composer-document').ComposerDocument,
+  ): boolean
+  clearSubmittedComposerDraft(
+    targetSessionId: string,
+    expectedRevision: number,
+    consumedImageIds?: readonly string[],
+  ): void
+  syncToMain?: (
+    content: string,
+    commentIds: string[],
+    skills?: SkillSelection[],
+  ) => Promise<import('@pact/contracts').SideChatSyncMainReceipt | undefined>
   loading: boolean
   sending: boolean
   stopping: boolean
@@ -496,7 +669,23 @@ export function useConversation(
   visible = true,
   onErrorNotice: (message: string) => void = onNotice,
   onInfoNotice: (message: string) => void = onNotice,
+  hookOptions?: {
+    disableAutoInterest?: boolean | undefined
+    waitForInterest?: (() => Promise<boolean>) | undefined
+    onSessionRead?: ((session: CollaborationSession) => void) | undefined
+  },
 ): ConversationFlow {
+  const onSessionReadRef = useRef(hookOptions?.onSessionRead)
+  useLayoutEffect(() => {
+    onSessionReadRef.current = hookOptions?.onSessionRead
+  }, [hookOptions?.onSessionRead])
+  const disableAutoInterest = Boolean(hookOptions?.disableAutoInterest)
+  const disableAutoInterestRef = useRef(disableAutoInterest)
+  const waitForInterestRef = useRef(hookOptions?.waitForInterest)
+  useLayoutEffect(() => {
+    disableAutoInterestRef.current = disableAutoInterest
+    waitForInterestRef.current = hookOptions?.waitForInterest
+  }, [disableAutoInterest, hookOptions?.waitForInterest])
   const queryClient = useQueryClient()
   const [operationsBySession, setOperationsBySession] = useState<
     Record<string, SessionOperationState>
@@ -524,6 +713,17 @@ export function useConversation(
   const [nativeInputDrafts, setNativeInputDrafts] = useState<Record<string, NativeInputDraft>>({})
   const markedReadRef = useRef<{ sessionId: string; sequence: number } | undefined>(undefined)
   const pendingBySessionRef = useRef(new Map<string, PendingSubmission>())
+  const pendingSyncMainRef = useRef(new Map<string, PendingSyncMain>())
+  const pendingSyncInFlightRef = useRef(new Set<string>())
+  useEffect(() => {
+    const pendingSync = pendingSyncMainRef.current
+    const inFlight = pendingSyncInFlightRef.current
+    return () => {
+      for (const entry of pendingSync.values()) entry.inputPreparation?.abort()
+      pendingSync.clear()
+      inFlight.clear()
+    }
+  }, [])
   const activeSessionIdRef = useRef(sessionId)
   const admitComposerResidency = useCallback(
     (
@@ -787,7 +987,13 @@ export function useConversation(
       }
       const read = async () => {
         checkCurrent()
-        unwrapRpcResult(await window.pact.setConversationInterest(sessionId ?? null, generation))
+        if (!disableAutoInterestRef.current) {
+          unwrapRpcResult(await window.pact.setConversationInterest(sessionId ?? null, generation))
+        } else if (waitForInterestRef.current) {
+          if (!(await waitForInterestRef.current())) {
+            throw new Error('Could not subscribe to active sessions.')
+          }
+        }
         checkCurrent()
         const aroundMessageId = readingMessageIdRef.current
         let result = await window.pact.getConversation({
@@ -866,9 +1072,11 @@ export function useConversation(
           queryKey: conversationQueryKeys.session(sessionId),
           exact: true,
         })
-      void window.pact
-        .setConversationInterest(null, ++interestGenerationRef.current)
-        .catch(() => undefined)
+      if (!disableAutoInterestRef.current) {
+        void window.pact
+          .setConversationInterest(null, ++interestGenerationRef.current)
+          .catch(() => undefined)
+      }
     }
   }, [queryClient, refetchConversation, sessionId, visible])
   /* oxlint-enable react/set-state-in-effect */
@@ -905,9 +1113,11 @@ export function useConversation(
             .catch(() => undefined)
       }
       pendingBySessionRef.current.clear()
-      void window.pact
-        .setConversationInterest(null, ++interestGenerationRef.current)
-        .catch(() => undefined)
+      if (!disableAutoInterestRef.current) {
+        void window.pact
+          .setConversationInterest(null, ++interestGenerationRef.current)
+          .catch(() => undefined)
+      }
     },
     [],
   )
@@ -1067,6 +1277,63 @@ export function useConversation(
       })
     },
     [sessionId, putComposerDraft],
+  )
+  const seedComposerDraft = useCallback(
+    (targetSessionId: string, value: import('./composer-document').ComposerDocument): boolean => {
+      const previous = composerDraftsRef.current[targetSessionId]
+      const next: ConversationComposerDraft = {
+        ...previous,
+        text: value.text,
+        skills: value.skills.length ? value.skills : undefined,
+        mention: value.mention,
+        route: value.route ? releaseComposerRoute(value.route) : undefined,
+        returnedInputOperationId: undefined,
+        queueReturnOperationId: undefined,
+        revision: (previous?.revision ?? 0) + 1,
+      }
+      const admitted = putComposerDraft(targetSessionId, next)
+      if (admitted && activeSessionIdRef.current === targetSessionId) {
+        latestComposerDraft.current = { sessionId: targetSessionId, draft: next }
+      }
+      return admitted
+    },
+    [putComposerDraft],
+  )
+  const clearSubmittedComposerDraft = useCallback(
+    (
+      targetSessionId: string,
+      expectedRevision: number,
+      consumedImageIds: readonly string[] = [],
+    ): void => {
+      const latest =
+        latestComposerDraft.current?.sessionId === targetSessionId
+          ? latestComposerDraft.current.draft
+          : composerDraftsRef.current[targetSessionId]
+      if (!latest) return
+      const currentRevision = latest.revision ?? 0
+      const remainingImages = latest.images?.filter(
+        (entry) => !entry.image || !consumedImageIds.includes(entry.image.id),
+      )
+      const cleared: ConversationComposerDraft =
+        currentRevision === expectedRevision
+          ? {
+              ...(remainingImages?.length ? { images: remainingImages } : {}),
+              text: '',
+              revision: currentRevision + 1,
+            }
+          : {
+              ...latest,
+              ...(remainingImages !== undefined
+                ? { images: remainingImages.length ? remainingImages : undefined }
+                : {}),
+              revision: currentRevision + 1,
+            }
+      putComposerDraft(targetSessionId, cleared)
+      if (latestComposerDraft.current?.sessionId === targetSessionId) {
+        latestComposerDraft.current = { sessionId: targetSessionId, draft: cleared }
+      }
+    },
+    [putComposerDraft],
   )
 
   const updateImages = useCallback(
@@ -1947,6 +2214,7 @@ export function useConversation(
           await window.pact.markSessionRead({ sessionId, throughSequence: sequence }),
         )
         acceptSessionCatalogChange(queryClient, change)
+        onSessionReadRef.current?.(change.session)
       } catch {
         if (markedReadRef.current === request) markedReadRef.current = undefined
       }
@@ -2840,91 +3108,23 @@ export function useConversation(
       if (!frozen.inputId && inlineBytes > INLINE_INPUT_BYTES) {
         const controller = new AbortController()
         frozen.inputPreparation = controller
-        const timeout = window.setTimeout(() => controller.abort(), INPUT_UPLOAD_TIMEOUT_MS)
-        const write = (input: Parameters<typeof window.pact.writeConversationInput>[0]) =>
-          new Promise<Awaited<ReturnType<typeof window.pact.writeConversationInput>>>(
-            (resolve, reject) => {
-              const abort = () =>
-                reject(new Error('Sending was cancelled or timed out. Your draft was kept.'))
-              controller.signal.addEventListener('abort', abort, { once: true })
-              if (controller.signal.aborted) {
-                controller.signal.removeEventListener('abort', abort)
-                abort()
-                return
-              }
-              void window.pact.writeConversationInput(input).then(
-                (reply) => {
-                  controller.signal.removeEventListener('abort', abort)
-                  if (controller.signal.aborted) {
-                    if (reply.ok)
-                      void window.pact
-                        .writeConversationInput({
-                          type: 'release',
-                          sessionId,
-                          inputId: reply.value.inputId,
-                        })
-                        .catch(() => undefined)
-                    return undefined
-                  }
-                  resolve(reply)
-                  return undefined
-                },
-                (writeError: unknown) => {
-                  controller.signal.removeEventListener('abort', abort)
-                  reject(writeError)
-                  return undefined
-                },
-              )
-            },
-          )
         try {
-          const initial = unwrapRpcResult(
-            await write({ type: 'begin', sessionId, clientMessageId }),
-          )
-          frozen.inputId = initial.inputId
-          if (initial.offset !== 0 || initial.sealed)
-            throw new Error('Couldn’t start sending this message. Your draft was kept.')
-          let offset = 0
-          while (offset < content.length) {
-            let end = Math.min(content.length, offset + INPUT_UPLOAD_CHARS)
-            const high = content.charCodeAt(end - 1),
-              low = content.charCodeAt(end)
-            if (
-              end < content.length &&
-              high >= 0xd800 &&
-              high <= 0xdbff &&
-              low >= 0xdc00 &&
-              low <= 0xdfff
-            )
-              end -= 1
-            const part: import('@pact/contracts').ConversationInputState = unwrapRpcResult(
-              // oxlint-disable-next-line no-await-in-loop -- Each bounded UTF-16 segment follows the acknowledged offset under one deadline.
-              await write({
-                type: 'append',
-                sessionId,
-                inputId: frozen.inputId,
-                offset,
-                text: content.slice(offset, end),
-              }),
-            )
-            if (part.inputId !== frozen.inputId || part.offset !== end || part.sealed)
-              throw new Error('Couldn’t send all of this message. Your draft was kept.')
-            offset = end
-          }
-          const sealed = unwrapRpcResult(
-            await write({ type: 'seal', sessionId, inputId: frozen.inputId }),
-          )
-          if (
-            !sealed.sealed ||
-            sealed.inputId !== frozen.inputId ||
-            sealed.offset !== content.length ||
-            sealed.chars !== content.length
-          )
-            throw new Error('Couldn’t finish sending this message. Your draft was kept.')
-          if (controller.signal.aborted || pendingBySessionRef.current.get(sessionId) !== frozen)
-            throw new Error('Sending was cancelled. Your draft was kept.')
+          frozen.inputId = await uploadLargeConversationInput({
+            sessionId,
+            clientMessageId,
+            content,
+            controller,
+            cancelErrorMessage: 'Sending was cancelled or timed out. Your draft was kept.',
+            startErrorMessage: 'Couldn’t start sending this message. Your draft was kept.',
+            appendErrorMessage: 'Couldn’t send all of this message. Your draft was kept.',
+            sealErrorMessage: 'Couldn’t finish sending this message. Your draft was kept.',
+            cancelledCheckErrorMessage: 'Sending was cancelled. Your draft was kept.',
+            onInputId: (id) => {
+              frozen.inputId = id
+            },
+            isCurrent: () => pendingBySessionRef.current.get(sessionId) === frozen,
+          })
         } finally {
-          window.clearTimeout(timeout)
           frozen.inputPreparation = undefined
         }
       }
@@ -3016,6 +3216,320 @@ export function useConversation(
           .catch(() => undefined)
       updateSessionOperations(sessionId, (current) =>
         current.sendingOperationId === operationId
+          ? { ...current, sendingOperationId: undefined }
+          : current,
+      )
+    }
+  }
+
+  const finalizeSyncedSideChatDraft = (
+    ownerSessionId: string,
+    draftRevision: number,
+    consumedImageIds: readonly string[],
+    consumedCommentCount: number,
+  ): void => {
+    clearSubmittedComposerDraft(ownerSessionId, draftRevision, consumedImageIds)
+    for (const id of consumedImageIds) {
+      if (
+        !composerDraftsRef.current[ownerSessionId]?.images?.some((entry) => entry.image?.id === id)
+      ) {
+        releaseDraftImage(ownerSessionId, id)
+      }
+    }
+    if (consumedCommentCount > 0 && activeSessionIdRef.current === ownerSessionId) {
+      void refetchConversation({ cancelRefetch: false })
+      draftReloadTokenRef.current += 1
+      setDraftReloadToken(draftReloadTokenRef.current)
+    }
+  }
+
+  const syncToMain = async (
+    composerSnapshot: string,
+    commentIds: string[],
+    skills?: SkillSelection[],
+  ): Promise<import('@pact/contracts').SideChatSyncMainReceipt | undefined> => {
+    if (
+      !sessionId ||
+      sending ||
+      returnOperation.current?.sessionId === sessionId ||
+      pendingSyncInFlightRef.current.has(sessionId)
+    )
+      return undefined
+    const ownerSessionId = sessionId
+    const draft =
+      latestComposerDraft.current?.sessionId === ownerSessionId
+        ? latestComposerDraft.current.draft
+        : composerDraftsRef.current[ownerSessionId]
+    const expectedRevision = draft?.revision ?? 0
+    const images = draft?.images ?? []
+    if (images.some((image) => image.status !== 'ready' || !image.image)) {
+      onNotice('Wait for images to finish preparing, or remove an image that could not be added.')
+      return undefined
+    }
+    const imageIds = images.map((entry) => entry.image!.id)
+    const content = composerSnapshot.trim()
+    const hasDraftComments = commentIds.length > 0 || draftHasMore || draftHasEarlier
+    if (content.length === 0 && imageIds.length === 0 && !hasDraftComments) {
+      onNotice('Write a message before sending to the main chat.')
+      return undefined
+    }
+    const currentRevision = windowRef.current?.view.commentsRevision
+    if (currentRevision === undefined) return undefined
+    if (draftsReadyRevision !== currentRevision) {
+      updateSessionOperations(ownerSessionId, (current) => ({
+        ...current,
+        error: 'Comment drafts are still loading. Try again in a moment.',
+      }))
+      return undefined
+    }
+    const normalizedSkills = [...(skills ?? [])]
+    const currentPayload: Omit<
+      PendingSyncMain,
+      'operationId' | 'inputPreparation' | 'inputId' | 'contentSha256'
+    > = {
+      content,
+      imageIds: [...imageIds],
+      commentIds: [...commentIds],
+      skills: normalizedSkills,
+      ...(draft?.userInformation ? { userInformation: draft.userInformation } : {}),
+      expectedRevision,
+      expectedCommentsRevision: currentRevision,
+    }
+    const preserved = pendingSyncMainRef.current.get(ownerSessionId)
+    let activeOperationId = preserved?.operationId ?? crypto.randomUUID()
+    let pendingEntry: PendingSyncMain | undefined
+    let preparedInputId: string | undefined
+    let preparedContentSha256: string | undefined
+    let keepRemoteInput = false
+    pendingSyncInFlightRef.current.add(ownerSessionId)
+    updateSessionOperations(ownerSessionId, (current) => ({
+      ...current,
+      sendingOperationId: activeOperationId,
+      error: undefined,
+    }))
+    try {
+      if (preserved) {
+        const verifiedPrevious = await window.pact
+          .readSyncSideChatReceipt({ operationId: preserved.operationId })
+          .catch(() => undefined)
+        if (!verifiedPrevious?.ok) {
+          const probeError =
+            verifiedPrevious?.error?.message ??
+            'Could not verify whether your previous message finished sending. Try again.'
+          if (!sameSyncMainPayload(preserved, currentPayload)) {
+            onErrorNotice(probeError)
+            updateSessionOperations(ownerSessionId, (current) => ({
+              ...current,
+              error: probeError,
+            }))
+            return undefined
+          }
+          preparedInputId = preserved.inputId
+          preparedContentSha256 = preserved.contentSha256
+        } else if (verifiedPrevious.value) {
+          if (pendingSyncMainRef.current.get(ownerSessionId) === preserved) {
+            pendingSyncMainRef.current.delete(ownerSessionId)
+          }
+          if (preserved.inputId) releasePreparedInput(ownerSessionId, preserved.inputId)
+          finalizeSyncedSideChatDraft(
+            ownerSessionId,
+            preserved.expectedRevision,
+            preserved.imageIds,
+            Math.max(1, preserved.commentIds.length),
+          )
+          if (sameSyncMainPayload(preserved, currentPayload)) {
+            return verifiedPrevious.value
+          }
+          onNotice(
+            'Your previous message was already sent to the main chat. Send again if you also want to send your edits.',
+          )
+          return undefined
+        } else if (!sameSyncMainPayload(preserved, currentPayload)) {
+          if (pendingSyncMainRef.current.get(ownerSessionId) === preserved) {
+            pendingSyncMainRef.current.delete(ownerSessionId)
+          }
+          if (preserved.inputId) releasePreparedInput(ownerSessionId, preserved.inputId)
+          activeOperationId = crypto.randomUUID()
+          updateSessionOperations(ownerSessionId, (current) => ({
+            ...current,
+            sendingOperationId: activeOperationId,
+          }))
+        } else {
+          preparedInputId = preserved.inputId
+          preparedContentSha256 = preserved.contentSha256
+        }
+      }
+      if (
+        !pendingSyncMainRef.current.has(ownerSessionId) &&
+        pendingSyncMainRef.current.size >= MAX_PENDING_SYNC_MAIN_SESSIONS
+      ) {
+        for (const [candidateSessionId, candidateEntry] of pendingSyncMainRef.current.entries()) {
+          // oxlint-disable-next-line no-await-in-loop -- Settle or discard one confirmed completed pending sync-back before admitting another.
+          const candidateStatus = await window.pact
+            .readSyncSideChatReceipt({ operationId: candidateEntry.operationId })
+            .catch(() => undefined)
+          if (!candidateStatus?.ok) continue
+          if (pendingSyncMainRef.current.get(candidateSessionId) === candidateEntry) {
+            pendingSyncMainRef.current.delete(candidateSessionId)
+          }
+          if (candidateEntry.inputId) {
+            releasePreparedInput(candidateSessionId, candidateEntry.inputId)
+          }
+          if (candidateStatus.value) {
+            finalizeSyncedSideChatDraft(
+              candidateSessionId,
+              candidateEntry.expectedRevision,
+              candidateEntry.imageIds,
+              Math.max(1, candidateEntry.commentIds.length),
+            )
+          }
+          break
+        }
+        if (pendingSyncMainRef.current.size >= MAX_PENDING_SYNC_MAIN_SESSIONS) {
+          const capacityMessage =
+            'Too many side chats have unconfirmed messages waiting for verification. Retry or wait for one to finish.'
+          onErrorNotice(capacityMessage)
+          updateSessionOperations(ownerSessionId, (current) => ({
+            ...current,
+            error: capacityMessage,
+          }))
+          return undefined
+        }
+      }
+      pendingEntry = {
+        ...currentPayload,
+        operationId: activeOperationId,
+        ...(preparedInputId ? { inputId: preparedInputId } : {}),
+        ...(preparedContentSha256 ? { contentSha256: preparedContentSha256 } : {}),
+      }
+      pendingSyncMainRef.current.set(ownerSessionId, pendingEntry)
+
+      const syncMetadata = {
+        operationId: activeOperationId,
+        sideChatId: ownerSessionId,
+        imageIds,
+        commentIds,
+        skills: normalizedSkills,
+        ...(draft?.userInformation ? { userInformation: draft.userInformation } : {}),
+        expectedCommentsRevision: currentRevision,
+      }
+      const encodedContentBytes = bodyTextEncoder.encode(content).byteLength
+      const inlineBytes =
+        bodyTextEncoder.encode(JSON.stringify({ ...syncMetadata, content: '' })).byteLength +
+        encodedContentBytes
+      const needsSealedInput =
+        content.length > 0 &&
+        (encodedContentBytes > INLINE_INPUT_BYTES || inlineBytes > INLINE_INPUT_BYTES)
+      if (needsSealedInput && (!preparedInputId || !preparedContentSha256)) {
+        const controller = new AbortController()
+        pendingEntry.inputPreparation = controller
+        try {
+          preparedInputId = await uploadLargeConversationInput({
+            sessionId: ownerSessionId,
+            clientMessageId: activeOperationId,
+            content,
+            controller,
+            cancelErrorMessage: 'Sending was cancelled or timed out. Your draft was kept.',
+            startErrorMessage: 'Couldn’t start sending this message. Your draft was kept.',
+            appendErrorMessage: 'Couldn’t send all of this message. Your draft was kept.',
+            sealErrorMessage: 'Couldn’t finish sending this message. Your draft was kept.',
+            cancelledCheckErrorMessage: 'Sending was cancelled. Your draft was kept.',
+            onInputId: (id) => {
+              preparedInputId = id
+              if (pendingEntry) pendingEntry.inputId = id
+            },
+            isCurrent: () => pendingSyncMainRef.current.get(ownerSessionId) === pendingEntry,
+          })
+        } finally {
+          pendingEntry.inputPreparation = undefined
+        }
+        preparedContentSha256 = await sha256Hex(content)
+        pendingEntry.contentSha256 = preparedContentSha256
+        if (
+          controller.signal.aborted ||
+          pendingSyncMainRef.current.get(ownerSessionId) !== pendingEntry
+        ) {
+          throw new Error('Sending was cancelled. Your draft was kept.')
+        }
+      }
+
+      keepRemoteInput = Boolean(preparedInputId)
+      const result = await window.pact.syncSideChatToMain({
+        ...syncMetadata,
+        ...(preparedInputId && preparedContentSha256
+          ? { content: '', inputId: preparedInputId, contentSha256: preparedContentSha256 }
+          : { content }),
+      })
+      let receipt: import('@pact/contracts').SideChatSyncMainReceipt | undefined
+      let uncertainOutcome = false
+      if (result.ok) {
+        receipt = result.value
+      } else if (result.error.code === 'TIMEOUT' || result.error.code === 'UNCERTAIN') {
+        const verified = await window.pact
+          .readSyncSideChatReceipt({ operationId: activeOperationId })
+          .catch(() => undefined)
+        if (verified?.ok && verified.value) {
+          receipt = verified.value
+        } else {
+          uncertainOutcome = true
+        }
+      }
+      if (!receipt) {
+        if (!uncertainOutcome && pendingSyncMainRef.current.get(ownerSessionId) === pendingEntry) {
+          pendingSyncMainRef.current.delete(ownerSessionId)
+          keepRemoteInput = false
+        }
+        const message = result.ok
+          ? 'The message could not be sent to the main chat.'
+          : result.error.message
+        onErrorNotice(message)
+        updateSessionOperations(ownerSessionId, (current) => ({
+          ...current,
+          error: message,
+        }))
+        return undefined
+      }
+      if (pendingSyncMainRef.current.get(ownerSessionId) === pendingEntry) {
+        pendingSyncMainRef.current.delete(ownerSessionId)
+      }
+      keepRemoteInput = false
+      finalizeSyncedSideChatDraft(
+        ownerSessionId,
+        expectedRevision,
+        imageIds,
+        hasDraftComments ? Math.max(1, commentIds.length) : 0,
+      )
+      return receipt
+    } catch (error) {
+      const uncertainError =
+        error instanceof RpcError && (error.code === 'TIMEOUT' || error.code === 'UNCERTAIN')
+      if (!uncertainError) {
+        if (pendingEntry && pendingSyncMainRef.current.get(ownerSessionId) === pendingEntry) {
+          pendingSyncMainRef.current.delete(ownerSessionId)
+        }
+        keepRemoteInput = false
+      }
+      const message =
+        error instanceof Error ? error.message : 'The message could not be sent to the main chat.'
+      onErrorNotice(message)
+      updateSessionOperations(ownerSessionId, (current) => ({
+        ...current,
+        error: message,
+      }))
+      return undefined
+    } finally {
+      pendingSyncInFlightRef.current.delete(ownerSessionId)
+      if (preparedInputId && !keepRemoteInput) {
+        void window.pact
+          .writeConversationInput({
+            type: 'release',
+            sessionId: ownerSessionId,
+            inputId: preparedInputId,
+          })
+          .catch(() => undefined)
+      }
+      updateSessionOperations(ownerSessionId, (current) =>
+        current.sendingOperationId === activeOperationId
           ? { ...current, sendingOperationId: undefined }
           : current,
       )
@@ -3836,7 +4350,9 @@ export function useConversation(
     background?: import('@pact/contracts').BackgroundStopTarget,
   ): Promise<boolean> => {
     if (!sessionId || stopping) return false
-    const preparing = pendingBySessionRef.current.get(sessionId)?.inputPreparation
+    const preparing =
+      pendingBySessionRef.current.get(sessionId)?.inputPreparation ??
+      pendingSyncMainRef.current.get(sessionId)?.inputPreparation
     if (preparing && !background) {
       preparing.abort()
       return true
@@ -3937,6 +4453,10 @@ export function useConversation(
     setComposerSkills,
     composerMention,
     setComposerMention,
+    composerRevision: composerDraft?.revision ?? 0,
+    seedComposerDraft,
+    clearSubmittedComposerDraft,
+    syncToMain,
     loading: Boolean(sessionId && visible && (query.isFetching || (!query.isError && readPending))),
     sending,
     stopping,

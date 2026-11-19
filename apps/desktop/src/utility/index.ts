@@ -1725,6 +1725,90 @@ async function bootstrap(
         return
       }
 
+      case 'side-chat.create.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'side-chat.create.response',
+              requestId,
+              result: await conversationOwner.createSideChat(input),
+            }),
+          )
+        })
+        return
+      }
+
+      case 'side-chat.create-receipt.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'side-chat.create-receipt.response',
+              requestId,
+              result: await conversationOwner.readCreateSideChatReceipt(input),
+            }),
+          )
+        })
+        return
+      }
+
+      case 'side-chat.list.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'side-chat.list.response',
+              requestId,
+              result: await conversationOwner.listSideChats(input),
+            }),
+          )
+        })
+        return
+      }
+
+      case 'side-chat.discard-empty.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'side-chat.discard-empty.response',
+              requestId,
+              result: await conversationOwner.discardEmptySideChat(input),
+            }),
+          )
+        })
+        return
+      }
+
+      case 'side-chat.sync-main.request': {
+        const { input, ownerKey, requestId } = request.data
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'side-chat.sync-main.response',
+              requestId,
+              result: await conversationOwner.syncSideChatToMain(input, ownerKey),
+            }),
+          )
+        })
+        return
+      }
+
+      case 'side-chat.sync-main-receipt.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'side-chat.sync-main-receipt.response',
+              requestId,
+              result: await conversationOwner.readSyncSideChatReceipt(input),
+            }),
+          )
+        })
+        return
+      }
+
       case 'appearance.get.request':
       case 'appearance.update.request':
       case 'appearance.reset.request':

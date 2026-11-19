@@ -5,6 +5,8 @@ import {
   composerListCommand,
   composerPactCommand,
   editComposerDocument,
+  extractBtwSideChatDraft,
+  extractMainSyncDraft,
   indexComposerLists,
   releaseComposerRoute,
   resolveComposerRoute,
@@ -178,5 +180,51 @@ describe('routing current and returned drafts', () => {
         'claude',
       ).targets,
     ).toEqual(['claude'])
+  })
+
+  it('extracts /btw and @Main drafts with shifted skill offsets and allows @Main only in side chats', () => {
+    expect(composerPactCommand(document('/btw quick question'))).toEqual({
+      kind: 'pact',
+      name: 'btw',
+      start: 0,
+      end: 4,
+    })
+    expect(composerPactCommand(document('/btw'))).toBeUndefined()
+
+    const btwDraft = extractBtwSideChatDraft({
+      text: '/btw /audit check auth',
+      skills: [{ id: 'a'.repeat(64), agentId: 'claude', name: 'audit', start: 5, end: 11 }],
+    })
+    expect(btwDraft).toEqual({
+      text: '/audit check auth',
+      skills: [{ id: 'a'.repeat(64), agentId: 'claude', name: 'audit', start: 0, end: 6 }],
+      returnedInputOperationId: undefined,
+      mention: undefined,
+      route: undefined,
+    })
+
+    expect(resolveComposerRoute(document('@Main takeaway'), 'codex').route).toEqual({
+      type: 'primary',
+    })
+    expect(
+      resolveComposerRoute(document('@Main takeaway'), 'codex', { allowMainRoute: true }),
+    ).toEqual({
+      route: { type: 'main' },
+      targets: ['codex'],
+      sendRoute: undefined,
+    })
+
+    const mainSync = extractMainSyncDraft({
+      text: '@Main /lint fix warnings',
+      skills: [{ id: 'b'.repeat(64), agentId: 'claude', name: 'lint', start: 6, end: 11 }],
+      mention: { route: { type: 'main' }, token: '@Main', start: 0, end: 5 },
+    })
+    expect(mainSync).toEqual({
+      text: '/lint fix warnings',
+      skills: [{ id: 'b'.repeat(64), agentId: 'claude', name: 'lint', start: 0, end: 5 }],
+      returnedInputOperationId: undefined,
+      mention: undefined,
+      route: { type: 'main' },
+    })
   })
 })

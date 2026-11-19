@@ -50,6 +50,8 @@ import type {
   SessionCatalogChange,
   ConversationRunContext,
   ConversationDisplayOrder,
+  SideChatSyncMainReceipt,
+  UserInformationDeclaration,
 } from '@pact/contracts'
 import type { SkillSelection } from '@pact/contracts'
 import type { ConversationImage } from '@pact/contracts/images'
@@ -70,10 +72,12 @@ import {
   defaultTaskStageRoles,
   isCollaborationOpenMode,
   pactEntryPrimary,
+  validateSideChatMainSyncContent,
 } from '@pact/contracts'
 
 import type { ConversationViewProjection } from './conversation-window'
 import type { DraftImage } from './image-client'
+import type { MessageTextSelection } from './MessageSelectionSurface'
 import type {
   ConversationComposerMention,
   ConversationHistoryControls,
@@ -95,6 +99,8 @@ import {
 import {
   composerDifference,
   composerHasContent,
+  extractBtwSideChatDraft,
+  extractMainSyncDraft,
   replaceComposerDocument,
   resolveComposerRoute,
   type ComposerDocument,
@@ -113,6 +119,7 @@ import {
   clearProjectionHighlight,
   focusProjectionRange,
   isProjectionHighlightOwned,
+  pulseMessageTarget,
   selectedTextRange,
   planSelectionSource,
   reportSelectionSource,
@@ -138,16 +145,25 @@ const EMPTY_SKILLS: SkillSelection[] = []
 const EMPTY_IMAGES: readonly DraftImage[] = []
 const EMPTY_COMMENTS: AnchoredComment[] = []
 const ignoreSkillChanges = (_value: SkillSelection[]): void => undefined
-const commentSourceLabel = (anchor: CommentAnchor): string =>
+const commentSourceLabel = (
+  anchor: CommentAnchor,
+  currentSession?: Pick<CollaborationSession, 'id' | 'parentSessionId'>,
+): string =>
   anchor.type === 'unavailable'
     ? 'Source unavailable'
     : anchor.type === 'file'
       ? anchor.path
-      : anchor.plan
-        ? `Plan v${anchor.plan.version}`
-        : anchor.report
-          ? 'Review'
-          : 'Message'
+      : anchor.type === 'cutoff_message'
+        ? (currentSession?.parentSessionId &&
+            anchor.sourceSessionId === currentSession.parentSessionId) ||
+          anchor.sourceSessionId === currentSession?.id
+          ? 'Main chat'
+          : 'Side chat'
+        : anchor.plan
+          ? `Plan v${anchor.plan.version}`
+          : anchor.report
+            ? 'Review'
+            : 'Message'
 
 interface ConversationViewProps {
   planPanelHost?: HTMLElement | null | undefined
@@ -190,6 +206,17 @@ interface ConversationViewProps {
   composerMention?: ConversationComposerMention | undefined
   composerRoute?: ComposerDocument['route']
   composerReturnedInputOperationId?: string | undefined
+  composerUserInformation?: UserInformationDeclaration | undefined
+  composerRevision?: number | undefined
+  onClearSubmittedDraft?: ((expectedRevision: number) => void) | undefined
+  handoffArriveKey?: string | number | undefined
+  mainTargetAgentId?: RuntimeAgentId | undefined
+  onOpenBtwSideChat?: ((draft: ComposerDocument) => Promise<boolean>) | undefined
+  onAskInSideChat?: ((selection: MessageTextSelection) => void) | undefined
+  onOpenSideChat?: ((sideChatId: string) => void) | undefined
+  resolveSideChatTitle?: ((sideChatId: string, fallbackTitle: string) => string) | undefined
+  onSyncToMain?: ConversationFlow['syncToMain'] | undefined
+  onViewMainMessage?: ((receipt: SideChatSyncMainReceipt) => void) | undefined
   onComposerMentionChange: (value: ConversationComposerMention | undefined) => void
   loading: boolean
   sending: boolean
@@ -227,6 +254,7 @@ interface ConversationViewProps {
     | {
         navigationId?: string
         messageId: string
+        queuedOperationId?: string | undefined
         startOffset: number
         endOffset: number
         textBasis?: MessageCommentAnchor['textBasis']
@@ -291,6 +319,37 @@ const mentionOptions = [
   },
 ]
 
+const sideChatMentionOptions = [
+  {
+    token: '@codex' as const,
+    label: 'Codex',
+    description: 'Send only to Codex',
+    route: { type: 'agent', agentId: 'codex' } as const,
+    icon: Bot,
+  },
+  {
+    token: '@claude' as const,
+    label: 'Claude Code',
+    description: 'Send only to Claude Code',
+    route: { type: 'agent', agentId: 'claude' } as const,
+    icon: Bot,
+  },
+  {
+    token: '@Main' as const,
+    label: 'Main chat',
+    description: 'Send to the main chat',
+    route: { type: 'main' } as const,
+    icon: CornerUpLeft,
+  },
+  {
+    token: '@all' as const,
+    label: 'All Agents',
+    description: 'Primary, then Secondary',
+    route: { type: 'all' } as const,
+    icon: Users,
+  },
+]
+
 function mentionQueryAt(value: string, cursor: number): MentionQuery | undefined {
   const prefix = value.slice(0, cursor)
   const match = /(?:^|\s)@([a-z]*)$/iu.exec(prefix)
@@ -337,6 +396,17 @@ export function ConversationView({
   composerMention,
   composerRoute,
   composerReturnedInputOperationId,
+  composerUserInformation,
+  composerRevision = 0,
+  onClearSubmittedDraft,
+  handoffArriveKey,
+  mainTargetAgentId,
+  onOpenBtwSideChat,
+  onAskInSideChat,
+  onOpenSideChat,
+  resolveSideChatTitle,
+  onSyncToMain,
+  onViewMainMessage,
   onComposerMentionChange,
   loading,
   sending,
@@ -650,6 +720,7 @@ export function ConversationView({
   const openPlanCallback = useRef(onOpenPlan)
   openPlanCallback.current = onOpenPlan
   const appliedNavigationRef = useRef<typeof messageNavigation>(undefined)
+  const queueDockRef = useRef<HTMLDivElement>(null)
   const appliedGapResyncRef = useRef(0)
   const gapRestoreRef = useRef<
     | {
@@ -1112,6 +1183,13 @@ export function ConversationView({
         (message.content.trim() || history.window?.messageMeta[message.id]?.oversized),
     ),
   )
+  const isSideChat = Boolean(session.parentSessionId)
+  const [btwSubmitting, setBtwSubmitting] = useState(false)
+  const [dismissedArriveKey, setDismissedArriveKey] = useState<string | number | undefined>()
+  const focusedArriveKeyRef = useRef<string | number | undefined>(undefined)
+  const [lastMainSync, setLastMainSync] = useState<
+    { sideChatId: string; receipt: SideChatSyncMainReceipt } | undefined
+  >()
   const composerDisabled = !agentActionsEnabled || recoveryLocked || Boolean(history.restoringInput)
   const composerContentReady = useMemo(() => composerHasContent(composer), [composer])
   const skillComposer = useSkillComposer({
@@ -1121,6 +1199,7 @@ export function ConversationView({
     route: composerRoute,
     mention: composerMention,
     returnedInputOperationId: composerReturnedInputOperationId,
+    mainTargetAgentId,
     disabled: composerDisabled || inputTakeover,
   })
   const activeSkillId = skillComposer.query
@@ -1147,16 +1226,18 @@ export function ConversationView({
     : queuedInput?.recipient === 'all'
       ? 'Messages for all Agents stay queued.'
       : 'Steer is available only for the Agent currently responding.'
-  const disabled =
+  const commonComposerBlocked =
     choosingImages ||
     composerImages.some((image) => image.status !== 'ready') ||
     Boolean(skillComposer.warning) ||
     skillComposer.checking ||
     composerDisabled ||
-    (inputGate === 'send_blocked' && (!activeRun?.collaboration || backgroundCheckNeeded)) ||
     sending ||
-    stopping ||
     history.draftsLoading
+  const disabled =
+    commonComposerBlocked ||
+    stopping ||
+    (inputGate === 'send_blocked' && (!activeRun?.collaboration || backgroundCheckNeeded))
   const previousDecisionRun = unfinishedTask ? runsById.get(unfinishedTask.runId) : undefined
   const incompleteCanAnswer =
     inputGateState !== 'incomplete' ||
@@ -1178,7 +1259,11 @@ export function ConversationView({
     Boolean(history.restoringInput) ||
     !incompleteCanAnswer
   const draftComments = snapshot?.draftComments ?? EMPTY_COMMENTS
-  const hasDraft = composerContentReady || draftComments.length > 0 || composerImages.length > 0
+  const hasDraft =
+    composerContentReady ||
+    draftComments.length > 0 ||
+    Boolean(history.draftPage?.hasMore || history.draftPage?.hasEarlier) ||
+    composerImages.length > 0
   const showSend = !showStop || hasDraft
   const workingIssues = backgroundIssues.filter((issue) => issue.phase === 'background_working')
   const waitingBackgroundIssue =
@@ -1211,16 +1296,59 @@ export function ConversationView({
   )
   const commentDraftId = commentEditor?.draftId
   const composerPrefix = parseComposerCommandPrefix(composer, composerSkills)
+  const isBtwReady = !isSideChat && Boolean(composerPrefix.btw && !composerPrefix.error)
+  const resolvedComposerRoute = resolveComposerRoute(
+    {
+      text: composer,
+      skills: composerSkills,
+      mention: composerMention,
+      route: composerRoute,
+      returnedInputOperationId: composerReturnedInputOperationId,
+    },
+    session.settings.primaryAgentId,
+    { allowMainRoute: isSideChat },
+  ).route
+  const isMainRoute = isSideChat && resolvedComposerRoute.type === 'main'
+  const isHandoffArriving =
+    handoffArriveKey !== undefined && handoffArriveKey !== dismissedArriveKey
+  useEffect(() => {
+    if (handoffArriveKey === undefined || handoffArriveKey === dismissedArriveKey) {
+      return undefined
+    }
+    const timer = window.setTimeout(() => setDismissedArriveKey(handoffArriveKey), 220)
+    return () => window.clearTimeout(timer)
+  }, [dismissedArriveKey, handoffArriveKey])
+  useLayoutEffect(() => {
+    if (
+      handoffArriveKey === undefined ||
+      !visible ||
+      composerDisabled ||
+      inputTakeover ||
+      focusedArriveKeyRef.current === handoffArriveKey
+    ) {
+      return
+    }
+    focusedArriveKeyRef.current = handoffArriveKey
+    const editor = composerRef.current
+    if (!editor) return
+    const end = editor.document().text.length
+    editor.focus()
+    editor.select(end, end)
+  }, [composerDisabled, handoffArriveKey, inputTakeover, visible])
   const defaultRecipient =
     unfinishedTask && !composerPrefix.pact
       ? collaborationActor(unfinishedTask, 'reply')
       : session.settings.primaryAgentId
   const primaryName = session.settings.primaryAgentId === 'claude' ? 'Claude Code' : 'Codex'
   const secondaryName = session.settings.primaryAgentId === 'claude' ? 'Codex' : 'Claude Code'
-  const filteredMentionOptions = mentionOptions.filter(
+  const availableMentionOptions = isSideChat ? sideChatMentionOptions : mentionOptions
+  const filteredMentionOptions = availableMentionOptions.filter(
     (option) =>
-      option.token.slice(1).startsWith(mentionQuery?.query ?? '') &&
-      (!unfinishedTask || option.token !== '@all'),
+      option.token
+        .slice(1)
+        .toLowerCase()
+        .startsWith((mentionQuery?.query ?? '').toLowerCase()) &&
+      (!unfinishedTask || isBtwReady || option.token !== '@all'),
   )
   const mentionListOpen = Boolean(
     mentionQuery &&
@@ -2115,6 +2243,20 @@ export function ConversationView({
     setRestorationMessageIds([])
     setRestorationPlan(undefined)
     setRestorationReport(undefined)
+    if (
+      messageNavigation.queuedOperationId &&
+      queuedInput?.id === messageNavigation.queuedOperationId
+    ) {
+      const dock = queueDockRef.current
+      if (!dock) return undefined
+      const focusDock = (): void => {
+        dock.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        pulseMessageTarget(dock)
+        appliedNavigationRef.current = messageNavigation
+      }
+      const frame = requestAnimationFrame(focusDock)
+      return () => cancelAnimationFrame(frame)
+    }
     void ensureMessage(messageNavigation.messageId)
     // A resident source marker can change the row key. Focus only after that
     // render has committed, never on a DOM node about to be replaced.
@@ -2123,6 +2265,11 @@ export function ConversationView({
     const message = navigationMessage
       ? messageRefs.current.get(messageNavigation.messageId)
       : undefined
+    if (!message && navigationMessage) {
+      const index = rows.findIndex((row) => row.message?.id === messageNavigation.messageId)
+      if (index >= 0) virtualizer.scrollToIndex(index, { align: 'center' })
+      return undefined
+    }
     if (message) {
       stickToBottomRef.current = false
       const focus = (): boolean => {
@@ -2153,6 +2300,23 @@ export function ConversationView({
           appliedNavigationRef.current = messageNavigation
           return true
         }
+        if (messageNavigation.textBasis === 'plain-visible-v1') {
+          const transcript = transcriptRef.current
+          const rect = message.getBoundingClientRect()
+          if (transcript && rect.height > 0) {
+            virtualizer.scrollToOffset(
+              transcript.scrollTop +
+                rect.top -
+                transcript.getBoundingClientRect().top -
+                transcript.clientHeight / 2 +
+                rect.height / 2,
+              { behavior: 'smooth' },
+            )
+          }
+          pulseMessageTarget(message)
+          appliedNavigationRef.current = messageNavigation
+          return true
+        }
         return false
       }
       const frame = focus() ? undefined : requestAnimationFrame(() => void focus())
@@ -2166,10 +2330,12 @@ export function ConversationView({
     dismissedNavigation,
     hasProtectedSelection,
     messageNavigation,
+    queuedInput?.id,
     history.window?.sourceMessageId,
     visible,
     navigationMessage,
     mountedRowKeys,
+    rows,
     virtualizer,
     cancelPrepend,
   ])
@@ -2370,7 +2536,7 @@ export function ConversationView({
     [composer, composerSkills, composerMention, composerRoute, composerReturnedInputOperationId],
   )
   const pactCommandHint = (() => {
-    if (!composerPrefix.pact || composerPrefix.error) return undefined
+    if (isSideChat || !composerPrefix.pact || composerPrefix.error) return undefined
     const inTaskReviewHint =
       composerPrefix.pact === 'review' &&
       unfinishedTask &&
@@ -2502,7 +2668,7 @@ export function ConversationView({
     }
   }
 
-  const chooseMention = (option: (typeof mentionOptions)[number]): void => {
+  const chooseMention = (option: (typeof sideChatMentionOptions)[number]): void => {
     if (!mentionQuery) return
     const current = composerRef.current?.document() ?? editorValue
     const selectedMention = current.mention
@@ -2555,13 +2721,97 @@ export function ConversationView({
 
   const submit = async (): Promise<void> => {
     if (inputTakeover) return
+    const document = composerRef.current?.document() ?? editorValue
+    const prefix = parseComposerCommandPrefix(document.text, document.skills)
+    if (isSideChat && (prefix.pact || prefix.btw)) {
+      onNotice('Pact commands (/plan, /build, /review, /btw) can only be used in the main chat.')
+      return
+    }
+    const { route: effectiveRoute, sendRoute } = resolveComposerRoute(document, defaultRecipient, {
+      allowMainRoute: isSideChat,
+    })
+    if (!isSideChat && prefix.btw && !prefix.error) {
+      if (btwSubmitting || commonComposerBlocked || !onOpenBtwSideChat) return
+      if (decisionReply) {
+        onNotice('Reply to the active questions before starting a /btw side chat.')
+        return
+      }
+      if (
+        composerReturnedInputOperationId ||
+        returnedInput?.state === 'installed' ||
+        queue?.returnedInput?.operationId ||
+        composerUserInformation
+      ) {
+        onNotice('Send or clear the saved message before starting a /btw side chat.')
+        return
+      }
+      if (composerImages.length > 0 || draftComments.length > 0) {
+        onNotice('Remove attached images or draft comments before starting a /btw side chat.')
+        return
+      }
+      const btwDraft = extractBtwSideChatDraft(document)
+      if (!btwDraft) return
+      const submittedRevision = composerRevision
+      setBtwSubmitting(true)
+      try {
+        const opened = await onOpenBtwSideChat(btwDraft)
+        if (opened) {
+          if (onClearSubmittedDraft) onClearSubmittedDraft(submittedRevision)
+          else if (onComposerDocumentChange) onComposerDocumentChange({ text: '', skills: [] })
+          else onComposerChange('')
+          skillComposer.close()
+          setMentionQuery(undefined)
+        }
+      } finally {
+        setBtwSubmitting(false)
+      }
+      return
+    }
+    if (isSideChat && effectiveRoute.type === 'main') {
+      if (commonComposerBlocked || !onSyncToMain) return
+      const syncDraft = extractMainSyncDraft(document)
+      const trimmedLead = syncDraft.text.length - syncDraft.text.trimStart().length
+      const syncContent = syncDraft.text.trim()
+      if (
+        syncContent.length === 0 &&
+        composerImages.length === 0 &&
+        draftComments.length === 0 &&
+        !history.draftPage?.hasMore &&
+        !history.draftPage?.hasEarlier
+      ) {
+        onNotice('Write a message before sending to the main chat.')
+        return
+      }
+      const shiftedSkills = syncDraft.skills.map((entry) =>
+        Object.assign({}, entry, {
+          start: entry.start - trimmedLead,
+          end: entry.end - trimmedLead,
+        }),
+      )
+      const syncValidation = validateSideChatMainSyncContent(syncContent, shiftedSkills)
+      if (!syncValidation.ok) {
+        onNotice(syncValidation.message)
+        return
+      }
+      const receipt = await onSyncToMain(
+        syncContent,
+        draftComments.map((comment) => comment.id),
+        shiftedSkills,
+      )
+      if (receipt) {
+        setLastMainSync({ sideChatId: session.id, receipt })
+        skillComposer.close()
+        setMentionQuery(undefined)
+      }
+      return
+    }
     if (responseInProgress && !queueEnabled && !unfinishedTask) return
     if (responseInProgress && queuedInput) {
       onNotice('One message is already queued. Edit or remove it before queuing another.')
       return
     }
     if (
-      (!composerHasContent(composerRef.current?.document().text ?? composer) &&
+      (!composerHasContent(document.text) &&
         draftComments.length === 0 &&
         composerImages.length === 0 &&
         !decisionAnswersReady) ||
@@ -2571,14 +2821,11 @@ export function ConversationView({
     stickToBottomRef.current = true
     cancelPrepend()
     scrollIntentRef.current = undefined
-    const document = composerRef.current?.document() ?? editorValue
     const removed = document.text.length - document.text.trimStart().length
-    const { sendRoute } = resolveComposerRoute(document, defaultRecipient)
     if (unfinishedTask && sendRoute?.type === 'all') {
       onNotice('Choose one Agent for this feedback batch.')
       return
     }
-    const prefix = parseComposerCommandPrefix(document.text, document.skills)
     if (decisionReply && prefix.pact) {
       onNotice('Send your answers as a reply before starting another Pact command.')
       return
@@ -3015,7 +3262,7 @@ export function ConversationView({
             commentId: submitted.commentId,
             body: submitted.body,
           }
-        : submitted.anchor.type === 'unavailable'
+        : submitted.anchor.type === 'unavailable' || submitted.anchor.type === 'cutoff_message'
           ? undefined
           : {
               mode: 'create' as const,
@@ -3270,7 +3517,7 @@ export function ConversationView({
               disabled={disabled || responseInProgress}
               continuationBlocked={continuationBlocked}
               onOpenPlan={openRecordedPlan}
-              onOpenSessionSettings={onOpenSessionSettings}
+              onOpenSessionSettings={isSideChat ? undefined : onOpenSessionSettings}
               nativePresentationSuspended={
                 nativePresentationSuspended ||
                 nativeQuestions.length > 0 ||
@@ -3342,7 +3589,7 @@ export function ConversationView({
               disabled={disabled || responseInProgress}
               continuationBlocked={continuationBlocked}
               onOpenPlan={openRecordedPlan}
-              onOpenSessionSettings={onOpenSessionSettings}
+              onOpenSessionSettings={isSideChat ? undefined : onOpenSessionSettings}
               nativePresentationSuspended={
                 nativePresentationSuspended ||
                 nativeQuestions.length > 0 ||
@@ -3494,6 +3741,31 @@ export function ConversationView({
                 ) : message.role === 'assistant' && messageRun ? (
                   <RunConfiguration run={messageRun} />
                 ) : null}
+                {!isSideChat &&
+                message.role === 'user' &&
+                message.originSideChat &&
+                onOpenSideChat ? (
+                  <button
+                    type="button"
+                    className="pact-side-chat-from-badge ml-1 inline-flex items-center gap-1 rounded-pill border border-border bg-surface-raised/90 px-2 py-0.5 text-caption font-medium leading-none text-secondary transition-colors hover:border-border-strong hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+                    title={`Open side chat: ${
+                      resolveSideChatTitle
+                        ? resolveSideChatTitle(
+                            message.originSideChat.sideChatId,
+                            message.originSideChat.sideChatTitle,
+                          )
+                        : message.originSideChat.sideChatTitle
+                    }`}
+                    onClick={() => onOpenSideChat(message.originSideChat!.sideChatId)}
+                  >
+                    <CornerUpLeft
+                      aria-hidden="true"
+                      className="size-3 shrink-0"
+                      strokeWidth={1.75}
+                    />
+                    From side chat
+                  </button>
+                ) : null}
               </p>
               {ownsRunActivity && messageRun?.handoffMessageCount ? (
                 <ContextReceipt
@@ -3536,6 +3808,15 @@ export function ConversationView({
                     messageId={message.id}
                     onCreateComment={
                       recoveryLocked || inputTakeover ? undefined : handleCreateMessageComment
+                    }
+                    onAskInSideChat={
+                      !isSideChat &&
+                      !backgroundReport &&
+                      !messageMeta?.oversized &&
+                      message.state !== 'streaming' &&
+                      (message.role === 'user' || message.role === 'assistant')
+                        ? onAskInSideChat
+                        : undefined
                     }
                   />
                 ) : null}
@@ -3581,6 +3862,7 @@ export function ConversationView({
               copyResult={copyFeedback?.messageId === message.id ? copyFeedback.result : undefined}
               onCopy={copyMessage}
               onFork={
+                !isSideChat &&
                 message.role === 'assistant' &&
                 !backgroundReport &&
                 message.outputSnapshot?.canonical !== false &&
@@ -3682,7 +3964,7 @@ export function ConversationView({
               className="mt-0.5 line-clamp-2 text-caption leading-relaxed text-secondary"
               title={commentEditor.quote}
             >
-              {commentSourceLabel(commentEditor.anchor)} · “{commentEditor.quote}”
+              {commentSourceLabel(commentEditor.anchor, session)} · “{commentEditor.quote}”
             </p>
             {commentEditor.anchor.type === 'unavailable' ? (
               <p className="mt-1 text-caption text-secondary">{commentEditor.anchor.reason}</p>
@@ -3746,55 +4028,60 @@ export function ConversationView({
           className="flex max-h-20 w-full flex-wrap gap-1.5 overflow-y-auto px-2 pt-1"
           aria-label="Attached Comment drafts"
         >
-          {draftComments.map((comment) => (
-            <span
-              key={comment.id}
-              className={`inline-flex max-w-64 items-center gap-1 rounded-pill bg-status-info-muted px-2.5 py-1 text-caption text-status-info-foreground ${recoveryLocked ? 'opacity-55' : ''}`}
-            >
-              <button
-                className="truncate text-left"
-                type="button"
-                title={
-                  comment.anchor.type === 'unavailable'
-                    ? `${comment.anchor.reason}\n${comment.body}`
-                    : comment.body
-                }
-                disabled={recoveryLocked}
-                onClick={() =>
-                  setCommentEditor({
-                    commentId: comment.id,
-                    draftId: crypto.randomUUID(),
-                    anchor: comment.anchor,
-                    quote: comment.anchor.quote,
-                    body: comment.body,
-                  })
-                }
+          {draftComments.map((comment) => {
+            const collapsedQuote = comment.anchor.quote.replace(/\s+/gu, ' ').trim()
+            const draftLabel =
+              comment.body.trim() || (collapsedQuote ? `“${collapsedQuote}”` : 'Quoted selection')
+            return (
+              <span
+                key={comment.id}
+                className={`inline-flex max-w-64 items-center gap-1 rounded-pill bg-status-info-muted px-2.5 py-1 text-caption text-status-info-foreground ${recoveryLocked ? 'opacity-55' : ''}`}
               >
-                {commentSourceLabel(comment.anchor)} · {comment.body}
-              </button>
-              {comment.anchor.type !== 'unavailable' ? (
                 <button
+                  className="truncate text-left"
                   type="button"
-                  aria-label="Return to Comment source"
-                  title="Return to source"
+                  title={
+                    comment.anchor.type === 'unavailable'
+                      ? `${comment.anchor.reason}${comment.body ? `\n${comment.body}` : ''}`
+                      : comment.body.trim() || comment.anchor.quote
+                  }
                   disabled={recoveryLocked}
-                  onClick={() => onOpenComment(comment)}
-                  className="grid size-6 shrink-0 place-items-center rounded-control hover:bg-status-info/15 focus-visible:outline-2 focus-visible:outline-focus"
+                  onClick={() =>
+                    setCommentEditor({
+                      commentId: comment.id,
+                      draftId: crypto.randomUUID(),
+                      anchor: comment.anchor,
+                      quote: comment.anchor.quote,
+                      body: comment.body,
+                    })
+                  }
                 >
-                  <CornerUpLeft aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
+                  {commentSourceLabel(comment.anchor, session)} · {draftLabel}
                 </button>
-              ) : null}
-              <button
-                className="grid size-4 shrink-0 place-items-center rounded-full hover:bg-status-info/15"
-                type="button"
-                aria-label="Remove Comment draft"
-                disabled={disabled}
-                onClick={() => void onRemoveCommentDraft(comment.id)}
-              >
-                <X aria-hidden="true" className="size-3" />
-              </button>
-            </span>
-          ))}
+                {comment.anchor.type !== 'unavailable' ? (
+                  <button
+                    type="button"
+                    aria-label="Return to Comment source"
+                    title="Return to source"
+                    disabled={recoveryLocked}
+                    onClick={() => onOpenComment(comment)}
+                    className="grid size-6 shrink-0 place-items-center rounded-control hover:bg-status-info/15 focus-visible:outline-2 focus-visible:outline-focus"
+                  >
+                    <CornerUpLeft aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
+                  </button>
+                ) : null}
+                <button
+                  className="grid size-4 shrink-0 place-items-center rounded-full hover:bg-status-info/15"
+                  type="button"
+                  aria-label="Remove Comment draft"
+                  disabled={disabled}
+                  onClick={() => void onRemoveCommentDraft(comment.id)}
+                >
+                  <X aria-hidden="true" className="size-3" />
+                </button>
+              </span>
+            )
+          })}
         </div>
       ) : null}
       {history.draftPage?.hasMore || history.draftPage?.hasEarlier ? (
@@ -3975,6 +4262,17 @@ export function ConversationView({
           </button>
         </div>
       ) : null}
+      {isSideChat && session.sideChatOrigin === 'btw' && session.sideChatHasContext ? (
+        <div
+          key={`origin:${session.id}`}
+          className="pact-side-chat-origin-enter shrink-0 px-section pt-2.5"
+        >
+          <div className="mx-auto flex w-full max-w-[78ch] items-center gap-1.5 text-caption text-tertiary">
+            <Info aria-hidden="true" className="size-3.5 shrink-0" strokeWidth={1.75} />
+            <span>Context from main chat</span>
+          </div>
+        </div>
+      ) : null}
       {/* oxlint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- The focusable Transcript region uses native wheel and keyboard scrolling. */}
       <section
         ref={transcriptRef}
@@ -4135,10 +4433,12 @@ export function ConversationView({
                 strokeWidth={1.5}
               />
               <h2 className="mt-section text-subtitle font-medium text-primary">
-                Start with {primaryName}
+                {isSideChat ? `Ask ${primaryName}` : `Start with ${primaryName}`}
               </h2>
               <p className="mx-auto mt-1 max-w-[46ch] text-caption leading-relaxed text-secondary">
-                Ask a question, describe a change, or type @ to mention an agent.
+                {isSideChat
+                  ? 'Ask about the main chat, or type @Main to send a takeaway back.'
+                  : 'Ask a question, describe a change, or type @ to mention an agent.'}
               </p>
             </div>
           )}
@@ -4251,7 +4551,7 @@ export function ConversationView({
               />
             ) : null}
           </div>
-          <div className="pact-queued-input flex min-h-0 flex-col">
+          <div ref={queueDockRef} className="pact-queued-input flex min-h-0 flex-col">
             {queue && queueActions ? (
               <QueueMessageBar
                 queue={queue}
@@ -4443,10 +4743,47 @@ export function ConversationView({
                     {history.restoringInput ? 'Restoring…' : 'Restore returned message'}
                   </button>
                 ) : null}
+                {isSideChat && lastMainSync?.sideChatId === session.id ? (
+                  <div
+                    role="status"
+                    className="pact-side-chat-sync-bar flex items-center justify-between gap-2 rounded-control border border-border bg-surface px-3 py-1.5 text-caption"
+                  >
+                    <span className="flex min-w-0 items-center gap-1.5 text-secondary">
+                      <Check
+                        aria-hidden="true"
+                        className="size-3.5 shrink-0 text-status-ready"
+                        strokeWidth={1.75}
+                      />
+                      <span className="truncate">
+                        Sent to main chat
+                        {lastMainSync.receipt.disposition === 'queued' ? ' (queued)' : ''}
+                      </span>
+                    </span>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {onViewMainMessage ? (
+                        <button
+                          type="button"
+                          className="font-medium text-focus hover:underline focus-visible:outline-2 focus-visible:outline-focus"
+                          onClick={() => onViewMainMessage(lastMainSync.receipt)}
+                        >
+                          View
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        aria-label="Dismiss main chat notification"
+                        className="grid size-5 place-items-center rounded-control text-tertiary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+                        onClick={() => setLastMainSync(undefined)}
+                      >
+                        <X aria-hidden="true" className="size-3" strokeWidth={1.75} />
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
                 <div
                   ref={composerBoxRef}
                   style={{ anchorName: composerMenuAnchor }}
-                  className={`pact-composer-box relative flex flex-col gap-1.5 rounded-card border border-border bg-surface-raised p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus ${recoveryLocked ? 'opacity-60' : ''} ${imageDropActive ? 'outline-2 outline-focus outline-offset-4' : ''}`}
+                  className={`pact-composer-box relative flex flex-col gap-1.5 rounded-card border border-border bg-surface-raised p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus ${isHandoffArriving ? 'pact-composer-handoff-arrive' : ''} ${recoveryLocked ? 'opacity-60' : ''} ${imageDropActive ? 'outline-2 outline-focus outline-offset-4' : ''}`}
                   onDragEnter={(event) => {
                     if (
                       !composerDisabled &&
@@ -4566,6 +4903,7 @@ export function ConversationView({
                     <ComposerEditor
                       editorRef={composerRef}
                       value={editorValue}
+                      allowPactCommands={!isSideChat}
                       onChange={acceptComposerDocument}
                       admitEdit={history.admitComposerEdit}
                       onCursor={cursorChanged}
@@ -4696,7 +5034,14 @@ export function ConversationView({
                           }
                         }
                         if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
-                          if (responseInProgress && !queueEnabled && !unfinishedTask) return
+                          if (
+                            !isBtwReady &&
+                            !isMainRoute &&
+                            responseInProgress &&
+                            !queueEnabled &&
+                            !unfinishedTask
+                          )
+                            return
                           event.preventDefault()
                           void submit()
                         }
@@ -4974,70 +5319,96 @@ export function ConversationView({
                         <button
                           className="grid size-9 place-items-center rounded-control bg-surface-inverse text-inverse hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-40"
                           type="button"
-                          aria-label="Send message"
-                          title="Send message"
+                          aria-label={isMainRoute ? 'Send to main' : 'Send message'}
+                          title={isMainRoute ? 'Send to main' : 'Send message'}
                           disabled={
-                            disabled ||
-                            !hasDraft ||
-                            Boolean(replacement) ||
-                            (responseInProgress && !queueEnabled && !unfinishedTask)
+                            isBtwReady
+                              ? commonComposerBlocked || btwSubmitting || !onOpenBtwSideChat
+                              : isMainRoute
+                                ? commonComposerBlocked || !onSyncToMain
+                                : disabled ||
+                                  !hasDraft ||
+                                  Boolean(replacement) ||
+                                  (responseInProgress && !queueEnabled && !unfinishedTask)
                           }
                           onClick={() => void submit()}
                         >
-                          <ArrowUp aria-hidden="true" className="size-4" strokeWidth={1.9} />
+                          {isMainRoute ? (
+                            <span
+                              key="send-main"
+                              className="pact-send-icon inline-flex items-center justify-center"
+                            >
+                              <CornerUpLeft
+                                aria-hidden="true"
+                                className="size-4"
+                                strokeWidth={1.9}
+                              />
+                            </span>
+                          ) : (
+                            <span
+                              key="send-normal"
+                              className="pact-send-icon inline-flex items-center justify-center"
+                            >
+                              <ArrowUp aria-hidden="true" className="size-4" strokeWidth={1.9} />
+                            </span>
+                          )}
                         </button>
                       ) : null}
                     </div>
                   </div>
                 </div>
-                <div className="pact-composer-controls flex min-w-0 items-center gap-2">
-                  {onSaveSessionPermission ? (
-                    <>
-                      {(['claude', 'codex'] as const).map((agent) => (
-                        <div
-                          key={`${session.id}-${agent}`}
-                          role="group"
-                          aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} settings`}
-                          className="pact-agent-controls text-caption"
-                        >
-                          <PermissionMenu
-                            session={session}
-                            agent={agent}
-                            run={activeRun ?? latestRun}
-                            busy={responseInProgress}
-                            disabled={sessionSettingsSaving}
-                            visible={visible && !nativePresentationSuspended && !inputTakeover}
-                            onSave={onSaveSessionPermission}
-                            onNotice={onNotice}
-                          />
-                          {onSaveSessionSpeed ? (
-                            <>
-                              <span className="pact-agent-divider" aria-hidden="true" />
-                              <SpeedMenu
-                                session={session}
-                                agent={agent}
-                                run={activeRun ?? latestRun}
-                                busy={responseInProgress}
-                                disabled={sessionSettingsSaving}
-                                visible={visible && !nativePresentationSuspended && !inputTakeover}
-                                onSave={onSaveSessionSpeed}
-                                onNotice={onNotice}
-                              />
-                            </>
-                          ) : null}
-                        </div>
-                      ))}
-                    </>
-                  ) : null}
-                  <ProjectContextMenu
-                    key={`${session.id}-${session.projectId}`}
-                    projectId={session.projectId}
-                    platform={platform}
-                    visible={visible && !inputTakeover}
-                    refreshKey={`${latestRun?.id ?? ''}:${latestRun?.status ?? ''}`}
-                    onNotice={onNotice}
-                  />
-                </div>
+                {!isSideChat ? (
+                  <div className="pact-composer-controls flex min-w-0 items-center gap-2">
+                    {onSaveSessionPermission ? (
+                      <>
+                        {(['claude', 'codex'] as const).map((agent) => (
+                          <div
+                            key={`${session.id}-${agent}`}
+                            role="group"
+                            aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} settings`}
+                            className="pact-agent-controls text-caption"
+                          >
+                            <PermissionMenu
+                              session={session}
+                              agent={agent}
+                              run={activeRun ?? latestRun}
+                              busy={responseInProgress}
+                              disabled={sessionSettingsSaving}
+                              visible={visible && !nativePresentationSuspended && !inputTakeover}
+                              onSave={onSaveSessionPermission}
+                              onNotice={onNotice}
+                            />
+                            {onSaveSessionSpeed ? (
+                              <>
+                                <span className="pact-agent-divider" aria-hidden="true" />
+                                <SpeedMenu
+                                  session={session}
+                                  agent={agent}
+                                  run={activeRun ?? latestRun}
+                                  busy={responseInProgress}
+                                  disabled={sessionSettingsSaving}
+                                  visible={
+                                    visible && !nativePresentationSuspended && !inputTakeover
+                                  }
+                                  onSave={onSaveSessionSpeed}
+                                  onNotice={onNotice}
+                                />
+                              </>
+                            ) : null}
+                          </div>
+                        ))}
+                      </>
+                    ) : null}
+                    <ProjectContextMenu
+                      key={`${session.id}-${session.projectId}`}
+                      projectId={session.projectId}
+                      platform={platform}
+                      visible={visible && !inputTakeover}
+                      refreshKey={`${latestRun?.id ?? ''}:${latestRun?.status ?? ''}`}
+                      onNotice={onNotice}
+                    />
+                  </div>
+                ) : null}
                 {history.draftError && snapshot ? (
                   <p
                     className="flex items-center gap-2 px-2 text-caption text-secondary"

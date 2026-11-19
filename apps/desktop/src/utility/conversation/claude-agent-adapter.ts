@@ -50,7 +50,7 @@ import {
 import {
   COLLABORATION_PLAN_CHUNK_BYTES,
   COLLABORATION_PUBLISHED_PLAN_MAX_BYTES,
-  collaborationSourceReadSchema,
+  collaborationSourceAnyReadSchema,
   collaborationReviewInputSchema,
   collaborationInputResultSchema,
   collaborationInputOutcomeAllowed,
@@ -103,7 +103,7 @@ import {
   collaborationToolAllowed,
   collaborationSourceToolDescription,
 } from './collaboration-prompt'
-import { readFrozenSourceTool } from './frozen-source-reader'
+import { cutoffSourceNavigator, readFrozenSourceTool } from './frozen-source-reader'
 import { NativeCheckOperation } from './native-check-operation'
 import {
   claudeFileChanges,
@@ -2328,7 +2328,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         'read_collaboration_source',
         {
           description: collaborationSourceToolDescription,
-          inputSchema: collaborationSourceReadSchema,
+          inputSchema: collaborationSourceAnyReadSchema,
           annotations: {
             readOnlyHint: true,
             destructiveHint: false,
@@ -5656,6 +5656,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         input.collaborationSourceReader
           ? (target) => input.collaborationSourceReader!.navigation(target, 'legacy')
           : undefined,
+        cutoffSourceNavigator(input.collaborationSourceReader, 'legacy'),
       )
       message = {
         type: 'user',

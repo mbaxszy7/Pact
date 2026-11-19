@@ -130,6 +130,31 @@ import {
   skillDocumentSchema,
 } from './skills.js'
 export * from './skills.js'
+import {
+  CONVERSATION_ACTIVE_SESSIONS_PER_VIEWER,
+  createSideChatInputSchema,
+  createSideChatReceiptSchema,
+  discardEmptySideChatInputSchema,
+  discardEmptySideChatResultSchema,
+  listSideChatsInputSchema,
+  listSideChatsPageSchema,
+  originSideChatSchema,
+  readSideChatReceiptInputSchema,
+  sideChatAnchorSchema,
+  sideChatOriginSchema,
+  sideChatSyncMainInputSchema,
+  sideChatSyncMainReceiptSchema,
+  type CreateSideChatInput,
+  type CreateSideChatReceipt,
+  type DiscardEmptySideChatInput,
+  type DiscardEmptySideChatResult,
+  type ListSideChatsInput,
+  type ListSideChatsPage,
+  type ReadSideChatReceiptInput,
+  type SideChatSyncMainInput,
+  type SideChatSyncMainReceipt,
+} from './side-chats.js'
+export * from './side-chats.js'
 import { z } from 'zod'
 
 import {
@@ -185,10 +210,12 @@ import {
 
 export {
   anchoredCommentSchema,
+  anchoredCommentSummarySchema,
   commentAnchorSchema,
   commentDraftRemoveInputSchema,
   commentDraftSaveInputSchema,
   commentSourceResolutionSchema,
+  cutoffMessageCommentAnchorSchema,
   fileCommentAnchorSchema,
   MAX_COMMENTS_PER_MESSAGE,
   MAX_COMMENT_QUOTE_LENGTH,
@@ -201,6 +228,7 @@ export {
   type CommentDraftRemoveInput,
   type CommentDraftSaveInput,
   type CommentSourceResolution,
+  type CutoffMessageCommentAnchor,
   type FileCommentAnchor,
   type MessageCommentAnchor,
 } from './anchored-comments.js'
@@ -212,6 +240,7 @@ import type {
 
 import {
   anchoredCommentSchema,
+  anchoredCommentSummarySchema,
   commentDraftRemoveInputSchema,
   commentDraftSaveInputSchema,
   commentSourceResolutionSchema,
@@ -350,6 +379,12 @@ export const IPC_CHANNELS = {
   workspaceChangesRead: 'pact:workspace-changes:read',
   workspaceChangeFileRead: 'pact:workspace-changes:file-read',
   workspaceChangesUndo: 'pact:workspace-changes:undo',
+  sideChatCreate: 'pact:side-chat:create',
+  sideChatCreateReceipt: 'pact:side-chat:create-receipt',
+  sideChatDiscardEmpty: 'pact:side-chat:discard-empty',
+  sideChatList: 'pact:side-chat:list',
+  sideChatSyncMain: 'pact:side-chat:sync-main',
+  sideChatSyncMainReceipt: 'pact:side-chat:sync-main-receipt',
 } as const
 
 export const appErrorSchema = z.object({
@@ -1044,6 +1079,10 @@ export const collaborationSessionSchema = z.strictObject({
   archivedAt: z.string().datetime().optional(),
   groupId: z.string().uuid().nullable().optional(),
   sidebarHidden: z.literal(true).optional(),
+  parentSessionId: z.string().uuid().nullable().optional(),
+  sideChatOrigin: sideChatOriginSchema.optional(),
+  sideChatAnchor: sideChatAnchorSchema.optional(),
+  sideChatHasContext: z.boolean().optional(),
 })
 export type CollaborationSession = z.infer<typeof collaborationSessionSchema>
 
@@ -1079,6 +1118,7 @@ export const sessionCatalogChangeSchema = z.strictObject({
   groupRevision: z.number().int().nonnegative().optional(),
   dissolvedGroupId: z.string().uuid().optional(),
   session: collaborationSessionSchema,
+  resolvedSideChat: collaborationSessionSchema.optional(),
 })
 export type SessionCatalogChange = z.infer<typeof sessionCatalogChangeSchema>
 
@@ -1581,6 +1621,7 @@ export const conversationMessageSchema = z.strictObject({
   route: conversationMessageRouteSchema.optional(),
   pendingAgentId: runtimeAgentIdSchema.optional(),
   sourceMessageId: z.string().uuid().optional(),
+  originSideChat: originSideChatSchema.optional(),
   content: z.string(),
   contentRevision: z.number().int().nonnegative(),
   state: z.enum(['complete', 'streaming', 'incomplete']),
@@ -2081,10 +2122,25 @@ export const CONVERSATION_PATCH_TEXT_BYTES = 16 * 1024
 export const CONVERSATION_PATCH_ACTIVITY_ITEMS = 16
 export const CONVERSATION_STREAM_BATCH_ITEMS = 64
 export const CONVERSATION_STREAM_BATCH_BYTES = 1024 * 1024
-export const conversationInterestSchema = z.strictObject({
-  sessionId: z.string().uuid().nullable(),
-  generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-})
+export const conversationInterestSchema = z
+  .strictObject({
+    sessionId: z.string().uuid().nullable().optional(),
+    sessionIds: z.array(z.string().uuid()).max(CONVERSATION_ACTIVE_SESSIONS_PER_VIEWER).optional(),
+    generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  })
+  .refine(
+    (value) => value.sessionId !== undefined || value.sessionIds !== undefined,
+    'Provide sessionId or sessionIds for conversation interest.',
+  )
+  .refine(
+    (value) => !(value.sessionId !== undefined && value.sessionIds !== undefined),
+    'Provide either sessionId or sessionIds, not both.',
+  )
+  .refine(
+    (value) =>
+      value.sessionIds === undefined || new Set(value.sessionIds).size === value.sessionIds.length,
+    'Conversation interest sessionIds must be unique.',
+  )
 export const conversationInterestsSchema = z
   .strictObject({
     sessionIds: z.array(z.string().uuid()).max(CONVERSATION_INTEREST_ITEMS),
@@ -2830,6 +2886,7 @@ export const collaborationReceivedMetadataSchema = z.strictObject({
   replaceTask: conversationSendInputSchema.shape.replaceTask,
   batchId: conversationSendInputSchema.shape.batchId,
   freezeDrafts: conversationSendInputSchema.shape.freezeDrafts,
+  originSideChat: originSideChatSchema.optional(),
 })
 
 export const peerProposalAcceptInputSchema = z.strictObject({
@@ -2894,7 +2951,7 @@ export const nativeContextRebuildChunkSchema = z.discriminatedUnion('kind', [
     kind: z.literal('comment'),
     messageId: z.string().uuid(),
     sequence: z.number().int().nonnegative(),
-    comment: anchoredCommentSchema.pick({ id: true, body: true, anchor: true }),
+    comment: anchoredCommentSummarySchema,
   }),
 ])
 export type NativeContextRebuildChunk = z.infer<typeof nativeContextRebuildChunkSchema>
@@ -3535,6 +3592,37 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
     requestId: z.string().uuid(),
     input: workspaceChangesUndoInputSchema,
   }),
+  z.strictObject({
+    type: z.literal('side-chat.create.request'),
+    requestId: z.string().uuid(),
+    input: createSideChatInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('side-chat.create-receipt.request'),
+    requestId: z.string().uuid(),
+    input: readSideChatReceiptInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('side-chat.list.request'),
+    requestId: z.string().uuid(),
+    input: listSideChatsInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('side-chat.discard-empty.request'),
+    requestId: z.string().uuid(),
+    input: discardEmptySideChatInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('side-chat.sync-main.request'),
+    requestId: z.string().uuid(),
+    input: sideChatSyncMainInputSchema,
+    ownerKey: z.string().uuid().optional(),
+  }),
+  z.strictObject({
+    type: z.literal('side-chat.sync-main-receipt.request'),
+    requestId: z.string().uuid(),
+    input: readSideChatReceiptInputSchema,
+  }),
 ])
 
 export type UtilityRequest = z.infer<typeof utilityRequestSchema>
@@ -3836,6 +3924,36 @@ export const utilityResponseSchema = z.discriminatedUnion('type', [
     requestId: z.string().uuid(),
     result: rpcResultSchema(workspaceChangeFilePreviewSchema),
   }),
+  z.strictObject({
+    type: z.literal('side-chat.create.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(createSideChatReceiptSchema),
+  }),
+  z.strictObject({
+    type: z.literal('side-chat.create-receipt.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(createSideChatReceiptSchema.nullable()),
+  }),
+  z.strictObject({
+    type: z.literal('side-chat.list.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(listSideChatsPageSchema),
+  }),
+  z.strictObject({
+    type: z.literal('side-chat.discard-empty.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(discardEmptySideChatResultSchema),
+  }),
+  z.strictObject({
+    type: z.literal('side-chat.sync-main.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(sideChatSyncMainReceiptSchema),
+  }),
+  z.strictObject({
+    type: z.literal('side-chat.sync-main-receipt.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(sideChatSyncMainReceiptSchema.nullable()),
+  }),
 ])
 
 export type UtilityResponse = z.infer<typeof utilityResponseSchema>
@@ -4033,9 +4151,21 @@ export interface DesktopBridge {
   ): Promise<RpcResult<import('./relay-decisions.js').RelayDecisionReceipt>>
   getConversation(input: ConversationGetInput): Promise<RpcResult<ConversationPage>>
   setConversationInterest(
-    sessionId: string | null,
+    sessionId: string | readonly string[] | null,
     generation: number,
   ): Promise<RpcResult<{ ready: true }>>
+  createSideChat(input: CreateSideChatInput): Promise<RpcResult<CreateSideChatReceipt>>
+  readCreateSideChatReceipt(
+    input: ReadSideChatReceiptInput,
+  ): Promise<RpcResult<CreateSideChatReceipt | null>>
+  listSideChats(input: ListSideChatsInput): Promise<RpcResult<ListSideChatsPage>>
+  discardEmptySideChat(
+    input: DiscardEmptySideChatInput,
+  ): Promise<RpcResult<DiscardEmptySideChatResult>>
+  syncSideChatToMain(input: SideChatSyncMainInput): Promise<RpcResult<SideChatSyncMainReceipt>>
+  readSyncSideChatReceipt(
+    input: ReadSideChatReceiptInput,
+  ): Promise<RpcResult<SideChatSyncMainReceipt | null>>
   writeConversationImage(
     input: import('./images.js').ImageWriteInput,
   ): Promise<RpcResult<import('./images.js').ImageWriteState>>

@@ -79,6 +79,7 @@ const CLIPBOARD_METADATA_BYTES = 64 * 1024
 export function ComposerEditor({
   value,
   disabled,
+  allowPactCommands = true,
   placeholder,
   onChange,
   admitEdit,
@@ -95,6 +96,7 @@ export function ComposerEditor({
 }: {
   value: ComposerDocument
   disabled: boolean
+  allowPactCommands?: boolean | undefined
   placeholder: string
   onChange: (value: ComposerDocument, cursor: number, composing: boolean) => boolean | void
   admitEdit?: ((nextChars: number) => boolean) | undefined
@@ -120,6 +122,7 @@ export function ComposerEditor({
     onImages,
     onNotice,
     disabled,
+    allowPactCommands,
   })
   const ownedAtoms = useRef(new Map<Node, ComposerAtom>())
   const ownedMarkers = useRef(new Map<Node, string>())
@@ -347,7 +350,7 @@ export function ComposerEditor({
       ownedMarkers.current.clear()
       ownedRows.current.clear()
       ownedTailBreak.current = undefined
-      const pact = composerPactCommand(documentValue)
+      const pact = allowPactCommands ? composerPactCommand(documentValue) : undefined
       const tokens: ComposerAtom[] = (
         pact ? [...documentValue.skills, pact] : documentValue.skills
       ).toSorted((a, b) => a.start - b.start)
@@ -450,7 +453,7 @@ export function ComposerEditor({
         selectAfterCommit.current = range
       }
     },
-    [select, notifyEditingFailure],
+    [allowPactCommands, select, notifyEditingFailure],
   )
   const remember = useCallback(
     (
@@ -553,7 +556,11 @@ export function ComposerEditor({
   )
   const replace = useCallback(
     (range: ComposerRange, text: string, skills: SkillSelection[] = []): void => {
-      const expandedRange = wholeComposerAtoms(model.current, range)
+      const expandedRange = wholeComposerAtoms(
+        model.current,
+        range,
+        callbacks.current.allowPactCommands,
+      )
       try {
         assertComposerReplacementCapacity(
           model.current.text,
@@ -770,6 +777,7 @@ export function ComposerEditor({
       onImages,
       onNotice,
       disabled,
+      allowPactCommands,
     }
   })
   useLayoutEffect(() => {
@@ -898,7 +906,11 @@ export function ComposerEditor({
           range = event.inputType.endsWith('Backward')
             ? { start: Math.max(0, range.start - 1), end: range.end }
             : { start: range.start, end: Math.min(model.current.text.length, range.end + 1) }
-        const expandedRange = wholeComposerAtoms(model.current, range)
+        const expandedRange = wholeComposerAtoms(
+          model.current,
+          range,
+          callbacks.current.allowPactCommands,
+        )
         beforeRange.current = range
         if (event.cancelable) {
           event.preventDefault()
@@ -933,7 +945,9 @@ export function ComposerEditor({
         else {
           const edited = formatComposerLists(model.current, next.document, [next.edit], range)
           let repaint = edited.document.text !== next.document.text
-          const pact = composerPactCommand(edited.document)
+          const pact = callbacks.current.allowPactCommands
+            ? composerPactCommand(edited.document)
+            : undefined
           repaint ||=
             JSON.stringify(
               [...ownedAtoms.current.values()].filter((atom) => !('agentId' in atom)),
@@ -1007,7 +1021,9 @@ export function ComposerEditor({
                 (entry) =>
                   entry.id === skill.id && entry.name === skill.name && entry.start === start,
               )
-            : composerPactCommand(model.current)
+            : callbacks.current.allowPactCommands
+              ? composerPactCommand(model.current)
+              : undefined
         if (
           current &&
           current.start === start &&
@@ -1059,7 +1075,11 @@ export function ComposerEditor({
       }
     }
     const copy = (event: ClipboardEvent): void => {
-      const range = wholeComposerAtoms(model.current, selection())
+      const range = wholeComposerAtoms(
+        model.current,
+        selection(),
+        callbacks.current.allowPactCommands,
+      )
       if (range.start === range.end) return
       event.preventDefault()
       const text = model.current.text.slice(range.start, range.end)

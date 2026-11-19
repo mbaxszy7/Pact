@@ -119,6 +119,12 @@ export const diagnosticRequestTypeSchema = z.enum([
   'provider-usage.refresh.request',
   'provider-usage.cancel.request',
   'provider-usage.release-owner.request',
+  'side-chat.create.request',
+  'side-chat.create-receipt.request',
+  'side-chat.list.request',
+  'side-chat.discard-empty.request',
+  'side-chat.sync-main.request',
+  'side-chat.sync-main-receipt.request',
 ])
 export const diagnosticNativeMethodSchema = z.enum([
   'initialize',
@@ -176,6 +182,7 @@ export const sourceReadDiagnosticSchema = z.strictObject({
     'root_document',
     'inputs',
     'handoff_sources',
+    'cutoff',
     'unknown',
   ]),
   offset: boundedCount.nullable(),

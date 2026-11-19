@@ -23,7 +23,16 @@ import type {
   ConversationQueueActionInput,
   ConversationQueueReturnInput,
   ConversationQueueEnabledInput,
+  CreateSideChatInput,
+  CreateSideChatReceipt,
+  DiscardEmptySideChatInput,
+  DiscardEmptySideChatResult,
+  ListSideChatsInput,
+  ListSideChatsPage,
   NativeContextRebuildInput,
+  ReadSideChatReceiptInput,
+  SideChatSyncMainInput,
+  SideChatSyncMainReceipt,
   PeerProposalAcceptInput,
   PeerProposalDismissInput,
   DefaultSessionSettingsEditorState,
@@ -369,6 +378,21 @@ export interface UtilityProcessClient {
     sessionIds: string[],
     timeoutMs?: number,
   ): Promise<RpcResult<{ ready: true }>>
+  createSideChat(input: CreateSideChatInput): Promise<RpcResult<CreateSideChatReceipt>>
+  readCreateSideChatReceipt(
+    input: ReadSideChatReceiptInput,
+  ): Promise<RpcResult<CreateSideChatReceipt | null>>
+  listSideChats(input: ListSideChatsInput): Promise<RpcResult<ListSideChatsPage>>
+  discardEmptySideChat(
+    input: DiscardEmptySideChatInput,
+  ): Promise<RpcResult<DiscardEmptySideChatResult>>
+  syncSideChatToMain(
+    input: SideChatSyncMainInput,
+    ownerKey?: string,
+  ): Promise<RpcResult<SideChatSyncMainReceipt>>
+  readSyncSideChatReceipt(
+    input: ReadSideChatReceiptInput,
+  ): Promise<RpcResult<SideChatSyncMainReceipt | null>>
   subscribeConversation(listener: (patch: ConversationPatch, progress: boolean) => void): () => void
   subscribeSessionNotifications?(listener: (event: SessionNotificationEvent) => void): () => void
   readProjectFile(input: ProjectFileReadInput): Promise<RpcResult<ProjectFile>>
@@ -2235,6 +2259,104 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
             result.kind === 'response'
               ? { code: 'INTERNAL', message: 'Unexpected interest acknowledgement.' }
               : result.error,
+        }
+  }
+
+  async createSideChat(input: CreateSideChatInput): Promise<RpcResult<CreateSideChatReceipt>> {
+    const result = await this.request(
+      { type: 'side-chat.create.request', input },
+      'side-chat.create.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind === 'unknown-delivery')
+      return { ok: false, error: { code: 'UNCERTAIN', message: result.error.message } }
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'side-chat.create.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected side chat response.' } }
+  }
+
+  async readCreateSideChatReceipt(
+    input: ReadSideChatReceiptInput,
+  ): Promise<RpcResult<CreateSideChatReceipt | null>> {
+    const result = await this.request(
+      { type: 'side-chat.create-receipt.request', input },
+      'side-chat.create-receipt.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'side-chat.create-receipt.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error: { code: 'INTERNAL', message: 'Unexpected side chat receipt response.' },
+        }
+  }
+
+  async listSideChats(input: ListSideChatsInput): Promise<RpcResult<ListSideChatsPage>> {
+    const result = await this.request(
+      { type: 'side-chat.list.request', input },
+      'side-chat.list.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'side-chat.list.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected side chat list response.' } }
+  }
+
+  async discardEmptySideChat(
+    input: DiscardEmptySideChatInput,
+  ): Promise<RpcResult<DiscardEmptySideChatResult>> {
+    const result = await this.request(
+      { type: 'side-chat.discard-empty.request', input },
+      'side-chat.discard-empty.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'side-chat.discard-empty.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error: { code: 'INTERNAL', message: 'Unexpected side chat discard response.' },
+        }
+  }
+
+  async syncSideChatToMain(
+    input: SideChatSyncMainInput,
+    ownerKey?: string,
+  ): Promise<RpcResult<SideChatSyncMainReceipt>> {
+    const result = await this.request(
+      {
+        type: 'side-chat.sync-main.request',
+        input,
+        ...(ownerKey ? { ownerKey } : {}),
+      },
+      'side-chat.sync-main.response',
+      CONVERSATION_SEND_TIMEOUT_MS,
+    )
+    if (result.kind === 'unknown-delivery')
+      return { ok: false, error: { code: 'UNCERTAIN', message: result.error.message } }
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'side-chat.sync-main.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected side chat sync response.' } }
+  }
+
+  async readSyncSideChatReceipt(
+    input: ReadSideChatReceiptInput,
+  ): Promise<RpcResult<SideChatSyncMainReceipt | null>> {
+    const result = await this.request(
+      { type: 'side-chat.sync-main-receipt.request', input },
+      'side-chat.sync-main-receipt.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'side-chat.sync-main-receipt.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error: { code: 'INTERNAL', message: 'Unexpected side chat sync receipt response.' },
         }
   }
 

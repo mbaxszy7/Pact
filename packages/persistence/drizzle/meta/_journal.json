@@ -743,6 +743,13 @@
       "when": 1794315022661,
       "tag": "0105_legacy_sidebar_empty_groups",
       "breakpoints": true
+    },
+    {
+      "idx": 106,
+      "version": "6",
+      "when": 1795006103326,
+      "tag": "0106_side_chats_and_cutoffs",
+      "breakpoints": true
     }
   ]
 }

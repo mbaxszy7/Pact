@@ -457,4 +457,211 @@ describe('Conversation interest IPC owner', () => {
     })
     expect(f.update.mock.calls.length).toBe(before)
   })
+
+  it('allows two simultaneous active sessions per viewer for main + side chat and rejects three', async () => {
+    const f = fixture(),
+      sender = f.viewer(),
+      mainId = randomUUID(),
+      sideChatId = randomUUID(),
+      thirdId = randomUUID()
+    const interest = harness.handlers.get(IPC_CHANNELS.conversationInterest)!
+    await expect(
+      interest(
+        { sender, senderFrame: sender.mainFrame },
+        { sessionIds: [mainId, sideChatId], generation: 1 },
+      ),
+    ).resolves.toEqual(ready)
+    expect(f.update).toHaveBeenLastCalledWith([mainId, sideChatId], expect.any(Number))
+    expect(f.dispose.isSessionVisible(mainId)).toBe(true)
+    expect(f.dispose.isSessionVisible(sideChatId)).toBe(true)
+    const mainPatch = patch(mainId)
+    const sidePatch = patch(sideChatId)
+    f.publish(mainPatch, true)
+    f.publish(sidePatch, true)
+    expect(sender.send).toHaveBeenCalledTimes(2)
+
+    await expect(
+      interest(
+        { sender, senderFrame: sender.mainFrame },
+        { sessionIds: [mainId, sideChatId, thirdId], generation: 2 },
+      ),
+    ).resolves.toMatchObject({ ok: false, error: { code: 'VALIDATION' } })
+  })
+
+  it('validates all 6 side-chat RPCs behind trusted main-frame access and releases their handlers on dispose', async () => {
+    const f = fixture(),
+      sender = f.viewer(),
+      unregistered = new Contents(),
+      parentSessionId = randomUUID(),
+      sideChatId = randomUUID(),
+      operationId = randomUUID(),
+      now = new Date().toISOString()
+
+    const createReceipt = {
+      operationId,
+      sideChat: {
+        id: sideChatId,
+        parentSessionId,
+        projectId: randomUUID(),
+        title: 'New side chat',
+        origin: 'btw' as const,
+        anchorQuotePreview: null,
+        previewText: null,
+        status: 'draft' as const,
+        isRunning: false,
+        needsAttention: false,
+        hasUnread: false,
+        createdAt: now,
+        updatedAt: now,
+      },
+      cutoffId: randomUUID(),
+      maxMessageSequence: 0,
+    }
+    const listPage = {
+      parentSessionId,
+      items: [createReceipt.sideChat],
+      nextCursor: null,
+      prevCursor: null,
+      hasMoreOlder: false,
+      hasMoreNewer: false,
+      activeCount: 0,
+      attentionCount: 0,
+      unreadCount: 0,
+    }
+    const syncReceipt = {
+      operationId,
+      sideChatId,
+      parentSessionId,
+      cutoffId: randomUUID(),
+      disposition: 'sent' as const,
+      mainMessageId: randomUUID(),
+      queuedOperationId: null,
+    }
+
+    const createSpy = vi
+      .spyOn(f.client, 'createSideChat')
+      .mockResolvedValue({ ok: true, value: createReceipt })
+    const readCreateSpy = vi
+      .spyOn(f.client, 'readCreateSideChatReceipt')
+      .mockResolvedValue({ ok: true, value: createReceipt })
+    const listSpy = vi
+      .spyOn(f.client, 'listSideChats')
+      .mockResolvedValue({ ok: true, value: listPage })
+    const discardSpy = vi
+      .spyOn(f.client, 'discardEmptySideChat')
+      .mockResolvedValue({ ok: true, value: { discarded: true } })
+    const syncSpy = vi
+      .spyOn(f.client, 'syncSideChatToMain')
+      .mockResolvedValue({ ok: true, value: syncReceipt })
+    const readSyncSpy = vi
+      .spyOn(f.client, 'readSyncSideChatReceipt')
+      .mockResolvedValue({ ok: true, value: syncReceipt })
+
+    const cases = [
+      {
+        channel: IPC_CHANNELS.sideChatCreate,
+        spy: createSpy,
+        valid: { origin: 'btw', operationId, parentSessionId },
+        invalid: [
+          { origin: 'btw', operationId, parentSessionId, extra: true },
+          {
+            origin: 'selection',
+            operationId,
+            parentSessionId,
+            messageId: randomUUID(),
+            quote: 'hello',
+            startOffset: 4,
+            endOffset: 4,
+          },
+        ],
+        expected: { ok: true, value: createReceipt },
+      },
+      {
+        channel: IPC_CHANNELS.sideChatCreateReceipt,
+        spy: readCreateSpy,
+        valid: { operationId },
+        invalid: [{ operationId: 'bad-id' }, { operationId, extra: 1 }],
+        expected: { ok: true, value: createReceipt },
+      },
+      {
+        channel: IPC_CHANNELS.sideChatList,
+        spy: listSpy,
+        valid: { parentSessionId },
+        invalid: [{ parentSessionId: 'bad-id' }, { parentSessionId, limit: 6 }],
+        expected: { ok: true, value: listPage },
+      },
+      {
+        channel: IPC_CHANNELS.sideChatDiscardEmpty,
+        spy: discardSpy,
+        valid: { sideChatId },
+        invalid: [{ sideChatId: 'bad-id' }, { sideChatId, force: true }],
+        expected: { ok: true, value: { discarded: true } },
+      },
+      {
+        channel: IPC_CHANNELS.sideChatSyncMain,
+        spy: syncSpy,
+        valid: {
+          operationId,
+          sideChatId,
+          content: '@Main takeaway',
+          expectedCommentsRevision: 0,
+        },
+        invalid: [
+          { operationId, sideChatId, content: '   ', expectedCommentsRevision: 0 },
+          {
+            operationId,
+            sideChatId,
+            inputId: randomUUID(),
+            content: 'cannot mix sealed and inline',
+            contentSha256: 'a'.repeat(64),
+            expectedCommentsRevision: 0,
+          },
+          {
+            operationId,
+            sideChatId,
+            content: 'x'.repeat(65 * 1024),
+            expectedCommentsRevision: 0,
+          },
+        ],
+        expected: { ok: true, value: syncReceipt },
+      },
+      {
+        channel: IPC_CHANNELS.sideChatSyncMainReceipt,
+        spy: readSyncSpy,
+        valid: { operationId },
+        invalid: [{ operationId: 'bad-id' }, { operationId, extra: true }],
+        expected: { ok: true, value: syncReceipt },
+      },
+    ] as const
+
+    for (const entry of cases) {
+      const handler = harness.handlers.get(entry.channel)
+      if (!handler) throw new Error(`Missing IPC handler for ${entry.channel}`)
+      // oxlint-disable-next-line no-await-in-loop -- Verify each channel independently before disposal.
+      await expect(
+        handler({ sender, senderFrame: sender.mainFrame }, entry.valid),
+      ).resolves.toEqual(entry.expected)
+      expect(entry.spy).toHaveBeenCalledTimes(1)
+      for (const bad of entry.invalid) {
+        // oxlint-disable-next-line no-await-in-loop -- Check each invalid payload sequentially.
+        await expect(
+          handler({ sender, senderFrame: sender.mainFrame }, bad),
+        ).resolves.toMatchObject({ ok: false, error: { code: 'VALIDATION' } })
+      }
+      expect(() =>
+        handler({ sender, senderFrame: { url: sender.mainFrame.url } }, entry.valid),
+      ).toThrow('Rejected IPC request from a non-main frame.')
+      expect(() =>
+        handler({ sender: unregistered, senderFrame: unregistered.mainFrame }, entry.valid),
+      ).toThrow('Rejected IPC request from an unregistered or inactive window.')
+      expect(entry.spy).toHaveBeenCalledTimes(1)
+    }
+
+    expect(syncSpy.mock.calls[0]![1]).toMatch(/^[a-f\d-]{36}$/iu)
+
+    f.dispose()
+    for (const entry of cases) {
+      expect(harness.handlers.has(entry.channel), `handler ${entry.channel} removed`).toBe(false)
+    }
+  })
 })

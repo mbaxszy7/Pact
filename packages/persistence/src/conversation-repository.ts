@@ -123,6 +123,13 @@ import {
   relayNativeRecoveryProofSchema,
   relayDecisionAnswerSchema,
   relayDecisionReceiptSchema,
+  originSideChatSchema,
+  type CommentAnchor,
+  type OriginSideChat,
+  type CreateSideChatInput,
+  type CreateSideChatReceipt,
+  type SideChatSyncMainInput,
+  type SideChatSyncMainReceipt,
   isOptionalRelaySuggestion,
   relayAnswerMatchesDecision,
   type RelaySchedulingDecision,
@@ -294,6 +301,33 @@ import {
   hasUnreadSessionMessage,
   projectSessionTitle,
 } from './session-projection.js'
+import {
+  allocateSessionMessageSequence,
+  buildCutoffInlineTail,
+  captureCutoffInTransaction,
+  createSideChatInTransaction,
+  discardEmptySideChatInTransaction,
+  finalizeMainSyncBackReceipt,
+  hasSideChatDrafts,
+  mergeDeliveredCutoffIds,
+  parseDeliveredCutoffIds,
+  prepareMainSyncBackInTransaction,
+  preserveMessagesBeforeCutoffMutation,
+  readCreateSideChatReceiptRecord,
+  readCutoffSource,
+  readMessageOriginCutoffs,
+  readSideChatAnchorCutoff,
+  readSyncMainReceiptRecord,
+  recoverIncompleteSyncMainOperations,
+  rollbackMainSyncBackInTransaction,
+  type CapturedCutoffRecord,
+  type CutoffCatalogItem,
+  type CutoffInlineTailResult,
+  type CutoffSourcePage,
+  type MessageOriginCutoffInfo,
+  type PrepareMainSyncBackResult,
+  type SideChatAnchorCutoffInfo,
+} from './side-chat-persistence.js'
 import {
   WorkspaceArchiveRepository,
   assertSessionAvailable,
@@ -733,6 +767,8 @@ export interface BeginRunInput {
   preserveDraftComments?: boolean
   suggestedTitle?: string
   handoffSourceRefs?: HandoffSourceRef[]
+  originSideChat?: OriginSideChat | undefined
+  syncMainOperationId?: string | undefined
 }
 
 export interface PreparedInputDispatch {
@@ -1544,6 +1580,7 @@ export class ConversationRepository {
       .delete(conversationBodyInputs)
       .where(
         and(
+          ne(conversationBodyInputs.purpose, 'cutoff'),
           isNull(conversationBodyInputs.committedMessageId),
           isNull(conversationBodyInputs.pendingReceiptId),
           or(
@@ -1670,6 +1707,7 @@ export class ConversationRepository {
         .insert(conversationImageAssets)
         .values({
           id: clientImageId,
+          storageObjectId: randomUUID(),
           ownerKey,
           ownerSessionId: sessionId,
           name,
@@ -1798,17 +1836,65 @@ export class ConversationRepository {
     })
   }
 
+  imageStorageObjectId(id: string): string | undefined {
+    const row = this.imageRecord(id)
+    return row ? (row.storageObjectId ?? row.id) : undefined
+  }
+
+  imageStorageObjectReferenced(storageObjectId: string): boolean {
+    return Boolean(
+      this.database
+        .select({ id: conversationImageAssets.id })
+        .from(conversationImageAssets)
+        .where(
+          or(
+            eq(conversationImageAssets.storageObjectId, storageObjectId),
+            and(
+              isNull(conversationImageAssets.storageObjectId),
+              eq(conversationImageAssets.id, storageObjectId),
+            ),
+          ),
+        )
+        .limit(1)
+        .get(),
+    )
+  }
+
+  releaseImageAsset(
+    id: string,
+    sessionId: string,
+    ownerKey: string,
+  ): { released: boolean; deleteStorageObjectId: string | null } {
+    return this.database.transaction(() => {
+      const image = this.imageRecord(id)
+      if (!image) {
+        return {
+          released: true,
+          deleteStorageObjectId: this.imageStorageObjectReferenced(id) ? null : id,
+        }
+      }
+      if (image.committed) return { released: false, deleteStorageObjectId: null }
+      if (image.ownerSessionId !== sessionId || image.ownerKey !== ownerKey)
+        throw new RunOperationConflictError('This image belongs to another owner.')
+      const storageObjectId = image.storageObjectId ?? image.id
+      this.database
+        .delete(conversationImageAssets)
+        .where(
+          and(eq(conversationImageAssets.id, id), eq(conversationImageAssets.committed, false)),
+        )
+        .run()
+      return {
+        released: true,
+        deleteStorageObjectId: this.imageStorageObjectReferenced(storageObjectId)
+          ? null
+          : storageObjectId,
+      }
+    })
+  }
+
   releaseImage(id: string, sessionId: string, ownerKey: string): boolean {
-    const image = this.imageRecord(id)
-    if (!image) return true
-    if (image.committed) return false
-    if (image.ownerSessionId !== sessionId || image.ownerKey !== ownerKey)
-      throw new RunOperationConflictError('This image belongs to another owner.')
-    this.database
-      .delete(conversationImageAssets)
-      .where(and(eq(conversationImageAssets.id, id), eq(conversationImageAssets.committed, false)))
-      .run()
-    return true
+    const outcome = this.releaseImageAsset(id, sessionId, ownerKey)
+    return outcome.released && outcome.deleteStorageObjectId !== null
   }
 
   /** Cleanup is paged. The file owner releases this batch before requesting the next. */
@@ -1943,6 +2029,7 @@ export class ConversationRepository {
       .delete(conversationBodyInputs)
       .where(
         and(
+          ne(conversationBodyInputs.purpose, 'cutoff'),
           isNull(conversationBodyInputs.committedMessageId),
           isNull(conversationBodyInputs.pendingReceiptId),
           isNull(conversationBodyInputs.sourceRunId),
@@ -1959,6 +2046,132 @@ export class ConversationRepository {
 
   releaseConversationInputs(ownerKey: string): void {
     this.sweepConversationInputs(ownerKey)
+  }
+
+  captureCutoff(input: {
+    sourceSessionId: string
+    ownerKind: 'side_chat' | 'sync_main'
+    ownerOperationId: string
+  }): CapturedCutoffRecord {
+    return this.database.transaction((transaction) =>
+      captureCutoffInTransaction(transaction, input),
+    )
+  }
+
+  readCutoffSource(
+    input: {
+      cutoffId: string
+      part: 'catalog' | 'message' | 'comments' | 'comment'
+      messageId?: string | undefined
+      commentId?: string | undefined
+      offset: number
+    },
+    fits?: (page: {
+      offset: number
+      nextOffset: number | null
+      text: string
+      items?: CutoffCatalogItem[]
+    }) => boolean,
+  ): CutoffSourcePage {
+    return readCutoffSource(this.database, input, fits)
+  }
+
+  buildCutoffInlineTail(cutoffId: string, maxBytes?: number): CutoffInlineTailResult {
+    return buildCutoffInlineTail(this.database, cutoffId, maxBytes)
+  }
+
+  createSideChat(
+    input: CreateSideChatInput,
+    options?: { resolveVisibleText?: (content: string) => string },
+  ): CreateSideChatReceipt {
+    return this.database.transaction((transaction) =>
+      createSideChatInTransaction(transaction, input, options),
+    )
+  }
+
+  readCreateSideChatReceipt(operationId: string): CreateSideChatReceipt | undefined {
+    return readCreateSideChatReceiptRecord(this.database, operationId)
+  }
+
+  prepareMainSyncBack(
+    input: SideChatSyncMainInput,
+    imageOwnerKey?: string,
+    resolvedContent?: string,
+    options?: { resolveVisibleText?: (content: string) => string },
+  ): PrepareMainSyncBackResult {
+    return this.database.transaction((transaction) =>
+      prepareMainSyncBackInTransaction(
+        transaction,
+        input,
+        (sessionId, ids, ownerKey) => this.resolveMessageImages(sessionId, ids, ownerKey),
+        imageOwnerKey,
+        resolvedContent,
+        options,
+      ),
+    )
+  }
+
+  hasSideChatDrafts(sideChatId: string): boolean {
+    return hasSideChatDrafts(this.database, sideChatId)
+  }
+
+  completeMainSyncBackReceipt(receipt: SideChatSyncMainReceipt): SideChatSyncMainReceipt {
+    return this.database.transaction((transaction) =>
+      finalizeMainSyncBackReceipt(transaction, receipt),
+    )
+  }
+
+  readSyncSideChatReceipt(operationId: string): SideChatSyncMainReceipt | undefined {
+    return readSyncMainReceiptRecord(this.database, operationId)
+  }
+
+  rollbackMainSyncBack(operationId: string): boolean {
+    return this.database.transaction((transaction) =>
+      rollbackMainSyncBackInTransaction(transaction, operationId),
+    )
+  }
+
+  deliveredCutoffIds(
+    sessionId: string,
+    agentId: RuntimeAgentId,
+    expectedBindingGeneration?: number,
+  ): string[] {
+    const row = this.sourceQueries.nativeContext().get({ sessionId, agentId })
+    if (!row) return []
+    if (
+      expectedBindingGeneration !== undefined &&
+      row.bindingGeneration !== expectedBindingGeneration
+    )
+      return []
+    return parseDeliveredCutoffIds(row.deliveredCutoffIdsJson)
+  }
+
+  markCutoffsDelivered(
+    sessionId: string,
+    agentId: RuntimeAgentId,
+    bindingGeneration: number,
+    cutoffIds: string[],
+  ): string[] {
+    return this.database.transaction((transaction) =>
+      mergeDeliveredCutoffIds(transaction, sessionId, agentId, bindingGeneration, cutoffIds),
+    )
+  }
+
+  sideChatAnchorCutoff(sessionId: string): SideChatAnchorCutoffInfo | undefined {
+    return readSideChatAnchorCutoff(this.database, sessionId)
+  }
+
+  messageOriginCutoffs(
+    sessionId: string,
+    messageIds: readonly string[],
+  ): MessageOriginCutoffInfo[] {
+    return readMessageOriginCutoffs(this.database, sessionId, messageIds)
+  }
+
+  discardEmptySideChat(sideChatId: string): boolean {
+    return this.database.transaction((transaction) =>
+      discardEmptySideChatInTransaction(transaction, sideChatId),
+    )
   }
 
   private bodyHasText(row: typeof conversationBodyInputs.$inferSelect): boolean {
@@ -2037,7 +2250,7 @@ export class ConversationRepository {
     const global = this.database.get<{ bytes: number; parts: number }>(sql`
       SELECT coalesce(sum(bytes), 0) AS bytes, coalesce(sum(parts), 0) AS parts
       FROM conversation_body_inputs INDEXED BY conversation_body_inputs_bytes_idx
-      WHERE committed_message_id IS NULL AND pending_receipt_id IS NULL AND source_run_id IS NULL
+      WHERE committed_message_id IS NULL AND pending_receipt_id IS NULL AND source_run_id IS NULL AND purpose <> 'cutoff'
     `)
     const owner = this.database
       .select({
@@ -2049,6 +2262,7 @@ export class ConversationRepository {
       .where(
         and(
           eq(conversationBodyInputs.ownerKey, ownerKey),
+          ne(conversationBodyInputs.purpose, 'cutoff'),
           isNull(conversationBodyInputs.committedMessageId),
           isNull(conversationBodyInputs.pendingReceiptId),
           isNull(conversationBodyInputs.sourceRunId),
@@ -2289,6 +2503,25 @@ export class ConversationRepository {
       .where(eq(conversationBodyInputs.id, row.id))
       .run()
     return this.bodyReceipt(next)
+  }
+
+  ownsTemporaryConversationInput(sessionId: string, inputId: string, ownerKey: string): boolean {
+    const row = this.database
+      .select({
+        sessionId: conversationBodyInputs.sessionId,
+        ownerKey: conversationBodyInputs.ownerKey,
+        purpose: conversationBodyInputs.purpose,
+        committedMessageId: conversationBodyInputs.committedMessageId,
+        pendingReceiptId: conversationBodyInputs.pendingReceiptId,
+      })
+      .from(conversationBodyInputs)
+      .where(eq(conversationBodyInputs.id, inputId))
+      .get()
+    if (!row) return false
+    if (row.sessionId !== sessionId || row.ownerKey !== ownerKey || row.purpose !== 'input') {
+      throw new RunOperationConflictError('This prepared body belongs to another owner.')
+    }
+    return !row.committedMessageId && !row.pendingReceiptId
   }
 
   resolveConversationInput(
@@ -2587,7 +2820,12 @@ export class ConversationRepository {
         message.state === 'complete' &&
         (message.isVisible || !isConversationBackgroundReport(message)),
     )?.sequence
-    const title = projectSessionTitle(session.title, session.titleSource)
+    const title = projectSessionTitle(
+      session.title,
+      session.titleSource,
+      session.parentSessionId ? 'New side chat' : 'New session',
+    )
+    const liveSideChatTitles = this.liveOriginSideChatTitles(messages)
     return {
       observation: this.currentObservation(sessionId),
       sessionId,
@@ -2603,7 +2841,7 @@ export class ConversationRepository {
         ),
         updatedAt: session.updatedAt,
       },
-      messages: messages.map((message) => this.toMessage(message)),
+      messages: messages.map((message) => this.toMessage(message, liveSideChatTitles)),
       comments: this.database
         .select()
         .from(anchoredComments)
@@ -8338,6 +8576,10 @@ export class ConversationRepository {
     anchorRunId: string,
     waitingForWork = true,
     rolePolicy?: CollaborationTask['rolePolicy'],
+    options?: {
+      originSideChat?: OriginSideChat
+      syncMainOperationId?: string
+    },
   ): ConversationPatch {
     const run = this.findRun(anchorRunId)
     if (!run || run.sessionId !== input.sessionId)
@@ -8352,6 +8594,7 @@ export class ConversationRepository {
         waitingForWork,
         anchorRunId,
         rolePolicy,
+        options,
       )
       this.database
         .update(collaborationInputs)
@@ -9208,12 +9451,7 @@ export class ConversationRepository {
       }
       const route = this.queueRoute(row),
         now = new Date().toISOString()
-      const sequence =
-        (this.database
-          .select({ value: max(conversationMessages.sequence) })
-          .from(conversationMessages)
-          .where(eq(conversationMessages.sessionId, op.sessionId))
-          .get()?.value ?? -1) + 1
+      const sequence = allocateSessionMessageSequence(this.database, op.sessionId)
       this.database
         .insert(conversationMessages)
         .values({
@@ -9223,6 +9461,9 @@ export class ConversationRepository {
           role: 'user',
           routeKind: route.type,
           routeAgentsJson: JSON.stringify([run.agentId]),
+          originSideChatJson: received.metadata.originSideChat
+            ? JSON.stringify(received.metadata.originSideChat)
+            : null,
           content: received.content,
           state: 'complete',
           sequence,
@@ -9804,9 +10045,16 @@ export class ConversationRepository {
     waitingForWork = false,
     anchorRunId?: string,
     rolePolicy?: CollaborationTask['rolePolicy'],
+    options?: {
+      originSideChat?: OriginSideChat
+      syncMainOperationId?: string
+    },
   ): ConversationPatch {
     return this.database.transaction(() => {
       assertSessionAvailable(this.database, input.sessionId)
+      const originSideChat = options?.originSideChat
+        ? originSideChatSchema.parse(options.originSideChat)
+        : undefined
       const priorReceipt = this.receivedInputReceipt(
         input.sessionId,
         input.clientMessageId,
@@ -9832,7 +10080,10 @@ export class ConversationRepository {
         .from(sessions)
         .where(eq(sessions.id, input.sessionId))
         .get()
-      if (!session || session.commentsRevision !== input.expectedCommentsRevision)
+      if (
+        !session ||
+        (!originSideChat && session.commentsRevision !== input.expectedCommentsRevision)
+      )
         throw new RunOperationConflictError('Comment drafts changed before receipt.')
       if (
         !session.queueEnabled &&
@@ -9851,9 +10102,13 @@ export class ConversationRepository {
         .where(
           and(
             eq(anchoredComments.sessionId, input.sessionId),
-            isNull(anchoredComments.sentWithMessageId),
-            isNull(anchoredComments.pendingReceiptId),
-            freezeDrafts ? undefined : sql`0`,
+            originSideChat
+              ? eq(anchoredComments.pendingReceiptId, input.clientMessageId)
+              : and(
+                  isNull(anchoredComments.sentWithMessageId),
+                  isNull(anchoredComments.pendingReceiptId),
+                  freezeDrafts ? undefined : sql`0`,
+                ),
           ),
         )
         .get()!.value
@@ -9988,6 +10243,7 @@ export class ConversationRepository {
         route: input.route,
         replyToDecision: input.replyToDecision,
         replaceTask: input.replaceTask,
+        ...(originSideChat ? { originSideChat } : {}),
       })
       if (Buffer.byteLength(metadata) > 64 * 1024)
         throw new RunOperationConflictError('Received metadata exceeds 64 KiB.')
@@ -9999,6 +10255,7 @@ export class ConversationRepository {
         actor,
         ...(task && !askOnly ? { taskId: task.id } : {}),
         inputId,
+        ...(originSideChat ? { pendingReceiptId: input.clientMessageId } : {}),
         preserveDraftComments: !freezeDrafts,
         ...(input.batchId ? { batchId: input.batchId } : {}),
       })
@@ -10041,7 +10298,7 @@ export class ConversationRepository {
         .set({ pendingReceiptId: input.clientMessageId })
         .where(eq(conversationBodyInputs.id, inputId))
         .run()
-      if (commentCount)
+      if (commentCount && !originSideChat)
         this.database
           .update(anchoredComments)
           .set({ pendingReceiptId: input.clientMessageId })
@@ -10067,12 +10324,25 @@ export class ConversationRepository {
       this.database
         .update(sessions)
         .set({
-          commentsRevision: session.commentsRevision + 1,
+          commentsRevision: originSideChat
+            ? session.commentsRevision
+            : session.commentsRevision + 1,
           queueRevision: session.queueRevision + 1,
           queuePauseReason: null,
         })
         .where(eq(sessions.id, input.sessionId))
         .run()
+      if (options?.syncMainOperationId && originSideChat) {
+        finalizeMainSyncBackReceipt(this.database, {
+          operationId: options.syncMainOperationId,
+          sideChatId: originSideChat.sideChatId,
+          parentSessionId: input.sessionId,
+          cutoffId: originSideChat.cutoffId,
+          disposition: 'queued',
+          mainMessageId: null,
+          queuedOperationId: input.clientMessageId,
+        })
+      }
       this.database
         .update(agentRuns)
         .set({ peerProposalState: 'superseded' })
@@ -10092,12 +10362,15 @@ export class ConversationRepository {
       return this.createPatch(input.sessionId, {
         receivedInputIds: [input.clientMessageId],
         ...(waitingForWork ? { queuedInputIds: [input.clientMessageId] } : {}),
-        resync: { messages: false, drafts: true, activityRunIds: [] },
+        resync: { messages: false, drafts: !originSideChat, activityRunIds: [] },
         runs: task ? [this.findRun(task.runId)!] : [],
         comments: {
-          revision: session.commentsRevision + 1,
+          revision: originSideChat ? session.commentsRevision : session.commentsRevision + 1,
           upserts: [],
-          removedIds: input.commentIds.length <= MAX_COMMENTS_PER_MESSAGE ? input.commentIds : [],
+          removedIds:
+            !originSideChat && input.commentIds.length <= MAX_COMMENTS_PER_MESSAGE
+              ? input.commentIds
+              : [],
         },
       })
     })
@@ -10319,6 +10592,7 @@ export class ConversationRepository {
       .run()
     this.recoverUnsentPlanQuestions()
     this.recoverRelayDecisionGates()
+    recoverIncompleteSyncMainOperations(this.database)
   }
 
   private recoverUnsentPlanQuestions(): void {
@@ -12059,6 +12333,7 @@ export class ConversationRepository {
             routeAgentsJson: conversationMessages.routeAgentsJson,
             routePendingAgentId: conversationMessages.routePendingAgentId,
             sourceMessageId: conversationMessages.sourceMessageId,
+            originSideChatJson: conversationMessages.originSideChatJson,
             skillsJson: sql<
               string | null
             >`json_extract(${conversationMessages.skillInvocationJson}, '$.selections')`,
@@ -12125,7 +12400,11 @@ export class ConversationRepository {
           ),
         )
         .get()?.value
-      const title = projectSessionTitle(session.title, session.titleSource)
+      const title = projectSessionTitle(
+        session.title,
+        session.titleSource,
+        session.parentSessionId ? 'New side chat' : 'New session',
+      )
       const receivedInput = this.receivedCollaborationInput(input.sessionId)
       const header: Extract<ConversationPage, { scope: 'messages' }>['header'] = {
         queue: this.queueState(input.sessionId),
@@ -12197,6 +12476,7 @@ export class ConversationRepository {
         }),
       )
       const candidateImages = this.imagesForMessages(candidates.map((row) => row.id))
+      const liveSideChatTitles = this.liveOriginSideChatTitles(candidates)
       const runIds = new Set<string>()
       const admitted: OutputTimelineItem[] = []
       for (const item of timelineItems.slice(0, CONVERSATION_PAGE_ITEMS)) {
@@ -12248,6 +12528,7 @@ export class ConversationRepository {
           ...(row.routePendingAgentId ? { pendingAgentId: row.routePendingAgentId } : {}),
           ...ConversationRepository.toMessageRoute(row),
           ...ConversationRepository.toMessageSkills(row),
+          ...ConversationRepository.toOriginSideChat(row, liveSideChatTitles),
         }
         const pageMessage =
           row.contentBytes > INLINE_CONTENT_BYTES
@@ -12493,6 +12774,7 @@ export class ConversationRepository {
         routeAgentsJson: conversationMessages.routeAgentsJson,
         routePendingAgentId: conversationMessages.routePendingAgentId,
         sourceMessageId: conversationMessages.sourceMessageId,
+        originSideChatJson: conversationMessages.originSideChatJson,
         skillsJson: sql<
           string | null
         >`json_extract(${conversationMessages.skillInvocationJson}, '$.selections')`,
@@ -12563,7 +12845,11 @@ export class ConversationRepository {
     const latestCompleteAssistantSequence = this.sourceQueries
       .latestCompleteVisibleSequence()
       .get({ sessionId })?.value
-    const title = projectSessionTitle(session.title, session.titleSource)
+    const title = projectSessionTitle(
+      session.title,
+      session.titleSource,
+      session.parentSessionId ? 'New side chat' : 'New session',
+    )
     return {
       id: session.id,
       title: title.title,
@@ -12600,6 +12886,7 @@ export class ConversationRepository {
         routeAgentsJson: conversationMessages.routeAgentsJson,
         routePendingAgentId: conversationMessages.routePendingAgentId,
         sourceMessageId: conversationMessages.sourceMessageId,
+        originSideChatJson: conversationMessages.originSideChatJson,
         skillsJson: sql<
           string | null
         >`json_extract(${conversationMessages.skillInvocationJson}, '$.selections')`,
@@ -12628,6 +12915,7 @@ export class ConversationRepository {
           ? 'advance'
           : 'invalidate'
         : requestedMode
+    const liveSideChatTitles = this.liveOriginSideChatTitles([row])
     return {
       message: {
         outputSnapshot: outputSnapshotMetadata(this.database, row.id),
@@ -12650,6 +12938,7 @@ export class ConversationRepository {
         ...(row.routePendingAgentId ? { pendingAgentId: row.routePendingAgentId } : {}),
         ...ConversationRepository.toMessageRoute(row),
         ...ConversationRepository.toMessageSkills(row),
+        ...ConversationRepository.toOriginSideChat(row, liveSideChatTitles),
       },
       mode,
       ...(mode === 'replace' || mode === 'append' ? { text: replacement ?? '' } : {}),
@@ -18220,14 +18509,20 @@ export class ConversationRepository {
       route.type === 'all' ? [route.firstAgentId, route.secondAgentId] : [route.agentId]
     const supersededProposalRunIds: string[] = []
     let replacedTaskRunId: string | undefined
-    const freezeDrafts = input.receivedInputId
-      ? (storedReceivedMetadata(
+    const receivedMeta = input.receivedInputId
+      ? storedReceivedMetadata(
           this.database
             .select({ json: collaborationInputs.metadataJson })
             .from(collaborationInputs)
             .where(eq(collaborationInputs.id, input.receivedInputId))
             .get()!.json,
-        ).freezeDrafts ?? true)
+        )
+      : undefined
+    const effectiveOriginSideChat = input.originSideChat
+      ? originSideChatSchema.parse(input.originSideChat)
+      : receivedMeta?.originSideChat
+    const freezeDrafts = receivedMeta
+      ? (receivedMeta.freezeDrafts ?? true)
       : (input.freezeDrafts ?? !input.preserveDraftComments)
     if (!freezeDrafts && !input.receivedInputId && input.commentIds.length)
       throw new RunOperationConflictError(
@@ -18370,6 +18665,7 @@ export class ConversationRepository {
           freezeDrafts &&
           !input.receivedInputId &&
           !input.preparedInput &&
+          !input.originSideChat &&
           session.commentsRevision !== input.expectedCommentsRevision
         ) {
           throw new Error('Comment drafts changed. Refresh and try again.')
@@ -18395,10 +18691,12 @@ export class ConversationRepository {
             ? eq(anchoredComments.pendingReceiptId, input.preparedInput.clientMessageId)
             : input.receivedInputId
               ? eq(anchoredComments.pendingReceiptId, input.receivedInputId)
-              : and(
-                  isNull(anchoredComments.sentWithMessageId),
-                  isNull(anchoredComments.pendingReceiptId),
-                ),
+              : input.originSideChat
+                ? eq(anchoredComments.pendingReceiptId, input.clientMessageId)
+                : and(
+                    isNull(anchoredComments.sentWithMessageId),
+                    isNull(anchoredComments.pendingReceiptId),
+                  ),
         )
         const draftCount = transaction
           .select({ value: sql<number>`count(*)` })
@@ -18514,12 +18812,7 @@ export class ConversationRepository {
             .set({ peerProposalState: 'superseded', updatedAt: createdAt })
             .where(inArray(agentRuns.id, supersededProposalRunIds))
             .run()
-        const messageSequence =
-          (transaction
-            .select({ value: max(conversationMessages.sequence) })
-            .from(conversationMessages)
-            .where(eq(conversationMessages.sessionId, input.sessionId))
-            .get()?.value ?? -1) + 1
+        const messageSequence = allocateSessionMessageSequence(transaction, input.sessionId)
 
         if (input.receivedInputId) {
           const received = this.receivedCollaborationInput(input.sessionId)
@@ -18742,6 +19035,9 @@ export class ConversationRepository {
               : null,
             routePendingAgentId: route.type === 'all' ? route.secondAgentId : null,
             sourceMessageId: input.sourceMessageId ?? null,
+            originSideChatJson: effectiveOriginSideChat
+              ? JSON.stringify(effectiveOriginSideChat)
+              : null,
             content: input.content,
             state: 'complete',
             sequence: messageSequence,
@@ -18756,7 +19052,7 @@ export class ConversationRepository {
             .run()
           transaction
             .update(conversationImageAssets)
-            .set({ committed: true, updatedAt: createdAt })
+            .set({ committed: true, pendingReceiptId: null, updatedAt: createdAt })
             .where(eq(conversationImageAssets.id, image.id))
             .run()
         }
@@ -18820,7 +19116,11 @@ export class ConversationRepository {
             : {}),
           runId,
           messageId: userMessageId,
-          ...(input.receivedInputId ? { pendingReceiptId: input.receivedInputId } : {}),
+          ...(input.receivedInputId
+            ? { pendingReceiptId: input.receivedInputId }
+            : input.originSideChat
+              ? { pendingReceiptId: input.clientMessageId }
+              : {}),
           preserveDraftComments: !freezeDrafts,
           ...(input.userInformation ? { userInformation: input.userInformation } : {}),
         })
@@ -18966,9 +19266,10 @@ export class ConversationRepository {
           .update(sessions)
           .set({
             status: 'discussing',
-            commentsRevision: freezeDrafts
-              ? session.commentsRevision + 1
-              : session.commentsRevision,
+            commentsRevision:
+              freezeDrafts && !input.originSideChat
+                ? session.commentsRevision + 1
+                : session.commentsRevision,
             ...(input.suggestedTitle
               ? { title: input.suggestedTitle, titleSource: 'local' as const }
               : {}),
@@ -18976,6 +19277,17 @@ export class ConversationRepository {
           })
           .where(eq(sessions.id, input.sessionId))
           .run()
+        if (input.syncMainOperationId && effectiveOriginSideChat) {
+          finalizeMainSyncBackReceipt(transaction, {
+            operationId: input.syncMainOperationId,
+            sideChatId: effectiveOriginSideChat.sideChatId,
+            parentSessionId: input.sessionId,
+            cutoffId: effectiveOriginSideChat.cutoffId,
+            disposition: 'sent',
+            mainMessageId: userMessageId,
+            queuedOperationId: null,
+          })
+        }
         appendAgentEvent(transaction, {
           sessionId: input.sessionId,
           runId,
@@ -19006,7 +19318,9 @@ export class ConversationRepository {
           }),
           createdAt,
         })
-        return freezeDrafts ? session.commentsRevision + 1 : session.commentsRevision
+        return freezeDrafts && !input.originSideChat
+          ? session.commentsRevision + 1
+          : session.commentsRevision
       },
     )
 
@@ -19038,17 +19352,18 @@ export class ConversationRepository {
     return {
       run,
       patch: this.createPatch(input.sessionId, {
-        resync: { messages: false, drafts: true, activityRunIds: [] },
+        resync: { messages: false, drafts: !input.originSideChat, activityRunIds: [] },
         messages: [this.messageChange(userMessageId, 'replace', input.content)],
         runs: [run, ...relatedRuns.slice(0, 3)],
         ...(relatedRuns.length > 3
-          ? { resync: { messages: true, drafts: true, activityRunIds: [] } }
+          ? { resync: { messages: true, drafts: !input.originSideChat, activityRunIds: [] } }
           : {}),
         comments: {
           revision: committedCommentsRevision,
           upserts: [],
           removedIds: [],
           ...(freezeDrafts &&
+          !input.originSideChat &&
           input.commentIds.length > 0 &&
           input.commentIds.length <= MAX_COMMENTS_PER_MESSAGE
             ? { sent: { messageId: userMessageId, commentIds: input.commentIds } }
@@ -19207,7 +19522,7 @@ export class ConversationRepository {
           ne(sessions.status, 'archived'),
           isNull(sessions.archivedAt),
           scope?.kind === 'session'
-            ? eq(sessions.id, scope.sessionId)
+            ? or(eq(sessions.id, scope.sessionId), eq(sessions.parentSessionId, scope.sessionId))
             : scope?.kind === 'project'
               ? eq(sessions.projectId, scope.projectId)
               : undefined,
@@ -19300,12 +19615,7 @@ export class ConversationRepository {
     const now = new Date().toISOString()
     const systemMessageId = randomUUID()
     this.database.transaction((transaction) => {
-      const messageSequence =
-        (transaction
-          .select({ value: max(conversationMessages.sequence) })
-          .from(conversationMessages)
-          .where(eq(conversationMessages.sessionId, sessionId))
-          .get()?.value ?? -1) + 1
+      const messageSequence = allocateSessionMessageSequence(transaction, sessionId)
 
       transaction
         .update(conversationMessages)
@@ -19826,6 +20136,21 @@ export class ConversationRepository {
           })
           .where(eq(agentRuns.id, runId))
           .run()
+        const affected = this.database
+          .select({ id: conversationMessages.id })
+          .from(conversationMessages)
+          .where(
+            and(
+              eq(conversationMessages.runId, runId),
+              eq(conversationMessages.role, 'assistant'),
+              ne(conversationMessages.state, 'complete'),
+            ),
+          )
+          .all()
+        preserveMessagesBeforeCutoffMutation(
+          this.database,
+          affected.map((item) => item.id),
+        )
         this.database
           .update(conversationMessages)
           .set({ state: 'incomplete' })
@@ -19928,12 +20253,14 @@ export class ConversationRepository {
           true,
           'incomplete',
         )
-      if (current && current.state !== 'complete')
+      if (current && current.state !== 'complete') {
+        preserveMessagesBeforeCutoffMutation(this.database, [current.id])
         this.database
           .update(conversationMessages)
           .set({ state: 'incomplete' })
           .where(eq(conversationMessages.id, current.id))
           .run()
+      }
       return this.createPatch(run.sessionId, {
         runs: [this.findRun(runId)!],
         messages: current ? [this.messageChange(current.id, 'metadata')] : [],
@@ -20981,6 +21308,7 @@ export class ConversationRepository {
         .set({ returnedInputJson: JSON.stringify(record) })
         .where(eq(nativeRebuildOperations.id, operationId))
         .run()
+      preserveMessagesBeforeCutoffMutation(this.database, [record.messageId])
       this.database
         .update(conversationMessages)
         .set({ isVisible: false })
@@ -21221,6 +21549,7 @@ export class ConversationRepository {
         rebuildMessageCount: row.messageCount,
         rebuiltThroughSequence:
           row.throughSequence !== null && row.throughSequence >= 0 ? row.throughSequence : null,
+        deliveredCutoffIdsJson: null,
         updatedAt: now,
       }
       this.database
@@ -21259,6 +21588,7 @@ export class ConversationRepository {
             )
               return null
             returnedMessageId = returned.messageId
+            preserveMessagesBeforeCutoffMutation(this.database, [returned.messageId])
             this.database
               .update(conversationMessages)
               .set({ isVisible: false })
@@ -21275,12 +21605,7 @@ export class ConversationRepository {
         .where(eq(nativeRebuildOperations.id, id))
         .run()
       scheduling.recordNativeRebuildActivity(this.database, id)
-      const sequence =
-        (this.database
-          .select({ value: max(conversationMessages.sequence) })
-          .from(conversationMessages)
-          .where(eq(conversationMessages.sessionId, row.sessionId))
-          .get()?.value ?? -1) + 1
+      const sequence = allocateSessionMessageSequence(this.database, row.sessionId)
       this.database
         .insert(conversationMessages)
         .values({
@@ -21321,7 +21646,16 @@ export class ConversationRepository {
     })
   }
 
-  saveCommentDraft(input: CommentDraftSaveInput): ConversationPatch {
+  saveCommentDraft(
+    input:
+      | CommentDraftSaveInput
+      | (Omit<Extract<CommentDraftSaveInput, { mode: 'create' }>, 'anchor'> & {
+          anchor: Exclude<CommentAnchor, { type: 'unavailable' }>
+        }),
+  ): ConversationPatch {
+    if (input.mode === 'create' && input.anchor.type === 'cutoff_message') {
+      throw new RunOperationConflictError('Cutoff comment anchors cannot be created as drafts.')
+    }
     const now = new Date().toISOString()
     const payloadHash = createHash('sha256')
       .update(
@@ -21980,6 +22314,7 @@ export class ConversationRepository {
       const now = new Date().toISOString()
       const state = body ? 'complete' : 'incomplete'
       if (previous) {
+        preserveMessagesBeforeCutoffMutation(transaction, [id])
         transaction
           .update(conversationMessages)
           .set({
@@ -21992,6 +22327,7 @@ export class ConversationRepository {
           .where(eq(conversationMessages.id, id))
           .run()
       } else {
+        const messageSequence = allocateSessionMessageSequence(transaction, run.sessionId)
         transaction
           .insert(conversationMessages)
           .values({
@@ -22004,8 +22340,7 @@ export class ConversationRepository {
             state,
             content,
             contentRevision: !body && phase === 'unavailable' ? 1 : 0,
-            sequence: sql<number>`(SELECT coalesce(max(${conversationMessages.sequence}), -1) + 1
-              FROM ${conversationMessages} WHERE ${conversationMessages.sessionId} = ${run.sessionId})`,
+            sequence: messageSequence,
             createdAt: now,
             updatedAt: now,
           })
@@ -22504,6 +22839,7 @@ export class ConversationRepository {
           bindingGeneration: nativeAgentContexts.bindingGeneration,
           rebuildMessageCount: nativeAgentContexts.rebuildMessageCount,
           rebuiltThroughSequence: nativeAgentContexts.rebuiltThroughSequence,
+          deliveredCutoffIdsJson: nativeAgentContexts.deliveredCutoffIdsJson,
         })
         .from(nativeAgentContexts)
         .where(
@@ -22534,6 +22870,7 @@ export class ConversationRepository {
           lastRunId: runId,
           recoveryFailureKind: null,
           recoveryFailureMessage: null,
+          deliveredCutoffIdsJson: null,
           updatedAt: now,
         })
         .onConflictDoUpdate({
@@ -22549,6 +22886,7 @@ export class ConversationRepository {
             recoveryFailureMessage: null,
             rebuildMessageCount: sameNativeContext ? priorContext.rebuildMessageCount : null,
             rebuiltThroughSequence: sameNativeContext ? priorContext.rebuiltThroughSequence : null,
+            deliveredCutoffIdsJson: sameNativeContext ? priorContext.deliveredCutoffIdsJson : null,
             updatedAt: now,
           },
         })
@@ -22897,14 +23235,17 @@ export class ConversationRepository {
           : undefined
       if (identicalFrozenSnapshot && previous) {
         // No new text after Steer: retain one exact source, relocate only its final display.
-        if (bodyState)
+        if (bodyState) {
+          preserveMessagesBeforeCutoffMutation(transaction, [previous.id])
           transaction
             .update(conversationMessages)
             .set({ state: bodyState, updatedAt: now })
             .where(eq(conversationMessages.id, previous.id))
             .run()
+        }
         messageChange = { id: previous.id, mode: 'metadata' }
       } else if (existing) {
+        preserveMessagesBeforeCutoffMutation(transaction, [existing.id])
         transaction
           .update(conversationMessages)
           .set({
@@ -22958,6 +23299,7 @@ export class ConversationRepository {
           visible &&
           ((!visible.hasBody && !archive) || replacesRecoveredSource || replacesSnapshot)
         ) {
+          preserveMessagesBeforeCutoffMutation(transaction, [visible.id])
           transaction
             .update(conversationMessages)
             .set({ isVisible: false })
@@ -22967,12 +23309,7 @@ export class ConversationRepository {
             snapshotMessageId = visible.id
           else removedMessageIds.push(visible.id)
         }
-        const messageSequence =
-          (transaction
-            .select({ value: max(conversationMessages.sequence) })
-            .from(conversationMessages)
-            .where(eq(conversationMessages.sessionId, sessionId))
-            .get()?.value ?? -1) + 1
+        const messageSequence = allocateSessionMessageSequence(transaction, sessionId)
         const messageId = randomUUID()
         transaction
           .insert(conversationMessages)
@@ -23128,6 +23465,7 @@ export class ConversationRepository {
             previous.state === 'incomplete' &&
             this.ownsNativeControl(runId)
           if (previous && (!archive || replacesArchivedSource)) {
+            preserveMessagesBeforeCutoffMutation(transaction, [previous.id])
             transaction
               .update(conversationMessages)
               .set({ isVisible: false })
@@ -23138,6 +23476,7 @@ export class ConversationRepository {
             else removedMessageIds.push(previous.id)
           }
           if (!archive || replacesArchivedSource) {
+            preserveMessagesBeforeCutoffMutation(transaction, [assistantMessage.id])
             transaction
               .update(conversationMessages)
               .set({ isVisible: true })
@@ -23169,6 +23508,7 @@ export class ConversationRepository {
             }
           }
         }
+        preserveMessagesBeforeCutoffMutation(transaction, [assistantMessage.id])
         transaction
           .update(conversationMessages)
           .set({
@@ -23304,6 +23644,17 @@ export class ConversationRepository {
         .set({ routePendingAgentId: null, updatedAt })
         .where(eq(conversationMessages.id, run.userMessageId))
         .run()
+      const failedAssistantMessages = transaction
+        .select({ id: conversationMessages.id })
+        .from(conversationMessages)
+        .where(
+          and(eq(conversationMessages.runId, runId), eq(conversationMessages.role, 'assistant')),
+        )
+        .all()
+      preserveMessagesBeforeCutoffMutation(
+        transaction,
+        failedAssistantMessages.map((item) => item.id),
+      )
       transaction
         .update(conversationMessages)
         .set({ state: 'incomplete', updatedAt })
@@ -23869,12 +24220,7 @@ export class ConversationRepository {
     const now = new Date().toISOString()
     const messageId = randomUUID()
     this.database.transaction((transaction) => {
-      const messageSequence =
-        (transaction
-          .select({ value: max(conversationMessages.sequence) })
-          .from(conversationMessages)
-          .where(eq(conversationMessages.sessionId, sessionId))
-          .get()?.value ?? -1) + 1
+      const messageSequence = allocateSessionMessageSequence(transaction, sessionId)
 
       transaction
         .insert(conversationMessages)
@@ -23904,13 +24250,52 @@ export class ConversationRepository {
     })
   }
 
+  private liveOriginSideChatTitles(
+    rows: ReadonlyArray<{ originSideChatJson?: string | null }>,
+  ): Map<string, string> {
+    const ids = new Set<string>()
+    for (const row of rows) {
+      if (!row.originSideChatJson) continue
+      const parsed = originSideChatSchema.safeParse(JSON.parse(row.originSideChatJson))
+      if (parsed.success) ids.add(parsed.data.sideChatId)
+    }
+    const titles = new Map<string, string>()
+    if (ids.size === 0) return titles
+    const uniqueIds = [...ids]
+    for (let start = 0; start < uniqueIds.length; start += 200) {
+      const chunk = uniqueIds.slice(start, start + 200)
+      const fetched = this.database
+        .select({
+          id: sessions.id,
+          title: sessions.title,
+          titleSource: sessions.titleSource,
+        })
+        .from(sessions)
+        .where(inArray(sessions.id, chunk))
+        .all()
+      for (const entry of fetched) {
+        titles.set(
+          entry.id,
+          projectSessionTitle(entry.title, entry.titleSource, 'New side chat').title,
+        )
+      }
+    }
+    return titles
+  }
+
   private toMessage(
-    row: Omit<typeof conversationMessages.$inferSelect, 'isVisible' | 'skillInvocationJson'> & {
+    row: Omit<
+      typeof conversationMessages.$inferSelect,
+      'isVisible' | 'skillInvocationJson' | 'originSideChatJson'
+    > & {
       isVisible?: boolean
       skillInvocationJson?: string | null
+      originSideChatJson?: string | null
       skillsJson?: string | null
     },
+    liveSideChatTitles?: ReadonlyMap<string, string>,
   ): ConversationMessage {
+    const resolvedTitles = liveSideChatTitles ?? this.liveOriginSideChatTitles([row])
     return {
       id: row.id,
       sessionId: row.sessionId,
@@ -23933,6 +24318,21 @@ export class ConversationRepository {
       ...(row.routePendingAgentId ? { pendingAgentId: row.routePendingAgentId } : {}),
       ...ConversationRepository.toMessageRoute(row),
       ...ConversationRepository.toMessageSkills(row),
+      ...ConversationRepository.toOriginSideChat(row, resolvedTitles),
+    }
+  }
+
+  private static toOriginSideChat(
+    row: {
+      originSideChatJson?: string | null
+    },
+    liveSideChatTitles?: ReadonlyMap<string, string>,
+  ): Pick<ConversationMessage, 'originSideChat'> {
+    if (!row.originSideChatJson) return {}
+    const parsed = originSideChatSchema.parse(JSON.parse(row.originSideChatJson))
+    const liveTitle = liveSideChatTitles?.get(parsed.sideChatId)
+    return {
+      originSideChat: liveTitle ? { ...parsed, sideChatTitle: liveTitle } : parsed,
     }
   }
 

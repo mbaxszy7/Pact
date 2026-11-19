@@ -1237,4 +1237,263 @@
       animation: none;
     }
   }
+
+  .pact-selection-surface-actions {
+    display: none;
+    opacity: 0;
+    transform: translateY(3px) scale(0.98);
+    transition:
+      opacity 90ms ease-out,
+      transform 90ms ease-out,
+      display 90ms allow-discrete;
+  }
+
+  .pact-selection-surface-actions[data-open='true'] {
+    display: inline-flex;
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    transition:
+      opacity 140ms var(--ease-out-pact),
+      transform 140ms var(--ease-out-pact),
+      display 140ms allow-discrete;
+  }
+
+  @starting-style {
+    .pact-selection-surface-actions[data-open='true'] {
+      opacity: 0;
+      transform: translateY(4px) scale(0.98);
+    }
+  }
+
+  @keyframes pact-side-chat-push-in {
+    from {
+      opacity: 0;
+      transform: translateX(12px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  @keyframes pact-side-chat-push-out {
+    from {
+      opacity: 1;
+      transform: translateX(0);
+    }
+    to {
+      opacity: 0;
+      transform: translateX(-12px);
+    }
+  }
+
+  @keyframes pact-side-chat-pop-in {
+    from {
+      opacity: 0;
+      transform: translateX(-12px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  @keyframes pact-side-chat-pop-out {
+    from {
+      opacity: 1;
+      transform: translateX(0);
+    }
+    to {
+      opacity: 0;
+      transform: translateX(12px);
+    }
+  }
+
+  .pact-side-chat-stage-layer[data-stage-state='active'][data-animate='true'][data-direction='1'] {
+    animation: pact-side-chat-push-in 180ms var(--ease-out-pact) both;
+  }
+
+  .pact-side-chat-stage-layer[data-stage-state='outgoing'][data-animate='true'][data-direction='-1'] {
+    animation: pact-side-chat-push-out 180ms var(--ease-out-pact) both;
+  }
+
+  .pact-side-chat-stage-layer[data-stage-state='active'][data-animate='true'][data-direction='-1'] {
+    animation: pact-side-chat-pop-in 160ms var(--ease-out-pact) both;
+  }
+
+  .pact-side-chat-stage-layer[data-stage-state='outgoing'][data-animate='true'][data-direction='1'] {
+    animation: pact-side-chat-pop-out 160ms var(--ease-out-pact) both;
+  }
+
+  @keyframes pact-side-chat-row-in {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .pact-side-chat-row-enter {
+    animation: pact-side-chat-row-in 150ms var(--ease-out-pact) both;
+  }
+
+  .pact-side-chat-chevron {
+    transition:
+      transform 150ms var(--ease-out-pact),
+      color 150ms ease-out;
+  }
+
+  .group:hover .pact-side-chat-chevron,
+  .group:focus-visible .pact-side-chat-chevron {
+    transform: translateX(2px);
+  }
+
+  @keyframes pact-side-chat-origin-in {
+    from {
+      opacity: 0;
+      transform: translateY(-8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .pact-side-chat-origin-enter {
+    animation: pact-side-chat-origin-in 180ms var(--ease-out-pact) both;
+  }
+
+  @keyframes pact-side-chat-badge-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .pact-side-chat-from-badge {
+    animation: pact-side-chat-badge-in 180ms var(--ease-out-pact) both;
+  }
+
+  .pact-side-chat-sync-bar {
+    animation: pact-reminder-enter 160ms var(--ease-out-pact) both;
+  }
+
+  .pact-send-icon {
+    opacity: 1;
+    transform: scale(1);
+    transition:
+      opacity 150ms var(--ease-out-pact),
+      transform 150ms var(--ease-out-pact);
+  }
+
+  @starting-style {
+    .pact-send-icon {
+      opacity: 0;
+      transform: scale(0.9);
+    }
+  }
+
+  @keyframes pact-composer-handoff-iris {
+    from {
+      opacity: 0.92;
+    }
+    to {
+      opacity: 0;
+    }
+  }
+
+  .pact-composer-handoff-arrive {
+    position: relative;
+  }
+
+  .pact-composer-handoff-arrive::after {
+    content: '';
+    pointer-events: none;
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    border: 2px solid var(--pact-focus);
+    background: color-mix(in srgb, var(--pact-focus) 7%, transparent);
+    animation: pact-composer-handoff-iris 220ms var(--ease-out-pact) forwards;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  @keyframes pact-side-chat-fade-in-reduced {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @keyframes pact-side-chat-fade-out-reduced {
+    from {
+      opacity: 1;
+    }
+    to {
+      opacity: 0;
+    }
+  }
+
+  .pact-selection-surface-actions,
+  .pact-selection-surface-actions[data-open='true'],
+  .pact-send-icon {
+    transform: none !important;
+    transition-property: opacity !important;
+    transition-duration: 60ms !important;
+  }
+
+  @starting-style {
+    .pact-selection-surface-actions[data-open='true'],
+    .pact-send-icon {
+      transform: none;
+    }
+  }
+
+  .pact-side-chat-stage-layer[data-stage-state='active'][data-animate='true'],
+  .pact-side-chat-row-enter,
+  .pact-side-chat-origin-enter,
+  .pact-side-chat-from-badge,
+  .pact-side-chat-sync-bar {
+    transform: none !important;
+    animation: pact-side-chat-fade-in-reduced 60ms linear both !important;
+    animation-delay: 0ms !important;
+  }
+
+  .pact-side-chat-stage-layer[data-stage-state='outgoing'][data-animate='true'] {
+    transform: none !important;
+    animation: pact-side-chat-fade-out-reduced 60ms linear both !important;
+  }
+
+  .group:hover .pact-side-chat-chevron,
+  .group:focus-visible .pact-side-chat-chevron {
+    transform: none !important;
+  }
+
+  .pact-composer-handoff-arrive::after {
+    animation-duration: 60ms !important;
+  }
+}
+
+@media (forced-colors: active) {
+  .pact-selection-surface-actions {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    box-shadow: none;
+  }
+
+  .pact-composer-handoff-arrive::after {
+    border-color: Highlight;
+    background: transparent;
+  }
 }

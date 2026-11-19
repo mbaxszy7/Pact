@@ -27,7 +27,8 @@ Forward execution preserves native tools and user permissions. Recorded Changes 
 ## Operating Context
 
 - A resizable desktop workspace with Project/Session navigation, shared Transcript/Composer and a contextual right pane.
-- The contextual pane presents the sole current Plan, files, historical Changes and Session settings. It can be closed/reopened without making a second full plan in Chat.
+- The contextual pane presents the sole current Plan, files, historical Changes, Session settings, and parent-scoped Side chats. It can be closed/reopened without making a second full plan in Chat.
+- Main Sessions support **Ask in side chat** from message selections and `/btw` Composer draft handoffs (`pact:btw` chip, seeding the new side chat without auto-sending), plus a continuous virtualized **Side chats** list (84px rows) in the contextual pane. Side chats lock settings/permission/speed/project controls, forbid `/plan`, `/build`, `/review`, `/btw`, and **Fork**, support `@Main` (**Send to main**) sync-back tagged **From side chat**, and return from pushed File/Changes/Skill previews via **‹ Back to side chat**.
 - The Composer combines text, route, native Skill selections, static images and persistent Comment drafts in one Send. Native question answers use their live forms.
 - **Implement plan**, **Review plan**, **Review code**, **Update plan**, **Fix issues**, and **Retry** explicitly authorize their displayed transition. Only Phase 1 `/plan` <-> `plan_review` advances automatically; Open Mode (`Implement plan`, `/build`, `/review`) always waits for an explicit user action. Native completion, independent review acceptance and dispatch readiness remain separate facts.
 - Preserve deliberate reading position, selection and focus while streaming, expanding details, paging, navigating Comments or loading historical sources.

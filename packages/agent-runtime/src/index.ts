@@ -18,7 +18,7 @@ import type {
   SessionPermissionMode,
   CollaborationReviewObservation,
   CollaborationSourceReadResult,
-  CollaborationSourceRead,
+  CollaborationSourceAnyRead,
   CodexCollaborationSourceWireRead,
   CollaborationSourceWireResult,
   CollaborationSourceNativeRoot,
@@ -394,7 +394,7 @@ export interface AgentRunInput {
   speed?: AgentSpeed
 }
 
-export type AgentSourceTarget = Omit<CollaborationSourceRead, 'runId' | 'grant' | 'offset'>
+export type AgentSourceTarget = Omit<CollaborationSourceAnyRead, 'runId' | 'grant' | 'offset'>
 export type AgentSourceReadForm = 'legacy' | 'sourceReference' | 'nativeRoot'
 export type AgentSourceNavigation = (target: AgentSourceTarget) => CodexCollaborationSourceWireRead
 
@@ -406,7 +406,7 @@ export interface AgentCollaborationSourceReader {
   ): ReturnType<AgentSourceNavigation>
   read(raw: unknown): {
     submitted: AgentSourceReadForm
-    request: CollaborationSourceRead
+    request: CollaborationSourceAnyRead
     page: CollaborationSourceWireResult
   }
   /** Internal transport entry: its caller must authenticate the exact ACKed native Root first. */

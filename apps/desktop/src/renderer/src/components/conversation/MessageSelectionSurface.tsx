@@ -1,4 +1,4 @@
-import { MessageCirclePlus } from 'lucide-react'
+import { MessageCirclePlus, MessagesSquare } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 
 import {
@@ -36,6 +36,7 @@ interface MessageSelectionSurfaceProps {
   children: ReactNode
   messageId?: string | undefined
   onCreateComment?: ((selection: MessageTextSelection) => void) | undefined
+  onAskInSideChat?: ((selection: MessageTextSelection) => void) | undefined
   documentSelection?: DocumentSelectionAdapter | undefined
 }
 
@@ -660,9 +661,10 @@ function NativeMessageSelectionSurface({
   children,
   messageId,
   onCreateComment,
+  onAskInSideChat,
 }: MessageSelectionSurfaceProps): React.JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
-  const actionRef = useRef<HTMLButtonElement>(null)
+  const actionRef = useRef<HTMLDivElement>(null)
   const cancelPendingSelectionCaptureRef = useRef<(() => void) | undefined>(undefined)
   const [selection, setSelection] = useState<
     | {
@@ -674,9 +676,10 @@ function NativeMessageSelectionSurface({
       }
     | undefined
   >()
+  const [lastCoords, setLastCoords] = useState<{ left: number; top: number }>({ left: 0, top: 0 })
 
   const captureSelection = (): void => {
-    if (!hostRef.current || !messageId || !onCreateComment) return
+    if (!hostRef.current || !messageId || (!onCreateComment && !onAskInSideChat)) return
     const browserSelection = window.getSelection()
     if (!browserSelection || browserSelection.rangeCount !== 1) {
       setSelection(undefined)
@@ -691,15 +694,19 @@ function NativeMessageSelectionSurface({
     const rects = [...range.getClientRects()]
     const rect = rects.at(-1) ?? range.getBoundingClientRect()
     const hostRect = hostRef.current.getBoundingClientRect()
-    const actionWidth = 128
+    const actionWidth = onCreateComment && onAskInSideChat ? 276 : onAskInSideChat ? 148 : 128
     const actionHeight = 32
     const gap = 8
     const centeredLeft = rect.left - hostRect.left + rect.width / 2 - actionWidth / 2
     const preferredTop = rect.top - hostRect.top - actionHeight - gap
-    setSelection({
-      ...selected,
+    const nextCoords = {
       left: Math.max(gap, Math.min(centeredLeft, hostRef.current.clientWidth - actionWidth - gap)),
       top: preferredTop >= 0 ? preferredTop : rect.bottom - hostRect.top + gap,
+    }
+    setLastCoords(nextCoords)
+    setSelection({
+      ...selected,
+      ...nextCoords,
     })
   }
 
@@ -763,6 +770,10 @@ function NativeMessageSelectionSurface({
     }
   }, [selection])
 
+  const hasActions = Boolean(messageId && (onCreateComment || onAskInSideChat))
+  const open = Boolean(selection && hasActions)
+  const coords = selection ?? lastCoords
+
   return (
     // Text selection only offers the action; saving still requires an explicit click.
     // oxlint-disable-next-line jsx-a11y/no-static-element-interactions
@@ -773,30 +784,71 @@ function NativeMessageSelectionSurface({
       onKeyUp={captureSelection}
     >
       <div data-pact-message-content>{children}</div>
-      {selection && messageId && onCreateComment ? (
-        <button
+      {hasActions && messageId ? (
+        <div
           ref={actionRef}
-          className="absolute z-10 inline-flex h-8 w-32 items-center justify-center gap-1.5 whitespace-nowrap rounded-control bg-surface-inverse px-2.5 text-caption font-medium text-inverse shadow-popover transition-[filter] duration-150 ease-out-pact hover:brightness-95 active:brightness-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
-          type="button"
-          style={{ left: selection.left, top: selection.top }}
-          aria-label="Comment on selected text"
-          title="Comment on selected text"
-          onMouseDown={(event) => event.preventDefault()}
-          onMouseUp={(event) => event.stopPropagation()}
-          onKeyUp={(event) => event.stopPropagation()}
-          onClick={() => {
-            onCreateComment({
-              messageId,
-              startOffset: selection.startOffset,
-              endOffset: selection.endOffset,
-              quote: selection.quote,
-            })
-            setSelection(undefined)
-          }}
+          data-open={open ? 'true' : 'false'}
+          inert={!open}
+          aria-hidden={!open}
+          className="pact-selection-surface-actions absolute z-10 h-8 items-center rounded-control bg-surface-inverse p-0.5 text-inverse shadow-popover"
+          style={{ left: coords.left, top: coords.top }}
         >
-          <MessageCirclePlus aria-hidden="true" className="size-4 shrink-0" strokeWidth={1.75} />
-          Add comment
-        </button>
+          {onCreateComment ? (
+            <button
+              className="inline-flex h-7 items-center justify-center gap-1.5 whitespace-nowrap rounded-[calc(var(--radius-control)-2px)] px-2.5 text-caption font-medium text-inverse transition-[filter] duration-150 ease-out-pact hover:brightness-95 active:brightness-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+              type="button"
+              aria-label="Comment on selected text"
+              title="Comment on selected text"
+              onMouseDown={(event) => event.preventDefault()}
+              onMouseUp={(event) => event.stopPropagation()}
+              onKeyUp={(event) => event.stopPropagation()}
+              onClick={() => {
+                if (!selection) return
+                onCreateComment({
+                  messageId,
+                  startOffset: selection.startOffset,
+                  endOffset: selection.endOffset,
+                  quote: selection.quote,
+                })
+                setSelection(undefined)
+              }}
+            >
+              <MessageCirclePlus
+                aria-hidden="true"
+                className="size-4 shrink-0"
+                strokeWidth={1.75}
+              />
+              Add comment
+            </button>
+          ) : null}
+          {onCreateComment && onAskInSideChat ? (
+            <span aria-hidden="true" className="mx-0.5 h-4 w-px bg-current/20" />
+          ) : null}
+          {onAskInSideChat ? (
+            <button
+              className="inline-flex h-7 items-center justify-center gap-1.5 whitespace-nowrap rounded-[calc(var(--radius-control)-2px)] px-2.5 text-caption font-medium text-inverse transition-[filter] duration-150 ease-out-pact hover:brightness-95 active:brightness-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+              type="button"
+              aria-label="Ask in side chat"
+              title="Ask in side chat"
+              onMouseDown={(event) => event.preventDefault()}
+              onMouseUp={(event) => event.stopPropagation()}
+              onKeyUp={(event) => event.stopPropagation()}
+              onClick={() => {
+                if (!selection) return
+                onAskInSideChat({
+                  messageId,
+                  startOffset: selection.startOffset,
+                  endOffset: selection.endOffset,
+                  quote: selection.quote,
+                })
+                setSelection(undefined)
+              }}
+            >
+              <MessagesSquare aria-hidden="true" className="size-4 shrink-0" strokeWidth={1.75} />
+              Ask in side chat
+            </button>
+          ) : null}
+        </div>
       ) : null}
     </div>
   )

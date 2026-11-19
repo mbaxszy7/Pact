@@ -1,20 +1,26 @@
 import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 
 import {
-  PACT_SKILLS,
+  PACT_COMPOSER_SKILLS,
   parseComposerCommandPrefix,
   type NativeSkill,
+  type PactComposerSkill,
+  type RuntimeAgentId,
   type SkillSelection,
   type SkillCatalogPage,
   type CollaborationSession,
 } from '@pact/contracts'
 
-import { resolveComposerRoute, type ComposerDocument } from './composer-document'
+import {
+  extractBtwSideChatDraft,
+  resolveComposerRoute,
+  type ComposerDocument,
+} from './composer-document'
 
 export type PactSkillOption = {
   id: string
   agentId: 'pact'
-  name: (typeof PACT_SKILLS)[number]
+  name: PactComposerSkill
   description: string
 }
 export type ComposerSkillOption = NativeSkill | PactSkillOption
@@ -76,8 +82,10 @@ export function useSkillComposer(input: {
   route?: ComposerDocument['route']
   mention?: ComposerDocument['mention']
   returnedInputOperationId?: ComposerDocument['returnedInputOperationId']
+  mainTargetAgentId?: RuntimeAgentId | undefined
   disabled: boolean
 }) {
+  const isSideChat = Boolean(input.session.parentSessionId)
   const [queryState, setQuery] = useState<Query>()
   const dismissedQuery = useRef<Query | undefined>(undefined)
   const query = queryState?.sessionId === input.session.id ? queryState : undefined
@@ -98,7 +106,49 @@ export function useSkillComposer(input: {
   const { route, targets } = resolveComposerRoute(
     { ...input, skills: input.selections },
     input.session.settings.primaryAgentId,
+    { allowMainRoute: isSideChat },
   )
+  const btwHandoffActive = !isSideChat && Boolean(prefix.btw && !prefix.error)
+  const btwDraft = useMemo(
+    () =>
+      btwHandoffActive
+        ? extractBtwSideChatDraft({
+            text: input.text,
+            skills: input.selections,
+            route: input.route,
+            mention: input.mention,
+            returnedInputOperationId: input.returnedInputOperationId,
+          })
+        : undefined,
+    [
+      btwHandoffActive,
+      input.text,
+      input.selections,
+      input.route,
+      input.mention,
+      input.returnedInputOperationId,
+    ],
+  )
+  const btwTargets = useMemo(
+    () =>
+      btwDraft
+        ? resolveComposerRoute(
+            {
+              text: btwDraft.text,
+              skills: btwDraft.skills,
+              route: btwDraft.route,
+              mention: btwDraft.mention,
+            },
+            input.session.settings.primaryAgentId,
+            { allowMainRoute: false },
+          ).targets
+        : undefined,
+    [btwDraft, input.session.settings.primaryAgentId],
+  )
+  const effectiveTargets: Agent[] =
+    route.type === 'main'
+      ? [input.mainTargetAgentId ?? input.session.settings.primaryAgentId]
+      : (btwTargets ?? targets)
   const names = [
     ...new Set([
       ...prefix.skills.map((entry) => entry.name),
@@ -109,7 +159,7 @@ export function useSkillComposer(input: {
     input.session.id,
     input.session.settingsRevision,
     route,
-    targets,
+    effectiveTargets,
     names,
     input.selections.map((entry) => [entry.id, entry.agentId]),
   ])
@@ -118,7 +168,8 @@ export function useSkillComposer(input: {
   const menuIdentity = JSON.stringify([input.session.id, input.session.settingsRevision])
   const menuKey = JSON.stringify([menuIdentity, query?.text])
   const paging = pagingOwner === menuKey
-  const agents: Agent[] = targets[0] === 'claude' ? ['claude', 'codex'] : ['codex', 'claude']
+  const agents: Agent[] =
+    effectiveTargets[0] === 'claude' ? ['claude', 'codex'] : ['codex', 'claude']
   const settled = menuReady === menuKey
   // Retain one bounded window while its replacement arrives; never blank it per keystroke.
   const currentPages = menuOwner === menuIdentity ? pages : {}
@@ -141,19 +192,29 @@ export function useSkillComposer(input: {
         : []
     }),
   ) as Partial<Record<Agent, Page>>
-  const pactOptions: PactSkillOption[] = PACT_SKILLS.filter(
-    (name) => Boolean(query && query.start <= prefix.argumentsStart) && name.includes(search),
-  ).map((name) => ({
-    id: `pact-${name}`,
-    agentId: 'pact',
-    name,
-    description:
-      name === 'plan'
-        ? 'Clarify, plan and collaborate'
-        : name === 'build'
-          ? 'Implement code and collaborate on Review'
-          : 'Review code and handle feedback',
-  }))
+  const editingBtwToken = Boolean(
+    query && prefix.btw && query.start === prefix.btw.start && query.end === prefix.btw.end,
+  )
+  const pactOptions: PactSkillOption[] = isSideChat
+    ? []
+    : PACT_COMPOSER_SKILLS.filter(
+        (name) =>
+          Boolean(
+            query && query.start <= prefix.argumentsStart && (!prefix.btw || editingBtwToken),
+          ) && name.includes(search),
+      ).map((name) => ({
+        id: `pact-${name}`,
+        agentId: 'pact',
+        name,
+        description:
+          name === 'plan'
+            ? 'Clarify, plan and collaborate'
+            : name === 'build'
+              ? 'Implement code and collaborate on Review'
+              : name === 'review'
+                ? 'Review code and handle feedback'
+                : 'Ask a side question in a new side chat',
+      }))
   const VISIBLE_SKILLS_PER_AGENT = pactOptions.length ? 18 : 20
   const options: ComposerSkillOption[] = [
     ...pactOptions,
@@ -204,15 +265,23 @@ export function useSkillComposer(input: {
     return `${page.startOffset + start + 1}–${page.startOffset + Math.min(start + VISIBLE_SKILLS_PER_AGENT, page.skills.length)} of ${page.total}`
   }
   const targetLabel = (target: Agent): string =>
-    route.type === 'primary'
-      ? `your primary Agent (${agentName(target)})`
-      : route.type === 'agent'
-        ? `your selected Agent @${target} (${agentName(target)})`
-        : `${agentName(target)} in @all`
-  const wrong = input.selections.find((entry) => !targets.includes(entry.agentId))
+    route.type === 'main'
+      ? `the main chat target (${agentName(target)})`
+      : route.type === 'primary'
+        ? `your primary Agent (${agentName(target)})`
+        : route.type === 'agent'
+          ? `your selected Agent @${target} (${agentName(target)})`
+          : `${agentName(target)} in @all`
+  const wrong = btwHandoffActive
+    ? undefined
+    : input.selections.find((entry) => !effectiveTargets.includes(entry.agentId))
   const sourceWarning = wrong
-    ? `/${wrong.name} belongs to ${agentName(wrong.agentId)}. It does not match ${targetLabel(targets[0]!)}.`
+    ? `/${wrong.name} belongs to ${agentName(wrong.agentId)}. It does not match ${targetLabel(effectiveTargets[0]!)}.`
     : undefined
+  const sideChatCommandError =
+    isSideChat && (prefix.pact || prefix.btw)
+      ? 'Pact commands (/plan, /build, /review, /btw) can only be used in the main chat.'
+      : undefined
 
   const loadMenu = useEffectEvent(async (expectedKey: string, alive: () => boolean) => {
     const directory: Partial<Record<Agent, Page>> = {},
@@ -265,10 +334,10 @@ export function useSkillComposer(input: {
   }, [input.session.id])
 
   const verify = useEffectEvent(async (expectedKey: string, alive: () => boolean) => {
-    if (!names.length || sourceWarning) return
+    if (!names.length || btwHandoffActive || sourceWarning || sideChatCommandError) return
     const deadline = Date.now() + 10_000
     try {
-      for (const target of targets) {
+      for (const target of effectiveTargets) {
         const found = new Map<string, string>()
         let offset = 0,
           generation: string | undefined
@@ -469,8 +538,16 @@ export function useSkillComposer(input: {
       void window.pact.cancelSkillCatalog(input.session.id).catch(() => undefined)
     },
     warning:
-      prefix.error ?? sourceWarning ?? (validation.key === key ? validation.warning : undefined),
-    checking: names.length > 0 && !sourceWarning && validation.key !== key,
+      prefix.error ??
+      sideChatCommandError ??
+      sourceWarning ??
+      (validation.key === key ? validation.warning : undefined),
+    checking:
+      !btwHandoffActive &&
+      names.length > 0 &&
+      !sourceWarning &&
+      !sideChatCommandError &&
+      validation.key !== key,
     hasMore: settled && agents.some((agent) => currentPages[agent]?.nextOffset != null),
   }
 }

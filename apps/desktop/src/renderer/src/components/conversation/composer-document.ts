@@ -1,6 +1,6 @@
 import type {
   ConversationSendInput,
-  PactSkill,
+  PactComposerSkill,
   RuntimeAgentId,
   SkillSelection,
 } from '@pact/contracts'
@@ -14,10 +14,11 @@ export type ComposerRoute =
   | { type: 'primary'; agentId?: RuntimeAgentId }
   | { type: 'agent'; agentId: RuntimeAgentId }
   | { type: 'all'; firstAgentId?: RuntimeAgentId; secondAgentId?: RuntimeAgentId }
+  | { type: 'main' }
 
 export interface ComposerMention {
-  route: NonNullable<ConversationSendInput['route']>
-  token: '@claude' | '@codex' | '@all'
+  route: NonNullable<ConversationSendInput['route']> | { type: 'main' }
+  token: '@claude' | '@codex' | '@all' | '@Main'
   start: number
   end: number
 }
@@ -38,14 +39,22 @@ export interface ComposerReplacement extends ComposerRange {
 
 export interface ComposerPactCommand extends ComposerRange {
   kind: 'pact'
-  name: PactSkill
+  name: PactComposerSkill
 }
 export type ComposerAtom = SkillSelection | ComposerPactCommand
 
 /** A completed Pact prefix is a local text projection, never a native Skill selection. */
 export function composerPactCommand(value: ComposerDocument): ComposerPactCommand | undefined {
   const prefix = parseComposerCommandPrefix(value.text, value.skills)
-  if (!prefix.pact || prefix.error) return undefined
+  if (prefix.error) return undefined
+  if (prefix.btw) {
+    const after = value.text.slice(prefix.btw.end)
+    if (/^\s/u.test(after)) {
+      return { kind: 'pact', name: 'btw', start: prefix.btw.start, end: prefix.btw.end }
+    }
+    return undefined
+  }
+  if (!prefix.pact) return undefined
   const leading = value.text.slice(0, prefix.argumentsStart)
   for (const match of leading.matchAll(/(?:^|\s)\/(plan|review|build)(?=\s)/gu)) {
     if (match[1] !== prefix.pact) continue
@@ -80,9 +89,80 @@ export function composerRouteIntent(
   )
     return 'explicit'
   const prefix = parseComposerCommandPrefix(value.text, value.skills)
-  return prefix.error || prefix.pact || prefix.route || prefix.skills.length || value.skills.length
+  return prefix.error ||
+    prefix.pact ||
+    prefix.btw ||
+    prefix.route ||
+    prefix.skills.length ||
+    value.skills.length
     ? 'explicit'
     : 'implicit'
+}
+
+function removeDraftRange(
+  value: ComposerDocument,
+  removeStart: number,
+  removeEnd: number,
+  nextRoute?: ComposerRoute,
+): ComposerDocument {
+  const delta = removeEnd - removeStart
+  const text = value.text.slice(0, removeStart) + value.text.slice(removeEnd)
+  const shift = <T extends ComposerRange>(entry: T): T | undefined => {
+    if (entry.end <= removeStart) return { ...entry }
+    if (entry.start >= removeEnd) {
+      return { ...entry, start: entry.start - delta, end: entry.end - delta }
+    }
+    return undefined
+  }
+  const mention = value.mention ? shift(value.mention) : undefined
+  return {
+    text,
+    skills: value.skills.flatMap((entry) => {
+      const next = shift(entry)
+      return next ? [next] : []
+    }),
+    returnedInputOperationId: undefined,
+    mention,
+    route: nextRoute,
+  }
+}
+
+/** Strips a leading `/btw` command (+ trailing space) and shifts skills/mention offsets for side-chat seeding. */
+export function extractBtwSideChatDraft(value: ComposerDocument): ComposerDocument | undefined {
+  const prefix = parseComposerCommandPrefix(value.text, value.skills)
+  if (!prefix.btw || prefix.error) return undefined
+  const onlyWhitespaceBefore = !/\S/u.test(value.text.slice(0, prefix.btw.start))
+  const removeStart = onlyWhitespaceBefore ? 0 : prefix.btw.start
+  const afterCommand = value.text.slice(prefix.btw.end)
+  const trailingSpace = /^[ \t]+/u.exec(afterCommand)?.[0].length ?? 0
+  const removeEnd = prefix.btw.end + trailingSpace
+  const preservedRoute =
+    value.route && value.route.type !== 'main' ? releaseComposerRoute(value.route) : undefined
+  return removeDraftRange(value, removeStart, removeEnd, preservedRoute)
+}
+
+/** Strips `@Main` (mention or leading token) and shifts skill offsets before syncing to the main chat. */
+export function extractMainSyncDraft(value: ComposerDocument): ComposerDocument {
+  if (value.mention?.route.type === 'main') {
+    const start = value.mention.start
+    const end = value.mention.end
+    const hasTrailingSpace = /^[ \t]/u.test(value.text.slice(end))
+    const hasLeadingSpace = start > 0 && /[ \t]/u.test(value.text[start - 1]!)
+    const removeStart = !hasTrailingSpace && hasLeadingSpace ? start - 1 : start
+    const removeEnd = hasTrailingSpace ? end + 1 : end
+    return removeDraftRange(value, removeStart, removeEnd, { type: 'main' })
+  }
+  const leadingMain = /^([ \t]*@Main)(?=[ \t\r\n]|$)([ \t]*)/iu.exec(value.text)
+  if (leadingMain) {
+    return removeDraftRange(value, 0, leadingMain[0].length, { type: 'main' })
+  }
+  return {
+    text: value.text,
+    skills: value.skills.map((entry) => ({ ...entry })),
+    returnedInputOperationId: undefined,
+    mention: undefined,
+    route: { type: 'main' },
+  }
 }
 
 /** One edit transforms all canonical range facts together, never the displayed chip text. */
@@ -124,13 +204,18 @@ export function resolveComposerRoute(
     'text' | 'skills' | 'mention' | 'route' | 'returnedInputOperationId'
   >,
   primaryAgentId: RuntimeAgentId,
+  options?: { allowMainRoute?: boolean | undefined },
 ): {
   route: ComposerRoute
   targets: RuntimeAgentId[]
   sendRoute: ConversationSendInput['route']
 } {
-  const requested =
-    value.mention?.route ?? parseComposerCommandPrefix(value.text, value.skills).route
+  const prefixRoute = parseComposerCommandPrefix(value.text, value.skills).route
+  const leadingMainRoute =
+    options?.allowMainRoute && !prefixRoute && /^[ \t]*@Main(?=\s|$)/iu.test(value.text)
+      ? ({ type: 'main' } as const)
+      : undefined
+  const requested = value.mention?.route ?? prefixRoute ?? leadingMainRoute
   const stored = value.returnedInputOperationId ? value.route : releaseComposerRoute(value.route)
   const keepsStored =
     stored &&
@@ -139,6 +224,13 @@ export function resolveComposerRoute(
         (stored.type !== 'agent' ||
           (requested.type === 'agent' && stored.agentId === requested.agentId))))
   const route: ComposerRoute = keepsStored ? stored : (requested ?? stored ?? { type: 'primary' })
+  if (route.type === 'main') {
+    return {
+      route,
+      targets: [primaryAgentId],
+      sendRoute: undefined,
+    }
+  }
   const secondaryAgentId = primaryAgentId === 'codex' ? 'claude' : 'codex'
   const targets: RuntimeAgentId[] =
     route.type === 'all'
@@ -173,9 +265,13 @@ export function composerDifference(before: string, after: string): ComposerRepla
   return { start, end: before.length - suffix, text: after.slice(start, after.length - suffix) }
 }
 
-export function wholeComposerAtoms(value: ComposerDocument, range: ComposerRange): ComposerRange {
+export function wholeComposerAtoms(
+  value: ComposerDocument,
+  range: ComposerRange,
+  includePact = true,
+): ComposerRange {
   const next = { ...range }
-  const pact = composerPactCommand(value)
+  const pact = includePact ? composerPactCommand(value) : undefined
   for (const skill of pact ? [...value.skills, pact] : value.skills) {
     if (next.start < skill.end && next.end > skill.start) {
       next.start = Math.min(next.start, skill.start)

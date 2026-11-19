@@ -39,16 +39,19 @@ export function SentComments({
           <div className="mt-1.5 space-y-2">
             {comments.map((comment) => {
               const unavailable = comment.anchor.type === 'unavailable'
+              const hasBody = Boolean(comment.body.trim())
               const content = (
                 <>
                   <span
-                    className={`block text-tertiary ${unavailable ? 'whitespace-pre-wrap break-words' : 'line-clamp-2'}`}
+                    className={`block ${hasBody ? 'text-tertiary' : 'text-secondary'} ${unavailable ? 'whitespace-pre-wrap break-words' : 'line-clamp-2'}`}
                   >
                     “{comment.anchor.quote}”
                   </span>
-                  <span className="mt-1 block whitespace-pre-wrap break-words text-primary">
-                    {comment.body}
-                  </span>
+                  {hasBody ? (
+                    <span className="mt-1 block whitespace-pre-wrap break-words text-primary">
+                      {comment.body}
+                    </span>
+                  ) : null}
                   {comment.anchor.type === 'unavailable' ? (
                     <span className="mt-1.5 block text-secondary">
                       <span className="font-medium">Source unavailable</span> ·{' '}

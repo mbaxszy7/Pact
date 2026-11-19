@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm'
 import {
+  check,
   foreignKey,
   index,
   integer,
@@ -167,8 +168,20 @@ export const sessions = sqliteTable(
       .default(false),
     queueEnabled: integer('queue_enabled', { mode: 'boolean' }).notNull().default(true),
     queueRevision: integer('queue_revision').notNull().default(0),
+    nextMessageSequence: integer('next_message_sequence').notNull().default(0),
     queuePauseReason: text('queue_pause_reason'),
     commentsRevision: integer('comments_revision').notNull().default(0),
+    parentSessionId: text('parent_session_id').references((): AnySQLiteColumn => sessions.id, {
+      onDelete: 'cascade',
+    }),
+    sideChatOrigin: text('side_chat_origin', { enum: ['selection', 'btw'] }),
+    anchorCutoffId: text('anchor_cutoff_id'),
+    anchorMessageId: text('anchor_message_id'),
+    anchorQuote: text('anchor_quote'),
+    anchorQuotePreview: text('anchor_quote_preview'),
+    anchorStartOffset: integer('anchor_start_offset'),
+    anchorEndOffset: integer('anchor_end_offset'),
+    mutationSeq: integer('mutation_seq').notNull().default(0),
     createdAt: text('created_at').notNull(),
     updatedAt: text('updated_at').notNull(),
     archivedAt: text('archived_at'),
@@ -177,7 +190,7 @@ export const sessions = sqliteTable(
     index('sessions_native_recent_idx')
       .on(table.lastOpenedOrdinal, table.id)
       .where(
-        sql`${table.workspaceVisible} = 1 AND ${table.needsAttention} = 0 AND ${table.lastOpenedOrdinal} IS NOT NULL`,
+        sql`${table.workspaceVisible} = 1 AND ${table.needsAttention} = 0 AND ${table.lastOpenedOrdinal} IS NOT NULL AND ${table.parentSessionId} IS NULL`,
       ),
     index('sessions_native_attention_idx')
       .on(table.lastOpenedOrdinal, table.id)
@@ -186,7 +199,14 @@ export const sessions = sqliteTable(
     index('sessions_project_created_id_active_idx')
       .on(table.projectId, table.createdAt, table.id)
       .where(sql`${table.status} <> 'archived'`),
+    index('sessions_parent_created_id_idx').on(table.parentSessionId, table.createdAt, table.id),
     uniqueIndex('sessions_id_project_unique').on(table.id, table.projectId),
+    check(
+      'sessions_side_chat_origin_check',
+      sql.raw(
+        "(CASE WHEN ((parent_session_id IS NULL AND side_chat_origin IS NULL AND anchor_cutoff_id IS NULL AND anchor_message_id IS NULL AND anchor_quote IS NULL AND anchor_quote_preview IS NULL AND anchor_start_offset IS NULL AND anchor_end_offset IS NULL) OR (parent_session_id IS NOT NULL AND parent_session_id <> id AND side_chat_origin = 'selection' AND anchor_cutoff_id IS NOT NULL AND anchor_message_id IS NOT NULL AND anchor_quote IS NOT NULL AND anchor_quote_preview IS NOT NULL AND anchor_start_offset IS NOT NULL AND anchor_end_offset IS NOT NULL AND anchor_start_offset >= 0 AND anchor_end_offset > anchor_start_offset) OR (parent_session_id IS NOT NULL AND parent_session_id <> id AND side_chat_origin = 'btw' AND anchor_cutoff_id IS NOT NULL AND anchor_message_id IS NULL AND anchor_quote IS NULL AND anchor_quote_preview IS NULL AND anchor_start_offset IS NULL AND anchor_end_offset IS NULL)) THEN 1 ELSE 0 END) = 1",
+      ),
+    ),
   ],
 )
 
@@ -333,6 +353,7 @@ export const conversationMessages = sqliteTable(
     skillInvocationJson: text('skill_invocation_json'),
     routePendingAgentId: text('route_pending_agent_id', { enum: ['claude', 'codex'] }),
     sourceMessageId: text('source_message_id'),
+    originSideChatJson: text('origin_side_chat_json'),
     content: text('content').notNull(),
     contentRevision: integer('content_revision').notNull().default(0),
     state: text('state', { enum: ['complete', 'streaming', 'incomplete'] }).notNull(),
@@ -436,6 +457,7 @@ export const conversationImageAssets = sqliteTable(
     height: integer('height'),
     sha256: text('sha256'),
     thumbnailBytes: integer('thumbnail_bytes').notNull().default(0),
+    storageObjectId: text('storage_object_id'),
     createdAt: text('created_at').notNull(),
     updatedAt: text('updated_at').notNull(),
   },
@@ -446,6 +468,7 @@ export const conversationImageAssets = sqliteTable(
     index('conversation_image_assets_temp_idx')
       .on(t.updatedAt)
       .where(sql`${t.committed} = 0`),
+    index('conversation_image_assets_storage_object_idx').on(t.storageObjectId),
   ],
 )
 export const conversationMessageImages = sqliteTable(
@@ -482,7 +505,7 @@ export const conversationBodyInputs = sqliteTable(
       .references(() => sessions.id, { onDelete: 'cascade' }),
     clientMessageId: text('client_message_id').notNull(),
     ownerKey: text('owner_key').notNull(),
-    purpose: text('purpose', { enum: ['input', 'answer', 'collaboration'] }).notNull(),
+    purpose: text('purpose', { enum: ['input', 'answer', 'collaboration', 'cutoff'] }).notNull(),
     bytes: integer('bytes').notNull().default(0),
     chars: integer('chars').notNull().default(0),
     parts: integer('parts').notNull().default(0),
@@ -501,17 +524,17 @@ export const conversationBodyInputs = sqliteTable(
     index('conversation_body_inputs_owner_capacity_idx')
       .on(table.ownerKey, table.bytes, table.parts)
       .where(
-        sql`${table.committedMessageId} IS NULL AND ${table.pendingReceiptId} IS NULL AND ${table.sourceRunId} IS NULL`,
+        sql`${table.committedMessageId} IS NULL AND ${table.pendingReceiptId} IS NULL AND ${table.sourceRunId} IS NULL AND ${table.purpose} <> 'cutoff'`,
       ),
     index('conversation_body_inputs_bytes_idx')
       .on(table.bytes, table.parts)
       .where(
-        sql`${table.committedMessageId} IS NULL AND ${table.pendingReceiptId} IS NULL AND ${table.sourceRunId} IS NULL`,
+        sql`${table.committedMessageId} IS NULL AND ${table.pendingReceiptId} IS NULL AND ${table.sourceRunId} IS NULL AND ${table.purpose} <> 'cutoff'`,
       ),
     index('conversation_body_inputs_unreferenced_expiry_idx')
       .on(table.updatedAt)
       .where(
-        sql`${table.committedMessageId} IS NULL AND ${table.pendingReceiptId} IS NULL AND ${table.sourceRunId} IS NULL`,
+        sql`${table.committedMessageId} IS NULL AND ${table.pendingReceiptId} IS NULL AND ${table.sourceRunId} IS NULL AND ${table.purpose} <> 'cutoff'`,
       ),
   ],
 )
@@ -526,7 +549,10 @@ export const conversationBodyParts = sqliteTable(
     text: text('text').notNull(),
     endBytes: integer('end_bytes').notNull(),
   },
-  (table) => [primaryKey({ columns: [table.inputId, table.offset] })],
+  (table) => [
+    primaryKey({ columns: [table.inputId, table.offset] }),
+    index('conversation_body_parts_input_end_bytes_idx').on(table.inputId, table.endBytes),
+  ],
 )
 
 export const anchoredComments = sqliteTable(
@@ -947,6 +973,7 @@ export const nativeAgentContexts = sqliteTable(
     rebuildMessageCount: integer('rebuild_message_count'),
     rebuiltThroughSequence: integer('rebuilt_through_sequence'),
     forkThroughSequence: integer('fork_through_sequence'),
+    deliveredCutoffIdsJson: text('delivered_cutoff_ids_json'),
     updatedAt: text('updated_at').notNull(),
   },
   (table) => [
@@ -2176,6 +2203,111 @@ export const conversationQueueOperations = sqliteTable(
   ],
 )
 
+export const conversationCutoffs = sqliteTable(
+  'conversation_cutoffs',
+  {
+    id: text('id').primaryKey(),
+    sourceSessionId: text('source_session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    ownerKind: text('owner_kind', { enum: ['side_chat', 'sync_main'] }).notNull(),
+    ownerOperationId: text('owner_operation_id').notNull(),
+    maxMessageSequence: integer('max_message_sequence').notNull(),
+    sessionMutationSeq: integer('session_mutation_seq').notNull(),
+    streamingMessageId: text('streaming_message_id'),
+    createdAt: text('created_at').notNull(),
+  },
+  (table) => [
+    uniqueIndex('conversation_cutoffs_owner_unique_idx').on(
+      table.ownerKind,
+      table.ownerOperationId,
+    ),
+    index('conversation_cutoffs_source_seq_idx').on(
+      table.sourceSessionId,
+      table.sessionMutationSeq,
+    ),
+    index('conversation_cutoffs_source_max_msg_idx').on(
+      table.sourceSessionId,
+      table.maxMessageSequence,
+      table.sessionMutationSeq,
+    ),
+    check(
+      'conversation_cutoffs_bounds_check',
+      sql.raw('max_message_sequence >= -1 AND session_mutation_seq >= 1'),
+    ),
+  ],
+)
+
+export const conversationCutoffRevisions = sqliteTable(
+  'conversation_cutoff_revisions',
+  {
+    id: text('id').primaryKey(),
+    sourceSessionId: text('source_session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    messageId: text('message_id').references(() => conversationMessages.id, {
+      onDelete: 'set null',
+    }),
+    preservedMessageId: text('preserved_message_id').notNull(),
+    messageSequence: integer('message_sequence').notNull(),
+    role: text('role', { enum: ['user', 'assistant', 'system'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex'] }),
+    messageCreatedAt: text('message_created_at').notNull(),
+    validUpToMutationSeq: integer('valid_up_to_mutation_seq').notNull(),
+    state: text('state', { enum: ['complete', 'streaming', 'incomplete'] }).notNull(),
+    isVisible: integer('is_visible', { mode: 'boolean' }).notNull(),
+    contentInline: text('content_inline'),
+    bodyInputId: text('body_input_id').references(() => conversationBodyInputs.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: text('created_at').notNull(),
+  },
+  (table) => [
+    uniqueIndex('conversation_cutoff_revisions_msg_seq_unique_idx').on(
+      table.preservedMessageId,
+      table.validUpToMutationSeq,
+    ),
+    index('conversation_cutoff_revisions_source_msg_idx').on(
+      table.sourceSessionId,
+      table.preservedMessageId,
+      table.validUpToMutationSeq,
+    ),
+    index('conversation_cutoff_revisions_source_seq_idx').on(
+      table.sourceSessionId,
+      table.messageSequence,
+      table.validUpToMutationSeq,
+    ),
+    index('conversation_cutoff_revisions_body_input_idx').on(table.bodyInputId),
+    check(
+      'conversation_cutoff_revisions_body_check',
+      sql.raw(
+        '(content_inline IS NOT NULL AND body_input_id IS NULL) OR (content_inline IS NULL AND body_input_id IS NOT NULL)',
+      ),
+    ),
+  ],
+)
+
+export const sideChatOperations = sqliteTable(
+  'side_chat_operations',
+  {
+    id: text('id').primaryKey(),
+    kind: text('kind', { enum: ['create', 'sync_main'] }).notNull(),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    targetSessionId: text('target_session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    requestSha256: text('request_sha256').notNull(),
+    receiptJson: text('receipt_json'),
+    createdAt: text('created_at').notNull(),
+  },
+  (table) => [
+    index('side_chat_operations_session_kind_idx').on(table.sessionId, table.kind),
+    index('side_chat_operations_target_kind_idx').on(table.targetSessionId, table.kind),
+  ],
+)
+
 export const schema = {
   schedulingSettings,
   schedulingHandoffs,
@@ -2243,4 +2375,7 @@ export const schema = {
   sessionForkOperations,
   nativeForkIntents,
   nativeForkCandidateReceipts,
+  conversationCutoffs,
+  conversationCutoffRevisions,
+  sideChatOperations,
 }

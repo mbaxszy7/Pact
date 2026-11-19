@@ -1111,6 +1111,32 @@ export function collaborationActor(
       : task.owner
 }
 
+/** Shared parent target resolver used identically by Main sync UI badges and Utility dispatch. */
+export function resolveMainChatSyncTarget(
+  primaryAgentId: AgentId,
+  task?: Pick<
+    CollaborationTask,
+    | 'owner'
+    | 'reviewer'
+    | 'rolePolicy'
+    | 'stageRoles'
+    | 'kind'
+    | 'codeRunId'
+    | 'pendingWork'
+    | 'planRevision'
+    | 'openMode'
+    | 'lastCodeActor'
+    | 'unreviewedCodeActor'
+    | 'unreviewedPlanActor'
+    | 'planAuthor'
+    | 'review'
+    | 'status'
+    | 'runId'
+  >,
+): AgentId {
+  return task ? collaborationActor(task, 'reply') : primaryAgentId
+}
+
 export function collaborationStageLabel(stage: CollaborationStage, kind?: PactSkill): string {
   return {
     plan: 'Update the plan',

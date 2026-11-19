@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { DefaultSessionSettings } from '@pact/contracts'
 
+import { copyLegacyDatabase } from './legacy-database.test-support.js'
 import { PactDatabase, DatabaseOpenError } from './pact-database.js'
 
 const folder = resolve(import.meta.dirname, '../drizzle')
@@ -189,9 +190,8 @@ describe('complete migration compatibility through PactDatabase.open', () => {
   })
 
   it('preserves a group with a previously hidden member and a later archived member on upgrade', async () => {
-    const { directory, filePath } = await fixture()
-    const prefix = await copyMigrationPrefix(directory, legacyGroupCleanupIndex)
-    const legacy = await PactDatabase.open({ filePath, migrationsFolder: prefix })
+    const { filePath } = await fixture()
+    const staging = await PactDatabase.open({ filePath: ':memory:', migrationsFolder: folder })
     const projectId = randomUUID(),
       groupId = randomUUID(),
       archivedId = randomUUID(),
@@ -206,9 +206,9 @@ describe('complete migration compatibility through PactDatabase.open', () => {
       maxRepairAttempts: 3,
     }
     const groupInput = { projectId, groupId }
-    const sessionRepository = legacy.sessionRepository
+    const sessionRepository = staging.sessionRepository
     try {
-      legacy.projectCatalogRepository.add({
+      staging.projectCatalogRepository.add({
         id: projectId,
         name: 'Migration fixture',
         directoryPath: '/group-migration-fixture',
@@ -244,7 +244,7 @@ describe('complete migration compatibility through PactDatabase.open', () => {
       })
       sessionRepository.setSidebarHidden({ sessionId: hiddenId, hidden: true })
 
-      const archives = legacy.conversationRepository.archives
+      const archives = staging.conversationRepository.archives
       const scope = { kind: 'session' as const, sessionId: archivedId }
       const operationId = randomUUID()
       archives.prepare(
@@ -262,8 +262,9 @@ describe('complete migration compatibility through PactDatabase.open', () => {
       expect(sessionRepository.readSessionGroup(groupInput).exists).toBe(true)
       expect(sessionRepository.find(archivedId)?.groupId).toBe(groupId)
       expect(sessionRepository.find(hiddenId)?.groupId).toBe(groupId)
+      copyLegacyDatabase(staging, filePath, folder, legacyGroupCleanupIndex - 1)
     } finally {
-      legacy.close()
+      staging.close()
     }
 
     const upgraded = await PactDatabase.open({ filePath, migrationsFolder: folder })

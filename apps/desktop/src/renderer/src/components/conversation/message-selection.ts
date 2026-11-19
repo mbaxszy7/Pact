@@ -145,6 +145,10 @@ export function drawMountedProjectionIntersection(
   highlightOwner = owner
 }
 
+export function pulseMessageTarget(container: HTMLElement): void {
+  pulseCommentTarget(container)
+}
+
 function pulseCommentTarget(container: HTMLElement): void {
   clearCommentPulse()
   pulseOwner = container

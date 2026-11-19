@@ -95,6 +95,7 @@ it('More Skills advances the visible window, crosses native pages and permits re
     'plan',
     'build',
     'review',
+    'btw',
   ])
   expect(
     hook.result.current.visibleOptions.length + hook.result.current.pactOptions.length,
@@ -144,4 +145,83 @@ it('distinguishes a primary mismatch from an explicit target even when the Agent
   expect(hook.result.current.warning).toContain('your primary Agent (Codex)')
   hook.rerender({ text: '/x @codex task' })
   expect(hook.result.current.warning).toContain('your selected Agent @codex (Codex)')
+})
+
+it('hides Pact slash options and rejects /plan, /build, /review, and /btw in a side chat', () => {
+  vi.stubGlobal('pact', composerBridgeFixture())
+  const sideChatSession: CollaborationSession = {
+    ...session,
+    id: '256996b7-77f1-4230-9dc9-f94ca3016c47',
+    parentSessionId: session.id,
+    sideChatOrigin: 'btw',
+  }
+
+  const hook = renderHook(
+    ({ text }) =>
+      useSkillComposer({
+        session: sideChatSession,
+        text,
+        selections: [],
+        disabled: false,
+      }),
+    { initialProps: { text: '/' } },
+  )
+
+  act(() => hook.result.current.update('/', 1, []))
+  expect(hook.result.current.pactOptions).toEqual([])
+
+  for (const command of ['/plan ', '/build ', '/review ', '/btw ']) {
+    hook.rerender({ text: `${command}follow up` })
+    expect(hook.result.current.warning).toBe(
+      'Pact commands (/plan, /build, /review, /btw) can only be used in the main chat.',
+    )
+    expect(hook.result.current.checking).toBe(false)
+  }
+})
+
+it('keeps main-chat /btw handoff unblocked and routes side-chat @Main validation to mainTargetAgentId', () => {
+  vi.stubGlobal('pact', composerBridgeFixture())
+  const claudeSkill: SkillSelection = {
+    id: 'b'.repeat(64),
+    agentId: 'claude',
+    name: 'audit',
+    start: 5,
+    end: 11,
+  }
+  const btwHook = renderHook(() =>
+    useSkillComposer({
+      session,
+      text: '/btw /audit check auth',
+      selections: [claudeSkill],
+      disabled: false,
+    }),
+  )
+  expect(btwHook.result.current.warning).toBeUndefined()
+  expect(btwHook.result.current.checking).toBe(false)
+
+  const sideChatSession: CollaborationSession = {
+    ...session,
+    id: '356996b7-77f1-4230-9dc9-f94ca3016c47',
+    parentSessionId: session.id,
+    sideChatOrigin: 'btw',
+  }
+  const codexSkill: SkillSelection = {
+    id: 'c'.repeat(64),
+    agentId: 'codex',
+    name: 'lint',
+    start: 6,
+    end: 11,
+  }
+  const mainHook = renderHook(() =>
+    useSkillComposer({
+      session: sideChatSession,
+      text: '@Main /lint fix warnings',
+      selections: [codexSkill],
+      mainTargetAgentId: 'claude',
+      disabled: false,
+    }),
+  )
+  expect(mainHook.result.current.warning).toBe(
+    '/lint belongs to Codex. It does not match the main chat target (Claude Code).',
+  )
 })

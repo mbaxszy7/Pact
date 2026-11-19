@@ -57,6 +57,15 @@ import {
   providerUsageReadInputSchema,
   providerUsageRefreshInputSchema,
   providerUsageSnapshotSchema,
+  createSideChatInputSchema,
+  createSideChatReceiptSchema,
+  discardEmptySideChatInputSchema,
+  discardEmptySideChatResultSchema,
+  readSideChatReceiptInputSchema,
+  listSideChatsInputSchema,
+  listSideChatsPageSchema,
+  sideChatSyncMainInputSchema,
+  sideChatSyncMainReceiptSchema,
 } from '@pact/contracts'
 
 import {
@@ -472,7 +481,39 @@ const bridge: DesktopBridge = {
     ),
   getConversation: (input) => invoke(IPC_CHANNELS.conversationGet, input),
   setConversationInterest: (sessionId, generation) =>
-    invoke(IPC_CHANNELS.conversationInterest, { sessionId, generation }),
+    invoke(
+      IPC_CHANNELS.conversationInterest,
+      typeof sessionId === 'string' || sessionId === null
+        ? { sessionId, generation }
+        : { sessionIds: [...sessionId], generation },
+    ),
+  createSideChat: async (input) =>
+    rpcResultSchema(createSideChatReceiptSchema).parse(
+      await invoke(IPC_CHANNELS.sideChatCreate, createSideChatInputSchema.parse(input)),
+    ),
+  readCreateSideChatReceipt: async (input) =>
+    rpcResultSchema(createSideChatReceiptSchema.nullable()).parse(
+      await invoke(IPC_CHANNELS.sideChatCreateReceipt, readSideChatReceiptInputSchema.parse(input)),
+    ),
+  listSideChats: async (input) =>
+    rpcResultSchema(listSideChatsPageSchema).parse(
+      await invoke(IPC_CHANNELS.sideChatList, listSideChatsInputSchema.parse(input)),
+    ),
+  discardEmptySideChat: async (input) =>
+    rpcResultSchema(discardEmptySideChatResultSchema).parse(
+      await invoke(IPC_CHANNELS.sideChatDiscardEmpty, discardEmptySideChatInputSchema.parse(input)),
+    ),
+  syncSideChatToMain: async (input) =>
+    rpcResultSchema(sideChatSyncMainReceiptSchema).parse(
+      await invoke(IPC_CHANNELS.sideChatSyncMain, sideChatSyncMainInputSchema.parse(input)),
+    ),
+  readSyncSideChatReceipt: async (input) =>
+    rpcResultSchema(sideChatSyncMainReceiptSchema.nullable()).parse(
+      await invoke(
+        IPC_CHANNELS.sideChatSyncMainReceipt,
+        readSideChatReceiptInputSchema.parse(input),
+      ),
+    ),
   writeConversationImage: (input) => invoke(IPC_CHANNELS.conversationImageWrite, input),
   chooseConversationImages: (input) => invoke(IPC_CHANNELS.conversationImageChoose, input),
   readConversationImage: (input) => invoke(IPC_CHANNELS.conversationImageRead, input),

@@ -1702,3 +1702,239 @@ describe.skipIf(!['darwin', 'win32'].includes(process.platform))(
     )
   },
 )
+
+describe('Side-chat UtilityProcessClient RPCs', () => {
+  it('validates and correlates all 6 side-chat request/response envelopes', async () => {
+    const client = createUtilityProcessClient()
+    client.start(startOptions)
+    const child = harness.children.at(-1)!
+    child.emit('message', { type: 'runtime.ready.event' })
+    const parentSessionId = randomUUID()
+    const sideChatId = randomUUID()
+    const operationId = randomUUID()
+    const cutoffId = randomUUID()
+    const ownerKey = randomUUID()
+    const now = new Date().toISOString()
+
+    const createReceipt = {
+      operationId,
+      sideChat: {
+        id: sideChatId,
+        parentSessionId,
+        projectId: randomUUID(),
+        title: 'New side chat',
+        origin: 'btw' as const,
+        anchorQuotePreview: null,
+        previewText: null,
+        status: 'draft' as const,
+        isRunning: false,
+        needsAttention: false,
+        hasUnread: false,
+        createdAt: now,
+        updatedAt: now,
+      },
+      cutoffId,
+      maxMessageSequence: 1,
+    }
+    const listPage = {
+      parentSessionId,
+      items: [createReceipt.sideChat],
+      nextCursor: null,
+      prevCursor: null,
+      hasMoreOlder: false,
+      hasMoreNewer: false,
+      activeCount: 0,
+      attentionCount: 0,
+      unreadCount: 0,
+    }
+    const syncReceipt = {
+      operationId,
+      sideChatId,
+      parentSessionId,
+      cutoffId,
+      disposition: 'sent' as const,
+      mainMessageId: randomUUID(),
+      queuedOperationId: null,
+    }
+
+    try {
+      const created = client.createSideChat({ origin: 'btw', operationId, parentSessionId })
+      const req0 = utilityRequestSchema.parse(child.posted[0])
+      expect(req0.type).toBe('side-chat.create.request')
+      child.emit(
+        'message',
+        utilityResponseSchema.parse({
+          type: 'side-chat.create.response',
+          requestId: req0.requestId,
+          result: { ok: true, value: createReceipt },
+        }),
+      )
+      await expect(created).resolves.toEqual({ ok: true, value: createReceipt })
+
+      const readCreate = client.readCreateSideChatReceipt({ operationId })
+      const req1 = utilityRequestSchema.parse(child.posted[1])
+      expect(req1.type).toBe('side-chat.create-receipt.request')
+      child.emit(
+        'message',
+        utilityResponseSchema.parse({
+          type: 'side-chat.create-receipt.response',
+          requestId: req1.requestId,
+          result: { ok: true, value: createReceipt },
+        }),
+      )
+      await expect(readCreate).resolves.toEqual({ ok: true, value: createReceipt })
+
+      const listed = client.listSideChats({
+        parentSessionId,
+        direction: 'older',
+        limit: 5,
+      })
+      const req2 = utilityRequestSchema.parse(child.posted[2])
+      expect(req2.type).toBe('side-chat.list.request')
+      child.emit(
+        'message',
+        utilityResponseSchema.parse({
+          type: 'side-chat.list.response',
+          requestId: req2.requestId,
+          result: { ok: true, value: listPage },
+        }),
+      )
+      await expect(listed).resolves.toEqual({ ok: true, value: listPage })
+
+      const discarded = client.discardEmptySideChat({ sideChatId })
+      const req3 = utilityRequestSchema.parse(child.posted[3])
+      expect(req3.type).toBe('side-chat.discard-empty.request')
+      child.emit(
+        'message',
+        utilityResponseSchema.parse({
+          type: 'side-chat.discard-empty.response',
+          requestId: req3.requestId,
+          result: { ok: true, value: { discarded: true } },
+        }),
+      )
+      await expect(discarded).resolves.toEqual({ ok: true, value: { discarded: true } })
+
+      const synced = client.syncSideChatToMain(
+        {
+          operationId,
+          sideChatId,
+          content: '@Main Summary',
+          imageIds: [],
+          commentIds: [],
+          skills: [],
+          expectedCommentsRevision: 0,
+        },
+        ownerKey,
+      )
+      const req4 = utilityRequestSchema.parse(child.posted[4])
+      expect(req4).toMatchObject({ type: 'side-chat.sync-main.request', ownerKey })
+      child.emit(
+        'message',
+        utilityResponseSchema.parse({
+          type: 'side-chat.sync-main.response',
+          requestId: req4.requestId,
+          result: { ok: true, value: syncReceipt },
+        }),
+      )
+      await expect(synced).resolves.toEqual({ ok: true, value: syncReceipt })
+
+      const readSync = client.readSyncSideChatReceipt({ operationId })
+      const req5 = utilityRequestSchema.parse(child.posted[5])
+      expect(req5.type).toBe('side-chat.sync-main-receipt.request')
+      child.emit(
+        'message',
+        utilityResponseSchema.parse({
+          type: 'side-chat.sync-main-receipt.response',
+          requestId: req5.requestId,
+          result: { ok: true, value: null },
+        }),
+      )
+      await expect(readSync).resolves.toEqual({ ok: true, value: null })
+    } finally {
+      client.dispose()
+    }
+  })
+
+  it.each([
+    {
+      name: 'createSideChat',
+      deadline: 5_000,
+      code: 'UNCERTAIN',
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.createSideChat({
+          origin: 'btw',
+          operationId: randomUUID(),
+          parentSessionId: randomUUID(),
+        }),
+    },
+    {
+      name: 'readCreateSideChatReceipt',
+      deadline: 5_000,
+      code: 'TIMEOUT',
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.readCreateSideChatReceipt({ operationId: randomUUID() }),
+    },
+    {
+      name: 'listSideChats',
+      deadline: 5_000,
+      code: 'TIMEOUT',
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.listSideChats({ parentSessionId: randomUUID(), direction: 'older', limit: 5 }),
+    },
+    {
+      name: 'discardEmptySideChat',
+      deadline: 5_000,
+      code: 'TIMEOUT',
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.discardEmptySideChat({ sideChatId: randomUUID() }),
+    },
+    {
+      name: 'syncSideChatToMain',
+      deadline: 27_000,
+      code: 'UNCERTAIN',
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.syncSideChatToMain({
+          operationId: randomUUID(),
+          sideChatId: randomUUID(),
+          content: '@Main Takeaway',
+          imageIds: [],
+          commentIds: [],
+          skills: [],
+          expectedCommentsRevision: 0,
+        }),
+    },
+    {
+      name: 'readSyncSideChatReceipt',
+      deadline: 5_000,
+      code: 'TIMEOUT',
+      invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
+        client.readSyncSideChatReceipt({ operationId: randomUUID() }),
+    },
+  ])(
+    'enforces $deadline ms deadline and returns $code without auto-retry for $name',
+    async ({ deadline, code, invoke }) => {
+      vi.useFakeTimers()
+      const client = createUtilityProcessClient()
+      client.start(startOptions)
+      const child = harness.children.at(-1)!
+      child.emit('message', { type: 'runtime.ready.event' })
+      let settled = false
+      const operation = invoke(client).then((result) => {
+        settled = true
+        return result
+      })
+      try {
+        await vi.advanceTimersByTimeAsync(deadline - 1)
+        expect(settled).toBe(false)
+        expect(child.posted).toHaveLength(1)
+        await vi.advanceTimersByTimeAsync(1)
+        expect(await operation).toMatchObject({ ok: false, error: { code } })
+        await vi.advanceTimersByTimeAsync(30_000)
+        expect(child.posted).toHaveLength(1)
+      } finally {
+        client.dispose()
+        vi.useRealTimers()
+      }
+    },
+  )
+})

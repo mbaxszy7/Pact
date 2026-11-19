@@ -6,6 +6,7 @@ export const MAX_COMMENT_QUOTE_LENGTH = 20_000
 export const MAX_COMMENTS_PER_MESSAGE = 24
 
 const commentBodySchema = z.string().trim().min(1).max(20_000)
+const optionalCommentBodySchema = z.string().trim().max(20_000)
 const quoteSchema = z.string().min(1).max(MAX_COMMENT_QUOTE_LENGTH)
 
 export const messageCommentAnchorSchema = z
@@ -64,6 +65,25 @@ const creatableCommentAnchorSchema = z.discriminatedUnion('type', [
   messageCommentAnchorSchema,
   fileCommentAnchorSchema,
 ])
+export const cutoffMessageCommentAnchorSchema = z
+  .strictObject({
+    type: z.literal('cutoff_message'),
+    sourceSessionId: z.string().uuid(),
+    cutoffId: z.string().uuid(),
+    messageId: z.string().uuid(),
+    textBasis: z
+      .enum(['markdown-visible-v1', MESSAGE_ANCHOR_TEXT_BASIS, 'plain-visible-v1'])
+      .optional(),
+    quote: quoteSchema,
+    startOffset: z.number().int().nonnegative(),
+    endOffset: z.number().int().positive(),
+    contentSha256: z.string().regex(/^[a-f\d]{64}$/iu),
+  })
+  .refine((anchor) => anchor.endOffset > anchor.startOffset, {
+    message: 'Cutoff message anchor range is invalid.',
+    path: ['endOffset'],
+  })
+export type CutoffMessageCommentAnchor = z.infer<typeof cutoffMessageCommentAnchorSchema>
 export const unavailableCommentAnchorSchema = z.strictObject({
   type: z.literal('unavailable'),
   quote: z.string().max(MAX_COMMENT_QUOTE_LENGTH),
@@ -72,6 +92,7 @@ export const unavailableCommentAnchorSchema = z.strictObject({
 export const commentAnchorSchema = z.discriminatedUnion('type', [
   messageCommentAnchorSchema,
   fileCommentAnchorSchema,
+  cutoffMessageCommentAnchorSchema,
   unavailableCommentAnchorSchema,
 ])
 export type CommentAnchor = z.infer<typeof commentAnchorSchema>
@@ -91,10 +112,27 @@ export function storedCommentAnchor(value: unknown): CommentAnchor {
   })
 }
 
-export const anchoredCommentSchema = z.strictObject({
+function refineAnchoredCommentBody(
+  value: { body: string; anchor: CommentAnchor },
+  context: z.RefinementCtx,
+): void {
+  if (
+    value.anchor.type !== 'cutoff_message' &&
+    value.anchor.type !== 'unavailable' &&
+    value.body.length === 0
+  ) {
+    context.addIssue({
+      code: 'custom',
+      message: 'Comment body is required.',
+      path: ['body'],
+    })
+  }
+}
+
+const anchoredCommentBaseSchema = z.strictObject({
   id: z.string().uuid(),
   sessionId: z.string().uuid(),
-  body: commentBodySchema,
+  body: optionalCommentBodySchema,
   anchor: commentAnchorSchema,
   status: z.enum(['draft', 'sent']),
   position: z.number().int().nonnegative(),
@@ -102,7 +140,14 @@ export const anchoredCommentSchema = z.strictObject({
   updatedAt: z.string().datetime(),
   sentWithMessageId: z.string().uuid().optional(),
 })
+
+export const anchoredCommentSchema =
+  anchoredCommentBaseSchema.superRefine(refineAnchoredCommentBody)
 export type AnchoredComment = z.infer<typeof anchoredCommentSchema>
+
+export const anchoredCommentSummarySchema = anchoredCommentBaseSchema
+  .pick({ id: true, body: true, anchor: true })
+  .superRefine(refineAnchoredCommentBody)
 
 export const commentDraftSaveInputSchema = z.discriminatedUnion('mode', [
   z.strictObject({

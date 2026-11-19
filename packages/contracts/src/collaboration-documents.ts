@@ -23,7 +23,30 @@ export type CollaborationInputBatchReference = z.infer<
   typeof collaborationInputBatchReferenceSchema
 >
 
-/** The current host-owned root selects its frozen sources; the model supplies no authority. */
+export const collaborationSourceCutoffPartSchema = z.enum([
+  'catalog',
+  'message',
+  'comments',
+  'comment',
+])
+export type CollaborationSourceCutoffPart = z.infer<typeof collaborationSourceCutoffPartSchema>
+
+const collaborationSourceReadWithCutoffSchema = z.strictObject({
+  runId: z.string().uuid(),
+  grant: z.string().uuid(),
+  source: z.enum(['document', 'batch', 'inputs', 'handoff_sources', 'cutoff']).default('document'),
+  document: collaborationDocumentSchema.optional(),
+  batchId: z.string().uuid().optional(),
+  cutoffId: z.string().uuid().optional(),
+  part: collaborationSourceCutoffPartSchema.optional(),
+  messageId: z.string().uuid().optional(),
+  commentId: z.string().uuid().optional(),
+  offset: z.number().int().nonnegative(),
+})
+
+/**
+ * Legacy 4-source routing schema preserved with exact static and runtime parity for routing evidence verification.
+ */
 export const collaborationSourceReadSchema = z.strictObject({
   runId: z.string().uuid(),
   grant: z.string().uuid(),
@@ -34,14 +57,41 @@ export const collaborationSourceReadSchema = z.strictObject({
 })
 export type CollaborationSourceRead = z.infer<typeof collaborationSourceReadSchema>
 
+/** Full host-owned frozen source schema admitting both routing sources and conversation cutoffs. */
+export const collaborationSourceAnyReadSchema = collaborationSourceReadWithCutoffSchema
+export type CollaborationSourceAnyRead = z.infer<typeof collaborationSourceAnyReadSchema>
+
+export const collaborationSourceCutoffTargetSchema = z
+  .strictObject({
+    source: z.literal('cutoff'),
+    cutoffId: z.string().uuid(),
+    part: collaborationSourceCutoffPartSchema,
+    messageId: z.string().uuid().optional(),
+    commentId: z.string().uuid().optional(),
+  })
+  .refine(
+    (value) =>
+      value.part === 'catalog'
+        ? value.messageId === undefined && value.commentId === undefined
+        : value.part === 'comment'
+          ? value.messageId === undefined && value.commentId !== undefined
+          : value.messageId !== undefined && value.commentId === undefined,
+    'Supply only messageId for message/comments reads, or commentId for a single cutoff comment read.',
+  )
+export type CollaborationSourceCutoffTarget = z.infer<typeof collaborationSourceCutoffTargetSchema>
+
 /** Fixed native Tool schema. Authentication and the exclusive request forms are checked by its owner. */
 export const collaborationSourceWireReadSchema = z.strictObject({
   sourceReference: z.string().min(1).max(2048).optional(),
   runId: z.string().uuid().optional(),
   grant: z.string().uuid().optional(),
-  source: z.enum(['document', 'batch', 'inputs', 'handoff_sources']).optional(),
+  source: z.enum(['document', 'batch', 'inputs', 'handoff_sources', 'cutoff']).optional(),
   document: collaborationDocumentSchema.optional(),
   batchId: z.string().uuid().optional(),
+  cutoffId: z.string().uuid().optional(),
+  part: collaborationSourceCutoffPartSchema.optional(),
+  messageId: z.string().uuid().optional(),
+  commentId: z.string().uuid().optional(),
   offset: z.number().int().nonnegative(),
 })
 export type CollaborationSourceWireRead = z.infer<typeof collaborationSourceWireReadSchema>
@@ -56,11 +106,25 @@ export const collaborationSourceNativeReadSchema = z
       'root_document',
       'inputs',
       'handoff_sources',
+      'cutoff',
     ]),
-    part: z.enum(['body', 'user_information', 'clarification_answer', 'comment']).optional(),
+    part: z
+      .enum([
+        'body',
+        'user_information',
+        'clarification_answer',
+        'comment',
+        'catalog',
+        'message',
+        'comments',
+      ])
+      .optional(),
     ordinal: z.number().int().nonnegative().optional(),
     document: collaborationDocumentSchema.optional(),
     batchId: z.string().uuid().optional(),
+    cutoffId: z.string().uuid().optional(),
+    messageId: z.string().uuid().optional(),
+    commentId: z.string().uuid().optional(),
     offset: z.number().int().nonnegative(),
   })
   .refine(
@@ -68,23 +132,64 @@ export const collaborationSourceNativeReadSchema = z
       value.source === 'root_document'
         ? value.document === undefined &&
           value.batchId === undefined &&
-          value.part !== undefined &&
+          value.cutoffId === undefined &&
+          value.messageId === undefined &&
+          value.commentId === undefined &&
+          (value.part === 'body' ||
+            value.part === 'user_information' ||
+            value.part === 'clarification_answer' ||
+            value.part === 'comment') &&
           (value.part === 'comment' ? value.ordinal !== undefined : value.ordinal === undefined)
-        : value.part === undefined &&
-          value.ordinal === undefined &&
-          (value.source === 'document'
-            ? value.document !== undefined && value.batchId === undefined
-            : value.source === 'batch'
-              ? value.batchId !== undefined && value.document === undefined
-              : value.document === undefined && value.batchId === undefined),
+        : value.source === 'cutoff'
+          ? value.document === undefined &&
+            value.batchId === undefined &&
+            value.ordinal === undefined &&
+            value.cutoffId !== undefined &&
+            (value.part === 'catalog' ||
+              value.part === 'message' ||
+              value.part === 'comments' ||
+              value.part === 'comment') &&
+            (value.part === 'catalog'
+              ? value.messageId === undefined && value.commentId === undefined
+              : value.part === 'comment'
+                ? value.messageId === undefined && value.commentId !== undefined
+                : value.messageId !== undefined && value.commentId === undefined)
+          : value.part === undefined &&
+            value.ordinal === undefined &&
+            value.cutoffId === undefined &&
+            value.messageId === undefined &&
+            value.commentId === undefined &&
+            (value.source === 'document'
+              ? value.document !== undefined && value.batchId === undefined
+              : value.source === 'batch'
+                ? value.batchId !== undefined && value.document === undefined
+                : value.document === undefined && value.batchId === undefined),
     'Supply only the explicit target for this native source selection.',
   )
 export const codexCollaborationSourceWireReadSchema = collaborationSourceWireReadSchema.extend({
   context: z.literal('native-root-v1').optional(),
   source: z
-    .enum(['document', 'batch', 'root_batch', 'root_document', 'inputs', 'handoff_sources'])
+    .enum([
+      'document',
+      'batch',
+      'root_batch',
+      'root_document',
+      'inputs',
+      'handoff_sources',
+      'cutoff',
+    ])
     .optional(),
-  part: z.enum(['body', 'user_information', 'clarification_answer', 'comment']).optional(),
+  part: z
+    .enum([
+      'body',
+      'user_information',
+      'clarification_answer',
+      'comment',
+      'catalog',
+      'message',
+      'comments',
+    ])
+    .optional(),
   ordinal: z.number().int().nonnegative().optional(),
 })
 export type CodexCollaborationSourceWireRead = z.infer<
@@ -111,9 +216,13 @@ export const collaborationSourceReferencePayloadSchema = z.strictObject({
   version: z.literal('pact-source-reference-v1'),
   request: collaborationSourceReadSchema.omit({ offset: true }),
 })
+export const collaborationSourceAnyReferencePayloadSchema = z.strictObject({
+  version: z.literal('pact-source-reference-v1'),
+  request: collaborationSourceAnyReadSchema.omit({ offset: true }),
+})
 
 const collaborationSourcePageShape = {
-  source: z.enum(['document', 'batch', 'inputs', 'handoff_sources']),
+  source: z.enum(['document', 'batch', 'inputs', 'handoff_sources', 'cutoff']),
   text: z.string(),
   offset: z.number().int().nonnegative(),
   nextOffset: z.number().int().nonnegative().nullable(),
@@ -147,6 +256,9 @@ export const collaborationSourceIndexNavigationSchema = z.strictObject({
       z.strictObject({
         batchRead: codexCollaborationSourceWireReadSchema.optional(),
         bodyRead: codexCollaborationSourceWireReadSchema.optional(),
+        messageRead: codexCollaborationSourceWireReadSchema.optional(),
+        commentsRead: codexCollaborationSourceWireReadSchema.optional(),
+        commentRead: codexCollaborationSourceWireReadSchema.optional(),
         documents: z
           .array(
             z.strictObject({
@@ -168,10 +280,33 @@ export type CollaborationSourceIndexNavigation = z.infer<
 export function collaborationSourceIndexNavigation(
   source: CollaborationSourceReadResult['source'],
   text: string,
+  part?: CollaborationSourceCutoffPart,
 ): CollaborationSourceIndexNavigation {
   if (source === 'document') return {}
-  const object = z.record(z.string(), z.unknown()),
-    index = object.parse(JSON.parse(text))
+  const object = z.record(z.string(), z.unknown())
+  if (source === 'cutoff') {
+    if (part === 'message' || part === 'comment') return {}
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      return {}
+    }
+    const index = object.safeParse(parsed)
+    if (!index.success || !Array.isArray(index.data['items'])) return {}
+    const items = z.array(object).parse(index.data['items'])
+    return collaborationSourceIndexNavigationSchema.parse({
+      items: items.map((item) => {
+        const value: Record<string, unknown> = {}
+        if (item['messageRead'] !== undefined) value['messageRead'] = item['messageRead']
+        if (item['commentsRead'] !== undefined) value['commentsRead'] = item['commentsRead']
+        if (item['commentRead'] !== undefined) value['commentRead'] = item['commentRead']
+        if (item['bodyRead'] !== undefined) value['bodyRead'] = item['bodyRead']
+        return value
+      }),
+    })
+  }
+  const index = object.parse(JSON.parse(text))
   if (source === 'batch') {
     const members = z.array(object).parse(index['members'])
     return collaborationSourceIndexNavigationSchema.parse({

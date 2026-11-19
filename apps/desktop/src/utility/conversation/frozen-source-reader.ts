@@ -5,27 +5,31 @@ import type {
   AgentSourceReadForm,
   AgentSourceTarget,
 } from '@pact/agent-runtime'
-import type { ConversationRepository } from '@pact/persistence'
+import type { ConversationRepository, CutoffCatalogItem } from '@pact/persistence'
 
 import {
   COLLABORATION_PAGE_BYTES,
+  collaborationSourceAnyReadSchema,
+  collaborationSourceAnyReferencePayloadSchema,
   collaborationSourceIndexNavigation,
-  collaborationSourceReadSchema,
   collaborationSourceReadResultSchema,
   collaborationSourceReferenceReadSchema,
-  collaborationSourceReferencePayloadSchema,
   collaborationSourceWireReadSchema,
   collaborationSourceWireResultSchema,
   collaborationSourceNativeReadSchema,
   collaborationSourceNativeRootSchema,
   collaborationSourceNativeProofSchema,
-  type CollaborationSourceRead,
+  type CodexCollaborationSourceWireRead,
+  type CollaborationSourceAnyRead,
+  type CollaborationSourceCutoffPart,
+  type CollaborationSourceCutoffTarget,
   type CollaborationSourceReadResult,
   type CollaborationSourceWireResult,
   type CollaborationSourceNativeRoot,
   type SourceReadStage,
 } from '@pact/contracts'
 const PAYLOAD_BYTES = 1200
+const SOURCE_READ_TIMEOUT_MS = 10_000
 
 /** Native-only closed failure facts. Original errors never cross this diagnostic seam. */
 export class NativeSourceReadFailure extends Error {
@@ -64,13 +68,56 @@ type Sources = Pick<
   | 'readFrozenInputBatch'
   | 'readWorkflowInputs'
   | 'readRunSources'
+  | 'readCutoffSource'
 >
+
+export type FrozenSourceTarget = AgentSourceTarget | CollaborationSourceCutoffTarget
+
+function validCutoffTargetSelection(
+  request: Pick<CollaborationSourceAnyRead, 'cutoffId' | 'part' | 'messageId' | 'commentId'>,
+): boolean {
+  if (!request.cutoffId || !request.part) return false
+  if (request.part === 'catalog') {
+    return request.messageId === undefined && request.commentId === undefined
+  }
+  if (request.part === 'comment') {
+    return request.commentId !== undefined && request.messageId === undefined
+  }
+  return request.messageId !== undefined && request.commentId === undefined
+}
+
+function parseCutoffCatalogHeader(
+  text: string,
+  fallbackCutoffId: string,
+): { cutoffId: string; sourceSessionId: string; maxMessageSequence: number } {
+  const parsed: unknown = JSON.parse(text)
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('Invalid cutoff catalog header.')
+  }
+  const cutoffId = Reflect.get(parsed, 'cutoffId')
+  const sourceSessionId = Reflect.get(parsed, 'sourceSessionId')
+  const maxMessageSequence = Reflect.get(parsed, 'maxMessageSequence')
+  if (
+    typeof sourceSessionId !== 'string' ||
+    typeof maxMessageSequence !== 'number' ||
+    !Number.isInteger(maxMessageSequence)
+  ) {
+    throw new Error('Invalid cutoff catalog header.')
+  }
+  return {
+    cutoffId: typeof cutoffId === 'string' ? cutoffId : fallbackCutoffId,
+    sourceSessionId,
+    maxMessageSequence,
+  }
+}
 
 /** One root's source reader. Repository remains the sole owner of frozen source authority. */
 export class FrozenSourceReader implements AgentCollaborationSourceReader {
   readonly identity: Readonly<{ runId: string; grant: string }>
   private key: Buffer | undefined = randomBytes(32)
   private readonly cancelled = (): void => this.retire()
+  private readonly authorizedCutoffs: Set<string>
+  private activeRead = false
 
   constructor(
     identity: { runId: string; grant: string },
@@ -81,30 +128,63 @@ export class FrozenSourceReader implements AgentCollaborationSourceReader {
     private readonly failed?: (error: unknown) => void,
     private readonly signal?: AbortSignal,
     private readonly originalBatchId?: string,
+    authorizedCutoffIds: readonly string[] = [],
   ) {
     this.identity = Object.freeze({ ...identity })
+    this.authorizedCutoffs = new Set(authorizedCutoffIds)
     if (signal?.aborted) this.retire()
     else signal?.addEventListener('abort', this.cancelled, { once: true })
   }
 
+  authorizeCutoffs(cutoffIds: readonly string[]): string[] {
+    const added: string[] = []
+    for (const id of cutoffIds) {
+      if (id && !this.authorizedCutoffs.has(id)) {
+        this.authorizedCutoffs.add(id)
+        added.push(id)
+      }
+    }
+    return added
+  }
+
+  revokeCutoffs(cutoffIds: readonly string[]): void {
+    for (const id of cutoffIds) {
+      if (id) this.authorizedCutoffs.delete(id)
+    }
+  }
+
   navigation(
-    target: AgentSourceTarget,
+    target: FrozenSourceTarget,
     form: AgentSourceReadForm,
   ): ReturnType<AgentCollaborationSourceReader['navigation']> {
     const native = form === 'nativeRoot'
     nativeStep(native, 'reader_current', () => this.assertCurrent())
     const request = nativeStep(native, 'navigation', () =>
-      collaborationSourceReadSchema.parse({ ...target, ...this.identity, offset: 0 }),
+      collaborationSourceAnyReadSchema.parse({ ...target, ...this.identity, offset: 0 }),
     )
-    if (form === 'legacy') return request
+    if (form === 'legacy') {
+      if (request.source === 'cutoff') {
+        this.explicitSelection(request)
+        this.authorize(request)
+      }
+      return request
+    }
     if (form === 'nativeRoot') {
       nativeStep(true, 'navigation', () => this.explicitSelection(request))
       this.authorize(request, true)
       return nativeStep(true, 'navigation', () =>
         collaborationSourceNativeReadSchema.parse({
-          ...(target.source === 'batch' && target.batchId === this.originalBatchId
+          ...(request.source === 'batch' && request.batchId === this.originalBatchId
             ? { source: 'root_batch' }
-            : target),
+            : request.source === 'cutoff'
+              ? {
+                  source: 'cutoff',
+                  cutoffId: request.cutoffId,
+                  part: request.part,
+                  ...(request.messageId ? { messageId: request.messageId } : {}),
+                  ...(request.commentId ? { commentId: request.commentId } : {}),
+                }
+              : target),
           context: 'native-root-v1',
           offset: 0,
         }),
@@ -115,7 +195,7 @@ export class FrozenSourceReader implements AgentCollaborationSourceReader {
     const { offset: _offset, ...selection } = request
     const bytes = Buffer.from(
       JSON.stringify(
-        collaborationSourceReferencePayloadSchema.parse({
+        collaborationSourceAnyReferencePayloadSchema.parse({
           version: 'pact-source-reference-v1',
           request: selection,
         }),
@@ -149,6 +229,15 @@ export class FrozenSourceReader implements AgentCollaborationSourceReader {
     raw: unknown,
     nativeRoot?: CollaborationSourceNativeRoot,
   ): ReturnType<AgentCollaborationSourceReader['read']> {
+    if (this.activeRead) {
+      const busy = nativeRoot
+        ? new NativeSourceReadFailure('page_read', true)
+        : new Error('Another frozen source read is already active for this root.')
+      this.failed?.(busy)
+      throw busy
+    }
+    this.activeRead = true
+    const deadline = Date.now() + SOURCE_READ_TIMEOUT_MS
     try {
       nativeStep(Boolean(nativeRoot), 'reader_current', () => this.assertCurrent())
       const native = nativeRoot
@@ -166,13 +255,21 @@ export class FrozenSourceReader implements AgentCollaborationSourceReader {
           : undefined
       const request = native
         ? nativeStep(true, 'request_parse', () =>
-            collaborationSourceReadSchema.parse({
+            collaborationSourceAnyReadSchema.parse({
               source:
                 native.source === 'root_batch'
                   ? 'batch'
                   : native.source === 'root_document'
                     ? 'document'
                     : native.source,
+              ...(native.source === 'cutoff'
+                ? {
+                    cutoffId: native.cutoffId,
+                    part: native.part,
+                    ...(native.messageId === undefined ? {} : { messageId: native.messageId }),
+                    ...(native.commentId === undefined ? {} : { commentId: native.commentId }),
+                  }
+                : {}),
               document:
                 native.source === 'root_document'
                   ? nativeStep(true, 'repository_scope', () => {
@@ -206,9 +303,12 @@ export class FrozenSourceReader implements AgentCollaborationSourceReader {
           )
         : reference
           ? this.resolveReference(reference.sourceReference, reference.offset)
-          : collaborationSourceReadSchema.parse(raw)
-      if (native) nativeStep(true, 'request_parse', () => this.explicitSelection(request))
+          : collaborationSourceAnyReadSchema.parse(raw)
+      if (native || request.source === 'cutoff')
+        nativeStep(Boolean(native), 'request_parse', () => this.explicitSelection(request))
       this.authorize(request, Boolean(native))
+      const cutoffPart: CollaborationSourceCutoffPart | undefined =
+        request.source === 'cutoff' ? request.part : undefined
       const binding: CollaborationSourceWireResult['binding'] = {
         submitted,
         callerRunId: this.identity.runId,
@@ -218,7 +318,7 @@ export class FrozenSourceReader implements AgentCollaborationSourceReader {
       }
       const wire = (page: CollaborationSourceReadResult): CollaborationSourceWireResult => ({
         ...page,
-        ...collaborationSourceIndexNavigation(page.source, page.text),
+        ...collaborationSourceIndexNavigation(page.source, page.text, cutoffPart),
         binding,
         ...(page.nextOffset === null
           ? {}
@@ -231,29 +331,39 @@ export class FrozenSourceReader implements AgentCollaborationSourceReader {
             }),
       })
       const fits = (page: CollaborationSourceReadResult): boolean =>
-        nativeStep(
-          Boolean(native),
-          'page_budget',
-          () =>
+        nativeStep(Boolean(native), 'page_budget', () => {
+          if (Date.now() > deadline) {
+            throw new Error('Reading the frozen source timed out.')
+          }
+          const wirePage = wire(page)
+          const nativeProof = nativeRoot
+            ? collaborationSourceNativeProofSchema.parse({
+                version: 'pact-native-source-root-v1',
+                root: nativeRoot,
+                callerRunId: this.identity.runId,
+                grantSha256: this.sha256(this.identity.grant),
+                requestSha256: '0'.repeat(64),
+                pageSha256: '0'.repeat(64),
+              })
+            : undefined
+          if (
             Buffer.byteLength(
-              JSON.stringify(
-                nativeRoot
-                  ? {
-                      page: wire(page),
-                      proof: collaborationSourceNativeProofSchema.parse({
-                        version: 'pact-native-source-root-v1',
-                        root: nativeRoot,
-                        callerRunId: this.identity.runId,
-                        grantSha256: this.sha256(this.identity.grant),
-                        requestSha256: '0'.repeat(64),
-                        pageSha256: '0'.repeat(64),
-                      }),
-                    }
-                  : wire(page),
-              ),
-            ) <= COLLABORATION_PAGE_BYTES,
-        )
-      const readDocument = (document: NonNullable<CollaborationSourceRead['document']>) =>
+              JSON.stringify(nativeProof ? { page: wirePage, proof: nativeProof } : wirePage),
+            ) > COLLABORATION_PAGE_BYTES
+          ) {
+            return false
+          }
+          const mcpEnvelope = {
+            jsonrpc: '2.0',
+            id: '0'.repeat(64),
+            result: {
+              content: [{ type: 'text', text: JSON.stringify(wirePage) }],
+              ...(nativeProof ? { _meta: { pactSourceRoot: nativeProof } } : {}),
+            },
+          }
+          return Buffer.byteLength(JSON.stringify(mcpEnvelope)) <= COLLABORATION_PAGE_BYTES
+        })
+      const readDocument = (document: NonNullable<CollaborationSourceAnyRead['document']>) =>
         nativeStep(Boolean(native), 'navigation', () =>
           this.navigation({ source: 'document', document }, submitted),
         )
@@ -261,6 +371,8 @@ export class FrozenSourceReader implements AgentCollaborationSourceReader {
         nativeStep(Boolean(native), 'navigation', () =>
           this.navigation({ source: 'batch', batchId }, submitted),
         )
+      const readCutoff = (target: CollaborationSourceCutoffTarget) =>
+        nativeStep(Boolean(native), 'navigation', () => this.navigation(target, submitted))
       let page: CollaborationSourceReadResult
       if (request.source === 'document') {
         const document = request.document!
@@ -293,7 +405,7 @@ export class FrozenSourceReader implements AgentCollaborationSourceReader {
         }
       } else if (request.source === 'batch') {
         const readPart = (
-          document: NonNullable<CollaborationSourceRead['document']>,
+          document: NonNullable<CollaborationSourceAnyRead['document']>,
           part: 'body' | 'user_information' | 'clarification_answer' | 'comment',
           ordinal?: number,
         ) => {
@@ -363,6 +475,115 @@ export class FrozenSourceReader implements AgentCollaborationSourceReader {
             ),
           ),
         )
+      } else if (request.source === 'cutoff') {
+        const cutoffId = request.cutoffId!
+        const part = request.part!
+        const project = (index: {
+          offset: number
+          nextOffset: number | null
+          text: string
+          items?: CutoffCatalogItem[]
+        }): CollaborationSourceReadResult => {
+          if (part === 'comments') {
+            const parsed: unknown = JSON.parse(index.text)
+            if (
+              !parsed ||
+              typeof parsed !== 'object' ||
+              !Array.isArray(Reflect.get(parsed, 'items'))
+            ) {
+              throw new Error('Invalid cutoff comments index.')
+            }
+            const rawItemsValue =
+              typeof parsed === 'object' && parsed !== null && 'items' in parsed
+                ? parsed.items
+                : undefined
+            const rawItems: Record<string, unknown>[] = Array.isArray(rawItemsValue)
+              ? rawItemsValue.filter(
+                  (entry): entry is Record<string, unknown> =>
+                    typeof entry === 'object' && entry !== null,
+                )
+              : []
+            const projectedItems: Record<string, unknown>[] = []
+            for (const item of rawItems) {
+              const commentId = item.commentId
+              if (typeof commentId !== 'string') {
+                projectedItems.push(item)
+                continue
+              }
+              projectedItems.push(
+                Object.assign({}, item, {
+                  commentRead: readCutoff({
+                    source: 'cutoff',
+                    cutoffId,
+                    part: 'comment',
+                    commentId,
+                  }),
+                }),
+              )
+            }
+            return {
+              source: 'cutoff',
+              text: JSON.stringify({
+                ...parsed,
+                items: projectedItems,
+              }),
+              offset: index.offset,
+              nextOffset: index.nextOffset,
+            }
+          }
+          if (part !== 'catalog') {
+            return {
+              source: 'cutoff',
+              text: index.text,
+              offset: index.offset,
+              nextOffset: index.nextOffset,
+            }
+          }
+          const header = parseCutoffCatalogHeader(index.text, cutoffId)
+          const items = (index.items ?? []).map((item) => {
+            const messageRead = readCutoff({
+              source: 'cutoff',
+              cutoffId: header.cutoffId,
+              part: 'message',
+              messageId: item.messageId,
+            })
+            if (!item.hasComments) {
+              return Object.assign({}, item, { messageRead })
+            }
+            return Object.assign({}, item, {
+              messageRead,
+              commentsRead: readCutoff({
+                source: 'cutoff',
+                cutoffId: header.cutoffId,
+                part: 'comments',
+                messageId: item.messageId,
+              }),
+            })
+          })
+          return {
+            source: 'cutoff',
+            text: JSON.stringify({
+              ...header,
+              items,
+            }),
+            offset: index.offset,
+            nextOffset: index.nextOffset,
+          }
+        }
+        page = project(
+          nativeStep(Boolean(native), 'page_read', () =>
+            this.sources.readCutoffSource(
+              {
+                cutoffId,
+                part,
+                ...(request.messageId ? { messageId: request.messageId } : {}),
+                ...(request.commentId ? { commentId: request.commentId } : {}),
+                offset: request.offset,
+              },
+              (index) => fits(project(index)),
+            ),
+          ),
+        )
       } else {
         const project = (index: ReturnType<Sources['readRunSources']>) => ({
           source: request.source,
@@ -403,6 +624,8 @@ export class FrozenSourceReader implements AgentCollaborationSourceReader {
     } catch (error) {
       this.failed?.(error)
       throw error
+    } finally {
+      this.activeRead = false
     }
   }
 
@@ -428,18 +651,37 @@ export class FrozenSourceReader implements AgentCollaborationSourceReader {
     return this.key!
   }
 
-  private explicitSelection(request: CollaborationSourceRead): void {
+  private explicitSelection(request: CollaborationSourceAnyRead): void {
     if (
       request.source === 'document'
-        ? !request.document || request.batchId !== undefined
+        ? !request.document ||
+          request.batchId !== undefined ||
+          request.cutoffId !== undefined ||
+          request.part !== undefined ||
+          request.messageId !== undefined ||
+          request.commentId !== undefined
         : request.source === 'batch'
-          ? !request.batchId || request.document !== undefined
-          : request.document !== undefined || request.batchId !== undefined
+          ? !request.batchId ||
+            request.document !== undefined ||
+            request.cutoffId !== undefined ||
+            request.part !== undefined ||
+            request.messageId !== undefined ||
+            request.commentId !== undefined
+          : request.source === 'cutoff'
+            ? request.document !== undefined ||
+              request.batchId !== undefined ||
+              !validCutoffTargetSelection(request)
+            : request.document !== undefined ||
+              request.batchId !== undefined ||
+              request.cutoffId !== undefined ||
+              request.part !== undefined ||
+              request.messageId !== undefined ||
+              request.commentId !== undefined
     )
       throw new Error('A source reference requires its exact explicit selection.')
   }
 
-  private authorize(request: CollaborationSourceRead, native = false): void {
+  private authorize(request: CollaborationSourceAnyRead, native = false): void {
     nativeStep(native, 'reader_current', () => this.assertCurrent())
     nativeStep(native, 'repository_scope', () => {
       if (request.runId !== this.identity.runId || request.grant !== this.identity.grant)
@@ -455,11 +697,14 @@ export class FrozenSourceReader implements AgentCollaborationSourceReader {
         this.sources.readFrozenInputBatch(request.runId, batchId, -1)
       } else if (request.source === 'inputs')
         this.sources.readWorkflowInputs(request.runId, request.offset)
-      else this.sources.readRunSources(request.runId, request.offset)
+      else if (request.source === 'cutoff') {
+        if (!validCutoffTargetSelection(request) || !this.authorizedCutoffs.has(request.cutoffId!))
+          throw new Error('The cutoff source is outside this Run authorization.')
+      } else this.sources.readRunSources(request.runId, request.offset)
     })
   }
 
-  private resolveReference(sourceReference: string, offset: number): CollaborationSourceRead {
+  private resolveReference(sourceReference: string, offset: number): CollaborationSourceAnyRead {
     const parts = /^p1\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]{43})$/u.exec(sourceReference)
     if (!parts) throw new Error('Source reference encoding is unavailable.')
     const encoded = parts[1]!
@@ -474,10 +719,10 @@ export class FrozenSourceReader implements AgentCollaborationSourceReader {
     const bytes = Buffer.from(encoded, 'base64url')
     if (bytes.length > PAYLOAD_BYTES || bytes.toString('base64url') !== encoded)
       throw new Error('Source reference payload is invalid.')
-    const payload = collaborationSourceReferencePayloadSchema.parse(
+    const payload = collaborationSourceAnyReferencePayloadSchema.parse(
       JSON.parse(bytes.toString('utf8')),
     )
-    const request = collaborationSourceReadSchema.parse({ ...payload.request, offset })
+    const request = collaborationSourceAnyReadSchema.parse({ ...payload.request, offset })
     this.explicitSelection(request)
     return request
   }
@@ -495,7 +740,7 @@ function readSourceTool(
   legacyRead: ((input: unknown) => CollaborationSourceReadResult) | undefined,
   authenticatedNativeRoot?: CollaborationSourceNativeRoot,
 ): CollaborationSourceReadResult | CollaborationSourceWireResult {
-  let request: CollaborationSourceRead
+  let request: CollaborationSourceAnyRead
   let page: CollaborationSourceReadResult | CollaborationSourceWireResult
   if (reader) {
     if (reader.identity.runId !== identity.runId || reader.identity.grant !== identity.grant)
@@ -538,7 +783,7 @@ function readSourceTool(
         throw new Error('The source page binding does not match this reader.')
       })
   } else {
-    request = collaborationSourceReadSchema.parse(raw)
+    request = collaborationSourceAnyReadSchema.parse(raw)
     if (!legacyRead) throw new Error('The source reader is unavailable.')
     if (request.runId !== identity.runId || request.grant !== identity.grant)
       throw new Error('This source capability does not belong to the current root.')
@@ -561,6 +806,16 @@ function readSourceTool(
       throw new Error('The frozen source page does not match this request.')
     })
   return page
+}
+
+/** Build an authenticated cutoff catalog navigator when the run owns a `FrozenSourceReader`. */
+export function cutoffSourceNavigator(
+  reader: AgentCollaborationSourceReader | undefined,
+  form: AgentSourceReadForm,
+): ((cutoffId: string) => CodexCollaborationSourceWireRead) | undefined {
+  return reader instanceof FrozenSourceReader
+    ? (cutoffId) => reader.navigation({ source: 'cutoff', cutoffId, part: 'catalog' }, form)
+    : undefined
 }
 
 /** Shared legacy/P1 transport entry never admits native-root arguments. */

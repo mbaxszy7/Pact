@@ -73,6 +73,16 @@ import type {
   SchedulingEligibility,
   DecisionHttpOwner,
   SessionNotificationEvent,
+  CreateSideChatInput,
+  CreateSideChatReceipt,
+  DiscardEmptySideChatInput,
+  DiscardEmptySideChatResult,
+  ListSideChatsInput,
+  ListSideChatsPage,
+  OriginSideChat,
+  ReadSideChatReceiptInput,
+  SideChatSyncMainInput,
+  SideChatSyncMainReceipt,
 } from '@pact/contracts'
 import type {
   ConversationImage,
@@ -110,6 +120,7 @@ import {
   isCollaborationOpenMode,
   collaborationInputGate,
   otherAgent,
+  resolveMainChatSyncTarget,
   collaborationMarkdownPageSchema,
   type CollaborationTask,
   type CollaborationActionInput,
@@ -138,6 +149,7 @@ import {
   type SkillDocumentRead,
   parseComposerCommandPrefix,
   skillArguments,
+  validateSideChatMainSyncContent,
   skillCatalogPageSchema,
   SKILL_PAGE_BYTES,
   SKILL_PAGE_ITEMS,
@@ -148,6 +160,7 @@ import {
 } from '@pact/contracts'
 import {
   conversationInterestsSchema,
+  CUTOFF_INLINE_TAIL_MAX_BYTES,
   WORKSPACE_ARCHIVE_PREVIEW_MS,
   WORKSPACE_ARCHIVE_STOP_MS,
   WORKSPACE_ARCHIVE_TASK_LIMIT,
@@ -182,6 +195,7 @@ import {
   OversizedConversationEntityError,
   ProjectCatalogRepository,
   SessionRepository,
+  SideChatPersistenceError,
   StaleConversationCursorError,
   WorkspaceArchiveConflictError,
 } from '@pact/persistence'
@@ -210,6 +224,7 @@ import { ConversationImages } from './conversation-images'
 import { type DecisionInputLoader } from './decision-runtime'
 import { pathlessExecutionInput, restoreExecutionInput } from './execution-input'
 import { FrozenSourceReader } from './frozen-source-reader'
+import { setPromptCutoffSupplement } from './native-image-content'
 import { encodeNativeJsonFrame } from './native-json-encoder'
 import { safeNativePermissionText } from './native-permission-wait'
 import { NativeWorkingMemory, type NativeMemoryAllocator } from './native-working-memory'
@@ -332,6 +347,8 @@ interface SendOptions {
   receivedComments?: AnchoredComment[] | undefined
   queuedRoute?: ConversationMessageRoute | undefined
   queuedRolePolicy?: CollaborationTask['rolePolicy'] | undefined
+  originSideChat?: OriginSideChat | undefined
+  syncMainOperationId?: string | undefined
 }
 
 interface PreparingContinuation {
@@ -1670,7 +1687,7 @@ export class Conversation {
         if (
           !work.tasks.length &&
           !work.blockedReason &&
-          !this.workspaceChanges?.hasPendingFinalization(receipt.preview.scope)
+          !this.scopeHasPendingWorkspaceFinalization(receipt.preview.scope)
         )
           this.conversations.archives.releaseResolved(operationId)
       }
@@ -1688,15 +1705,48 @@ export class Conversation {
     }
   }
 
+  private scopeHasPendingWorkspaceFinalization(scope: WorkspaceArchiveScope): boolean {
+    if (!this.workspaceChanges) return false
+    if (this.workspaceChanges.hasPendingFinalization(scope)) return true
+    if (scope.kind !== 'session') return false
+    return this.workspaceChanges
+      .pendingSessionIds()
+      .some((id) => this.sessions.find(id)?.parentSessionId === scope.sessionId)
+  }
+
+  private async awaitScopeWorkspaceFinalization(scope: WorkspaceArchiveScope): Promise<void> {
+    if (!this.workspaceChanges) return
+    if (scope.kind !== 'session') {
+      await this.workspaceChanges.awaitFinalization(scope)
+      return
+    }
+    const targets = new Set<string>([
+      scope.sessionId,
+      ...this.workspaceChanges
+        .pendingSessionIds()
+        .filter((id) => this.sessions.find(id)?.parentSessionId === scope.sessionId),
+    ])
+    await Promise.all(
+      [...targets].map((sessionId) =>
+        this.workspaceChanges!.awaitFinalization({ kind: 'session', sessionId }),
+      ),
+    )
+  }
+
   private archiveWork(scope: WorkspaceArchiveScope): {
     tasks: WorkspaceArchiveTask[]
     blockedReason?: string
   } {
     const projectId = this.conversations.archives.context(scope).projectId
-    const belongs = (sessionId: string): boolean =>
-      scope.kind === 'session'
-        ? sessionId === scope.sessionId
-        : this.conversations.archives.sessionMetadata(sessionId)?.projectId === projectId
+    const belongs = (sessionId: string): boolean => {
+      if (scope.kind === 'session') {
+        return (
+          sessionId === scope.sessionId ||
+          this.sessions.find(sessionId)?.parentSessionId === scope.sessionId
+        )
+      }
+      return this.conversations.archives.sessionMetadata(sessionId)?.projectId === projectId
+    }
     const identities = new Map<string, { ids: string[]; state: WorkspaceArchiveTask['state'] }>()
     const add = (
       sessionId: string,
@@ -1721,16 +1771,18 @@ export class Conversation {
       add(entry.sessionId, `pending:${entry.userMessageId}:${entry.agentId}`, 'continuing')
     for (const entry of this.conversations.archives.pendingInputs(scope))
       add(entry.sessionId, `input:${entry.id}`, 'continuing')
-    const tasks = [...identities].map(([sessionId, entry]) => ({
+    const allTasks = [...identities].map(([sessionId, entry]) => ({
       sessionId,
       title: this.conversations.archives.sessionMetadata(sessionId)!.title,
       state: entry.state,
       identity: entry.ids.toSorted().join('|'),
     }))
-    if (tasks.length > WORKSPACE_ARCHIVE_TASK_LIMIT)
+    const exceedsTaskLimit = allTasks.length > WORKSPACE_ARCHIVE_TASK_LIMIT
+    if (exceedsTaskLimit && scope.kind !== 'session')
       throw new WorkspaceArchiveConflictError(
         'Too many tasks changed at once. Nothing was stopped; try again.',
       )
+    const tasks = exceedsTaskLimit ? allTasks.slice(0, WORKSPACE_ARCHIVE_TASK_LIMIT) : allTasks
     const unsupported =
       [...this.decisionSessionIds()].some(belongs) ||
       [...this.nativeRebuilds.keys()].some(belongs) ||
@@ -1745,14 +1797,14 @@ export class Conversation {
         return !foreground || Boolean(this.conversations.findRun(foreground.run.id)?.nativeOutcome)
       }) ||
       this.conversations.archives.hasNativeWork(scope, runs)
+    const blockedReason = exceedsTaskLimit
+      ? 'More than 5 tasks are active across this Session and its side chats. Wait for tasks to finish before archiving. Nothing was stopped.'
+      : unsupported
+        ? 'Wait for active agent work (recovery, fork, rebuild, background tasks, or unconfirmed endings) to finish before archiving. Nothing was stopped.'
+        : undefined
     return {
       tasks,
-      ...(unsupported
-        ? {
-            blockedReason:
-              'Wait for active agent work (recovery, fork, rebuild, background tasks, or unconfirmed endings) to finish before archiving. Nothing was stopped.',
-          }
-        : {}),
+      ...(blockedReason ? { blockedReason } : {}),
     }
   }
 
@@ -1830,7 +1882,8 @@ export class Conversation {
       for (const entry of this.adapters.values()) {
         if (
           scope.kind === 'session'
-            ? entry.sessionId === scope.sessionId
+            ? entry.sessionId === scope.sessionId ||
+              this.sessions.find(entry.sessionId)?.parentSessionId === scope.sessionId
             : this.conversations.archives.sessionMetadata(entry.sessionId)?.projectId ===
               receipt.preview.projectId
         )
@@ -1923,7 +1976,7 @@ export class Conversation {
       }
       if (this.workspaceChanges)
         await Conversation.awaitArchiveFinalization(
-          this.workspaceChanges.awaitFinalization(scope),
+          this.awaitScopeWorkspaceFinalization(scope),
           deadline,
         )
       if (this.disposed || performance.now() >= deadline)
@@ -1965,7 +2018,7 @@ export class Conversation {
             this.conversations.archives.hasNativeWork(scope) ||
             remaining.tasks.length > 0 ||
             Boolean(remaining.blockedReason) ||
-            Boolean(this.workspaceChanges?.hasPendingFinalization(scope))
+            this.scopeHasPendingWorkspaceFinalization(scope)
           this.conversations.archives.fail(
             id,
             outcomes,
@@ -2208,6 +2261,11 @@ export class Conversation {
     const sourceSession = this.sessions.find(sourceSessionId)
     if (!sourceSession || sourceSession.status === 'archived')
       return { ok: false, error: { code: 'VALIDATION', message: 'Session is unavailable.' } }
+    if (sourceSession.parentSessionId)
+      return {
+        ok: false,
+        error: { code: 'CONFLICT', message: 'Side chats cannot be forked.' },
+      }
     if (input.action === 'create') {
       const existing = this.conversations.forkOperationById(input.operationId)
       if (existing) {
@@ -2893,6 +2951,14 @@ export class Conversation {
       return { ok: false, error: { code: 'VALIDATION', message: 'Session is unavailable.' } }
     }
     try {
+      if (input.scope === 'collaboration') {
+        await this.awaitSettlingExecution(input.sessionId, input.runId)
+        if (this.disposed) return Conversation.shuttingDown()
+        const currentSession = this.sessions.find(input.sessionId)
+        if (!currentSession || currentSession.status === 'archived') {
+          return { ok: false, error: { code: 'VALIDATION', message: 'Session is unavailable.' } }
+        }
+      }
       if (input.scope === 'collaboration-markdown' && input.basis !== 'plain-visible-v1') {
         const row = this.conversations.collaborationDocumentRow(input.sessionId, input.document)
         if (row.sourceRunId !== input.runId) throw new Error('The source Run changed.')
@@ -3239,6 +3305,17 @@ export class Conversation {
     input: ConversationSendInput,
     ownerKey?: string,
   ): Promise<RpcResult<ConversationPatch>> {
+    return await this.sendWithOptions(input, ownerKey)
+  }
+
+  private async sendWithOptions(
+    input: ConversationSendInput,
+    ownerKey?: string,
+    syncOptions?: {
+      originSideChat?: OriginSideChat | undefined
+      syncMainOperationId?: string | undefined
+    },
+  ): Promise<RpcResult<ConversationPatch>> {
     let releaseImages: (() => void) | undefined
     try {
       const held = this.conversations.heldPreparedInputPatch(input)
@@ -3311,6 +3388,15 @@ export class Conversation {
         releaseImages = this.images.hold(input.imageIds)
       }
       const prefix = parseComposerCommandPrefix(content, input.skills)
+      if (prefix.btw)
+        throw new RunOperationConflictError(
+          '/btw opens a side chat instead of sending a regular message.',
+        )
+      const targetSession = this.sessions.find(input.sessionId)
+      if (targetSession?.parentSessionId && prefix.pact)
+        throw new RunOperationConflictError(
+          'Side chats cannot run /plan, /build, or /review commands.',
+        )
       if (
         input.askOnly &&
         (!task ||
@@ -3421,6 +3507,13 @@ export class Conversation {
           throw new RunOperationConflictError(
             'Wait for the current execution to start before queuing a message.',
           )
+        if (syncOptions?.originSideChat) {
+          const gateFailure = this.checkSideChatSyncGateFailure(
+            syncOptions.originSideChat.sideChatId,
+            input.sessionId,
+          )
+          if (gateFailure) return gateFailure
+        }
         const patch = this.conversations.receiveQueuedInput(
           { ...input, content },
           retainedId,
@@ -3429,6 +3522,16 @@ export class Conversation {
           anchor.id,
           waitingForWork,
           prefix.pact && !inTaskReview ? 'split-stages-v1' : undefined,
+          syncOptions?.originSideChat || syncOptions?.syncMainOperationId
+            ? {
+                ...(syncOptions.originSideChat
+                  ? { originSideChat: syncOptions.originSideChat }
+                  : {}),
+                ...(syncOptions.syncMainOperationId
+                  ? { syncMainOperationId: syncOptions.syncMainOperationId }
+                  : {}),
+              }
+            : undefined,
         )
         this.publish(patch)
         if (task) {
@@ -3447,7 +3550,13 @@ export class Conversation {
       const { inputId } = input
       return await this.enqueueSend(
         { ...input, content },
-        ownerKey ? { imageOwnerKey: ownerKey } : {},
+        {
+          ...(ownerKey ? { imageOwnerKey: ownerKey } : {}),
+          ...(syncOptions?.originSideChat ? { originSideChat: syncOptions.originSideChat } : {}),
+          ...(syncOptions?.syncMainOperationId
+            ? { syncMainOperationId: syncOptions.syncMainOperationId }
+            : {}),
+        },
       ).then((result) => {
         if (result.ok && inputId)
           this.conversations.consumeConversationInput(input.sessionId, inputId, ownerKey!)
@@ -3578,6 +3687,7 @@ export class Conversation {
         phase: 'prepared' as 'prepared' | 'possibly_sent' | 'accepted' | 'rejected',
       }
       let invocation: FrozenSkillInvocation | undefined
+      let revokeNewlyAuthorizedCutoffs: (() => void) | undefined
       try {
         const queued = this.conversations.readReceivedInput(sessionId)
         if (!queued || queued.id !== input.inputId)
@@ -3632,10 +3742,54 @@ export class Conversation {
         )
         envelope.requiredInputScopeRef =
           envelope.collaborationAuthorization?.sourceManifestRef ?? undefined
+        const queuedCutoffId = queued.metadata.originSideChat?.cutoffId
+        const steerCutoffs = [
+          ...new Set([
+            ...this.authorizedCutoffsForEnvelope(
+              { sessionId, userMessageId: queued.id },
+              envelope,
+              Boolean(this.sessions.find(sessionId)?.parentSessionId),
+            ),
+            ...(queuedCutoffId &&
+            this.conversations.buildCutoffInlineTail(queuedCutoffId, 256).maxMessageSequence >= 0
+              ? [queuedCutoffId]
+              : []),
+          ]),
+        ]
+        const steerInjectedCutoffs = steerCutoffs.length
+          ? this.attachCutoffSupplement(
+              run.sessionId,
+              run.agentId,
+              run.bindingGeneration ?? 1,
+              envelope,
+              steerCutoffs,
+            )
+          : []
+        const newlyAuthorizedCutoffs = steerCutoffs.length
+          ? (this.nativeObservations.get(run.id)?.sourceReader?.authorizeCutoffs(steerCutoffs) ??
+            [])
+          : []
+        revokeNewlyAuthorizedCutoffs = () => {
+          if (newlyAuthorizedCutoffs.length) {
+            this.nativeObservations.get(run.id)?.sourceReader?.revokeCutoffs(newlyAuthorizedCutoffs)
+          }
+        }
+        let steerCutoffsMarked = false
+        const markSteerCutoffs = (): void => {
+          if (steerCutoffsMarked || !steerInjectedCutoffs.length) return
+          const marked = this.conversations.markCutoffsDelivered(
+            run.sessionId,
+            run.agentId,
+            run.bindingGeneration ?? 1,
+            steerInjectedCutoffs,
+          )
+          if (marked.length > 0) steerCutoffsMarked = true
+        }
         this.refreshExecutionInputScope(execution)
         this.publish(this.conversations.metadataPatch(sessionId))
         const accepted = (): void => {
           if (current()) this.flushRunOutput(run)
+          markSteerCutoffs()
           this.publish(this.conversations.markQueuedSteerAccepted(input.operationId, invocation))
           this.refreshExecutionInputScope(execution)
         }
@@ -3660,7 +3814,8 @@ export class Conversation {
               if (next === 'possibly_sent')
                 this.publish(this.conversations.markQueuedSteerPossiblySent(input.operationId))
               else if (next === 'accepted') accepted()
-              else
+              else {
+                revokeNewlyAuthorizedCutoffs?.()
                 this.publish(
                   this.conversations.markQueuedSteerRefused(
                     input.operationId,
@@ -3668,12 +3823,14 @@ export class Conversation {
                     true,
                   ),
                 )
+              }
               delivery.phase = next
               this.refreshExecutionInputScope(execution)
             },
             recordConsumption: (id) => {
               if (id !== queued.id || this.nativeObservations.get(run.id) !== owner) return
               if (current()) this.flushRunOutput(run)
+              markSteerCutoffs()
               this.publish(
                 this.conversations.markQueuedSteerConsumed(input.operationId, id, invocation),
               )
@@ -3686,7 +3843,8 @@ export class Conversation {
         else if (
           (result.status === 'unsupported' || result.status === 'rejected') &&
           delivery.phase !== 'rejected'
-        )
+        ) {
+          revokeNewlyAuthorizedCutoffs?.()
           this.publish(
             this.conversations.markQueuedSteerRefused(
               input.operationId,
@@ -3694,6 +3852,7 @@ export class Conversation {
               result.status === 'rejected',
             ),
           )
+        }
         this.refreshExecutionInputScope(execution)
         return { ok: true, value: this.conversations.metadataPatch(sessionId) }
       } catch (error) {
@@ -3705,14 +3864,15 @@ export class Conversation {
             this.refreshExecutionInputScope(execution)
             return { ok: true, value: consumed }
           }
-          if (delivery.phase === 'prepared')
+          if (delivery.phase === 'prepared') {
+            revokeNewlyAuthorizedCutoffs?.()
             this.publish(
               this.conversations.markQueuedSteerRefused(
                 input.operationId,
                 'Steering could not be prepared. Your message remains queued.',
               ),
             )
-          else if (delivery.phase !== 'rejected' && delivery.phase !== 'accepted')
+          } else if (delivery.phase !== 'rejected' && delivery.phase !== 'accepted')
             this.publish(
               this.conversations.markQueuedSteerUnknown(
                 input.operationId,
@@ -4452,9 +4612,23 @@ export class Conversation {
     return task
   }
 
+  private async awaitSettlingExecution(sessionId: string, runId?: string): Promise<void> {
+    const activeExecution = this.activeExecutions.get(sessionId)
+    if (!activeExecution?.completion) return
+    if (runId && activeExecution.run.id !== runId) return
+    const activeRun = this.conversations.findRun(activeExecution.run.id)
+    if (!activeRun || ['starting', 'running', 'recovering'].includes(activeRun.status)) return
+    await activeExecution.completion.catch(() => undefined)
+  }
+
   private async actOnCollaborationAdmitted(
     input: CollaborationActionInput,
   ): Promise<RpcResult<ConversationPatch>> {
+    if (this.disposed) return Conversation.shuttingDown()
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
+    if (this.conversations.archives.blocksSession(input.sessionId))
+      return Conversation.archiveBusy()
+    await this.awaitSettlingExecution(input.sessionId)
     if (this.disposed) return Conversation.shuttingDown()
     if (this.nativeQuitSealed()) return Conversation.quitPrepared()
     if (this.conversations.archives.blocksSession(input.sessionId))
@@ -5367,6 +5541,10 @@ export class Conversation {
   ): Promise<FrozenSkillInvocation | undefined> {
     const prefix = parseComposerCommandPrefix(input.content, input.skills)
     if (prefix.error) throw new RunOperationConflictError(prefix.error)
+    if (prefix.btw)
+      throw new RunOperationConflictError(
+        '/btw opens a side chat instead of sending a regular message.',
+      )
     const selections = input.skills ?? []
     const names = [
       ...new Set([
@@ -5439,6 +5617,7 @@ export class Conversation {
         !options.receivedInputId &&
         !options.sourceProposalId &&
         !options.preserveDraftComments &&
+        !options.originSideChat &&
         !this.pendingNativeInteractions(input.sessionId).length &&
         this.conversations.ordinaryInputWorthConsulting(input, session.settings.primaryAgentId)
       ) {
@@ -5708,6 +5887,14 @@ export class Conversation {
       if (!context.ok) return context
       const commandPrefix = parseComposerCommandPrefix(input.content, input.skills)
       if (commandPrefix.error) throw new RunOperationConflictError(commandPrefix.error)
+      if (commandPrefix.btw)
+        throw new RunOperationConflictError(
+          '/btw opens a side chat instead of sending a regular message.',
+        )
+      if (context.value.session.parentSessionId && commandPrefix.pact)
+        throw new RunOperationConflictError(
+          'Side chats cannot run /plan, /build, or /review commands.',
+        )
       if (
         commandPrefix.pact &&
         this.conversations.receivedCollaborationInput(input.sessionId)?.id !==
@@ -5992,6 +6179,13 @@ export class Conversation {
       }
       if (this.hasBlockingBackgroundWork(input.sessionId))
         throw new RunOperationConflictError(BACKGROUND_INPUT_REASON)
+      if (options.originSideChat) {
+        const gateFailure = this.checkSideChatSyncGateFailure(
+          options.originSideChat.sideChatId,
+          input.sessionId,
+        )
+        if (gateFailure) return gateFailure
+      }
       const started = this.conversations.beginRun({
         preparedInput: options.preparedInput,
         inputRouting: options.inputRouting,
@@ -6030,6 +6224,10 @@ export class Conversation {
         ...(options.sourceMessageId ? { sourceMessageId: options.sourceMessageId } : {}),
         ...(options.sourceProposalId ? { sourceProposalId: options.sourceProposalId } : {}),
         ...(options.preserveDraftComments ? { preserveDraftComments: true } : {}),
+        ...(options.originSideChat ? { originSideChat: options.originSideChat } : {}),
+        ...(options.syncMainOperationId
+          ? { syncMainOperationId: options.syncMainOperationId }
+          : {}),
         handoffSourceRefs: handoff.map((source) =>
           Object.assign(
             {
@@ -6040,8 +6238,13 @@ export class Conversation {
             source.contextVersion ? { contextVersion: source.contextVersion } : {},
           ),
         ),
-        ...(context.value.session.titleSource === 'placeholder'
-          ? { suggestedTitle: Conversation.localTitle(input.content) }
+        ...(context.value.session.titleSource === 'placeholder' && input.content.trim()
+          ? {
+              suggestedTitle: Conversation.localTitle(
+                input.content,
+                context.value.session.parentSessionId ? 'New side chat' : 'New session',
+              ),
+            }
           : {}),
       })
       prompt.inputBatchRef = this.conversations.inputBatchForRun(started.run.id) ?? undefined
@@ -6086,6 +6289,7 @@ export class Conversation {
           error instanceof WorkspaceChangeError
             ? error.code
             : error instanceof RunOperationConflictError ||
+                error instanceof SideChatPersistenceError ||
                 error instanceof WorkspaceArchiveConflictError
               ? 'CONFLICT'
               : error instanceof HandoffTooLargeError ||
@@ -7503,6 +7707,57 @@ export class Conversation {
         value: { status: 'unavailable', commentId, quote: anchor.quote, reason: anchor.reason },
       }
     if (anchor.type === 'file') return this.projectFiles.resolveCommentSource(sessionId, comment)
+    if (anchor.type === 'cutoff_message') {
+      const textBasis = anchor.textBasis ?? MESSAGE_ANCHOR_TEXT_BASIS
+      if (textBasis !== MESSAGE_ANCHOR_TEXT_BASIS && textBasis !== 'markdown-visible-v1') {
+        return {
+          ok: true,
+          value: {
+            status: 'outdated',
+            commentId,
+            quote: anchor.quote,
+            reason: 'This Comment uses an unsupported Markdown projection.',
+          },
+        }
+      }
+      const metadata = this.conversations.messageMetadata(anchor.messageId, anchor.sourceSessionId)
+      const liveMessage = metadata
+        ? this.conversations.internalMessage(anchor.messageId, anchor.sourceSessionId)
+        : undefined
+      const liveHash = liveMessage
+        ? createHash('sha256').update(liveMessage.content, 'utf8').digest('hex')
+        : undefined
+      if (!metadata || !liveMessage || liveHash !== anchor.contentSha256) {
+        return {
+          ok: true,
+          value: {
+            status: 'outdated',
+            commentId,
+            quote: anchor.quote,
+            reason: 'The referenced message changed or is unavailable.',
+          },
+        }
+      }
+      const projected =
+        textBasis === MESSAGE_ANCHOR_TEXT_BASIS
+          ? await Conversation.markdownVisibleProjection(liveMessage.content)
+          : liveMessage.content
+      if (projected.slice(anchor.startOffset, anchor.endOffset) !== anchor.quote) {
+        return {
+          ok: true,
+          value: {
+            status: 'outdated',
+            commentId,
+            quote: anchor.quote,
+            reason: 'Comment source changed.',
+          },
+        }
+      }
+      return {
+        ok: true,
+        value: { status: 'resolved', commentId, anchor: { ...anchor, textBasis } },
+      }
+    }
 
     if (
       anchor.textBasis !== MESSAGE_ANCHOR_TEXT_BASIS &&
@@ -8400,6 +8655,8 @@ export class Conversation {
     )
     if (
       prefix.error ||
+      prefix.btw ||
+      (session.parentSessionId && prefix.pact) ||
       expectedInTaskReview !== actualInTaskReview ||
       (Boolean(prefix.pact) && !expectedInTaskReview) !== input.metadata.workflowCommand ||
       (prefix.pact && input.taskId && !expectedInTaskReview)
@@ -8408,7 +8665,11 @@ export class Conversation {
         this.conversations.pauseConversationQueue(
           sessionId,
           prefix.error ??
-            'The queued message no longer matches its frozen task. Edit it before sending.',
+            (prefix.btw
+              ? '/btw opens a side chat instead of sending a regular message.'
+              : session.parentSessionId && prefix.pact
+                ? 'Side chats cannot run /plan, /build, or /review commands.'
+                : 'The queued message no longer matches its frozen task. Edit it before sending.'),
         ),
       )
       return
@@ -9367,6 +9628,7 @@ export class Conversation {
               ),
             )
           } else this.publish(this.conversations.applyArchivedEvent(run.sessionId, run.id, fact))
+          if (fact.type === 'turn.started' || fact.type === 'turn.completed') markInjectedCutoffs()
           if (
             fact.type === 'turn.completed' &&
             fact.outcome === 'completed' &&
@@ -9473,6 +9735,20 @@ export class Conversation {
       valid: () =>
         stillOwned() && (currentControl() || Boolean(adapter.hasActiveBackgroundWork?.(run.id))),
     })
+    let cutoffsMarked = false
+    let injectedCutoffIds: string[] = []
+    const markInjectedCutoffs = (): void => {
+      if (cutoffsMarked || !injectedCutoffIds.length) return
+      const currentBindingGen =
+        this.conversations.findRun(run.id)?.bindingGeneration ?? run.bindingGeneration ?? 1
+      const marked = this.conversations.markCutoffsDelivered(
+        run.sessionId,
+        run.agentId,
+        currentBindingGen,
+        injectedCutoffIds,
+      )
+      if (marked.length > 0) cutoffsMarked = true
+    }
     try {
       this.publish(this.conversations.updateAttempt(run.id, 1, false))
       this.publish(this.conversations.recordNativeEffects(run.id, 'pending'))
@@ -9487,12 +9763,26 @@ export class Conversation {
       promptEnvelope.inputBatchRef = originalInputBatch ?? promptEnvelope.inputBatchRef
       promptEnvelope.requiredInputScopeRef =
         promptEnvelope.collaborationAuthorization?.sourceManifestRef ?? undefined
+      const runSession = this.sessions.find(run.sessionId)
+      const authorizedCutoffIds = this.authorizedCutoffsForEnvelope(
+        run,
+        promptEnvelope,
+        Boolean(runSession?.parentSessionId),
+      )
+      injectedCutoffIds = this.attachCutoffSupplement(
+        run.sessionId,
+        run.agentId,
+        run.bindingGeneration ?? 1,
+        promptEnvelope,
+        authorizedCutoffIds,
+      )
       // Recovery and Handoff retain their original frozen source scope, but each
       // physical reader always uses this exact current root's ephemeral capability.
       promptEnvelope.sourceGrant =
         promptEnvelope.collaboration ||
         promptEnvelope.inputBatchRef ||
-        promptEnvelope.handoffContext?.some((source) => source.inputBatchRef)
+        promptEnvelope.handoffContext?.some((source) => source.inputBatchRef) ||
+        authorizedCutoffIds.length > 0
           ? { runId: run.id, grant: generation }
           : undefined
       if (promptEnvelope.sourceGrant)
@@ -9521,6 +9811,7 @@ export class Conversation {
           },
           signal,
           originalInputBatch?.id,
+          authorizedCutoffIds,
         )
       execution.promptEnvelope = promptEnvelope
       adapter.preflightPrompt?.({
@@ -9535,7 +9826,7 @@ export class Conversation {
         effort: run.effort,
         speed: run.speed ?? 'native',
       })
-      const titleSource = this.sessions.find(run.sessionId)?.titleSource
+      const titleSource = runSession?.titleSource
       if (
         (titleSource === 'placeholder' || titleSource === 'local') &&
         !this.conversations.forkOperation(run.sessionId)
@@ -9676,8 +9967,10 @@ export class Conversation {
                 ...(executorId ? { executorId } : {}),
               })
             if (phase === 'possibly_sent' || phase === 'accepted') execution.deliveryPossible = true
-            if (stillOwned())
+            if (stillOwned()) {
               this.publish(this.conversations.recordDispatch(run.id, phase, nativeId, executorId))
+              if (phase === 'accepted') markInjectedCutoffs()
+            }
           },
           observeNativeDelta: (value) => {
             if (stillOwned()) this.observeNativeDelta(owner, value)
@@ -10047,6 +10340,8 @@ export class Conversation {
             try {
               const patch = this.conversations.applyEvent(run.sessionId, run.id, fact)
               this.publish(patch)
+              if (fact.type === 'turn.started' || fact.type === 'turn.completed')
+                markInjectedCutoffs()
               if (fact.type === 'session.title.updated' && fact.origin === 'turn_result')
                 reportedTitle =
                   patch.session.titleSource === 'agent' && patch.session.title === fact.title
@@ -10758,9 +11053,26 @@ export class Conversation {
         await cached.adapter.dispose()
         this.adapters.delete(key)
       }
+      const acquiringParentId = this.sessions.find(sessionId)?.parentSessionId
+      const evictionPriority = (candidateSessionId: string): number => {
+        const isSideChat = Boolean(this.sessions.find(candidateSessionId)?.parentSessionId)
+        const isProtected =
+          this.interestedSessionIds.has(candidateSessionId) ||
+          candidateSessionId === sessionId ||
+          (!isSideChat && candidateSessionId === acquiringParentId)
+        if (isSideChat && !isProtected) return 0
+        if (!isSideChat && !isProtected) return 1
+        if (isSideChat) return 2
+        return 3
+      }
       while (this.adapters.size >= MAX_ADAPTER_SLOTS) {
-        const idle = [...this.adapters].find(
-          ([, candidate]) =>
+        let idle:
+          | [string, typeof this.adapters extends Map<string, infer V> ? V : never]
+          | undefined
+        let idleScore = Number.POSITIVE_INFINITY
+        for (const entry of this.adapters) {
+          const [, candidate] = entry
+          const isEligible =
             !candidate.adapter.hasActiveBackgroundWork?.() &&
             [...this.nativeChecks.values()].every((owner) => owner.adapter !== candidate.adapter) &&
             [...this.skillDiscoveries.values()].every(
@@ -10788,8 +11100,15 @@ export class Conversation {
             ) &&
             [...this.nativeForks.values()].every(
               (owner) => (owner.sessionId ?? owner.sourceSessionId) !== candidate.sessionId,
-            ),
-        )
+            )
+          if (!isEligible) continue
+          const score = evictionPriority(candidate.sessionId)
+          if (score < idleScore) {
+            idle = entry
+            idleScore = score
+            if (score === 0) break
+          }
+        }
         if (!idle) throw new Error('No idle Agent Adapter slot is available.')
         const [idleKey, candidate] = idle
         const title = this.titleEnrichments.get(candidate.sessionId)
@@ -11159,6 +11478,572 @@ export class Conversation {
     return projection
   }
 
+  private checkSideChatSyncGateFailure(
+    sideChatId: string,
+    parentSessionId: string,
+  ): RpcResult<never> | undefined {
+    if (this.disposed) return Conversation.shuttingDown()
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
+    if (
+      this.conversations.archives.blocksSession(sideChatId) ||
+      this.conversations.archives.blocksSession(parentSessionId)
+    ) {
+      return Conversation.archiveBusy()
+    }
+    const sideChat = this.sessions.find(sideChatId)
+    if (
+      !sideChat ||
+      sideChat.parentSessionId !== parentSessionId ||
+      sideChat.status === 'archived'
+    ) {
+      throw new RunOperationConflictError('The side chat is unavailable.')
+    }
+    const parent = this.sessions.find(parentSessionId)
+    if (!parent || parent.status === 'archived' || parent.parentSessionId) {
+      throw new RunOperationConflictError('The parent Session is unavailable.')
+    }
+    if (this.pendingNativeInteractions(sideChatId).length > 0) {
+      throw new RunOperationConflictError(
+        'Respond to the pending native permission or question in this side chat first.',
+      )
+    }
+    if (
+      this.conversations.nativeRecoveryBlocksInput(sideChatId) ||
+      this.conversations.nativeRecoveryBlocksInput(parentSessionId)
+    ) {
+      return Conversation.nativeRecoveryRequired()
+    }
+    if (this.hasBlockingBackgroundWork(parentSessionId)) {
+      throw new RunOperationConflictError(BACKGROUND_INPUT_REASON)
+    }
+    this.conversations.assertRelayDecisionResolved(parentSessionId, undefined, true)
+    return undefined
+  }
+
+  async createSideChat(input: CreateSideChatInput): Promise<RpcResult<CreateSideChatReceipt>> {
+    if (this.disposed) return Conversation.shuttingDown()
+    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
+    if (this.conversations.archives.blocksSession(input.parentSessionId))
+      return Conversation.archiveBusy()
+    try {
+      const parent = this.sessions.find(input.parentSessionId)
+      if (!parent || parent.status === 'archived') {
+        throw new RunOperationConflictError('The parent Session is unavailable.')
+      }
+      if (parent.parentSessionId) {
+        throw new RunOperationConflictError('Side chats cannot be nested inside another side chat.')
+      }
+      if (
+        input.origin === 'btw' &&
+        !this.conversations.readCreateSideChatReceipt(input.operationId)
+      ) {
+        const issues = this.sessionIssues(
+          input.parentSessionId,
+          this.conversations.nativeContexts(input.parentSessionId),
+        )
+        if (issues.inputGate === 'read_only') {
+          throw new RunOperationConflictError(
+            'Finish or recover the active Fork before running /btw.',
+          )
+        }
+        if (this.conversations.nativeRecoveryBlocksInput(input.parentSessionId)) {
+          return Conversation.nativeRecoveryRequired()
+        }
+        if (issues.inputGate === 'send_blocked') {
+          throw new RunOperationConflictError(
+            'Resolve the pending Session issue before running /btw.',
+          )
+        }
+        if (this.pendingNativeInteractions(input.parentSessionId).length > 0) {
+          throw new RunOperationConflictError(
+            'Respond to the pending native permission or question before running /btw.',
+          )
+        }
+        if (this.hasBlockingBackgroundWork(input.parentSessionId)) {
+          throw new RunOperationConflictError(BACKGROUND_INPUT_REASON)
+        }
+        this.conversations.assertRelayDecisionResolved(input.parentSessionId, undefined, true)
+        const received = this.conversations.receivedCollaborationInput(input.parentSessionId)
+        if (received?.state === 'blocked') {
+          throw new RunOperationConflictError(
+            'Resolve the blocked queued message before running /btw.',
+          )
+        }
+        this.conversations.assertDecisionInput({
+          sessionId: input.parentSessionId,
+          content: '',
+          imageIds: [],
+          commentIds: [],
+          route: { type: 'primary' },
+        })
+        const savedTask = this.conversations.collaboration(input.parentSessionId)
+        const task = savedTask?.status === 'complete' ? undefined : savedTask
+        const taskGate = task ? collaborationInputGate(task) : undefined
+        if (taskGate === 'needs_reply' || taskGate === 'incomplete') {
+          throw new RunOperationConflictError(
+            'Respond to the current workflow question or recovery prompt before running /btw.',
+          )
+        }
+      }
+      const { markdownVisibleProjection } = await import('../../shared/message-anchor-text.js')
+      const receipt = this.conversations.createSideChat(input, {
+        resolveVisibleText: markdownVisibleProjection,
+      })
+      this.nativeMetadataChanged()
+      return { ok: true, value: receipt }
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    }
+  }
+
+  async readCreateSideChatReceipt(
+    input: ReadSideChatReceiptInput,
+  ): Promise<RpcResult<CreateSideChatReceipt | null>> {
+    if (this.disposed) return Conversation.shuttingDown()
+    try {
+      return {
+        ok: true,
+        value: this.conversations.readCreateSideChatReceipt(input.operationId) ?? null,
+      }
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    }
+  }
+
+  async listSideChats(input: ListSideChatsInput): Promise<RpcResult<ListSideChatsPage>> {
+    if (this.disposed) return Conversation.shuttingDown()
+    try {
+      const parent = this.sessions.find(input.parentSessionId)
+      if (!parent) {
+        throw new RunOperationConflictError('The parent Session does not exist.')
+      }
+      if (parent.parentSessionId) {
+        throw new RunOperationConflictError('Side chats cannot contain nested side chats.')
+      }
+      return { ok: true, value: this.sessions.listSideChatsPage(input) }
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    }
+  }
+
+  async discardEmptySideChat(
+    input: DiscardEmptySideChatInput,
+  ): Promise<RpcResult<DiscardEmptySideChatResult>> {
+    if (this.disposed || this.nativeQuitSealed()) return { ok: true, value: { discarded: false } }
+    if (
+      this.conversations.archives.blocksSession(input.sideChatId) ||
+      this.hasSessionOperation(input.sideChatId, true) ||
+      [...this.adapters.values()].some((entry) => entry.sessionId === input.sideChatId)
+    ) {
+      return { ok: true, value: { discarded: false } }
+    }
+    try {
+      const discarded = this.conversations.discardEmptySideChat(input.sideChatId)
+      if (discarded) this.nativeMetadataChanged()
+      return { ok: true, value: { discarded } }
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    }
+  }
+
+  async readSyncSideChatReceipt(
+    input: ReadSideChatReceiptInput,
+  ): Promise<RpcResult<SideChatSyncMainReceipt | null>> {
+    if (this.disposed) return Conversation.shuttingDown()
+    try {
+      return {
+        ok: true,
+        value: this.conversations.readSyncSideChatReceipt(input.operationId) ?? null,
+      }
+    } catch (error) {
+      return Conversation.sendFailure(error)
+    }
+  }
+
+  async syncSideChatToMain(
+    input: SideChatSyncMainInput,
+    ownerKey?: string,
+  ): Promise<RpcResult<SideChatSyncMainReceipt>> {
+    let releaseSourceImages: (() => void) | undefined
+    let releaseClonedImages: (() => void) | undefined
+    let preparedNeedsRollback = false
+    let preparedCommentCount = 0
+    let sealedInputId: string | undefined
+    const releaseSealedInput = (): void => {
+      if (!sealedInputId || !ownerKey) return
+      const id = sealedInputId
+      sealedInputId = undefined
+      try {
+        this.conversations.writeConversationInput(
+          { type: 'release', sessionId: input.sideChatId, inputId: id },
+          ownerKey,
+        )
+      } catch {
+        // Best-effort cleanup of temporary side-chat @Main input segments.
+      }
+    }
+    const skillController = new AbortController()
+    const skillTimeout = setTimeout(() => skillController.abort(), PREPARATION_TIMEOUT_MS)
+    try {
+      if (this.disposed) return Conversation.shuttingDown()
+      if (input.inputId) {
+        if (!ownerKey) {
+          throw new RunOperationConflictError('Prepared input owner is unavailable.')
+        }
+        if (
+          this.conversations.ownsTemporaryConversationInput(
+            input.sideChatId,
+            input.inputId,
+            ownerKey,
+          )
+        ) {
+          sealedInputId = input.inputId
+        }
+      }
+      if (this.nativeQuitSealed()) return Conversation.quitPrepared()
+      if (this.conversations.archives.blocksSession(input.sideChatId))
+        return Conversation.archiveBusy()
+
+      const sideChat = this.sessions.find(input.sideChatId)
+      if (!sideChat || !sideChat.parentSessionId || sideChat.status === 'archived') {
+        throw new RunOperationConflictError('The side chat is unavailable.')
+      }
+      const parentSessionId = sideChat.parentSessionId
+      if (this.conversations.archives.blocksSession(parentSessionId))
+        return Conversation.archiveBusy()
+      const parent = this.sessions.find(parentSessionId)
+      if (!parent || parent.status === 'archived' || parent.parentSessionId) {
+        throw new RunOperationConflictError('The parent Session is unavailable.')
+      }
+
+      let rawContent = input.content
+      let hasResolvedInput = false
+      if (input.inputId) {
+        if (sealedInputId || !this.conversations.readSyncSideChatReceipt(input.operationId)) {
+          sealedInputId = input.inputId
+          rawContent = this.conversations.resolveConversationInput(
+            input.sideChatId,
+            input.operationId,
+            input.inputId,
+            ownerKey!,
+          )
+          hasResolvedInput = true
+        }
+      }
+      if (input.contentSha256 && (hasResolvedInput || !input.inputId)) {
+        const expectedDigest = input.contentSha256.toLowerCase()
+        const actualDigest = createHash('sha256').update(rawContent, 'utf8').digest('hex')
+        if (actualDigest !== expectedDigest) {
+          throw new RunOperationConflictError('The prepared message changed before sending.')
+        }
+      }
+
+      if (this.conversations.readSyncSideChatReceipt(input.operationId)) {
+        const verified = this.conversations.prepareMainSyncBack(input, ownerKey)
+        if (verified.existingReceipt) return { ok: true, value: verified.existingReceipt }
+      }
+
+      const prePrepGateFailure = this.checkSideChatSyncGateFailure(
+        input.sideChatId,
+        parentSessionId,
+      )
+      if (prePrepGateFailure) return prePrepGateFailure
+
+      const stripped = Conversation.stripLeadingMainToken(rawContent, input.skills)
+      if (
+        !stripped.content.trim() &&
+        !input.imageIds.length &&
+        input.commentIds.length === 0 &&
+        !this.conversations.hasSideChatDrafts(input.sideChatId)
+      ) {
+        throw new RunOperationConflictError(
+          'Write a message, add a Comment, or attach an image before sending to main.',
+        )
+      }
+      const syncValidation = validateSideChatMainSyncContent(stripped.content, stripped.skills)
+      if (!syncValidation.ok) {
+        throw new RunOperationConflictError(syncValidation.message)
+      }
+      const prefix = parseComposerCommandPrefix(stripped.content, stripped.skills)
+
+      const parentSavedTask = this.conversations.collaboration(parentSessionId)
+      const parentTask = parentSavedTask?.status === 'complete' ? undefined : parentSavedTask
+      const parentWaitingForWork =
+        parentTask?.status === 'running' || this.hasSessionOperation(parentSessionId)
+      if (
+        input.userInformation &&
+        (parentTask ||
+          parentWaitingForWork ||
+          stripped.skills.length ||
+          input.imageIds.length ||
+          prefix.skills.length)
+      ) {
+        throw new RunOperationConflictError(
+          'Reserved information supports a new ordinary message only. Remove it before queueing, replying to a workflow, using Skills, images, or @all. Your draft was kept.',
+        )
+      }
+
+      this.conversations.assertRelayDecisionResolved(parentSessionId, undefined, true)
+      this.conversations.assertDecisionInput({
+        sessionId: parentSessionId,
+        content: stripped.content,
+        imageIds: input.imageIds,
+        commentIds: [],
+        skills: stripped.skills,
+        route: { type: 'primary' },
+      })
+      if (this.conversations.receivedCollaborationInput(parentSessionId)) {
+        throw new RunOperationConflictError(
+          'One message is already queued on the parent Session. Your draft was preserved.',
+        )
+      }
+      if (this.conversations.nativeRecoveryBlocksInput(parentSessionId))
+        return Conversation.nativeRecoveryRequired()
+      if (this.hasBlockingBackgroundWork(parentSessionId))
+        throw new RunOperationConflictError(BACKGROUND_INPUT_REASON)
+
+      if (parentTask || parentWaitingForWork) {
+        const parentPatch = this.conversations.metadataPatch(parentSessionId)
+        if (!parentTask && !parentPatch.queue?.enabled) {
+          throw new RunOperationConflictError('The queue is disabled. Your draft was preserved.')
+        }
+        const anchor =
+          this.activeExecutions.get(parentSessionId)?.run ??
+          (parentTask ? this.conversations.findRun(parentTask.runId) : undefined) ??
+          [
+            this.conversations.latestAgentRun(parentSessionId, 'claude'),
+            this.conversations.latestAgentRun(parentSessionId, 'codex'),
+          ]
+            .filter((run): run is AgentRun => Boolean(run))
+            .toSorted((left, right) => right.createdAt.localeCompare(left.createdAt))[0]
+        if (!anchor) {
+          throw new RunOperationConflictError(
+            'Wait for the current execution to start before queuing a message.',
+          )
+        }
+      } else {
+        if (this.conversations.hasPendingRoutedContinuation(parentSessionId)) {
+          throw new RunOperationConflictError(
+            'Wait for or stop the remaining @all response before sending another message.',
+          )
+        }
+        if (
+          this.conversations
+            .nativeContexts(parentSessionId)
+            .some(
+              (context) =>
+                context.continuationState === 'responding' ||
+                context.continuationState === 'waiting_user',
+            )
+        )
+          return Conversation.capacityFailure()
+        if (this.operationCount() >= MAX_AGENT_OPERATIONS) return Conversation.capacityFailure()
+      }
+
+      this.conversations.assertTaskReplacement({ sessionId: parentSessionId }, false)
+      const defaultParentActor = resolveMainChatSyncTarget(
+        parent.settings.primaryAgentId,
+        parentTask,
+      )
+      const parentTargets: RuntimeAgentId[] = [defaultParentActor]
+      await this.prepareSkillInvocation(
+        { sessionId: parentSessionId, content: stripped.content, skills: stripped.skills },
+        parentTargets,
+        skillController.signal,
+      )
+
+      const postPrepGateFailure = this.checkSideChatSyncGateFailure(
+        input.sideChatId,
+        parentSessionId,
+      )
+      if (postPrepGateFailure) return postPrepGateFailure
+
+      if (input.imageIds.length) {
+        if (!this.images) throw new Error('Image input is unavailable.')
+        this.conversations.resolveMessageImages(input.sideChatId, input.imageIds, ownerKey)
+        releaseSourceImages = this.images.hold(input.imageIds)
+      }
+
+      const { markdownVisibleProjection } = await import('../../shared/message-anchor-text.js')
+      const prepared = this.conversations.prepareMainSyncBack(input, ownerKey, rawContent, {
+        resolveVisibleText: markdownVisibleProjection,
+      })
+      if (prepared.existingReceipt) {
+        return { ok: true, value: prepared.existingReceipt }
+      }
+      preparedNeedsRollback = true
+      preparedCommentCount = prepared.mainCommentIds.length
+
+      if (prepared.mainImageIds.length && this.images) {
+        releaseClonedImages = this.images.hold(prepared.mainImageIds)
+      }
+
+      const parentDrafts = this.conversations.readPage({
+        scope: 'drafts',
+        sessionId: parentSessionId,
+      })
+      const expectedParentCommentsRevision =
+        parentDrafts.scope === 'drafts' ? parentDrafts.commentsRevision : 0
+      const sendInput: ConversationSendInput = {
+        sessionId: prepared.parentSessionId,
+        clientMessageId: prepared.mainMessageId,
+        content: stripped.content,
+        route: { type: 'primary' },
+        ...(stripped.skills.length ? { skills: stripped.skills } : {}),
+        ...(prepared.mainImageIds.length ? { imageIds: prepared.mainImageIds } : {}),
+        commentIds: prepared.mainCommentIds,
+        expectedCommentsRevision: expectedParentCommentsRevision,
+        ...(input.userInformation ? { userInformation: input.userInformation } : {}),
+      }
+      const sent = await this.sendWithOptions(sendInput, ownerKey, {
+        originSideChat: prepared.originSideChat,
+        syncMainOperationId: input.operationId,
+      })
+      if (!sent.ok) {
+        const finalized = this.conversations.readSyncSideChatReceipt(input.operationId)
+        if (finalized) {
+          preparedNeedsRollback = false
+          if (prepared.mainCommentIds.length > 0) {
+            this.publish(
+              this.conversations.metadataPatch(input.sideChatId, { draftsChanged: true }),
+            )
+          }
+          return { ok: true, value: finalized }
+        }
+        this.conversations.rollbackMainSyncBack(input.operationId)
+        preparedNeedsRollback = false
+        return sent
+      }
+      const receipt = this.conversations.readSyncSideChatReceipt(input.operationId)
+      if (!receipt) {
+        this.conversations.rollbackMainSyncBack(input.operationId)
+        preparedNeedsRollback = false
+        throw new RunOperationConflictError(
+          'The parent Session could not confirm syncing this message.',
+        )
+      }
+      preparedNeedsRollback = false
+      if (prepared.mainCommentIds.length > 0) {
+        this.publish(this.conversations.metadataPatch(input.sideChatId, { draftsChanged: true }))
+      }
+      return { ok: true, value: receipt }
+    } catch (error) {
+      if (preparedNeedsRollback) {
+        const finalized = this.conversations.readSyncSideChatReceipt(input.operationId)
+        if (finalized) {
+          if (preparedCommentCount > 0) {
+            this.publish(
+              this.conversations.metadataPatch(input.sideChatId, { draftsChanged: true }),
+            )
+          }
+          return { ok: true, value: finalized }
+        }
+        try {
+          this.conversations.rollbackMainSyncBack(input.operationId)
+        } catch {
+          // Best-effort cleanup so rejected sends never leave orphaned sync rows.
+        }
+      }
+      return Conversation.sendFailure(error)
+    } finally {
+      clearTimeout(skillTimeout)
+      releaseSealedInput()
+      releaseClonedImages?.()
+      releaseSourceImages?.()
+    }
+  }
+
+  private authorizedCutoffsForEnvelope(
+    run: Pick<AgentRun, 'sessionId' | 'userMessageId'>,
+    envelope: AgentPromptEnvelope,
+    isSideChat: boolean,
+  ): string[] {
+    if (isSideChat) {
+      const anchor = this.conversations.sideChatAnchorCutoff(run.sessionId)
+      return anchor && anchor.maxMessageSequence >= 0 ? [anchor.cutoffId] : []
+    }
+    const candidateMessageIds = [
+      ...new Set(
+        [
+          run.userMessageId,
+          envelope.message.id,
+          ...(envelope.handoffContext ?? []).map((entry) => entry.messageId),
+          ...(envelope.rebuiltContext ?? []).map((entry) => entry.message.id),
+          envelope.collaborationBasis?.original?.id,
+          envelope.collaborationBasis?.latest?.id,
+        ].filter((id): id is string => Boolean(id)),
+      ),
+    ]
+    if (!candidateMessageIds.length) return []
+    const origins = this.conversations.messageOriginCutoffs(run.sessionId, candidateMessageIds)
+    const unique = new Set<string>()
+    for (const entry of origins) {
+      if (entry.maxMessageSequence >= 0) unique.add(entry.originSideChat.cutoffId)
+    }
+    return [...unique]
+  }
+
+  private attachCutoffSupplement(
+    sessionId: string,
+    agentId: RuntimeAgentId,
+    bindingGeneration: number,
+    envelope: AgentPromptEnvelope,
+    authorizedCutoffIds: readonly string[],
+  ): string[] {
+    if (!authorizedCutoffIds.length) {
+      setPromptCutoffSupplement(envelope, undefined)
+      return []
+    }
+    const delivered = new Set(
+      this.conversations.deliveredCutoffIds(sessionId, agentId, bindingGeneration),
+    )
+    let remainingBytes = CUTOFF_INLINE_TAIL_MAX_BYTES
+    const inlineTails: Array<{ cutoffId: string; text: string }> = []
+    const newlyInjected: string[] = []
+    for (const cutoffId of authorizedCutoffIds) {
+      if (delivered.has(cutoffId)) continue
+      if (remainingBytes < 256) break
+      const tail = this.conversations.buildCutoffInlineTail(cutoffId, remainingBytes)
+      const tailBytes = tail.text ? Buffer.byteLength(tail.text, 'utf8') : 0
+      if (tail.text && tailBytes <= remainingBytes) {
+        inlineTails.push({ cutoffId, text: tail.text })
+        remainingBytes -= tailBytes
+        newlyInjected.push(cutoffId)
+      }
+    }
+    setPromptCutoffSupplement(envelope, {
+      cutoffIds: [...authorizedCutoffIds],
+      inlineTails,
+    })
+    return newlyInjected
+  }
+
+  private static stripLeadingMainToken(
+    content: string,
+    skills: NonNullable<ConversationSendInput['skills']>,
+  ): { content: string; skills: NonNullable<ConversationSendInput['skills']> } {
+    const match = /^([ \t]*@Main)(?=[ \t\r\n]|$)([ \t]*)/iu.exec(content)
+    if (!match) {
+      return { content, skills: skills.map((entry) => ({ ...entry })) }
+    }
+    const removeEnd = match[0].length
+    const nextContent = content.slice(removeEnd)
+    const shiftedSkills = skills.flatMap((entry) => {
+      if (entry.end <= removeEnd) return []
+      if (entry.start < removeEnd) {
+        throw new RunOperationConflictError('Skill selection overlaps the leading @Main mention.')
+      }
+      return [
+        {
+          ...entry,
+          start: entry.start - removeEnd,
+          end: entry.end - removeEnd,
+        },
+      ]
+    })
+    return { content: nextContent, skills: shiftedSkills }
+  }
+
   private forkBlocked(sessionId: string): boolean {
     return (
       this.hasSessionOperation(sessionId, true) ||
@@ -11185,13 +12070,13 @@ export class Conversation {
     })
   }
 
-  private static localTitle(content: string): string {
+  private static localTitle(content: string, fallback = 'New session'): string {
     const plain = content
       .replace(/```[\s\S]*?```/gu, ' ')
       .replace(/[`*_>#()[\]]/gu, ' ')
       .replace(/\s+/gu, ' ')
       .trim()
-    if (!plain) return 'New session'
+    if (!plain) return fallback
     // Persist title text, not a display-width preview. Keep the existing rename
     // limit in UTF-16 units without splitting an emoji or combining sequence.
     let title = ''
@@ -11201,7 +12086,7 @@ export class Conversation {
       if (title.length + segment.length > 120) break
       title += segment
     }
-    return title.trimEnd() || 'New session'
+    return title.trimEnd() || fallback
   }
 
   private static peerActionCopy(kind: PeerRequestKind, source: string): string {

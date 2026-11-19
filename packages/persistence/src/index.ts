@@ -38,6 +38,16 @@ export {
 export { ProjectCatalogRepository } from './project-catalog-repository.js'
 export { projectSessionIssues } from './session-issues.js'
 export {
+  SideChatPersistenceError,
+  type CapturedCutoffRecord,
+  type CutoffCatalogItem,
+  type CutoffInlineTailResult,
+  type CutoffSourcePage,
+  type MessageOriginCutoffInfo,
+  type PrepareMainSyncBackResult,
+  type SideChatAnchorCutoffInfo,
+} from './side-chat-persistence.js'
+export {
   WorkspaceArchiveRepository,
   WorkspaceArchiveConflictError,
   workspaceArchiveBlocked,
@@ -85,6 +95,8 @@ export {
   conversationMessageImages,
   conversationBodyInputs,
   conversationBodyParts,
+  conversationCutoffs,
+  conversationCutoffRevisions,
   defaultSessionSettings,
   sessionCatalogRevisions,
   pactSchemaMeta,
@@ -92,6 +104,7 @@ export {
   nativeAgentContexts,
   runtimeCliPaths,
   sessions,
+  sideChatOperations,
   sessionSettingsRevisions,
   sessionGroups,
   sessionGroupMembers,

@@ -50,6 +50,10 @@ import type {
   DissolveSessionGroupInput,
   SetSessionGroupInput,
   SessionGroupMutation,
+  ListSideChatsInput,
+  ListSideChatsPage,
+  SideChatCursor,
+  SideChatSummary,
 } from '@pact/contracts'
 
 import {
@@ -57,6 +61,9 @@ import {
   SESSION_CATALOG_PAGE_ITEMS,
   SESSION_GROUP_PAGE_BYTES,
   SESSION_GROUP_PAGE_ITEMS,
+  SIDE_CHAT_LIST_PAGE_BYTES,
+  SIDE_CHAT_LIST_PAGE_ITEMS,
+  sideChatAnchorSchema,
 } from '@pact/contracts'
 
 import type { PactDrizzleDatabase } from './drizzle-database.js'
@@ -82,6 +89,7 @@ import {
   projectSessionTitle,
   type LatestRunActivity,
 } from './session-projection.js'
+import { trimToSurrogateSafePrefix } from './side-chat-persistence.js'
 import {
   assertArchiveCommit,
   assertProjectAvailable,
@@ -105,6 +113,7 @@ const sidebarVisible = and(
   isNull(sessions.archivedAt),
   sql`${sessions.status} <> 'archived'`,
   eq(sessions.sidebarHidden, false),
+  isNull(sessions.parentSessionId),
 )
 
 function navigationCursor(
@@ -240,15 +249,16 @@ export class SessionRepository {
   }
 
   nativeRecent(): NativeSessionRow[] {
-    const ids = this.database
-      .select({ id: sessions.id })
-      .from(sessions)
-      .where(
-        sql`${sessions.workspaceVisible} = 1 AND ${sessions.needsAttention} = 0 AND ${sessions.lastOpenedOrdinal} IS NOT NULL`,
-      )
-      .orderBy(desc(sessions.lastOpenedOrdinal), desc(sessions.id))
-      .limit(18)
-      .all()
+    const ids = this.database.all<{ id: string }>(sql`
+      SELECT ${sessions.id} AS id
+      FROM ${sessions} INDEXED BY sessions_native_recent_idx
+      WHERE ${sessions.workspaceVisible} = 1
+        AND ${sessions.needsAttention} = 0
+        AND ${sessions.lastOpenedOrdinal} IS NOT NULL
+        AND ${sessions.parentSessionId} IS NULL
+      ORDER BY ${sessions.lastOpenedOrdinal} DESC, ${sessions.id} DESC
+      LIMIT 18
+    `)
     return ids.flatMap((row) => {
       const item = this.findNativeRow(row.id)
       return item ? [item] : []
@@ -259,17 +269,28 @@ export class SessionRepository {
     // The two indexed partitions cover every visible opened Session. Their top
     // five can contribute at most ten candidates to the final five.
     const select = (attention: boolean) =>
-      this.database
-        .select({ id: sessions.id, ordinal: sessions.lastOpenedOrdinal })
-        .from(sessions)
-        .where(
-          attention
-            ? sql`${sessions.workspaceVisible} = 1 AND ${sessions.needsAttention} = 1 AND ${sessions.lastOpenedOrdinal} IS NOT NULL`
-            : sql`${sessions.workspaceVisible} = 1 AND ${sessions.needsAttention} = 0 AND ${sessions.lastOpenedOrdinal} IS NOT NULL`,
-        )
-        .orderBy(desc(sessions.lastOpenedOrdinal), desc(sessions.id))
-        .limit(5)
-        .all()
+      this.database.all<{ id: string; ordinal: number | null }>(
+        attention
+          ? sql`
+              SELECT ${sessions.id} AS id, ${sessions.lastOpenedOrdinal} AS ordinal
+              FROM ${sessions} INDEXED BY sessions_native_attention_idx
+              WHERE ${sessions.workspaceVisible} = 1
+                AND ${sessions.needsAttention} = 1
+                AND ${sessions.lastOpenedOrdinal} IS NOT NULL
+              ORDER BY ${sessions.lastOpenedOrdinal} DESC, ${sessions.id} DESC
+              LIMIT 5
+            `
+          : sql`
+              SELECT ${sessions.id} AS id, ${sessions.lastOpenedOrdinal} AS ordinal
+              FROM ${sessions} INDEXED BY sessions_native_recent_idx
+              WHERE ${sessions.workspaceVisible} = 1
+                AND ${sessions.needsAttention} = 0
+                AND ${sessions.lastOpenedOrdinal} IS NOT NULL
+                AND ${sessions.parentSessionId} IS NULL
+              ORDER BY ${sessions.lastOpenedOrdinal} DESC, ${sessions.id} DESC
+              LIMIT 5
+            `,
+      )
     return [...select(false), ...select(true)]
       .toSorted(
         (a, b) => (b.ordinal ?? 0) - (a.ordinal ?? 0) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
@@ -325,6 +346,7 @@ export class SessionRepository {
         session: {
           id: sessions.id,
           projectId: sessions.projectId,
+          parentSessionId: sessions.parentSessionId,
           title: sessions.title,
           titleSource: sessions.titleSource,
           lastSeen: sessions.lastSeenMessageSequence,
@@ -349,7 +371,11 @@ export class SessionRepository {
       )
       .get()
     if (!row) return undefined
-    const title = projectSessionTitle(row.session.title, row.session.titleSource).title
+    const title = projectSessionTitle(
+      row.session.title,
+      row.session.titleSource,
+      row.session.parentSessionId ? 'New side chat' : 'New session',
+    ).title
     return {
       sessionId: row.session.id,
       projectId: row.session.projectId,
@@ -366,6 +392,25 @@ export class SessionRepository {
     return this.database.transaction((transaction) => {
       const row = this.findNativeRow(sessionId)
       if (!row) throw new Error('This Session or its Project is archived or no longer available.')
+      const meta = transaction
+        .select({ parentSessionId: sessions.parentSessionId })
+        .from(sessions)
+        .where(eq(sessions.id, sessionId))
+        .get()
+      if (meta?.parentSessionId) {
+        if (!this.findNativeRow(meta.parentSessionId))
+          throw new Error('This Session or its Project is archived or no longer available.')
+        const resolvedSideChat = this.find(sessionId)
+        const result: SessionCatalogChange = {
+          ...this.change(meta.parentSessionId),
+          groupRevision: SessionRepository.readGroupRevision(transaction, row.projectId).revision,
+          ...(resolvedSideChat ? { resolvedSideChat } : {}),
+        }
+        if (SessionRepository.responseBytes(result) > SESSION_CATALOG_PAGE_BYTES) {
+          throw new OversizedCatalogSessionError(result.session)
+        }
+        return result
+      }
       return {
         ...this.change(sessionId),
         groupRevision: SessionRepository.readGroupRevision(transaction, row.projectId).revision,
@@ -376,6 +421,12 @@ export class SessionRepository {
   recordNativeOpened(input: NativeSessionOpenInput): boolean {
     return this.database.transaction((transaction) => {
       if (!this.findNativeRow(input.sessionId)) throw new Error('This Session is unavailable.')
+      const target = transaction
+        .select({ parentSessionId: sessions.parentSessionId })
+        .from(sessions)
+        .where(eq(sessions.id, input.sessionId))
+        .get()
+      if (target?.parentSessionId) return false
       const prior = transaction
         .select()
         .from(sessionOpenOperations)
@@ -496,6 +547,7 @@ export class SessionRepository {
             eq(sessions.projectId, projectId),
             isNull(sessions.archivedAt),
             sql`${sessions.status} <> 'archived'`,
+            isNull(sessions.parentSessionId),
             after,
           ),
         )
@@ -537,6 +589,200 @@ export class SessionRepository {
       }
       if (SessionRepository.responseBytes(page) > SESSION_CATALOG_PAGE_BYTES) {
         throw new Error('Session Catalog page exceeded its byte budget.')
+      }
+      return page
+    })
+  }
+
+  /** Keyset-paginated list of non-archived side chats under a parent Session (<=5 items / <=64 KiB). */
+  listSideChatsPage(input: ListSideChatsInput): ListSideChatsPage {
+    const limit = Math.min(
+      Math.max(1, input.limit ?? SIDE_CHAT_LIST_PAGE_ITEMS),
+      SIDE_CHAT_LIST_PAGE_ITEMS,
+    )
+    const direction = input.direction ?? 'older'
+    return this.database.transaction((transaction) => {
+      const parent = transaction
+        .select({ id: sessions.id, parentSessionId: sessions.parentSessionId })
+        .from(sessions)
+        .where(eq(sessions.id, input.parentSessionId))
+        .get()
+      if (!parent) throw new Error('Session does not exist.')
+      if (parent.parentSessionId) throw new Error('Side chats cannot contain nested side chats.')
+
+      const scopeFilter = and(
+        eq(sessions.parentSessionId, input.parentSessionId),
+        isNull(sessions.archivedAt),
+        sql`${sessions.status} <> 'archived'`,
+      )
+      const counts = transaction
+        .select({
+          activeCount: sql<number>`coalesce(sum(CASE WHEN (${sessions.needsAttention} = 1 OR EXISTS (SELECT 1 FROM agent_runs r WHERE r.session_id = "sessions"."id" AND r.fork_source_run_id IS NULL AND r.control_disposition <> 'abandoned' AND r.status IN ('starting', 'running', 'recovering') LIMIT 1)) THEN 1 ELSE 0 END), 0)`,
+          attentionCount: sql<number>`coalesce(sum(CASE WHEN ${sessions.needsAttention} = 1 THEN 1 ELSE 0 END), 0)`,
+          unreadCount: sql<number>`coalesce(sum(CASE WHEN (${sessions.lastSeenMessageSequence} IS NOT NULL AND (SELECT max(m.sequence) FROM conversation_messages m WHERE m.session_id = "sessions"."id" AND m.role = 'assistant' AND m.state = 'complete' AND m.is_visible = 1) > ${sessions.lastSeenMessageSequence}) THEN 1 ELSE 0 END), 0)`,
+        })
+        .from(sessions)
+        .where(scopeFilter)
+        .get()!
+
+      const cursorBoundary = input.cursor
+        ? direction === 'older'
+          ? or(
+              lt(sessions.createdAt, input.cursor.createdAt),
+              and(eq(sessions.createdAt, input.cursor.createdAt), lt(sessions.id, input.cursor.id)),
+            )
+          : or(
+              gt(sessions.createdAt, input.cursor.createdAt),
+              and(eq(sessions.createdAt, input.cursor.createdAt), gt(sessions.id, input.cursor.id)),
+            )
+        : undefined
+
+      const rows = transaction
+        .select({
+          id: sessions.id,
+          parentSessionId: sessions.parentSessionId,
+          projectId: sessions.projectId,
+          title: sessions.title,
+          titleSource: sessions.titleSource,
+          sideChatOrigin: sessions.sideChatOrigin,
+          anchorQuotePreview: sessions.anchorQuotePreview,
+          status: sessions.status,
+          needsAttention: sessions.needsAttention,
+          lastSeenMessageSequence: sessions.lastSeenMessageSequence,
+          latestCompleteAssistantSequence: sql<number | null>`(
+            SELECT max(m.sequence)
+            FROM conversation_messages m
+            WHERE m.session_id = "sessions"."id"
+              AND m.role = 'assistant'
+              AND m.state = 'complete'
+              AND m.is_visible = 1
+          )`,
+          createdAt: sessions.createdAt,
+          updatedAt: sessions.updatedAt,
+          isRunning: sql<number>`EXISTS (
+            SELECT 1 FROM agent_runs r
+            WHERE r.session_id = "sessions"."id"
+              AND r.fork_source_run_id IS NULL
+              AND r.control_disposition <> 'abandoned'
+              AND r.status IN ('starting', 'running', 'recovering')
+            LIMIT 1
+          )`,
+          previewRaw: sql<string | null>`(
+            SELECT substr(m.content, 1, 512)
+            FROM conversation_messages m
+            WHERE m.session_id = "sessions"."id"
+              AND m.is_visible = 1
+              AND length(trim(m.content)) > 0
+            ORDER BY m.sequence DESC
+            LIMIT 1
+          )`,
+        })
+        .from(sessions)
+        .where(and(scopeFilter, cursorBoundary))
+        .orderBy(
+          direction === 'older' ? desc(sessions.createdAt) : asc(sessions.createdAt),
+          direction === 'older' ? desc(sessions.id) : asc(sessions.id),
+        )
+        .limit(limit + 1)
+        .all()
+
+      const sliced = rows.slice(0, limit)
+      const ordered = direction === 'newer' ? sliced.toReversed() : sliced
+      const items: SideChatSummary[] = ordered.map((row) => {
+        const title = projectSessionTitle(row.title, row.titleSource, 'New side chat')
+        const normalizedPreview = row.previewRaw
+          ? trimToSurrogateSafePrefix(row.previewRaw.replace(/\s+/gu, ' ').trim(), 240)
+          : ''
+        return {
+          id: row.id,
+          parentSessionId: row.parentSessionId ?? input.parentSessionId,
+          projectId: row.projectId,
+          title: title.title,
+          origin: row.sideChatOrigin ?? 'btw',
+          anchorQuotePreview: row.anchorQuotePreview ?? null,
+          previewText: normalizedPreview || null,
+          status: row.status,
+          isRunning: Boolean(row.isRunning),
+          needsAttention: row.needsAttention,
+          hasUnread: hasUnreadSessionMessage(
+            row.lastSeenMessageSequence,
+            row.latestCompleteAssistantSequence ?? undefined,
+          ),
+          createdAt: row.createdAt,
+          updatedAt: row.updatedAt,
+        }
+      })
+
+      const pagePayload = (
+        entries: SideChatSummary[],
+        older: boolean,
+        newer: boolean,
+      ): ListSideChatsPage => ({
+        parentSessionId: input.parentSessionId,
+        items: entries,
+        nextCursor:
+          older && entries.length
+            ? { createdAt: entries.at(-1)!.createdAt, id: entries.at(-1)!.id }
+            : null,
+        prevCursor:
+          newer && entries.length ? { createdAt: entries[0]!.createdAt, id: entries[0]!.id } : null,
+        hasMoreOlder: older,
+        hasMoreNewer: newer,
+        activeCount: counts.activeCount,
+        attentionCount: counts.attentionCount,
+        unreadCount: counts.unreadCount,
+      })
+
+      const existsEdge = (dir: 'older' | 'newer', edge: SideChatCursor): boolean =>
+        Boolean(
+          transaction
+            .select({ id: sessions.id })
+            .from(sessions)
+            .where(
+              and(
+                scopeFilter,
+                dir === 'older'
+                  ? or(
+                      lt(sessions.createdAt, edge.createdAt),
+                      and(eq(sessions.createdAt, edge.createdAt), lt(sessions.id, edge.id)),
+                    )
+                  : or(
+                      gt(sessions.createdAt, edge.createdAt),
+                      and(eq(sessions.createdAt, edge.createdAt), gt(sessions.id, edge.id)),
+                    ),
+              ),
+            )
+            .limit(1)
+            .get(),
+        )
+
+      let hasMoreOlder = items.length
+        ? direction === 'older' && rows.length > items.length
+          ? true
+          : existsEdge('older', items.at(-1)!)
+        : input.cursor
+          ? existsEdge('older', input.cursor)
+          : false
+      let hasMoreNewer = items.length
+        ? direction === 'newer' && rows.length > items.length
+          ? true
+          : input.cursor
+            ? existsEdge('newer', items[0]!)
+            : false
+        : input.cursor
+          ? existsEdge('newer', input.cursor)
+          : false
+
+      let page = pagePayload(items, hasMoreOlder, hasMoreNewer)
+      while (Buffer.byteLength(JSON.stringify(page), 'utf8') > SIDE_CHAT_LIST_PAGE_BYTES) {
+        if (items.length <= 1) {
+          throw new Error('Side chat summary exceeded the 64 KiB page budget.')
+        }
+        if (direction === 'newer') items.shift()
+        else items.pop()
+        hasMoreOlder = existsEdge('older', items.at(-1)!)
+        hasMoreNewer = existsEdge('newer', items[0]!)
+        page = pagePayload(items, hasMoreOlder, hasMoreNewer)
       }
       return page
     })
@@ -1081,6 +1327,7 @@ export class SessionRepository {
         const session = transaction
           .select({
             projectId: sessions.projectId,
+            parentSessionId: sessions.parentSessionId,
             archivedAt: sessions.archivedAt,
             status: sessions.status,
           })
@@ -1089,6 +1336,7 @@ export class SessionRepository {
           .get()
         if (
           !session ||
+          session.parentSessionId !== null ||
           session.projectId !== input.projectId ||
           session.archivedAt ||
           session.status === 'archived'
@@ -1316,6 +1564,7 @@ export class SessionRepository {
       const session = transaction
         .select({
           projectId: sessions.projectId,
+          parentSessionId: sessions.parentSessionId,
           archivedAt: sessions.archivedAt,
           status: sessions.status,
           sidebarHidden: sessions.sidebarHidden,
@@ -1325,6 +1574,7 @@ export class SessionRepository {
         .get()
       if (
         !session ||
+        session.parentSessionId !== null ||
         session.projectId !== input.projectId ||
         session.archivedAt ||
         session.status === 'archived'
@@ -1639,6 +1889,9 @@ export class SessionRepository {
         session: sessions,
         settings: sessionSettingsRevisions,
         forkError: sql<number>`EXISTS (SELECT 1 FROM ${sessionForkOperations} f WHERE f.session_id=${sessions.id} AND (f.ready=0 OR (SELECT count(*) FROM ${nativeAgentContexts} c WHERE c.session_id=f.session_id)<>2))`,
+        sideChatHasContext: sql<
+          number | null
+        >`CASE WHEN ${sessions.parentSessionId} IS NOT NULL THEN EXISTS (SELECT 1 FROM conversation_cutoffs c WHERE c.id = ${sessions.anchorCutoffId} AND c.max_message_sequence >= 0) ELSE NULL END`,
       })
       .from(sessions)
       .innerJoin(
@@ -1694,6 +1947,7 @@ export class SessionRepository {
           latestRun,
           latestCompletedMessage?.sequence,
           membership?.groupId ?? null,
+          row.session.parentSessionId ? Boolean(row.sideChatHasContext) : undefined,
         )
       : undefined
     if (projected && row?.forkError) projected.activity = { state: 'error' }
@@ -1788,6 +2042,8 @@ export class SessionRepository {
     this.database.transaction((transaction) => {
       const current = transaction.select().from(sessions).where(eq(sessions.id, sessionId)).get()
       if (!current) throw new Error('Session does not exist.')
+      if (current.parentSessionId)
+        throw new Error('Side chat settings are inherited from the parent Session.')
 
       const revision = current.settingsRevision + 1
       const updatedAt = new Date().toISOString()
@@ -1813,6 +2069,8 @@ export class SessionRepository {
   savePermission(input: SessionPermissionSaveInput): SessionCatalogChange {
     return this.database.transaction(() => {
       const current = this.find(input.sessionId)
+      if (current?.parentSessionId)
+        throw new Error('Side chat settings are inherited from the parent Session.')
       if (
         !current ||
         current.status === 'archived' ||
@@ -1836,6 +2094,8 @@ export class SessionRepository {
   saveSpeed(input: SessionSpeedSaveInput): SessionCatalogChange {
     return this.database.transaction(() => {
       const current = this.find(input.sessionId)
+      if (current?.parentSessionId)
+        throw new Error('Side chat settings are inherited from the parent Session.')
       if (
         !current ||
         current.status === 'archived' ||
@@ -1914,18 +2174,29 @@ export class SessionRepository {
   archive(sessionId: string, operationId?: string): SessionCatalogChange {
     const archivedAt = new Date().toISOString()
     this.database.transaction((transaction) => {
-      if (!this.find(sessionId)?.archivedAt)
+      const target = transaction
+        .select({
+          id: sessions.id,
+          parentSessionId: sessions.parentSessionId,
+          archivedAt: sessions.archivedAt,
+        })
+        .from(sessions)
+        .where(eq(sessions.id, sessionId))
+        .get()
+      if (!target) throw new Error('Session does not exist.')
+      if (!target.archivedAt)
         assertArchiveCommit(transaction, { kind: 'session', sessionId }, operationId)
-      const result = transaction
+      const cascadeScope = target.parentSessionId
+        ? eq(sessions.id, sessionId)
+        : or(eq(sessions.id, sessionId), eq(sessions.parentSessionId, sessionId))
+      const updated = transaction
         .update(sessions)
         .set({ status: 'archived', archivedAt, updatedAt: archivedAt })
-        .where(and(eq(sessions.id, sessionId), ne(sessions.status, 'archived')))
-        .run()
-      if (result.changes === 0) {
-        if (this.find(sessionId)?.status !== 'archived') throw new Error('Session does not exist.')
-        return
-      }
-      updateSessionNativeMetadata(transaction, sessionId)
+        .where(and(cascadeScope, ne(sessions.status, 'archived')))
+        .returning({ id: sessions.id })
+        .all()
+      if (updated.length === 0) return
+      for (const row of updated) updateSessionNativeMetadata(transaction, row.id)
       transaction
         .update(sessionCatalogRevisions)
         .set({ revision: sql`${sessionCatalogRevisions.revision} + 1` })
@@ -1938,24 +2209,53 @@ export class SessionRepository {
   restore(sessionId: string): SessionCatalogChange {
     const restoredAt = new Date().toISOString()
     this.database.transaction((transaction) => {
-      const session = this.find(sessionId)
-      if (session && workspaceArchiveBlocked(transaction, session.projectId, sessionId))
+      const target = transaction
+        .select({
+          id: sessions.id,
+          projectId: sessions.projectId,
+          parentSessionId: sessions.parentSessionId,
+          status: sessions.status,
+          archivedAt: sessions.archivedAt,
+        })
+        .from(sessions)
+        .where(eq(sessions.id, sessionId))
+        .get()
+      if (!target) throw new Error('Session does not exist.')
+      if (workspaceArchiveBlocked(transaction, target.projectId, sessionId))
         throw new Error('This archive is still settling. Check its result before restoring.')
-      const result = transaction
-        .update(sessions)
-        .set({ status: 'draft', archivedAt: null, sidebarHidden: false, updatedAt: restoredAt })
-        .where(
-          and(
-            eq(sessions.id, sessionId),
-            sql`(${sessions.archivedAt} IS NOT NULL OR ${sessions.status} = 'archived')`,
-          ),
-        )
-        .run()
-      if (result.changes === 0) {
-        if (!this.find(sessionId)) throw new Error('Session does not exist.')
-        return
+      if (target.parentSessionId) {
+        const parent = transaction
+          .select({ archivedAt: sessions.archivedAt, status: sessions.status })
+          .from(sessions)
+          .where(eq(sessions.id, target.parentSessionId))
+          .get()
+        if (!parent || parent.archivedAt || parent.status === 'archived')
+          throw new Error('Restore the parent Session before restoring a side chat.')
       }
-      updateSessionNativeMetadata(transaction, sessionId)
+      const archivedFilter = sql`(${sessions.archivedAt} IS NOT NULL OR ${sessions.status} = 'archived')`
+      if (!target.archivedAt && target.status !== 'archived') return
+      const cascadeScope = target.parentSessionId
+        ? and(eq(sessions.id, sessionId), archivedFilter)
+        : or(
+            and(eq(sessions.id, sessionId), archivedFilter),
+            and(
+              eq(sessions.parentSessionId, sessionId),
+              target.archivedAt ? eq(sessions.archivedAt, target.archivedAt) : sql`0`,
+            ),
+          )
+      const restored = transaction
+        .update(sessions)
+        .set({
+          status: 'draft',
+          archivedAt: null,
+          sidebarHidden: sql<boolean>`CASE WHEN ${sessions.parentSessionId} IS NOT NULL THEN 1 ELSE 0 END`,
+          updatedAt: restoredAt,
+        })
+        .where(cascadeScope)
+        .returning({ id: sessions.id })
+        .all()
+      if (restored.length === 0) return
+      for (const row of restored) updateSessionNativeMetadata(transaction, row.id)
       transaction
         .update(sessionCatalogRevisions)
         .set({ revision: sql`${sessionCatalogRevisions.revision} + 1` })
@@ -1968,7 +2268,11 @@ export class SessionRepository {
   setSidebarHidden(input: SessionSidebarHiddenInput): SessionCatalogChange {
     return this.database.transaction((transaction) => {
       const row = transaction
-        .select({ projectId: sessions.projectId, groupId: sessionGroupMembers.groupId })
+        .select({
+          projectId: sessions.projectId,
+          parentSessionId: sessions.parentSessionId,
+          groupId: sessionGroupMembers.groupId,
+        })
         .from(sessions)
         .leftJoin(sessionGroupMembers, eq(sessionGroupMembers.sessionId, sessions.id))
         .where(
@@ -1980,6 +2284,8 @@ export class SessionRepository {
         )
         .get()
       if (!row) throw new Error('This Session is no longer available.')
+      if (row.parentSessionId)
+        throw new Error('Side chats do not appear in the main Session sidebar.')
       assertProjectAvailable(transaction, row.projectId)
       let { revision } = SessionRepository.readGroupRevision(transaction, row.projectId)
       const updated = transaction
@@ -2067,8 +2373,13 @@ export class SessionRepository {
     latestRun?: LatestRunActivity,
     latestCompletedMessageSequence?: number,
     groupId: string | null = null,
+    sideChatHasContext?: boolean,
   ): CollaborationSession {
-    const title = projectSessionTitle(session.title, session.titleSource)
+    const title = projectSessionTitle(
+      session.title,
+      session.titleSource,
+      session.parentSessionId ? 'New side chat' : 'New session',
+    )
     const result: CollaborationSession = {
       id: session.id,
       projectId: session.projectId,
@@ -2088,6 +2399,27 @@ export class SessionRepository {
     if (groupId) result.groupId = groupId
     if (session.archivedAt) result.archivedAt = session.archivedAt
     if (session.sidebarHidden) result.sidebarHidden = true
+    if (session.parentSessionId) {
+      result.parentSessionId = session.parentSessionId
+      if (sideChatHasContext !== undefined) result.sideChatHasContext = sideChatHasContext
+    }
+    if (session.sideChatOrigin) result.sideChatOrigin = session.sideChatOrigin
+    if (
+      session.sideChatOrigin === 'selection' &&
+      session.anchorMessageId &&
+      session.anchorQuote !== null &&
+      session.anchorQuotePreview !== null &&
+      session.anchorStartOffset !== null &&
+      session.anchorEndOffset !== null
+    ) {
+      result.sideChatAnchor = sideChatAnchorSchema.parse({
+        messageId: session.anchorMessageId,
+        quote: session.anchorQuote,
+        quotePreview: session.anchorQuotePreview,
+        startOffset: session.anchorStartOffset,
+        endOffset: session.anchorEndOffset,
+      })
+    }
     return result
   }
 

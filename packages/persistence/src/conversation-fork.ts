@@ -6,6 +6,7 @@ import {
   desc,
   eq,
   getTableColumns,
+  gte,
   inArray,
   isNull,
   or,
@@ -29,6 +30,7 @@ import {
   nativeForkBoundarySchema,
   nativeForkWitnessSchema,
   commentAnchorSchema,
+  cutoffMessageCommentAnchorSchema,
   storedCommentAnchor,
   sessionForkOperationSchema,
   type AgentNativeForkBoundary,
@@ -55,6 +57,8 @@ import {
   agentRunActivities,
   agentRuns,
   anchoredComments,
+  conversationCutoffRevisions,
+  conversationCutoffs,
   conversationMessages,
   conversationMessageImages,
   conversationOutputSnapshots,
@@ -102,6 +106,7 @@ export function selectForkSource(
       .get()
     if (!session || session.status === 'archived')
       throw new Error('The source session is unavailable.')
+    if (session.parentSessionId) throw new Error('Side chats cannot be forked.')
     if (session.settingsRevision !== expectedSettingsRevision)
       throw new Error(
         'Source settings changed while checking readiness. Review the current settings again.',
@@ -279,6 +284,7 @@ export function commitFork(
       .from(sessions)
       .where(eq(sessions.id, prepared.sourceSessionId))
       .get()
+    if (source?.parentSessionId) throw new Error('Side chats cannot be forked.')
     if (
       database
         .select({ id: sessionForkOperations.id })
@@ -712,10 +718,83 @@ export function commitFork(
       pendingDocuments.delete(ref.id)
       return next
     }
+    const validateForkCutoffMessageAnchor = (value: unknown) => {
+      const parsed = cutoffMessageCommentAnchorSchema.safeParse(value)
+      if (!parsed.success) {
+        throw new Error('A required Fork cutoff Comment anchor is invalid.')
+      }
+      const anchor = parsed.data
+      const cutoff = database
+        .select({
+          id: conversationCutoffs.id,
+          maxMessageSequence: conversationCutoffs.maxMessageSequence,
+          sessionMutationSeq: conversationCutoffs.sessionMutationSeq,
+        })
+        .from(conversationCutoffs)
+        .where(
+          and(
+            eq(conversationCutoffs.id, anchor.cutoffId),
+            eq(conversationCutoffs.sourceSessionId, anchor.sourceSessionId),
+          ),
+        )
+        .get()
+      if (!cutoff) {
+        throw new Error('A required Fork cutoff source is unavailable.')
+      }
+      const preservedRevision = database
+        .select({
+          messageSequence: conversationCutoffRevisions.messageSequence,
+          isVisible: conversationCutoffRevisions.isVisible,
+        })
+        .from(conversationCutoffRevisions)
+        .where(
+          and(
+            eq(conversationCutoffRevisions.preservedMessageId, anchor.messageId),
+            eq(conversationCutoffRevisions.sourceSessionId, anchor.sourceSessionId),
+            gte(conversationCutoffRevisions.validUpToMutationSeq, cutoff.sessionMutationSeq),
+          ),
+        )
+        .orderBy(asc(conversationCutoffRevisions.validUpToMutationSeq))
+        .limit(1)
+        .get()
+      if (preservedRevision) {
+        if (
+          !preservedRevision.isVisible ||
+          preservedRevision.messageSequence > cutoff.maxMessageSequence
+        ) {
+          throw new Error('A required Fork cutoff Comment message is outside the cutoff.')
+        }
+        return anchor
+      }
+      const liveMessage = database
+        .select({
+          sequence: conversationMessages.sequence,
+          isVisible: conversationMessages.isVisible,
+        })
+        .from(conversationMessages)
+        .where(
+          and(
+            eq(conversationMessages.id, anchor.messageId),
+            eq(conversationMessages.sessionId, anchor.sourceSessionId),
+          ),
+        )
+        .get()
+      if (
+        !liveMessage ||
+        !liveMessage.isVisible ||
+        liveMessage.sequence > cutoff.maxMessageSequence
+      ) {
+        throw new Error('A required Fork cutoff Comment message is outside the cutoff.')
+      }
+      return anchor
+    }
     const remapMetadata = (value: unknown, depth = 0): unknown => {
       if (depth > 64) throw new Error('Fork source metadata exceeds its stack bound.')
       if (Array.isArray(value)) return value.map((item) => remapMetadata(item, depth + 1))
       if (!value || typeof value !== 'object') return value
+      if (Reflect.get(value, 'type') === 'cutoff_message') {
+        return validateForkCutoffMessageAnchor(value)
+      }
       const doc = collaborationDocumentSchema.safeParse(value)
       if (doc.success) return remapDocument(doc.data)
       const object: Record<string, unknown> = Object.fromEntries(Object.entries(value))
@@ -799,6 +878,9 @@ export function commitFork(
     }
     const remapCommentAnchor = (json: string): string => {
       const sourceAnchor = storedCommentAnchor(JSON.parse(json))
+      if (sourceAnchor.type === 'cutoff_message') {
+        return JSON.stringify(validateForkCutoffMessageAnchor(sourceAnchor))
+      }
       return JSON.stringify(commentAnchorSchema.parse(remapMetadata(sourceAnchor)))
     }
     const remapCollaboration = (stateJson: string): string => {

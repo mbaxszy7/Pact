@@ -23,7 +23,12 @@ import App from './App'
 import { createRendererQueryClient } from './query-client'
 
 vi.mock('./components/conversation/useConversation', () => ({
-  useConversation: () => ({ snapshot: undefined, composer: '', composerSkills: [] }),
+  useConversation: () => ({
+    snapshot: undefined,
+    composer: '',
+    composerSkills: [],
+    history: { window: undefined, retryRead: vi.fn<() => void>() },
+  }),
   commentDraftSaveSucceeded: vi.fn<() => void>(),
 }))
 vi.mock('./components/workspace/WorkspaceView', () => ({
@@ -169,6 +174,24 @@ function setup(options?: { updateAvailable?: boolean }) {
       }
     }),
     onNativePresenceChanged: vi.fn<DesktopBridge['onNativePresenceChanged']>(() => () => undefined),
+    setConversationInterest: vi.fn<DesktopBridge['setConversationInterest']>(async () => ({
+      ok: true,
+      value: { ready: true },
+    })),
+    listSideChats: vi.fn<DesktopBridge['listSideChats']>(async ({ parentSessionId }) => ({
+      ok: true,
+      value: {
+        parentSessionId,
+        items: [],
+        nextCursor: null,
+        prevCursor: null,
+        hasMoreOlder: false,
+        hasMoreNewer: false,
+        activeCount: 0,
+        attentionCount: 0,
+        unreadCount: 0,
+      },
+    })),
     onSessionReminderChanged: vi.fn<NonNullable<DesktopBridge['onSessionReminderChanged']>>(
       (listener) => {
         reminderListener = listener

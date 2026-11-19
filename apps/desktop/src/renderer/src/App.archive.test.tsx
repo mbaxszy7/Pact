@@ -26,7 +26,12 @@ import { createRendererQueryClient } from './query-client'
 // Exercise App's public workspace callbacks, real catalog hooks, and named Bridge operations.
 // Conversation rendering and navigation visuals have their own tests and are unrelated to archiving.
 vi.mock('./components/conversation/useConversation', () => ({
-  useConversation: () => ({ snapshot: undefined, composer: '', composerSkills: [] }),
+  useConversation: () => ({
+    snapshot: undefined,
+    composer: '',
+    composerSkills: [],
+    history: { window: undefined, retryRead: vi.fn<() => void>() },
+  }),
   commentDraftSaveSucceeded: vi.fn<() => void>(),
 }))
 vi.mock('./components/workspace/WorkspaceView', () => ({
@@ -193,6 +198,24 @@ function fixture(projectCount = 2) {
     })),
     onUpdateStateChanged: vi.fn<DesktopBridge['onUpdateStateChanged']>(() => () => undefined),
     onNativePresenceChanged: vi.fn<DesktopBridge['onNativePresenceChanged']>(() => () => undefined),
+    setConversationInterest: vi.fn<DesktopBridge['setConversationInterest']>(async () => ({
+      ok: true,
+      value: { ready: true },
+    })),
+    listSideChats: vi.fn<DesktopBridge['listSideChats']>(async ({ parentSessionId }) => ({
+      ok: true,
+      value: {
+        parentSessionId,
+        items: [],
+        nextCursor: null,
+        prevCursor: null,
+        hasMoreOlder: false,
+        hasMoreNewer: false,
+        activeCount: 0,
+        attentionCount: 0,
+        unreadCount: 0,
+      },
+    })),
     getAppInfo: vi.fn<DesktopBridge['getAppInfo']>(async () => ({
       ok: true,
       value: { name: 'Pact', version: '0.0.0', platform: 'win32', arch: 'x64', packaged: false },
@@ -320,6 +343,8 @@ function fixture(projectCount = 2) {
     | 'getSchedulingState'
     | 'onUpdateStateChanged'
     | 'onNativePresenceChanged'
+    | 'setConversationInterest'
+    | 'listSideChats'
     | 'getAppInfo'
     | 'getRuntimePreparation'
     | 'getAppearanceSettings'

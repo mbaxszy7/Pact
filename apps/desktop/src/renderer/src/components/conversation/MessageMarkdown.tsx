@@ -34,6 +34,7 @@ interface MessageMarkdownProps {
   onOpenProjectFile: (target: ProjectFileTarget) => void
   messageId?: string | undefined
   onCreateComment?: ((selection: MessageTextSelection) => void) | undefined
+  onAskInSideChat?: ((selection: MessageTextSelection) => void) | undefined
   documentSelection?: DocumentSelectionAdapter | undefined
 }
 
@@ -44,6 +45,7 @@ export const MessageMarkdown = memo(function MessageMarkdown({
   onOpenProjectFile,
   messageId,
   onCreateComment,
+  onAskInSideChat,
   documentSelection,
 }: MessageMarkdownProps): React.JSX.Element {
   const openProjectFileRef = useRef(onOpenProjectFile)
@@ -121,6 +123,7 @@ export const MessageMarkdown = memo(function MessageMarkdown({
     <MessageSelectionSurface
       messageId={messageId}
       onCreateComment={onCreateComment}
+      onAskInSideChat={onAskInSideChat}
       documentSelection={documentSelection}
     >
       {renderedMarkdown}

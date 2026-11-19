@@ -83,6 +83,7 @@ import {
   collaborationInputResultAllowed,
   frozenSourceInstructions,
 } from './collaboration-prompt'
+import { cutoffSourceNavigator } from './frozen-source-reader'
 import { NativeCheckOperation } from './native-check-operation'
 import {
   codexFileChanges,
@@ -3017,6 +3018,10 @@ export class CodexAgentAdapter implements AgentAdapter {
                       owner.sourceReadForm ?? 'legacy',
                     )
                 : undefined,
+              cutoffSourceNavigator(
+                owner.input.collaborationSourceReader,
+                owner.sourceReadForm ?? 'legacy',
+              ),
             ),
           ],
         },
@@ -4493,6 +4498,10 @@ export class CodexAgentAdapter implements AgentAdapter {
                       background.sourceReadForm ?? 'legacy',
                     )
                 : undefined,
+              cutoffSourceNavigator(
+                input.collaborationSourceReader,
+                background.sourceReadForm ?? 'legacy',
+              ),
             ),
           ],
           ...(workflow ? phasePolicy : {}),

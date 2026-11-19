@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
 import { lstat, open } from 'node:fs/promises'
 
+import type { CodexCollaborationSourceWireRead } from '@pact/contracts'
+
 import {
   agentPromptImageGroups,
   serializeAgentPromptEnvelope,
@@ -11,6 +13,71 @@ import {
 } from '@pact/agent-runtime'
 
 import { AgentExecutionError } from './agent-execution-error'
+
+export interface PromptCutoffSupplement {
+  cutoffIds: string[]
+  inlineTails: Array<{ cutoffId: string; text: string }>
+}
+
+const promptCutoffSupplements = new WeakMap<AgentPromptEnvelope, PromptCutoffSupplement>()
+
+export function setPromptCutoffSupplement(
+  envelope: AgentPromptEnvelope,
+  supplement: PromptCutoffSupplement | undefined,
+): void {
+  if (!supplement || (supplement.cutoffIds.length === 0 && supplement.inlineTails.length === 0)) {
+    promptCutoffSupplements.delete(envelope)
+    return
+  }
+  promptCutoffSupplements.set(envelope, supplement)
+}
+
+export function getPromptCutoffSupplement(
+  envelope: AgentPromptEnvelope,
+): PromptCutoffSupplement | undefined {
+  return promptCutoffSupplements.get(envelope)
+}
+
+export type CutoffSourceNavigator = (cutoffId: string) => CodexCollaborationSourceWireRead
+
+export function serializeAgentPromptEnvelopeWithCutoffs(
+  envelope: AgentPromptEnvelope,
+  navigate?: AgentSourceNavigation,
+  navigateCutoff?: CutoffSourceNavigator,
+): string {
+  const baseText = serializeAgentPromptEnvelope(envelope, navigate)
+  const supplement = promptCutoffSupplements.get(envelope)
+  if (!supplement || (supplement.cutoffIds.length === 0 && supplement.inlineTails.length === 0)) {
+    return baseText
+  }
+  const sections: string[] = [baseText]
+  if (supplement.cutoffIds.length > 0 && (navigateCutoff || envelope.sourceGrant)) {
+    const cutoffNavigation = supplement.cutoffIds.flatMap((cutoffId) => {
+      const read =
+        navigateCutoff?.(cutoffId) ??
+        (envelope.sourceGrant
+          ? {
+              source: 'cutoff' as const,
+              runId: envelope.sourceGrant.runId,
+              grant: envelope.sourceGrant.grant,
+              cutoffId,
+              part: 'catalog' as const,
+              offset: 0,
+            }
+          : undefined)
+      return read ? [{ kind: 'cutoff' as const, cutoffId, read }] : []
+    })
+    if (cutoffNavigation.length > 0) {
+      sections.push(
+        `Cutoff source navigation (read frozen parent/side-chat context on demand with read_collaboration_source):\n${JSON.stringify({ cutoffNavigation })}`,
+      )
+    }
+  }
+  for (const tail of supplement.inlineTails) {
+    if (tail.text) sections.push(tail.text)
+  }
+  return sections.join('\n\n')
+}
 
 export interface NativeImageBlock {
   type: 'image'
@@ -84,13 +151,21 @@ export async function nativeImageBlock(
   }
 }
 
-export function codexPromptInput(envelope: AgentPromptEnvelope, navigate?: AgentSourceNavigation) {
+export function codexPromptInput(
+  envelope: AgentPromptEnvelope,
+  navigate?: AgentSourceNavigation,
+  navigateCutoff?: CutoffSourceNavigator,
+) {
   type Input =
     | { type: 'text'; text: string; text_elements: never[] }
     | { type: 'localImage'; path: string }
     | { type: 'skill'; name: string; path: string | undefined }
   const input: Input[] = [
-    { type: 'text', text: serializeAgentPromptEnvelope(envelope, navigate), text_elements: [] },
+    {
+      type: 'text',
+      text: serializeAgentPromptEnvelopeWithCutoffs(envelope, navigate, navigateCutoff),
+      text_elements: [],
+    },
   ]
   for (const group of agentPromptImageGroups(envelope)) {
     input.push({
@@ -125,8 +200,9 @@ export async function claudePromptContent(
   envelope: AgentPromptEnvelope,
   signal?: AbortSignal,
   navigate?: AgentSourceNavigation,
+  navigateCutoff?: CutoffSourceNavigator,
 ) {
-  const serialized = serializeAgentPromptEnvelope(envelope, navigate)
+  const serialized = serializeAgentPromptEnvelopeWithCutoffs(envelope, navigate, navigateCutoff)
   // Pact already owns workflow commands and the Adapter selects native Plan mode.
   // Keep the original request as text, not a headless Claude slash-command invocation.
   const text = envelope.collaboration ? `Pact user request:\n${serialized}` : serialized

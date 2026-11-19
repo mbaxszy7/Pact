@@ -2435,3 +2435,299 @@ describe('task replacement confirmation', () => {
     expect(screen.queryByRole('button', { name: /\bend task\b/i })).toBeNull()
   })
 })
+
+describe('Side-chat UI, /btw, and @Main routing', () => {
+  it('renders the /btw Pact chip, enforces send gating, and hands off a stripped draft', async () => {
+    const onOpenBtwSideChat = vi
+      .fn<NonNullable<ComponentProps<typeof ConversationView>['onOpenBtwSideChat']>>()
+      .mockResolvedValue(true)
+    const onClearSubmittedDraft = vi.fn<(expectedRevision: number) => void>()
+    const base = fixture()
+    base.composer = '/btw check auth edge cases'
+    base.composerRevision = 7
+
+    // Without onOpenBtwSideChat, Send is disabled for /btw.
+    const view = render(<ConversationView {...base} />)
+    const chip = document.querySelector<HTMLElement>('[data-pact-command="btw"]')
+    expect(chip).not.toBeNull()
+    expect(chip?.textContent).toContain('pact:btw')
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' }).disabled).toBe(
+      true,
+    )
+
+    // Attached images block /btw handoff with a notice.
+    view.rerender(
+      <ConversationView
+        {...base}
+        onOpenBtwSideChat={onOpenBtwSideChat}
+        onClearSubmittedDraft={onClearSubmittedDraft}
+        composerImages={[
+          {
+            id: crypto.randomUUID(),
+            name: 'shot.png',
+            status: 'ready',
+            image: {
+              id: crypto.randomUUID(),
+              name: 'shot.png',
+              mediaType: 'image/png',
+              bytes: 128,
+              width: 10,
+              height: 10,
+              sha256: 'a'.repeat(64),
+            },
+          },
+        ]}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(base.onNotice).toHaveBeenCalledWith(
+      'Remove attached images or draft comments before starting a /btw side chat.',
+    )
+    expect(onOpenBtwSideChat).not.toHaveBeenCalled()
+
+    // Saved/returned input blocks /btw handoff with a notice.
+    vi.mocked(base.onNotice).mockClear()
+    view.rerender(
+      <ConversationView
+        {...base}
+        onOpenBtwSideChat={onOpenBtwSideChat}
+        onClearSubmittedDraft={onClearSubmittedDraft}
+        composerReturnedInputOperationId={crypto.randomUUID()}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(base.onNotice).toHaveBeenCalledWith(
+      'Send or clear the saved message before starting a /btw side chat.',
+    )
+    expect(onOpenBtwSideChat).not.toHaveBeenCalled()
+
+    // Clean /btw draft opens side chat with stripped text and clears submitted draft revision.
+    view.rerender(
+      <ConversationView
+        {...base}
+        onOpenBtwSideChat={onOpenBtwSideChat}
+        onClearSubmittedDraft={onClearSubmittedDraft}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    await waitFor(() => expect(onOpenBtwSideChat).toHaveBeenCalledTimes(1))
+    expect(onOpenBtwSideChat).toHaveBeenCalledWith({
+      text: 'check auth edge cases',
+      skills: [],
+      returnedInputOperationId: undefined,
+      mention: undefined,
+      route: undefined,
+    })
+    expect(onClearSubmittedDraft).toHaveBeenCalledWith(7)
+    expect(base.onSend).not.toHaveBeenCalled()
+  })
+
+  it('orders @Main below @claude in side-chat autocomplete and switches Send to Send to main', async () => {
+    const parentId = crypto.randomUUID()
+    const base = fixture()
+    base.session = {
+      ...base.session,
+      parentSessionId: parentId,
+      sideChatOrigin: 'btw',
+      settings: {
+        ...base.session.settings,
+        primaryAgentId: 'claude',
+      },
+    }
+    base.snapshot!.messages = []
+    const onSyncToMain = vi
+      .fn<NonNullable<ComponentProps<typeof ConversationView>['onSyncToMain']>>()
+      .mockResolvedValue({
+        operationId: crypto.randomUUID(),
+        sideChatId: base.session.id,
+        parentSessionId: parentId,
+        cutoffId: crypto.randomUUID(),
+        disposition: 'sent',
+        mainMessageId: crypto.randomUUID(),
+        queuedOperationId: null,
+      })
+
+    function SideChatHarness() {
+      const [composer, setComposer] = useState('')
+      const [mention, setMention] =
+        useState<ComponentProps<typeof ConversationView>['composerMention']>()
+      const [route, setRoute] = useState<ComponentProps<typeof ConversationView>['composerRoute']>()
+      return (
+        <ConversationView
+          {...base}
+          composer={composer}
+          composerMention={mention}
+          composerRoute={route}
+          onComposerChange={setComposer}
+          onComposerDocumentChange={(doc) => {
+            setComposer(doc.text)
+            setMention(doc.mention)
+            setRoute(doc.route)
+          }}
+          onComposerMentionChange={setMention}
+          onSyncToMain={onSyncToMain}
+        />
+      )
+    }
+
+    render(<SideChatHarness />)
+
+    // Side-chat empty state copy uses primary agent name and @Main guidance.
+    expect(screen.getByRole('heading', { level: 2, name: 'Ask Claude Code' })).toBeTruthy()
+    expect(
+      screen.getByText('Ask about the main chat, or type @Main to send a takeaway back.'),
+    ).toBeTruthy()
+
+    // Typing "@" opens the mention listbox with @Main immediately below @claude.
+    const editor = screen.getByRole('combobox', { name: 'Message' })
+    act(() => editor.focus())
+    const typeAt = new InputEvent('beforeinput', {
+      inputType: 'insertText',
+      data: '@',
+      bubbles: true,
+      cancelable: true,
+    })
+    Object.defineProperty(typeAt, 'getTargetRanges', { value: () => [] })
+    fireEvent(editor, typeAt)
+
+    const listbox = await screen.findByRole('listbox', { name: 'Message recipients' })
+    const options = within(listbox).getAllByRole('option')
+    expect(options.map((option) => option.textContent)).toEqual([
+      expect.stringContaining('@codex'),
+      expect.stringContaining('@claude'),
+      expect.stringContaining('@Main'),
+      expect.stringContaining('@all'),
+    ])
+
+    // Choosing @Main switches Send button to "Send to main".
+    fireEvent.click(options[2]!)
+    const sendMainButton = await screen.findByRole<HTMLButtonElement>('button', {
+      name: 'Send to main',
+    })
+    expect(sendMainButton.title).toBe('Send to main')
+
+    // Submitting with empty takeaway notifies instead of syncing.
+    fireEvent.click(sendMainButton)
+    expect(base.onNotice).toHaveBeenCalledWith('Write a message before sending to the main chat.')
+    expect(onSyncToMain).not.toHaveBeenCalled()
+
+    // Appending takeaway text and submitting calls onSyncToMain with stripped content.
+    const typeBody = new InputEvent('beforeinput', {
+      inputType: 'insertText',
+      data: 'Use token bucket rate limiting',
+      bubbles: true,
+      cancelable: true,
+    })
+    Object.defineProperty(typeBody, 'getTargetRanges', { value: () => [] })
+    fireEvent(editor, typeBody)
+    fireEvent.click(screen.getByRole('button', { name: 'Send to main' }))
+    await waitFor(() => expect(onSyncToMain).toHaveBeenCalledTimes(1))
+    expect(onSyncToMain).toHaveBeenCalledWith('Use token bucket rate limiting', [], [])
+    expect(base.onSend).not.toHaveBeenCalled()
+  })
+
+  it('shows a live From side chat badge tooltip via resolveSideChatTitle and opens the side chat on click', () => {
+    const base = fixture()
+    const sideChatId = crypto.randomUUID()
+    const cutoffId = crypto.randomUUID()
+    const onOpenSideChat = vi.fn<(id: string) => void>()
+    base.snapshot!.messages = [
+      {
+        id: crypto.randomUUID(),
+        sessionId: base.session.id,
+        role: 'user',
+        content: 'Synced takeaway from side chat',
+        contentRevision: 0,
+        state: 'complete',
+        sequence: 1,
+        originSideChat: {
+          sideChatId,
+          cutoffId,
+          sideChatTitle: 'Original side chat title',
+        },
+        createdAt: base.session.createdAt,
+        updatedAt: base.session.updatedAt,
+      },
+    ]
+
+    const view = render(
+      <ConversationView
+        {...base}
+        onOpenSideChat={onOpenSideChat}
+        resolveSideChatTitle={(id, fallback) =>
+          id === sideChatId ? 'Live updated side chat' : fallback
+        }
+      />,
+    )
+
+    const badge = screen.getByRole('button', { name: 'From side chat' })
+    expect(badge.getAttribute('title')).toBe('Open side chat: Live updated side chat')
+    fireEvent.click(badge)
+    expect(onOpenSideChat).toHaveBeenCalledWith(sideChatId)
+
+    view.rerender(
+      <ConversationView
+        {...base}
+        onOpenSideChat={onOpenSideChat}
+        resolveSideChatTitle={(id, fallback) => (id === sideChatId ? 'Renamed again' : fallback)}
+      />,
+    )
+    expect(screen.getByRole('button', { name: 'From side chat' }).getAttribute('title')).toBe(
+      'Open side chat: Renamed again',
+    )
+  })
+
+  it('locks the side-chat composer by hiding Permission, Speed, Project context, and Fork and rejecting Pact commands', () => {
+    const base = fixture()
+    const assistantMessageId = crypto.randomUUID()
+    base.session = {
+      ...base.session,
+      parentSessionId: crypto.randomUUID(),
+      sideChatOrigin: 'selection',
+    }
+    base.snapshot!.forkBlocked = false
+    base.snapshot!.messages = [
+      {
+        id: assistantMessageId,
+        sessionId: base.session.id,
+        role: 'assistant',
+        agentId: 'codex',
+        content: 'Assistant answer in side chat.',
+        contentRevision: 0,
+        state: 'complete',
+        sequence: 1,
+        createdAt: base.session.createdAt,
+        updatedAt: base.session.updatedAt,
+      },
+    ]
+
+    const commonProps = {
+      ...base,
+      onSaveSessionPermission: vi.fn<() => Promise<boolean>>().mockResolvedValue(true),
+      onSaveSessionSpeed: vi.fn<() => Promise<boolean>>().mockResolvedValue(true),
+      onForkSessionCreated: vi.fn<() => void>(),
+    }
+
+    const view = render(<ConversationView {...commonProps} composer="/plan draft plan" />)
+
+    // Permission, Speed, Project context, and Fork actions are all hidden in a side chat.
+    expect(screen.queryByRole('group', { name: 'Claude Code settings' })).toBeNull()
+    expect(screen.queryByRole('group', { name: 'Codex settings' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Project context/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Fork/i })).toBeNull()
+
+    // Pact commands (/plan, /build, /review, /btw) are never turned into chips and are rejected.
+    for (const command of ['/plan ', '/build ', '/review ', '/btw ']) {
+      view.rerender(<ConversationView {...commonProps} composer={`${command}do work`} />)
+      expect(document.querySelector('[data-pact-command]')).toBeNull()
+      expect(
+        screen.getByText(
+          'Pact commands (/plan, /build, /review, /btw) can only be used in the main chat.',
+        ),
+      ).toBeTruthy()
+      expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' }).disabled).toBe(
+        true,
+      )
+    }
+  })
+})

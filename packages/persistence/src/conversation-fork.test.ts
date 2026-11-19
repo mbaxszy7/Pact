@@ -904,8 +904,8 @@ it('admits a 9000-message frozen prefix when its actual complete material is bel
           id: randomUUID(),
           sessionId: f.sourceId,
           role: 'user' as const,
-          // Retain the original serialized workload after adding nullable Skill metadata.
-          content: 'x'.repeat(478),
+          // Retain the original serialized workload after adding nullable Skill and side-chat origin metadata.
+          content: 'x'.repeat(452),
           state: 'complete' as const,
           sequence: start + index,
           createdAt: timestamp,

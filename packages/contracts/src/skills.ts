@@ -1,6 +1,10 @@
 import { z } from 'zod'
 
-import { pactSkillSchema, type PactSkill } from './collaboration.js'
+import { PACT_SKILLS, pactSkillSchema, type PactSkill } from './collaboration.js'
+
+export const PACT_COMPOSER_SKILLS = [...PACT_SKILLS, 'btw'] as const
+export type PactComposerSkill = (typeof PACT_COMPOSER_SKILLS)[number]
+export const pactComposerSkillSchema = z.enum(PACT_COMPOSER_SKILLS)
 
 export const SKILL_CATALOG_ITEMS = 4_096
 export const SKILL_CATALOG_BYTES = 1_024 * 1_024
@@ -184,6 +188,7 @@ export interface FrozenSkillInvocation {
 type AgentRoute = { type: 'agent'; agentId: 'claude' | 'codex' } | { type: 'all' }
 export interface ComposerCommandPrefix {
   pact?: PactSkill
+  btw?: { start: number; end: number }
   route?: AgentRoute
   skills: Array<{ name: string; start: number; end: number }>
   argumentsStart: number
@@ -246,6 +251,14 @@ export function parseComposerCommandPrefix(
         target === 'all'
           ? { type: 'all' }
           : { type: 'agent', agentId: target === 'claude' ? 'claude' : 'codex' }
+    } else if (token[2] === 'btw') {
+      if (result.pact || result.btw) {
+        result.error = 'Choose one Pact Skill for this task.'
+        break
+      }
+      result.btw = { start: offset, end: offset + token[0].length }
+      offset += token[0].length
+      break
     } else if (pact.success) {
       if (result.pact) {
         result.error = 'Choose one Pact Skill for this task.'
@@ -282,4 +295,32 @@ export function skillArguments(content: string, selections: SkillSelection[]): s
     offset = entry.end
   }
   return (result + content.slice(offset)).trim()
+}
+
+/** Rejects residual Pact/agent directives left after stripping a leading `@Main` target. */
+export function validateSideChatMainSyncContent(
+  content: string,
+  selections: readonly Pick<SkillSelection, 'name' | 'start' | 'end'>[] = [],
+): { ok: true } | { ok: false; message: string } {
+  const prefix = parseComposerCommandPrefix(content, selections)
+  if (prefix.error) return { ok: false, message: prefix.error }
+  if (prefix.btw) {
+    return {
+      ok: false,
+      message: '/btw opens a side chat instead of sending a regular message.',
+    }
+  }
+  if (prefix.pact) {
+    return {
+      ok: false,
+      message: 'Pact commands (/plan, /build, /review) can only be used directly in the main chat.',
+    }
+  }
+  if (prefix.route) {
+    return {
+      ok: false,
+      message: 'Remove @claude, @codex, or @all after @Main before sending to the main chat.',
+    }
+  }
+  return { ok: true }
 }

@@ -1,4 +1,4 @@
-import { BookOpen, Maximize2, Minimize2, RotateCcw, X } from 'lucide-react'
+import { BookOpen, ChevronLeft, Maximize2, Minimize2, RotateCcw, X } from 'lucide-react'
 import { Component, lazy, Suspense, type ReactNode } from 'react'
 
 import type { SkillDocument, SkillSelection } from '@pact/contracts'
@@ -46,18 +46,32 @@ export function SkillDocumentPanel({
   expanded,
   onExpandedChange,
   onClose,
+  onBackToSideChat,
   onRetry,
 }: {
   state: SkillDocumentPanelState
   expanded: boolean
   onExpandedChange: (value: boolean) => void
   onClose: () => void
+  onBackToSideChat?: (() => void) | undefined
   onRetry: () => void
 }): React.JSX.Element {
   const label = state.skill.agentId === 'codex' ? 'Codex' : 'Claude Code'
   const document = state.document
   return (
     <section className="flex h-full min-h-0 flex-col" aria-label="Skill document">
+      {onBackToSideChat ? (
+        <div className="flex h-10 shrink-0 items-center border-b border-border px-3">
+          <button
+            type="button"
+            className="inline-flex h-7 items-center gap-1 rounded-control px-2 text-caption font-medium text-secondary transition-colors hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+            onClick={onBackToSideChat}
+          >
+            <ChevronLeft aria-hidden="true" className="size-4" strokeWidth={1.75} />
+            Back to side chat
+          </button>
+        </div>
+      ) : null}
       <header className="flex shrink-0 items-start justify-between gap-group border-b border-border px-panel py-group">
         <div className="flex min-w-0 items-start gap-2.5">
           <BookOpen

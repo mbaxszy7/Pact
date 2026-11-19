@@ -46,6 +46,7 @@ import { markdownVisibleProjection } from '../../shared/message-anchor-text.js'
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
 import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
+import { WorkspaceChanges } from '../workspace-changes/workspace-changes.js'
 import {
   collaborationInputResultRequired,
   collaborationPlanMode,
@@ -4557,4 +4558,184 @@ describe('confirmed task replacement', () => {
     expect(old.ending).toBeUndefined()
     await f.settled()
   })
+})
+
+it('waits for terminal workspace finalization before serving collaboration reports or admitting the next action', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'pact-collaboration-settling-'))
+  const db = await PactDatabase.open({
+    filePath: ':memory:',
+    migrationsFolder: resolve(import.meta.dirname, '../../../../../packages/persistence/drizzle'),
+  })
+  const projectId = randomUUID()
+  const sessionId = randomUUID()
+  const createdAt = new Date().toISOString()
+  db.projectCatalogRepository.add({
+    id: projectId,
+    name: 'Collaboration Settling',
+    directoryPath: directory,
+    kind: 'directory',
+    createdAt,
+  })
+  db.sessionRepository.create(
+    { id: sessionId, projectId, title: 'Collaboration Settling', createdAt },
+    {
+      primaryAgentId: 'codex',
+      agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+      maxDiscussionRounds: 6,
+      maxReviewCycles: 3,
+      maxRepairAttempts: 3,
+    },
+  )
+  native.recordCodeChange = (runInput) => {
+    const run = db.conversationRepository.findRun(runInput.runId)
+    if (!run) return
+    const now = new Date().toISOString()
+    db.drizzle
+      .insert(workspaceChangeSets)
+      .values({
+        id: runInput.runId,
+        runId: runInput.runId,
+        sessionId: runInput.sessionId,
+        projectId,
+        agentId: run.agentId,
+        root: directory,
+        rootDevice: '1',
+        rootInode: '1',
+        stagingRoot: join(directory, '.staging'),
+        state: 'ready',
+        fileCount: 1,
+        additions: 1,
+        deletions: 0,
+        createdAt: now,
+        finalizedAt: now,
+        projectionPending: false,
+        revision: 1,
+      })
+      .run()
+  }
+  const preparation = new RuntimePreparation(db.runtimePreparationRepository)
+  vi.spyOn(preparation, 'findRecoveryExecutable').mockResolvedValue(process.execPath)
+  vi.spyOn(preparation, 'inspectReadiness').mockResolvedValue({
+    ok: true,
+    value: {
+      firstUse: false,
+      agents: [
+        {
+          agentId: 'codex',
+          executablePath: process.execPath,
+          state: 'ready',
+          checkedAt: createdAt,
+        },
+        {
+          agentId: 'claude',
+          executablePath: process.execPath,
+          state: 'ready',
+          checkedAt: createdAt,
+        },
+      ],
+    },
+  })
+  const workspace = new WorkspaceChanges(
+    db.workspaceChangesRepository,
+    db.sessionRepository,
+    db.projectCatalogRepository,
+    join(directory, 'storage'),
+    runDirectoryWorker,
+  )
+  await workspace.initialize()
+  const flow = new Conversation(
+    db.conversationRepository,
+    db.sessionRepository,
+    db.projectCatalogRepository,
+    preparation,
+    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
+    workspace,
+  )
+  const holdFinish = Promise.withResolvers<void>()
+  let holdActive = false
+  const finishEntered = Promise.withResolvers<void>()
+  const originalFinish = workspace.finish.bind(workspace)
+  vi.spyOn(workspace, 'finish').mockImplementation(async (runId) => {
+    if (holdActive) {
+      finishEntered.resolve()
+      await holdFinish.promise
+    }
+    return originalFinish(runId)
+  })
+  try {
+    const drafts = db.conversationRepository.readPage({ scope: 'drafts', sessionId })
+    if (drafts.scope !== 'drafts') throw Error('Missing draft page')
+    expect(
+      (
+        await flow.send({
+          sessionId,
+          clientMessageId: randomUUID(),
+          content: '/plan Plan the cancellation settling fix.',
+          commentIds: [],
+          expectedCommentsRevision: drafts.commentsRevision,
+        })
+      ).ok,
+    ).toBe(true)
+    await vi.waitFor(() => {
+      expect(db.conversationRepository.collaboration(sessionId)?.status).toBe('ready')
+      expect(flow.diagnostics().activeExecutions).toBe(0)
+    })
+    const readyTask = db.conversationRepository.collaboration(sessionId)!
+    holdActive = true
+    expect(
+      (
+        await flow.actOnCollaboration({
+          sessionId,
+          taskId: readyTask.id,
+          revision: readyTask.revision,
+          clientMessageId: randomUUID(),
+          action: 'execute',
+        })
+      ).ok,
+    ).toBe(true)
+    await finishEntered.promise
+    const implementTask = db.conversationRepository.collaboration(sessionId)!
+    expect(db.conversationRepository.findRun(implementTask.runId)?.status).toBe('completed')
+    expect(flow.diagnostics().activeExecutions).toBe(1)
+
+    let loadedSettled = false
+    const reportPromise = flow
+      .load({
+        scope: 'collaboration',
+        sessionId,
+        runId: implementTask.runId,
+        projection: 'report',
+      })
+      .then((result) => {
+        loadedSettled = true
+        return result
+      })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(loadedSettled).toBe(false)
+
+    holdActive = false
+    holdFinish.resolve()
+    const report = await reportPromise
+    expect(report.ok).toBe(true)
+    expect(flow.diagnostics().activeExecutions).toBe(0)
+    if (!report.ok || report.value.scope !== 'collaboration') throw Error('Expected collaboration')
+    expect(report.value.view.availableActions).toContain('review_code')
+    const latestTask = report.value.view.task!
+    const reviewResponse = await flow.actOnCollaboration({
+      sessionId,
+      taskId: latestTask.id,
+      revision: latestTask.revision,
+      clientMessageId: randomUUID(),
+      action: 'review_code',
+    })
+    expect(reviewResponse).toMatchObject({ ok: true })
+    await vi.waitFor(() => expect(flow.diagnostics().activeExecutions).toBe(0))
+  } finally {
+    holdFinish.resolve()
+    await flow.dispose()
+    await workspace.dispose()
+    db.close()
+    await rm(directory, { recursive: true, force: true })
+  }
 })
